@@ -1,0 +1,49 @@
+[package]
+name = "nntune-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Usenet data-plane core for NNTune v2: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
+license = "MIT"
+rust-version = "1.75"
+
+[features]
+default = ["native-tls"]
+native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
+
+[dependencies]
+crc32fast = "1"
+quick-xml = "0.42"
+sha2 = "0.11"
+md5 = "0.8"
+aes = "0.9"
+cbc = "0.2"
+# No default features: the default `getrandom` backend does not build for
+# wasm32-unknown-unknown, and this crate never generates keys/nonces.
+crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "1", optional = true }
+worker = { version = "0.8", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["io-util", "net", "time"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["io-util"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+criterion = "0.8"
+
+[[bench]]
+name = "yenc"
+harness = false
+
+[lib]
+name = "nntune_core"
+path = "src/lib.rs"
