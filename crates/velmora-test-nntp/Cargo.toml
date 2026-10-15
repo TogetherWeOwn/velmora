@@ -1,0 +1,24 @@
+[package]
+name = "nntune-test-nntp"
+version = "0.1.0"
+edition = "2021"
+description = "Synthetic NNTP test server + fixture corpus for NNTune v2 CI (no real Usenet in CI)"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/nntunev2"
+
+[[bin]]
+name = "nntp-fixture-server"
+path = "src/main.rs"
+
+[lib]
+name = "nntune_test_nntp"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

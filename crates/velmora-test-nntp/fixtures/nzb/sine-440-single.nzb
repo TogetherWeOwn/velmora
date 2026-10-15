@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/nzb/nzb-1.1">
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-440 [01/01] - &quot;sine-440.wav&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.nntune.test</group></groups>
+    <segments>
+      <segment bytes="1004" number="1">&lt;single-yenc-001@nntune.test&gt;</segment>
+    </segments>
+  </file>
+</nzb>

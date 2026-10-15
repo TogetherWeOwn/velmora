@@ -185,6 +185,26 @@ async fn article_430_is_not_found() {
 }
 
 #[tokio::test]
+async fn auth_required_480_surfaces_auth_failed() {
+    // RFC 4643 s2.3.1: 480 means authentication is required. The client
+    // must surface it as an auth error (same class as 481/482), so the
+    // synthetic harness can exercise the 480 path real providers send.
+    let script = Script::new(
+        "200 ready\r\n500 no\r\n281 ok\r\n480 authentication required\r\n",
+        &[
+            "MODE READER\r\n",
+            "AUTHINFO USER user\r\n",
+            "STAT <a@x>\r\n",
+        ],
+    );
+    let mut client = NntpClient::connect(script, &config_auth_user_only())
+        .await
+        .unwrap();
+    let err = client.stat("a@x").await.unwrap_err();
+    assert!(matches!(err, Error::AuthFailed(_)), "got {err}");
+}
+
+#[tokio::test]
 async fn pipelined_fetch_many_reads_in_order() {
     let script = Script::new(
         "200 ready\r\n500 no\r\n281 ok\r\n\
