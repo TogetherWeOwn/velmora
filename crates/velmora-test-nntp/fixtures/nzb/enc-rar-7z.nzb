@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/nzb/nzb-1.1">
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture enc-rar [01/01] - &quot;enc-audio.rar&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.nntune.test</group></groups>
+    <segments>
+      <segment bytes="520" number="1">&lt;enc-rar-001@nntune.test&gt;</segment>
+    </segments>
+  </file>
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture enc-7z [01/01] - &quot;enc-audio.7z&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.nntune.test</group></groups>
+    <segments>
+      <segment bytes="518" number="1">&lt;enc-7z-001@nntune.test&gt;</segment>
+    </segments>
+  </file>
+</nzb>

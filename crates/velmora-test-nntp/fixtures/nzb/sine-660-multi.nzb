@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/nzb/nzb-1.1">
+  <file poster="fixture@nntune.test" date="1760313600" subject="NNTune-Fixture sine-660 [01/03] - &quot;sine-660.wav&quot; yEnc">
+    <groups><group>alt.binaries.nntune.test</group></groups>
+    <segments>
+      <segment bytes="575" number="1">&lt;multi-660-part1-of-3@nntune.test&gt;</segment>
+      <segment bytes="575" number="2">&lt;multi-660-part2-of-3@nntune.test&gt;</segment>
+      <segment bytes="574" number="3">&lt;multi-660-part3-of-3@nntune.test&gt;</segment>
+    </segments>
+  </file>
+</nzb>

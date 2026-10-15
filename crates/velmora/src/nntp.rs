@@ -5,7 +5,8 @@
 //! numeric codes; the reply codes this client acts on are:
 //!
 //! - `430` — no such article → [`Error::ArticleNotFound`].
-//! - `481`/`482` — authentication rejected/required → [`Error::AuthFailed`].
+//! - `480`/`481`/`482` — authentication required/rejected/out-of-sequence
+//!   (RFC 4643 s2.3) → [`Error::AuthFailed`].
 //! - `502` — no permission → [`Error::NoPermission`].
 //!
 //! NNTP is lock-step ordered, so pipelining is simply writing several
@@ -291,7 +292,7 @@ impl<T: Transport> NntpClient<T> {
                 let pass_reply = self.command(&format!("AUTHINFO PASS {password}")).await?;
                 match pass_reply.code {
                     281 => Ok(()),
-                    481 | 482 => Err(Error::AuthFailed(pass_reply.text)),
+                    480..=482 => Err(Error::AuthFailed(pass_reply.text)),
                     502 => Err(Error::NoPermission(pass_reply.text)),
                     code => Err(Error::NntpReply {
                         code,
@@ -300,7 +301,7 @@ impl<T: Transport> NntpClient<T> {
                 }
             }
             281 => Ok(()),
-            481 | 482 => Err(Error::AuthFailed(user_reply.text)),
+            480..=482 => Err(Error::AuthFailed(user_reply.text)),
             502 => Err(Error::NoPermission(user_reply.text)),
             code => Err(Error::NntpReply {
                 code,
@@ -327,7 +328,7 @@ impl<T: Transport> NntpClient<T> {
     fn classify(&self, reply: &Reply, subject: &str) -> Error {
         match reply.code {
             430 => Error::ArticleNotFound(subject.to_string()),
-            481 | 482 => Error::AuthFailed(reply.text.clone()),
+            480..=482 => Error::AuthFailed(reply.text.clone()),
             502 => Error::NoPermission(reply.text.clone()),
             code => Error::NntpReply {
                 code,
