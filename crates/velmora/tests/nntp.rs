@@ -103,6 +103,76 @@ async fn auth_failure_surfaces_481() {
 }
 
 #[tokio::test]
+async fn auth_exchange_replies_never_retain_server_text() {
+    // Unmodelled AUTHINFO PASS replies (here 504) must drop their text at
+    // construction: neither Display nor Debug may echo it.
+    let script = Script::new(
+        "200 ready\r\n500 no\r\n381 more\r\n504 weird s3cret-provider-password\r\n",
+        &[
+            "MODE READER\r\n",
+            "AUTHINFO USER user\r\n",
+            "AUTHINFO PASS pass\r\n",
+        ],
+    );
+    let Err(err) = NntpClient::connect(script, &config()).await else {
+        panic!("expected NNTP error")
+    };
+    assert!(
+        matches!(err, Error::NntpReply { code: 504, .. }),
+        "got {err}"
+    );
+    for rendered in [err.to_string(), format!("{err:?}")] {
+        assert!(
+            !rendered.contains("s3cret-provider-password"),
+            "credential material retained from auth reply: {rendered}"
+        );
+        assert!(
+            !rendered.contains("weird"),
+            "auth reply text echoed: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn article_480_is_auth_failed_482_is_not() {
+    // 480 on a non-auth command = session no longer authenticated (the
+    // stale-credential signal); 482 there is out-of-sequence and must
+    // stay a generic protocol error.
+    let script = Script::new(
+        "200 ready\r\n500 no\r\n281 ok\r\n480 authentication required\r\n",
+        &[
+            "MODE READER\r\n",
+            "AUTHINFO USER user\r\n",
+            "STAT <a@x>\r\n",
+        ],
+    );
+    let mut client = NntpClient::connect(script, &config())
+        .await
+        .expect("handshake");
+    let err = client.stat("a@x").await.expect_err("480 must fail");
+    assert!(matches!(err, Error::AuthFailed(_)), "got {err}");
+    assert!(err.is_auth_failure());
+
+    let script = Script::new(
+        "200 ready\r\n500 no\r\n281 ok\r\n482 out of sequence\r\n",
+        &[
+            "MODE READER\r\n",
+            "AUTHINFO USER user\r\n",
+            "STAT <a@x>\r\n",
+        ],
+    );
+    let mut client = NntpClient::connect(script, &config())
+        .await
+        .expect("handshake");
+    let err = client.stat("a@x").await.expect_err("482 must fail");
+    assert!(
+        matches!(err, Error::NntpReply { code: 482, .. }),
+        "got {err}"
+    );
+    assert!(!err.is_auth_failure());
+}
+
+#[tokio::test]
 async fn greeting_502_is_no_permission() {
     let Err(err) = NntpClient::connect(Script::new("502 access denied\r\n", &[]), &config()).await
     else {
