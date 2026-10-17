@@ -41,7 +41,23 @@ impl ReadAt for Vec<u8> {
     }
 }
 
+fn range_overflow() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "ciphertext range exceeds addressable offsets",
+    )
+}
+
 fn read_exact_at(src: &impl ReadAt, mut dst: &mut [u8], off: u64) -> io::Result<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    // The offset of the last byte read must be representable; reject
+    // before issuing any source request that would need a wrapped offset.
+    // `dst.len() as u64` is lossless (usize never exceeds 64 bits) and
+    // `dst` is non-empty here, so the subtraction cannot underflow.
+    off.checked_add(dst.len() as u64 - 1)
+        .ok_or_else(range_overflow)?;
     let mut pos = off;
     while !dst.is_empty() {
         let n = src.read_at(dst, pos)?;
@@ -51,8 +67,16 @@ fn read_exact_at(src: &impl ReadAt, mut dst: &mut [u8], off: u64) -> io::Result<
                 "ciphertext source ended mid-range",
             ));
         }
+        if n > dst.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ciphertext source returned more bytes than requested",
+            ));
+        }
         dst = &mut dst[n..];
-        pos += n as u64;
+        if !dst.is_empty() {
+            pos = pos.checked_add(n as u64).ok_or_else(range_overflow)?;
+        }
     }
     Ok(())
 }
@@ -91,18 +115,33 @@ pub mod aes_cbc {
             )));
         }
 
+        let out_of_range = || Error::Decrypt("aes-cbc range out of bounds".into());
         let first_block = off / BLOCK_SIZE as u64;
         let discard = (off % BLOCK_SIZE as u64) as usize;
-        let plain_blocks = (discard + dst.len()).div_ceil(BLOCK_SIZE);
-        let mut cipher_off = first_block * BLOCK_SIZE as u64;
+        let plain_blocks = discard
+            .checked_add(dst.len())
+            .ok_or_else(out_of_range)?
+            .div_ceil(BLOCK_SIZE);
+        let cipher_len = plain_blocks
+            .checked_mul(BLOCK_SIZE)
+            .ok_or_else(out_of_range)?;
+        // `first_block * BLOCK_SIZE <= off`, so this cannot overflow, but
+        // keep the coordinate arithmetic checked like every other step.
+        let mut cipher_off = first_block
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or_else(out_of_range)?;
         let mut iv = *initial_iv;
         if first_block > 0 {
-            cipher_off -= BLOCK_SIZE as u64;
+            cipher_off = cipher_off
+                .checked_sub(BLOCK_SIZE as u64)
+                .ok_or_else(out_of_range)?;
             read_exact_at(src, &mut iv, cipher_off).map_err(Error::Io)?;
-            cipher_off += BLOCK_SIZE as u64;
+            cipher_off = cipher_off
+                .checked_add(BLOCK_SIZE as u64)
+                .ok_or_else(out_of_range)?;
         }
 
-        let mut ciphertext = vec![0u8; plain_blocks * BLOCK_SIZE];
+        let mut ciphertext = vec![0u8; cipher_len];
         read_exact_at(src, &mut ciphertext, cipher_off).map_err(Error::Io)?;
         // NoPadding: the range is always a whole number of blocks, so unpad
         // is the identity over the full buffer.
@@ -183,14 +222,42 @@ pub mod rclone {
         let cipher = XSalsa20Poly1305::new_from_slice(&derived[..32])
             .map_err(|e| Error::Decrypt(format!("rclone key: {e}")))?;
 
+        // `dst` was truncated to `plaintext_size - off` above and is
+        // non-empty here, so `off + dst.len()` cannot exceed
+        // `plaintext_size`; keep the arithmetic checked regardless.
+        let range_end = off
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| Error::Decrypt("rclone range out of bounds".into()))?;
         let first_block = off / PLAIN_BLOCK_SIZE;
-        let last_block = (off + dst.len() as u64 - 1) / PLAIN_BLOCK_SIZE;
+        let last_block = (range_end - 1) / PLAIN_BLOCK_SIZE;
         let mut written = 0usize;
         for block_number in first_block..=last_block {
-            let block_plain_start = block_number * PLAIN_BLOCK_SIZE;
-            let plain_len = PLAIN_BLOCK_SIZE.min(plaintext_size - block_plain_start);
-            let mut sealed = vec![0u8; plain_len as usize + CIPHER_OVERHEAD as usize];
-            let cipher_off = HEADER_SIZE + block_number * CIPHER_BLOCK_SIZE;
+            let out_of_range = || {
+                Error::Decrypt(format!(
+                    "rclone block {block_number} ciphertext range out of bounds"
+                ))
+            };
+            let block_plain_start = block_number
+                .checked_mul(PLAIN_BLOCK_SIZE)
+                .ok_or_else(out_of_range)?;
+            let remaining = plaintext_size
+                .checked_sub(block_plain_start)
+                .ok_or_else(out_of_range)?;
+            let plain_len = PLAIN_BLOCK_SIZE.min(remaining);
+            // Expand the plaintext block index into ciphertext coordinates
+            // with checked arithmetic and reject before allocating or
+            // issuing a (wrapped) block request. The sealed-block extent
+            // itself is validated by `read_exact_at`.
+            let cipher_off = block_number
+                .checked_mul(CIPHER_BLOCK_SIZE)
+                .and_then(|base| base.checked_add(HEADER_SIZE))
+                .ok_or_else(out_of_range)?;
+            // `plain_len <= PLAIN_BLOCK_SIZE`, so both conversions fit.
+            let sealed_len = usize::try_from(plain_len)
+                .ok()
+                .and_then(|n| n.checked_add(CIPHER_OVERHEAD as usize))
+                .ok_or_else(out_of_range)?;
+            let mut sealed = vec![0u8; sealed_len];
             read_exact_at(src, &mut sealed, cipher_off)
                 .map_err(|e| Error::Decrypt(format!("rclone block {block_number}: {e}")))?;
 
@@ -207,9 +274,13 @@ pub mod rclone {
                     Error::Decrypt(format!("rclone block {block_number} authentication failed"))
                 })?;
 
+            // `block_plain_start + plain_len <= plaintext_size` because
+            // `plain_len` was clamped to the remaining plaintext above.
+            let block_plain_end = block_plain_start
+                .checked_add(plain_len)
+                .ok_or_else(out_of_range)?;
             let from = off.max(block_plain_start) - block_plain_start;
-            let to =
-                (off + dst.len() as u64).min(block_plain_start + plain_len) - block_plain_start;
+            let to = range_end.min(block_plain_end) - block_plain_start;
             written += copy_slice(&mut dst[written..], &ciphertext[from as usize..to as usize]);
         }
         Ok(written)
@@ -248,7 +319,7 @@ pub mod rclone {
         if derived.len() != 80 {
             return Err(Error::Decrypt("rclone derived key length, want 80".into()));
         }
-        if sealed.len() != plaintext.len() + CIPHER_OVERHEAD as usize {
+        if plaintext.len().checked_add(CIPHER_OVERHEAD as usize) != Some(sealed.len()) {
             return Err(Error::Decrypt(
                 "rclone seal buffer has the wrong size".into(),
             ));
