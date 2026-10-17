@@ -116,9 +116,10 @@ pub struct NntpClient<T: Transport> {
 
 impl<T: Transport> NntpClient<T> {
     /// Runs the opening handshake on an already-connected transport:
-    /// greeting (`200`/`201`), `MODE READER` (best-effort: failure is
-    /// tolerated because some servers reject it post-auth), and `AUTHINFO`
-    /// when the config carries credentials.
+    /// greeting (`200`/`201`), `MODE READER` (any well-formed reply code
+    /// is tolerated because some servers reject it pre-auth, but a broken
+    /// exchange fails setup), and `AUTHINFO` when the config carries
+    /// credentials.
     pub async fn connect(transport: T, config: &NntpConfig) -> Result<Self> {
         if config.max_pipelined == 0 {
             return Err(Error::Malformed(
@@ -147,9 +148,13 @@ impl<T: Transport> NntpClient<T> {
                 })
             }
         }
-        // Best-effort: servers that require auth first answer 482 here, and
-        // the AUTHINFO exchange below resolves it.
-        let _ = client.command("MODE READER").await;
+        // Best-effort on the reply code only: servers that require auth
+        // first answer 482 here, and the AUTHINFO exchange below resolves
+        // it, so any well-formed reply is tolerated. A broken exchange
+        // (write/read error, EOF, malformed reply) leaves the session
+        // state unknown and fails setup instead of handing back an
+        // unusable client.
+        let _ = client.command("MODE READER").await?;
         if let Some(username) = &config.username {
             let password = config
                 .password
