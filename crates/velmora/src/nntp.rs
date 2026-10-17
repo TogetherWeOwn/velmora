@@ -99,6 +99,19 @@ fn parse_reply(line: &[u8]) -> Result<Reply> {
             String::from_utf8_lossy(line)
         )));
     }
+    // The three digits must be followed by end-of-line or a space before
+    // the reply text. A fourth digit or attached suffix (`2000`, `281x`)
+    // is a different, malformed frame — never truncate it to a 3-digit
+    // code. The diagnostic is generic: the reply line is untrusted and
+    // must not be echoed.
+    match line.get(3) {
+        None | Some(b' ') => {}
+        Some(_) => {
+            return Err(Error::Malformed(
+                "NNTP reply code is not followed by a space or end of line".into(),
+            ))
+        }
+    }
     let code = std::str::from_utf8(&line[..3])
         .map_err(|_| Error::Malformed("NNTP reply code is not UTF-8".into()))?
         .parse()
