@@ -22,3 +22,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+nntune-core = { path = "../nntune-core", default-features = false, features = ["native-tls"] }
