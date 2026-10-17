@@ -331,6 +331,13 @@ pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) ->
 /// line carries only ASCII `key=value` tokens, so a trailer that is not
 /// valid UTF-8 is likewise rejected instead of letting the size and CRC
 /// lookups silently miss every key.
+///
+/// Checksum validation follows the same scoping: a multipart article is
+/// validated against its part checksum (`pcrc32=`) only — a whole-file
+/// `crc32=` covers bytes this article does not contain and is never
+/// compared against the decoded part alone, so a multipart article with
+/// only the whole-file checksum still decodes. Checksums stay optional,
+/// and a present but malformed applicable checksum is rejected.
 pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usize> {
     let mut lines = split_lines(article);
 
@@ -483,9 +490,19 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
             ));
         }
     }
-    if let Some(crc_text) =
+    // Checksum scope: `pcrc32=` covers this decoded part, while `crc32=`
+    // covers the whole file. For a multipart article only the part checksum
+    // can be compared against the bytes decoded here; a whole-file `crc32=`
+    // must never be used as if it were the part checksum (and stays
+    // unverified until reassembly, which is out of scope for this decoder).
+    // For a single-part article part == whole file, so either field applies,
+    // preserving the existing pcrc32-then-crc32 precedence.
+    let crc_text = if multipart {
+        header_value(trailer, "pcrc32=")
+    } else {
         header_value(trailer, "pcrc32=").or_else(|| header_value(trailer, "crc32="))
-    {
+    };
+    if let Some(crc_text) = crc_text {
         match u32::from_str_radix(crc_text, 16) {
             Ok(want) => {
                 let got = hash.finalize();
