@@ -715,3 +715,6 @@ fn zero_run_crc32(n: u64) -> u32 {
 /// job, never a Worker. On wasm32 the function exists but always reports
 /// [`Error::UnsupportedOnWasm`].
 pub mod repair;
+/// Scratch-object layout shared by ingest, the repair Worker and the
+/// repair Container (prefix derivation, file-name and key validation).
+pub mod scratch;
