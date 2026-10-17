@@ -102,23 +102,67 @@ pub struct RecoverySet {
     pub files: HashMap<[u8; 16], RecoveryFile>,
 }
 
-impl RecoverySet {
-    /// Parses and fully validates a concatenated PAR2 packet stream (one or
-    /// more `.par2` objects back to back). Repeated metadata packets are
-    /// normal across volume files, but only byte-identical repeats pass.
-    pub fn parse(data: &[u8]) -> Result<RecoverySet> {
-        let mut set = RecoverySet::default();
-        let mut members: HashMap<[u8; 16], ()> = HashMap::new();
-        let mut protected: HashMap<[u8; 16], ()> = HashMap::new();
-        let mut filenames: HashMap<Vec<u8>, [u8; 16]> = HashMap::new();
-        let mut recovery_packets: HashMap<u32, [u8; 16]> = HashMap::new();
-        let mut set_id_seen = false;
-        let mut main_seen = false;
-        let mut main_digest = [0u8; 16];
-        // (file_id -> (packet md5, kind)) for duplicate validation.
-        let mut filedesc_digests: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
-        let mut ifsc_digests: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
+/// Incremental counterpart of [`RecoverySet::parse`]: packet streams
+/// (whole `.par2` objects, or chunks split at packet boundaries) are fed
+/// one at a time with [`add_stream`](Self::add_stream) and validated as
+/// one set by [`finish`](Self::finish). This lets a memory-bounded caller
+/// restore a large set from storage object by object instead of holding
+/// every staged byte at once; only the parsed metadata (plus per-packet
+/// digests for duplicate validation) is retained.
+#[derive(Debug, Clone, Default)]
+pub struct RecoverySetBuilder {
+    set: RecoverySet,
+    members: HashMap<[u8; 16], ()>,
+    protected: HashMap<[u8; 16], ()>,
+    filenames: HashMap<Vec<u8>, [u8; 16]>,
+    recovery_packets: HashMap<u32, [u8; 16]>,
+    set_id_seen: bool,
+    main_seen: bool,
+    main_digest: [u8; 16],
+    // (file_id -> (packet md5, kind)) for duplicate validation.
+    filedesc_digests: HashMap<[u8; 16], [u8; 16]>,
+    ifsc_digests: HashMap<[u8; 16], [u8; 16]>,
+}
 
+/// Set id carried by the first packet in `data`, without validating the
+/// stream: enough for a caller restoring several sets to route each
+/// object to its [`RecoverySetBuilder`] (which then fully validates it).
+/// `None` when `data` does not start with a PAR2 packet header.
+pub fn peek_set_id(data: &[u8]) -> Option<[u8; 16]> {
+    if data.len() < PACKET_HEADER_SIZE || data[..8] != PACKET_MAGIC {
+        return None;
+    }
+    data[32..48].try_into().ok()
+}
+
+impl RecoverySetBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The set id seen so far, once any packet has been accepted.
+    pub fn set_id(&self) -> Option<[u8; 16]> {
+        self.set_id_seen.then_some(self.set.set_id)
+    }
+
+    /// Feed one packet stream. `data` must begin and end on packet
+    /// boundaries (splitting between packets is fine, splitting inside
+    /// one is not). Packets are checksum- and set-verified before they
+    /// are applied, so an error leaves earlier accepted packets intact;
+    /// the caller decides whether the offending stream dooms the set.
+    pub fn add_stream(&mut self, data: &[u8]) -> Result<()> {
+        let Self {
+            set,
+            members,
+            protected,
+            filenames,
+            recovery_packets,
+            set_id_seen,
+            main_seen,
+            main_digest,
+            filedesc_digests,
+            ifsc_digests,
+        } = self;
         let mut offset = 0usize;
         while offset < data.len() {
             let remaining = &data[offset..];
@@ -144,9 +188,9 @@ impl RecoverySet {
                 )));
             }
             let set_id: [u8; 16] = packet[32..48].try_into().unwrap();
-            if !set_id_seen {
+            if !*set_id_seen {
                 set.set_id = set_id;
-                set_id_seen = true;
+                *set_id_seen = true;
             } else if set.set_id != set_id {
                 return Err(malformed(format!("mixed recovery set at offset {offset}")));
             }
@@ -157,17 +201,17 @@ impl RecoverySet {
             if kind == main_type() {
                 parse_main_body(
                     body,
-                    &mut members,
-                    &mut protected,
-                    &mut main_seen,
-                    &mut main_digest,
-                    &mut set,
+                    members,
+                    protected,
+                    main_seen,
+                    main_digest,
+                    set,
                     set_id,
                 )?;
             } else if kind == filedesc_type() {
-                parse_filedesc_body(body, &mut set, &mut filenames, &mut filedesc_digests)?;
+                parse_filedesc_body(body, set, filenames, filedesc_digests)?;
             } else if kind == ifsc_type() {
-                parse_ifsc_body(body, &mut set, &mut ifsc_digests)?;
+                parse_ifsc_body(body, set, ifsc_digests)?;
             } else if kind == recv_slic_type() {
                 if body.len() < 4 {
                     return Err(malformed("recovery slice body too short"));
@@ -189,23 +233,38 @@ impl RecoverySet {
             // their checksum and set-ID checks above still applied.
             offset += length;
         }
+        Ok(())
+    }
 
-        if !main_seen || set.block_size == 0 {
+    /// Validate the accumulated streams as one recovery set: a Main
+    /// packet must have been seen, and it is the only authority on
+    /// membership (checked last because packet order is not fixed).
+    pub fn finish(mut self) -> Result<RecoverySet> {
+        if !self.main_seen || self.set.block_size == 0 {
             return Err(malformed("no Main packet found"));
         }
-        // The Main packet is the only authority on membership: checked after
-        // the whole stream because packet order is not fixed.
-        for (id, file) in set.files.iter_mut() {
-            if !members.contains_key(id) {
+        for (id, file) in self.set.files.iter_mut() {
+            if !self.members.contains_key(id) {
                 return Err(malformed(format!(
                     "file ID {} is not listed in the Main packet",
                     hex16(id)
                 )));
             }
-            file.protected = protected.contains_key(id);
+            file.protected = self.protected.contains_key(id);
         }
-        let _ = main_digest;
-        Ok(set)
+        let _ = self.main_digest;
+        Ok(self.set)
+    }
+}
+
+impl RecoverySet {
+    /// Parses and fully validates a concatenated PAR2 packet stream (one or
+    /// more `.par2` objects back to back). Repeated metadata packets are
+    /// normal across volume files, but only byte-identical repeats pass.
+    pub fn parse(data: &[u8]) -> Result<RecoverySet> {
+        let mut builder = RecoverySetBuilder::new();
+        builder.add_stream(data)?;
+        builder.finish()
     }
 
     /// Resolves a display name only when it identifies exactly one file.
