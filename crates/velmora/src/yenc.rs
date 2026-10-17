@@ -332,6 +332,14 @@ pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) ->
 /// valid UTF-8 is likewise rejected instead of letting the size and CRC
 /// lookups silently miss every key.
 ///
+/// The `=ybegin` line is the one place a poster-supplied filename appears,
+/// and legacy postings carry it in Latin-1/CP1252 or other non-UTF-8 bytes.
+/// Its ASCII control fields are therefore read from raw bytes, and only
+/// from the tokens before the trailing `name=` field: filename bytes are
+/// never decoded, transcoded, or reinterpreted as control tags. The
+/// `=ypart` and `=yend` lines carry no filename and keep the strict UTF-8
+/// parsing above.
+///
 /// Checksum validation follows the same scoping: a multipart article is
 /// validated against its part checksum (`pcrc32=`) only — a whole-file
 /// `crc32=` covers bytes this article does not contain and is never
@@ -351,7 +359,7 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
         }
     };
 
-    let declared_size = header_int(begin_line, "size=")
+    let declared_size = begin_header_int(begin_line, "size=")
         .filter(|&v| v >= 0)
         .ok_or_else(|| malformed(message_id, "=ybegin missing or invalid size="))?;
     // A part= label in second position marks a multi-part article, where
@@ -593,6 +601,28 @@ fn split_lines(mut rest: &[u8]) -> impl Iterator<Item = (&[u8], bool)> + '_ {
 
 fn header_int(line: &[u8], key: &str) -> Option<i64> {
     header_value(line, key)?.parse().ok()
+}
+
+/// Byte-oriented counterpart of [`header_int`] for the `=ybegin` line only.
+///
+/// The filename after `name=` is the last field on that line and may carry
+/// legacy Latin-1/CP1252 (or otherwise non-UTF-8) bytes, so UTF-8 decoding
+/// the whole line would lose the valid ASCII control fields before it.
+/// Tokens are scanned as raw bytes and the scan stops at the `name=` token:
+/// everything from there on is filename bytes, never control fields, even
+/// when it contains tag-looking ASCII. The matched value itself must still
+/// be a plain UTF-8 decimal, so numeric validation is exactly as strict as
+/// [`header_int`].
+fn begin_header_int(line: &[u8], key: &str) -> Option<i64> {
+    for token in line.split(|&b| b == b' ' || b == b'\t') {
+        if token.starts_with(b"name=") {
+            return None;
+        }
+        if let Some(value) = token.strip_prefix(key.as_bytes()) {
+            return std::str::from_utf8(value).ok()?.parse().ok();
+        }
+    }
+    None
 }
 
 fn header_value<'a>(line: &'a [u8], key: &str) -> Option<&'a str> {
