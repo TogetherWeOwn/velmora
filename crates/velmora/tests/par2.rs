@@ -4,7 +4,7 @@
 //! values and a concatenation property test.
 
 use nntune_core::error::Error;
-use nntune_core::par2::{crc32_combine, RecoverySet};
+use nntune_core::par2::{crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder};
 
 const BLOCK_SIZE: u64 = 256;
 const FILENAME: &str = "track.flac";
@@ -122,6 +122,76 @@ fn fixture_with_crcs(crcs: Vec<u32>, block_size: u64) -> Fixture {
         set_bytes,
         file_id,
     }
+}
+
+/// Split a packet stream at packet boundaries (declared lengths).
+fn split_packets(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let len = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()) as usize;
+        out.push(&bytes[offset..offset + len]);
+        offset += len;
+    }
+    out
+}
+
+// --- Streaming builder ------------------------------------------------------
+
+#[test]
+fn builder_accumulates_packet_streams_into_the_same_set() {
+    let f = fixture();
+    let whole = RecoverySet::parse(&f.set_bytes).unwrap();
+    let packets = split_packets(&f.set_bytes);
+    assert!(packets.len() >= 4);
+
+    // One packet per stream, routed by the peeked set id exactly like a
+    // staged-object restore does.
+    let mut builder = RecoverySetBuilder::new();
+    assert_eq!(builder.set_id(), None);
+    for packet_bytes in &packets {
+        assert_eq!(peek_set_id(packet_bytes), Some(whole.set_id));
+        builder.add_stream(packet_bytes).unwrap();
+    }
+    assert_eq!(builder.set_id(), Some(whole.set_id));
+    let streamed = builder.finish().unwrap();
+    assert_eq!(streamed.set_id, whole.set_id);
+    assert_eq!(streamed.block_size, whole.block_size);
+    assert_eq!(streamed.recovery_blocks, whole.recovery_blocks);
+    let streamed_file = streamed
+        .protected_file_by_name(FILENAME)
+        .expect("file protected after streaming");
+    assert_eq!(streamed_file.file_id, f.file_id);
+    assert_eq!(
+        streamed_file.block_crc32s,
+        whole.protected_file_by_name(FILENAME).unwrap().block_crc32s
+    );
+    // And the streamed set verifies the file like the one-shot parse.
+    streamed.verify(FILENAME, &f.data).unwrap();
+}
+
+#[test]
+fn builder_rejects_mixed_sets_and_finish_without_main() {
+    let f = fixture();
+    let packets = split_packets(&f.set_bytes);
+    // The RecvSlic packet alone: accepted as a stream, but finish()
+    // still requires the Main packet.
+    let mut builder = RecoverySetBuilder::new();
+    builder.add_stream(packets[1]).unwrap();
+    assert!(builder.finish().is_err());
+
+    // A packet from a different set (same stream, forged set id in the
+    // header) is rejected on the mixed-set check.
+    let mut builder = RecoverySetBuilder::new();
+    builder.add_stream(packets[0]).unwrap();
+    let mut forged = packets[3].to_vec();
+    forged[32] ^= 0xff;
+    let digest = md5::compute(&forged[32..]).0;
+    forged[16..32].copy_from_slice(&digest);
+    assert!(builder.add_stream(&forged).is_err());
+
+    assert_eq!(peek_set_id(b"not a par2 packet stream"), None);
+    assert_eq!(peek_set_id(b""), None);
 }
 
 // --- Parser ---------------------------------------------------------------

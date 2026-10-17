@@ -49,6 +49,19 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024;
 /// Default maximum decoded wire bytes in a single article/dot-block (v1 parity).
 pub const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Message of the [`io::Error`] a dot-block read returns when the article
+/// exceeds the configured byte limit. Callers classify that error with
+/// [`is_article_limit_error`] instead of treating it as a connection or
+/// provider failure: the article is simply too large to hand back.
+pub const ARTICLE_LIMIT_ERROR: &str = "NNTP article exceeds byte limit";
+
+/// Whether `error` is the article-byte-limit refusal above. The
+/// connection that produced it has been invalidated (the dot-block was
+/// abandoned mid-stream) and cannot be reused.
+pub fn is_article_limit_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData && error.to_string() == ARTICLE_LIMIT_ERROR
+}
+
 /// CRLF line framing and NNTP dot-block reading over any [`Transport`].
 pub struct BufferedTransport<T: Transport> {
     inner: T,
@@ -183,7 +196,7 @@ impl<T: Transport> BufferedTransport<T> {
             if content.len() + 2 > remaining {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "NNTP article exceeds byte limit",
+                    ARTICLE_LIMIT_ERROR,
                 ));
             }
             out.extend_from_slice(content);
