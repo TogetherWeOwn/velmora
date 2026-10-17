@@ -16,10 +16,12 @@
 //! - Timestamps are Unix seconds (`i64`), not calendar types: no `time`/`chrono`
 //!   dependency on wasm.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
 
-use quick_xml::events::Event;
+use quick_xml::escape::resolve_xml_entity;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
 use sha2::{Digest, Sha256};
 
@@ -669,22 +671,33 @@ fn parse_segment<R: BufRead>(
             ))
         })?;
 
+    // The reader trims each Text event independently, which would silently
+    // delete whitespace adjacent to a reference or CDATA section from the
+    // middle of the ID; the embedded-whitespace rejection must see the true
+    // resolved text. Accumulate untrimmed and let `normalize_message_id`
+    // trim the edges. Error returns abort the whole parse, so the saved
+    // settings only need restoring on the success path below.
+    let saved_trim = (
+        reader.config().trim_text_start,
+        reader.config().trim_text_end,
+    );
+    reader.config_mut().trim_text(false);
     let mut text = String::new();
     loop {
         match reader.read_event_into(buf) {
             Ok(Event::Text(e)) => {
-                let chunk = e.xml10_content();
-                if text.len() + chunk.len() > MAX_SEGMENT_TEXT_BYTES {
-                    return Err(Error::Malformed("segment text is too large".into()));
-                }
-                text.push_str(&chunk);
+                push_segment_text(&mut text, &e.xml10_content())?;
             }
             Ok(Event::CData(e)) => {
                 let chunk: &str = e.as_ref();
-                if text.len() + chunk.len() > MAX_SEGMENT_TEXT_BYTES {
-                    return Err(Error::Malformed("segment text is too large".into()));
-                }
-                text.push_str(chunk);
+                push_segment_text(&mut text, chunk)?;
+            }
+            Ok(Event::GeneralRef(e)) => {
+                // Character/predefined references are part of the ID text:
+                // resolve them (expanded output counts against the same
+                // bound) instead of silently dropping them.
+                let resolved = resolve_segment_reference(&e)?;
+                push_segment_text(&mut text, &resolved)?;
             }
             Ok(Event::End(e)) => {
                 if local_name(&e.name()) != "segment" {
@@ -722,12 +735,79 @@ fn parse_segment<R: BufRead>(
         }
         buf.clear();
     }
+    reader.config_mut().trim_text_start = saved_trim.0;
+    reader.config_mut().trim_text_end = saved_trim.1;
     Ok(Segment {
         ordinal,
         number,
         message_id: normalize_message_id(&text)?,
         encoded_bytes,
     })
+}
+
+/// Appends one piece of `<segment>` character data, enforcing
+/// [`MAX_SEGMENT_TEXT_BYTES`] on the accumulated (already reference-expanded)
+/// text.
+fn push_segment_text(text: &mut String, chunk: &str) -> Result<()> {
+    if chunk.len() > MAX_SEGMENT_TEXT_BYTES - text.len() {
+        return Err(Error::Malformed("segment text is too large".into()));
+    }
+    text.push_str(chunk);
+    Ok(())
+}
+
+/// Resolves a `&...;` reference inside `<segment>` text.
+///
+/// Only decimal/hex character references and the five predefined XML
+/// entities (`lt`, `gt`, `amp`, `apos`, `quot`) resolve; DTDs are rejected
+/// before this point, so nothing else is defined — unknown names, malformed
+/// numbers, non-scalars and characters outside the XML 1.0 `Char`
+/// production are explicit errors, never empty text. No external or
+/// network resolution is ever attempted.
+fn resolve_segment_reference(reference: &BytesRef<'_>) -> Result<Cow<'static, str>> {
+    if reference.is_char_ref() {
+        // `resolve_char_ref` also errors on malformed numbers, surrogates,
+        // code points above U+10FFFF and NUL, but does not enforce the
+        // XML 1.0 legal-char production (e.g. U+FFFE).
+        let ch = reference
+            .resolve_char_ref()
+            .map_err(|e| {
+                Error::Malformed(format!(
+                    "invalid character reference &{}; in segment: {e}",
+                    reference.as_ref()
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::Malformed(format!(
+                    "invalid character reference &{}; in segment",
+                    reference.as_ref()
+                ))
+            })?;
+        if !matches!(
+            ch,
+            '\u{9}'
+                | '\u{a}'
+                | '\u{d}'
+                | '\u{20}'..='\u{d7ff}'
+                | '\u{e000}'..='\u{fffd}'
+                | '\u{10000}'..='\u{10ffff}'
+        ) {
+            return Err(Error::Malformed(format!(
+                "character reference &{}; is not a valid XML 1.0 character",
+                reference.as_ref()
+            )));
+        }
+        let mut buf = [0u8; 4];
+        return Ok(Cow::Owned(ch.encode_utf8(&mut buf).to_string()));
+    }
+    resolve_xml_entity(reference.as_ref())
+        .map(Cow::Borrowed)
+        .ok_or_else(|| {
+            Error::Malformed(format!(
+                "unknown entity reference &{}; in segment",
+                reference.as_ref()
+            ))
+        })
 }
 
 fn local_name(name: &quick_xml::name::QName<'_>) -> String {
