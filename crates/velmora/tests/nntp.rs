@@ -309,6 +309,10 @@ async fn max_pipelined_zero_is_rejected() {
 }
 
 /// Live loopback: the native TCP transport against a scripted fake server.
+/// TLS-integration proof: requires the `native-tls` transport, so it runs
+/// only in the default-feature lane. The transport-free lane
+/// (`--no-default-features`) still runs every scripted test above.
+#[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
 #[tokio::test]
 async fn native_transport_against_loopback_server() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
