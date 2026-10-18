@@ -12,7 +12,9 @@
 pub mod tokio_tls;
 
 #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
-pub use tokio_tls::{connect as connect_native, NativeTlsTransport};
+pub use tokio_tls::{
+    connect as connect_native, connect_pinned as connect_native_pinned, NativeTlsTransport,
+};
 
 #[cfg(all(feature = "worker-transport", target_arch = "wasm32"))]
 pub mod worker_socket;

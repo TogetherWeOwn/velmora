@@ -6,6 +6,8 @@
 //! Modules:
 //!
 //! - [`nntp`]: NNTP client over a portable [`transport::Transport`] trait.
+//! - [`pinned_transport`]: pinned, cancellable fetch policy (TLS-on only,
+//!   port allowlist, cooperative cancellation, names-only diagnostics).
 //! - [`yenc`]: yEnc encode/decode with an explicit SIMD fast path (x86_64 SSE2,
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
@@ -22,6 +24,7 @@ pub mod error;
 pub mod nntp;
 pub mod nzb;
 pub mod par2;
+pub mod pinned_transport;
 pub mod transport;
 pub mod transports;
 pub mod yenc;
