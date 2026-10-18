@@ -7,7 +7,8 @@ Synthetic NNTP test server + fixture corpus for NNTune v2 CI. **No real Usenet i
 - Async Tokio NNTP server (RFC 3977 subset): `CAPABILITIES`, `MODE READER`,
   `AUTHINFO USER/PASS`, `GROUP`, `LIST`, `XOVER`, `ARTICLE`/`BODY`/`HEAD`/`STAT`, `QUIT`.
 - Fixture corpus generated at runtime from **synthesized sine tones** (8-bit PCM WAV,
-  8 kHz, ≤ 0.25 s): single-part yEnc, 3-part multi-part, obfuscated subjects,
+  8 kHz, ≤ 0.25 s): single-part yEnc, two 3-part multi-part sets (plain +
+  obfuscated subjects),
   `Rar!`-style and `7z`-style payloads (marker + deterministic filler — not real
   archives), plus a plain-text control. CC0 by construction; nothing to license.
 - Fault injection: per-credential connection caps (`502`), `430` missing articles,
