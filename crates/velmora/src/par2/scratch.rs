@@ -15,12 +15,12 @@
 //! crafted prefix cannot point repair at another job's objects.
 //!
 //! `manifest.json` also carries a `staging_id`: the writer (verify)
-//! mints a fresh random id for every (re)staging of a round's inputs
-//! and never reuses one across stagings. File names and sizes alone
-//! do not identify a staging — a damaged file usually keeps its full
-//! length — so repair idempotency keys on a digest that includes the
-//! `staging_id`; otherwise a redriven job (which reuses round 1)
-//! would replay the previous generation's verdict.
+//! derives it from every staged file's content hash, so identical
+//! bytes keep the id and any byte change yields a new one. File names
+//! and sizes alone do not identify a staging — a damaged file usually
+//! keeps its full length — so repair idempotency keys on a digest that
+//! includes the `staging_id`; otherwise a redriven job (which reuses
+//! round 1) would replay the previous generation's verdict.
 
 use sha2::{Digest, Sha256};
 
@@ -89,9 +89,10 @@ pub fn object_key_for_file_name(file_name: &str) -> String {
     sha256_hex(file_name.as_bytes())
 }
 
-/// A `staging_id` is an opaque per-staging token minted by the
-/// manifest writer (UUID/ULID/hex shapes all fit): 16–128 chars of
-/// `[A-Za-z0-9_-]`, long enough that two stagings never collide in
+/// A `staging_id` is the content-derived token for one staging
+/// (verify hashes every staged file's index, content hash and size;
+/// currently 64-char lowercase hex): 16–128 chars of `[A-Za-z0-9_-]`
+/// are accepted, long enough that two stagings never collide in
 /// practice. Anything else cannot prove which staging a stored
 /// repair result belongs to, so it is rejected.
 pub fn validate_staging_id(raw: &str) -> bool {
