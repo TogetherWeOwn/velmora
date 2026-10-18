@@ -8,6 +8,7 @@ native targets (services, Container batch jobs).
 |---|---|
 | `nntp` | NNTP client (RFC 3977): greeting, `MODE READER`, `AUTHINFO`, `GROUP`, `STAT`, `ARTICLE`, `BODY`, `QUIT`, pipelined `fetch_many`; `430`/`480`/`481`/`502` (plus `482` on `AUTHINFO`) mapped to typed errors |
 | `transport` | Portable `Transport` byte-pipe trait + CRLF/dot-block framing; every impl enforces per-op timeouts as `TimedOut` |
+| `pinned_transport` | Pinned, cancellable fetch policy for NZB fetch: TLS-on only, port allowlist, cooperative cancellation, names-only diagnostics (see below) |
 | `transports::tokio_tls` | Native transport: tokio TCP with optional rustls (Mozilla roots), feature `native-tls` |
 | `transports::worker_socket` | Workers transport over `connect()`, timeouts via `worker::Delay`, feature `worker-transport` (wasm32) |
 | `yenc` | yEnc encode/decode, byte-identical to v1; explicit SIMD fast path (x86_64 SSE2, wasm simd128 with `RUSTFLAGS="-C target-feature=+simd128"`), scalar fallback |
@@ -25,6 +26,46 @@ Mozilla roots `src/transports/tokio_tls.rs:57-58`, gating `src/transports/mod.rs
 `yenc` `src/yenc.rs:1-12`; `nzb` `src/nzb.rs:1-6,129-131`; `decrypt`
 `src/decrypt.rs:1-11`, `seal_block` `src/decrypt.rs:310-318`; `par2`
 `src/par2.rs:9-21`, Linux-only repair `src/par2/repair.rs:70-107`.)
+
+## Pinned transport proof (NZB fetch)
+
+`nntune_core::pinned_transport` is the fail-closed policy the NZB intake
+wiring consumes (separate intake card, untouched here):
+
+- **Allowlist:** `ALLOWED_NNTP_PORTS = [119, 563]` (the NNTP conventions).
+  The policy additionally requires TLS-on, so `119` is only valid as a TLS
+  port here, never as plaintext.
+- **TLS-first order:** `validate_nntp_endpoint` checks `tls` BEFORE the port
+  allowlist. A TLS-off config is `TlsRequired` whatever the port — even an
+  off-allowlist one — so port policy never launders a plaintext config into
+  a port error. Pure validation: no I/O, no DNS, no clock.
+- **Cancel bound:** `CANCEL_BOUND_MS = 1_000`. `with_cancel(fetch, cancel)`
+  resolves the fetch unless `cancel` resolves first (fetch wins ties). A
+  cancelled session has unknown wire state: discard the client and
+  reconnect, never reuse it. The fetch future is dropped at cancel. The
+  pinned entry points run the same validation before any dial — native
+  `transports::tokio_tls::connect_pinned` and wasm32
+  `WorkerTransport::connect_pinned` (the general `connect` entry points stay
+  permissive for the plaintext loopback fixtures used by the stream/ingest
+  harnesses and client unit tests; NZB fetch must use the pinned entry point
+  for its target). This is an NNTP dial policy for NZB fetch, not the HTTPS
+  pinned-443 contract.
+- **Stable codes:** `TransportRejection::code()` returns
+  `transport_tls_required` (`TlsRequired`), `transport_port_not_allowed`
+  (`PortNotAllowed(port)` — the payload never changes the code), and
+  `transport_cancelled` (`Cancelled`). Both pinned entries funnel through
+  the shared `pinned_rejection_message` helper before any dial, so they
+  embed the same codes by construction: native `connect_pinned` in its
+  `io::Error` message (`InvalidInput`), Workers `connect_pinned` in
+  `worker::Error::RustError`. The helper's mapping is unit-tested natively
+  and a wiring guard fails if either entry stops calling it first (the
+  Workers socket open itself stays wasm32 compile-checked — CI has no wasm
+  test runner).
+- **Names-only diagnostics:** `Display`/`Debug` for `TransportRejection` and
+  `ValidatedEndpoint` render host, port and code material only — never the
+  configured username or password. Shared path is `std`-only (cancellation
+  via `std::future::poll_fn`, no `tokio`), so the wasm32 check keeps
+  passing.
 
 ## Features
 

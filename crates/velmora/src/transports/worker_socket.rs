@@ -48,7 +48,30 @@ async fn with_timeout<T>(
 }
 
 impl WorkerTransport {
+    /// Pinned NZB-fetch entry point (wasm32): runs the fail-closed
+    /// [`crate::pinned_transport`] policy via
+    /// [`crate::pinned_transport::pinned_rejection_message`] (TLS-first, then
+    /// port allowlist `119`/`563`) BEFORE opening the `connect()` socket,
+    /// then delegates to [`Self::connect`].
+    ///
+    /// A TLS-off or off-allowlist config fails here with
+    /// `worker::Error::RustError` whose message carries the stable code
+    /// (`transport_tls_required` / `transport_port_not_allowed`); the
+    /// diagnostic is names-only, never credentials. The NZB intake wiring on
+    /// Workers consumes this (not [`Self::connect`]).
+    pub fn connect_pinned(config: &NntpConfig) -> worker::Result<Self> {
+        if let Some(message) = crate::pinned_transport::pinned_rejection_message(config) {
+            return Err(worker::Error::RustError(message));
+        }
+        Self::connect(config)
+    }
+
     /// Opens `config.host:config.port` (implicit TLS when `config.tls`).
+    ///
+    /// General entry point: still dials plaintext fixtures when `config.tls`
+    /// is false. The NZB fetch path must use [`Self::connect_pinned`], which
+    /// enforces the fail-closed [`crate::pinned_transport`] policy before
+    /// any socket open.
     pub fn connect(config: &NntpConfig) -> worker::Result<Self> {
         let secure = if config.tls {
             SecureTransport::On
