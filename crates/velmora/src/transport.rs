@@ -70,6 +70,61 @@ pub struct BufferedTransport<T: Transport> {
     usable: bool,
 }
 
+/// Borrow-safe cancellation cleanup for [`BufferedTransport::read_dot_block`].
+///
+/// The guard owns both mutable borrows for the duration of the dot-block
+/// read, so every line append goes through it. If the read completes, the
+/// caller disarms the guard and keeps the output. If the inner operation
+/// returns `Err` or the awaiting future is dropped after its first poll, the
+/// guard is still armed when it is dropped and restores the caller's original
+/// output prefix while poisoning the connection. The guard is only created
+/// after the first poll starts running the `async` body, so dropping the
+/// future before its first poll performs no cleanup and causes no false
+/// poisoning. No `unsafe` code, protocol changes, or read-line redesign.
+struct DotBlockCancelGuard<'a, T: Transport> {
+    transport: &'a mut BufferedTransport<T>,
+    out: &'a mut Vec<u8>,
+    start: usize,
+    armed: bool,
+}
+
+impl<T: Transport> Drop for DotBlockCancelGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.out.truncate(self.start);
+            self.transport.invalidate();
+        }
+    }
+}
+
+impl<T: Transport> DotBlockCancelGuard<'_, T> {
+    async fn run(&mut self) -> io::Result<()> {
+        loop {
+            let line = self.transport.read_line().await?;
+            if line == b"." {
+                return Ok(());
+            }
+            let content = if line.starts_with(b"..") {
+                &line[1..]
+            } else {
+                &line[..]
+            };
+            let remaining = self
+                .transport
+                .max_article_bytes
+                .saturating_sub(self.out.len() - self.start);
+            if content.len() + 2 > remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    ARTICLE_LIMIT_ERROR,
+                ));
+            }
+            self.out.extend_from_slice(content);
+            self.out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
 impl<T: Transport> BufferedTransport<T> {
     /// Wraps a connected transport (the server greeting is still unread).
     pub fn new(inner: T) -> Self {
@@ -169,39 +224,27 @@ impl<T: Transport> BufferedTransport<T> {
     /// performing dot-unstuffing (`..X` → `.X`). The terminating lone `.`
     /// line is consumed and not written. The limit counts appended bytes,
     /// including CRLF, not pre-existing contents. On failure, partial output is
-    /// rolled back and this connection cannot be reused.
+    /// rolled back and this connection cannot be reused. Dropping the returned
+    /// future after it has been polled performs the same rollback and
+    /// poisoning; dropping before the first poll runs no code and leaves the
+    /// connection untouched.
     pub async fn read_dot_block(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         self.ensure_usable()?;
         let start = out.len();
-        let result = self.read_dot_block_inner(out, start).await;
-        if result.is_err() {
-            out.truncate(start);
-            self.invalidate();
+        let mut guard = DotBlockCancelGuard {
+            transport: self,
+            out,
+            start,
+            armed: true,
+        };
+        let result = guard.run().await;
+        if result.is_ok() {
+            guard.armed = false;
         }
+        // On `Err` the guard stays armed so its `Drop` performs the same
+        // truncate + invalidate as cancellation. On `Ok` it is disarmed, so
+        // completed output and connection usability are retained.
         result
-    }
-
-    async fn read_dot_block_inner(&mut self, out: &mut Vec<u8>, start: usize) -> io::Result<()> {
-        loop {
-            let line = self.read_line().await?;
-            if line == b"." {
-                return Ok(());
-            }
-            let content = if line.starts_with(b"..") {
-                &line[1..]
-            } else {
-                &line[..]
-            };
-            let remaining = self.max_article_bytes.saturating_sub(out.len() - start);
-            if content.len() + 2 > remaining {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    ARTICLE_LIMIT_ERROR,
-                ));
-            }
-            out.extend_from_slice(content);
-            out.extend_from_slice(b"\r\n");
-        }
     }
 
     /// Sends one protocol line (appends CRLF) in a single write, so one
