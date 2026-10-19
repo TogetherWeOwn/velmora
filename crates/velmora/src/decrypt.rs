@@ -338,3 +338,64 @@ pub mod rclone {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Scripted byte source: returns `script` counts in order, recording calls.
+    struct Scripted {
+        script: Vec<usize>,
+        calls: Cell<usize>,
+    }
+
+    impl ReadAt for Scripted {
+        fn read_at(&self, _buf: &mut [u8], _off: u64) -> io::Result<usize> {
+            let i = self.calls.get();
+            self.calls.set(i + 1);
+            Ok(self.script.get(i).copied().unwrap_or(0))
+        }
+    }
+
+    #[test]
+    fn over_returning_source_is_rejected_not_trusted() {
+        // A source returning more than requested would panic the `dst[n..]`
+        // slicing; the guard must reject it as corrupt input instead.
+        let src = Scripted {
+            script: vec![usize::MAX],
+            calls: Cell::new(0),
+        };
+        let mut dst = [0u8; 8];
+        let err = read_exact_at(&src, &mut dst, 0).expect_err("over-return must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn extent_ending_exactly_at_u64_max_is_allowed() {
+        let src = Scripted {
+            script: vec![1],
+            calls: Cell::new(0),
+        };
+        let mut dst = [0u8; 1];
+        read_exact_at(&src, &mut dst, u64::MAX).expect("a last byte of u64::MAX is representable");
+        assert_eq!(src.calls.get(), 1);
+    }
+
+    #[test]
+    fn extent_past_u64_max_fails_before_any_source_read() {
+        let src = Scripted {
+            script: vec![2],
+            calls: Cell::new(0),
+        };
+        let mut dst = [0u8; 2];
+        let err =
+            read_exact_at(&src, &mut dst, u64::MAX).expect_err("unrepresentable extent must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            src.calls.get(),
+            0,
+            "no source request may use a wrapped offset"
+        );
+    }
+}
