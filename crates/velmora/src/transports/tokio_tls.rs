@@ -88,8 +88,9 @@ pub async fn connect(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
 /// [`crate::pinned_transport`] policy (TLS-first, then port allowlist
 /// `119`/`563`) BEFORE any TCP dial, then delegates to [`connect`].
 ///
-/// A TLS-off or off-allowlist config fails here with `InvalidInput` whose
-/// message carries the stable code (`transport_tls_required` /
+/// A TLS-off config without the plaintext acknowledgment, or an
+/// off-allowlist config, fails here with `InvalidInput` whose message
+/// carries the stable code (`transport_tls_required` /
 /// `transport_port_not_allowed`); the diagnostic is names-only, never
 /// credentials. The NZB intake wiring consumes this (not [`connect`]) plus
 /// [`crate::pinned_transport::with_cancel`] for the fetch itself.
@@ -141,6 +142,7 @@ mod tests {
             host: host.to_owned(),
             port,
             tls,
+            allow_insecure_plaintext: false,
             username: Some(SENTINEL_USER.to_owned()),
             password: Some(SENTINEL_PASS.to_owned()),
             // Short deadline so a validation-skipping mutant fails fast

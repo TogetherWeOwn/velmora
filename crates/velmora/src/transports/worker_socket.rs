@@ -54,11 +54,12 @@ impl WorkerTransport {
     /// port allowlist `119`/`563`) BEFORE opening the `connect()` socket,
     /// then delegates to [`Self::connect`].
     ///
-    /// A TLS-off or off-allowlist config fails here with
-    /// `worker::Error::RustError` whose message carries the stable code
-    /// (`transport_tls_required` / `transport_port_not_allowed`); the
-    /// diagnostic is names-only, never credentials. The NZB intake wiring on
-    /// Workers consumes this (not [`Self::connect`]).
+    /// A TLS-off config without the plaintext acknowledgment, or an
+    /// off-allowlist config, fails here with `worker::Error::RustError`
+    /// whose message carries the stable code (`transport_tls_required` /
+    /// `transport_port_not_allowed`); the diagnostic is names-only, never
+    /// credentials. The NZB intake wiring on Workers consumes this (not
+    /// [`Self::connect`]).
     pub fn connect_pinned(config: &NntpConfig) -> worker::Result<Self> {
         if let Some(message) = crate::pinned_transport::pinned_rejection_message(config) {
             return Err(worker::Error::RustError(message));
