@@ -38,6 +38,15 @@ pub struct NntpConfig {
     pub port: u16,
     /// Use implicit TLS from the first byte (NNTPS).
     pub tls: bool,
+    /// Explicit opt-in to dial without TLS, mirroring the vault's
+    /// `allow_insecure_plaintext` acknowledgment (the user accepted the
+    /// cleartext warning at save time). Default `false`.
+    ///
+    /// The pinned transport gate still enforces the NNTP port allowlist for
+    /// acknowledged-plaintext configs; only the TLS requirement is lifted.
+    /// Paths that never carry a vault acknowledgment (NZB fetch) leave this
+    /// `false` and stay TLS-only.
+    pub allow_insecure_plaintext: bool,
     /// AUTHINFO username. `None` means unauthenticated access.
     pub username: Option<String>,
     /// AUTHINFO password. Required when `username` is set.
@@ -59,6 +68,7 @@ impl fmt::Debug for NntpConfig {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("tls", &self.tls)
+            .field("allow_insecure_plaintext", &self.allow_insecure_plaintext)
             .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
@@ -74,6 +84,7 @@ impl Default for NntpConfig {
             host: String::new(),
             port: 563,
             tls: true,
+            allow_insecure_plaintext: false,
             username: None,
             password: None,
             timeout: Duration::from_secs(20),

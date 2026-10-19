@@ -1,16 +1,23 @@
 //! Pinned, cancellable NNTP transport proof for NZB fetch.
 //!
 //! Fail-closed policy consumed by the NZB intake wiring (separate intake
-//! card, untouched here): TLS-on only, NNTP port allowlist, cooperative
+//! card, untouched here) and the stream pool dial sites: TLS-on unless the
+//! plaintext acknowledgment is set, NNTP port allowlist, cooperative
 //! cancellation, names-only diagnostics.
 //!
 //! - **Allowlist:** [`ALLOWED_NNTP_PORTS`] (`119`, `563` — the NNTP
-//!   conventions; the policy additionally requires TLS-on, so `119` is only
-//!   valid as a TLS port here, never as plaintext).
+//!   conventions; the policy additionally requires TLS-on unless the
+//!   plaintext acknowledgment is set, so `119` is only valid as a TLS
+//!   port here for unacknowledged configs, never as unacknowledged
+//!   plaintext).
 //! - **TLS-first order:** [`validate_nntp_endpoint`] checks `tls` BEFORE the
-//!   port allowlist. A TLS-off config is [`TransportRejection::TlsRequired`]
-//!   whatever the port — port policy never launders a plaintext config into
-//!   a port error.
+//!   port allowlist. A TLS-off config without the plaintext acknowledgment
+//!   ([`NntpConfig::allow_insecure_plaintext`]) is
+//!   [`TransportRejection::TlsRequired`] whatever the port — port policy
+//!   never launders a plaintext config into a port error. An
+//!   acknowledged-plaintext config (the vault's explicit opt-in, mirrored
+//!   onto the dial config by the pool's vault-read slice) skips only the
+//!   TLS check; the port allowlist still applies.
 //! - **Cancel bound:** [`CANCEL_BOUND_MS`] (`1_000` ms). [`with_cancel`]
 //!   resolves the fetch unless the cancel future resolves first; a cancelled
 //!   session has unknown wire state, so the caller must discard the client
@@ -44,7 +51,8 @@ use std::future::Future;
 use crate::nntp::NntpConfig;
 
 /// NNTP ports the fetch path accepts: `119` and `563` (TLS required
-/// separately — `119` is never plaintext here).
+/// separately unless the plaintext acknowledgment is set — `119` is never
+/// unacknowledged plaintext here).
 pub const ALLOWED_NNTP_PORTS: [u16; 2] = [119, 563];
 
 /// Bound (ms) within which [`with_cancel`] must surface a fired cancel.
@@ -58,7 +66,9 @@ pub const CANCEL_BOUND_MS: u64 = 1_000;
 /// so `Display` and `Debug` are safe for logs by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportRejection {
-    /// TLS-off config (`tls == false`): rejected before connect on any port.
+    /// TLS-off config without the plaintext acknowledgment
+    /// (`tls == false`, `allow_insecure_plaintext == false`): rejected
+    /// before connect on any port.
     TlsRequired,
     /// TLS-on config with an off-allowlist port; carries the offending port.
     PortNotAllowed(u16),
@@ -111,13 +121,18 @@ pub struct ValidatedEndpoint {
 
 /// Pure, fail-closed validation: no I/O, no DNS, no clock.
 ///
-/// Checks TLS FIRST (a TLS-off config is [`TransportRejection::TlsRequired`]
-/// whatever the port), then the port allowlist. Credentials on the config
-/// are ignored, never echoed.
+/// Checks TLS FIRST (a TLS-off config without the plaintext acknowledgment
+/// is [`TransportRejection::TlsRequired`] whatever the port), then the
+/// port allowlist. An acknowledged-plaintext config
+/// (`allow_insecure_plaintext == true`, the vault's explicit opt-in)
+/// skips only the TLS check so the pool can dial providers the vault
+/// accepted with the cleartext acknowledgment; the port allowlist still
+/// applies to that cohort. Credentials on the config are ignored, never
+/// echoed.
 pub fn validate_nntp_endpoint(
     config: &NntpConfig,
 ) -> Result<ValidatedEndpoint, TransportRejection> {
-    if !config.tls {
+    if !config.tls && !config.allow_insecure_plaintext {
         return Err(TransportRejection::TlsRequired);
     }
     if !ALLOWED_NNTP_PORTS.contains(&config.port) {
@@ -185,11 +200,22 @@ mod tests {
             host: host.to_owned(),
             port,
             tls,
+            allow_insecure_plaintext: false,
             username: Some(SENTINEL_USER.to_owned()),
             password: Some(SENTINEL_PASS.to_owned()),
             timeout: Duration::from_millis(200),
             max_pipelined: 1,
             max_article_bytes: crate::transport::MAX_ARTICLE_BYTES,
+        }
+    }
+
+    /// An acknowledged-plaintext config: `tls: false` with the vault's
+    /// explicit opt-in mirrored on, as the pool's vault-read slice must
+    /// produce for providers saved with the cleartext acknowledgment.
+    fn config_ack(host: &str, port: u16) -> NntpConfig {
+        NntpConfig {
+            allow_insecure_plaintext: true,
+            ..config(host, port, false)
         }
     }
 
@@ -204,16 +230,45 @@ mod tests {
         );
     }
 
-    /// The shared helper rejects TLS-off configs on any port (kills a mutant
-    /// that weakens the helper: the mutant would return `None` and the pinned
-    /// entries would dial plaintext).
+    /// The shared helper rejects unacknowledged TLS-off configs on any port
+    /// (kills a mutant that weakens the helper: the mutant would return
+    /// `None` and the pinned entries would dial plaintext).
     #[test]
-    fn pinned_helper_rejects_tls_off_on_any_port() {
+    fn pinned_helper_rejects_unacknowledged_tls_off_on_any_port() {
         for port in [80, 119, 563] {
             let msg = pinned_rejection_message(&config("127.0.0.1", port, false))
                 .expect("TLS-off config must be rejected");
             assert_names_only(&msg, "transport_tls_required");
         }
+    }
+
+    /// Acknowledged-plaintext configs (the vault's explicit opt-in mirrored
+    /// on the dial config) pass the TLS check on allowlisted ports, so the
+    /// pool can dial providers the vault accepted with the cleartext
+    /// acknowledgment. Kills a mutant that drops the acknowledgment read:
+    /// the mutant would reject this cohort with `transport_tls_required`.
+    #[test]
+    fn pinned_helper_allows_acknowledged_plaintext_on_allowlisted_ports() {
+        for port in ALLOWED_NNTP_PORTS {
+            let endpoint = validate_nntp_endpoint(&config_ack("news.example", port))
+                .expect("acknowledged plaintext on allowlisted port must pass");
+            assert_eq!(endpoint.port, port);
+            assert!(
+                pinned_rejection_message(&config_ack("news.example", port)).is_none(),
+                "acknowledged plaintext on allowlisted port {port} must pass"
+            );
+        }
+    }
+
+    /// The port allowlist still applies to the acknowledged cohort: an
+    /// acknowledged-plaintext config on an off-allowlist port is a port
+    /// rejection, never a dial (kills a mutant that lets the acknowledgment
+    /// bypass port policy).
+    #[test]
+    fn pinned_helper_still_enforces_port_allowlist_for_acknowledged_plaintext() {
+        let msg = pinned_rejection_message(&config_ack("127.0.0.1", 80))
+            .expect("off-allowlist port must be rejected even when acknowledged");
+        assert_names_only(&msg, "transport_port_not_allowed");
     }
 
     /// The shared helper rejects TLS-on configs on off-allowlist ports and
