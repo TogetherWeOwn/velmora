@@ -504,11 +504,12 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
     // must never be used as if it were the part checksum (and stays
     // unverified until reassembly, which is out of scope for this decoder).
     // For a single-part article part == whole file, so either field applies,
-    // preserving the existing pcrc32-then-crc32 precedence.
+    // with `crc32=` precedence (matching the stream decoder): `crc32=` is
+    // selected when present, `pcrc32=` only when `crc32=` is absent.
     let crc_text = if multipart {
         header_value(trailer, "pcrc32=")
     } else {
-        header_value(trailer, "pcrc32=").or_else(|| header_value(trailer, "crc32="))
+        header_value(trailer, "crc32=").or_else(|| header_value(trailer, "pcrc32="))
     };
     if let Some(crc_text) = crc_text {
         match u32::from_str_radix(crc_text, 16) {
