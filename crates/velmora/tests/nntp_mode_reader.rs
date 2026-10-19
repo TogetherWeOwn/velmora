@@ -307,9 +307,10 @@ async fn mode_reader_overlong_reply_line_fails_connect_without_credentials() {
 
 // ---------------------------------------------------------------------
 // Broken exchanges with credentials configured: connect must fail AND
-// AUTHINFO must not be issued into an unknown session state. The
-// malformed-reply case is the desync case: scripted 381/281 replies
-// are waiting, but they answer a session whose framing already broke.
+// AUTHINFO must not be issued into an unknown session state. Only the
+// malformed-reply case scripts waiting 381/281 replies (a desync case:
+// they answer a session whose framing already broke); the write-failure,
+// EOF, and timeout cases fail with nothing scripted after the greeting.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
