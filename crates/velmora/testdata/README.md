@@ -76,6 +76,6 @@ plain.len() + 16` (`tests/decrypt_vectors.rs:93-97`; magic per
 `src/decrypt.rs:186`, header size per `src/decrypt.rs:177-178`). Full read plus
 ranged and tamper checks live in `tests/decrypt_vectors.rs:99-143`.
 Multi-block behaviour is covered by `seal_block` round-trips building a
-two-block file in `tests/decrypt_vectors.rs:151-204` (`seal_block` contract:
+two-block file in `tests/decrypt_vectors.rs:151-204` (the `seal_block` contract:
 `sealed.len() == plaintext.len() + CIPHER_OVERHEAD`, `src/decrypt.rs:309-312`;
 derived key length 80, `src/decrypt.rs:319-320`).
