@@ -150,6 +150,46 @@ fn validate_argument(arg: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates a successful article-envelope reply (`223`/`220`/`222`) against
+/// the requested Message-ID and returns the article number.
+///
+/// RFC 3977 envelopes carry `<number> <message-id>` ahead of any trailing
+/// prose. The number must be unsigned decimal that fits `u64` (a bare digit
+/// string: no sign, hex, suffix, or overflow), and the very next token must
+/// be exactly `<{message_id}>` — byte-identical, including case — so a reply
+/// naming another article is never accepted under the requested ID.
+/// Trailing explanatory text after the ID is not identity and is ignored.
+/// Article number 0 is valid: servers report it when fetching by Message-ID.
+///
+/// Every failure is [`Error::Malformed`] with a fixed diagnostic. Neither
+/// the envelope text nor the requested ID is echoed: both are untrusted
+/// bytes that must not reach logs or error bodies.
+fn parse_envelope(text: &str, message_id: &str) -> Result<u64> {
+    let mut parts = text.split_whitespace();
+    let invalid = || {
+        Error::Malformed("NNTP article envelope is missing the article number or Message-ID".into())
+    };
+    match (parts.next(), parts.next()) {
+        (Some(number), Some(id)) => {
+            if !number.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let article = number.parse().map_err(|_| invalid())?;
+            if id.len() != message_id.len() + 2
+                || !id.starts_with('<')
+                || !id.ends_with('>')
+                || &id[1..id.len() - 1] != message_id
+            {
+                return Err(Error::Malformed(
+                    "NNTP article envelope names a different article".into(),
+                ));
+            }
+            Ok(article)
+        }
+        _ => Err(invalid()),
+    }
+}
+
 /// Summary returned by `GROUP`.
 #[derive(Debug, Clone)]
 pub struct GroupInfo {
@@ -244,41 +284,55 @@ impl<T: Transport> NntpClient<T> {
         self.transport.into_inner()
     }
 
-    /// `STAT <message-id>`: returns the article number. `430` becomes
-    /// [`Error::ArticleNotFound`].
+    /// `STAT <message-id>`: returns the article number after correlating the
+    /// `223` envelope (article number + bracketed Message-ID) with the
+    /// requested article. An uncorrelated envelope is [`Error::Malformed`];
+    /// `430` becomes [`Error::ArticleNotFound`].
     pub async fn stat(&mut self, message_id: &str) -> Result<u64> {
         validate_argument(message_id)?;
         let reply = self.command(&format!("STAT <{message_id}>")).await?;
         match reply.code {
-            223 => reply
-                .text
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok())
-                .ok_or_else(|| {
-                    Error::Malformed(format!("STAT reply has no article number: {}", reply.text))
-                }),
+            223 => parse_envelope(&reply.text, message_id),
             _ => Err(self.classify(&reply, message_id)),
         }
     }
 
     /// `ARTICLE <message-id>`: appends the raw article (headers + body) to
-    /// `out`. `430` becomes [`Error::ArticleNotFound`].
+    /// `out`. The `220` envelope is correlated with the requested article
+    /// before any byte is read: a rejection appends nothing and invalidates
+    /// the connection, because the promised dot-block is still unread on the
+    /// wire and the stream is no longer at a command boundary. `430` becomes
+    /// [`Error::ArticleNotFound`].
     pub async fn article_to(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<()> {
         validate_argument(message_id)?;
         let reply = self.command(&format!("ARTICLE <{message_id}>")).await?;
         match reply.code {
-            220 => self.transport.read_dot_block(out).await.map_err(Error::Io),
+            220 => {
+                if let Err(err) = parse_envelope(&reply.text, message_id) {
+                    self.transport.invalidate();
+                    return Err(err);
+                }
+                self.transport.read_dot_block(out).await.map_err(Error::Io)
+            }
             _ => Err(self.classify(&reply, message_id)),
         }
     }
 
-    /// `BODY <message-id>`: appends just the body to `out`.
+    /// `BODY <message-id>`: appends just the body to `out`. Like
+    /// [`NntpClient::article_to`], the `222` envelope is correlated before
+    /// any byte is read, and a rejection appends nothing and invalidates
+    /// the connection.
     pub async fn body_to(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<()> {
         validate_argument(message_id)?;
         let reply = self.command(&format!("BODY <{message_id}>")).await?;
         match reply.code {
-            222 => self.transport.read_dot_block(out).await.map_err(Error::Io),
+            222 => {
+                if let Err(err) = parse_envelope(&reply.text, message_id) {
+                    self.transport.invalidate();
+                    return Err(err);
+                }
+                self.transport.read_dot_block(out).await.map_err(Error::Io)
+            }
             _ => Err(self.classify(&reply, message_id)),
         }
     }
@@ -323,7 +377,10 @@ impl<T: Transport> NntpClient<T> {
     /// retrying; never reuse `into_inner()` after a failed batch. A
     /// pre-write argument refusal ([`Error::Malformed`]) writes nothing
     /// and leaves the connection usable. A per-article `430` returns
-    /// [`Error::ArticleNotFound`].
+    /// [`Error::ArticleNotFound`]. Every `220` envelope is correlated with
+    /// its requested article before its dot-block is read: one uncorrelated
+    /// reply discards the whole batch (no partial success) and invalidates
+    /// the client.
     pub async fn fetch_many(&mut self, message_ids: &[&str]) -> Result<Vec<FetchOutcome>> {
         // Pre-write refusal must not poison the connection: nothing is on
         // the wire yet, so return before entering the invalidating path.
@@ -357,6 +414,10 @@ impl<T: Transport> NntpClient<T> {
                 let reply = self.read_reply().await?;
                 match reply.code {
                     220 => {
+                        // Correlate before reading: a mismatched envelope
+                        // must never relabel foreign bytes, and the error
+                        // path in `fetch_many` invalidates the client.
+                        parse_envelope(&reply.text, id)?;
                         let mut article = Vec::new();
                         self.transport
                             .read_dot_block(&mut article)
@@ -479,5 +540,83 @@ impl<T: Transport> NntpClient<T> {
     /// Reads the dot-block following a `2xx` reply to [`NntpClient::raw_command`].
     pub async fn raw_dot_block(&mut self, out: &mut Vec<u8>) -> Result<()> {
         self.transport.read_dot_block(out).await.map_err(Error::Io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_accepts_zero_max_and_trailing_prose() {
+        for (text, want) in [
+            ("0 <a@x>", 0),
+            ("42 <a@x>", 42),
+            ("18446744073709551615 <a@x> exists", u64::MAX),
+            ("42 <a@x> article follows; <b@x> is only prose", 42),
+            ("  42   <a@x>  ", 42),
+        ] {
+            assert_eq!(parse_envelope(text, "a@x").unwrap(), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn envelope_rejects_malformed_numbers() {
+        for text in [
+            "",
+            "<a@x>",
+            "42",
+            "-1 <a@x>",
+            "+1 <a@x>",
+            "0x2a <a@x>",
+            "42x <a@x>",
+            "4_2 <a@x>",
+            "18446744073709551616 <a@x>",
+        ] {
+            assert!(
+                matches!(parse_envelope(text, "a@x"), Err(Error::Malformed(_))),
+                "{text:?} must be a malformed envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_rejects_unmatched_ids() {
+        for text in [
+            "42 <b@x>",
+            "42 <A@x>",
+            "42 <a@x.extra>",
+            "42 a@x",
+            "42 <a@x",
+            "42 <>",
+            "42 <a@x>>",
+            "42 <<a@x>>",
+            "42 <b@x> explanation <a@x>",
+        ] {
+            assert!(
+                matches!(parse_envelope(text, "a@x"), Err(Error::Malformed(_))),
+                "{text:?} must not correlate with a@x"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_diagnostics_echo_neither_side() {
+        let hostile = "42 <\x1b[31mcanary> untrusted-explanation";
+        for err in [
+            parse_envelope(hostile, "wanted@x").unwrap_err(),
+            parse_envelope("no-number-here", "wanted@x").unwrap_err(),
+        ] {
+            assert!(!err.is_auth_failure());
+            for rendered in [err.to_string(), format!("{err:?}"), format!("{err:#?}")] {
+                for forbidden in ["\x1b", "canary", "untrusted-explanation", "wanted@x"] {
+                    assert!(
+                        !rendered.contains(forbidden),
+                        "diagnostic echoes untrusted text: {rendered:?}"
+                    );
+                }
+                assert!(rendered.len() <= 256, "unbounded: {rendered:?}");
+            }
+        }
     }
 }
