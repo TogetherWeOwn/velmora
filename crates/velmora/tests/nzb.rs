@@ -16,7 +16,7 @@ const BASIC: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <groups><group>alt.binaries.music</group></groups>
 <segments>
 <segment bytes="100" number="1">seg-1@example.com</segment>
-<segment bytes="100" number="2">&lt;seg-2@example.com&gt;</segment>
+<segment bytes="100" number="2">seg-2@example.com</segment>
 </segments>
 </file>
 <file poster="p@example.com" date="1699999999" subject="Some Album [03/10] - &quot;02 track.flac&quot; yEnc (1/1)">
@@ -41,7 +41,7 @@ fn parses_basic_document() {
     assert_eq!(f0.ordinal, 0);
     assert_eq!(f0.segments.len(), 2);
     assert_eq!(f0.segments[0].message_id, "seg-1@example.com");
-    // Entity-escaped brackets are decoded, then normalised to bare form.
+    // Bare segment text parses to the identical bare identity.
     assert_eq!(f0.segments[1].message_id, "seg-2@example.com");
     assert_eq!(f0.role, "content");
     assert_eq!(f0.container, "flac");
@@ -202,9 +202,12 @@ fn xxee_and_billion_laughs_are_rejected() {
 
 #[test]
 fn normalize_message_id_rules() {
-    assert_eq!(normalize_message_id("<a@b>").unwrap(), "a@b");
-    assert_eq!(normalize_message_id("  a@b  ").unwrap(), "a@b");
-    assert_eq!(normalize_message_id("< a@b >").unwrap(), "a@b");
+    // Strict: only already-bare ids pass; brackets and padding are refused,
+    // never trimmed or stripped into acceptance.
+    assert_eq!(normalize_message_id("a@b").unwrap(), "a@b");
+    assert!(normalize_message_id("<a@b>").is_err());
+    assert!(normalize_message_id("  a@b  ").is_err());
+    assert!(normalize_message_id("< a@b >").is_err());
     assert!(normalize_message_id("").is_err());
     assert!(normalize_message_id("a b@c").is_err());
     assert!(normalize_message_id("a<b@c>").is_err());

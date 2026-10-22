@@ -696,9 +696,9 @@ fn parse_segment<R: BufRead>(
 
     // The reader trims each Text event independently, which would silently
     // delete whitespace adjacent to a reference or CDATA section from the
-    // middle of the ID; the embedded-whitespace rejection must see the true
+    // middle of the ID; the whitespace rejection must see the true
     // resolved text. Accumulate untrimmed and let `normalize_message_id`
-    // trim the edges. Error returns abort the whole parse, so the saved
+    // refuse any padding. Error returns abort the whole parse, so the saved
     // settings only need restoring on the success path below.
     let saved_trim = (
         reader.config().trim_text_start,
@@ -862,24 +862,30 @@ fn is_password_meta(name: &str, attrs: &HashMap<String, String>) -> bool {
             .is_some_and(|t| t.eq_ignore_ascii_case("password"))
 }
 
-/// Normalises a Message-ID to its bare form (no brackets, no surrounding
-/// whitespace). Mirrors v1's `NormalizeMessageID`.
+/// Accepts a Message-ID only when it is already bare: non-empty, at most
+/// 998 bytes, no `<`/`>`, and no whitespace or control bytes anywhere —
+/// never trimmed, unbracketed, or otherwise transformed, so a refused
+/// spelling can never become an accepted identity downstream.
+///
+/// This is the structural parse bound (it also admits shapes the wire
+/// rule refuses, such as `@`-less tokens and 251..=998-byte ids); the
+/// shared 250-byte wire-identity ceiling and the exactly-one-`@` shape
+/// are enforced after parsing by
+/// [`segment_identity::valid_segment_id`](crate::segment_identity::valid_segment_id).
+/// Use that for identity validation; this function only guards the
+/// parser's structural output.
 pub fn normalize_message_id(value: &str) -> Result<String> {
-    let mut id = value.trim().to_string();
-    if id.starts_with('<') && id.ends_with('>') && id.len() >= 2 {
-        id = id[1..id.len() - 1].trim().to_string();
-    }
-    if id.is_empty() || id.len() > 998 || id.contains(['<', '>']) {
+    if value.is_empty() || value.len() > 998 || value.contains(['<', '>']) {
         return Err(Error::Malformed(
             "Message-ID must be bare, non-empty, and at most 998 bytes".into(),
         ));
     }
-    if id.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+    if value.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err(Error::Malformed(
             "Message-ID contains whitespace or a control byte".into(),
         ));
     }
-    Ok(id)
+    Ok(value.to_string())
 }
 
 /// SHA-256 over sorted Message-IDs with 4-byte big-endian length prefixes.
