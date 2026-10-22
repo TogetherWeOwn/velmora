@@ -4,7 +4,9 @@
 //! values and a concatenation property test.
 
 use nntune_core::error::Error;
-use nntune_core::par2::{crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder};
+use nntune_core::par2::{
+    crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder, MAX_PAR2_FILES,
+};
 
 const BLOCK_SIZE: u64 = 256;
 const FILENAME: &str = "track.flac";
@@ -115,6 +117,55 @@ fn fixture_with_crcs(crcs: Vec<u32>, block_size: u64) -> Fixture {
     // Deliberately scramble packet order: the format fixes no order.
     set_bytes.extend(packet(&set_id, &ptype(b"FileDesc"), &fd_body));
     set_bytes.extend(packet(&set_id, &ptype(b"RecvSlic"), &rs_body));
+    set_bytes.extend(packet(&set_id, &ptype(b"IFSC\0\0\0\0"), &ifsc_body));
+    set_bytes.extend(packet(&set_id, &ptype(b"Main\0\0\0\0"), &main_body));
+    Fixture {
+        data,
+        set_bytes,
+        file_id,
+    }
+}
+
+/// Builds the fixture around a caller-supplied raw FileDesc name, deriving
+/// the File ID from those exact bytes, so name-rule tests are self-consistent:
+/// only the rule under test may reject the set. `raw_name` must carry no
+/// trailing NUL padding of its own (the packet padder appends it), otherwise
+/// the parser's trailing trim would desync the identity derivation.
+fn fixture_with_name(raw_name: &[u8]) -> Fixture {
+    let data = file_bytes();
+    let whole_md5 = md5::compute(&data).0;
+    let first16k = md5::compute(&data[..data.len().min(16 * 1024)]).0;
+    let mut seed = Vec::new();
+    seed.extend_from_slice(&first16k);
+    seed.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    seed.extend_from_slice(raw_name);
+    let file_id = md5::compute(&seed).0;
+
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&BLOCK_SIZE.to_le_bytes());
+    main_body.extend_from_slice(&1u32.to_le_bytes()); // 1 recoverable file
+    main_body.extend_from_slice(&file_id);
+    let set_id = md5::compute(&main_body).0;
+
+    let mut fd_body = Vec::new();
+    fd_body.extend_from_slice(&file_id);
+    fd_body.extend_from_slice(&whole_md5);
+    fd_body.extend_from_slice(&first16k);
+    fd_body.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    fd_body.extend_from_slice(raw_name);
+    while fd_body.len() % 4 != 0 {
+        fd_body.push(0);
+    }
+
+    let mut ifsc_body = Vec::new();
+    ifsc_body.extend_from_slice(&file_id);
+    for crc in block_crcs(&data) {
+        ifsc_body.extend_from_slice(&[0u8; 16]); // per-slice MD5 (unused by verify)
+        ifsc_body.extend_from_slice(&crc.to_le_bytes());
+    }
+
+    let mut set_bytes = Vec::new();
+    set_bytes.extend(packet(&set_id, &ptype(b"FileDesc"), &fd_body));
     set_bytes.extend(packet(&set_id, &ptype(b"IFSC\0\0\0\0"), &ifsc_body));
     set_bytes.extend(packet(&set_id, &ptype(b"Main\0\0\0\0"), &main_body));
     Fixture {
@@ -306,15 +357,93 @@ fn verify_and_precheck_reject_extra_block_crcs_without_panicking() {
     let set = RecoverySet::parse(&f.set_bytes).expect("over-long IFSC parses");
     let err = set.verify(FILENAME, &f.data).unwrap_err();
     assert!(
-        matches!(err, Error::Par2Unhealthy { .. }),
-        "want Par2Unhealthy, got: {err}"
+        matches!(err, Error::Malformed(_)),
+        "want Malformed, got: {err}"
     );
     let cuts = [0usize, 500, 1000];
     let segments: Vec<(u32, u64)> = cuts
         .windows(2)
         .map(|w| (crc32fast::hash(&f.data[w[0]..w[1]]), (w[1] - w[0]) as u64))
         .collect();
-    assert!(set.precheck(FILENAME, &segments).is_err());
+    let err = set.precheck(FILENAME, &segments).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "verify and precheck must agree, got: {err}"
+    );
+}
+
+/// Invalid metadata dead-letters even when the candidate bytes are also
+/// damaged: a count-mismatched set plus truncated bytes must be Malformed
+/// (like precheck), never Par2Unhealthy.
+#[test]
+fn verify_reports_invalid_metadata_before_damaged_bytes() {
+    let mut crcs = block_crcs(&file_bytes());
+    crcs.push(0xdead_beef);
+    let f = fixture_with_crcs(crcs, BLOCK_SIZE);
+    let set = RecoverySet::parse(&f.set_bytes).expect("over-long IFSC parses");
+    let err = set.verify(FILENAME, &f.data[..999]).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "metadata-first: want Malformed, got: {err}"
+    );
+}
+
+/// FileDesc and IFSC identities share one file cap: per-path digest gates
+/// alone would admit MAX_PAR2_FILES of each with disjoint IDs, doubling the
+/// documented bound mid-stream. The union gate must refuse the packet that
+/// would open file MAX_PAR2_FILES + 1.
+#[test]
+fn disjoint_filedesc_and_ifsc_identities_share_one_file_cap() {
+    let set_id = [0x42; 16];
+    let mut builder = RecoverySetBuilder::new();
+    for i in 0..MAX_PAR2_FILES {
+        let name = format!("track-{i}.flac");
+        let first16k = [0x11; 16];
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&first16k);
+        seed.extend_from_slice(&1000u64.to_le_bytes());
+        seed.extend_from_slice(name.as_bytes());
+        let file_id = md5::compute(&seed).0;
+        let mut body = Vec::new();
+        body.extend_from_slice(&file_id);
+        body.extend_from_slice(&[0x22; 16]); // whole md5 (unchecked at parse)
+        body.extend_from_slice(&first16k);
+        body.extend_from_slice(&1000u64.to_le_bytes());
+        body.extend_from_slice(name.as_bytes());
+        builder
+            .add_stream(&packet(&set_id, &ptype(b"FileDesc"), &body))
+            .expect("descriptions within cap must be accepted");
+    }
+    let mut ifsc = vec![0x99; 16]; // disjoint from every derived File ID
+    ifsc.extend_from_slice(&[0u8; 20]);
+    let err = builder
+        .add_stream(&packet(&set_id, &ptype(b"IFSC\0\0\0\0"), &ifsc))
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "union cap: want Malformed, got: {err}"
+    );
+}
+
+/// A FileDesc name with a leading NUL byte is malformed even when the set is
+/// otherwise fully self-consistent (File ID derived from the raw name bytes,
+/// correct packet MD5, listed in Main): only the name rule may reject it.
+#[test]
+fn parse_and_stream_reject_leading_nul_filename() {
+    let f = fixture_with_name(b"\0track.flac");
+    let err = RecoverySet::parse(&f.set_bytes).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "leading-NUL name: want Malformed, got: {err}"
+    );
+    let mut builder = RecoverySetBuilder::new();
+    let err = builder
+        .add_stream(split_packets(&f.set_bytes)[0])
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "streaming path must agree, got: {err}"
+    );
 }
 
 /// Same for FEWER checksums than required: 3 instead of 4.
@@ -363,7 +492,7 @@ fn verify_accepts_healthy_and_rejects_damaged() {
     assert!(err.to_string().contains("length"), "got: {err}");
 
     let err = set.verify("nope.flac", &f.data).unwrap_err();
-    assert!(matches!(err, Error::Par2Unhealthy { .. }), "got: {err}");
+    assert!(matches!(err, Error::Malformed(_)), "got: {err}");
 }
 
 // --- Precheck + crc32_combine ------------------------------------------------

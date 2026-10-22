@@ -1,7 +1,7 @@
 //! Pin for the two PAR2 framing literals (`crates/nntune-core/src/par2.rs`):
-//! `IFSC_ENTRY_SIZE` (`:30`, length validation at `:640`, chunked walk at
-//! `:654`) and `ZERO_CHUNK_SIZE` (`:44`, streaming zero-run hasher at
-//! `:748-750`, so verification never holds a slice-sized zero allocation).
+//! `IFSC_ENTRY_SIZE` (`:54`, length validation at `:709`, chunked walk at
+//! `:728`) and `ZERO_CHUNK_SIZE` (`:84`, streaming zero-run hasher at
+//! `:822-824`, so verification never holds a slice-sized zero allocation).
 //!
 //! Both literals are private to `par2.rs`, and this card forbids
 //! production-code changes (so no `pub` re-export to import here). The value
@@ -308,13 +308,11 @@ fn empty_ifsc_entries_parse_with_no_checksums() {
         .block_crc32s
         .is_empty());
     let err = set.verify(FILENAME, &data).unwrap_err();
-    match err {
-        Error::Par2Unhealthy { detail, .. } => assert!(
-            detail.contains("carries no block checksums"),
-            "empty IFSC must fail verify for lack of checksums, got: {detail}"
-        ),
-        other => panic!("expected Par2Unhealthy, got {other:?}"),
-    }
+    let msg = malformed_message(&err);
+    assert!(
+        msg.contains("carries no block checksums"),
+        "empty IFSC must fail verify for lack of checksums, got: {msg}"
+    );
 }
 
 #[test]
