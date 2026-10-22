@@ -255,12 +255,15 @@ pub fn default_corpus() -> Vec<Article> {
     articles
 }
 
-/// Render a minimal NZB 1.1 document for the given articles.
+/// Render a minimal NZB 1.1 document for the given articles. Segment
+/// text carries the bare shared-rule identity (corpus keys arrive
+/// bracketed and are unbracketed here at the fixture boundary, never by
+/// the parser, which refuses non-bare spellings).
 pub fn nzb_for(articles: &[&Article], group: &str) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/nzb/nzb-1.1\">\n");
     for a in articles {
         out.push_str(&format!(
-            "  <file poster=\"fixture@nntune.test\" date=\"1760313600\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n      <segment bytes=\"{}\" number=\"1\">&lt;{}&gt;</segment>\n    </segments>\n  </file>\n",
+            "  <file poster=\"fixture@nntune.test\" date=\"1760313600\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n      <segment bytes=\"{}\" number=\"1\">{}</segment>\n    </segments>\n  </file>\n",
             xml_escape(&a.subject),
             group,
             a.payload.len(),

@@ -374,34 +374,25 @@ async fn nzb_fixtures_match_served_ids() {
     let mut declared_bytes: HashMap<String, u64> = HashMap::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-        // Parse each <segment bytes="N" ...>&lt;id&gt;</segment>.
+        // Parse each <segment bytes="N" ...>bare-id</segment>. Fixture text
+        // is the bare shared-rule identity; brackets are added here only to
+        // match the corpus keys.
         let mut rest = text.as_str();
-        while let Some(seg) = rest.find("<segment") {
+        while let Some(seg) = rest.find("<segment ") {
             rest = &rest[seg..];
             let bytes_start = rest.find("bytes=\"").expect("segment bytes=");
             let bytes_rest = &rest[bytes_start + 7..];
             let bytes_end = bytes_rest.find('"').expect("closing quote");
             let bytes: u64 = bytes_rest[..bytes_end].parse().expect("bytes number");
-            let lt = rest.find("&lt;").expect("segment id");
-            let gt = rest[lt..].find("&gt;").expect("segment id end");
-            let id = format!("<{}>", &rest[lt + 4..lt + gt]);
+            let body_start = rest.find('>').expect("segment body") + 1;
+            let body_end = rest[body_start..]
+                .find("</segment>")
+                .expect("segment id end")
+                + body_start;
+            let id = format!("<{}>", rest[body_start..body_end].trim());
             referenced.insert(id.clone());
             declared_bytes.insert(id, bytes);
-            rest = &rest[lt + gt + 4..];
-        }
-        // Fallback for files without <segment> (should not happen, but keeps
-        // the old ID-only extraction working).
-        if referenced.is_empty() {
-            let mut r2 = text.as_str();
-            while let Some(i) = r2.find("&lt;") {
-                r2 = &r2[i + 4..];
-                if let Some(j) = r2.find("&gt;") {
-                    referenced.insert(format!("<{}>", &r2[..j]));
-                    r2 = &r2[j + 4..];
-                } else {
-                    break;
-                }
-            }
+            rest = &rest[body_end..];
         }
     }
     assert!(

@@ -28,7 +28,7 @@ fn document(subject: &str) -> String {
     format!(
         "<nzb><file poster=\"p@example.com\" date=\"1700000000\" subject=\"{escaped}\">\
          <groups><group>alt.binaries.test</group></groups><segments>\
-         <segment bytes=\"100\" number=\"1\">&lt;seg2@example.com&gt;</segment>\
+         <segment bytes=\"100\" number=\"1\">seg2@example.com</segment>\
          <segment bytes=\"200\" number=\"2\">seg1@example.com</segment>\
          <segment bytes=\"300\" number=\"3\">seg10@example.com</segment>\
          </segments></file></nzb>"

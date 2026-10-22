@@ -39,14 +39,14 @@ fn message_id(segment_inner: &str) -> nntune_core::Result<String> {
 
 #[test]
 fn valid_literal_segment_is_unchanged() {
-    // Positive control: literal text, brackets and surrounding whitespace
-    // behave exactly as before.
+    // Positive control: bare literal text passes through exactly.
     assert_eq!(message_id("a@b").unwrap(), "a@b");
-    assert_eq!(message_id("  a@b  ").unwrap(), "a@b");
     assert_eq!(
         message_id("seg-1@example.com").unwrap(),
         "seg-1@example.com"
     );
+    // Padding is refused, never trimmed into acceptance.
+    assert!(message_id("  a@b  ").is_err());
 }
 
 #[test]
@@ -121,10 +121,12 @@ fn reference_to_embedded_bracket_is_rejected() {
 }
 
 #[test]
-fn escaped_brackets_and_surrounding_whitespace_still_normalize() {
-    assert_eq!(message_id("&#60;a@b&#62;").unwrap(), "a@b");
-    assert_eq!(message_id("&lt;a@b&gt;").unwrap(), "a@b");
-    assert_eq!(message_id("&#32;a@b&#32;").unwrap(), "a@b");
+fn escaped_brackets_and_surrounding_whitespace_are_rejected() {
+    // Resolution happens before the strict bare check, so referenced
+    // brackets and padding are refused just like the literals.
+    assert!(message_id("&#60;a@b&#62;").is_err());
+    assert!(message_id("&lt;a@b&gt;").is_err());
+    assert!(message_id("&#32;a@b&#32;").is_err());
 }
 
 #[test]
