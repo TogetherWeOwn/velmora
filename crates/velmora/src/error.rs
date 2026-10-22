@@ -49,7 +49,10 @@ pub enum Error {
     /// Decryption/authentication failure (bad key, bad nonce, bad padding,
     /// secretbox authentication failure, range outside the plaintext).
     Decrypt(String),
-    /// PAR2 verification found damaged blocks (verify-only path, no repair).
+    /// PAR2 verification found damaged candidate bytes (verify-only path, no
+    /// repair): wrong length, a whole-file MD5 mismatch, or a per-block CRC32
+    /// mismatch against valid set metadata. Invalid metadata itself is
+    /// [`Error::Malformed`] (dead-letter), never this variant.
     Par2Unhealthy { filename: String, detail: String },
     /// Operation needs a native target (e.g. spawning the `par2` repair binary).
     UnsupportedOnWasm(&'static str),

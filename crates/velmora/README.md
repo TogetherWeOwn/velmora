@@ -96,9 +96,9 @@ CRLF counting and rollback `src/transport.rs:168-182`, `fetch_many` poisoning
 - **PAR2:** Original `filename_bytes` determine identity. Ambiguous display-name
   lookups return `None`; use `file_by_name_bytes`, `verify_bytes`, and
   `precheck_bytes` for byte-precise selection and verification.
-  (Sources: `file_by_name` ambiguity `src/par2.rs:270-281`, `file_by_name_bytes`
-  `src/par2.rs:286-290`, `verify_bytes` `src/par2.rs:321-328`, `precheck_bytes`
-  `src/par2.rs:422-427`.)
+  (Sources: `file_by_name` ambiguity `src/par2.rs:329-340`, `file_by_name_bytes`
+  `src/par2.rs:343-347`, `verify_bytes` `src/par2.rs:380-385`, `precheck_bytes`
+  `src/par2.rs:475-480`.)
 
 **Native repair is Linux-only**, requiring `/usr/bin/prlimit`, a trusted
 image-pinned binary, and an exclusive scratch directory. Default ceilings are
