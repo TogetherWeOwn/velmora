@@ -62,7 +62,9 @@ pub const OGG_FIXED_SERIAL: u32 = 1;
 ///   (a video stream in tagged FLAC/MP3) must never reach the muxer.
 /// - `-map_metadata -1`: input tags differ between rips of identical
 ///   audio and would otherwise break byte-identical output.
-/// - `-c:a libopus -b:a 64k -ar 48000 -ac 2`: the §4.1 profile.
+/// - `-c:a libopus -b:a 64k -vbr off -ar 48000 -ac 2`: the §4.1 profile.
+///   Explicit CBR keeps packet bitrate at 64k; libopus's default VBR
+///   treats `-b:a` as a target and can exceed the profile's envelope.
 ///
 /// The exact argv is pinned by tests: any flag change alters artifact
 /// bytes and therefore every content hash, so it is a deliberate,
@@ -84,6 +86,8 @@ pub fn ffmpeg_argv(input: &str, output: &str) -> Vec<String> {
         "libopus".to_string(),
         "-b:a".to_string(),
         "64k".to_string(),
+        "-vbr".to_string(),
+        "off".to_string(),
         "-ar".to_string(),
         "48000".to_string(),
         "-ac".to_string(),
@@ -261,6 +265,55 @@ pub fn artifact_r2_key(artifact_sha256_hex: &str) -> Result<String, KeyError> {
     Ok(format!("audio/{}/{}/{}", &sha[0..2], &sha[2..4], sha))
 }
 
+/// Staged transcode input object name: `{index:04}-{sha256(file_name)}`
+/// (69 chars), exactly the verify-staged name
+/// (`VerifyProgress::file_key`) the front reads back from
+/// `{scratch_prefix}in/`. The index keeps two files that share a name
+/// from sharing one staged object; the name hash keeps hostile NZB
+/// bytes out of key space entirely.
+///
+/// Shared by the ingest dispatch, the transcode front contract and the
+/// Container staging path so the three can never disagree on what an
+/// input key looks like. The bare 64-hex core-contract shape is NOT
+/// accepted: no producer stages it, and accepting two shapes would let
+/// a forged key address bytes the job never staged.
+pub fn validate_transcode_input_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.len() != 69 || bytes[4] != b'-' {
+        return false;
+    }
+    if !bytes[..4].iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    bytes[5..]
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// Scratch round-dir prefixes are short by construction
+/// (`ingest-scratch/{job_id}/r{round}/`); anything longer is not one.
+pub const MAX_TRANSCODE_PREFIX_BYTES: usize = 256;
+
+/// True only for the round dir the job's verify staging lives in:
+/// `ingest-scratch/{job_id}/.../` with a trailing slash, a safe
+/// charset, and the length cap. The job containment is the point: a
+/// forged prefix must never address another job's staged bytes.
+///
+/// Shared by the ingest dispatch and the transcode front parse so the
+/// two can never disagree on the containment rule.
+pub fn validate_transcode_prefix(prefix: &str, job_id: &str) -> bool {
+    if prefix.len() > MAX_TRANSCODE_PREFIX_BYTES || !prefix.ends_with('/') {
+        return false;
+    }
+    let root = format!("ingest-scratch/{job_id}/");
+    if !prefix.starts_with(&root) {
+        return false;
+    }
+    prefix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'_' || b == b'-' || b == b'.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +338,8 @@ mod tests {
                 "libopus",
                 "-b:a",
                 "64k",
+                "-vbr",
+                "off",
                 "-ar",
                 "48000",
                 "-ac",
@@ -485,5 +540,62 @@ mod tests {
             artifact_r2_key(&non_hex),
             Err(KeyError::NonHex { offset: 7 })
         );
+    }
+
+    #[test]
+    fn transcode_input_key_shape_is_indexed_staged_name() {
+        let hex = "9d70f11bc759d734ebb343f5932f005cebb343f5932f005c9d70f11bc759d734";
+        // Exactly what verify stages: `{index:04}-{sha256(file_name)}`.
+        assert!(validate_transcode_input_key(&format!("0007-{hex}")));
+        assert!(validate_transcode_input_key(&format!("1023-{hex}")));
+        // Bare object keys, wrong shapes, traversal and hostile bytes fail.
+        assert!(!validate_transcode_input_key(hex));
+        assert!(!validate_transcode_input_key("7-9d70"));
+        assert!(!validate_transcode_input_key(&format!("0007_{hex}")));
+        assert!(!validate_transcode_input_key(&format!(
+            "0007-{}",
+            hex.to_ascii_uppercase()
+        )));
+        assert!(!validate_transcode_input_key(&format!("0007-{hex}/")));
+        assert!(!validate_transcode_input_key("../0007-x"));
+        assert!(!validate_transcode_input_key(""));
+        assert!(!validate_transcode_input_key(&format!("0007-{hex}x")));
+    }
+
+    #[test]
+    fn transcode_prefix_containment_pins_job_root() {
+        const JOB: &str = "job_01J9ZQ8K2M";
+        assert!(validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1/",
+            JOB
+        ));
+        assert!(validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r12/",
+            JOB
+        ));
+        // Another job, missing slash, hostile bytes fail. Dots pass
+        // the charset (R2 keys are flat strings, so `..` traverses
+        // nothing) but containment still holds: the prefix must start
+        // with this job's root.
+        assert!(!validate_transcode_prefix(
+            "ingest-scratch/job_other/r1/",
+            JOB
+        ));
+        assert!(!validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1",
+            JOB
+        ));
+        assert!(validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1.backup/",
+            JOB
+        ));
+        assert!(!validate_transcode_prefix(
+            "ingest-scratch/job_01J9ZQ8K2M/r1/\0",
+            JOB
+        ));
+        assert!(!validate_transcode_prefix("", JOB));
+        let long = format!("ingest-scratch/{JOB}/r1/{}", "x".repeat(256));
+        assert!(long.len() > MAX_TRANSCODE_PREFIX_BYTES);
+        assert!(!validate_transcode_prefix(&long, JOB));
     }
 }
