@@ -366,39 +366,73 @@ async fn mid_body_disconnect_drops_connection() {
     );
 }
 
+/// Parse each `<segment bytes="N" ...>bare-id</segment>` out of an NZB
+/// document built by [`nzb_for`]. Document text carries the bare
+/// shared-rule identity; brackets are added here only to match the corpus
+/// keys.
+fn parse_generated_nzb(text: &str) -> HashMap<String, u64> {
+    // message-id -> declared segment bytes (NZB `bytes=` attribute).
+    let mut declared_bytes: HashMap<String, u64> = HashMap::new();
+    let mut rest = text;
+    while let Some(seg) = rest.find("<segment ") {
+        rest = &rest[seg..];
+        let bytes_start = rest.find("bytes=\"").expect("segment bytes=");
+        let bytes_rest = &rest[bytes_start + 7..];
+        let bytes_end = bytes_rest.find('"').expect("closing quote");
+        let bytes: u64 = bytes_rest[..bytes_end].parse().expect("bytes number");
+        let body_start = rest.find('>').expect("segment body") + 1;
+        let body_end = rest[body_start..]
+            .find("</segment>")
+            .expect("segment id end")
+            + body_start;
+        let id = format!("<{}>", rest[body_start..body_end].trim());
+        declared_bytes.insert(id, bytes);
+        rest = &rest[body_end..];
+    }
+    declared_bytes
+}
+
 #[tokio::test]
-async fn nzb_fixtures_match_served_ids() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/nzb");
+async fn generated_nzbs_match_served_ids() {
+    // No checked-in NZB files anywhere: every NZB under test is built in
+    // memory with `nzb_for()` from the served corpus. One document per
+    // corpus shape keeps a bad slice attributable to its shape.
+    let corpus = nntune_test_nntp::default_corpus();
+    let by_id: HashMap<_, _> = corpus.iter().map(|a| (a.message_id.as_str(), a)).collect();
+    let group = "alt.binaries.nntune.test";
+    let shapes: &[&[&str]] = &[
+        &["<single-yenc-001@nntune.test>"],
+        &[
+            "<multi-660-part1-of-3@nntune.test>",
+            "<multi-660-part2-of-3@nntune.test>",
+            "<multi-660-part3-of-3@nntune.test>",
+        ],
+        &[
+            "<obf-550-part1-of-3@nntune.test>",
+            "<obf-550-part2-of-3@nntune.test>",
+            "<obf-550-part3-of-3@nntune.test>",
+        ],
+        &["<enc-rar-001@nntune.test>", "<enc-7z-001@nntune.test>"],
+    ];
     let mut referenced = HashSet::new();
     // message-id -> declared segment bytes (NZB `bytes=` attribute).
     let mut declared_bytes: HashMap<String, u64> = HashMap::new();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-        // Parse each <segment bytes="N" ...>bare-id</segment>. Fixture text
-        // is the bare shared-rule identity; brackets are added here only to
-        // match the corpus keys.
-        let mut rest = text.as_str();
-        while let Some(seg) = rest.find("<segment ") {
-            rest = &rest[seg..];
-            let bytes_start = rest.find("bytes=\"").expect("segment bytes=");
-            let bytes_rest = &rest[bytes_start + 7..];
-            let bytes_end = bytes_rest.find('"').expect("closing quote");
-            let bytes: u64 = bytes_rest[..bytes_end].parse().expect("bytes number");
-            let body_start = rest.find('>').expect("segment body") + 1;
-            let body_end = rest[body_start..]
-                .find("</segment>")
-                .expect("segment id end")
-                + body_start;
-            let id = format!("<{}>", rest[body_start..body_end].trim());
+    for shape in shapes {
+        let articles: Vec<_> = shape
+            .iter()
+            .map(|id| {
+                *by_id
+                    .get(id)
+                    .unwrap_or_else(|| panic!("unknown corpus id {id}"))
+            })
+            .collect();
+        let text = nntune_test_nntp::nzb_for(&articles, group);
+        for (id, bytes) in parse_generated_nzb(&text) {
             referenced.insert(id.clone());
             declared_bytes.insert(id, bytes);
-            rest = &rest[body_end..];
         }
     }
-    assert!(
-        !referenced.is_empty(),
-        "no message-ids found in fixtures/nzb"
-    );
+    assert!(!referenced.is_empty(), "no message-ids in generated NZBs");
     // Every referenced ID except the intentionally-missing one must be servable.
     let corpus: HashMap<_, _> = nntune_test_nntp::default_corpus()
         .into_iter()

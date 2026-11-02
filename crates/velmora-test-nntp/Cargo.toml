@@ -6,19 +6,12 @@ description = "Synthetic NNTP test server + fixture corpus for NNTune v2 CI (no 
 license = "MIT"
 repository = "https://github.com/TogetherWeOwn/nntunev2"
 
-[[bin]]
-name = "nntp-fixture-server"
-path = "src/main.rs"
-
 [lib]
 name = "nntune_test_nntp"
 path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
