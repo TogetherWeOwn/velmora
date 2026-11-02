@@ -195,6 +195,20 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
         errors.push("NZB declares no <group>s".to_string());
     }
 
+    // Per file, segment numbers must be 1..=N, contiguous, each exactly
+    // once, in ascending document order (a reordered NZB would silently
+    // scramble the reconstructed payload for order-based consumers).
+    for (fi, file) in parsed.files.iter().enumerate() {
+        let numbers: Vec<u32> = file.segments.iter().map(|s| s.number).collect();
+        let expected: Vec<u32> = (1..=file.segments.len() as u32).collect();
+        if numbers != expected {
+            errors.push(format!(
+                "file {} segment numbers {numbers:?} are not contiguous 1..=N in order (expected {expected:?})",
+                fi + 1
+            ));
+        }
+    }
+
     for seg in &all_segments {
         match corpus.get(&seg.id) {
             None => errors.push(format!(
@@ -305,6 +319,28 @@ fn validator_rejects_unknown_and_renamed_ids() {
     assert!(
         errors.iter().any(|e| e.contains("declares bytes=9")),
         "byte-count drift not reported: {errors:?}"
+    );
+}
+
+#[test]
+fn validator_rejects_reordered_segment_numbers() {
+    // A hand-built NZB listing the multipart segments as 3, 2, 1: every ID
+    // resolves, bytes agree, but the numbers are not contiguous 1..=N in
+    // document order. Order-based consumers would silently descramble the
+    // payload, so the validator must flag the document, not pass it.
+    let text = generated_multipart_nzb(&[
+        "<multi-660-part1-of-3@nntune.test>",
+        "<multi-660-part2-of-3@nntune.test>",
+        "<multi-660-part3-of-3@nntune.test>",
+    ]);
+    let reordered = text
+        .replace(r#"number="1""#, r#"number="X""#)
+        .replace(r#"number="3""#, r#"number="1""#)
+        .replace(r#"number="X""#, r#"number="3""#);
+    let errors = validate_nzb_against_corpus(&reordered);
+    assert!(
+        errors.iter().any(|e| e.contains("contiguous")),
+        "reordered numbers not reported: {errors:?}"
     );
 }
 
@@ -446,10 +482,18 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
         assert!(g.starts_with("211"), "GROUP {group}: {g:?}");
     }
 
+    // The generated documents under test each carry one yEnc file per NZB
+    // `<file>`: shared name/size/total across its segments, checked in
+    // document order below after sorting by number.
+    let mut ordered = parsed.segments();
+    ordered.sort_by_key(|s| s.number);
+
+    let mut file_name: Option<String> = None;
     let mut file_size: Option<u64> = None;
+    let mut total_parts: Option<u32> = None;
     let mut placed: Vec<(u64, Vec<u8>)> = Vec::new(); // (1-based begin, decoded)
 
-    for seg in &parsed.segments() {
+    for seg in &ordered {
         let (first, block) = c.cmd_block(&format!("ARTICLE {}", seg.id)).await;
         assert!(
             first.starts_with("220"),
@@ -459,6 +503,13 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
         );
         let body = article_body(&block);
 
+        // One NZB file = one yEnc file: shared name/size across segments.
+        let name = framing_param(body, "=ybegin", "name")
+            .unwrap_or_else(|| panic!("segment {} has no =ybegin name", seg.number));
+        match &file_name {
+            None => file_name = Some(name),
+            Some(prev) => assert_eq!(&name, prev, "generated NZB mixes yEnc files"),
+        }
         let size: u64 = framing_param(body, "=ybegin", "size")
             .unwrap_or_else(|| panic!("segment {} has no =ybegin size", seg.number))
             .parse()
@@ -466,6 +517,24 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
         match file_size {
             None => file_size = Some(size),
             Some(prev) => assert_eq!(size, prev, "=ybegin size changes across segments"),
+        }
+
+        // NZB segment number must be the yEnc part number (single-part
+        // framing has no part=/total= and is part 1 of 1).
+        let part: u32 = framing_param(body, "=ybegin", "part")
+            .map(|p| p.parse().expect("=ybegin part"))
+            .unwrap_or(1);
+        assert_eq!(
+            part, seg.number,
+            "NZB number= disagrees with yEnc part= for {}",
+            seg.id
+        );
+        let total: u32 = framing_param(body, "=ybegin", "total")
+            .map(|p| p.parse().expect("=ybegin total"))
+            .unwrap_or(1);
+        match total_parts {
+            None => total_parts = Some(total),
+            Some(prev) => assert_eq!(total, prev, "=ybegin total changes across segments"),
         }
 
         let decoded = nntune_test_nntp::yenc::decode(body);
@@ -496,6 +565,13 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
         );
         placed.push((begin, decoded));
     }
+
+    // The NZB must carry the *complete* file, not a subset of its parts.
+    assert_eq!(
+        total_parts,
+        Some(ordered.len() as u32),
+        "generated NZB does not carry every part of its yEnc file"
+    );
 
     let size = file_size.expect("no segments") as usize;
     let mut reassembled = vec![0u8; size];
