@@ -14,5 +14,5 @@ pub mod fixtures;
 pub mod server;
 pub mod yenc;
 
-pub use fixtures::{default_corpus, generate_wav_bytes, nzb_for, Article};
+pub use fixtures::{default_corpus, generate_wav_bytes, nzb_for, nzb_for_multipart, Article};
 pub use server::{ServerConfig, TestNntpServer, UserConfig};

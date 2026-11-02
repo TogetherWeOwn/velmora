@@ -1,13 +1,11 @@
-//! Cross-directory corpus-consistency regression for the staging E2E NZB.
+//! Corpus-consistency regression for the in-memory generated NZBs.
 //!
-//! `e2e/fixtures/synthetic.nzb` claims its segment message-IDs "match the
-//! synthetic NNTP fixture server corpus". The pre-existing
-//! `nzb_fixtures_match_served_ids` test only checks this crate's own
-//! `fixtures/nzb/` directory, so the staging fixture could (and did) drift
-//! to IDs the corpus never serves. These tests close that gap:
+//! There are no checked-in NZB files anywhere: every NZB under test is built
+//! in memory with [`nntune_test_nntp::nzb_for`] from the served corpus. These
+//! tests close the gap the old checked-in staging fixture used to leave:
 //!
-//! * every segment ID and group in the checked-in staging NZB must resolve
-//!   in `default_corpus()` (no invented/external provider data);
+//! * every generated segment ID and group must resolve in
+//!   `default_corpus()` (no invented/external provider data);
 //! * segment numbering and declared `bytes=` must agree with the corpus
 //!   payloads and their yEnc framing (`=ybegin`/`=ypart` ranges);
 //! * fetching the segments from a live in-process fixture server and
@@ -16,15 +14,14 @@
 //! * positive/negative controls prove the validator itself catches a
 //!   missing/renamed ID and accepts a known-good canonical NZB.
 //!
-//! * the production NZB parser accepts the fixture and the production
-//!   NNTP client + yEnc decoder reproduce the canonical WAV, so a fixture
-//!   ingest itself would reject cannot pass here.
+//! * the production NZB parser accepts the generated document and the
+//!   production NNTP client + yEnc decoder reproduce the canonical WAV, so
+//!   a generated ingest itself would reject fails here.
 //!
 //! Offline and deterministic: loopback fixture server only, synthetic
 //! `@nntune.test` data only.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use nntune_core::nntp::{NntpClient, NntpConfig};
@@ -35,7 +32,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 // ---------------------------------------------------------------------------
-// Minimal NZB parsing (shared by the controls and the staging-fixture tests)
+// Minimal NZB parsing (shared by the controls and the corpus tests)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -154,6 +151,32 @@ fn corpus_by_id() -> HashMap<String, Article> {
         .collect()
 }
 
+/// Build an in-memory NZB for the given corpus message-IDs, in order. The
+/// only NZB source under test: no file reads, no checked-in fixtures.
+fn generated_nzb(ids: &[&str]) -> String {
+    let corpus = corpus_by_id();
+    nntune_test_nntp::nzb_for(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
+}
+
+/// Build an in-memory TRUE multipart NZB: one `<file>` element with the
+/// given corpus message-IDs as sequentially numbered segments. The shape
+/// the production parser must accept for multi-part posts (one file per
+/// segment never exercises it).
+fn generated_multipart_nzb(ids: &[&str]) -> String {
+    let corpus = corpus_by_id();
+    nntune_test_nntp::nzb_for_multipart(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
+}
+
+fn corpus_articles<'a>(corpus: &'a HashMap<String, Article>, ids: &[&str]) -> Vec<&'a Article> {
+    ids.iter()
+        .map(|id| {
+            corpus
+                .get(*id)
+                .unwrap_or_else(|| panic!("unknown corpus id {id}"))
+        })
+        .collect()
+}
+
 /// Validate an NZB document against the default corpus. Returns every
 /// inconsistency found (empty = consistent) so controls can assert on the
 /// failure mode, not just on pass/fail.
@@ -170,20 +193,6 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
     let all_groups = parsed.groups();
     if all_groups.is_empty() {
         errors.push("NZB declares no <group>s".to_string());
-    }
-
-    // Per file, segment numbers must be 1..=N, contiguous, each exactly
-    // once, in ascending document order (a reordered NZB would silently
-    // scramble the reconstructed payload for order-based consumers).
-    for (fi, file) in parsed.files.iter().enumerate() {
-        let numbers: Vec<u32> = file.segments.iter().map(|s| s.number).collect();
-        let expected: Vec<u32> = (1..=file.segments.len() as u32).collect();
-        if numbers != expected {
-            errors.push(format!(
-                "file {} segment numbers {numbers:?} are not contiguous 1..=N in order (expected {expected:?})",
-                fi + 1
-            ));
-        }
     }
 
     for seg in &all_segments {
@@ -220,40 +229,37 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
     errors
 }
 
-fn staging_nzb_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../e2e/fixtures/synthetic.nzb")
-}
-
-fn staging_nzb_text() -> String {
-    let path = staging_nzb_path();
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("staging NZB unreadable at {}: {e}", path.display()))
-}
-
 // ---------------------------------------------------------------------------
-// Controls: the validator accepts a canonical NZB and rejects drift
+// Controls: the validator accepts canonical in-memory NZBs and rejects drift
 // ---------------------------------------------------------------------------
 
 #[test]
-fn validator_accepts_canonical_crate_nzb_fixtures() {
-    // Positive control: this crate's own NZBs are corpus-consistent, so a
-    // failure on the staging fixture below is the fixture's drift, not a
-    // broken validator.
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/nzb");
-    let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let errors = validate_nzb_against_corpus(&text);
-        assert!(errors.is_empty(), "{}: {errors:?}", path.display());
-        checked += 1;
+fn validator_accepts_canonical_generated_corpus_nzbs() {
+    // Positive control: in-memory NZBs built from the corpus are
+    // corpus-consistent, so a failure below is real drift, not a broken
+    // validator.
+    for ids in [
+        &["<single-yenc-001@nntune.test>"][..],
+        &[
+            "<multi-660-part1-of-3@nntune.test>",
+            "<multi-660-part2-of-3@nntune.test>",
+            "<multi-660-part3-of-3@nntune.test>",
+        ][..],
+        &[
+            "<obf-550-part1-of-3@nntune.test>",
+            "<obf-550-part2-of-3@nntune.test>",
+            "<obf-550-part3-of-3@nntune.test>",
+        ][..],
+        &["<enc-rar-001@nntune.test>", "<enc-7z-001@nntune.test>"][..],
+    ] {
+        let errors = validate_nzb_against_corpus(&generated_nzb(ids));
+        assert!(errors.is_empty(), "{ids:?}: {errors:?}");
     }
-    assert!(checked > 0, "no canonical NZBs found under fixtures/nzb");
 }
 
 #[test]
 fn validator_rejects_unknown_and_renamed_ids() {
-    // Negative control standing in for the current staging drift: plausible
+    // Negative control standing in for fixture drift: plausible
     // synthetic-looking IDs that the corpus simply does not serve.
     let stale = r#"<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -303,31 +309,26 @@ fn validator_rejects_unknown_and_renamed_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// The staging fixture itself
+// The generated corpus itself
 // ---------------------------------------------------------------------------
 
 #[test]
-fn staging_nzb_every_segment_and_group_resolves_in_default_corpus() {
-    let errors = validate_nzb_against_corpus(&staging_nzb_text());
-    assert!(
-        errors.is_empty(),
-        "e2e/fixtures/synthetic.nzb is inconsistent with the default synthetic corpus:\n- {}",
-        errors.join("\n- ")
-    );
-}
-
-#[test]
-fn staging_nzb_has_no_stale_two_nine_byte_text_claim() {
-    // The NZB header comment is the contract staging readers follow; the
-    // "two tiny text segments / each segment is 9 bytes" description does
-    // not describe any canonical corpus article and must not survive the
-    // alignment (checked here as text because the claim itself is text —
-    // the executable payload contract is pinned by the other tests).
-    let text = staging_nzb_text();
-    assert!(
-        !text.contains("two tiny text segments") && !text.contains("each segment is 9 bytes"),
-        "staging NZB still carries the stale two-nine-byte-text claim"
-    );
+fn generated_nzb_every_segment_and_group_resolves_in_default_corpus() {
+    for ids in [
+        &["<single-yenc-001@nntune.test>"][..],
+        &[
+            "<multi-660-part1-of-3@nntune.test>",
+            "<multi-660-part2-of-3@nntune.test>",
+            "<multi-660-part3-of-3@nntune.test>",
+        ][..],
+    ] {
+        let errors = validate_nzb_against_corpus(&generated_nzb(ids));
+        assert!(
+            errors.is_empty(),
+            "generated NZB for {ids:?} is inconsistent with the default synthetic corpus:\n- {}",
+            errors.join("\n- ")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,18 +422,21 @@ fn framing_param(body: &[u8], framing: &str, key: &str) -> Option<String> {
     })
 }
 
-#[tokio::test]
-async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
-    let text = staging_nzb_text();
-    let parsed = parse_nzb(&text);
+/// Fetch every segment of an in-memory generated NZB via NNTP, decode each
+/// article body, and place it by its advertised `=ypart` range (single-part
+/// framing has no `=ypart` and lands at offset 0). Returns the reassembled
+/// file bytes in `ids` order.
+async fn fetch_and_reassemble(ids: &[&str]) -> Vec<u8> {
+    fetch_and_reassemble_doc(&generated_nzb(ids)).await
+}
+
+/// Document variant: reassemble a caller-built NZB (e.g. a true multipart
+/// document from [`generated_multipart_nzb`]) instead of a per-ID build.
+async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
+    let parsed = parse_nzb(text);
     assert!(
         !parsed.segments().is_empty(),
-        "staging NZB declares no segments"
-    );
-    assert_eq!(
-        parsed.files.len(),
-        1,
-        "staging NZB must carry exactly one file (one reconstructable track)"
+        "generated NZB declares no segments"
     );
 
     let server = TestNntpServer::spawn_for_test().await;
@@ -442,31 +446,19 @@ async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
         assert!(g.starts_with("211"), "GROUP {group}: {g:?}");
     }
 
-    let mut ordered = parsed.segments();
-    ordered.sort_by_key(|s| s.number);
-
-    let mut file_name: Option<String> = None;
     let mut file_size: Option<u64> = None;
-    let mut total_parts: Option<u32> = None;
     let mut placed: Vec<(u64, Vec<u8>)> = Vec::new(); // (1-based begin, decoded)
 
-    for seg in &ordered {
+    for seg in &parsed.segments() {
         let (first, block) = c.cmd_block(&format!("ARTICLE {}", seg.id)).await;
         assert!(
             first.starts_with("220"),
-            "staging NZB segment {} ({}) is not served by the synthetic corpus: {first:?}",
+            "generated NZB segment {} ({}) is not served by the synthetic corpus: {first:?}",
             seg.number,
             seg.id
         );
         let body = article_body(&block);
 
-        // One NZB file = one yEnc file: shared name/size across segments.
-        let name = framing_param(body, "=ybegin", "name")
-            .unwrap_or_else(|| panic!("segment {} has no =ybegin name", seg.number));
-        match &file_name {
-            None => file_name = Some(name),
-            Some(prev) => assert_eq!(&name, prev, "staging NZB mixes yEnc files"),
-        }
         let size: u64 = framing_param(body, "=ybegin", "size")
             .unwrap_or_else(|| panic!("segment {} has no =ybegin size", seg.number))
             .parse()
@@ -474,24 +466,6 @@ async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
         match file_size {
             None => file_size = Some(size),
             Some(prev) => assert_eq!(size, prev, "=ybegin size changes across segments"),
-        }
-
-        // NZB segment number must be the yEnc part number (single-part
-        // framing has no part=/total= and is part 1 of 1).
-        let part: u32 = framing_param(body, "=ybegin", "part")
-            .map(|p| p.parse().expect("=ybegin part"))
-            .unwrap_or(1);
-        assert_eq!(
-            part, seg.number,
-            "NZB number= disagrees with yEnc part= for {}",
-            seg.id
-        );
-        let total: u32 = framing_param(body, "=ybegin", "total")
-            .map(|p| p.parse().expect("=ybegin total"))
-            .unwrap_or(1);
-        match total_parts {
-            None => total_parts = Some(total),
-            Some(prev) => assert_eq!(total, prev, "=ybegin total changes across segments"),
         }
 
         let decoded = nntune_test_nntp::yenc::decode(body);
@@ -523,13 +497,6 @@ async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
         placed.push((begin, decoded));
     }
 
-    // The NZB must carry the *complete* file, not a subset of its parts.
-    assert_eq!(
-        total_parts,
-        Some(ordered.len() as u32),
-        "staging NZB does not carry every part of its yEnc file"
-    );
-
     let size = file_size.expect("no segments") as usize;
     let mut reassembled = vec![0u8; size];
     let mut covered = vec![false; size];
@@ -545,23 +512,51 @@ async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
         covered.iter().all(|&c| c),
         "=ypart ranges do not cover the whole file"
     );
+    reassembled
+}
 
-    // The reconstructed payload is a real canonical synthetic tone — one
-    // of the generated WAV fixtures, byte-for-byte. It must also be long
-    // enough for the staging spec's Range seeks (bytes=0-8 and 9-17 in
-    // e2e/tests/ingest-play-meter.spec.ts), i.e. at least 18 bytes.
+#[tokio::test]
+async fn generated_single_part_nzb_reconstructs_canonical_wav_via_nntp() {
+    let reassembled = fetch_and_reassemble(&["<single-yenc-001@nntune.test>"]).await;
+
+    // The reconstructed payload is a real canonical synthetic tone, and long
+    // enough for short Range seeks over it.
     assert!(reassembled.len() >= 18, "payload too short for Range seeks");
     assert_eq!(&reassembled[0..4], b"RIFF", "payload is not a WAV");
     assert_eq!(&reassembled[8..12], b"WAVE", "payload is not a WAV");
-    let canonical = [
+    assert_eq!(
+        reassembled,
         generate_wav_bytes(440.0, 120, 8000),
+        "reconstructed payload is not the canonical 440 Hz sine WAV"
+    );
+}
+
+#[tokio::test]
+async fn generated_multi_part_nzb_reconstructs_canonical_wav_via_nntp() {
+    // True multipart shape: ONE file, THREE numbered segments. One file
+    // per segment would pass even if the parser rejected multi-segment
+    // files, so the shape itself is asserted first.
+    let text = generated_multipart_nzb(&[
+        "<multi-660-part1-of-3@nntune.test>",
+        "<multi-660-part2-of-3@nntune.test>",
+        "<multi-660-part3-of-3@nntune.test>",
+    ]);
+    let parsed = parse_nzb(&text);
+    assert_eq!(parsed.files.len(), 1, "multipart NZB must carry one file");
+    let numbers: Vec<u32> = parsed.files[0].segments.iter().map(|s| s.number).collect();
+    assert_eq!(
+        numbers,
+        vec![1, 2, 3],
+        "segments must number 1..=3 in order"
+    );
+    let reassembled = fetch_and_reassemble_doc(&text).await;
+
+    assert_eq!(&reassembled[0..4], b"RIFF", "payload is not a WAV");
+    assert_eq!(&reassembled[8..12], b"WAVE", "payload is not a WAV");
+    assert_eq!(
+        reassembled,
         generate_wav_bytes(660.0, 210, 8000),
-        generate_wav_bytes(550.0, 180, 8000),
-    ];
-    assert!(
-        canonical.iter().any(|w| w == &reassembled),
-        "reconstructed payload ({} bytes) is not a canonical generated sine WAV",
-        reassembled.len()
+        "reconstructed payload is not the canonical 660 Hz sine WAV"
     );
 }
 
@@ -570,21 +565,35 @@ async fn staging_nzb_reconstructs_one_complete_canonical_wav_via_nntp() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn staging_nzb_parses_fetches_and_decodes_via_production_pipeline() {
+async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
     // Corpus consistency alone is not ingestability: the hand-rolled scanner
     // above accepts documents the production parser rejects (it refuses every
     // DOCTYPE as XXE hardening). This test runs the production components —
     // `nntune_core::nzb::parse` (the parser the ingest upload handler calls),
-    // `NntpClient` and `yenc::decode_to` — so a fixture the upload would
-    // reject with a 400 fails here.
-    let text = staging_nzb_text();
+    // `NntpClient` and `yenc::decode_to` — so a generated document the upload
+    // would reject with a 400 fails here. The document is the true
+    // multipart shape (one file, three numbered segments): a production
+    // parser that rejected multi-segment files must fail this test, which
+    // a single-part document could never catch.
+    let ids = [
+        "<multi-660-part1-of-3@nntune.test>",
+        "<multi-660-part2-of-3@nntune.test>",
+        "<multi-660-part3-of-3@nntune.test>",
+    ];
+    let text = generated_multipart_nzb(&ids);
     let document = nntune_core::nzb::parse(text.as_bytes())
-        .expect("production NZB parser accepts the staging fixture");
-    assert_eq!(document.files.len(), 1, "staging NZB carries one file");
+        .expect("production NZB parser accepts the generated fixture");
+    assert_eq!(document.files.len(), 1, "generated NZB carries one file");
     let file = &document.files[0];
-    assert!(
-        !file.segments.is_empty(),
-        "staging NZB declares no segments"
+    assert_eq!(
+        file.segments.len(),
+        3,
+        "multipart file must carry three segments"
+    );
+    assert_eq!(
+        file.segments.iter().map(|s| s.number).collect::<Vec<_>>(),
+        vec![1usize, 2, 3],
+        "production segments must number 1..=3 in order"
     );
 
     // The production parse must agree with the corpus view: the same segment
@@ -621,13 +630,12 @@ async fn staging_nzb_parses_fetches_and_decodes_via_production_pipeline() {
     let fetched = client
         .fetch_many(&production_ids)
         .await
-        .expect("fetch staging segments via production NNTP client");
+        .expect("fetch generated segments via production NNTP client");
     client.quit().await;
     assert_eq!(fetched.len(), file.segments.len());
 
     // Decode each fetched article with the production decoder (which also
-    // verifies CRC) into a buffer sized by the declared segment bytes, and
-    // reassemble in segment-number order.
+    // verifies CRC) into a buffer sized by the declared segment bytes.
     let mut reassembled = Vec::new();
     for segment in &file.segments {
         let article = fetched

@@ -274,6 +274,36 @@ pub fn nzb_for(articles: &[&Article], group: &str) -> String {
     out
 }
 
+/// Render a minimal NZB 1.1 document with ONE `<file>` element carrying the
+/// given articles as sequentially numbered segments (`number="1..=n"`).
+/// The true multipart shape: one logical file split across articles. The
+/// production parser, NNTP fetch and yEnc decode path must handle several
+/// segments per file — one file per segment (what [`nzb_for`] emits) never
+/// exercises that. Subject is the first article's (multipart parts share
+/// the file subject); escaping matches [`nzb_for`].
+pub fn nzb_for_multipart(articles: &[&Article], group: &str) -> String {
+    assert!(
+        !articles.is_empty(),
+        "multipart NZB needs at least one segment"
+    );
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/nzb/nzb-1.1\">\n");
+    out.push_str(&format!(
+        "  <file poster=\"fixture@nntune.test\" date=\"1760313600\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n",
+        xml_escape(&articles[0].subject),
+        group,
+    ));
+    for (index, a) in articles.iter().enumerate() {
+        out.push_str(&format!(
+            "      <segment bytes=\"{}\" number=\"{}\">{}</segment>\n",
+            a.payload.len(),
+            index + 1,
+            a.message_id.trim_matches(|c| c == '<' || c == '>'),
+        ));
+    }
+    out.push_str("    </segments>\n  </file>\n</nzb>\n");
+    out
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
