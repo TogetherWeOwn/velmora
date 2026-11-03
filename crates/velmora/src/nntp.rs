@@ -1,8 +1,8 @@
 //! NNTP client (RFC 3977) over a [`crate::transport::Transport`].
 //!
 //! Supported commands: greeting + `MODE READER`, `AUTHINFO USER/PASS`,
-//! `GROUP`, `STAT`, `ARTICLE`, `BODY`, `QUIT`. Responses are parsed into
-//! numeric codes; the reply codes this client acts on are:
+//! `GROUP`, `STAT`, `ARTICLE`, `BODY`, `POST`, `QUIT`. Responses are parsed
+//! into numeric codes; the reply codes this client acts on are:
 //!
 //! - `430` — no such article → [`Error::ArticleNotFound`].
 //! - `480` (authentication required, RFC 4643) / `481` (rejected), and
@@ -13,6 +13,12 @@
 //!   signal). Reply text from the `AUTHINFO` exchange — including a
 //!   malformed reply line that never parses to a code — is redacted at
 //!   construction: it is attacker-influenced and may reflect credentials.
+//! - `POST` flow: `340` (send the article) then `240` (accepted) →
+//!   [`PostOutcome::Posted`]; a `435`/`441` duplicate reply is confirmed
+//!   with `STAT` and counts as success ([`PostOutcome::Duplicate`]); `440`
+//!   (posting not permitted) → [`Error::PostProhibited`]. Retry discipline
+//!   is postie-style: stale-connection (transport I/O) errors only, see
+//!   [`is_retryable_post_error`] and [`MAX_POST_ATTEMPTS`].
 //!
 //! NNTP is lock-step ordered, so pipelining is simply writing several
 //! commands before reading their replies in order ([`NntpClient::fetch_many`]
@@ -22,7 +28,25 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::transport::{BufferedTransport, Transport};
+use crate::transport::{
+    check_dot_block_framing, is_article_limit_error, BufferedTransport, Transport,
+};
+
+/// Total `POST` tries per article (the initial try plus reconnect retries),
+/// postie discipline: retries happen on stale-connection errors only (see
+/// [`is_retryable_post_error`]). Reply errors — `440` prohibited,
+/// `435`/`441` duplicates, `480` auth, `5xx` — never retry on their own: the
+/// caller reconnects (a fresh handshake re-authenticates) and retries only
+/// when the error is retryable, stopping after this many tries.
+pub const MAX_POST_ATTEMPTS: u32 = 3;
+
+/// Whether a failed `POST` may be retried after a reconnect: true only for
+/// stale-connection transport I/O (dropped connections, timeouts). The
+/// article byte-limit refusal is local, not a stale connection, and reply
+/// errors carry a server verdict that redialing cannot change.
+pub fn is_retryable_post_error(err: &Error) -> bool {
+    matches!(err, Error::Io(io) if !is_article_limit_error(io))
+}
 
 /// Connection settings. `timeout` is enforced per transport operation by the
 /// [`Transport`] implementation (see its contract).
@@ -212,6 +236,17 @@ pub struct FetchOutcome {
     pub article: Vec<u8>,
 }
 
+/// Outcome of [`NntpClient::post_article`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostOutcome {
+    /// `240`: the server accepted the article.
+    Posted,
+    /// `435`/`441` followed by a `STAT` confirming the Message-ID is
+    /// present: the article is already there, which counts as success (the
+    /// verify stage treats both outcomes as posted).
+    Duplicate,
+}
+
 /// NNTP client. Obtain a connected [`Transport`] from
 /// [`crate::transports`], then [`NntpClient::connect`] performs the greeting,
 /// `MODE READER`, and `AUTHINFO` handshake.
@@ -334,6 +369,127 @@ impl<T: Transport> NntpClient<T> {
                 self.transport.read_dot_block(out).await.map_err(Error::Io)
             }
             _ => Err(self.classify(&reply, message_id)),
+        }
+    }
+
+    /// `POST` one article: sends `POST`, dot-stuffs `article` with the
+    /// `.` terminator on a `340`, and maps the final reply:
+    ///
+    /// - `240` → [`PostOutcome::Posted`].
+    /// - `435`/`441` → `STAT <message-id>`; present (`223`, envelope
+    ///   correlated) → [`PostOutcome::Duplicate`], which counts as success.
+    ///   A `430` there means the server claims a duplicate it does not have:
+    ///   the original `435`/`441` is returned as [`Error::NntpReply`] so the
+    ///   caller can re-post (same Message-ID) through the verify stage.
+    /// - `440` → [`Error::PostProhibited`] (permanent for this account).
+    /// - `480`/`481` → [`Error::AuthFailed`] (stale credentials, re-auth).
+    ///
+    /// `message_id` is the article's Message-ID (without brackets), used
+    /// only for the duplicate-confirming `STAT`. `article` is the complete
+    /// article (headers, blank line, body) with CRLF line endings; a bare CR
+    /// or LF fails closed with [`Error::Malformed`] before anything is sent.
+    /// An empty article is likewise refused.
+    ///
+    /// A transport failure after the article bytes start flowing invalidates
+    /// the connection (reconnect before retrying, honouring
+    /// [`is_retryable_post_error`] and [`MAX_POST_ATTEMPTS`]): the server
+    /// may or may not have stored the article, and a blind re-POST on the
+    /// same broken stream would corrupt framing. Refusals that arrive as
+    /// well-formed replies (`240`/`435`/`441`/`440`/…) leave the connection
+    /// usable — the reply is only sent after the terminator is consumed.
+    pub async fn post_article(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
+        validate_argument(message_id)?;
+        if article.is_empty() {
+            return Err(Error::Malformed("POST article is empty".into()));
+        }
+        // Framing is validated before the POST command: a refused article
+        // leaves zero bytes on the wire, so the server never enters
+        // send-article state and the connection stays usable.
+        check_dot_block_framing(article).map_err(|_| {
+            Error::Malformed("POST article holds a bare CR or LF outside CRLF".into())
+        })?;
+        let greeting = self.command("POST").await?;
+        if greeting.code != 340 {
+            // Not yet in send-article state: map the bare-POST reply
+            // without the post-send 240 → Posted arm (no article byte has
+            // gone on the wire, so 240 here is a protocol error, not a
+            // posting).
+            return self.initial_refusal(greeting, message_id).await;
+        }
+        match self
+            .transport
+            .write_dot_block(article)
+            .await
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::InvalidInput {
+                    Error::Malformed("POST article holds a bare CR or LF outside CRLF".into())
+                } else {
+                    Error::Io(err)
+                }
+            }) {
+            Ok(()) => {}
+            Err(err) => {
+                // Nothing was written on a framing refusal (write_dot_block
+                // validates first), so the connection stays usable; anything
+                // else is a stale connection.
+                if !matches!(err, Error::Malformed(_)) {
+                    self.transport.invalidate();
+                }
+                return Err(err);
+            }
+        }
+        let reply = self.read_reply().await?;
+        self.refusal_after_reply(reply, message_id).await
+    }
+
+    /// Maps the reply to the bare `POST` command — before any article byte
+    /// is sent — onto an outcome. `435`/`441` mean "already have it, do not
+    /// send" and confirm via `STAT` like a post-send duplicate; `440` is
+    /// prohibited; everything else follows [`classify`]. `240` is
+    /// deliberately not success here: the server answered before the article
+    /// went on the wire (RFC 3977 admits only 340/440 as the initial POST
+    /// reply), so reporting `Posted` would record an article that was never
+    /// sent.
+    async fn initial_refusal(&mut self, reply: Reply, message_id: &str) -> Result<PostOutcome> {
+        match reply.code {
+            435 | 441 => self.confirm_duplicate(reply, message_id).await,
+            440 => Err(Error::PostProhibited(reply.text)),
+            _ => Err(self.classify(&reply, message_id)),
+        }
+    }
+
+    /// Maps the reply after the sent article onto an outcome. `240` posts;
+    /// `435`/`441` confirm via `STAT`; `440` is prohibited; everything else
+    /// follows [`classify`] (`480`/`481` stay stale-credential signals).
+    async fn refusal_after_reply(&mut self, reply: Reply, message_id: &str) -> Result<PostOutcome> {
+        match reply.code {
+            240 => Ok(PostOutcome::Posted),
+            435 | 441 => self.confirm_duplicate(reply, message_id).await,
+            440 => Err(Error::PostProhibited(reply.text)),
+            _ => Err(self.classify(&reply, message_id)),
+        }
+    }
+
+    /// Confirms a `435`/`441` duplicate with `STAT <message_id>`: `223`
+    /// (envelope correlated) counts as success; `430` returns the original
+    /// duplicate reply for a same-ID re-post; any other `STAT` outcome is
+    /// classified normally.
+    async fn confirm_duplicate(
+        &mut self,
+        duplicate: Reply,
+        message_id: &str,
+    ) -> Result<PostOutcome> {
+        let stat = self.command(&format!("STAT <{message_id}>")).await?;
+        match stat.code {
+            223 => {
+                parse_envelope(&stat.text, message_id)?;
+                Ok(PostOutcome::Duplicate)
+            }
+            430 => Err(Error::NntpReply {
+                code: duplicate.code,
+                text: duplicate.text,
+            }),
+            _ => Err(self.classify(&stat, message_id)),
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Snapshots every `Display` arm, pins `Debug` redaction for the
 //! credential-bearing variants, and covers `source()`, `From<io::Error>`,
-//! and `code()` for all 11 variants. No network, no credentials.
+//! and `code()` for all 12 variants. No network, no credentials.
 //!
 //! Out of scope: no error-type, message-text, redaction-policy, or
 //! call-site changes. Any `Display`/`Debug` string change here is a
@@ -22,6 +22,7 @@ fn assert_all_variants_known(err: &Error) {
         | Error::AuthFailed(_)
         | Error::NoPermission(_)
         | Error::ArticleNotFound(_)
+        | Error::PostProhibited(_)
         | Error::Malformed(_)
         | Error::CrcMismatch { .. }
         | Error::Bounds { .. }
@@ -63,6 +64,12 @@ fn display_auth_failed_is_generic_with_documented_code() {
 fn display_no_permission_is_redacted_marker() {
     let err = Error::NoPermission("502 denied".to_string());
     assert_eq!(err.to_string(), "NNTP permission denied: <redacted>");
+}
+
+#[test]
+fn display_post_prohibited_is_redacted_marker() {
+    let err = Error::PostProhibited("440 posting not allowed".to_string());
+    assert_eq!(err.to_string(), "NNTP posting not permitted: <redacted>");
 }
 
 #[test]
@@ -168,6 +175,18 @@ fn debug_no_permission_redacts_exactly_like_display() {
     assert_eq!(rendered, r#"NoPermission("<redacted>")"#);
     assert!(!rendered.contains(secret));
     assert!(!rendered.contains("502 denied"));
+}
+
+#[test]
+fn debug_post_prohibited_redacts_reply_text() {
+    // The 440 reply text is attacker-influenced server prose: redacted like
+    // the auth-exchange variants, and never an auth-failure signal.
+    let err = Error::PostProhibited("440 posting not allowed here".to_string());
+    let rendered = format!("{err:?}");
+    assert_eq!(rendered, r#"PostProhibited("<redacted>")"#);
+    assert!(!rendered.contains("posting not allowed"));
+    assert!(!err.is_auth_failure());
+    assert!(!err.to_string().contains("posting not allowed"));
 }
 
 #[test]
@@ -283,6 +302,7 @@ fn source_is_some_only_for_io() {
         Error::AuthFailed("x".to_string()),
         Error::NoPermission("x".to_string()),
         Error::ArticleNotFound("x".to_string()),
+        Error::PostProhibited("x".to_string()),
         Error::Malformed("x".to_string()),
         Error::CrcMismatch {
             message_id: "x".to_string(),
@@ -317,7 +337,7 @@ fn from_io_error_preserves_kind_and_source() {
 }
 
 #[test]
-fn code_covers_all_eleven_variants() {
+fn code_covers_all_twelve_variants() {
     let cases: Vec<(Error, &'static str)> = vec![
         (Error::Io(io::Error::other("x")), "request_failed"),
         (
@@ -333,6 +353,7 @@ fn code_covers_all_eleven_variants() {
         ),
         (Error::NoPermission("x".to_string()), "request_failed"),
         (Error::ArticleNotFound("x".to_string()), "request_failed"),
+        (Error::PostProhibited("x".to_string()), "request_failed"),
         (Error::Malformed("x".to_string()), "request_failed"),
         (
             Error::CrcMismatch {
@@ -359,7 +380,7 @@ fn code_covers_all_eleven_variants() {
         ),
         (Error::UnsupportedOnWasm("op"), "request_failed"),
     ];
-    assert_eq!(cases.len(), 11, "all 11 Error variants must be covered");
+    assert_eq!(cases.len(), 12, "all 12 Error variants must be covered");
     for (err, expected) in &cases {
         // Compile-time guard: a new variant breaks `assert_all_variants_known`.
         assert_all_variants_known(err);

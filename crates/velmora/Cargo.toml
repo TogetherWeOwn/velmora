@@ -21,6 +21,10 @@ cbc = "0.2"
 # No default features: the default `getrandom` backend does not build for
 # wasm32-unknown-unknown, and this crate never generates keys/nonces.
 crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
+# Posting obfuscation mints randomness in this crate (`rng::SystemRng`).
+# The `js` feature is the wasm32-unknown-unknown backend (Workers posting
+# path); on native targets it selects the OS backend as usual.
+getrandom = { version = "0.2", features = ["js"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 webpki-roots = { version = "1", optional = true }

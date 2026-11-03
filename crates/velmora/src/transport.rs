@@ -247,6 +247,71 @@ impl<T: Transport> BufferedTransport<T> {
         result
     }
 
+    /// Sends an NNTP dot-block (POST article bytes): dot-stuffs every line
+    /// that starts with `.` (including a leading `.` on the very first line
+    /// — the yEnc layer never sees this framing concern), appends CRLF when
+    /// the data does not end with one, then sends the `.` terminator line.
+    ///
+    /// Fails closed on framing-breaking input: a bare CR or LF outside a
+    /// CRLF pair is refused with [`io::ErrorKind::InvalidInput`] *before*
+    /// any byte is written, so a refused block leaves the connection usable.
+    /// A write failure mid-block invalidates the connection instead: the
+    /// server state is then unknown and the caller must reconnect. The
+    /// stuffed block is assembled in one buffer (about one article) and sent
+    /// with a single `write_all`.
+    pub async fn write_dot_block(&mut self, data: &[u8]) -> io::Result<()> {
+        self.ensure_usable()?;
+        // Fail closed before any byte is written, so callers that validate
+        // up front (like the POST path) and callers that rely on this check
+        // agree: a refused block never reaches the wire.
+        check_dot_block_framing(data)?;
+        let mut stuffed = Vec::with_capacity(data.len() + 64);
+        let mut at_line_start = true;
+        let mut i = 0;
+        while i < data.len() {
+            match data[i] {
+                b'\r' => {
+                    // Checked by `check_dot_block_framing` above; re-checked
+                    // here as defence in depth.
+                    if data.get(i + 1) != Some(&b'\n') {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "NNTP dot-block holds a bare CR outside CRLF",
+                        ));
+                    }
+                    stuffed.extend_from_slice(b"\r\n");
+                    i += 2;
+                    at_line_start = true;
+                }
+                b'\n' => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "NNTP dot-block holds a bare LF outside CRLF",
+                    ));
+                }
+                b'.' if at_line_start => {
+                    stuffed.extend_from_slice(b"..");
+                    i += 1;
+                    at_line_start = false;
+                }
+                b => {
+                    stuffed.push(b);
+                    i += 1;
+                    at_line_start = false;
+                }
+            }
+        }
+        if !stuffed.ends_with(b"\r\n") {
+            stuffed.extend_from_slice(b"\r\n");
+        }
+        stuffed.extend_from_slice(b".\r\n");
+        let result = self.inner.write_all(&stuffed).await;
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
     /// Sends one protocol line (appends CRLF) in a single write, so one
     /// command is always one packet on the wire.
     pub async fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
@@ -266,4 +331,35 @@ impl<T: Transport> BufferedTransport<T> {
         }
         result
     }
+}
+
+/// Validates dot-block input framing without writing anything: every CR
+/// must be part of a CRLF pair and every LF must follow a CR. A violation
+/// is [`io::ErrorKind::InvalidInput`]; valid input leaves the connection
+/// untouched, so callers can fail closed before their first write (the POST
+/// path validates ahead of the `POST` command, keeping the server out of
+/// send-article state on a refusal).
+pub(crate) fn check_dot_block_framing(data: &[u8]) -> io::Result<()> {
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            b'\r' => {
+                if data.get(i + 1) != Some(&b'\n') {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "NNTP dot-block holds a bare CR outside CRLF",
+                    ));
+                }
+                i += 2;
+            }
+            b'\n' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "NNTP dot-block holds a bare LF outside CRLF",
+                ));
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
 }
