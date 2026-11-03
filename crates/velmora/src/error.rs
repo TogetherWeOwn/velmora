@@ -36,6 +36,10 @@ pub enum Error {
     NoPermission(String),
     /// Article does not exist (`430`).
     ArticleNotFound(String),
+    /// Server refused a `POST` (`440`: posting not permitted on this
+    /// account). Permanent: retrying the same account cannot succeed, so
+    /// this never feeds the stale-connection retry budget.
+    PostProhibited(String),
     /// Malformed yEnc article, NZB document, PAR2 set, or ciphertext.
     Malformed(String),
     /// yEnc CRC32 mismatch after a successful structural decode.
@@ -73,6 +77,12 @@ impl fmt::Debug for Error {
             // exchange are the same attacker-influenced reply text.
             Error::NoPermission(_) => f.debug_tuple("NoPermission").field(&"<redacted>").finish(),
             Error::ArticleNotFound(id) => f.debug_tuple("ArticleNotFound").field(id).finish(),
+            // Redacted like AuthFailed: the 440 reply text is
+            // attacker-influenced server prose from the post exchange.
+            Error::PostProhibited(_) => f
+                .debug_tuple("PostProhibited")
+                .field(&"<redacted>")
+                .finish(),
             Error::Malformed(r) => f.debug_tuple("Malformed").field(r).finish(),
             Error::CrcMismatch {
                 message_id,
@@ -134,6 +144,9 @@ impl fmt::Display for Error {
             ),
             Error::NoPermission(_) => write!(f, "NNTP permission denied: <redacted>"),
             Error::ArticleNotFound(id) => write!(f, "article not found: {id}"),
+            // Generic by construction, like AuthFailed/NoPermission: the 440
+            // reply text is attacker-influenced and is never echoed.
+            Error::PostProhibited(_) => write!(f, "NNTP posting not permitted: <redacted>"),
             Error::Malformed(r) => write!(f, "malformed input: {r}"),
             Error::CrcMismatch {
                 message_id,

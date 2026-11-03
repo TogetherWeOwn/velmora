@@ -5,6 +5,11 @@
 //!
 //! Modules:
 //!
+//! - [`article`]: posting article assembly — header builder with folding,
+//!   per-article obfuscation, newsgroup allow-list selection, cipher-block
+//!   payload sizing.
+//! - [`rng`]: CSPRNG bytes (`getrandom`, `js` backend on wasm) behind an
+//!   injectable [`rng::FillRandom`] source.
 //! - [`nntp`]: NNTP client over a portable [`transport::Transport`] trait.
 //! - [`pinned_transport`]: pinned, cancellable fetch policy (TLS-on only,
 //!   port allowlist, cooperative cancellation, names-only diagnostics).
@@ -25,12 +30,14 @@
 //! own network I/O and per-operation timeouts (see [`transport`] and
 //! [`transports`]); the native repair runner owns its subprocess deadline.
 
+pub mod article;
 pub mod decrypt;
 pub mod error;
 pub mod nntp;
 pub mod nzb;
 pub mod par2;
 pub mod pinned_transport;
+pub mod rng;
 pub mod segment_identity;
 pub mod transcode;
 pub mod transport;
