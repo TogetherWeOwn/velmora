@@ -347,6 +347,22 @@ pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) ->
 /// only the whole-file checksum still decodes. Checksums stay optional,
 /// and a present but malformed applicable checksum is rejected.
 pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usize> {
+    decode_part_to(message_id, article, dst).map(|part| part.written)
+}
+
+/// Verified placement from the same bounded decoder used by ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedPart {
+    pub written: usize,
+    pub file_size: u64,
+    pub offset: u64,
+    pub multipart: bool,
+    pub part_number: Option<u64>,
+}
+
+/// Decode into caller-bounded storage and retain the actual yEnc geometry.
+/// Neither checksums nor geometry authenticate original media cryptographically.
+pub fn decode_part_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<DecodedPart> {
     let mut lines = split_lines(article);
 
     let begin_line = loop {
@@ -367,8 +383,19 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
     // from the =ypart range instead. Position 2 (right after =ybegin) is
     // checked rather than the whole line so a filename containing "part="
     // cannot flip the interpretation.
-    let fields: Vec<&[u8]> = begin_line.split(|&b| b == b' ' || b == b'\t').collect();
-    let multipart = fields.len() > 1 && fields[1].starts_with(b"part=");
+    let multipart = begin_line
+        .split(|&b| b == b' ' || b == b'\t')
+        .nth(1)
+        .is_some_and(|field| field.starts_with(b"part="));
+    let part_number = if multipart {
+        Some(
+            begin_header_int(begin_line, "part=")
+                .filter(|&n| n > 0)
+                .ok_or_else(|| malformed(message_id, "invalid part number"))? as u64,
+        )
+    } else {
+        None
+    };
     if !multipart && declared_size as u64 > dst.len() as u64 {
         return Err(malformed(
             message_id,
@@ -527,7 +554,17 @@ pub fn decode_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Result<usi
         }
     }
 
-    Ok(written)
+    Ok(DecodedPart {
+        written,
+        file_size: declared_size as u64,
+        offset: if multipart {
+            (ypart_begin - 1) as u64
+        } else {
+            0
+        },
+        multipart,
+        part_number,
+    })
 }
 
 fn malformed(message_id: &str, reason: &str) -> Error {
