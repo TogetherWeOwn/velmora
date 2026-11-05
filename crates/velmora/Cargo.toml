@@ -54,6 +54,10 @@ harness = false
 name = "par2_nzb"
 harness = false
 
+[[bench]]
+name = "par2_create"
+harness = false
+
 [lib]
 name = "nntune_core"
 path = "src/lib.rs"
