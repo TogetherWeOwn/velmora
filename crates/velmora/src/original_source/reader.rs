@@ -2,7 +2,14 @@
 //! to the request authority; this seam neither dials nor authenticates users.
 //! The verified prefix walk is deliberately the baseline even with a hint.
 
-use std::{io::Read, ops::Range};
+use std::{
+    collections::VecDeque,
+    future::{poll_fn, Future},
+    io::{Cursor, Read},
+    ops::Range,
+    pin::pin,
+    task::{Context, Poll},
+};
 
 use super::{OriginalSource, RangeHint, SourceError, MAX_ARTICLE_BYTES};
 use crate::yenc::{self, DecodedPart};
@@ -25,19 +32,17 @@ struct Part {
     geometry: DecodedPart,
 }
 
-fn fetch<T: ArticleSource, C: ReadControl>(
+fn decode<C: ReadControl>(
     source: &OriginalSource,
     index: usize,
     decoded_budget: u64,
-    transport: &mut T,
+    mut body: impl Read,
     control: &mut C,
 ) -> Result<Part, SourceError> {
     control.check()?;
     if decoded_budget == 0 {
         return Err(SourceError::Integrity);
     }
-    let article = source.article(index)?;
-    let mut body = transport.open(article.reference())?;
     let mut encoded = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -52,8 +57,6 @@ fn fetch<T: ArticleSource, C: ReadControl>(
         encoded.extend_from_slice(&chunk[..n]);
     }
     control.check()?;
-    // At most one decoded article, never the yEnc whole-file size. The
-    // decoder checks capacity on every write as well as declared lengths.
     let decode_cap = decoded_budget.min(MAX_ARTICLE_BYTES as u64) as usize;
     let mut decoded = vec![0u8; encoded.len().min(decode_cap)];
     let geometry = yenc::decode_part_to("original-source", &encoded, &mut decoded)
@@ -148,12 +151,149 @@ pub fn corroborate_hint(
         .then_some(ranges)
 }
 
-/// Stream a validated half-open range through a contiguous prefix walk.
-/// No hint can bypass the baseline. Actual final-part corroboration happens
-/// before output, and every covering/intermediate part is checked before
-/// slicing. At most N BODY opens occur; endpoint data is not fetched twice.
-/// An error after output requires the authority to abort the response, never
-/// claim a complete file. The sink must stream, not retain a file-sized Vec.
+/// Incremental bounded prefix walk for synchronous or asynchronous transports.
+/// The authority awaits exactly the reference requested by `next_reference`,
+/// then supplies its framed body to `push`. Final-part proof precedes output;
+/// the last part is retained, not refetched. No reference or size is caller
+/// selected. At most two decoded articles are retained, never a whole file.
+/// A failed push poisons this walk: partial-output failures must abort the
+/// response, not retry, finish or publish it as a complete file.
+pub struct RangeReader<'a> {
+    source: &'a OriginalSource,
+    range: Range<u64>,
+    last: Option<Part>,
+    final_loaded: bool,
+    index: usize,
+    position: u64,
+    total_decoded: u64,
+    hint: Option<UniformRanges>,
+    done: bool,
+    failed: bool,
+}
+
+impl<'a> RangeReader<'a> {
+    pub fn new(source: &'a OriginalSource, range: Range<u64>) -> Result<Self, SourceError> {
+        if range.start >= range.end || range.end > source.file_size() {
+            return Err(SourceError::Range);
+        }
+        Ok(Self {
+            source,
+            range,
+            last: None,
+            final_loaded: false,
+            index: 0,
+            position: 0,
+            total_decoded: 0,
+            hint: None,
+            done: false,
+            failed: false,
+        })
+    }
+
+    fn request(&self) -> Result<Option<(usize, u64)>, SourceError> {
+        if self.failed {
+            return Err(SourceError::Integrity);
+        }
+        if self.done {
+            return Ok(None);
+        }
+        if !self.final_loaded {
+            return Ok(Some((
+                self.source.article_count() - 1,
+                self.source.file_size(),
+            )));
+        }
+        let budget = self
+            .source
+            .file_size()
+            .checked_sub(self.total_decoded)
+            .filter(|&n| n > 0)
+            .ok_or(SourceError::Integrity)?;
+        Ok(Some((self.index, budget)))
+    }
+
+    pub fn next_reference(&self) -> Result<Option<&str>, SourceError> {
+        self.request()?
+            .map(|(index, _)| self.source.article(index).map(|a| a.reference()))
+            .transpose()
+    }
+
+    /// A successful push can emit multiple slices (the current and retained
+    /// final article). The sink must stream and propagate failure; it must not
+    /// grow a file-sized buffer. `control` checks also guard each output slice.
+    pub fn push<C: ReadControl>(
+        &mut self,
+        body: impl Read,
+        control: &mut C,
+        mut sink: impl FnMut(&[u8]) -> Result<(), SourceError>,
+    ) -> Result<(), SourceError> {
+        let (index, budget) = self.request()?.ok_or(SourceError::Integrity)?;
+        self.failed = true;
+        let part = decode(self.source, index, budget, body, control)?;
+        self.total_decoded = self
+            .total_decoded
+            .checked_add(part.geometry.written as u64)
+            .filter(|&n| n <= self.source.file_size())
+            .ok_or(SourceError::Integrity)?;
+        let last_index = self.source.article_count() - 1;
+        if !self.final_loaded {
+            self.final_loaded = true;
+            self.last = Some(part);
+        } else {
+            self.emit(part, control, &mut sink)?;
+            self.index += 1;
+        }
+        if !self.done && self.index == last_index {
+            let part = self.last.take().ok_or(SourceError::Integrity)?;
+            self.emit(part, control, &mut sink)?;
+        }
+        control.check()?;
+        self.failed = false;
+        Ok(())
+    }
+
+    fn emit<C: ReadControl>(
+        &mut self,
+        part: Part,
+        control: &mut C,
+        sink: &mut impl FnMut(&[u8]) -> Result<(), SourceError>,
+    ) -> Result<(), SourceError> {
+        let actual = part.geometry;
+        if actual.offset != self.position {
+            return Err(SourceError::Integrity);
+        }
+        let end = self
+            .position
+            .checked_add(actual.written as u64)
+            .filter(|&n| n <= self.source.file_size())
+            .ok_or(SourceError::Integrity)?;
+        if self.index == 0 {
+            let last_geometry = self.last.as_ref().map_or(actual, |p| p.geometry);
+            self.hint = corroborate_hint(self.source, &actual, &last_geometry);
+        }
+        if self
+            .hint
+            .is_some_and(|h| !h.corroborates(self.index, &actual))
+        {
+            self.hint = None;
+        }
+        let start_out = self.range.start.max(self.position);
+        let end_out = self.range.end.min(end);
+        if start_out < end_out {
+            control.check()?;
+            let a = usize::try_from(start_out - self.position).map_err(|_| SourceError::Bounds)?;
+            let b = usize::try_from(end_out - self.position).map_err(|_| SourceError::Bounds)?;
+            sink(part.bytes.get(a..b).ok_or(SourceError::Integrity)?)?;
+        }
+        self.position = end;
+        self.done = self.position >= self.range.end;
+        Ok(())
+    }
+}
+
+/// Stream a validated half-open range through the same incremental prefix
+/// walk used by async callers. At most N opens occur; endpoint data is never
+/// fetched twice. A sink error requires the authority to abort the response.
 pub fn read_range<T: ArticleSource, C: ReadControl>(
     source: &OriginalSource,
     range: Range<u64>,
@@ -161,64 +301,122 @@ pub fn read_range<T: ArticleSource, C: ReadControl>(
     control: &mut C,
     mut sink: impl FnMut(&[u8]) -> Result<(), SourceError>,
 ) -> Result<(), SourceError> {
-    if range.start >= range.end || range.end > source.file_size() {
-        return Err(SourceError::Range);
+    let mut reader = RangeReader::new(source, range)?;
+    while let Some(reference) = reader.next_reference()? {
+        control.check()?;
+        let body = transport.open(reference)?;
+        reader.push(body, control, &mut sink)?;
     }
-    let last_index = source.article_count() - 1;
-    let mut last = Some(fetch(
-        source,
-        last_index,
-        source.file_size(),
-        transport,
-        control,
-    )?);
-    let last_geometry = last.as_ref().ok_or(SourceError::Integrity)?.geometry;
-    let mut position = 0u64;
-    let mut total_decoded = last_geometry.written as u64;
-    let mut hint = None;
-    for index in 0..source.article_count() {
-        let part = if index == last_index {
-            last.take().ok_or(SourceError::Integrity)?
-        } else {
-            let remaining = source
-                .file_size()
-                .checked_sub(total_decoded)
-                .ok_or(SourceError::Integrity)?;
-            let part = fetch(source, index, remaining, transport, control)?;
-            total_decoded = total_decoded
-                .checked_add(part.geometry.written as u64)
-                .filter(|&n| n <= source.file_size())
-                .ok_or(SourceError::Integrity)?;
-            part
-        };
-        let actual = part.geometry;
-        if actual.offset != position {
-            return Err(SourceError::Integrity);
+    Ok(())
+}
+
+/// Async supplier for one complete, transfer-encoded article. The supplier
+/// must cap collection at `MAX_ARTICLE_BYTES` before growing its buffer and
+/// enforce its own operation timer. `index` is the trusted source ordinal,
+/// not a client-selected article. Dropping the future cancels local work;
+/// account capacity/physical close remain the supplier's responsibility.
+pub trait AsyncArticleSource {
+    fn open(
+        &mut self,
+        index: usize,
+        reference: &str,
+    ) -> impl Future<Output = Result<Vec<u8>, SourceError>>;
+}
+
+/// Request authority with a wakeable cancellation/deadline signal. A pending
+/// implementation must register the waker; `check` alone cannot interrupt an
+/// awaited article. Return the same redacted error that `check` would return.
+pub trait AsyncReadControl: ReadControl {
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<SourceError>;
+}
+
+/// Lazy async wrapper over the shared incremental `RangeReader`. A push may
+/// emit the current and retained final slice; at most two bounded article
+/// slices are queued, and each pull releases only one. These are verified
+/// bytes, not writer acknowledgements or delivery evidence.
+/// An error or a dropped pending pull permanently stops the wrapper. Drop it
+/// to discard buffers; an uncertain supplier operation is never retried.
+pub struct AsyncRangeReader<'a> {
+    walk: RangeReader<'a>,
+    pending: VecDeque<Vec<u8>>,
+    stopped: bool,
+}
+
+impl<'a> AsyncRangeReader<'a> {
+    pub fn new(source: &'a OriginalSource, range: Range<u64>) -> Result<Self, SourceError> {
+        Ok(Self {
+            walk: RangeReader::new(source, range)?,
+            pending: VecDeque::new(),
+            stopped: false,
+        })
+    }
+
+    pub async fn next<T: AsyncArticleSource, C: AsyncReadControl>(
+        &mut self,
+        transport: &mut T,
+        control: &mut C,
+    ) -> Result<Option<Vec<u8>>, SourceError> {
+        if self.stopped {
+            return Err(SourceError::Cancelled);
         }
-        let end = position
-            .checked_add(actual.written as u64)
-            .filter(|&n| n <= source.file_size())
-            .ok_or(SourceError::Integrity)?;
-        if index == 0 {
-            hint = corroborate_hint(source, &actual, &last_geometry);
-        }
-        if hint.is_some_and(|h| !h.corroborates(index, &actual)) {
-            // The actual contiguous geometry still has to pass above; a
-            // stale uniform hint is merely discarded, never repairs media.
-            hint = None;
-        }
-        let start_out = range.start.max(position);
-        let end_out = range.end.min(end);
-        if start_out < end_out {
+        // Fail closed even when the caller drops an externally pending await.
+        self.stopped = true;
+        control.check()?;
+        loop {
+            // Also check the wakeable signal before releasing buffered output:
+            // draining the retained final slice does not await the transport.
+            poll_fn(|cx| match control.poll_cancel(cx) {
+                Poll::Ready(error) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Ready(Ok(())),
+            })
+            .await?;
+            if let Some(bytes) = self.pending.pop_front() {
+                control.check()?;
+                self.stopped = false;
+                return Ok(Some(bytes));
+            }
+            let Some((index, _)) = self.walk.request()? else {
+                self.stopped = false;
+                return Ok(None);
+            };
+            let encoded = {
+                let reference = self.walk.next_reference()?.ok_or(SourceError::Integrity)?;
+                control.check()?;
+                let mut opening = pin!(async { transport.open(index, reference).await });
+                poll_fn(|cx| {
+                    // Cancellation wins a simultaneous-ready article race.
+                    if let Poll::Ready(error) = control.poll_cancel(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                    opening.as_mut().poll(cx)
+                })
+                .await?
+            };
             control.check()?;
-            let a = usize::try_from(start_out - position).map_err(|_| SourceError::Bounds)?;
-            let b = usize::try_from(end_out - position).map_err(|_| SourceError::Bounds)?;
-            sink(part.bytes.get(a..b).ok_or(SourceError::Integrity)?)?;
-        }
-        position = end;
-        if position >= range.end {
-            return Ok(());
+            let walking_prefix = self.walk.final_loaded;
+            self.walk.push(Cursor::new(encoded), control, |bytes| {
+                // This is an article-sized adapter, never a file accumulator.
+                if self.pending.len() == 2 || bytes.len() > MAX_ARTICLE_BYTES {
+                    return Err(SourceError::Bounds);
+                }
+                self.pending.push_back(bytes.to_vec());
+                Ok(())
+            })?;
+            if walking_prefix && self.pending.is_empty() && !self.walk.done {
+                // Ready suppliers must not monopolize a poll while skipping a
+                // long prefix. Retain progress, then recheck control next poll.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
         }
     }
-    Err(SourceError::Integrity)
 }
