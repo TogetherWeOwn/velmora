@@ -859,6 +859,18 @@ fn zero_run_crc32(n: u64) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Creator side
+// ---------------------------------------------------------------------------
+
+/// PAR2 set creator: GF(2^16) Reed-Solomon over the ciphertext, one set per
+/// file at 10% redundancy, generated before posting. Runs anywhere (pure
+/// compute, wasm-safe); production repair stays on the native repair path.
+pub mod creator;
+/// GF(2^16) field arithmetic and the creator's multiply-accumulate kernels
+/// (wasm simd128 + scalar fallback).
+pub mod gf16;
+
+// ---------------------------------------------------------------------------
 // Native-only repair
 // ---------------------------------------------------------------------------
 
