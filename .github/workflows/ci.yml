@@ -1,0 +1,143 @@
+name: ci
+
+# `ci-ok` is the aggregate check meant to be required on main: its NAME must
+# stay `ci-ok`, and every gating job id must be listed in its `needs`.
+# Patterns (pinned actions, cache policy, pinned cargo-deny, fail-closed
+# aggregate) are copied from nntunev2's ci.yml at the extraction baseline.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Merge queue validation: every required check must report on the queue's
+  # temporary merge commit. merge_group runs are never cancelled.
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # merge_group refs are per-queue-entry and must run to completion.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The org `public-pr-security` caller is wired in by a follow-up PR: its
+  # OSV comparison needs a lockfile on the base branch, and main gets its
+  # first Cargo.lock from this change.
+
+  rust-test:
+    name: rust test (native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt,clippy
+          rustup default stable
+      # rust-cache policy: PR and merge-queue runs restore main's cache but
+      # only main saves, so per-PR copies do not evict main's entries.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Reference PAR2 binary for the creator interop test
+      # (`interop_repair_with_reference_binary_when_available`, which repairs
+      # a creator-emitted set through the repair path and skips when no
+      # binary is present). Distro par2cmdline proves spec-level interop of
+      # the emitted bytes.
+      - name: Install reference par2 binary for creator interop test
+        run: sudo apt-get update && sudo apt-get install -y par2
+      - run: cargo test --locked --workspace
+      # Transport-free portable core on the same native runner: executes
+      # velmora without default TLS features. This is native portable
+      # behavior, not a wasm-runtime check (see rust-wasm).
+      - run: cargo test --locked -p velmora --no-default-features
+
+  rust-wasm:
+    name: rust check (wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Scalar core (no transport features) and the Workers transport build.
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport -- -D warnings
+      # The simd128 yEnc fast path must keep compiling (Workers run V8 with
+      # Wasm SIMD; consumers enable it via this RUSTFLAGS).
+      - run: RUSTFLAGS="-C target-feature=+simd128" cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
+
+  # Dependency/security gate: the reviewed deny.toml policy must pass for
+  # the committed lockfile. Findings are fixed by updating the dependency,
+  # never by weakening the policy. Keep this job id in ci-ok's needs.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - name: Install pinned cargo-deny 0.20.2
+        run: |
+          set -euo pipefail
+          deny_version="0.20.2"
+          asset="cargo-deny-${deny_version}-x86_64-unknown-linux-musl.tar.gz"
+          base="https://github.com/EmbarkStudios/cargo-deny/releases/download/${deny_version}"
+          # Pinned digest recorded in-repo so a replaced release artifact
+          # fails closed instead of executing. Re-pin deliberately when the
+          # version above changes, verifying the digest out-of-band first.
+          expected_sha256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+          curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
+            -o "/tmp/${asset}" "${base}/${asset}"
+          echo "${expected_sha256}  /tmp/${asset}" | (cd /tmp && sha256sum -c -)
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "/tmp/${asset}" -C /tmp
+          install -m 755 "/tmp/cargo-deny-${deny_version}-x86_64-unknown-linux-musl/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          cargo-deny --version
+      # Fail-closed freshness: the committed lockfile must match the
+      # manifests, or the audit below would check a stale dependency set.
+      - name: Prove the committed lockfile is fresh
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: Audit advisories, bans, licenses, sources
+        run: cargo-deny --manifest-path Cargo.toml check
+
+  ci-ok:
+    name: ci-ok
+    needs: [rust-test, rust-wasm, cargo-deny]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          if ! jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS_JSON" > /dev/null; then
+            echo "ci-ok: a required job did not succeed"
+            exit 1
+          fi
+          echo "ci-ok: all required jobs passed"
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
