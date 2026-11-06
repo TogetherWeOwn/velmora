@@ -1,8 +1,8 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 #[derive(Default)]
 pub struct Trace {

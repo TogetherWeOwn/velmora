@@ -2,7 +2,7 @@
 //!
 //! Sibling of the pinned `max_pipelined == 0` arm: [`NntpClient::connect`]
 //! fails closed when the cap is `0` or above
-//! [`MAX_ARTICLE_BYTES`](nntune_core::transport::MAX_ARTICLE_BYTES), before any
+//! [`MAX_ARTICLE_BYTES`](velmora::transport::MAX_ARTICLE_BYTES), before any
 //! I/O. Fake transport only; no network.
 
 #[path = "review_support/nntp.rs"]
@@ -10,8 +10,8 @@ mod support;
 
 use std::io;
 
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::{Transport, MAX_ARTICLE_BYTES};
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::{Transport, MAX_ARTICLE_BYTES};
 
 /// Inert transport: connect-time validation runs before any I/O, so the
 /// rejection arms never touch the wire.

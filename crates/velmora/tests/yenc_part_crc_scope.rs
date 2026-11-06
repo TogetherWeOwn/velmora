@@ -3,7 +3,7 @@
 //! covers bytes this article does not contain, so it must never be compared
 //! against the decoded part alone.
 //!
-//! Contract under test (for the Builder), via `nntune_core::yenc::decode_to`:
+//! Contract under test (for the Builder), via `velmora::yenc::decode_to`:
 //! - Multipart, `pcrc32=` present: it is checked against the decoded part
 //!   (match decodes, mismatch is `Error::CrcMismatch`), whether or not a
 //!   whole-file `crc32=` is also present, in either field order.
@@ -33,8 +33,8 @@
 //! token on a multipart article whose value is not compared, and any
 //! whole-file reassembly/verification feature (out of scope).
 
-use nntune_core::yenc::{decode_to, encode_segment, SegmentParams};
-use nntune_core::Error;
+use velmora::yenc::{decode_to, encode_segment, SegmentParams};
+use velmora::Error;
 
 const WHOLE: &[u8] = b"abcdef";
 const PART1: &[u8] = b"abc";

@@ -1,13 +1,13 @@
 //! yEnc throughput benches. Report as ms/MB for the bench gate (baseline:
 //! the TS/V8 implementation at 1.2 ms/MB on Workers).
 //!
-//! Native runs: `cargo bench -p nntune-core`.
+//! Native runs: `cargo bench -p velmora`.
 //! Workers runs: deploy `workers/bench` (sibling card) which calls the same
 //! `decode_to`/`encode_body` over 1 MiB and reports `Date.now()` deltas.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use nntune_core::yenc::{decode_to, encode_body, encode_segment, SegmentParams};
 use std::hint::black_box;
+use velmora::yenc::{decode_to, encode_body, encode_segment, SegmentParams};
 
 /// Deterministic PRNG (xorshift64*) so benches are stable across runs.
 fn pseudorandom(len: usize) -> Vec<u8> {

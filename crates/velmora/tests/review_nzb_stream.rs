@@ -2,8 +2,8 @@
 
 use std::io::{self, BufRead, Read};
 
-use nntune_core::error::Error;
-use nntune_core::nzb::{Limits, Parser};
+use velmora::error::Error;
+use velmora::nzb::{Limits, Parser};
 
 const FILE_START: &str = "<file poster=\"p\" date=\"1\" subject=\"s\"><segments>";
 const SEGMENT: &str = "<segment bytes=\"1\" number=\"1\">a@x</segment>";

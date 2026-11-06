@@ -1,6 +1,6 @@
 //! NZB parse-limits literal pins (tests-only).
 //!
-//! Contract under test (`crates/nntune-core/src/nzb.rs:32,34,38,42`):
+//! Contract under test (`crates/velmora/src/nzb.rs:32,34,38,42`):
 //!
 //! - `MAX_FILES == 1024` — most `<file>` elements one document holds.
 //! - `MAX_SEGMENTS_PER_FILE == 4096` — most `<segment>` elements in one file.
@@ -38,11 +38,11 @@
 //! Run only this file:
 //!
 //! ```sh
-//! cargo test -p nntune-core --test nzb_limits_literals_acceptance
+//! cargo test -p velmora --test nzb_limits_literals_acceptance
 //! ```
 
-use nntune_core::error::Error;
-use nntune_core::nzb::{
+use velmora::error::Error;
+use velmora::nzb::{
     Limits, Parser, MAX_DOCUMENT_BYTES, MAX_FILES, MAX_SEGMENTS_PER_FILE, MAX_SEGMENT_BYTES,
 };
 

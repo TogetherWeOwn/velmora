@@ -1,4 +1,4 @@
-//! Pin for the two PAR2 framing literals (`crates/nntune-core/src/par2.rs`):
+//! Pin for the two PAR2 framing literals (`crates/velmora/src/par2.rs`):
 //! `IFSC_ENTRY_SIZE` (`:54`, length validation at `:709`, chunked walk at
 //! `:728`) and `ZERO_CHUNK_SIZE` (`:84`, streaming zero-run hasher at
 //! `:822-824`, so verification never holds a slice-sized zero allocation).
@@ -34,8 +34,8 @@
 //! error type; hashes come from the format's own crates (`md5`,
 //! `crc32fast`).
 
-use nntune_core::error::Error;
-use nntune_core::par2::RecoverySet;
+use velmora::error::Error;
+use velmora::par2::RecoverySet;
 
 /// The crate source under test. Both framing literals are private, so the
 /// value pins match their declaration lines here instead of importing them.

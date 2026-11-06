@@ -1,5 +1,5 @@
 //! Pin for the PAR2 precheck segment-sum overflow arm
-//! (`crates/nntune-core/src/par2.rs:457-458`): segment lengths summing past
+//! (`crates/velmora/src/par2.rs:457-458`): segment lengths summing past
 //! `u64::MAX` must surface the exact overflow message, never wrap.
 //!
 //! Controls:
@@ -7,8 +7,8 @@
 //!   fires instead);
 //! - an empty IFSC (no block checksums) hits the adjacent early return.
 
-use nntune_core::error::Error;
-use nntune_core::par2::RecoverySet;
+use velmora::error::Error;
+use velmora::par2::RecoverySet;
 
 const BLOCK_SIZE: u64 = 256;
 const FILENAME: &str = "track.flac";

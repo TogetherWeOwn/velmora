@@ -1,6 +1,6 @@
-# nntune-core
+# velmora
 
-Shared Usenet data-plane core for NNTune v2. Compiles for
+Shared Usenet data-plane engine (extracted from NNTune v2). Compiles for
 `wasm32-unknown-unknown` (Cloudflare Workers via `workers-rs`) **and**
 native targets (services, Container batch jobs).
 
@@ -29,7 +29,7 @@ Mozilla roots `src/transports/tokio_tls.rs:57-58`, gating `src/transports/mod.rs
 
 ## Pinned transport proof (NZB fetch)
 
-`nntune_core::pinned_transport` is the fail-closed policy the NZB intake
+`velmora::pinned_transport` is the fail-closed policy the NZB intake
 wiring consumes (separate intake card, untouched here):
 
 - **Allowlist:** `ALLOWED_NNTP_PORTS = [119, 563]` (the NNTP conventions).
@@ -73,8 +73,8 @@ wiring consumes (separate intake card, untouched here):
 - `native-tls` — tokio + rustls transport (non-wasm).
 - `worker-transport` — Workers `connect()` socket transport (wasm32 only).
 
-(Sources: `crates/nntune-core/Cargo.toml:10-12`; gating `src/transports/mod.rs:11-21`;
-wasm32 tokio `io-util`-only `Cargo.toml:36-37`.)
+(Sources: `crates/velmora/Cargo.toml:11-13`; gating `src/transports/mod.rs:11-21`;
+wasm32 tokio `io-util`-only `Cargo.toml:43-44`.)
 
 The protocol/parser core uses injected transports; the transport implementations
 and the native repair runner own network I/O and deadlines.
@@ -125,11 +125,11 @@ neither a sandbox nor a hard disk quota.
 ## Checks
 
 ```sh
-cargo test -p nntune-core                    # incl. Go-vector interop
-cargo clippy -p nntune-core --all-targets    # clean, `-D warnings` in CI
-cargo bench -p nntune-core                   # yEnc ms/MB for the bench gate
-cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features [--features worker-transport]
-RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+cargo test -p velmora                    # incl. Go-vector interop
+cargo clippy -p velmora --all-targets    # clean, `-D warnings` in CI
+cargo bench -p velmora                   # yEnc ms/MB for the bench gate
+cargo check -p velmora --target wasm32-unknown-unknown --no-default-features [--features worker-transport]
+RUSTFLAGS="-C target-feature=+simd128" cargo check -p velmora --target wasm32-unknown-unknown --no-default-features
 ```
 
 ## Bench gate (this PR)

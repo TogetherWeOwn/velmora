@@ -7,8 +7,8 @@
 //! implementation constant: smaller documented caps are permitted. Replaying
 //! an identical packet must not consume another unique-entry allowance.
 
-use nntune_core::error::Error;
-use nntune_core::par2::{RecoverySet, RecoverySetBuilder};
+use velmora::error::Error;
+use velmora::par2::{RecoverySet, RecoverySetBuilder};
 
 const NAME: &str = "track.flac";
 const DATA: &[u8] = b"0123456789abcdef0123456789";

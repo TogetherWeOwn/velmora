@@ -12,18 +12,18 @@
 
 use std::collections::HashSet;
 
-use nntune_core::article::{
+use velmora::article::{
     assemble_article, obfuscate_article, render_obfuscated_headers, select_newsgroup,
     ArticleHeaders, ARTICLE_CIPHER_BLOCKS, ARTICLE_PAYLOAD_BYTES, ARTICLE_PLAINTEXT_BYTES,
     DATE_JITTER_SECS, MSGID_DOMAIN_LEFT_LEN, MSGID_DOMAIN_RIGHT_LEN, MSGID_LOCAL_LEN,
     OBFUSCATED_FROM_LOCAL_LEN, OBFUSCATED_SUBJECT_LEN, OBFUSCATED_YENC_NAME_LEN,
 };
-use nntune_core::decrypt::rclone::{CIPHER_BLOCK_SIZE, PLAIN_BLOCK_SIZE};
-use nntune_core::error::Error;
-use nntune_core::rng::{FillRandom, SystemRng};
-use nntune_core::segment_identity::valid_segment_id;
-use nntune_core::yenc::{decode_to, encode_segment, SegmentParams};
-use nntune_core::Result;
+use velmora::decrypt::rclone::{CIPHER_BLOCK_SIZE, PLAIN_BLOCK_SIZE};
+use velmora::error::Error;
+use velmora::rng::{FillRandom, SystemRng};
+use velmora::segment_identity::valid_segment_id;
+use velmora::yenc::{decode_to, encode_segment, SegmentParams};
+use velmora::Result;
 
 /// Deterministic xorshift64* byte source (test-only stand-in for `SystemRng`).
 struct TestRng(u64);
@@ -662,7 +662,7 @@ fn date_parser_agrees_with_known_weekday() {
 /// Minimal inline `POST`-capable fake NNTP server for the loopback test.
 ///
 /// Kept inside this test file so the suite compiles and runs standalone:
-/// the shared `nntune-test-nntp` fake server answers retrieval commands
+/// the shared `velmora-test-nntp` fake server answers retrieval commands
 /// only, so posting tests script their own transport (see `tests/post.rs`)
 /// or serve a loopback here. Speaks just enough NNTP — greeting,
 /// `MODE READER`, `AUTHINFO USER`, `POST` (`340`/`240`, `435` duplicate,
@@ -916,8 +916,8 @@ mod loopback {
 async fn loopback_post_stat_fetch_and_duplicate() {
     use std::time::Duration;
 
-    use nntune_core::nntp::{NntpClient, NntpConfig, PostOutcome};
-    use nntune_core::transports::connect_native;
+    use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
+    use velmora::transports::connect_native;
 
     use self::loopback::LoopbackServer;
 

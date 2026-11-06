@@ -1,4 +1,4 @@
-//! Par2 scratch file-name cap pin (`crates/nntune-core/src/par2/scratch.rs`).
+//! Par2 scratch file-name cap pin (`crates/velmora/src/par2/scratch.rs`).
 //!
 //! Contract under test (`MAX_FILE_NAME_BYTES` at `:36`, enforced by
 //! `validate_file_name` at `:67-75`):
@@ -18,7 +18,7 @@
 //! restored to green. Lowering the cap flips the 255-byte accept; raising it
 //! flips the 256-byte reject.
 
-use nntune_core::par2::scratch::{validate_file_name, MAX_FILE_NAME_BYTES};
+use velmora::par2::scratch::{validate_file_name, MAX_FILE_NAME_BYTES};
 
 /// Local literal: the cap value under test. Boundary fixtures below are built
 /// from this, not from the crate constant, so a cap-value change fails the

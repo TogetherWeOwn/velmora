@@ -2,7 +2,7 @@
 //! canary card; these numbers feed the card, not the `review_bench_guard`
 //! gate (that gate pins the verify/precheck benches only).
 //!
-//! Native runs: `cargo bench -p nntune-core --bench par2_create`.
+//! Native runs: `cargo bench -p velmora --bench par2_create`.
 //!
 //! Geometry mirrors the posting pipeline: the slice is the design §4 example
 //! (11 cipher blocks = 721,072 article bytes, rounded down to 721,024), and
@@ -10,9 +10,9 @@
 //! boundaries exactly as it will in production.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use nntune_core::par2::creator::{create_single_file, Par2Creator};
 use std::hint::black_box;
 use std::time::Duration;
+use velmora::par2::creator::{create_single_file, Par2Creator};
 
 // Design §4 example: 11 cipher blocks of article payload, aligned to 128.
 const ARTICLE_PUSH: usize = 721_072;

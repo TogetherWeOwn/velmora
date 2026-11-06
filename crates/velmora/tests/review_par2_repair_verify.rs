@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use nntune_core::par2::repair::repair_with_binary;
-use nntune_core::par2::RecoverySet;
-use nntune_core::Error;
+use velmora::par2::repair::repair_with_binary;
+use velmora::par2::RecoverySet;
+use velmora::Error;
 
 const BLOCK_SIZE: u64 = 1024;
 const FILE_LEN: usize = 8192;

@@ -1,4 +1,4 @@
-//! Segment-text accumulation-cap pin (`crates/nntune-core/src/nzb.rs:44`
+//! Segment-text accumulation-cap pin (`crates/velmora/src/nzb.rs:44`
 //! `push_segment_text`, `MAX_SEGMENT_TEXT_BYTES`).
 ///
 /// Contract under test:
@@ -26,7 +26,7 @@
 /// the implementation is untouched.
 use std::io::{self, BufRead, Read};
 
-use nntune_core::nzb::{Limits, Parser, MAX_SEGMENT_TEXT_BYTES};
+use velmora::nzb::{Limits, Parser, MAX_SEGMENT_TEXT_BYTES};
 
 fn doc_with_segment_text(inner: &str) -> Vec<u8> {
     format!(

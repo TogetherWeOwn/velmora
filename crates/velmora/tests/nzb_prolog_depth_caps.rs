@@ -1,5 +1,5 @@
 //! Pin for the NZB prolog bound and the metadata-depth bound
-//! (`crates/nntune-core/src/nzb.rs`): `MAX_PROLOG_BYTES` (4096) and
+//! (`crates/velmora/src/nzb.rs`): `MAX_PROLOG_BYTES` (4096) and
 //! `MAX_METADATA_DEPTH` (64). Tests only; the parser is untouched.
 //!
 //! Contract under test:
@@ -25,8 +25,8 @@
 //! the public `nzb::{parse, MAX_PROLOG_BYTES, MAX_METADATA_DEPTH}` seam
 //! plus `Error` for variant matching.
 
-use nntune_core::error::Error;
-use nntune_core::nzb::{parse, MAX_METADATA_DEPTH, MAX_PROLOG_BYTES};
+use velmora::error::Error;
+use velmora::nzb::{parse, MAX_METADATA_DEPTH, MAX_PROLOG_BYTES};
 
 /// Local literals: the bounds under test. Fixtures below are built from
 /// these, not from the crate constants, so a bound-value change fails the

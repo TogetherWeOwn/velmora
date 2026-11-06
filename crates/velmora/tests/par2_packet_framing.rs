@@ -1,5 +1,5 @@
 //! Pin for the PAR2 packet-framing rejections
-//! (`crates/nntune-core/src/par2.rs:169-180`, via [`RecoverySet::parse`]):
+//! (`crates/velmora/src/par2.rs:169-180`, via [`RecoverySet::parse`]):
 //! a stream shorter than the 64-byte header, a wrong magic, and a bad length
 //! must each fail closed with the exact framing message, while a minimal
 //! well-formed single-packet (lone Main) set parses to `Ok`.
@@ -17,8 +17,8 @@
 //! imports from the crate are the parser entry point (`RecoverySet`) and the
 //! error type; hashes come from the format's own crates (`md5`).
 
-use nntune_core::error::Error;
-use nntune_core::par2::RecoverySet;
+use velmora::error::Error;
+use velmora::par2::RecoverySet;
 
 const TRUNCATED_MSG: &str = "par2: malformed recovery set: truncated packet header at offset 0";
 const BAD_MAGIC_MSG: &str = "par2: malformed recovery set: bad magic at offset 0";

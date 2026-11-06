@@ -16,8 +16,8 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
-use nntune_core::error::{Error, Result};
-use nntune_core::nntp::{NntpClient, NntpConfig};
+use velmora::error::{Error, Result};
+use velmora::nntp::{NntpClient, NntpConfig};
 
 const PREFIX: &[u8] = b"caller-prefix:\x00\xff";
 const CANARY: &str = "foreign-envelope-canary-9e72";

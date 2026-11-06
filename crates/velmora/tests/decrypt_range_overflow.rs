@@ -45,11 +45,9 @@
 use std::cell::RefCell;
 use std::io;
 
-use nntune_core::decrypt::rclone::{
-    CIPHER_BLOCK_SIZE, CIPHER_OVERHEAD, HEADER_SIZE, PLAIN_BLOCK_SIZE,
-};
-use nntune_core::decrypt::{aes_cbc, rclone, ReadAt};
-use nntune_core::Error;
+use velmora::decrypt::rclone::{CIPHER_BLOCK_SIZE, CIPHER_OVERHEAD, HEADER_SIZE, PLAIN_BLOCK_SIZE};
+use velmora::decrypt::{aes_cbc, rclone, ReadAt};
+use velmora::Error;
 
 const RANGE_OVERFLOW_MSG: &str = "ciphertext range exceeds addressable offsets";
 

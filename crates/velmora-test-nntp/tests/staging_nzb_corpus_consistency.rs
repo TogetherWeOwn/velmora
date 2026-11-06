@@ -1,7 +1,7 @@
 //! Corpus-consistency regression for the in-memory generated NZBs.
 //!
 //! There are no checked-in NZB files anywhere: every NZB under test is built
-//! in memory with [`nntune_test_nntp::nzb_for`] from the served corpus. These
+//! in memory with [`velmora_test_nntp::nzb_for`] from the served corpus. These
 //! tests close the gap the old checked-in staging fixture used to leave:
 //!
 //! * every generated segment ID and group must resolve in
@@ -24,12 +24,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transports::connect_native;
-use nntune_test_nntp::{default_corpus, generate_wav_bytes, Article, TestNntpServer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transports::connect_native;
+use velmora_test_nntp::{default_corpus, generate_wav_bytes, Article, TestNntpServer};
 
 // ---------------------------------------------------------------------------
 // Minimal NZB parsing (shared by the controls and the corpus tests)
@@ -155,7 +155,7 @@ fn corpus_by_id() -> HashMap<String, Article> {
 /// only NZB source under test: no file reads, no checked-in fixtures.
 fn generated_nzb(ids: &[&str]) -> String {
     let corpus = corpus_by_id();
-    nntune_test_nntp::nzb_for(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
+    velmora_test_nntp::nzb_for(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
 }
 
 /// Build an in-memory TRUE multipart NZB: one `<file>` element with the
@@ -164,7 +164,7 @@ fn generated_nzb(ids: &[&str]) -> String {
 /// segment never exercises it).
 fn generated_multipart_nzb(ids: &[&str]) -> String {
     let corpus = corpus_by_id();
-    nntune_test_nntp::nzb_for_multipart(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
+    velmora_test_nntp::nzb_for_multipart(&corpus_articles(&corpus, ids), "alt.binaries.nntune.test")
 }
 
 fn corpus_articles<'a>(corpus: &'a HashMap<String, Article>, ids: &[&str]) -> Vec<&'a Article> {
@@ -537,7 +537,7 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
             Some(prev) => assert_eq!(total, prev, "=ybegin total changes across segments"),
         }
 
-        let decoded = nntune_test_nntp::yenc::decode(body);
+        let decoded = velmora_test_nntp::yenc::decode(body);
         assert_eq!(
             decoded.len() as u64,
             seg.bytes,
@@ -645,7 +645,7 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
     // Corpus consistency alone is not ingestability: the hand-rolled scanner
     // above accepts documents the production parser rejects (it refuses every
     // DOCTYPE as XXE hardening). This test runs the production components —
-    // `nntune_core::nzb::parse` (the parser the ingest upload handler calls),
+    // `velmora::nzb::parse` (the parser the ingest upload handler calls),
     // `NntpClient` and `yenc::decode_to` — so a generated document the upload
     // would reject with a 400 fails here. The document is the true
     // multipart shape (one file, three numbered segments): a production
@@ -657,7 +657,7 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
         "<multi-660-part3-of-3@nntune.test>",
     ];
     let text = generated_multipart_nzb(&ids);
-    let document = nntune_core::nzb::parse(text.as_bytes())
+    let document = velmora::nzb::parse(text.as_bytes())
         .expect("production NZB parser accepts the generated fixture");
     assert_eq!(document.files.len(), 1, "generated NZB carries one file");
     let file = &document.files[0];
@@ -720,7 +720,7 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
             .unwrap_or_else(|| panic!("no fetched article for {}", segment.message_id));
         let mut decoded = vec![0u8; segment.encoded_bytes as usize];
         let decoded_len =
-            nntune_core::yenc::decode_to(&segment.message_id, &article.article, &mut decoded)
+            velmora::yenc::decode_to(&segment.message_id, &article.article, &mut decoded)
                 .unwrap_or_else(|e| {
                     panic!(
                         "production yEnc decoder rejects {}: {e:?}",

@@ -2,11 +2,11 @@
 //! be rejected, while an *absent* trailer size stays optional.
 //!
 //! Contract under test (for the Builder):
-//! - Decoder entry point: `nntune_core::yenc::decode_to` (single-part and
+//! - Decoder entry point: `velmora::yenc::decode_to` (single-part and
 //!   multi-part paths).
 //! - Present-but-invalid trailer sizes — empty, non-numeric, trailing-junk,
 //!   negative, or out-of-range/overflowing decimals — fail with the existing
-//!   malformed-article taxonomy: `nntune_core::Error::Malformed`. They must
+//!   malformed-article taxonomy: `velmora::Error::Malformed`. They must
 //!   not be silently treated as an omitted (optional) size.
 //! - A present valid trailer size must equal the decoded payload length.
 //! - An absent trailer size (and the existing optional CRC behaviour) is
@@ -16,8 +16,8 @@
 //! only in the `=yend size=` token, so every other check (header size,
 //! `=ypart` range, CRC, destination bounds) passes on its own merits.
 
-use nntune_core::yenc::{decode_to, encode_segment, SegmentParams};
-use nntune_core::Error;
+use velmora::yenc::{decode_to, encode_segment, SegmentParams};
+use velmora::Error;
 
 fn single(payload: &[u8]) -> Vec<u8> {
     let mut article = Vec::new();

@@ -42,7 +42,7 @@
 //!   code material only — never the configured username or password.
 //!
 //! The shared path is `std`-only (no `tokio`, no sockets, no new crates) so
-//! `cargo check -p nntune-core --target wasm32-unknown-unknown` keeps
+//! `cargo check -p velmora --target wasm32-unknown-unknown` keeps
 //! passing; cancellation is implemented with [`std::future::poll_fn`].
 
 use std::fmt;

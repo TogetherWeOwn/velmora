@@ -1,13 +1,13 @@
 [package]
-name = "nntune-test-nntp"
+name = "velmora-test-nntp"
 version = "0.1.0"
 edition = "2021"
-description = "Synthetic NNTP test server + fixture corpus for NNTune v2 CI (no real Usenet in CI)"
+description = "Synthetic NNTP test server + fixture corpus for velmora CI (no real Usenet in CI)"
 license = "MIT"
-repository = "https://github.com/TogetherWeOwn/nntunev2"
+repository = "https://github.com/TogetherWeOwn/velmora"
 
 [lib]
-name = "nntune_test_nntp"
+name = "velmora_test_nntp"
 path = "src/lib.rs"
 
 [dependencies]
@@ -15,4 +15,4 @@ tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-nntune-core = { version = "0.1.0", path = "../nntune-core", default-features = false, features = ["native-tls"] }
+velmora = { version = "0.1.0", path = "../velmora", default-features = false, features = ["native-tls"] }

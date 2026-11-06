@@ -13,10 +13,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::{is_retryable_post_error, PostOutcome, MAX_POST_ATTEMPTS};
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::error::Error;
+use velmora::nntp::{is_retryable_post_error, PostOutcome, MAX_POST_ATTEMPTS};
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 /// Scripted transport: reads come from `to_client`, writes are asserted
 /// against `expect_writes` in order (same harness as `tests/nntp.rs`).

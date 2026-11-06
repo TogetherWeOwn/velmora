@@ -1,6 +1,6 @@
 //! PAR2 Main-packet `MAX_BLOCK_SIZE` boundary pin.
 //!
-//! Contract under test (`crates/nntune-core/src/par2.rs`, `parse_main_body`):
+//! Contract under test (`crates/velmora/src/par2.rs`, `parse_main_body`):
 //!
 //! - `MAX_BLOCK_SIZE` is `256 << 20` (256 MiB). A Main packet declaring
 //!   exactly that slice size parses and its file verifies.
@@ -19,7 +19,7 @@
 //! the public cap constant (asserted equal to the local literal), and the
 //! hash crates the format itself requires (`md5`, `crc32fast`).
 
-use nntune_core::par2::{RecoverySet, MAX_BLOCK_SIZE};
+use velmora::par2::{RecoverySet, MAX_BLOCK_SIZE};
 
 /// Local literal: the cap value under test. Packets below are built from
 /// this, not from the crate constant, so a cap-value change fails the

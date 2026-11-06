@@ -9,7 +9,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use nntune_core::transport::{BufferedTransport, Transport, MAX_ARTICLE_BYTES};
+use velmora::transport::{BufferedTransport, Transport, MAX_ARTICLE_BYTES};
 
 #[derive(Default)]
 struct Trace {

@@ -10,7 +10,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use nntune_core::transport::{
+use velmora::transport::{
     is_article_limit_error, BufferedTransport, Transport, ARTICLE_LIMIT_ERROR, MAX_LINE_BYTES,
 };
 

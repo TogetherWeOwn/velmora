@@ -1,7 +1,7 @@
 //! NZB parser tests: golden-file parsing, cross-implementation digest check,
 //! and the resource-bound / malformation rejections ported from v1.
 
-use nntune_core::nzb::{digest_message_ids, normalize_message_id, parse, Limits, Parser};
+use velmora::nzb::{digest_message_ids, normalize_message_id, parse, Limits, Parser};
 
 // NOTE: no DOCTYPE — like v1, this parser rejects ALL directives (even a
 // bare `<!DOCTYPE nzb>` with no entities) as a hard XXE/billion-laughs
