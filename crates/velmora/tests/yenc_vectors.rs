@@ -9,7 +9,7 @@
 //!
 //! Regenerate with the exporter documented in `testdata/README.md`.
 
-use nntune_core::yenc::{decode_to, encode_body, encode_segment, SegmentParams};
+use velmora::yenc::{decode_to, encode_body, encode_segment, SegmentParams};
 
 static VECTORS: &[u8] = include_bytes!("../testdata/yenc_go_vectors.bin");
 
@@ -200,7 +200,7 @@ fn decode_rejects_go_style_malformations() {
     article[pos] = if article[pos] == b'0' { b'1' } else { b'0' };
     let err = decode_to("t", &article, &mut dst).unwrap_err();
     assert!(
-        matches!(err, nntune_core::Error::CrcMismatch { .. }),
+        matches!(err, velmora::Error::CrcMismatch { .. }),
         "want CrcMismatch, got {err}"
     );
 

@@ -2,16 +2,16 @@
 //!
 //! These run in CI with no real Usenet: every test spawns an in-process
 //! `TestNntpServer` on an ephemeral loopback port and speaks raw NNTP.
-//! They are the acceptance proof for the fixture server — `nntune-core`
+//! They are the acceptance proof for the fixture server — `velmora`
 //! (and stream/ingest harnesses) reuse the same spawn helpers.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use nntune_test_nntp::{ServerConfig, TestNntpServer};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use velmora_test_nntp::{ServerConfig, TestNntpServer};
 
 struct Client {
     reader: BufReader<OwnedReadHalf>,
@@ -203,11 +203,11 @@ async fn yenc_single_part_decodes_to_wav() {
     c.auth("testuser", "testpass").await;
     let (first, block) = c.cmd_block("ARTICLE <single-yenc-001@nntune.test>").await;
     assert!(first.starts_with("220"));
-    let decoded = nntune_test_nntp::yenc::decode(article_body(&block));
+    let decoded = velmora_test_nntp::yenc::decode(article_body(&block));
     assert_eq!(&decoded[0..4], b"RIFF");
     assert_eq!(&decoded[8..12], b"WAVE");
     // Matches the locally generated reference tone byte-for-byte.
-    let expected = nntune_test_nntp::generate_wav_bytes(440.0, 120, 8000);
+    let expected = velmora_test_nntp::generate_wav_bytes(440.0, 120, 8000);
     assert_eq!(decoded, expected);
 }
 
@@ -221,11 +221,11 @@ async fn multipart_reassembles_original() {
         let id = format!("<multi-660-part{n}-of-3@nntune.test>");
         let (first, block) = c.cmd_block(&format!("ARTICLE {id}")).await;
         assert!(first.starts_with("220"), "part {n}: {first:?}");
-        joined.extend(nntune_test_nntp::yenc::decode(article_body(&block)));
+        joined.extend(velmora_test_nntp::yenc::decode(article_body(&block)));
     }
     assert_eq!(
         joined,
-        nntune_test_nntp::generate_wav_bytes(660.0, 210, 8000)
+        velmora_test_nntp::generate_wav_bytes(660.0, 210, 8000)
     );
 }
 
@@ -240,7 +240,7 @@ async fn obfuscated_subjects_served() {
     assert!(first.starts_with("220"));
     // Served under an opaque subject, but the payload still decodes.
     assert!(block.windows(12).any(|w| w == b"q7w2e9r4t6y1"));
-    let decoded = nntune_test_nntp::yenc::decode(article_body(&block));
+    let decoded = velmora_test_nntp::yenc::decode(article_body(&block));
     assert!(!decoded.is_empty());
 }
 
@@ -251,11 +251,11 @@ async fn rar_and_7z_markers_present() {
     c.auth("testuser", "testpass").await;
 
     let (_, rar_block) = c.cmd_block("ARTICLE <enc-rar-001@nntune.test>").await;
-    let rar = nntune_test_nntp::yenc::decode(article_body(&rar_block));
+    let rar = velmora_test_nntp::yenc::decode(article_body(&rar_block));
     assert_eq!(&rar[0..4], b"Rar!");
 
     let (_, seven_block) = c.cmd_block("ARTICLE <enc-7z-001@nntune.test>").await;
-    let seven = nntune_test_nntp::yenc::decode(article_body(&seven_block));
+    let seven = velmora_test_nntp::yenc::decode(article_body(&seven_block));
     assert_eq!(&seven[0..2], b"7z");
 }
 
@@ -397,7 +397,7 @@ async fn generated_nzbs_match_served_ids() {
     // No checked-in NZB files anywhere: every NZB under test is built in
     // memory with `nzb_for()` from the served corpus. One document per
     // corpus shape keeps a bad slice attributable to its shape.
-    let corpus = nntune_test_nntp::default_corpus();
+    let corpus = velmora_test_nntp::default_corpus();
     let by_id: HashMap<_, _> = corpus.iter().map(|a| (a.message_id.as_str(), a)).collect();
     let group = "alt.binaries.nntune.test";
     let shapes: &[&[&str]] = &[
@@ -426,7 +426,7 @@ async fn generated_nzbs_match_served_ids() {
                     .unwrap_or_else(|| panic!("unknown corpus id {id}"))
             })
             .collect();
-        let text = nntune_test_nntp::nzb_for(&articles, group);
+        let text = velmora_test_nntp::nzb_for(&articles, group);
         for (id, bytes) in parse_generated_nzb(&text) {
             referenced.insert(id.clone());
             declared_bytes.insert(id, bytes);
@@ -434,7 +434,7 @@ async fn generated_nzbs_match_served_ids() {
     }
     assert!(!referenced.is_empty(), "no message-ids in generated NZBs");
     // Every referenced ID except the intentionally-missing one must be servable.
-    let corpus: HashMap<_, _> = nntune_test_nntp::default_corpus()
+    let corpus: HashMap<_, _> = velmora_test_nntp::default_corpus()
         .into_iter()
         .map(|a| (a.message_id.clone(), a))
         .collect();
@@ -501,7 +501,7 @@ async fn multipart_framing_uses_file_offsets_and_crc() {
     let mut c = Client::connect(&server).await;
     c.auth("testuser", "testpass").await;
 
-    let expected = nntune_test_nntp::generate_wav_bytes(660.0, 210, 8000);
+    let expected = velmora_test_nntp::generate_wav_bytes(660.0, 210, 8000);
     let full_size = expected.len().to_string();
     let mut names = Vec::new();
     let mut reassembled = vec![0u8; expected.len()];
@@ -543,9 +543,9 @@ async fn multipart_framing_uses_file_offsets_and_crc() {
             Some(n_s.as_str()),
             "yend part {n}"
         );
-        let decoded = nntune_test_nntp::yenc::decode(body);
+        let decoded = velmora_test_nntp::yenc::decode(body);
         assert_eq!(decoded.len() as u64, exp_end - exp_begin + 1);
-        let expect_pcrc = format!("{:08x}", nntune_test_nntp::yenc::crc32(&decoded));
+        let expect_pcrc = format!("{:08x}", velmora_test_nntp::yenc::crc32(&decoded));
         assert_eq!(
             param(&yend, "pcrc32").as_deref(),
             Some(expect_pcrc.as_str())

@@ -1,9 +1,10 @@
 [package]
-name = "nntune-core"
+name = "velmora"
 version = "0.1.0"
 edition = "2021"
-description = "Shared Usenet data-plane core for NNTune v2: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
+description = "Shared Usenet data-plane engine: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
 license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
 rust-version = "1.75"
 
 [features]
@@ -59,5 +60,5 @@ name = "par2_create"
 harness = false
 
 [lib]
-name = "nntune_core"
+name = "velmora"
 path = "src/lib.rs"

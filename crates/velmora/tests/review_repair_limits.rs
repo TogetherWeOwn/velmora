@@ -10,9 +10,9 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nntune_core::error::Result;
-use nntune_core::par2::repair::{repair_with_limits, RepairLimits, RepairReport};
 use support::Fixture;
+use velmora::error::Result;
+use velmora::par2::repair::{repair_with_limits, RepairLimits, RepairReport};
 
 fn limits() -> RepairLimits {
     RepairLimits {

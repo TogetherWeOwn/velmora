@@ -23,7 +23,7 @@
 //! lands):
 //!
 //! ```sh
-//! cargo test -p nntune-core --test transport_pinned_verdicts
+//! cargo test -p velmora --test transport_pinned_verdicts
 //! ```
 //!
 //! Fixtures are synthetic and `std`-only plus the crate's `tokio` dev
@@ -33,17 +33,17 @@
 //!
 //! # BUILDER CONTRACT (implement to make this file compile green)
 //!
-//! Add one module to `crates/nntune-core/src` and re-export it from `lib.rs`:
+//! Add one module to `crates/velmora/src` and re-export it from `lib.rs`:
 //!
 //! ```text
-//! nntune_core::pinned_transport
+//! velmora::pinned_transport
 //! ```
 //!
 //! Minimum shapes used below (you may extend, never narrow). The shared
 //! path must stay wasm-safe: `std` only, no `tokio` (not even
 //! `tokio::select!`), no sockets, no new crates — implement cancellation
 //! with `std::future::poll_fn` so
-//! `cargo check -p nntune-core --target wasm32-unknown-unknown` keeps
+//! `cargo check -p velmora --target wasm32-unknown-unknown` keeps
 //! passing. `tokio` appears in this test file only (host-only dev
 //! dependency for the sleep clock).
 //!
@@ -87,7 +87,7 @@
 //! Wire `validate_nntp_endpoint` into the native `connect` path so a
 //! TLS-off or off-allowlist config fails before any TCP dial, keeping the
 //! same stable codes. Document the allowlist, the TLS-first order, the
-//! cancel bound and every stable code in `crates/nntune-core/README.md`.
+//! cancel bound and every stable code in `crates/velmora/README.md`.
 //!
 //! EXPECTED STATE: this file does NOT compile until the build lands
 //! (unresolved `pinned_transport` import). That red target is the
@@ -101,12 +101,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::pinned_transport::{
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::pinned_transport::{
     validate_nntp_endpoint, with_cancel, TransportRejection, ValidatedEndpoint, ALLOWED_NNTP_PORTS,
     CANCEL_BOUND_MS,
 };
-use nntune_core::transport::Transport;
+use velmora::transport::Transport;
 
 /// Transport that serves scripted reads, records writes, and — once the
 /// script is exhausted — pends forever instead of failing. That models an

@@ -25,9 +25,9 @@ mod support;
 
 use std::io;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::NntpConfig;
-use nntune_core::transport::{BufferedTransport, Transport, MAX_LINE_BYTES};
+use velmora::error::Error;
+use velmora::nntp::NntpConfig;
+use velmora::transport::{BufferedTransport, Transport, MAX_LINE_BYTES};
 
 /// Exact refusal message in `transport.rs` (`read_line_inner`, both arms).
 const LINE_LIMIT_MESSAGE: &str = "NNTP line exceeds 16 KiB";

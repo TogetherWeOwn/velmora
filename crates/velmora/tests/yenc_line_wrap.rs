@@ -1,5 +1,5 @@
 //! 128-column wrap and trailer line-length pin
-//! (`crates/nntune-core/src/yenc.rs`, `LINE_LENGTH`, `LineBuf`, `encode_body`,
+//! (`crates/velmora/src/yenc.rs`, `LINE_LENGTH`, `LineBuf`, `encode_body`,
 //! `encode_segment`).
 //!
 //! Contract under test (tests only; the implementation is untouched):
@@ -38,7 +38,7 @@
 //! Uses only the public `yenc::{LINE_LENGTH, encode_body, encode_segment,
 //! SegmentParams, decode_to}` surface; the implementation is untouched.
 
-use nntune_core::yenc::{decode_to, encode_body, encode_segment, SegmentParams, LINE_LENGTH};
+use velmora::yenc::{decode_to, encode_body, encode_segment, SegmentParams, LINE_LENGTH};
 
 /// Raw bytes whose `+42` value needs escaping (NUL, LF, CR, `=` map to
 /// `0xD6, 0xE0, 0xE3, 0x13` respectively). Each encodes to two columns.

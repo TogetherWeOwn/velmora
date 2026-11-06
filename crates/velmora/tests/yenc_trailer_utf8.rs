@@ -12,8 +12,8 @@
 //! Each article is produced by the crate's own encoder and mutated only in
 //! the `=yend` line, so every other check passes on its own merits.
 
-use nntune_core::yenc::{decode_to, encode_segment, SegmentParams};
-use nntune_core::Error;
+use velmora::yenc::{decode_to, encode_segment, SegmentParams};
+use velmora::Error;
 
 fn single(payload: &[u8]) -> Vec<u8> {
     let mut article = Vec::new();

@@ -1,7 +1,7 @@
 //! S7 RED: forced-401 fixture must surface the documented
 //! `provider_auth_expired` code, never credential material.
 
-use nntune_core::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
+use velmora::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
 
 #[test]
 fn documented_code_is_provider_auth_expired() {

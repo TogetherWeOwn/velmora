@@ -1,6 +1,6 @@
 //! File IDs authenticate raw FileDesc filename bytes, not display strings.
 
-use nntune_core::par2::RecoverySet;
+use velmora::par2::RecoverySet;
 
 const BLOCK_SIZE: u64 = 16;
 const LATIN1_NAME: &[u8] = b"Bj\xf6rk - J\xf3ga.flac";

@@ -26,9 +26,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::error::Error;
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 const HOST: &str = "news.fixture.invalid";
 /// Synthetic credential sentinels. Distinctive enough that they cannot

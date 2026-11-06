@@ -19,8 +19,8 @@
 //! two-part file (`abcdef` = `abc` + `def`) whose whole-file CRC differs
 //! from each part CRC. No real Usenet articles and no external endpoints.
 
-use nntune_core::yenc::{decode_to, encode_segment, SegmentParams};
-use nntune_core::Error;
+use velmora::yenc::{decode_to, encode_segment, SegmentParams};
+use velmora::Error;
 
 const WHOLE: &[u8] = b"abcdef";
 const PART1: &[u8] = b"abc";

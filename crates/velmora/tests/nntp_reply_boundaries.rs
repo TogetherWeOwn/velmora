@@ -31,9 +31,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nntune_core::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 const GREETING: &str = "200 news.example.com ready\r\n";
 const MODE_READER_OK: &str = "200 reader mode on\r\n";

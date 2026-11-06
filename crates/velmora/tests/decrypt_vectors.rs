@@ -6,8 +6,8 @@
 //! range-edge behaviour is covered by round-trips through `seal_block` plus
 //! targeted AES-CBC range tests.
 
-use nntune_core::decrypt::rclone::{seal_block, CIPHER_OVERHEAD, HEADER_SIZE, PLAIN_BLOCK_SIZE};
-use nntune_core::decrypt::{aes_cbc, rclone, ReadAt};
+use velmora::decrypt::rclone::{seal_block, CIPHER_OVERHEAD, HEADER_SIZE, PLAIN_BLOCK_SIZE};
+use velmora::decrypt::{aes_cbc, rclone, ReadAt};
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())

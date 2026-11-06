@@ -27,11 +27,11 @@
 use std::cell::RefCell;
 use std::io;
 
-use nntune_core::decrypt::rclone::{
+use velmora::decrypt::rclone::{
     seal_block, CIPHER_BLOCK_SIZE, CIPHER_OVERHEAD, HEADER_SIZE, PLAIN_BLOCK_SIZE,
 };
-use nntune_core::decrypt::{aes_cbc, rclone, ReadAt};
-use nntune_core::{Error, Result};
+use velmora::decrypt::{aes_cbc, rclone, ReadAt};
+use velmora::{Error, Result};
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())

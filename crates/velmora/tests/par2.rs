@@ -3,10 +3,8 @@
 //! format rules ported from v1, plus `crc32_combine` against the Go reference
 //! values and a concatenation property test.
 
-use nntune_core::error::Error;
-use nntune_core::par2::{
-    crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder, MAX_PAR2_FILES,
-};
+use velmora::error::Error;
+use velmora::par2::{crc32_combine, peek_set_id, RecoverySet, RecoverySetBuilder, MAX_PAR2_FILES};
 
 const BLOCK_SIZE: u64 = 256;
 const FILENAME: &str = "track.flac";

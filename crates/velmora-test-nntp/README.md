@@ -1,6 +1,6 @@
-# nntune-test-nntp
+# velmora-test-nntp
 
-Synthetic NNTP test server + fixture corpus for NNTune v2 CI. **No real Usenet is used in CI.**
+Synthetic NNTP test server + fixture corpus for velmora CI (extracted from NNTune v2). **No real Usenet is used in CI.**
 
 ## What it is
 
@@ -22,17 +22,17 @@ Synthetic NNTP test server + fixture corpus for NNTune v2 CI. **No real Usenet i
 ## Use from integration tests
 
 ```rust
-let server = nntune_test_nntp::TestNntpServer::spawn_for_test().await;
+let server = velmora_test_nntp::TestNntpServer::spawn_for_test().await;
 // connect a raw TCP NNTP client to server.addr(), AUTHINFO testuser/testpass
 ```
 
 Custom fault configs via `ServerConfig`:
 
 ```rust
-let mut cfg = nntune_test_nntp::ServerConfig::for_test();
+let mut cfg = velmora_test_nntp::ServerConfig::for_test();
 cfg.slow_bytes_per_sec = Some(400);
 cfg.drop_after_bytes.insert("<single-yenc-001@nntune.test>".into(), 16);
-let server = nntune_test_nntp::TestNntpServer::spawn(cfg).await;
+let server = velmora_test_nntp::TestNntpServer::spawn(cfg).await;
 ```
 
 Default credentials: `testuser/testpass` (max 2 connections),
@@ -65,9 +65,9 @@ Default credentials: `testuser/testpass` (max 2 connections),
 Local Rust builds go through the bounded Cargo pool (see repo `AGENTS.md`):
 
 ```sh
-python3 scripts/cargo_cache.py run -- test -p nntune-test-nntp
-python3 scripts/cargo_cache.py run -- clippy -p nntune-test-nntp --all-targets -- -D warnings
-python3 scripts/cargo_cache.py run -- fmt -p nntune-test-nntp -- --check
+python3 scripts/cargo_cache.py run -- test -p velmora-test-nntp
+python3 scripts/cargo_cache.py run -- clippy -p velmora-test-nntp --all-targets -- -D warnings
+python3 scripts/cargo_cache.py run -- fmt -p velmora-test-nntp -- --check
 ```
 
 `tests/integration_nntp.rs` is the acceptance suite: auth, group/article/body/head/stat,

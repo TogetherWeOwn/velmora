@@ -3,8 +3,8 @@
 #[path = "review_support/nntp.rs"]
 mod support;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::NntpConfig;
+use velmora::error::Error;
+use velmora::nntp::NntpConfig;
 
 #[tokio::test]
 async fn failed_batch_drains_queued_replies_or_permanently_closes_client() {

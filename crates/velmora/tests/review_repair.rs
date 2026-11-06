@@ -8,8 +8,8 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use nntune_core::par2::repair::repair_with_binary;
 use support::Fixture;
+use velmora::par2::repair::repair_with_binary;
 
 #[test]
 fn no_repair_required_reports_zero_blocks() {

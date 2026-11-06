@@ -16,9 +16,9 @@
 use std::collections::VecDeque;
 use std::io;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::error::Error;
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 /// Transport that serves scripted reads and records every write.
 struct Recorder {

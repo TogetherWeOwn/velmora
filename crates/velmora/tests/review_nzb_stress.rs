@@ -2,7 +2,7 @@
 //!
 //! The large corpus is 64 files x 1024 segments = 65,536 Message-IDs, each
 //! declaring a 1 MiB payload: 64 GiB declared, exactly
-//! [`nntune_core::nzb::MAX_ENCODED_BYTES`], in ~5 MiB of XML. Declared bytes
+//! [`velmora::nzb::MAX_ENCODED_BYTES`], in ~5 MiB of XML. Declared bytes
 //! are O(1) arithmetic per segment; what scales is the segment count (XML
 //! size, ID collection, digest), so the corpus is sized on ID count, not on
 //! declared gigabytes.
@@ -21,8 +21,8 @@
 
 use std::time::{Duration, Instant};
 
-use nntune_core::nzb::Parser;
 use sha2::{Digest, Sha256};
+use velmora::nzb::Parser;
 
 /// Stated CI time bound for parsing the full-cap stress corpus (debug build).
 const STRESS_TIME_BOUND: Duration = Duration::from_secs(5);
@@ -60,7 +60,7 @@ fn build_corpus(files: usize, segments_per_file: usize) -> Vec<u8> {
 /// Expected segment digest, computed from first principles: sort the IDs
 /// this corpus generates, then SHA-256 over each ID's 4-byte big-endian
 /// length followed by its bytes. Deliberately does not call
-/// `nntune_core::nzb::digest_message_ids`, so a truncated or mis-ordered
+/// `velmora::nzb::digest_message_ids`, so a truncated or mis-ordered
 /// production digest fails the equality assertions below.
 fn expected_digest(files: usize, segments_per_file: usize) -> [u8; 32] {
     let mut ids: Vec<String> = (0..files)
@@ -75,7 +75,7 @@ fn expected_digest(files: usize, segments_per_file: usize) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn parse_timed(xml: &[u8]) -> (nntune_core::nzb::Document, Duration) {
+fn parse_timed(xml: &[u8]) -> (velmora::nzb::Document, Duration) {
     let started = Instant::now();
     let doc = Parser::with_default_limits()
         .unwrap()
@@ -97,7 +97,7 @@ fn stress_corpus_at_encoded_bytes_cap_parses_under_time_bound() {
     // 65,536 Message-IDs in ~5 MiB of XML.
     let xml = build_corpus(LARGE_FILES, LARGE_SEGMENTS_PER_FILE);
     assert!(
-        (xml.len() as u64) < nntune_core::nzb::MAX_DOCUMENT_BYTES,
+        (xml.len() as u64) < velmora::nzb::MAX_DOCUMENT_BYTES,
         "corpus XML {} bytes must stay under the document bound",
         xml.len()
     );
@@ -108,7 +108,7 @@ fn stress_corpus_at_encoded_bytes_cap_parses_under_time_bound() {
         .iter()
         .all(|f| f.segments.len() == LARGE_SEGMENTS_PER_FILE));
     let declared = LARGE_FILES as i64 * LARGE_SEGMENTS_PER_FILE as i64 * BYTES_PER_SEGMENT;
-    assert_eq!(declared, nntune_core::nzb::MAX_ENCODED_BYTES);
+    assert_eq!(declared, velmora::nzb::MAX_ENCODED_BYTES);
     assert_eq!(doc.encoded_bytes, declared);
     let ids: usize = doc.files.iter().map(|f| f.segments.len()).sum();
     assert_eq!(ids, LARGE_FILES * LARGE_SEGMENTS_PER_FILE);

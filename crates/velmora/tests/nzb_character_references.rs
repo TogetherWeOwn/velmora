@@ -21,7 +21,7 @@
 //! Assertions are behavioural only (parsed IDs, digests, `Err`); error
 //! message wording is the implementer's choice.
 
-use nntune_core::nzb::{parse, Limits, Parser, MAX_SEGMENT_TEXT_BYTES};
+use velmora::nzb::{parse, Limits, Parser, MAX_SEGMENT_TEXT_BYTES};
 
 fn doc_with_segment(segment_inner: &str) -> String {
     format!(
@@ -32,7 +32,7 @@ fn doc_with_segment(segment_inner: &str) -> String {
 }
 
 /// Parses a one-segment document and returns the segment's Message-ID.
-fn message_id(segment_inner: &str) -> nntune_core::Result<String> {
+fn message_id(segment_inner: &str) -> velmora::Result<String> {
     parse(doc_with_segment(segment_inner).as_bytes())
         .map(|doc| doc.files[0].segments[0].message_id.clone())
 }

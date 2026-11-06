@@ -7,7 +7,7 @@
 //! lossy conversion while keeping every length/MD5/CRC/protected-membership
 //! check identical.
 
-use nntune_core::par2::RecoverySet;
+use velmora::par2::RecoverySet;
 
 const BLOCK_SIZE: u64 = 16;
 const LATIN1_NAME: &[u8] = b"Bj\xf6rk - J\xf3ga.flac";

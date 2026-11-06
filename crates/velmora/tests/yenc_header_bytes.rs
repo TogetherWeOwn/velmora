@@ -3,7 +3,7 @@
 //! be valid UTF-8.
 //!
 //! Contract under test (for the Builder):
-//! - Decoder entry point: `nntune_core::yenc::decode_to` (single-part and
+//! - Decoder entry point: `velmora::yenc::decode_to` (single-part and
 //!   multi-part paths).
 //! - An otherwise valid article whose filename carries legacy
 //!   Latin-1/CP1252 bytes (or other invalid-UTF-8 byte sequences) decodes
@@ -26,8 +26,8 @@
 //! controls, which additionally mutate exactly the field named by the
 //! test), so header/ypart/trailer sizes and CRCs stay self-consistent.
 
-use nntune_core::yenc::{decode_to, encode_segment, SegmentParams};
-use nntune_core::Error;
+use velmora::yenc::{decode_to, encode_segment, SegmentParams};
+use velmora::Error;
 
 fn single(payload: &[u8]) -> Vec<u8> {
     let mut article = Vec::new();

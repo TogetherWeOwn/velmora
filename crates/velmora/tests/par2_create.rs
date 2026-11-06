@@ -8,12 +8,12 @@
 //! the bottom runs only when a `par2` binary is available (CI installs one;
 //! local runs without it skip with a note).
 
-use nntune_core::par2::creator::{
+use velmora::par2::creator::{
     create_single_file, data_slice_count, recover_slices, recovery_slice_count,
     slice_size_for_article_payload, CreatedSet, Par2Creator,
 };
-use nntune_core::par2::gf16;
-use nntune_core::par2::RecoverySet;
+use velmora::par2::gf16;
+use velmora::par2::RecoverySet;
 
 const FILENAME: &[u8] = b"par2-create-test.bin";
 const SLICE: u64 = 1024;
@@ -495,12 +495,9 @@ fn interop_repair_with_reference_binary_when_available() {
     let parsed = RecoverySet::parse(&set.bytes()).unwrap();
     assert!(parsed.verify(name, &staged).is_err());
 
-    let report = nntune_core::par2::repair::repair_with_binary(
-        &par2_bin,
-        &scratch,
-        &[Path::new("set.par2")],
-    )
-    .expect("repair path runs");
+    let report =
+        velmora::par2::repair::repair_with_binary(&par2_bin, &scratch, &[Path::new("set.par2")])
+            .expect("repair path runs");
     assert!(report.success, "reference repair failed: {report:?}");
     let repaired = fs::read(scratch.join("par2-create-test.bin")).unwrap();
     assert_eq!(repaired, data, "reference binary did not restore our bytes");

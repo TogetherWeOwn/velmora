@@ -22,9 +22,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::error::Error;
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 const GREETING: &str = "200 news.example.com ready\r\n";
 const SYNTHETIC_PASSWORD: &str = "synthetic-fixture-password";

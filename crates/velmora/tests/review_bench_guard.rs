@@ -8,14 +8,14 @@
 //! last slice) in the same run, and fails when the verify/reference time
 //! ratio regresses more than 20% past the pinned baseline below.
 //!
-//! Re-pinning: run `cargo test -p nntune-core bench_guard -- --nocapture`,
+//! Re-pinning: run `cargo test -p velmora bench_guard -- --nocapture`,
 //! read the printed ratio on the reference machine, and set
 //! `BASELINE_RATIO` to it. Only re-pin after an intentional algorithmic
 //! change, never to make a red run green.
 
 use std::time::{Duration, Instant};
 
-use nntune_core::par2::RecoverySet;
+use velmora::par2::RecoverySet;
 
 const BLOCK_SIZE: u64 = 32 << 10;
 const FILE_LEN: usize = 2 << 20;

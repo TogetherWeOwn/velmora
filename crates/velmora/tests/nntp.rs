@@ -4,9 +4,9 @@
 use std::collections::VecDeque;
 use std::io;
 
-use nntune_core::error::Error;
-use nntune_core::nntp::{NntpClient, NntpConfig};
-use nntune_core::transport::Transport;
+use velmora::error::Error;
+use velmora::nntp::{NntpClient, NntpConfig};
+use velmora::transport::Transport;
 
 /// Scripted transport: reads come from `to_client`, writes are asserted
 /// against `expect_writes` in order.
@@ -341,7 +341,7 @@ async fn native_transport_against_loopback_server() {
         port,
         ..config_auth_user_only()
     };
-    let transport = nntune_core::transports::connect_native(&cfg)
+    let transport = velmora::transports::connect_native(&cfg)
         .await
         .expect("connect");
     let mut client = NntpClient::connect(transport, &cfg)

@@ -4,7 +4,7 @@
 #[path = "review_support/nntp.rs"]
 mod support;
 
-use nntune_core::nntp::{NntpClient, NntpConfig};
+use velmora::nntp::{NntpClient, NntpConfig};
 
 #[derive(Clone, Copy, Debug)]
 enum Method {
@@ -17,7 +17,7 @@ async fn read(
     method: Method,
     client: &mut NntpClient<support::Script>,
     out: &mut Vec<u8>,
-) -> nntune_core::error::Result<()> {
+) -> velmora::error::Result<()> {
     match method {
         Method::Article => client.article_to("a@x", out).await,
         Method::Body => client.body_to("a@x", out).await,

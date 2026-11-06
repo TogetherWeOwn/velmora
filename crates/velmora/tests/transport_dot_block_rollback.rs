@@ -14,7 +14,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use nntune_core::transport::{BufferedTransport, Transport};
+use velmora::transport::{BufferedTransport, Transport};
 
 const UNUSABLE_MESSAGE: &str = "NNTP connection is unusable; reconnect before retrying";
 

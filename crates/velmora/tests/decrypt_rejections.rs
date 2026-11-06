@@ -12,9 +12,9 @@
 
 use std::io;
 
-use nntune_core::decrypt::rclone::{seal_block, CIPHER_OVERHEAD};
-use nntune_core::decrypt::{aes_cbc, rclone, ReadAt};
-use nntune_core::Error;
+use velmora::decrypt::rclone::{seal_block, CIPHER_OVERHEAD};
+use velmora::decrypt::{aes_cbc, rclone, ReadAt};
+use velmora::Error;
 
 /// Source that always lies: fills what it can, then reports one byte more
 /// than requested. `read_exact_at` must reject this with `InvalidData`

@@ -17,7 +17,7 @@
 //! Builder must preserve this acceptance file and add production parser docs
 //! alongside the implementation; these tests intentionally precede that work.
 
-use nntune_core::nzb::{parse, Document, Limits, Parser};
+use velmora::nzb::{parse, Document, Limits, Parser};
 
 fn document(subject: &str) -> String {
     let escaped = subject

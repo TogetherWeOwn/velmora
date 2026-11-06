@@ -2,12 +2,12 @@
 //! gate: the `review_bench_guard` test fails on a >20% regression past its
 //! pinned baseline.
 //!
-//! Native runs: `cargo bench -p nntune-core --bench par2_nzb`.
+//! Native runs: `cargo bench -p velmora --bench par2_nzb`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use nntune_core::nzb::Parser;
-use nntune_core::par2::RecoverySet;
 use std::hint::black_box;
+use velmora::nzb::Parser;
+use velmora::par2::RecoverySet;
 
 const BLOCK_SIZE: u64 = 32 << 10;
 const FILE_LEN: usize = 1 << 20;

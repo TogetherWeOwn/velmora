@@ -5,11 +5,11 @@
 //! until unhidden, and two instances hold fully independent spools.
 //! Synthetic content only; no checked-in NZBs.
 
-use nntune_test_nntp::{ServerConfig, TestNntpServer};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use velmora_test_nntp::{ServerConfig, TestNntpServer};
 
 /// Fail fast instead of hanging to the CI job timeout when the server stops
 /// replying with the socket still open.

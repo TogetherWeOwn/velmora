@@ -2,7 +2,7 @@
 //! repair Container: one canonical prefix shape, safe file names, and
 //! content keys derived from file names (never from caller input alone).
 
-use nntune_core::par2::scratch::{
+use velmora::par2::scratch::{
     object_key_for_file_name, scratch_prefix, validate_file_name, validate_object_key,
     validate_scratch_prefix, validate_staging_id,
 };

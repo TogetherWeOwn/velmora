@@ -11,7 +11,7 @@
 use std::error::Error as StdError;
 use std::io;
 
-use nntune_core::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
+use velmora::error::{Error, PROVIDER_AUTH_EXPIRED_CODE};
 
 /// Exhaustive match with no wildcard arm: adding a new `Error` variant breaks
 /// compilation here, forcing this file to pin the new variant's rendering.
