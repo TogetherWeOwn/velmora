@@ -12,8 +12,9 @@ use std::io;
 
 use sha2::{Digest, Sha256};
 use velmora::media::{
-    chunk_count, chunk_offset, ciphertext_size, Context, ConvergentKey, FileKey, Header, KeyMode,
-    Profile, ReadAt, Sealer, VerifiedHeader, CIPHER_CHUNK_SIZE, HEADER_SIZE, PLAIN_CHUNK_SIZE,
+    chunk_count, chunk_offset, ciphertext_size, ContentIdentity, Context, ConvergentKey, FileKey,
+    Header, KeyMode, Profile, ReadAt, Sealer, VerifiedHeader, CIPHER_CHUNK_SIZE, HEADER_SIZE,
+    PLAIN_CHUNK_SIZE,
 };
 use velmora::rng::FillRandom;
 use velmora::{Error, Result};
@@ -174,8 +175,10 @@ fn extension_is_rejected() {
         "appended chunk, grown P",
     );
 
-    // An empty final chunk when P > 0 (exact multiple): sealing refuses it,
-    // and a hand-built one is trailing data.
+    // An empty final chunk when P > 0 (exact multiple): sealing refuses it.
+    // A hand-built, AEAD-valid one needs the private STREAM layer, so the
+    // reader side is `empty_final_chunk_after_full_chunk_is_rejected` in
+    // src/media.rs.
     let profile = Profile::nntune();
     let mut s = Sealer::random(&profile, &obj.key, &mut Counter(9)).unwrap();
     s.seal_chunk(&vec![1; CHUNK], false).unwrap();
@@ -272,17 +275,15 @@ fn cross_file_splice_is_rejected() {
 
 fn all_modes(pt: &[u8]) -> Vec<(KeyMode, FileKey, Header, Vec<u8>)> {
     let profile = Profile::drive();
-    let d = digest(pt);
-    let p = pt.len() as u64;
     let random_key = FileKey::from_bytes([0x33; 32]);
     let r = Sealer::random(&profile, &random_key, &mut Counter(7)).unwrap();
     let rh = r.header();
     let rc = r.seal_to_vec(pt).unwrap();
-    let vk = ConvergentKey::vault(&[0x44; 32], "drive/media", p, &d).unwrap();
+    let vk = ConvergentKey::vault(&[0x44; 32], "drive/media", ContentIdentity::of(pt)).unwrap();
     let vs = Sealer::convergent(&profile, &vk).unwrap();
     let vh = vs.header();
     let vc = vs.seal_to_vec(pt).unwrap();
-    let pk = ConvergentKey::public(&[0x55; 64], "drive/media", p, &d).unwrap();
+    let pk = ConvergentKey::public(&[0x55; 64], "drive/media", ContentIdentity::of(pt)).unwrap();
     let ps = Sealer::convergent(&profile, &pk).unwrap();
     let ph = ps.header();
     let pc = ps.seal_to_vec(pt).unwrap();
@@ -336,7 +337,7 @@ fn wrong_key_ctx_mode_and_profile_fail_at_the_header() {
     }
     assert!(VerifiedHeader::verify_record(&nntune, 1, &obj.key, &obj.header).is_ok());
     // NNTune may not write convergent objects either.
-    let ck = ConvergentKey::vault(&[1; 32], "nntune/media", 0, &digest(&[])).unwrap();
+    let ck = ConvergentKey::vault(&[1; 32], "nntune/media", ContentIdentity::of(&[])).unwrap();
     assert!(Sealer::convergent(&nntune, &ck).is_err());
 }
 
@@ -393,15 +394,15 @@ fn every_byte_bit_flip_is_rejected() {
 fn convergent_modes_are_deterministic_and_scoped() {
     let profile = Profile::drive();
     let pt = plaintext(70_000, 12);
-    let d = digest(&pt);
-    let p = pt.len() as u64;
     let seal = |ck: &ConvergentKey| {
         Sealer::convergent(&profile, ck)
             .unwrap()
             .seal_to_vec(&pt)
             .unwrap()
     };
-    let vault = |key: [u8; 32]| ConvergentKey::vault(&key, "drive/media", p, &d).unwrap();
+    let vault = |key: [u8; 32]| {
+        ConvergentKey::vault(&key, "drive/media", ContentIdentity::of(&pt)).unwrap()
+    };
     assert_eq!(
         seal(&vault([1; 32])),
         seal(&vault([1; 32])),
@@ -412,13 +413,14 @@ fn convergent_modes_are_deterministic_and_scoped() {
         seal(&vault([2; 32])),
         "other vault never converges"
     );
-    let public = |o: [u8; 64]| ConvergentKey::public(&o, "drive/media", p, &d).unwrap();
+    let public =
+        |o: [u8; 64]| ConvergentKey::public(&o, "drive/media", ContentIdentity::of(&pt)).unwrap();
     assert_eq!(seal(&public([3; 64])), seal(&public([3; 64])));
     assert_ne!(seal(&public([3; 64])), seal(&vault([3; 32])));
 
     // Another ctx gives another K and another N.
     let other_profile = Profile::new("other/media", &[KeyMode::VaultConvergent]).unwrap();
-    let other = ConvergentKey::vault(&[1; 32], "other/media", p, &d).unwrap();
+    let other = ConvergentKey::vault(&[1; 32], "other/media", ContentIdentity::of(&pt)).unwrap();
     let other_ct = Sealer::convergent(&other_profile, &other)
         .unwrap()
         .seal_to_vec(&pt)
@@ -432,7 +434,7 @@ fn convergent_modes_are_deterministic_and_scoped() {
 fn convergent_non_derived_nonce_is_rejected() {
     let profile = Profile::drive();
     let pt = plaintext(500, 13);
-    let ck = ConvergentKey::vault(&[7; 32], "drive/media", 500, &digest(&pt)).unwrap();
+    let ck = ConvergentKey::vault(&[7; 32], "drive/media", ContentIdentity::of(&pt)).unwrap();
     let key = FileKey::from_bytes(*ck.file_key().expose_secret());
     // A Random-mode encoding under the convergent K: valid commitment for
     // mode Random, but presented as VaultConvergent its N is not derived.
@@ -449,12 +451,81 @@ fn convergent_non_derived_nonce_is_rejected() {
     VerifiedHeader::verify(&profile, KeyMode::VaultConvergent, &key, &good).unwrap();
 }
 
+/// Decision §2.4.3 (rev 3): a changed **non-final** chunk must be refused
+/// before it is sealed, so no chunk of the changed content is ever released
+/// under the canonical keystream.
+#[test]
+fn toctou_non_final_chunk_change_releases_nothing() {
+    let profile = Profile::drive();
+    let first = plaintext(3 * CHUNK + 10, 15);
+    let ck = ConvergentKey::vault(&[9; 32], "drive/media", ContentIdentity::of(&first)).unwrap();
+    let mut changed = first.clone();
+    changed[CHUNK + 5] ^= 1;
+    let mut s = Sealer::convergent(&profile, &ck).unwrap();
+    s.seal_chunk(&changed[..CHUNK], false).unwrap();
+    assert!(
+        s.seal_chunk(&changed[CHUNK..2 * CHUNK], false).is_err(),
+        "changed chunk 1 refused before sealing"
+    );
+    assert!(s.is_finished());
+    assert!(
+        s.seal_chunk(&changed[2 * CHUNK..3 * CHUNK], false).is_err(),
+        "nothing further released"
+    );
+    // Changed first chunk: refused at chunk 0.
+    let mut head = first.clone();
+    head[0] ^= 1;
+    let mut s = Sealer::convergent(&profile, &ck).unwrap();
+    assert!(s.seal_chunk(&head[..CHUNK], false).is_err());
+    // Whole-buffer sealing stops at the changed chunk too.
+    assert!(Sealer::convergent(&profile, &ck)
+        .unwrap()
+        .seal_to_vec(&changed)
+        .is_err());
+    // Chunks out of order, or the final flag at the wrong index, are refused
+    // even when each chunk's bytes are genuine.
+    let mut s = Sealer::convergent(&profile, &ck).unwrap();
+    assert!(s.seal_chunk(&first[CHUNK..2 * CHUNK], false).is_err());
+    let mut s = Sealer::convergent(&profile, &ck).unwrap();
+    s.seal_chunk(&first[..CHUNK], false).unwrap();
+    assert!(s.seal_chunk(&first[CHUNK..2 * CHUNK], true).is_err());
+}
+
+#[test]
+fn content_hasher_matches_one_shot_identity() {
+    for size in [0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK, 2 * CHUNK + 7] {
+        let pt = plaintext(size, 16);
+        let one_shot = ContentIdentity::of(&pt);
+        assert_eq!(one_shot.plaintext_len(), size as u64);
+        assert_eq!(one_shot.digest(), &digest(&pt));
+        // Odd piece sizes across chunk boundaries give the same identity,
+        // so the per-chunk list seals the same bytes.
+        let mut h = velmora::media::ContentHasher::new();
+        for piece in pt.chunks(4099) {
+            h.update(piece);
+        }
+        let streamed = h.finish();
+        assert_eq!(streamed.digest(), one_shot.digest());
+        let profile = Profile::drive();
+        let a = ConvergentKey::vault(&[2; 32], "drive/media", one_shot).unwrap();
+        let b = ConvergentKey::vault(&[2; 32], "drive/media", streamed).unwrap();
+        let ca = Sealer::convergent(&profile, &a)
+            .unwrap()
+            .seal_to_vec(&pt)
+            .unwrap();
+        let cb = Sealer::convergent(&profile, &b)
+            .unwrap()
+            .seal_to_vec(&pt)
+            .unwrap();
+        assert_eq!(ca, cb, "size {size}");
+    }
+}
+
 #[test]
 fn toctou_content_change_withholds_the_final_chunk() {
     let profile = Profile::drive();
     let first = plaintext(CHUNK + 10, 14);
-    let ck =
-        ConvergentKey::vault(&[9; 32], "drive/media", first.len() as u64, &digest(&first)).unwrap();
+    let ck = ConvergentKey::vault(&[9; 32], "drive/media", ContentIdentity::of(&first)).unwrap();
     // Same length, one byte changed between the hashing pass and sealing.
     let mut changed = first.clone();
     changed[CHUNK + 5] ^= 1;
@@ -485,7 +556,7 @@ fn toctou_content_change_withholds_the_final_chunk() {
 
 #[test]
 fn context_validation_and_k_helpers_reject_bad_ctx() {
-    let d = digest(b"x");
+    let d = ContentIdentity::of(b"x");
     for bad in [
         "",
         "nntune\0media",
@@ -498,15 +569,15 @@ fn context_validation_and_k_helpers_reject_bad_ctx() {
         assert!(Context::new(bad).is_err(), "{bad:?}");
         assert!(Profile::new(bad, &[KeyMode::Random]).is_err(), "{bad:?}");
         assert!(
-            ConvergentKey::vault(&[1; 32], bad, 1, &d).is_err(),
+            ConvergentKey::vault(&[1; 32], bad, d.clone()).is_err(),
             "vault {bad:?}"
         );
         assert!(
-            ConvergentKey::public(&[1; 64], bad, 1, &d).is_err(),
+            ConvergentKey::public(&[1; 64], bad, d.clone()).is_err(),
             "public {bad:?}"
         );
         assert!(
-            velmora::media::public_oprf_input(bad, 1, &d).is_err(),
+            velmora::media::public_oprf_input(bad, &d).is_err(),
             "oprf {bad:?}"
         );
     }

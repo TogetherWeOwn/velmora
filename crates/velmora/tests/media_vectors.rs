@@ -18,8 +18,8 @@
 
 use sha2::{Digest, Sha256};
 use velmora::media::{
-    public_oprf_input, ConvergentKey, FileKey, Header, KeyMode, Profile, Sealer, VerifiedHeader,
-    PLAIN_CHUNK_SIZE,
+    public_oprf_input, ContentIdentity, ConvergentKey, FileKey, Header, KeyMode, Profile, Sealer,
+    VerifiedHeader, PLAIN_CHUNK_SIZE,
 };
 use velmora::rng::FillRandom;
 use velmora::Result;
@@ -57,7 +57,9 @@ fn plaintext(size: usize) -> Vec<u8> {
 }
 
 fn records() -> Vec<Vec<(String, String)>> {
-    let text = include_str!("../testdata/media-v1/vectors.txt");
+    // `.gitattributes` keeps testdata byte-exact; normalise anyway so a
+    // CRLF checkout cannot turn every record into one block.
+    let text = include_str!("../testdata/media-v1/vectors.txt").replace("\r\n", "\n");
     text.split("\n\n")
         .map(|block| {
             block
@@ -91,6 +93,9 @@ fn independent_vectors_match_byte_for_byte() {
         let pt = plaintext(size as usize);
         let digest: [u8; 32] = Sha256::digest(&pt).into();
         assert_eq!(digest, arr::<32>(get("d")), "{label}: D");
+        let content = ContentIdentity::of(&pt);
+        assert_eq!(content.plaintext_len(), size, "{label}: P");
+        assert_eq!(content.digest(), &digest, "{label}: identity D");
         let profile = Profile::new(ctx, ALL_MODES).unwrap();
 
         let (key_bytes, sealer) = match mode {
@@ -100,8 +105,7 @@ fn independent_vectors_match_byte_for_byte() {
                 (*key.expose_secret(), sealer)
             }
             KeyMode::VaultConvergent => {
-                let ck = ConvergentKey::vault(&arr(get("vault_dedupe_key")), ctx, size, &digest)
-                    .unwrap();
+                let ck = ConvergentKey::vault(&arr(get("vault_dedupe_key")), ctx, content).unwrap();
                 (
                     *ck.file_key().expose_secret(),
                     Sealer::convergent(&profile, &ck).unwrap(),
@@ -109,12 +113,11 @@ fn independent_vectors_match_byte_for_byte() {
             }
             KeyMode::PublicConvergent => {
                 assert_eq!(
-                    public_oprf_input(ctx, size, &digest).unwrap(),
+                    public_oprf_input(ctx, &content).unwrap().as_slice(),
                     hex(get("oprf_input")),
                     "{label}: OPRF input"
                 );
-                let ck =
-                    ConvergentKey::public(&arr(get("oprf_output")), ctx, size, &digest).unwrap();
+                let ck = ConvergentKey::public(&arr(get("oprf_output")), ctx, content).unwrap();
                 (
                     *ck.file_key().expose_secret(),
                     Sealer::convergent(&profile, &ck).unwrap(),

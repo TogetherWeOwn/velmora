@@ -62,9 +62,14 @@ key, mode, ctx or version fails with one generic error and no AEAD call.
 | `VaultConvergent` (2) | `HMAC-SHA256(vault_dedupe_key, "velmora.media.v1/vault-K" ‖ 0 ‖ ctx ‖ 0 ‖ BE64(P) ‖ SHA-256(content))` (`ConvergentKey::vault`) | derived from `(K, mode, ctx)` | Drive private files (default) |
 | `PublicConvergent` (3) | `HKDF(OPRF output, "velmora.media.v1/public-K")` over `public_oprf_input` (`ConvergentKey::public`) | derived | Drive public share links only |
 
-The convergent `Sealer` re-hashes the plaintext while sealing and withholds
-the final chunk unless it matches the `(P, D)` the key came from (TOCTOU
-gate). The OPRF, `vault_dedupe_key` custody and the dedupe service rules
+Convergent keys take a `ContentIdentity` from the first hashing pass
+(`ContentHasher`): `P`, `D` and the SHA-256 of every 64 KiB chunk. The
+convergent `Sealer` checks each chunk against its entry *before* sealing it
+and checks `(P, D)` again at the final chunk, so content that changed
+between the passes never releases a chunk under the canonical keystream
+(per-chunk TOCTOU gate); on failure the caller aborts the upload. Products
+use `Profile::nntune()` and `Profile::drive()`, never a hand-built
+`Profile`. The OPRF, `vault_dedupe_key` custody and the dedupe service rules
 (always upload full ciphertext, no existence signal, server-computed dedupe
 ID) belong to the Drive crypto design, not this crate.
 

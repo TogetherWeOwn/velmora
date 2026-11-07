@@ -1,0 +1,2 @@
+# Test vectors are byte-exact fixtures: never convert line endings.
+crates/velmora/testdata/** -text

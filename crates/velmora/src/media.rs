@@ -28,11 +28,12 @@
 //! place that compares the commitment and derives the payload key.
 //!
 //! ```compile_fail
-//! // A reader cannot be built from a raw key or an unverified header.
-//! use velmora::media::{ChunkReader, FileKey, Header};
-//! let key = FileKey::from_bytes([0u8; 32]);
-//! let header = Header::from_bytes(&[0u8; 48]);
-//! let reader = ChunkReader { key, header, plaintext_size: 0 };
+//! // A reader cannot be built around a header by hand: its fields are
+//! // private (E0451), so `VerifiedHeader::reader` is the only constructor.
+//! use velmora::media::{ChunkReader, VerifiedHeader};
+//! fn forge(verified: &VerifiedHeader) -> ChunkReader<'_> {
+//!     ChunkReader { verified, plaintext_size: 0 }
+//! }
 //! ```
 //!
 //! Key modes (all fixed in v1 so no later format change is needed):
@@ -175,6 +176,10 @@ pub const DRIVE_CTX: &str = "drive/media";
 
 impl Profile {
     /// A profile over `ctx` allowing exactly `modes` (must be non-empty).
+    ///
+    /// For tests and future products only: NNTune must use
+    /// [`Profile::nntune`] and Drive [`Profile::drive`], which pin the
+    /// decided ctx and mode allow-lists.
     pub fn new(ctx: &str, modes: &'static [KeyMode]) -> Result<Self> {
         if modes.is_empty() {
             return Err(media_error("profile must allow at least one key mode"));
@@ -306,15 +311,15 @@ fn mode_info(label: &[u8], mode: KeyMode, ctx: &Context) -> Vec<u8> {
 }
 
 /// `label ‖ 0x00 ‖ ctx ‖ 0x00 ‖ BE64(P) ‖ D`: the convergent-K input.
-fn content_info(label: &[u8], ctx: &Context, plaintext_len: u64, digest: &[u8; 32]) -> Vec<u8> {
+fn content_info(label: &[u8], ctx: &Context, content: &ContentIdentity) -> Zeroizing<Vec<u8>> {
     let mut info = Vec::with_capacity(label.len() + ctx.0.len() + 2 + 8 + 32);
     info.extend_from_slice(label);
     info.push(0x00);
     info.extend_from_slice(ctx.0.as_bytes());
     info.push(0x00);
-    info.extend_from_slice(&plaintext_len.to_be_bytes());
-    info.extend_from_slice(digest);
-    info
+    info.extend_from_slice(&content.plaintext_len.to_be_bytes());
+    info.extend_from_slice(&content.digest[..]);
+    Zeroizing::new(info)
 }
 
 fn hkdf_expand(hk: &Hkdf<Sha256>, info: &[u8], out: &mut [u8]) {
@@ -384,16 +389,18 @@ fn chunk_nonce(index: u64, last: bool) -> Nonce {
 }
 
 impl Stream {
-    /// Seals one chunk: returns `ct ‖ tag`.
+    /// Seals one chunk: returns `ct ‖ tag`. The buffer holds plaintext
+    /// until encryption runs, so it is wiped if sealing fails.
     fn seal(&self, index: u64, last: bool, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(plaintext.len() + TAG_SIZE as usize);
+        let mut out = Zeroizing::new(Vec::with_capacity(plaintext.len() + TAG_SIZE as usize));
         out.extend_from_slice(plaintext);
         let tag = self
             .aead
             .encrypt_inout_detached(&chunk_nonce(index, last), b"", out.as_mut_slice().into())
             .map_err(|_| media_error("chunk seal failed"))?;
         out.extend_from_slice(tag.as_slice());
-        Ok(out)
+        // Ciphertext from here on: hand it out without the wipe.
+        Ok(std::mem::take(&mut *out))
     }
 
     /// Opens `ct ‖ tag` in place; on success the first `len - 16` bytes are
@@ -465,59 +472,156 @@ fn chunk_plain_len(plaintext_size: u64, index: u64) -> Option<u64> {
 // Convergent keys
 // ---------------------------------------------------------------------------
 
-/// A convergent-mode file key plus the content identity it was derived
-/// from. The [`Sealer`] re-hashes the plaintext while encrypting and
-/// refuses to emit the final chunk unless it matches (two-pass TOCTOU gate,
-/// decision §2.4.3).
+/// Pass-1 content identity for the convergent modes: the plaintext length
+/// `P`, its SHA-256 `D`, and the SHA-256 of every 64 KiB STREAM chunk,
+/// all computed in the same hashing pass (so the chunk list is bound to
+/// `D`). Built only by [`ContentHasher`] (or [`ContentIdentity::of`]).
+///
+/// The [`Sealer`] checks each chunk against its entry here *before*
+/// sealing it (decision §2.4.3, per-chunk TOCTOU gate), so content that
+/// changed after this pass never releases a single chunk under the
+/// canonical keystream.
+#[derive(Clone)]
+pub struct ContentIdentity {
+    plaintext_len: u64,
+    digest: Zeroizing<[u8; 32]>,
+    chunk_digests: Zeroizing<Vec<[u8; 32]>>,
+}
+
+impl ContentIdentity {
+    /// Hashes a whole in-memory plaintext.
+    pub fn of(plaintext: &[u8]) -> Self {
+        let mut hasher = ContentHasher::new();
+        hasher.update(plaintext);
+        hasher.finish()
+    }
+
+    /// `P`, the plaintext length.
+    pub fn plaintext_len(&self) -> u64 {
+        self.plaintext_len
+    }
+
+    /// `D`, the SHA-256 of the complete plaintext.
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl std::fmt::Debug for ContentIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `D` of private content is a confirmation oracle: never rendered.
+        f.debug_struct("ContentIdentity")
+            .field("plaintext_len", &self.plaintext_len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Streaming first pass that builds a [`ContentIdentity`]. Feed the
+/// plaintext in order, in pieces of any size.
+pub struct ContentHasher {
+    whole: Sha256,
+    chunk: Sha256,
+    in_chunk: u64,
+    plaintext_len: u64,
+    chunk_digests: Zeroizing<Vec<[u8; 32]>>,
+}
+
+impl Default for ContentHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContentHasher {
+    /// An empty hashing pass.
+    pub fn new() -> Self {
+        ContentHasher {
+            whole: Sha256::new(),
+            chunk: Sha256::new(),
+            in_chunk: 0,
+            plaintext_len: 0,
+            chunk_digests: Zeroizing::new(Vec::new()),
+        }
+    }
+
+    /// Hashes the next plaintext bytes.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.whole.update(data);
+        self.plaintext_len = self.plaintext_len.saturating_add(data.len() as u64);
+        while !data.is_empty() {
+            // `in_chunk < PLAIN_CHUNK_SIZE` here, so the room fits in usize.
+            let room = (PLAIN_CHUNK_SIZE - self.in_chunk) as usize;
+            let take = room.min(data.len());
+            self.chunk.update(&data[..take]);
+            self.in_chunk += take as u64;
+            data = &data[take..];
+            if self.in_chunk == PLAIN_CHUNK_SIZE {
+                self.chunk_digests
+                    .push(std::mem::take(&mut self.chunk).finalize().into());
+                self.in_chunk = 0;
+            }
+        }
+    }
+
+    /// Ends the pass. The chunk list has exactly `L = max(1, ceil(P / 64 KiB))`
+    /// entries: a full final chunk adds no empty one, and `P = 0` has the
+    /// one empty chunk.
+    pub fn finish(mut self) -> ContentIdentity {
+        if self.in_chunk > 0 || self.chunk_digests.is_empty() {
+            self.chunk_digests
+                .push(std::mem::take(&mut self.chunk).finalize().into());
+        }
+        ContentIdentity {
+            plaintext_len: self.plaintext_len,
+            digest: Zeroizing::new(std::mem::take(&mut self.whole).finalize().into()),
+            chunk_digests: std::mem::take(&mut self.chunk_digests),
+        }
+    }
+}
+
+/// A convergent-mode file key plus the [`ContentIdentity`] it was derived
+/// from. The [`Sealer`] checks every chunk against that identity before
+/// sealing it (two-pass TOCTOU gate, decision §2.4.3).
 pub struct ConvergentKey {
     key: FileKey,
     mode: KeyMode,
     ctx: Context,
-    plaintext_len: u64,
-    content_digest: [u8; 32],
+    content: ContentIdentity,
 }
 
 impl ConvergentKey {
     /// VaultConvergent `K = HMAC-SHA256(vault_dedupe_key, "velmora.media.v1/vault-K" ‖ 0 ‖ ctx ‖ 0 ‖ BE64(P) ‖ D)`.
     ///
     /// `vault_dedupe_key` is client-only and never leaves the vault's
-    /// clients. `content_sha256` is `D = SHA-256` of the complete, exact
-    /// plaintext, and `plaintext_len` its length `P`.
+    /// clients. `content` is the first hashing pass over the complete,
+    /// exact plaintext (`P` and `D`).
     pub fn vault(
         vault_dedupe_key: &[u8; KEY_SIZE],
         ctx: &str,
-        plaintext_len: u64,
-        content_sha256: &[u8; 32],
+        content: ContentIdentity,
     ) -> Result<Self> {
         let ctx = Context::new(ctx)?;
         let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(vault_dedupe_key)
             .map_err(|_| media_error("vault dedupe key"))?;
-        mac.update(&content_info(
-            VAULT_K_LABEL,
-            &ctx,
-            plaintext_len,
-            content_sha256,
-        ));
-        let mut key = [0u8; KEY_SIZE];
-        key.copy_from_slice(&mac.finalize().into_bytes());
+        mac.update(&content_info(VAULT_K_LABEL, &ctx, &content));
+        let mut key = Zeroizing::new([0u8; KEY_SIZE]);
+        hmac::digest::FixedOutput::finalize_into(mac, (&mut *key).into());
         Ok(ConvergentKey {
-            key: FileKey(Zeroizing::new(key)),
+            key: FileKey(key),
             mode: KeyMode::VaultConvergent,
             ctx,
-            plaintext_len,
-            content_digest: *content_sha256,
+            content,
         })
     }
 
     /// PublicConvergent `K = HKDF(ikm = O, salt = "", info = "velmora.media.v1/public-K", L = 32)`,
     /// where `O` is the RFC 9497 ristretto255-SHA512 OPRF output over
-    /// [`public_oprf_input`]`(ctx, P, D)`. The OPRF itself lives in the
+    /// [`public_oprf_input`]`(ctx, content)`. The OPRF itself lives in the
     /// Drive crypto design, not here.
     pub fn public(
         oprf_output: &[u8; OPRF_OUTPUT_SIZE],
         ctx: &str,
-        plaintext_len: u64,
-        content_sha256: &[u8; 32],
+        content: ContentIdentity,
     ) -> Result<Self> {
         let ctx = Context::new(ctx)?;
         let hk = Hkdf::<Sha256>::new(None, oprf_output);
@@ -527,9 +631,13 @@ impl ConvergentKey {
             key: FileKey(key),
             mode: KeyMode::PublicConvergent,
             ctx,
-            plaintext_len,
-            content_digest: *content_sha256,
+            content,
         })
+    }
+
+    /// The content identity `(P, D)` this key was derived from.
+    pub fn content(&self) -> &ContentIdentity {
+        &self.content
     }
 
     /// The file key `K` (to wrap for the vault, or to put in a link fragment).
@@ -545,29 +653,46 @@ impl ConvergentKey {
 
 /// OPRF input for PublicConvergent:
 /// `"velmora.media.v1/public-K" ‖ 0 ‖ ctx ‖ 0 ‖ BE64(P) ‖ D`.
-pub fn public_oprf_input(
-    ctx: &str,
-    plaintext_len: u64,
-    content_sha256: &[u8; 32],
-) -> Result<Vec<u8>> {
+pub fn public_oprf_input(ctx: &str, content: &ContentIdentity) -> Result<Zeroizing<Vec<u8>>> {
     let ctx = Context::new(ctx)?;
-    Ok(content_info(
-        PUBLIC_K_LABEL,
-        &ctx,
-        plaintext_len,
-        content_sha256,
-    ))
+    Ok(content_info(PUBLIC_K_LABEL, &ctx, content))
 }
 
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
+/// Per-chunk TOCTOU gate (decision §2.4.3): chunk `i` is sealed only if
+/// its SHA-256 equals pass-1 entry `i`; the final chunk additionally needs
+/// the running `(P, D)` to match.
 struct ContentGate {
-    expected_digest: [u8; 32],
-    expected_len: u64,
+    expected: ContentIdentity,
     hasher: Sha256,
     seen: u64,
+}
+
+impl ContentGate {
+    /// True when chunk `index` (with this `last` flag) is exactly the
+    /// pass-1 content. Runs before the chunk is sealed.
+    fn admits(&mut self, index: u64, last: bool, plaintext: &[u8]) -> bool {
+        let chunks = &self.expected.chunk_digests;
+        let Some(expected) = usize::try_from(index).ok().and_then(|i| chunks.get(i)) else {
+            return false;
+        };
+        let final_index = index + 1 == chunks.len() as u64;
+        let chunk_digest: [u8; 32] = Sha256::digest(plaintext).into();
+        if last != final_index || !bool::from(chunk_digest[..].ct_eq(&expected[..])) {
+            return false;
+        }
+        self.hasher.update(plaintext);
+        self.seen = self.seen.saturating_add(plaintext.len() as u64);
+        if !last {
+            return true;
+        }
+        let digest: [u8; 32] = std::mem::take(&mut self.hasher).finalize().into();
+        self.seen == self.expected.plaintext_len
+            && bool::from(digest[..].ct_eq(&self.expected.digest[..]))
+    }
 }
 
 /// Streaming writer. Emits the header, then one sealed chunk per call in
@@ -601,8 +726,7 @@ impl Sealer {
         }
         let nonce = convergent_nonce(&key.key, key.mode, &profile.ctx);
         let gate = ContentGate {
-            expected_digest: key.content_digest,
-            expected_len: key.plaintext_len,
+            expected: key.content.clone(),
             hasher: Sha256::new(),
             seen: 0,
         };
@@ -653,9 +777,11 @@ impl Sealer {
     }
 
     /// Seals the next chunk. `last` marks the final chunk. For convergent
-    /// keys the final chunk is only returned if the bytes sealed match the
-    /// `(P, D)` the key was derived from; otherwise the writer fails and the
-    /// object has no valid final chunk, so it can never verify.
+    /// keys every chunk is checked against the key's [`ContentIdentity`]
+    /// *before* it is sealed (and the final one against `(P, D)` too). On a
+    /// mismatch the writer fails, nothing further is released, and the
+    /// caller must abort the upload: the object has no valid final chunk,
+    /// so it can never verify.
     pub fn seal_chunk(&mut self, plaintext: &[u8], last: bool) -> Result<Vec<u8>> {
         if self.finished {
             return Err(media_error("writer already finished"));
@@ -671,20 +797,9 @@ impl Sealer {
             return Err(media_error("chunk plaintext length violates the format"));
         }
         if let Some(gate) = self.gate.as_mut() {
-            gate.hasher.update(plaintext);
-            gate.seen = gate.seen.saturating_add(len);
-            if gate.seen > gate.expected_len {
+            if !gate.admits(self.next, last, plaintext) {
                 self.finished = true;
                 return Err(media_error("content changed since the key was derived"));
-            }
-            if last {
-                let digest: [u8; 32] = std::mem::take(&mut gate.hasher).finalize().into();
-                let same = gate.seen == gate.expected_len
-                    && bool::from(digest[..].ct_eq(&gate.expected_digest[..]));
-                if !same {
-                    self.finished = true;
-                    return Err(media_error("content changed since the key was derived"));
-                }
             }
         }
         let index = self.next;
@@ -943,7 +1058,7 @@ impl ChunkReader<'_> {
         let range_end = off + keep as u64;
         let first = off / PLAIN_CHUNK_SIZE;
         let last = (range_end - 1) / PLAIN_CHUNK_SIZE;
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         let mut written = 0usize;
         for index in first..=last {
             let plain_len = self.open_chunk(src, index, &mut buf)?;
@@ -966,7 +1081,7 @@ impl ChunkReader<'_> {
         read_exact_at(src, &mut wire, 0).map_err(Error::Io)?;
         self.check_wire_header(&wire)?;
         let mut hasher = Sha256::new();
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::new(Vec::new());
         for index in 0..chunk_count(self.plaintext_size) {
             let n = self.open_chunk(src, index, &mut buf)?;
             hasher.update(&buf[..n]);
@@ -1130,6 +1245,40 @@ mod tests {
             chunk[..10].iter().all(|&b| b == 0),
             "unverified plaintext is wiped"
         );
+    }
+
+    /// age forbids an empty final chunk after data. With `P` an exact
+    /// multiple of 64 KiB the full chunk is final, so an AEAD-valid empty
+    /// chunk appended after it is trailing data, and a full chunk sealed
+    /// non-final plus an empty final one does not open at all.
+    #[test]
+    fn empty_final_chunk_after_full_chunk_is_rejected() {
+        let profile = Profile::nntune();
+        let key = FileKey::from_bytes([5; 32]);
+        let sealer = Sealer::random(&profile, &key, &mut Fixed(6)).unwrap();
+        let header = sealer.header();
+        let pt = vec![0x42u8; PLAIN_CHUNK_SIZE as usize];
+        let object = sealer.seal_to_vec(&pt).unwrap();
+        let verified = VerifiedHeader::verify(&profile, KeyMode::Random, &key, &header).unwrap();
+        let reader = verified.reader(PLAIN_CHUNK_SIZE).unwrap();
+        reader.verify_all(&object).unwrap();
+
+        let mut appended = object.clone();
+        appended.extend_from_slice(&verified.stream.seal(1, true, &[]).unwrap());
+        assert!(
+            reader.verify_all(&appended).is_err(),
+            "empty chunk after a full final chunk"
+        );
+
+        let mut split = header.to_bytes().to_vec();
+        split.extend_from_slice(&verified.stream.seal(0, false, &pt).unwrap());
+        split.extend_from_slice(&verified.stream.seal(1, true, &[]).unwrap());
+        assert!(
+            reader.verify_all(&split).is_err(),
+            "full chunk sealed non-final"
+        );
+        let mut dst = [0u8; 1];
+        assert!(reader.read_at(&split, &mut dst, 0).is_err());
     }
 
     /// Scripted byte source: returns `script` counts in order, recording calls.
