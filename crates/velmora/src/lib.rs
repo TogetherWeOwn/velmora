@@ -16,7 +16,9 @@
 //! - [`yenc`]: yEnc encode/decode with an explicit SIMD fast path (x86_64 SSE2,
 //!   wasm32 simd128) and scalar fallback, plus CRC32.
 //! - [`nzb`]: streaming NZB parser with hard resource bounds.
-//! - [`decrypt`]: AES-CBC and rclone-crypt ranged decryption.
+//! - [`media`]: `velmora.media.v1`, the media encryption format (age v1
+//!   STREAM payload, 48-byte committing header, three key modes): sealing,
+//!   commitment-gated ranged reads and full verification.
 //! - [`par2`]: PAR2 recovery-set parsing and verification, plus the creator
 //!   (GF(2^16) Reed-Solomon, one set per file at 10%). Repair is native-only
 //!   (it shells out to `par2cmdline-turbo` in a Container).
@@ -29,8 +31,8 @@
 //! [`transports`]); the native repair runner owns its subprocess deadline.
 
 pub mod article;
-pub mod decrypt;
 pub mod error;
+pub mod media;
 pub mod nntp;
 pub mod nzb;
 pub mod par2;
