@@ -412,17 +412,13 @@ fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
     } else {
         // Greedy word packing; words are split on spaces only, so commas
         // stay glued to their group token and folding lands after ", ".
-        // `split(' ')` yields one empty word per extra space, so every
+        // `split(' ')` keeps one empty word per extra space, so every
         // separator is explicit: `sep` records whether the next word is
-        // preceded by a space, and a fold always happens at a separator —
-        // the continuation's leading space replaces exactly that one.
+        // preceded by a space, and a fold always happens AT a separator —
+        // the continuation's leading space replaces exactly that one on
+        // unfolding, and the rest of a run stays literal.
         let words: Vec<&str> = value.split(' ').collect();
         let mut current = first_prefix.clone();
-        // Whether the next word is preceded by a separator space. `split`
-        // keeps one empty word per extra space, so every separator is
-        // explicit and a fold always happens AT a separator: the
-        // continuation's leading space replaces exactly that one space on
-        // unfolding, and the rest of a run stays literal.
         let mut sep = false;
         for &word in &words {
             if sep {
@@ -567,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn newsgroup_tokens_reject_commas_at_both_entry_points() {
+    fn newsgroup_tokens_reject_commas_at_all_entry_points() {
         // A comma inside one allow-list entry would render as two groups
         // (the renderer joins with ", ") — an unintended cross-post.
         let mut rng = ZeroRng;
@@ -598,25 +594,31 @@ mod tests {
 
     #[test]
     fn folding_round_trips_repeated_and_edge_spaces() {
+        fn assert_lines_fit(folded: &[u8]) {
+            for line in folded.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let content = line.strip_suffix(b"\r").unwrap_or(line);
+                assert!(content.len() <= 78, "overlong: {content:?}");
+            }
+        }
+
         // Regression: "a  b" must keep both spaces through a fold.
         let value = format!("a  b {}", "c ".repeat(40));
         let folded = fold_header("Subject", &value).unwrap();
         assert!(folded.windows(3).any(|w| w == b"\r\n "), "must fold");
         assert_eq!(unfold_value("Subject", &folded), value);
-        for line in folded.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let content = line.strip_suffix(b"\r").unwrap_or(line);
-            assert!(content.len() <= 78, "overlong: {content:?}");
-        }
-        // Leading, trailing and longer runs round-trip too.
+        assert_lines_fit(&folded);
+        // Leading, trailing and longer runs round-trip too, including a
+        // space run straddling the 78-column fold boundary.
         for value in [
             "  lead".to_string(),
             "trail  ".to_string(),
             format!("mid   run {}", "c ".repeat(40)),
             format!(" x{}", "c ".repeat(40)),
             format!("x {}", "c ".repeat(40)),
+            format!("a{}b", " ".repeat(70)),
         ] {
             let folded = fold_header("Subject", &value).unwrap();
             assert_eq!(
@@ -624,6 +626,7 @@ mod tests {
                 value,
                 "round trip {value:?}"
             );
+            assert_lines_fit(&folded);
         }
     }
 
