@@ -1,0 +1,18 @@
+[package]
+name = "velmora-test-nntp"
+version = "0.1.0"
+edition = "2021"
+description = "Synthetic NNTP test server + fixture corpus for velmora CI (no real Usenet in CI)"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+
+[lib]
+name = "velmora_test_nntp"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+velmora = { version = "0.1.0", path = "../velmora", default-features = false, features = ["native-tls"] }

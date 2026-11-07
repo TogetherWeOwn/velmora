@@ -1,0 +1,64 @@
+[package]
+name = "velmora"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Usenet data-plane engine: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+rust-version = "1.89"
+
+[features]
+default = ["native-tls"]
+native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"
+quick-xml = "0.42"
+sha2 = "0.11"
+md5 = "0.8"
+aes = "0.9"
+cbc = "0.2"
+# No default features: the default `getrandom` backend does not build for
+# wasm32-unknown-unknown, and this crate never generates keys/nonces.
+crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
+# Posting obfuscation mints randomness in this crate (`rng::SystemRng`).
+# The `js` feature is the wasm32-unknown-unknown backend (Workers posting
+# path); on native targets it selects the OS backend as usual.
+getrandom = { version = "0.2", features = ["js"] }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "1", optional = true }
+worker = { version = "0.8", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["io-util", "net", "time"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["io-util"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+criterion = "0.8"
+
+[[bench]]
+name = "yenc"
+harness = false
+
+[[bench]]
+name = "par2_nzb"
+harness = false
+
+[[bench]]
+name = "par2_create"
+harness = false
+
+[lib]
+name = "velmora"
+path = "src/lib.rs"

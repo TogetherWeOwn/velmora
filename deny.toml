@@ -1,0 +1,65 @@
+# cargo-deny policy for the velmora Rust workspace.
+#
+# Reviewed dependency/security gate, copied from nntunev2's deny.toml at
+# f7c9f6d (the extraction baseline): `cargo deny check` must pass for the
+# committed root Cargo.lock and is a required CI job wired fail-closed into
+# `ci-ok`. Findings are resolved by updating or replacing the dependency,
+# never by weakening this policy to get green.
+#
+# License inventory: every crate in the lock is a subset of the nntunev2
+# root lock reviewed there, all under permissive licenses. The only
+# copyleft text is an OR-option next to MIT (`r-efi`, used under MIT).
+# Notable single-license crates: `ring` (Apache-2.0 AND ISC),
+# `webpki-roots` (CDLA-Permissive-2.0). No git or non-crates.io sources.
+
+[graph]
+# The two targets CI ever builds: native tests/lints and the Worker
+# deploy target. Deps exclusive to any other target are out of scope.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "wasm32-unknown-unknown",
+]
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked dependency (e.g. inout 0.2.3, fixed by updating) must fail the
+# gate: silently building on yanked code is not acceptable.
+yanked = "deny"
+
+[licenses]
+# Dev-dependencies ship in no artifact but still enter the tree; check them
+# against the same allow list so a disallowed dev-only license fails loudly.
+include-dev = true
+# Fail-closed allow list: any license not named here rejects the build.
+# Copyleft licenses (GPL/AGPL/LGPL-any, SSPL, ...) are deliberately absent.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "BSL-1.0",
+  "Zlib",
+  "CC0-1.0",
+  "Unlicense",
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate versions are common in the workers-rs graph and upgrading them
+# in lockstep is follow-up work, so duplicates warn rather than fail.
+# New crates with wildcard requirements fail: every version bound must be
+# an explicit range.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Every dependency must come from crates.io. A new git or registry source
+# fails the gate until it is reviewed and added here deliberately.
+unknown-registry = "deny"
+unknown-git = "deny"
