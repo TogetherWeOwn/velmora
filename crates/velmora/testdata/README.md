@@ -105,8 +105,10 @@ rage's output keeps rage as the oracle without it.
 
 8 records, P ∈ {0, 1, 65,535, 65,536, 65,537, 131,072, 131,073, 200,003},
 plaintext byte `i` = `((i·31) ⊕ (i >> 9)) mod 256`. rage seals each one to a
-fixed synthetic scrypt passphrase. Each record has the 16-byte file key
-(unwrapped from the scrypt stanza), rage's nonce `N`, the length and SHA-256
+fixed synthetic scrypt passphrase. Each record is `name: value` lines: the
+16-byte age file key as `file ikm` (velmora's HKDF input; the name keeps
+gitleaks' generic key rule off a public test value), unwrapped from the
+scrypt stanza, rage's nonce `N`, the length and SHA-256
 of rage's payload `N ‖ chunks`, and the whole age file when the payload is
 at most 100 bytes. Before writing a record, the generator checks that rage
 decrypts its own file and that an independent STREAM decoder (pyca

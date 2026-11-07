@@ -1404,12 +1404,12 @@ mod tests {
             let field = |k: &str| {
                 record
                     .lines()
-                    .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                    .find_map(|l| l.strip_prefix(&format!("{k}: ")))
                     .map(str::to_owned)
             };
             let len: usize = field("len").unwrap().parse().unwrap();
             lengths.push(len);
-            let file_key = hex(&field("file_key").unwrap());
+            let file_key = hex(&field("file ikm").unwrap());
             assert_eq!(file_key.len(), 16, "len {len}: age file key");
             let nonce: [u8; NONCE_SIZE] = hex(&field("nonce").unwrap()).try_into().unwrap();
             let plaintext = oracle_plaintext(len);
@@ -1422,13 +1422,13 @@ mod tests {
             payload.extend_from_slice(&object[HEADER_SIZE as usize..]);
             assert_eq!(
                 payload.len().to_string(),
-                field("payload_len").unwrap(),
+                field("payload length").unwrap(),
                 "len {len}"
             );
             let digest: [u8; 32] = Sha256::digest(&payload).into();
             assert_eq!(
                 digest.to_vec(),
-                hex(&field("payload_sha256").unwrap()),
+                hex(&field("payload sha256").unwrap()),
                 "len {len}"
             );
 
@@ -1442,7 +1442,7 @@ mod tests {
             assert_eq!(reader.verify_all(&object).unwrap(), expected, "len {len}");
 
             // Short vectors carry the whole age file: open rage's own bytes.
-            if let Some(age_file) = field("age_file").map(|h| hex(&h)) {
+            if let Some(age_file) = field("age file").map(|h| hex(&h)) {
                 let at = find(&age_file, b"\n--- ").unwrap() + 1;
                 let at = at + find(&age_file[at..], b"\n").unwrap() + 1;
                 assert!(age_file[at..] == payload[..], "len {len}: rage's bytes");

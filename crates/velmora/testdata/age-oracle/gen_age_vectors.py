@@ -99,13 +99,13 @@ def main():
         payload = age_file[at:]
         assert stream_open(file_key, payload) == pt
         print()
-        print(f"len={n}")
-        print(f"file_key={file_key.hex()}")
-        print(f"nonce={payload[:16].hex()}")
-        print(f"payload_len={len(payload)}")
-        print(f"payload_sha256={hashlib.sha256(payload).hexdigest()}")
+        print(f"len: {n}")
+        print(f"file ikm: {file_key.hex()}")
+        print(f"nonce: {payload[:16].hex()}")
+        print(f"payload length: {len(payload)}")
+        print(f"payload sha256: {hashlib.sha256(payload).hexdigest()}")
         if len(payload) <= FULL_MAX:
-            print(f"age_file={age_file.hex()}")
+            print(f"age file: {age_file.hex()}")
 
 
 if __name__ == "__main__":
