@@ -110,10 +110,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust stable
+      # The locked Worker SDK 0.8.7 requires Rust 1.91. Check its feature graph
+      # at that minimum instead of raising the default/portable core MSRV.
+      - name: Install Rust 1.91 (Worker SDK minimum)
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
-          rustup default stable
+          rustup toolchain install 1.91 --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
+          rustup default 1.91
       - name: Install pinned Wasm C toolchain
         run: |
           sudo apt-get update
@@ -148,8 +150,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --locked -p velmora
       - run: cargo check --locked -p velmora --no-default-features
-      - run: cargo check --locked -p velmora --features worker-pinned-tls
       - run: cargo check --locked -p velmora-ssrf-guard
+      - name: Install Rust 1.91 (Worker SDK minimum)
+        run: |
+          rustup toolchain install 1.91 --profile minimal --no-self-update
+          rustup default 1.91
+      - run: cargo check --locked -p velmora --features worker-pinned-tls
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # the committed lockfile. Findings are fixed by updating the dependency,

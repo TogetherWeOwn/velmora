@@ -111,3 +111,11 @@ no-default-feature tests (including the 13 auth-guard tests), and reruns library
 tests with the qualification feature enabled. MSRV and dependency/security gates
 remain required. Exact-head run/job results and any unrun cases belong in the PR
 verification receipt; the commands configured here are not a claim they passed.
+
+The default native-TLS and no-default-feature core, plus the SSRF crate, keep
+Rust 1.89 compatibility. The already-locked Worker SDK 0.8.7 (including its
+macros/sys crates) requires Rust 1.91. Worker feature checks therefore use 1.91
+on native and in the fresh Wasm qualification job, without changing dependency
+versions or raising the core's declared MSRV. The initial Actions run exposed
+this feature-specific toolchain requirement; it is not a transport test failure
+or evidence of Worker runtime qualification.
