@@ -103,8 +103,12 @@ not permission to enable arbitrary hooks.
 
 GitHub Actions performs locked dependency fetch/build and all suite/gate runs.
 The Worker-pinned-TLS compile job uses a fresh runner with no restored Cargo
-build cache and no deployment credentials. It compiles both opt-in-only and
-all-features Wasm combinations, runs clippy, and checks the SSRF crate on Wasm.
+build cache and no deployment credentials. It compiles default-only, opt-in-only
+and all-features Wasm combinations, runs clippy, and checks the SSRF crate on Wasm.
+The default `native-tls` feature also activates the existing wasm-only ring
+dependency so its `wasm32_unknown_unknown_js` cfg is enabled independently of
+Worker features. ring 0.17.14's `SystemRandom` implementation requires that cfg;
+the existing getrandom/js dependency alone does not enable it.
 Native CI runs both preserved SSRF tests, all nine peer/TLS tests and the two
 existing native pre-dial refusal tests through the workspace suite, preserves
 no-default-feature tests (including the 13 auth-guard tests), and reruns library

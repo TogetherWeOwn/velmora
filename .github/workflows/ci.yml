@@ -125,6 +125,9 @@ jobs:
           wasm-ld-18 --version
       - run: cargo fetch --locked
       - run: cargo check --locked -p velmora-ssrf-guard --target wasm32-unknown-unknown
+      # Check default native-tls alone before Worker features can mask missing
+      # Wasm backend wiring through Cargo feature unification.
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls
       - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls -- -D warnings
       # Retain compatibility when consumers leave native-tls enabled on wasm.
