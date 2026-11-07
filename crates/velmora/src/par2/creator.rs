@@ -236,7 +236,7 @@ impl Par2Creator {
     /// (see [`slice_size_for_article_payload`]).
     pub fn new(filename: &[u8], total_len: u64, slice_size: u64) -> Result<Self> {
         check_filename(filename)?;
-        if slice_size == 0 || slice_size % 4 != 0 {
+        if slice_size == 0 || !slice_size.is_multiple_of(4) {
             return Err(malformed(format!(
                 "slice size {slice_size} is not a non-zero multiple of 4"
             )));
@@ -368,7 +368,7 @@ impl Par2Creator {
         for (word, pair) in self
             .slice_scratch
             .iter_mut()
-            .zip(self.slice_buf.chunks_exact(2))
+            .zip(self.slice_buf.as_chunks::<2>().0)
         {
             *word = u16::from_le_bytes([pair[0], pair[1]]);
         }
@@ -441,7 +441,12 @@ impl Par2Creator {
         packets.push(packet(&set_id, &ptype(b"IFSC\0\0\0\0"), &ifsc_body));
         let mut row_bytes = vec![0u8; self.slice_size];
         for (e, acc_row) in self.acc.chunks_exact(self.slice_words).enumerate() {
-            for (dst, word) in row_bytes.chunks_exact_mut(2).zip(acc_row.iter()) {
+            for (dst, word) in row_bytes
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(acc_row.iter())
+            {
                 dst.copy_from_slice(&word.to_le_bytes());
             }
             let mut body = Vec::with_capacity(4 + self.slice_size);
@@ -492,7 +497,7 @@ pub fn recover_slices(
     present: &[(u32, Vec<u8>)],
     recovery: &[(u16, Vec<u8>)],
 ) -> Result<Vec<(u32, Vec<u8>)>> {
-    if block_size == 0 || block_size % 2 != 0 {
+    if block_size == 0 || !block_size.is_multiple_of(2) {
         return Err(malformed("recovery needs a non-zero even block size"));
     }
     if data_count == 0 || data_count > MAX_DATA_SLICES as usize {
@@ -535,7 +540,7 @@ pub fn recover_slices(
     {
         let m = missing.len() as u64;
         let bytes = m.checked_mul(m).and_then(|cells| cells.checked_mul(6));
-        if bytes.map_or(true, |b| b > MAX_RECOVERY_SCRATCH_BYTES) {
+        if bytes.is_none_or(|b| b > MAX_RECOVERY_SCRATCH_BYTES) {
             return Err(malformed(format!(
                 "recovery of {} slices needs past the {MAX_RECOVERY_SCRATCH_BYTES}-byte scratch budget",
                 missing.len()
@@ -632,14 +637,16 @@ fn invert_matrix(a: &[Vec<u16>]) -> Option<Vec<Vec<u16>>> {
 
 fn bytes_to_words(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
 
 fn words_to_bytes(words: &[u16]) -> Vec<u8> {
     let mut out = vec![0u8; words.len() * 2];
-    for (dst, word) in out.chunks_exact_mut(2).zip(words.iter()) {
+    for (dst, word) in out.as_chunks_mut::<2>().0.iter_mut().zip(words.iter()) {
         dst.copy_from_slice(&word.to_le_bytes());
     }
     out
@@ -658,7 +665,7 @@ fn ptype(suffix: &[u8]) -> [u8; 16] {
 
 fn packet(set_id: &[u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut aligned = body.to_vec();
-    while aligned.len() % 4 != 0 {
+    while !aligned.len().is_multiple_of(4) {
         aligned.push(0);
     }
     let mut p = Vec::with_capacity(64 + aligned.len());

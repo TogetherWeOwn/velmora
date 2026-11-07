@@ -567,7 +567,7 @@ fn parse_main_body(
     if body.len() < MAIN_HEADER_SIZE {
         return Err(malformed("Main packet body too short"));
     }
-    if (body.len() - MAIN_HEADER_SIZE) % 16 != 0 {
+    if !(body.len() - MAIN_HEADER_SIZE).is_multiple_of(16) {
         return Err(malformed(
             "Main packet file ID list is not a whole number of 16-byte IDs",
         ));
@@ -607,7 +607,12 @@ fn parse_main_body(
     if *main_seen {
         return Ok(());
     }
-    for (index, chunk) in body[MAIN_HEADER_SIZE..].chunks_exact(16).enumerate() {
+    for (index, chunk) in body[MAIN_HEADER_SIZE..]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let mut id = [0u8; 16];
         id.copy_from_slice(chunk);
         if members.contains_key(&id) {
@@ -724,7 +729,7 @@ fn parse_ifsc_body(
     let mut file_id = [0u8; 16];
     file_id.copy_from_slice(&body[0..16]);
     let entries = &body[16..];
-    if entries.len() % IFSC_ENTRY_SIZE != 0 {
+    if !entries.len().is_multiple_of(IFSC_ENTRY_SIZE) {
         return Err(malformed(
             "IFSC packet body is not a whole number of slice checksums",
         ));
@@ -744,7 +749,9 @@ fn parse_ifsc_body(
     }
     digests.insert(file_id, digest);
     let crc32s = entries
-        .chunks_exact(IFSC_ENTRY_SIZE)
+        .as_chunks::<IFSC_ENTRY_SIZE>()
+        .0
+        .iter()
         .map(|e| u32::from_le_bytes(e[16..20].try_into().unwrap()))
         .collect();
     let file = set.files.entry(file_id).or_insert(RecoveryFile {
