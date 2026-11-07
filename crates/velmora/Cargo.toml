@@ -2,7 +2,7 @@
 name = "velmora"
 version = "0.1.0"
 edition = "2021"
-description = "Shared Usenet data-plane engine: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
+description = "Shared Usenet data-plane engine: NNTP client, yEnc, NZB, velmora.media.v1 encryption, par2 verify (native + wasm32)"
 license = "MIT"
 repository = "https://github.com/TogetherWeOwn/velmora"
 rust-version = "1.89"
@@ -19,11 +19,15 @@ crc32fast = "1"
 quick-xml = "0.42"
 sha2 = "0.11"
 md5 = "0.8"
-aes = "0.9"
-cbc = "0.2"
-# No default features: the default `getrandom` backend does not build for
-# wasm32-unknown-unknown, and this crate never generates keys/nonces.
-crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
+# velmora.media.v1 (format decision §1.6): stable releases only, matching
+# the sha2 0.11 / digest 0.11 generation. No getrandom: keys and nonces come
+# in through `rng::FillRandom`.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["zeroize"] }
+hkdf = "0.13"
+# `zeroize`: wipes the HKDF PRK and HMAC state on drop.
+hmac = { version = "0.13", features = ["zeroize"] }
+subtle = { version = "2", default-features = false }
+zeroize = "1"
 # Posting obfuscation mints randomness in this crate (`rng::SystemRng`).
 # The `js` feature is the wasm32-unknown-unknown backend (Workers posting
 # path); on native targets it selects the OS backend as usual.
@@ -46,6 +50,9 @@ tokio = { version = "1", features = ["io-util"], optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 criterion = "0.8"
+# Inflates the zlib-compressed C2SP CCTV age vectors (`cctv_age_stream_vectors`
+# in src/media.rs).
+miniz_oxide = "0.8"
 
 [[bench]]
 name = "yenc"

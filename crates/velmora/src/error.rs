@@ -50,8 +50,9 @@ pub enum Error {
     },
     /// An NZB/PAR2 resource bound from [`crate::nzb::Limits`] was exceeded.
     Bounds { bound: &'static str, limit: i64 },
-    /// Decryption/authentication failure (bad key, bad nonce, bad padding,
-    /// secretbox authentication failure, range outside the plaintext).
+    /// Encryption-format failure: header verification (wrong key, mode,
+    /// context or commitment), chunk authentication, writer contract, or a
+    /// range outside the plaintext. Messages never carry key material.
     Decrypt(String),
     /// PAR2 verification found damaged candidate bytes (verify-only path, no
     /// repair): wrong length, a whole-file MD5 mismatch, or a per-block CRC32

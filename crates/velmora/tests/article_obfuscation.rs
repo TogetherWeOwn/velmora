@@ -18,8 +18,8 @@ use velmora::article::{
     DATE_JITTER_SECS, MSGID_DOMAIN_LEFT_LEN, MSGID_DOMAIN_RIGHT_LEN, MSGID_LOCAL_LEN,
     OBFUSCATED_FROM_LOCAL_LEN, OBFUSCATED_SUBJECT_LEN, OBFUSCATED_YENC_NAME_LEN,
 };
-use velmora::decrypt::rclone::{CIPHER_BLOCK_SIZE, PLAIN_BLOCK_SIZE};
 use velmora::error::Error;
+use velmora::media::{CIPHER_CHUNK_SIZE, PLAIN_CHUNK_SIZE};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora::segment_identity::valid_segment_id;
 use velmora::yenc::{decode_to, encode_segment, SegmentParams};
@@ -73,11 +73,11 @@ const NOW: i64 = 1793707200; // Tue, 03 Nov 2026 12:00:00 UTC.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn payload_consts_match_rclone_block_layout() {
+fn payload_consts_match_media_chunk_layout() {
     assert_eq!(ARTICLE_CIPHER_BLOCKS, 11);
-    assert_eq!(ARTICLE_PAYLOAD_BYTES, 11 * CIPHER_BLOCK_SIZE);
+    assert_eq!(ARTICLE_PAYLOAD_BYTES, 11 * CIPHER_CHUNK_SIZE);
     assert_eq!(ARTICLE_PAYLOAD_BYTES, 721_072);
-    assert_eq!(ARTICLE_PLAINTEXT_BYTES, 11 * PLAIN_BLOCK_SIZE);
+    assert_eq!(ARTICLE_PLAINTEXT_BYTES, 11 * PLAIN_CHUNK_SIZE);
     assert_eq!(ARTICLE_PLAINTEXT_BYTES, 720_896);
 }
 
