@@ -285,7 +285,7 @@ fn body_lines_never_exceed_128_across_payloads() {
         cases.push(
             (0..len)
                 .map(|i| {
-                    if i % 3 == 0 {
+                    if i.is_multiple_of(3) {
                         ESCAPABLE_RAW[i % 4]
                     } else {
                         PLAIN_RAW
@@ -347,7 +347,7 @@ fn full_segment_bodies_never_exceed_128() {
     // single-part and multi-part segments.
     let payload: Vec<u8> = (0..1000u32)
         .map(|i| {
-            if i % 5 == 0 {
+            if i.is_multiple_of(5) {
                 ESCAPABLE_RAW[(i as usize) % 4]
             } else {
                 (i & 0xff) as u8

@@ -113,7 +113,7 @@ fn block_crcs(data: &[u8]) -> Vec<u32> {
 
 fn packet(set_id: &[u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut aligned = body.to_vec();
-    while aligned.len() % 4 != 0 {
+    while !aligned.len().is_multiple_of(4) {
         aligned.push(0);
     }
     let mut p = Vec::new();
@@ -163,7 +163,7 @@ fn recovery_set_bytes_with_bad_crc(data: &[u8], bad_crc_block: Option<usize>) ->
     fd_body.extend_from_slice(&first16k);
     fd_body.extend_from_slice(&(data.len() as u64).to_le_bytes());
     fd_body.extend_from_slice(FILENAME.as_bytes());
-    while fd_body.len() % 4 != 0 {
+    while !fd_body.len().is_multiple_of(4) {
         fd_body.push(0);
     }
 

@@ -69,7 +69,7 @@ fn padded_block_crc(data: &[u8], block_size: u64) -> u32 {
 
 fn packet(set_id: &[u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut aligned = body.to_vec();
-    while aligned.len() % 4 != 0 {
+    while !aligned.len().is_multiple_of(4) {
         aligned.push(0);
     }
     let mut p = Vec::new();

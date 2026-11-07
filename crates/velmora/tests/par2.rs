@@ -40,7 +40,7 @@ fn block_crcs(data: &[u8]) -> Vec<u32> {
 fn packet(set_id: &[u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     // Packet lengths are multiples of 4; pad the body like par2cmdline does.
     let mut aligned = body.to_vec();
-    while aligned.len() % 4 != 0 {
+    while !aligned.len().is_multiple_of(4) {
         aligned.push(0);
     }
     let mut p = Vec::new();
@@ -97,7 +97,7 @@ fn fixture_with_crcs(crcs: Vec<u32>, block_size: u64) -> Fixture {
     fd_body.extend_from_slice(&first16k);
     fd_body.extend_from_slice(&(data.len() as u64).to_le_bytes());
     fd_body.extend_from_slice(FILENAME.as_bytes());
-    while fd_body.len() % 4 != 0 {
+    while !fd_body.len().is_multiple_of(4) {
         fd_body.push(0);
     }
 
@@ -151,7 +151,7 @@ fn fixture_with_name(raw_name: &[u8]) -> Fixture {
     fd_body.extend_from_slice(&first16k);
     fd_body.extend_from_slice(&(data.len() as u64).to_le_bytes());
     fd_body.extend_from_slice(raw_name);
-    while fd_body.len() % 4 != 0 {
+    while !fd_body.len().is_multiple_of(4) {
         fd_body.push(0);
     }
 
