@@ -21,8 +21,8 @@
 //! appear here: the caller records the chosen group and minted message-IDs
 //! in the DB posted-file record only.
 
-use crate::decrypt::rclone::{CIPHER_BLOCK_SIZE, PLAIN_BLOCK_SIZE};
 use crate::error::{Error, Result};
+use crate::media::{CIPHER_CHUNK_SIZE, HEADER_SIZE, PLAIN_CHUNK_SIZE};
 use crate::rng::{fill_alphabet, uniform_below, FillRandom};
 use crate::segment_identity::valid_segment_id;
 
@@ -61,20 +61,25 @@ pub const DATE_JITTER_SECS: i64 = 6 * 3600;
 // Article payload sizing (design §4)
 // ---------------------------------------------------------------------------
 
-/// Cipher blocks per posted article. Payload bytes are the rclone-crypt
-/// ciphertext (64 KiB plaintext blocks plus 16-byte tags, header in front of
-/// article 0), so every article decrypts on its own and an HTTP range maps
-/// to whole articles via the stored plaintext/ciphertext offsets.
+/// Cipher chunks per posted article. Payload bytes are the
+/// [`velmora.media.v1`](crate::media) ciphertext (64 KiB plaintext chunks
+/// plus 16-byte tags, the 48-byte header in front of article 0), so every
+/// article decrypts on its own and an HTTP range maps to whole articles via
+/// the stored plaintext/ciphertext offsets.
 pub const ARTICLE_CIPHER_BLOCKS: usize = 11;
 
-/// Encoded article payload size: `k` ciphertext blocks
+/// Encoded article payload size: `k` ciphertext chunks
 /// (`11 * 65,552 = 721,072` B). yEnc article `size=` values and segment
-/// ranges for a full article equal this; the last article of a file holds
+/// ranges for a full article equal this; article 0 adds the header
+/// ([`ARTICLE_ZERO_PAYLOAD_BYTES`]) and the last article of a file holds
 /// the remainder.
-pub const ARTICLE_PAYLOAD_BYTES: u64 = ARTICLE_CIPHER_BLOCKS as u64 * CIPHER_BLOCK_SIZE;
+pub const ARTICLE_PAYLOAD_BYTES: u64 = ARTICLE_CIPHER_BLOCKS as u64 * CIPHER_CHUNK_SIZE;
+
+/// A full article 0: the 48-byte header plus `k` chunks (`721,120` B).
+pub const ARTICLE_ZERO_PAYLOAD_BYTES: u64 = HEADER_SIZE + ARTICLE_PAYLOAD_BYTES;
 
 /// Plaintext covered by one full article (`11 * 65,536 = 720,896` B).
-pub const ARTICLE_PLAINTEXT_BYTES: u64 = ARTICLE_CIPHER_BLOCKS as u64 * PLAIN_BLOCK_SIZE;
+pub const ARTICLE_PLAINTEXT_BYTES: u64 = ARTICLE_CIPHER_BLOCKS as u64 * PLAIN_CHUNK_SIZE;
 
 // ---------------------------------------------------------------------------
 // Newsgroup allow-list selection
@@ -518,9 +523,11 @@ mod tests {
     #[test]
     fn payload_constants_match_design_section_4() {
         assert_eq!(ARTICLE_CIPHER_BLOCKS, 11);
-        assert_eq!(CIPHER_BLOCK_SIZE, 65_552);
-        assert_eq!(PLAIN_BLOCK_SIZE, 65_536);
+        assert_eq!(CIPHER_CHUNK_SIZE, 65_552);
+        assert_eq!(PLAIN_CHUNK_SIZE, 65_536);
+        assert_eq!(HEADER_SIZE, 48);
         assert_eq!(ARTICLE_PAYLOAD_BYTES, 721_072);
+        assert_eq!(ARTICLE_ZERO_PAYLOAD_BYTES, 721_120);
         assert_eq!(ARTICLE_PLAINTEXT_BYTES, 720_896);
     }
 

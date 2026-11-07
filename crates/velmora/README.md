@@ -13,7 +13,7 @@ native targets (services, Container batch jobs).
 | `transports::worker_socket` | Workers transport over `connect()`, timeouts via `worker::Delay`, feature `worker-transport` (wasm32) |
 | `yenc` | yEnc encode/decode, byte-identical to v1; explicit SIMD fast path (x86_64 SSE2, wasm simd128 with `RUSTFLAGS="-C target-feature=+simd128"`), scalar fallback |
 | `nzb` | Streaming NZB parser (quick-xml) with hard bounds on files, segments, bytes, nesting; SHA-256 segment digest identical to v1 |
-| `decrypt` | Ranged AES-CBC and rclone-crypt (`seal_block` helper for tests/tooling) |
+| `media` | `velmora.media.v1`, the only format velmora products write: age v1 STREAM payload with a 48-byte committing header, three key modes, commitment-gated ranged reads and full verification (see below) |
 | `par2` | PAR2 recovery-set parse + `verify` + CRC-recombine `precheck` (all wasm-safe); `repair` shells out to `par2cmdline-turbo` and is Linux-only |
 
 (Table sources: `nntp` commands and codes `src/nntp.rs:1-19`, `QUIT` `src/nntp.rs:204-207`,
@@ -23,9 +23,81 @@ native targets (services, Container batch jobs).
 Mozilla roots `src/transports/tokio_tls.rs:57-58`, gating `src/transports/mod.rs:11-15`;
 `worker_socket` `src/transports/worker_socket.rs:1-9,50-65`, timeouts
 `src/transports/worker_socket.rs:37-48`, gating `src/transports/mod.rs:17-21`;
-`yenc` `src/yenc.rs:1-12`; `nzb` `src/nzb.rs:1-6,129-131`; `decrypt`
-`src/decrypt.rs:1-11`, `seal_block` `src/decrypt.rs:310-318`; `par2`
+`yenc` `src/yenc.rs:1-12`; `nzb` `src/nzb.rs:1-6,129-131`; `media`
+`src/media.rs` module docs; `par2`
 `src/par2.rs:9-21`, Linux-only repair `src/par2/repair.rs:70-107`.)
+
+## Media encryption: `velmora.media.v1`
+
+Decided in TWO-3698 (Applied Cryptography Reviewer, approved by the Security
+Engineer, 2026-11-07). Every object NNTune or the Cloudflare Drive writes to
+Usenet uses this format and nothing else. velmora has no rclone-crypt or
+AES-CBC code; reading third-party encrypted releases would need its own
+decision and a separate read-only `velmora::compat` module.
+
+**Layout.** `N` (16 B) ‖ `commitment` (32 B) ‖ chunks. Each chunk is the age
+v1 STREAM construction unchanged: ChaCha20-Poly1305 under
+`payload_key = HKDF-SHA256(salt = N, ikm = K, info = "payload")`, 64 KiB of
+plaintext plus a 16-byte tag, nonce = 11-byte big-endian counter ‖
+last-chunk flag. `L = max(1, ceil(P / 65536))`; the object is
+`48 + P + 16·L` bytes. A full chunk is 65,552 B, so
+`ARTICLE_CIPHER_BLOCKS = 11` still gives 721,072 B articles; article 0 is
+721,120 B.
+
+**Key commitment and binding.** `commitment = HKDF-Expand(PRK,
+"velmora.media.v1/commit" ‖ 0x00 ‖ mode ‖ ctx)` with `PRK =
+HKDF-Extract(N, K)`. Format version, key mode and product context (`ctx`:
+`nntune/media` or `drive/media`) are not on the wire: they are stored with
+the record and bound only through the commitment (and the derived `N` in
+convergent modes). `VerifiedHeader::verify` is the only way to a
+`ChunkReader`; it checks the profile's mode allow-list, the derived `N`, and
+the commitment in constant time before deriving the payload key, so a wrong
+key, mode, ctx or version fails with one generic error and no AEAD call.
+
+**Key modes** (`KeyMode`, stored as one byte):
+
+| Mode | `K` | `N` | Used by |
+|---|---|---|---|
+| `Random` (1) | fresh CSPRNG per file (`FileKey::generate`) | fresh CSPRNG | NNTune (only mode its profile allows); Drive private files without dedupe |
+| `VaultConvergent` (2) | `HMAC-SHA256(vault_dedupe_key, "velmora.media.v1/vault-K" ‖ 0 ‖ ctx ‖ 0 ‖ BE64(P) ‖ SHA-256(content))` (`ConvergentKey::vault`) | derived from `(K, mode, ctx)` | Drive private files (default) |
+| `PublicConvergent` (3) | `HKDF(OPRF output, "velmora.media.v1/public-K")` over `public_oprf_input` (`ConvergentKey::public`) | derived | Drive public share links only |
+
+The convergent `Sealer` re-hashes the plaintext while sealing and withholds
+the final chunk unless it matches the `(P, D)` the key came from (TOCTOU
+gate). The OPRF, `vault_dedupe_key` custody and the dedupe service rules
+(always upload full ciphertext, no existence signal, server-computed dedupe
+ID) belong to the Drive design (TWO-3136), not this crate.
+
+**Reader rules.** The header and `P` come from the trusted record, so ranged
+reads never need article 0; when article 0 is fetched,
+`ChunkReader::check_wire_header` must pass. Only chunks whose tag verified
+release plaintext (a failed chunk's buffer is wiped). `verify_all` (post-verify,
+backup drill) also requires the flagged final chunk at `L-1` and end of
+source right after it, and returns the plaintext SHA-256. Keys and payload
+keys are zeroized on drop; errors carry no key- or nonce-derived bytes.
+
+**Threat model delta (vs the rclone-crypt layout it replaces).**
+
+| Property | rclone-crypt | `velmora.media.v1` |
+|---|---|---|
+| Whole-chunk truncation, appended chunks | only via the DB length | detected in band (final flag) and via the trusted length |
+| Reorder, duplicate, cross-file splice | detected | detected (counter nonce, per-file HKDF payload key) |
+| Key commitment / multi-key ciphertexts | none | 32-byte commitment checked before any decrypt |
+| Version, mode, product separation | fixed `RCLONE` magic | bound into the commitment; fails closed |
+| Deterministic (dedupe) modes | undefined | per-vault (no provider confirmation) and public-share only; no cross-user convergence of private files |
+| Wire fingerprint | constant 8-byte magic | no constant bytes (sizes still reveal the scheme) |
+
+Unchanged residuals: Usenet observers see sizes, timing and article
+relationships and can withhold articles (PAR2 and backbones handle
+availability); there is no rollback protection beyond the trusted record;
+key custody is governed by each product.
+
+**Vectors.** `src/media.rs` runs every C2SP CCTV age `stream_*` vector (Go
+reference) through the STREAM layer; `tests/media_vectors.rs` checks
+`testdata/media-v1/vectors.txt`, generated by an independent pyca
+`cryptography` script, for all three modes; `tests/media_rejections.rs`
+covers truncation, extension, reorder, splice, wrong key/ctx/mode, bit
+flips, convergent determinism, the TOCTOU gate and ranged-read coordinates.
 
 ## Pinned transport proof (NZB fetch)
 
@@ -125,7 +197,7 @@ neither a sandbox nor a hard disk quota.
 ## Checks
 
 ```sh
-cargo test -p velmora                    # incl. Go-vector interop
+cargo test -p velmora                    # incl. Go-vector interop and age CCTV vectors
 cargo clippy -p velmora --all-targets    # clean, `-D warnings` in CI
 cargo bench -p velmora                   # yEnc ms/MB for the bench gate
 cargo check -p velmora --target wasm32-unknown-unknown --no-default-features [--features worker-transport]
