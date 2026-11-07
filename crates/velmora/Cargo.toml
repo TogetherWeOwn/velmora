@@ -9,8 +9,10 @@ rust-version = "1.89"
 
 [features]
 default = ["native-tls"]
-native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:velmora-ssrf-guard"]
 worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
+# Qualification-only; no runtime call site is enabled by this feature.
+worker-pinned-tls = ["worker-transport", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:rustls-pki-types", "dep:velmora-ssrf-guard"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,11 +30,12 @@ crypto_secretbox = { version = "0.1", default-features = false, features = ["sal
 # The `js` feature is the wasm32-unknown-unknown backend (Workers posting
 # path); on native targets it selects the OS backend as usual.
 getrandom = { version = "0.2", features = ["js"] }
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
 worker = { version = "0.8", optional = true }
 futures-util = { version = "0.3", optional = true }
+velmora-ssrf-guard = { version = "0.1.0", path = "../velmora-ssrf-guard", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -42,6 +45,8 @@ tokio = { version = "1", features = ["io-util", "net", "time"], optional = true 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", features = ["io-util"], optional = true }
+ring = { version = "0.17", optional = true, features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", optional = true, features = ["web"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -8,6 +8,12 @@
 //!   TCP socket, with per-operation timeouts via
 //!   [`worker::Delay`](https://docs.rs/worker).
 
+#[cfg(any(feature = "native-tls", feature = "worker-pinned-tls"))]
+pub mod peer_tls;
+
+#[cfg(all(feature = "worker-pinned-tls", target_arch = "wasm32"))]
+pub mod worker_pinned_tls;
+
 #[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
 pub mod tokio_tls;
 
