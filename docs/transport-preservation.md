@@ -111,7 +111,12 @@ and all-features Wasm combinations, runs clippy, and checks the SSRF crate on Wa
 The default `native-tls` feature also activates the existing wasm-only ring
 dependency so its `wasm32_unknown_unknown_js` cfg is enabled independently of
 Worker features. ring 0.17.14's `SystemRandom` implementation requires that cfg;
-the existing getrandom/js dependency alone does not enable it.
+the existing getrandom/js dependency alone does not enable it. It also activates
+the existing wasm-only `rustls-pki-types` declaration with `web`, independently
+of Worker features. The checksum-matched 1.15.1 source gates `UnixTime::now()`
+on that feature for wasm32-unknown-unknown; rustls's `std` feature alone does not
+provide it there. The uncached default-only check exposed this clock feature gap
+after the ring correction. No clock implementation or dependency version changes.
 Native CI runs both preserved SSRF tests, all nine peer/TLS tests and the two
 existing native pre-dial refusal tests through the workspace suite, preserves
 no-default-feature tests (including the 13 auth-guard tests), and reruns library
