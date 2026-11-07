@@ -28,9 +28,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The org `public-pr-security` caller is wired in by a follow-up PR: its
-  # OSV comparison needs a lockfile on the base branch, and main gets its
-  # first Cargo.lock from this change.
+  public-pr-security:
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
+    # The nested OSV reusable requires this exact permission ceiling: actions
+    # reads same-run comparison artifacts, contents reads the PR tree/history,
+    # and security-events uploads comparison SARIF. No secrets are passed.
+    permissions:
+      actions: read # Nested OSV reads same-run comparison artifacts.
+      contents: read
+      security-events: write # Nested OSV uploads comparison SARIF.
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@feb1e0e2111da007f38ca75ee95c6f6944723d36 # v0.5.0
 
   rust-test:
     name: rust test (native)
@@ -149,16 +156,23 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-msrv, cargo-deny]
+    needs: [rust-test, rust-wasm, rust-msrv, cargo-deny, public-pr-security]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - run: |
-          if ! jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS_JSON" > /dev/null; then
+          # Only the PR-only caller may skip, and only outside pull_request.
+          # A private PR skips the caller but fails ci-ok without scanning.
+          if ! jq -e --arg event "$CI_EVENT_NAME" '
+            length > 1 and
+            .["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
+            (del(.["public-pr-security"]) | all(.[]; .result == "success"))
+          ' <<< "$NEEDS_JSON" > /dev/null; then
             echo "ci-ok: a required job did not succeed"
             exit 1
           fi
           echo "ci-ok: all required jobs passed"
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          CI_EVENT_NAME: ${{ github.event_name }}
