@@ -70,6 +70,9 @@ jobs:
       # velmora without default TLS features. This is native portable
       # behavior, not a wasm-runtime check (see rust-wasm).
       - run: cargo test --locked -p velmora --no-default-features
+      # Exercise the preserved native TLS tests with the qualification feature
+      # enabled as well. This does not execute the wasm-only Worker adapter.
+      - run: cargo test --locked -p velmora --features worker-pinned-tls --lib
 
   rust-wasm:
     name: rust check (wasm32)
@@ -94,6 +97,42 @@ jobs:
       # Wasm SIMD; consumers enable it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
 
+  # Clean, uncached compile of the preserved qualification-only Worker slice.
+  # Compilation is not Worker entropy/clock, dialing or physical-close evidence.
+  rust-worker-pinned-tls:
+    name: rust check (Worker pinned TLS, compile only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CC_wasm32_unknown_unknown: clang-18
+      AR_wasm32_unknown_unknown: llvm-ar-18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The locked Worker SDK 0.8.7 requires Rust 1.91. Check its feature graph
+      # at that minimum instead of raising the default/portable core MSRV.
+      - name: Install Rust 1.91 (Worker SDK minimum)
+        run: |
+          rustup toolchain install 1.91 --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
+          rustup default 1.91
+      - name: Install pinned Wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 lld-18
+          clang-18 --version
+          llvm-ar-18 --version
+          wasm-ld-18 --version
+      - run: cargo fetch --locked
+      - run: cargo check --locked -p velmora-ssrf-guard --target wasm32-unknown-unknown
+      # Check default native-tls alone before Worker features can mask missing
+      # Wasm backend wiring through Cargo feature unification.
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls
+      - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls -- -D warnings
+      # Retain compatibility when consumers leave native-tls enabled on wasm.
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --all-features
+
   # MSRV gate: `rust-version` in crates/velmora/Cargo.toml must build the
   # locked dependency graph. Bump both together when the lockfile needs a
   # newer toolchain.
@@ -114,6 +153,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --locked -p velmora
       - run: cargo check --locked -p velmora --no-default-features
+      - run: cargo check --locked -p velmora-ssrf-guard
+      - name: Install Rust 1.91 (Worker SDK minimum)
+        run: |
+          rustup toolchain install 1.91 --profile minimal --no-self-update
+          rustup default 1.91
+      - run: cargo check --locked -p velmora --features worker-pinned-tls
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # the committed lockfile. Findings are fixed by updating the dependency,
@@ -156,7 +201,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-msrv, cargo-deny, public-pr-security]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

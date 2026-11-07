@@ -34,7 +34,7 @@ fn timed_out(op: &'static str) -> io::Error {
     )
 }
 
-async fn with_timeout<T>(
+pub(super) async fn with_timeout<T>(
     timeout: Duration,
     op: &'static str,
     fut: impl std::future::Future<Output = io::Result<T>>,

@@ -7,14 +7,11 @@
 #![cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
 
 use std::io;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
 
 use crate::nntp::NntpConfig;
 use crate::transport::Transport;
@@ -59,12 +56,7 @@ pub async fn connect(config: &NntpConfig) -> io::Result<NativeTlsTransport> {
     // off for pipelined command latency.
     tcp.set_nodelay(true)?;
     let stream = if config.tls {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(tls_config));
+        let connector = super::peer_tls::public_connector()?;
         let server_name = ServerName::try_from(config.host.clone())
             .map_err(|_| {
                 io::Error::new(
@@ -114,7 +106,9 @@ impl Transport for NativeTlsTransport {
         let timeout = self.timeout;
         match &mut self.stream {
             Stream::Plain(s) => with_timeout(timeout, s.write_all(buf)).await,
-            Stream::Tls(s) => with_timeout(timeout, s.write_all(buf)).await,
+            Stream::Tls(s) => {
+                with_timeout(timeout, super::peer_tls::write_all_flushed(s, buf)).await
+            }
         }
     }
 

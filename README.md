@@ -41,6 +41,13 @@ velmora = { git = "https://github.com/TogetherWeOwn/velmora", rev = "<full 40-ch
 
 - `default = ["native-tls"]`: tokio + rustls transport (non-wasm).
 - `worker-transport`: Workers `connect()` socket transport (wasm32).
+- `worker-pinned-tls`: opt-in, qualification-only peer-pinned Worker TLS;
+  no runtime activation or physical-close qualification is implied. See
+  [preservation and qualification boundaries](docs/transport-preservation.md).
+
+The default native-TLS and no-default-feature core retain Rust 1.89 support.
+Worker features require Rust 1.91 because the locked Worker SDK 0.8.7 requires
+that toolchain; CI checks the pinned-TLS feature on native and wasm32 at 1.91.
 
 ## Checks
 

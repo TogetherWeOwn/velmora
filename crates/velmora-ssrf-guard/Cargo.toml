@@ -1,0 +1,11 @@
+[package]
+name = "velmora-ssrf-guard"
+version = "0.1.0"
+edition = "2021"
+description = "Shared SSRF address guard and test vectors for NNTune v2 workers (native + wasm32, std-only)"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+
+[lib]
+name = "velmora_ssrf_guard"
+path = "src/lib.rs"
