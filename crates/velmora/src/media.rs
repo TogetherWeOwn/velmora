@@ -1343,4 +1343,366 @@ mod tests {
         assert_eq!(n.as_slice(), &[0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1]);
         assert_eq!(chunk_nonce(0, false).as_slice(), &[0u8; 12]);
     }
+
+    // -----------------------------------------------------------------------
+    // `age` crate oracle (decision §4): rage seals, velmora must open, and
+    // velmora's writer must reproduce rage's chunks byte for byte under the
+    // same file key and `N` (so rage opens velmora's payload). The vectors
+    // are rage output frozen by `testdata/age-oracle/gen_age_vectors.py`:
+    // the `age` crate itself cannot be a dev-dependency (cargo-deny and OSV
+    // refuse its dependency tree). age's file key is 16 bytes, velmora's
+    // `K` 32, so both sides use age's key as the HKDF input (any length is
+    // valid); keys and nonces come from the vectors, never from literals.
+    // -----------------------------------------------------------------------
+
+    use crate::rng::SystemRng;
+
+    /// Same pattern as `plaintext()` in `gen_age_vectors.py`.
+    fn oracle_plaintext(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 9)) as u8)
+            .collect()
+    }
+
+    /// The Random-mode writer, keyed by age's file key instead of a
+    /// [`FileKey`]: [`Sealer::with_nonce`] without the 32-byte key type.
+    fn age_keyed_sealer(file_key: &[u8], nonce: [u8; NONCE_SIZE]) -> Sealer {
+        let prk = extract(file_key, &nonce);
+        Sealer {
+            stream: payload_cipher(&prk),
+            header: Header {
+                nonce,
+                commitment: commitment(&prk, KeyMode::Random, Profile::nntune().ctx()),
+            },
+            mode: KeyMode::Random,
+            next: 0,
+            finished: false,
+            gate: None,
+        }
+    }
+
+    /// The reader side, keyed the same way.
+    fn age_keyed_reader(file_key: &[u8], nonce: [u8; NONCE_SIZE]) -> VerifiedHeader {
+        let prk = extract(file_key, &nonce);
+        VerifiedHeader {
+            stream: payload_cipher(&prk),
+            header: Header {
+                nonce,
+                commitment: commitment(&prk, KeyMode::Random, Profile::nntune().ctx()),
+            },
+            mode: KeyMode::Random,
+        }
+    }
+
+    #[test]
+    fn age_crate_vectors_match_velmora_stream() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/age-oracle/vectors.txt");
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lengths = Vec::new();
+        for record in text.split("\n\n").skip(1) {
+            let field = |k: &str| {
+                record
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{k}: ")))
+                    .map(str::to_owned)
+            };
+            let len: usize = field("len").unwrap().parse().unwrap();
+            lengths.push(len);
+            let file_key = hex(&field("file ikm").unwrap());
+            assert_eq!(file_key.len(), 16, "len {len}: age file key");
+            let nonce: [u8; NONCE_SIZE] = hex(&field("nonce").unwrap()).try_into().unwrap();
+            let plaintext = oracle_plaintext(len);
+
+            // velmora's writer reproduces rage's payload `N ‖ chunks`.
+            let object = age_keyed_sealer(&file_key, nonce)
+                .seal_to_vec(&plaintext)
+                .unwrap();
+            let mut payload = nonce.to_vec();
+            payload.extend_from_slice(&object[HEADER_SIZE as usize..]);
+            assert_eq!(
+                payload.len().to_string(),
+                field("payload length").unwrap(),
+                "len {len}"
+            );
+            let digest: [u8; 32] = Sha256::digest(&payload).into();
+            assert_eq!(
+                digest.to_vec(),
+                hex(&field("payload sha256").unwrap()),
+                "len {len}"
+            );
+
+            // velmora's reader opens those (rage-identical) bytes.
+            let verified = age_keyed_reader(&file_key, nonce);
+            let reader = verified.reader(len as u64).unwrap();
+            let mut opened = vec![0u8; len];
+            assert_eq!(reader.read_at(&object, &mut opened, 0).unwrap(), len);
+            assert!(opened == plaintext, "len {len}: velmora opens the payload");
+            let expected: [u8; 32] = Sha256::digest(&plaintext).into();
+            assert_eq!(reader.verify_all(&object).unwrap(), expected, "len {len}");
+
+            // Short vectors carry the whole age file: open rage's own bytes.
+            if let Some(age_file) = field("age file").map(|h| hex(&h)) {
+                let at = find(&age_file, b"\n--- ").unwrap() + 1;
+                let at = at + find(&age_file[at..], b"\n").unwrap() + 1;
+                assert!(age_file[at..] == payload[..], "len {len}: rage's bytes");
+                assert_eq!(age_open(&file_key, &age_file[at..]).unwrap(), plaintext);
+            }
+        }
+        assert_eq!(
+            lengths,
+            [0, 1, 65_535, 65_536, 65_537, 131_072, 131_073, 200_003],
+            "every chunk boundary is covered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-key ChaCha20-Poly1305 fixture (decision §4): a chunk that opens
+    // under the payload keys of two file keys sharing `N` (partitioning
+    // oracle / invisible salamanders). The commitment binds the header to
+    // one `K`, so the second key must be refused before any AEAD call.
+    // -----------------------------------------------------------------------
+
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+    /// Arithmetic mod the Poly1305 prime `p = 2^130 - 5`.
+    #[allow(clippy::needless_range_loop)]
+    mod p1305 {
+        /// Little-endian u64 limbs; reduced values are below `p`.
+        pub type Fe = [u64; 3];
+
+        pub const P: Fe = [0xffff_ffff_ffff_fffb, u64::MAX, 3];
+
+        fn lt(a: Fe, b: Fe) -> bool {
+            for i in (0..3).rev() {
+                if a[i] != b[i] {
+                    return a[i] < b[i];
+                }
+            }
+            false
+        }
+
+        /// `a - b` for `a >= b`.
+        pub fn sub_raw(a: Fe, b: Fe) -> Fe {
+            let mut out = [0u64; 3];
+            let mut borrow = false;
+            for i in 0..3 {
+                let (d, b1) = a[i].overflowing_sub(b[i]);
+                let (d, b2) = d.overflowing_sub(u64::from(borrow));
+                out[i] = d;
+                borrow = b1 || b2;
+            }
+            out
+        }
+
+        /// Reduces a 384-bit value: `2^130 ≡ 5 (mod p)` folds the bits
+        /// above 130 back in until none remain.
+        fn reduce(mut w: [u64; 6]) -> Fe {
+            loop {
+                let hi = [
+                    (w[2] >> 2) | (w[3] << 62),
+                    (w[3] >> 2) | (w[4] << 62),
+                    (w[4] >> 2) | (w[5] << 62),
+                    w[5] >> 2,
+                ];
+                if hi == [0; 4] {
+                    break;
+                }
+                let mut next = [w[0], w[1], w[2] & 3, 0, 0, 0];
+                let mut carry = 0u128;
+                for i in 0..6 {
+                    let five_hi = if i < 4 { u128::from(hi[i]) * 5 } else { 0 };
+                    let t = u128::from(next[i]) + five_hi + carry;
+                    next[i] = t as u64;
+                    carry = t >> 64;
+                }
+                w = next;
+            }
+            let r = [w[0], w[1], w[2]];
+            if lt(r, P) {
+                r
+            } else {
+                sub_raw(r, P)
+            }
+        }
+
+        pub fn add(a: Fe, b: Fe) -> Fe {
+            let mut w = [0u64; 6];
+            let mut carry = 0u128;
+            for i in 0..3 {
+                let t = u128::from(a[i]) + u128::from(b[i]) + carry;
+                w[i] = t as u64;
+                carry = t >> 64;
+            }
+            w[3] = carry as u64;
+            reduce(w)
+        }
+
+        /// `a - b` for reduced `b`.
+        pub fn sub(a: Fe, b: Fe) -> Fe {
+            add(a, sub_raw(P, b))
+        }
+
+        pub fn mul(a: Fe, b: Fe) -> Fe {
+            let mut w = [0u64; 6];
+            for i in 0..3 {
+                let mut carry = 0u128;
+                for j in 0..3 {
+                    let t = u128::from(w[i + j]) + u128::from(a[i]) * u128::from(b[j]) + carry;
+                    w[i + j] = t as u64;
+                    carry = t >> 64;
+                }
+                w[i + 3] = carry as u64;
+            }
+            reduce(w)
+        }
+
+        /// `a^(p-2)`: the inverse of a non-zero `a` (Fermat).
+        pub fn inv(a: Fe) -> Fe {
+            let exp = sub_raw(P, [2, 0, 0]);
+            let mut out = [1, 0, 0];
+            for bit in (0..192).rev() {
+                out = mul(out, out);
+                if (exp[bit / 64] >> (bit % 64)) & 1 == 1 {
+                    out = mul(out, a);
+                }
+            }
+            out
+        }
+
+        pub fn from_u128(v: u128) -> Fe {
+            [v as u64, (v >> 64) as u64, 0]
+        }
+    }
+
+    #[test]
+    fn p1305_inverse_round_trips() {
+        let a = p1305::from_u128(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        assert_eq!(p1305::mul(a, p1305::inv(a)), [1, 0, 0]);
+        let top = p1305::sub_raw(p1305::P, [1, 0, 0]);
+        assert_eq!(p1305::mul(top, top), [1, 0, 0], "(-1)^2 = 1");
+        assert_eq!(p1305::add(top, [1, 0, 0]), [0, 0, 0], "p - 1 + 1 = 0");
+    }
+
+    /// Poly1305 `(r, s)` of final chunk 0 under `key`: ChaCha20 block 0 of
+    /// the payload key, exactly as ChaCha20-Poly1305 derives it.
+    fn poly1305_key(key: &FileKey, nonce: &[u8; NONCE_SIZE]) -> (p1305::Fe, p1305::Fe) {
+        let mut payload_key = Zeroizing::new([0u8; KEY_SIZE]);
+        hkdf_expand(
+            &extract(key.expose_secret(), nonce),
+            PAYLOAD_INFO,
+            payload_key.as_mut(),
+        );
+        let mut block = [0u8; 64];
+        chacha20::ChaCha20::new_from_slices(&payload_key[..], chunk_nonce(0, true).as_slice())
+            .unwrap()
+            .apply_keystream(&mut block);
+        let le = |b: &[u8]| u128::from_le_bytes(b.try_into().unwrap());
+        let r = le(&block[..16]) & 0x0fff_fffc_0fff_fffc_0fff_fffc_0fff_ffff;
+        (p1305::from_u128(r), p1305::from_u128(le(&block[16..32])))
+    }
+
+    /// Opens final chunk 0 with the raw STREAM layer of `key` (no header
+    /// check), returning the plaintext.
+    fn open_chunk0(key: &FileKey, nonce: &[u8; NONCE_SIZE], sealed: &[u8]) -> Result<Vec<u8>> {
+        let mut buf = sealed.to_vec();
+        let stream = payload_cipher(&extract(key.expose_secret(), nonce));
+        Ok(stream.open(0, true, &mut buf)?.to_vec())
+    }
+
+    /// A sealed final chunk 0 (`ct ‖ tag`, 32-byte ciphertext) valid under
+    /// the payload keys of both `k1` and `k2` with the same `N`. The
+    /// Poly1305 equation is solved for the first ciphertext block (Len,
+    /// Grubbs and Ristenpart, "Partitioning Oracle Attacks", USENIX
+    /// Security 2021); the tag then comes from sealing under `k1`.
+    fn two_key_chunk(nonce: &[u8; NONCE_SIZE], k1: &FileKey, k2: &FileKey) -> Vec<u8> {
+        use p1305::{add, inv, mul, sub};
+        let (r1, s1) = poly1305_key(k1, nonce);
+        let (r2, s2) = poly1305_key(k2, nonce);
+        let stream1 = payload_cipher(&extract(k1.expose_secret(), nonce));
+        // Sealing zeros yields chunk 0's keystream under k1.
+        let keystream1 = stream1.seal(0, true, &[0u8; 32]).unwrap();
+        // Poly1305 blocks (each + 2^128): c0, c1, le64(|AD| = 0) ‖ le64(|C| = 32).
+        let pad = [0, 0, 1];
+        let lengths = add([0, 32, 0], pad);
+        let cube = |r| mul(mul(r, r), r);
+        for y in 0u64..4096 {
+            let c1 = add([y, 0, 0], pad);
+            // h(r) = c0·r³ + c1·r² + lengths·r; solve h(r1) + s1 = h(r2) + s2 for c0.
+            let rest = |r| add(mul(c1, mul(r, r)), mul(lengths, r));
+            let rhs = add(sub(s2, s1), sub(rest(r2), rest(r1)));
+            let c0 = mul(rhs, inv(sub(cube(r1), cube(r2))));
+            // c0 must be a 16-byte block plus the 2^128 pad bit.
+            if c0[2] != 1 {
+                continue;
+            }
+            let mut ciphertext = Vec::with_capacity(32);
+            ciphertext.extend_from_slice(&c0[0].to_le_bytes());
+            ciphertext.extend_from_slice(&c0[1].to_le_bytes());
+            ciphertext.extend_from_slice(&y.to_le_bytes());
+            ciphertext.resize(32, 0);
+            // The k1 plaintext is ct ⊕ keystream; sealing it gives ct ‖ tag1.
+            let plaintext: Vec<u8> = ciphertext
+                .iter()
+                .zip(&keystream1)
+                .map(|(c, k)| c ^ k)
+                .collect();
+            let sealed = stream1.seal(0, true, &plaintext).unwrap();
+            assert_eq!(sealed[..32], ciphertext[..]);
+            // Equal mod p is not always equal mod 2^128: keep a y where it is.
+            if open_chunk0(k2, nonce, &sealed).is_ok() {
+                return sealed;
+            }
+        }
+        panic!("no two-key chunk in 4096 tries");
+    }
+
+    /// The two-key chunk opens under both payload keys at the STREAM layer,
+    /// yet [`VerifiedHeader::verify`] refuses the second file key in every
+    /// mode, with zero AEAD calls.
+    #[test]
+    fn two_key_chunk_is_refused_before_any_aead_call() {
+        let profile = Profile::drive();
+        let k1 = FileKey::generate(&mut SystemRng).unwrap();
+        let k2 = FileKey::generate(&mut SystemRng).unwrap();
+        let header = Sealer::random(&profile, &k1, &mut SystemRng)
+            .unwrap()
+            .header();
+        let chunk = two_key_chunk(&header.nonce, &k1, &k2);
+
+        // The fixture really is multi-key: both keys open it, differently.
+        let p1 = open_chunk0(&k1, &header.nonce, &chunk).expect("opens under k1");
+        let p2 = open_chunk0(&k2, &header.nonce, &chunk).expect("opens under k2");
+        assert_ne!(p1, p2);
+
+        let mut object = header.to_bytes().to_vec();
+        object.extend_from_slice(&chunk);
+        let v1 = VerifiedHeader::verify(&profile, KeyMode::Random, &k1, &header).unwrap();
+        let mut out = [0u8; 32];
+        assert_eq!(
+            v1.reader(32)
+                .unwrap()
+                .read_at(&object, &mut out, 0)
+                .unwrap(),
+            32
+        );
+        assert_eq!(out.to_vec(), p1);
+
+        let before = opens();
+        for mode in [
+            KeyMode::Random,
+            KeyMode::VaultConvergent,
+            KeyMode::PublicConvergent,
+        ] {
+            assert!(
+                VerifiedHeader::verify(&profile, mode, &k2, &header).is_err(),
+                "{mode:?}"
+            );
+            assert!(
+                VerifiedHeader::verify_record(&profile, mode.as_byte(), &k2, &header).is_err(),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(opens(), before, "no AEAD call for the second key");
+    }
 }

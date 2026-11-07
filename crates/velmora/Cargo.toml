@@ -53,6 +53,9 @@ criterion = "0.8"
 # Inflates the zlib-compressed C2SP CCTV age vectors (`cctv_age_stream_vectors`
 # in src/media.rs).
 miniz_oxide = "0.8"
+# Raw ChaCha20 block 0 (the Poly1305 key) for the two-key chunk fixture.
+# Already in the tree through chacha20poly1305.
+chacha20 = "=0.10.2"
 
 [[bench]]
 name = "yenc"
