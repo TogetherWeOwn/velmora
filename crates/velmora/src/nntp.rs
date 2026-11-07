@@ -260,8 +260,31 @@ impl<T: Transport> NntpClient<T> {
     /// greeting (`200`/`201`), `MODE READER` (any well-formed reply code
     /// is tolerated because some servers reject it pre-auth, but a broken
     /// exchange fails setup), and `AUTHINFO` when the config carries
-    /// credentials.
+    /// credentials. This compatibility entry point has no authorization gate;
+    /// service-account callers must use [`Self::connect_with_auth_guard`].
     pub async fn connect(transport: T, config: &NntpConfig) -> Result<Self> {
+        Self::connect_with_auth_guard(transport, config, || Ok(())).await
+    }
+
+    /// Opening handshake with a synchronous gate at each credential write.
+    /// The gate runs after greeting and MODE READER, immediately before USER
+    /// and again before PASS (the USER reply can consume the remaining proof
+    /// lifetime). It must check the admitted account/configuration identity,
+    /// resolution expiry, cancellation and revocation without awaiting.
+    ///
+    /// This hook does not establish TLS, vet peers or own capacity. Its caller
+    /// must supply an authenticated transport and retain independent physical
+    /// socket-close authority across errors and cancellation. Dropping this
+    /// future is not closure evidence and must not release an account slot.
+    /// A transport write may remain pending after the check; the supervisor
+    /// must force-close that socket if cancellation/revocation or its deadline
+    /// arrives while writing. The hook alone cannot enforce physical closure.
+    /// Guard diagnostics are redacted, preserving only the I/O error kind.
+    pub async fn connect_with_auth_guard(
+        transport: T,
+        config: &NntpConfig,
+        mut auth_guard: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<Self> {
         if config.max_pipelined == 0 {
             return Err(Error::Malformed(
                 "NntpConfig.max_pipelined must be at least 1".into(),
@@ -301,7 +324,7 @@ impl<T: Transport> NntpClient<T> {
                 .password
                 .as_deref()
                 .ok_or_else(|| Error::Malformed("NNTP username set without a password".into()))?;
-            client.auth(username, password).await?;
+            client.auth(username, password, &mut auth_guard).await?;
         }
         Ok(client)
     }
@@ -596,7 +619,12 @@ impl<T: Transport> NntpClient<T> {
         self.max_pipelined.max(1)
     }
 
-    async fn auth(&mut self, username: &str, password: &str) -> Result<()> {
+    async fn auth(
+        &mut self,
+        username: &str,
+        password: &str,
+        auth_guard: &mut impl FnMut() -> std::io::Result<()>,
+    ) -> Result<()> {
         // Every reply inside the AUTHINFO exchange is mapped through
         // `auth_reply_error`, which drops the server text before it can
         // reach logs or error bodies (see module docs). A reply that is
@@ -605,12 +633,12 @@ impl<T: Transport> NntpClient<T> {
         // the raw line — so both commands go through `auth_command`,
         // which replaces that payload with a fixed redacted message.
         let user_reply = self
-            .auth_command(&format!("AUTHINFO USER {username}"))
+            .auth_command(&format!("AUTHINFO USER {username}"), auth_guard)
             .await?;
         match user_reply.code {
             381 => {
                 let pass_reply = self
-                    .auth_command(&format!("AUTHINFO PASS {password}"))
+                    .auth_command(&format!("AUTHINFO PASS {password}"), auth_guard)
                     .await?;
                 match pass_reply.code {
                     281 => Ok(()),
@@ -628,7 +656,17 @@ impl<T: Transport> NntpClient<T> {
     /// carry the credentials just sent — is replaced with a fixed
     /// redacted message. Transport I/O (including timeouts) is
     /// untouched: it carries no reply text.
-    async fn auth_command(&mut self, cmd: &str) -> Result<Reply> {
+    async fn auth_command(
+        &mut self,
+        cmd: &str,
+        auth_guard: &mut impl FnMut() -> std::io::Result<()>,
+    ) -> Result<Reply> {
+        auth_guard().map_err(|err| {
+            Error::Io(std::io::Error::new(
+                err.kind(),
+                "NNTP authentication gate refused",
+            ))
+        })?;
         self.command(cmd).await.map_err(|err| match err {
             Error::Malformed(_) => {
                 Error::Malformed("NNTP reply to AUTHINFO is not a 3-digit code: <redacted>".into())
