@@ -65,9 +65,11 @@ key, mode, ctx or version fails with one generic error and no AEAD call.
 Convergent keys take a `ContentIdentity` from the first hashing pass
 (`ContentHasher`): `P`, `D` and the SHA-256 of every 64 KiB chunk. The
 convergent `Sealer` checks each chunk against its entry *before* sealing it
-and checks `(P, D)` again at the final chunk, so content that changed
-between the passes never releases a chunk under the canonical keystream
-(per-chunk TOCTOU gate); on failure the caller aborts the upload. Products
+and checks `(P, D)` again at the final chunk, so a chunk that changed
+between the passes is never sealed under the canonical keystream
+(per-chunk TOCTOU gate). Chunks before the first mismatch match the hashed
+content and may already have been returned; on failure the caller aborts
+the upload. Products
 use `Profile::nntune()` and `Profile::drive()`, never a hand-built
 `Profile`. The OPRF, `vault_dedupe_key` custody and the dedupe service rules
 (always upload full ciphertext, no existence signal, server-computed dedupe

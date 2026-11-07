@@ -478,9 +478,10 @@ fn chunk_plain_len(plaintext_size: u64, index: u64) -> Option<u64> {
 /// `D`). Built only by [`ContentHasher`] (or [`ContentIdentity::of`]).
 ///
 /// The [`Sealer`] checks each chunk against its entry here *before*
-/// sealing it (decision §2.4.3, per-chunk TOCTOU gate), so content that
-/// changed after this pass never releases a single chunk under the
-/// canonical keystream.
+/// sealing it (decision §2.4.3, per-chunk TOCTOU gate), so a chunk that
+/// changed after this pass is never sealed under the canonical keystream.
+/// Chunks before the first mismatch match the hashed content and may
+/// already have been returned; the caller aborts the upload on error.
 #[derive(Clone)]
 pub struct ContentIdentity {
     plaintext_len: u64,
