@@ -416,7 +416,12 @@ pub fn decode_part_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Resul
         let Some((content, terminated)) = lines.next() else {
             return Err(malformed(message_id, "missing =yend line"));
         };
-        if content.starts_with(b"=yend") {
+        // Match the `=yend` keyword as a whole token. A bare prefix match
+        // would take a malformed line such as `=yending` as the trailer; it
+        // declares no size= or crc32=, so a corrupted body whose length
+        // matches the header would decode with no checksum at all.
+        if content == b"=yend" || content.starts_with(b"=yend ") || content.starts_with(b"=yend\t")
+        {
             trailer = content;
             break;
         }

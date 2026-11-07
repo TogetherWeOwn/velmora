@@ -62,12 +62,12 @@ Default credentials: `testuser/testpass` (max 2 connections),
 
 ## Tests
 
-Local Rust builds go through the bounded Cargo pool (see repo `AGENTS.md`):
+Run from the workspace root:
 
 ```sh
-python3 scripts/cargo_cache.py run -- test -p velmora-test-nntp
-python3 scripts/cargo_cache.py run -- clippy -p velmora-test-nntp --all-targets -- -D warnings
-python3 scripts/cargo_cache.py run -- fmt -p velmora-test-nntp -- --check
+cargo test -p velmora-test-nntp
+cargo clippy -p velmora-test-nntp --all-targets -- -D warnings
+cargo fmt -p velmora-test-nntp -- --check
 ```
 
 `tests/integration_nntp.rs` is the acceptance suite: auth, group/article/body/head/stat,

@@ -5,7 +5,7 @@ edition = "2021"
 description = "Shared Usenet data-plane engine: NNTP client, yEnc, NZB, ranged decrypt, par2 verify (native + wasm32)"
 license = "MIT"
 repository = "https://github.com/TogetherWeOwn/velmora"
-rust-version = "1.75"
+rust-version = "1.89"
 
 [features]
 default = ["native-tls"]

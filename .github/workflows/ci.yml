@@ -87,6 +87,27 @@ jobs:
       # Wasm SIMD; consumers enable it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
 
+  # MSRV gate: `rust-version` in crates/velmora/Cargo.toml must build the
+  # locked dependency graph. Bump both together when the lockfile needs a
+  # newer toolchain.
+  rust-msrv:
+    name: rust check (msrv)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.89 (velmora rust-version)
+        run: |
+          rustup toolchain install 1.89 --profile minimal --no-self-update
+          rustup default 1.89
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --locked -p velmora
+      - run: cargo check --locked -p velmora --no-default-features
+
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # the committed lockfile. Findings are fixed by updating the dependency,
   # never by weakening the policy. Keep this job id in ci-ok's needs.
@@ -128,7 +149,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, cargo-deny]
+    needs: [rust-test, rust-wasm, rust-msrv, cargo-deny]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
