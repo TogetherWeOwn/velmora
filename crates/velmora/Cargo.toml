@@ -53,6 +53,14 @@ criterion = "0.8"
 # Inflates the zlib-compressed C2SP CCTV age vectors (`cctv_age_stream_vectors`
 # in src/media.rs).
 miniz_oxide = "0.8"
+# Interop oracle for the media STREAM layer (format decision §4): rage
+# seals and opens against velmora's writer and reader. Pinned exactly;
+# `age-core` supplies the `FileKey`/`Stanza` types of its recipient traits.
+age = "=0.12.1"
+age-core = "=0.12.0"
+# Raw ChaCha20 block 0 (the Poly1305 key) for the two-key chunk fixture.
+# Already in the tree through chacha20poly1305.
+chacha20 = "=0.10.2"
 
 [[bench]]
 name = "yenc"
