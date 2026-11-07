@@ -280,7 +280,7 @@ fn ifsc_tail_not_a_multiple_of_20_is_rejected() {
             "tail {tail} must stay fractional after {pad} pad bytes"
         );
         let mut entries = entry(0x1234_5678).to_vec();
-        entries.extend(std::iter::repeat(0xABu8).take(tail));
+        entries.extend(std::iter::repeat_n(0xABu8, tail));
         let err = RecoverySet::parse(&set_bytes(64, &entries)).unwrap_err();
         assert_eq!(
             malformed_message(&err),

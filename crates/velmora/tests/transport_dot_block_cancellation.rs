@@ -20,7 +20,7 @@ use std::future::Future;
 use std::io;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use velmora::transport::{BufferedTransport, Transport};
 
@@ -96,17 +96,10 @@ fn transport(
     (BufferedTransport::new(inner), trace)
 }
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 /// Polls a future exactly once. The scripted transport only pends where it
 /// is scripted to, so one poll runs the dot-block read up to that point.
 fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     future.poll(&mut cx)
 }
 

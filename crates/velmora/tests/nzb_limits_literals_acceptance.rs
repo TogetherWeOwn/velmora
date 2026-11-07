@@ -118,7 +118,7 @@ fn doc_padded_to(total: usize) -> Vec<u8> {
     let pad = total - base;
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(DOC_PAD_PREFIX.as_bytes());
-    out.extend(std::iter::repeat(b' ').take(pad));
+    out.extend(std::iter::repeat_n(b' ', pad));
     out.extend_from_slice(DOC_PAD_REST.as_bytes());
     debug_assert_eq!(out.len(), total);
     out

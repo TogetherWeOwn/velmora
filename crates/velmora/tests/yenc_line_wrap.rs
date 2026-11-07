@@ -281,7 +281,7 @@ fn body_lines_never_exceed_128_across_payloads() {
         vec![PLAIN_RAW; 300],
         vec![ESCAPABLE_RAW[0]; 300],
     ];
-    for len in [63, 64, 65, 127, 128, 129, 255, 256, 1000, 4096] {
+    for len in [63usize, 64, 65, 127, 128, 129, 255, 256, 1000, 4096] {
         cases.push(
             (0..len)
                 .map(|i| {
