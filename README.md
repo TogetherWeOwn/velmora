@@ -5,7 +5,7 @@ Shared Usenet data-plane engine in Rust, for native targets and for
 
 | Crate | Library | What |
 |---|---|---|
-| [`crates/velmora`](crates/velmora/README.md) | `velmora` | NNTP client and transports (native rustls, Workers sockets), pinned/cancellable fetch policy, yEnc (SIMD + scalar), NZB parser, ranged AES-CBC and rclone-crypt decrypt, PAR2 parse/verify/create and Linux repair, segment identity, posting article assembly |
+| [`crates/velmora`](crates/velmora/README.md) | `velmora` | NNTP client and transports (native rustls, Workers sockets), pinned/cancellable fetch policy, yEnc (SIMD + scalar), NZB parser, `velmora.media.v1` media encryption (age STREAM + key commitment), PAR2 parse/verify/create and Linux repair, segment identity, posting article assembly |
 | [`crates/velmora-test-nntp`](crates/velmora-test-nntp/README.md) | `velmora_test_nntp` | Synthetic in-process NNTP server and fixture corpus, so no CI run touches real Usenet |
 
 ## Scope

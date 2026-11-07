@@ -78,8 +78,11 @@ No blanket exception or global tool configuration is introduced.
 The preserved manifest disables rustls/tokio-rustls default providers and selects
 ring explicitly. Existing locked ring 0.17.14, rustls 0.23.46,
 tokio-rustls 0.26.6 and rustls-pki-types 1.15.1 versions are retained.
-AWS-LC and its now-unreachable build dependencies disappear. HMAC and product
-pool modules are not added; rustls's existing transitive `subtle` remains.
+AWS-LC and its now-unreachable build dependencies disappear. This transport
+slice adds no HMAC or product pool modules; rustls's transitive `subtle` remains.
+The conflict-only restack onto main `fe8b840b077027f9792430c5fe9f6fc53ed0012b` (media-format PR #8) preserves
+that base's media source, tests and crypto dependencies, including its direct
+HMAC/subtle declarations. Those declarations are not transport dependencies.
 
 The only added registry package is the preserved source lock's web-time 1.1.0,
 checksum `5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb`.
