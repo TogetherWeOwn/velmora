@@ -43,12 +43,21 @@ impl CleanupSlot {
     }
 
     fn reserve_from(counter: &'static AtomicUsize) -> io::Result<Self> {
-        counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < MAX_OWNED_CHILDREN).then_some(n + 1)
-            })
-            .map(|_| Self(counter))
-            .map_err(|_| io::Error::other("par2 repair: cleanup capacity exhausted"))
+        let mut count = counter.load(Ordering::Relaxed);
+        loop {
+            if count >= MAX_OWNED_CHILDREN {
+                return Err(io::Error::other("par2 repair: cleanup capacity exhausted"));
+            }
+            match counter.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Self(counter)),
+                Err(current) => count = current,
+            }
+        }
     }
 }
 impl Drop for CleanupSlot {
