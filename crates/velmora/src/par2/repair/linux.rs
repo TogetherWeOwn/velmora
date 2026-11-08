@@ -36,7 +36,10 @@ fn check_deadline(deadline: Instant) -> Result<()> {
 const MAX_OWNED_CHILDREN: usize = 32;
 static OWNED_CHILDREN: AtomicUsize = AtomicUsize::new(0);
 
-struct CleanupSlot(&'static AtomicUsize);
+struct CleanupSlot {
+    counter: &'static AtomicUsize,
+    reusable: bool,
+}
 impl CleanupSlot {
     fn reserve() -> io::Result<Self> {
         Self::reserve_from(&OWNED_CHILDREN)
@@ -54,7 +57,12 @@ impl CleanupSlot {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(Self(counter)),
+                Ok(_) => {
+                    return Ok(Self {
+                        counter,
+                        reusable: true,
+                    })
+                }
                 Err(current) => count = current,
             }
         }
@@ -62,13 +70,15 @@ impl CleanupSlot {
 }
 impl Drop for CleanupSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        if self.reusable {
+            self.counter.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 struct OwnedChild {
     child: Child,
-    _slot: CleanupSlot,
+    slot: CleanupSlot,
 }
 type Reaper = Arc<Mutex<Vec<OwnedChild>>>;
 
@@ -133,7 +143,7 @@ impl Process {
         let reaper = reaper()?;
         let child = cmd.spawn()?;
         Ok(Self {
-            owned: Some(OwnedChild { child, _slot: slot }),
+            owned: Some(OwnedChild { child, slot: slot }),
             reaper,
             state: ProcessState::Reserved,
             #[cfg(test)]
@@ -203,6 +213,12 @@ impl Process {
                 self.state = ProcessState::Signalled;
                 let pid = self.child().id() as libc::pid_t;
                 let group = self.signal(-pid);
+                if group.is_err() {
+                    // Reaping the leader cannot prove its descendants exited.
+                    // Permanently charge this counter, retaining no stale IDs
+                    // or handles once reaped and never signalling them later.
+                    self.owned.as_mut().expect("owned child").slot.reusable = false;
+                }
                 let leader = self.signal(pid);
                 signal_error = group.err().or_else(|| leader.err());
             }

@@ -109,6 +109,114 @@ fn cleanup_capacity_fails_closed_and_recovers_when_ownership_is_released() {
     assert_eq!(COUNT.load(Ordering::Relaxed), 0);
 }
 
+fn denied_group_cleanup_retains_admission(counter: &'static AtomicUsize, deferred: bool) {
+    use std::io::Write;
+
+    let slots = (0..MAX_OWNED_CHILDREN - 1)
+        .map(|_| CleanupSlot::reserve_from(counter).unwrap())
+        .collect::<Vec<_>>();
+    // The descendant holds stdout open, announcing startup and finite exit.
+    // Stdin holds the deferred leader alive until after cleanup returns.
+    let script = if deferred {
+        "(printf ready; sleep 2; printf done) & read -r release; exit 0"
+    } else {
+        "(printf ready; sleep 2; printf done) & exit 0"
+    };
+    let mut process = Process::spawn(
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0),
+    )
+    .unwrap();
+    process.owned.as_mut().unwrap().slot = CleanupSlot::reserve_from(counter).unwrap();
+    let pid = process.child().id();
+    let mut release = process.child().stdin.take().unwrap();
+    let mut output = process.child().stdout.take().unwrap();
+    let mut ready = [0; 5];
+    output.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
+    nonblocking(&output).unwrap();
+    if !deferred {
+        observe_exit(&mut process);
+    }
+    let targets = Rc::new(RefCell::new(Vec::new()));
+    let captured = Rc::clone(&targets);
+    process.signal_spy = Some(Box::new(move |target| {
+        captured.borrow_mut().push(target);
+        if target < 0 || deferred {
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        } else {
+            Ok(())
+        }
+    }));
+    let start = Instant::now();
+    assert_eq!(
+        process.finish().unwrap_err().raw_os_error(),
+        Some(libc::EPERM)
+    );
+    assert!(start.elapsed() < Duration::from_millis(500));
+    assert_eq!(matches!(process.state, ProcessState::Unavailable), deferred);
+    assert!(process.owned.is_none());
+    process.signal_spy = Some(Box::new(|_| panic!("signal after cleanup handoff or reap")));
+    drop(process);
+    if deferred {
+        release.write_all(b"release\n").unwrap();
+    }
+    drop(release);
+    assert_eventually_reaped(pid);
+    // Synchronize with removal, not just the worker's successful wait syscall.
+    let worker = reaper().unwrap();
+    let pending = worker.lock().unwrap();
+    assert!(!pending.iter().any(|owned| owned.child.id() == pid));
+    drop(pending);
+    let mut byte = [0];
+    assert_eq!(
+        output.read(&mut byte).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock,
+        "descendant must still be running after leader reap"
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), MAX_OWNED_CHILDREN);
+    assert!(CleanupSlot::reserve_from(counter).is_err());
+    assert_eq!(
+        *targets.borrow(),
+        vec![-(pid as libc::pid_t), pid as libc::pid_t]
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut done = Vec::new();
+    loop {
+        match output.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => done.extend_from_slice(&byte),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "finite descendant did not exit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("descendant output: {err}"),
+        }
+    }
+    assert_eq!(done, b"done");
+    // Even finite exit cannot safely be inferred from a stale numeric PGID.
+    assert!(CleanupSlot::reserve_from(counter).is_err());
+    drop(slots);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn denied_group_cleanup_retains_admission_after_immediate_leader_reap() {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    denied_group_cleanup_retains_admission(&COUNT, false);
+}
+
+#[test]
+fn denied_group_cleanup_retains_admission_after_deferred_leader_reap() {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    denied_group_cleanup_retains_admission(&COUNT, true);
+}
+
 #[test]
 fn reaper_initialization_retries_after_worker_start_failure_and_caches_success() {
     let cache = Mutex::new(None);

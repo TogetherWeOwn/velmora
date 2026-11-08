@@ -85,9 +85,13 @@ pub fn repair_with_binary(
 /// Paths are canonicalised and checked against the private scratch directory.
 /// A budget breach attempts to terminate the process group and never reports
 /// success. Cleanup never blocks awaiting exit: one shared reaper retains child
-/// ownership until exit, with at most 32 active/deferred children per process.
-/// New starts fail closed when that capacity is exhausted. A sandbox denying
-/// signals can prevent termination; this runner cannot override that policy.
+/// ownership until exit. At most 32 active/deferred children or unresolved group
+/// cleanups are admitted per process. A failed group signal permanently consumes
+/// its slot, even after leader reap: descendant exit cannot safely be proved from
+/// stale IDs. New starts fail closed when capacity is exhausted; restart the
+/// process to reset it only after externally ensuring those descendants exited.
+/// A sandbox denying signals can prevent termination; this runner cannot
+/// override that policy.
 /// Kernel-enforced termination may appear as an unsuccessful report; other
 /// limit violations return errors. Files are preserved for diagnosis.
 pub fn repair_with_limits(
