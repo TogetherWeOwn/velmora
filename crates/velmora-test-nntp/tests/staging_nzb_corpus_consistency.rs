@@ -209,7 +209,11 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
         }
     }
 
-    for seg in &all_segments {
+    for (file, seg) in parsed
+        .files
+        .iter()
+        .flat_map(|file| file.segments.iter().map(move |seg| (file, seg)))
+    {
         match corpus.get(&seg.id) {
             None => errors.push(format!(
                 "segment {} references {} which the default synthetic corpus does not serve",
@@ -225,10 +229,10 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
                         article.payload.len()
                     ));
                 }
-                if !all_groups.iter().any(|g| g == &article.group) {
+                if !file.groups.iter().any(|g| g == &article.group) {
                     errors.push(format!(
-                        "segment {} ({}) is served in group {} which the NZB does not list (groups: {:?})",
-                        seg.number, seg.id, article.group, all_groups
+                        "segment {} ({}) is served in group {} which its NZB file does not list (groups: {:?})",
+                        seg.number, seg.id, article.group, file.groups
                     ));
                 }
             }
