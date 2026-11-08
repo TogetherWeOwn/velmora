@@ -267,9 +267,9 @@ pub fn nzb_for(articles: &[&Article], group: &str) -> String {
         out.push_str(&format!(
             "  <file poster=\"fixture@nntune.test\" date=\"1760313600\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n      <segment bytes=\"{}\" number=\"1\">{}</segment>\n    </segments>\n  </file>\n",
             xml_escape(&a.subject),
-            group,
+            xml_escape(group),
             a.raw.len(),
-            a.message_id.trim_matches(|c| c == '<' || c == '>'),
+            xml_escape(a.message_id.trim_matches(|c| c == '<' || c == '>')),
         ));
     }
     out.push_str("</nzb>\n");
@@ -292,14 +292,14 @@ pub fn nzb_for_multipart(articles: &[&Article], group: &str) -> String {
     out.push_str(&format!(
         "  <file poster=\"fixture@nntune.test\" date=\"1760313600\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n",
         xml_escape(&articles[0].subject),
-        group,
+        xml_escape(group),
     ));
     for (index, a) in articles.iter().enumerate() {
         out.push_str(&format!(
             "      <segment bytes=\"{}\" number=\"{}\">{}</segment>\n",
             a.raw.len(),
             index + 1,
-            a.message_id.trim_matches(|c| c == '<' || c == '>'),
+            xml_escape(a.message_id.trim_matches(|c| c == '<' || c == '>')),
         ));
     }
     out.push_str("    </segments>\n  </file>\n</nzb>\n");

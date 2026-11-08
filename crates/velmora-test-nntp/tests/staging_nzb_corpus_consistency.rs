@@ -210,7 +210,11 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
         }
     }
 
-    for seg in &all_segments {
+    for (file, seg) in parsed
+        .files
+        .iter()
+        .flat_map(|file| file.segments.iter().map(move |seg| (file, seg)))
+    {
         match corpus.get(&seg.id) {
             None => errors.push(format!(
                 "segment {} references {} which the default synthetic corpus does not serve",
@@ -226,10 +230,10 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
                         article.raw.len()
                     ));
                 }
-                if !all_groups.iter().any(|g| g == &article.group) {
+                if !file.groups.iter().any(|g| g == &article.group) {
                     errors.push(format!(
-                        "segment {} ({}) is served in group {} which the NZB does not list (groups: {:?})",
-                        seg.number, seg.id, article.group, all_groups
+                        "segment {} ({}) is served in group {} which its NZB file does not list (groups: {:?})",
+                        seg.number, seg.id, article.group, file.groups
                     ));
                 }
             }
@@ -269,6 +273,40 @@ fn validator_accepts_canonical_generated_corpus_nzbs() {
     ] {
         let errors = validate_nzb_against_corpus(&generated_nzb(ids));
         assert!(errors.is_empty(), "{ids:?}: {errors:?}");
+    }
+}
+
+#[test]
+fn validator_accepts_canonical_two_file_nzb() {
+    let text = generated_nzb(&["<enc-rar-001@nntune.test>", "<enc-7z-001@nntune.test>"]);
+    assert_eq!(parse_nzb(&text).files.len(), 2);
+    let errors = validate_nzb_against_corpus(&text);
+    assert!(errors.is_empty(), "canonical two-file NZB: {errors:?}");
+}
+
+#[test]
+fn validator_rejects_wrong_or_missing_first_file_group() {
+    let text = generated_nzb(&["<enc-rar-001@nntune.test>", "<enc-7z-001@nntune.test>"]);
+    for replacement in ["<group>alt.binaries.nonexistent</group>", ""] {
+        // Leave the second file's valid group intact: its group must not
+        // satisfy the first file's article membership check.
+        let drifted = text.replacen("<group>alt.binaries.nntune.test</group>", replacement, 1);
+        let parsed = parse_nzb(&drifted);
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files[1].groups, ["alt.binaries.nntune.test"]);
+        let errors = validate_nzb_against_corpus(&drifted);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("<enc-rar-001@nntune.test>") && e.contains("is served in group")
+            }),
+            "first-file group drift not reported: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.contains("<enc-7z-001@nntune.test>")),
+            "valid second file incorrectly rejected: {errors:?}"
+        );
     }
 }
 
@@ -668,6 +706,72 @@ async fn generated_multi_part_nzb_reconstructs_canonical_wav_via_nntp() {
 // ---------------------------------------------------------------------------
 // Production path: the parser, NNTP client and yEnc decoder ingest uses
 // ---------------------------------------------------------------------------
+
+fn assert_xml_sensitive_ids_round_trip(render: fn(&[&Article], &str) -> String) {
+    let bare_ids = [
+        "a&b@nntune.test",
+        "a&amp;b@nntune.test",
+        "a&#64;b@nntune.test",
+        "a&#x40;b@nntune.test",
+        "a&apos;b@nntune.test",
+        "a\"'b@nntune.test",
+    ];
+    let mut articles = Vec::new();
+    for id in bare_ids {
+        assert_eq!(velmora::nzb::normalize_message_id(id).unwrap(), id);
+        let mut article = default_corpus().remove(0);
+        article.message_id = format!("<{id}>");
+        article.subject = "fixture & <tag> \"quoted.wav\"".to_string();
+        articles.push(article);
+    }
+    let refs: Vec<&Article> = articles.iter().collect();
+    let text = render(&refs, "alt.binaries.nntune.test");
+    let document = velmora::nzb::parse(text.as_bytes())
+        .expect("production parser accepts XML-sensitive fixture identities");
+    let parsed_ids: Vec<&str> = document
+        .files
+        .iter()
+        .flat_map(|f| f.segments.iter().map(|s| s.message_id.as_str()))
+        .collect();
+    assert_eq!(
+        parsed_ids, bare_ids,
+        "XML references must remain literal ID text"
+    );
+    for file in &document.files {
+        assert_eq!(file.subject, articles[0].subject);
+        for segment in &file.segments {
+            assert_eq!(segment.encoded_bytes, articles[0].raw.len() as i64);
+        }
+    }
+}
+
+#[test]
+fn generated_nzb_xml_sensitive_ids_round_trip_via_production_parser() {
+    assert_xml_sensitive_ids_round_trip(velmora_test_nntp::nzb_for);
+}
+
+#[test]
+fn generated_multipart_nzb_xml_sensitive_ids_round_trip_via_production_parser() {
+    assert_xml_sensitive_ids_round_trip(velmora_test_nntp::nzb_for_multipart);
+}
+
+#[test]
+fn generated_nzb_group_text_is_xml_escaped_in_both_shapes() {
+    let corpus = default_corpus();
+    let articles = [&corpus[0], &corpus[1]];
+    let group = "alt.binaries.a&<b>\"'";
+    for text in [
+        velmora_test_nntp::nzb_for(&articles, group),
+        velmora_test_nntp::nzb_for_multipart(&articles, group),
+    ] {
+        assert!(text.contains("<group>alt.binaries.a&amp;&lt;b&gt;&quot;'</group>"));
+        let parsed = parse_nzb(&text);
+        for file in parsed.files {
+            assert_eq!(file.groups, [group]);
+        }
+        velmora::nzb::parse(text.as_bytes()).expect("escaped group text is valid XML");
+    }
+}
 
 #[tokio::test]
 async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
