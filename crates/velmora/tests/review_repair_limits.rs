@@ -174,6 +174,39 @@ fn timeout_returns_promptly_reaps_child_and_stops_descendants() {
     assert!(!f.scratch.join("escaped-timeout").exists());
 }
 
+fn assert_family_stopped(f: &Fixture) {
+    let parent = OwnedProcess::from_file(&f.scratch.join("parent.pid"));
+    let child = OwnedProcess::from_file(&f.scratch.join("child.pid"));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while (parent.running() || child.running()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(process_state(parent.pid).is_none(), "leader was not reaped");
+    assert!(!child.running(), "descendant survived cleanup");
+}
+
+#[test]
+fn successful_leader_cleans_up_descendant_holding_output_open() {
+    let f = Fixture::new("printf '%s' \"$$\" > parent.pid\nsleep 3 &\nprintf '%s' \"$!\" > child.pid\nprintf 'Repair complete.\\n'\nexit 0");
+    let started = Instant::now();
+    let report = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
+    assert!(report.success);
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.tail.contains("Repair complete."));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_family_stopped(&f);
+}
+
+#[test]
+fn output_limit_error_reaps_leader_and_stops_descendants() {
+    let f = Fixture::new("printf '%s' \"$$\" > parent.pid\nsleep 3 &\nprintf '%s' \"$!\" > child.pid\ni=0; while [ \"$i\" -lt 8192 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nwait");
+    let started = Instant::now();
+    let err = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap_err();
+    assert!(err.to_string().contains("output limit exceeded"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_family_stopped(&f);
+}
+
 #[test]
 fn existing_workspace_over_budget_is_rejected_before_spawn() {
     let f = Fixture::new("printf 'invoked' > invoked; printf 'Repair complete.\\n'");

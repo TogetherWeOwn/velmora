@@ -7,7 +7,7 @@ use std::os::unix::{
     process::{CommandExt, ExitStatusExt},
 };
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 fn limit_error(name: &str) -> Error {
@@ -28,23 +28,101 @@ fn check_deadline(deadline: Instant) -> Result<()> {
     }
 }
 
-// A dedicated process group is killed on every exit path, including errors
-// setting up the pipes and descendants that outlive a successful parent.
-struct Process(Child);
+enum ProcessState {
+    Reserved,
+    Killed,
+    Reaped(ExitStatus),
+    Unavailable,
+}
+
+// The unreaped leader reserves its PID/PGID until group cleanup is complete,
+// including setup errors and descendants that outlive a successful parent.
+struct Process {
+    child: Child,
+    state: ProcessState,
+    #[cfg(test)]
+    signal_spy: Option<Box<dyn FnMut(libc::pid_t)>>,
+}
 impl Process {
-    fn kill_group(&mut self) {
-        // SAFETY: process_group(0) made this child's PID its group ID. Negative
-        // kill targets only that group; no signal handler or shared state.
-        unsafe {
-            libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            state: ProcessState::Reserved,
+            #[cfg(test)]
+            signal_spy: None,
         }
-        let _ = self.0.kill();
+    }
+
+    fn exited(&mut self) -> io::Result<bool> {
+        // SAFETY: siginfo_t is valid when zeroed; waitid initializes it on
+        // success. WNOWAIT observes only our child and never releases its PID.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                // An external reaper (or SIGCHLD disposition) has removed our
+                // reservation. Never signal a potentially reused numeric ID.
+                self.state = ProcessState::Unavailable;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        // SAFETY: waitid succeeded; si_pid is zero when WNOHANG saw no exit.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    fn signal(&mut self, pid: libc::pid_t) {
+        #[cfg(test)]
+        if let Some(spy) = &mut self.signal_spy {
+            spy(pid);
+            return;
+        }
+        // SAFETY: called only before reaping the leader. process_group(0)
+        // made its PID the group ID; both numeric IDs are still reserved.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+
+    fn finish(&mut self) -> io::Result<ExitStatus> {
+        match self.state {
+            ProcessState::Reaped(status) => return Ok(status),
+            ProcessState::Unavailable => return Err(io::Error::from_raw_os_error(libc::ECHILD)),
+            ProcessState::Reserved => {
+                self.state = ProcessState::Killed;
+                let pid = self.child.id() as libc::pid_t;
+                self.signal(-pid);
+                self.signal(pid);
+            }
+            ProcessState::Killed => {}
+        }
+        match self.child.wait() {
+            Ok(status) => {
+                self.state = ProcessState::Reaped(status);
+                Ok(status)
+            }
+            Err(err) => {
+                if err.raw_os_error() == Some(libc::ECHILD) {
+                    self.state = ProcessState::Unavailable;
+                }
+                Err(err)
+            }
+        }
     }
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        self.kill_group();
-        let _ = self.0.wait();
+        let _ = self.finish();
     }
 }
 
@@ -191,9 +269,9 @@ pub(super) fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut process = Process(cmd.spawn().map_err(Error::Io)?);
-    let mut stdout = process.0.stdout.take().expect("piped stdout");
-    let mut stderr = process.0.stderr.take().expect("piped stderr");
+    let mut process = Process::new(cmd.spawn().map_err(Error::Io)?);
+    let mut stdout = process.child.stdout.take().expect("piped stdout");
+    let mut stderr = process.child.stderr.take().expect("piped stderr");
     nonblocking(&stdout)?;
     nonblocking(&stderr)?;
     let mut output = Vec::new();
@@ -202,8 +280,8 @@ pub(super) fn run(
         drain(&mut stdout, &mut output, limits.max_output_bytes, deadline)?;
         drain(&mut stderr, &mut output, limits.max_output_bytes, deadline)?;
         workspace_size(&root, limits.max_workspace_bytes, deadline)?;
-        if let Some(status) = process.0.try_wait().map_err(Error::Io)? {
-            process.kill_group();
+        if process.exited().map_err(Error::Io)? {
+            let status = process.finish().map_err(Error::Io)?;
             drain(&mut stdout, &mut output, limits.max_output_bytes, deadline)?;
             drain(&mut stderr, &mut output, limits.max_output_bytes, deadline)?;
             workspace_size(&root, limits.max_workspace_bytes, deadline)?;
@@ -228,6 +306,127 @@ pub(super) fn run(
         targets: par2_files.iter().map(|p| p.to_path_buf()).collect(),
         tail: lines.join("\n"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn spawn(script: &str) -> Process {
+        Process::new(
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn observe_exit(process: &mut Process) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process.exited().unwrap() {
+            assert!(Instant::now() < deadline, "fixture did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn assert_reaped(pid: u32) {
+        let mut status = 0;
+        // SAFETY: only asks about the test's direct child; status is writable.
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn signals_only_while_leader_is_reserved_never_after_reap() {
+        let mut process = spawn("exit 7");
+        let pid = process.child.id();
+        let signals = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&signals);
+        // Replace all signal syscalls. A regression can never hit a reused ID,
+        // and each attempted signal must still find our unreaped zombie.
+        process.signal_spy = Some(Box::new(move |target| {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: valid writable info; WNOWAIT does not consume the child.
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0,
+                "signal attempted after leader was reaped"
+            );
+            // SAFETY: waitid succeeded and initialized info.
+            assert_eq!(unsafe { info.si_pid() }, pid as libc::pid_t);
+            captured.borrow_mut().push(target);
+        }));
+        observe_exit(&mut process);
+        // Observing a second time must not consume the exit status either.
+        assert!(process.exited().unwrap());
+        let status = process.finish().unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_reaped(pid);
+        assert_eq!(process.finish().unwrap(), status);
+        drop(process);
+        assert_eq!(
+            *signals.borrow(),
+            vec![-(pid as libc::pid_t), pid as libc::pid_t]
+        );
+    }
+
+    #[test]
+    fn setup_error_drops_guard_and_reaps_running_child() {
+        struct InvalidPipe;
+        impl AsRawFd for InvalidPipe {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                -1
+            }
+        }
+        fn setup(process: Process) -> Result<()> {
+            let _guard = process;
+            nonblocking(&InvalidPipe)?;
+            Ok(())
+        }
+        let process = spawn("exec sleep 3");
+        let pid = process.child.id();
+        let started = Instant::now();
+        assert!(setup(process).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn missing_child_disarms_cleanup_without_signalling() {
+        let mut process = spawn("exit 0");
+        observe_exit(&mut process);
+        // Simulate another reaper, without exposing any real signal syscall.
+        process.child.wait().unwrap();
+        process.signal_spy = Some(Box::new(|_| panic!("signal after ECHILD")));
+        assert_eq!(
+            process.exited().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(
+            process.finish().unwrap_err().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        drop(process);
+    }
 }
 
 fn parse_repaired(output: &str) -> i64 {
