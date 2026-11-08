@@ -444,12 +444,12 @@ async fn generated_nzbs_match_served_ids() {
             "NZB references unknown article {id}"
         );
     }
-    // Declared segment bytes must match the served decoded payload size.
+    // Declared segment bytes count the encoded article, not its decoded payload.
     for (id, bytes) in &declared_bytes {
         let article = corpus.get(id).expect("known id");
         assert_eq!(
             *bytes,
-            article.payload.len() as u64,
+            article.raw.len() as u64,
             "NZB bytes mismatch for {id}"
         );
     }

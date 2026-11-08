@@ -16,6 +16,9 @@ Synthetic NNTP test server + fixture corpus for velmora CI (extracted from NNTun
   `481` auth failures, throttled slow links, mid-body disconnects, latency.
 - No checked-in NZB files anywhere: tests that need an NZB build it in memory
   with `nzb_for()` from the served corpus (see `tests/integration_nntp.rs`).
+  Both NZB generators declare encoded article sizes in `bytes=`: `Article::raw`
+  (headers, encoded body and CRLF), before NNTP dot-stuffing, status and terminator.
+  Decoded lengths come from yEnc `=yend size=` / `=ypart` ranges, not NZB `bytes=`.
   The staging E2E never touches this corpus: it ingests a secret-held real
   NZB rebuilt into `RUNNER_TEMP` only (see `e2e/`).
 
