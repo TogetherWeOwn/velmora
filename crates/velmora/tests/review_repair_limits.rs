@@ -97,6 +97,42 @@ fn combined_stdout_and_stderr_share_one_output_budget() {
     }
 }
 
+#[test]
+fn invalid_bytes_at_raw_limit_have_a_decoded_tail_budget() {
+    let f = Fixture::new("i=0; while [ \"$i\" -lt 1024 ]; do printf '\\377'; i=$((i+1)); done");
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.tail, "\u{fffd}".repeat(341));
+    assert!(result.tail.len() <= limits().max_output_bytes);
+}
+
+#[test]
+fn valid_multibyte_output_at_raw_limit_is_preserved() {
+    let f = Fixture::new("i=0; while [ \"$i\" -lt 512 ]; do printf '\\303\\251'; i=$((i+1)); done");
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.tail, "é".repeat(512));
+}
+
+#[test]
+fn valid_multibyte_output_over_raw_limit_is_rejected() {
+    let f = Fixture::new("i=0; while [ \"$i\" -lt 513 ]; do printf '\\303\\251'; i=$((i+1)); done");
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits());
+    assert!(
+        result.is_err(),
+        "raw output cap must not become truncation-only"
+    );
+}
+
+#[test]
+fn invalid_output_over_combined_raw_limit_is_rejected() {
+    let f = Fixture::new(
+        "i=0; while [ \"$i\" -lt 513 ]; do printf '\\377'; printf '\\377' >&2; i=$((i+1)); done",
+    );
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits());
+    assert!(result.is_err(), "stdout and stderr must share the raw cap");
+}
+
 // Fixtures save their identities while alive, before repair cleanup. These
 // observations never signal PIDs, even on assertion failure; fixtures are finite.
 struct ObservedProcess {
@@ -144,7 +180,9 @@ fn timeout_returns_promptly_reaps_child_and_stops_descendants() {
     let parent = ObservedProcess::from_file(&f.scratch.join("parent.stat"));
     let child = ObservedProcess::from_file(&f.scratch.join("child.stat"));
     let grace = Instant::now();
-    while (parent.running() || child.running()) && grace.elapsed() < Duration::from_millis(500) {
+    while (parent.state().is_some() || child.running())
+        && grace.elapsed() < Duration::from_millis(500)
+    {
         thread::sleep(Duration::from_millis(10));
     }
     assert_not_success(&result);
@@ -162,7 +200,7 @@ fn assert_family_stopped(f: &Fixture) {
     let parent = ObservedProcess::from_file(&f.scratch.join("parent.stat"));
     let child = ObservedProcess::from_file(&f.scratch.join("child.stat"));
     let deadline = Instant::now() + Duration::from_millis(500);
-    while (parent.running() || child.running()) && Instant::now() < deadline {
+    while (parent.state().is_some() || child.running()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(parent.state().is_none(), "leader was not reaped");
