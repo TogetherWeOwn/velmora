@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use super::{RepairLimits, RepairReport};
 use crate::error::{Error, Result};
 use std::io::{self, Read};
@@ -7,7 +10,9 @@ use std::os::unix::{
     process::{CommandExt, ExitStatusExt},
 };
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 fn limit_error(name: &str) -> Error {
@@ -28,23 +33,195 @@ fn check_deadline(deadline: Instant) -> Result<()> {
     }
 }
 
-// A dedicated process group is killed on every exit path, including errors
-// setting up the pipes and descendants that outlive a successful parent.
-struct Process(Child);
+const MAX_OWNED_CHILDREN: usize = 32;
+static OWNED_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+
+struct CleanupSlot(&'static AtomicUsize);
+impl CleanupSlot {
+    fn reserve() -> io::Result<Self> {
+        Self::reserve_from(&OWNED_CHILDREN)
+    }
+
+    fn reserve_from(counter: &'static AtomicUsize) -> io::Result<Self> {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_OWNED_CHILDREN).then_some(n + 1)
+            })
+            .map(|_| Self(counter))
+            .map_err(|_| io::Error::other("par2 repair: cleanup capacity exhausted"))
+    }
+}
+impl Drop for CleanupSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct OwnedChild {
+    child: Child,
+    _slot: CleanupSlot,
+}
+type Reaper = Arc<Mutex<Vec<OwnedChild>>>;
+
+fn reaper() -> io::Result<Reaper> {
+    static REAPER: OnceLock<io::Result<Reaper>> = OnceLock::new();
+    match REAPER.get_or_init(|| {
+        let pending: Reaper = Arc::new(Mutex::new(Vec::with_capacity(MAX_OWNED_CHILDREN)));
+        let worker = Arc::clone(&pending);
+        let _ = std::thread::Builder::new()
+            .name("par2-reaper".into())
+            .spawn(move || loop {
+                {
+                    let mut children = worker.lock().unwrap_or_else(|e| e.into_inner());
+                    children.retain_mut(|owned| match owned.child.try_wait() {
+                        Ok(Some(_)) => false,
+                        Err(err) if err.raw_os_error() == Some(libc::ECHILD) => false,
+                        _ => true,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            })?;
+        Ok(pending)
+    }) {
+        Ok(pending) => Ok(Arc::clone(pending)),
+        Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+    }
+}
+
+enum ProcessState {
+    Reserved,
+    Signalled,
+    Reaped(ExitStatus),
+    Unavailable,
+}
+
+// As in the group-before-reap guard, WNOWAIT reserves the numeric PID/PGID
+// until all signal attempts finish. Exclusive child ownership is required:
+// callers must not ignore SIGCHLD or externally reap this child.
+struct Process {
+    owned: Option<OwnedChild>,
+    reaper: Reaper,
+    state: ProcessState,
+    #[cfg(test)]
+    signal_spy: Option<Box<dyn FnMut(libc::pid_t) -> io::Result<()>>>,
+}
 impl Process {
-    fn kill_group(&mut self) {
-        // SAFETY: process_group(0) made this child's PID its group ID. Negative
-        // kill targets only that group; no signal handler or shared state.
-        unsafe {
-            libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
+    fn spawn(cmd: &mut Command) -> io::Result<Self> {
+        // Reserve bounded deferred-cleanup capacity and start the worker before
+        // spawning. Denied signals cannot create unbounded threads or zombies.
+        let slot = CleanupSlot::reserve()?;
+        let reaper = reaper()?;
+        let child = cmd.spawn()?;
+        Ok(Self {
+            owned: Some(OwnedChild { child, _slot: slot }),
+            reaper,
+            state: ProcessState::Reserved,
+            #[cfg(test)]
+            signal_spy: None,
+        })
+    }
+
+    fn child(&mut self) -> &mut Child {
+        &mut self.owned.as_mut().expect("owned child").child
+    }
+
+    fn exited(&mut self) -> io::Result<bool> {
+        match self.state {
+            ProcessState::Reaped(_) => return Ok(true),
+            ProcessState::Unavailable => return Err(io::Error::from_raw_os_error(libc::ECHILD)),
+            _ => {}
         }
-        let _ = self.0.kill();
+        // SAFETY: zeroed siginfo_t is valid and waitid initializes it. WNOWAIT
+        // observes only our child, without releasing its PID reservation.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child().id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                self.state = ProcessState::Unavailable;
+                self.owned = None;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        // SAFETY: waitid succeeded; si_pid is zero when WNOHANG saw no exit.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    fn signal(&mut self, pid: libc::pid_t) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(spy) = &mut self.signal_spy {
+            return spy(pid);
+        }
+        // SAFETY: called only before reaping our exclusively owned leader.
+        // process_group(0) made its PID the PGID; both IDs remain reserved.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
+            let err = io::Error::last_os_error();
+            // An already-exited leader or empty group needs no signal.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<ExitStatus> {
+        let mut signal_error = None;
+        match self.state {
+            ProcessState::Reaped(status) => return Ok(status),
+            ProcessState::Unavailable => return Err(io::Error::from_raw_os_error(libc::ECHILD)),
+            ProcessState::Reserved => {
+                self.state = ProcessState::Signalled;
+                let pid = self.child().id() as libc::pid_t;
+                let group = self.signal(-pid);
+                let leader = self.signal(pid);
+                signal_error = group.err().or_else(|| leader.err());
+            }
+            ProcessState::Signalled => {}
+        }
+        // Never block on wait, even after successful kill: denied signals or
+        // uninterruptible sleep need not produce an exit before our deadline.
+        let waited = self.child().try_wait();
+        match waited {
+            Ok(Some(status)) => {
+                self.state = ProcessState::Reaped(status);
+                self.owned = None;
+                signal_error.map_or(Ok(status), Err)
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ECHILD) => {
+                self.state = ProcessState::Unavailable;
+                self.owned = None;
+                Err(err)
+            }
+            other => {
+                let owned = self.owned.take().expect("owned child");
+                // The worker owns the child until reap, never signals, and
+                // retains the slot so repeated failures eventually fail closed.
+                self.reaper
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(owned);
+                self.state = ProcessState::Unavailable;
+                Err(signal_error.unwrap_or_else(|| match other {
+                    Err(err) => err,
+                    _ => io::Error::new(io::ErrorKind::WouldBlock, "par2 repair: cleanup deferred"),
+                }))
+            }
+        }
     }
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        self.kill_group();
-        let _ = self.0.wait();
+        let _ = self.finish();
     }
 }
 
@@ -191,9 +368,9 @@ pub(super) fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut process = Process(cmd.spawn().map_err(Error::Io)?);
-    let mut stdout = process.0.stdout.take().expect("piped stdout");
-    let mut stderr = process.0.stderr.take().expect("piped stderr");
+    let mut process = Process::spawn(&mut cmd).map_err(Error::Io)?;
+    let mut stdout = process.child().stdout.take().expect("piped stdout");
+    let mut stderr = process.child().stderr.take().expect("piped stderr");
     nonblocking(&stdout)?;
     nonblocking(&stderr)?;
     let mut output = Vec::new();
@@ -202,8 +379,8 @@ pub(super) fn run(
         drain(&mut stdout, &mut output, limits.max_output_bytes, deadline)?;
         drain(&mut stderr, &mut output, limits.max_output_bytes, deadline)?;
         workspace_size(&root, limits.max_workspace_bytes, deadline)?;
-        if let Some(status) = process.0.try_wait().map_err(Error::Io)? {
-            process.kill_group();
+        if process.exited().map_err(Error::Io)? {
+            let status = process.finish().map_err(Error::Io)?;
             drain(&mut stdout, &mut output, limits.max_output_bytes, deadline)?;
             drain(&mut stderr, &mut output, limits.max_output_bytes, deadline)?;
             workspace_size(&root, limits.max_workspace_bytes, deadline)?;
@@ -214,8 +391,6 @@ pub(super) fn run(
         );
     };
     let combined = String::from_utf8_lossy(&output);
-    let mut lines = combined.lines().rev().take(20).collect::<Vec<_>>();
-    lines.reverse();
     Ok(RepairReport {
         success: status.success(),
         exit_code: status.code(),
@@ -226,8 +401,21 @@ pub(super) fn run(
             -1
         },
         targets: par2_files.iter().map(|p| p.to_path_buf()).collect(),
-        tail: lines.join("\n"),
+        tail: retained_tail(&combined, limits.max_output_bytes),
     })
+}
+
+fn retained_tail(combined: &str, limit: usize) -> String {
+    let mut lines = combined.lines().rev().take(20).collect::<Vec<_>>();
+    lines.reverse();
+    let tail = lines.join("\n");
+    // Lossy decoding can triple the raw size. Keep the newest complete UTF-8
+    // characters, independently of the combined raw stdout/stderr acceptance cap.
+    let mut start = tail.len().saturating_sub(limit);
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    tail[start..].to_owned()
 }
 
 fn parse_repaired(output: &str) -> i64 {

@@ -98,6 +98,42 @@ fn combined_stdout_and_stderr_share_one_output_budget() {
     }
 }
 
+#[test]
+fn invalid_bytes_at_raw_limit_have_a_decoded_tail_budget() {
+    let f = Fixture::new("i=0; while [ \"$i\" -lt 1024 ]; do printf '\\377'; i=$((i+1)); done");
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.tail, "\u{fffd}".repeat(341));
+    assert!(result.tail.len() <= limits().max_output_bytes);
+}
+
+#[test]
+fn valid_multibyte_output_at_raw_limit_is_preserved() {
+    let f = Fixture::new("i=0; while [ \"$i\" -lt 512 ]; do printf '\\303\\251'; i=$((i+1)); done");
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
+    assert!(result.success);
+    assert_eq!(result.tail, "é".repeat(512));
+}
+
+#[test]
+fn valid_multibyte_output_over_raw_limit_is_rejected() {
+    let f = Fixture::new("i=0; while [ \"$i\" -lt 513 ]; do printf '\\303\\251'; i=$((i+1)); done");
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits());
+    assert!(
+        result.is_err(),
+        "raw output cap must not become truncation-only"
+    );
+}
+
+#[test]
+fn invalid_output_over_combined_raw_limit_is_rejected() {
+    let f = Fixture::new(
+        "i=0; while [ \"$i\" -lt 513 ]; do printf '\\377'; printf '\\377' >&2; i=$((i+1)); done",
+    );
+    let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits());
+    assert!(result.is_err(), "stdout and stderr must share the raw cap");
+}
+
 // Track Linux PID start times so cleanup never signals an unrelated reused PID.
 struct OwnedProcess {
     pid: u32,

@@ -14,7 +14,8 @@ mod linux;
 pub struct RepairLimits {
     /// Wall-clock deadline, including output draining and workspace checks.
     pub timeout: Duration,
-    /// Maximum combined stdout/stderr bytes retained or accepted.
+    /// Maximum combined raw stdout/stderr bytes accepted, and maximum UTF-8
+    /// bytes retained in the decoded report tail.
     pub max_output_bytes: usize,
     /// Aggregate workspace ceiling and the kernel's per-file size ceiling.
     pub max_workspace_bytes: u64,
@@ -63,7 +64,8 @@ pub struct RepairReport {
     pub repaired_blocks: i64,
     /// Target PAR2 paths supplied by the caller.
     pub targets: Vec<PathBuf>,
-    /// Last 20 lines of bounded stdout/stderr, in capture order.
+    /// Last 20 lines of stdout/stderr, in capture order, trimmed to a UTF-8
+    /// suffix no larger than `max_output_bytes`.
     pub tail: String,
 }
 
@@ -81,7 +83,11 @@ pub fn repair_with_binary(
 
 /// Runs with explicit positive budgets, no greater than the default ceilings.
 /// Paths are canonicalised and checked against the private scratch directory.
-/// A budget breach terminates the process group and never reports success.
+/// A budget breach attempts to terminate the process group and never reports
+/// success. Cleanup never blocks awaiting exit: one shared reaper retains child
+/// ownership until exit, with at most 32 active/deferred children per process.
+/// New starts fail closed when that capacity is exhausted. A sandbox denying
+/// signals can prevent termination; this runner cannot override that policy.
 /// Kernel-enforced termination may appear as an unsuccessful report; other
 /// limit violations return errors. Files are preserved for diagnosis.
 pub fn repair_with_limits(
