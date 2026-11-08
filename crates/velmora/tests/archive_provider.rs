@@ -60,21 +60,33 @@ fn intent(backend: Backend, sizes: &[usize]) -> (WriteIntent, Vec<u8>) {
 struct Authority {
     tenant: Id,
     state: Rc<Cell<Option<Failure>>>,
+    write_state: Rc<Cell<Option<Failure>>>,
 }
 impl Authority {
     fn new() -> Self {
         Self {
             tenant: id("tenant-a"),
             state: Rc::new(Cell::new(None)),
+            write_state: Rc::new(Cell::new(None)),
         }
     }
 }
 impl Control for Authority {
-    fn check(&self, target: &Target, _: Action) -> Result<()> {
+    fn check(&self, target: &Target, action: Action) -> Result<()> {
         if self.tenant != target.tenant {
             return Err(Failure::Denied);
         }
-        self.state.get().map_or(Ok(()), Err)
+        self.state.get().map_or(Ok(()), Err)?;
+        if action == Action::Write {
+            self.write_state.get().map_or(Ok(()), Err)?;
+        }
+        Ok(())
+    }
+
+    async fn cancelled(&self, _: &Target, _: Action) -> Failure {
+        // Only synchronous fake operations use this authority. Pending native
+        // I/O below uses an event-driven Revocation control instead.
+        std::future::pending().await
     }
 }
 
@@ -92,6 +104,9 @@ impl Sink for Output {
 struct ObjectStore {
     calls: usize,
     binding: Option<[u8; 32]>,
+    remote: Option<Id>,
+    aborted: bool,
+    after_read: Option<Rc<Cell<Option<Failure>>>>,
     parts: BTreeMap<usize, Vec<u8>>,
     complete: Option<(s3::Metadata, Vec<u8>)>,
     lost_part: bool,
@@ -100,6 +115,20 @@ struct ObjectStore {
     corrupt: bool,
     after_complete: Option<Rc<Cell<Option<Failure>>>>,
 }
+impl ObjectStore {
+    fn check_session(&self, session: &WriteSession) -> Result<()> {
+        if self.binding != Some(session.intent.binding()?)
+            || self.remote.as_ref() != Some(&session.remote)
+        {
+            return Err(Failure::Conflict);
+        }
+        if self.aborted {
+            return Err(Failure::Missing);
+        }
+        Ok(())
+    }
+}
+
 impl s3::SafeTransport for ObjectStore {
     async fn begin(
         &mut self,
@@ -112,8 +141,12 @@ impl s3::SafeTransport for ObjectStore {
         if self.binding.is_some_and(|old| old != binding) {
             return Err(Failure::Conflict);
         }
+        if self.aborted {
+            return Err(Failure::Missing);
+        }
         self.binding = Some(binding);
-        Ok(id("upload-a"))
+        let remote = self.remote.get_or_insert_with(|| id("upload-a"));
+        Ok(remote.clone())
     }
     async fn upload_part(
         &mut self,
@@ -124,7 +157,8 @@ impl s3::SafeTransport for ObjectStore {
         _: &impl Control,
     ) -> Result<s3::PartAck> {
         self.calls += 1;
-        if self.binding != Some(session.intent.binding()?) {
+        self.check_session(session)?;
+        if self.complete.is_some() {
             return Err(Failure::Conflict);
         }
         self.parts.insert(index, bytes.to_vec());
@@ -144,6 +178,7 @@ impl s3::SafeTransport for ObjectStore {
         _: &impl Control,
     ) -> Result<s3::Metadata> {
         self.calls += 1;
+        self.check_session(session)?;
         if let Some((metadata, _)) = &self.complete {
             return Ok(metadata.clone());
         }
@@ -170,14 +205,16 @@ impl s3::SafeTransport for ObjectStore {
     async fn abort_incomplete(
         &mut self,
         _: &s3::Config,
-        _: &WriteSession,
+        session: &WriteSession,
         _: &impl Control,
     ) -> Result<AbortOutcome> {
         self.calls += 1;
+        self.check_session(session)?;
         if self.complete.is_some() {
             return Ok(AbortOutcome::Irreversible);
         }
         self.parts.clear();
+        self.aborted = true;
         Ok(AbortOutcome::IncompleteRemoved)
     }
     async fn head(
@@ -209,6 +246,9 @@ impl s3::SafeTransport for ObjectStore {
         }
         let end = range.end(bytes.len() as u64)? as usize;
         out.copy_from_slice(&bytes[range.offset as usize..end]);
+        if let Some(state) = &self.after_read {
+            state.set(Some(Failure::Denied));
+        }
         if self.corrupt && !out.is_empty() {
             out[0] ^= 1;
         }
@@ -222,10 +262,11 @@ impl s3::SafeTransport for ObjectStore {
     async fn reconcile(
         &mut self,
         _: &s3::Config,
-        _: &WriteSession,
+        session: &WriteSession,
         _: &impl Control,
     ) -> Result<Option<s3::Metadata>> {
         self.calls += 1;
+        self.check_session(session)?;
         // All this fake's requests settle synchronously before returning.
         Ok(self.complete.as_ref().map(|(metadata, _)| metadata.clone()))
     }
@@ -518,23 +559,87 @@ async fn s3_abort_incomplete_and_zero_length_object_have_explicit_outcomes() {
         provider.abort(&session, &authority).await.unwrap(),
         AbortOutcome::IncompleteRemoved
     );
-    let receipt = provider
-        .write_part(&session, 0, &[], &authority)
-        .await
-        .unwrap();
-    assert_eq!(receipts, vec![receipt.clone()]);
+    assert_eq!(
+        provider.write_part(&session, 0, &[], &authority).await,
+        Err(Failure::Missing)
+    );
+    assert_eq!(
+        provider.commit(&session, &receipts, &authority).await,
+        Err(Failure::Missing)
+    );
+    // A successful abort invalidates that allocation. Empty-object completion
+    // is an independent allocation, never resurrection of the aborted upload.
+    let mut provider = s3::Provider::new(Some(config()), ObjectStore::default()).unwrap();
+    let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
     let proof = provider
-        .commit(&session, &[receipt], &authority)
+        .commit(&session, &receipts, &authority)
         .await
         .unwrap();
     assert_eq!(proof.record.identity.bytes, 0);
     assert!(proof.full_ciphertext_readback);
 }
 
+#[tokio::test]
+async fn s3_commit_and_reconcile_recheck_write_authority_after_readback() {
+    let (intent, bytes) = intent(Backend::S3, &[73]);
+    let authority = Authority::new();
+    let mut provider = s3::Provider::new(
+        Some(config()),
+        ObjectStore {
+            after_read: Some(authority.write_state.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+    assert_eq!(
+        provider.commit(&session, &receipts, &authority).await,
+        Err(Failure::Uncertain)
+    );
+    assert_eq!(authority.check(&intent.target, Action::Read), Ok(()));
+    authority.write_state.set(None);
+    assert_eq!(
+        provider.reconcile(&session, &authority).await,
+        Ok(Reconciled::Uncertain)
+    );
+}
+
+#[tokio::test]
+async fn s3_fake_transport_rejects_cross_upload_sessions() {
+    let (intent, bytes) = intent(Backend::S3, &[73]);
+    let authority = Authority::new();
+    let mut provider = s3::Provider::new(Some(config()), ObjectStore::default()).unwrap();
+    let session = provider.begin(&intent, &authority).await.unwrap();
+    let mut other = session.clone();
+    other.remote = id("other-upload");
+    assert_eq!(
+        provider.write_part(&other, 0, &bytes, &authority).await,
+        Err(Failure::Conflict)
+    );
+    assert_eq!(
+        provider.abort(&other, &authority).await,
+        Err(Failure::Conflict)
+    );
+    assert_eq!(
+        provider.reconcile(&other, &authority).await,
+        Err(Failure::Conflict)
+    );
+    let receipt = provider
+        .write_part(&session, 0, &bytes, &authority)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.commit(&other, &[receipt], &authority).await,
+        Err(Failure::Conflict)
+    );
+}
+
 #[derive(Default)]
 struct Spool {
     articles: BTreeMap<String, Vec<u8>>,
     fail_after: Option<usize>,
+    read_error: Option<Failure>,
+    after_read: Option<Rc<Cell<Option<Failure>>>>,
     posts: usize,
 }
 impl nntp::Io for Spool {
@@ -553,6 +658,12 @@ impl nntp::Io for Spool {
         Ok(())
     }
     async fn body(&mut self, _: &Target, message_id: &str, _: &impl Control) -> Result<Vec<u8>> {
+        if let Some(error) = self.read_error {
+            return Err(error);
+        }
+        if let Some(state) = &self.after_read {
+            state.set(Some(Failure::Denied));
+        }
         self.articles
             .get(message_id)
             .cloned()
@@ -664,6 +775,61 @@ async fn nntp_partial_posts_never_become_absent_and_restart_reuses_article_ids()
         .unwrap();
     assert_eq!(proof.record.identity.sha256, digest(&bytes));
     assert_eq!(restarted.into_io().articles.len(), 2);
+}
+
+#[tokio::test]
+async fn nntp_commit_and_reconcile_recheck_write_authority_after_readback() {
+    let (intent, bytes) = intent(Backend::Nntp, &[73]);
+    let authority = Authority::new();
+    let mut provider = nntp::Provider::new(
+        id("account-a"),
+        Spool {
+            after_read: Some(authority.write_state.clone()),
+            ..Default::default()
+        },
+        Some(posting(&intent)),
+    );
+    let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+    assert_eq!(
+        provider.commit(&session, &receipts, &authority).await,
+        Err(Failure::Uncertain)
+    );
+    assert_eq!(authority.check(&intent.target, Action::Read), Ok(()));
+    authority.write_state.set(None);
+    assert_eq!(
+        provider.reconcile(&session, &authority).await,
+        Ok(Reconciled::Uncertain)
+    );
+}
+
+#[tokio::test]
+async fn nntp_acknowledged_commit_readback_failure_preserves_uncertainty() {
+    for error in [
+        Failure::Missing,
+        Failure::Transient,
+        Failure::Cancelled,
+        Failure::Deadline,
+    ] {
+        let (intent, bytes) = intent(Backend::Nntp, &[73]);
+        let authority = Authority::new();
+        let mut provider = nntp::Provider::new(
+            id("account-a"),
+            Spool {
+                read_error: Some(error),
+                ..Default::default()
+            },
+            Some(posting(&intent)),
+        );
+        let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+        assert_eq!(
+            provider.commit(&session, &receipts, &authority).await,
+            Err(Failure::Uncertain)
+        );
+        assert_eq!(
+            provider.reconcile(&session, &authority).await,
+            Ok(Reconciled::Uncertain)
+        );
+    }
 }
 
 #[tokio::test]

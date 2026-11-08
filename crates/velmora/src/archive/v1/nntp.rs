@@ -2,8 +2,9 @@
 //!
 //! Borrow a leased, authenticated client through `ClientIo`, or implement `Io`
 //! using the product's existing bounded multi-account broker. No account choice,
-//! connection creation, new pool, repair process or cancellation supervisor is
-//! installed here. Optimized client operations remain available unchanged.
+//! connection creation, new pool or repair process is installed here. `ClientIo`
+//! supervises in-flight operations using the caller's event-driven control.
+//! Optimized client operations remain available unchanged.
 
 use super::*;
 use crate::{article, nntp::NntpClient, transport::Transport, yenc};
@@ -94,6 +95,9 @@ fn read_error(error: crate::Error) -> Failure {
     match error {
         crate::Error::ArticleNotFound(_) => Failure::Missing,
         crate::Error::AuthFailed(_) | crate::Error::NoPermission(_) => Failure::Denied,
+        crate::Error::Io(ref error) if crate::transport::is_article_limit_error(error) => {
+            Failure::Limit
+        }
         crate::Error::Io(_) => Failure::Transient,
         crate::Error::Bounds { .. } => Failure::Limit,
         crate::Error::NntpReply {
@@ -101,6 +105,31 @@ fn read_error(error: crate::Error) -> Failure {
         } => Failure::Transient,
         _ => Failure::Integrity,
     }
+}
+
+async fn controlled<F: Future>(
+    operation: F,
+    target: &Target,
+    action: Action,
+    control: &impl Control,
+) -> Result<F::Output> {
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(control.cancelled(target, action));
+    std::future::poll_fn(|cx| {
+        if let Err(error) = control.check(target, action) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        if let std::task::Poll::Ready(error) = cancelled.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        match operation.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                std::task::Poll::Ready(control.check(target, action).map(|()| result))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
 }
 
 impl<T: Transport> Io for ClientIo<'_, T> {
@@ -112,15 +141,26 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         control: &impl Control,
     ) -> Result<()> {
         control.check(target, Action::Write)?;
-        self.client
-            .post_article(message_id, article)
-            .await
-            .map_err(|error| match error {
-                crate::Error::AuthFailed(_)
-                | crate::Error::NoPermission(_)
-                | crate::Error::PostProhibited(_) => Failure::Denied,
-                _ => Failure::Uncertain,
-            })?;
+        let result = controlled(
+            self.client.post_article(message_id, article),
+            target,
+            Action::Write,
+            control,
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.client.shutdown_unusable().await;
+                return Err(Failure::Uncertain);
+            }
+        };
+        result.map_err(|error| match error {
+            crate::Error::AuthFailed(_)
+            | crate::Error::NoPermission(_)
+            | crate::Error::PostProhibited(_) => Failure::Denied,
+            _ => Failure::Uncertain,
+        })?;
         control
             .check(target, Action::Write)
             .map_err(|_| Failure::Uncertain)
@@ -134,10 +174,20 @@ impl<T: Transport> Io for ClientIo<'_, T> {
     ) -> Result<Vec<u8>> {
         control.check(target, Action::Read)?;
         let mut out = Vec::new();
-        self.client
-            .body_to(message_id, &mut out)
-            .await
-            .map_err(read_error)?;
+        let result = controlled(
+            self.client.body_to(message_id, &mut out),
+            target,
+            Action::Read,
+            control,
+        )
+        .await;
+        match result {
+            Ok(result) => result.map_err(read_error)?,
+            Err(error) => {
+                let _ = self.client.shutdown_unusable().await;
+                return Err(error);
+            }
+        }
         control.check(target, Action::Read)?;
         Ok(out)
     }
@@ -149,7 +199,16 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         control: &impl Control,
     ) -> Result<()> {
         control.check(target, Action::Read)?;
-        self.client.stat(message_id).await.map_err(read_error)?;
+        let result = controlled(self.client.stat(message_id), target, Action::Read, control).await;
+        match result {
+            Ok(result) => {
+                result.map_err(read_error)?;
+            }
+            Err(error) => {
+                let _ = self.client.shutdown_unusable().await;
+                return Err(error);
+            }
+        }
         control.check(target, Action::Read)
     }
 }
@@ -263,6 +322,8 @@ impl<I: Io> Provider<I> {
             return Err(Failure::Integrity);
         }
         self.check(&record.identity.target, Action::Read, control)?;
+        self.check(&record.identity.target, Action::Write, control)
+            .map_err(|_| Failure::Uncertain)?;
         Ok(WriteProof {
             record,
             acknowledged: true,
@@ -350,7 +411,11 @@ impl<I: Io> ArchiveProvider for Provider<I> {
             return Err(Failure::Conflict);
         }
         let record = self.record(session)?;
-        self.prove(record, control).await
+        // POST receipts already acknowledge irreversible effects. A failed
+        // readback (including propagation delay or revocation) is not absence.
+        self.prove(record, control)
+            .await
+            .map_err(|_| Failure::Uncertain)
     }
 
     async fn abort(
@@ -422,9 +487,14 @@ impl<I: Io> ArchiveProvider for Provider<I> {
             Ok(proof) => Ok(Reconciled::Verified(Box::new(proof))),
             // One missing article can mean partial propagation or pending POST;
             // it never establishes that nothing irreversible has happened.
-            Err(Failure::Missing | Failure::Transient | Failure::Uncertain) => {
-                Ok(Reconciled::Uncertain)
-            }
+            Err(
+                Failure::Missing
+                | Failure::Transient
+                | Failure::Uncertain
+                | Failure::Cancelled
+                | Failure::Deadline
+                | Failure::Denied,
+            ) => Ok(Reconciled::Uncertain),
             Err(error) => Err(error),
         }
     }

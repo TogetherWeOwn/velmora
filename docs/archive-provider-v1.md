@@ -77,8 +77,15 @@ Changed content under the same part/intent conflicts before effects.
 
 `Control` is trusted current authority plus cancellation/deadline/resource checks,
 not a deserialized request boolean. Boundary checks run before I/O and after it;
-transports additionally enforce those controls *inside* I/O. Dropping a future
-is not remote rollback or physical-close proof. Pool slots remain charged until
+transports additionally enforce those controls *inside* I/O. `Control::cancelled`
+is a required event-driven future for the exact target/action; it must register
+cancellation, current-policy revocation and deadline wakeups before rechecking
+policy, including when the socket never progresses. `ClientIo` races every NNTP
+operation against it and rechecks authority on each poll and after completion;
+revocation drops the command then invalidates and shuts down the client without
+sending QUIT into an incomplete exchange. A failed or dropped shutdown is not
+close proof: the product retains the lease and owns physical-close confirmation.
+Dropping a future is not remote rollback or physical-close proof. Pool slots remain charged until
 socket closure/settlement is proven. A late cancellation after completion is
 uncertain, not "nothing committed". The product's own journal/outbox must survive
 process loss; the library's serializable values are not a database implementation.

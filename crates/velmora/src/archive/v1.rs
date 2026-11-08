@@ -267,6 +267,16 @@ pub enum Action {
 /// cancel an already-issued remote effect. `check` is synchronous and fail closed.
 pub trait Control {
     fn check(&self, target: &Target, action: Action) -> Result<()>;
+
+    /// Wait for cancellation, expiry or revocation of this exact action. Register
+    /// the wake source before checking policy to avoid a lost notification. This
+    /// future must wake even when the underlying socket makes no progress; a
+    /// polling-only or never-woken implementation is not a valid live control.
+    fn cancelled<'a>(
+        &'a self,
+        target: &'a Target,
+        action: Action,
+    ) -> impl Future<Output = Failure> + 'a;
 }
 
 pub trait Sink {

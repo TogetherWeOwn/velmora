@@ -336,6 +336,15 @@ impl<T: Transport> NntpClient<T> {
         let _ = self.transport.shutdown().await;
     }
 
+    /// Invalidates the session before shutting down without a protocol command.
+    /// Use when invocation revocation interrupts an exchange: QUIT would race
+    /// an incomplete command or article body. Keep the pool lease until shutdown
+    /// succeeds; an error or dropped shutdown future is not physical-close proof.
+    pub async fn shutdown_unusable(&mut self) -> std::io::Result<()> {
+        self.transport.invalidate();
+        self.transport.shutdown().await
+    }
+
     /// Returns the wrapped transport without QUIT (for connection reuse by
     /// the caller after a failed handshake, e.g. to surface raw replies).
     pub fn into_inner(self) -> T {

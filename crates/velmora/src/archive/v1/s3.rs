@@ -295,6 +295,8 @@ impl<T: SafeTransport> Provider<T> {
             return Err(Failure::Integrity);
         }
         self.check(&record.identity.target, Action::Read, control)?;
+        self.check(&record.identity.target, Action::Write, control)
+            .map_err(|_| Failure::Uncertain)?;
         Ok(WriteProof {
             record,
             acknowledged: true,
@@ -461,9 +463,18 @@ impl<T: SafeTransport> ArchiveProvider for Provider<T> {
         {
             Ok(Some(metadata)) => {
                 let record = self.record(&session.intent, metadata)?;
-                Ok(Reconciled::Verified(Box::new(
-                    self.prove(record, control).await?,
-                )))
+                match self.prove(record, control).await {
+                    Ok(proof) => Ok(Reconciled::Verified(Box::new(proof))),
+                    Err(
+                        Failure::Missing
+                        | Failure::Transient
+                        | Failure::Uncertain
+                        | Failure::Cancelled
+                        | Failure::Deadline
+                        | Failure::Denied,
+                    ) => Ok(Reconciled::Uncertain),
+                    Err(error) => Err(error),
+                }
             }
             Ok(None) => {
                 self.check(&session.intent.target, Action::Write, control)?;
