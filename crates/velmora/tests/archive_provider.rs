@@ -113,6 +113,9 @@ struct ObjectStore {
     lost_complete: bool,
     bad_range: bool,
     corrupt: bool,
+    head_error: Option<Failure>,
+    head_override: Option<s3::Metadata>,
+    head_calls: usize,
     after_complete: Option<Rc<Cell<Option<Failure>>>>,
 }
 impl ObjectStore {
@@ -225,11 +228,15 @@ impl s3::SafeTransport for ObjectStore {
         _: &impl Control,
     ) -> Result<s3::Metadata> {
         self.calls += 1;
+        self.head_calls += 1;
+        if let Some(error) = self.head_error {
+            return Err(error);
+        }
         let metadata = &self.complete.as_ref().ok_or(Failure::Missing)?.0;
         if version != &metadata.version {
             return Err(Failure::Missing);
         }
-        Ok(metadata.clone())
+        Ok(self.head_override.as_ref().unwrap_or(metadata).clone())
     }
     async fn get_range(
         &mut self,
@@ -577,6 +584,85 @@ async fn s3_abort_incomplete_and_zero_length_object_have_explicit_outcomes() {
         .unwrap();
     assert_eq!(proof.record.identity.bytes, 0);
     assert!(proof.full_ciphertext_readback);
+    assert!(matches!(
+        provider.reconcile(&session, &authority).await,
+        Ok(Reconciled::Verified(_))
+    ));
+    assert_eq!(provider.into_transport().head_calls, 2);
+}
+
+#[tokio::test]
+async fn s3_empty_object_proof_requires_exact_version_head() {
+    for failure in 0..5 {
+        let (intent, bytes) = intent(Backend::S3, &[0]);
+        let authority = Authority::new();
+        let mut metadata = s3::Metadata {
+            version: id("immutable-version-a"),
+            bytes: 0,
+            intent_binding: intent.binding().unwrap(),
+            checksum: s3::ProviderChecksum::CompositeSha256,
+        };
+        match failure {
+            1 => metadata.version = id("other-version"),
+            2 => metadata.bytes = 1,
+            3 => metadata.intent_binding[0] ^= 1,
+            4 => metadata.checksum = s3::ProviderChecksum::FullSha256([1; 32]),
+            _ => {}
+        }
+        let mut provider = s3::Provider::new(
+            Some(config()),
+            ObjectStore {
+                head_error: (failure == 0).then_some(Failure::Missing),
+                head_override: Some(metadata),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+        assert_eq!(
+            provider.commit(&session, &receipts, &authority).await,
+            Err(Failure::Uncertain)
+        );
+        assert_eq!(
+            provider.reconcile(&session, &authority).await,
+            Ok(Reconciled::Uncertain)
+        );
+        assert_eq!(provider.into_transport().head_calls, 2);
+    }
+}
+
+#[tokio::test]
+async fn s3_completed_reconciliation_validation_and_readback_failures_remain_uncertain() {
+    for failure in 0..4 {
+        let (intent, bytes) = intent(Backend::S3, &[73]);
+        let authority = Authority::new();
+        let mut provider = s3::Provider::new(
+            Some(config()),
+            ObjectStore {
+                lost_complete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+        assert_eq!(
+            provider.commit(&session, &receipts, &authority).await,
+            Err(Failure::Uncertain)
+        );
+        let mut transport = provider.into_transport();
+        match failure {
+            0 => transport.corrupt = true,
+            1 => transport.bad_range = true,
+            2 => transport.complete.as_mut().unwrap().0.intent_binding[0] ^= 1,
+            _ => transport.complete.as_mut().unwrap().0.bytes += 1,
+        }
+        let mut restarted = s3::Provider::new(Some(config()), transport).unwrap();
+        assert_eq!(
+            restarted.reconcile(&session, &authority).await,
+            Ok(Reconciled::Uncertain)
+        );
+        assert!(restarted.into_transport().complete.is_some());
+    }
 }
 
 #[tokio::test]
@@ -809,6 +895,8 @@ async fn nntp_acknowledged_commit_readback_failure_preserves_uncertainty() {
         Failure::Transient,
         Failure::Cancelled,
         Failure::Deadline,
+        Failure::Integrity,
+        Failure::Limit,
     ] {
         let (intent, bytes) = intent(Backend::Nntp, &[73]);
         let authority = Authority::new();
@@ -864,4 +952,8 @@ async fn nntp_corrupt_article_does_not_release_requested_bytes() {
         Err(Failure::Integrity)
     );
     assert!(output.0.is_empty());
+    assert_eq!(
+        provider.reconcile(&session, &authority).await,
+        Ok(Reconciled::Uncertain)
+    );
 }

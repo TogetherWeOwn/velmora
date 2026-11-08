@@ -255,7 +255,11 @@ impl<T: SafeTransport> Provider<T> {
         // The caller validates the manifest before allocation. The transport
         // fills a fixed slice and cannot over-return into a growing Vec.
         let mut out = vec![0; part.bytes as usize];
-        if part.bytes != 0 {
+        if part.bytes == 0 {
+            // There is no byte range to GET, but the exact empty version must
+            // still exist with the expected length, checksum and intent binding.
+            self.stat(record, control).await?;
+        } else {
             let reply = self
                 .transport
                 .get_range(
@@ -462,18 +466,14 @@ impl<T: SafeTransport> ArchiveProvider for Provider<T> {
             .await
         {
             Ok(Some(metadata)) => {
-                let record = self.record(&session.intent, metadata)?;
+                // Completion is a remote effect even if metadata or ciphertext
+                // cannot be verified. Keep the allocation and safety copy.
+                let Ok(record) = self.record(&session.intent, metadata) else {
+                    return Ok(Reconciled::Uncertain);
+                };
                 match self.prove(record, control).await {
                     Ok(proof) => Ok(Reconciled::Verified(Box::new(proof))),
-                    Err(
-                        Failure::Missing
-                        | Failure::Transient
-                        | Failure::Uncertain
-                        | Failure::Cancelled
-                        | Failure::Deadline
-                        | Failure::Denied,
-                    ) => Ok(Reconciled::Uncertain),
-                    Err(error) => Err(error),
+                    Err(_) => Ok(Reconciled::Uncertain),
                 }
             }
             Ok(None) => {

@@ -151,11 +151,15 @@ versioned buckets with a non-null immutable VersionId are supported. UploadPart
 must acknowledge the submitted SHA-256; ETags remain opaque. A supplied full-object
 SHA-256 must match. A multipart **composite** checksum is never misrepresented as
 the full-object digest. Regardless of checksum availability/type, commit and
-successful reconciliation read every part from that exact version, verify each
-part and compute the full SHA-256 before returning a proof. Ranged replies must
-match exact version, offset, total and count; corruption/over-return releases no
-bytes from that part. Successful remote completion followed by failed readback
-remains uncertain and retains the safety copy.
+successful reconciliation read every nonempty part from that exact version,
+verify each part and compute the full SHA-256 before returning a proof. An empty
+object has no GET byte interval: exact-version HEAD must verify existence, zero
+length, intent binding and any supplied full checksum; hashing the empty body
+then completes the zero-byte readback proof. Ranged replies must match exact
+version, offset, total and count; corruption/over-return releases no bytes from
+that part. Successful remote completion followed by failed metadata validation or
+readback remains uncertain and retains the safety copy. NNTP reconciliation also
+keeps corrupt or oversized possibly-posted articles uncertain, never absent.
 
 This is backend-specific acknowledgement/version/ciphertext-readback evidence,
 not a supplier durability SLA, client cryptographic readability, future retention,

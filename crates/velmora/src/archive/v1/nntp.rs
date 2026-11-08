@@ -485,17 +485,9 @@ impl<I: Io> ArchiveProvider for Provider<I> {
         let record = self.record(session)?;
         match self.prove(record, control).await {
             Ok(proof) => Ok(Reconciled::Verified(Box::new(proof))),
-            // One missing article can mean partial propagation or pending POST;
-            // it never establishes that nothing irreversible has happened.
-            Err(
-                Failure::Missing
-                | Failure::Transient
-                | Failure::Uncertain
-                | Failure::Cancelled
-                | Failure::Deadline
-                | Failure::Denied,
-            ) => Ok(Reconciled::Uncertain),
-            Err(error) => Err(error),
+            // Missing, corrupt or oversized readback never establishes that
+            // nothing irreversible has happened to possibly-posted articles.
+            Err(_) => Ok(Reconciled::Uncertain),
         }
     }
 
