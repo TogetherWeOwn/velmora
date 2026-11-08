@@ -6,7 +6,6 @@ mod support;
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,55 +97,43 @@ fn combined_stdout_and_stderr_share_one_output_budget() {
     }
 }
 
-// Track Linux PID start times so cleanup never signals an unrelated reused PID.
-struct OwnedProcess {
+// Fixtures save their identities while alive, before repair cleanup. These
+// observations never signal PIDs, even on assertion failure; fixtures are finite.
+struct ObservedProcess {
     pid: u32,
-    start: Option<String>,
+    start: String,
 }
 
-fn process_state(pid: u32) -> Option<(char, String)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+fn parse_state(stat: &str) -> Option<(char, String)> {
     let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
     Some((fields.first()?.chars().next()?, fields.get(19)?.to_string()))
 }
 
-impl OwnedProcess {
+impl ObservedProcess {
     fn from_file(path: &Path) -> Self {
-        let pid = fs::read_to_string(path)
-            .expect("fake process started")
-            .trim()
-            .parse()
-            .unwrap();
+        let stat = fs::read_to_string(path).expect("fake process recorded its identity");
         Self {
-            pid,
-            start: process_state(pid).map(|(_, start)| start),
+            pid: stat.split_once(' ').unwrap().0.parse().unwrap(),
+            start: parse_state(&stat).unwrap().1,
         }
+    }
+
+    fn state(&self) -> Option<char> {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        let (state, start) = parse_state(&stat)?;
+        (self.start == start).then_some(state)
     }
 
     fn running(&self) -> bool {
-        match (self.start.as_ref(), process_state(self.pid)) {
-            (Some(start), Some((state, current))) => {
-                *start == current && state != 'Z' && state != 'X'
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Drop for OwnedProcess {
-    fn drop(&mut self) {
-        if self.running() {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &self.pid.to_string()])
-                .status();
-        }
+        self.state()
+            .is_some_and(|state| state != 'Z' && state != 'X')
     }
 }
 
 #[test]
 fn timeout_returns_promptly_reaps_child_and_stops_descendants() {
     // Three-second fallback means this fixture cannot hang even without limits.
-    let f = Fixture::new("printf '%s' \"$$\" > parent.pid\nsleep 3 &\nchild=$!\nprintf '%s' \"$child\" > child.pid\nwait \"$child\"\nprintf 'late write' > escaped-timeout\nprintf 'Repair complete.\\n'");
+    let f = Fixture::new("cat /proc/$$/stat > parent.stat\nsleep 3 &\nchild=$!\ncat /proc/$child/stat > child.stat\nwait \"$child\"\nprintf 'late write' > escaped-timeout\nprintf 'Repair complete.\\n'");
     let limits = RepairLimits {
         timeout: Duration::from_millis(500),
         ..limits()
@@ -154,8 +141,8 @@ fn timeout_returns_promptly_reaps_child_and_stops_descendants() {
     let started = Instant::now();
     let result = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits);
     let elapsed = started.elapsed();
-    let parent = OwnedProcess::from_file(&f.scratch.join("parent.pid"));
-    let child = OwnedProcess::from_file(&f.scratch.join("child.pid"));
+    let parent = ObservedProcess::from_file(&f.scratch.join("parent.stat"));
+    let child = ObservedProcess::from_file(&f.scratch.join("child.stat"));
     let grace = Instant::now();
     while (parent.running() || child.running()) && grace.elapsed() < Duration::from_millis(500) {
         thread::sleep(Duration::from_millis(10));
@@ -166,28 +153,25 @@ fn timeout_returns_promptly_reaps_child_and_stops_descendants() {
         "timeout waited {elapsed:?} for fake process"
     );
     assert!(!parent.running(), "repair process survived timeout");
-    assert!(
-        process_state(parent.pid).is_none(),
-        "direct child was not reaped"
-    );
+    assert!(parent.state().is_none(), "direct child was not reaped");
     assert!(!child.running(), "repair descendant survived timeout");
     assert!(!f.scratch.join("escaped-timeout").exists());
 }
 
 fn assert_family_stopped(f: &Fixture) {
-    let parent = OwnedProcess::from_file(&f.scratch.join("parent.pid"));
-    let child = OwnedProcess::from_file(&f.scratch.join("child.pid"));
+    let parent = ObservedProcess::from_file(&f.scratch.join("parent.stat"));
+    let child = ObservedProcess::from_file(&f.scratch.join("child.stat"));
     let deadline = Instant::now() + Duration::from_millis(500);
     while (parent.running() || child.running()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(process_state(parent.pid).is_none(), "leader was not reaped");
+    assert!(parent.state().is_none(), "leader was not reaped");
     assert!(!child.running(), "descendant survived cleanup");
 }
 
 #[test]
 fn successful_leader_cleans_up_descendant_holding_output_open() {
-    let f = Fixture::new("printf '%s' \"$$\" > parent.pid\nsleep 3 &\nprintf '%s' \"$!\" > child.pid\nprintf 'Repair complete.\\n'\nexit 0");
+    let f = Fixture::new("cat /proc/$$/stat > parent.stat\nsleep 3 &\ncat /proc/$!/stat > child.stat\nprintf 'Repair complete.\\n'\nexit 0");
     let started = Instant::now();
     let report = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap();
     assert!(report.success);
@@ -199,7 +183,7 @@ fn successful_leader_cleans_up_descendant_holding_output_open() {
 
 #[test]
 fn output_limit_error_reaps_leader_and_stops_descendants() {
-    let f = Fixture::new("printf '%s' \"$$\" > parent.pid\nsleep 3 &\nprintf '%s' \"$!\" > child.pid\ni=0; while [ \"$i\" -lt 8192 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nwait");
+    let f = Fixture::new("cat /proc/$$/stat > parent.stat\nsleep 3 &\ncat /proc/$!/stat > child.stat\ni=0; while [ \"$i\" -lt 8192 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nwait");
     let started = Instant::now();
     let err = repair_with_limits(&f.binary, &f.scratch, &[f.input()], &limits()).unwrap_err();
     assert!(err.to_string().contains("output limit exceeded"), "{err}");

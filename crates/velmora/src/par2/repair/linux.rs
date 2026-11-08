@@ -37,6 +37,8 @@ enum ProcessState {
 
 // The unreaped leader reserves its PID/PGID until group cleanup is complete,
 // including setup errors and descendants that outlive a successful parent.
+// Like Child::wait, this requires exclusive child ownership: the embedding
+// process must not ignore SIGCHLD or reap this child from another thread.
 struct Process {
     child: Child,
     state: ProcessState,
