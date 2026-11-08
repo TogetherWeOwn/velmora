@@ -143,7 +143,7 @@ impl Process {
         let reaper = reaper()?;
         let child = cmd.spawn()?;
         Ok(Self {
-            owned: Some(OwnedChild { child, slot: slot }),
+            owned: Some(OwnedChild { child, slot }),
             reaper,
             state: ProcessState::Reserved,
             #[cfg(test)]
