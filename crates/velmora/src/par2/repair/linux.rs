@@ -308,6 +308,32 @@ pub(super) fn run(
     })
 }
 
+fn parse_repaired(output: &str) -> i64 {
+    // Whole-trimmed-line equality only. par2 echoes untrusted target file
+    // names in `Target: "<name>"` lines, so any substring or integer scan
+    // is spoofable (a file named `9 more recovery blocks.bin` or
+    // `x - repair is not required.bin` would set the count). A `Target:`
+    // line never equals a bare summary sentence, so exact matches are safe.
+    // At single `-q` the real binary prints no repair count: healthy sets
+    // print exactly `All files are correct, repair is not required.`,
+    // repaired sets print exactly `Repair complete.`. Report 0 when nothing
+    // was needed, -1 (repaired or unknown) otherwise.
+    let mut healthy = false;
+    for line in output.lines() {
+        match line.trim() {
+            "All files are correct, repair is not required." | "Repair is not required." => {
+                healthy = true;
+            }
+            _ => {}
+        }
+    }
+    if healthy {
+        0
+    } else {
+        -1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,31 +452,5 @@ mod tests {
             Some(libc::ECHILD)
         );
         drop(process);
-    }
-}
-
-fn parse_repaired(output: &str) -> i64 {
-    // Whole-trimmed-line equality only. par2 echoes untrusted target file
-    // names in `Target: "<name>"` lines, so any substring or integer scan
-    // is spoofable (a file named `9 more recovery blocks.bin` or
-    // `x - repair is not required.bin` would set the count). A `Target:`
-    // line never equals a bare summary sentence, so exact matches are safe.
-    // At single `-q` the real binary prints no repair count: healthy sets
-    // print exactly `All files are correct, repair is not required.`,
-    // repaired sets print exactly `Repair complete.`. Report 0 when nothing
-    // was needed, -1 (repaired or unknown) otherwise.
-    let mut healthy = false;
-    for line in output.lines() {
-        match line.trim() {
-            "All files are correct, repair is not required." | "Repair is not required." => {
-                healthy = true;
-            }
-            _ => {}
-        }
-    }
-    if healthy {
-        0
-    } else {
-        -1
     }
 }
