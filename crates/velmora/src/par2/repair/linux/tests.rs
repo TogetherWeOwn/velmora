@@ -110,6 +110,24 @@ fn cleanup_capacity_fails_closed_and_recovers_when_ownership_is_released() {
 }
 
 #[test]
+fn reaper_initialization_retries_after_worker_start_failure_and_caches_success() {
+    let cache = Mutex::new(None);
+    let err = reaper_with(&cache, |_| Err(io::Error::from_raw_os_error(libc::EAGAIN)))
+        .err()
+        .expect("worker startup must fail closed");
+    assert_eq!(err.raw_os_error(), Some(libc::EAGAIN));
+    assert!(cache.lock().unwrap().is_none());
+
+    let pending = reaper_with(&cache, |worker| {
+        assert!(worker.lock().unwrap().is_empty());
+        Ok(())
+    })
+    .unwrap();
+    let cached = reaper_with(&cache, |_| panic!("successful worker must not restart")).unwrap();
+    assert!(Arc::ptr_eq(&pending, &cached));
+}
+
+#[test]
 fn setup_error_drops_guard_and_reaps_running_child() {
     struct InvalidPipe;
     impl AsRawFd for InvalidPipe {

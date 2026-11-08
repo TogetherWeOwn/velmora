@@ -180,7 +180,9 @@ fn timeout_returns_promptly_reaps_child_and_stops_descendants() {
     let parent = ObservedProcess::from_file(&f.scratch.join("parent.stat"));
     let child = ObservedProcess::from_file(&f.scratch.join("child.stat"));
     let grace = Instant::now();
-    while (parent.running() || child.running()) && grace.elapsed() < Duration::from_millis(500) {
+    while (parent.state().is_some() || child.running())
+        && grace.elapsed() < Duration::from_millis(500)
+    {
         thread::sleep(Duration::from_millis(10));
     }
     assert_not_success(&result);
@@ -198,7 +200,7 @@ fn assert_family_stopped(f: &Fixture) {
     let parent = ObservedProcess::from_file(&f.scratch.join("parent.stat"));
     let child = ObservedProcess::from_file(&f.scratch.join("child.stat"));
     let deadline = Instant::now() + Duration::from_millis(500);
-    while (parent.running() || child.running()) && Instant::now() < deadline {
+    while (parent.state().is_some() || child.running()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(parent.state().is_none(), "leader was not reaped");

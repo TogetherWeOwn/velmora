@@ -12,7 +12,7 @@ use std::os::unix::{
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn limit_error(name: &str) -> Error {
@@ -72,11 +72,25 @@ struct OwnedChild {
 }
 type Reaper = Arc<Mutex<Vec<OwnedChild>>>;
 
+fn reaper_with(
+    cache: &Mutex<Option<Reaper>>,
+    start_worker: impl FnOnce(Reaper) -> io::Result<()>,
+) -> io::Result<Reaper> {
+    // Serialize startup, but cache only success so transient thread exhaustion
+    // rejects this attempt without disabling repair for the process lifetime.
+    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pending) = cached.as_ref() {
+        return Ok(Arc::clone(pending));
+    }
+    let pending: Reaper = Arc::new(Mutex::new(Vec::with_capacity(MAX_OWNED_CHILDREN)));
+    start_worker(Arc::clone(&pending))?;
+    *cached = Some(Arc::clone(&pending));
+    Ok(pending)
+}
+
 fn reaper() -> io::Result<Reaper> {
-    static REAPER: OnceLock<io::Result<Reaper>> = OnceLock::new();
-    match REAPER.get_or_init(|| {
-        let pending: Reaper = Arc::new(Mutex::new(Vec::with_capacity(MAX_OWNED_CHILDREN)));
-        let worker = Arc::clone(&pending);
+    static REAPER: Mutex<Option<Reaper>> = Mutex::new(None);
+    reaper_with(&REAPER, |worker| {
         let _ = std::thread::Builder::new()
             .name("par2-reaper".into())
             .spawn(move || loop {
@@ -90,11 +104,8 @@ fn reaper() -> io::Result<Reaper> {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             })?;
-        Ok(pending)
-    }) {
-        Ok(pending) => Ok(Arc::clone(pending)),
-        Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
-    }
+        Ok(())
+    })
 }
 
 enum ProcessState {
