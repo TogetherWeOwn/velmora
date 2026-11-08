@@ -110,6 +110,27 @@ fn cleanup_capacity_fails_closed_and_recovers_when_ownership_is_released() {
 }
 
 #[test]
+fn setup_error_drops_guard_and_reaps_running_child() {
+    struct InvalidPipe;
+    impl AsRawFd for InvalidPipe {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            -1
+        }
+    }
+    fn setup(process: Process) -> Result<()> {
+        let _guard = process;
+        nonblocking(&InvalidPipe)?;
+        Ok(())
+    }
+    let mut process = spawn("exec sleep 3");
+    let pid = process.child().id();
+    let start = Instant::now();
+    assert!(setup(process).is_err());
+    assert_eventually_reaped(pid);
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
 fn setup_error_drop_does_not_wait_after_denied_signals() {
     struct InvalidPipe;
     impl AsRawFd for InvalidPipe {

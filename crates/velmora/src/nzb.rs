@@ -863,7 +863,7 @@ fn is_password_meta(name: &str, attrs: &HashMap<String, String>) -> bool {
 }
 
 /// Accepts a Message-ID only when it is already bare: non-empty, at most
-/// 998 bytes, no `<`/`>`, and no whitespace or control bytes anywhere —
+/// 998 bytes, no `<`/`>`, and no whitespace or control characters anywhere —
 /// never trimmed, unbracketed, or otherwise transformed, so a refused
 /// spelling can never become an accepted identity downstream.
 ///
@@ -880,9 +880,9 @@ pub fn normalize_message_id(value: &str) -> Result<String> {
             "Message-ID must be bare, non-empty, and at most 998 bytes".into(),
         ));
     }
-    if value.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(Error::Malformed(
-            "Message-ID contains whitespace or a control byte".into(),
+            "Message-ID contains whitespace or a control character".into(),
         ));
     }
     Ok(value.to_string())
