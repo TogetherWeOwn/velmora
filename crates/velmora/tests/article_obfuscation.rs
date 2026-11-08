@@ -542,6 +542,7 @@ fn payload(len: usize) -> Vec<u8> {
 /// block with UTF-8 line I/O, which rejects arbitrary binary yEnc bodies;
 /// the full-binary path is covered by the round-trip tests above, which
 /// never touch the server.
+#[cfg(all(feature = "native-tls", not(target_arch = "wasm32")))]
 fn ascii_payload(len: usize) -> Vec<u8> {
     const HEX: &[u8] = b"0123456789ABCDEF";
     (0..len).map(|i| HEX[i % HEX.len()]).collect()
