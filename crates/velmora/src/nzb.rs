@@ -593,22 +593,28 @@ fn copy_metadata<R: BufRead>(
     loop {
         match reader.read_event_into(buf) {
             Ok(Event::Start(e)) => {
+                if depth + inner_depth > MAX_METADATA_DEPTH {
+                    return Err(Error::Bounds {
+                        bound: "metadata nesting depth",
+                        limit: MAX_METADATA_DEPTH as i64,
+                    });
+                }
                 let child = local_name(&e.name());
                 let child_attrs = collect_attrs(&e)?;
                 if is_password_meta(&child, &child_attrs) {
                     has_password = true;
-                    skip_element(reader, buf, &child)?;
+                    skip_element(reader, buf, &child, depth + inner_depth)?;
                 } else {
                     inner_depth += 1;
-                    if depth + inner_depth > MAX_METADATA_DEPTH + 1 {
-                        return Err(Error::Bounds {
-                            bound: "metadata nesting depth",
-                            limit: MAX_METADATA_DEPTH as i64,
-                        });
-                    }
                 }
             }
             Ok(Event::Empty(e)) => {
+                if depth + inner_depth > MAX_METADATA_DEPTH {
+                    return Err(Error::Bounds {
+                        bound: "metadata nesting depth",
+                        limit: MAX_METADATA_DEPTH as i64,
+                    });
+                }
                 let child = local_name(&e.name());
                 let child_attrs = collect_attrs(&e)?;
                 if is_password_meta(&child, &child_attrs) {
@@ -637,20 +643,27 @@ fn copy_metadata<R: BufRead>(
 }
 
 /// Skips one already-opened element (used to drop password metadata).
-fn skip_element<R: BufRead>(reader: &mut Reader<R>, buf: &mut Vec<u8>, _name: &str) -> Result<()> {
-    let mut depth = 1usize;
-    while depth > 0 {
+fn skip_element<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    _name: &str,
+    depth: usize,
+) -> Result<()> {
+    let mut inner_depth = 1usize;
+    while inner_depth > 0 {
         match reader.read_event_into(buf) {
-            Ok(Event::Start(_)) => {
-                depth += 1;
-                if depth > MAX_METADATA_DEPTH {
+            Ok(event @ (Event::Start(_) | Event::Empty(_))) => {
+                if depth + inner_depth > MAX_METADATA_DEPTH {
                     return Err(Error::Bounds {
                         bound: "metadata nesting depth",
                         limit: MAX_METADATA_DEPTH as i64,
                     });
                 }
+                if matches!(event, Event::Start(_)) {
+                    inner_depth += 1;
+                }
             }
-            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::End(_)) => inner_depth -= 1,
             Ok(Event::DocType(_)) | Ok(Event::PI(_)) => {
                 return Err(Error::Malformed(
                     "NZB XML directives are not allowed".into(),

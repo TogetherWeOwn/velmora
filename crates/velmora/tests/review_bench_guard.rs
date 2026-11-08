@@ -128,12 +128,55 @@ fn reference_work(data: &[u8]) -> Duration {
     started.elapsed()
 }
 
-fn best_of(rounds: usize, mut work: impl FnMut() -> Duration) -> Duration {
-    let mut best = Duration::MAX;
-    for _ in 0..rounds {
-        best = best.min(work());
+fn best_of_alternating(
+    rounds: usize,
+    mut verify: impl FnMut() -> Duration,
+    mut reference: impl FnMut() -> Duration,
+) -> (Duration, Duration) {
+    let mut best_verify = Duration::MAX;
+    let mut best_reference = Duration::MAX;
+    for round in 0..rounds {
+        if round % 2 == 0 {
+            best_verify = best_verify.min(verify());
+            best_reference = best_reference.min(reference());
+        } else {
+            best_reference = best_reference.min(reference());
+            best_verify = best_verify.min(verify());
+        }
     }
-    best
+    (best_verify, best_reference)
+}
+
+#[test]
+fn measurement_rounds_alternate_order_and_keep_independent_minima() {
+    use std::cell::RefCell;
+
+    let calls = RefCell::new(Vec::new());
+    let mut verify_times = [9, 2, 5].into_iter();
+    let mut reference_times = [3, 8, 1].into_iter();
+    let measured = best_of_alternating(
+        3,
+        || {
+            calls.borrow_mut().push("verify");
+            Duration::from_nanos(verify_times.next().unwrap())
+        },
+        || {
+            calls.borrow_mut().push("reference");
+            Duration::from_nanos(reference_times.next().unwrap())
+        },
+    );
+    assert_eq!(
+        calls.into_inner(),
+        [
+            "verify",
+            "reference",
+            "reference",
+            "verify",
+            "verify",
+            "reference"
+        ]
+    );
+    assert_eq!(measured, (Duration::from_nanos(2), Duration::from_nanos(1)));
 }
 
 #[test]
@@ -145,12 +188,15 @@ fn par2_verify_has_no_regression_beyond_twenty_percent() {
     set.verify(FILENAME, &data).expect("healthy verifies");
     reference_work(&data);
 
-    let verify = best_of(ROUNDS, || {
-        let started = Instant::now();
-        set.verify(FILENAME, &data).expect("healthy verifies");
-        started.elapsed()
-    });
-    let reference = best_of(ROUNDS, || reference_work(&data));
+    let (verify, reference) = best_of_alternating(
+        ROUNDS,
+        || {
+            let started = Instant::now();
+            set.verify(FILENAME, &data).expect("healthy verifies");
+            started.elapsed()
+        },
+        || reference_work(&data),
+    );
     let ratio = verify.as_secs_f64() / reference.as_secs_f64().max(f64::EPSILON);
     eprintln!("bench guard: verify={verify:?} reference={reference:?} ratio={ratio:.3}");
 
