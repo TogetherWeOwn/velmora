@@ -1,6 +1,6 @@
 //! Pin for the NZB prolog bound and the metadata-depth bound
 //! (`crates/velmora/src/nzb.rs`): `MAX_PROLOG_BYTES` (4096) and
-//! `MAX_METADATA_DEPTH` (64). Tests only; the parser is untouched.
+//! `MAX_METADATA_DEPTH` (64), including empty and skipped password elements.
 //!
 //! Contract under test:
 //!
@@ -134,6 +134,59 @@ fn metadata_64_deep_passes() {
         parse(&doc_with_head_inner(&nesting(DEPTH_CAP))).expect("64-deep metadata must parse");
     assert_eq!(doc.files.len(), 1);
     assert!(!doc.has_password);
+}
+
+#[test]
+fn metadata_leaf_depth_is_independent_of_empty_spelling() {
+    // Put the leaf at depth 64 or 65, in ordinary metadata, at the
+    // password boundary, and inside a skipped password subtree.
+    for password_depth in [None, Some(1), Some(2), Some(DEPTH_CAP), Some(DEPTH_CAP + 1)] {
+        for leaf_depth in [DEPTH_CAP, DEPTH_CAP + 1] {
+            for empty in [false, true] {
+                let mut inner = String::new();
+                for depth in 1..leaf_depth {
+                    inner.push_str(if password_depth == Some(depth) {
+                        "<meta type=\"password\">"
+                    } else {
+                        "<m>"
+                    });
+                }
+                let leaf = if password_depth == Some(leaf_depth) {
+                    "meta type=\"password\""
+                } else {
+                    "m"
+                };
+                if empty {
+                    inner.push_str(&format!("<{leaf}/>"));
+                } else {
+                    let name = leaf.split_whitespace().next().unwrap();
+                    inner.push_str(&format!("<{leaf}></{name}>"));
+                }
+                for depth in (1..leaf_depth).rev() {
+                    inner.push_str(if password_depth == Some(depth) {
+                        "</meta>"
+                    } else {
+                        "</m>"
+                    });
+                }
+                let result = parse(&doc_with_head_inner(&inner));
+                if leaf_depth == DEPTH_CAP {
+                    let doc = result.expect("at-limit metadata must parse");
+                    assert_eq!(doc.files.len(), 1);
+                    assert_eq!(
+                        doc.has_password,
+                        password_depth.is_some_and(|depth| depth <= leaf_depth)
+                    );
+                } else {
+                    expect_bounds(
+                        result.expect_err("over-limit metadata must be rejected"),
+                        "metadata nesting depth",
+                        DEPTH_CAP as i64,
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

@@ -6,8 +6,9 @@
 //!
 //! * every generated segment ID and group must resolve in
 //!   `default_corpus()` (no invented/external provider data);
-//! * segment numbering and declared `bytes=` must agree with the corpus
-//!   payloads and their yEnc framing (`=ybegin`/`=ypart` ranges);
+//! * segment numbering must agree with yEnc part numbers; declared `bytes=`
+//!   counts encoded articles (headers + body, before NNTP dot-stuffing),
+//!   while decoded lengths agree with yEnc `=yend size=` / `=ypart` ranges;
 //! * fetching the segments from a live in-process fixture server and
 //!   yEnc-decoding them must reconstruct one complete canonical synthetic
 //!   WAV (a generated sine tone, byte-for-byte);
@@ -220,13 +221,13 @@ fn validate_nzb_against_corpus(text: &str) -> Vec<String> {
                 seg.number, seg.id
             )),
             Some(article) => {
-                if seg.bytes != article.payload.len() as u64 {
+                if seg.bytes != article.raw.len() as u64 {
                     errors.push(format!(
-                        "segment {} ({}) declares bytes={} but the corpus payload is {} bytes",
+                        "segment {} ({}) declares bytes={} but the encoded corpus article is {} bytes",
                         seg.number,
                         seg.id,
                         seg.bytes,
-                        article.payload.len()
+                        article.raw.len()
                     ));
                 }
                 if !file.groups.iter().any(|g| g == &article.group) {
@@ -305,6 +306,34 @@ fn validator_rejects_wrong_or_missing_first_file_group() {
                 .iter()
                 .all(|e| !e.contains("<enc-7z-001@nntune.test>")),
             "valid second file incorrectly rejected: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn generated_nzb_sizes_distinguish_encoded_articles_from_decoded_payloads() {
+    let corpus = default_corpus();
+    let single = &corpus[0];
+    for text in [
+        velmora_test_nntp::nzb_for(&[single], &single.group),
+        velmora_test_nntp::nzb_for_multipart(&[single], &single.group),
+    ] {
+        assert_ne!(single.raw.len(), single.payload.len());
+        let document = velmora::nzb::parse(text.as_bytes()).unwrap();
+        let segment = &document.files[0].segments[0];
+        assert_eq!(segment.encoded_bytes, single.raw.len() as i64);
+        assert_ne!(segment.encoded_bytes, single.payload.len() as i64);
+        assert!(validate_nzb_against_corpus(&text).is_empty());
+
+        let decoded_size = text.replace(
+            &format!("bytes=\"{}\"", single.raw.len()),
+            &format!("bytes=\"{}\"", single.payload.len()),
+        );
+        assert!(
+            validate_nzb_against_corpus(&decoded_size)
+                .iter()
+                .any(|error| error.contains("encoded corpus article")),
+            "decoded-size substitution must fail corpus validation"
         );
     }
 }
@@ -539,6 +568,7 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
             seg.number,
             seg.id
         );
+        assert_eq!(block.len() as u64, seg.bytes, "encoded article size");
         let body = article_body(&block);
 
         // One NZB file = one yEnc file: shared name/size across segments.
@@ -576,15 +606,14 @@ async fn fetch_and_reassemble_doc(text: &str) -> Vec<u8> {
         }
 
         let decoded = velmora_test_nntp::yenc::decode(body);
-        assert_eq!(
-            decoded.len() as u64,
-            seg.bytes,
-            "decoded payload length disagrees with NZB bytes= for {}",
-            seg.id
-        );
+        let declared_decoded: usize = framing_param(body, "=yend", "size")
+            .expect("=yend size")
+            .parse()
+            .expect("numeric =yend size");
+        assert_eq!(decoded.len(), declared_decoded, "decoded part size");
 
         // Placement comes from the advertised =ypart range, whose length
-        // must also equal the declared/decoded byte count.
+        // must equal the decoded byte count, not the encoded NZB bytes.
         let (begin, end) = match (
             framing_param(body, "=ypart", "begin"),
             framing_param(body, "=ypart", "end"),
@@ -711,7 +740,7 @@ fn assert_xml_sensitive_ids_round_trip(render: fn(&[&Article], &str) -> String) 
     for file in &document.files {
         assert_eq!(file.subject, articles[0].subject);
         for segment in &file.segments {
-            assert_eq!(segment.encoded_bytes, articles[0].payload.len() as i64);
+            assert_eq!(segment.encoded_bytes, articles[0].raw.len() as i64);
         }
     }
 }
@@ -814,15 +843,26 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
     client.quit().await;
     assert_eq!(fetched.len(), file.segments.len());
 
-    // Decode each fetched article with the production decoder (which also
-    // verifies CRC) into a buffer sized by the declared segment bytes.
+    // NZB bytes count the encoded article. Decode into a buffer sized by
+    // the yEnc part range instead; the production decoder also verifies CRC.
     let mut reassembled = Vec::new();
     for segment in &file.segments {
         let article = fetched
             .iter()
             .find(|f| f.message_id == segment.message_id)
             .unwrap_or_else(|| panic!("no fetched article for {}", segment.message_id));
-        let mut decoded = vec![0u8; segment.encoded_bytes as usize];
+        assert_eq!(article.article.len() as i64, segment.encoded_bytes);
+        let body = article_body(&article.article);
+        let begin: usize = framing_param(body, "=ypart", "begin")
+            .expect("multipart begin")
+            .parse()
+            .unwrap();
+        let end: usize = framing_param(body, "=ypart", "end")
+            .expect("multipart end")
+            .parse()
+            .unwrap();
+        let part_len = end + 1 - begin;
+        let mut decoded = vec![0u8; part_len];
         let decoded_len =
             velmora::yenc::decode_to(&segment.message_id, &article.article, &mut decoded)
                 .unwrap_or_else(|e| {
@@ -834,7 +874,7 @@ async fn generated_nzb_parses_fetches_and_decodes_via_production_pipeline() {
         assert_eq!(
             decoded_len,
             decoded.len(),
-            "decoded length disagrees with NZB bytes= for {}",
+            "decoded length disagrees with yEnc part range for {}",
             segment.message_id
         );
         reassembled.extend_from_slice(&decoded);

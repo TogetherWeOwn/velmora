@@ -258,7 +258,9 @@ pub fn default_corpus() -> Vec<Article> {
 /// Render a minimal NZB 1.1 document for the given articles. Segment
 /// text carries the bare shared-rule identity (corpus keys arrive
 /// bracketed and are unbracketed here at the fixture boundary, never by
-/// the parser, which refuses non-bare spellings).
+/// the parser, which refuses non-bare spellings). `bytes=` is the encoded
+/// article length (`Article::raw`: headers + yEnc body + CRLF, before NNTP
+/// dot-stuffing/status/terminator), never the decoded payload length.
 pub fn nzb_for(articles: &[&Article], group: &str) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/nzb/nzb-1.1\">\n");
     for a in articles {
@@ -266,7 +268,7 @@ pub fn nzb_for(articles: &[&Article], group: &str) -> String {
             "  <file poster=\"fixture@nntune.test\" date=\"1760313600\" subject=\"{}\">\n    <groups><group>{}</group></groups>\n    <segments>\n      <segment bytes=\"{}\" number=\"1\">{}</segment>\n    </segments>\n  </file>\n",
             xml_escape(&a.subject),
             xml_escape(group),
-            a.payload.len(),
+            a.raw.len(),
             xml_escape(a.message_id.trim_matches(|c| c == '<' || c == '>')),
         ));
     }
@@ -280,7 +282,7 @@ pub fn nzb_for(articles: &[&Article], group: &str) -> String {
 /// production parser, NNTP fetch and yEnc decode path must handle several
 /// segments per file — one file per segment (what [`nzb_for`] emits) never
 /// exercises that. Subject is the first article's (multipart parts share
-/// the file subject); escaping matches [`nzb_for`].
+/// the file subject); escaping and encoded article sizes match [`nzb_for`].
 pub fn nzb_for_multipart(articles: &[&Article], group: &str) -> String {
     assert!(
         !articles.is_empty(),
@@ -295,7 +297,7 @@ pub fn nzb_for_multipart(articles: &[&Article], group: &str) -> String {
     for (index, a) in articles.iter().enumerate() {
         out.push_str(&format!(
             "      <segment bytes=\"{}\" number=\"{}\">{}</segment>\n",
-            a.payload.len(),
+            a.raw.len(),
             index + 1,
             xml_escape(a.message_id.trim_matches(|c| c == '<' || c == '>')),
         ));

@@ -569,16 +569,19 @@ pub fn recover_slices(
     // The coefficient matrix is shared by all words: solve once per word as
     // x = inv * rhs with rhs[r] = rec[r] - sum_present(present * base^exp).
     let mut out: Vec<Vec<u16>> = vec![vec![0u16; words]; m];
+    let mut rhs = vec![0u16; m];
     for w in 0..words {
+        for (r, (exp, _)) in used.iter().enumerate() {
+            rhs[r] = rec_words[r][w];
+            for (p, &i) in present_order.iter().enumerate() {
+                let f = gf16::pow(bases[i], u32::from(*exp));
+                rhs[r] ^= gf16::mul(present_words[p][w], f);
+            }
+        }
         for (c, row) in out.iter_mut().enumerate().take(m) {
             let mut v = 0u16;
-            for (r, (exp, _)) in used.iter().enumerate() {
-                let mut rhs = rec_words[r][w];
-                for (p, &i) in present_order.iter().enumerate() {
-                    let f = gf16::pow(bases[i], u32::from(*exp));
-                    rhs ^= gf16::mul(present_words[p][w], f);
-                }
-                v ^= gf16::mul(inv[c][r], rhs);
+            for (r, &value) in rhs.iter().enumerate() {
+                v ^= gf16::mul(inv[c][r], value);
             }
             row[w] = v;
         }

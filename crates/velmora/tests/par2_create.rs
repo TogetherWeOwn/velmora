@@ -361,6 +361,26 @@ fn roundtrip_multi_slice_loss_up_to_redundancy() {
 }
 
 #[test]
+fn multi_slice_recovery_reuses_rhs_with_nonzero_exponents_and_reordered_present() {
+    let slice = 128;
+    let data = pseudorandom(40 * slice - 7, 0x1234_5678_9abc_def1);
+    let set = create_single_file(FILENAME, &data, slice as u64).unwrap();
+    let (mut present, original) = erase_slices(&data, slice, &[0, 12, 39]);
+    present.reverse();
+    // Exponents 1, 2, 3 exercise nontrivial factors in every recovery row.
+    let recovery = set.recovery_pairs();
+    let recovered = recover_slices(slice, 40, &present, &recovery[1..]).unwrap();
+    assert_eq!(
+        recovered.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec![0, 12, 39]
+    );
+    for (index, bytes) in &recovered {
+        assert_eq!(bytes, &original[*index as usize]);
+    }
+    assert_eq!(reassemble(&recovered, &present, data.len()), data);
+}
+
+#[test]
 fn roundtrip_corrupt_then_erase_mirrors_production_flow() {
     // Corrupt bytes in place: verify (existing path) rejects, the slice is
     // declared lost, recovery restores it, verify accepts.
