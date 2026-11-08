@@ -21,7 +21,7 @@
 //! Assertions are behavioural only (parsed IDs, digests, `Err`); error
 //! message wording is the implementer's choice.
 
-use velmora::nzb::{parse, Limits, Parser, MAX_SEGMENT_TEXT_BYTES};
+use velmora::nzb::{normalize_message_id, parse, Limits, Parser, MAX_SEGMENT_TEXT_BYTES};
 
 fn doc_with_segment(segment_inner: &str) -> String {
     format!(
@@ -111,6 +111,55 @@ fn reference_to_embedded_whitespace_or_control_is_rejected() {
     // newline or DEL is embedded whitespace/control just like the literal.
     for inner in ["a&#32;b@c", "a&#9;b@c", "a&#10;b@c", "a&#x7f;b@c"] {
         assert!(message_id(inner).is_err(), "expected Err for {inner}");
+    }
+}
+
+#[test]
+fn unicode_whitespace_and_controls_are_rejected_before_document_digest() {
+    // U+0080 is a C1 control but not whitespace, independently exercising
+    // control rejection alongside NBSP, NEL and LINE SEPARATOR.
+    for ch in ['\u{a0}', '\u{85}', '\u{2028}', '\u{80}'] {
+        for id in [format!("{ch}a@b"), format!("a{ch}@b"), format!("a@b{ch}")] {
+            assert!(normalize_message_id(&id).is_err(), "accepted {id:?}");
+            for inner in [
+                id.clone(),
+                id.replace(ch, &format!("&#{};", u32::from(ch))),
+                id.replace(ch, &format!("&#x{:X};", u32::from(ch))),
+                format!("<![CDATA[{id}]]>"),
+            ] {
+                // No Document (and thus no accepted segments or digest) may
+                // escape the public parser for any spelling of the bad ID.
+                assert!(
+                    parse(doc_with_segment(&inner).as_bytes()).is_err(),
+                    "accepted segment {inner:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn non_ascii_letters_keep_their_identity_and_digest() {
+    let id = "café@b";
+    assert_eq!(normalize_message_id(id).unwrap(), id);
+    let literal = parse(doc_with_segment(id).as_bytes()).unwrap();
+    assert_eq!(literal.files[0].segments[0].message_id, id);
+    for inner in ["caf&#233;@b", "caf&#xE9;@b", "<![CDATA[café@b]]>"] {
+        let doc = parse(doc_with_segment(inner).as_bytes()).unwrap();
+        assert_eq!(doc.files[0].segments[0].message_id, id);
+        assert_eq!(doc.segment_digest, literal.segment_digest);
+    }
+}
+
+#[test]
+fn ascii_whitespace_and_controls_remain_rejected() {
+    for ch in (0u8..=0x20).chain(std::iter::once(0x7f)) {
+        let id = format!("a{}@b", char::from(ch));
+        assert!(normalize_message_id(&id).is_err(), "accepted {id:?}");
+        assert!(
+            parse(doc_with_segment(&id).as_bytes()).is_err(),
+            "accepted segment {id:?}"
+        );
     }
 }
 
