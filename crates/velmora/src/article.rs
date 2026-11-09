@@ -110,15 +110,18 @@ pub fn select_newsgroup<R: FillRandom>(rng: &mut R, allow_list: &[&str]) -> Resu
 }
 
 /// Bare group token: non-empty printable ASCII (`0x21..=0x7E`) minus
-/// `<`/`>`, so no whitespace, controls, or framing delimiters that could
-/// break the `Newsgroups` header or the NNTP command line. Newsgroup names
-/// carry no other structure this layer needs to enforce.
+/// `<`/`>` and `,`, so no whitespace, controls, or framing delimiters that
+/// could break the `Newsgroups` header or the NNTP command line. The comma
+/// is excluded because it is the header's group separator: one allow-list
+/// entry must stay one group on the wire and can never turn a draw into a
+/// cross-post. Newsgroup names carry no other structure this layer needs
+/// to enforce.
 fn valid_group_token(group: &str) -> bool {
     !group.is_empty()
         && group.len() <= 998
         && group
             .bytes()
-            .all(|b| (0x21..=0x7E).contains(&b) && b != b'<' && b != b'>')
+            .all(|b| (0x21..=0x7E).contains(&b) && b != b'<' && b != b'>' && b != b',')
 }
 
 // ---------------------------------------------------------------------------
@@ -389,10 +392,11 @@ fn check_body_framing(body: &[u8]) -> Result<()> {
 /// spaces (a long group name, the bracketed message-ID) cannot fold and is
 /// emitted whole; anything that still exceeds 998 bytes fails closed.
 ///
-/// A fold consumes exactly one separator space (the continuation's leading
-/// space replaces it on unfolding), so the extra spaces of a run stay
-/// literal: unfolding restores the value byte-for-byte, including repeated,
-/// leading and trailing spaces.
+/// Separators are tracked explicitly (`split(' ')` yields one empty word
+/// per extra space, and a fold consumes exactly one separator — the
+/// continuation's leading space replaces it on unfolding). The rest of a
+/// run stays literal, so unfolding restores the value byte-for-byte,
+/// including repeated, leading and trailing spaces.
 ///
 /// The returned bytes end with CRLF.
 fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
@@ -408,47 +412,34 @@ fn fold_header(name: &str, value: &str) -> Result<Vec<u8>> {
     } else {
         // Greedy word packing; words are split on spaces only, so commas
         // stay glued to their group token and folding lands after ", ".
+        // `split(' ')` keeps one empty word per extra space, so every
+        // separator is explicit: `sep` records whether the next word is
+        // preceded by a space, and a fold always happens AT a separator —
+        // the continuation's leading space replaces exactly that one on
+        // unfolding, and the rest of a run stays literal.
         let words: Vec<&str> = value.split(' ').collect();
         let mut current = first_prefix.clone();
-        // Whether the space run currently being folded already broke onto
-        // a continuation line: unfolding removes only the CRLF, so that
-        // leading space already IS one literal space. The run's final
-        // (trailing) space must not add another, or the round trip gains
-        // one; reset by every non-space word.
-        let mut run_folded = false;
-        for (i, &word) in words.iter().enumerate() {
-            if word.is_empty() {
-                // Extra space from a run of consecutive spaces: keep it
-                // literal on this line. Folding here would drop it (the
-                // continuation's leading space already accounts for one
-                // separator), so break first when the line is full and
-                // carry the space onto the new line — except the run's
-                // final space after a fold, which the leading space
-                // already represents.
-                if current.len() >= 78 {
+        let mut sep = false;
+        for &word in &words {
+            if sep {
+                if current.len() + 1 + word.len() <= 78 {
+                    current.push(' ');
+                    current.push_str(word);
+                } else {
+                    // Fold at the owed separator: it becomes the
+                    // continuation's leading space, so the word starts
+                    // the new line alone.
                     lines.push(current);
-                    current = String::from(" ");
-                    run_folded = true;
+                    current = format!(" {word}");
                 }
-                if !(i + 1 == words.len() && run_folded) {
-                    current.push(' ');
-                }
-                continue;
-            }
-            run_folded = false;
-            if current.len() + word.len() < 78 {
-                if !current.ends_with(' ') && !current.ends_with(": ") {
-                    current.push(' ');
-                }
-                current.push_str(word);
-            } else if current == first_prefix || current.trim() == first_prefix.trim() {
-                // First word already overlong (or the value has no spaces):
-                // emit whole — the 998-byte ceiling below is the backstop.
-                current.push_str(word);
             } else {
-                lines.push(current);
-                current = format!(" {word}");
+                // The first word starts right after `Name: `; no
+                // separator is owed. An overlong first token (or a
+                // space-free value) is emitted whole — the 998-byte
+                // ceiling below is the backstop.
+                current.push_str(word);
             }
+            sep = true;
         }
         lines.push(current);
     }
@@ -520,6 +511,26 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 mod tests {
     use super::*;
 
+    /// Deterministic byte source for unit tests: all-zero bytes make
+    /// `uniform_below` draw 0 and `fill_alphabet` repeat alphabet[0].
+    struct ZeroRng;
+
+    impl FillRandom for ZeroRng {
+        fn fill_bytes(&mut self, dest: &mut [u8]) -> Result<()> {
+            dest.fill(0);
+            Ok(())
+        }
+    }
+
+    /// Reconstructs a folded header value: the continuation's leading
+    /// space stands for the folded separator, so unfolding is
+    /// `s/\r\n / /` — the inverse RFC 5322 §2.2.3 requires.
+    fn unfold_value(name: &str, folded: &[u8]) -> String {
+        let text = String::from_utf8(folded.to_vec()).unwrap();
+        let stripped = text.strip_prefix(&format!("{name}: ")).unwrap();
+        stripped.trim_end_matches("\r\n").replace("\r\n ", " ")
+    }
+
     #[test]
     fn payload_constants_match_design_section_4() {
         assert_eq!(ARTICLE_CIPHER_BLOCKS, 11);
@@ -549,6 +560,74 @@ mod tests {
             "Thu, 29 Feb 2024 00:00:00 +0000"
         );
         assert!(format_nntp_date(-1).is_err());
+    }
+
+    #[test]
+    fn newsgroup_tokens_reject_commas_at_all_entry_points() {
+        // A comma inside one allow-list entry would render as two groups
+        // (the renderer joins with ", ") — an unintended cross-post.
+        let mut rng = ZeroRng;
+        assert!(select_newsgroup(&mut rng, &["a.b,c.d"]).is_err());
+        assert!(select_newsgroup(&mut rng, &["a.b", "c.d"]).is_ok());
+        assert_eq!(select_newsgroup(&mut rng, &["a.b"]).unwrap(), "a.b");
+        assert!(ArticleHeaders::new(
+            "u@example.com",
+            &["a.b,c.d"],
+            "subject",
+            "Thu, 01 Jan 1970 00:00:00 +0000",
+            "abc123@d.e",
+        )
+        .is_err());
+        assert!(ArticleHeaders::new(
+            "u@example.com",
+            &["a.b", "c.d"],
+            "subject",
+            "Thu, 01 Jan 1970 00:00:00 +0000",
+            "abc123@d.e",
+        )
+        .is_ok());
+        // `obfuscate_article` reaches the same validator through
+        // `select_newsgroup`.
+        assert!(obfuscate_article(&mut rng, 1_793_707_200, &["a.b,c.d"]).is_err());
+        assert!(obfuscate_article(&mut rng, 1_793_707_200, &["a.b"]).is_ok());
+    }
+
+    #[test]
+    fn folding_round_trips_repeated_and_edge_spaces() {
+        fn assert_lines_fit(folded: &[u8]) {
+            for line in folded.split(|&b| b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let content = line.strip_suffix(b"\r").unwrap_or(line);
+                assert!(content.len() <= 78, "overlong: {content:?}");
+            }
+        }
+
+        // Regression: "a  b" must keep both spaces through a fold.
+        let value = format!("a  b {}", "c ".repeat(40));
+        let folded = fold_header("Subject", &value).unwrap();
+        assert!(folded.windows(3).any(|w| w == b"\r\n "), "must fold");
+        assert_eq!(unfold_value("Subject", &folded), value);
+        assert_lines_fit(&folded);
+        // Leading, trailing and longer runs round-trip too, including a
+        // space run straddling the 78-column fold boundary.
+        for value in [
+            "  lead".to_string(),
+            "trail  ".to_string(),
+            format!("mid   run {}", "c ".repeat(40)),
+            format!(" x{}", "c ".repeat(40)),
+            format!("x {}", "c ".repeat(40)),
+            format!("a{}b", " ".repeat(70)),
+        ] {
+            let folded = fold_header("Subject", &value).unwrap();
+            assert_eq!(
+                unfold_value("Subject", &folded),
+                value,
+                "round trip {value:?}"
+            );
+            assert_lines_fit(&folded);
+        }
     }
 
     #[test]
