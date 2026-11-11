@@ -36,16 +36,14 @@ tiers:
     - "README.md"
     - "crates/velmora/README.md"
     - "crates/velmora-test-nntp/README.md"
+    - "crates/velmora/testdata/README.md"
     - "docs/**/*.md"
     # Additive unit/integration tests only; content triggers above apply.
-    # These globs also cover test-support files and test fixtures under
-    # tests/ (e.g. review_support/, fixtures/peer_tls DER certs): changes to
-    # verification harness material are reviewed by QA under the low tier and
-    # are escalated by the test-file content triggers.
+    # Security-verification material under tests/ is carved out to sensitive
+    # below (TLS trust-anchor/key DER fixtures and the review_support harness);
+    # the crypto/parser oracles under testdata/ are likewise listed sensitive.
     - "crates/velmora/tests/**"
     - "crates/velmora-test-nntp/tests/**"
-    # Static non-sensitive fixtures consumed only by tests.
-    - "crates/velmora/testdata/**"
   # Bounded behavior change inside audited low-risk modules only. No velmora
   # module currently qualifies: every library module parses untrusted wire
   # bytes, handles auth/credential-shaped material, performs crypto or I/O,
@@ -56,6 +54,13 @@ tiers:
     # Review policy, CI, and governance, always sensitive (this file first).
     - ".github/review-tiers.yml"
     - ".github/**"
+    # Canonical floor paths, listed explicitly so a future broad low glob
+    # cannot capture them (sensitive wins on overlap only when listed).
+    - "**/CODEOWNERS"
+    - "AGENTS.md"
+    - ".claude/**"
+    - "**/build.rs"
+    - ".cargo/**"
     # Dependency manifests, lockfiles, and supply-chain gates (incl. dev deps).
     - "Cargo.toml"
     - "Cargo.lock"
@@ -63,8 +68,19 @@ tiers:
     - "**/Cargo.lock"
     - "deny.toml"
     - ".gitleaks.toml"
-    # Fixture generators produce code (crypto test vectors), not fixtures.
+    # Crypto/parser expected-output oracles: editing these redefines what
+    # correct crypto and parser output is. Fixture generators produce code
+    # (crypto test vectors), not fixtures.
+    - "crates/velmora/testdata/age-oracle/**"
+    - "crates/velmora/testdata/media-v1/**"
+    - "crates/velmora/testdata/cctv-age/**"
+    - "crates/velmora/testdata/yenc_go_vectors.bin"
     - "crates/velmora/testdata/**/gen_*.py"
+    # TLS trust-anchor/key material baked into pinned-TLS tests via
+    # include_bytes!, and the mock NNTP/repair harness behind the security
+    # test suite.
+    - "crates/velmora/tests/fixtures/peer_tls/**"
+    - "crates/velmora/tests/review_support/**"
     # All library sources: untrusted-input parsing (yEnc, NZB, PAR2),
     # media encryption and CSPRNG, NNTP auth handling and diagnostic
     # secrecy, TLS transports and pinned fetch policy, SSRF guard, and the
