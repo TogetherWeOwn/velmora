@@ -1154,19 +1154,22 @@ async fn s3_write_revocation_interrupts_stalled_proof_readback() {
                 Ok(Reconciled::Uncertain)
             );
         } else {
-            let operation = provider.commit(&session, &receipts, &control);
-            tokio::pin!(operation);
-            tokio::select! {
-                _ = started.notified() => {},
-                result = &mut operation => panic!("commit proof did not stall: {result:?}"),
-            }
-            control.revoke_write(Failure::Deadline);
-            assert_eq!(
+            // The pinned commit future borrows `provider` until it is
+            // dropped, so scope it in a block: `into_transport` below can
+            // only move `provider` after that borrow has been released.
+            let result = {
+                let operation = provider.commit(&session, &receipts, &control);
+                tokio::pin!(operation);
+                tokio::select! {
+                    _ = started.notified() => {},
+                    result = &mut operation => panic!("commit proof did not stall: {result:?}"),
+                }
+                control.revoke_write(Failure::Deadline);
                 tokio::time::timeout(std::time::Duration::from_secs(1), operation)
                     .await
-                    .unwrap(),
-                Err(Failure::Uncertain)
-            );
+                    .unwrap()
+            };
+            assert_eq!(result, Err(Failure::Uncertain));
             // Completion had already taken effect remotely before the
             // interruption: uncertainty is retained, never absence/rollback.
             assert!(provider.into_transport().complete.is_some());
