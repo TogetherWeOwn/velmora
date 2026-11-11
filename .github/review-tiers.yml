@@ -1,0 +1,77 @@
+# Risk-tier map for tiered review (TogetherWeOwn/velmora).
+#
+# Classification: a pull request's tier is the highest tier of any changed
+# file. `sensitive` wins on overlap. Anything unmatched defaults to
+# `sensitive` (every new top-level path stays sensitive until classified).
+#
+# Content triggers escalate to `sensitive` regardless of path: a new or
+# changed public endpoint or input parsing; auth, authz or session handling;
+# crypto or keys; secrets or credentials; permission checks; tenant
+# isolation or personal data; SQL, schema or migrations; dependency or
+# lockfile changes; CI or workflow changes; weakened test assertions, deleted
+# tests or snapshots, or lowered gates in test files.
+#
+# Review per tier: low -> QA. ordinary -> QA. sensitive/unclassified ->
+# Security, then QA. QA verifies the author's `risk_tier` attestation and may
+# escalate any pull request. This file itself is always sensitive.
+#
+# When in doubt, leave a path unlisted (= sensitive). Do not broaden
+# low/ordinary to look productive; a small correct map beats a big wrong one.
+# In this repo that applies in full: velmora is a security-sensitive
+# Usenet data-plane library (yEnc/NZB/PAR2 parsing of untrusted bytes, media
+# encryption, CSPRNG, NNTP auth handling, TLS transports, SSRF guard). No
+# library module has been audited as free of untrusted input, sensitive
+# output, or trust-boundary effect, so `ordinary` is intentionally empty.
+
+version: 1
+default_tier: sensitive # anything not matched below
+
+tiers:
+  # Allowlisted docs copy, static non-sensitive fixtures, and additive unit
+  # tests. Content triggers still escalate any of these to sensitive:
+  # weakened assertions, deleted tests/snapshots, or lowered gates in a test
+  # file are sensitive; a fixture change that feeds parser/crypto inputs is
+  # sensitive.
+  low:
+    - "README.md"
+    - "crates/velmora/README.md"
+    - "crates/velmora-test-nntp/README.md"
+    - "docs/**/*.md"
+    # Additive unit/integration tests only; content triggers above apply.
+    # These globs also cover test-support files and test fixtures under
+    # tests/ (e.g. review_support/, fixtures/peer_tls DER certs): changes to
+    # verification harness material are reviewed by QA under the low tier and
+    # are escalated by the test-file content triggers.
+    - "crates/velmora/tests/**"
+    - "crates/velmora-test-nntp/tests/**"
+    # Static non-sensitive fixtures consumed only by tests.
+    - "crates/velmora/testdata/**"
+  # Bounded behavior change inside audited low-risk modules only. No velmora
+  # module currently qualifies: every library module parses untrusted wire
+  # bytes, handles auth/credential-shaped material, performs crypto or I/O,
+  # or enforces protocol bounds with a trust-boundary effect. Intentionally
+  # empty; each future entry must be justified in its pull request.
+  ordinary: []
+  sensitive:
+    # Review policy, CI, and governance, always sensitive (this file first).
+    - ".github/review-tiers.yml"
+    - ".github/**"
+    # Dependency manifests, lockfiles, and supply-chain gates (incl. dev deps).
+    - "Cargo.toml"
+    - "Cargo.lock"
+    - "**/Cargo.toml"
+    - "**/Cargo.lock"
+    - "deny.toml"
+    - ".gitleaks.toml"
+    # Fixture generators produce code (crypto test vectors), not fixtures.
+    - "crates/velmora/testdata/**/gen_*.py"
+    # All library sources: untrusted-input parsing (yEnc, NZB, PAR2),
+    # media encryption and CSPRNG, NNTP auth handling and diagnostic
+    # secrecy, TLS transports and pinned fetch policy, SSRF guard, and the
+    # test NNTP server that backs verification of the whole suite.
+    - "crates/velmora/src/**"
+    - "crates/velmora-ssrf-guard/src/**"
+    - "crates/velmora-test-nntp/src/**"
+    # Benchmarks gate performance bounds on parser/crypto paths.
+    - "crates/velmora/benches/**"
+    # Repo-root metadata (LICENSE, .gitattributes) stays unlisted = sensitive.
