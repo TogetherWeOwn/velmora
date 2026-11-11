@@ -4,6 +4,12 @@
 # file. `sensitive` wins on overlap. Anything unmatched defaults to
 # `sensitive` (every new top-level path stays sensitive until classified).
 #
+# Matcher contract for any consumer: `**` spans zero or more directories,
+# so `a/**/*.md` matches `a/x.md` and `a/b/c/x.md` alike (gitignore /
+# minimatch semantics); a matcher without zero-directory `**` (e.g. Python
+# fnmatch/pathlib) must not be used. Consumers must also reject duplicate
+# mapping keys when parsing this file.
+#
 # Content triggers escalate to `sensitive` regardless of path: a new or
 # changed public endpoint or input parsing; auth, authz or session handling;
 # crypto or keys; secrets or credentials; permission checks; tenant
@@ -37,7 +43,6 @@ tiers:
     - "crates/velmora/README.md"
     - "crates/velmora-test-nntp/README.md"
     - "crates/velmora/testdata/README.md"
-    - "docs/**/*.md"
     # Additive unit/integration tests only; content triggers above apply.
     # Security-verification material under tests/ is carved out to sensitive
     # below (TLS trust-anchor/key DER fixtures and the review_support harness);
@@ -68,6 +73,10 @@ tiers:
     - "**/Cargo.lock"
     - "deny.toml"
     - ".gitleaks.toml"
+    # Security-provenance evidence: the SHA-256 content-comparison record
+    # for the relocated SSRF guard and peer-pinned TLS implementation.
+    # Listed explicitly so its tier cannot depend on glob `**` semantics.
+    - "docs/transport-preservation.md"
     # Crypto/parser expected-output oracles: editing these redefines what
     # correct crypto and parser output is. Fixture generators produce code
     # (crypto test vectors), not fixtures.
