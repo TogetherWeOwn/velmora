@@ -97,6 +97,32 @@ impl<T: Transport> Drop for DotBlockCancelGuard<'_, T> {
     }
 }
 
+/// Poisons the connection if the awaiting future is dropped mid-operation.
+///
+/// Every NNTP exchange suspends only inside `read_line`, `write_line`,
+/// `write_dot_block` or `read_dot_block`, so arming this guard around the
+/// inner await of the first three (the dot-block read has its own guard)
+/// makes an interrupted exchange unusable synchronously on drop: an outer
+/// timeout/select that destroys the operation future can no longer leave a
+/// borrowed client marked usable with a reply or article still in flight.
+/// Poisoning only prevents reuse; it is not physical-close evidence and
+/// performs no shutdown. The guard is created inside the async body, so
+/// dropping the future before its first poll runs no code and leaves the
+/// connection untouched. Completed operations disarm it; their error paths
+/// invalidate explicitly where required.
+struct InvalidateOnDrop<'a, T: Transport> {
+    transport: &'a mut BufferedTransport<T>,
+    armed: bool,
+}
+
+impl<T: Transport> Drop for InvalidateOnDrop<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.transport.invalidate();
+        }
+    }
+}
+
 impl<T: Transport> DotBlockCancelGuard<'_, T> {
     async fn run(&mut self) -> io::Result<()> {
         loop {
@@ -148,6 +174,13 @@ impl<T: Transport> BufferedTransport<T> {
         self.buf.clear();
     }
 
+    /// The effective per-dot-block receive cap in bytes (already clamped to
+    /// [`MAX_ARTICLE_BYTES`]). Callers admitting outbound work against a
+    /// readback bound use this, not the hard ceiling.
+    pub fn max_article_bytes(&self) -> usize {
+        self.max_article_bytes
+    }
+
     fn ensure_usable(&self) -> io::Result<()> {
         if self.usable {
             Ok(())
@@ -170,12 +203,19 @@ impl<T: Transport> BufferedTransport<T> {
     }
 
     /// Reads one CRLF-terminated server line, returned WITHOUT the terminator.
-    /// Bare-LF line endings are tolerated.
+    /// Bare-LF line endings are tolerated. Dropping the returned future after
+    /// it has been polled poisons the connection (an `InvalidateOnDrop` guard);
+    /// dropping it before the first poll leaves the connection untouched.
     pub async fn read_line(&mut self) -> io::Result<Vec<u8>> {
         self.ensure_usable()?;
-        let result = self.read_line_inner().await;
+        let mut guard = InvalidateOnDrop {
+            transport: self,
+            armed: true,
+        };
+        let result = guard.transport.read_line_inner().await;
+        guard.armed = false;
         if result.is_err() {
-            self.invalidate();
+            guard.transport.invalidate();
         }
         result
     }
@@ -256,9 +296,10 @@ impl<T: Transport> BufferedTransport<T> {
     /// CRLF pair is refused with [`io::ErrorKind::InvalidInput`] *before*
     /// any byte is written, so a refused block leaves the connection usable.
     /// A write failure mid-block invalidates the connection instead: the
-    /// server state is then unknown and the caller must reconnect. The
-    /// stuffed block is assembled in one buffer (about one article) and sent
-    /// with a single `write_all`.
+    /// server state is then unknown and the caller must reconnect. Dropping
+    /// the returned future while the write is in flight invalidates it the
+    /// same way (an `InvalidateOnDrop` guard). The stuffed block is assembled in
+    /// one buffer (about one article) and sent with a single `write_all`.
     pub async fn write_dot_block(&mut self, data: &[u8]) -> io::Result<()> {
         self.ensure_usable()?;
         // Fail closed before any byte is written, so callers that validate
@@ -305,15 +346,23 @@ impl<T: Transport> BufferedTransport<T> {
             stuffed.extend_from_slice(b"\r\n");
         }
         stuffed.extend_from_slice(b".\r\n");
-        let result = self.inner.write_all(&stuffed).await;
+        let mut guard = InvalidateOnDrop {
+            transport: self,
+            armed: true,
+        };
+        let result = guard.transport.inner.write_all(&stuffed).await;
+        guard.armed = false;
         if result.is_err() {
-            self.invalidate();
+            guard.transport.invalidate();
         }
         result
     }
 
     /// Sends one protocol line (appends CRLF) in a single write, so one
-    /// command is always one packet on the wire.
+    /// command is always one packet on the wire. Dropping the returned future
+    /// while the write is in flight poisons the connection (see
+    /// `InvalidateOnDrop` guard): the server may already hold part or all of the
+    /// command, so the stream is no longer at a known boundary.
     pub async fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
         self.ensure_usable()?;
         if line.contains(&b'\r') || line.contains(&b'\n') {
@@ -325,9 +374,14 @@ impl<T: Transport> BufferedTransport<T> {
         let mut framed = Vec::with_capacity(line.len() + 2);
         framed.extend_from_slice(line);
         framed.extend_from_slice(b"\r\n");
-        let result = self.inner.write_all(&framed).await;
+        let mut guard = InvalidateOnDrop {
+            transport: self,
+            armed: true,
+        };
+        let result = guard.transport.inner.write_all(&framed).await;
+        guard.armed = false;
         if result.is_err() {
-            self.invalidate();
+            guard.transport.invalidate();
         }
         result
     }

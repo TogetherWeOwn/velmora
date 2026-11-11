@@ -61,6 +61,12 @@ pub struct PostingPlan {
 /// physical close on revocation/deadline/cancellation. Every in-flight operation
 /// remains charged to its account until closure/settlement is proven. POST I/O
 /// failures are uncertain. Absence after STAT never settles an in-flight POST.
+///
+/// Any in-flight operation future may be dropped by an outer supervisor —
+/// including a proof `body` dropped when the enclosing Write action is
+/// revoked mid-readback. Dropping must poison the session (no later command
+/// may reuse it or consume the abandoned reply); it is never physical-close
+/// or rollback evidence.
 #[allow(async_fn_in_trait)]
 pub trait Io {
     async fn post(
@@ -82,11 +88,28 @@ pub trait Io {
         message_id: &str,
         control: &impl Control,
     ) -> Result<()>;
+
+    /// Effective cap, in bytes, on one encoded BODY this `Io` can read back.
+    /// The provider rejects an encoded body above this bound *before* the
+    /// irreversible POST, so a same-configuration write can never strand an
+    /// object its own readback must refuse. `None` declares no bound tighter
+    /// than the contract maximum; an implementation with a tighter receive
+    /// cap MUST report it here.
+    fn max_encoded_body_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Does not dial or release a pool slot. Construct only after existing guarded
 /// authentication and resource admission; the caller retains close authority.
-/// The client's configured article cap remains enforced (hard maximum 64 MiB).
+/// The client's configured article cap remains enforced (hard maximum 64 MiB),
+/// including as the pre-POST encoded-body admission bound.
+///
+/// On interruption this adapter invalidates the client and attempts shutdown.
+/// Neither is physical-close proof (a successful shutdown may be only a
+/// write-half shutdown of a socket this borrowed client still owns): retain
+/// the pool lease until closure is independently verified or the client is
+/// destroyed, even after a successful shutdown.
 pub struct ClientIo<'a, T: Transport> {
     pub client: &'a mut NntpClient<T>,
 }
@@ -107,31 +130,6 @@ fn read_error(error: crate::Error) -> Failure {
     }
 }
 
-async fn controlled<F: Future>(
-    operation: F,
-    target: &Target,
-    action: Action,
-    control: &impl Control,
-) -> Result<F::Output> {
-    let mut operation = std::pin::pin!(operation);
-    let mut cancelled = std::pin::pin!(control.cancelled(target, action));
-    std::future::poll_fn(|cx| {
-        if let Err(error) = control.check(target, action) {
-            return std::task::Poll::Ready(Err(error));
-        }
-        if let std::task::Poll::Ready(error) = cancelled.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Err(error));
-        }
-        match operation.as_mut().poll(cx) {
-            std::task::Poll::Ready(result) => {
-                std::task::Poll::Ready(control.check(target, action).map(|()| result))
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    })
-    .await
-}
-
 impl<T: Transport> Io for ClientIo<'_, T> {
     async fn post(
         &mut self,
@@ -141,7 +139,7 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         control: &impl Control,
     ) -> Result<()> {
         control.check(target, Action::Write)?;
-        let result = controlled(
+        let result = supervised(
             self.client.post_article(message_id, article),
             target,
             Action::Write,
@@ -174,7 +172,7 @@ impl<T: Transport> Io for ClientIo<'_, T> {
     ) -> Result<Vec<u8>> {
         control.check(target, Action::Read)?;
         let mut out = Vec::new();
-        let result = controlled(
+        let result = supervised(
             self.client.body_to(message_id, &mut out),
             target,
             Action::Read,
@@ -199,7 +197,7 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         control: &impl Control,
     ) -> Result<()> {
         control.check(target, Action::Read)?;
-        let result = controlled(self.client.stat(message_id), target, Action::Read, control).await;
+        let result = supervised(self.client.stat(message_id), target, Action::Read, control).await;
         match result {
             Ok(result) => {
                 result.map_err(read_error)?;
@@ -210,6 +208,10 @@ impl<T: Transport> Io for ClientIo<'_, T> {
             }
         }
         control.check(target, Action::Read)
+    }
+
+    fn max_encoded_body_bytes(&self) -> Option<usize> {
+        Some(self.client.max_article_bytes())
     }
 }
 
@@ -315,7 +317,21 @@ impl<I: Io> Provider<I> {
         self.validate_intent(&record.intent())?;
         let mut hash = Sha256::new();
         for part in &record.parts {
-            hash.update(self.fetch_part(&record, part, control).await?);
+            // Proof belongs to the enclosing Write invocation: Read checks and
+            // per-call Read supervision continue inside `fetch_part`, but a
+            // Write cancellation/deadline/revocation must also interrupt a
+            // stalled readback instead of only being observed after it ends.
+            // Interruption drops the in-flight BODY, which poisons the client
+            // (never reuse it); already-posted effects stay Uncertain.
+            let bytes = supervised(
+                self.fetch_part(&record, part, control),
+                &record.identity.target,
+                Action::Write,
+                control,
+            )
+            .await
+            .map_err(|_| Failure::Uncertain)??;
+            hash.update(bytes);
         }
         let actual: [u8; 32] = hash.finalize().into();
         if actual != record.identity.sha256 {
@@ -376,6 +392,19 @@ impl<I: Io> ArchiveProvider for Provider<I> {
             bytes,
         )
         .map_err(|_| Failure::Invalid)?;
+        // Admission before the irreversible POST: an encoded body above the
+        // Io's effective readback cap could be posted but never read back by
+        // the same configuration, stranding the object as permanently
+        // uncertain. Reject it here with zero POST bytes. This write-side
+        // admission does not change read-only handling of oversized legacy
+        // articles, which still classify as Limit on reads.
+        if self
+            .io
+            .max_encoded_body_bytes()
+            .is_some_and(|cap| body.len() > cap)
+        {
+            return Err(Failure::Limit);
+        }
         let article = article::assemble_article(&headers, &body).map_err(|_| Failure::Invalid)?;
         self.io
             .post(

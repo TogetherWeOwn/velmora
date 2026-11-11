@@ -130,6 +130,14 @@ pub struct RangeReply {
 /// bytes. Return metadata from the same response, not a separate unpinned HEAD.
 /// `reconcile` settles ALL issued requests for this operation before `Absent`;
 /// S3 404 alone does not prove quiescence. No hidden retries or account fallback.
+///
+/// In-call cancellation carries the enclosing action, not only the immediate
+/// one: `head`/`get_range` issued during a commit/reconcile proof remain
+/// subject to that invocation's Write cancellation/deadline/revocation, and
+/// the adapter may drop such an in-flight future when Write is revoked even
+/// while Read stays allowed. A transport must treat a dropped in-flight read
+/// as abandoned (publish no success from it) and keep any already-issued
+/// mutation's outcome `Failure::Uncertain`, never absent or rolled back.
 #[allow(async_fn_in_trait)]
 pub trait SafeTransport {
     async fn begin(
@@ -292,7 +300,20 @@ impl<T: SafeTransport> Provider<T> {
         record.validate()?;
         let mut hash = Sha256::new();
         for part in &record.parts {
-            hash.update(self.fetch_part(&record, part, control).await?);
+            // Same enclosing-Write supervision as the NNTP proof: Read checks
+            // continue inside `fetch_part`, and a Write
+            // cancellation/deadline/revocation interrupts a stalled GET/HEAD
+            // instead of only fencing eventual success. Interruption after a
+            // possibly completed upload stays Uncertain, never Absent.
+            let bytes = supervised(
+                self.fetch_part(&record, part, control),
+                &record.identity.target,
+                Action::Write,
+                control,
+            )
+            .await
+            .map_err(|_| Failure::Uncertain)??;
+            hash.update(bytes);
         }
         let actual: [u8; 32] = hash.finalize().into();
         if actual != record.identity.sha256 {

@@ -419,6 +419,38 @@ pub(crate) fn check_receipts(session: &WriteSession, receipts: &[PartReceipt]) -
     Ok(())
 }
 
+/// Races `operation` against cancellation/deadline/revocation of `action`:
+/// the control is checked before the first poll and again before a completed
+/// result is accepted, and the registered `cancelled` future is polled
+/// alongside the operation so a stalled operation still observes the signal
+/// even when its own I/O never wakes. On interruption the operation future
+/// is dropped; callers must treat that as abandonment (poison/uncertainty),
+/// never as proof that nothing happened.
+pub(crate) async fn supervised<F: Future>(
+    operation: F,
+    target: &Target,
+    action: Action,
+    control: &impl Control,
+) -> Result<F::Output> {
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(control.cancelled(target, action));
+    std::future::poll_fn(|cx| {
+        if let Err(error) = control.check(target, action) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        if let std::task::Poll::Ready(error) = cancelled.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        match operation.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                std::task::Poll::Ready(control.check(target, action).map(|()| result))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
 pub(crate) async fn emit(
     bytes: &[u8],
     target: &Target,
@@ -427,7 +459,12 @@ pub(crate) async fn emit(
 ) -> Result<()> {
     for block in bytes.chunks(STREAM_BLOCK_BYTES) {
         control.check(target, Action::Read)?;
-        sink.write(block).await?;
+        // A sink has no control of its own and may never wake, so each pending
+        // write is supervised with Read control: cancellation, deadline or
+        // revocation ends the read instead of retaining the fetched part
+        // forever. Interruption drops the sink future; the invisible-prefix
+        // rule on `Sink` still applies and success is never published.
+        supervised(sink.write(block), target, Action::Read, control).await??;
     }
     control.check(target, Action::Read)
 }

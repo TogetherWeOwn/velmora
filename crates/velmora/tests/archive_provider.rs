@@ -100,6 +100,69 @@ impl Sink for Output {
     }
 }
 
+/// Event-driven control with independent Read and Write revocation, so a test
+/// can revoke exactly one action while an operation for the other is stalled.
+struct ActionControl {
+    tenant: Id,
+    read_state: Rc<Cell<Option<Failure>>>,
+    write_state: Rc<Cell<Option<Failure>>>,
+    notify: Rc<tokio::sync::Notify>,
+}
+impl ActionControl {
+    fn new() -> Self {
+        Self {
+            tenant: id("tenant-a"),
+            read_state: Rc::new(Cell::new(None)),
+            write_state: Rc::new(Cell::new(None)),
+            notify: Rc::new(tokio::sync::Notify::new()),
+        }
+    }
+    fn revoke_read(&self, failure: Failure) {
+        self.read_state.set(Some(failure));
+        self.notify.notify_waiters();
+    }
+    fn revoke_write(&self, failure: Failure) {
+        self.write_state.set(Some(failure));
+        self.notify.notify_waiters();
+    }
+}
+impl Control for ActionControl {
+    fn check(&self, target: &Target, action: Action) -> Result<()> {
+        if self.tenant != target.tenant {
+            return Err(Failure::Denied);
+        }
+        match action {
+            Action::Read => self.read_state.get().map_or(Ok(()), Err),
+            Action::Write => self.write_state.get().map_or(Ok(()), Err),
+            Action::AbortIncomplete | Action::Health => Ok(()),
+        }
+    }
+
+    async fn cancelled(&self, target: &Target, action: Action) -> Failure {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Err(error) = self.check(target, action) {
+                return error;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct PendingSink {
+    started: Rc<tokio::sync::Notify>,
+    received: Vec<u8>,
+}
+impl Sink for PendingSink {
+    async fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        self.started.notify_one();
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct ObjectStore {
     calls: usize,
@@ -117,6 +180,7 @@ struct ObjectStore {
     head_override: Option<s3::Metadata>,
     head_calls: usize,
     after_complete: Option<Rc<Cell<Option<Failure>>>>,
+    stall_range: Option<Rc<tokio::sync::Notify>>,
 }
 impl ObjectStore {
     fn check_session(&self, session: &WriteSession) -> Result<()> {
@@ -247,6 +311,10 @@ impl s3::SafeTransport for ObjectStore {
         _: &impl Control,
     ) -> Result<s3::RangeReply> {
         self.calls += 1;
+        if let Some(started) = &self.stall_range {
+            started.notify_one();
+            std::future::pending::<()>().await;
+        }
         let (metadata, bytes) = self.complete.as_ref().ok_or(Failure::Missing)?;
         if record.identity.version != metadata.version {
             return Err(Failure::Missing);
@@ -727,6 +795,7 @@ struct Spool {
     read_error: Option<Failure>,
     after_read: Option<Rc<Cell<Option<Failure>>>>,
     posts: usize,
+    stall_body: Option<Rc<tokio::sync::Notify>>,
 }
 impl nntp::Io for Spool {
     async fn post(
@@ -744,6 +813,10 @@ impl nntp::Io for Spool {
         Ok(())
     }
     async fn body(&mut self, _: &Target, message_id: &str, _: &impl Control) -> Result<Vec<u8>> {
+        if let Some(started) = &self.stall_body {
+            started.notify_one();
+            std::future::pending::<()>().await;
+        }
         if let Some(error) = self.read_error {
             return Err(error);
         }
@@ -956,4 +1029,148 @@ async fn nntp_corrupt_article_does_not_release_requested_bytes() {
         provider.reconcile(&session, &authority).await,
         Ok(Reconciled::Uncertain)
     );
+}
+
+#[tokio::test]
+async fn pending_sink_write_observes_read_cancellation_and_deadline() {
+    for signal in [Failure::Cancelled, Failure::Deadline] {
+        let (intent, bytes) = intent(Backend::S3, &[137]);
+        let authority = Authority::new();
+        let mut provider = s3::Provider::new(Some(config()), ObjectStore::default()).unwrap();
+        let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+        let proof = provider
+            .commit(&session, &receipts, &authority)
+            .await
+            .unwrap();
+        let control = ActionControl::new();
+        let started = Rc::new(tokio::sync::Notify::new());
+        let mut sink = PendingSink {
+            started: started.clone(),
+            received: Vec::new(),
+        };
+        let result = {
+            let operation = provider.read_range(
+                &proof.record,
+                Range {
+                    offset: 0,
+                    bytes: intent.bytes,
+                },
+                &mut sink,
+                &control,
+            );
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = started.notified() => {},
+                result = &mut operation => panic!("read did not reach the pending sink: {result:?}"),
+            }
+            control.revoke_read(signal);
+            tokio::time::timeout(std::time::Duration::from_secs(1), operation)
+                .await
+                .unwrap()
+        };
+        // Bounded completion with the signal, and no success published.
+        assert_eq!(result, Err(signal));
+        assert!(sink.received.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn nntp_write_revocation_interrupts_stalled_proof_readback() {
+    for reconcile in [false, true] {
+        let (intent, bytes) = intent(Backend::Nntp, &[73]);
+        let authority = Authority::new();
+        let mut provider =
+            nntp::Provider::new(id("account-a"), Spool::default(), Some(posting(&intent)));
+        let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+        let started = Rc::new(tokio::sync::Notify::new());
+        let mut spool = provider.into_io();
+        spool.stall_body = Some(started.clone());
+        let mut provider = nntp::Provider::new(id("account-a"), spool, Some(posting(&intent)));
+        let control = ActionControl::new();
+        if reconcile {
+            let operation = provider.reconcile(&session, &control);
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = started.notified() => {},
+                result = &mut operation => panic!("reconcile proof did not stall: {result:?}"),
+            }
+            control.revoke_write(Failure::Cancelled);
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), operation)
+                    .await
+                    .unwrap(),
+                Ok(Reconciled::Uncertain)
+            );
+        } else {
+            let operation = provider.commit(&session, &receipts, &control);
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = started.notified() => {},
+                result = &mut operation => panic!("commit proof did not stall: {result:?}"),
+            }
+            control.revoke_write(Failure::Cancelled);
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), operation)
+                    .await
+                    .unwrap(),
+                Err(Failure::Uncertain)
+            );
+        }
+        // Only Write was revoked; Read authority never changed.
+        assert_eq!(control.check(&intent.target, Action::Read), Ok(()));
+    }
+}
+
+#[tokio::test]
+async fn s3_write_revocation_interrupts_stalled_proof_readback() {
+    for reconcile in [false, true] {
+        let (intent, bytes) = intent(Backend::S3, &[73]);
+        let authority = Authority::new();
+        let mut provider = s3::Provider::new(Some(config()), ObjectStore::default()).unwrap();
+        let (session, receipts) = upload(&mut provider, &intent, &bytes, &authority).await;
+        if reconcile {
+            provider
+                .commit(&session, &receipts, &authority)
+                .await
+                .unwrap();
+        }
+        let started = Rc::new(tokio::sync::Notify::new());
+        let mut transport = provider.into_transport();
+        transport.stall_range = Some(started.clone());
+        let mut provider = s3::Provider::new(Some(config()), transport).unwrap();
+        let control = ActionControl::new();
+        if reconcile {
+            let operation = provider.reconcile(&session, &control);
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = started.notified() => {},
+                result = &mut operation => panic!("reconcile proof did not stall: {result:?}"),
+            }
+            control.revoke_write(Failure::Deadline);
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), operation)
+                    .await
+                    .unwrap(),
+                Ok(Reconciled::Uncertain)
+            );
+        } else {
+            let operation = provider.commit(&session, &receipts, &control);
+            tokio::pin!(operation);
+            tokio::select! {
+                _ = started.notified() => {},
+                result = &mut operation => panic!("commit proof did not stall: {result:?}"),
+            }
+            control.revoke_write(Failure::Deadline);
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), operation)
+                    .await
+                    .unwrap(),
+                Err(Failure::Uncertain)
+            );
+            // Completion had already taken effect remotely before the
+            // interruption: uncertainty is retained, never absence/rollback.
+            assert!(provider.into_transport().complete.is_some());
+        }
+        assert_eq!(control.check(&intent.target, Action::Read), Ok(()));
+    }
 }

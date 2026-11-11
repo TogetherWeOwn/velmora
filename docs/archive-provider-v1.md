@@ -82,13 +82,24 @@ is a required event-driven future for the exact target/action; it must register
 cancellation, current-policy revocation and deadline wakeups before rechecking
 policy, including when the socket never progresses. `ClientIo` races every NNTP
 operation against it and rechecks authority on each poll and after completion;
-revocation drops the command then invalidates and shuts down the client without
-sending QUIT into an incomplete exchange. A failed or dropped shutdown is not
-close proof: the product retains the lease and owns physical-close confirmation.
-Dropping a future is not remote rollback or physical-close proof. Pool slots remain charged until
-socket closure/settlement is proven. A late cancellation after completion is
-uncertain, not "nothing committed". The product's own journal/outbox must survive
-process loss; the library's serializable values are not a database implementation.
+revocation drops the command then invalidates and attempts shutdown of the client
+without sending QUIT into an incomplete exchange. No shutdown outcome — success,
+failure or a dropped shutdown future — is physical-close proof: a successful
+transport shutdown may complete only a write-half shutdown while the borrowed
+client still owns a live socket. The product retains the lease, even after a
+successful shutdown, until closure is independently verified or the client is
+destroyed, and owns physical-close confirmation. Dropping an in-flight command
+future poisons the NNTP session synchronously (no later command may reuse it),
+but dropping is not remote rollback or physical-close proof. Pool slots remain
+charged until socket closure/settlement is proven. A late cancellation after
+completion is uncertain, not "nothing committed". Commit/reconcile proof readback
+stays under the enclosing Write control as well as Read, and pending sink writes
+stay under Read control, so revoking either action interrupts a stalled proof or
+sink instead of only fencing its eventual success; already-acknowledged effects
+remain uncertain. An encoded NNTP body above the Io's effective readback cap is
+rejected before POST, never posted into permanent same-configuration uncertainty.
+The product's own journal/outbox must survive process loss; the library's
+serializable values are not a database implementation.
 
 `Absent` requires settlement of every issued request. A HEAD/STAT 404 alone cannot
 prove quiescence. An NNTP partial post/propagation failure always remains uncertain,
