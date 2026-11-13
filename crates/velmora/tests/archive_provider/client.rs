@@ -369,11 +369,34 @@ async fn dropping_a_stalled_article_write_poisons_the_session() {
     assert_eq!(outgoing.borrow().len(), sent);
 }
 
+#[derive(Clone, Copy)]
+enum ShutdownOutcome {
+    Success,
+    Failure,
+    Pending,
+}
+
+#[derive(Default)]
+struct CloseEvidence {
+    requests: Cell<usize>,
+    shutdowns_started: Cell<usize>,
+    shutdowns_completed: Cell<usize>,
+    destroyed: Cell<bool>,
+    confirmed: Cell<bool>,
+}
+impl CloseEvidence {
+    fn confirm(&self, result: io::Result<()>) -> io::Result<()> {
+        result?;
+        self.confirmed.set(true);
+        Ok(())
+    }
+}
+
 struct HalfClose {
     incoming: Cursor<Vec<u8>>,
     outgoing: Rc<RefCell<Vec<u8>>>,
-    shutdowns: Rc<Cell<usize>>,
-    destroyed: Rc<Cell<bool>>,
+    outcome: ShutdownOutcome,
+    close: Rc<CloseEvidence>,
 }
 impl Transport for HalfClose {
     async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -384,49 +407,98 @@ impl Transport for HalfClose {
         Ok(())
     }
     async fn shutdown(&mut self) -> io::Result<()> {
-        // Models a write-half shutdown that reports success while the
-        // transport (and its socket) remains owned and alive.
-        self.shutdowns.set(self.shutdowns.get() + 1);
-        Ok(())
+        self.close.requests.set(self.close.requests.get() + 1);
+        self.close
+            .shutdowns_started
+            .set(self.close.shutdowns_started.get() + 1);
+        let result = match self.outcome {
+            // A completed write-half shutdown is not full socket closure.
+            ShutdownOutcome::Success => Ok(()),
+            ShutdownOutcome::Failure => Err(io::Error::other("synthetic shutdown failure")),
+            ShutdownOutcome::Pending => std::future::pending().await,
+        };
+        self.close
+            .shutdowns_completed
+            .set(self.close.shutdowns_completed.get() + 1);
+        result
     }
 }
 impl Drop for HalfClose {
     fn drop(&mut self) {
-        self.destroyed.set(true);
+        // Like an asynchronous-close transport, Drop requests but cannot
+        // confirm closure. The external control outlives this transport.
+        self.close.requests.set(self.close.requests.get() + 1);
+        self.close.destroyed.set(true);
     }
 }
 
 #[tokio::test]
-async fn successful_shutdown_attempt_is_not_physical_close_evidence() {
-    let (intent, _) = intent(Backend::Nntp, &[13]);
-    let outgoing = Rc::new(RefCell::new(Vec::new()));
-    let shutdowns = Rc::new(Cell::new(0));
-    let destroyed = Rc::new(Cell::new(false));
-    let transport = HalfClose {
-        incoming: Cursor::new(b"200 ready\r\n200 reader\r\n".to_vec()),
-        outgoing: outgoing.clone(),
-        shutdowns: shutdowns.clone(),
-        destroyed: destroyed.clone(),
-    };
-    let mut client =
-        NntpClient::connect_with_auth_guard(transport, &NntpConfig::default(), || Ok(()))
+async fn shutdown_and_destruction_do_not_replace_independent_close_confirmation() {
+    for outcome in [
+        ShutdownOutcome::Success,
+        ShutdownOutcome::Failure,
+        ShutdownOutcome::Pending,
+    ] {
+        let (intent, _) = intent(Backend::Nntp, &[13]);
+        let outgoing = Rc::new(RefCell::new(Vec::new()));
+        let close = Rc::new(CloseEvidence::default());
+        let transport = HalfClose {
+            incoming: Cursor::new(b"200 ready\r\n200 reader\r\n".to_vec()),
+            outgoing: outgoing.clone(),
+            outcome,
+            close: close.clone(),
+        };
+        let mut client =
+            NntpClient::connect_with_auth_guard(transport, &NntpConfig::default(), || Ok(()))
+                .await
+                .unwrap();
+        match outcome {
+            ShutdownOutcome::Success => client.shutdown_unusable().await.unwrap(),
+            ShutdownOutcome::Failure => assert!(client.shutdown_unusable().await.is_err()),
+            ShutdownOutcome::Pending => {
+                let shutdown = client.shutdown_unusable();
+                tokio::pin!(shutdown);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(shutdown.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                // Drop the polled shutdown future without completing it.
+            }
+        }
+        assert_eq!(close.shutdowns_started.get(), 1);
+        assert_eq!(
+            close.shutdowns_completed.get(),
+            usize::from(!matches!(outcome, ShutdownOutcome::Pending))
+        );
+        assert_eq!(close.requests.get(), 1);
+        assert!(!close.confirmed.get());
+        let sent = outgoing.borrow().len();
+        assert!(client
+            .stat(intent.parts[0].reference.as_str())
             .await
-            .unwrap();
-    client.shutdown_unusable().await.unwrap();
-    // Attempt happened and succeeded; the session refuses further use...
-    assert_eq!(shutdowns.get(), 1);
-    let sent = outgoing.borrow().len();
-    assert!(client
-        .stat(intent.parts[0].reference.as_str())
-        .await
-        .is_err());
-    assert_eq!(outgoing.borrow().len(), sent);
-    // ...but success is not closure: the transport is still owned/alive, so a
-    // pool following the documented contract retains the lease. Only client
-    // destruction ends that ownership in this model.
-    assert!(!destroyed.get());
-    drop(client);
-    assert!(destroyed.get());
+            .is_err());
+        assert_eq!(outgoing.borrow().len(), sent);
+        assert!(!close.destroyed.get());
+        drop(client);
+        assert!(close.destroyed.get());
+        assert_eq!(close.requests.get(), 2);
+        assert!(
+            !close.confirmed.get(),
+            "destruction is only a close request"
+        );
+        // A product following the contract still retains its lease here.
+        // Model external confirmation, not a live Worker socket or pool.
+        assert!(close
+            .confirm(Err(io::Error::other("close failed")))
+            .is_err());
+        assert!(
+            !close.confirmed.get(),
+            "failed confirmation retains the charge"
+        );
+        close.confirm(Ok(())).unwrap();
+        assert!(close.confirmed.get());
+    }
 }
 
 #[tokio::test]

@@ -86,9 +86,12 @@ revocation drops the command then invalidates and attempts shutdown of the clien
 without sending QUIT into an incomplete exchange. No shutdown outcome — success,
 failure or a dropped shutdown future — is physical-close proof: a successful
 transport shutdown may complete only a write-half shutdown while the borrowed
-client still owns a live socket. The product retains the lease, even after a
-successful shutdown, until closure is independently verified or the client is
-destroyed, and owns physical-close confirmation. Dropping an in-flight command
+client still owns a live socket. The product retains the lease/account charge
+until physical closure is independently confirmed, even after successful shutdown
+or client/transport destruction. Destruction may only request asynchronous close:
+for Worker pinned TLS, retain the external `WorkerSocketControl` and charge until
+its `close` succeeds after both close promises complete. Pending or failed close
+confirmation does not release capacity. Dropping an in-flight command
 future poisons the NNTP session synchronously (no later command may reuse it),
 but dropping is not remote rollback or physical-close proof. Pool slots remain
 charged until socket closure/settlement is proven. A late cancellation after

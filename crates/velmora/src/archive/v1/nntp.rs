@@ -108,8 +108,11 @@ pub trait Io {
 /// On interruption this adapter invalidates the client and attempts shutdown.
 /// Neither is physical-close proof (a successful shutdown may be only a
 /// write-half shutdown of a socket this borrowed client still owns): retain
-/// the pool lease until closure is independently verified or the client is
-/// destroyed, even after a successful shutdown.
+/// the pool lease/account charge until physical closure is independently
+/// confirmed, even after successful shutdown or client/transport destruction.
+/// Destruction may only request asynchronous close. For Worker pinned TLS,
+/// retain the external `WorkerSocketControl` and charge until its `close`
+/// succeeds; transport drop alone does not confirm closure.
 pub struct ClientIo<'a, T: Transport> {
     pub client: &'a mut NntpClient<T>,
 }

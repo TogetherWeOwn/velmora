@@ -350,10 +350,12 @@ impl<T: Transport> NntpClient<T> {
     /// shutdown can succeed by completing only a write-half shutdown while
     /// the socket — still owned by this borrowed client — keeps a live read
     /// half, and an error or a dropped shutdown future proves even less.
-    /// The caller MUST retain the pool lease/account charge until closure is
-    /// independently verified or the client (and its transport) is destroyed,
-    /// *even after this method returns `Ok`*. Success here only means the
-    /// shutdown attempt completed and the session will refuse further use.
+    /// The caller MUST retain the pool lease/account charge until physical
+    /// closure is independently confirmed, *even after this method returns
+    /// `Ok` or the client and its transport are destroyed*. Destruction may
+    /// only request asynchronous close; it is not universal closure evidence.
+    /// Success here only means the shutdown attempt completed and the session
+    /// will refuse further use.
     /// Invalidation happens synchronously on the future's first poll, before
     /// the shutdown attempt, so an interrupted attempt still leaves the
     /// session unusable.
