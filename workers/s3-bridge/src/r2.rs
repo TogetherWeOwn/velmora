@@ -54,6 +54,14 @@ fn r2_range(span: ByteSpan) -> Result<Range> {
     })
 }
 
+/// An empty span is valid up to and including the end of the object.
+fn empty_span(span: ByteSpan, size: u64) -> Result<Vec<u8>> {
+    if span.start > size {
+        return Err(BridgeError::Blob("r2: range past end".into()));
+    }
+    Ok(Vec::new())
+}
+
 impl BlobStore for R2Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
         self.bucket
@@ -71,7 +79,10 @@ impl BlobStore for R2Blobs {
         match span {
             // R2 has no empty range: answer from a head.
             Some(s) if s.len == 0 => {
-                return Ok(self.head(key).await?.map(|_| Vec::new()));
+                return match self.head(key).await? {
+                    None => Ok(None),
+                    Some(size) => empty_span(s, size).map(Some),
+                };
             }
             Some(s) => req = req.range(r2_range(s)?),
             None => {}
@@ -128,6 +139,8 @@ mod tests {
             Range::OffsetWithLength { offset, length } => assert_eq!((offset, length), (10, 5)),
             _ => panic!("wrong range kind"),
         }
+        let empty = |start| empty_span(ByteSpan { start, len: 0 }, 10);
+        assert!(empty(0).is_ok() && empty(10).is_ok() && empty(11).is_err());
         assert!(r2_range(ByteSpan {
             start: MAX_SAFE_OFFSET,
             len: 1
