@@ -630,8 +630,10 @@ jobs:
           echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code}"
           exit 1
       # On any failure or cancellation after the rollback target was
-      # recorded: roll back to that exact version, but only if the active
-      # version changed. If the active version cannot be read, roll back.
+      # recorded: roll back to that exact version, but only when the active
+      # version is the one this run deployed (from the wrangler output), so
+      # a deployment made outside this job is never replaced. Any other
+      # state fails the step for a manual check.
       - name: Roll back to the recorded version
         if: ${{ (failure() || cancelled()) && steps.prev.outputs.version != '' }}
         working-directory: workers/s3-bridge
@@ -639,20 +641,39 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           PREV_VERSION: ${{ steps.prev.outputs.version }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
         run: |
           set -euo pipefail
+          deployed=""
+          if [ -f "$WRANGLER_OUTPUT_FILE_PATH" ]; then
+            deployed=$(jq -r 'select(.type == "deploy") | .version_id // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)
+          fi
           out="${RUNNER_TEMP}/deployments-after.json"
           active=""
-          if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml > "$out"; then
-            active=$(jq -r 'if (.versions | length) == 1 and .versions[0].percentage == 100 then .versions[0].version_id else empty end' "$out")
-          fi
-          if [ "$active" = "$PREV_VERSION" ]; then
+          for _ in 1 2 3; do
+            if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml > "$out"; then
+              active=$(jq -r 'if (.versions | length) == 1 and .versions[0].percentage == 100 then .versions[0].version_id else empty end' "$out")
+              break
+            fi
+            sleep 5
+          done
+          if [ -n "$active" ] && [ "$active" = "$PREV_VERSION" ]; then
             echo "rollback: active version is still ${PREV_VERSION}; nothing to roll back"
             exit 0
           fi
+          if [ -z "$deployed" ]; then
+            echo "::error::rollback: this run has no deployed version id and the active version is '${active:-unknown}', not ${PREV_VERSION}; not rolling back, check manually"
+            exit 1
+          fi
+          if [ -n "$active" ] && [ "$active" != "$deployed" ]; then
+            echo "::error::rollback: active version ${active} is neither ${PREV_VERSION} nor this run's ${deployed}; not rolling back, check manually"
+            exit 1
+          fi
+          # active is this run's version, or could not be read after a
+          # deploy this run made: restore the recorded version.
           ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
             --message "automatic rollback: deploy job failed or was cancelled" -y
-          echo "Deploy failed or was cancelled; rolled back to Worker version \`${PREV_VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy failed or was cancelled; rolled back from \`${deployed}\` to Worker version \`${PREV_VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
       - name: Record the Worker version id
         if: steps.fresh.outputs.fresh == 'true'
         env:
@@ -660,7 +681,7 @@ jobs:
           PREV_VERSION: ${{ steps.prev.outputs.version }}
         run: |
           set -euo pipefail
-          version_id=$(jq -r 'select(.type == "deploy") | .version_id // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)
+          version_id=$(jq -r 'select(.type == "deploy") | .version_id // empty' "$WRANGLER_OUTPUT_FILE_PATH" 2>/dev/null | tail -n 1 || true)
           # The deploy already passed its smoke test; a missing id is a
           # reporting problem only and must not trigger a rollback.
           if [ -z "$version_id" ]; then
