@@ -82,8 +82,12 @@ is a required event-driven future for the exact target/action; it must register
 cancellation, current-policy revocation and deadline wakeups before rechecking
 policy, including when the socket never progresses. `ClientIo` races every NNTP
 operation against it and rechecks authority on each poll and after completion;
-revocation drops the command then invalidates and attempts shutdown of the client
-without sending QUIT into an incomplete exchange. No shutdown outcome — success,
+revocation drops the command and synchronously invalidates the client, returning
+without awaiting transport cleanup or sending QUIT into an incomplete exchange.
+POST returns `Uncertain` for possibly posted effects; BODY/STAT preserve the Read
+failure. Cleanup remains caller-owned: a later `shutdown_unusable` attempt needs
+its own bounded cleanup budget, never an awaited extension of an expired
+invocation. No background cleanup task is spawned. No shutdown outcome — success,
 failure or a dropped shutdown future — is physical-close proof: a successful
 transport shutdown may complete only a write-half shutdown while the borrowed
 client still owns a live socket. The product retains the lease/account charge

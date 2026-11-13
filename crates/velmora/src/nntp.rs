@@ -342,6 +342,11 @@ impl<T: Transport> NntpClient<T> {
         let _ = self.transport.shutdown().await;
     }
 
+    /// Synchronously poisons the session without I/O or a close claim.
+    pub(crate) fn invalidate(&mut self) {
+        self.transport.invalidate();
+    }
+
     /// Invalidates the session, then attempts transport shutdown without a
     /// protocol command. Use when invocation revocation interrupts an
     /// exchange: QUIT would race an incomplete command or article body.
@@ -358,9 +363,11 @@ impl<T: Transport> NntpClient<T> {
     /// will refuse further use.
     /// Invalidation happens synchronously on the future's first poll, before
     /// the shutdown attempt, so an interrupted attempt still leaves the
-    /// session unusable.
+    /// session unusable. This caller-owned cleanup has no completion bound;
+    /// supervise it with a separate cleanup budget, never await it as a
+    /// prerequisite to returning an invocation's cancellation/deadline result.
     pub async fn shutdown_unusable(&mut self) -> std::io::Result<()> {
-        self.transport.invalidate();
+        self.invalidate();
         self.transport.shutdown().await
     }
 

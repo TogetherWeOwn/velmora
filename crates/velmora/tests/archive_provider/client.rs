@@ -148,7 +148,7 @@ impl Transport for Suspended {
 }
 
 #[tokio::test]
-async fn invocation_revocation_interrupts_pending_post_body_and_stat_and_attempts_shutdown() {
+async fn invocation_revocation_interrupts_pending_post_body_and_stat_without_inline_shutdown() {
     use nntp::Io;
     for phase in 0..4 {
         let (intent, _) = intent(Backend::Nntp, &[13]);
@@ -210,9 +210,9 @@ async fn invocation_revocation_interrupts_pending_post_body_and_stat_and_attempt
                 })
             );
         }
-        // One shutdown *attempt* was made. The counter proves the attempt
-        // only — never physical socket closure (see the half-close test).
-        assert_eq!(shutdowns.get(), 1);
+        // Result delivery never waits for cleanup. The caller still owns
+        // the poisoned client, its cleanup budget and the charged lease.
+        assert_eq!(shutdowns.get(), 0);
         let sent = outgoing.borrow().len();
         assert!(client
             .stat(intent.parts[0].reference.as_str())
@@ -429,6 +429,159 @@ impl Drop for HalfClose {
         // confirm closure. The external control outlives this transport.
         self.close.requests.set(self.close.requests.get() + 1);
         self.close.destroyed.set(true);
+    }
+}
+
+struct AdapterCleanup {
+    inner: HalfClose,
+}
+impl Transport for AdapterCleanup {
+    async fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.inner.incoming.position() < self.inner.incoming.get_ref().len() as u64 {
+            return self.inner.read(out).await;
+        }
+        std::future::pending().await
+    }
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_all(bytes).await
+    }
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+}
+
+#[tokio::test]
+async fn adapter_cancellation_returns_without_waiting_for_caller_owned_cleanup() {
+    use nntp::Io;
+    for outcome in [
+        ShutdownOutcome::Success,
+        ShutdownOutcome::Failure,
+        ShutdownOutcome::Pending,
+    ] {
+        for signal in [Failure::Cancelled, Failure::Deadline] {
+            // POST before 340 / after article, BODY before envelope, STAT.
+            for phase in 0..4 {
+                let (intent, _) = intent(Backend::Nntp, &[13]);
+                let reference = intent.parts[0].reference.as_str();
+                let outgoing = Rc::new(RefCell::new(Vec::new()));
+                let close = Rc::new(CloseEvidence::default());
+                let mut incoming = b"200 ready\r\n200 reader\r\n".to_vec();
+                if phase == 1 {
+                    incoming.extend_from_slice(b"340 send\r\n");
+                }
+                let transport = AdapterCleanup {
+                    inner: HalfClose {
+                        incoming: Cursor::new(incoming),
+                        outgoing: outgoing.clone(),
+                        outcome,
+                        close: close.clone(),
+                    },
+                };
+                let mut client =
+                    NntpClient::connect_with_auth_guard(transport, &NntpConfig::default(), || {
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                let control = Revocation {
+                    authority: Authority::new(),
+                    notify: tokio::sync::Notify::new(),
+                };
+                {
+                    let operation = async {
+                        let mut io = nntp::ClientIo {
+                            client: &mut client,
+                        };
+                        match phase {
+                            0 | 1 => {
+                                io.post(&intent.target, reference, b"synthetic\r\n", &control)
+                                    .await
+                            }
+                            2 => io
+                                .body(&intent.target, reference, &control)
+                                .await
+                                .map(|_| ()),
+                            _ => io.stat(&intent.target, reference, &control).await,
+                        }
+                    };
+                    tokio::pin!(operation);
+                    std::future::poll_fn(|cx| {
+                        assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    assert!(outgoing.borrow().len() > b"MODE READER\r\n".len());
+                    control.authority.state.set(Some(signal.clone()));
+                    control.notify.notify_waiters();
+                    // One poll must deliver the result even if shutdown never
+                    // completes. No wall-clock timeout or cleanup task is needed.
+                    std::future::poll_fn(|cx| {
+                        assert_eq!(
+                            std::future::Future::poll(operation.as_mut(), cx),
+                            std::task::Poll::Ready(Err(if phase < 2 {
+                                Failure::Uncertain
+                            } else {
+                                signal.clone()
+                            }))
+                        );
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert_eq!(close.shutdowns_started.get(), 0);
+                assert_eq!(close.requests.get(), 0);
+                assert!(!close.confirmed.get());
+                let sent = outgoing.borrow().len();
+                assert!(client.stat(reference).await.is_err());
+                assert_eq!(outgoing.borrow().len(), sent);
+                // Cleanup belongs to the caller, outside result delivery. Even
+                // an abandoned cleanup attempt must leave the session poisoned.
+                match outcome {
+                    ShutdownOutcome::Success => client.shutdown_unusable().await.unwrap(),
+                    ShutdownOutcome::Failure => assert!(client.shutdown_unusable().await.is_err()),
+                    ShutdownOutcome::Pending => {
+                        let shutdown = client.shutdown_unusable();
+                        tokio::pin!(shutdown);
+                        std::future::poll_fn(|cx| {
+                            assert!(std::future::Future::poll(shutdown.as_mut(), cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                    }
+                }
+                assert_eq!(close.shutdowns_started.get(), 1);
+                assert_eq!(
+                    close.shutdowns_completed.get(),
+                    usize::from(!matches!(outcome, ShutdownOutcome::Pending))
+                );
+                assert!(client.stat(reference).await.is_err());
+                {
+                    let quit = client.quit();
+                    tokio::pin!(quit);
+                    std::future::poll_fn(|cx| {
+                        let _ = std::future::Future::poll(quit.as_mut(), cx);
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert_eq!(
+                    outgoing.borrow().len(),
+                    sent,
+                    "no command or QUIT after poisoning"
+                );
+                assert!(close.destroyed.get());
+                assert!(
+                    !close.confirmed.get(),
+                    "cleanup/drop cannot release the charge"
+                );
+                assert!(close
+                    .confirm(Err(io::Error::other("close failed")))
+                    .is_err());
+                assert!(!close.confirmed.get());
+                close.confirm(Ok(())).unwrap();
+                assert!(close.confirmed.get());
+            }
+        }
     }
 }
 

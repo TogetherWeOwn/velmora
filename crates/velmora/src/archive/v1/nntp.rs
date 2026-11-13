@@ -105,8 +105,10 @@ pub trait Io {
 /// The client's configured article cap remains enforced (hard maximum 64 MiB),
 /// including as the pre-POST encoded-body admission bound.
 ///
-/// On interruption this adapter invalidates the client and attempts shutdown.
-/// Neither is physical-close proof (a successful shutdown may be only a
+/// On interruption this adapter synchronously invalidates the client and returns
+/// without awaiting cleanup. The caller owns any later `shutdown_unusable`
+/// attempt and its separate bounded cleanup budget; no background task is spawned.
+/// Invalidation is not physical-close proof (a successful shutdown may be only a
 /// write-half shutdown of a socket this borrowed client still owns): retain
 /// the pool lease/account charge until physical closure is independently
 /// confirmed, even after successful shutdown or client/transport destruction.
@@ -152,7 +154,7 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         let result = match result {
             Ok(result) => result,
             Err(_) => {
-                let _ = self.client.shutdown_unusable().await;
+                self.client.invalidate();
                 return Err(Failure::Uncertain);
             }
         };
@@ -185,7 +187,7 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         match result {
             Ok(result) => result.map_err(read_error)?,
             Err(error) => {
-                let _ = self.client.shutdown_unusable().await;
+                self.client.invalidate();
                 return Err(error);
             }
         }
@@ -206,7 +208,7 @@ impl<T: Transport> Io for ClientIo<'_, T> {
                 result.map_err(read_error)?;
             }
             Err(error) => {
-                let _ = self.client.shutdown_unusable().await;
+                self.client.invalidate();
                 return Err(error);
             }
         }
