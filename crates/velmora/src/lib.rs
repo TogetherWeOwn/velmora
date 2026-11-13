@@ -30,8 +30,6 @@
 //! own network I/O and per-operation timeouts (see [`transport`] and
 //! [`transports`]); the native repair runner owns its subprocess deadline.
 
-#[cfg(feature = "archive-provider")]
-pub mod archive;
 pub mod article;
 pub mod error;
 pub mod media;
