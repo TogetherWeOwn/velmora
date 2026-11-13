@@ -2,7 +2,8 @@
 // original path crates/qerith-core/src/s3/wire.rs. License: MIT.
 // Copied verbatim except: this header; the `restore` subresource is removed from the
 // accepted query keys (S3 STANDARD semantics); object keys over 1024 bytes or with C0
-// controls / U+FFFE / U+FFFF (not representable in XML 1.0) are rejected.
+// controls / U+FFFE / U+FFFF (not representable in XML 1.0) are rejected; the
+// CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted.
 
 use super::{ErrorCode, Policy, Result};
 
@@ -289,7 +290,7 @@ impl Headers {
             if matches!(
                 k,
                 "x-amz-checksum-algorithm" | "x-amz-sdk-checksum-algorithm"
-            ) && !matches!(v, "SHA256" | "CRC32")
+            ) && super::ChecksumAlgorithm::from_name(v).is_none()
             {
                 return Err(ErrorCode::InvalidRequest);
             }
@@ -302,7 +303,12 @@ impl Headers {
                         | "x-amz-storage-class"
                         | "x-amz-checksum-sha256"
                         | "x-amz-checksum-crc32"
+                        | "x-amz-checksum-crc32c"
+                        | "x-amz-checksum-crc64nvme"
+                        | "x-amz-checksum-sha1"
                         | "x-amz-checksum-type"
+                        | "x-amz-decoded-content-length"
+                        | "x-amz-trailer"
                         | "x-amz-sdk-checksum-algorithm"
                         | "x-amz-checksum-algorithm"
                         | "x-amz-checksum-mode"

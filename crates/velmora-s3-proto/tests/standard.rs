@@ -273,7 +273,7 @@ fn upload_metadata_from_headers_keeps_persistent_fields_only() {
     for (k, v) in [
         ("x-amz-storage-class", "GLACIER"),
         ("x-amz-acl", "public-read"),
-        ("x-amz-checksum-algorithm", "CRC64NVME"),
+        ("x-amz-checksum-algorithm", "XXHASH64"),
     ] {
         let h = Headers::new(&[("host", HOST), (k, v)], &policy()).unwrap();
         assert_eq!(

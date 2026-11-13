@@ -1,12 +1,15 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/auth.rs. License: MIT.
 // Copied verbatim except: test fixture path `../../tests/fixtures/published-crypto.json` -> `../tests/fixtures/published-crypto.json` (line 245); this header;
-// added (not from qerith): `SINGLE_VALUE_HEADERS` and the signed comma-value check in `verify`.
+// added (not from qerith): `SINGLE_VALUE_HEADERS` and the signed comma-value check in `verify`;
+// the `STREAMING-*` (aws-chunked) payload values, the streaming seed in `VerifiedRequest`
+// and the `signing_key`/`sign` helpers.
 
 use chrono::NaiveDateTime;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
+use super::chunked::{Streaming, StreamingSeed};
 use super::{canonical_request, decimal, hex, unhex, ErrorCode, Headers, Policy, Result, Target};
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -68,11 +71,23 @@ pub struct VerifiedRequest {
     pub access_key: String,
     pub mode: AuthMode,
     payload: String,
+    /// Set for the signed `STREAMING-*` payloads: chunk signatures chain
+    /// from this request's signature.
+    streaming: Option<StreamingSeed>,
 }
 
 impl VerifiedRequest {
     pub fn payload_hash(&self) -> &str {
         &self.payload
+    }
+
+    /// The aws-chunked variant the signed payload value selected, if any.
+    pub fn streaming(&self) -> Option<Streaming> {
+        Streaming::from_payload(&self.payload)
+    }
+
+    pub(crate) fn streaming_seed(&self) -> Option<&StreamingSeed> {
+        self.streaming.as_ref()
     }
 
     pub fn recheck(&self, authority: &impl Authority, method: &str, target: &Target) -> Result<()> {
@@ -230,13 +245,19 @@ pub fn verify(
         None if presigned => "UNSIGNED-PAYLOAD",
         None => return Err(ErrorCode::InvalidRequest),
     };
+    let streaming = Streaming::from_payload(payload);
+    if streaming.is_some() && presigned {
+        // A presigned URL has no seed signature for a chunk chain.
+        return Err(ErrorCode::InvalidRequest);
+    }
     if payload != "UNSIGNED-PAYLOAD"
+        && streaming.is_none()
         && (payload.len() != 64
             || !payload
                 .bytes()
                 .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
     {
-        // aws-chunked signed chunks/trailers need a separate qualified decoder.
+        // Anything else (SigV4a `STREAMING-AWS4-ECDSA-*`) is not qualified.
         return Err(ErrorCode::InvalidRequest);
     }
     let canonical = canonical_request(method, target, headers, signed, payload, presigned)?;
@@ -248,12 +269,7 @@ pub fn verify(
     let key = authority
         .credential(scope[0])
         .ok_or(ErrorCode::AccessDenied)?;
-    let mut prefixed = b"AWS4".to_vec();
-    prefixed.extend_from_slice(key.secret);
-    let date_key = hmac(&prefixed, scope[1].as_bytes());
-    let region_key = hmac(&date_key, scope[2].as_bytes());
-    let service_key = hmac(&region_key, b"s3");
-    let signing_key = hmac(&service_key, b"aws4_request");
+    let signing_key = signing_key(key.secret, scope[1], scope[2]);
     let signature = unhex(signature).map_err(|_| ErrorCode::SignatureDoesNotMatch)?;
     let mut verifier =
         Hmac::<Sha256>::new_from_slice(&signing_key).map_err(|_| ErrorCode::InternalError)?;
@@ -264,12 +280,37 @@ pub fn verify(
     if !authority.authorize(key.principal, method, target) {
         return Err(ErrorCode::AccessDenied);
     }
+    let streaming = streaming.filter(|s| s.signed()).map(|_| StreamingSeed {
+        key: signing_key,
+        timestamp: date.into(),
+        scope: scope_string.clone(),
+        signature: hex(&signature),
+    });
     Ok(VerifiedRequest {
         principal: key.principal.into(),
         access_key: scope[0].into(),
         mode,
         payload: payload.into(),
+        streaming,
     })
+}
+
+/// The SigV4 signing key for `s3` in `region` on `date` (`YYYYMMDD`).
+pub(crate) fn signing_key(secret: &[u8], date: &str, region: &str) -> [u8; 32] {
+    let mut prefixed = b"AWS4".to_vec();
+    prefixed.extend_from_slice(secret);
+    let date_key = hmac(&prefixed, date.as_bytes());
+    let region_key = hmac(&date_key, region.as_bytes());
+    let service_key = hmac(&region_key, b"s3");
+    hmac(&service_key, b"aws4_request")
+        .try_into()
+        .expect("HMAC-SHA256 is 32 bytes")
+}
+
+/// HMAC-SHA256 of a string to sign.
+#[cfg(test)]
+pub(crate) fn sign(key: &[u8; 32], string_to_sign: &str) -> Vec<u8> {
+    hmac(key, string_to_sign.as_bytes())
 }
 
 fn hmac(key: &[u8], value: &[u8]) -> Vec<u8> {

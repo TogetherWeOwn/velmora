@@ -344,11 +344,8 @@ pub(super) fn stored_headers(g: &GenerationRow) -> Option<Vec<(String, String)>>
 
 /// `checksum_json` for a full-object checksum the client supplied.
 pub(super) fn checksum_json(algorithm: ChecksumAlgorithm, value: &str) -> String {
-    let name = match algorithm {
-        ChecksumAlgorithm::Sha256 => "SHA256",
-        ChecksumAlgorithm::Crc32 => "CRC32",
-    };
-    serde_json::json!({ "algorithm": name, "type": "FULL_OBJECT", "value": value }).to_string()
+    serde_json::json!({ "algorithm": algorithm.name(), "type": "FULL_OBJECT", "value": value })
+        .to_string()
 }
 
 /// The full-object checksum stored with a generation. Any other shape
@@ -358,10 +355,6 @@ pub(super) fn stored_checksum(g: &GenerationRow) -> Option<StoredChecksum> {
     if v.get("type")?.as_str()? != "FULL_OBJECT" {
         return None;
     }
-    let algorithm = match v.get("algorithm")?.as_str()? {
-        "SHA256" => ChecksumAlgorithm::Sha256,
-        "CRC32" => ChecksumAlgorithm::Crc32,
-        _ => return None,
-    };
+    let algorithm = ChecksumAlgorithm::from_name(v.get("algorithm")?.as_str()?)?;
     StoredChecksum::full(algorithm, v.get("value")?.as_str()?.to_owned()).ok()
 }
