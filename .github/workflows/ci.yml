@@ -99,6 +99,10 @@ jobs:
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; consumers enable it via this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
+      # S3 bridge core and protocol crates are runtime-agnostic and must
+      # build for the Worker target without engine transport features.
+      - run: cargo check --locked -p velmora-bridge -p velmora-s3-proto --target wasm32-unknown-unknown
+      - run: cargo clippy --locked -p velmora-bridge -p velmora-s3-proto --target wasm32-unknown-unknown -- -D warnings
 
   # Clean, uncached compile of the preserved qualification-only Worker slice.
   # Compilation is not Worker entropy/clock, dialing or physical-close evidence.
@@ -157,11 +161,15 @@ jobs:
       - run: cargo check --locked -p velmora
       - run: cargo check --locked -p velmora --no-default-features
       - run: cargo check --locked -p velmora-ssrf-guard
+      # Bridge core and protocol crates declare the same 1.89 MSRV.
+      - run: cargo check --locked -p velmora-s3-proto -p velmora-bridge
       - name: Install Rust 1.91 (Worker SDK minimum)
         run: |
           rustup toolchain install 1.91 --profile minimal --no-self-update
           rustup default 1.91
       - run: cargo check --locked -p velmora --features worker-pinned-tls
+      # The S3 Worker crate declares rust-version 1.91 (workers-rs 0.8.7).
+      - run: cargo check --locked -p velmora-s3-bridge
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # the committed lockfile. Findings are fixed by updating the dependency,
@@ -202,9 +210,161 @@ jobs:
       - name: Audit advisories, bans, licenses, sources
         run: cargo-deny --manifest-path Cargo.toml check
 
+  # Path filter for the S3 bridge jobs below. Pull requests that touch only
+  # files outside the Rust workspace (docs, READMEs, other workflows) skip
+  # them; every other event runs them. Plain git, no third-party action. A
+  # failure here fails ci-ok, so a broken filter can never skip a job.
+  changes:
+    name: changes (bridge paths)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      bridge: ${{ steps.filter.outputs.bridge }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR merge commit and its first parent (the base tip).
+          fetch-depth: 2
+          persist-credentials: false
+      - id: filter
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$CI_EVENT_NAME" != "pull_request" ]; then
+            echo "bridge=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          if grep -qE '^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/)' <<< "$changed"; then
+            echo "bridge=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bridge=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # S3 bridge core: contract tests (rusqlite Sql, in-memory blobs, fakes)
+  # and, as lanes land, NntpClient against the in-process test server.
+  bridge-native:
+    name: bridge native tests
+    needs: changes
+    if: needs.changes.outputs.bridge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge
+      - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
+      - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
+
+  # The S3 Worker bundle: wasm clippy with the request-target lint
+  # (workers/s3-bridge/clippy.toml bans worker::Request::url), worker-build, size budget.
+  worker-build:
+    name: worker build (s3-bridge)
+    needs: changes
+    if: needs.changes.outputs.bridge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Matches the locked workers-rs 0.8.7 and wrangler.toml [build].
+      - name: Install pinned worker-build 0.8.7
+        run: cargo install --locked worker-build --version 0.8.7
+      - run: cargo clippy --locked -p velmora-s3-bridge --target wasm32-unknown-unknown -- -D warnings
+      - name: Build the Worker bundle
+        working-directory: workers/s3-bridge
+        run: worker-build --release
+      - name: Size budget (index_bg.wasm under 3 MB)
+        working-directory: workers/s3-bridge
+        run: |
+          set -euo pipefail
+          size=$(stat -c %s build/index_bg.wasm)
+          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
+          test "$size" -lt 3000000
+
+  # Local end-to-end slice under `wrangler dev` with the fake NNTP server.
+  # Passes with "skipped: no script" until workers/s3-bridge/e2e/slice.sh
+  # exists. The script runs from workers/s3-bridge as
+  # `bash e2e/slice.sh http://127.0.0.1:8787`; it starts fakesrv
+  # ($FAKESRV_BIN), applies migrations --local (dev database
+  # `velmora-catalog-dev`) and starts
+  # `npx wrangler@4 dev --env dev --local --test-scheduled --port 8787`.
+  worker-e2e:
+    name: worker e2e (wrangler dev)
+    needs: changes
+    if: needs.changes.outputs.bridge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: script
+        run: |
+          if [ -f workers/s3-bridge/e2e/slice.sh ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "skipped: no script"
+          fi
+      - name: Install Rust stable
+        if: steps.script.outputs.present == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.script.outputs.present == 'true'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install pinned worker-build 0.8.7
+        if: steps.script.outputs.present == 'true'
+        run: cargo install --locked worker-build --version 0.8.7
+      - name: Install pinned aws-cli 2.31.23
+        if: steps.script.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          zip="awscli-exe-linux-x86_64-2.31.23.zip"
+          # Digest of the release zip, recorded after verifying its PGP
+          # signature against the AWS CLI Team key (fingerprint
+          # FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C) out of band.
+          # A replaced artifact fails closed here.
+          expected_sha256="eca61882437a815d7a7df9e70982a71cdaef0c4061cf4fb63a07726bd6dfee08"
+          curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 -o "/tmp/${zip}" "https://awscli.amazonaws.com/${zip}"
+          echo "${expected_sha256}  /tmp/${zip}" | (cd /tmp && sha256sum -c -)
+          unzip -q "/tmp/${zip}" -d /tmp/awscli
+          sudo /tmp/awscli/aws/install --update
+          aws --version
+      - name: Build fakesrv
+        if: steps.script.outputs.present == 'true'
+        run: cargo build --locked -p velmora-test-nntp --bin fakesrv
+      - name: Run the local slice
+        if: steps.script.outputs.present == 'true'
+        working-directory: workers/s3-bridge
+        env:
+          FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
+          WRANGLER_SEND_METRICS: "false"
+        run: bash e2e/slice.sh http://127.0.0.1:8787
+
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -212,10 +372,18 @@ jobs:
       - run: |
           # Only the PR-only caller may skip, and only outside pull_request.
           # A private PR skips the caller but fails ci-ok without scanning.
-          if ! jq -e --arg event "$CI_EVENT_NAME" '
-            length > 1 and
-            .["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
-            (del(.["public-pr-security"]) | all(.[]; .result == "success"))
+          # The path-filtered bridge jobs must succeed when the filter says
+          # bridge=true and must be skipped (not failed or cancelled) when it
+          # says bridge=false; the filter job itself must succeed.
+          if ! jq -e --arg event "$CI_EVENT_NAME" --arg bridge "$BRIDGE" '
+            . as $n |
+            ["bridge-native", "worker-build", "worker-e2e"] as $filtered |
+            ($n | length) > 1 and
+            $n["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
+            $n.changes.result == "success" and
+            ($bridge == "true" or $bridge == "false") and
+            all($filtered[]; $n[.].result == (if $bridge == "true" then "success" else "skipped" end)) and
+            ($n | del(.["public-pr-security"]) | del(.[$filtered[]]) | all(.[]; .result == "success"))
           ' <<< "$NEEDS_JSON" > /dev/null; then
             echo "ci-ok: a required job did not succeed"
             exit 1
@@ -224,3 +392,4 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           CI_EVENT_NAME: ${{ github.event_name }}
+          BRIDGE: ${{ needs.changes.outputs.bridge }}

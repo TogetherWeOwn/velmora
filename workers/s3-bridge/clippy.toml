@@ -1,0 +1,9 @@
+# Clippy configuration for the S3 Worker crate (clippy reads the
+# nearest clippy.toml from the crate directory upward).
+disallowed-methods = [
+  # workers-rs `Request::url()` parses through `url::Url`, which resolves
+  # `..`/`%2E%2E`/`.` segments and rewrites `\` to `/`: SigV4 would then be
+  # verified over a different target than the client signed. The S3 Worker
+  # takes the raw target from `req.inner().url()` only.
+  { path = "worker::Request::url", reason = "normalizes the request target; use req.inner().url() via origin_form" },
+]

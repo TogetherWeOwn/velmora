@@ -1,0 +1,10 @@
+# Local `wrangler dev --env dev` secrets. Copy to `.dev.vars` (gitignored,
+# mode 0600) and fill with throwaway values; never real keys.
+#
+# VELMORA_KEK_1: base64 of 32 random bytes (`openssl rand -base64 32`).
+# NNTP_PROVIDERS: JSON array, see DESIGN §A.7; for local runs point it at
+#   fakesrv on loopback port 11119 with "tls": false (dev only).
+# ADMIN_TOKEN: at least 32 characters (`openssl rand -hex 32`).
+VELMORA_KEK_1=
+NNTP_PROVIDERS=
+ADMIN_TOKEN=
