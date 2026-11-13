@@ -76,6 +76,14 @@ fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
     f.poll(&mut Context::from_waker(Waker::noop()))
 }
 
+fn ready<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    match poll_once(future.as_mut()) {
+        Poll::Ready(result) => result,
+        Poll::Pending => panic!("poisoned connection must refuse immediately"),
+    }
+}
+
 async fn exchange(t: &mut BufferedTransport<Script>, operation: u8) -> io::Result<()> {
     match operation {
         0 => t.read_line().await.map(|_| ()),
@@ -96,13 +104,13 @@ async fn dropping_polled_exchanges_poisons_without_more_io() {
         let before = trace.lock().unwrap().clone();
         for next in 0..3 {
             assert_eq!(
-                exchange(&mut t, next).await.unwrap_err().kind(),
+                ready(exchange(&mut t, next)).unwrap_err().kind(),
                 io::ErrorKind::BrokenPipe
             );
         }
         let mut out = b"prefix".to_vec();
         assert_eq!(
-            t.read_dot_block(&mut out).await.unwrap_err().kind(),
+            ready(t.read_dot_block(&mut out)).unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
         assert_eq!(out, b"prefix");
@@ -143,7 +151,7 @@ async fn caller_owned_cleanup_poisons_before_success_failure_or_pending() {
         let before = trace.lock().unwrap().clone();
         assert_eq!(before.shutdowns, 1);
         assert_eq!(before.drops, 0, "cleanup still borrows a live transport");
-        assert!(client.stat("generated@test").await.is_err());
+        assert!(ready(client.stat("generated@test")).is_err());
         assert_eq!(*trace.lock().unwrap(), before);
         drop(client);
         let after = trace.lock().unwrap().clone();
@@ -182,7 +190,7 @@ async fn abandoned_client_commands_never_reuse_the_stream_or_send_quit() {
             assert!(poll_once(future.as_mut()).is_pending());
         }
         let before = trace.lock().unwrap().clone();
-        assert!(client.stat("generated@test").await.is_err());
+        assert!(ready(client.stat("generated@test")).is_err());
         assert_eq!(*trace.lock().unwrap(), before);
         assert_eq!(out, b"prefix");
         client.quit().await;
