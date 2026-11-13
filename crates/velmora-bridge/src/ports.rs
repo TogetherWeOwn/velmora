@@ -15,8 +15,8 @@ use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
     CompleteUpload, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep, GenerationId,
     GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage,
-    OutboxStats, Perm, ProviderConfig, SafetyState, UnixMs, UploadId, UploadPartRow, UploadRow,
-    VerificationRow,
+    OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow,
+    UploadRow, VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -337,6 +337,17 @@ pub trait Catalog {
     ) -> Result<Option<Permit>>;
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool>;
     async fn release_permit(&self, p: &Permit) -> Result<()>;
+
+    // provider pool
+    /// Held slots, slots ever handed out and health, per provider that
+    /// has a permit or a health row.
+    async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>>;
+    /// One failed session. Repeated failures start a cooldown; a failure
+    /// reported while the provider is cooling changes nothing.
+    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()>;
+    /// One good session: clears failures and the cooldown history, unless
+    /// the provider is cooling now.
+    async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------

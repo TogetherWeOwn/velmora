@@ -40,22 +40,33 @@ async fn seed<S: Sql>(c: &SqlCatalog<S>, p: &ProviderConfig) -> Result<u64> {
         .await
 }
 
+// One statement, so the pool count and the take cannot interleave with
+// another acquire. `?6` is the pool (NULL = none) and `?7` its limit: the
+// slot is taken only while fewer than `?7` slots tagged with the pool are
+// held. The tag is written on every acquire, so a held slot always counts
+// against the pool it was taken under.
 macro_rules! take_slot {
     ($order:literal) => {
         concat!(
-            "UPDATE provider_permits SET token = token + 1, holder = ?2, lease_until = ?3 \
+            "UPDATE provider_permits SET token = token + 1, holder = ?2, lease_until = ?3, \
+               pool = ?6 \
              WHERE provider_id = ?1 AND slot = (SELECT slot FROM provider_permits \
                WHERE provider_id = ?1 AND slot < ?4 AND lease_until < ?5 \
                ORDER BY slot ",
             $order,
-            " LIMIT 1) RETURNING slot, token"
+            " LIMIT 1) \
+               AND (?6 IS NULL OR (SELECT COUNT(*) FROM provider_permits \
+                 WHERE pool = ?6 AND lease_until >= ?5) < ?7) \
+             RETURNING slot, token"
         )
     };
 }
 
 /// Takes a free or expired slot below the caller's limit: all
 /// `max_conns` slots for a read, one fewer for a background job when the
-/// provider allows two or more. `None` = no connection may be opened.
+/// provider allows two or more. A provider in a pool also needs room under
+/// `pool_max_conns`, counted over every account of the pool with the same
+/// reserve. `None` = no connection may be opened.
 pub(super) async fn acquire_permit<S: Sql>(
     c: &SqlCatalog<S>,
     p: &ProviderConfig,
@@ -63,16 +74,23 @@ pub(super) async fn acquire_permit<S: Sql>(
     holder: &str,
     now: UnixMs,
 ) -> Result<Option<Permit>> {
-    let limit = match class {
-        PermitClass::Read => p.max_conns,
-        PermitClass::Background => p.max_conns - read_reserve(p.max_conns),
+    let limit = |max: u32| match class {
+        PermitClass::Read => max,
+        PermitClass::Background => max - read_reserve(max),
+    };
+    // The pool keeps a read reserve of its own, like each provider.
+    let (pool, pool_limit) = match (&p.pool, p.pool_max_conns) {
+        (Some(pool), Some(max)) => (text(pool), limit(max)),
+        _ => (SqlValue::Null, 0),
     };
     let params = [
         text(&p.id),
         text(holder),
         ms(now.plus_ms(PERMIT_TTL_MS)),
-        SqlValue::Int(i64::from(limit)),
+        SqlValue::Int(i64::from(limit(p.max_conns))),
         ms(now),
+        pool,
+        SqlValue::Int(i64::from(pool_limit)),
     ];
     // Reads fill from the top, so they use the reserved slot first and
     // leave the shared ones to background jobs.

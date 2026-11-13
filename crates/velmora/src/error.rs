@@ -3,7 +3,7 @@
 use std::{fmt, io};
 
 /// Documented worker/API error code for stale provider credentials (S7).
-/// Every NNTP path that observes `480`/`481` (or `482` on `AUTHINFO`) maps
+/// Every NNTP path that observes `480`/`481` maps
 /// to this code; the web app renders an inline re-auth prompt
 /// on it instead of a generic error page. The code is safe to log and to
 /// return in error bodies: it carries no credential material.
@@ -27,8 +27,8 @@ pub enum Error {
     Io(io::Error),
     /// Unexpected NNTP reply: (numeric code, human-readable text).
     NntpReply { code: u16, text: String },
-    /// Server rejected our credentials (`480`/`481`, `482` on `AUTHINFO`)
-    /// or demands auth first.
+    /// Server rejected our credentials (`480`/`481`) or demands auth
+    /// first.
     AuthFailed(String),
     /// Server refused the command (`502`: no permission / access denied).
     /// Deliberately NOT an auth-failure signal: `502` also covers service
@@ -122,8 +122,8 @@ impl Error {
         }
     }
 
-    /// True when the provider rejected our credentials (`480`/`481`, or
-    /// `482` on `AUTHINFO`) or demands auth first. The caller must surface
+    /// True when the provider rejected our credentials (`480`/`481`) or
+    /// demands auth first. The caller must surface
     /// [`PROVIDER_AUTH_EXPIRED_CODE`] (HTTP 401) with no credential material.
     pub fn is_auth_failure(&self) -> bool {
         matches!(self, Error::AuthFailed(_))

@@ -5,10 +5,11 @@
 //! into numeric codes; the reply codes this client acts on are:
 //!
 //! - `430` — no such article → [`Error::ArticleNotFound`].
-//! - `480` (authentication required, RFC 4643) / `481` (rejected), and
-//!   `482` on `AUTHINFO` replies → [`Error::AuthFailed`]. A `482` on a
-//!   non-auth command is an out-of-sequence protocol error, not stale
-//!   credentials, and stays a generic [`Error::NntpReply`].
+//! - `480` (authentication required, RFC 4643) / `481` (rejected)
+//!   → [`Error::AuthFailed`]. A `482` is never stale credentials: on a
+//!   non-auth command it is an out-of-sequence protocol error, and on
+//!   `AUTHINFO` providers also use it for "too many connections". It
+//!   stays a generic [`Error::NntpReply`] with its code.
 //! - `502` — no permission → [`Error::NoPermission`] (never a re-auth
 //!   signal). Reply text from the `AUTHINFO` exchange — including a
 //!   malformed reply line that never parses to a code — is redacted at
@@ -755,10 +756,12 @@ impl<T: Transport> NntpClient<T> {
 /// time, and the generic arm replaces the text outright so no
 /// credential-adjacent text survives in the error value. `502` stays
 /// [`Error::NoPermission`] — it is not proof of stale credentials and
-/// must not surface the re-auth code.
+/// must not surface the re-auth code. `482` keeps its code in the generic
+/// arm: providers answer a login over the account's connection limit
+/// with it, so it is not proof of bad credentials either.
 fn auth_reply_error(code: u16, text: String) -> Error {
     match code {
-        480..=482 => Error::AuthFailed(text),
+        480 | 481 => Error::AuthFailed(text),
         502 => Error::NoPermission(text),
         code => Error::NntpReply {
             code,

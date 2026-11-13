@@ -158,6 +158,16 @@ pub struct Entry {
 struct Slot {
     token: u64,
     until: i64,
+    /// The pool the slot was last taken under.
+    pool: Option<String>,
+}
+
+/// A provider's strikes, as `provider_health` keeps them.
+#[derive(Clone, Copy, Default)]
+struct Health {
+    failures: u32,
+    cooldowns: u32,
+    until: i64,
 }
 
 /// A takeover injected at the `mark_posted` call of one article index.
@@ -175,6 +185,7 @@ pub enum Fault {
 pub struct MemCatalog {
     pub entries: RefCell<BTreeMap<ExtentId, Entry>>,
     slots: RefCell<BTreeMap<String, Vec<Slot>>>,
+    health: RefCell<BTreeMap<String, Health>>,
     /// The next `n` `mark_posted` calls fail before writing (a job that
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
@@ -489,20 +500,32 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         self.seed_permits(core::slice::from_ref(p)).await?;
-        let reserve = u32::from(p.max_conns >= 2);
-        let limit = match class {
-            PermitClass::Background => p.max_conns - reserve,
-            PermitClass::Read => p.max_conns,
+        let limit = |max: u32| match class {
+            PermitClass::Background => max - u32::from(max >= 2),
+            PermitClass::Read => max,
         };
-        let mut slots = self.slots.borrow_mut();
-        let slots = slots.get_mut(&p.id).expect("seeded");
-        let free = (0..limit as usize).find(|&i| slots[i].until < now.0);
-        let Some(i) = free else {
+        let mut all = self.slots.borrow_mut();
+        // Held slots of the whole pool count against its shared limit.
+        let pool_full = match (&p.pool, p.pool_max_conns) {
+            (Some(pool), Some(max)) => {
+                let held = all
+                    .values()
+                    .flatten()
+                    .filter(|s| s.pool.as_ref() == Some(pool) && s.until >= now.0)
+                    .count();
+                held >= limit(max) as usize
+            }
+            _ => false,
+        };
+        let slots = all.get_mut(&p.id).expect("seeded");
+        let free = (0..limit(p.max_conns) as usize).find(|&i| slots[i].until < now.0);
+        let Some(i) = free.filter(|_| !pool_full) else {
             self.permit_refusals.set(self.permit_refusals.get() + 1);
             return Ok(None);
         };
         slots[i].token += 1;
         slots[i].until = now.plus_secs(PERMIT_SECS).0;
+        slots[i].pool.clone_from(&p.pool);
         let held = slots.iter().filter(|s| s.until >= now.0).count() as u32;
         let mut peak = self.permit_peak.borrow_mut();
         let peak = peak.entry(p.id.clone()).or_default();
@@ -607,6 +630,52 @@ impl Catalog for MemCatalog {
     async fn abort_upload(&self, _: &UploadTarget<'_>, _: UnixMs) -> Result<Guard<()>> {
         unused()
     }
+    async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        let slots = self.slots.borrow();
+        let health = self.health.borrow();
+        let ids: std::collections::BTreeSet<&String> = slots.keys().chain(health.keys()).collect();
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let s = slots.get(id).map(Vec::as_slice).unwrap_or_default();
+                let h = health.get(id).copied().unwrap_or_default();
+                ProviderLoad {
+                    provider_id: id.clone(),
+                    held: s.iter().filter(|s| s.until >= now.0).count() as u32,
+                    uses: s.iter().map(|s| s.token).sum(),
+                    failures: h.failures,
+                    cooldowns: h.cooldowns,
+                    cooldown_until: UnixMs(h.until),
+                }
+            })
+            .collect())
+    }
+
+    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+        let mut health = self.health.borrow_mut();
+        let h = health.entry(provider.to_string()).or_default();
+        if h.until > now.0 {
+            return Ok(());
+        }
+        if h.failures + 1 >= 3 || h.cooldowns > 0 {
+            h.until = now.0 + (60_000i64 << h.cooldowns).min(900_000);
+            h.cooldowns = (h.cooldowns + 1).min(4);
+            h.failures = 0;
+        } else {
+            h.failures += 1;
+        }
+        Ok(())
+    }
+
+    async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()> {
+        if let Some(h) = self.health.borrow_mut().get_mut(provider) {
+            if h.until <= now.0 {
+                *h = Health::default();
+            }
+        }
+        Ok(())
+    }
+
     async fn due(&self, _: UnixMs, _: u32) -> Result<Vec<DueRow>> {
         unused()
     }
@@ -692,6 +761,11 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             post: spec.post,
             read: true,
             max_conns: spec.max_conns,
+            priority: 0,
+            retention_days: None,
+            pool: None,
+            pool_max_conns: None,
+            enabled: true,
         });
         servers.push(server);
     }

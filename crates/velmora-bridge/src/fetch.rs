@@ -10,6 +10,7 @@ use velmora::transport::is_article_limit_error;
 use velmora::yenc::decode_part_to;
 
 use crate::articles::article_spans;
+use crate::pool::Pool;
 use crate::ports::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
     NntpSession, Permit, PermitClass,
@@ -31,6 +32,29 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     pub(crate) provider: &'a ProviderConfig,
     permit: Permit,
     session: Option<N::Session>,
+    /// How the last connect or command went; `None` = nothing ran.
+    healthy: Option<bool>,
+}
+
+/// Whether an error says the provider itself is in trouble: a failed
+/// connect or login, a broken connection, an unexpected reply. A missing
+/// article, a refused or duplicate POST, "too many connections" and an
+/// oversized body say nothing about its health.
+fn is_provider_fault(e: &BridgeError) -> bool {
+    use velmora::Error as E;
+    match e {
+        BridgeError::Nntp(E::Io(io)) => !is_article_limit_error(io),
+        BridgeError::Nntp(
+            E::ArticleNotFound(_)
+            | E::PostProhibited(_)
+            | E::NoPermission(_)
+            | E::NntpReply {
+                code: 435 | 441, ..
+            },
+        ) => false,
+        BridgeError::Nntp(_) => true,
+        _ => false,
+    }
 }
 
 impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
@@ -54,6 +78,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             provider,
             permit,
             session: None,
+            healthy: None,
         }))
     }
 
@@ -82,16 +107,22 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// The live session, connecting first when there is none. A provider
-    /// that refuses the connection with `502` ("too many connections") is
-    /// reported as "no slot".
+    /// that refuses the connection or the login with `502` or `482` ("too
+    /// many connections") is reported as "no slot": no strike, and the
+    /// caller waits as it does for a permit.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
                 Ok(session) => session,
-                Err(BridgeError::Nntp(velmora::Error::NoPermission(_))) => {
+                Err(BridgeError::Nntp(
+                    velmora::Error::NoPermission(_) | velmora::Error::NntpReply { code: 482, .. },
+                )) => {
                     return Err(Stop::NoPermit);
                 }
-                Err(e) => return Err(Stop::Session(e)),
+                Err(e) => {
+                    self.note_err(&e);
+                    return Err(Stop::Session(e));
+                }
             };
             self.session = Some(session);
         }
@@ -103,12 +134,37 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         self.session = None;
     }
 
+    /// Records a command the provider answered in order (a `430` too).
+    pub(crate) fn note_ok(&mut self) {
+        self.healthy = Some(true);
+    }
+
+    /// Records a failed connect or command, if it is the provider's fault.
+    pub(crate) fn note_err(&mut self, e: &BridgeError) {
+        if is_provider_fault(e) {
+            self.healthy = Some(false);
+        }
+    }
+
     /// Ends the session and frees the slot. The release is fenced by the
     /// permit token, so a holder that lost its slot frees nothing.
+    ///
+    /// A session whose last word from the provider was a failure is one
+    /// strike against it; a good session clears the strikes. The catalogue
+    /// decides on the provider's state at that moment, so a session that
+    /// started before another one failed still clears that failure.
     pub(crate) async fn close(mut self) {
         if let Some(session) = self.session.take() {
             session.quit().await;
         }
+        // Health is advice: a write that fails here costs nothing.
+        let id = self.provider.id.as_str();
+        let now = self.clock.now();
+        let _ = match self.healthy {
+            Some(false) => self.catalog.provider_failed(id, now).await,
+            Some(true) => self.catalog.provider_recovered(id, now).await,
+            _ => Ok(()),
+        };
         // A failed release is safe: the permit expires on its own.
         let _ = self.catalog.release_permit(&self.permit).await;
     }
@@ -168,10 +224,16 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
             Err(stop) => return Err(stop),
         };
         let err = match result {
-            Ok(BodyOutcome::Found) => return Ok(check_payload(row, wire)),
-            Ok(BodyOutcome::Missing) => return Ok(Checked::Missing),
+            Ok(found) => {
+                session.note_ok();
+                return Ok(match found {
+                    BodyOutcome::Found => check_payload(row, wire),
+                    BodyOutcome::Missing => Checked::Missing,
+                });
+            }
             Err(e) => e,
         };
+        session.note_err(&err);
         session.discard();
         match err {
             // A body over the article limit is not an article we posted.
@@ -275,8 +337,10 @@ where
     T: Clock,
 {
     /// Rebuilds an extent's ciphertext from Usenet when neither blob store
-    /// has it. Each article is read from the first `read` provider that
-    /// serves it intact. The assembled extent is checked against
+    /// has it. Each article is read from the first `read` provider, in
+    /// pool order, that serves it intact; a provider is not asked for an
+    /// article older than its retention, and a provider in a cooldown is
+    /// not asked at all. The assembled extent is checked against
     /// `cipher_sha256` and written to the cache before it is returned, so
     /// nothing unverified is ever served or cached.
     pub async fn fetch_cold(&self, extent: &ExtentRow) -> Result<ColdFetch> {
@@ -295,12 +359,43 @@ where
         let mut cipher = vec![0u8; size];
         let mut have = vec![false; plan.len()];
         let mut busy = false;
-        let mut interrupted = false;
         let holder = format!("get:{}", extent.id);
-        for provider in self.cfg.providers.iter().filter(|p| p.read) {
-            let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
-            if wanted.is_empty() {
+        let now = self.clock.now();
+        let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
+        let readers: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.read).collect();
+        let mut interrupted = false;
+        let mut order = pool.order(readers.clone());
+        if order.is_empty() {
+            // Every reader is cooling: a read is worth one attempt on the
+            // provider that is due back first.
+            order.extend(pool.soonest_cooling(&readers));
+        }
+        // An article past every reader's stated retention may still be
+        // there: a second pass asks for those before giving up.
+        let orphan = |a: &ArticleRow| {
+            !readers
+                .iter()
+                .any(|p| p.enabled && p.retains(a.posted_at, now))
+        };
+        let mut asked: Vec<&str> = Vec::new();
+        let passes = [false, true];
+        for (provider, expired) in passes
+            .iter()
+            .flat_map(|&expired| order.iter().map(move |&p| (p, expired)))
+        {
+            if !have.contains(&false) {
                 break;
+            }
+            let wanted: Vec<&ArticleRow> = plan
+                .iter()
+                .filter(|a| !have[a.idx as usize])
+                .filter(|a| match expired {
+                    false => provider.retains(a.posted_at, now),
+                    true => orphan(a),
+                })
+                .collect();
+            if wanted.is_empty() {
+                continue;
             }
             let Some(mut session) = ProviderSession::open(
                 &self.catalog,
@@ -324,9 +419,13 @@ where
             .await;
             session.close().await;
             match read {
-                Ok(_) => {}
+                Ok(_) => asked.push(provider.id.as_str()),
+                // The provider is at its connection limit.
+                Err(Stop::NoPermit) => busy = true,
                 // The read broke off: this provider may still have the rest.
-                Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => interrupted = true,
+                Err(Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+                    interrupted = true;
+                }
                 Err(Stop::Fenced | Stop::Catalog) => {
                     return Err(BridgeError::Sql(
                         "catalogue failed during a cold read".into(),
@@ -335,6 +434,17 @@ where
             }
         }
         if have.contains(&false) {
+            // A cooling provider that retains a missing article and was
+            // not asked may hold what the others lack: retry later.
+            let missing = |p: &ProviderConfig| {
+                !asked.contains(&p.id.as_str())
+                    && plan
+                        .iter()
+                        .any(|a| !have[a.idx as usize] && p.retains(a.posted_at, now))
+            };
+            let waiting: Vec<&ProviderConfig> =
+                readers.into_iter().filter(|p| missing(p)).collect();
+            interrupted |= pool.cooling_until(&waiting).is_some();
             return Ok(if interrupted {
                 ColdFetch::Interrupted
             } else if busy {
