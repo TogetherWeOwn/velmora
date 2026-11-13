@@ -859,3 +859,148 @@ async fn failed_batch_writes_nothing() {
     assert_eq!((upload.state, upload.revision), (UploadState::Open, 1));
     assert_eq!(parts[0].extent_id, x1);
 }
+
+// ---------------------------------------------------------------------------
+// Scope of side effects
+// ---------------------------------------------------------------------------
+
+/// Publishes a one-part object and returns its extent and generation ids.
+async fn publish(fx: &Fx, bucket: &BucketId, key: &str) -> (ExtentId, String) {
+    let id = fx.create(bucket, key).await;
+    let t = target(bucket, key, &id);
+    let (x, _) = fx.part(&t, 1, 400).await;
+    let c = fx.commit(bucket, key, &[(&x, 400)]);
+    let done = fx.cat.complete_upload(&t, 1, &DIGEST, &c).await.unwrap();
+    assert_eq!(done, Guard::Applied(()));
+    (x, c.generation.id.to_string())
+}
+
+/// A part added after Complete's read is not in the list Complete
+/// validated. The revision catches it even though every listed extent is
+/// still adoptable.
+#[tokio::test]
+async fn complete_loses_to_a_part_added_after_its_read() {
+    let fx = Fx::new().await;
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    let (x1, _) = fx.part(&t, 1, 500).await;
+    let (x2, _) = fx.part(&t, 2, 700).await;
+    let (seen, _) = fx.read(&t).await;
+    let stale = fx.commit(&fx.bucket, KEY, &[(&x1, 500), (&x2, 700)]);
+
+    let (_, g) = fx.part(&t, 3, 300).await;
+    assert_eq!(g, Guard::Applied(()));
+    assert_eq!(
+        fx.cat
+            .complete_upload(&t, seen.revision, &DIGEST, &stale)
+            .await
+            .unwrap(),
+        Guard::Lost
+    );
+    assert_eq!(fx.count("SELECT COUNT(*) FROM generations").await, 0);
+    assert!(fx.gc_extents().await.is_empty());
+    assert_eq!(fx.read(&t).await.0.state, UploadState::Open);
+}
+
+/// An overwrite retires the previous generation of that key in that
+/// bucket and nothing else.
+#[tokio::test]
+async fn overwrite_retires_only_the_same_key_in_the_same_bucket() {
+    let fx = Fx::new().await;
+    let (old_x, old_gen) = publish(&fx, &fx.bucket, KEY).await;
+    let (posted_x, posted_gen) = publish(&fx, &fx.bucket, "posted").await;
+    let (neighbour_x, neighbour_gen) = publish(&fx, &fx.bucket, "neighbour").await;
+    let (twin_x, twin_gen) = publish(&fx, &fx.other_bucket, KEY).await;
+    // One object already finished posting; overwrite it too, below.
+    fx.run(
+        "UPDATE outbox SET stage = 'done' WHERE extent_id = ?1",
+        &[text(posted_x.as_str())],
+    )
+    .await;
+
+    let (new_x, new_gen) = publish(&fx, &fx.bucket, KEY).await;
+    publish(&fx, &fx.bucket, "posted").await;
+
+    let fx = &fx;
+    let state = |generation: String| async move {
+        fx.texts(
+            "SELECT state FROM generations WHERE id = ?1",
+            &[text(&generation)],
+        )
+        .await
+        .pop()
+        .unwrap()
+    };
+    let stage = |extent: ExtentId| async move {
+        fx.texts(
+            "SELECT stage FROM outbox WHERE extent_id = ?1",
+            &[text(extent.as_str())],
+        )
+        .await
+        .pop()
+        .unwrap()
+    };
+    assert_eq!(state(old_gen).await, "superseded");
+    assert_eq!(state(posted_gen).await, "superseded");
+    assert_eq!(stage(old_x.clone()).await, "cancelled");
+    // A finished job stays finished: its history is not rewritten.
+    assert_eq!(stage(posted_x.clone()).await, "done");
+    for (extent, generation) in [
+        (neighbour_x, neighbour_gen),
+        (twin_x, twin_gen),
+        (new_x, new_gen),
+    ] {
+        assert_eq!(state(generation).await, "live");
+        assert_eq!(stage(extent).await, "post");
+    }
+    assert_eq!(
+        fx.gc_extents().await,
+        {
+            let mut want = vec![old_x.to_string(), posted_x.to_string()];
+            want.sort();
+            want
+        },
+        "GC rows only for the two retired extents"
+    );
+    assert_eq!(
+        fx.live_generation(&fx.bucket, "neighbour").await.is_some(),
+        fx.live_generation(&fx.other_bucket, KEY).await.is_some()
+    );
+    fx.assert_no_live_extent_is_gc_bound().await;
+}
+
+/// Abort and part replacement queue GC for this upload's extents only.
+#[tokio::test]
+async fn abort_touches_only_its_own_parts() {
+    let fx = Fx::new().await;
+    let mine = fx.create(&fx.bucket, KEY).await;
+    let theirs = fx.create(&fx.bucket, KEY).await;
+    let t_mine = target(&fx.bucket, KEY, &mine);
+    let t_theirs = target(&fx.bucket, KEY, &theirs);
+    let (x_mine, _) = fx.part(&t_mine, 1, 100).await;
+    let (x_theirs, _) = fx.part(&t_theirs, 1, 100).await;
+
+    // Replacing my part 1 leaves their part 1 alone.
+    let (x_mine2, _) = fx.part(&t_mine, 1, 120).await;
+    assert_eq!(fx.gc_extents().await, vec![x_mine.to_string()]);
+    assert_eq!(
+        fx.cat.abort_upload(&t_mine, T0).await.unwrap(),
+        Guard::Applied(())
+    );
+    let mut want = vec![x_mine.to_string(), x_mine2.to_string()];
+    want.sort();
+    assert_eq!(fx.gc_extents().await, want);
+
+    // Their upload is intact and still completes.
+    let (seen, parts) = fx.read(&t_theirs).await;
+    assert_eq!((seen.state, parts.len()), (UploadState::Open, 1));
+    let c = fx.commit(&fx.bucket, KEY, &[(&x_theirs, 100)]);
+    assert_eq!(
+        fx.cat
+            .complete_upload(&t_theirs, seen.revision, &DIGEST, &c)
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    fx.assert_no_live_extent_is_gc_bound().await;
+}
