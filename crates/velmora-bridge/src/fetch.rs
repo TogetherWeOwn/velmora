@@ -226,14 +226,41 @@ pub(crate) async fn read_articles<C: Catalog, N: NntpConnector, T: Clock>(
     Ok(tally)
 }
 
+/// Longest a cold read keeps retrying while every provider slot it could
+/// use is taken, before `503 SlowDown`. Clients fan one download out into
+/// many concurrent range reads, more than a provider has connections.
+pub const COLD_WAIT_MS: u32 = 25_000;
+
+/// Base poll interval while a cold read waits for a provider slot.
+pub const COLD_POLL_MS: u32 = 50;
+
+/// Most jitter added to [`COLD_POLL_MS`], so waiters that started together
+/// do not retry in lockstep.
+pub const COLD_JITTER_MS: u32 = 25;
+
+/// The next poll interval of a waiting cold read: [`COLD_POLL_MS`] plus a
+/// jitter in `0..=COLD_JITTER_MS` drawn from `seed` (any value that differs
+/// between waiters and between their attempts).
+pub fn cold_poll_ms(seed: u64) -> u32 {
+    // splitmix64 finaliser: spreads nearby seeds over the whole range.
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    // The remainder is at most COLD_JITTER_MS, so it fits a u32.
+    COLD_POLL_MS + (z % u64::from(COLD_JITTER_MS + 1)) as u32
+}
+
 /// Result of a cold read of one extent from Usenet.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ColdFetch {
     /// The complete, verified ciphertext. It is already in the cache.
     Filled(Vec<u8>),
     /// A provider that could still hold missing articles had no free
-    /// connection slot or failed in transit: retry shortly.
+    /// connection slot: worth waiting for one.
     Busy,
+    /// A provider read broke off in transit: retry later, not at once.
+    Interrupted,
     /// No provider could supply every article intact.
     Unavailable,
 }
@@ -268,6 +295,7 @@ where
         let mut cipher = vec![0u8; size];
         let mut have = vec![false; plan.len()];
         let mut busy = false;
+        let mut interrupted = false;
         let holder = format!("get:{}", extent.id);
         for provider in self.cfg.providers.iter().filter(|p| p.read) {
             let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
@@ -298,7 +326,7 @@ where
             match read {
                 Ok(_) => {}
                 // The read broke off: this provider may still have the rest.
-                Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => busy = true,
+                Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => interrupted = true,
                 Err(Stop::Fenced | Stop::Catalog) => {
                     return Err(BridgeError::Sql(
                         "catalogue failed during a cold read".into(),
@@ -307,7 +335,9 @@ where
             }
         }
         if have.contains(&false) {
-            return Ok(if busy {
+            return Ok(if interrupted {
+                ColdFetch::Interrupted
+            } else if busy {
                 ColdFetch::Busy
             } else {
                 ColdFetch::Unavailable

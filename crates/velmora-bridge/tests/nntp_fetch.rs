@@ -102,7 +102,7 @@ async fn read_reconnects_are_bounded() {
 
     rig.server().drop_next_bodies(3).await;
     let before = rig.bridge.nntp.connects();
-    assert_eq!(rig.fetch(&s).await, ColdFetch::Busy);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Interrupted);
     assert_eq!(rig.bridge.nntp.connects() - before, 3);
     assert_eq!(rig.cached(&s), None);
     assert_eq!(rig.bridge.nntp.live(), 0);

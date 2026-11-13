@@ -189,6 +189,15 @@ pub fn rig() -> Rig {
 
 pub fn rig_with<N: NntpConnector + 'static>(nntp: N, cfg: BridgeConfig) -> Rig<N> {
     let budget = ByteBudget::new(cfg.inflight_budget_bytes);
+    rig_with_budget(nntp, cfg, budget)
+}
+
+/// A rig whose byte budget is `budget` (for example one with a sleeper).
+pub fn rig_with_budget<N: NntpConnector + 'static>(
+    nntp: N,
+    cfg: BridgeConfig,
+    budget: ByteBudget,
+) -> Rig<N> {
     Rig {
         bridge: Rc::new(Bridge {
             catalog: SqlCatalog::new(FailSql {

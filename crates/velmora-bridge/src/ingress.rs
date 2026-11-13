@@ -349,6 +349,13 @@ impl ByteBudget {
         self.state.capacity
     }
 
+    /// The host sleeper, if this budget may wait. Other bounded waits on
+    /// the same request path (a cold read waiting for a provider slot)
+    /// poll with it too, so a budget without one never waits anywhere.
+    pub fn sleeper(&self) -> Option<&Sleeper> {
+        self.sleeper.as_ref()
+    }
+
     /// Bytes charged right now.
     pub fn in_use(&self) -> u64 {
         self.state.in_use.get()

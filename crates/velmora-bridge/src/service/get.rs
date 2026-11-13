@@ -6,6 +6,7 @@
 //! sealed chunks authenticated is returned.
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::stream::{self, StreamExt};
 use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
@@ -14,7 +15,7 @@ use super::common::{
     authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
-use crate::fetch::ColdFetch;
+use crate::fetch::{cold_poll_ms, ColdFetch, COLD_WAIT_MS};
 use crate::ingress::{ByteBudget, Charge};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
@@ -258,6 +259,41 @@ fn retain(budget: &ByteBudget, work: Charge, plain: Vec<u8>) -> Option<(Vec<u8>,
     Some((plain, held))
 }
 
+/// The piece's plaintext from the cache or else the safety copy. A copy
+/// that is absent, short or fails authentication is skipped, never
+/// served: the next source is tried instead. The caller holds a charge
+/// for the ciphertext span and the plaintext.
+async fn warm_piece<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    piece: &Piece,
+    span: ByteSpan,
+) -> Option<Vec<u8>>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let extent = &piece.extent;
+    for (store, key) in [
+        (&bridge.cache, extent.id.cache_key()),
+        (&bridge.safety, extent.id.safety_key()),
+    ] {
+        if let Some(src) = warm(store, &key, span).await {
+            if let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) {
+                return Some(plain);
+            }
+        }
+    }
+    None
+}
+
+/// Tells concurrent waiters apart in the poll jitter.
+static WAITERS: AtomicU64 = AtomicU64::new(0);
+
 /// Produces one piece of plaintext together with the byte-budget charge
 /// that covers it; the caller keeps the charge for as long as it keeps
 /// the bytes.
@@ -283,39 +319,67 @@ where
             .charge(span.len.saturating_add(piece.len))
             .await
             .map_err(|_| ReadFail::Busy)?;
-        // A copy that is absent, short or fails authentication is skipped,
-        // never served: the next source is tried instead.
-        for (store, key) in [
-            (&bridge.cache, extent.id.cache_key()),
-            (&bridge.safety, extent.id.safety_key()),
-        ] {
-            if let Some(src) = warm(store, &key, span).await {
-                if let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) {
-                    drop(src);
-                    return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
-                }
-            }
+        if let Some(plain) = warm_piece(bridge, bucket, piece, span).await {
+            return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
         }
     }
 
     // Cold: the whole extent comes back verified against the catalogue
     // digest and is already written to the cache. Two extents' worth is
     // live at the peak: the ciphertext and its copy for the cache while
-    // it is being written, then the ciphertext and the plaintext.
-    let work = bridge
+    // it is being written, then the ciphertext and the plaintext. The
+    // warm span and its plaintext are never larger than that.
+    let need = extent.cipher_size.saturating_mul(2);
+    let mut work = bridge
         .budget
-        .charge(extent.cipher_size.saturating_mul(2))
+        .charge(need)
         .await
         .map_err(|_| ReadFail::Busy)?;
-    match bridge.fetch_cold(extent).await {
-        Ok(ColdFetch::Filled(cipher)) => {
-            let plain =
-                open(&bridge.kek, bucket, piece, 0, &cipher).ok_or(ReadFail::Unavailable)?;
-            drop(cipher);
-            retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)
+    // While every provider slot is taken (more concurrent misses than
+    // connections) the read waits and retries until COLD_WAIT_MS after
+    // the first miss, per piece, so a later extent of a stream gets the
+    // same allowance as the first. The deadline is wall-clock time, which
+    // includes the catalogue and blob round trips of each poll; the sum of
+    // the sleeps is a backstop in case the clock does not move. The
+    // budget charge is released for each wait so
+    // waiting readers do not starve the budget, and taken again without
+    // waiting: each retry only sleeps here, inside the same bound. After
+    // each wait the cache is checked again: another reader may have
+    // filled it in the meantime.
+    let waiter = WAITERS.fetch_add(1, Ordering::Relaxed);
+    let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+    let mut slept = 0u32;
+    let mut attempt = 0u64;
+    loop {
+        match bridge.fetch_cold(extent).await {
+            Ok(ColdFetch::Filled(cipher)) => {
+                let plain =
+                    open(&bridge.kek, bucket, piece, 0, &cipher).ok_or(ReadFail::Unavailable)?;
+                drop(cipher);
+                return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
+            }
+            Ok(ColdFetch::Busy) => {}
+            Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy),
+            Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
+            Err(_) => return Err(ReadFail::Internal),
         }
-        Ok(ColdFetch::Busy) => Err(ReadFail::Busy),
-        Ok(ColdFetch::Unavailable) => Err(ReadFail::Unavailable),
-        Err(_) => Err(ReadFail::Internal),
+        drop(work);
+        let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
+        work = loop {
+            if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
+                return Err(ReadFail::Busy);
+            }
+            attempt += 1;
+            let seed = (bridge.clock.now().0 as u64) ^ waiter.rotate_left(32) ^ attempt;
+            let ms = cold_poll_ms(seed);
+            sleep(ms).await;
+            slept = slept.saturating_add(ms);
+            if let Some(charge) = bridge.budget.try_charge(need) {
+                break charge;
+            }
+        };
+        if let Some(plain) = warm_piece(bridge, bucket, piece, span).await {
+            return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
+        }
     }
 }
