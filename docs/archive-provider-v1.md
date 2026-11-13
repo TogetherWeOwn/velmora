@@ -19,3 +19,7 @@ prefixes. It is internal, not a public validator, existence oracle, serving
 grant or authorization decision. A digest alone does not authenticate media.
 These serializable records are not proof of durability; callers must bound
 untrusted input before deserialization. Provider operations are not implemented.
+
+`Range::end` checks offset plus byte count against the committed length before
+I/O, including arithmetic overflow. A zero-byte range is valid at EOF; validation
+of a range is not authorization to read the object.
