@@ -13,6 +13,10 @@ use std::fmt;
 
 /// Version of the portable archive contract.
 pub const API_VERSION: u16 = 1;
+/// Maximum ciphertext bytes in one part.
+pub const MAX_PART_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum number of parts in a manifest.
+pub const MAX_PARTS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
@@ -123,6 +127,52 @@ impl ObjectIdentity {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    pub offset: u64,
+    pub bytes: u32,
+    pub sha256: [u8; 32],
+    /// Stable article identity for NNTP; stable part identity for S3.
+    pub reference: Id,
+}
+
+/// A journal input; callers must bound and authorize serialized data before decoding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteIntent {
+    pub target: Target,
+    /// Tenant-scoped operation ID bound to this exact serialized intent.
+    pub operation: Id,
+    pub bytes: u64,
+    pub sha256: [u8; 32],
+    pub parts: Vec<Part>,
+}
+
+impl WriteIntent {
+    pub fn validate(&self) -> Result<()> {
+        if self.parts.is_empty() || self.parts.len() > MAX_PARTS {
+            return Err(Failure::Limit);
+        }
+        let mut offset = 0u64;
+        let mut references = std::collections::HashSet::with_capacity(self.parts.len());
+        for part in &self.parts {
+            if part.offset != offset
+                || part.bytes as usize > MAX_PART_BYTES
+                || (part.bytes == 0 && (self.bytes != 0 || self.parts.len() != 1))
+                || !references.insert(&part.reference)
+            {
+                return Err(Failure::Invalid);
+            }
+            offset = offset
+                .checked_add(u64::from(part.bytes))
+                .ok_or(Failure::Limit)?;
+        }
+        if offset != self.bytes {
+            return Err(Failure::Integrity);
+        }
+        Ok(())
+    }
+}
+
 /// A byte range within a committed ciphertext object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
@@ -202,6 +252,51 @@ mod tests {
             bytes: 17,
             sha256: digest(b"ciphertext"),
         }
+    }
+
+    #[test]
+    fn manifests_validate_bounds_contiguity_and_unique_references() {
+        let part = |offset, bytes, reference| Part {
+            offset,
+            bytes,
+            sha256: digest(b"part"),
+            reference: id(reference),
+        };
+        let mut intent = WriteIntent {
+            target: identity().target,
+            operation: id("operation"),
+            bytes: 3,
+            sha256: digest(b"all"),
+            parts: vec![part(0, 1, "one"), part(1, 2, "two")],
+        };
+        assert_eq!(intent.validate(), Ok(()));
+        let json = serde_json::to_string(&intent).unwrap();
+        assert_eq!(serde_json::from_str::<WriteIntent>(&json).unwrap(), intent);
+        let original = intent.clone();
+        intent.parts[1].offset = 2;
+        assert_eq!(intent.validate(), Err(Failure::Invalid));
+        intent = original.clone();
+        intent.parts[1].reference = intent.parts[0].reference.clone();
+        assert_eq!(intent.validate(), Err(Failure::Invalid));
+        intent = original.clone();
+        intent.parts[0].bytes = MAX_PART_BYTES as u32 + 1;
+        assert_eq!(intent.validate(), Err(Failure::Invalid));
+        intent = original.clone();
+        intent.parts[0].bytes = 0;
+        assert_eq!(intent.validate(), Err(Failure::Invalid));
+        intent = original.clone();
+        intent.bytes = 4;
+        assert_eq!(intent.validate(), Err(Failure::Integrity));
+        intent.parts.clear();
+        assert_eq!(intent.validate(), Err(Failure::Limit));
+        intent.parts = vec![part(0, 1, "one"); MAX_PARTS + 1];
+        assert_eq!(intent.validate(), Err(Failure::Limit));
+        intent.bytes = 0;
+        intent.parts = vec![part(0, 0, "empty")];
+        assert_eq!(intent.validate(), Ok(()));
+        intent.bytes = MAX_PART_BYTES as u64;
+        intent.parts = vec![part(0, MAX_PART_BYTES as u32, "maximum")];
+        assert_eq!(intent.validate(), Ok(()));
     }
 
     #[test]

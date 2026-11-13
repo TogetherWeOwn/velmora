@@ -20,6 +20,13 @@ grant or authorization decision. A digest alone does not authenticate media.
 These serializable records are not proof of durability; callers must bound
 untrusted input before deserialization. Provider operations are not implemented.
 
+`WriteIntent::validate` accepts at most 10,000 uniquely referenced, contiguous
+parts of at most 8 MiB each and checks their combined length. An empty object
+uses one explicit empty part. Callers must compute the manifest from staged
+ciphertext and bound and authorize serialized metadata before decoding it;
+validation after deserialization cannot prevent an unbounded decoder allocation.
+Validation does not establish digest correctness or durability.
+
 `Range::end` checks offset plus byte count against the committed length before
 I/O, including arithmetic overflow. A zero-byte range is valid at EOF; validation
 of a range is not authorization to read the object.
