@@ -439,6 +439,23 @@ async fn same_backbone_counts_once() {
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
 }
 
+/// Two spellings of one backbone label are still one backbone.
+#[tokio::test]
+async fn backbone_labels_ignore_case_and_spaces() {
+    let mut rig = two_backbone_rig().await;
+    rig.bridge.cfg.providers[0].backbone = "Shared".into();
+    rig.bridge.cfg.providers[1].backbone = " shared ".into();
+    let (s, _) = rig.posted(20).await;
+    rig.propagate(&s, 0, 1).await;
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.rows(&s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].backbone, "shared");
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert!(rig.safety_held(&s));
+}
+
 /// A result left behind by a backbone that is no longer configured does
 /// not count towards a release.
 #[tokio::test]

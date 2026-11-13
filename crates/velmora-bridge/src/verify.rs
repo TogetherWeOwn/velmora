@@ -46,14 +46,21 @@ struct Evidence<'a> {
     plan_rev: u32,
 }
 
+/// A backbone label as it is compared and recorded: trimmed, lower case.
+/// Two spellings of one backbone must never count as two copies.
+fn label(backbone: &str) -> String {
+    backbone.trim().to_lowercase()
+}
+
 /// `read` providers grouped by backbone, in configuration order. Two
 /// providers on one backbone are one copy, so they share an entry.
-fn backbones(providers: &[ProviderConfig]) -> Vec<(&str, Vec<&ProviderConfig>)> {
-    let mut groups: Vec<(&str, Vec<&ProviderConfig>)> = Vec::new();
+fn backbones(providers: &[ProviderConfig]) -> Vec<(String, Vec<&ProviderConfig>)> {
+    let mut groups: Vec<(String, Vec<&ProviderConfig>)> = Vec::new();
     for p in providers.iter().filter(|p| p.read) {
-        match groups.iter_mut().find(|(b, _)| *b == p.backbone) {
+        let name = label(&p.backbone);
+        match groups.iter_mut().find(|(b, _)| *b == name) {
             Some((_, members)) => members.push(p),
-            None => groups.push((&p.backbone, vec![p])),
+            None => groups.push((name, vec![p])),
         }
     }
     groups
@@ -148,7 +155,7 @@ where
         let total = extent.article_count.unwrap_or(0);
         let row = VerificationRow {
             extent_id: extent.id.clone(),
-            backbone: provider.backbone.clone(),
+            backbone: label(&provider.backbone),
             provider_id: provider.id.clone(),
             verified_at: self.clock.now(),
             plan_rev: extent.plan_rev,
@@ -233,7 +240,7 @@ where
         self.cursor(lease, 0).await?;
         // Results for backbones that are no longer configured do not count.
         let mut status = self.catalog.backbone_status(&extent.id).await?;
-        status.retain(|s| groups.iter().any(|(b, _)| *b == s.backbone));
+        status.retain(|s| groups.iter().any(|(b, _)| *b == label(&s.backbone)));
         let counting = status.iter().filter(|s| s.counts).count();
         let now = self.clock.now();
         if counting >= self.cfg.required_backbones as usize && counting > 0 {
