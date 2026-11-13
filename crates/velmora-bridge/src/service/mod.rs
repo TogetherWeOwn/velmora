@@ -109,11 +109,30 @@ const SUBRESOURCES: &[&str] = &[
     "website",
 ];
 
-fn query_names(query: &str) -> impl Iterator<Item = &str> {
+/// Percent-decodes a query parameter name the way the SigV4 target parser
+/// does (`%XX` in either case, `+` literal). `None` on a malformed escape.
+fn decode_name(name: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(name.len());
+    let mut bytes = name.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = (bytes.next()? as char).to_digit(16)?;
+            let lo = (bytes.next()? as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+        } else {
+            out.push(b);
+        }
+    }
+    Some(out)
+}
+
+/// Decoded query parameter names; `None` if any name is malformed.
+pub(crate) fn query_names(query: &str) -> Option<Vec<Vec<u8>>> {
     query
         .split('&')
         .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').map_or(p, |(n, _)| n))
+        .map(|p| decode_name(p.split_once('=').map_or(p, |(n, _)| n)))
+        .collect()
 }
 
 /// Classifies an origin-form target (`/path?query`).
@@ -127,8 +146,15 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
     let Some(path) = path.strip_prefix('/') else {
         return Route::NotImplemented;
     };
-    let mut sub: Vec<&str> = query_names(query)
-        .filter(|n| SUBRESOURCES.contains(n))
+    // Names are compared decoded and exactly (case-sensitive), as the
+    // handlers' target parser will see them: `?%75ploads` is `uploads`.
+    let Some(names) = query_names(query) else {
+        return Route::NotImplemented;
+    };
+    let mut sub: Vec<&str> = SUBRESOURCES
+        .iter()
+        .copied()
+        .filter(|s| names.iter().any(|n| n.as_slice() == s.as_bytes()))
         .collect();
     sub.sort_unstable();
     sub.dedup();
@@ -140,8 +166,9 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
     };
 
     if bucket.is_empty() {
-        return match (method, sub.as_slice()) {
-            (Method::Get, []) => Route::ListBuckets,
+        // Only the bare service root is ListBuckets; `//k` is not.
+        return match (method, sub.as_slice(), path.is_empty()) {
+            (Method::Get, [], true) => Route::ListBuckets,
             _ => Route::NotImplemented,
         };
     }
@@ -336,6 +363,38 @@ mod tests {
             (Head, "/b", Route::NotImplemented),
             (Other("PATCH".into()), "/b/k", Route::NotImplemented),
             (Get, "b/k", Route::NotImplemented),
+            // Only `/` is the service root.
+            (Get, "//k", Route::NotImplemented),
+            (Get, "//", Route::NotImplemented),
+            (Get, "/?x-id=ListBuckets", Route::ListBuckets),
+            // Sub-resource names compare decoded and exactly.
+            (
+                Post,
+                "/b/k?%75ploads",
+                Route::CreateMultipartUpload {
+                    bucket: "b",
+                    key: "k",
+                },
+            ),
+            (
+                Delete,
+                "/b/k?upload%49d=u",
+                Route::AbortMultipartUpload {
+                    bucket: "b",
+                    key: "k",
+                },
+            ),
+            (Get, "/b/k?%61cl", Route::NotImplemented),
+            (Get, "/b/k?%zz", Route::NotImplemented),
+            (
+                Get,
+                "/b/k?ACL",
+                Route::GetObject {
+                    bucket: "b",
+                    key: "k",
+                },
+            ),
+            (Post, "/b/k?Uploads", Route::NotImplemented),
         ];
         for (method, target, want) in cases {
             assert_eq!(&classify(method, target), want, "{method:?} {target}");
