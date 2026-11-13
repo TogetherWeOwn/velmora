@@ -8,10 +8,25 @@
 # queue send is lost, then calls the scheduled handler. Everything it started
 # or wrote is removed on exit.
 #
-# Remote (any other base URL): runs against a deployed Worker. The admin
-# bearer comes from the 0600 file named by VELMORA_ADMIN_TOKEN_FILE. Step 4
-# accepts `verify` (release waits for a second backbone) and step 7 waits for
-# the real cron instead of calling the scheduled handler.
+# Remote (any other base URL): runs against a deployed Worker. Nothing is
+# started or migrated. The admin bearer comes from the 0600 file named by
+# VELMORA_ADMIN_TOKEN_FILE. Differences from local, per the prod setup with
+# one backbone:
+#   - setup creates run-unique buckets (slice-<8 hex>, other-<8 hex>) and
+#     fails if a name is taken; the in-flight peak may be 0 (the status call
+#     can land on another isolate);
+#   - step 4 accepts `verify` (release waits for a second backbone) and polls
+#     up to STEP4_TIMEOUT_SECS (default 900: posting plus VERIFY_DELAY_SECS).
+#     In both modes each extent's stage must agree with required_backbones
+#     from /_admin/status: fewer counting backbones than required means no
+#     release and the pinned copy held;
+#   - step 5 also requires every pinned copy deleted and every cache copy
+#     absent before the cold GET, so it can only be served from Usenet, and
+#     logs the cold-read latency;
+#   - step 5b runs POST /_admin/drill (read from Usenet only, no cache) and
+#     requires match:true and the upload's sha256;
+#   - step 7 waits for CRON_RUNS (default 2) runs of the real cron, each one
+#     advancing last_dispatch_at, instead of calling the scheduled handler.
 #
 # No secret ever appears in argv, in xtrace output or in the log: the bearer
 # reaches curl through a 0600 header file (`-H @file`), the S3 key reaches
@@ -24,6 +39,8 @@
 #   READY_TIMEOUT_SECS        wait for `wrangler dev` to answer (default 1200;
 #                             the first run compiles the Worker)
 #   VELMORA_ADMIN_TOKEN_FILE  admin bearer file, mode 0600 (remote only)
+#   STEP4_TIMEOUT_SECS        step 4 poll limit (default 180 local, 900 remote)
+#   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
 #
 # Every failure prints `SLICE FAILED at step <n>: <what>` with the expected
 # and the actual value, and the script exits non-zero.
@@ -283,7 +300,10 @@ expect_err() {
 
 # same_bytes <what> <expected-file> <actual-file>
 same_bytes() {
-  cmp -s "$2" "$3" && return 0
+  if cmp -s "$2" "$3"; then
+    log "$1: equal, $(stat -c %s "$3") bytes, sha256 $(sha256sum <"$3" | cut -c1-64)"
+    return 0
+  fi
   fail "$1" "$(stat -c %s "$2") bytes, sha256 $(sha256sum <"$2" | cut -c1-64)" \
     "$(stat -c %s "$3" 2>/dev/null || echo 0) bytes, sha256 $(sha256sum <"$3" | cut -c1-64), $(cmp "$2" "$3" 2>&1 | head -1)"
 }
@@ -296,19 +316,36 @@ run_aws() {
   printf '%s' "$out"
 }
 
+now_ms() { date +%s%3N; }
+
+# make_bucket <name>: a new disposable bucket. Any answer but 2xx fails the
+# run, a 409 (name taken) included: a run never reuses a bucket.
+make_bucket() {
+  adm "POST /_admin/buckets $1" -XPOST "$BASE/_admin/buckets" -H 'content-type: application/json' \
+    -d "{\"name\":\"$1\",\"disposable\":true}" >/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Setup: buckets, key, aws-cli
 # ---------------------------------------------------------------------------
 
 STEP=0-setup
 log "step $STEP"
-adm "POST /_admin/buckets slice" -XPOST "$BASE/_admin/buckets" -H 'content-type: application/json' \
-  -d '{"name":"slice","disposable":true}' >/dev/null
-adm "POST /_admin/buckets other" -XPOST "$BASE/_admin/buckets" -H 'content-type: application/json' \
-  -d '{"name":"other","disposable":true}' >/dev/null
+# Remote runs get their own buckets, so a run never touches data it did
+# not write and overlapping runs cannot see each other's objects. Local
+# runs start from an empty throwaway state.
+if [[ $MODE == local ]]; then
+  SB=slice OB=other
+else
+  RUN_ID=$(openssl rand -hex 4)
+  SB=slice-$RUN_ID OB=other-$RUN_ID
+fi
+log "buckets: $SB, $OB"
+make_bucket "$SB"
+make_bucket "$OB"
 # The key secret goes straight from curl through jq into a 0600 file.
 adm "POST /_admin/keys" -XPOST "$BASE/_admin/keys" -H 'content-type: application/json' \
-  -d '{"buckets":["slice","other"],"perm":"rw"}' >"$T/key.json"
+  -d "{\"buckets\":[\"$SB\",\"$OB\"],\"perm\":\"rw\"}" >"$T/key.json"
 jq -e '(.access_key_id|type=="string") and (.secret|type=="string")' "$T/key.json" >/dev/null ||
   fail "POST /_admin/keys response" "{access_key_id, secret} strings" "keys: $(jq -c 'keys' "$T/key.json" 2>&1)"
 jq -r '"[default]\naws_access_key_id=\(.access_key_id)\naws_secret_access_key=\(.secret)"' \
@@ -325,11 +362,18 @@ S3API=(aws s3api --endpoint-url "$BASE")
 
 head -c 1048576 /dev/urandom >"$T/small.bin"
 head -c 100663296 /dev/urandom >"$T/big.bin" # 96 MiB: 12 parts, 10 in flight
-run_aws "PUT a/small.bin" "${S3[@]}" cp "$T/small.bin" s3://slice/a/small.bin >/dev/null
-run_aws "multipart PUT a/big.bin" "${S3[@]}" cp "$T/big.bin" s3://slice/a/big.bin >/dev/null
+run_aws "PUT a/small.bin" "${S3[@]}" cp "$T/small.bin" "s3://$SB/a/small.bin" >/dev/null
+run_aws "multipart PUT a/big.bin" "${S3[@]}" cp "$T/big.bin" "s3://$SB/a/big.bin" >/dev/null
 json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-jcheck "inflight_peak_bytes within the 48 MiB budget" \
-  '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes > 0 and .inflight_peak_bytes <= 50331648' "$json"
+if [[ $MODE == local ]]; then
+  jcheck "inflight_peak_bytes within the 48 MiB budget" \
+    '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes > 0 and .inflight_peak_bytes <= 50331648' "$json"
+else
+  # The answering isolate may not be one that served the uploads.
+  jcheck "inflight_peak_bytes within the 48 MiB budget" \
+    '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes <= 50331648' "$json"
+  log "inflight_peak_bytes of the answering isolate: $(jq -r .inflight_peak_bytes <<<"$json")"
+fi
 if [[ $MODE == local ]]; then
   json=$(adm "POST /_admin/dev/guard-selftest" -XPOST "$BASE/_admin/dev/guard-selftest")
   jcheck "guard self-test rolls back" '.rolled_back == true' "$json"
@@ -341,9 +385,9 @@ fi
 
 STEP=1-read-after-write
 log "step $STEP"
-run_aws "GET a/big.bin" "${S3[@]}" cp s3://slice/a/big.bin "$T/got-big.bin" >/dev/null
+run_aws "GET a/big.bin" "${S3[@]}" cp "s3://$SB/a/big.bin" "$T/got-big.bin" >/dev/null
 same_bytes "GET a/big.bin equals the upload" "$T/big.bin" "$T/got-big.bin"
-run_aws "GET a/small.bin" "${S3[@]}" cp s3://slice/a/small.bin "$T/got-small.bin" >/dev/null
+run_aws "GET a/small.bin" "${S3[@]}" cp "s3://$SB/a/small.bin" "$T/got-small.bin" >/dev/null
 same_bytes "GET a/small.bin equals the upload" "$T/small.bin" "$T/got-small.bin"
 
 # ---------------------------------------------------------------------------
@@ -352,15 +396,15 @@ same_bytes "GET a/small.bin equals the upload" "$T/small.bin" "$T/got-small.bin"
 
 STEP=2-head-list-etag
 log "step $STEP"
-json=$(run_aws "HEAD a/big.bin" "${S3API[@]}" head-object --bucket slice --key a/big.bin)
+json=$(run_aws "HEAD a/big.bin" "${S3API[@]}" head-object --bucket "$SB" --key a/big.bin)
 jcheck "HEAD a/big.bin: 96 MiB and a 12-part ETag" '.ContentLength == 100663296 and (.ETag | test("^\"[0-9a-f]{32}-12\"$"))' "$json"
 ODD='a/sp ace+plus%25/ü.bin'
-run_aws "PUT a key with reserved characters" "${S3[@]}" cp "$T/small.bin" "s3://slice/$ODD" >/dev/null
-run_aws "HEAD a key with reserved characters" "${S3API[@]}" head-object --bucket slice --key "$ODD" >/dev/null
-json=$(run_aws "ListObjectsV2 prefix=a/ delimiter=/" "${S3API[@]}" list-objects-v2 --bucket slice --prefix a/ --delimiter /)
+run_aws "PUT a key with reserved characters" "${S3[@]}" cp "$T/small.bin" "s3://$SB/$ODD" >/dev/null
+run_aws "HEAD a key with reserved characters" "${S3API[@]}" head-object --bucket "$SB" --key "$ODD" >/dev/null
+json=$(run_aws "ListObjectsV2 prefix=a/ delimiter=/" "${S3API[@]}" list-objects-v2 --bucket "$SB" --prefix a/ --delimiter /)
 jcheck "LIST keys and one common prefix" \
   '[.Contents[].Key] == ["a/big.bin","a/small.bin"] and ([.CommonPrefixes[].Prefix] == ["a/sp ace+plus%25/"])' "$json"
-json=$(run_aws "ListObjectsV2 continuation" "${S3API[@]}" list-objects-v2 --bucket slice --prefix a/ --page-size 1)
+json=$(run_aws "ListObjectsV2 continuation" "${S3API[@]}" list-objects-v2 --bucket "$SB" --prefix a/ --page-size 1)
 jcheck "LIST across pages of one key" \
   '[.Contents[].Key] == ["a/big.bin","a/small.bin","a/sp ace+plus%25/ü.bin"]' "$json"
 
@@ -370,7 +414,7 @@ jcheck "LIST across pages of one key" \
 
 STEP=3-range-across-extents
 log "step $STEP"
-run_aws "GET a/big.bin bytes=8388000-8389000" "${S3API[@]}" get-object --bucket slice --key a/big.bin \
+run_aws "GET a/big.bin bytes=8388000-8389000" "${S3API[@]}" get-object --bucket "$SB" --key a/big.bin \
   --range bytes=8388000-8389000 "$T/range.bin" >/dev/null
 dd if="$T/big.bin" of="$T/range-want.bin" bs=1 skip=8388000 count=1001 status=none
 same_bytes "range body equals bytes 8388000-8389000" "$T/range-want.bin" "$T/range.bin"
@@ -380,19 +424,19 @@ same_bytes "range body equals bytes 8388000-8389000" "$T/range-want.bin" "$T/ran
 STEP=3b-safety-rules
 log "step $STEP"
 expect_err "conditional PUT is refused" NotImplemented \
-  "${S3API[@]}" put-object --bucket slice --key a/cond --body "$T/small.bin" --if-none-match '*'
+  "${S3API[@]}" put-object --bucket "$SB" --key a/cond --body "$T/small.bin" --if-none-match '*'
 expect_err "nothing was stored by the refused PUT" '\(404\)' \
-  "${S3API[@]}" head-object --bucket slice --key a/cond
-json=$(run_aws "CreateMultipartUpload a/mp" "${S3API[@]}" create-multipart-upload --bucket slice --key a/mp)
+  "${S3API[@]}" head-object --bucket "$SB" --key a/cond
+json=$(run_aws "CreateMultipartUpload a/mp" "${S3API[@]}" create-multipart-upload --bucket "$SB" --key a/mp)
 UP=$(jq -r .UploadId <<<"$json")
 expect_err "UploadPart under another bucket" NoSuchUpload \
-  "${S3API[@]}" upload-part --bucket other --key a/mp --part-number 1 --upload-id "$UP" --body "$T/small.bin"
+  "${S3API[@]}" upload-part --bucket "$OB" --key a/mp --part-number 1 --upload-id "$UP" --body "$T/small.bin"
 expect_err "Abort under another bucket" NoSuchUpload \
-  "${S3API[@]}" abort-multipart-upload --bucket other --key a/mp --upload-id "$UP"
+  "${S3API[@]}" abort-multipart-upload --bucket "$OB" --key a/mp --upload-id "$UP"
 expect_err "UploadPart under another key" NoSuchUpload \
-  "${S3API[@]}" upload-part --bucket slice --key a/mp2 --part-number 1 --upload-id "$UP" --body "$T/small.bin"
+  "${S3API[@]}" upload-part --bucket "$SB" --key a/mp2 --part-number 1 --upload-id "$UP" --body "$T/small.bin"
 run_aws "Abort a/mp under its own bucket and key" \
-  "${S3API[@]}" abort-multipart-upload --bucket slice --key a/mp --upload-id "$UP" >/dev/null
+  "${S3API[@]}" abort-multipart-upload --bucket "$SB" --key a/mp --upload-id "$UP" >/dev/null
 
 # ---------------------------------------------------------------------------
 # 4 posting + verification reached (poll <= 180 s)
@@ -407,21 +451,47 @@ else
   REACHED='.extents | length > 0 and all(.stage == "verify" or .stage == "release" or .stage == "done")'
 fi
 COUNTED='.extents | length > 0 and all(.backbones | any(.counts))'
+# The stage must agree with the Worker's required_backbones: with fewer
+# counting backbones than required, release never starts and the pinned
+# copy stays held; with enough, the extent goes on to release.
+json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+REQUIRED=$(jq -r '.required_backbones' <<<"$json")
+[[ $REQUIRED =~ ^[1-9][0-9]*$ ]] || fail "required_backbones in /_admin/status" "a positive integer" "$json"
+log "required_backbones=$REQUIRED"
+# shellcheck disable=SC2016 # $n and $required are jq variables, not shell ones
+CONSISTENT='.extents | all(([.backbones[] | select(.counts) | .backbone] | unique | length) as $n
+  | if $n < $required then (.stage == "verify" or .stage == "done") and .safety_state == "held"
+    else .stage == "release" or .stage == "done" end)'
 stage_reached() {
   local j
-  j=$(adm_try "$BASE/_admin/objects/slice/a/$1") || return 1
-  jq -e "($REACHED) and ($COUNTED)" >/dev/null 2>&1 <<<"$j" || return 1
+  j=$(adm_try "$BASE/_admin/objects/$SB/a/$1") || return 1
+  jq -e --argjson required "$REQUIRED" "($REACHED) and ($COUNTED) and ($CONSISTENT)" >/dev/null 2>&1 <<<"$j" || return 1
 }
 # Any progress past a fresh commit (used by step 7).
 stage_moved() {
   local j
-  j=$(adm_try "$BASE/_admin/objects/slice/a/$1") || return 1
+  j=$(adm_try "$BASE/_admin/objects/$SB/a/$1") || return 1
   jq -e '.extents | any(.stage != "post" or .attempts != 0)' >/dev/null 2>&1 <<<"$j" || return 1
 }
-if ! poll 180 2 stage_reached big.bin; then
-  json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
-  fail "a/big.bin posted and verified within 180 s" "jq: ($REACHED) and ($COUNTED)" "$json"
+if [[ $MODE == local ]]; then
+  STEP4_TIMEOUT=${STEP4_TIMEOUT_SECS:-180}
+  STEP4_EVERY=2
+else
+  STEP4_TIMEOUT=${STEP4_TIMEOUT_SECS:-900}
+  STEP4_EVERY=10
 fi
+[[ $STEP4_TIMEOUT =~ ^[1-9][0-9]*$ ]] || fail "STEP4_TIMEOUT_SECS" "a positive integer" "$STEP4_TIMEOUT"
+t0=$(now_ms)
+if ! poll "$STEP4_TIMEOUT" "$STEP4_EVERY" stage_reached big.bin; then
+  json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+  fail "a/big.bin posted and verified within $STEP4_TIMEOUT s" \
+    "jq: ($REACHED) and ($COUNTED) and ($CONSISTENT), required=$REQUIRED" "$json"
+fi
+json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+log "a/big.bin verified $(($(now_ms) - t0)) ms after the step started:" \
+  "$(jq -c '{extents: (.extents | length), stages: ([.extents[].stage] | group_by(.) | map({(.[0]): length}) | add),
+    counting: ([.extents[].backbones[] | select(.counts) | .backbone] | group_by(.) | map({(.[0]): length}) | add),
+    safety: ([.extents[].safety_state] | group_by(.) | map({(.[0]): length}) | add)}' <<<"$json")"
 
 # ---------------------------------------------------------------------------
 # 5 cold read: wipe CACHE + SAFETY (disposable bucket only), GET from NNTP
@@ -429,13 +499,34 @@ fi
 
 STEP=5-cold-read
 log "step $STEP"
-json=$(adm "POST /_admin/evict a/big.bin" -XPOST "$BASE/_admin/evict/slice/a/big.bin?include_safety=1")
+json=$(adm "POST /_admin/evict a/big.bin" -XPOST "$BASE/_admin/evict/$SB/a/big.bin?include_safety=1")
 jcheck "evict removed blobs" '.evicted > 0' "$json"
+log "evict: $(jq -c . <<<"$json")"
+if [[ $MODE == remote ]]; then
+  # Nothing but Usenet may hold the bytes now.
+  jcheck "evict gave up every pinned copy" '.safety_kept == 0 and .safety_deleted == .evicted' "$json"
+  json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+  jcheck "no extent in the cache before the cold GET" '.extents | length > 0 and all(.cache == "absent")' "$json"
+fi
 # NNTP BODY -> yEnc -> sha256 -> R2 refill -> decrypt
-run_aws "cold GET a/big.bin" "${S3[@]}" cp s3://slice/a/big.bin "$T/cold-big.bin" >/dev/null
+t0=$(now_ms)
+run_aws "cold GET a/big.bin" "${S3[@]}" cp "s3://$SB/a/big.bin" "$T/cold-big.bin" >/dev/null
+log "cold GET a/big.bin: $(($(now_ms) - t0)) ms for $(stat -c %s "$T/cold-big.bin") bytes"
 same_bytes "cold GET a/big.bin equals the upload" "$T/big.bin" "$T/cold-big.bin"
-json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
+json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
 jcheck "every extent refilled into the cache" '.extents | length > 0 and all(.cache == "present")' "$json"
+
+if [[ $MODE == remote ]]; then
+  # 5b drill: read back from Usenet only, without the cache.
+  STEP=5b-drill
+  log "step $STEP"
+  WANT_SHA=$(sha256sum <"$T/big.bin" | cut -c1-64)
+  t0=$(now_ms)
+  json=$(adm "POST /_admin/drill/$SB/a/big.bin" -XPOST "$BASE/_admin/drill/$SB/a/big.bin")
+  log "drill: $(($(now_ms) - t0)) ms: $(jq -c . <<<"$json")"
+  jcheck "drill reads the upload back from Usenet" \
+    ".source == \"nntp\" and .match == true and .plaintext_sha256 == \"$WANT_SHA\"" "$json"
+fi
 
 # ---------------------------------------------------------------------------
 # 6 delete
@@ -443,9 +534,9 @@ jcheck "every extent refilled into the cache" '.extents | length > 0 and all(.ca
 
 STEP=6-delete
 log "step $STEP"
-run_aws "DELETE a/small.bin" "${S3[@]}" rm s3://slice/a/small.bin >/dev/null
+run_aws "DELETE a/small.bin" "${S3[@]}" rm "s3://$SB/a/small.bin" >/dev/null
 expect_err "HEAD a/small.bin after delete" '\(404\)' \
-  "${S3API[@]}" head-object --bucket slice --key a/small.bin
+  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
 
 # ---------------------------------------------------------------------------
 # 7 dispatcher recovery
@@ -469,13 +560,13 @@ if [[ $MODE == local ]]; then
   stop_wrangler
   write_dev_vars 1
   start_wrangler
-  run_aws "PUT a/lost.bin" "${S3[@]}" cp "$T/small.bin" s3://slice/a/lost.bin >/dev/null
-  json=$(adm "GET /_admin/objects/slice/a/lost.bin" "$BASE/_admin/objects/slice/a/lost.bin")
+  run_aws "PUT a/lost.bin" "${S3[@]}" cp "$T/small.bin" "s3://$SB/a/lost.bin" >/dev/null
+  json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
   jcheck "a/lost.bin is committed but never enqueued" \
     '.extents | length > 0 and all(.stage == "post" and .attempts == 0)' "$json"
   # No queue delivery can move it: it stays at post until the cron runs.
   if poll 10 2 stage_moved lost.bin; then
-    json=$(adm "GET /_admin/objects/slice/a/lost.bin" "$BASE/_admin/objects/slice/a/lost.bin")
+    json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
     fail "a/lost.bin stays at post without a queue message" "stage post, 0 attempts for 10 s" "$json"
   fi
   cron_then_check() {
@@ -483,21 +574,32 @@ if [[ $MODE == local ]]; then
     stage_reached lost.bin
   }
   if ! poll 90 2 cron_then_check; then
-    json=$(adm "GET /_admin/objects/slice/a/lost.bin" "$BASE/_admin/objects/slice/a/lost.bin")
+    json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
     fail "a/lost.bin recovered by the scheduled handler within 90 s" "jq: ($REACHED) and ($COUNTED)" "$json"
   fi
 else
-  # The drop counter is dev-only: prove the real cron runs after deploy.
-  START_MS=$(($(date +%s) * 1000))
-  dispatched() {
+  # The drop counter is dev-only: prove the real cron runs after deploy,
+  # CRON_RUNS times, each run advancing last_dispatch_at.
+  CRON_RUNS=${CRON_RUNS:-2}
+  [[ $CRON_RUNS =~ ^[1-9][0-9]*$ ]] || fail "CRON_RUNS" "a positive integer" "$CRON_RUNS"
+  json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+  SEEN=$(jq -r '.last_dispatch_at // 0' <<<"$json")
+  log "last_dispatch_at before: $SEEN"
+  dispatched_after() {
     local j
     j=$(adm_try "$BASE/_admin/status") || return 1
-    jq -e --argjson t "$START_MS" '(.last_dispatch_at // 0) >= $t' >/dev/null 2>&1 <<<"$j" || return 1
+    jq -e --argjson t "$1" '(.last_dispatch_at // 0) > $t' >/dev/null 2>&1 <<<"$j" || return 1
   }
-  if ! poll 360 10 dispatched; then
+  for ((run = 1; run <= CRON_RUNS; run++)); do
+    if ! poll 360 10 dispatched_after "$SEEN"; then
+      json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+      fail "dispatcher run $run of $CRON_RUNS within 6 min" "last_dispatch_at > $SEEN" "$json"
+    fi
     json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-    fail "a dispatcher run within 6 min" "last_dispatch_at >= $START_MS" "$json"
-  fi
+    SEEN=$(jq -r '.last_dispatch_at' <<<"$json")
+    log "dispatcher run $run of $CRON_RUNS: last_dispatch_at=$SEEN ($(date -u -d "@$((SEEN / 1000))" +%H:%M:%SZ))"
+  done
+  log "status: $(jq -c '{environment, gc_mode, required_backbones, real_data_ready, outbox, dead, last_dispatch_at}' <<<"$json")"
 fi
 
 STEP=finished
