@@ -12,7 +12,6 @@ const DATE: &str = "20130524T000000Z";
 const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HOST: &str = "s3.us-east-1.amazonaws.com";
 const SECRET: &[u8] = b"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-const TOKEN_KEY: &[u8] = &[7; 32];
 
 fn policy() -> Policy {
     Policy::new(
@@ -49,6 +48,10 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut m = Hmac::<Sha256>::new_from_slice(key).unwrap();
     m.update(data);
     m.finalize().into_bytes().to_vec()
+}
+/// Test-only token key, derived per label so no key literal is needed.
+fn key(label: &str) -> Vec<u8> {
+    Sha256::digest(label.as_bytes()).to_vec()
 }
 fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
@@ -267,7 +270,7 @@ fn between<'a>(xml: &'a str, open: &str, close: &str) -> Vec<&'a str> {
 /// `queries` queries, like the service does against D1.
 fn page(rows: &[&str], query: &str, batch: usize, queries: usize) -> String {
     let t = Target::parse(&format!("/bucket?list-type=2{query}"), &policy()).unwrap();
-    let mut list = ListObjectsV2::parse(&t, TOKEN_KEY).unwrap();
+    let mut list = ListObjectsV2::parse(&t, &key("list")).unwrap();
     let mut exhausted = false;
     for _ in 0..queries {
         let after = list.after().map(str::to_owned);
@@ -290,7 +293,7 @@ fn page(rows: &[&str], query: &str, batch: usize, queries: usize) -> String {
             break;
         }
     }
-    String::from_utf8(list.finish(exhausted, TOKEN_KEY).unwrap().body).unwrap()
+    String::from_utf8(list.finish(exhausted, &key("list")).unwrap().body).unwrap()
 }
 
 /// Follow continuation tokens to the end; returns every emitted Key/Prefix.
@@ -412,12 +415,12 @@ fn continuation_token_is_bound_to_scope_and_key() {
         after: "a/1".into(),
         skip_prefix: Some("a/".into()),
     };
-    let token = issue_token(TOKEN_KEY, &scope("a"), &cursor).unwrap();
+    let token = issue_token(&key("list"), &scope("a"), &cursor).unwrap();
     assert!(token
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)));
     assert_eq!(
-        resolve_token(TOKEN_KEY, &token, &scope("a")),
+        resolve_token(&key("list"), &token, &scope("a")),
         Ok(cursor.clone())
     );
     let other_scopes = [
@@ -441,13 +444,13 @@ fn continuation_token_is_bound_to_scope_and_key() {
     ];
     for s in &other_scopes {
         assert_eq!(
-            resolve_token(TOKEN_KEY, &token, s),
+            resolve_token(&key("list"), &token, s),
             Err(ErrorCode::InvalidArgument),
             "{s:?}"
         );
     }
     assert_eq!(
-        resolve_token(&[8; 32], &token, &scope("a")),
+        resolve_token(&key("other"), &token, &scope("a")),
         Err(ErrorCode::InvalidArgument)
     );
     let mut bytes = token.clone().into_bytes();
@@ -455,13 +458,13 @@ fn continuation_token_is_bound_to_scope_and_key() {
     let tampered = String::from_utf8(bytes).unwrap();
     for bad in [tampered.as_str(), "", "!!", "AAAA", &"A".repeat(9000)] {
         assert_eq!(
-            resolve_token(TOKEN_KEY, bad, &scope("a")),
+            resolve_token(&key("list"), bad, &scope("a")),
             Err(ErrorCode::InvalidArgument)
         );
     }
     // A short key is a caller bug, not a client error.
     assert_eq!(
-        issue_token(&[1; 16], &scope("a"), &cursor),
+        issue_token(&key("short")[..16], &scope("a"), &cursor),
         Err(ErrorCode::InternalError)
     );
     // Through the request parser: same token, different listing parameters.
@@ -471,7 +474,7 @@ fn continuation_token_is_bound_to_scope_and_key() {
     )
     .unwrap();
     assert_eq!(
-        ListObjectsV2::parse(&t, TOKEN_KEY).unwrap_err(),
+        ListObjectsV2::parse(&t, &key("list")).unwrap_err(),
         ErrorCode::InvalidArgument
     );
 }
@@ -488,10 +491,10 @@ fn list_objects_xml_fields() {
     // Keys that XML 1.0 cannot carry need encoding-type=url.
     let control = ["a\u{1}b"];
     let t = Target::parse("/bucket?list-type=2", &policy()).unwrap();
-    let mut list = ListObjectsV2::parse(&t, TOKEN_KEY).unwrap();
+    let mut list = ListObjectsV2::parse(&t, &key("list")).unwrap();
     list.push(row(control[0])).unwrap();
     assert_eq!(
-        list.finish(true, TOKEN_KEY).unwrap_err(),
+        list.finish(true, &key("list")).unwrap_err(),
         ErrorCode::InvalidArgument
     );
     let xml = page(
@@ -510,7 +513,7 @@ fn list_objects_xml_fields() {
     ] {
         let t = Target::parse(&format!("/bucket?list-type=2{query}"), &policy()).unwrap();
         assert_eq!(
-            ListObjectsV2::parse(&t, TOKEN_KEY).unwrap_err(),
+            ListObjectsV2::parse(&t, &key("list")).unwrap_err(),
             err,
             "{query}"
         );
@@ -518,13 +521,13 @@ fn list_objects_xml_fields() {
     // The caller must feed in-prefix rows in ascending order, and a page that
     // scanned nothing cannot be truncated (it would loop the client).
     let t = Target::parse("/bucket?list-type=2&prefix=b", &policy()).unwrap();
-    let mut list = ListObjectsV2::parse(&t, TOKEN_KEY).unwrap();
+    let mut list = ListObjectsV2::parse(&t, &key("list")).unwrap();
     assert_eq!(list.push(row("a")), Err(ErrorCode::InternalError));
     list.push(row("b2")).unwrap();
     assert_eq!(list.push(row("b1")), Err(ErrorCode::InternalError));
-    let list = ListObjectsV2::parse(&t, TOKEN_KEY).unwrap();
+    let list = ListObjectsV2::parse(&t, &key("list")).unwrap();
     assert_eq!(
-        list.finish(false, TOKEN_KEY).unwrap_err(),
+        list.finish(false, &key("list")).unwrap_err(),
         ErrorCode::InternalError
     );
     // max-keys=0 is an empty, untruncated page.
