@@ -1,0 +1,27 @@
+[package]
+name = "velmora-nntp-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Throwaway Worker proving Cloudflare Workers can reach an NNTP provider (TLS, AUTHINFO, POST, STAT, BODY) and showing what the runtime preserves of the raw request target"
+license = "MIT"
+publish = false
+
+# Deliberately its own workspace: this probe is not a member of the root
+# workspace, so it never affects the engine's lockfile or CI matrix.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+velmora = { path = "../../crates/velmora", default-features = false, features = ["worker-transport"] }
+worker = "0.8"
+serde_json = "1"
+sha2 = "0.11"
+subtle = { version = "2", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

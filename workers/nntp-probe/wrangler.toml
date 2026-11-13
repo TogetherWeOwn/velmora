@@ -1,0 +1,15 @@
+name = "velmora-nntp-probe"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+# Account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),
+# never from this file. Secrets (PROBE_TOKEN, NNTP_HOST, NNTP_PORT,
+# NNTP_USER, NNTP_PASS) are set with `wrangler secret put`; see README.md.
+
+[build]
+command = "worker-build --release"
+
+[vars]
+# Posting allow-list (comma-separated). Group names only, no credentials.
+NEWSGROUPS = "alt.binaries.test"
