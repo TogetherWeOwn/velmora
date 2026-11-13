@@ -33,16 +33,13 @@ cannot undo remote effects. `Sink` declares that only complete-part-verified
 ciphertext is emitted in blocks of at most 64 KiB; callers must stage prefixes
 invisibly because an error or cancellation can leave an incomplete output.
 
-`nntp::ClientIo` borrows an admitted authenticated client and races each command
-against event-driven control. Interruption invalidates the session without
-waiting for cleanup or sending QUIT; BODY and STAT retain the read failure.
-This slice exposes no archive POST operation. A caller owns the cleanup budget and must retain
-its lease/account charge until physical closure is independently confirmed.
-Even successful shutdown can be only a write-half shutdown, and dropping the
-client or transport may only request asynchronous close. For Worker pinned TLS,
-retain `WorkerSocketControl` until its close succeeds; pending or failed close
-confirmation does not release capacity. Dropping a command is neither rollback
-nor closure proof.
+`nntp::ClientIo` borrows a client the caller attests is authenticated for its
+bound account. Event-driven interruption invalidates without cleanup or QUIT;
+STAT retains the read failure. BODY and POST are not exposed in this slice.
+The caller owns cleanup and retains the lease/account charge until physical
+closure is independently confirmed. Shutdown may only close the write half;
+dropping the client or transport may only request asynchronous close. For Worker
+pinned TLS, retain `WorkerSocketControl` until close succeeds.
 
 These are interface obligations, not an implementation of authorization,
 transport closure or output verification. Consumer integration and the complete

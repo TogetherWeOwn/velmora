@@ -162,7 +162,7 @@ fn parse_reply(line: &[u8]) -> Result<Reply> {
 /// injected second command line via CRLF). Rejects with [`Error::Malformed`]
 /// before any byte is written. The diagnostic is generic: the argument may
 /// carry control characters that must not reach logs verbatim.
-fn validate_argument(arg: &str) -> Result<()> {
+pub(crate) fn validate_argument(arg: &str) -> Result<()> {
     if arg
         .chars()
         .any(|c| c == '<' || c == '>' || c.is_whitespace() || c.is_control())

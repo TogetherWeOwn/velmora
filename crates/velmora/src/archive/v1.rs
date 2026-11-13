@@ -188,12 +188,10 @@ pub(crate) async fn supervised<F: Future>(
         if let std::task::Poll::Ready(error) = cancelled.as_mut().poll(cx) {
             return std::task::Poll::Ready(Err(error));
         }
-        match operation.as_mut().poll(cx) {
-            std::task::Poll::Ready(result) => {
-                std::task::Poll::Ready(control.check(target, action).map(|()| result))
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        operation
+            .as_mut()
+            .poll(cx)
+            .map(|result| control.check(target, action).map(|()| result))
     })
     .await
 }

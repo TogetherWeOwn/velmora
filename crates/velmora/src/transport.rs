@@ -46,6 +46,22 @@ pub trait Transport {
 /// unbounded growth on a hostile or broken server).
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 
+#[derive(Debug)]
+struct LineLimit;
+impl std::fmt::Display for LineLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NNTP line exceeds 16 KiB")
+    }
+}
+impl std::error::Error for LineLimit {}
+
+#[cfg(feature = "archive-provider")]
+pub(crate) fn is_line_limit_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<LineLimit>())
+}
+
 /// Default maximum decoded wire bytes in a single article/dot-block (v1 parity).
 pub const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -224,10 +240,7 @@ impl<T: Transport> BufferedTransport<T> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 if pos >= MAX_LINE_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "NNTP line exceeds 16 KiB",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, LineLimit));
                 }
                 let mut line = self.buf.drain(..=pos).collect::<Vec<u8>>();
                 line.pop();
@@ -237,10 +250,7 @@ impl<T: Transport> BufferedTransport<T> {
                 return Ok(line);
             }
             if self.buf.len() >= MAX_LINE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "NNTP line exceeds 16 KiB",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, LineLimit));
             }
             let mut chunk = [0u8; 4096];
             let n = self.inner.read(&mut chunk).await?;
