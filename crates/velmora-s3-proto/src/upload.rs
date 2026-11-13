@@ -214,6 +214,12 @@ impl UploadValidator {
                 Some(algorithm)
             }
         };
+        // The unsigned stream has no chunk signatures: a checksum (trailer
+        // or header) is its only integrity check, so one is required.
+        if streaming == Some(Streaming::UnsignedTrailer) && trailer.is_none() && checksum.is_none()
+        {
+            return Err(ErrorCode::InvalidRequest);
+        }
         let algorithm = checksum.as_ref().map(|(a, _)| *a).or(trailer);
         if let Some(requested) = headers
             .get("x-amz-checksum-algorithm")

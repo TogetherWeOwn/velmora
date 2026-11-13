@@ -488,3 +488,35 @@ fn aws_chunked_is_not_stored_as_content_encoding() {
         [("content-encoding".to_string(), "gzip".to_string())]
     );
 }
+
+#[test]
+fn unsigned_stream_needs_a_checksum() {
+    let d = b"abc";
+    let body = unsigned_body(&[d], "");
+    let base = [
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", "3"),
+    ];
+    // No trailer and no checksum header: nothing would protect the bytes.
+    let (all, _) = request(&base, UNSIGNED_TRAILER);
+    assert_eq!(
+        upload(&all, &body, 3).unwrap_err(),
+        ErrorCode::InvalidRequest
+    );
+    // A checksum header (no trailer) is enough, and it is checked.
+    let crc32 = STANDARD.encode(crc32fast::hash(d).to_be_bytes());
+    let mut fields = base.to_vec();
+    fields.push(("x-amz-checksum-crc32", &crc32));
+    let (all, _) = request(&fields, UNSIGNED_TRAILER);
+    let (out, receipt) = upload(&all, &body, 3).unwrap();
+    assert_eq!(out, d);
+    assert_eq!(
+        receipt.checksum(),
+        Some(&(ChecksumAlgorithm::Crc32, crc32.clone()))
+    );
+    let wrong = STANDARD.encode(crc32fast::hash(b"abd").to_be_bytes());
+    let mut fields = base.to_vec();
+    fields.push(("x-amz-checksum-crc32", &wrong));
+    let (all, _) = request(&fields, UNSIGNED_TRAILER);
+    assert_eq!(upload(&all, &body, 3).unwrap_err(), ErrorCode::BadDigest);
+}

@@ -266,8 +266,11 @@ impl ChunkedDecoder {
                 if seen == 0 {
                     self.state = State::DataEnd(1);
                 } else {
-                    let digest = hex(&std::mem::take(&mut self.chunk).finalize());
-                    self.check_chunk(&digest)?;
+                    // Only the signed variants hash chunks.
+                    if self.seed.is_some() {
+                        let digest = hex(&std::mem::take(&mut self.chunk).finalize());
+                        self.check_chunk(&digest)?;
+                    }
                     self.state = State::Header;
                 }
                 Ok(&input[1..])
