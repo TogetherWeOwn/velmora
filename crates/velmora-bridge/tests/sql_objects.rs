@@ -5,7 +5,7 @@
 //! bound parameters (the D1 limit), counts queries, and can make a batch
 //! lose its guard after all of its statements ran.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::RusqliteSql;
@@ -24,6 +24,10 @@ struct Probe {
     /// When set, every batch ends with a failing `tx_guard` insert.
     lose_guard: Cell<bool>,
     queries: Cell<u32>,
+    execs: Cell<u32>,
+    batches: Cell<u32>,
+    /// Statements of the most recent batch, in order.
+    last_batch: RefCell<Vec<&'static str>>,
 }
 
 fn check_params(params: &[SqlValue]) {
@@ -42,10 +46,13 @@ impl Sql for Probe {
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         check_params(params);
+        self.execs.set(self.execs.get() + 1);
         self.db.exec(sql, params).await
     }
     async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         stmts.iter().for_each(|(_, p)| check_params(p));
+        self.batches.set(self.batches.get() + 1);
+        *self.last_batch.borrow_mut() = stmts.iter().map(|(sql, _)| *sql).collect();
         if self.lose_guard.get() {
             stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
         }
@@ -65,6 +72,9 @@ impl Fx {
                 db: RusqliteSql::with_schema().unwrap(),
                 lose_guard: Cell::new(false),
                 queries: Cell::new(0),
+                execs: Cell::new(0),
+                batches: Cell::new(0),
+                last_batch: RefCell::new(vec![]),
             }),
             next_id: Cell::new(1),
         }
@@ -165,6 +175,11 @@ impl Fx {
             let rows = stmt.query_map([], |r| r.get(0)).unwrap();
             rows.map(|r| r.unwrap()).collect()
         })
+    }
+
+    /// `(batch, exec)` calls since the last reading.
+    fn writes(&self) -> (u32, u32) {
+        (self.cat.sql.batches.take(), self.cat.sql.execs.take())
     }
 
     fn run(&self, sql: &str) {
@@ -338,6 +353,155 @@ async fn failed_overwrite_keeps_the_old_generation_live() {
     assert_eq!(fx.strings("SELECT stage FROM outbox"), ["post"]);
 }
 
+/// The pointer move is the last statement of a publication and the
+/// pointer removal the last of a deletion. Failing exactly there proves
+/// everything before it was in the same transaction.
+#[tokio::test(flavor = "current_thread")]
+async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+
+    // One batch and nothing else per successful write.
+    fx.writes();
+    let v1 = fx.commit(&b.id, "k", 2, T0);
+    fx.cat.commit_generation(&v1).await.unwrap();
+    assert_eq!(fx.writes(), (1, 0), "first commit");
+    assert!(fx
+        .cat
+        .sql
+        .last_batch
+        .borrow()
+        .last()
+        .is_some_and(|s| s.starts_with("INSERT INTO objects")));
+    fx.cat
+        .commit_generation(&fx.commit(&b.id, "k", 1, T0.plus_ms(1)))
+        .await
+        .unwrap();
+    assert_eq!(fx.writes(), (1, 0), "overwrite");
+    fx.cat
+        .delete_object(&b.id, "k", T0.plus_ms(2))
+        .await
+        .unwrap();
+    assert_eq!(fx.writes(), (1, 0), "delete");
+    assert!(fx
+        .cat
+        .sql
+        .last_batch
+        .borrow()
+        .last()
+        .is_some_and(|s| s.starts_with("DELETE FROM objects")));
+
+    let live = fx.put(&b.id, "live", T0.plus_ms(3)).await;
+    let before = fx.footprint();
+    let rows = |fx: &Fx| {
+        fx.strings(
+            "SELECT 'g:' || id || ':' || state || ':' || COALESCE(retired_at, '') FROM generations \
+             UNION ALL SELECT 'x:' || id || ':' || generation_id FROM extents \
+             UNION ALL SELECT 'o:' || extent_id || ':' || stage || ':' || updated_at FROM outbox \
+             UNION ALL SELECT 'p:' || key || ':' || generation_id FROM objects \
+             UNION ALL SELECT 'c:' || extent_id || ':' || action FROM gc ORDER BY 1",
+        )
+    };
+    let snapshot = rows(&fx);
+
+    fx.run(
+        "CREATE TRIGGER fail_ins BEFORE INSERT ON objects BEGIN SELECT RAISE(ABORT, 'x'); END;
+         CREATE TRIGGER fail_upd BEFORE UPDATE ON objects BEGIN SELECT RAISE(ABORT, 'x'); END;
+         CREATE TRIGGER fail_del BEFORE DELETE ON objects BEGIN SELECT RAISE(ABORT, 'x'); END;",
+    );
+    fx.writes();
+    // New key: the pointer insert fails.
+    let fresh = fx.commit(&b.id, "fresh", 2, T0.plus_ms(10));
+    let err = fx.cat.commit_generation(&fresh).await.unwrap_err();
+    assert!(matches!(err, BridgeError::Sql(_)), "{err:?}");
+    assert_eq!(fx.writes(), (1, 0));
+    assert_eq!(
+        (fx.footprint(), rows(&fx)),
+        (before, snapshot.clone()),
+        "insert"
+    );
+    // Overwrite: the pointer update fails after the old generation was
+    // retired, its outbox cancelled and its GC rows written.
+    let over = fx.commit(&b.id, "live", 1, T0.plus_ms(11));
+    let err = fx.cat.commit_generation(&over).await.unwrap_err();
+    assert!(matches!(err, BridgeError::Sql(_)), "{err:?}");
+    assert_eq!(fx.writes(), (1, 0));
+    assert_eq!(
+        (fx.footprint(), rows(&fx)),
+        (before, snapshot.clone()),
+        "update"
+    );
+    // Delete: the pointer removal fails.
+    let err = fx
+        .cat
+        .delete_object(&b.id, "live", T0.plus_ms(12))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BridgeError::Sql(_)), "{err:?}");
+    assert_eq!(fx.writes(), (1, 0));
+    assert_eq!((fx.footprint(), rows(&fx)), (before, snapshot), "delete");
+
+    let (generation, extents) = fx.cat.live_object(&b.id, "live").await.unwrap().unwrap();
+    assert_eq!((generation, extents), (live.generation, live.extents));
+    assert!(fx.cat.live_object(&b.id, "fresh").await.unwrap().is_none());
+
+    // With the triggers gone the same writes go through.
+    fx.run("DROP TRIGGER fail_ins; DROP TRIGGER fail_upd; DROP TRIGGER fail_del;");
+    fx.cat.commit_generation(&fresh).await.unwrap();
+    fx.cat.commit_generation(&over).await.unwrap();
+    fx.cat
+        .delete_object(&b.id, "live", T0.plus_ms(12))
+        .await
+        .unwrap();
+}
+
+/// Retiring a generation must not read the whole outbox: the cancel is
+/// driven from the live pointer through indexed lookups.
+#[tokio::test(flavor = "current_thread")]
+async fn outbox_cancel_does_not_scan_the_outbox() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    fx.put(&b.id, "k", T0).await;
+    fx.cat.delete_object(&b.id, "k", T0).await.unwrap();
+    let delete = fx.cat.sql.last_batch.borrow().clone();
+    fx.put(&b.id, "k2", T0).await;
+    fx.put(&b.id, "k2", T0.plus_ms(1)).await;
+    let overwrite = fx.cat.sql.last_batch.borrow().clone();
+
+    // Unbound parameters plan the same way as bound ones.
+    let explain = |sql: &str| {
+        fx.cat.sql.db.with_conn(|c| {
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let mut rows = stmt.raw_query();
+            let mut lines = vec![];
+            while let Some(row) = rows.next().unwrap() {
+                lines.push(row.get::<_, String>(3).unwrap());
+            }
+            lines.join("\n")
+        })
+    };
+    for batch in [&delete, &overwrite] {
+        let cancel: Vec<_> = batch
+            .iter()
+            .filter(|s| s.starts_with("UPDATE outbox"))
+            .collect();
+        assert_eq!(cancel.len(), 1);
+        let plan = explain(cancel[0]);
+        assert!(plan.contains("SEARCH outbox USING"), "{plan}");
+        assert!(plan.contains("SEARCH o USING PRIMARY KEY"), "{plan}");
+        assert!(plan.contains("SEARCH e USING"), "{plan}");
+        // No statement of a retirement reads a whole table.
+        for sql in batch.iter() {
+            let plan = explain(sql);
+            let scans: Vec<_> = plan
+                .lines()
+                .filter(|l| l.starts_with("SCAN") && *l != "SCAN CONSTANT ROW" && *l != "SCAN a")
+                .collect();
+            assert!(scans.is_empty(), "{sql}\n{plan}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn overwrite_supersedes_old_generation_and_adds_gc_rows() {
     let fx = Fx::new();
@@ -453,6 +617,18 @@ async fn commit_rejects_input_that_is_not_one_live_generation() {
     let mut c = good.clone();
     c.extents[0].seq = None;
     cases.push(c);
+    let mut c = good.clone();
+    c.extents[1].wrapped_file_key = None;
+    cases.push(c);
+    for state in [
+        SafetyState::Releasing,
+        SafetyState::Released,
+        SafetyState::Deleted,
+    ] {
+        let mut c = good.clone();
+        c.extents[0].safety_state = state;
+        cases.push(c);
+    }
     let mut c = good.clone();
     c.extents[0].plain_offset = None;
     cases.push(c);
@@ -824,13 +1000,33 @@ async fn list_delimiter_matches_model_at_every_page_size() {
     let (keys, prefixes, _) = page_all(&fx, &b.id, query("a/", Some(""), 2)).await;
     assert_eq!((keys, prefixes), model(&all, "a/", None));
 
-    // start-after inside a folded prefix still reports that prefix.
+    // A common prefix at or before start-after is not reported, at any
+    // page size, and the keys under it are not listed either.
+    for after in ["a/", "a/1", "a/b/1", "a/zzz"] {
+        for max_keys in [1, 2, 1000] {
+            let mut q = query("", Some("/"), max_keys);
+            q.after = Some(after.into());
+            let (keys, prefixes, _) = page_all(&fx, &b.id, q).await;
+            let at = format!("after {after:?} max_keys {max_keys}");
+            assert_eq!(prefixes, ["b/", "d/", "photos/", "z/"], "{at}");
+            assert_eq!(keys, ["a0", "c", "z"], "{at}");
+        }
+    }
+    // start-after before the prefix string itself leaves it in.
     let mut q = query("", Some("/"), 1000);
-    q.after = Some("a/1".into());
+    q.after = Some("a".into());
     let page = fx.cat.list(&b.id, &q).await.unwrap();
     assert_eq!(page.common_prefixes, ["a/", "b/", "d/", "photos/", "z/"]);
-    let keys: Vec<_> = page.entries.iter().map(|e| e.key.as_str()).collect();
-    assert_eq!(keys, ["a0", "c", "z"]);
+    // Nested: only the prefix that contains start-after is dropped.
+    let mut q = query("a/", Some("/"), 1000);
+    q.after = Some("a/b/1".into());
+    let page = fx.cat.list(&b.id, &q).await.unwrap();
+    assert_eq!(page.common_prefixes, [] as [&str; 0]);
+    assert!(page.entries.is_empty() && page.next.is_none());
+    let mut q = query("a/", Some("/"), 1000);
+    q.after = Some("a/1".into());
+    let page = fx.cat.list(&b.id, &q).await.unwrap();
+    assert_eq!(page.common_prefixes, ["a/b/"]);
 }
 
 #[tokio::test(flavor = "current_thread")]

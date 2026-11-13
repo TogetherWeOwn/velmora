@@ -186,7 +186,8 @@ pub(super) async fn live_object<S: Sql>(
     key: &str,
 ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
     let sql = format!(
-        "SELECT {GENERATION_COLS} FROM objects o JOIN generations g ON g.id = o.generation_id \
+        "SELECT {GENERATION_COLS} FROM objects o JOIN generations g \
+         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
          WHERE o.bucket_id = ?1 AND o.key = ?2"
     );
     let rows = c
@@ -228,8 +229,9 @@ fn retire_live(bucket: &BucketId, key: &str, to: GenerationState, now: UnixMs) -
         ),
         (
             "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
-             WHERE stage NOT IN ('done', 'cancelled') AND generation_id = \
-               (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
+             WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN \
+               (SELECT e.id FROM objects o JOIN extents e ON e.generation_id = o.generation_id \
+                WHERE o.bucket_id = ?1 AND o.key = ?2)",
             vec![b(), text(key), ms(now)],
         ),
         (
@@ -284,14 +286,17 @@ pub(super) async fn commit_generation<S: Sql>(
 ) -> Result<()> {
     let g = &commit.generation;
     // The extents must tile the object exactly, in order: a gap or an
-    // overlap here would be served as wrong bytes later.
+    // overlap here would be served as wrong bytes later. Each must still
+    // have its key and its pinned copy, or the object could not be read.
     let mut offset = 0u64;
     let mut tiled = usize::try_from(g.extent_count).ok() == Some(commit.extents.len());
     for (i, e) in commit.extents.iter().enumerate() {
         tiled &= e.bucket_id == g.bucket_id
             && e.generation_id.as_ref().is_none_or(|id| id == &g.id)
             && e.seq.map(u64::from) == u64::try_from(i).ok()
-            && e.plain_offset == Some(offset);
+            && e.plain_offset == Some(offset)
+            && e.wrapped_file_key.is_some()
+            && e.safety_state == SafetyState::Held;
         offset = offset.saturating_add(e.plain_size);
     }
     if !tiled || offset != g.size || g.state != GenerationState::Live || g.retired_at.is_some() {
@@ -401,7 +406,8 @@ pub(super) async fn list<S: Sql>(
     let upper = successor(&q.prefix);
     let sql = format!(
         "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
-         JOIN generations g ON g.id = o.generation_id \
+         JOIN generations g \
+         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
          WHERE o.bucket_id = ?1 AND o.key >= ?2 AND o.key > ?3 {} ORDER BY o.key LIMIT ?4",
         if upper.is_some() {
             "AND o.key < ?5"
@@ -441,6 +447,20 @@ pub(super) async fn list<S: Sql>(
                 after = key;
                 continue;
             }
+            let folded = delimiter.and_then(|d| {
+                let rest = key.get(q.prefix.len()..)?;
+                let end = q.prefix.len() + rest.find(d)? + d.len();
+                Some(key[..end].to_string())
+            });
+            // A common prefix that the lower bound lies inside sorts at or
+            // before that bound: it is not reported, and its keys are skipped.
+            if let Some(prefix) = &folded {
+                if q.after.as_deref().is_some_and(|a| a.starts_with(prefix)) {
+                    skip = folded;
+                    after = key;
+                    continue;
+                }
+            }
             if emitted == q.max_keys {
                 page.next = Some(ListCursor {
                     after,
@@ -448,11 +468,6 @@ pub(super) async fn list<S: Sql>(
                 });
                 return Ok(page);
             }
-            let folded = delimiter.and_then(|d| {
-                let rest = key.get(q.prefix.len()..)?;
-                let end = q.prefix.len() + rest.find(d)? + d.len();
-                Some(key[..end].to_string())
-            });
             match folded {
                 Some(prefix) => {
                     page.common_prefixes.push(prefix.clone());
@@ -501,7 +516,8 @@ pub(super) async fn object_status<S: Sql>(
     key: &str,
 ) -> Result<Option<ObjectStatus>> {
     let sql = format!(
-        "SELECT {GENERATION_COLS} FROM objects o JOIN generations g ON g.id = o.generation_id \
+        "SELECT {GENERATION_COLS} FROM objects o JOIN generations g \
+         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
          WHERE o.bucket_id = ?1 AND o.key = ?2"
     );
     let rows = c
