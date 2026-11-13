@@ -4,7 +4,9 @@
 # Local (base URL on 127.0.0.1 or localhost): starts fakesrv, applies the D1
 # migrations to a throwaway local state, writes a throwaway .dev.vars, starts
 # `wrangler dev --env dev --local --test-scheduled` on the URL's port, then
-# runs the steps. Everything it started or wrote is removed on exit.
+# runs the steps. Step 7 restarts it with DEV_DROP_NOTIFY_N=1 so the next
+# queue send is lost, then calls the scheduled handler. Everything it started
+# or wrote is removed on exit.
 #
 # Remote (any other base URL): runs against a deployed Worker. The admin
 # bearer comes from the 0600 file named by VELMORA_ADMIN_TOKEN_FILE. Step 4
@@ -163,17 +165,23 @@ if [[ $MODE == local ]]; then
   poll 30 0.2 port_open "$FAKESRV_PORT" ||
     { redacted_tail "$T/fakesrv.log"; fail "fakesrv listening" "port $FAKESRV_PORT open within 30 s" "closed"; }
 
-  # printf is a builtin: the values never reach argv.
-  {
-    printf 'VELMORA_KEK_1=%s\n' "$KEK"
-    printf 'ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN"
-    printf 'NNTP_PROVIDERS=[{"id":"fake1","host":"127.0.0.1","port":%s,"tls":false,"user":"slice","pass":"%s","backbone":"fake","post":true,"read":true,"max_conns":2}]\n' \
-      "$FAKESRV_PORT" "$NNTP_PASS"
-    # The host clients sign is this run's port, not the default in wrangler.toml.
-    printf 'S3_HOST=%s:%s\n' "$HOST" "$PORT"
-  } >"$WORKER_DIR/.dev.vars"
-  DEV_VARS_WRITTEN=1
-  chmod 600 "$WORKER_DIR/.dev.vars"
+  # write_dev_vars <drop-notify-n>: the throwaway .dev.vars (0600). printf
+  # is a builtin, so the values never reach argv.
+  write_dev_vars() {
+    DEV_VARS_WRITTEN=1
+    {
+      printf 'VELMORA_KEK_1=%s\n' "$KEK"
+      printf 'ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN"
+      printf 'NNTP_PROVIDERS=[{"id":"fake1","host":"127.0.0.1","port":%s,"tls":false,"user":"slice","pass":"%s","backbone":"fake","post":true,"read":true,"max_conns":2}]\n' \
+        "$FAKESRV_PORT" "$NNTP_PASS"
+      # The host clients sign is this run's port, not the default in wrangler.toml.
+      printf 'S3_HOST=%s:%s\n' "$HOST" "$PORT"
+      # Dev only: the first n queue sends of the isolate are lost (step 7).
+      printf 'DEV_DROP_NOTIFY_N=%s\n' "$1"
+    } >"$WORKER_DIR/.dev.vars"
+    chmod 600 "$WORKER_DIR/.dev.vars"
+  }
+  write_dev_vars 0
   printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" >"$T/admin.hdr"
 
   cd "$WORKER_DIR"
@@ -184,28 +192,42 @@ if [[ $MODE == local ]]; then
     fail "d1 migrations apply" "exit 0" "non-zero exit (log above)"
   fi
 
-  log "starting wrangler dev on port $PORT (the first run compiles the Worker)"
-  setsid npx --yes wrangler@4 dev --env dev --local --test-scheduled \
-    --ip 127.0.0.1 --port "$PORT" --persist-to "$T/state" --show-interactive-dev-session=false \
-    >"$T/wrangler.log" 2>&1 </dev/null &
-  WRANGLER_PID=$!
-
   wrangler_ready() {
     kill -0 "$WRANGLER_PID" 2>/dev/null || return 2
     local code
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/" || true)
     [[ $code != 000 ]]
   }
-  rc=0
-  poll "${READY_TIMEOUT_SECS:-1200}" 2 wrangler_ready || rc=$?
-  if ! kill -0 "$WRANGLER_PID" 2>/dev/null; then
-    redacted_tail "$T/wrangler.log"
-    fail "wrangler dev" "running and answering on $BASE" "the process exited (log above)"
-  elif ((rc != 0)); then
-    redacted_tail "$T/wrangler.log"
-    fail "wrangler dev" "answering on $BASE within ${READY_TIMEOUT_SECS:-1200} s" "no answer (log above)"
-  fi
-  log "wrangler dev is answering"
+
+  # Starts `wrangler dev` on the persisted local state and waits until it
+  # answers (or exits, which fails at once).
+  start_wrangler() {
+    local rc=0
+    setsid npx --yes wrangler@4 dev --env dev --local --test-scheduled \
+      --ip 127.0.0.1 --port "$PORT" --persist-to "$T/state" --show-interactive-dev-session=false \
+      >>"$T/wrangler.log" 2>&1 </dev/null &
+    WRANGLER_PID=$!
+    poll "${READY_TIMEOUT_SECS:-1200}" 2 wrangler_ready || rc=$?
+    if ! kill -0 "$WRANGLER_PID" 2>/dev/null; then
+      redacted_tail "$T/wrangler.log"
+      fail "wrangler dev" "running and answering on $BASE" "the process exited (log above)"
+    elif ((rc != 0)); then
+      redacted_tail "$T/wrangler.log"
+      fail "wrangler dev" "answering on $BASE within ${READY_TIMEOUT_SECS:-1200} s" "no answer (log above)"
+    fi
+    log "wrangler dev is answering"
+  }
+
+  # Stops `wrangler dev` and waits until its port is free again.
+  stop_wrangler() {
+    stop_group "$WRANGLER_PID"
+    WRANGLER_PID=
+    port_closed() { ! port_open "$PORT"; }
+    poll 30 0.2 port_closed || fail "wrangler dev stopped" "port $PORT free within 30 s" "still in use"
+  }
+
+  log "starting wrangler dev on port $PORT (the first run compiles the Worker)"
+  start_wrangler
 else
   STEP=remote-setup
   TOKEN_FILE=${VELMORA_ADMIN_TOKEN_FILE:-}
@@ -216,8 +238,8 @@ else
   ADMIN_TOKEN=$(<"$TOKEN_FILE")
   SECRETS=("$ADMIN_TOKEN")
   printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" >"$T/admin.hdr"
+  unset ADMIN_TOKEN
 fi
-unset ADMIN_TOKEN KEK NNTP_PASS
 
 # ---------------------------------------------------------------------------
 # Request helpers
@@ -390,6 +412,12 @@ stage_reached() {
   j=$(adm_try "$BASE/_admin/objects/slice/a/$1") || return 1
   jq -e "($REACHED) and ($COUNTED)" >/dev/null 2>&1 <<<"$j" || return 1
 }
+# Any progress past a fresh commit (used by step 7).
+stage_moved() {
+  local j
+  j=$(adm_try "$BASE/_admin/objects/slice/a/$1") || return 1
+  jq -e '.extents | any(.stage != "post" or .attempts != 0)' >/dev/null 2>&1 <<<"$j" || return 1
+}
 if ! poll 180 2 stage_reached big.bin; then
   json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
   fail "a/big.bin posted and verified within 180 s" "jq: ($REACHED) and ($COUNTED)" "$json"
@@ -426,12 +454,30 @@ expect_err "HEAD a/small.bin after delete" '\(404\)' \
 STEP=7-dispatcher-recovery
 log "step $STEP"
 if [[ $MODE == local ]]; then
-  # Lose the queue notification, then invoke the scheduled handler.
-  adm "POST /_admin/dev/suppress-notify" -XPOST "$BASE/_admin/dev/suppress-notify?n=1" >/dev/null
+  # Let earlier work settle, so the dropped send is this PUT's notification.
+  settled() {
+    local j
+    j=$(adm_try "$BASE/_admin/status") || return 1
+    jq -e '((.outbox.post // 0) == 0) and ((.outbox.verify // 0) == 0)' >/dev/null 2>&1 <<<"$j" || return 1
+  }
+  if ! poll 180 2 settled; then
+    json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+    fail "earlier objects settled within 180 s" "no outbox row in post or verify" "$json"
+  fi
+  # Restart with the first queue send of the new isolate dropped.
+  log "restarting wrangler dev with DEV_DROP_NOTIFY_N=1"
+  stop_wrangler
+  write_dev_vars 1
+  start_wrangler
   run_aws "PUT a/lost.bin" "${S3[@]}" cp "$T/small.bin" s3://slice/a/lost.bin >/dev/null
   json=$(adm "GET /_admin/objects/slice/a/lost.bin" "$BASE/_admin/objects/slice/a/lost.bin")
   jcheck "a/lost.bin is committed but never enqueued" \
     '.extents | length > 0 and all(.stage == "post" and .attempts == 0)' "$json"
+  # No queue delivery can move it: it stays at post until the cron runs.
+  if poll 10 2 stage_moved lost.bin; then
+    json=$(adm "GET /_admin/objects/slice/a/lost.bin" "$BASE/_admin/objects/slice/a/lost.bin")
+    fail "a/lost.bin stays at post without a queue message" "stage post, 0 attempts for 10 s" "$json"
+  fi
   cron_then_check() {
     curl -sf --max-time 60 "$BASE/__scheduled?cron=*/5+*+*+*+*" >/dev/null || return 1
     stage_reached lost.bin
@@ -441,7 +487,7 @@ if [[ $MODE == local ]]; then
     fail "a/lost.bin recovered by the scheduled handler within 90 s" "jq: ($REACHED) and ($COUNTED)" "$json"
   fi
 else
-  # suppress-notify is dev-only: prove the real cron runs after deploy.
+  # The drop counter is dev-only: prove the real cron runs after deploy.
   START_MS=$(($(date +%s) * 1000))
   dispatched() {
     local j
