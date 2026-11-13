@@ -92,6 +92,15 @@ impl Cols {
         }
     }
 
+    pub(super) fn blob(&mut self) -> Result<Vec<u8>> {
+        self.opt_blob()?.ok_or_else(|| bad("unexpected NULL"))
+    }
+
+    /// A fixed-length digest column.
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        <[u8; N]>::try_from(self.blob()?).map_err(|_| bad("digest length"))
+    }
+
     /// A `CHECK (… IN (…))` column through the enum's `parse`.
     pub(super) fn parsed<T>(&mut self, parse: fn(&str) -> Option<T>) -> Result<T> {
         parse(&self.text()?).ok_or_else(|| bad("unknown enum value"))
