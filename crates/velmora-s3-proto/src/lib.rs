@@ -3,7 +3,8 @@
 // Copied verbatim except: removed line 9 `pub mod archive;` (the archive module is not copied); this header.
 // Re-typed for S3 STANDARD semantics: the cold-archive restore module, its error codes,
 // limits and `Policy::restore` are removed; `storage_class` accepts STANDARD only;
-// the `listing` module is added; `xml` also maps U+FFFE/U+FFFF to U+FFFD.
+// the `listing` module is added; `xml` also maps U+FFFE/U+FFFF to U+FFFD;
+// the `checksum` and `chunked` (aws-chunked) modules are added.
 
 //! Restricted archive S3 wire primitives, not an HTTP service or an IAM implementation.
 //!
@@ -14,6 +15,8 @@
 //! prove encryption nor grant a durable commit.
 
 mod auth;
+mod checksum;
+pub mod chunked;
 pub mod listing;
 pub mod mutation;
 mod read;
@@ -22,7 +25,7 @@ mod wire;
 
 pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest, SINGLE_VALUE_HEADERS};
 pub use read::{plan_read, ByteRange, Conditions, ObjectMetadata, ReadPlan, StoredChecksum};
-pub use upload::{ChecksumAlgorithm, DecodedUpload, UploadValidator};
+pub use upload::{is_aws_chunked, ChecksumAlgorithm, DecodedUpload, UploadValidator};
 pub use wire::{canonical_request, Headers, Target, MAX_KEY_BYTES};
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;

@@ -3,7 +3,9 @@
 // Copied verbatim except: line 1 `use qerith_core::s3::*;` -> `use velmora_s3_proto::*;`, which rustfmt then sorts after `use serde_json::Value;`; this header.
 // Changed for S3 STANDARD semantics: the cold-archive (restore/unavailable) cases are
 // removed, `plan_read` lost its `available` argument, and storage-class assertions
-// expect STANDARD.
+// expect STANDARD. The streaming-payload refusal case now uses the SigV4a value,
+// since the SigV4 `STREAMING-*` values are qualified; the unknown-algorithm upload case
+// uses `XXHASH64`, since `CRC64NVME` is qualified.
 
 use serde_json::Value;
 use velmora_s3_proto::*;
@@ -424,11 +426,13 @@ fn unknown_integrity_encryption_tokens_and_policy_fields_fail_closed() {
         )
         .is_err());
     }
+    // aws-chunked SigV4 payloads are qualified (see tests/aws_chunked.rs);
+    // the SigV4a streaming payload is not.
     let mut f = fields(&v);
     set(
         &mut f,
         "x-amz-content-sha256",
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
     );
     assert_eq!(
         verify(
@@ -625,7 +629,7 @@ fn upload_errors_never_produce_a_commit_receipt() {
         ("trailer", "x-amz-checksum-sha256"),
         ("x-amz-checksum-sha256", "not base64"),
         ("x-amz-checksum-crc32", "AAAA"),
-        ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+        ("x-amz-sdk-checksum-algorithm", "XXHASH64"),
         ("x-amz-checksum-type", "COMPOSITE"),
         ("content-md5", "AAAA"),
         ("content-length", "1025"),

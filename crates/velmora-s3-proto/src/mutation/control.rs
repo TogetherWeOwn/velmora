@@ -1,6 +1,7 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/mutation/control.rs. License: MIT.
-// Copied verbatim except: line 4 `use crate::s3::{...}` -> `use crate::{...}`; this header.
+// Copied verbatim except: line 4 `use crate::s3::{...}` -> `use crate::{...}`; this header;
+// `parse_complete` names the part checksum element from `ChecksumAlgorithm::name`.
 
 use quick_xml::{events::Event, Reader};
 
@@ -245,17 +246,13 @@ pub fn parse_complete(
                 }
                 "ETag" if etag.is_none() => etag = Some(text.to_owned()),
                 name if value.is_none() => {
-                    let (expected, size) = match checksum {
+                    let algorithm = match checksum {
                         MultipartChecksum::None => return Err(ErrorCode::InvalidRequest),
-                        MultipartChecksum::CompositeSha256
-                        | MultipartChecksum::Full(super::ChecksumAlgorithm::Sha256) => {
-                            ("ChecksumSHA256", 32)
-                        }
-                        MultipartChecksum::Full(super::ChecksumAlgorithm::Crc32) => {
-                            ("ChecksumCRC32", 4)
-                        }
+                        MultipartChecksum::CompositeSha256 => super::ChecksumAlgorithm::Sha256,
+                        MultipartChecksum::Full(algorithm) => algorithm,
                     };
-                    if name != expected {
+                    let size = algorithm.size();
+                    if name.strip_prefix("Checksum") != Some(algorithm.name()) {
                         return Err(ErrorCode::InvalidRequest);
                     }
                     value = Some(digest_value(text, size)?);

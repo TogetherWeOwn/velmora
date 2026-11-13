@@ -83,7 +83,8 @@ pub struct PartEvidence {
 // Provenance: carved from TogetherWeOwn/qerith at commit fc09396c,
 // crates/qerith-core/src/s3/mutation.rs lines 107-148 (`UploadMetadata`). License: MIT.
 // Re-typed: the archive-only `recovery_ref` and `encryption_context` fields are
-// dropped, so `from_headers` takes only the headers; `validate` is folded into it.
+// dropped, so `from_headers` takes only the headers; `validate` is folded into it;
+// the `aws-chunked` coding is removed from a stored `content-encoding`.
 
 /// Persistent object metadata captured from an upload request (Content-Type and
 /// friends, `x-amz-meta-*`), validated with the same rules as stored metadata.
@@ -99,7 +100,18 @@ impl UploadMetadata {
             headers: headers
                 .iter()
                 .filter(|(k, _)| crate::wire::persistent_metadata(k))
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .filter_map(|(k, v)| {
+                    if k != "content-encoding" {
+                        return Some((k.to_owned(), v.to_owned()));
+                    }
+                    // `aws-chunked` is the transfer framing, not a coding of
+                    // the stored object: S3 drops it from the metadata.
+                    let kept: Vec<_> = v
+                        .split(',')
+                        .filter(|e| !e.trim().eq_ignore_ascii_case("aws-chunked"))
+                        .collect();
+                    (!kept.is_empty()).then(|| (k.to_owned(), kept.join(",")))
+                })
                 .collect(),
         };
         ObjectMetadata::new(
@@ -192,8 +204,5 @@ impl CommitResult {
 }
 
 fn checksum_name(algorithm: ChecksumAlgorithm) -> &'static str {
-    match algorithm {
-        ChecksumAlgorithm::Sha256 => "SHA256",
-        ChecksumAlgorithm::Crc32 => "CRC32",
-    }
+    algorithm.name()
 }
