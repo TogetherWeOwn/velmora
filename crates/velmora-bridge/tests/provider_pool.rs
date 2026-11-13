@@ -218,6 +218,53 @@ async fn reads_skip_a_provider_past_its_retention() {
     assert_eq!(seen.last().unwrap().provider_id, "p1");
 }
 
+/// An article older than every reader's stated retention is still asked
+/// for before the read gives up: the stated retention is an estimate.
+#[tokio::test]
+async fn article_past_every_retention_is_still_asked_for() {
+    let mut rig = pool_rig(2).await;
+    rig.bridge.cfg.providers[0].retention_days = Some(10);
+    rig.bridge.cfg.providers[1].retention_days = Some(5);
+    let (s, _) = rig.posted_on(21, &[]).await;
+    rig.bridge.clock.advance_secs(11 * DAY_SECS);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
+/// The provider answers the login with `482` because the account is at
+/// its connection limit. That is "no slot", not a fault: the read reports
+/// "busy", the post waits without spending an attempt, nothing goes to a
+/// lower tier and the provider takes no strike.
+#[tokio::test]
+async fn login_refused_over_the_limit_is_no_slot_not_a_fault() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let (s, _) = rig.posted_on(22, &[]).await;
+    let to_post = rig.seed(23, &marked_plaintext(PLAIN_LEN)).await;
+
+    // Someone else holds both of the account's connections on p0.
+    rig.servers[0].set_limit_reply_482(true).await;
+    let addr = rig.servers[0].addr();
+    let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+    let held = [dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()];
+
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Busy);
+    let attempts = rig.bridge.catalog.outbox(&to_post.extent).attempts;
+    assert!(matches!(
+        rig.run_post(&to_post).await,
+        JobOutcome::Retry { .. }
+    ));
+    let outbox = rig.bridge.catalog.outbox(&to_post.extent);
+    assert_eq!(outbox.attempts, attempts);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    let load = rig.load(0).await;
+    assert_eq!((load.failures, load.cooldown_until), (0, UnixMs(0)));
+
+    for client in held {
+        client.quit().await;
+    }
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
 // ---------------------------------------------------------------------------
 // Cooldown
 // ---------------------------------------------------------------------------
@@ -293,6 +340,35 @@ async fn read_while_the_only_source_cools_is_retryable() {
     rig.bridge.cfg.providers[0].port = port;
     rig.bridge.clock.advance_secs(60);
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
+/// Every reader is cooling: the read still gets one attempt, on the
+/// provider that is due back first, instead of failing unasked.
+#[tokio::test]
+async fn read_tries_the_soonest_cooling_provider_when_all_cool() {
+    let rig = pool_rig(2).await;
+    let (s, _) = rig.posted_on(24, &[]).await;
+    let now = rig.bridge.clock.now();
+    // p1 trips twice (60 s, then 120 s from +60 s); p0 once at +100 s.
+    let catalog = &rig.bridge.catalog;
+    for at in [0, 0, 0, 60] {
+        let failed = catalog.provider_failed("p1", now.plus_secs(at));
+        failed.await.unwrap();
+    }
+    rig.bridge.clock.set(now.plus_secs(100));
+    for _ in 0..3 {
+        let failed = catalog.provider_failed("p0", now.plus_secs(100));
+        failed.await.unwrap();
+    }
+    assert!(rig.cooling(0).await && rig.cooling(1).await);
+    assert!(rig.load(0).await.cooldown_until < rig.load(1).await.cooldown_until);
+
+    let before = (rig.uses(0).await, rig.uses(1).await);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert_eq!(
+        (rig.uses(0).await, rig.uses(1).await),
+        (before.0 + 1, before.1)
+    );
 }
 
 /// A cooling provider that no longer retains the missing article is not

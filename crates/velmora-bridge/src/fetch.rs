@@ -107,13 +107,16 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// The live session, connecting first when there is none. A provider
-    /// that refuses the connection with `502` ("too many connections") is
-    /// reported as "no slot".
+    /// that refuses the connection or the login with `502` or `482` ("too
+    /// many connections") is reported as "no slot": no strike, and the
+    /// caller waits as it does for a permit.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
                 Ok(session) => session,
-                Err(BridgeError::Nntp(velmora::Error::NoPermission(_))) => {
+                Err(BridgeError::Nntp(
+                    velmora::Error::NoPermission(_) | velmora::Error::NntpReply { code: 482, .. },
+                )) => {
                     return Err(Stop::NoPermit);
                 }
                 Err(e) => {
@@ -361,13 +364,35 @@ where
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
         let readers: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.read).collect();
         let mut interrupted = false;
-        for provider in pool.order(readers.clone()) {
+        let mut order = pool.order(readers.clone());
+        if order.is_empty() {
+            // Every reader is cooling: a read is worth one attempt on the
+            // provider that is due back first.
+            order.extend(pool.soonest_cooling(&readers));
+        }
+        // An article past every reader's stated retention may still be
+        // there: a second pass asks for those before giving up.
+        let orphan = |a: &ArticleRow| {
+            !readers
+                .iter()
+                .any(|p| p.enabled && p.retains(a.posted_at, now))
+        };
+        let mut asked: Vec<&str> = Vec::new();
+        let passes = [false, true];
+        for (provider, expired) in passes
+            .iter()
+            .flat_map(|&expired| order.iter().map(move |&p| (p, expired)))
+        {
             if !have.contains(&false) {
                 break;
             }
             let wanted: Vec<&ArticleRow> = plan
                 .iter()
-                .filter(|a| !have[a.idx as usize] && provider.retains(a.posted_at, now))
+                .filter(|a| !have[a.idx as usize])
+                .filter(|a| match expired {
+                    false => provider.retains(a.posted_at, now),
+                    true => orphan(a),
+                })
                 .collect();
             if wanted.is_empty() {
                 continue;
@@ -394,9 +419,11 @@ where
             .await;
             session.close().await;
             match read {
-                Ok(_) => {}
+                Ok(_) => asked.push(provider.id.as_str()),
+                // The provider is at its connection limit.
+                Err(Stop::NoPermit) => busy = true,
                 // The read broke off: this provider may still have the rest.
-                Err(Stop::NoPermit | Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+                Err(Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
                     interrupted = true;
                 }
                 Err(Stop::Fenced | Stop::Catalog) => {
@@ -407,11 +434,13 @@ where
             }
         }
         if have.contains(&false) {
-            // A cooling provider that retains a missing article may hold
-            // what the others lack: retry later.
+            // A cooling provider that retains a missing article and was
+            // not asked may hold what the others lack: retry later.
             let missing = |p: &ProviderConfig| {
-                plan.iter()
-                    .any(|a| !have[a.idx as usize] && p.retains(a.posted_at, now))
+                !asked.contains(&p.id.as_str())
+                    && plan
+                        .iter()
+                        .any(|a| !have[a.idx as usize] && p.retains(a.posted_at, now))
             };
             let waiting: Vec<&ProviderConfig> =
                 readers.into_iter().filter(|p| missing(p)).collect();

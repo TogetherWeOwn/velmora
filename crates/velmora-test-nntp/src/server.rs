@@ -111,6 +111,9 @@ struct Spool {
     drop_bodies: usize,
     /// While true, `STAT` answers `430` for articles in the `POST` spool.
     stat_lag: bool,
+    /// While true, a login over the connection cap is answered `482`
+    /// instead of `502`.
+    limit_482: bool,
 }
 
 struct Shared {
@@ -137,6 +140,7 @@ impl Shared {
             drop_posts: 0,
             drop_bodies: 0,
             stat_lag: false,
+            limit_482: false,
         };
         Self {
             config,
@@ -308,6 +312,12 @@ impl TestNntpServer {
     pub async fn set_stat_lag(&self, lag: bool) {
         self.shared.spool.lock().await.stat_lag = lag;
     }
+
+    /// While set, a login over the per-user connection cap is answered
+    /// `482` (as some providers do) instead of `502`.
+    pub async fn set_limit_reply_482(&self, on: bool) {
+        self.shared.spool.lock().await.limit_482 = on;
+    }
 }
 
 impl Drop for TestNntpServer {
@@ -443,9 +453,11 @@ async fn handle_connection(
                     let count = active.get(&user).copied().unwrap_or(0);
                     if count >= max {
                         drop(active);
-                        let _ = writer
-                            .write_all(b"502 Too many connections for user\r\n")
-                            .await;
+                        let reply: &[u8] = match shared.spool.lock().await.limit_482 {
+                            true => b"482 Too many connections for user\r\n",
+                            false => b"502 Too many connections for user\r\n",
+                        };
+                        let _ = writer.write_all(reply).await;
                         break;
                     }
                     active.insert(user.clone(), count + 1);

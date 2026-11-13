@@ -248,9 +248,14 @@ impl BridgeConfig {
             return Err(ConfigError::Refused("DEV_TRUST_HTTP outside dev"));
         }
 
-        let providers: Vec<ProviderConfig> =
+        let mut providers: Vec<ProviderConfig> =
             serde_json::from_str(&required(&get, "NNTP_PROVIDERS")?)
                 .map_err(|_| ConfigError::Invalid("NNTP_PROVIDERS".into()))?;
+        // Two spellings of one pool name must never be two pools, each
+        // with the full shared limit: trimmed, lower case, like backbones.
+        for pool in providers.iter_mut().filter_map(|p| p.pool.as_mut()) {
+            *pool = pool.trim().to_lowercase();
+        }
         validate_providers(&providers, dev)?;
 
         let admin_token = required(&get, "ADMIN_TOKEN")?;

@@ -1395,6 +1395,29 @@ fn provider_pool_settings_parse() {
     assert!(a.retains(None, now));
 }
 
+/// Two spellings of one pool name are one pool: the name is stored
+/// trimmed and lower case, and the members must agree on the limit.
+#[test]
+fn provider_pool_names_are_normalised() {
+    let pool = |name: &str, max: u32| format!(r#""pool":"{name}","pool_max_conns":{max}"#);
+    let providers = providers_of(&[
+        provider_json("a", &pool(" Bundle ", 3)),
+        provider_json("b", &pool("bundle", 3)),
+    ])
+    .unwrap();
+    assert_eq!(providers[0].pool.as_deref(), Some("bundle"));
+    assert_eq!(providers[0].pool, providers[1].pool);
+
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let mixed = [
+        provider_json("a", &pool("BUNDLE", 3)),
+        provider_json("b", &pool("bundle", 4)),
+    ];
+    assert_eq!(providers_of(&mixed), invalid);
+    // Only blanks is no name.
+    assert_eq!(providers_of(&[provider_json("a", &pool("  ", 3))]), invalid);
+}
+
 #[test]
 fn provider_pool_settings_fail_closed() {
     let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));

@@ -480,6 +480,124 @@ async fn post_verify_release_over_fake_nntp() {
     assert_eq!(fx.scalar(held, &[]).await, "0");
 }
 
+// ---------------------------------------------------------------------------
+// Provider pool, on the SQL catalogue
+// ---------------------------------------------------------------------------
+
+impl Fx {
+    /// Makes the object's outbox row claimable now.
+    async fn make_due(&self, o: &Obj) {
+        let sql = "UPDATE outbox SET next_at = 0, lease_until = NULL WHERE extent_id = ?1";
+        self.sql
+            .exec(sql, &[text(o.extent.as_str())])
+            .await
+            .unwrap();
+    }
+
+    /// Connection slots handed out so far, over all providers.
+    async fn uses(&self) -> u64 {
+        let load = self.bridge.catalog.provider_load(self.clock.now());
+        load.await.unwrap().iter().map(|l| l.uses).sum()
+    }
+
+    async fn health(&self, column: &str) -> String {
+        let sql = format!("SELECT {column} FROM provider_health WHERE provider_id = 'p0'");
+        self.scalar(&sql, &[]).await
+    }
+}
+
+/// Three post jobs that cannot connect start a cooldown in
+/// `provider_health`. While it lasts a job waits without an attempt and
+/// without a connection slot; after it, a good session clears the record.
+#[tokio::test]
+async fn provider_cooldown_on_the_sql_catalogue() {
+    let mut fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "a/cool.bin", &plaintext()).await;
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = dead.local_addr().unwrap().port();
+    let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead);
+
+    for run in 0..3 {
+        fx.make_due(&o).await;
+        let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+        assert!(matches!(outcome, JobOutcome::Retry { .. }));
+        if run < 2 {
+            assert_eq!(fx.health("cooldown_until").await, "0");
+            fx.clock.advance_secs(3600);
+        }
+    }
+    assert_eq!(fx.outbox(&o, "attempts").await, "3");
+    let until = fx.clock.now().plus_secs(60);
+    assert_eq!(fx.health("cooldown_until").await, until.0.to_string());
+    assert_eq!(fx.health("cooldowns").await, "1");
+
+    // Cooling: the job is put off to the end of the cooldown.
+    let before = fx.uses().await;
+    fx.clock.advance_secs(20);
+    fx.make_due(&o).await;
+    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    assert_eq!(outcome, JobOutcome::Retry { delay_secs: 40 });
+    assert_eq!(fx.outbox(&o, "attempts").await, "3");
+    assert_eq!(fx.outbox(&o, "next_at").await, until.0.to_string());
+    assert_eq!(fx.uses().await, before);
+
+    // Repaired: the first good session after the cooldown clears it.
+    fx.bridge.cfg.providers[0].port = port;
+    fx.clock.set(until);
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    fx.pump().await;
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.health("failures").await, "0");
+    assert_eq!(fx.health("cooldowns").await, "0");
+    assert_eq!(fx.health("cooldown_until").await, "0");
+}
+
+/// Two accounts of one pool share `pool_max_conns` in `provider_permits`:
+/// while the other account holds the pool's background slot, a post job
+/// waits without an attempt; once the slot is free it posts.
+#[tokio::test]
+async fn pool_limit_on_the_sql_catalogue() {
+    let mut fx = Fx::new().await;
+    let mut twin = fx.bridge.cfg.providers[0].clone();
+    twin.id = "p1".to_string();
+    twin.post = false;
+    fx.bridge.cfg.providers.push(twin);
+    for p in &mut fx.bridge.cfg.providers {
+        p.pool = Some("bundle".to_string());
+        // One background slot and one kept for reads.
+        p.pool_max_conns = Some(2);
+    }
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "a/pool.bin", &plaintext()).await;
+
+    let twin = &fx.bridge.cfg.providers[1];
+    let catalog = &fx.bridge.catalog;
+    let permit = catalog.acquire_permit(twin, PermitClass::Background, "other", fx.clock.now());
+    let permit = permit.await.unwrap().expect("the pool's background slot");
+
+    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert_eq!(fx.outbox(&o, "stage").await, "post");
+    assert_eq!(fx.outbox(&o, "attempts").await, "0");
+    assert_eq!(fx.outbox(&o, "last_error").await, "NULL");
+    assert_eq!(fx.server.posted_count().await, 0);
+    assert_eq!(fx.bridge.nntp.inner.connects(), 0);
+
+    catalog.release_permit(&permit).await.unwrap();
+    fx.make_due(&o).await;
+    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    assert_eq!(fx.server.posted_count().await, 3);
+    let pooled = "SELECT COUNT(*) FROM provider_permits WHERE pool = 'bundle'";
+    assert_ne!(fx.scalar(pooled, &[]).await, "0");
+}
+
 #[tokio::test]
 async fn duplicate_and_stale_jobs_are_noops() {
     let fx = Fx::new().await;

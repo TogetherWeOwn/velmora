@@ -98,4 +98,17 @@ impl<'a> Pool<'a> {
             .filter_map(|p| self.state(&p.id).map(|l| l.cooldown_until))
             .min()
     }
+
+    /// The enabled cooling provider among `candidates` whose cooldown
+    /// ends first.
+    pub(crate) fn soonest_cooling<'c>(
+        &self,
+        candidates: &[&'c ProviderConfig],
+    ) -> Option<&'c ProviderConfig> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|p| p.enabled && self.cooling(p))
+            .min_by_key(|p| self.state(&p.id).map(|l| l.cooldown_until))
+    }
 }
