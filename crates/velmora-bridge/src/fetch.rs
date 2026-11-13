@@ -114,7 +114,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 }
 
-/// Reconnects one job or cold read may spend on broken sessions.
+/// Reconnects one pass over a provider may spend on broken sessions.
 pub(crate) const MAX_READ_RECONNECTS: u32 = 2;
 
 /// What one pass over a set of articles found. Indexes are `ArticleRow::idx`.
@@ -232,7 +232,7 @@ pub enum ColdFetch {
     /// The complete, verified ciphertext. It is already in the cache.
     Filled(Vec<u8>),
     /// A provider that could still hold missing articles had no free
-    /// connection slot: retry shortly.
+    /// connection slot or failed in transit: retry shortly.
     Busy,
     /// No provider could supply every article intact.
     Unavailable,
@@ -296,8 +296,9 @@ where
             .await;
             session.close().await;
             match read {
-                Ok(_) | Err(Stop::Fail(..) | Stop::Session(_)) => {}
-                Err(Stop::NoPermit) => busy = true,
+                Ok(_) => {}
+                // The read broke off: this provider may still have the rest.
+                Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => busy = true,
                 Err(Stop::Fenced | Stop::Catalog) => {
                     return Err(BridgeError::Sql(
                         "catalogue failed during a cold read".into(),

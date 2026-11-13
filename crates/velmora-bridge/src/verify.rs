@@ -231,7 +231,9 @@ where
 
         // Every backbone has a recorded result for this round.
         self.cursor(lease, 0).await?;
-        let status = self.catalog.backbone_status(&extent.id).await?;
+        // Results for backbones that are no longer configured do not count.
+        let mut status = self.catalog.backbone_status(&extent.id).await?;
+        status.retain(|s| groups.iter().any(|(b, _)| *b == s.backbone));
         let counting = status.iter().filter(|s| s.counts).count();
         let now = self.clock.now();
         if counting >= self.cfg.required_backbones as usize && counting > 0 {
@@ -240,7 +242,8 @@ where
                 .plus_secs(self.cfg.safety_min_age_secs)
                 .max(now);
             self.advance(lease, OutboxStage::Release, ready).await?;
-            let delay = (ready.0 - now.0).div_euclid(1000);
+            // Rounded up: a job that arrives early cannot claim the row.
+            let delay = (ready.0 - now.0).saturating_add(999).div_euclid(1000);
             self.notify(
                 lease,
                 OutboxStage::Release,
@@ -253,7 +256,7 @@ where
         if failed(VerifyResult::Corrupt) {
             return Err(Stop::Fail(FailClass::Corrupt, Some(REVERIFY_SECS)));
         }
-        if status.iter().any(|s| !s.counts) || status.is_empty() {
+        if status.iter().any(|s| !s.counts) || status.len() < groups.len() || status.is_empty() {
             return Err(Stop::Fail(FailClass::MissingPending, Some(REVERIFY_SECS)));
         }
         // Every configured backbone holds the extent, but there are fewer
@@ -296,10 +299,19 @@ where
             let (provider, tally) = self.read_backbone(lease, &plan, &providers).await?;
             match result_of(&tally) {
                 VerifyResult::Ok => rows.push(self.record(lease, extent, provider, &tally).await?),
-                VerifyResult::Missing => return Err(Stop::fail(FailClass::MissingPending)),
+                // The extent is not releasable after all: it goes back to
+                // verify, which owns the retry waits and the health record.
+                VerifyResult::Missing => {
+                    self.cursor(lease, 0).await?;
+                    self.advance(lease, OutboxStage::Verify, now).await?;
+                    self.notify(lease, OutboxStage::Verify, 0).await;
+                    return Ok(());
+                }
                 _ => {
                     self.record(lease, extent, provider, &tally).await?;
-                    return Err(Stop::Fail(FailClass::Corrupt, Some(REVERIFY_SECS)));
+                    self.cursor(lease, 0).await?;
+                    let again = self.clock.now().plus_secs(REVERIFY_SECS);
+                    return self.advance(lease, OutboxStage::Verify, again).await;
                 }
             }
         }

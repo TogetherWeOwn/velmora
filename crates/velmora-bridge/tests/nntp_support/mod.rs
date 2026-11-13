@@ -239,7 +239,6 @@ impl MemCatalog {
             .iter()
             .filter(|v| v.plan_rev == extent.plan_rev)
         {
-            // Later rows win, including at the same timestamp.
             match latest.get(v.backbone.as_str()) {
                 Some(old) if old.verified_at > v.verified_at => {}
                 _ => {
@@ -414,14 +413,23 @@ impl Catalog for MemCatalog {
     }
 
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool> {
-        Ok(self
-            .fenced(l, |e| {
-                e.verifications.push(v.clone());
-                if v.result == VerifyResult::Ok {
-                    e.job.extent.last_verified_at = Some(v.verified_at);
-                }
-            })
-            .is_some())
+        // One row per extent, backbone and instant, as in the real table.
+        let stored = self.fenced(l, |e| {
+            let taken =
+                |o: &VerificationRow| o.backbone == v.backbone && o.verified_at == v.verified_at;
+            if e.verifications.iter().any(taken) {
+                return false;
+            }
+            e.verifications.push(v.clone());
+            if v.result == VerifyResult::Ok {
+                e.job.extent.last_verified_at = Some(v.verified_at);
+            }
+            true
+        });
+        match stored {
+            Some(false) => Err(BridgeError::Sql("duplicate verification row".into())),
+            other => Ok(other.is_some()),
+        }
     }
 
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
@@ -760,6 +768,25 @@ pub async fn two_backbone_rig() -> Rig {
         },
         Spec {
             backbone: "bb1",
+            post: false,
+            max_conns: 2,
+        },
+    ])
+    .await;
+    rig.bridge.cfg.required_backbones = 2;
+    rig
+}
+
+/// Two providers on the same backbone: one copy, however many accounts.
+pub async fn shared_backbone_rig() -> Rig {
+    let mut rig = rig(&[
+        Spec {
+            backbone: "bb0",
+            post: true,
+            max_conns: 2,
+        },
+        Spec {
+            backbone: "bb0",
             post: false,
             max_conns: 2,
         },

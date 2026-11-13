@@ -36,7 +36,9 @@ impl Rig {
         assert_eq!(self.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
         assert_eq!(self.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
         assert_eq!(self.outbox(&s).stage, OutboxStage::Release);
+        assert_eq!(self.outbox(&s).cursor, 0);
         self.bridge.jobs.take();
+        self.bridge.clock.advance_secs(1);
         (s, plan)
     }
 
@@ -342,24 +344,45 @@ async fn release_deletes_the_safety_copy_on_fresh_evidence() {
     assert_eq!(cold, fetch::ColdFetch::Filled(s.cipher.clone()));
 }
 
-/// An earlier pass is not enough: the release reads every backbone again,
-/// and an article that has gone missing since keeps the safety copy.
+/// An earlier pass is not enough: the release reads every backbone again.
+/// An article that has gone missing since keeps the safety copy and sends
+/// the extent back to verify, which records the loss after its waits.
 #[tokio::test]
 async fn release_needs_fresh_evidence() {
     let rig = two_backbone_rig().await;
     let (s, plan) = rig.verified_on_two(11).await;
     rig.servers[1].hide(&plan[0].message_id).await;
+    let now = rig.bridge.clock.now();
 
-    let delay = retry_delay(&rig.run(&s, OutboxStage::Release).await);
-    assert_eq!(delay, backoff(rig.outbox(&s).attempts));
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert!(rig.safety_held(&s));
-    let outbox = rig.outbox(&s);
-    assert_eq!(outbox.stage, OutboxStage::Release);
-    assert_eq!(outbox.last_error, Some(FailClass::MissingPending));
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    assert_eq!(outbox.next_at, now);
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
 
+    // Verify walks its waits and then records the second backbone's loss.
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    for wait in MISSING_BACKOFF_SECS {
+        assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), wait);
+        rig.bridge.clock.advance_secs(wait);
+    }
+    let last = rig.run(&s, OutboxStage::Verify).await;
+    assert_eq!(retry_delay(&last), REVERIFY_SECS);
+    let status = rig.bridge.catalog.backbone_status(&s.extent).await.unwrap();
+    let bb1 = status.iter().find(|b| b.backbone == "bb1").unwrap();
+    assert_eq!((bb1.result, bb1.counts), (VerifyResult::Missing, false));
+    assert!(rig.safety_held(&s));
+
+    // The article comes back: verify passes and the release goes through.
     rig.servers[1].unhide(&plan[0].message_id).await;
-    rig.bridge.clock.advance_secs(delay);
+    rig.bridge.clock.advance_secs(REVERIFY_SECS);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert!(!rig.bridge.safety.contains(&s.extent.safety_key()));
 }
@@ -378,16 +401,63 @@ async fn newer_failure_cancels_pass() {
     client.post_article(id, &planted).await.unwrap();
     client.quit().await;
 
-    assert_eq!(
-        retry_delay(&rig.run(&s, OutboxStage::Release).await),
-        REVERIFY_SECS
-    );
+    let now = rig.bridge.clock.now();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert!(rig.safety_held(&s));
-    assert_eq!(rig.outbox(&s).last_error, Some(FailClass::Corrupt));
+    // Back to verify, which re-checks after the long wait.
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    assert_eq!(outbox.next_at, now.plus_secs(REVERIFY_SECS));
     let status = rig.bridge.catalog.backbone_status(&s.extent).await.unwrap();
     let bb1 = status.iter().find(|b| b.backbone == "bb1").unwrap();
     assert_eq!(bb1.result, VerifyResult::Corrupt);
     assert!(!bb1.counts);
+}
+
+/// Two accounts on one backbone are one copy: they never add up to the
+/// two backbones a release needs.
+#[tokio::test]
+async fn same_backbone_counts_once() {
+    let rig = shared_backbone_rig().await;
+    let (s, _) = rig.posted(18).await;
+    rig.propagate(&s, 0, 1).await;
+
+    // One job covers the backbone; the second account is not a second pass.
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.rows(&s).len(), 1);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert!(rig.sent_stages().is_empty());
+    assert!(rig.safety_held(&s));
+
+    // Even a release job that runs anyway deletes nothing.
+    let to_release = |e: &mut Entry| e.outbox.stage = OutboxStage::Release;
+    rig.bridge.catalog.edit(&s.extent, to_release);
+    rig.bridge.clock.advance_secs(1);
+    let outcome = rig.run(&s, OutboxStage::Release).await;
+    assert_eq!(retry_delay(&outcome), REVERIFY_SECS);
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+}
+
+/// A result left behind by a backbone that is no longer configured does
+/// not count towards a release.
+#[tokio::test]
+async fn removed_backbone_does_not_count() {
+    let mut rig = two_backbone_rig().await;
+    let (s, _) = rig.posted(19).await;
+    rig.propagate(&s, 0, 1).await;
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+
+    // The second backbone is dropped from the configuration.
+    rig.bridge.cfg.providers.truncate(1);
+    let to_verify = |e: &mut Entry| e.outbox.stage = OutboxStage::Verify;
+    rig.bridge.catalog.edit(&s.extent, to_verify);
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert!(rig.safety_held(&s));
 }
 
 /// A job died between the release decision and the delete: the next job
