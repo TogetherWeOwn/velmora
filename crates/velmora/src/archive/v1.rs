@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{fmt, future::Future};
 
 /// Version of the portable archive contract.
 pub const API_VERSION: u16 = 1;
@@ -141,6 +141,39 @@ impl Range {
         }
         Ok(end)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Read,
+    Write,
+    AbortIncomplete,
+    Health,
+}
+
+/// Trusted product authority and invocation control. Derive this from verified
+/// authentication and current policy, never client-supplied boolean fields.
+/// Transports must enforce it during I/O, including physical closure and pool
+/// leases until closure is proven. Boundary checks cannot cancel remote effects.
+/// `check` is synchronous and fail closed.
+pub trait Control {
+    fn check(&self, target: &Target, action: Action) -> Result<()>;
+
+    /// Wait for cancellation, expiry or revocation of this exact action. Register
+    /// the wake source before checking policy to avoid a lost notification. The
+    /// future must wake even when the underlying socket makes no progress.
+    fn cancelled<'a>(
+        &'a self,
+        target: &'a Target,
+        action: Action,
+    ) -> impl Future<Output = Failure> + 'a;
+}
+
+pub trait Sink {
+    /// Receives only complete-part-verified ciphertext, in <=64 KiB blocks.
+    /// A later error can leave an earlier prefix: stage invisibly, never publish
+    /// or serve a prefix as a complete object. Cancellation does not undo writes.
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> impl Future<Output = Result<()>> + 'a;
 }
 
 /// SHA-256 of the supplied bytes, without any authentication claim.
