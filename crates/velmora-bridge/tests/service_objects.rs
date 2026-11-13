@@ -330,6 +330,60 @@ async fn unauthenticated_body_never_read() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn edge_added_headers_are_ignored() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let edge = [
+        ("cf-connecting-ip", "203.0.113.7"),
+        ("cf-ipcity", "S\u{e3}o Paulo"),
+        ("cf-ray", "8f0000000000abcd-GRU"),
+        ("x-forwarded-for", "203.0.113.7, 198.51.100.2"),
+        ("x-forwarded-proto", "https"),
+        ("x-real-ip", "203.0.113.7"),
+        ("true-client-ip", "203.0.113.7"),
+        ("cdn-loop", "edge; loops=1"),
+    ];
+    let with_edge = |mut req: Req| {
+        for (name, value) in edge {
+            req.headers.push((name.to_string(), value.to_string()));
+        }
+        req
+    };
+    let put = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, "k"),
+        &[],
+        &[],
+        b"payload".to_vec(),
+    );
+    rig.send(with_edge(put)).await.expect(200);
+    let head = signer.sign(
+        rig.now(),
+        Method::Head,
+        &path(BUCKET, "k"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    rig.send(with_edge(head)).await.expect(200);
+
+    // They cannot stand in for a signature.
+    let mut unsigned = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, "k2"),
+        &[],
+        &[],
+        b"payload".to_vec(),
+    );
+    unsigned.headers.retain(|(n, _)| n != "authorization");
+    let (resp, polled) = rig.send_watched(with_edge(unsigned)).await;
+    resp.expect_error(403, "AccessDenied");
+    assert!(!polled);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn denials_do_not_reveal_what_exists() {
     let rig = rig();
     let (_, signer) = rig.standard(BUCKET).await;

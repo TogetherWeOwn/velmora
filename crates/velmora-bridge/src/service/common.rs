@@ -190,6 +190,15 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     (!akid.is_empty()).then(|| akid.to_owned())
 }
 
+/// Headers the edge adds. They are never signed and their values are not
+/// always printable ASCII, so they are dropped before header validation.
+/// Dropping a header can only fail a signature, never satisfy one.
+pub(super) fn edge_header(name: &str) -> bool {
+    name.starts_with("cf-")
+        || name.starts_with("x-forwarded-")
+        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
+}
+
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A missing bucket, an unknown or disabled
 /// key and a missing grant are indistinguishable (`AccessDenied`).
@@ -210,6 +219,7 @@ where
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
+        .filter(|(n, _)| !edge_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).map_err(s3_error)?;
