@@ -11,11 +11,13 @@ use super::{canonical_request, decimal, hex, unhex, ErrorCode, Headers, Policy, 
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
-/// Headers that are single-valued by definition, so a comma in their value is
-/// literal. Any other signed header whose value contains a comma is rejected:
-/// an edge that merges duplicate fields into one `", "`-joined value makes a
-/// merged duplicate indistinguishable from a literal comma.
-pub const SINGLE_VALUE_HEADERS: [&str; 9] = [
+/// Headers whose commas are taken literally. Any other signed header whose value
+/// contains a comma is rejected: an edge that merges duplicate fields into one
+/// `", "`-joined value makes a merged duplicate indistinguishable from a literal
+/// comma. The standard headers listed here are safe to take literally because a
+/// merged duplicate (`a, b`) never canonicalises like the client's signed
+/// duplicate (`a,b`), so it fails closed with SignatureDoesNotMatch.
+pub const SINGLE_VALUE_HEADERS: [&str; 19] = [
     "host",
     "content-type",
     "content-md5",
@@ -25,6 +27,16 @@ pub const SINGLE_VALUE_HEADERS: [&str; 9] = [
     "x-amz-content-sha256",
     "x-amz-security-token",
     "x-amz-copy-source",
+    "expires",
+    "date",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-match",
+    "if-none-match",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

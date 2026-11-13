@@ -105,9 +105,8 @@ fn signed_comma_duplicate_rejected() {
     // the same name are combined the same way: both are refused when signed.
     for fields in [
         vec![("x-amz-meta-a", "1, 2")],
-        vec![("cache-control", "public"), ("cache-control", "no-store")],
-        vec![("cache-control", "private, no-store")],
-        vec![("expires", "Sat, 25 May 2013 00:00:00 GMT")],
+        vec![("x-amz-meta-b", "a,b")],
+        vec![("x-test", "one"), ("x-test", "two")],
     ] {
         let signed = format!("{};{base}", fields[0].0);
         let signed = {
@@ -162,6 +161,16 @@ fn single_value_headers_keep_literal_commas() {
             "x-amz-content-sha256",
             "x-amz-security-token",
             "x-amz-copy-source",
+            "expires",
+            "date",
+            "if-modified-since",
+            "if-unmodified-since",
+            "if-match",
+            "if-none-match",
+            "cache-control",
+            "content-disposition",
+            "content-encoding",
+            "content-language",
         ]
     );
     let t = Target::parse("/bucket/key", &policy()).unwrap();
@@ -175,6 +184,33 @@ fn single_value_headers_keep_literal_commas() {
         "content-type;host;range;x-amz-content-sha256;x-amz-date",
     );
     assert_eq!(check("GET", &t, &all).unwrap().principal, "p");
+}
+
+#[test]
+fn signed_cache_control_with_commas_verifies() {
+    let t = Target::parse("/bucket/key", &policy()).unwrap();
+    let signed = "cache-control;host;x-amz-content-sha256;x-amz-date";
+    let all = sign(
+        "GET",
+        &t,
+        &[("cache-control", "public, max-age=60")],
+        signed,
+    );
+    assert_eq!(check("GET", &t, &all).unwrap().principal, "p");
+    // A duplicate the client signed as two fields ("public,no-store") but the
+    // edge merged into one ("public, no-store") fails closed, never verifies.
+    let mut all = sign(
+        "GET",
+        &t,
+        &[("cache-control", "public"), ("cache-control", "no-store")],
+        signed,
+    );
+    all.retain(|(k, _)| k != "cache-control");
+    all.push(("cache-control".into(), "public, no-store".into()));
+    assert_eq!(
+        check("GET", &t, &all).unwrap_err(),
+        ErrorCode::SignatureDoesNotMatch
+    );
 }
 
 #[test]

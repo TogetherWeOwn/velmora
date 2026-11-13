@@ -1,10 +1,9 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/tests/s3_contract.rs. License: MIT.
 // Copied verbatim except: line 1 `use qerith_core::s3::*;` -> `use velmora_s3_proto::*;`, which rustfmt then sorts after `use serde_json::Value;`; this header.
-// Changed for S3 STANDARD semantics and the signed comma-value rule: the cold-archive
-// (restore/unavailable) cases are removed, `plan_read` lost its `available` argument,
-// storage-class assertions expect STANDARD, and the `signed-metadata` vector (signed
-// Cache-Control and Expires values contain commas) now expects InvalidRequest.
+// Changed for S3 STANDARD semantics: the cold-archive (restore/unavailable) cases are
+// removed, `plan_read` lost its `available` argument, and storage-class assertions
+// expect STANDARD.
 
 use serde_json::Value;
 use velmora_s3_proto::*;
@@ -122,23 +121,7 @@ fn static_botocore_canonical_and_signature_goldens() {
             "{}",
             v["name"]
         );
-        if v["name"] == "signed-metadata" {
-            // Signed comma-bearing values off the single-value allow-list are
-            // refused before the signature is computed (possible merged duplicates).
-            assert_eq!(
-                verify(
-                    v["method"].as_str().unwrap(),
-                    &target,
-                    &h,
-                    true,
-                    NOW,
-                    &p,
-                    &authority()
-                )
-                .unwrap_err(),
-                ErrorCode::InvalidRequest
-            );
-        } else if !v["canonical_only"].as_bool().unwrap() {
+        if !v["canonical_only"].as_bool().unwrap() {
             let result = verify(
                 v["method"].as_str().unwrap(),
                 &target,
@@ -696,6 +679,15 @@ fn authenticated_metadata_survives_commit_and_read_without_whitespace_folding() 
         (
             "metadata-token-name",
             vec![("x-amz-meta-file_name!#$%&'*+-.^`|~", "a\t b   c")],
+        ),
+        (
+            "signed-metadata",
+            vec![
+                ("content-disposition", "attachment; filename=\"a  b.txt\""),
+                ("cache-control", "private, no-store"),
+                ("expires", "Sat, 25 May 2013 00:00:00 GMT"),
+                ("content-language", "en"),
+            ],
         ),
     ] {
         let v = fixture(name);
