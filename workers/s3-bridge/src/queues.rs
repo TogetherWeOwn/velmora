@@ -44,9 +44,19 @@ impl DropNotify {
 
     /// `true` = drop this send (and count it).
     fn take(&self) -> bool {
-        self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate while its replacement is above the MSRV.
+        let mut n = self.0.load(Ordering::Relaxed);
+        while n > 0 {
+            match self
+                .0
+                .compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
+        false
     }
 
     #[cfg(test)]
