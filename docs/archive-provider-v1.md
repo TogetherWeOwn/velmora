@@ -25,7 +25,10 @@ parts of at most 8 MiB each and checks their combined length. An empty object
 uses one explicit empty part. Callers must compute the manifest from staged
 ciphertext and bound and authorize serialized metadata before decoding it;
 validation after deserialization cannot prevent an unbounded decoder allocation.
-Validation does not establish digest correctness or durability.
+Validation does not establish digest correctness or durability. The product's
+journal or outbox must survive process loss; these values are not a database.
+Persist the exact intent and operation binding before I/O, the remote session
+before parts, and each receipt before acknowledging it.
 
 `Range::end` checks offset plus byte count against the committed length before
 I/O, including arithmetic overflow. A zero-byte range is valid at EOF; validation

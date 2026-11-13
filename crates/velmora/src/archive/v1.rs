@@ -17,6 +17,8 @@ pub const API_VERSION: u16 = 1;
 pub const MAX_PART_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum number of parts in a manifest.
 pub const MAX_PARTS: usize = 10_000;
+/// Maximum bytes per verified output block in a future streaming implementation.
+pub const STREAM_BLOCK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
@@ -396,6 +398,35 @@ mod tests {
     }
 
     #[test]
+    fn manifest_part_count_and_declared_length_boundaries() {
+        let mut intent = WriteIntent {
+            target: identity().target,
+            operation: id("operation"),
+            bytes: MAX_PARTS as u64,
+            sha256: digest(b"all"),
+            parts: (0..MAX_PARTS)
+                .map(|index| Part {
+                    offset: index as u64,
+                    bytes: 1,
+                    sha256: digest(b"x"),
+                    reference: id(&format!("part-{index}")),
+                })
+                .collect(),
+        };
+        assert_eq!(intent.validate(), Ok(()));
+        intent.bytes = u64::MAX;
+        assert_eq!(intent.validate(), Err(Failure::Integrity));
+        intent.bytes = MAX_PARTS as u64 + 1;
+        intent.parts.push(Part {
+            offset: MAX_PARTS as u64,
+            bytes: 1,
+            sha256: digest(b"x"),
+            reference: id("extra"),
+        });
+        assert_eq!(intent.validate(), Err(Failure::Limit));
+    }
+
+    #[test]
     fn intent_binding_and_part_checks_are_stable_and_fail_closed() {
         let mut intent = WriteIntent {
             target: identity().target,
@@ -545,6 +576,7 @@ mod tests {
     fn api_version_is_one() {
         let version: u16 = crate::archive::v1::API_VERSION;
         assert_eq!(version, 1);
+        assert_eq!(STREAM_BLOCK_BYTES, 64 * 1024);
     }
 
     #[test]
