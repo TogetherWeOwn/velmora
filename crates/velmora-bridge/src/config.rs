@@ -28,6 +28,9 @@ pub const MAX_CONNS_LIMIT: u32 = 64;
 /// version up to the active one, so the loop must stay bounded.
 pub const MAX_KEK_VERSION: u32 = 1024;
 
+/// Ports a TLS provider may use (the engine's pinned-TLS policy).
+pub const TLS_PORTS: [u16; 2] = [119, 563];
+
 /// Shortest accepted `ADMIN_TOKEN` (characters).
 pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
 
@@ -292,6 +295,11 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
         }
         if !p.tls && !dev {
             return Err(ConfigError::Refused("plaintext NNTP provider outside dev"));
+        }
+        // The engine's pinned-TLS policy connects to these ports only; refuse
+        // anything else here rather than failing on every connect.
+        if p.tls && !TLS_PORTS.contains(&p.port) {
+            return Err(bad());
         }
     }
     if !providers.iter().any(|p| p.post) || !providers.iter().any(|p| p.read) {

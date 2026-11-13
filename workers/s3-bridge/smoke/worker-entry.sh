@@ -6,7 +6,8 @@
 # Run against `npx wrangler@4 dev --env dev --local --port <p>` with a
 # throwaway `.dev.vars`. The round trip needs the base URL's host:port to
 # equal S3_HOST (the host clients sign), the S3 handlers and the admin
-# routes; until those exist it prints SKIP and exits 0.
+# routes; until those exist it prints SKIP, and the last line says so.
+# Set REQUIRE_ROUND_TRIP=1 to make a skip fail the run.
 #
 # Secrets never reach argv, `set -x` output or the log: the admin bearer
 # and the S3 key live in 0600 temp files read by curl (`-H @file`, `-K`).
@@ -29,6 +30,7 @@ printf 'Authorization: Bearer %s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | t
 SIG='Authorization: AWS4-HMAC-SHA256 Credential=AKVLSMOKE0000000000/20261113/auto/s3/aws4_request, SignedHeaders=host, Signature=00'
 
 fails=0
+skips=0
 expect() { # label, want-status, want-code ('-' = any), curl args...
   local label=$1 want=$2 want_code=$3
   shift 3
@@ -89,6 +91,7 @@ round_trip() {
     --data "{\"name\":\"$bucket\",\"disposable\":true}" "$BASE/_admin/buckets")
   if [[ $status == 501 ]]; then
     echo "SKIP deployed_signed_put_get: admin routes not implemented yet"
+    skips=$((skips + 1))
     return 0
   fi
   [[ $status == 2* ]] || { echo "FAIL create bucket: HTTP $status"; return 1; }
@@ -104,7 +107,9 @@ round_trip() {
     -H "x-amz-content-sha256: $(sha256sum "$TMP/obj" | cut -d' ' -f1)" \
     --data-binary @"$TMP/obj" "$BASE/$bucket/$key")
   if [[ $status == 501 ]]; then
-    echo "SKIP deployed_signed_put_get: S3 handlers not implemented yet"
+    # The disposable bucket and key stay behind (no delete route yet).
+    echo "SKIP deployed_signed_put_get: S3 handlers not implemented yet (left disposable bucket $bucket)"
+    skips=$((skips + 1))
     return 0
   fi
   [[ $status == 200 ]] || { echo "FAIL signed PUT: HTTP $status"; return 1; }
@@ -120,5 +125,10 @@ round_trip || fails=$((fails + 1))
 if ((fails)); then
   echo "$fails check(s) failed"
   exit 1
+fi
+if ((skips)); then
+  echo "checks passed, $skips skipped: deployed_signed_put_get NOT demonstrated"
+  [[ ${REQUIRE_ROUND_TRIP:-0} == 1 ]] && exit 1
+  exit 0
 fi
 echo "all checks passed"

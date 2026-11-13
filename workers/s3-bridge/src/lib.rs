@@ -14,11 +14,14 @@ mod nntp;
 mod queues;
 mod r2;
 
+use std::cell::RefCell;
+use std::future::poll_fn;
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 
 use velmora_bridge::ingress;
 use velmora_bridge::service::classify;
-use velmora_bridge::{BridgeError, Job, JobOutcome};
+use velmora_bridge::{BridgeError, Job, JobOutcome, S3Response};
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt,
     QueueRetryOptionsBuilder, Request, Response, Result, ScheduleContext, ScheduledEvent,
@@ -40,8 +43,46 @@ fn error_class(e: &BridgeError) -> &'static str {
     }
 }
 
+/// One-shot hand-off of the handler's response to the fetch future.
+#[derive(Default)]
+struct Slot {
+    resp: Option<S3Response>,
+    waker: Option<Waker>,
+}
+
+/// Runs `Bridge::handle` under `waitUntil`, so a client disconnect does not
+/// strand it mid-await: the runtime keeps driving it, a withheld body then
+/// fails its read, and every budget `Charge` it holds is dropped.
+async fn handle_detached(
+    ctx: &Context,
+    bridge: Rc<env::WorkerBridge>,
+    req: velmora_bridge::S3Request,
+) -> S3Response {
+    let slot = Rc::new(RefCell::new(Slot::default()));
+    let tx = Rc::clone(&slot);
+    ctx.wait_until(async move {
+        let resp = bridge.handle(req).await;
+        let mut s = tx.borrow_mut();
+        s.resp = Some(resp);
+        if let Some(w) = s.waker.take() {
+            w.wake();
+        }
+    });
+    poll_fn(|cx| {
+        let mut s = slot.borrow_mut();
+        match s.resp.take() {
+            Some(resp) => Poll::Ready(resp),
+            None => {
+                s.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.inner().method();
     let request_id = req
         .headers()
@@ -70,7 +111,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let route = classify(&incoming.req.method, &target);
     let resp = match ingress::precheck(&route, &incoming.req, &bridge.cfg, incoming.https) {
         Err(e) => e.response(),
-        Ok(()) => Rc::clone(&bridge).handle(incoming.req).await,
+        Ok(()) => handle_detached(&ctx, Rc::clone(&bridge), incoming.req).await,
     };
     console_log!(
         "{}",

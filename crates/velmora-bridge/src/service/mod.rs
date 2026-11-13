@@ -127,7 +127,7 @@ fn decode_name(name: &str) -> Option<Vec<u8>> {
 }
 
 /// Decoded query parameter names; `None` if any name is malformed.
-fn query_names(query: &str) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn query_names(query: &str) -> Option<Vec<Vec<u8>>> {
     query
         .split('&')
         .filter(|p| !p.is_empty())

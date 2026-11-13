@@ -181,6 +181,9 @@ fn https_comes_from_the_runtime_scheme() {
     assert!(ingress::is_https("HTTPS://h/b"));
     assert!(!ingress::is_https("http://h/b"));
     assert!(!ingress::is_https("http"));
+    // Never panics on a multi-byte character across byte 8.
+    assert!(!ingress::is_https("https:/€/h"));
+    assert!(!ingress::is_https("httpsé://h/"));
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +273,24 @@ fn unauthenticated_body_never_read() {
         Body::Empty,
     );
     assert_eq!(check(&presigned, &cfg, true), Ok(()));
+    // Names are matched decoded, as the SigV4 target parser reads them.
+    let encoded = request(
+        Method::Get,
+        "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signatur%65=00",
+        &[],
+        Body::Empty,
+    );
+    assert_eq!(check(&encoded, &cfg, true), Ok(()));
+    let lookalike = request(
+        Method::Get,
+        "/bucket/key?x-amz-signature=00&X-Amz-Signature-x=1",
+        &[],
+        Body::Empty,
+    );
+    assert_eq!(
+        check(&lookalike, &cfg, true),
+        Err(IngressError::AccessDenied)
+    );
 }
 
 #[test]
@@ -725,4 +746,31 @@ fn kek_active_is_bounded() {
     use velmora_bridge::Kek as _;
     assert_eq!(ring.active().0, MAX_KEK_VERSION);
     assert!(ring.version(1).is_some());
+}
+
+#[test]
+fn tls_provider_port_must_be_119_or_563() {
+    let provider = |port: u16, tls: bool| {
+        format!(
+            r#"[{{"id":"p1","host":"nntp.invalid","port":{port},"tls":{tls},"user":"u","pass":"p","backbone":"bb1","post":true,"read":true,"max_conns":2}}]"#
+        )
+    };
+    let load = |providers: String| {
+        let mut v = vars(true);
+        v.insert("NNTP_PROVIDERS".into(), providers);
+        BridgeConfig::from_vars(|k| v.get(k).cloned())
+    };
+    assert_eq!(velmora_bridge::config::TLS_PORTS, [119, 563]);
+    for port in [119, 563] {
+        assert!(load(provider(port, true)).is_ok(), "tls port {port}");
+    }
+    for port in [1, 443, 562, 564, 8563, 11119, 65535] {
+        assert_eq!(
+            load(provider(port, true)).unwrap_err(),
+            ConfigError::Invalid("NNTP_PROVIDERS".into()),
+            "tls port {port}"
+        );
+    }
+    // Plaintext (dev only) is not bound by the TLS policy.
+    assert!(load(provider(11119, false)).is_ok());
 }

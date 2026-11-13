@@ -179,7 +179,9 @@ pub fn origin_form(url: &str) -> Result<&str, IngressError> {
 /// `true` when the runtime's URL says `https`. Only the runtime's own URL is
 /// trusted, never `X-Forwarded-Proto` or `Forwarded`.
 pub fn is_https(url: &str) -> bool {
-    url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://")
+    url.as_bytes()
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"))
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +250,12 @@ pub fn has_s3_credential(req: &S3Request) -> bool {
     if header(req, "authorization").is_some_and(|v| !v.trim().is_empty()) {
         return true;
     }
+    // Names decoded as the router and the SigV4 target parser decode them.
     let query = req.raw_target.split_once('?').map_or("", |(_, q)| q);
-    query.split('&').any(|p| {
-        let name = p.split_once('=').map_or(p, |(n, _)| n);
-        name == "X-Amz-Signature" || name == "X-Amz-Credential"
+    crate::service::query_names(query).is_some_and(|names| {
+        names
+            .iter()
+            .any(|n| n.as_slice() == b"X-Amz-Signature" || n.as_slice() == b"X-Amz-Credential")
     })
 }
 
