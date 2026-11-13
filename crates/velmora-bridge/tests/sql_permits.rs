@@ -291,12 +291,12 @@ async fn pool_shared_permits_never_exceed_the_pool_limit() {
         pool_peak = pool_peak.max(in_pool);
         assert!(in_pool <= POOL_MAX, "round {round}: {in_pool} held");
         assert_eq!(held(&c, now).await, i64::from(in_pool));
-        for account in &accounts {
+        for (member, account) in accounts.iter().enumerate() {
             let own = live
                 .iter()
                 .filter(|(p, _)| p.provider == account.id)
                 .count() as u32;
-            assert!(own <= account.max_conns, "round {round}: {}", account.id);
+            assert!(own <= account.max_conns, "round {round}: member {member}");
         }
         let background = live
             .iter()
