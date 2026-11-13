@@ -4,7 +4,8 @@
 //!
 //! - [`RusqliteSql`]: `Sql` over an in-memory SQLite with the D1 schema;
 //!   `batch` is one transaction that rolls back entirely on any failure.
-//! - [`MemBlobStore`]: `BlobStore` in memory, with stored metadata.
+//! - [`MemBlobStore`]: `BlobStore` in memory, with stored metadata; `put`
+//!   refuses bytes whose SHA-256 differs from `cipher_sha256`, as R2 does.
 //! - [`FixedClock`]: settable `Clock`.
 //! - [`FakeJobs`]: records sends; `drop_next(n)` loses the next `n`.
 //! - [`TestKek`]: fixed, non-secret KEKs.
@@ -14,6 +15,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection};
+use sha2::{Digest, Sha256};
 
 use crate::ports::{
     BlobMeta, BlobStore, Clock, JobSink, Kek, Row, Sql, SqlValue, MAX_QUEUE_DELAY_SECS,
@@ -175,6 +177,10 @@ pub struct StoredBlob {
 
 /// In-memory `BlobStore`. A span past the end is an error (callers always
 /// derive spans from catalogue sizes).
+///
+/// `put` checks the bytes against `meta.cipher_sha256` the way the R2
+/// adapter asks R2 to: on a mismatch it fails with `BridgeError::Blob` and
+/// stores nothing (an existing blob under the key is left untouched).
 #[derive(Default)]
 pub struct MemBlobStore {
     blobs: RefCell<BTreeMap<String, StoredBlob>>,
@@ -211,6 +217,10 @@ impl MemBlobStore {
 
 impl BlobStore for MemBlobStore {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if digest != *meta.cipher_sha256 {
+            return Err(BridgeError::Blob("mem: put digest mismatch".into()));
+        }
         self.blobs.borrow_mut().insert(
             key.to_string(),
             StoredBlob {

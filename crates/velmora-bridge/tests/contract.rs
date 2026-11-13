@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, MAX_EXTENT_BYTES_LIMIT,
 };
@@ -944,10 +945,11 @@ async fn contract_compiles_against_fakes() {
     // Blob store: put with metadata, ranged get, head, delete.
     let blobs = MemBlobStore::new();
     let (b, x) = (BucketId::mint([2; 8]), ExtentId::mint([2; 13]));
+    let digest: [u8; 32] = Sha256::digest(b"0123456789").into();
     let meta = BlobMeta {
         bucket: &b,
         extent: &x,
-        cipher_sha256: &[9; 32],
+        cipher_sha256: &digest,
     };
     blobs
         .put(&x.safety_key(), b"0123456789".to_vec(), &meta)
@@ -963,10 +965,7 @@ async fn contract_compiles_against_fakes() {
         .get(&x.safety_key(), Some(ByteSpan { start: 8, len: 3 }))
         .await
         .is_err());
-    assert_eq!(
-        blobs.stored(&x.safety_key()).unwrap().cipher_sha256,
-        [9; 32]
-    );
+    assert_eq!(blobs.stored(&x.safety_key()).unwrap().cipher_sha256, digest);
     blobs.delete(&x.safety_key()).await.unwrap();
     blobs.delete(&x.safety_key()).await.unwrap();
     assert_eq!(blobs.get(&x.safety_key(), None).await.unwrap(), None);
@@ -1278,4 +1277,51 @@ fn fail_classes_are_fixed_strings() {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'-'));
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mem_blob_store_refuses_a_digest_mismatch() {
+    // Same rule as the R2 adapter: the store checks the bytes against
+    // `cipher_sha256` and refuses a mismatch without storing anything.
+    let blobs = MemBlobStore::new();
+    let (b, x) = (BucketId::mint([3; 8]), ExtentId::mint([3; 13]));
+    let good: [u8; 32] = Sha256::digest(b"original").into();
+    let meta = |d| BlobMeta {
+        bucket: &b,
+        extent: &x,
+        cipher_sha256: d,
+    };
+
+    // A wrong digest on an absent key stores nothing.
+    let wrong = [0u8; 32];
+    let err = blobs
+        .put(&x.cache_key(), b"original".to_vec(), &meta(&wrong))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BridgeError::Blob(_)), "{err:?}");
+    assert!(!blobs.contains(&x.cache_key()));
+
+    // A matching digest stores; one flipped byte against the same digest
+    // is refused and leaves the stored blob untouched.
+    blobs
+        .put(&x.cache_key(), b"original".to_vec(), &meta(&good))
+        .await
+        .unwrap();
+    let err = blobs
+        .put(&x.cache_key(), b"origina1".to_vec(), &meta(&good))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BridgeError::Blob(_)), "{err:?}");
+    assert_eq!(
+        blobs.get(&x.cache_key(), None).await.unwrap(),
+        Some(b"original".to_vec())
+    );
+
+    // The empty blob has a digest too.
+    let empty: [u8; 32] = Sha256::digest(b"").into();
+    blobs
+        .put(&x.safety_key(), Vec::new(), &meta(&empty))
+        .await
+        .unwrap();
+    assert_eq!(blobs.head(&x.safety_key()).await.unwrap(), Some(0));
 }
