@@ -619,6 +619,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "meta",
             "objects",
             "outbox",
+            "provider_health",
             "provider_permits",
             "tx_guard",
             "upload_parts",
@@ -1324,4 +1325,125 @@ async fn mem_blob_store_refuses_a_digest_mismatch() {
         .await
         .unwrap();
     assert_eq!(blobs.head(&x.safety_key()).await.unwrap(), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// Provider pool settings in `NNTP_PROVIDERS`
+// ---------------------------------------------------------------------------
+
+/// One provider entry with the old fields, then `extra` (JSON members).
+fn provider_json(id: &str, extra: &str) -> String {
+    let sep = if extra.is_empty() { "" } else { "," };
+    format!(
+        r#"{{"id":"{id}","host":"nntp.invalid","port":563,"tls":true,"user":"u-fixture","pass":"p-fixture","backbone":"bb-{id}","post":true,"read":true,"max_conns":2{sep}{extra}}}"#
+    )
+}
+
+fn providers_of(entries: &[String]) -> std::result::Result<Vec<ProviderConfig>, ConfigError> {
+    let (prod, _) = wrangler_vars();
+    let json = format!("[{}]", entries.join(","));
+    load(&with_secrets(prod, &json)).map(|cfg| cfg.providers)
+}
+
+/// A provider list written before the pool settings existed still loads,
+/// and means what it meant: first priority, no retention limit, no pool,
+/// enabled.
+#[test]
+fn old_provider_config_parses_with_pool_defaults() {
+    let (prod, _) = wrangler_vars();
+    let cfg = load(&with_secrets(prod, PROVIDER_TLS)).unwrap();
+    assert_eq!(cfg.providers.len(), 1);
+    let p = &cfg.providers[0];
+    assert_eq!(
+        (p.id.as_str(), p.max_conns, p.post, p.read),
+        ("p1", 2, true, true)
+    );
+    assert_eq!(p.priority, 0);
+    assert_eq!(p.retention_days, None);
+    assert_eq!(p.pool, None);
+    assert_eq!(p.pool_max_conns, None);
+    assert!(p.enabled);
+    // No retention limit: every article is in reach, whatever its age.
+    let now = UnixMs(1_800_000_000_000);
+    assert!(p.retains(Some(UnixMs(0)), now));
+    assert!(p.retains(None, now));
+}
+
+#[test]
+fn provider_pool_settings_parse() {
+    let pool = r#""pool":"bundle","pool_max_conns":3"#;
+    let providers = providers_of(&[
+        provider_json("a", &format!(r#""priority":1,"retention_days":30,{pool}"#)),
+        provider_json("b", &format!(r#"{pool},"enabled":false"#)),
+        provider_json("c", ""),
+    ])
+    .unwrap();
+    let a = &providers[0];
+    assert_eq!((a.priority, a.retention_days), (1, Some(30)));
+    assert_eq!(
+        (a.pool.as_deref(), a.pool_max_conns),
+        (Some("bundle"), Some(3))
+    );
+    assert!(a.enabled && !providers[1].enabled && providers[2].enabled);
+
+    // Retention is counted from the article's posting time.
+    const DAY_MS: i64 = 86_400_000;
+    let now = UnixMs(1_800_000_000_000);
+    assert!(a.retains(Some(now.plus_ms(-30 * DAY_MS)), now));
+    assert!(!a.retains(Some(now.plus_ms(-30 * DAY_MS - 1)), now));
+    // An article with no posting time is not ruled out.
+    assert!(a.retains(None, now));
+}
+
+#[test]
+fn provider_pool_settings_fail_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+    let pool = |max: &str| format!(r#""pool":"bundle","pool_max_conns":{max}"#);
+
+    // A pool and its limit come together.
+    assert_eq!(one(r#""pool":"bundle""#), invalid);
+    assert_eq!(one(r#""pool_max_conns":3"#), invalid);
+    assert_eq!(one(r#""pool":"","pool_max_conns":3"#), invalid);
+    assert_eq!(one(&pool("0")), invalid);
+    assert_eq!(one(&pool("100000")), invalid);
+    let long = format!(r#""pool":"{}","pool_max_conns":3"#, "x".repeat(65));
+    assert_eq!(one(&long), invalid);
+    // Every account of a pool states the same limit.
+    assert_eq!(
+        providers_of(&[
+            provider_json("a", &pool("3")),
+            provider_json("b", &pool("4"))
+        ]),
+        invalid
+    );
+    assert!(providers_of(&[
+        provider_json("a", &pool("3")),
+        provider_json("b", &pool("3"))
+    ])
+    .is_ok());
+
+    // Values of the wrong shape or range.
+    assert_eq!(one(r#""retention_days":0"#), invalid);
+    assert_eq!(one(r#""retention_days":-1"#), invalid);
+    assert_eq!(one(r#""priority":256"#), invalid);
+    assert_eq!(one(r#""priority":"high""#), invalid);
+    assert_eq!(one(r#""enabled":"no""#), invalid);
+    assert_eq!(one(r#""prority":1"#), invalid, "unknown field");
+
+    // A disabled provider cannot be the only one that posts or reads.
+    assert_eq!(one(r#""enabled":false"#), invalid);
+    let read_only = provider_json("b", "").replace(r#""post":true"#, r#""post":false"#);
+    assert_eq!(
+        providers_of(&[provider_json("a", r#""enabled":false"#), read_only.clone()]),
+        invalid
+    );
+    assert!(providers_of(&[provider_json("a", ""), read_only]).is_ok());
+
+    // The list itself is bounded.
+    let many: Vec<String> = (0..33)
+        .map(|i| provider_json(&format!("p{i}"), ""))
+        .collect();
+    assert_eq!(providers_of(&many), invalid);
+    assert!(providers_of(&many[..32]).is_ok());
 }

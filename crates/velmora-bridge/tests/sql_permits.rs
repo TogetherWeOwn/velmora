@@ -242,3 +242,184 @@ async fn lowered_max_conns_is_obeyed() {
     }
     assert_eq!(got, vec![1, 0]);
 }
+
+// ---------------------------------------------------------------------------
+// Pools: accounts that share one connection limit
+// ---------------------------------------------------------------------------
+
+fn pooled(id: &str, max_conns: u32, pool: &str, pool_max_conns: u32) -> ProviderConfig {
+    let mut p = provider(id, max_conns);
+    p.pool = Some(pool.into());
+    p.pool_max_conns = Some(pool_max_conns);
+    p
+}
+
+/// Three accounts of one pool under an interleaved schedule: no account
+/// passes its own `max_conns`, the accounts together never pass
+/// `pool_max_conns`, and background jobs leave the pool's read slot free.
+#[tokio::test]
+async fn pool_shared_permits_never_exceed_the_pool_limit() {
+    const POOL_MAX: u32 = 4;
+    let c = catalog();
+    let accounts = [
+        pooled("a", 3, "bundle", POOL_MAX),
+        pooled("b", 3, "bundle", POOL_MAX),
+        pooled("c", 2, "bundle", POOL_MAX),
+    ];
+    // Outside the pool: unaffected by it.
+    let alone = provider("z", 2);
+    let mut live: Vec<(Permit, PermitClass)> = Vec::new();
+    let mut pool_peak = 0;
+    let mut refused = 0;
+    for round in 0..120u32 {
+        let now = T0.plus_ms(i64::from(round));
+        let account = &accounts[(round % 3) as usize];
+        let class = if round % 4 == 0 {
+            PermitClass::Read
+        } else {
+            PermitClass::Background
+        };
+        match acquire(&c, account, class, now).await {
+            Some(permit) => live.push((permit, class)),
+            None => refused += 1,
+        }
+        if round % 5 == 4 {
+            let (permit, _) = live.remove(0);
+            c.release_permit(&permit).await.unwrap();
+        }
+        let in_pool = live.len() as u32;
+        pool_peak = pool_peak.max(in_pool);
+        assert!(in_pool <= POOL_MAX, "round {round}: {in_pool} held");
+        assert_eq!(held(&c, now).await, i64::from(in_pool));
+        for account in &accounts {
+            let own = live
+                .iter()
+                .filter(|(p, _)| p.provider == account.id)
+                .count() as u32;
+            assert!(own <= account.max_conns, "round {round}: {}", account.id);
+        }
+        let background = live
+            .iter()
+            .filter(|(_, class)| *class == PermitClass::Background)
+            .count() as u32;
+        assert!(background < POOL_MAX, "round {round}: no read slot left");
+        let slots: BTreeSet<(String, u32)> = live
+            .iter()
+            .map(|(p, _)| (p.provider.clone(), p.slot))
+            .collect();
+        assert_eq!(slots.len(), live.len(), "a slot is held twice");
+    }
+    assert_eq!(pool_peak, POOL_MAX);
+    assert!(refused > 0);
+
+    // The pool is full; a provider outside it still gets its slots.
+    while acquire(&c, &accounts[0], PermitClass::Read, T0.plus_ms(200))
+        .await
+        .is_some()
+    {}
+    assert!(acquire(&c, &alone, PermitClass::Read, T0.plus_ms(200))
+        .await
+        .is_some());
+}
+
+/// An expired slot of one account frees room for another account of the
+/// pool, and two pools do not count against each other.
+#[tokio::test]
+async fn pool_limit_counts_live_slots_of_its_own_pool_only() {
+    let c = catalog();
+    let a = pooled("a", 2, "one", 2);
+    let b = pooled("b", 2, "one", 2);
+    let other = pooled("c", 2, "two", 2);
+    for _ in 0..2 {
+        assert!(acquire(&c, &a, PermitClass::Read, T0).await.is_some());
+    }
+    assert!(acquire(&c, &b, PermitClass::Read, T0).await.is_none());
+    assert!(acquire(&c, &other, PermitClass::Read, T0).await.is_some());
+    // Both of `a`'s slots expire unreleased.
+    let later = T0.plus_ms(TTL_MS + 1);
+    assert!(acquire(&c, &b, PermitClass::Read, later).await.is_some());
+    assert!(acquire(&c, &b, PermitClass::Read, later).await.is_some());
+    assert!(acquire(&c, &a, PermitClass::Read, later).await.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Health and cooldown
+// ---------------------------------------------------------------------------
+
+async fn load_of(c: &SqlCatalog<RusqliteSql>, id: &str, now: UnixMs) -> Option<ProviderLoad> {
+    let all = c.provider_load(now).await.unwrap();
+    all.into_iter().find(|l| l.provider_id == id)
+}
+
+const MINUTE_MS: i64 = 60_000;
+
+/// Three failed sessions in a row start a one-minute cooldown. Each
+/// further failure after a cooldown doubles it, up to fifteen minutes.
+/// One good session clears everything.
+#[tokio::test]
+async fn cooldown_starts_after_repeated_failures_and_doubles() {
+    let c = catalog();
+    assert_eq!(load_of(&c, "p1", T0).await, None);
+
+    c.provider_failed("p1", T0).await.unwrap();
+    c.provider_failed("p1", T0.plus_ms(1)).await.unwrap();
+    let before = load_of(&c, "p1", T0.plus_ms(1)).await.unwrap();
+    assert_eq!((before.failures, before.cooldown_until), (2, UnixMs(0)));
+
+    let mut now = T0.plus_ms(2);
+    c.provider_failed("p1", now).await.unwrap();
+    let tripped = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!(tripped.cooldown_until, now.plus_ms(MINUTE_MS));
+    assert_eq!((tripped.failures, tripped.cooldowns), (0, 1));
+
+    // Reports that arrive while it cools change nothing: jobs that fail
+    // together do not stack cooldowns.
+    c.provider_failed("p1", now.plus_ms(10)).await.unwrap();
+    c.provider_recovered("p1", now.plus_ms(10)).await.unwrap();
+    assert_eq!(load_of(&c, "p1", now).await.unwrap(), tripped);
+
+    // After a cooldown one more failure is enough, and the wait doubles.
+    for minutes in [2, 4, 8, 15, 15] {
+        now = load_of(&c, "p1", now).await.unwrap().cooldown_until;
+        c.provider_failed("p1", now).await.unwrap();
+        let l = load_of(&c, "p1", now).await.unwrap();
+        assert_eq!(l.cooldown_until, now.plus_ms(minutes * MINUTE_MS));
+    }
+
+    // Recovery: back to a clean slate, three strikes again.
+    now = load_of(&c, "p1", now).await.unwrap().cooldown_until;
+    c.provider_recovered("p1", now).await.unwrap();
+    let clean = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!(
+        (clean.failures, clean.cooldowns, clean.cooldown_until),
+        (0, 0, UnixMs(0))
+    );
+    c.provider_failed("p1", now).await.unwrap();
+    c.provider_failed("p1", now).await.unwrap();
+    assert_eq!(load_of(&c, "p1", now).await.unwrap().cooldown_until.0, 0);
+    // Other providers are untouched.
+    assert_eq!(load_of(&c, "p2", now).await, None);
+}
+
+/// The load snapshot joins held slots, hand-outs so far and health.
+#[tokio::test]
+async fn provider_load_reports_slots_and_health_per_provider() {
+    let c = catalog();
+    let p1 = provider("p1", 3);
+    let p2 = provider("p2", 2);
+    let first = acquire(&c, &p1, PermitClass::Read, T0).await.unwrap();
+    acquire(&c, &p1, PermitClass::Read, T0).await.unwrap();
+    acquire(&c, &p2, PermitClass::Read, T0).await.unwrap();
+    c.release_permit(&first).await.unwrap();
+    c.provider_failed("p2", T0).await.unwrap();
+
+    let l1 = load_of(&c, "p1", T0).await.unwrap();
+    assert_eq!((l1.held, l1.failures), (1, 0));
+    let l2 = load_of(&c, "p2", T0).await.unwrap();
+    assert_eq!((l2.held, l2.failures), (1, 1));
+    // `uses` grows with every hand-out, held or not.
+    assert!(l1.uses > l2.uses);
+    // Expired slots are not held.
+    let later = T0.plus_ms(TTL_MS + 1);
+    assert_eq!(load_of(&c, "p1", later).await.unwrap().held, 0);
+}

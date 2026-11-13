@@ -22,13 +22,14 @@ use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
 use crate::fetch::ProviderSession;
+use crate::pool::Pool;
 use crate::ports::{
     BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
     NntpSession, PermitClass, MAX_QUEUE_DELAY_SECS,
 };
 use crate::types::{
     ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent, JobOutcome,
-    OutboxStage, Result, JOB_VERSION,
+    OutboxStage, ProviderConfig, Result, UnixMs, JOB_VERSION,
 };
 
 impl<T: Transport> NntpSession for NntpClient<T> {
@@ -75,6 +76,9 @@ pub(crate) enum Stop {
     Fenced,
     /// No provider slot: free the lease without spending an attempt.
     NoPermit,
+    /// Every provider that could do the work is in a cooldown until then:
+    /// free the lease until that time without spending an attempt.
+    Cooling(UnixMs),
     /// Free the lease with a failure class; `None` = the default backoff.
     Fail(FailClass, Option<u32>),
     /// The catalogue failed, so nothing can be recorded; the lease expires.
@@ -138,6 +142,17 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
                 .unwrap_or(0);
             let delay_secs = NO_PERMIT_MIN_SECS + jitter;
             match catalog.defer(lease, now.plus_secs(delay_secs), now).await {
+                Ok(false) => JobOutcome::Ack,
+                _ => JobOutcome::Retry { delay_secs },
+            }
+        }
+        Stop::Cooling(until) => {
+            // Rounded up: a job that arrives early cannot claim the row.
+            let secs = (until.0 - now.0).saturating_add(999).div_euclid(1000);
+            let delay_secs = u32::try_from(secs)
+                .unwrap_or(0)
+                .clamp(1, MAX_QUEUE_DELAY_SECS);
+            match catalog.defer(lease, until.max(now), now).await {
                 Ok(false) => JobOutcome::Ack,
                 _ => JobOutcome::Retry { delay_secs },
             }
@@ -223,31 +238,11 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Err(Stop::fail(FailClass::Corrupt));
         }
-        let plan = self.stored_plan(lease, extent, &cipher).await?;
+        let mut plan = self.stored_plan(lease, extent, &cipher).await?;
 
         if plan.iter().any(|a| a.state == ArticleState::Planned) {
-            let provider = self
-                .cfg
-                .providers
-                .iter()
-                .find(|p| p.post)
-                .ok_or(Stop::fail(FailClass::Internal))?;
-            let holder = format!("post:{}", extent.id);
-            let mut session = ProviderSession::open(
-                &self.catalog,
-                &self.nntp,
-                &self.clock,
-                provider,
-                PermitClass::Background,
-                &holder,
-            )
-            .await?
-            .ok_or(Stop::NoPermit)?;
-            let posted = self
-                .post_planned(lease, extent, &plan, &cipher, &mut session)
-                .await;
-            session.close().await;
-            posted?;
+            self.post_through_pool(lease, extent, &mut plan, &cipher)
+                .await?;
         }
 
         let now = self.clock.now();
@@ -325,16 +320,55 @@ where
         Ok(plan)
     }
 
+    /// Posts the planned articles through the first usable `post`
+    /// provider in pool order.
+    async fn post_through_pool(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+        plan: &mut [ArticleRow],
+        cipher: &[u8],
+    ) -> core::result::Result<(), Stop> {
+        let holder = format!("post:{}", extent.id);
+        let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
+        let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
+        let cooling = pool.cooling_until(&posters);
+        let Some(provider) = pool.order(posters).into_iter().next() else {
+            return Err(match cooling {
+                Some(until) => Stop::Cooling(until),
+                None => Stop::fail(FailClass::Internal),
+            });
+        };
+        let mut session = ProviderSession::open(
+            &self.catalog,
+            &self.nntp,
+            &self.clock,
+            provider,
+            PermitClass::Background,
+            &holder,
+            pool.suspect(provider),
+        )
+        .await?
+        .ok_or(Stop::NoPermit)?;
+        let posted = self
+            .post_planned(lease, extent, plan, cipher, &mut session)
+            .await;
+        session.close().await;
+        posted
+    }
+
+    /// Posts every article of `plan` that is still planned on `session`
+    /// and marks each one posted, in the catalogue and in `plan`.
     async fn post_planned(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
-        plan: &[ArticleRow],
+        plan: &mut [ArticleRow],
         cipher: &[u8],
         session: &mut ProviderSession<'_, C, N, T>,
     ) -> core::result::Result<(), Stop> {
         let total = u32::try_from(plan.len()).map_err(|_| Stop::fail(FailClass::Internal))?;
-        for row in plan.iter().filter(|a| a.state == ArticleState::Planned) {
+        for row in plan.iter_mut().filter(|a| a.state == ArticleState::Planned) {
             session.keep(Some(lease)).await?;
             let payload = payload_of(cipher, row)
                 .filter(|p| sha256(p) == row.payload_sha256)
@@ -350,6 +384,7 @@ where
             {
                 return Err(Stop::Fenced);
             }
+            row.state = ArticleState::Posted;
         }
         Ok(())
     }
@@ -374,9 +409,13 @@ async fn post_one<C: Catalog, N: NntpConnector, T: Clock>(
             Err(stop) => return Err(stop),
         };
         let err = match result {
-            Ok(PostOutcome::Posted | PostOutcome::Duplicate) => return Ok(()),
+            Ok(PostOutcome::Posted | PostOutcome::Duplicate) => {
+                session.note_ok();
+                return Ok(());
+            }
             Err(e) => e,
         };
+        session.note_err(&err);
         // Any session error: never reuse the session.
         session.discard();
         match err {

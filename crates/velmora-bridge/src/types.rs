@@ -376,6 +376,60 @@ pub struct ProviderConfig {
     pub read: bool,
     /// Concurrent connections allowed; the number of permit slots.
     pub max_conns: u32,
+    /// Tier, `0` = tried first. Providers of one tier share the load.
+    #[serde(default)]
+    pub priority: u8,
+    /// Days the provider keeps an article; `None` = no known limit. An
+    /// article older than this is not asked of the provider.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+    /// Accounts with the same pool name share one connection limit,
+    /// `pool_max_conns` (accounts sold as a bundle may).
+    #[serde(default)]
+    pub pool: Option<String>,
+    /// Connections all accounts of `pool` may hold together. Required on
+    /// every member of a pool, with one value; refused without `pool`.
+    #[serde(default)]
+    pub pool_max_conns: Option<u32>,
+    /// `false` = configured but never used.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// Milliseconds in one day.
+const DAY_MS: i64 = 86_400_000;
+
+impl ProviderConfig {
+    /// Whether an article posted at `posted_at` is still inside this
+    /// provider's retention at `now`. An unknown age or limit is "yes".
+    pub fn retains(&self, posted_at: Option<UnixMs>, now: UnixMs) -> bool {
+        match (self.retention_days, posted_at) {
+            (Some(days), Some(at)) => {
+                now.0.saturating_sub(at.0) <= i64::from(days).saturating_mul(DAY_MS)
+            }
+            _ => true,
+        }
+    }
+}
+
+/// One provider's connection load and health (`Catalog::provider_load`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProviderLoad {
+    pub provider_id: String,
+    /// Connection slots held now.
+    pub held: u32,
+    /// Slots ever handed out; the least-used provider wins a tie.
+    pub uses: u64,
+    /// Failed sessions in a row since the last good one or cooldown.
+    pub failures: u32,
+    /// Cooldowns in a row; each one doubles the next.
+    pub cooldowns: u32,
+    /// The provider is skipped until this time (`0` = not cooling).
+    pub cooldown_until: UnixMs,
 }
 
 /// Redacts host and credentials: provider identity in logs is `id` and
@@ -393,6 +447,11 @@ impl fmt::Debug for ProviderConfig {
             .field("post", &self.post)
             .field("read", &self.read)
             .field("max_conns", &self.max_conns)
+            .field("priority", &self.priority)
+            .field("retention_days", &self.retention_days)
+            .field("pool", &self.pool)
+            .field("pool_max_conns", &self.pool_max_conns)
+            .field("enabled", &self.enabled)
             .finish()
     }
 }

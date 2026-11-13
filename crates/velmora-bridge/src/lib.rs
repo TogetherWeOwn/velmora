@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod fetch;
 pub mod ingress;
 pub mod jobs;
+mod pool;
 pub mod ports;
 pub mod post;
 pub mod service;

@@ -186,6 +186,11 @@ impl Fx {
             post: true,
             read: true,
             max_conns: 2,
+            priority: 0,
+            retention_days: None,
+            pool: None,
+            pool_max_conns: None,
+            enabled: true,
         }];
         let cfg = BridgeConfig {
             environment: Environment::Dev,

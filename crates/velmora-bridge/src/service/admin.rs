@@ -620,7 +620,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .cfg
         .providers
         .iter()
-        .filter(|p| p.read)
+        .filter(|p| p.read && p.enabled)
         .map(|p| label(&p.backbone))
         .collect();
     let on_usenet = |x: &crate::types::ExtentStatus| {
@@ -715,7 +715,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let mut busy = false;
     let mut last_provider = String::new();
     let holder = format!("drill:{}", extent.id);
-    for provider in bridge.cfg.providers.iter().filter(|p| p.read) {
+    for provider in bridge.cfg.providers.iter().filter(|p| p.read && p.enabled) {
         let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
         if wanted.is_empty() {
             break;
@@ -727,6 +727,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             provider,
             PermitClass::Background,
             &holder,
+            false,
         )
         .await?
         else {
@@ -744,7 +745,9 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         match read {
             Ok(tally) if tally.ok > 0 => last_provider.clone_from(&provider.id),
             Ok(_) => {}
-            Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => busy = true,
+            Err(Stop::NoPermit | Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+                busy = true;
+            }
             Err(Stop::Fenced | Stop::Catalog) => {
                 return Err(BridgeError::Sql("catalogue failed during a drill".into()));
             }
@@ -838,6 +841,27 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
+    let now = bridge.clock.now();
+    let load = bridge.catalog.provider_load(now).await.or_internal()?;
+    // Identity is `id` and `backbone` only: never a host or a login.
+    let providers: Vec<Value> = bridge
+        .cfg
+        .providers
+        .iter()
+        .map(|p| {
+            let l = load.iter().find(|l| l.provider_id == p.id);
+            json!({
+                "id": p.id,
+                "backbone": p.backbone,
+                "priority": p.priority,
+                "enabled": p.enabled,
+                "held": l.map_or(0, |l| l.held),
+                "failures": l.map_or(0, |l| l.failures),
+                "cooling": l.is_some_and(|l| l.cooldown_until > now),
+                "cooldown_until": l.map_or(0, |l| l.cooldown_until.0),
+            })
+        })
+        .collect();
     let mut outbox = serde_json::Map::new();
     for (stage, n) in &stats.by_stage {
         outbox.insert(stage.as_str().to_string(), json!(n));
@@ -862,5 +886,6 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         "outbox": outbox,
         "dead": stats.dead,
         "last_dispatch_at": stats.last_dispatch_at,
+        "providers": providers,
     })))
 }

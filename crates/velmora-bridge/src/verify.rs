@@ -15,6 +15,7 @@
 use serde::Serialize;
 
 use crate::fetch::{read_articles, ProviderSession, ReadTally};
+use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
     MAX_QUEUE_DELAY_SECS,
@@ -52,11 +53,11 @@ fn label(backbone: &str) -> String {
     backbone.trim().to_lowercase()
 }
 
-/// `read` providers grouped by backbone, in configuration order. Two
+/// Enabled `read` providers grouped by backbone, in configuration order. Two
 /// providers on one backbone are one copy, so they share an entry.
-fn backbones(providers: &[ProviderConfig]) -> Vec<(String, Vec<&ProviderConfig>)> {
+pub(crate) fn backbones(providers: &[ProviderConfig]) -> Vec<(String, Vec<&ProviderConfig>)> {
     let mut groups: Vec<(String, Vec<&ProviderConfig>)> = Vec::new();
-    for p in providers.iter().filter(|p| p.read) {
+    for p in providers.iter().filter(|p| p.read && p.enabled) {
         let name = label(&p.backbone);
         match groups.iter_mut().find(|(b, _)| *b == name) {
             Some((_, members)) => members.push(p),
@@ -116,7 +117,9 @@ where
     }
 
     /// Reads every article from one backbone, through its first provider
-    /// with a free slot.
+    /// in pool order with a free slot. Providers that still retain the
+    /// oldest article are preferred; when none does, the others answer,
+    /// because a result needs a read.
     async fn read_backbone<'p>(
         &self,
         lease: &Lease,
@@ -125,7 +128,23 @@ where
     ) -> Staged<(&'p ProviderConfig, ReadTally)> {
         let holder = format!("verify:{}", lease.extent);
         let rows: Vec<&ArticleRow> = plan.iter().collect();
-        for &provider in providers {
+        let now = self.clock.now();
+        let oldest = plan.iter().filter_map(|a| a.posted_at).min();
+        let (mut fresh, expired): (Vec<_>, Vec<_>) = providers
+            .iter()
+            .copied()
+            .partition(|p| p.retains(oldest, now));
+        if fresh.is_empty() {
+            fresh = expired;
+        }
+        let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
+        let usable = pool.order(fresh.clone());
+        if usable.is_empty() {
+            if let Some(until) = pool.cooling_until(&fresh) {
+                return Err(Stop::Cooling(until));
+            }
+        }
+        for provider in usable {
             let Some(mut session) = ProviderSession::open(
                 &self.catalog,
                 &self.nntp,
@@ -133,6 +152,7 @@ where
                 provider,
                 PermitClass::Background,
                 &holder,
+                pool.suspect(provider),
             )
             .await?
             else {

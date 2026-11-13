@@ -122,6 +122,11 @@ impl Fx {
             post: true,
             read: true,
             max_conns: 2,
+            priority: 0,
+            retention_days: None,
+            pool: None,
+            pool_max_conns: None,
+            enabled: true,
         }];
         let cfg = BridgeConfig {
             environment,
@@ -1180,4 +1185,52 @@ async fn evict_ignores_a_read_back_from_a_backbone_no_longer_configured() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(r.json()["safety_deleted"], 1);
     assert!(!fx.has_safety(&o));
+}
+
+/// Status lists each provider's health by id and backbone, and nothing
+/// that identifies the account behind it.
+#[tokio::test]
+async fn status_reports_provider_health_without_credentials() {
+    let fx = Fx::new().await;
+    let now = fx.bridge.clock.now();
+    let p = fx.bridge.cfg.providers[0].clone();
+
+    let r = fx.get("/status").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let providers = r.json()["providers"].clone();
+    assert_eq!(providers.as_array().unwrap().len(), 1);
+    let one = &providers[0];
+    assert_eq!(one["id"], p.id.as_str());
+    assert_eq!(one["backbone"], p.backbone.as_str());
+    assert_eq!(
+        (one["priority"].as_u64(), one["enabled"].as_bool()),
+        (Some(0), Some(true))
+    );
+    assert_eq!(
+        (one["held"].as_u64(), one["failures"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(one["cooling"], false);
+
+    // A held slot and three failed sessions show up.
+    let permit = fx
+        .bridge
+        .catalog
+        .acquire_permit(&p, PermitClass::Read, "t", now)
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..3 {
+        fx.bridge.catalog.provider_failed(&p.id, now).await.unwrap();
+    }
+    let r = fx.get("/status").await;
+    let one = r.json()["providers"][0].clone();
+    assert_eq!(one["held"], 1);
+    assert_eq!(one["cooling"], true);
+    assert_eq!(one["cooldown_until"], now.0 + 60_000);
+    let body = r.text();
+    for secret in [p.user.as_str(), p.pass.as_str(), p.host.as_str()] {
+        assert!(!body.contains(secret), "status leaks provider details");
+    }
+    fx.bridge.catalog.release_permit(&permit).await.unwrap();
 }

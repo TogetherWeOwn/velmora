@@ -27,6 +27,10 @@ use crate::types::{BridgeError, BucketId, ByteSpan, ExtentId, Job, KekBytes, Res
 pub const MIGRATION_0001: &str =
     include_str!("../../../workers/s3-bridge/migrations/0001_init.sql");
 
+/// Provider health and pool-shared connection limits.
+pub const MIGRATION_0002: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0002_provider_health.sql");
+
 // ---------------------------------------------------------------------------
 // RusqliteSql
 // ---------------------------------------------------------------------------
@@ -105,10 +109,11 @@ impl RusqliteSql {
         })
     }
 
-    /// In-memory database with `0001_init.sql` applied.
+    /// In-memory database with every migration applied, in order.
     pub fn with_schema() -> Result<Self> {
         let db = Self::open_in_memory()?;
         db.apply(MIGRATION_0001)?;
+        db.apply(MIGRATION_0002)?;
         Ok(db)
     }
 

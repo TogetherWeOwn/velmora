@@ -24,6 +24,12 @@ pub const MAX_EXTENT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
 
+/// Most entries `NNTP_PROVIDERS` may hold.
+pub const MAX_PROVIDERS: usize = 32;
+
+/// Longest accepted provider `pool` name (bytes).
+pub const MAX_POOL_NAME_LEN: usize = 64;
+
 /// Highest accepted `VELMORA_KEK_ACTIVE`. `KekRing::from_vars` probes every
 /// version up to the active one, so the loop must stay bounded.
 pub const MAX_KEK_VERSION: u32 = 1024;
@@ -281,8 +287,27 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
     if providers.is_empty() {
         return Err(bad());
     }
+    if providers.len() > MAX_PROVIDERS {
+        return Err(bad());
+    }
     let mut ids = BTreeSet::new();
+    let mut pools: BTreeMap<&str, u32> = BTreeMap::new();
     for p in providers {
+        // A pool limit is stated by every member, with one value, and
+        // never without a pool: a shared cap is not left to guesswork.
+        let pool_ok = match (p.pool.as_deref(), p.pool_max_conns) {
+            (None, None) => true,
+            (Some(name), Some(max)) => {
+                !name.is_empty()
+                    && name.len() <= MAX_POOL_NAME_LEN
+                    && (1..=MAX_CONNS_LIMIT).contains(&max)
+                    && *pools.entry(name).or_insert(max) == max
+            }
+            _ => false,
+        };
+        if !pool_ok || p.retention_days == Some(0) {
+            return Err(bad());
+        }
         if p.id.is_empty()
             || p.host.is_empty()
             || p.backbone.is_empty()
@@ -302,7 +327,8 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
             return Err(bad());
         }
     }
-    if !providers.iter().any(|p| p.post) || !providers.iter().any(|p| p.read) {
+    let usable = |role: fn(&ProviderConfig) -> bool| providers.iter().any(|p| p.enabled && role(p));
+    if !usable(|p| p.post) || !usable(|p| p.read) {
         return Err(bad());
     }
     Ok(())

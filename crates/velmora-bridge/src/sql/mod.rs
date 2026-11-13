@@ -11,10 +11,12 @@
 //! | `uploads` | multipart (guarded batches, receipt) |
 //! | `outbox` | leases, article plan, verification, release, dispatcher reads |
 //! | `gc` | due rows, begin, done |
-//! | `permits` | provider connection slots |
+//! | `permits` | provider connection slots, pool-shared limits |
+//! | `health` | provider load, failures and cooldown |
 
 mod auth;
 mod gc;
+mod health;
 mod objects;
 mod outbox;
 mod permits;
@@ -25,7 +27,8 @@ use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep, GenerationId,
     GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm,
-    ProviderConfig, Result, SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
+    ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow, UploadRow,
+    VerificationRow,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -274,5 +277,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn release_permit(&self, p: &Permit) -> Result<()> {
         permits::release_permit(self, p).await
+    }
+
+    // provider pool
+    async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        health::provider_load(self, now).await
+    }
+    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+        health::provider_failed(self, provider, now).await
+    }
+    async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()> {
+        health::provider_recovered(self, provider, now).await
     }
 }
