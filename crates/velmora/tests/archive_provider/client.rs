@@ -511,7 +511,7 @@ async fn adapter_cancellation_returns_without_waiting_for_caller_owned_cleanup()
                     })
                     .await;
                     assert!(outgoing.borrow().len() > b"MODE READER\r\n".len());
-                    control.authority.state.set(Some(signal.clone()));
+                    control.authority.state.set(Some(signal));
                     control.notify.notify_waiters();
                     // One poll must deliver the result even if shutdown never
                     // completes. No wall-clock timeout or cleanup task is needed.
@@ -521,7 +521,7 @@ async fn adapter_cancellation_returns_without_waiting_for_caller_owned_cleanup()
                             std::task::Poll::Ready(Err(if phase < 2 {
                                 Failure::Uncertain
                             } else {
-                                signal.clone()
+                                signal
                             }))
                         );
                         std::task::Poll::Ready(())
