@@ -13,10 +13,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use velmora::article::assemble_article;
 use velmora::media::{FileKey, Profile, Sealer};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::rng::SystemRng;
 use velmora::transports::NativeTlsTransport;
+use velmora::yenc::{encode_segment, SegmentParams};
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek};
@@ -726,6 +728,47 @@ pub async fn simple_rig() -> Rig {
     .await
 }
 
+/// A well-formed article for `row` under its stored headers. With `flip`
+/// one payload bit is wrong: the yEnc checksum still matches, the planned
+/// SHA-256 does not.
+pub fn render(plan: &[ArticleRow], row: &ArticleRow, cipher: &[u8], flip: bool) -> Vec<u8> {
+    let start = row.cipher_offset as usize;
+    let mut payload = cipher[start..start + row.cipher_len as usize].to_vec();
+    if flip {
+        payload[10] ^= 1;
+    }
+    let params = SegmentParams {
+        name: "planted".to_string(),
+        part: row.idx + 1,
+        total: plan.len() as u32,
+        begin: row.cipher_offset + 1,
+        end: row.cipher_offset + row.cipher_len,
+        file_size: cipher.len() as u64,
+    };
+    let mut body = Vec::new();
+    encode_segment(&mut body, &params, &payload).unwrap();
+    assemble_article(&row.headers, &body).unwrap()
+}
+
+/// Two backbones: `p0` posts and reads, `p1` only reads.
+pub async fn two_backbone_rig() -> Rig {
+    let mut rig = rig(&[
+        Spec {
+            backbone: "bb0",
+            post: true,
+            max_conns: 2,
+        },
+        Spec {
+            backbone: "bb1",
+            post: false,
+            max_conns: 2,
+        },
+    ])
+    .await;
+    rig.bridge.cfg.required_backbones = 2;
+    rig
+}
+
 /// A seeded extent: its ids and the sealed ciphertext held in the safety
 /// store.
 pub struct Seeded {
@@ -831,6 +874,63 @@ impl Rig {
         let lease = self.claim(s, OutboxStage::Post).await;
         let job = self.job(s).await;
         self.bridge.post_stage(&lease, &job).await
+    }
+
+    /// Claims `stage` and runs it once.
+    pub async fn run(&self, s: &Seeded, stage: OutboxStage) -> JobOutcome {
+        let lease = self.claim(s, stage).await;
+        let job = self.job(s).await;
+        match stage {
+            OutboxStage::Post => self.bridge.post_stage(&lease, &job).await,
+            OutboxStage::Verify => self.bridge.verify_stage(&lease, &job).await,
+            OutboxStage::Release => self.bridge.release_stage(&lease, &job).await,
+            other => panic!("no stage function for {other:?}"),
+        }
+    }
+
+    /// Posts the extent and moves the clock to the start of verification.
+    pub async fn post(&self, s: &Seeded) -> Vec<ArticleRow> {
+        assert_eq!(self.run_post(s).await, JobOutcome::Ack);
+        self.bridge
+            .clock
+            .advance_secs(self.bridge.cfg.verify_delay_secs);
+        self.bridge.jobs.take();
+        self.plan(s).await
+    }
+
+    /// Plans the extent, plants a well-formed article with the wrong
+    /// payload under the planned message-id of article `idx`, then posts
+    /// the rest. The provider keeps the planted copy (the stage's own POST
+    /// of that id is answered as a duplicate).
+    pub async fn post_with_planted_article(&self, s: &Seeded, idx: usize) -> Vec<ArticleRow> {
+        self.server().set_posting_allowed(false).await;
+        assert_ne!(self.run_post(s).await, JobOutcome::Ack);
+        self.server().set_posting_allowed(true).await;
+        let plan = self.plan(s).await;
+        let row = &plan[idx];
+        let article = render(&plan, row, &s.cipher, true);
+        let mut client = self.raw_client(0).await;
+        client
+            .post_article(&row.message_id, &article)
+            .await
+            .unwrap();
+        client.quit().await;
+        self.bridge.clock.advance_secs(60);
+        self.post(s).await
+    }
+
+    /// Copies every planned article from server `from` to server `to`
+    /// (what peering between backbones does).
+    pub async fn propagate(&self, s: &Seeded, from: usize, to: usize) {
+        let mut src = self.raw_client(from).await;
+        let mut dst = self.raw_client(to).await;
+        for row in self.plan(s).await {
+            let mut article = Vec::new();
+            src.article_to(&row.message_id, &mut article).await.unwrap();
+            dst.post_article(&row.message_id, &article).await.unwrap();
+        }
+        src.quit().await;
+        dst.quit().await;
     }
 
     pub async fn plan(&self, s: &Seeded) -> Vec<ArticleRow> {
