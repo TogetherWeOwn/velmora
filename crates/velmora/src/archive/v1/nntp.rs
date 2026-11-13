@@ -92,7 +92,7 @@ mod tests {
         value.message_id = "bad id".into();
         assert_eq!(PostHeaders::from_obfuscated(&value), Err(Failure::Invalid));
         value = metadata();
-        value.newsgroup = "bad/group".into();
+        value.newsgroup = "a.b,c.d".into();
         assert_eq!(PostHeaders::from_obfuscated(&value), Err(Failure::Invalid));
         let mut headers = PostHeaders::from_obfuscated(&metadata()).unwrap();
         headers.date = "x".repeat(129);
