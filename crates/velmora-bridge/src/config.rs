@@ -24,6 +24,10 @@ pub const MAX_EXTENT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
 
+/// Highest accepted `VELMORA_KEK_ACTIVE`. `KekRing::from_vars` probes every
+/// version up to the active one, so the loop must stay bounded.
+pub const MAX_KEK_VERSION: u32 = 1024;
+
 /// Shortest accepted `ADMIN_TOKEN` (characters).
 pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
 
@@ -197,7 +201,7 @@ impl BridgeConfig {
         }
 
         let kek_active: u32 = number(&get, "VELMORA_KEK_ACTIVE")?;
-        if kek_active == 0 {
+        if kek_active == 0 || kek_active > MAX_KEK_VERSION {
             return Err(ConfigError::Invalid("VELMORA_KEK_ACTIVE".into()));
         }
         // Presence and shape only; the key itself is held by `KekRing`.
@@ -313,7 +317,7 @@ impl KekRing {
         active: u32,
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<KekRing, ConfigError> {
-        if active == 0 {
+        if active == 0 || active > MAX_KEK_VERSION {
             return Err(ConfigError::Invalid("VELMORA_KEK_ACTIVE".into()));
         }
         let mut keys = BTreeMap::new();
