@@ -1,10 +1,15 @@
-//! Bindings and secrets -> validated `Bridge` (integration lane).
+//! Bindings and secrets -> validated `Bridge`, built once per isolate.
 //!
-//! Walking skeleton: builds the full `Bridge` per call. Values are read
-//! inside the process and never logged; errors name a variable or rule.
+//! Values are read inside the process and never logged; a refusal names a
+//! variable, binding or rule only. A refused configuration is not cached,
+//! so every request fails closed with a class-only `500` until it is fixed.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
 use velmora_bridge::config::{BridgeConfig, KekRing};
-use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::{Bridge, Clock, UnixMs};
 use worker::Env;
@@ -35,8 +40,28 @@ fn lookup(env: &Env, name: &str) -> Option<String> {
         .ok()
 }
 
+thread_local! {
+    static BRIDGE: RefCell<Option<Rc<WorkerBridge>>> = const { RefCell::new(None) };
+}
+
+/// The isolate's bridge, built on first use. Construction is synchronous,
+/// so two requests can never race to build it.
+pub fn bridge(env: &Env) -> Result<Rc<WorkerBridge>, String> {
+    if let Some(b) = BRIDGE.with(|c| c.borrow().clone()) {
+        return Ok(b);
+    }
+    let b = Rc::new(build(env)?);
+    BRIDGE.with(|c| *c.borrow_mut() = Some(Rc::clone(&b)));
+    Ok(b)
+}
+
+/// Lets a request wait for budget without reading its body.
+fn sleeper() -> Sleeper {
+    Rc::new(|ms| Box::pin(worker::Delay::from(Duration::from_millis(u64::from(ms)))))
+}
+
 /// Builds the bridge or returns a class-only reason.
-pub fn build(env: &Env) -> Result<WorkerBridge, String> {
+fn build(env: &Env) -> Result<WorkerBridge, String> {
     let get = |name: &str| lookup(env, name);
     let cfg = BridgeConfig::from_vars(get).map_err(|e| e.to_string())?;
     let kek = KekRing::from_vars(cfg.kek_active, get).map_err(|e| e.to_string())?;
@@ -52,7 +77,7 @@ pub fn build(env: &Env) -> Result<WorkerBridge, String> {
         ),
         kek,
         clock: WorkerClock,
-        budget: ByteBudget::new(cfg.inflight_budget_bytes),
+        budget: ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(sleeper()),
         cfg,
     })
 }
