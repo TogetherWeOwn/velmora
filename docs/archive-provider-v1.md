@@ -62,9 +62,12 @@ requires `AbortIncomplete`; stat and range read require `Read`; health requires
 `Health`. Proof readback remains under the enclosing write authority as well as
 read authority; sink writes remain under read authority. A lost response
 or cancellation after a possible remote effect is uncertain: preserve the same
-intent and session, reconcile before a bounded retry, and never automatically
-abort, reallocate or report success. No alternate account or cache fallback is
-permitted.
+intent and any known session, reconcile before a bounded retry, and never
+implicitly abort, reallocate or report success. If a begin response is lost,
+`begin` resolves the issued request under the original intent before it may
+create an allocation. No alternate account or cache fallback is permitted.
+A verified reconciliation requires complete part and ciphertext-digest readback;
+a range read verifies whole covering parts but emits only the requested slice.
 
 These are interface obligations, not an implementation of authorization,
 revocation, transport closure or output verification. Provider adapters and

@@ -310,6 +310,8 @@ pub struct WriteProof {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reconciled {
+    /// Every part and the complete ciphertext digest were verified on readback.
+    /// The proof must record `full_ciphertext_readback` as true.
     Verified(Box<WriteProof>),
     /// Proven not committed at observation time, not safe to race a pending
     /// request. A transport must settle all issued requests before returning it.
@@ -370,6 +372,7 @@ pub trait ArchiveProvider {
         record: &ObjectRecord,
         control: &impl Control,
     ) -> Result<ObjectIdentity>;
+    /// Verify each covering part completely, but emit only the requested slice.
     async fn read_range(
         &mut self,
         record: &ObjectRecord,
