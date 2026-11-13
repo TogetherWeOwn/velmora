@@ -105,6 +105,12 @@ struct Spool {
     next_number: u32,
     /// Runtime posting switch; `POST` answers `440` while false.
     posting_allowed: bool,
+    /// Remaining `POST`s to store and then drop without a reply.
+    drop_posts: usize,
+    /// Remaining `BODY` replies to cut mid-body.
+    drop_bodies: usize,
+    /// While true, `STAT` answers `430` for articles in the `POST` spool.
+    stat_lag: bool,
 }
 
 struct Shared {
@@ -128,6 +134,9 @@ impl Shared {
             hidden: config.missing_ids.clone(),
             next_number,
             posting_allowed: config.posting_allowed,
+            drop_posts: 0,
+            drop_bodies: 0,
+            stat_lag: false,
         };
         Self {
             config,
@@ -281,6 +290,23 @@ impl TestNntpServer {
     /// Toggle whether `POST` is accepted (`440` while disabled).
     pub async fn set_posting_allowed(&self, allowed: bool) {
         self.shared.spool.lock().await.posting_allowed = allowed;
+    }
+
+    /// The next `n` `POST`s are stored, then the connection closes without
+    /// a reply: the client cannot tell whether the article landed.
+    pub async fn drop_next_posts(&self, n: usize) {
+        self.shared.spool.lock().await.drop_posts = n;
+    }
+
+    /// The next `n` `BODY` replies stop mid-body and close the connection.
+    pub async fn drop_next_bodies(&self, n: usize) {
+        self.shared.spool.lock().await.drop_bodies = n;
+    }
+
+    /// While set, `STAT` answers `430` for posted articles although `BODY`
+    /// serves them (a provider whose `STAT` lags right after a `POST`).
+    pub async fn set_stat_lag(&self, lag: bool) {
+        self.shared.spool.lock().await.stat_lag = lag;
     }
 }
 
@@ -612,6 +638,28 @@ async fn handle_connection(
                     _ => &article.raw,
                 };
                 let header_line = format!("{code} {} {}\r\n", article.number, article.message_id);
+                // Runtime hooks: a lagging STAT and a one-shot mid-body drop.
+                {
+                    let mut spool = shared.spool.lock().await;
+                    if cmd.as_str() == "STAT"
+                        && spool.stat_lag
+                        && spool
+                            .posted
+                            .iter()
+                            .any(|a| a.message_id == article.message_id)
+                    {
+                        drop(spool);
+                        let _ = writer.write_all(b"430 No such article\r\n").await;
+                        continue;
+                    }
+                    if cmd.as_str() == "BODY" && spool.drop_bodies > 0 {
+                        spool.drop_bodies -= 1;
+                        drop(spool);
+                        let _ = writer.write_all(header_line.as_bytes()).await;
+                        let _ = writer.write_all(&payload[..payload.len() / 2]).await;
+                        break;
+                    }
+                }
                 // Mid-body disconnect: partial write then abrupt close.
                 if let Some(&cut) = shared.config.drop_after_bytes.get(&article.message_id) {
                     let _ = writer.write_all(header_line.as_bytes()).await;
@@ -650,6 +698,14 @@ async fn handle_connection(
                         let reply =
                             store_posted(&shared, authed.as_deref().unwrap_or("poster"), &raw)
                                 .await;
+                        // Runtime hook: the article is stored, the reply lost.
+                        {
+                            let mut spool = shared.spool.lock().await;
+                            if spool.drop_posts > 0 {
+                                spool.drop_posts -= 1;
+                                break;
+                            }
+                        }
                         let _ = writer.write_all(reply.as_bytes()).await;
                     }
                     PostBody::Empty => {
