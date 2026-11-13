@@ -56,6 +56,8 @@ impl Clock for SharedClock {
 struct GuardedBlob {
     inner: MemBlobStore,
     forbid: Rc<Cell<bool>>,
+    /// A key whose delete fails.
+    broken: RefCell<Option<String>>,
 }
 
 impl GuardedBlob {
@@ -79,6 +81,9 @@ impl BlobStore for GuardedBlob {
     }
     async fn delete(&self, key: &str) -> Result<()> {
         self.check();
+        if self.broken.borrow().as_deref() == Some(key) {
+            return Err(BridgeError::Blob("delete failed".to_string()));
+        }
         self.inner.delete(key).await
     }
 }
@@ -205,6 +210,7 @@ impl Fx {
         let blob = || GuardedBlob {
             inner: MemBlobStore::new(),
             forbid: Rc::clone(&forbid_io),
+            broken: RefCell::new(None),
         };
         let bridge = Bridge {
             catalog: SqlCatalog::new(Shared(Rc::clone(&sql))),
@@ -921,4 +927,39 @@ async fn gc_job_caps_actions() {
     // Blobs of live generations were never candidates.
     assert_eq!(fx.bridge.safety.inner.keys().len(), 30);
     assert_eq!(fx.bridge.cache.inner.keys().len(), 30);
+}
+
+#[tokio::test]
+async fn gc_failing_row_does_not_block_the_batch() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let mut old = Vec::new();
+    for i in 0..3 {
+        let key = format!("k{i}");
+        old.push(fx.put(&bucket, &key, b"one").await);
+        fx.put(&bucket, &key, b"two").await;
+    }
+    let open = "SELECT COUNT(*) FROM gc WHERE done_at IS NULL AND action LIKE 'delete_%'";
+    assert_eq!(fx.scalar(open, &[]).await, "6");
+    // The first extent's cache object cannot be deleted right now.
+    let stuck = old[0].extent.cache_key();
+    *fx.bridge.cache.broken.borrow_mut() = Some(stuck.clone());
+
+    let gc = Job::Gc { v: JOB_VERSION };
+    assert!(matches!(
+        fx.bridge.run_job(&gc).await,
+        JobOutcome::Retry { .. }
+    ));
+    // Every other row was handled; the failing one is still due.
+    assert_eq!(fx.scalar(open, &[]).await, "1");
+    assert!(fx.has_cache(&old[0]) && !fx.has_safety(&old[0]));
+    for o in &old[1..] {
+        assert!(!fx.has_cache(o) && !fx.has_safety(o));
+    }
+
+    // Once the store recovers, the retry finishes the row.
+    *fx.bridge.cache.broken.borrow_mut() = None;
+    assert_eq!(fx.bridge.run_job(&gc).await, JobOutcome::Ack);
+    assert_eq!(fx.scalar(open, &[]).await, "0");
+    assert!(!fx.has_cache(&old[0]));
 }

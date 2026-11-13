@@ -16,8 +16,8 @@ use crate::config::{GcMode, Maintenance};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::post::{settle, Stop};
 use crate::types::{
-    BlobStoreKind, DispatchReport, ExtentId, FailClass, GcStep, GenerationId, Job, JobOutcome,
-    OutboxStage, Result, JOB_VERSION,
+    BlobStoreKind, DispatchReport, ExtentId, FailClass, GcRow, GcStep, GenerationId, Job,
+    JobOutcome, OutboxStage, Result, JOB_VERSION,
 };
 
 /// Outbox rows one dispatcher run re-sends (one queue batch).
@@ -135,18 +135,12 @@ where
     async fn gc_batch(&self, disposable_only: bool) -> Result<()> {
         let now = self.clock.now();
         let rows = self.catalog.gc_due(now, GC_BATCH, disposable_only).await?;
+        // One row that fails must not hold up the rows behind it. The row
+        // stays due, and the first error makes the job retry.
+        let mut failed = None;
         for row in &rows {
-            // The catalogue re-checks that no live generation uses the
-            // extent and names the one blob that may go.
-            match self.catalog.gc_begin(row, now).await? {
-                GcStep::DeleteBlob { store, key } => {
-                    match store {
-                        BlobStoreKind::Safety => self.safety.delete(&key).await?,
-                        BlobStoreKind::Cache => self.cache.delete(&key).await?,
-                    }
-                    self.catalog.gc_done(row.id, self.clock.now()).await?;
-                }
-                GcStep::Done | GcStep::Skipped => {}
+            if let Err(e) = self.gc_row(row).await {
+                failed.get_or_insert(e);
             }
         }
         if rows.len() >= GC_BATCH as usize {
@@ -154,7 +148,22 @@ where
             // the next one.
             self.jobs.send(&Job::Gc { v: JOB_VERSION }, 0).await?;
         }
-        Ok(())
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// One `gc` row: the catalogue re-checks that no live generation uses
+    /// the extent and names the one blob that may go.
+    async fn gc_row(&self, row: &GcRow) -> Result<()> {
+        match self.catalog.gc_begin(row, self.clock.now()).await? {
+            GcStep::DeleteBlob { store, key } => {
+                match store {
+                    BlobStoreKind::Safety => self.safety.delete(&key).await?,
+                    BlobStoreKind::Cache => self.cache.delete(&key).await?,
+                }
+                self.catalog.gc_done(row.id, self.clock.now()).await
+            }
+            GcStep::Done | GcStep::Skipped => Ok(()),
+        }
     }
 
     /// The whole cron handler: bounded catalogue reads and queue sends

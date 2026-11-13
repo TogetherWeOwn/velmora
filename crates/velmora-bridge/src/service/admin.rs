@@ -12,7 +12,6 @@
 //! | `POST /_admin/drill/<bucket>/<key>` | `200` read-back from Usenet only |
 //! | `GET /_admin/status` | `200` |
 //! | `POST /_admin/dev/guard-selftest` | `200` in dev, `404` otherwise |
-//! | `POST /_admin/dev/suppress-notify` | `501` in dev, `404` otherwise |
 //!
 //! Secrets: the access key secret exists in the `POST /_admin/keys`
 //! response body and nowhere else. No error body carries request data,
@@ -253,18 +252,11 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             return Err(not_found());
         }
         return match dev {
-            "guard-selftest" | "suppress-notify" if !post => Err(wrong_method()),
+            "guard-selftest" if !post => Err(wrong_method()),
             "guard-selftest" => {
                 let rolled_back = bridge.catalog.guard_selftest().await.or_internal()?;
                 Ok(ok(&json!({ "rolled_back": rolled_back })))
             }
-            // Dropping queue sends needs a hook in the queue adapter; the
-            // service core has none.
-            "suppress-notify" => Err(fail(
-                501,
-                "NotImplemented",
-                "The queue adapter has no send suppression.",
-            )),
             _ => Err(not_found()),
         };
     }
@@ -478,6 +470,10 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         created_at: bridge.clock.now(),
     };
     bridge.catalog.create_access_key(&row).await.or_internal()?;
+    // A grant that fails leaves a key row with some of its grants. That
+    // key cannot be used: its secret exists only in this buffer and is
+    // returned only after every grant is stored. The catalogue has no call
+    // to disable or delete a key, so the row stays.
     for bucket in &grants {
         bridge
             .catalog
@@ -616,6 +612,23 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .or_internal()?
         .ok_or_else(no_key)?;
 
+    // Only a read-back from a backbone that is still configured is
+    // evidence, as in the verify stage. Labels compare trimmed and in
+    // lower case.
+    let label = |b: &str| b.trim().to_lowercase();
+    let configured: Vec<String> = bridge
+        .cfg
+        .providers
+        .iter()
+        .filter(|p| p.read)
+        .map(|p| label(&p.backbone))
+        .collect();
+    let on_usenet = |x: &crate::types::ExtentStatus| {
+        x.backbones
+            .iter()
+            .any(|b| b.counts && configured.contains(&label(&b.backbone)))
+    };
+
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
     for x in &status.extents {
         bridge
@@ -633,7 +646,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
                 // copy on a backbone the pinned one is the only one.
                 let posted = !matches!(x.stage, None | Some(OutboxStage::Post));
                 posted
-                    && x.backbones.iter().any(|b| b.counts)
+                    && on_usenet(x)
                     && bridge
                         .catalog
                         .set_safety_state(&x.extent_id, SafetyState::Held, SafetyState::Deleted)

@@ -4,7 +4,7 @@
 
 mod nntp_support;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use futures_util::StreamExt;
@@ -24,7 +24,33 @@ const BUDGET: u64 = 48 * 1024 * 1024;
 const TOKEN: &str = "admin-token-fixture-0123456789abcdef";
 
 type TestBridge =
-    Bridge<SqlCatalog<RusqliteSql>, MemBlobStore, TcpConnector, FakeJobs, TestKek, FixedClock>;
+    Bridge<SqlCatalog<RacingSql>, MemBlobStore, TcpConnector, FakeJobs, TestKek, FixedClock>;
+
+/// The SQLite catalogue, plus one test hook: with `race` set, the next
+/// safety-state compare-and-set finds that another writer moved every
+/// extent to that state first.
+struct RacingSql {
+    inner: RusqliteSql,
+    race: RefCell<Option<&'static str>>,
+}
+
+impl Sql for RacingSql {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.inner.query(sql, params).await
+    }
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        if sql.starts_with("UPDATE extents SET safety_state") {
+            if let Some(state) = self.race.take() {
+                let first = "UPDATE extents SET safety_state = ?1";
+                self.inner.exec(first, &[text(state)]).await?;
+            }
+        }
+        self.inner.exec(sql, params).await
+    }
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        self.inner.batch(stmts).await
+    }
+}
 
 struct Fx {
     bridge: Rc<TestBridge>,
@@ -115,7 +141,10 @@ impl Fx {
             admin_token: Secret::new(TOKEN.to_string()),
         };
         let bridge = Bridge {
-            catalog: SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
+            catalog: SqlCatalog::new(RacingSql {
+                inner: RusqliteSql::with_schema().unwrap(),
+                race: RefCell::new(None),
+            }),
             safety: MemBlobStore::new(),
             cache: MemBlobStore::new(),
             nntp: TcpConnector::default(),
@@ -739,8 +768,8 @@ async fn dev_routes_are_refused_outside_dev() {
     let r = dev.post("/dev/guard-selftest").await;
     assert_eq!(r.status, 200);
     assert_eq!(r.json(), json!({ "rolled_back": true }));
-    // The service core cannot drop queue sends; it says so.
-    assert_eq!(dev.post("/dev/suppress-notify?n=1").await.status, 501);
+    // Dropping queue sends is the queue adapter's business: no route.
+    assert_eq!(dev.post("/dev/suppress-notify?n=1").await.status, 404);
 
     let prod = Fx::with(Environment::Prod, Maintenance::Off).await;
     for path in [
@@ -1049,4 +1078,106 @@ async fn drill_refuses_an_object_that_was_never_posted() {
     assert_eq!(r.json()["match"], false);
     assert_eq!(r.json()["articles"], 0);
     assert_eq!(fx.bridge.nntp.connects(), 0);
+}
+
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_while_a_release_is_running() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    // A release job has decided and is reading the copy for its last check.
+    let id = [text(o.extent.as_str())];
+    let sql = &fx.bridge.catalog.sql;
+    sql.exec(
+        "UPDATE extents SET safety_state = 'releasing' WHERE id = ?1",
+        &id,
+    )
+    .await
+    .unwrap();
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o), "the release job still needs the copy");
+    assert_eq!(fx.safety_state(&o).await, "releasing");
+}
+
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_it_loses_the_state_race() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // Between the evict's read and its write, a release job takes the copy.
+    *fx.bridge.catalog.sql.race.borrow_mut() = Some("releasing");
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(
+        fx.bridge.catalog.sql.race.borrow().is_none(),
+        "the race ran"
+    );
+    assert!(fx.has_safety(&o), "the loser deletes nothing");
+    assert_eq!(fx.safety_state(&o).await, "releasing");
+}
+
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_of_an_extent_being_reposted() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    // Back at the post stage: the old read-back is on record, but the
+    // post job is about to read the pinned copy again.
+    let id = [text(o.extent.as_str())];
+    let sql = &fx.bridge.catalog.sql;
+    sql.exec("UPDATE outbox SET stage = 'post' WHERE extent_id = ?1", &id)
+        .await
+        .unwrap();
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+}
+
+#[tokio::test]
+async fn evict_ignores_a_read_back_from_a_backbone_no_longer_configured() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    // The only read-back is from a backbone the configuration dropped.
+    let sql = &fx.bridge.catalog.sql;
+    sql.exec("UPDATE verifications SET backbone = 'gone'", &[])
+        .await
+        .unwrap();
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // The same backbone under another spelling is still the same backbone.
+    sql.exec("UPDATE verifications SET backbone = ' BB0 '", &[])
+        .await
+        .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
 }
