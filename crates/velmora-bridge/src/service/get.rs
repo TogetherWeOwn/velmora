@@ -5,7 +5,6 @@
 //! any byte is released). Whatever the source, only plaintext whose
 //! sealed chunks authenticated is returned.
 
-use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -192,8 +191,7 @@ async fn read<
     // The first piece is produced before the status line goes out, so an
     // object that cannot be read is an error response, not a cut-off 200.
     let bucket = bucket.clone();
-    let waited = Rc::new(Cell::new(0u32));
-    let ready = read_piece(bridge, &bucket, &first, &waited)
+    let ready = read_piece(bridge, &bucket, &first)
         .await
         .map_err(|fail| fail.response())?;
     // One item per extent, also for a single extent: the plaintext that
@@ -203,11 +201,11 @@ async fn read<
     // sees a body shorter than Content-Length.
     resp.body = RespBody::Stream(
         stream::unfold(
-            (Rc::clone(bridge), bucket, todo, Some(ready), waited),
-            |(bridge, bucket, mut todo, ready, waited)| async move {
+            (Rc::clone(bridge), bucket, todo, Some(ready)),
+            |(bridge, bucket, mut todo, ready)| async move {
                 let item = match ready {
                     Some(held) => Ok(held),
-                    None => read_piece(&bridge, &bucket, &todo.next()?, &waited).await,
+                    None => read_piece(&bridge, &bucket, &todo.next()?).await,
                 };
                 if item.is_err() {
                     todo = Vec::new().into_iter();
@@ -216,7 +214,7 @@ async fn read<
                     // The charge ends here, with the bytes leaving.
                     item.map(|(bytes, _charge)| bytes)
                         .map_err(|fail| fail.stream_error()),
-                    (bridge, bucket, todo, None, waited),
+                    (bridge, bucket, todo, None),
                 ))
             },
         )
@@ -298,13 +296,11 @@ static WAITERS: AtomicU64 = AtomicU64::new(0);
 
 /// Produces one piece of plaintext together with the byte-budget charge
 /// that covers it; the caller keeps the charge for as long as it keeps
-/// the bytes. `waited` is the request's total wait for provider slots so
-/// far, shared by all its pieces.
+/// the bytes.
 async fn read_piece<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
     piece: &Piece,
-    waited: &Cell<u32>,
 ) -> core::result::Result<(Vec<u8>, Charge), ReadFail>
 where
     C: Catalog,
@@ -340,13 +336,19 @@ where
         .await
         .map_err(|_| ReadFail::Busy)?;
     // While every provider slot is taken (more concurrent misses than
-    // connections) the read waits and retries, up to COLD_WAIT_MS for the
-    // whole request. The budget charge is released for each wait so
+    // connections) the read waits and retries until COLD_WAIT_MS after
+    // the first miss, per piece, so a later extent of a stream gets the
+    // same allowance as the first. The deadline is wall-clock time, which
+    // includes the catalogue and blob round trips of each poll; the sum of
+    // the sleeps is a backstop in case the clock does not move. The
+    // budget charge is released for each wait so
     // waiting readers do not starve the budget, and taken again without
     // waiting: each retry only sleeps here, inside the same bound. After
     // each wait the cache is checked again: another reader may have
     // filled it in the meantime.
     let waiter = WAITERS.fetch_add(1, Ordering::Relaxed);
+    let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+    let mut slept = 0u32;
     let mut attempt = 0u64;
     loop {
         match bridge.fetch_cold(extent).await {
@@ -364,14 +366,14 @@ where
         drop(work);
         let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
         work = loop {
-            if waited.get() >= COLD_WAIT_MS {
+            if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
                 return Err(ReadFail::Busy);
             }
             attempt += 1;
             let seed = (bridge.clock.now().0 as u64) ^ waiter.rotate_left(32) ^ attempt;
             let ms = cold_poll_ms(seed);
             sleep(ms).await;
-            waited.set(waited.get().saturating_add(ms));
+            slept = slept.saturating_add(ms);
             if let Some(charge) = bridge.budget.try_charge(need) {
                 break charge;
             }

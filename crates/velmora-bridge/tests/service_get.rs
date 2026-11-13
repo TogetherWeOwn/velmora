@@ -872,12 +872,15 @@ type PollHook = Rc<
 >;
 
 /// Sleeper that lets no real time pass. It adds up the milliseconds asked
-/// for, checks that the waiting read holds no budget, and runs `hook`.
+/// for, moves the rig's clock by them plus `overhead_ms` (the round trips
+/// of a poll), checks that the waiting read holds no budget, and runs
+/// `hook`.
 fn fake_cold_sleeper(
     asked: Rc<Cell<u64>>,
     polls: Rc<Cell<u32>>,
     bridge: Rc<RefCell<Weak<TestBridge<TcpConnector>>>>,
     hook: PollHook,
+    overhead_ms: i64,
 ) -> Sleeper {
     Rc::new(move |ms| {
         assert!((COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms));
@@ -885,6 +888,7 @@ fn fake_cold_sleeper(
         polls.set(polls.get() + 1);
         let bridge = bridge.borrow().upgrade().expect("rig is alive");
         assert_eq!(bridge.budget.in_use(), 0, "a waiting read holds budget");
+        bridge.clock.advance_ms(i64::from(ms) + overhead_ms);
         match hook.borrow().as_ref() {
             Some(hook) => hook(polls.get(), bridge),
             None => Box::pin(async {}),
@@ -920,6 +924,7 @@ async fn cold_read_waits_for_a_slot_then_slows_down() {
         polls.clone(),
         weak.clone(),
         PollHook::default(),
+        0,
     );
     let cold = cold_rig_with(4, Some(sleeper)).await;
     let rig = &cold.rig;
@@ -965,7 +970,7 @@ async fn waiting_cold_read_is_served_from_a_cache_filled_meanwhile() {
     let polls = Rc::new(Cell::new(0u32));
     let weak = Rc::new(RefCell::new(Weak::new()));
     let hook = PollHook::default();
-    let sleeper = fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone());
+    let sleeper = fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone(), 0);
     let cold = cold_rig_with(4, Some(sleeper)).await;
     let rig = &cold.rig;
     *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
@@ -1010,6 +1015,144 @@ async fn waiting_cold_read_is_served_from_a_cache_filled_meanwhile() {
         connects,
         "no session was opened"
     );
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn slow_polls_end_the_wait_by_the_clock() {
+    // Each poll also spends a second on round trips: the bound is elapsed
+    // time, not the sum of the sleeps asked for.
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let weak = Rc::new(RefCell::new(Weak::new()));
+    let sleeper = fake_cold_sleeper(
+        asked.clone(),
+        polls.clone(),
+        weak.clone(),
+        PollHook::default(),
+        1_000,
+    );
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
+    let body = pattern(59, 300_000);
+    let extent = cold.put_and_post("cold.bin", &body).await;
+    evict(rig, &extent).await;
+    let _held = hold_all_slots(rig).await;
+
+    let start = rig.now();
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    let elapsed = rig.now().0 - start.0;
+    let bound = i64::from(COLD_WAIT_MS);
+    let poll_max = i64::from(COLD_POLL_MS + COLD_JITTER_MS) + 1_000;
+    assert!(elapsed >= bound, "gave up after {elapsed} ms");
+    assert!(elapsed < bound + poll_max, "waited {elapsed} ms");
+    assert!(asked.get() < u64::from(COLD_WAIT_MS) / 10);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn each_extent_of_a_stream_gets_its_own_wait() {
+    // The first extent is served after a 20 s wait; the second, read
+    // mid-stream, still gets a full allowance of its own.
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let weak = Rc::new(RefCell::new(Weak::new()));
+    let hook = PollHook::default();
+    let sleeper = fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone(), 0);
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
+    let parts = [pattern(61, 200_000), pattern(62, 150_000)];
+    let whole: Vec<u8> = parts.concat();
+    let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    let extents = commit_parts(rig, &cold.signer, &cold.bucket, "multi", &slices).await;
+    let blobs: Vec<Vec<u8>> = extents
+        .iter()
+        .map(|e| rig.bridge.safety.stored(&e.id.safety_key()).unwrap().bytes)
+        .collect();
+    for extent in &extents {
+        cold.post(extent.generation_id.as_ref().unwrap(), extent)
+            .await;
+        evict(rig, extent).await;
+    }
+    let _held = hold_all_slots(rig).await;
+
+    // Another reader's fill of extent i lands in the cache once 20 s
+    // (first) and 40 s (second) have passed since the GET began.
+    let start = rig.now();
+    let bucket = cold.bucket.id.clone();
+    let fills: Vec<(i64, ExtentRow, Vec<u8>)> = extents
+        .iter()
+        .zip(blobs)
+        .enumerate()
+        .map(|(i, (e, b))| (20_000 * (i as i64 + 1), e.clone(), b))
+        .collect();
+    *hook.borrow_mut() = Some(Box::new(move |_, bridge| {
+        let elapsed = bridge.clock.now().0 - start.0;
+        let due: Vec<(ExtentRow, Vec<u8>)> = fills
+            .iter()
+            .filter(|(at, e, _)| elapsed >= *at && !bridge.cache.contains(&e.id.cache_key()))
+            .map(|(_, e, b)| (e.clone(), b.clone()))
+            .collect();
+        let bucket = bucket.clone();
+        Box::pin(async move {
+            for (extent, blob) in due {
+                let meta = BlobMeta {
+                    bucket: &bucket,
+                    extent: &extent.id,
+                    cipher_sha256: &extent.cipher_sha256,
+                };
+                bridge
+                    .cache
+                    .put(&extent.id.cache_key(), blob, &meta)
+                    .await
+                    .unwrap();
+            }
+        })
+    }));
+
+    let resp = get(rig, &cold.signer, "multi", &[]).await;
+    resp.expect(200);
+    assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+    assert!(resp.body == whole);
+    let elapsed = rig.now().0 - start.0;
+    assert!(elapsed >= 40_000, "only {elapsed} ms passed");
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupted_cold_read_is_slow_down_without_waiting() {
+    // A read that breaks off in transit is not slot contention: it is
+    // SlowDown at once, never retried in the wait loop.
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let weak = Rc::new(RefCell::new(Weak::new()));
+    let sleeper = fake_cold_sleeper(
+        asked.clone(),
+        polls.clone(),
+        weak.clone(),
+        PollHook::default(),
+        0,
+    );
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
+    let body = pattern(67, 300_000);
+    let extent = cold.put_and_post("cold.bin", &body).await;
+    evict(rig, &extent).await;
+    let connects = rig.bridge.nntp.connects();
+
+    // Every reconnect the read is allowed breaks off mid-body.
+    cold.server.drop_next_bodies(3).await;
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    assert!(resp.header("retry-after").is_some());
+    assert_eq!(polls.get(), 0, "an interrupted read was retried");
+    assert_eq!(rig.bridge.nntp.connects() - connects, 3, "one fetch only");
+    assert!(rig.bridge.cache.keys().is_empty());
+    assert_eq!(rig.bridge.nntp.live(), 0);
     assert_eq!(rig.bridge.budget.in_use(), 0);
 }
 
