@@ -62,6 +62,11 @@ async fn posts_the_stored_plan_and_no_plaintext() {
         assert_eq!(part.file_size, s.cipher.len() as u64);
         let start = row.cipher_offset as usize;
         assert_eq!(payload, s.cipher[start..start + payload.len()]);
+        assert!(
+            !contains(&payload, MARKER),
+            "plaintext in payload {}",
+            row.idx
+        );
         assert_eq!(sha256(&payload), row.payload_sha256);
     }
     client.quit().await;
@@ -276,28 +281,120 @@ async fn stale_lease_stops_before_any_post() {
     assert_eq!(rig.server().posted_count().await, 3);
 }
 
-/// A lease lost in the middle of the stage stops it at the next article.
+/// The lease is taken over while the stage is posting: the next article
+/// is never sent.
 #[tokio::test]
 async fn lease_lost_mid_stage_stops_posting() {
     let rig = simple_rig().await;
     let s = rig.seed(8, &marked_plaintext(PLAIN_LEN)).await;
 
-    // The first job plans and posts one article, then dies.
-    rig.bridge.catalog.fail_mark_posted.set(1);
-    let stale = rig.claim(&s, OutboxStage::Post).await;
-    let job = rig.job(&s).await;
-    rig.bridge.post_stage(&stale, &job).await;
-    rig.bridge.clock.advance_secs(LEASE_SECS + 1);
-    let _current = rig.claim(&s, OutboxStage::Post).await;
+    rig.bridge
+        .catalog
+        .fault
+        .set(Some(Fault::StealLeaseAfterMark(0)));
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
 
-    // Re-driving the stale job: the plan exists, the lease does not.
-    assert_eq!(rig.bridge.post_stage(&stale, &job).await, JobOutcome::Ack);
+    let plan = rig.plan(&s).await;
+    assert_eq!(rig.server().posted_ids().await, bracketed(&plan)[..1]);
+    assert_eq!(plan[0].state, ArticleState::Posted);
+    assert!(plan[1..].iter().all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.bridge.nntp.connects(), 1);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    // Nothing was advanced or enqueued by the stale job.
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).stage,
+        OutboxStage::Post
+    );
+    assert!(rig.bridge.jobs.sent().is_empty());
+}
+
+/// The lease is lost between a POST and its catalogue write: the write is
+/// refused, the job stops, and the successor confirms the same article.
+#[tokio::test]
+async fn fenced_mark_posted_stops_and_successor_confirms() {
+    let rig = simple_rig().await;
+    let s = rig.seed(22, &marked_plaintext(PLAIN_LEN)).await;
+
+    rig.bridge
+        .catalog
+        .fault
+        .set(Some(Fault::StealLeaseBeforeMark(1)));
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let planned = rig.plan(&s).await;
+    assert_eq!(planned[1].state, ArticleState::Planned);
+    assert_eq!(planned[2].state, ArticleState::Planned);
+    assert_eq!(rig.server().posted_ids().await, bracketed(&planned)[..2]);
+
+    rig.bridge.clock.advance_secs(LEASE_SECS + 1);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let plan = rig.plan(&s).await;
+    assert_eq!(ids(&plan), ids(&planned));
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(rig.server().posted_ids().await, bracketed(&plan));
+}
+
+/// The lease is lost after the last article: the stale job does not move
+/// the row to the next stage.
+#[tokio::test]
+async fn fenced_advance_leaves_the_stage_alone() {
+    let rig = simple_rig().await;
+    let s = rig.seed(23, &marked_plaintext(PLAIN_LEN)).await;
+
+    rig.bridge
+        .catalog
+        .fault
+        .set(Some(Fault::StealLeaseAfterMark(2)));
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).stage,
+        OutboxStage::Post
+    );
+    assert!(rig.bridge.jobs.sent().is_empty());
+}
+
+/// The permit slot is taken over mid-stage: the socket is dropped and the
+/// job is deferred, with nothing more posted on the lost slot.
+#[tokio::test]
+async fn lost_permit_stops_posting() {
+    let rig = simple_rig().await;
+    let s = rig.seed(24, &marked_plaintext(PLAIN_LEN)).await;
+
+    rig.bridge
+        .catalog
+        .fault
+        .set(Some(Fault::RevokePermitAfterMark(0)));
+    let delay = retry_delay(&rig.run_post(&s).await);
+    assert!((15..=60).contains(&delay), "delay {delay}");
     assert_eq!(rig.server().posted_count().await, 1);
-    assert!(rig
-        .plan(&s)
-        .await
-        .iter()
-        .all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!(outbox.attempts, 0);
+    assert_eq!(outbox.stage, OutboxStage::Post);
+}
+
+/// A repost is byte-identical to the first post: the provider lost the
+/// article (so the repost is stored again) and the stored bytes match.
+#[tokio::test]
+async fn repost_is_byte_identical() {
+    let rig = simple_rig().await;
+    let s = rig.seed(25, &marked_plaintext(PLAIN_LEN)).await;
+
+    rig.bridge.catalog.fail_mark_posted.set(1);
+    rig.run_post(&s).await;
+    let id = rig.plan(&s).await[0].message_id.clone();
+    let mut client = rig.raw_client(0).await;
+    let mut first = Vec::new();
+    client.article_to(&id, &mut first).await.unwrap();
+
+    rig.server().hide(&id).await;
+    rig.bridge.clock.advance_secs(LEASE_SECS + 1);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let mut second = Vec::new();
+    client.article_to(&id, &mut second).await.unwrap();
+    client.quit().await;
+    assert!(!first.is_empty());
+    assert_eq!(first, second);
+    assert_eq!(rig.server().posted_count().await, 3);
 }
 
 /// Overlapping jobs never hold more provider connections than the slots

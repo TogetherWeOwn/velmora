@@ -158,6 +158,17 @@ struct Slot {
     until: i64,
 }
 
+/// A takeover injected at a chosen `mark_posted` call (by article index).
+#[derive(Clone, Copy, Debug)]
+pub enum Fault {
+    /// Another job takes the lease before the write: the write is fenced.
+    StealLeaseBeforeMark(u32),
+    /// Another job takes the lease right after the write.
+    StealLeaseAfterMark(u32),
+    /// The permit slot is taken over right after the write.
+    RevokePermitAfterMark(u32),
+}
+
 #[derive(Default)]
 pub struct MemCatalog {
     pub entries: RefCell<BTreeMap<ExtentId, Entry>>,
@@ -165,6 +176,7 @@ pub struct MemCatalog {
     /// The next `n` `mark_posted` calls fail before writing (a job that
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
+    pub fault: Cell<Option<Fault>>,
     /// Most permits ever held at once, per provider.
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
     pub permit_refusals: Cell<u32>,
@@ -366,14 +378,37 @@ impl Catalog for MemCatalog {
             self.fail_mark_posted.set(self.fail_mark_posted.get() - 1);
             return Err(BridgeError::Sql("injected mark_posted failure".into()));
         }
-        Ok(self
+        let fault = self.fault.get();
+        let steal = |e: &mut Entry| {
+            e.outbox.token += 1;
+            e.outbox.lease_until = Some(now.plus_secs(LEASE_SECS));
+        };
+        if matches!(fault, Some(Fault::StealLeaseBeforeMark(i)) if i == idx) {
+            self.fault.set(None);
+            self.edit(&l.extent, steal);
+        }
+        let written = self
             .fenced(l, |e| {
                 let a = &mut e.articles[idx as usize];
                 a.state = ArticleState::Posted;
                 a.provider_id = Some(provider.to_string());
                 a.posted_at = Some(now);
             })
-            .is_some())
+            .is_some();
+        match fault {
+            Some(Fault::StealLeaseAfterMark(i)) if i == idx => {
+                self.fault.set(None);
+                self.edit(&l.extent, steal);
+            }
+            Some(Fault::RevokePermitAfterMark(i)) if i == idx => {
+                self.fault.set(None);
+                for slot in self.slots.borrow_mut().values_mut().flatten() {
+                    slot.token += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(written)
     }
 
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool> {

@@ -1,7 +1,8 @@
 //! Permit-scoped provider sessions: every NNTP path holds a provider
 //! connection slot before it opens a socket ("no permit, no socket").
 
-use crate::ports::{Catalog, Clock, NntpConnector, NntpSession, Permit, PermitClass};
+use crate::ports::{Catalog, Clock, Lease, NntpConnector, NntpSession, Permit, PermitClass};
+use crate::post::Stop;
 use crate::types::{BridgeError, ProviderConfig, Result};
 
 /// One provider connection slot and the session opened under it.
@@ -44,30 +45,47 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }))
     }
 
-    /// Extends the permit. `false` = the slot now belongs to someone else:
-    /// the socket is dropped at once and the caller must stop.
-    pub(crate) async fn renew(&mut self) -> Result<bool> {
-        match self
-            .catalog
-            .renew_permit(&self.permit, self.clock.now())
-            .await
-        {
-            Ok(true) => Ok(true),
-            other => {
+    /// Renews the job's lease (if it has one) and then the permit. Call it
+    /// before every article and before every reconnect: no POST, read or
+    /// new socket happens on a lease or a slot that now belongs to someone
+    /// else. On a lost permit the socket is dropped at once.
+    pub(crate) async fn keep(&mut self, lease: Option<&Lease>) -> core::result::Result<(), Stop> {
+        let now = self.clock.now();
+        if let Some(lease) = lease {
+            if !self.catalog.renew(lease, now).await? {
+                return Err(Stop::Fenced);
+            }
+        }
+        match self.catalog.renew_permit(&self.permit, now).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
                 self.session = None;
-                other
+                Err(Stop::NoPermit)
+            }
+            Err(e) => {
+                self.session = None;
+                Err(e.into())
             }
         }
     }
 
-    /// The live session, connecting first when there is none.
-    pub(crate) async fn session(&mut self) -> Result<&mut N::Session> {
+    /// The live session, connecting first when there is none. A provider
+    /// that refuses the connection with `502` ("too many connections") is
+    /// reported as "no slot".
+    pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
-            self.session = Some(self.nntp.connect(self.provider, &self.permit).await?);
+            let session = match self.nntp.connect(self.provider, &self.permit).await {
+                Ok(session) => session,
+                Err(BridgeError::Nntp(velmora::Error::NoPermission(_))) => {
+                    return Err(Stop::NoPermit);
+                }
+                Err(e) => return Err(Stop::Session(e)),
+            };
+            self.session = Some(session);
         }
         self.session
             .as_mut()
-            .ok_or(BridgeError::Invalid("nntp session"))
+            .ok_or(Stop::fail(crate::types::FailClass::Internal))
     }
 
     /// Drops the session without reuse or `QUIT` (after any session error).

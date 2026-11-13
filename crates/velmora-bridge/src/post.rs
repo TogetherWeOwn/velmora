@@ -79,6 +79,8 @@ pub(crate) enum Stop {
     Fail(FailClass, Option<u32>),
     /// The catalogue failed, so nothing can be recorded; the lease expires.
     Catalog,
+    /// A session error the caller has not classified yet (it may reconnect).
+    Session(BridgeError),
 }
 
 impl Stop {
@@ -90,11 +92,12 @@ impl Stop {
 impl From<BridgeError> for Stop {
     fn from(e: BridgeError) -> Stop {
         match e {
-            // "Too many connections" is the provider saying "no slot".
-            BridgeError::Nntp(velmora::Error::NoPermission(_)) => Stop::NoPermit,
-            BridgeError::Nntp(velmora::Error::PostProhibited(_)) => {
-                Stop::fail(FailClass::PostRefused)
-            }
+            // `440`, or a `502` in answer to a command: the provider
+            // refuses this account. Only a `502` to the connection itself
+            // means "no slot" (see `ProviderSession::session`).
+            BridgeError::Nntp(
+                velmora::Error::PostProhibited(_) | velmora::Error::NoPermission(_),
+            ) => Stop::fail(FailClass::PostRefused),
             BridgeError::Nntp(_) => Stop::fail(FailClass::NntpError),
             BridgeError::Blob(_) => Stop::fail(FailClass::BlobError),
             BridgeError::Crypto(_) => Stop::fail(FailClass::CryptoError),
@@ -119,8 +122,12 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
     stop: Stop,
 ) -> JobOutcome {
     let now = clock.now();
+    let stop = match stop {
+        Stop::Session(e) => e.into(),
+        stop => stop,
+    };
     match stop {
-        Stop::Fenced => JobOutcome::Ack,
+        Stop::Fenced | Stop::Session(_) => JobOutcome::Ack,
         Stop::Catalog => JobOutcome::Retry {
             delay_secs: CATALOG_RETRY_SECS,
         },
@@ -328,18 +335,13 @@ where
     ) -> core::result::Result<(), Stop> {
         let total = u32::try_from(plan.len()).map_err(|_| Stop::fail(FailClass::Internal))?;
         for row in plan.iter().filter(|a| a.state == ArticleState::Planned) {
-            if !self.catalog.renew(lease, self.clock.now()).await? {
-                return Err(Stop::Fenced);
-            }
-            if !session.renew().await? {
-                return Err(Stop::NoPermit);
-            }
+            session.keep(Some(lease)).await?;
             let payload = payload_of(cipher, row)
                 .filter(|p| sha256(p) == row.payload_sha256)
                 .ok_or(Stop::fail(FailClass::Internal))?;
             let article = render_article(row, total, extent.cipher_size, payload)
                 .map_err(|_| Stop::fail(FailClass::Internal))?;
-            post_one(session, row, &article).await?;
+            post_one(session, lease, row, &article).await?;
             let provider = session.provider.id.as_str();
             if !self
                 .catalog
@@ -355,10 +357,12 @@ where
 
 /// POSTs one article. `Posted` and a confirmed `Duplicate` both mean the
 /// provider has it. A stale connection is replaced and the same article
-/// re-sent, at most [`MAX_POST_ATTEMPTS`] tries in all; a server verdict
-/// is never retried here.
+/// re-sent, at most [`MAX_POST_ATTEMPTS`] tries in all; the lease and the
+/// permit are renewed before each reconnect. A server verdict is never
+/// retried here.
 async fn post_one<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
+    lease: &Lease,
     row: &ArticleRow,
     article: &[u8],
 ) -> core::result::Result<(), Stop> {
@@ -366,7 +370,8 @@ async fn post_one<C: Catalog, N: NntpConnector, T: Clock>(
     loop {
         let result = match session.session().await {
             Ok(s) => s.post(&row.message_id, article).await,
-            Err(e) => Err(e),
+            Err(Stop::Session(e)) => Err(e),
+            Err(stop) => return Err(stop),
         };
         let err = match result {
             Ok(PostOutcome::Posted | PostOutcome::Duplicate) => return Ok(()),
@@ -377,9 +382,11 @@ async fn post_one<C: Catalog, N: NntpConnector, T: Clock>(
         match err {
             BridgeError::Nntp(e) if is_retryable_post_error(&e) && attempt < MAX_POST_ATTEMPTS => {
                 attempt += 1;
+                session.keep(Some(lease)).await?;
             }
-            // The server says "duplicate" but cannot show the article yet:
-            // come back later with the same message-id.
+            // The server says "duplicate" (or a bare "posting failed") but
+            // cannot show the article: come back later with the same
+            // message-id, never a new one.
             BridgeError::Nntp(velmora::Error::NntpReply {
                 code: 435 | 441, ..
             }) => return Err(Stop::fail(FailClass::DupUnconfirmed)),
