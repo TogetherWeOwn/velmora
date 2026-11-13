@@ -1,0 +1,9 @@
+{
+  "name": "velmora-s3-bridge-deploy",
+  "private": true,
+  "license": "MIT",
+  "description": "Pinned deploy tooling for the S3 Worker; CI installs it with npm ci.",
+  "devDependencies": {
+    "wrangler": "4.161.0"
+  }
+}

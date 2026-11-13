@@ -394,17 +394,80 @@ jobs:
           CI_EVENT_NAME: ${{ github.event_name }}
           BRIDGE: ${{ needs.changes.outputs.bridge }}
 
-  # Production deploy of the S3 Worker, after ci-ok on a push to main. It
-  # depends on ci-ok, never the reverse, and is not part of ci-ok.
-  # Cloudflare credentials and per-account values live only in the protected
-  # `production` environment (protected branches only). The token and
-  # account id reach only the migration, deploy and rollback steps, through
-  # env, never argv; the build runs with no credentials. Worker secrets are
-  # never read, written or listed.
+  # Production deploy of the S3 Worker after ci-ok on a push to main, in two
+  # jobs. They depend on ci-ok, never the reverse, and are not part of
+  # ci-ok. `!cancelled()` is needed because the PR-only public-pr-security
+  # job is a skipped ancestor, which would make the implicit success()
+  # skip these jobs.
+  #
+  # deploy-build compiles the Worker with no environment and no secrets,
+  # and hands the bundle to deploy as an artifact. deploy runs in the
+  # protected `production` environment (main only) and executes no cargo,
+  # build.rs or worker-build code. Wrangler comes from the committed
+  # workers/s3-bridge/package-lock.json, installed with `npm ci
+  # --ignore-scripts` before any credential is in env. The Cloudflare token
+  # and account id reach only the wrangler steps that call the API, through
+  # env, never argv. Worker secrets are never read, written or listed.
+  #
+  # D1 migrations must be additive-only (expand, then contract in a later
+  # release): they run before the new version goes live, and a rollback
+  # restores the previous Worker version but never reverts a migration.
+  deploy-build:
+    name: deploy build (s3-bridge bundle)
+    needs: [ci-ok, changes]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.bridge == 'true' && needs.changes.result == 'success' && needs.ci-ok.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      fresh: ${{ steps.fresh.outputs.fresh }}
+    steps:
+      # Stale-run guard: build and deploy only while this commit is still
+      # the tip of main, so an older run never replaces a newer release.
+      - id: fresh
+        name: Check that this commit is still the tip of main
+        run: |
+          set -euo pipefail
+          tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            echo "deploy: ${GITHUB_SHA} is the tip of main"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            echo "Deploy skipped: main moved to \`${tip}\`; the newer run deploys." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.fresh.outputs.fresh == 'true'
+        with:
+          persist-credentials: false
+      # No build cache: a deploy never restores a cache another run wrote.
+      - name: Install Rust stable
+        if: steps.fresh.outputs.fresh == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
+          rustup default stable
+      # Matches the locked workers-rs 0.8.7 and wrangler.toml [build].
+      - name: Install pinned worker-build 0.8.7
+        if: steps.fresh.outputs.fresh == 'true'
+        run: cargo install --locked worker-build --version 0.8.7
+      - name: Build the Worker bundle
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        run: worker-build --release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.fresh.outputs.fresh == 'true'
+        with:
+          name: s3-bridge-bundle
+          path: workers/s3-bridge/build/
+          if-no-files-found: error
+          retention-days: 1
+
   deploy:
     name: deploy (production)
-    needs: [ci-ok, changes]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.bridge == 'true' && needs.ci-ok.result == 'success'
+    needs: [deploy-build]
+    if: ${{ !cancelled() && needs.deploy-build.result == 'success' && needs.deploy-build.outputs.fresh == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -417,8 +480,7 @@ jobs:
     env:
       WRANGLER_SEND_METRICS: "false"
     steps:
-      # Stale-run guard: deploy only if this commit is still the tip of
-      # main, so an older run can never replace a newer release.
+      # Re-check after the build and the concurrency wait.
       - id: fresh
         name: Check that this commit is still the tip of main
         run: |
@@ -426,39 +488,36 @@ jobs:
           tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "deploy: ${GITHUB_SHA} is the tip of main"
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
           else
             echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
             echo "Deploy skipped: main moved to \`${tip}\`; the newer run deploys." >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.fresh.outputs.deploy == 'true'
+        if: steps.fresh.outputs.fresh == 'true'
         with:
           persist-credentials: false
-      # No build cache: a deploy never restores a cache another run wrote.
-      - name: Install Rust stable
-        if: steps.fresh.outputs.deploy == 'true'
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target wasm32-unknown-unknown
-          rustup default stable
-      # Matches the locked workers-rs 0.8.7 and wrangler.toml [build].
-      - name: Install pinned worker-build 0.8.7
-        if: steps.fresh.outputs.deploy == 'true'
-        run: cargo install --locked worker-build --version 0.8.7
-      - name: Build the Worker bundle (no credentials in env)
-        if: steps.fresh.outputs.deploy == 'true'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.fresh.outputs.fresh == 'true'
+        with:
+          name: s3-bridge-bundle
+          path: workers/s3-bridge/build
+      # Pinned wrangler from the committed lockfile; no install scripts run,
+      # and no credentials are in env.
+      - name: Install pinned wrangler (npm ci)
+        if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
-        run: worker-build --release
+        run: npm ci --ignore-scripts --no-audit --no-fund
       # Writes wrangler.deploy.toml: fills the prod S3_HOST and the prod
       # (first) database_id placeholder, each of which must appear exactly
       # once before the first [env.*] table, and drops the prod [build]
-      # table so wrangler deploy uploads the bundle built above instead of
-      # running repository build code with credentials in its environment.
-      # Values must be a plain hostname and a UUID, so nothing else can be
-      # injected into the TOML. Values are never printed.
+      # table so wrangler uploads the downloaded bundle and runs no
+      # repository build code. Values must be a valid hostname and a UUID,
+      # so nothing else can be injected into the TOML. Values are never
+      # printed. Pure Python, no repository code.
       - name: Generate the production wrangler config
-        if: steps.fresh.outputs.deploy == 'true'
+        if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
@@ -503,27 +562,56 @@ jobs:
               f.write("\n".join(lines))
           print("wrangler.deploy.toml: 2 prod placeholders substituted, prod [build] removed")
           PY
-      - name: Apply D1 migrations (remote)
-        if: steps.fresh.outputs.deploy == 'true'
+      # The version serving 100% of traffic now, the rollback target. A
+      # Worker that does not exist yet (first deploy) has none; any other
+      # failure, or a split (gradual) deployment, stops the deploy.
+      - id: prev
+        name: Record the active Worker version
+        if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes wrangler@4.161.0 d1 migrations apply velmora-catalog --remote -c wrangler.deploy.toml
-      - name: Deploy the Worker
-        if: steps.fresh.outputs.deploy == 'true'
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/deployments-before.json"
+          err="${RUNNER_TEMP}/deployments-before.err"
+          if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml > "$out" 2> "$err"; then
+            version=$(jq -r 'if (.versions | length) == 1 and .versions[0].percentage == 100 then .versions[0].version_id else empty end' "$out")
+            if ! [[ "$version" =~ ^[0-9a-f-]{36}$ ]]; then
+              echo "active deployment is not a single version at 100%; refusing to deploy"
+              exit 1
+            fi
+            echo "active version before deploy: ${version}"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          elif grep -q 'code: 10007' "$err"; then
+            echo "first deploy: the Worker does not exist yet, so there is no rollback target"
+          else
+            cat "$err"
+            exit 1
+          fi
+      - name: Apply D1 migrations (remote)
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: ./node_modules/.bin/wrangler d1 migrations apply velmora-catalog --remote -c wrangler.deploy.toml
+      - id: deploy
+        name: Deploy the Worker
+        if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # Structured (ND-JSON) output, read below for the version id.
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
-        run: npx --yes wrangler@4.161.0 deploy -c wrangler.deploy.toml
+        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml
       # An unsigned GET must be refused with 403 and an S3 AccessDenied
       # body. Retries cover the propagation window right after deploy.
       - id: smoke
         name: Smoke test (unsigned GET is refused)
-        if: steps.fresh.outputs.deploy == 'true'
+        if: steps.fresh.outputs.fresh == 'true'
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
         run: |
@@ -541,29 +629,48 @@ jobs:
           done
           echo "smoke: expected HTTP 403 AccessDenied for an unsigned GET, last got ${code}"
           exit 1
-      - name: Roll back after a failed smoke test
-        if: failure() && steps.smoke.outcome == 'failure'
+      # On any failure or cancellation after the rollback target was
+      # recorded: roll back to that exact version, but only if the active
+      # version changed. If the active version cannot be read, roll back.
+      - name: Roll back to the recorded version
+        if: ${{ (failure() || cancelled()) && steps.prev.outputs.version != '' }}
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PREV_VERSION: ${{ steps.prev.outputs.version }}
         run: |
-          npx --yes wrangler@4.161.0 rollback -c wrangler.deploy.toml --message "smoke failed" -y
-          echo "Smoke test failed; rolled back to the previous Worker version." >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          out="${RUNNER_TEMP}/deployments-after.json"
+          active=""
+          if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml > "$out"; then
+            active=$(jq -r 'if (.versions | length) == 1 and .versions[0].percentage == 100 then .versions[0].version_id else empty end' "$out")
+          fi
+          if [ "$active" = "$PREV_VERSION" ]; then
+            echo "rollback: active version is still ${PREV_VERSION}; nothing to roll back"
+            exit 0
+          fi
+          ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
+            --message "automatic rollback: deploy job failed or was cancelled" -y
+          echo "Deploy failed or was cancelled; rolled back to Worker version \`${PREV_VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
       - name: Record the Worker version id
-        if: steps.fresh.outputs.deploy == 'true'
+        if: steps.fresh.outputs.fresh == 'true'
         env:
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+          PREV_VERSION: ${{ steps.prev.outputs.version }}
         run: |
           set -euo pipefail
           version_id=$(jq -r 'select(.type == "deploy") | .version_id // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)
+          # The deploy already passed its smoke test; a missing id is a
+          # reporting problem only and must not trigger a rollback.
           if [ -z "$version_id" ]; then
-            echo "no version id in the wrangler output"
-            exit 1
+            echo "::warning::no version id in the wrangler output"
+            version_id="unknown (see the deploy step log)"
           fi
           {
             echo "### Worker deployed"
             echo ""
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Worker version id: \`${version_id}\`"
+            echo "- Previous version id: \`${PREV_VERSION:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
