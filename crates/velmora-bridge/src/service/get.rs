@@ -14,7 +14,7 @@ use super::common::{
     authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
-use crate::fetch::ColdFetch;
+use crate::fetch::{cold_poll_ms, ColdFetch, COLD_WAIT_MS};
 use crate::ingress::{ByteBudget, Charge};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
@@ -302,20 +302,45 @@ where
     // digest and is already written to the cache. Two extents' worth is
     // live at the peak: the ciphertext and its copy for the cache while
     // it is being written, then the ciphertext and the plaintext.
-    let work = bridge
+    let need = extent.cipher_size.saturating_mul(2);
+    let mut work = bridge
         .budget
-        .charge(extent.cipher_size.saturating_mul(2))
+        .charge(need)
         .await
         .map_err(|_| ReadFail::Busy)?;
-    match bridge.fetch_cold(extent).await {
-        Ok(ColdFetch::Filled(cipher)) => {
-            let plain =
-                open(&bridge.kek, bucket, piece, 0, &cipher).ok_or(ReadFail::Unavailable)?;
-            drop(cipher);
-            retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)
+    // While every provider slot is taken (more concurrent misses than
+    // connections) the read waits and retries, up to COLD_WAIT_MS in all.
+    // The budget charge is released for each wait so waiting readers do
+    // not starve the budget, and taken again without waiting: each retry
+    // only sleeps here, inside the same bound.
+    let mut waited = 0u32;
+    let mut attempt = 0u64;
+    loop {
+        match bridge.fetch_cold(extent).await {
+            Ok(ColdFetch::Filled(cipher)) => {
+                let plain =
+                    open(&bridge.kek, bucket, piece, 0, &cipher).ok_or(ReadFail::Unavailable)?;
+                drop(cipher);
+                return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
+            }
+            Ok(ColdFetch::Busy) => {}
+            Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
+            Err(_) => return Err(ReadFail::Internal),
         }
-        Ok(ColdFetch::Busy) => Err(ReadFail::Busy),
-        Ok(ColdFetch::Unavailable) => Err(ReadFail::Unavailable),
-        Err(_) => Err(ReadFail::Internal),
+        drop(work);
+        let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
+        work = loop {
+            if waited >= COLD_WAIT_MS {
+                return Err(ReadFail::Busy);
+            }
+            attempt += 1;
+            let seed = (bridge.clock.now().0 as u64) ^ piece.off.rotate_left(32) ^ attempt;
+            let ms = cold_poll_ms(seed);
+            sleep(ms).await;
+            waited = waited.saturating_add(ms);
+            if let Some(charge) = bridge.budget.try_charge(need) {
+                break charge;
+            }
+        };
     }
 }

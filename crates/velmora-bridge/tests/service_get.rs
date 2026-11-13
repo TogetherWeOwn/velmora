@@ -5,12 +5,15 @@ mod nntp_support;
 mod service_support;
 
 use nntp_support::{TcpConnector, PASS, USER};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use futures_util::StreamExt;
 use service_support::*;
 use velmora::rng::SystemRng;
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk};
+use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
+use velmora_bridge::ingress::{ByteBudget, Sleeper, CHARGE_POLL_MS};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -563,6 +566,12 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
 }
 
 async fn cold_rig() -> Cold {
+    cold_rig_with(2, None).await
+}
+
+/// A cold-read rig whose provider allows `max_conns` connections and whose
+/// byte budget polls with `sleeper` (none: nothing ever waits).
+async fn cold_rig_with(max_conns: u32, sleeper: Option<Sleeper>) -> Cold {
     let mut server_cfg = ServerConfig::for_test();
     server_cfg.articles = Vec::new();
     server_cfg.missing_ids.clear();
@@ -574,8 +583,14 @@ async fn cold_rig() -> Cold {
         },
     );
     let server = TestNntpServer::spawn(server_cfg).await;
-    let cfg = config(vec![provider(&server)]);
-    let rig = rig_with(TcpConnector::default(), cfg);
+    let mut p = provider(&server);
+    p.max_conns = max_conns;
+    let cfg = config(vec![p]);
+    let mut budget = ByteBudget::new(cfg.inflight_budget_bytes);
+    if let Some(sleeper) = sleeper {
+        budget = budget.with_sleeper(sleeper);
+    }
+    let rig = rig_with_budget(TcpConnector::default(), cfg, budget);
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)
@@ -597,25 +612,31 @@ impl Cold {
         rig.put(&self.signer, BUCKET, key, body).await.expect(200);
         let (generation, extents) = rig.live(&self.bucket, key).await.unwrap();
         let extent = extents.into_iter().next().unwrap();
+        self.post(&generation.id, &extent).await;
+        extent
+    }
+
+    /// Runs the posting stage for one extent of a committed generation.
+    async fn post(&self, generation: &GenerationId, extent: &ExtentRow) {
+        let rig = &self.rig;
         let catalog = &rig.bridge.catalog;
         let lease = catalog
             .claim(
                 &extent.id,
-                &generation.id,
+                generation,
                 OutboxStage::Post,
                 "test-worker",
                 rig.now(),
             )
             .await
             .unwrap()
-            .expect("the PUT left a claimable posting obligation");
+            .expect("the commit left a claimable posting obligation");
         let job = catalog
-            .job_extent(&extent.id, &generation.id)
+            .job_extent(&extent.id, generation)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
-        extent
     }
 }
 
@@ -734,6 +755,167 @@ async fn cold_read_without_a_free_connection_is_slow_down() {
         "no session was opened"
     );
     assert!(rig.bridge.cache.keys().is_empty());
+
+    for permit in &held {
+        rig.bridge.catalog.release_permit(permit).await.unwrap();
+    }
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+}
+
+/// Sleeper that really sleeps 1 ms per poll (so sessions in flight make
+/// progress) and adds up the milliseconds the bridge asked for.
+fn short_sleeper(asked: Rc<Cell<u64>>, polls: Rc<Cell<u32>>) -> Sleeper {
+    Rc::new(move |ms| {
+        assert!(
+            (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) || ms == CHARGE_POLL_MS
+        );
+        asked.set(asked.get() + u64::from(ms));
+        polls.set(polls.get() + 1);
+        Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)))
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_cold_range_reads_wait_for_a_provider_slot() {
+    // The way aws-cli downloads: ten range GETs at once, more than the
+    // provider's four connections.
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let cold = cold_rig_with(4, Some(short_sleeper(asked.clone(), polls.clone()))).await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(41, 1_300_000),
+        pattern(42, 900_001),
+        pattern(43, 1_100_000),
+    ];
+    let whole: Vec<u8> = parts.concat();
+    let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    let extents = commit_parts(rig, &cold.signer, &cold.bucket, "multi", &slices).await;
+    for extent in &extents {
+        cold.post(extent.generation_id.as_ref().unwrap(), extent)
+            .await;
+        evict(rig, extent).await;
+    }
+    assert!(rig.bridge.cache.keys().is_empty());
+    let template = rig.live(&cold.bucket, "template").await.unwrap().1;
+    evict(rig, &template[0]).await;
+    assert!(rig.bridge.safety.keys().is_empty());
+    let connects = rig.bridge.nntp.connects();
+
+    let total = whole.len();
+    let step = total / 10;
+    let ranges: Vec<(usize, usize)> = (0..10)
+        .map(|i| {
+            (
+                i * step,
+                if i == 9 {
+                    total - 1
+                } else {
+                    (i + 1) * step - 1
+                },
+            )
+        })
+        .collect();
+    let gets = ranges.iter().map(|(start, end)| {
+        let range = format!("bytes={start}-{end}");
+        let signer = &cold.signer;
+        async move { get_range(rig, signer, "multi", &range).await }
+    });
+    let resps = futures_util::future::join_all(gets).await;
+    for ((start, end), resp) in ranges.iter().zip(&resps) {
+        resp.expect(206);
+        assert!(resp.stream_error.is_none(), "{start}-{end}");
+        assert!(
+            resp.body == whole[*start..=*end],
+            "{start}-{end}: other bytes"
+        );
+    }
+
+    // Some readers found every slot taken and waited for one; at no point
+    // were more sessions open than the provider allows.
+    assert!(polls.get() > 0, "no reader had to wait");
+    assert!(asked.get() < u64::from(COLD_WAIT_MS));
+    assert!(rig.bridge.nntp.connects() > connects);
+    assert!(
+        rig.bridge.nntp.peak() <= 4,
+        "peak {}",
+        rig.bridge.nntp.peak()
+    );
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+    for extent in &extents {
+        assert!(rig.bridge.cache.contains(&extent.id.cache_key()));
+    }
+    // Every slot is free again.
+    let provider = &rig.bridge.cfg.providers[0];
+    let mut held = Vec::new();
+    while let Some(permit) = rig
+        .bridge
+        .catalog
+        .acquire_permit(provider, PermitClass::Read, "check", rig.now())
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+        assert!(held.len() <= 4, "more permits than max_conns");
+    }
+    assert_eq!(held.len(), 4);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cold_read_waits_for_a_slot_then_slows_down() {
+    // No real time passes: the sleeper only adds up what was asked.
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let (a, p) = (asked.clone(), polls.clone());
+    let sleeper: Sleeper = Rc::new(move |ms| {
+        assert!((COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms));
+        a.set(a.get() + u64::from(ms));
+        p.set(p.get() + 1);
+        Box::pin(async {})
+    });
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    let body = pattern(47, 300_000);
+    let extent = cold.put_and_post("cold.bin", &body).await;
+    evict(rig, &extent).await;
+
+    // Other readers hold every slot for longer than the bound.
+    let provider = &rig.bridge.cfg.providers[0];
+    let mut held = Vec::new();
+    while let Some(permit) = rig
+        .bridge
+        .catalog
+        .acquire_permit(provider, PermitClass::Read, "other", rig.now())
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+        assert!(held.len() <= 4, "more permits than max_conns");
+    }
+    assert_eq!(held.len(), 4);
+    let connects = rig.bridge.nntp.connects();
+
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    assert!(resp.header("retry-after").is_some());
+    let bound = u64::from(COLD_WAIT_MS);
+    assert!(asked.get() >= bound, "gave up after {} ms", asked.get());
+    assert!(
+        asked.get() < bound + u64::from(COLD_POLL_MS + COLD_JITTER_MS),
+        "waited {} ms",
+        asked.get()
+    );
+    assert!(polls.get() > 1);
+    assert_eq!(
+        rig.bridge.nntp.connects(),
+        connects,
+        "no session was opened"
+    );
+    assert!(rig.bridge.cache.keys().is_empty());
+    assert_eq!(rig.bridge.budget.in_use(), 0);
 
     for permit in &held {
         rig.bridge.catalog.release_permit(permit).await.unwrap();
