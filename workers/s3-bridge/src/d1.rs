@@ -100,13 +100,22 @@ async fn settle(call: std::result::Result<Promise, JsValue>) -> Result<JsValue> 
 /// `meta.changes`; absent reads as 0 (a `SELECT`).
 fn changes(result: &JsValue) -> Result<u64> {
     let field = |obj: &JsValue, name: &str| Reflect::get(obj, &JsValue::from_str(name));
+    // A missing or malformed count is an error, never "0 rows changed":
+    // fenced catalogue calls read 0 as "lease lost", which would turn a
+    // committed write into a silent no-op.
+    if field(result, "success")
+        .map_err(|_| decode_err())?
+        .as_bool()
+        == Some(false)
+    {
+        return Err(decode_err());
+    }
     let meta = field(result, "meta").map_err(|_| decode_err())?;
     if meta.is_null() || meta.is_undefined() {
-        return Ok(0);
+        return Err(decode_err());
     }
     let n = field(&meta, "changes").map_err(|_| decode_err())?;
     match n.as_f64() {
-        None if n.is_null() || n.is_undefined() => Ok(0),
         None => Err(decode_err()),
         Some(f) => u64::try_from(number_to_int(f)?).map_err(|_| decode_err()),
     }
@@ -194,7 +203,13 @@ fn from_js(v: JsValue) -> Result<SqlValue> {
 fn error_text(e: &JsValue) -> String {
     let message = |v: &JsValue| match v.dyn_ref::<js_sys::Error>() {
         Some(err) => String::from(err.message()),
-        None => v.as_string().unwrap_or_default(),
+        None => v.as_string().unwrap_or_else(|| {
+            // A plain `{message}` rejection must still reach the guard rule.
+            Reflect::get(v, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|m| m.as_string())
+                .unwrap_or_default()
+        }),
     };
     match e.dyn_ref::<js_sys::Error>() {
         Some(err) => format!("{} | {}", message(e), message(&err.cause())),
