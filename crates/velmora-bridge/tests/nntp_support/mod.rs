@@ -610,6 +610,13 @@ pub struct Rig {
 /// A recognisable plaintext: any leak into an article is easy to find.
 pub const MARKER: &[u8] = b"PLAINTEXT-MARKER";
 
+/// A bucket name that cannot appear in an article by chance.
+pub const BUCKET_NAME: &str = "private-bucket-name";
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn marked_plaintext(len: usize) -> Vec<u8> {
     MARKER.iter().copied().cycle().take(len).collect()
 }
@@ -705,7 +712,7 @@ impl Rig {
         let cipher = sealer.seal_to_vec(plain).unwrap();
         let bucket = Bucket {
             id: BucketId::mint([7; 8]),
-            name: "bucket".to_string(),
+            name: BUCKET_NAME.to_string(),
             owner: "owner".to_string(),
             bdk_wrapped: vec![0; 73],
             kek_version: 1,
@@ -725,7 +732,7 @@ impl Rig {
             media_header: cipher[..48].to_vec(),
             key_mode: 1,
             wrapped_file_key: Some(vec![0; 73]),
-            plain_md5: [0; 16],
+            plain_md5: sha256(plain)[..16].try_into().unwrap(),
             plain_sha256: sha256(plain),
             cipher_sha256: sha256(&cipher),
             safety_state: SafetyState::Held,

@@ -82,6 +82,52 @@ async fn posts_the_stored_plan_and_no_plaintext() {
     assert_eq!(rig.bridge.nntp.connects(), 1);
 }
 
+/// Articles carry only the obfuscated headers: no catalogue identifier and
+/// no plaintext digest appears anywhere in a posted article.
+#[tokio::test]
+async fn posted_articles_carry_no_identifying_metadata() {
+    let rig = simple_rig().await;
+    let s = rig.seed(9, &marked_plaintext(PLAIN_LEN)).await;
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let job = rig.job(&s).await;
+    let extent = &job.extent;
+    let mut secrets: Vec<Vec<u8>> = vec![
+        BUCKET_NAME.into(),
+        job.bucket.id.as_str().into(),
+        job.bucket.owner.clone().into(),
+        extent.id.as_str().into(),
+        s.generation.as_str().into(),
+    ];
+    for digest in [&extent.plain_md5[..], &extent.plain_sha256[..]] {
+        secrets.push(digest.to_vec());
+        secrets.push(hex(digest).into());
+        secrets.push(hex(digest).to_uppercase().into());
+    }
+
+    let mut client = rig.raw_client(0).await;
+    for row in rig.plan(&s).await {
+        let mut article = Vec::new();
+        client
+            .article_to(&row.message_id, &mut article)
+            .await
+            .unwrap();
+        for secret in &secrets {
+            assert!(
+                !contains(&article, secret),
+                "article {} leaks metadata",
+                row.idx
+            );
+            assert!(!contains(&row.headers, secret));
+        }
+        // The stored headers are the posted headers.
+        let headers = String::from_utf8(row.headers.clone()).unwrap();
+        let subject = headers.lines().find(|l| l.starts_with("Subject:")).unwrap();
+        assert!(contains(&article, subject.as_bytes()));
+    }
+    client.quit().await;
+}
+
 /// The job dies after the POST and before the catalogue write. Its
 /// successor re-sends the same message-id, the server answers "duplicate",
 /// and the article is confirmed: no second copy, no new id.
