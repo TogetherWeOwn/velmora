@@ -125,8 +125,22 @@ async fn head_uses_the_catalogue_only() {
             b"",
         )
         .await;
+    // HEAD has no ranges: the header is ignored, not applied.
     range.expect(200);
-    assert_eq!(range.header("content-length"), Some("3"));
+    assert_eq!(range.header("content-length"), Some("5"));
+    assert_eq!(range.header("content-range"), None);
+    let unsatisfiable = rig
+        .call(
+            &signer,
+            Method::Head,
+            &path(BUCKET, "k"),
+            &[],
+            &[("range", "bytes=100-200")],
+            b"",
+        )
+        .await;
+    unsatisfiable.expect(200);
+    assert_eq!(unsatisfiable.header("content-length"), Some("5"));
 
     let not_modified = rig
         .call(
@@ -188,24 +202,44 @@ async fn put_is_not_acked_when_the_commit_fails() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn safety_copy_is_written_before_the_commit() {
+async fn put_is_not_acked_when_the_database_is_down() {
     let rig = rig();
-    let (_, signer) = rig.standard(BUCKET).await;
-    // Exhaust the store: an in-memory store cannot fail, so make the
-    // catalogue refuse instead and check the order through what is left.
-    rig.bridge.catalog.sql.with_conn(|c| {
-        c.execute_batch(
-            "CREATE TRIGGER refuse BEFORE INSERT ON generations \
-             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
-        )
-        .unwrap()
-    });
-    rig.put(&signer, BUCKET, "k", b"payload")
-        .await
-        .expect_error(500, "InternalError");
-    // The safety copy was written before the catalogue was asked.
-    assert_eq!(rig.bridge.safety.keys().len(), 1);
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.bridge.catalog.sql.fail_writes.set(true);
+    let put = rig.put(&signer, BUCKET, "k", b"payload").await;
+    put.expect_error(500, "InternalError");
+    assert_eq!(put.header("etag"), None);
+    rig.bridge.catalog.sql.fail_writes.set(false);
+
+    assert!(rig.live(&bucket, "k").await.is_none());
     assert_eq!(rig.count("objects"), 0);
+    assert_eq!(rig.count("generations"), 0);
+    assert_eq!(rig.count("outbox"), 0);
+    assert!(rig.bridge.jobs.inner.sent().is_empty());
+    // The safety copy was written before the catalogue was asked: what
+    // is left is an unreferenced blob, never a row without bytes.
+    assert_eq!(rig.bridge.safety.keys().len(), 1);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+    rig.head(&signer, BUCKET, "k").await.expect(404);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_is_not_acked_when_the_safety_copy_fails() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.bridge.safety.fail_put.set(true);
+    let put = rig.put(&signer, BUCKET, "k", b"payload").await;
+    put.expect_error(500, "InternalError");
+    assert_eq!(put.header("etag"), None);
+    // Without a safety copy the catalogue is never told about the object.
+    assert!(rig.live(&bucket, "k").await.is_none());
+    assert_nothing_stored(&rig);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+    rig.head(&signer, BUCKET, "k").await.expect(404);
+
+    // The store recovers and the same request goes through.
+    rig.bridge.safety.fail_put.set(false);
+    rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -618,7 +652,7 @@ async fn digest_mismatch_stores_nothing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn real_bucket_refused_before_h9() {
+async fn real_bucket_refused_while_not_ready() {
     // This test describes the closed gate; opening it must revisit it.
     const { assert!(!REAL_DATA_READY) }
     let rig = rig();

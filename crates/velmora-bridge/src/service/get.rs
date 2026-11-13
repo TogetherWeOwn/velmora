@@ -83,7 +83,8 @@ async fn head<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T:
         &metadata,
         true,
         &Conditions::from_headers(&authed.headers),
-        authed.headers.get("range"),
+        // HEAD has no ranges: a `Range` header is ignored.
+        None,
         authed.headers.get("x-amz-checksum-mode").is_some(),
     )
     .map_err(s3_error)?;

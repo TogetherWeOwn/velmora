@@ -38,8 +38,8 @@ pub fn secret() -> &'static str {
     SECRET.with(|s| *s)
 }
 
-pub type TestCatalog = SqlCatalog<RusqliteSql>;
-pub type TestBridge<N> = Bridge<TestCatalog, MemBlobStore, N, Jobs, TestKek, FixedClock>;
+pub type TestCatalog = SqlCatalog<FailSql>;
+pub type TestBridge<N> = Bridge<TestCatalog, Blobs, N, Jobs, TestKek, FixedClock>;
 
 // ---------------------------------------------------------------------------
 // A connector for tests that must never reach Usenet
@@ -92,6 +92,69 @@ impl JobSink for Jobs {
     }
 }
 
+/// A blob store whose writes can be made to fail.
+#[derive(Default)]
+pub struct Blobs {
+    pub inner: MemBlobStore,
+    pub fail_put: Cell<bool>,
+}
+
+impl std::ops::Deref for Blobs {
+    type Target = MemBlobStore;
+    fn deref(&self) -> &MemBlobStore {
+        &self.inner
+    }
+}
+
+impl BlobStore for Blobs {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        if self.fail_put.get() {
+            return Err(BridgeError::Blob("store down".into()));
+        }
+        self.inner.put(key, bytes, meta).await
+    }
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key, span).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A database whose writes can be made to fail; reads keep working.
+pub struct FailSql {
+    pub inner: RusqliteSql,
+    pub fail_writes: Cell<bool>,
+}
+
+impl std::ops::Deref for FailSql {
+    type Target = RusqliteSql;
+    fn deref(&self) -> &RusqliteSql {
+        &self.inner
+    }
+}
+
+impl Sql for FailSql {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.inner.query(sql, params).await
+    }
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        if self.fail_writes.get() {
+            return Err(BridgeError::Sql("database down".into()));
+        }
+        self.inner.exec(sql, params).await
+    }
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        if self.fail_writes.get() {
+            return Err(BridgeError::Sql("database down".into()));
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rig
 // ---------------------------------------------------------------------------
@@ -128,9 +191,12 @@ pub fn rig_with<N: NntpConnector + 'static>(nntp: N, cfg: BridgeConfig) -> Rig<N
     let budget = ByteBudget::new(cfg.inflight_budget_bytes);
     Rig {
         bridge: Rc::new(Bridge {
-            catalog: SqlCatalog::new(RusqliteSql::with_schema().unwrap()),
-            safety: MemBlobStore::new(),
-            cache: MemBlobStore::new(),
+            catalog: SqlCatalog::new(FailSql {
+                inner: RusqliteSql::with_schema().unwrap(),
+                fail_writes: Cell::new(false),
+            }),
+            safety: Blobs::default(),
+            cache: Blobs::default(),
             nntp,
             jobs: Jobs::default(),
             kek: TestKek::new(),
