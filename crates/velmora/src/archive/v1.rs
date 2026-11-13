@@ -291,6 +291,13 @@ pub trait Sink {
     fn write<'a>(&'a mut self, bytes: &'a [u8]) -> impl Future<Output = Result<()>> + 'a;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// Configured transport is available; no object durability is implied.
+    Available,
+    Unavailable,
+}
+
 /// SHA-256 of the supplied bytes, without any authentication claim.
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()

@@ -7,8 +7,8 @@
 //! A transport timeout after issuing a mutation MUST be `Failure::Uncertain`.
 //! Constructors perform no I/O. Only explicitly enabled configurations operate.
 //!
-//! This slice ships the explicit configuration and transport-owned types only;
-//! the `SafeTransport` port and adapter arrive with their first operations.
+//! This slice ships multipart begin/write_part and health ops only; abort,
+//! completion, readback and reconciliation arrive with their own ops.
 
 use super::*;
 
@@ -122,4 +122,134 @@ pub struct RangeReply {
     pub offset: u64,
     pub total: u64,
     pub version: Id,
+}
+
+/// Trusted infrastructure port, not deserialized client assertions. Every method
+/// uses HTTPS:443 to the configured pinned endpoint with scoped signing from the
+/// credential reference. Never forward credentials across hosts/redirects.
+///
+/// `begin` reconciles the durable intent/remote-upload binding before returning
+/// an existing upload or issuing CreateMultipartUpload. Persist the request and
+/// returned upload ID before ack; a lost response is uncertain, not a new upload.
+/// `upload_part` executes UploadPart with SHA-256 and the exact index+1; retry
+/// is only the same bytes/part/upload. `abort_incomplete` removes at most
+/// staging for this exact upload; a completed object is `Irreversible`. A
+/// transport must treat a dropped in-flight call as abandoned (publish no
+/// success from it) and keep any already-issued mutation's outcome
+/// `Failure::Uncertain`, never absent or rolled back. Abort, completion,
+/// readback and settlement arrive with their operations; no hidden retries or
+/// account fallback.
+#[allow(async_fn_in_trait)]
+pub trait SafeTransport {
+    async fn begin(
+        &mut self,
+        config: &Config,
+        intent: &WriteIntent,
+        control: &impl Control,
+    ) -> Result<Id>;
+    async fn upload_part(
+        &mut self,
+        config: &Config,
+        session: &WriteSession,
+        index: usize,
+        bytes: &[u8],
+        control: &impl Control,
+    ) -> Result<PartAck>;
+    async fn health(
+        &mut self,
+        config: &Config,
+        target: &Target,
+        control: &impl Control,
+    ) -> Result<Health>;
+}
+
+pub struct Provider<T> {
+    config: Config,
+    transport: T,
+}
+
+impl<T: SafeTransport> Provider<T> {
+    pub fn new(config: Option<Config>, transport: T) -> Result<Self> {
+        let config = config.ok_or(Failure::Configuration)?;
+        config.validate()?;
+        Ok(Self { config, transport })
+    }
+
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
+    fn check(&self, target: &Target, action: Action, control: &impl Control) -> Result<()> {
+        self.config.validate()?;
+        if target.backend != Backend::S3 || target.account != self.config.account {
+            return Err(Failure::Configuration);
+        }
+        control.check(target, action)
+    }
+
+    fn validate_intent(&self, intent: &WriteIntent) -> Result<()> {
+        intent.validate()?;
+        if intent.parts[..intent.parts.len() - 1]
+            .iter()
+            .any(|part| (part.bytes as usize) < MIN_MULTIPART_BYTES)
+        {
+            return Err(Failure::Invalid);
+        }
+        Ok(())
+    }
+
+    /// Issues or rebinds the remote multipart upload for this exact intent.
+    pub async fn begin(
+        &mut self,
+        intent: &WriteIntent,
+        control: &impl Control,
+    ) -> Result<WriteSession> {
+        self.check(&intent.target, Action::Write, control)?;
+        self.validate_intent(intent)?;
+        let remote = self.transport.begin(&self.config, intent, control).await?;
+        // Once issued, late cancellation/expiry cannot turn a successful remote
+        // effect into a "nothing happened" error. Reconcile before cleanup.
+        self.check(&intent.target, Action::Write, control)
+            .map_err(|_| Failure::Uncertain)?;
+        Ok(WriteSession {
+            intent: intent.clone(),
+            remote,
+        })
+    }
+
+    /// Uploads the exact checksummed manifest part. Retry is only the same
+    /// bytes/part/upload; an unacknowledged effect stays `Uncertain`.
+    pub async fn write_part(
+        &mut self,
+        session: &WriteSession,
+        index: usize,
+        bytes: &[u8],
+        control: &impl Control,
+    ) -> Result<PartReceipt> {
+        self.check(&session.intent.target, Action::Write, control)?;
+        self.validate_intent(&session.intent)?;
+        let part = session.intent.check_part(index, bytes)?;
+        let ack = self
+            .transport
+            .upload_part(&self.config, session, index, bytes, control)
+            .await?;
+        if ack.sha256 != part.sha256 {
+            return Err(Failure::Uncertain);
+        }
+        self.check(&session.intent.target, Action::Write, control)
+            .map_err(|_| Failure::Uncertain)?;
+        Ok(PartReceipt {
+            index,
+            intent_binding: session.intent.binding()?,
+            acknowledgement: ack.etag,
+        })
+    }
+
+    /// Adapter availability only; never a whole-object durability signal.
+    pub async fn health(&mut self, target: &Target, control: &impl Control) -> Result<Health> {
+        self.check(target, Action::Health, control)?;
+        let health = self.transport.health(&self.config, target, control).await?;
+        self.check(target, Action::Health, control)?;
+        Ok(health)
+    }
 }

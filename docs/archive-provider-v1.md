@@ -18,11 +18,12 @@ contain no keys, OPRF output, private dedupe digest or secret.
 prefixes. It is internal, not a public validator, existence oracle, serving
 grant or authorization decision. A digest alone does not authenticate media.
 These serializable records are not proof of durability; callers must bound
-untrusted input before deserialization. Provider operations are not implemented.
+untrusted input before deserialization.
 
 `WriteIntent::validate` accepts at most 10,000 uniquely referenced, contiguous
 parts of at most 8 MiB each and checks their combined length. An empty object
-uses one explicit empty part. Callers must compute the manifest from staged
+uses one explicit empty part. S3 non-final multipart parts require at least
+5 MiB; only the final part may be smaller. Callers must compute the manifest from staged
 ciphertext and bound and authorize serialized metadata before decoding it;
 validation after deserialization cannot prevent an unbounded decoder allocation.
 Validation does not establish digest correctness or durability.
@@ -48,10 +49,19 @@ bucket, region and credential-reference shapes are checked the same way. Host
 syntax validation here is not DNS or peer qualification. The trusted transport
 must still resolve, vet and pin every connection, use HTTPS:443 to the
 configured endpoint, sign only through the scoped credential reference, refuse
-redirects and never forward credentials across hosts. There is no shipped live
-signer, HTTP implementation, credential resolution or provider probe.
+redirects and never forward credentials across hosts. The safe transport
+journals stable operation/request/upload IDs before acknowledging them, and
+UploadPart must acknowledge the submitted SHA-256 while ETags remain opaque.
+There is no shipped live signer, HTTP implementation, credential resolution or
+provider probe.
+
+`s3::Provider` ships only multipart `begin`/`write_part` and `health` over
+that port; `abort` (at most the incomplete staging of its exact upload, never
+a completed object or another attempt), completion, readback and
+reconciliation are not callable yet. `health` reports adapter availability
+only, never whole-object durability.
 
 These are interface obligations, not an implementation of authorization,
-revocation, transport closure or output verification. Provider adapters,
-consumer integration and the complete provider trait are still pending; no
-physical deletion or eviction API is provided.
+revocation, transport closure or output verification. Consumer integration and
+the complete provider trait are still pending; no physical deletion or
+eviction API is provided.
