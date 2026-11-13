@@ -24,6 +24,9 @@ fn s3_disabled_and_unsafe_config_fails_closed_without_io() {
     assert_eq!(disabled.validate(), Err(Failure::Disabled));
     for host in [
         "127.0.0.1",
+        "127.1",
+        "0x7f.0.0.1",
+        "0177.0.0.1",
         "https://archive.example.com",
         "a.local",
         "a.internal",

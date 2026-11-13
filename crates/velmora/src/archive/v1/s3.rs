@@ -34,6 +34,7 @@ impl Config {
         if host.len() > 253
             || !host.contains('.')
             || host.parse::<std::net::IpAddr>().is_ok()
+            || host.split('.').all(numeric_address_label)
             || host.ends_with('.')
             || host.eq_ignore_ascii_case("localhost")
             || [".localhost", ".local", ".internal", ".invalid", ".test"]
@@ -80,6 +81,16 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn numeric_address_label(label: &str) -> bool {
+    if let Some(hex) = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+    {
+        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
