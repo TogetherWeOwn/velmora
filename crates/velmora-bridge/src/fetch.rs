@@ -257,8 +257,10 @@ pub enum ColdFetch {
     /// The complete, verified ciphertext. It is already in the cache.
     Filled(Vec<u8>),
     /// A provider that could still hold missing articles had no free
-    /// connection slot or failed in transit: retry shortly.
+    /// connection slot: worth waiting for one.
     Busy,
+    /// A provider read broke off in transit: retry later, not at once.
+    Interrupted,
     /// No provider could supply every article intact.
     Unavailable,
 }
@@ -293,6 +295,7 @@ where
         let mut cipher = vec![0u8; size];
         let mut have = vec![false; plan.len()];
         let mut busy = false;
+        let mut interrupted = false;
         let holder = format!("get:{}", extent.id);
         for provider in self.cfg.providers.iter().filter(|p| p.read) {
             let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
@@ -323,7 +326,7 @@ where
             match read {
                 Ok(_) => {}
                 // The read broke off: this provider may still have the rest.
-                Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => busy = true,
+                Err(Stop::NoPermit | Stop::Fail(..) | Stop::Session(_)) => interrupted = true,
                 Err(Stop::Fenced | Stop::Catalog) => {
                     return Err(BridgeError::Sql(
                         "catalogue failed during a cold read".into(),
@@ -332,7 +335,9 @@ where
             }
         }
         if have.contains(&false) {
-            return Ok(if busy {
+            return Ok(if interrupted {
+                ColdFetch::Interrupted
+            } else if busy {
                 ColdFetch::Busy
             } else {
                 ColdFetch::Unavailable
