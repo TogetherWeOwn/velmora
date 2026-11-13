@@ -158,15 +158,15 @@ struct Slot {
     until: i64,
 }
 
-/// A takeover injected at a chosen `mark_posted` call (by article index).
+/// A takeover injected at the `mark_posted` call of one article index.
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
     /// Another job takes the lease before the write: the write is fenced.
-    StealLeaseBeforeMark(u32),
+    StealLeaseBefore(u32),
     /// Another job takes the lease right after the write.
-    StealLeaseAfterMark(u32),
+    StealLeaseAfter(u32),
     /// The permit slot is taken over right after the write.
-    RevokePermitAfterMark(u32),
+    RevokePermitAfter(u32),
 }
 
 #[derive(Default)]
@@ -383,7 +383,7 @@ impl Catalog for MemCatalog {
             e.outbox.token += 1;
             e.outbox.lease_until = Some(now.plus_secs(LEASE_SECS));
         };
-        if matches!(fault, Some(Fault::StealLeaseBeforeMark(i)) if i == idx) {
+        if matches!(fault, Some(Fault::StealLeaseBefore(i)) if i == idx) {
             self.fault.set(None);
             self.edit(&l.extent, steal);
         }
@@ -396,11 +396,11 @@ impl Catalog for MemCatalog {
             })
             .is_some();
         match fault {
-            Some(Fault::StealLeaseAfterMark(i)) if i == idx => {
+            Some(Fault::StealLeaseAfter(i)) if i == idx => {
                 self.fault.set(None);
                 self.edit(&l.extent, steal);
             }
-            Some(Fault::RevokePermitAfterMark(i)) if i == idx => {
+            Some(Fault::RevokePermitAfter(i)) if i == idx => {
                 self.fault.set(None);
                 for slot in self.slots.borrow_mut().values_mut().flatten() {
                     slot.token += 1;

@@ -291,7 +291,7 @@ async fn lease_lost_mid_stage_stops_posting() {
     rig.bridge
         .catalog
         .fault
-        .set(Some(Fault::StealLeaseAfterMark(0)));
+        .set(Some(Fault::StealLeaseAfter(0)));
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
 
     let plan = rig.plan(&s).await;
@@ -318,7 +318,7 @@ async fn fenced_mark_posted_stops_and_successor_confirms() {
     rig.bridge
         .catalog
         .fault
-        .set(Some(Fault::StealLeaseBeforeMark(1)));
+        .set(Some(Fault::StealLeaseBefore(1)));
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
     let planned = rig.plan(&s).await;
     assert_eq!(planned[1].state, ArticleState::Planned);
@@ -343,7 +343,7 @@ async fn fenced_advance_leaves_the_stage_alone() {
     rig.bridge
         .catalog
         .fault
-        .set(Some(Fault::StealLeaseAfterMark(2)));
+        .set(Some(Fault::StealLeaseAfter(2)));
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
     assert_eq!(
         rig.bridge.catalog.outbox(&s.extent).stage,
@@ -362,7 +362,7 @@ async fn lost_permit_stops_posting() {
     rig.bridge
         .catalog
         .fault
-        .set(Some(Fault::RevokePermitAfterMark(0)));
+        .set(Some(Fault::RevokePermitAfter(0)));
     let delay = retry_delay(&rig.run_post(&s).await);
     assert!((15..=60).contains(&delay), "delay {delay}");
     assert_eq!(rig.server().posted_count().await, 1);
