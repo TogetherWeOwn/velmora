@@ -205,7 +205,10 @@ where
     T: Clock,
 {
     /// Entry point for every fetch: S3 and `/_admin`.
-    pub async fn handle(self: Rc<Self>, req: S3Request) -> S3Response {
+    pub async fn handle(self: Rc<Self>, req: S3Request) -> S3Response
+    where
+        Self: 'static,
+    {
         let target = req.raw_target.clone();
         match classify(&req.method, &target) {
             Route::Admin { rest } => admin::handle(&self, req, rest).await,
