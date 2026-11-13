@@ -192,6 +192,50 @@ impl WriteIntent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteSession {
+    pub intent: WriteIntent,
+    /// Remote upload ID, or NNTP manifest allocation. Persist before part I/O.
+    pub remote: Id,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartReceipt {
+    pub index: usize,
+    pub intent_binding: [u8; 32],
+    pub acknowledgement: Id,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectRecord {
+    pub identity: ObjectIdentity,
+    pub operation: Id,
+    pub parts: Vec<Part>,
+}
+
+impl ObjectRecord {
+    pub fn intent(&self) -> WriteIntent {
+        WriteIntent {
+            target: self.identity.target.clone(),
+            operation: self.operation.clone(),
+            bytes: self.identity.bytes,
+            sha256: self.identity.sha256,
+            parts: self.parts.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if (self.identity.target.backend == Backend::Nntp
+            && self.identity.version != self.identity.target.generation)
+            || (self.identity.target.backend == Backend::S3
+                && self.identity.version.as_str() == "null")
+        {
+            return Err(Failure::Integrity);
+        }
+        self.intent().validate()
+    }
+}
+
 /// A byte range within a committed ciphertext object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
@@ -378,6 +422,48 @@ mod tests {
         intent.parts[0].offset = 1;
         assert_eq!(intent.binding(), Err(Failure::Invalid));
         assert_eq!(intent.check_part(0, b"abc"), Err(Failure::Invalid));
+    }
+
+    #[test]
+    fn journal_records_round_trip_and_validate_versions_and_manifest() {
+        let mut record = ObjectRecord {
+            identity: identity(),
+            operation: id("operation"),
+            parts: vec![Part {
+                offset: 0,
+                bytes: 17,
+                sha256: digest(b"part"),
+                reference: id("part"),
+            }],
+        };
+        assert_eq!(record.validate(), Ok(()));
+        let session = WriteSession {
+            intent: record.intent(),
+            remote: id("upload"),
+        };
+        let receipt = PartReceipt {
+            index: 0,
+            intent_binding: session.intent.binding().unwrap(),
+            acknowledgement: id("ack"),
+        };
+        let json =
+            serde_json::to_string(&(record.clone(), session.clone(), receipt.clone())).unwrap();
+        let decoded: (ObjectRecord, WriteSession, PartReceipt) =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, (record.clone(), session, receipt));
+        record.identity.version = id("null");
+        assert_eq!(record.validate(), Err(Failure::Integrity));
+        record.identity.target.backend = Backend::Nntp;
+        assert_eq!(record.validate(), Err(Failure::Integrity));
+        record.identity.version = record.identity.target.generation.clone();
+        assert_eq!(record.validate(), Ok(()));
+        record.parts[0].offset = 1;
+        assert_eq!(record.validate(), Err(Failure::Invalid));
+        record.parts[0].offset = 0;
+        record.identity.bytes += 1;
+        assert_eq!(record.validate(), Err(Failure::Integrity));
+        record.parts.clear();
+        assert_eq!(record.validate(), Err(Failure::Limit));
     }
 
     #[test]
