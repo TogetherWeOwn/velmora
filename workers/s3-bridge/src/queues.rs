@@ -1,5 +1,13 @@
 //! `impl JobSink` over Queues. A `Job` is sent as a JSON message. Post jobs
 //! go to `POST_Q`; verify, release and gc jobs go to `VERIFY_Q`.
+//!
+//! Dev only: `DEV_DROP_NOTIFY_N` makes the first `n` `send` calls of the
+//! isolate vanish while reporting success (a lost queue notification), so
+//! the local acceptance run can prove that the cron dispatcher re-drives
+//! the outbox. `send_many` (the dispatcher) is never dropped. Outside
+//! `ENVIRONMENT=dev` the variable is ignored.
+
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use velmora_bridge::{BridgeError, Job, JobSink, OutboxStage, Result, MAX_QUEUE_DELAY_SECS};
 use worker::{MessageBuilder, Queue, QueueContentType};
@@ -7,14 +15,57 @@ use worker::{MessageBuilder, Queue, QueueContentType};
 /// Queues' `sendBatch` limit.
 const MAX_BATCH: usize = 100;
 
+/// Name of the dev-only drop counter variable.
+pub const DEV_DROP_NOTIFY_N: &str = "DEV_DROP_NOTIFY_N";
+
+/// Sends still to be dropped. Read once when the isolate builds its bridge,
+/// so it counts down across the isolate's requests.
+#[derive(Debug, Default)]
+pub struct DropNotify(AtomicU32);
+
+impl DropNotify {
+    /// `dev` is the validated environment. Outside dev the value is never
+    /// read (always 0). In dev, absent or empty is 0 and anything other than
+    /// a non-negative integer is refused.
+    pub fn from_var(dev: bool, raw: Option<&str>) -> std::result::Result<Self, String> {
+        if !dev {
+            return Ok(DropNotify::default());
+        }
+        let n = match raw.map(str::trim) {
+            None | Some("") => 0,
+            Some(v) => v
+                .parse::<u32>()
+                .map_err(|_| format!("invalid {DEV_DROP_NOTIFY_N}"))?,
+        };
+        Ok(DropNotify(AtomicU32::new(n)))
+    }
+
+    /// `true` = drop this send (and count it).
+    fn take(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn remaining(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 pub struct QueueSink {
     post: Queue,
     verify: Queue,
+    drop_notify: DropNotify,
 }
 
 impl QueueSink {
-    pub fn new(post: Queue, verify: Queue) -> Self {
-        QueueSink { post, verify }
+    pub fn new(post: Queue, verify: Queue, drop_notify: DropNotify) -> Self {
+        QueueSink {
+            post,
+            verify,
+            drop_notify,
+        }
     }
 
     fn queue(&self, lane: Lane) -> &Queue {
@@ -57,6 +108,9 @@ fn send_err(_: worker::Error) -> BridgeError {
 impl JobSink for QueueSink {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
         check_delay(delay_secs)?;
+        if self.drop_notify.take() {
+            return Ok(());
+        }
         let msg = MessageBuilder::new(job)
             .content_type(QueueContentType::Json)
             .delay_seconds(delay_secs)
@@ -105,6 +159,41 @@ mod tests {
             assert_eq!(lane(&extent_job(stage)), Lane::Verify);
         }
         assert_eq!(lane(&Job::Gc { v: JOB_VERSION }), Lane::Verify);
+    }
+
+    #[test]
+    fn drop_counter_drops_exactly_n_then_passes() {
+        let d = DropNotify::from_var(true, Some("2")).unwrap();
+        assert_eq!(d.remaining(), 2);
+        assert!(d.take());
+        assert!(d.take());
+        assert!(!d.take(), "after n drops, sends go through");
+        assert!(!d.take());
+        assert_eq!(d.remaining(), 0);
+    }
+
+    #[test]
+    fn drop_counter_in_dev_defaults_to_zero_and_refuses_garbage() {
+        for raw in [None, Some(""), Some(" "), Some("0")] {
+            let d = DropNotify::from_var(true, raw).unwrap();
+            assert!(!d.take(), "{raw:?}");
+        }
+        assert!(DropNotify::from_var(true, Some(" 1 ")).unwrap().take());
+        for raw in ["-1", "x", "1.5", "4294967296"] {
+            // The refusal names the variable, never the value.
+            let err = DropNotify::from_var(true, Some(raw)).unwrap_err();
+            assert_eq!(err, "invalid DEV_DROP_NOTIFY_N");
+        }
+    }
+
+    #[test]
+    fn drop_counter_is_ignored_outside_dev() {
+        // Prod never drops, whatever the variable says, and never refuses.
+        for raw in [None, Some("1"), Some("1000"), Some("garbage")] {
+            let d = DropNotify::from_var(false, raw).unwrap();
+            assert_eq!(d.remaining(), 0, "{raw:?}");
+            assert!(!d.take(), "{raw:?}");
+        }
     }
 
     #[test]

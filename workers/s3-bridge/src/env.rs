@@ -16,7 +16,7 @@ use worker::Env;
 
 use crate::d1::D1Sql;
 use crate::nntp::WorkerConnector;
-use crate::queues::QueueSink;
+use crate::queues::{DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
 use crate::r2::R2Blobs;
 
 /// Wall clock of the Workers runtime (advances on I/O only).
@@ -65,6 +65,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let get = |name: &str| lookup(env, name);
     let cfg = BridgeConfig::from_vars(get).map_err(|e| e.to_string())?;
     let kek = KekRing::from_vars(cfg.kek_active, get).map_err(|e| e.to_string())?;
+    let drop_notify = DropNotify::from_var(cfg.is_dev(), get(DEV_DROP_NOTIFY_N).as_deref())?;
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
     Ok(Bridge {
         catalog: SqlCatalog::new(D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)),
@@ -74,6 +75,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         jobs: QueueSink::new(
             env.queue("POST_Q").map_err(binding("POST_Q"))?,
             env.queue("VERIFY_Q").map_err(binding("VERIFY_Q"))?,
+            drop_notify,
         ),
         kek,
         clock: WorkerClock,
