@@ -50,11 +50,9 @@ impl<'a, T: Transport> ClientIo<'a, T> {
             return Err(Failure::Denied);
         }
         control.check(target, Action::Read)?;
-        // STAT framing and CRLF consume nine bytes of the 512-byte command limit.
-        if message_id.is_empty() || message_id.len() > 503 {
+        if !crate::segment_identity::valid_segment_id(message_id) {
             return Err(Failure::Invalid);
         }
-        crate::nntp::validate_argument(message_id).map_err(|_| Failure::Invalid)?;
         control.check_part(target, message_id)?;
         let result = supervised(self.client.stat(message_id), target, Action::Read, control).await;
         match result {

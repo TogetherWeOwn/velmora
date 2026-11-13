@@ -79,14 +79,14 @@ impl ReadControl for Revocation {
         self.part_checks.set(remaining.saturating_sub(1));
         if self.part_revoked.get()
             || remaining == 1
-            || (message_id != "part@synthetic.invalid" && message_id != "x".repeat(503))
+            || (message_id != "part@synthetic.invalid"
+                && message_id != format!("{}@b", "x".repeat(248)))
         {
             return Err(Failure::Denied);
         }
         Ok(())
     }
 }
-
 fn target() -> Target {
     let id = || Id::new("synthetic").unwrap();
     Target {
@@ -156,7 +156,6 @@ async fn interruption_returns_without_cleanup_and_poisons_stat() {
         assert!(!outgoing.borrow().windows(4).any(|bytes| bytes == b"QUIT"));
     }
 }
-
 #[tokio::test]
 async fn bad_replies_poison_stat_session() {
     for (reply, expected, revoke) in [
@@ -189,7 +188,7 @@ async fn bad_replies_poison_stat_session() {
 async fn stat_checks_binding_and_classifies_oversized_reply() {
     let unrelated = io::Error::new(io::ErrorKind::InvalidData, "NNTP line exceeds 16 KiB");
     assert!(!crate::transport::is_line_limit_error(&unrelated));
-    let max_id = "x".repeat(503);
+    let max_id = format!("{}@b", "x".repeat(248));
     let mut incoming = format!("200 ready\r\n200 reader\r\n223 1 <{max_id}>\r\n223 ").into_bytes();
     incoming.extend(std::iter::repeat_n(b'x', crate::transport::MAX_LINE_BYTES));
     incoming.extend_from_slice(b"\r\n");
@@ -214,7 +213,10 @@ async fn stat_checks_binding_and_classifies_oversized_reply() {
         io.stat(&target, "other@synthetic.invalid", &control).await,
         Err(Failure::Denied)
     );
-    for invalid in ["", &"x".repeat(504), "part@synthetic.invalid\r\n"] {
+    let too_long = format!("x{max_id}");
+    for invalid in [
+        "", &too_long, "missing", "a@@b", "@b", "a@", "é@b", "a@b\r\n",
+    ] {
         assert_eq!(
             io.stat(&target, invalid, &control).await,
             Err(Failure::Invalid)
@@ -222,7 +224,7 @@ async fn stat_checks_binding_and_classifies_oversized_reply() {
     }
     assert_eq!(outgoing.borrow().len(), sent);
     assert_eq!(io.stat(&target, &max_id, &control).await, Ok(()));
-    assert_eq!(outgoing.borrow().len() - sent, 512);
+    assert_eq!(outgoing.borrow().len() - sent, 259);
     assert_eq!(
         io.stat(&target, "part@synthetic.invalid", &control).await,
         Err(Failure::Limit)
