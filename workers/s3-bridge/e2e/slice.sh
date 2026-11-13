@@ -116,12 +116,17 @@ redacted_tail() {
 }
 
 # poll <timeout-secs> <interval-secs> <command...>: true once the command
-# succeeds, false when the timeout passes.
+# succeeds; false when the timeout passes, or at once when the command
+# returns 2 (give up: e.g. the awaited process has exited).
 poll() {
-  local timeout=$1 interval=$2
+  local timeout=$1 interval=$2 rc
   shift 2
   local deadline=$((SECONDS + timeout))
-  until "$@"; do
+  while true; do
+    rc=0
+    "$@" || rc=$?
+    ((rc == 0)) && return 0
+    ((rc == 2)) && return 2
     ((SECONDS < deadline)) || return 1
     sleep "$interval"
   done
@@ -165,7 +170,7 @@ if [[ $MODE == local ]]; then
     printf 'NNTP_PROVIDERS=[{"id":"fake1","host":"127.0.0.1","port":%s,"tls":false,"user":"slice","pass":"%s","backbone":"fake","post":true,"read":true,"max_conns":2}]\n' \
       "$FAKESRV_PORT" "$NNTP_PASS"
     # The host clients sign is this run's port, not the default in wrangler.toml.
-    printf 'S3_HOST=127.0.0.1:%s\n' "$PORT"
+    printf 'S3_HOST=%s:%s\n' "$HOST" "$PORT"
   } >"$WORKER_DIR/.dev.vars"
   DEV_VARS_WRITTEN=1
   chmod 600 "$WORKER_DIR/.dev.vars"
@@ -301,7 +306,8 @@ head -c 100663296 /dev/urandom >"$T/big.bin" # 96 MiB: 12 parts, 10 in flight
 run_aws "PUT a/small.bin" "${S3[@]}" cp "$T/small.bin" s3://slice/a/small.bin >/dev/null
 run_aws "multipart PUT a/big.bin" "${S3[@]}" cp "$T/big.bin" s3://slice/a/big.bin >/dev/null
 json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-jcheck "inflight_peak_bytes within the 48 MiB budget" '.inflight_peak_bytes <= 50331648' "$json"
+jcheck "inflight_peak_bytes within the 48 MiB budget" \
+  '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes > 0 and .inflight_peak_bytes <= 50331648' "$json"
 if [[ $MODE == local ]]; then
   json=$(adm "POST /_admin/dev/guard-selftest" -XPOST "$BASE/_admin/dev/guard-selftest")
   jcheck "guard self-test rolls back" '.rolled_back == true' "$json"
@@ -382,7 +388,7 @@ COUNTED='.extents | length > 0 and all(.backbones | any(.counts))'
 stage_reached() {
   local j
   j=$(adm_try "$BASE/_admin/objects/slice/a/$1") || return 1
-  jq -e "($REACHED) and ($COUNTED)" >/dev/null 2>&1 <<<"$j"
+  jq -e "($REACHED) and ($COUNTED)" >/dev/null 2>&1 <<<"$j" || return 1
 }
 if ! poll 180 2 stage_reached big.bin; then
   json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
@@ -440,7 +446,7 @@ else
   dispatched() {
     local j
     j=$(adm_try "$BASE/_admin/status") || return 1
-    jq -e --argjson t "$START_MS" '(.last_dispatch_at // 0) >= $t' >/dev/null 2>&1 <<<"$j"
+    jq -e --argjson t "$START_MS" '(.last_dispatch_at // 0) >= $t' >/dev/null 2>&1 <<<"$j" || return 1
   }
   if ! poll 360 10 dispatched; then
     json=$(adm "GET /_admin/status" "$BASE/_admin/status")

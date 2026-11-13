@@ -985,8 +985,8 @@ async fn slice_acceptance() {
     let peak = st["inflight_peak_bytes"].as_u64();
     expect(
         s,
-        "status.inflight_peak_bytes <= INFLIGHT_BUDGET_BYTES (50331648)",
-        peak.is_some_and(|p| p <= 50_331_648),
+        "status.inflight_peak_bytes in 1..=INFLIGHT_BUDGET_BYTES (50331648)",
+        peak.is_some_and(|p| p > 0 && p <= 50_331_648),
         format!("{peak:?}"),
     );
     let g = rig
@@ -1279,26 +1279,34 @@ async fn slice_acceptance() {
     for id in &posted {
         let mut article = Vec::new();
         audit
-            .article_to(&format!("<{id}>"), &mut article)
+            .article_to(id, &mut article)
             .await
             .unwrap_or_else(|e| fail(s, "audit ARTICLE", "the posted article", e));
         let split = article
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .unwrap_or(article.len());
-        let (head, body) = article.split_at(split);
-        for name in ["small.bin", "big.bin", "slice"] {
-            if head.windows(name.len()).any(|w| w == name.as_bytes()) {
+        let body = &article[split..];
+        // Headers and the yEnc `=ybegin name=` line alike.
+        for name in ["small.bin", "big.bin", "ü.bin", "slice"] {
+            if article.windows(name.len()).any(|w| w == name.as_bytes()) {
                 fail(
                     s,
-                    "article headers are obfuscated",
+                    "articles are obfuscated (headers and yEnc name)",
                     "no object name",
                     format!("<{id}> names {name:?}"),
                 );
             }
         }
         let payload = velmora_test_nntp::yenc::decode(body);
-        if let Some(at) = find_block(&payload, &blocks) {
+        expect(
+            s,
+            &format!("<{id}> has a yEnc payload"),
+            !payload.is_empty(),
+            "empty",
+        );
+        // Raw body too: an unencoded post would be garbled by the decode.
+        if let Some(at) = find_block(&payload, &blocks).or_else(|| find_block(body, &blocks)) {
             fail(
                 s,
                 "no article body contains plaintext",
@@ -1502,8 +1510,8 @@ async fn permits_never_exceed_max_conns() {
     rig.pump(s).await;
     expect(
         s,
-        "open provider sessions never exceeded max_conns and no login was refused",
-        rig.n.peak.get() <= MAX_CONNS && rig.n.refused.get() == 0,
+        "open provider sessions reached but never exceeded max_conns, and no login was refused",
+        rig.n.peak.get() == MAX_CONNS && rig.n.refused.get() == 0,
         format!(
             "peak {} (max_conns {MAX_CONNS}), refused {}, connects {}",
             rig.n.peak.get(),
