@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fmt, future::Future};
 
+pub mod s3;
+
 /// Version of the portable archive contract.
 pub const API_VERSION: u16 = 1;
 /// Maximum ciphertext bytes in one part.

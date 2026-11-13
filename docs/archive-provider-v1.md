@@ -40,6 +40,17 @@ cannot undo remote effects. `Sink` declares that only complete-part-verified
 ciphertext is emitted in blocks of at most 64 KiB; callers must stage prefixes
 invisibly because an error or cancellation can leave an incomplete output.
 
+`s3::Config` requires an explicit `enabled` flag; a missing or disabled S3
+configuration fails closed and never substitutes another account, backend or
+implicit environment. The configured host is a TLS DNS name only: no URL,
+path, port, IP literal, trailing dot, localhost or internal/test suffix, and
+bucket, region and credential-reference shapes are checked the same way. Host
+syntax validation here is not DNS or peer qualification. The trusted transport
+must still resolve, vet and pin every connection, use HTTPS:443 to the
+configured endpoint, sign only through the scoped credential reference, refuse
+redirects and never forward credentials across hosts. There is no shipped live
+signer, HTTP implementation, credential resolution or provider probe.
+
 These are interface obligations, not an implementation of authorization,
 revocation, transport closure or output verification. Provider adapters,
 consumer integration and the complete provider trait are still pending; no
