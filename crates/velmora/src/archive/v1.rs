@@ -18,6 +18,9 @@ pub const MAX_PART_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum number of parts in a manifest.
 pub const MAX_PARTS: usize = 10_000;
 
+/// Stable NNTP posting metadata; persist before posting, and reuse on retry.
+pub mod nntp;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
     Nntp,
