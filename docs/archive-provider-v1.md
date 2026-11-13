@@ -18,7 +18,7 @@ contain no keys, OPRF output, private dedupe digest or secret.
 prefixes. It is internal, not a public validator, existence oracle, serving
 grant or authorization decision. A digest alone does not authenticate media.
 These serializable records are not proof of durability; callers must bound
-untrusted input before deserialization. Provider operations are not implemented.
+untrusted input before deserialization. Complete provider operations remain pending.
 
 `Range::end` checks offset plus byte count against the committed length before
 I/O, including arithmetic overflow. A zero-byte range is valid at EOF; validation
@@ -33,7 +33,17 @@ cannot undo remote effects. `Sink` declares that only complete-part-verified
 ciphertext is emitted in blocks of at most 64 KiB; callers must stage prefixes
 invisibly because an error or cancellation can leave an incomplete output.
 
+`nntp::ClientIo` borrows an admitted authenticated client and races each command
+against event-driven control. Interruption invalidates the session without
+waiting for cleanup or sending QUIT; POST returns `Uncertain`, while BODY and
+STAT retain the read failure. A caller owns the cleanup budget and must retain
+its lease/account charge until physical closure is independently confirmed.
+Even successful shutdown can be only a write-half shutdown, and dropping the
+client or transport may only request asynchronous close. For Worker pinned TLS,
+retain `WorkerSocketControl` until its close succeeds; pending or failed close
+confirmation does not release capacity. Dropping a command is neither rollback
+nor closure proof.
+
 These are interface obligations, not an implementation of authorization,
-revocation, transport closure or output verification. Provider adapters,
-consumer integration and the complete provider trait are still pending; no
-physical deletion or eviction API is provided.
+transport closure or output verification. Consumer integration and the complete
+provider trait remain pending; no physical deletion or eviction API is provided.

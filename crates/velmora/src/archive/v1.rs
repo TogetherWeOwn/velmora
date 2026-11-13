@@ -5,7 +5,9 @@
 //! serializable values are journal inputs, not a database, authority token, or
 //! proof of durability. Dropping a future does not roll back effects; reconcile
 //! uncertain effects under the same intent before a bounded retry, and never
-//! mint a new target. This module does not implement providers or I/O.
+//! mint a new target. Complete provider implementations remain pending.
+
+pub mod nntp;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -167,6 +169,33 @@ pub trait Control {
         target: &'a Target,
         action: Action,
     ) -> impl Future<Output = Failure> + 'a;
+}
+
+/// Race an operation against event-driven cancellation, rechecking authority
+/// before polling and before accepting its result. Dropping is not rollback.
+pub(crate) async fn supervised<F: Future>(
+    operation: F,
+    target: &Target,
+    action: Action,
+    control: &impl Control,
+) -> Result<F::Output> {
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(control.cancelled(target, action));
+    std::future::poll_fn(|cx| {
+        if let Err(error) = control.check(target, action) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        if let std::task::Poll::Ready(error) = cancelled.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        match operation.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => {
+                std::task::Poll::Ready(control.check(target, action).map(|()| result))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
 }
 
 pub trait Sink {
