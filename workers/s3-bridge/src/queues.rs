@@ -64,6 +64,9 @@ impl JobSink for QueueSink {
         self.queue(lane(job)).send(msg).await.map_err(send_err)
     }
 
+    /// One batch per queue. An `Err` may follow a sent `POST_Q` batch; the
+    /// dispatcher re-drives from the outbox and a duplicate job only finds
+    /// its lease taken.
     async fn send_many(&self, jobs: &[Job]) -> Result<()> {
         if jobs.len() > MAX_BATCH {
             return Err(BridgeError::Queue(format!("batch above {MAX_BATCH} jobs")));

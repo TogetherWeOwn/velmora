@@ -9,9 +9,10 @@
 //!   `tls: false` outside `ENVIRONMENT=dev`, and the deployed runtime cannot
 //!   reach loopback.
 //!
-//! Sessions read at most 1 MiB per article body. Errors carry no host or
-//! credential: socket failures are class-only, engine errors redact reply
-//! text in `Debug`.
+//! Sessions read at most 1 MiB per article body. Policy refusals and
+//! socket-open failures are class-only (no host or credential). Later
+//! session errors are the engine's own: their `Debug` redacts auth reply
+//! text, but `Display` may carry a runtime I/O message or a server reply.
 
 use std::io;
 use std::net::IpAddr;

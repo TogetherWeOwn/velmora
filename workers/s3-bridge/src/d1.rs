@@ -20,40 +20,48 @@
 use velmora_bridge::{
     is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_PARAMS,
 };
-use worker::js_sys::{self, Array, ArrayBuffer, Uint8Array};
+use worker::js_sys::{self, Array, ArrayBuffer, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
-use worker::{D1Database, D1PreparedStatement, D1Result};
+use worker::wasm_bindgen_futures::JsFuture;
+use worker::worker_sys::{D1Database as D1Sys, D1PreparedStatement};
+use worker::D1Database;
 
 /// Largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_SAFE_INT: i64 = (1 << 53) - 1;
 
+/// Talks to the raw binding so that only `meta.changes` is read from a
+/// result: the workers-rs `D1ResultMeta` decodes `size_after` as a 32-bit
+/// `usize` on wasm and would fail after a committed write once the
+/// database passes 4 GiB.
 pub struct D1Sql {
-    db: D1Database,
+    db: D1Sys,
 }
 
 impl D1Sql {
     pub fn new(db: D1Database) -> Self {
-        D1Sql { db }
+        let raw: &JsValue = db.as_ref();
+        D1Sql {
+            db: raw.clone().unchecked_into(),
+        }
     }
 
     fn statement(&self, sql: &str, params: &[SqlValue]) -> Result<D1PreparedStatement> {
         check_params(params.len())?;
-        let values = params.iter().map(to_js).collect::<Result<Vec<_>>>()?;
+        let values = params.iter().map(to_js).collect::<Result<Array>>()?;
+        let bind_err = |_| BridgeError::Sql("d1: bind failed".into());
         self.db
             .prepare(sql)
-            .bind(&values)
-            .map_err(|_| BridgeError::Sql("d1: bind failed".into()))
+            .map_err(bind_err)?
+            .bind(values)
+            .map_err(bind_err)
     }
 }
 
 impl Sql for D1Sql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        let rows = self
-            .statement(sql, params)?
-            .raw_js_value()
-            .await
-            .map_err(map_err)?;
-        rows.into_iter()
+        let rows = settle(self.statement(sql, params)?.raw()).await?;
+        let rows = rows.dyn_into::<Array>().map_err(|_| decode_err())?;
+        rows.iter()
             .map(|row| {
                 let row = row.dyn_into::<Array>().map_err(|_| decode_err())?;
                 row.iter().map(from_js).collect()
@@ -62,30 +70,46 @@ impl Sql for D1Sql {
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        let result = self.statement(sql, params)?.run().await.map_err(map_err)?;
-        changes(&result)
+        changes(&settle(self.statement(sql, params)?.run()).await?)
     }
 
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if stmts.is_empty() {
             return Ok(Vec::new());
         }
-        let n = stmts.len();
         let prepared = stmts
             .iter()
             .map(|(sql, params)| self.statement(sql, params))
-            .collect::<Result<Vec<_>>>()?;
-        let results = self.db.batch(prepared).await.map_err(map_err)?;
-        if results.len() != n {
+            .collect::<Result<Array>>()?;
+        let results = settle(self.db.batch(prepared)).await?;
+        let results = results.dyn_into::<Array>().map_err(|_| decode_err())?;
+        if results.length() as usize != stmts.len() {
             return Err(decode_err());
         }
-        results.iter().map(changes).collect()
+        results.iter().map(|r| changes(&r)).collect()
     }
 }
 
-fn changes(result: &D1Result) -> Result<u64> {
-    let meta = result.meta().map_err(|_| decode_err())?;
-    Ok(meta.and_then(|m| m.changes).unwrap_or(0) as u64)
+/// Awaits a D1 call; a throw or rejection is classified.
+async fn settle(call: std::result::Result<Promise, JsValue>) -> Result<JsValue> {
+    JsFuture::from(call.map_err(map_err)?)
+        .await
+        .map_err(map_err)
+}
+
+/// `meta.changes`; absent reads as 0 (a `SELECT`).
+fn changes(result: &JsValue) -> Result<u64> {
+    let field = |obj: &JsValue, name: &str| Reflect::get(obj, &JsValue::from_str(name));
+    let meta = field(result, "meta").map_err(|_| decode_err())?;
+    if meta.is_null() || meta.is_undefined() {
+        return Ok(0);
+    }
+    let n = field(&meta, "changes").map_err(|_| decode_err())?;
+    match n.as_f64() {
+        None if n.is_null() || n.is_undefined() => Ok(0),
+        None => Err(decode_err()),
+        Some(f) => u64::try_from(number_to_int(f)?).map_err(|_| decode_err()),
+    }
 }
 
 fn decode_err() -> BridgeError {
@@ -167,17 +191,18 @@ fn from_js(v: JsValue) -> Result<SqlValue> {
 
 /// Every message D1 attached to the failure (the thrown error and its
 /// cause). Used for classification only; never logged or returned.
-fn error_text(e: &worker::Error) -> String {
-    match e {
-        worker::Error::D1(d) => {
-            let err: &js_sys::Error = d.as_ref();
-            format!("{} | {}", String::from(err.message()), d.cause())
-        }
-        other => other.to_string(),
+fn error_text(e: &JsValue) -> String {
+    let message = |v: &JsValue| match v.dyn_ref::<js_sys::Error>() {
+        Some(err) => String::from(err.message()),
+        None => v.as_string().unwrap_or_default(),
+    };
+    match e.dyn_ref::<js_sys::Error>() {
+        Some(err) => format!("{} | {}", message(e), message(&err.cause())),
+        None => message(e),
     }
 }
 
-fn map_err(e: worker::Error) -> BridgeError {
+fn map_err(e: JsValue) -> BridgeError {
     classify(&error_text(&e))
 }
 
