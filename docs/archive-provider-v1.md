@@ -35,8 +35,8 @@ invisibly because an error or cancellation can leave an incomplete output.
 
 `nntp::ClientIo` borrows an admitted authenticated client and races each command
 against event-driven control. Interruption invalidates the session without
-waiting for cleanup or sending QUIT; POST returns `Uncertain`, while BODY and
-STAT retain the read failure. A caller owns the cleanup budget and must retain
+waiting for cleanup or sending QUIT; BODY and STAT retain the read failure.
+This slice exposes no archive POST operation. A caller owns the cleanup budget and must retain
 its lease/account charge until physical closure is independently confirmed.
 Even successful shutdown can be only a write-half shutdown, and dropping the
 client or transport may only request asynchronous close. For Worker pinned TLS,

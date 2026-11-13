@@ -73,14 +73,11 @@ fn target() -> Target {
 #[tokio::test]
 async fn interruption_returns_without_cleanup_and_poisons_each_command() {
     for failure in [Failure::Cancelled, Failure::Deadline] {
-        for phase in 0..4 {
+        for phase in 0..2 {
             let started = Rc::new(tokio::sync::Notify::new());
             let shutdowns = Rc::new(Cell::new(0));
             let outgoing = Rc::new(RefCell::new(Vec::new()));
-            let mut incoming = b"200 ready\r\n200 reader\r\n".to_vec();
-            if phase == 1 {
-                incoming.extend_from_slice(b"340 send\r\n");
-            }
+            let incoming = b"200 ready\r\n200 reader\r\n".to_vec();
             let transport = Script {
                 incoming: Cursor::new(incoming),
                 outgoing: outgoing.clone(),
@@ -103,16 +100,7 @@ async fn interruption_returns_without_cleanup_and_poisons_each_command() {
                         client: &mut client,
                     };
                     match phase {
-                        0 | 1 => {
-                            io.post(
-                                &target,
-                                "part@synthetic.invalid",
-                                b"synthetic\r\n",
-                                &control,
-                            )
-                            .await
-                        }
-                        2 => io
+                        0 => io
                             .body(&target, "part@synthetic.invalid", &control)
                             .await
                             .map(|_| ()),
@@ -129,20 +117,54 @@ async fn interruption_returns_without_cleanup_and_poisons_each_command() {
                 let result = tokio::time::timeout(std::time::Duration::from_secs(1), operation)
                     .await
                     .unwrap();
-                assert_eq!(
-                    result,
-                    Err(if phase < 2 {
-                        Failure::Uncertain
-                    } else {
-                        failure
-                    })
-                );
+                assert_eq!(result, Err(failure));
             }
             assert_eq!(shutdowns.get(), 0);
             let sent = outgoing.borrow().len();
             assert!(client.stat("part@synthetic.invalid").await.is_err());
             assert_eq!(outgoing.borrow().len(), sent);
             assert!(!outgoing.borrow().windows(4).any(|bytes| bytes == b"QUIT"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn bad_replies_poison_body_and_stat_sessions() {
+    for reply in [b"invalid\r\n".as_slice(), b"220 unexpected\r\n".as_slice()] {
+        for body in [false, true] {
+            let outgoing = Rc::new(RefCell::new(Vec::new()));
+            let mut incoming = b"200 ready\r\n200 reader\r\n".to_vec();
+            incoming.extend_from_slice(reply);
+            incoming.extend_from_slice(b"223 1 <part@synthetic.invalid>\r\n.\r\n");
+            let transport = Script {
+                incoming: Cursor::new(incoming),
+                outgoing: outgoing.clone(),
+                started: Rc::new(tokio::sync::Notify::new()),
+                shutdowns: Rc::new(Cell::new(0)),
+                suspend: false,
+            };
+            let mut client =
+                NntpClient::connect_with_auth_guard(transport, &NntpConfig::default(), || Ok(()))
+                    .await
+                    .unwrap();
+            let control = Revocation {
+                failure: Cell::new(None),
+                notify: tokio::sync::Notify::new(),
+            };
+            let mut io = ClientIo {
+                client: &mut client,
+            };
+            let result = if body {
+                io.body(&target(), "part@synthetic.invalid", &control)
+                    .await
+                    .map(|_| ())
+            } else {
+                io.stat(&target(), "part@synthetic.invalid", &control).await
+            };
+            assert_eq!(result, Err(Failure::Integrity));
+            let sent = outgoing.borrow().len();
+            assert!(client.stat("part@synthetic.invalid").await.is_err());
+            assert_eq!(outgoing.borrow().len(), sent);
         }
     }
 }

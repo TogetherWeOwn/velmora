@@ -8,8 +8,7 @@ use crate::{nntp::NntpClient, transport::Transport};
 mod tests;
 
 /// The product owns journaling, admission, leases and physical close. In-flight
-/// operations remain charged until closure/settlement is proven. POST I/O failures
-/// are uncertain; absence after STAT never settles an in-flight POST.
+/// operations remain charged until closure/settlement is proven.
 ///
 /// Any in-flight operation future may be dropped by an outer supervisor —
 /// including a proof `body` dropped when the enclosing Write action is
@@ -18,13 +17,6 @@ mod tests;
 /// or rollback evidence.
 #[allow(async_fn_in_trait)]
 pub trait Io {
-    async fn post(
-        &mut self,
-        target: &Target,
-        message_id: &str,
-        article: &[u8],
-        control: &impl Control,
-    ) -> Result<()>;
     async fn body(
         &mut self,
         target: &Target,
@@ -38,12 +30,8 @@ pub trait Io {
         control: &impl Control,
     ) -> Result<()>;
 
-    /// Effective cap, in bytes, on one encoded BODY this `Io` can read back.
-    /// The provider rejects an encoded body above this bound *before* the
-    /// irreversible POST, so a same-configuration write can never strand an
-    /// object its own readback must refuse. `None` declares no bound tighter
-    /// than the contract maximum; an implementation with a tighter receive
-    /// cap MUST report it here.
+    /// Aggregate encoded BODY limit, independent of any per-line limit.
+    /// `None` declares no bound tighter than the contract maximum.
     fn max_encoded_body_bytes(&self) -> Option<usize> {
         None
     }
@@ -51,8 +39,8 @@ pub trait Io {
 
 /// Does not dial or release a pool slot. Construct only after existing guarded
 /// authentication and resource admission; the caller retains close authority.
-/// The client's configured article cap remains enforced (hard maximum 64 MiB),
-/// including as the pre-POST encoded-body admission bound.
+/// The client's configured aggregate article cap remains enforced (hard maximum
+/// 64 MiB), alongside the transport's separate per-line limit.
 ///
 /// On interruption this adapter synchronously invalidates the client and returns
 /// without awaiting cleanup. The caller owns any later `shutdown_unusable`
@@ -85,39 +73,6 @@ fn read_error(error: crate::Error) -> Failure {
 }
 
 impl<T: Transport> Io for ClientIo<'_, T> {
-    async fn post(
-        &mut self,
-        target: &Target,
-        message_id: &str,
-        article: &[u8],
-        control: &impl Control,
-    ) -> Result<()> {
-        control.check(target, Action::Write)?;
-        let result = supervised(
-            self.client.post_article(message_id, article),
-            target,
-            Action::Write,
-            control,
-        )
-        .await;
-        let result = match result {
-            Ok(result) => result,
-            Err(_) => {
-                self.client.invalidate();
-                return Err(Failure::Uncertain);
-            }
-        };
-        result.map_err(|error| match error {
-            crate::Error::AuthFailed(_)
-            | crate::Error::NoPermission(_)
-            | crate::Error::PostProhibited(_) => Failure::Denied,
-            _ => Failure::Uncertain,
-        })?;
-        control
-            .check(target, Action::Write)
-            .map_err(|_| Failure::Uncertain)
-    }
-
     async fn body(
         &mut self,
         target: &Target,
@@ -134,7 +89,11 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         )
         .await;
         match result {
-            Ok(result) => result.map_err(read_error)?,
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.client.invalidate();
+                return Err(read_error(error));
+            }
             Err(error) => {
                 self.client.invalidate();
                 return Err(error);
@@ -153,8 +112,10 @@ impl<T: Transport> Io for ClientIo<'_, T> {
         control.check(target, Action::Read)?;
         let result = supervised(self.client.stat(message_id), target, Action::Read, control).await;
         match result {
-            Ok(result) => {
-                result.map_err(read_error)?;
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                self.client.invalidate();
+                return Err(read_error(error));
             }
             Err(error) => {
                 self.client.invalidate();
