@@ -22,9 +22,9 @@ constant time. Anything else returns `401`.
 
 | Route | What it does |
 |---|---|
-| `POST /probe/post?size=<bytes>&payload=media\|random` | Builds one article (default: article 0 of a file, 48-byte header + 11 chunks = 721,120 B of `media.v1` ciphertext; `size` caps the ciphertext; `payload=random` posts exactly `size` random bytes), opens one TLS socket, runs greeting + `MODE READER` + `AUTHINFO`, `POST`s, then `STAT` + `BODY` on the same connection, yEnc-decodes and compares SHA-256. Returns per-step timings and reply-code classes. |
+| `POST /probe/post?size=<bytes>&payload=media\|random` | Builds one article (default: article 0 of a file, 48-byte header + 11 chunks = 721,120 B of `media.v1` ciphertext; `size` caps the ciphertext, 1 B to 8 MiB, anything else is a 400; `payload=random` posts exactly `size` random bytes; any other `payload` is a 400), opens one TLS socket, runs greeting + `MODE READER` + `AUTHINFO`, `POST`s, then `STAT` + `BODY` on the same connection, yEnc-decodes and compares SHA-256. Returns per-step timings and reply-code classes. |
 | `GET /probe/body?mid=<message-id>` | New connection, `STAT` + `BODY` of an earlier post, decoded SHA-256 and timings. Used to measure propagation. |
-| `GET\|PUT /raw/<anything>` | Echoes `req.inner().url()`, `req.url()` (parsed), `req.path()`, the parsed query and the header list as the Worker sees them. Values are echoed only for `x-amz-*`, `content-*`, `host`, `user-agent`, `accept`, `expect` and `range`; other headers are listed by name only. |
+| `GET\|PUT /raw/<anything>` | Echoes `req.inner().url()`, `req.url()` (parsed), `req.path()`, the parsed query and the header list as the Worker sees them. Values are echoed only for `x-amz-*`, `content-*`, `host`, `user-agent`, `accept`, `expect` and `range`; other headers are listed by name only. For `PUT`, the body is not read; the declared `content-length` is reported. |
 
 Responses never contain provider reply text, the provider host or account
 values. Errors are reported as a class plus the numeric NNTP code.

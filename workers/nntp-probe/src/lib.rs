@@ -33,7 +33,7 @@ use worker::{
 
 /// Upper bound for one probe payload. The probe exists to find the
 /// provider's article-size behaviour, not to stress isolate memory.
-const MAX_PROBE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PROBE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Per-operation socket timeout. Generous: a multi-MB POST is one write.
 const OP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -141,6 +141,10 @@ fn classify(err: &velmora::Error, cfg: &NntpConfig) -> Value {
         E::NoPermission(_) => json!({"class": "no_permission", "code": 502}),
         E::ArticleNotFound(_) => json!({"class": "article_not_found", "code": 430}),
         E::PostProhibited(_) => json!({"class": "post_prohibited", "code": 440}),
+        // The engine embeds the raw server line in this message; never echo it.
+        E::Malformed(m) if m.starts_with("NNTP reply is not") => {
+            json!({"class": "malformed", "detail": "unparseable reply line"})
+        }
         E::Malformed(m) => json!({"class": "malformed", "detail": redact(m, cfg)}),
         E::CrcMismatch { want, got, .. } => {
             json!({"class": "crc_mismatch", "want": want, "got": got})
@@ -256,7 +260,7 @@ fn make_payload(kind: &str, size: Option<u64>) -> velmora::Result<Vec<u8>> {
             Ok(buf)
         }
         _ => {
-            // Real media.v1 ciphertext (random key, random plaintext): article 0
+            // "media": real media.v1 ciphertext (random key, random plaintext): article 0
             // of a file, i.e. the 48-byte header plus 11 chunks by default.
             let plain_len = match size {
                 Some(s) => plaintext_for_ciphertext(s),
@@ -280,11 +284,18 @@ async fn probe_post(req: &Request, env: &Env) -> Result<Response> {
         Ok(cfg) => cfg,
         Err(e) => return json_response(&json!({"ok": false, "error": e}), 500),
     };
-    let size = query_param(req, "size").and_then(|s| s.parse::<u64>().ok());
-    if size.is_some_and(|s| s == 0 || s > MAX_PROBE_BYTES) {
-        return json_response(&json!({"ok": false, "error": "size out of range"}), 400);
-    }
+    let size = match query_param(req, "size").map(|s| s.parse::<u64>()) {
+        None => None,
+        Some(Ok(s)) if s > 0 && s <= MAX_PROBE_BYTES => Some(s),
+        Some(_) => return json_response(&json!({"ok": false, "error": "size out of range"}), 400),
+    };
     let kind = query_param(req, "payload").unwrap_or_else(|| "media".into());
+    if kind != "media" && kind != "random" {
+        return json_response(
+            &json!({"ok": false, "error": "payload must be media or random"}),
+            400,
+        );
+    }
     let groups_var = env
         .var("NEWSGROUPS")
         .map(|v| v.to_string())
@@ -530,7 +541,7 @@ fn echo_value(name: &str) -> bool {
         || matches!(name, "host" | "user-agent" | "accept" | "expect" | "range")
 }
 
-async fn raw(mut req: Request) -> Result<Response> {
+async fn raw(req: Request) -> Result<Response> {
     let inner_url = req.inner().url();
     let parsed = req.url();
     let headers: Vec<Value> = req
@@ -545,7 +556,13 @@ async fn raw(mut req: Request) -> Result<Response> {
         })
         .collect();
     let body_len = if req.method() == Method::Put {
-        req.bytes().await.map(|b| b.len()).unwrap_or(0)
+        // Report the declared length; buffering the body is not needed.
+        req.headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
     } else {
         0
     };
