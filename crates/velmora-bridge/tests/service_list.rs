@@ -386,7 +386,7 @@ async fn list_buckets_shows_only_granted_buckets() {
     rig.grant(AKID, &alpha, Perm::Ro).await;
     rig.bucket("bkt-hidden", true).await;
     let stranger = rig
-        .key("AKIDSTRANGER00000000", SECRET, KeyStatus::Active)
+        .key("AKIDSTRANGER00000000", secret(), KeyStatus::Active)
         .await;
 
     let resp = rig.call(&signer, Method::Get, "/", &[], &[], b"").await;
@@ -400,9 +400,9 @@ async fn list_buckets_shows_only_granted_buckets() {
     assert!(resp.values("Name").is_empty());
 
     // Unknown and disabled keys are denied like any other request.
-    let unknown = Signer::new("AKIDUNKNOWN000000000", SECRET);
+    let unknown = Signer::new("AKIDUNKNOWN000000000", secret());
     let disabled = rig
-        .key("AKIDDISABLED00000000", SECRET, KeyStatus::Disabled)
+        .key("AKIDDISABLED00000000", secret(), KeyStatus::Disabled)
         .await;
     rig.grant("AKIDDISABLED00000000", &alpha, Perm::Rw).await;
     for who in [&unknown, &disabled] {

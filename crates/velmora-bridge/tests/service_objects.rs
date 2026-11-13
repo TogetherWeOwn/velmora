@@ -286,7 +286,7 @@ async fn unauthenticated_body_never_read() {
     assert!(!polled);
 
     // A signature made with another secret.
-    let forged = Signer::new(AKID, "not-the-secret-not-the-secret-000000000");
+    let forged = Signer::new(AKID, &format!("{}-other", secret()));
     let req = forged.sign(
         rig.now(),
         Method::Put,
@@ -390,13 +390,13 @@ async fn denials_do_not_reveal_what_exists() {
     let other = rig.bucket("bkt-other", true).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
 
-    let unknown = Signer::new("AKIDUNKNOWN000000000", SECRET);
+    let unknown = Signer::new("AKIDUNKNOWN000000000", secret());
     let disabled = rig
-        .key("AKIDDISABLED00000000", SECRET, KeyStatus::Disabled)
+        .key("AKIDDISABLED00000000", secret(), KeyStatus::Disabled)
         .await;
     rig.grant("AKIDDISABLED00000000", &other, Perm::Rw).await;
     let ungranted = rig
-        .key("AKIDUNGRANTED0000000", SECRET, KeyStatus::Active)
+        .key("AKIDUNGRANTED0000000", secret(), KeyStatus::Active)
         .await;
 
     let mut denials = Vec::new();
@@ -442,7 +442,7 @@ async fn read_only_grant_cannot_mutate() {
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let reader = rig
-        .key("AKIDREADONLY00000000", SECRET, KeyStatus::Active)
+        .key("AKIDREADONLY00000000", secret(), KeyStatus::Active)
         .await;
     rig.grant("AKIDREADONLY00000000", &bucket, Perm::Ro).await;
 
@@ -623,7 +623,7 @@ async fn real_bucket_refused_before_h9() {
     const { assert!(!REAL_DATA_READY) }
     let rig = rig();
     let real = rig.bucket("bkt-real", false).await;
-    let signer = rig.key(AKID, SECRET, KeyStatus::Active).await;
+    let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
     rig.grant(AKID, &real, Perm::Rw).await;
 
     let req = signer.sign(

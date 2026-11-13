@@ -23,8 +23,20 @@ pub const T0: UnixMs = UnixMs(1_800_000_000_000);
 pub const HOST: &str = "s3.test";
 pub const REGION: &str = "auto";
 pub const AKID: &str = "AKIDTESTKEY000000001";
-pub const SECRET: &str = "test-secret-access-key-0000000000000001";
 pub const MIB: usize = 1024 * 1024;
+
+/// A secret access key drawn fresh for each test thread, so no test
+/// depends on a fixed credential.
+pub fn secret() -> &'static str {
+    thread_local! {
+        static SECRET: &'static str = {
+            let mut bytes = [0u8; 20];
+            velmora::rng::FillRandom::fill_bytes(&mut SystemRng, &mut bytes).expect("os randomness");
+            Box::leak(hex(&bytes).into_boxed_str())
+        };
+    }
+    SECRET.with(|s| *s)
+}
 
 pub type TestCatalog = SqlCatalog<RusqliteSql>;
 pub type TestBridge<N> = Bridge<TestCatalog, MemBlobStore, N, Jobs, TestKek, FixedClock>;
@@ -183,7 +195,7 @@ impl<N: NntpConnector + 'static> Rig<N> {
     /// One disposable bucket and one read-write key on it.
     pub async fn standard(&self, bucket: &str) -> (Bucket, Signer) {
         let b = self.bucket(bucket, true).await;
-        let signer = self.key(AKID, SECRET, KeyStatus::Active).await;
+        let signer = self.key(AKID, secret(), KeyStatus::Active).await;
         self.grant(AKID, &b, Perm::Rw).await;
         (b, signer)
     }
