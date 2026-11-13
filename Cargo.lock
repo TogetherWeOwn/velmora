@@ -66,6 +66,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -510,6 +516,12 @@ dependencies = [
  "bytes",
  "http",
 ]
+
+[[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
@@ -1326,6 +1338,22 @@ dependencies = [
  "webpki-roots",
  "worker",
  "zeroize",
+]
+
+[[package]]
+name = "velmora-s3-proto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "crc32fast",
+ "hmac",
+ "httpdate",
+ "md5",
+ "quick-xml",
+ "serde_json",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]

@@ -1,0 +1,438 @@
+[
+  {
+    "name": "header-empty",
+    "method": "GET",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=697a882a767a4274a07920dc710776ce4a761b1f5a97ef843fb5efb032c26632"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/key\n\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "header-put",
+    "method": "PUT",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "Content-Length",
+        "3"
+      ],
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date, Signature=01aefeb38de7d67bec4b17e4e8388b610eb5a5429dd8a12d341f59467d0de05f"
+      ]
+    ],
+    "signed_headers": "content-length;host;x-amz-content-sha256;x-amz-date",
+    "canonical": "PUT\n/bucket/key\n\ncontent-length:3\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nx-amz-date:20130524T000000Z\n\ncontent-length;host;x-amz-content-sha256;x-amz-date\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "body": "abc",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "encoded-path",
+    "method": "GET",
+    "target": "/bucket/A//./../%E9%9B%AA+%2B%25%2f",
+    "headers": [
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=5bc1c9856c2ada4ba746a9e2b1b01481a55ec79b8ecbf3dd4b1a9346c0279b92"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/A//./../%E9%9B%AA+%2B%25%2f\n\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "query-order",
+    "method": "GET",
+    "target": "/bucket/key?prefix=%E9%9B%AA%2B%25&delimiter=%2F&list-type=2",
+    "headers": [
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=b7dab930fb40db60d5eb381d989cba37ed9b92511f7cf4aa7752229d9e7c569e"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/key\ndelimiter=%2F&list-type=2&prefix=%E9%9B%AA%2B%25\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "empty-query",
+    "method": "GET",
+    "target": "/bucket/key?uploads",
+    "headers": [
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ee1c745beeeb3f5d70e9aecf487cfe3e85998a0659b7236c04c829f29fedcf13"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/key\nuploads=\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "repeated-query",
+    "method": "GET",
+    "target": "/bucket/key?z=2&z=1&Z=&=x&&plus=+&percent=%25",
+    "headers": [
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=d0a42afd563b04225332ce45b84546e1090e9345b5326feb999ea417edfc8776"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/key\n=&=x&Z=&percent=%25&plus=+&z=1&z=2\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": true
+  },
+  {
+    "name": "header-whitespace",
+    "method": "PUT",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "Content-Length",
+        "3"
+      ],
+      [
+        "X-Amz-Meta-Name",
+        "  a\t b   c  "
+      ],
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date;x-amz-meta-name, Signature=0d2463724cf00b1466de06af238b69acf60f135701ddc805035291b4b8c17b18"
+      ]
+    ],
+    "signed_headers": "content-length;host;x-amz-content-sha256;x-amz-date;x-amz-meta-name",
+    "canonical": "PUT\n/bucket/key\n\ncontent-length:3\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nx-amz-date:20130524T000000Z\nx-amz-meta-name:a b c\n\ncontent-length;host;x-amz-content-sha256;x-amz-date;x-amz-meta-name\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "body": "abc",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "metadata-token-name",
+    "method": "PUT",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "Content-Length",
+        "3"
+      ],
+      [
+        "X-Amz-Meta-File_Name!#$%&'*+-.^`|~",
+        "  a\t b   c  "
+      ],
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date;x-amz-meta-file_name!#$%&'*+-.^`|~, Signature=6648aba425c2725f7152175edd06ecc6c0efd0d35d8a13c1c1fe6e0776d50c05"
+      ]
+    ],
+    "signed_headers": "content-length;host;x-amz-content-sha256;x-amz-date;x-amz-meta-file_name!#$%&'*+-.^`|~",
+    "canonical": "PUT\n/bucket/key\n\ncontent-length:3\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nx-amz-date:20130524T000000Z\nx-amz-meta-file_name!#$%&'*+-.^`|~:a b c\n\ncontent-length;host;x-amz-content-sha256;x-amz-date;x-amz-meta-file_name!#$%&'*+-.^`|~\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "body": "abc",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "signed-metadata",
+    "method": "PUT",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "Content-Length",
+        "3"
+      ],
+      [
+        "Content-Disposition",
+        "attachment; filename=\"a  b.txt\""
+      ],
+      [
+        "Cache-Control",
+        "private, no-store"
+      ],
+      [
+        "Expires",
+        "Sat, 25 May 2013 00:00:00 GMT"
+      ],
+      [
+        "Content-Language",
+        "en"
+      ],
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=cache-control;content-disposition;content-language;content-length;expires;host;x-amz-content-sha256;x-amz-date, Signature=446dcd39be2d05cffe4f97a03427c4b7d675015daa4d89f9975ed613a4ecfbb2"
+      ]
+    ],
+    "signed_headers": "cache-control;content-disposition;content-language;content-length;expires;host;x-amz-content-sha256;x-amz-date",
+    "canonical": "PUT\n/bucket/key\n\ncache-control:private, no-store\ncontent-disposition:attachment; filename=\"a b.txt\"\ncontent-language:en\ncontent-length:3\nexpires:Sat, 25 May 2013 00:00:00 GMT\nhost:s3.us-east-1.amazonaws.com\nx-amz-content-sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nx-amz-date:20130524T000000Z\n\ncache-control;content-disposition;content-language;content-length;expires;host;x-amz-content-sha256;x-amz-date\nba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "body": "abc",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "presign-get",
+    "method": "GET",
+    "target": "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=4e92e518768b38697e05b1ba05c38ab19c4fdfb43194d4c95c879c958bfa807c",
+    "headers": [
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ]
+    ],
+    "signed_headers": "host",
+    "canonical": "GET\n/bucket/key\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host\nhost:s3.us-east-1.amazonaws.com\n\nhost\nUNSIGNED-PAYLOAD",
+    "body": "",
+    "presigned": true,
+    "canonical_only": false
+  },
+  {
+    "name": "presign-put",
+    "method": "PUT",
+    "target": "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=content-length%3Bcontent-md5%3Bhost&X-Amz-Signature=f6e6fe3022535064fb99c405eab45ba1f87fd36380463e7bc7417ca10538e80b",
+    "headers": [
+      [
+        "Content-Length",
+        "3"
+      ],
+      [
+        "Content-MD5",
+        "kAFQmDzST7DWlj99KOF/cg=="
+      ],
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ]
+    ],
+    "signed_headers": "content-length;content-md5;host",
+    "canonical": "PUT\n/bucket/key\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=content-length%3Bcontent-md5%3Bhost\ncontent-length:3\ncontent-md5:kAFQmDzST7DWlj99KOF/cg==\nhost:s3.us-east-1.amazonaws.com\n\ncontent-length;content-md5;host\nUNSIGNED-PAYLOAD",
+    "body": "abc",
+    "presigned": true,
+    "canonical_only": false
+  },
+  {
+    "name": "presign-head",
+    "method": "HEAD",
+    "target": "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=058887be27d8c1a44b178f1ec7edb385c5ee84ac0c953666c573863d1bf53432",
+    "headers": [
+      [
+        "Host",
+        "s3.us-east-1.amazonaws.com"
+      ]
+    ],
+    "signed_headers": "host",
+    "canonical": "HEAD\n/bucket/key\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host\nhost:s3.us-east-1.amazonaws.com\n\nhost\nUNSIGNED-PAYLOAD",
+    "body": "",
+    "presigned": true,
+    "canonical_only": false
+  },
+  {
+    "name": "header-mixed-host",
+    "method": "GET",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "Host",
+        "S3.US-East-1.AMAZONAWS.com"
+      ],
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=cce94ac8d6e09efc2563b003b8c92f6bfe221ce83767cb444e07c46e3e21c483"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/key\n\nhost:S3.US-East-1.AMAZONAWS.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "presign-mixed-host",
+    "method": "GET",
+    "target": "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=51bc312f4ec6f98cbba86ab1e898cc3590bf83e04a9054b8ddf41f3cdca8aa3d",
+    "headers": [
+      [
+        "Host",
+        "S3.US-East-1.AMAZONAWS.com"
+      ]
+    ],
+    "signed_headers": "host",
+    "canonical": "GET\n/bucket/key\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host\nhost:S3.US-East-1.AMAZONAWS.com\n\nhost\nUNSIGNED-PAYLOAD",
+    "body": "",
+    "presigned": true,
+    "canonical_only": false
+  },
+  {
+    "name": "header-host-port",
+    "method": "GET",
+    "target": "/bucket/key",
+    "headers": [
+      [
+        "Host",
+        "S3.US-East-1.AMAZONAWS.com:8443"
+      ],
+      [
+        "X-Amz-Date",
+        "20130524T000000Z"
+      ],
+      [
+        "X-Amz-Content-SHA256",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      ],
+      [
+        "Authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=f97e4514ed0d100560359afd6c5af38e01b7b73fb48af6a75f9745e7b1408bdd"
+      ]
+    ],
+    "signed_headers": "host;x-amz-content-sha256;x-amz-date",
+    "canonical": "GET\n/bucket/key\n\nhost:S3.US-East-1.AMAZONAWS.com:8443\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "body": "",
+    "presigned": false,
+    "canonical_only": false
+  },
+  {
+    "name": "presign-host-port",
+    "method": "GET",
+    "target": "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=64ed981a30c9d5dc0748f64adf475cf7bc655aa4560ce0ab7efa84a2e1f0647a",
+    "headers": [
+      [
+        "Host",
+        "S3.US-East-1.AMAZONAWS.com:8443"
+      ]
+    ],
+    "signed_headers": "host",
+    "canonical": "GET\n/bucket/key\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host\nhost:S3.US-East-1.AMAZONAWS.com:8443\n\nhost\nUNSIGNED-PAYLOAD",
+    "body": "",
+    "presigned": true,
+    "canonical_only": false
+  }
+]

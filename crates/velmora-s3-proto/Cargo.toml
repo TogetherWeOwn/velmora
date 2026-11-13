@@ -1,0 +1,24 @@
+[package]
+name = "velmora-s3-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Pure S3 protocol layer (SigV4, wire, upload validation, read planning); no I/O"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+# Uses as_chunks, is_multiple_of and is_none_or; same MSRV as the workspace.
+rust-version = "1.89"
+
+# Pins copied from TogetherWeOwn/qerith crates/qerith-core/Cargo.toml at fc09396c.
+[dependencies]
+base64 = "=0.22.1"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+crc32fast = "=1.5.3"
+hmac = "=0.13.0"
+httpdate = "=1.0.3"
+md5 = "=0.8.1"
+quick-xml = "=0.42.0"
+sha2 = "=0.11.1"
+subtle = "=2.6.1"
+
+[dev-dependencies]
+serde_json = "=1.0.154"
