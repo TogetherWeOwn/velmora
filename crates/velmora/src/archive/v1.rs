@@ -1,7 +1,17 @@
-//! Portable archive identity atoms.
+//! Versioned, portable ciphertext archive contract: identity atoms only.
+//!
+//! In a complete archive implementation, callers durably record intent before
+//! I/O and each remote session, part, and result before acknowledging it. These
+//! serializable values are journal inputs, not a database, authority token, or
+//! proof of durability. Dropping a future does not roll back effects; reconcile
+//! uncertain effects under the same intent before a bounded retry, and never
+//! mint a new target. This module does not implement providers or I/O.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// Version of the portable archive contract.
+pub const API_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
@@ -83,6 +93,12 @@ pub type Result<T> = std::result::Result<T, Failure>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_version_is_one() {
+        let version: u16 = crate::archive::v1::API_VERSION;
+        assert_eq!(version, 1);
+    }
 
     #[test]
     fn identifiers_validate_on_construction_and_deserialization() {
