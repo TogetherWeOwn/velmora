@@ -171,6 +171,25 @@ impl WriteIntent {
         }
         Ok(())
     }
+
+    pub fn binding(&self) -> Result<[u8; 32]> {
+        self.validate()?;
+        // Struct fields, byte arrays and vectors have deterministic order; there
+        // are no maps or floats. Version labels prevent cross-contract replays.
+        let mut hash = Sha256::new();
+        hash.update(b"velmora.archive.v1/intent\0");
+        hash.update(serde_json::to_vec(self).map_err(|_| Failure::Invalid)?);
+        Ok(hash.finalize().into())
+    }
+
+    pub fn check_part(&self, index: usize, bytes: &[u8]) -> Result<&Part> {
+        self.validate()?;
+        let part = self.parts.get(index).ok_or(Failure::Invalid)?;
+        if bytes.len() != part.bytes as usize || digest(bytes) != part.sha256 {
+            return Err(Failure::Integrity);
+        }
+        Ok(part)
+    }
 }
 
 /// A byte range within a committed ciphertext object.
@@ -330,6 +349,35 @@ mod tests {
         intent.bytes = MAX_PART_BYTES as u64;
         intent.parts = vec![part(0, MAX_PART_BYTES as u32, "maximum")];
         assert_eq!(intent.validate(), Ok(()));
+    }
+
+    #[test]
+    fn intent_binding_and_part_checks_are_stable_and_fail_closed() {
+        let mut intent = WriteIntent {
+            target: identity().target,
+            operation: id("operation"),
+            bytes: 3,
+            sha256: digest(b"abc"),
+            parts: vec![Part {
+                offset: 0,
+                bytes: 3,
+                sha256: digest(b"abc"),
+                reference: id("part"),
+            }],
+        };
+        let binding = intent.binding().unwrap();
+        let restored: WriteIntent =
+            serde_json::from_str(&serde_json::to_string(&intent).unwrap()).unwrap();
+        assert_eq!(restored.binding(), Ok(binding));
+        assert_eq!(intent.check_part(0, b"abc"), Ok(&intent.parts[0]));
+        assert_eq!(intent.check_part(1, b"abc"), Err(Failure::Invalid));
+        assert_eq!(intent.check_part(0, b"ab"), Err(Failure::Integrity));
+        assert_eq!(intent.check_part(0, b"abd"), Err(Failure::Integrity));
+        intent.operation = id("other-operation");
+        assert_ne!(intent.binding(), Ok(binding));
+        intent.parts[0].offset = 1;
+        assert_eq!(intent.binding(), Err(Failure::Invalid));
+        assert_eq!(intent.check_part(0, b"abc"), Err(Failure::Invalid));
     }
 
     #[test]
