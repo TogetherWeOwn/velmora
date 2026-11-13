@@ -250,6 +250,12 @@ pub enum PostOutcome {
 /// NNTP client. Obtain a connected [`Transport`] from
 /// [`crate::transports`], then [`NntpClient::connect`] performs the greeting,
 /// `MODE READER`, and `AUTHINFO` handshake.
+///
+/// Dropping an in-flight command future (an outer timeout/select abandoning
+/// `POST`, `BODY`, `STAT`, …) poisons the session synchronously: the next
+/// operation fails instead of consuming an abandoned reply. Poisoning is
+/// not physical closure — the caller still owns shutdown and close proof
+/// (see [`NntpClient::shutdown_unusable`]).
 pub struct NntpClient<T: Transport> {
     transport: BufferedTransport<T>,
     max_pipelined: usize,
@@ -334,6 +340,43 @@ impl<T: Transport> NntpClient<T> {
     pub async fn quit(mut self) {
         let _ = self.transport.write_line(b"QUIT").await;
         let _ = self.transport.shutdown().await;
+    }
+
+    /// Synchronously poisons the session without I/O or a close claim.
+    pub(crate) fn invalidate(&mut self) {
+        self.transport.invalidate();
+    }
+
+    /// Invalidates the session, then attempts transport shutdown without a
+    /// protocol command. Use when invocation revocation interrupts an
+    /// exchange: QUIT would race an incomplete command or article body.
+    ///
+    /// The attempt's outcome is never physical-close proof. A transport
+    /// shutdown can succeed by completing only a write-half shutdown while
+    /// the socket — still owned by this borrowed client — keeps a live read
+    /// half, and an error or a dropped shutdown future proves even less.
+    /// The caller MUST retain the pool lease/account charge until physical
+    /// closure is independently confirmed, *even after this method returns
+    /// `Ok` or the client and its transport are destroyed*. Destruction may
+    /// only request asynchronous close; it is not universal closure evidence.
+    /// Success here only means the shutdown attempt completed and the session
+    /// will refuse further use.
+    /// Invalidation happens synchronously on the future's first poll, before
+    /// the shutdown attempt, so an interrupted attempt still leaves the
+    /// session unusable. This caller-owned cleanup has no completion bound;
+    /// supervise it with a separate cleanup budget, never await it as a
+    /// prerequisite to returning an invocation's cancellation/deadline result.
+    pub async fn shutdown_unusable(&mut self) -> std::io::Result<()> {
+        self.invalidate();
+        self.transport.shutdown().await
+    }
+
+    /// The configured per-article receive cap in bytes (hard maximum 64 MiB),
+    /// as enforced while reading ARTICLE/BODY dot-blocks. Adapters admitting
+    /// outbound articles against a readback bound must use this effective
+    /// cap, not the hard ceiling.
+    pub fn max_article_bytes(&self) -> usize {
+        self.transport.max_article_bytes()
     }
 
     /// Returns the wrapped transport without QUIT (for connection reuse by
