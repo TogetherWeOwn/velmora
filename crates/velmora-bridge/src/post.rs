@@ -320,8 +320,11 @@ where
         Ok(plan)
     }
 
-    /// Posts the planned articles through the first usable `post`
-    /// provider in pool order.
+    /// Posts the planned articles through one `post` provider of the best
+    /// usable priority tier. Inside that tier the pool order applies and a
+    /// provider without a free slot is passed over for the next one. A
+    /// lower tier is a backup: it is never used because the tier above is
+    /// busy.
     async fn post_through_pool(
         &self,
         lease: &Lease,
@@ -333,27 +336,33 @@ where
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
         let cooling = pool.cooling_until(&posters);
-        let Some(provider) = pool.order(posters).into_iter().next() else {
+        let order = pool.order(posters);
+        let Some(tier) = order.first().map(|p| p.priority) else {
             return Err(match cooling {
                 Some(until) => Stop::Cooling(until),
                 None => Stop::fail(FailClass::Internal),
             });
         };
-        let mut session = ProviderSession::open(
-            &self.catalog,
-            &self.nntp,
-            &self.clock,
-            provider,
-            PermitClass::Background,
-            &holder,
-        )
-        .await?
-        .ok_or(Stop::NoPermit)?;
-        let posted = self
-            .post_planned(lease, extent, plan, cipher, &mut session)
-            .await;
-        session.close().await;
-        posted
+        for provider in order.into_iter().take_while(|p| p.priority == tier) {
+            let Some(mut session) = ProviderSession::open(
+                &self.catalog,
+                &self.nntp,
+                &self.clock,
+                provider,
+                PermitClass::Background,
+                &holder,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let posted = self
+                .post_planned(lease, extent, plan, cipher, &mut session)
+                .await;
+            session.close().await;
+            return posted;
+        }
+        Err(Stop::NoPermit)
     }
 
     /// Posts every article of `plan` that is still planned on `session`

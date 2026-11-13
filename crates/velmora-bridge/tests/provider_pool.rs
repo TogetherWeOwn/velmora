@@ -334,6 +334,78 @@ async fn posting_follows_priority() {
     assert_eq!(rig.servers[0].posted_count().await, 0);
 }
 
+/// Posting spreads inside a tier like reading does: a provider whose
+/// slots are all in use is passed over for another one of the same tier.
+#[tokio::test]
+async fn posting_spreads_inside_a_tier() {
+    let rig = pool_rig(2).await;
+    let now = rig.bridge.clock.now();
+    let catalog = &rig.bridge.catalog;
+    let p0 = &rig.bridge.cfg.providers[0];
+    for _ in 0..2 {
+        let permit = catalog.acquire_permit(p0, PermitClass::Read, "t", now);
+        permit.await.unwrap().expect("free slot");
+    }
+    let s = rig.seed(8, &marked_plaintext(PLAIN_LEN)).await;
+    let plan = rig.post(&s).await;
+    assert!(plan.iter().all(|a| a.provider_id.as_deref() == Some("p1")));
+    assert_eq!(rig.servers[0].posted_count().await, 0);
+}
+
+/// The pool's snapshot ranks a provider first, but the permit gate
+/// refuses it (its free slot is reserved for reads): the post goes to
+/// the next provider of the tier.
+#[tokio::test]
+async fn post_passes_over_a_tier_member_without_a_permit() {
+    let mut rig = pool_rig(2).await;
+    rig.bridge.cfg.providers[0].max_conns = 3;
+    // One connection and so no read reserve: p1 has one free slot too.
+    rig.bridge.cfg.providers[1].max_conns = 1;
+    let now = rig.bridge.clock.now();
+    let catalog = &rig.bridge.catalog;
+    let (p0, p1) = (&rig.bridge.cfg.providers[0], &rig.bridge.cfg.providers[1]);
+    // p1 has been used more, so p0 wins the tie on free slots.
+    for _ in 0..4 {
+        let permit = catalog.acquire_permit(p1, PermitClass::Read, "t", now);
+        let permit = permit.await.unwrap().expect("free slot");
+        catalog.release_permit(&permit).await.unwrap();
+    }
+    // p0: both background slots held, one slot left for reads only.
+    for _ in 0..2 {
+        let permit = catalog.acquire_permit(p0, PermitClass::Background, "t", now);
+        permit.await.unwrap().expect("free slot");
+    }
+
+    let s = rig.seed(9, &marked_plaintext(PLAIN_LEN)).await;
+    let plan = rig.post(&s).await;
+    assert!(plan.iter().all(|a| a.provider_id.as_deref() == Some("p1")));
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    assert_eq!(rig.servers[0].posted_count().await, 0);
+}
+
+/// A lower tier is a backup, not overflow: while the tier above is only
+/// busy, the job waits and nothing is posted further down.
+#[tokio::test]
+async fn post_does_not_drop_a_tier_when_the_top_one_is_busy() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let now = rig.bridge.clock.now();
+    let p0 = &rig.bridge.cfg.providers[0];
+    for _ in 0..2 {
+        let permit = rig
+            .bridge
+            .catalog
+            .acquire_permit(p0, PermitClass::Read, "t", now);
+        permit.await.unwrap().expect("free slot");
+    }
+    let s = rig.seed(10, &marked_plaintext(PLAIN_LEN)).await;
+    let attempts = rig.bridge.catalog.outbox(&s.extent).attempts;
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+    assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, attempts);
+    assert_eq!(rig.servers[0].posted_count().await, 0);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+}
+
 /// Every provider that could post is cooling: the job waits for the
 /// cooldown without spending an attempt and without a connection.
 #[tokio::test]
