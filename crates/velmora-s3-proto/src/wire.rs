@@ -1,6 +1,7 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/wire.rs. License: MIT.
-// Copied verbatim except: this header only.
+// Copied verbatim except: this header; the `restore` subresource is removed from the
+// accepted query keys (S3 STANDARD semantics).
 
 use super::{ErrorCode, Policy, Result};
 
@@ -118,7 +119,6 @@ impl Target {
                     | "uploads"
                     | "uploadId"
                     | "partNumber"
-                    | "restore"
                     | "location"
                     | "delete"
                     | "list-type"
