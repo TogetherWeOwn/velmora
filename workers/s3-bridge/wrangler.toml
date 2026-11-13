@@ -74,42 +74,43 @@ crons = ["*/5 * * * *"]
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
-# Environments do not inherit bindings, so dev repeats them all.
+# Environments do not inherit bindings, so dev repeats them all, under
+# its own resource names (-dev) so a dev run can never touch prod data.
 
 [[env.dev.d1_databases]]
 binding = "CATALOG"
-database_name = "velmora-catalog"
+database_name = "velmora-catalog-dev"
 database_id = "<from wrangler d1 create>"
 migrations_dir = "migrations"
 
 [[env.dev.r2_buckets]]
 binding = "SAFETY"
-bucket_name = "velmora-safety"
+bucket_name = "velmora-safety-dev"
 
 [[env.dev.r2_buckets]]
 binding = "CACHE"
-bucket_name = "velmora-cache"
+bucket_name = "velmora-cache-dev"
 
 [[env.dev.queues.producers]]
 binding = "POST_Q"
-queue = "velmora-post"
+queue = "velmora-post-dev"
 
 [[env.dev.queues.producers]]
 binding = "VERIFY_Q"
-queue = "velmora-verify"
+queue = "velmora-verify-dev"
 
 [[env.dev.queues.consumers]]
-queue = "velmora-post"
+queue = "velmora-post-dev"
 max_batch_size = 1
 max_concurrency = 2
 max_retries = 20
 retry_delay = 60
-dead_letter_queue = "velmora-dlq"
+dead_letter_queue = "velmora-dlq-dev"
 
 [[env.dev.queues.consumers]]
-queue = "velmora-verify"
+queue = "velmora-verify-dev"
 max_batch_size = 1
 max_concurrency = 2
 max_retries = 20
 retry_delay = 120
-dead_letter_queue = "velmora-dlq"
+dead_letter_queue = "velmora-dlq-dev"

@@ -303,7 +303,8 @@ jobs:
   # Passes with "skipped: no script" until workers/s3-bridge/e2e/slice.sh
   # exists. The script runs from workers/s3-bridge as
   # `bash e2e/slice.sh http://127.0.0.1:8787`; it starts fakesrv
-  # ($FAKESRV_BIN), applies migrations --local and starts
+  # ($FAKESRV_BIN), applies migrations --local (dev database
+  # `velmora-catalog-dev`) and starts
   # `npx wrangler@4 dev --env dev --local --test-scheduled --port 8787`.
   worker-e2e:
     name: worker e2e (wrangler dev)

@@ -12,10 +12,11 @@ use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 pub use crate::types::Result;
 use crate::types::{
-    AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration, DueRow,
-    ExtentId, ExtentRow, GcRow, GcStep, GenerationId, GenerationRow, Job, JobExtent, KekBytes,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, Perm, ProviderConfig, SafetyState, UnixMs,
-    UploadId, UploadPartRow, UploadRow, VerificationRow,
+    AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
+    CompleteUpload, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep, GenerationId,
+    GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage,
+    OutboxStats, Perm, ProviderConfig, SafetyState, UnixMs, UploadId, UploadPartRow, UploadRow,
+    VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,11 @@ pub type Row = Vec<SqlValue>;
 /// `batch` is all-or-nothing. A `tx_guard` CHECK failure is
 /// `Err(BridgeError::GuardFailed)` (DESIGN §A.11); any other failing
 /// statement is an error too, and in both cases nothing was written.
+///
+/// As on D1: at most [`MAX_SQL_PARAMS`] bound parameters per statement
+/// (more is an error), and `exec`/`batch` run every statement to
+/// completion, so `RETURNING` and `SELECT` statements are accepted (their
+/// rows are discarded; a `SELECT` changes 0 rows).
 pub trait Sql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>>;
     /// Returns the number of rows changed.
@@ -47,6 +53,9 @@ pub trait Sql {
     /// Atomic. Returns rows changed per statement.
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>>;
 }
+
+/// D1's bound-parameter limit per statement.
+pub const MAX_SQL_PARAMS: usize = 100;
 
 /// Whether a database error message is the `tx_guard` CHECK firing
 /// (`CHECK (ok = 1)` in `0001_init.sql`). SQLite and D1 both report
@@ -121,7 +130,11 @@ pub trait NntpConnector {
 // Queues, clock, keys
 // ---------------------------------------------------------------------------
 
+/// Longest queue delivery delay Queues accepts (12 h).
+pub const MAX_QUEUE_DELAY_SECS: u32 = 43_200;
+
 pub trait JobSink {
+    /// `delay_secs` above [`MAX_QUEUE_DELAY_SECS`] is an error.
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()>;
     /// Dispatcher only; at most 100 jobs.
     async fn send_many(&self, jobs: &[Job]) -> Result<()>;
@@ -159,6 +172,11 @@ pub struct Lease {
     pub generation: GenerationId,
     pub stage: OutboxStage,
     pub token: u64,
+    /// `outbox.attempts` after this claim (the claim counts as one), so
+    /// retry backoff is derived from it.
+    pub attempts: u32,
+    /// `outbox.cursor` at claim time (verify/release: backbone index).
+    pub cursor: u32,
 }
 
 /// A held provider connection slot (fenced by `token`).
@@ -231,12 +249,13 @@ pub trait Catalog {
         extent: &ExtentRow,
         now: UnixMs,
     ) -> Result<Guard<()>>;
+    /// Publishes the staged part extents in place (see [`CompleteUpload`]).
     async fn complete_upload(
         &self,
         t: &UploadTarget<'_>,
         revision: u64,
         digest: &[u8; 32],
-        c: &CommitGeneration,
+        c: &CompleteUpload,
     ) -> Result<Guard<()>>;
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>>;
 
@@ -257,7 +276,11 @@ pub trait Catalog {
         next_at: UnixMs,
         now: UnixMs,
     ) -> Result<bool>;
-    async fn fail(&self, l: &Lease, class: &str, next_at: UnixMs, now: UnixMs) -> Result<bool>;
+    /// Releases the lease with `next_at`; stores `class` only.
+    async fn fail(&self, l: &Lease, class: FailClass, next_at: UnixMs, now: UnixMs)
+        -> Result<bool>;
+    /// Fenced resume point (verify/release: next backbone index).
+    async fn set_cursor(&self, l: &Lease, cursor: u32, now: UnixMs) -> Result<bool>;
     /// No permit: frees the lease without consuming an attempt.
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool>;
     /// Extent + bucket + generation state.
@@ -287,6 +310,13 @@ pub trait Catalog {
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     async fn due(&self, now: UnixMs, limit: u32) -> Result<Vec<DueRow>>;
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64>;
+    /// Stamps `meta.last_dispatch_at` (the dispatcher, once per run).
+    async fn record_dispatch(&self, now: UnixMs) -> Result<()>;
+    /// Counts per stage, dead count, last dispatch time.
+    async fn outbox_stats(&self) -> Result<OutboxStats>;
+    /// Dev self-test: a batch of `[marker write, failing tx_guard]`.
+    /// `true` = the batch failed with `GuardFailed` and the marker is absent.
+    async fn guard_selftest(&self) -> Result<bool>;
 
     // gc
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>>;

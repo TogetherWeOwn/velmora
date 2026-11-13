@@ -114,6 +114,26 @@ fn number<N: core::str::FromStr>(
         .map_err(|_| ConfigError::Invalid(name.to_string()))
 }
 
+/// `[A-Za-z0-9.-]+` with an optional `:port` (1..=65535).
+fn valid_s3_host(h: &str) -> bool {
+    let (name, port) = match h.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (h, None),
+    };
+    let name_ok = !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    let port_ok = port.is_none_or(|p| {
+        !p.is_empty()
+            && p.len() <= 5
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=65_535).contains(&n))
+    });
+    name_ok && port_ok
+}
+
 fn valid_newsgroup(g: &str) -> bool {
     !g.is_empty()
         && g.len() <= 128
@@ -147,7 +167,7 @@ impl BridgeConfig {
         let dev = environment == Environment::Dev;
 
         let s3_host = required(&get, "S3_HOST")?;
-        if s3_host.contains(['/', ' ', '@']) {
+        if !valid_s3_host(&s3_host) {
             return Err(ConfigError::Invalid("S3_HOST".into()));
         }
         let region = required(&get, "S3_REGION")?;
@@ -285,15 +305,28 @@ pub struct KekRing {
 }
 
 impl KekRing {
-    /// Loads `VELMORA_KEK_<active>`; fails closed when it is absent or not
-    /// 32 bytes of base64.
+    /// Loads every `VELMORA_KEK_<v>` for `v` in `1..=active`, so data
+    /// wrapped under an older version stays readable after a rotation.
+    /// Fails closed when the active version is absent, or when any present
+    /// version is not 32 bytes of base64. Absent older versions are skipped.
     pub fn from_vars(
         active: u32,
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<KekRing, ConfigError> {
-        let key = parse_kek(&get, active)?;
+        if active == 0 {
+            return Err(ConfigError::Invalid("VELMORA_KEK_ACTIVE".into()));
+        }
         let mut keys = BTreeMap::new();
-        keys.insert(active, key);
+        keys.insert(active, parse_kek(&get, active)?);
+        for v in 1..active {
+            match parse_kek(&get, v) {
+                Ok(key) => {
+                    keys.insert(v, key);
+                }
+                Err(ConfigError::Missing(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(KekRing { active, keys })
     }
 }

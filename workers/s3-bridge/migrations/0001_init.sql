@@ -167,3 +167,8 @@ CREATE TABLE provider_permits (                   -- one row per allowed NNTP co
   lease_until    INTEGER NOT NULL DEFAULT 0,      -- 0 = free
   PRIMARY KEY (provider_id, slot)
 ) WITHOUT ROWID;
+
+CREATE TABLE meta (                               -- small operational values
+  k              TEXT PRIMARY KEY,                -- 'last_dispatch_at' (UnixMs) | 'guard_selftest_marker'
+  v              INTEGER NOT NULL
+) WITHOUT ROWID;

@@ -208,7 +208,14 @@ fn kek_b64(byte: u8, len: usize) -> String {
     base64::engine::general_purpose::STANDARD.encode(vec![byte; len])
 }
 
+/// The shipped prod `S3_HOST` is a placeholder that config refuses (see
+/// `config_loads_from_documented_vars`); fixtures use a concrete host.
+const PROD_HOST_FIXTURE: &str = "velmora-s3.example.workers.dev";
+
 fn with_secrets(mut vars: BTreeMap<String, String>, providers: &str) -> BTreeMap<String, String> {
+    if vars.get("S3_HOST").is_some_and(|h| h.contains('<')) {
+        vars.insert("S3_HOST".into(), PROD_HOST_FIXTURE.into());
+    }
     vars.insert("VELMORA_KEK_1".into(), kek_b64(0x11, 32));
     vars.insert("NNTP_PROVIDERS".into(), providers.into());
     vars.insert("ADMIN_TOKEN".into(), ADMIN_TOKEN_FIXTURE.into());
@@ -223,8 +230,17 @@ fn load(vars: &BTreeMap<String, String>) -> std::result::Result<BridgeConfig, Co
 fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
 
+    // Until deploy fills in the account subdomain, prod refuses to start.
+    let mut shipped = with_secrets(prod.clone(), PROVIDER_TLS);
+    shipped.insert("S3_HOST".into(), prod["S3_HOST"].clone());
+    assert_eq!(
+        load(&shipped).unwrap_err(),
+        ConfigError::Invalid("S3_HOST".into())
+    );
+
     let cfg = load(&with_secrets(prod, PROVIDER_TLS)).unwrap();
     assert_eq!(cfg.environment, Environment::Prod);
+    assert_eq!(cfg.s3_host, PROD_HOST_FIXTURE);
     assert_eq!(cfg.required_backbones, 2);
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
@@ -599,6 +615,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "gc",
             "generations",
             "grants",
+            "meta",
             "objects",
             "outbox",
             "provider_permits",
@@ -641,6 +658,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
          vec![text("x_2"), text(GcAction::ShredKey.as_str()), SqlValue::Int(T0.plus_secs(86_400).0), SqlValue::Null]),
         ("INSERT INTO provider_permits(provider_id,slot,token,holder,lease_until) VALUES (?1,?2,?3,?4,?5)",
          vec![text("p1"), i(0), i(0), SqlValue::Null, i(0)]),
+        ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
     assert!(changed.iter().all(|n| *n == 1), "{changed:?}");
@@ -769,6 +787,15 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         extents: vec![extent.clone()],
         now: T0,
     };
+    let complete = CompleteUpload {
+        generation: gen.clone(),
+        placements: vec![ExtentPlacement {
+            extent_id: extent.id.clone(),
+            seq: 0,
+            plain_offset: 0,
+        }],
+        now: T0,
+    };
     let uid = UploadId::mint([1; 16]);
     let target = UploadTarget {
         bucket: b,
@@ -801,6 +828,8 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         generation: gen.id.clone(),
         stage: OutboxStage::Post,
         token: 1,
+        attempts: 1,
+        cursor: 0,
     };
     let article = ArticleRow {
         extent_id: extent.id.clone(),
@@ -874,14 +903,15 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.create_upload(&upload).await;
     let _ = c.upload(&target).await;
     let _ = c.put_upload_part(&target, &part, &extent, T0).await;
-    let _ = c.complete_upload(&target, 1, &[0; 32], &commit).await;
+    let _ = c.complete_upload(&target, 1, &[0; 32], &complete).await;
     let _ = c.abort_upload(&target, T0).await;
     let _ = c
         .claim(&extent.id, &gen.id, OutboxStage::Post, "owner-1", T0)
         .await;
     let _ = c.renew(&lease, T0).await;
     let _ = c.advance(&lease, OutboxStage::Verify, T0, T0).await;
-    let _ = c.fail(&lease, "test", T0, T0).await;
+    let _ = c.fail(&lease, FailClass::NntpError, T0, T0).await;
+    let _ = c.set_cursor(&lease, 1, T0).await;
     let _ = c.defer(&lease, T0, T0).await;
     let _ = c.job_extent(&extent.id, &gen.id).await;
     let _ = c
@@ -895,6 +925,9 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.finish_release(&lease, T0).await;
     let _ = c.due(T0, 100).await;
     let _ = c.bury_exhausted(50, T0).await;
+    let _ = c.record_dispatch(T0).await;
+    let _ = c.outbox_stats().await;
+    let _ = c.guard_selftest().await;
     let _ = c.gc_due(T0, 50, true).await;
     let _ = c.gc_begin(&gc_row, T0).await;
     let _ = c.gc_done(1, T0).await;
@@ -996,4 +1029,253 @@ async fn contract_compiles_against_fakes() {
         })
         .await;
     assert!((200..600).contains(&resp.status));
+}
+
+// ---------------------------------------------------------------------------
+// Regressions from the contract review
+// ---------------------------------------------------------------------------
+
+/// The verify stage's missing-article backoff (2 min, 10 min, 1 h, 6 h,
+/// then record `missing`) is derived from the lease alone: `attempts`
+/// counts the claim that produced the lease, `cursor` is the backbone
+/// resume point.
+#[test]
+fn lease_carries_attempts_and_cursor() {
+    const BACKOFF_SECS: [u32; 4] = [120, 600, 3_600, 21_600];
+    let backoff = |l: &Lease| BACKOFF_SECS.get(l.attempts as usize - 1).copied();
+    let mut lease = Lease {
+        extent: ExtentId::mint([3; 13]),
+        generation: GenerationId::mint(T0, [3; 8]),
+        stage: OutboxStage::Verify,
+        token: 7,
+        attempts: 1,
+        cursor: 2,
+    };
+    assert_eq!(backoff(&lease), Some(120));
+    lease.attempts = 4;
+    assert_eq!(backoff(&lease), Some(21_600));
+    lease.attempts = 5;
+    assert_eq!(backoff(&lease), None, "after the last step: record missing");
+    assert_eq!(lease.cursor, 2);
+}
+
+/// Complete publishes staged extents in place from placements only: the
+/// input type has no field that could carry hashes, keys or headers.
+#[test]
+fn complete_upload_takes_placements_not_extent_rows() {
+    let gen = GenerationId::mint(T0, [4; 8]);
+    let placements: Vec<ExtentPlacement> = (0..3u32)
+        .map(|i| ExtentPlacement {
+            extent_id: ExtentId::mint([i as u8; 13]),
+            seq: i,
+            plain_offset: u64::from(i) * 8 * 1024 * 1024,
+        })
+        .collect();
+    let complete = CompleteUpload {
+        generation: GenerationRow {
+            id: gen,
+            bucket_id: BucketId::mint([4; 8]),
+            key: "a/big.bin".into(),
+            state: GenerationState::Live,
+            size: 3 * 8 * 1024 * 1024,
+            etag: "\"x-3\"".into(),
+            checksum_json: None,
+            content_json: "{}".into(),
+            user_meta_json: "{}".into(),
+            extent_count: 3,
+            created_at: T0,
+            retired_at: None,
+        },
+        placements,
+        now: T0,
+    };
+    // Exhaustive destructuring: adding a field to either type fails here.
+    let CompleteUpload {
+        generation,
+        placements,
+        now,
+    } = complete;
+    for ExtentPlacement {
+        extent_id,
+        seq,
+        plain_offset,
+    } in &placements
+    {
+        assert!(extent_id.as_str().starts_with("x_"));
+        assert_eq!(*plain_offset, u64::from(*seq) * 8 * 1024 * 1024);
+    }
+    assert_eq!(generation.extent_count as usize, placements.len());
+    assert_eq!(now, T0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sql_rejects_more_than_100_params_like_d1() {
+    let db = RusqliteSql::with_schema().unwrap();
+    let in_list = |n: usize| {
+        let marks: Vec<String> = (1..=n).map(|i| format!("?{i}")).collect();
+        format!(
+            "SELECT count(*) FROM gc WHERE extent_id IN ({})",
+            marks.join(",")
+        )
+    };
+    let params = |n: usize| (0..n).map(|i| text(&format!("x_{i}"))).collect::<Vec<_>>();
+    let sql100: &'static str = Box::leak(in_list(100).into_boxed_str());
+    let sql101: &'static str = Box::leak(in_list(101).into_boxed_str());
+
+    db.query(sql100, &params(100)).await.unwrap();
+    db.exec(sql100, &params(100)).await.unwrap();
+    db.batch(vec![(sql100, params(100))]).await.unwrap();
+
+    for err in [
+        db.query(sql101, &params(101)).await.unwrap_err(),
+        db.exec(sql101, &params(101)).await.unwrap_err(),
+        db.batch(vec![
+            (INSERT_GC_MARKER, vec![text("x_a"), SqlValue::Int(T0.0)]),
+            (sql101, params(101)),
+        ])
+        .await
+        .unwrap_err(),
+    ] {
+        assert!(
+            matches!(&err, BridgeError::Sql(m) if m.contains("too many bound parameters")),
+            "{err:?}"
+        );
+    }
+    assert_eq!(
+        count(&db, "gc"),
+        0,
+        "an over-limit statement rolls back its batch"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exec_and_batch_run_returning_and_select_to_completion() {
+    let db = RusqliteSql::with_schema().unwrap();
+    let returning =
+        "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, 'delete_cache', ?2) RETURNING id";
+    assert_eq!(
+        db.exec(returning, &[text("x_a"), SqlValue::Int(T0.0)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(db.exec("SELECT * FROM gc", &[]).await.unwrap(), 0);
+    let changed = db
+        .batch(vec![
+            (returning, vec![text("x_b"), SqlValue::Int(T0.0)]),
+            ("SELECT id FROM gc", vec![]),
+            (
+                "UPDATE gc SET done_at = ?1 RETURNING id",
+                vec![SqlValue::Int(T0.0)],
+            ),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(changed, vec![1, 0, 2]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn guard_selftest_reports_rollback() {
+    let catalog = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+    assert!(catalog.guard_selftest().await.unwrap());
+    assert!(catalog.guard_selftest().await.unwrap(), "repeatable");
+    assert_eq!(count(&catalog.sql, "meta"), 0, "no marker left behind");
+}
+
+#[test]
+fn kek_ring_loads_every_version_up_to_active() {
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    vars.insert("VELMORA_KEK_1".into(), kek_b64(0x01, 32));
+    vars.insert("VELMORA_KEK_3".into(), kek_b64(0x03, 32));
+    vars.insert("VELMORA_KEK_4".into(), kek_b64(0x04, 32));
+    let ring = KekRing::from_vars(3, |k| vars.get(k).cloned()).unwrap();
+    assert_eq!(ring.active().0, 3);
+    assert_eq!(ring.active().1.expose(), &[0x03; 32]);
+    assert_eq!(ring.version(1).unwrap().expose(), &[0x01; 32]);
+    assert!(
+        ring.version(2).is_none(),
+        "absent older versions are skipped"
+    );
+    assert!(
+        ring.version(4).is_none(),
+        "nothing above the active version"
+    );
+
+    // Only the active version is mandatory.
+    assert_eq!(
+        KekRing::from_vars(2, |k| vars.get(k).cloned()).unwrap_err(),
+        ConfigError::Missing("VELMORA_KEK_2".into())
+    );
+    // A present but malformed older key still fails closed.
+    vars.insert("VELMORA_KEK_2".into(), kek_b64(0x02, 16));
+    assert_eq!(
+        KekRing::from_vars(3, |k| vars.get(k).cloned()).unwrap_err(),
+        ConfigError::Invalid("VELMORA_KEK_2".into())
+    );
+}
+
+#[test]
+fn s3_host_allows_only_hostname_and_port() {
+    let (_, dev) = wrangler_vars();
+    let base = with_secrets(dev, PROVIDER_PLAIN);
+    let host = |h: &str| {
+        let mut m = base.clone();
+        m.insert("S3_HOST".into(), h.into());
+        load(&m).map(|c| c.s3_host)
+    };
+    for ok in [
+        "s3.example.com",
+        "velmora-s3.Sub-1.workers.dev",
+        "127.0.0.1:8787",
+        "h:1",
+        "h:65535",
+    ] {
+        assert_eq!(host(ok).unwrap(), ok);
+    }
+    for bad in [
+        "velmora-s3.<account>.workers.dev",
+        "h/path",
+        "user@h",
+        "h h",
+        "h:",
+        "h:0",
+        "h:65536",
+        "h:80:80",
+        "h:+80",
+        ":80",
+        "h_1",
+        "[::1]:80",
+        "h\u{e9}",
+    ] {
+        assert_eq!(
+            host(bad).unwrap_err(),
+            ConfigError::Invalid("S3_HOST".into()),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fake_jobs_reject_delays_over_12_hours() {
+    let jobs = FakeJobs::new();
+    let job = Job::Gc { v: JOB_VERSION };
+    jobs.send(&job, MAX_QUEUE_DELAY_SECS).await.unwrap();
+    assert!(matches!(
+        jobs.send(&job, MAX_QUEUE_DELAY_SECS + 1).await,
+        Err(BridgeError::Queue(_))
+    ));
+    assert_eq!(jobs.sent().len(), 1);
+}
+
+#[test]
+fn fail_classes_are_fixed_strings() {
+    assert_eq!(FailClass::DupUnconfirmed.as_str(), "dup-unconfirmed");
+    assert_eq!(FailClass::MissingPending.as_str(), "missing-pending");
+    for c in FailClass::ALL {
+        assert_eq!(FailClass::parse(c.as_str()), Some(*c));
+        assert!(c
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'-'));
+    }
 }

@@ -5,5 +5,5 @@ disallowed-methods = [
   # `..`/`%2E%2E`/`.` segments and rewrites `\` to `/`: SigV4 would then be
   # verified over a different target than the client signed. The S3 Worker
   # takes the raw target from `req.inner().url()` only.
-  { path = "worker::Request::url", reason = "normalizes the request target; use req.inner().url() via origin_form", allow-invalid = true },
+  { path = "worker::Request::url", reason = "normalizes the request target; use req.inner().url() via origin_form" },
 ]

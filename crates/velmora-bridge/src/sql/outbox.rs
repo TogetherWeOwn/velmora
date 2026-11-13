@@ -5,8 +5,8 @@
 use super::SqlCatalog;
 use crate::ports::{Guard, Lease, Sql};
 use crate::types::{
-    ArticleRow, BackboneStatus, BridgeError, DueRow, ExtentId, GenerationId, JobExtent,
-    OutboxStage, Result, UnixMs, VerificationRow,
+    ArticleRow, BackboneStatus, BridgeError, DueRow, ExtentId, FailClass, GenerationId, JobExtent,
+    OutboxStage, OutboxStats, Result, UnixMs, VerificationRow,
 };
 
 pub(super) async fn claim<S: Sql>(
@@ -37,7 +37,7 @@ pub(super) async fn advance<S: Sql>(
 pub(super) async fn fail<S: Sql>(
     _c: &SqlCatalog<S>,
     _l: &Lease,
-    _class: &str,
+    _class: FailClass,
     _next_at: UnixMs,
     _now: UnixMs,
 ) -> Result<bool> {
@@ -135,4 +135,21 @@ pub(super) async fn bury_exhausted<S: Sql>(
     _now: UnixMs,
 ) -> Result<u64> {
     Err(BridgeError::NotImplemented("sql::outbox::bury_exhausted"))
+}
+
+pub(super) async fn set_cursor<S: Sql>(
+    _c: &SqlCatalog<S>,
+    _l: &Lease,
+    _cursor: u32,
+    _now: UnixMs,
+) -> Result<bool> {
+    Err(BridgeError::NotImplemented("sql::outbox::set_cursor"))
+}
+
+pub(super) async fn record_dispatch<S: Sql>(_c: &SqlCatalog<S>, _now: UnixMs) -> Result<()> {
+    Err(BridgeError::NotImplemented("sql::outbox::record_dispatch"))
+}
+
+pub(super) async fn outbox_stats<S: Sql>(_c: &SqlCatalog<S>) -> Result<OutboxStats> {
+    Err(BridgeError::NotImplemented("sql::outbox::outbox_stats"))
 }

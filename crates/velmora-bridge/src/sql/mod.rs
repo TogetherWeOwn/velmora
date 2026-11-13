@@ -20,13 +20,16 @@ mod outbox;
 mod permits;
 mod uploads;
 
-use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, UploadTarget};
+use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, SqlValue, UploadTarget};
 use crate::types::{
-    AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, CommitGeneration, DueRow, ExtentId,
-    ExtentRow, GcRow, GcStep, GenerationId, GenerationRow, JobExtent, ListPage, ListQuery,
-    ObjectStatus, OutboxStage, Perm, ProviderConfig, Result, SafetyState, UnixMs, UploadPartRow,
-    UploadRow, VerificationRow,
+    AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
+    CompleteUpload, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep, GenerationId,
+    GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm,
+    ProviderConfig, Result, SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
 };
+
+/// `meta` key the guard self-test writes inside its failing batch.
+const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
 
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
@@ -116,7 +119,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         t: &UploadTarget<'_>,
         revision: u64,
         digest: &[u8; 32],
-        c: &CommitGeneration,
+        c: &CompleteUpload,
     ) -> Result<Guard<()>> {
         uploads::complete_upload(self, t, revision, digest, c).await
     }
@@ -147,8 +150,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         outbox::advance(self, l, to, next_at, now).await
     }
-    async fn fail(&self, l: &Lease, class: &str, next_at: UnixMs, now: UnixMs) -> Result<bool> {
+    async fn fail(
+        &self,
+        l: &Lease,
+        class: FailClass,
+        next_at: UnixMs,
+        now: UnixMs,
+    ) -> Result<bool> {
         outbox::fail(self, l, class, next_at, now).await
+    }
+    async fn set_cursor(&self, l: &Lease, cursor: u32, now: UnixMs) -> Result<bool> {
+        outbox::set_cursor(self, l, cursor, now).await
     }
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool> {
         outbox::defer(self, l, next_at, now).await
@@ -196,6 +208,41 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64> {
         outbox::bury_exhausted(self, max_attempts, now).await
+    }
+    async fn record_dispatch(&self, now: UnixMs) -> Result<()> {
+        outbox::record_dispatch(self, now).await
+    }
+    async fn outbox_stats(&self) -> Result<OutboxStats> {
+        outbox::outbox_stats(self).await
+    }
+
+    /// Writes a marker, then fires the guard, in one batch. Rolled back
+    /// means: the batch reported `GuardFailed` and the marker is absent.
+    async fn guard_selftest(&self) -> Result<bool> {
+        let key = || vec![SqlValue::Text(GUARD_SELFTEST_KEY.to_string())];
+        let outcome = self
+            .sql
+            .batch(vec![
+                ("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, 1)", key()),
+                ("INSERT INTO tx_guard(ok) SELECT 0", vec![]),
+            ])
+            .await;
+        let guard_fired = match outcome {
+            Err(BridgeError::GuardFailed) => true,
+            Ok(_) => false,
+            Err(e) => return Err(e),
+        };
+        let marker = self
+            .sql
+            .query("SELECT 1 FROM meta WHERE k = ?1", &key())
+            .await?;
+        if !marker.is_empty() {
+            // Atomicity is broken; leave no residue for the next run.
+            self.sql
+                .exec("DELETE FROM meta WHERE k = ?1", &key())
+                .await?;
+        }
+        Ok(guard_fired && marker.is_empty())
     }
 
     // gc

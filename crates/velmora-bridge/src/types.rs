@@ -671,15 +671,60 @@ pub struct ObjectStatus {
     pub extents: Vec<ExtentStatus>,
 }
 
-/// Input of one publication batch (single PUT or multipart Complete).
-/// For Complete, `extents` are the staged part extents with `seq`,
-/// `plain_offset` and `generation_id` filled in.
+/// Input of a single-PUT publication batch: the new generation and its
+/// freshly sealed extents (inserted as `committed`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitGeneration {
     pub generation: GenerationRow,
     pub extents: Vec<ExtentRow>,
     pub now: UnixMs,
 }
+
+/// Where one staged part extent lands in the completed object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtentPlacement {
+    pub extent_id: ExtentId,
+    pub seq: u32,
+    pub plain_offset: u64,
+}
+
+/// Input of a multipart Complete publication batch. The catalogue only
+/// sets `generation_id`, `seq`, `plain_offset` and `state = 'committed'` on
+/// the existing staged extents; it never rewrites their hashes, keys or
+/// headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteUpload {
+    pub generation: GenerationRow,
+    /// In part order.
+    pub placements: Vec<ExtentPlacement>,
+    pub now: UnixMs,
+}
+
+/// `GET /_admin/status` catalogue figures.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct OutboxStats {
+    /// Row count per stage; stages with no rows are omitted.
+    pub by_stage: Vec<(OutboxStage, u64)>,
+    pub dead: u64,
+    /// Last `Catalog::record_dispatch` (`meta.last_dispatch_at`).
+    pub last_dispatch_at: Option<UnixMs>,
+}
+
+db_enum!(
+    /// Failure class stored in `outbox.last_error`. A class only: provider
+    /// reply text can carry credentials and is never stored.
+    FailClass {
+        DupUnconfirmed => "dup-unconfirmed",
+        MissingPending => "missing-pending",
+        Corrupt => "corrupt",
+        NntpError => "nntp-error",
+        PostRefused => "post-refused",
+        BlobError => "blob-error",
+        CryptoError => "crypto-error",
+        QueueError => "queue-error",
+        Internal => "internal",
+    }
+);
 
 /// ListObjectsV2 catalogue query. The service turns a prefix into the
 /// `[prefix, successor(prefix))` range and folds delimiters in Rust.

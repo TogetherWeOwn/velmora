@@ -5,7 +5,7 @@
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, UploadTarget};
 use crate::types::{
-    BridgeError, CommitGeneration, ExtentRow, Result, UnixMs, UploadPartRow, UploadRow,
+    BridgeError, CompleteUpload, ExtentRow, Result, UnixMs, UploadPartRow, UploadRow,
 };
 
 pub(super) async fn create_upload<S: Sql>(_c: &SqlCatalog<S>, _u: &UploadRow) -> Result<()> {
@@ -34,7 +34,7 @@ pub(super) async fn complete_upload<S: Sql>(
     _t: &UploadTarget<'_>,
     _revision: u64,
     _digest: &[u8; 32],
-    _commit: &CommitGeneration,
+    _commit: &CompleteUpload,
 ) -> Result<Guard<()>> {
     Err(BridgeError::NotImplemented("sql::uploads::complete_upload"))
 }

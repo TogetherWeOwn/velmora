@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection};
 
-use crate::ports::{BlobMeta, BlobStore, Clock, JobSink, Kek, Row, Sql, SqlValue};
+use crate::ports::{
+    BlobMeta, BlobStore, Clock, JobSink, Kek, Row, Sql, SqlValue, MAX_QUEUE_DELAY_SECS,
+    MAX_SQL_PARAMS,
+};
 use crate::types::{BridgeError, BucketId, ByteSpan, ExtentId, Job, KekBytes, Result, UnixMs};
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
@@ -64,6 +67,31 @@ fn map_err(e: rusqlite::Error) -> BridgeError {
     }
 }
 
+/// D1 rejects statements with more than `MAX_SQL_PARAMS` bound values.
+fn check_params(params: &[SqlValue]) -> Result<()> {
+    if params.len() > MAX_SQL_PARAMS {
+        return Err(BridgeError::Sql(format!(
+            "too many bound parameters: {} > {MAX_SQL_PARAMS}",
+            params.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Steps one statement to completion like D1 `run()`: `RETURNING` and
+/// `SELECT` are accepted and their rows discarded. Returns rows changed.
+fn run_to_completion(conn: &Connection, sql: &str, params: &[SqlValue]) -> Result<u64> {
+    check_params(params)?;
+    let before = conn.total_changes();
+    let mut stmt = conn.prepare(sql).map_err(map_err)?;
+    let mut rows = stmt
+        .query(params_from_iter(params.iter().map(to_value)))
+        .map_err(map_err)?;
+    while rows.next().map_err(map_err)?.is_some() {}
+    drop(rows);
+    Ok(conn.total_changes().saturating_sub(before))
+}
+
 impl RusqliteSql {
     /// Empty in-memory database with foreign keys on.
     pub fn open_in_memory() -> Result<Self> {
@@ -95,6 +123,7 @@ impl RusqliteSql {
 
 impl Sql for RusqliteSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        check_params(params)?;
         let conn = self.conn.borrow();
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
         let cols = stmt.column_count();
@@ -113,11 +142,7 @@ impl Sql for RusqliteSql {
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        let conn = self.conn.borrow();
-        let n = conn
-            .execute(sql, params_from_iter(params.iter().map(to_value)))
-            .map_err(map_err)?;
-        Ok(n as u64)
+        run_to_completion(&self.conn.borrow(), sql, params)
     }
 
     /// One transaction: the first failing statement (a guard CHECK or any
@@ -128,10 +153,7 @@ impl Sql for RusqliteSql {
         let mut changed = Vec::with_capacity(stmts.len());
         for (sql, params) in &stmts {
             // On error `tx` drops here, which rolls back.
-            let n = tx
-                .execute(sql, params_from_iter(params.iter().map(to_value)))
-                .map_err(map_err)?;
-            changed.push(n as u64);
+            changed.push(run_to_completion(&tx, sql, params)?);
         }
         tx.commit().map_err(map_err)?;
         Ok(changed)
@@ -327,6 +349,9 @@ impl FakeJobs {
 
 impl JobSink for FakeJobs {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
+        if delay_secs > MAX_QUEUE_DELAY_SECS {
+            return Err(BridgeError::Queue("delay over 12 hours".into()));
+        }
         self.record(job, delay_secs);
         Ok(())
     }
