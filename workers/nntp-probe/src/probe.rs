@@ -67,10 +67,26 @@ fn authorized(req: &Request, env: &Env) -> bool {
     bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
 }
 
+/// A secret with surrounding whitespace (e.g. a trailing newline from a
+/// piped `secret put`) removed. A value with an inner CR or LF is rejected:
+/// spliced into an NNTP command it would split the line.
 fn secret(env: &Env, name: &str) -> std::result::Result<String, Value> {
-    env.secret(name)
+    let value = env
+        .secret(name)
         .map(|s| s.to_string())
-        .map_err(|_| json!({"class": "config", "missing": name}))
+        .map_err(|_| json!({"class": "config", "missing": name}))?;
+    let value = value.trim().to_string();
+    if value.contains(['\r', '\n']) {
+        return Err(json!({"class": "config", "invalid": name}));
+    }
+    Ok(value)
+}
+
+/// Error response for a failed config lookup: 400 for a bad request
+/// parameter, 500 for a deployment problem.
+fn config_error(e: Value) -> Result<Response> {
+    let status = if e["class"] == "request" { 400 } else { 500 };
+    json_response(&json!({"ok": false, "error": e}), status)
 }
 
 /// Secret-name prefix for the account selected by `?p=<n>`: `NNTP_P<n>_`
@@ -118,9 +134,13 @@ fn nntp_config(req: &Request, env: &Env) -> std::result::Result<NntpConfig, Valu
         username: Some(secret(env, &format!("{prefix}USER"))?),
         password: Some(secret(env, &format!("{prefix}PASS"))?),
         timeout: OP_TIMEOUT,
+        max_article_bytes: MAX_READ_BYTES,
         ..NntpConfig::default()
     })
 }
+
+/// Largest article body `/probe/body` and `/probe/post` will buffer.
+const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
 /// Every configured host, user and password across all accounts, with the
 /// label that replaces it in provider free text. Bundle accounts can name
@@ -139,10 +159,18 @@ fn all_configured_values(env: &Env) -> Vec<(String, String)> {
             ("HOST", format!("<configured-host:{account}>")),
         ] {
             if let Ok(v) = env.secret(&format!("{prefix}{field}")) {
-                let v = v.to_string();
-                if !v.trim().is_empty() {
+                let v = v.to_string().trim().to_string();
+                if !v.is_empty() {
                     out.push((v, label));
                 }
+            }
+        }
+        if let Ok(list) = env.secret(&format!("{prefix}ALT")) {
+            let list = list.to_string();
+            let mut k = 0;
+            while let Some((host, _)) = discovery::alt_endpoint(&list, k) {
+                out.push((host, format!("<alt-host:{account}:{k}>")));
+                k += 1;
             }
         }
     }
@@ -166,20 +194,16 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Removes every configured connection value from a diagnostic string, so
 /// a runtime error that quotes the host or account never leaves the Worker.
 fn redact(msg: &str, cfg: &NntpConfig) -> String {
-    let mut out = msg.to_string();
-    for value in [
-        Some(cfg.host.as_str()),
-        cfg.username.as_deref(),
-        cfg.password.as_deref(),
+    let mut values: Vec<(String, String)> = [
+        (Some(cfg.host.as_str()), "<host>"),
+        (cfg.username.as_deref(), "<user>"),
+        (cfg.password.as_deref(), "<password>"),
     ]
     .into_iter()
-    .flatten()
-    {
-        if !value.is_empty() {
-            out = out.replace(value, "<redacted>");
-        }
-    }
-    out
+    .filter_map(|(v, label)| v.map(|v| (v.to_string(), label.to_string())))
+    .collect();
+    values.sort_by_key(|(v, _)| std::cmp::Reverse(v.len()));
+    discovery::redact_ips(&discovery::redact_values(msg, &values))
 }
 
 /// Error class and numeric code only; provider reply text is never echoed.
@@ -243,11 +267,20 @@ async fn open_session(
         .map_err(|e| {
             json!({"step": "connect", "class": "socket_create", "detail": redact(&e.to_string(), cfg)})
         })?;
-    if let Err(e) = socket.opened().await {
+    let opened = with_timeout_for(OP_TIMEOUT, async {
+        socket
+            .opened()
+            .await
+            .map_err(|e| std::io::Error::other(redact(&e.to_string(), cfg)))
+    })
+    .await;
+    if let Err(e) = opened {
+        let mut socket = socket;
+        let _ = socket.close().await;
         return Err(json!({
             "step": "connect_tls",
             "class": "socket_open",
-            "detail": redact(&e.to_string(), cfg),
+            "detail": e.to_string(),
             "ms": now_ms() - t0,
         }));
     }
@@ -337,7 +370,7 @@ fn make_payload(kind: &str, size: Option<u64>) -> velmora::Result<Vec<u8>> {
 async fn probe_post(req: &Request, env: &Env) -> Result<Response> {
     let cfg = match nntp_config(req, env) {
         Ok(cfg) => cfg,
-        Err(e) => return json_response(&json!({"ok": false, "error": e}), 500),
+        Err(e) => return config_error(e),
     };
     let size = match query_param(req, "size").map(|s| s.parse::<u64>()) {
         None => None,
@@ -551,7 +584,7 @@ async fn read_body(
 async fn probe_body(req: &Request, env: &Env) -> Result<Response> {
     let cfg = match nntp_config(req, env) {
         Ok(cfg) => cfg,
-        Err(e) => return json_response(&json!({"ok": false, "error": e}), 500),
+        Err(e) => return config_error(e),
     };
     let Some(mid) = query_param(req, "mid").and_then(|m| discovery::normalize_message_id(&m))
     else {
@@ -603,6 +636,10 @@ const MAX_LINE: usize = 4096;
 /// Most lines accepted in one dot-block (HEAD, CAPABILITIES).
 const MAX_BLOCK_LINES: usize = 512;
 
+/// Deadline for a whole dot-block, so a server dribbling one line at a
+/// time cannot hold a session for `MAX_BLOCK_LINES` x the line timeout.
+const BLOCK_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Concurrent sessions per `/probe/ramp` call. The Workers runtime allows at
 /// most six open outbound sockets per invocation.
 const MAX_RAMP: u32 = 6;
@@ -621,8 +658,15 @@ fn timed_out() -> std::io::Error {
 async fn with_timeout<T>(
     fut: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> std::io::Result<T> {
+    with_timeout_for(DISCOVERY_TIMEOUT, fut).await
+}
+
+async fn with_timeout_for<T>(
+    limit: Duration,
+    fut: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
     let fut = std::pin::pin!(fut);
-    let delay = std::pin::pin!(Delay::from(DISCOVERY_TIMEOUT));
+    let delay = std::pin::pin!(Delay::from(limit));
     match future::select(fut, delay).await {
         Either::Left((out, _)) => out,
         Either::Right(_) => Err(timed_out()),
@@ -659,13 +703,23 @@ impl Mini {
         .await
         .is_err()
         {
+            // worker's Socket has no Drop; close it so a failed attempt
+            // does not hold a socket (and a provider slot) until the
+            // invocation ends.
+            let mut socket = socket;
+            let _ = socket.close().await;
             return Err(json!({"step": "connect_tls", "class": "socket_open"}));
         }
         let mut mini = Mini {
             io: BufReader::new(socket),
         };
-        let greeting = mini.line().await.map_err(|e| io_error("greeting", &e))?;
-        Ok((mini, greeting))
+        match mini.line().await {
+            Ok(greeting) => Ok((mini, greeting)),
+            Err(e) => {
+                mini.quit().await;
+                Err(io_error("greeting", &e))
+            }
+        }
     }
 
     /// One CRLF line without the terminator, capped at [`MAX_LINE`].
@@ -705,6 +759,10 @@ impl Mini {
 
     /// Reads a dot-terminated block, dot-unstuffed.
     async fn dot_block(&mut self) -> std::io::Result<Vec<Vec<u8>>> {
+        with_timeout_for(BLOCK_DEADLINE, self.dot_block_inner()).await
+    }
+
+    async fn dot_block_inner(&mut self) -> std::io::Result<Vec<Vec<u8>>> {
         let mut lines = Vec::new();
         loop {
             let mut line = self.line().await?;
@@ -746,11 +804,21 @@ impl Mini {
         Ok((u, p))
     }
 
+    /// Best-effort QUIT, then always shut down and close the socket, even
+    /// when the QUIT write fails.
     async fn quit(mut self) {
         let _ = with_timeout(async {
             self.io.write_all(b"QUIT\r\n").await?;
-            self.io.flush().await?;
-            self.io.shutdown().await
+            self.io.flush().await
+        })
+        .await;
+        let _ = with_timeout(self.io.shutdown()).await;
+        let _ = with_timeout(async {
+            self.io
+                .get_mut()
+                .close()
+                .await
+                .map_err(|_| std::io::Error::other("close"))
         })
         .await;
     }
@@ -771,7 +839,7 @@ fn bad_request(msg: &str) -> Result<Response> {
 async fn probe_caps(req: &Request, env: &Env) -> Result<Response> {
     let cfg = match nntp_config(req, env) {
         Ok(cfg) => cfg,
-        Err(e) => return json_response(&json!({"ok": false, "error": e}), 500),
+        Err(e) => return config_error(e),
     };
     let values = all_configured_values(env);
     let t0 = now_ms();
@@ -850,7 +918,7 @@ async fn capabilities(
 async fn probe_head(req: &Request, env: &Env) -> Result<Response> {
     let cfg = match nntp_config(req, env) {
         Ok(cfg) => cfg,
-        Err(e) => return json_response(&json!({"ok": false, "error": e}), 500),
+        Err(e) => return config_error(e),
     };
     let mids: Vec<String> = req
         .url()
@@ -1014,7 +1082,7 @@ async fn ramp_session(cfg: &NntpConfig, idx: u32, hold: Duration) -> Value {
 async fn probe_ramp(req: &Request, env: &Env) -> Result<Response> {
     let cfg = match nntp_config(req, env) {
         Ok(cfg) => cfg,
-        Err(e) => return json_response(&json!({"ok": false, "error": e}), 500),
+        Err(e) => return config_error(e),
     };
     let n = match query_param(req, "n").map(|s| s.parse::<u32>()) {
         Some(Ok(n)) if (1..=MAX_RAMP).contains(&n) => n,

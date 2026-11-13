@@ -44,12 +44,15 @@ request.
 | `GET\|PUT /raw/<anything>` | Echoes `req.inner().url()`, `req.url()` (parsed), `req.path()`, the parsed query and the header list as the Worker sees them. Values are echoed only for `x-amz-*`, `content-*`, `host`, `user-agent`, `accept`, `expect` and `range`; other headers are listed by name only. For `PUT`, the body is not read; the declared `content-length` is reported. |
 
 Responses never contain credentials. Errors are reported as a class plus the
-numeric NNTP code. Provider free text (greeting line, capability lines) and
-the selected headers are returned only after redaction: every configured
-host (shown as `<configured-host:p<n>>`), user and password of every account
-is replaced, every IPv4/IPv6-shaped token becomes `<redacted>`,
-`NNTP-Posting-Host` is dropped entirely, and `Injection-Info` keeps only the
-injecting server name and parameter names.
+numeric NNTP code; I/O errors from the engine routes also carry the runtime's
+detail string with the selected account's host, user and password and any IP
+address removed. Provider free text (greeting line, capability lines) and the
+selected headers are returned only after redaction: every configured host
+(shown as `<configured-host:p<n>>`), every alternate host (`<alt-host:p<n>:<k>>`),
+user and password of every account is replaced, every IPv4/IPv6-shaped
+substring becomes `<redacted>`, the `NNTP-Posting-Host` value is replaced
+whole, and `Injection-Info` keeps only the injecting server name and
+well-formed parameter names.
 
 ## Configuration
 

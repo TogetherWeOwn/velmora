@@ -75,38 +75,97 @@ pub fn select_headers(lines: &[Vec<u8>]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// True for a dotted-quad IPv4 address (optionally followed by `:port`).
-fn looks_like_ipv4(tok: &str) -> bool {
-    let tok = tok.split(':').next().unwrap_or(tok);
-    let parts: Vec<&str> = tok.split('.').collect();
-    parts.len() == 4
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()))
+/// Length of a dotted-quad IPv4 run (`d{1,3}(.d{1,3}){3}`) starting at
+/// `i`, if one starts there and is not followed by another digit.
+fn ipv4_run_at(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    for part in 0..4 {
+        if part > 0 {
+            if b.get(j) != Some(&b'.') {
+                return None;
+            }
+            j += 1;
+        }
+        let start = j;
+        while j < b.len() && j - start < 3 && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == start {
+            return None;
+        }
+    }
+    if b.get(j).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(j - i)
+}
+
+/// Replaces every IPv4 run anywhere in `s` (inside Path diagnostics such as
+/// `.POSTED.203.0.113.9`, in brackets, after `@`, before a full stop).
+fn redact_ipv4_runs(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let starts_run = b[i].is_ascii_digit() && (i == 0 || !b[i - 1].is_ascii_digit());
+        if let Some(len) = starts_run.then(|| ipv4_run_at(b, i)).flatten() {
+            // Runs are ASCII, so these are char boundaries.
+            out.push_str(&s[copied..i]);
+            out.push_str(REDACTED);
+            i += len;
+            copied = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 /// True for something shaped like an IPv6 address: hex digits and at least
-/// two colons, nothing else (brackets allowed).
+/// two colons, nothing else (embedded IPv4 tails are caught separately).
 fn looks_like_ipv6(tok: &str) -> bool {
-    let t = tok.trim_start_matches('[').trim_end_matches(']');
+    let t = tok.trim_end_matches('.');
     t.matches(':').count() >= 2
         && t.bytes().any(|b| b.is_ascii_hexdigit())
         && t.bytes()
             .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
 }
 
-/// Separators that split a header value into tokens for IP detection.
+/// Separators that split a value into tokens for IPv6 detection.
 fn is_sep(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '!' | ';' | ',' | '"' | '(' | ')' | '=' | '/' | '<' | '>')
+    c.is_whitespace()
+        || matches!(
+            c,
+            '!' | ';'
+                | ','
+                | '"'
+                | '\''
+                | '('
+                | ')'
+                | '='
+                | '/'
+                | '<'
+                | '>'
+                | '['
+                | ']'
+                | '@'
+                | '%'
+        )
 }
 
-/// Replaces every IP-shaped token with [`REDACTED`], keeping separators.
+/// Replaces every IP-shaped substring with [`REDACTED`].
 pub fn redact_ips(s: &str) -> String {
+    let s = redact_ipv4_runs(s);
     let mut out = String::with_capacity(s.len());
     let mut tok = String::new();
     let flush = |tok: &mut String, out: &mut String| {
-        if looks_like_ipv4(tok) || looks_like_ipv6(tok) {
+        if looks_like_ipv6(tok) {
             out.push_str(REDACTED);
+            if tok.ends_with('.') {
+                out.push('.');
+            }
         } else {
             out.push_str(tok);
         }
@@ -124,47 +183,73 @@ pub fn redact_ips(s: &str) -> String {
     out
 }
 
-/// Replaces each non-empty secret value (case-insensitively) with a label.
+/// Replaces each non-empty secret value (ASCII case-insensitively) with its
+/// label in one left-to-right pass over the original string, so a short
+/// value can never match inside a label inserted for another. `values`
+/// should be sorted longest first; at each position the first match wins.
 pub fn redact_values(s: &str, values: &[(String, String)]) -> String {
-    let mut out = s.to_string();
-    for (value, label) in values {
-        if value.is_empty() {
+    let lower = s.to_ascii_lowercase();
+    let needles: Vec<(String, &str)> = values
+        .iter()
+        .filter(|(v, _)| !v.is_empty())
+        .map(|(v, l)| (v.to_ascii_lowercase(), l.as_str()))
+        .collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if let Some((v, label)) = needles
+            .iter()
+            .find(|(v, _)| lower[i..].starts_with(v.as_str()))
+        {
+            out.push_str(label);
+            i += v.len();
             continue;
         }
-        let lower_out = out.to_ascii_lowercase();
-        let lower_val = value.to_ascii_lowercase();
-        if !lower_out.contains(&lower_val) {
-            continue;
-        }
-        let mut rebuilt = String::with_capacity(out.len());
-        let mut rest = out.as_str();
-        let mut lower_rest = lower_out.as_str();
-        while let Some(pos) = lower_rest.find(&lower_val) {
-            rebuilt.push_str(&rest[..pos]);
-            rebuilt.push_str(label);
-            rest = &rest[pos + value.len()..];
-            lower_rest = &lower_rest[pos + value.len()..];
-        }
-        rebuilt.push_str(rest);
-        out = rebuilt;
+        let ch = s[i..].chars().next().expect("i is a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
 
-/// `Injection-Info: <server>; key="value"; ...` keeps the injecting server
-/// name and the parameter names; every parameter value is redacted (they
-/// carry posting hosts, account ids and logging data).
+/// Splits on `;` outside double quotes.
+fn split_params(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0;
+    for (i, c) in value.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                parts.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// `Injection-Info: <server> [comment]; key="value"; ...` keeps only the
+/// injecting server name (first token) and well-formed parameter names;
+/// every parameter value is redacted (they carry posting hosts, account
+/// ids and logging data).
 pub fn redact_injection_info(value: &str) -> String {
-    let mut parts = value.split(';');
-    let mut out = parts.next().unwrap_or("").trim().to_string();
-    for p in parts {
+    let parts = split_params(value);
+    let mut out = parts[0].split_whitespace().next().unwrap_or("").to_string();
+    for p in &parts[1..] {
         let p = p.trim();
         if p.is_empty() {
             continue;
         }
         let name = p.split('=').next().unwrap_or("").trim();
+        let name_ok = p.contains('=')
+            && !name.is_empty()
+            && name.len() <= 40
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
         out.push_str("; ");
-        out.push_str(name);
+        out.push_str(if name_ok { name } else { REDACTED });
         out.push('=');
         out.push_str(REDACTED);
     }
@@ -297,8 +382,52 @@ mod tests {
             redact_line("200 Welcome ACCT-USER from 192.0.2.1", &values),
             "200 Welcome <user> from <redacted>"
         );
+        // IPv4 anywhere: Path diagnostics, brackets, after @, before a full stop.
+        for (input, want) in [
+            (
+                "fx1.iad.POSTED.203.0.113.9!x",
+                "fx1.iad.POSTED.<redacted>!x",
+            ),
+            ("from 192.0.2.1.", "from <redacted>."),
+            ("[192.0.2.1]", "[<redacted>]"),
+            ("user@1.2.3.4", "user@<redacted>"),
+            ("host:1.2.3.4", "host:<redacted>"),
+            ("'1.2.3.4'", "'<redacted>'"),
+            ("fe80::1%eth0", "<redacted>%eth0"),
+            ("[2001:db8::1]:563", "[<redacted>]:563"),
+            ("::ffff:192.0.2.1", "<redacted><redacted>"),
+        ] {
+            assert_eq!(redact_ips(input), want, "{input}");
+        }
         // Hostnames with digits are not IPs; version strings are not either.
         assert_eq!(redact_ips("news4.example v2.1.3"), "news4.example v2.1.3");
+    }
+
+    #[test]
+    fn injection_info_is_quote_aware() {
+        assert_eq!(
+            redact_injection_info(
+                "inj.example (user 1234); posting-account=\"abc;uid42\"; bare; x y=\"1\""
+            ),
+            "inj.example; posting-account=<redacted>; <redacted>=<redacted>; <redacted>=<redacted>"
+        );
+    }
+
+    #[test]
+    fn value_redaction_is_single_pass() {
+        // A short value must not match inside a label inserted earlier.
+        let values = vec![
+            (
+                "news.example".to_string(),
+                "<configured-host:p1>".to_string(),
+            ),
+            ("host".to_string(), "<user>".to_string()),
+        ];
+        assert_eq!(
+            redact_values("200 NEWS.example host", &values),
+            "200 <configured-host:p1> <user>"
+        );
+        assert_eq!(redact_values("caf\u{e9} host", &values), "caf\u{e9} <user>");
     }
 
     #[test]
