@@ -71,7 +71,7 @@ jobs:
       # behavior, not a wasm-runtime check (see rust-wasm).
       - run: cargo test --locked -p velmora --no-default-features
       - run: cargo clippy --locked -p velmora --no-default-features --features archive-provider --all-targets -- -D warnings
-      - run: cargo test --locked -p velmora --no-default-features --features archive-provider archive::
+      - run: 'cargo test --locked -p velmora --no-default-features --features archive-provider archive::'
       # Exercise the preserved native TLS tests with the qualification feature
       # enabled as well. This does not execute the wasm-only Worker adapter.
       - run: cargo test --locked -p velmora --features worker-pinned-tls --lib

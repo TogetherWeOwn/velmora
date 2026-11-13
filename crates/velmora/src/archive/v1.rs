@@ -11,6 +11,8 @@ pub enum Backend {
 
 /// An access-controlled identifier or credential *reference*, never a secret.
 /// Redacted in diagnostics; callers must also avoid logging serialized records.
+/// The 1024-byte limit applies to accepted values, not deserializer allocations;
+/// callers must bound untrusted input before deserialization.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Id(String);
