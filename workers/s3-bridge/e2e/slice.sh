@@ -8,10 +8,21 @@
 # queue send is lost, then calls the scheduled handler. Everything it started
 # or wrote is removed on exit.
 #
-# Remote (any other base URL): runs against a deployed Worker. The admin
-# bearer comes from the 0600 file named by VELMORA_ADMIN_TOKEN_FILE. Step 4
-# accepts `verify` (release waits for a second backbone) and step 7 waits for
-# the real cron instead of calling the scheduled handler.
+# Remote (any other base URL): runs against a deployed Worker. Nothing is
+# started or migrated. The admin bearer comes from the 0600 file named by
+# VELMORA_ADMIN_TOKEN_FILE. Differences from local, per the prod setup with
+# one backbone:
+#   - setup accepts buckets that already exist (a rerun), and the in-flight
+#     peak may be 0 (the status call can land on another isolate);
+#   - step 4 accepts `verify` (release waits for a second backbone) and polls
+#     up to STEP4_TIMEOUT_SECS (default 900: posting plus VERIFY_DELAY_SECS);
+#   - step 5 also requires every pinned copy deleted and every cache copy
+#     absent before the cold GET, so it can only be served from Usenet, and
+#     logs the cold-read latency;
+#   - step 5b runs POST /_admin/drill (read from Usenet only, no cache) and
+#     requires match:true and the upload's sha256;
+#   - step 7 waits for CRON_RUNS (default 2) runs of the real cron, each one
+#     advancing last_dispatch_at, instead of calling the scheduled handler.
 #
 # No secret ever appears in argv, in xtrace output or in the log: the bearer
 # reaches curl through a 0600 header file (`-H @file`), the S3 key reaches
@@ -24,6 +35,8 @@
 #   READY_TIMEOUT_SECS        wait for `wrangler dev` to answer (default 1200;
 #                             the first run compiles the Worker)
 #   VELMORA_ADMIN_TOKEN_FILE  admin bearer file, mode 0600 (remote only)
+#   STEP4_TIMEOUT_SECS        step 4 poll limit (default 180 local, 900 remote)
+#   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
 #
 # Every failure prints `SLICE FAILED at step <n>: <what>` with the expected
 # and the actual value, and the script exits non-zero.
@@ -283,7 +296,10 @@ expect_err() {
 
 # same_bytes <what> <expected-file> <actual-file>
 same_bytes() {
-  cmp -s "$2" "$3" && return 0
+  if cmp -s "$2" "$3"; then
+    log "$1: equal, $(stat -c %s "$3") bytes, sha256 $(sha256sum <"$3" | cut -c1-64)"
+    return 0
+  fi
   fail "$1" "$(stat -c %s "$2") bytes, sha256 $(sha256sum <"$2" | cut -c1-64)" \
     "$(stat -c %s "$3" 2>/dev/null || echo 0) bytes, sha256 $(sha256sum <"$3" | cut -c1-64), $(cmp "$2" "$3" 2>&1 | head -1)"
 }
@@ -296,16 +312,31 @@ run_aws() {
   printf '%s' "$out"
 }
 
+now_ms() { date +%s%3N; }
+
+# make_bucket <name>: a disposable bucket. Remote accepts 409 (a rerun:
+# while real data is not allowed every existing bucket is disposable).
+make_bucket() {
+  local code
+  code=$(curl -sS -o "$T/adm.out" -w '%{http_code}' --max-time 300 -H @"$T/admin.hdr" \
+    -XPOST "$BASE/_admin/buckets" -H 'content-type: application/json' \
+    -d "{\"name\":\"$1\",\"disposable\":true}" 2>"$T/adm.err") ||
+    fail "POST /_admin/buckets $1" "an HTTP answer" "curl: $(<"$T/adm.err")"
+  if [[ $MODE == remote && $code == 409 ]]; then
+    log "bucket $1 already exists (rerun)"
+    return 0
+  fi
+  ((code >= 200 && code < 300)) || fail "POST /_admin/buckets $1" "HTTP 2xx" "HTTP $code $(<"$T/adm.out")"
+}
+
 # ---------------------------------------------------------------------------
 # Setup: buckets, key, aws-cli
 # ---------------------------------------------------------------------------
 
 STEP=0-setup
 log "step $STEP"
-adm "POST /_admin/buckets slice" -XPOST "$BASE/_admin/buckets" -H 'content-type: application/json' \
-  -d '{"name":"slice","disposable":true}' >/dev/null
-adm "POST /_admin/buckets other" -XPOST "$BASE/_admin/buckets" -H 'content-type: application/json' \
-  -d '{"name":"other","disposable":true}' >/dev/null
+make_bucket slice
+make_bucket other
 # The key secret goes straight from curl through jq into a 0600 file.
 adm "POST /_admin/keys" -XPOST "$BASE/_admin/keys" -H 'content-type: application/json' \
   -d '{"buckets":["slice","other"],"perm":"rw"}' >"$T/key.json"
@@ -328,8 +359,15 @@ head -c 100663296 /dev/urandom >"$T/big.bin" # 96 MiB: 12 parts, 10 in flight
 run_aws "PUT a/small.bin" "${S3[@]}" cp "$T/small.bin" s3://slice/a/small.bin >/dev/null
 run_aws "multipart PUT a/big.bin" "${S3[@]}" cp "$T/big.bin" s3://slice/a/big.bin >/dev/null
 json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-jcheck "inflight_peak_bytes within the 48 MiB budget" \
-  '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes > 0 and .inflight_peak_bytes <= 50331648' "$json"
+if [[ $MODE == local ]]; then
+  jcheck "inflight_peak_bytes within the 48 MiB budget" \
+    '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes > 0 and .inflight_peak_bytes <= 50331648' "$json"
+else
+  # The answering isolate may not be one that served the uploads.
+  jcheck "inflight_peak_bytes within the 48 MiB budget" \
+    '(.inflight_peak_bytes | type == "number") and .inflight_peak_bytes <= 50331648' "$json"
+  log "inflight_peak_bytes of the answering isolate: $(jq -r .inflight_peak_bytes <<<"$json")"
+fi
 if [[ $MODE == local ]]; then
   json=$(adm "POST /_admin/dev/guard-selftest" -XPOST "$BASE/_admin/dev/guard-selftest")
   jcheck "guard self-test rolls back" '.rolled_back == true' "$json"
@@ -418,10 +456,22 @@ stage_moved() {
   j=$(adm_try "$BASE/_admin/objects/slice/a/$1") || return 1
   jq -e '.extents | any(.stage != "post" or .attempts != 0)' >/dev/null 2>&1 <<<"$j" || return 1
 }
-if ! poll 180 2 stage_reached big.bin; then
-  json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
-  fail "a/big.bin posted and verified within 180 s" "jq: ($REACHED) and ($COUNTED)" "$json"
+if [[ $MODE == local ]]; then
+  STEP4_TIMEOUT=${STEP4_TIMEOUT_SECS:-180}
+  STEP4_EVERY=2
+else
+  STEP4_TIMEOUT=${STEP4_TIMEOUT_SECS:-900}
+  STEP4_EVERY=10
 fi
+t0=$(now_ms)
+if ! poll "$STEP4_TIMEOUT" "$STEP4_EVERY" stage_reached big.bin; then
+  json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
+  fail "a/big.bin posted and verified within $STEP4_TIMEOUT s" "jq: ($REACHED) and ($COUNTED)" "$json"
+fi
+json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
+log "a/big.bin verified $(($(now_ms) - t0)) ms after the step started:" \
+  "$(jq -c '{extents: (.extents | length), stages: ([.extents[].stage] | group_by(.) | map({(.[0]): length}) | add),
+    counting: ([.extents[].backbones[] | select(.counts) | .backbone] | group_by(.) | map({(.[0]): length}) | add)}' <<<"$json")"
 
 # ---------------------------------------------------------------------------
 # 5 cold read: wipe CACHE + SAFETY (disposable bucket only), GET from NNTP
@@ -431,11 +481,32 @@ STEP=5-cold-read
 log "step $STEP"
 json=$(adm "POST /_admin/evict a/big.bin" -XPOST "$BASE/_admin/evict/slice/a/big.bin?include_safety=1")
 jcheck "evict removed blobs" '.evicted > 0' "$json"
+log "evict: $(jq -c . <<<"$json")"
+if [[ $MODE == remote ]]; then
+  # Nothing but Usenet may hold the bytes now.
+  jcheck "evict gave up every pinned copy" '.safety_kept == 0 and .safety_deleted == .evicted' "$json"
+  json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
+  jcheck "no extent in the cache before the cold GET" '.extents | length > 0 and all(.cache == "absent")' "$json"
+fi
 # NNTP BODY -> yEnc -> sha256 -> R2 refill -> decrypt
+t0=$(now_ms)
 run_aws "cold GET a/big.bin" "${S3[@]}" cp s3://slice/a/big.bin "$T/cold-big.bin" >/dev/null
+log "cold GET a/big.bin: $(($(now_ms) - t0)) ms for $(stat -c %s "$T/cold-big.bin") bytes"
 same_bytes "cold GET a/big.bin equals the upload" "$T/big.bin" "$T/cold-big.bin"
 json=$(adm "GET /_admin/objects/slice/a/big.bin" "$BASE/_admin/objects/slice/a/big.bin")
 jcheck "every extent refilled into the cache" '.extents | length > 0 and all(.cache == "present")' "$json"
+
+if [[ $MODE == remote ]]; then
+  # 5b drill: read back from Usenet only, without the cache.
+  STEP=5b-drill
+  log "step $STEP"
+  WANT_SHA=$(sha256sum <"$T/big.bin" | cut -c1-64)
+  t0=$(now_ms)
+  json=$(adm "POST /_admin/drill/slice/a/big.bin" -XPOST "$BASE/_admin/drill/slice/a/big.bin")
+  log "drill: $(($(now_ms) - t0)) ms: $(jq -c . <<<"$json")"
+  jcheck "drill reads the upload back from Usenet" \
+    ".source == \"nntp\" and .match == true and .plaintext_sha256 == \"$WANT_SHA\"" "$json"
+fi
 
 # ---------------------------------------------------------------------------
 # 6 delete
@@ -487,17 +558,28 @@ if [[ $MODE == local ]]; then
     fail "a/lost.bin recovered by the scheduled handler within 90 s" "jq: ($REACHED) and ($COUNTED)" "$json"
   fi
 else
-  # The drop counter is dev-only: prove the real cron runs after deploy.
-  START_MS=$(($(date +%s) * 1000))
-  dispatched() {
+  # The drop counter is dev-only: prove the real cron runs after deploy,
+  # CRON_RUNS times, each run advancing last_dispatch_at.
+  CRON_RUNS=${CRON_RUNS:-2}
+  [[ $CRON_RUNS =~ ^[1-9][0-9]*$ ]] || fail "CRON_RUNS" "a positive integer" "$CRON_RUNS"
+  json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+  SEEN=$(jq -r '.last_dispatch_at // 0' <<<"$json")
+  log "last_dispatch_at before: $SEEN"
+  dispatched_after() {
     local j
     j=$(adm_try "$BASE/_admin/status") || return 1
-    jq -e --argjson t "$START_MS" '(.last_dispatch_at // 0) >= $t' >/dev/null 2>&1 <<<"$j" || return 1
+    jq -e --argjson t "$1" '(.last_dispatch_at // 0) > $t' >/dev/null 2>&1 <<<"$j" || return 1
   }
-  if ! poll 360 10 dispatched; then
+  for ((run = 1; run <= CRON_RUNS; run++)); do
+    if ! poll 360 10 dispatched_after "$SEEN"; then
+      json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+      fail "dispatcher run $run of $CRON_RUNS within 6 min" "last_dispatch_at > $SEEN" "$json"
+    fi
     json=$(adm "GET /_admin/status" "$BASE/_admin/status")
-    fail "a dispatcher run within 6 min" "last_dispatch_at >= $START_MS" "$json"
-  fi
+    SEEN=$(jq -r '.last_dispatch_at' <<<"$json")
+    log "dispatcher run $run of $CRON_RUNS: last_dispatch_at=$SEEN ($(date -u -d "@$((SEEN / 1000))" +%H:%M:%SZ))"
+  done
+  log "status: $(jq -c '{environment, gc_mode, required_backbones, real_data_ready, outbox, dead, last_dispatch_at}' <<<"$json")"
 fi
 
 STEP=finished
