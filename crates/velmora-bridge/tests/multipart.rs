@@ -836,8 +836,8 @@ async fn complete_vs_upload_part_race() {
     assert_eq!(r.outcome(), "200", "{}", r.body);
     assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == new);
 
-    // Complete commits first: the part arrives at a closed upload, is
-    // refused and its blob is removed again.
+    // Complete commits first: the part arrives at a closed upload and is
+    // refused.
     let rig = Rig::new().await;
     let id = rig.create("alpha", KEY).await;
     let old_etag = rig.part("alpha", KEY, &id, 1, &old).await;
@@ -850,7 +850,9 @@ async fn complete_vs_upload_part_race() {
     assert_eq!(complete.outcome(), "200", "{}", complete.body);
     assert_eq!(part.outcome(), "404 NoSuchUpload");
     assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == old);
-    assert_eq!(rig.bridge.safety.keys().len(), 1);
+    // The refused part's blob stays as an orphan for garbage collection:
+    // the handler never deletes from the safety store. No row names it.
+    assert_eq!(rig.bridge.safety.keys().len(), 2);
     assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 1);
     assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 1);
 }
@@ -1099,6 +1101,23 @@ async fn complete_validates_the_part_list() {
         ))
         .await;
     assert_eq!(r.outcome(), "400 MalformedXML");
+    // A part list without parts.
+    for empty in [
+        "<CompleteMultipartUpload/>",
+        "<CompleteMultipartUpload></CompleteMultipartUpload>",
+    ] {
+        let r = rig
+            .send(sign(
+                RW_KEY,
+                Method::Post,
+                &object_path("alpha", KEY),
+                &[("uploadId", &id)],
+                &[],
+                empty.as_bytes().to_vec(),
+            ))
+            .await;
+        assert_eq!(r.outcome(), "400 MalformedXML", "{empty}");
+    }
 
     // None of the refusals published or closed anything.
     assert!(rig.object(&rig.alpha, KEY).await.is_none());

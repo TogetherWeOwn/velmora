@@ -694,10 +694,9 @@ where
         }),
         Guard::Lost => {
             // The upload was completed or aborted meanwhile. The batch
-            // wrote nothing, so no catalogue row names this freshly minted
-            // extent and its blob can go. Best effort: a blob left behind
-            // is unreferenced ciphertext.
-            let _ = bridge.safety.delete(&safety_key).await;
+            // wrote nothing, so the blob just stored is an orphan no
+            // catalogue row names. It is left for garbage collection,
+            // which is the only path that deletes from the safety store.
             Err(ErrorCode::NoSuchUpload.into())
         }
     }
@@ -816,7 +815,18 @@ where
     };
     let max = MAX_COMPLETE_BODY_BYTES.min(bridge.cfg.max_extent_bytes);
     let body = read_verified_body(bridge, &a, req, max).await?;
-    let listed = parse_complete(&body, &a.policy, MAX_PARTS, MultipartChecksum::None)?;
+    let listed = parse_complete(&body, &a.policy, MAX_PARTS, MultipartChecksum::None).map_err(
+        |e| match e {
+            // A document that lists no part at all is not a part list,
+            // whether its root is empty or self-closing.
+            ErrorCode::InvalidPart | ErrorCode::InvalidRequest
+                if !body.windows(5).any(|w| w == b"<Part") =>
+            {
+                ErrorCode::MalformedXML
+            }
+            e => e,
+        },
+    )?;
     drop(body);
     let digest = receipt_digest(&listed);
 
