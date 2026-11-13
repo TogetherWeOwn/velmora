@@ -4,8 +4,10 @@
 //! Dev only: `DEV_DROP_NOTIFY_N` makes the first `n` `send` calls of the
 //! isolate vanish while reporting success (a lost queue notification), so
 //! the local acceptance run can prove that the cron dispatcher re-drives
-//! the outbox. `send_many` (the dispatcher) is never dropped. Outside
-//! `ENVIRONMENT=dev` the variable is ignored.
+//! the outbox. `send_many` is never dropped; the dispatcher must keep
+//! re-enqueueing extents through it so the re-drive itself is never lost.
+//! A restarted isolate re-arms the counter. Outside `ENVIRONMENT=dev` the
+//! variable is ignored.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
