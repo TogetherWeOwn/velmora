@@ -2,7 +2,7 @@
 name = "velmora-nntp-probe"
 version = "0.1.0"
 edition = "2021"
-description = "Throwaway Worker proving Cloudflare Workers can reach an NNTP provider (TLS, AUTHINFO, POST, STAT, BODY) and showing what the runtime preserves of the raw request target"
+description = "Throwaway Worker proving Cloudflare Workers can reach NNTP providers (TLS, AUTHINFO, POST, STAT, BODY, HEAD, CAPABILITIES, connection ramp) and showing what the runtime preserves of the raw request target"
 license = "MIT"
 publish = false
 
@@ -20,6 +20,8 @@ worker = "0.8"
 serde_json = "1"
 sha2 = "0.11"
 subtle = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "s"

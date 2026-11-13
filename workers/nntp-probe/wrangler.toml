@@ -4,8 +4,10 @@ compatibility_date = "2026-11-01"
 workers_dev = true
 
 # Account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),
-# never from this file. Secrets (PROBE_TOKEN, NNTP_HOST, NNTP_PORT,
-# NNTP_USER, NNTP_PASS) are set with `wrangler secret put`; see README.md.
+# never from this file. Secrets (PROBE_TOKEN, and per account NNTP_P<n>_HOST,
+# _PORT, _USER, _PASS and optional _ALT; or the single-account NNTP_HOST,
+# NNTP_PORT, NNTP_USER, NNTP_PASS) are set with `wrangler secret put` or
+# `wrangler secret bulk` on stdin; see README.md.
 
 [build]
 command = "worker-build --release"
