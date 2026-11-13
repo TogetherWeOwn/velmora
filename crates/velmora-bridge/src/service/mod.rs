@@ -6,6 +6,7 @@
 //! slice is `NotImplemented`.
 
 mod admin;
+mod common;
 mod delete;
 mod get;
 mod list;
