@@ -913,6 +913,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             gc_enqueued: true,
             buried: 0,
             permits_seeded: true,
+            redriven: 0,
+            redrive_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -1085,4 +1087,173 @@ async fn gc_failing_row_does_not_block_the_batch() {
     assert_eq!(fx.bridge.run_job(&gc).await, JobOutcome::Ack);
     assert_eq!(fx.scalar(open, &[]).await, "0");
     assert!(!fx.has_cache(&old[0]));
+}
+
+// ---------------------------------------------------------------------------
+// Re-drive
+// ---------------------------------------------------------------------------
+
+/// An object stored while one backbone was configured stops at `done` with
+/// its safety copy held. Once a second backbone is configured, the
+/// dispatcher sends it back to verify, and the copy is released on the
+/// evidence of both.
+#[tokio::test]
+async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.required_backbones = 2;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    fx.pump().await;
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert!(fx.has_safety(&o));
+
+    // One backbone can never satisfy two: the tick leaves the row alone
+    // instead of verifying it again on every run.
+    fx.clock.advance_secs(300);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.redriven, report.enqueued), (0, 0));
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+
+    // A second backbone that has the articles by peering.
+    let mut config = ServerConfig::for_test();
+    config.articles = Vec::new();
+    config.missing_ids.clear();
+    config.users.insert(
+        USER.to_string(),
+        UserConfig {
+            password: PASS.to_string(),
+            max_connections: 2,
+        },
+    );
+    let second = TestNntpServer::spawn(config).await;
+    let peer = |server: &TestNntpServer| {
+        let addr = server.addr();
+        nntp_support::nntp_config(
+            &addr.ip().to_string(),
+            addr.port(),
+            "otheruser",
+            "otherpass",
+        )
+    };
+    let mut src = nntp_support::dial(&peer(&fx.server)).await.unwrap();
+    let mut dst = nntp_support::dial(&peer(&second)).await.unwrap();
+    for row in fx.bridge.catalog.articles(&o.extent).await.unwrap() {
+        let mut article = Vec::new();
+        src.article_to(&row.message_id, &mut article).await.unwrap();
+        dst.post_article(&row.message_id, &article).await.unwrap();
+    }
+    src.quit().await;
+    dst.quit().await;
+    let mut p1 = fx.bridge.cfg.providers[0].clone();
+    p1.id = "p1".to_string();
+    p1.port = second.addr().port();
+    p1.backbone = "bb1".to_string();
+    p1.post = false;
+    fx.bridge.cfg.providers.push(p1);
+
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.redriven, report.enqueued), (1, 1));
+    assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Verify));
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    fx.pump().await;
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert!(!fx.has_safety(&o));
+    let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
+    assert_eq!(status.iter().filter(|s| s.counts).count(), 2);
+    // Nothing was posted twice.
+    assert_eq!(fx.server.posted_count().await, 3);
+
+    // Released: the next tick has nothing to re-drive.
+    fx.clock.advance_secs(300);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.redriven, report.enqueued), (0, 0));
+}
+
+/// An NNTP server with the test account and no articles.
+async fn empty_server() -> TestNntpServer {
+    let mut config = ServerConfig::for_test();
+    config.articles = Vec::new();
+    config.missing_ids.clear();
+    config.users.insert(
+        USER.to_string(),
+        UserConfig {
+            password: PASS.to_string(),
+            max_connections: 2,
+        },
+    );
+    TestNntpServer::spawn(config).await
+}
+
+/// Three backbones, two required, and the third never receives the
+/// extent. Two good copies are enough: the third is recorded as missing
+/// and the safety copy is released, once. The extent must not go round
+/// between verify and release for ever.
+#[tokio::test]
+async fn release_with_a_backbone_that_never_has_the_extent() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.required_backbones = 2;
+    // bb1 is a second account on the server that has the articles.
+    let mut p1 = fx.bridge.cfg.providers[0].clone();
+    p1.id = "p1".to_string();
+    p1.backbone = "bb1".to_string();
+    p1.post = false;
+    let third = empty_server().await;
+    let mut p2 = p1.clone();
+    p2.id = "p2".to_string();
+    p2.backbone = "bb2".to_string();
+    p2.port = third.addr().port();
+    fx.bridge.cfg.providers.extend([p1, p2]);
+
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    // Post, three verify reads with bb2's four waits, one release.
+    let runs = fx.pump().await;
+    assert!(runs <= 12, "{runs} deliveries");
+
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert!(!fx.has_safety(&o));
+    let evidence = fx.extent(&o, "release_evidence").await;
+    let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(evidence.as_array().unwrap().len(), 2);
+    let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
+    let of = |b: &str| status.iter().find(|s| s.backbone == b).unwrap();
+    assert!(of("bb0").counts && of("bb1").counts);
+    assert!(!of("bb2").counts);
+    assert_eq!(of("bb2").result, VerifyResult::Missing);
+    assert_eq!(third.posted_count().await, 0);
+
+    // Released: a later tick finds nothing to send or to re-drive.
+    fx.clock.advance_secs(300);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.redriven, report.enqueued), (0, 0));
+    assert_eq!(fx.pump().await, 0);
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+}
+
+/// A re-drive that fails is reported and the due rows still go out.
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_survives_a_failed_redrive() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.make_due(&o).await;
+    fx.sql.exec("DROP TABLE scan_cursors", &[]).await.unwrap();
+
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert!(report.redrive_failed);
+    assert_eq!((report.redriven, report.enqueued), (0, 1));
+    assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Post));
 }

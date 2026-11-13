@@ -158,7 +158,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             return;
         }
     };
-    if let Err(e) = bridge.dispatch().await {
-        console_error!("dispatch failed: {}", error_class(&e));
+    match bridge.dispatch().await {
+        Ok(report) if report.redrive_failed => console_error!("dispatch: re-drive failed"),
+        Ok(_) => {}
+        Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
     }
 }

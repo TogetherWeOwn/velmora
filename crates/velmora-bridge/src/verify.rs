@@ -318,30 +318,39 @@ where
             return Ok(());
         }
 
-        // Only what this job reads now counts as evidence.
+        // Only what this job reads now counts as evidence. Every
+        // backbone is read: one that lacks the extent does not hold the
+        // release up while `required` others pass.
         let plan = self.posted_plan(extent).await?;
-        let mut rows = Vec::new();
+        let mut read = Vec::new();
         for (_, providers) in backbones(&self.cfg.providers) {
-            let (provider, tally) = self.read_backbone(lease, &plan, &providers).await?;
-            match result_of(&tally) {
-                VerifyResult::Ok => rows.push(self.record(lease, extent, provider, &tally).await?),
-                // The extent is not releasable after all: it goes back to
-                // verify, which owns the retry waits and the health record.
-                VerifyResult::Missing => {
-                    self.cursor(lease, 0).await?;
-                    self.advance(lease, OutboxStage::Verify, now).await?;
-                    self.notify(lease, OutboxStage::Verify, 0).await;
-                    return Ok(());
-                }
-                _ => {
-                    self.record(lease, extent, provider, &tally).await?;
-                    self.cursor(lease, 0).await?;
-                    let again = self.clock.now().plus_secs(REVERIFY_SECS);
-                    return self.advance(lease, OutboxStage::Verify, again).await;
-                }
+            read.push(self.read_backbone(lease, &plan, &providers).await?);
+        }
+        let result = |r| read.iter().filter(|(_, t)| result_of(t) == r).count();
+        let (passed, missing) = (result(VerifyResult::Ok), result(VerifyResult::Missing));
+        let enough = passed >= required as usize;
+        if !enough && passed + missing == read.len() && missing > 0 {
+            // Not releasable after all, and nothing worse than missing:
+            // back to verify, which owns the retry waits and the record.
+            self.cursor(lease, 0).await?;
+            self.advance(lease, OutboxStage::Verify, now).await?;
+            self.notify(lease, OutboxStage::Verify, 0).await;
+            return Ok(());
+        }
+        let mut rows = Vec::new();
+        for (provider, tally) in &read {
+            let row = self.record(lease, extent, provider, tally).await?;
+            if row.result == VerifyResult::Ok {
+                rows.push(row);
             }
         }
-        if rows.len() < required as usize {
+        if !enough && rows.len() < read.len() {
+            // A backbone serves damaged articles: verify again later.
+            self.cursor(lease, 0).await?;
+            let again = self.clock.now().plus_secs(REVERIFY_SECS);
+            return self.advance(lease, OutboxStage::Verify, again).await;
+        }
+        if !enough {
             return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
         }
         let evidence: Vec<Evidence<'_>> = rows

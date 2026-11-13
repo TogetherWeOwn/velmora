@@ -348,6 +348,17 @@ pub trait Catalog {
     /// One good session: clears failures and the cooldown history, unless
     /// the provider is cooling now.
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;
+    /// Sends live `done` extents back to verify: safety copy still
+    /// `held`, fewer than `required` of `backbones` counting. One call
+    /// looks at the next `limit` held extents, in a rotation over all of
+    /// them. Returns how many moved.
+    async fn redrive_underverified(
+        &self,
+        backbones: &[String],
+        required: u32,
+        limit: u32,
+        now: UnixMs,
+    ) -> Result<u64>;
 }
 
 // ---------------------------------------------------------------------------

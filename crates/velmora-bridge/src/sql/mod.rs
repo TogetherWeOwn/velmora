@@ -289,4 +289,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()> {
         health::provider_recovered(self, provider, now).await
     }
+    async fn redrive_underverified(
+        &self,
+        backbones: &[String],
+        required: u32,
+        limit: u32,
+        now: UnixMs,
+    ) -> Result<u64> {
+        outbox::redrive_underverified(self, backbones, required, limit, now).await
+    }
 }

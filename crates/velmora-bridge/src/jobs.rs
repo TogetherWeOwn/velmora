@@ -19,9 +19,12 @@ use crate::types::{
     BlobStoreKind, DispatchReport, ExtentId, FailClass, GcRow, GcStep, GenerationId, Job,
     JobOutcome, OutboxStage, Result, JOB_VERSION,
 };
+use crate::verify::backbones;
 
 /// Outbox rows one dispatcher run re-sends (one queue batch).
 pub const DISPATCH_LIMIT: u32 = 100;
+/// Held extents one dispatcher run checks for the re-drive.
+pub const REDRIVE_LIMIT: u32 = 500;
 /// Claims after which the dispatcher moves an unleased row to `dead`.
 pub const MAX_ATTEMPTS: u32 = 50;
 /// GC rows one GC job handles before it re-enqueues itself.
@@ -180,6 +183,26 @@ where
 
         // Buried first, so an exhausted row is not sent once more.
         report.buried = self.catalog.bury_exhausted(MAX_ATTEMPTS, now).await?;
+
+        // A `done` extent whose safety copy is held was short of backbones
+        // when it was verified. Once enough are configured it is verified
+        // again; the rows moved here are due at once and sent below.
+        let labels: Vec<String> = backbones(&self.cfg.providers)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        let required = self.cfg.required_backbones;
+        if labels.len() >= required as usize {
+            // The re-drive is an extra: its failure must not keep the
+            // due rows below from being sent.
+            let redriven =
+                self.catalog
+                    .redrive_underverified(&labels, required, REDRIVE_LIMIT, now);
+            match redriven.await {
+                Ok(n) => report.redriven = n,
+                Err(_) => report.redrive_failed = true,
+            }
+        }
 
         let due = self.catalog.due(now, DISPATCH_LIMIT).await?;
         let jobs: Vec<Job> = due

@@ -597,6 +597,91 @@ pub(super) async fn bury_exhausted<S: Sql>(
         .await
 }
 
+/// Sends `done` extents that a release could not be decided for back to
+/// verify: the generation is live, the safety copy is still `held`, and
+/// fewer than `required` of the configured `backbones` count. The row
+/// restarts as a fresh obligation (cursor and attempts at zero) and the
+/// lease token moves on. One statement, so a row is moved once.
+pub(super) async fn redrive_underverified<S: Sql>(
+    c: &SqlCatalog<S>,
+    backbones: &[String],
+    required: u32,
+    limit: u32,
+    now: UnixMs,
+) -> Result<u64> {
+    let labels =
+        serde_json::to_string(backbones).map_err(|_| BridgeError::Invalid("backbone labels"))?;
+    // One run looks at a window of `limit` held extents, read from the
+    // partial index alone, and the next run starts after it: the cost
+    // of a run does not grow with the number of held extents.
+    let after = c
+        .sql
+        .query("SELECT v FROM scan_cursors WHERE k = 'redrive'", &[])
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| Cols::new(row).text())
+        .transpose()?
+        .unwrap_or_default();
+    let window = c
+        .sql
+        .query(
+            "SELECT id FROM extents INDEXED BY extents_held               WHERE safety_state = 'held' AND id > ?1 ORDER BY id LIMIT ?2",
+            &[text(&after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let full = window.len() >= limit as usize;
+    let Some(last) = window.into_iter().next_back() else {
+        set_redrive_cursor(c, "").await?;
+        return Ok(0);
+    };
+    let last = Cols::new(last).text()?;
+    let sql = concat!(
+        "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
+           last_error = NULL, updated_at = ?1, ",
+        unlease!(),
+        " WHERE stage = 'done' AND extent_id IN ( \
+           SELECT e.id FROM extents e INDEXED BY extents_held \
+             JOIN outbox o ON o.extent_id = e.id \
+             JOIN generations g ON g.id = o.generation_id \
+            WHERE e.safety_state = 'held' AND e.id > ?4 AND e.id <= ?5 \
+              AND o.stage = 'done' AND g.state = 'live' \
+              AND (SELECT COUNT(*) FROM verifications v \
+                    WHERE v.extent_id = e.id \
+                      AND v.backbone IN (SELECT value FROM json_each(?2)) AND ",
+        latest!(),
+        " AND ",
+        counts!(),
+        ") < ?3)"
+    );
+    let moved = c
+        .sql
+        .exec(
+            sql,
+            &[
+                ms(now),
+                text(&labels),
+                SqlValue::Int(i64::from(required)),
+                text(&after),
+                text(&last),
+            ],
+        )
+        .await?;
+    // A short window was the end of the index: start over next time.
+    set_redrive_cursor(c, if full { &last } else { "" }).await?;
+    Ok(moved)
+}
+
+async fn set_redrive_cursor<S: Sql>(c: &SqlCatalog<S>, at: &str) -> Result<()> {
+    c.sql
+        .exec(
+            "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('redrive', ?1)",
+            &[text(at)],
+        )
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn record_dispatch<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
     c.sql
         .exec(

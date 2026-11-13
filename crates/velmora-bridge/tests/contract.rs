@@ -621,6 +621,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "outbox",
             "provider_health",
             "provider_permits",
+            "scan_cursors",
             "tx_guard",
             "upload_parts",
             "uploads",
