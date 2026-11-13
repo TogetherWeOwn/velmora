@@ -26,6 +26,8 @@ fn s3_disabled_and_unsafe_config_fails_closed_without_io() {
         "127.0.0.1",
         "127.1",
         "0x7f.0.0.1",
+        "0x7f.0x.0x.1",
+        "0X7F.0X.0X.1",
         "0177.0.0.1",
         "https://archive.example.com",
         "a.local",

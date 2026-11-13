@@ -88,7 +88,7 @@ fn numeric_address_label(label: &str) -> bool {
         .strip_prefix("0x")
         .or_else(|| label.strip_prefix("0X"))
     {
-        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        return hex.bytes().all(|b| b.is_ascii_hexdigit());
     }
     !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit())
 }
