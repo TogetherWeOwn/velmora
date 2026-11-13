@@ -123,6 +123,26 @@ impl ObjectIdentity {
     }
 }
 
+/// A byte range within a committed ciphertext object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Range {
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+impl Range {
+    pub fn end(self, total: u64) -> Result<u64> {
+        let end = self
+            .offset
+            .checked_add(self.bytes)
+            .ok_or(Failure::Invalid)?;
+        if end > total {
+            return Err(Failure::Invalid);
+        }
+        Ok(end)
+    }
+}
+
 /// SHA-256 of the supplied bytes, without any authentication claim.
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -182,6 +202,32 @@ mod tests {
             bytes: 17,
             sha256: digest(b"ciphertext"),
         }
+    }
+
+    #[test]
+    fn ranges_check_bounds_and_overflow() {
+        let end = |offset, bytes, total| Range { offset, bytes }.end(total);
+        assert_eq!(end(2, 3, 5), Ok(5));
+        assert_eq!(end(5, 0, 5), Ok(5));
+        assert_eq!(end(0, 0, 0), Ok(0));
+        assert_eq!(end(6, 0, 5), Err(Failure::Invalid));
+        assert_eq!(end(4, 2, 5), Err(Failure::Invalid));
+        assert_eq!(
+            Range {
+                offset: u64::MAX,
+                bytes: 2
+            }
+            .end(u64::MAX),
+            Err(Failure::Invalid)
+        );
+        assert_eq!(
+            Range {
+                offset: u64::MAX,
+                bytes: 0
+            }
+            .end(u64::MAX),
+            Ok(u64::MAX)
+        );
     }
 
     #[test]
