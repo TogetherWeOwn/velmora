@@ -340,8 +340,11 @@ pub enum Health {
 #[allow(async_fn_in_trait)]
 pub trait ArchiveProvider {
     fn capabilities(&self) -> Capabilities;
+    /// Resolve any previously issued begin for this intent before creating a new
+    /// remote allocation, including when its response was lost.
     async fn begin(&mut self, intent: &WriteIntent, control: &impl Control)
         -> Result<WriteSession>;
+    /// Verify the exact part bytes against the bound intent before remote effects.
     async fn write_part(
         &mut self,
         session: &WriteSession,
@@ -349,6 +352,8 @@ pub trait ArchiveProvider {
         bytes: &[u8],
         control: &impl Control,
     ) -> Result<PartReceipt>;
+    /// Reject missing, duplicate, out-of-order or differently bound receipts
+    /// before remote effects; verify the committed ciphertext before proof.
     async fn commit(
         &mut self,
         session: &WriteSession,
