@@ -23,3 +23,17 @@ untrusted input before deserialization. Provider operations are not implemented.
 `Range::end` checks offset plus byte count against the committed length before
 I/O, including arithmetic overflow. A zero-byte range is valid at EOF; validation
 of a range is not authorization to read the object.
+
+`Control` declares the bridge from trusted product authority to each exact
+`Target` and `Action`; neither serialized records nor client-supplied flags
+confer authority. Live transports must enforce cancellation and revocation
+throughout I/O, register the wake source before checking policy, and retain
+leases until physical closure is proven. Checks at operation boundaries alone
+cannot undo remote effects. `Sink` declares that only complete-part-verified
+ciphertext is emitted in blocks of at most 64 KiB; callers must stage prefixes
+invisibly because an error or cancellation can leave an incomplete output.
+
+These are interface obligations, not an implementation of authorization,
+revocation, transport closure or output verification. Provider adapters,
+consumer integration and the complete provider trait are still pending; no
+physical deletion or eviction API is provided.
