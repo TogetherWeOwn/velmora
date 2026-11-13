@@ -1,0 +1,115 @@
+name = "velmora-s3"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+
+# The account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),
+# never from this file. Binding ids below are placeholders until the
+# resources are created.
+
+[build]
+# worker-build 0.8.7 matches the locked workers-rs 0.8.7 (the 0.7 line does
+# not). `--locked` installs it from its own lockfile.
+command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
+
+[limits]
+cpu_ms = 300000              # crypto-heavy fetch + queue handlers; measure, then lower
+
+[vars]
+ENVIRONMENT = "prod"
+S3_HOST = "velmora-s3.<account>.workers.dev"
+S3_REGION = "auto"
+MAX_EXTENT_BYTES = "16777216"
+REQUIRED_BACKBONES = "2"
+SAFETY_MIN_AGE_SECS = "604800"
+VERIFY_DELAY_SECS = "120"
+NEWSGROUPS = "alt.binaries.test"   # posting here is proven by the provider probe
+VELMORA_KEK_ACTIVE = "1"
+INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
+GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
+MAINTENANCE = "off"                  # off | restore
+
+[[d1_databases]]
+binding = "CATALOG"
+database_name = "velmora-catalog"
+database_id = "<from wrangler d1 create>"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "SAFETY"
+bucket_name = "velmora-safety"
+
+[[r2_buckets]]
+binding = "CACHE"
+bucket_name = "velmora-cache"
+
+[[queues.producers]]
+binding = "POST_Q"
+queue = "velmora-post"
+
+[[queues.producers]]
+binding = "VERIFY_Q"
+queue = "velmora-verify"
+
+[[queues.consumers]]
+queue = "velmora-post"
+max_batch_size = 1
+max_concurrency = 2          # secondary bound only; provider_permits is the real gate
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-verify"
+max_batch_size = 1
+max_concurrency = 2
+max_retries = 20
+retry_delay = 120
+dead_letter_queue = "velmora-dlq"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+# secrets (wrangler secret put, value on stdin): VELMORA_KEK_1, NNTP_PROVIDERS, ADMIN_TOKEN
+
+[env.dev]
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off" }
+# dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
+# Environments do not inherit bindings, so dev repeats them all.
+
+[[env.dev.d1_databases]]
+binding = "CATALOG"
+database_name = "velmora-catalog"
+database_id = "<from wrangler d1 create>"
+migrations_dir = "migrations"
+
+[[env.dev.r2_buckets]]
+binding = "SAFETY"
+bucket_name = "velmora-safety"
+
+[[env.dev.r2_buckets]]
+binding = "CACHE"
+bucket_name = "velmora-cache"
+
+[[env.dev.queues.producers]]
+binding = "POST_Q"
+queue = "velmora-post"
+
+[[env.dev.queues.producers]]
+binding = "VERIFY_Q"
+queue = "velmora-verify"
+
+[[env.dev.queues.consumers]]
+queue = "velmora-post"
+max_batch_size = 1
+max_concurrency = 2
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[env.dev.queues.consumers]]
+queue = "velmora-verify"
+max_batch_size = 1
+max_concurrency = 2
+max_retries = 20
+retry_delay = 120
+dead_letter_queue = "velmora-dlq"
