@@ -9,6 +9,7 @@ rust-version = "1.89"
 
 [features]
 default = ["native-tls"]
+archive-provider = []
 native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:rustls-pki-types", "dep:velmora-ssrf-guard"]
 worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
 # Qualification-only; no runtime call site is enabled by this feature.
