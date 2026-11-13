@@ -606,7 +606,9 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # Structured (ND-JSON) output, read below for the version id.
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
-        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml
+        # The version message identifies this run's version even when
+        # wrangler fails before writing its deploy output entry.
+        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml --message "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}"
       # An unsigned GET must be refused with 403 and an S3 AccessDenied
       # body. Retries cover the propagation window right after deploy.
       - id: smoke
@@ -660,6 +662,20 @@ jobs:
           if [ -n "$active" ] && [ "$active" = "$PREV_VERSION" ]; then
             echo "rollback: active version is still ${PREV_VERSION}; nothing to roll back"
             exit 0
+          fi
+          # wrangler writes its deploy output entry only after the trigger
+          # and queue-consumer updates, so a failure or cancellation there
+          # leaves no id although the new version is live. Adopt the active
+          # version only if its message is exactly this run's.
+          if [ -z "$deployed" ] && [ -n "$active" ]; then
+            message=""
+            if ./node_modules/.bin/wrangler versions view "$active" --json -c wrangler.deploy.toml > "${RUNNER_TEMP}/active-version.json"; then
+              message=$(jq -r '.annotations["workers/message"] // empty' "${RUNNER_TEMP}/active-version.json")
+            fi
+            if [ "$message" = "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}" ]; then
+              echo "rollback: active version ${active} carries this run's message; treating it as this run's deploy"
+              deployed="$active"
+            fi
           fi
           if [ -z "$deployed" ]; then
             echo "::error::rollback: this run has no deployed version id and the active version is '${active:-unknown}', not ${PREV_VERSION}; not rolling back, check manually"
