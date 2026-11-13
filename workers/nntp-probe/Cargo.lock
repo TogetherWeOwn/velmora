@@ -845,9 +845,11 @@ dependencies = [
 name = "velmora-nntp-probe"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "serde_json",
  "sha2",
  "subtle",
+ "tokio",
  "velmora",
  "worker",
 ]
