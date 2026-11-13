@@ -1,0 +1,13 @@
+{
+  "rfc4231_case_one": {
+    "source": "https://www.rfc-editor.org/rfc/rfc4231#section-4.2",
+    "key_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+    "data": "Hi There",
+    "hmac_sha256": "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+  },
+  "botocore_s3_query": {
+    "source": "https://github.com/boto/botocore/blob/fdee2825e01b4c3e7bc7c6f21ee384bebf7b9e0c/tests/unit/auth/test_signers.py",
+    "prefixed_key": "AWS4secret_key",
+    "signature": "ac1b8b9e47e8685c5c963d75e35e8741d55251cd955239cc1efad4dc7201db66"
+  }
+}
