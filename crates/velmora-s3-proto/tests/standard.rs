@@ -680,3 +680,88 @@ fn put_and_copy_results_render_etag_and_checksum() {
         ("x-amz-checksum-crc32".to_string(), "NSRBwg==".to_string())
     );
 }
+
+#[test]
+fn object_keys_are_bounded_and_xml_safe() {
+    let k1024 = "k".repeat(MAX_KEY_BYTES);
+    assert_eq!(
+        Target::parse(&format!("/bucket/{k1024}"), &policy())
+            .unwrap()
+            .key
+            .unwrap()
+            .len(),
+        1024
+    );
+    for bad in [
+        format!("/bucket/{k1024}k"),
+        "/bucket/a%01b".into(),
+        "/bucket/a%09b".into(),
+        "/bucket/a%0Db".into(),
+        "/bucket/a%00b".into(),
+        "/bucket/a%EF%BF%BEb".into(),
+        "/bucket/a%EF%BF%BFb".into(),
+    ] {
+        assert_eq!(
+            Target::parse(&bad, &policy()).unwrap_err(),
+            ErrorCode::InvalidArgument,
+            "{bad}"
+        );
+    }
+    // DEL and other XML 1.0 characters stay valid key bytes.
+    assert!(Target::parse("/bucket/a%7Fb%C3%A9", &policy()).is_ok());
+    // The XML escaper never emits the two non-characters either.
+    let body = ErrorCode::NoSuchKey.response(false, "a\u{fffe}b\u{ffff}");
+    assert!(String::from_utf8(body.body)
+        .unwrap()
+        .contains("<RequestId>a\u{fffd}b\u{fffd}</RequestId>"));
+}
+
+#[test]
+fn longest_key_token_round_trips() {
+    let long = format!("{}/1", "a".repeat(MAX_KEY_BYTES - 2));
+    assert_eq!(long.len(), 1024);
+    let rows = [long.as_str(), "b/1"];
+    let first = page(&rows, "&delimiter=%2F&max-keys=1", 1000, 1);
+    let token = between(&first, "<NextContinuationToken>", "<")[0].to_owned();
+    assert!(token.len() < 8192);
+    let second = page(
+        &rows,
+        &format!("&delimiter=%2F&max-keys=1&continuation-token={token}"),
+        1000,
+        1,
+    );
+    assert!(second.contains("<CommonPrefixes><Prefix>b/</Prefix></CommonPrefixes>"));
+    assert_eq!(
+        walk(&rows, "&delimiter=%2F&max-keys=1", 1000, 200),
+        [format!("{}/", "a".repeat(MAX_KEY_BYTES - 2)), "b/".into()]
+    );
+    // A cursor that would not fit a resumable token is never issued.
+    let scope = TokenScope {
+        bucket: "bucket".into(),
+        prefix: String::new(),
+        delimiter: String::new(),
+        start_after: None,
+        url_encoding: false,
+    };
+    let huge = Cursor {
+        after: "x".repeat(7000),
+        skip_prefix: None,
+    };
+    assert_eq!(
+        issue_token(&key("list"), &scope, &huge),
+        Err(ErrorCode::InternalError)
+    );
+}
+
+#[test]
+fn skip_prefix_exposes_the_emitted_common_prefix() {
+    let t = Target::parse("/bucket?list-type=2&delimiter=%2F", &policy()).unwrap();
+    let mut list = ListObjectsV2::parse(&t, &key("list")).unwrap();
+    assert_eq!(list.skip_prefix(), None);
+    list.push(row("a/1")).unwrap();
+    assert_eq!(list.skip_prefix(), Some("a/"));
+    list.push(row("a/2")).unwrap();
+    assert_eq!(list.skip_prefix(), Some("a/"));
+    list.push(row("c")).unwrap();
+    assert_eq!(list.skip_prefix(), None);
+}

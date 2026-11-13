@@ -3,7 +3,7 @@
 // Copied verbatim except: removed line 9 `pub mod archive;` (the archive module is not copied); this header.
 // Re-typed for S3 STANDARD semantics: the cold-archive restore module, its error codes,
 // limits and `Policy::restore` are removed; `storage_class` accepts STANDARD only;
-// the `listing` module is added.
+// the `listing` module is added; `xml` also maps U+FFFE/U+FFFF to U+FFFD.
 
 //! Restricted archive S3 wire primitives, not an HTTP service or an IAM implementation.
 //!
@@ -23,7 +23,7 @@ mod wire;
 pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest, SINGLE_VALUE_HEADERS};
 pub use read::{plan_read, ByteRange, Conditions, ObjectMetadata, ReadPlan, StoredChecksum};
 pub use upload::{ChecksumAlgorithm, DecodedUpload, UploadValidator};
-pub use wire::{canonical_request, Headers, Target};
+pub use wire::{canonical_request, Headers, Target, MAX_KEY_BYTES};
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;
 
@@ -103,6 +103,7 @@ fn xml(value: &str) -> String {
             '"' => "&quot;".into(),
             '\'' => "&apos;".into(),
             '\r' => "&#13;".into(),
+            '\u{fffe}' | '\u{ffff}' => "\u{fffd}".into(),
             c if c == '\t' || c == '\n' || c >= ' ' => c.to_string(),
             _ => "\u{fffd}".into(),
         })

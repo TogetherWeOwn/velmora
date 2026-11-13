@@ -14,9 +14,12 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// Headers whose commas are taken literally. Any other signed header whose value
 /// contains a comma is rejected: an edge that merges duplicate fields into one
 /// `", "`-joined value makes a merged duplicate indistinguishable from a literal
-/// comma. The standard headers listed here are safe to take literally because a
-/// merged duplicate (`a, b`) never canonicalises like the client's signed
-/// duplicate (`a,b`), so it fails closed with SignatureDoesNotMatch.
+/// comma. The standard headers listed here are safe to take literally: the
+/// signature binds exactly the value string the server then uses. A merged
+/// duplicate usually canonicalises differently from the client's signed fields
+/// (`a, b` vs `a,b`) and fails closed with SignatureDoesNotMatch; where it does
+/// match (`public` plus an empty field merges to `public,`), the verified string
+/// is the one acted on, so nothing unsigned is ever accepted.
 pub const SINGLE_VALUE_HEADERS: [&str; 19] = [
     "host",
     "content-type",

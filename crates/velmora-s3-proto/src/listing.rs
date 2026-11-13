@@ -112,7 +112,12 @@ pub fn issue_token(key: &[u8], scope: &TokenScope, cursor: &Cursor) -> Result<St
     let mut m = mac(key)?;
     m.update(&body);
     body.extend_from_slice(&m.finalize().into_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(body))
+    let token = URL_SAFE_NO_PAD.encode(body);
+    // resolve_token refuses longer tokens; never hand out one that cannot resume.
+    if token.len() > MAX_TOKEN_CHARS {
+        return Err(ErrorCode::InternalError);
+    }
+    Ok(token)
 }
 
 /// Any malformed, forged or out-of-scope token is `InvalidArgument`.
@@ -220,6 +225,11 @@ impl ListObjectsV2 {
     }
     pub fn prefix(&self) -> &str {
         &self.scope.prefix
+    }
+    /// CommonPrefix already emitted; rows under it are skipped, so the caller
+    /// may seek past it instead of scanning them.
+    pub fn skip_prefix(&self) -> Option<&str> {
+        self.cursor.skip_prefix.as_deref()
     }
     /// Exclusive lower bound for the next query; None = from the prefix start.
     pub fn after(&self) -> Option<&str> {
