@@ -1,6 +1,9 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/mod.rs. License: MIT.
 // Copied verbatim except: removed line 9 `pub mod archive;` (the archive module is not copied); this header.
+// Re-typed for S3 STANDARD semantics: the cold-archive restore module, its error codes,
+// limits and `Policy::restore` are removed; `storage_class` accepts STANDARD only;
+// the `listing` module is added; `xml` also maps U+FFFE/U+FFFF to U+FFFD.
 
 //! Restricted archive S3 wire primitives, not an HTTP service or an IAM implementation.
 //!
@@ -8,20 +11,19 @@
 //! establish TLS themselves, authenticate before catalogue lookup, and recheck
 //! authorization at mutation/publication/serving boundaries. Only fully validated
 //! decoded upload bytes may enter the retained-cache commit. These types neither
-//! prove encryption nor grant a restore lease or durable commit.
+//! prove encryption nor grant a durable commit.
 
 mod auth;
+pub mod listing;
 pub mod mutation;
 mod read;
-mod restore;
 mod upload;
 mod wire;
 
-pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest};
+pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest, SINGLE_VALUE_HEADERS};
 pub use read::{plan_read, ByteRange, Conditions, ObjectMetadata, ReadPlan, StoredChecksum};
-pub use restore::{parse_restore, RestoreStatus};
 pub use upload::{ChecksumAlgorithm, DecodedUpload, UploadValidator};
-pub use wire::{canonical_request, Headers, Target};
+pub use wire::{canonical_request, Headers, Target, MAX_KEY_BYTES};
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;
 
@@ -39,7 +41,6 @@ pub enum ErrorCode {
     MalformedXML,
     PreconditionFailed,
     InvalidRange,
-    InvalidObjectState,
     NoSuchBucket,
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
@@ -49,7 +50,6 @@ pub enum ErrorCode {
     InvalidPartOrder,
     EntityTooSmall,
     ConditionalRequestConflict,
-    RestoreAlreadyInProgress,
     NotImplemented,
     SlowDown,
     InternalError,
@@ -58,15 +58,11 @@ pub enum ErrorCode {
 impl ErrorCode {
     pub fn status(self) -> u16 {
         match self {
-            Self::AccessDenied
-            | Self::SignatureDoesNotMatch
-            | Self::RequestTimeTooSkewed
-            | Self::InvalidObjectState => 403,
+            Self::AccessDenied | Self::SignatureDoesNotMatch | Self::RequestTimeTooSkewed => 403,
             Self::PreconditionFailed => 412,
             Self::InvalidRange => 416,
             Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload => 404,
-            Self::RestoreAlreadyInProgress
-            | Self::BucketAlreadyOwnedByYou
+            Self::BucketAlreadyOwnedByYou
             | Self::BucketNotEmpty
             | Self::ConditionalRequestConflict => 409,
             Self::NotImplemented => 501,
@@ -107,10 +103,26 @@ fn xml(value: &str) -> String {
             '"' => "&quot;".into(),
             '\'' => "&apos;".into(),
             '\r' => "&#13;".into(),
+            '\u{fffe}' | '\u{ffff}' => "\u{fffd}".into(),
             c if c == '\t' || c == '\n' || c >= ' ' => c.to_string(),
             _ => "\u{fffd}".into(),
         })
         .collect()
+}
+
+pub(crate) fn xml_response(body: String) -> Response {
+    Response {
+        status: 200,
+        headers: vec![("content-type".into(), "application/xml".into())],
+        body: body.into_bytes(),
+    }
+}
+
+/// ISO 8601 with milliseconds, as S3 renders `LastModified` and `CreationDate`.
+pub(crate) fn iso_date_ms(unix_ms: i64) -> Result<String> {
+    chrono::DateTime::from_timestamp_millis(unix_ms)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .ok_or(ErrorCode::InternalError)
 }
 
 /// No Default: production numbers must be explicitly selected and validated.
@@ -129,8 +141,6 @@ pub struct Limits {
     pub header_count: usize,
     pub query_pairs: usize,
     pub upload_bytes: u64,
-    pub min_restore_days: u32,
-    pub max_restore_days: u32,
     pub clock_skew_seconds: u32,
     pub presign_seconds: u32,
 }
@@ -151,8 +161,6 @@ impl Policy {
             || limits.header_count == 0
             || limits.query_pairs == 0
             || limits.upload_bytes == 0
-            || limits.min_restore_days == 0
-            || limits.min_restore_days > limits.max_restore_days
             || limits.clock_skew_seconds == 0
             || limits.presign_seconds == 0
             || limits.presign_seconds > 604800
@@ -164,19 +172,6 @@ impl Policy {
             host,
             region,
         })
-    }
-
-    /// Validate typed restore parameters. Wire callers use parse_restore, which
-    /// also rejects unknown XML features before any downstream effects.
-    pub fn restore(&self, days: &str, tier: Option<&str>) -> Result<u32> {
-        let days = decimal(days).map_err(|_| ErrorCode::InvalidArgument)?;
-        if days < u64::from(self.limits.min_restore_days)
-            || days > u64::from(self.limits.max_restore_days)
-            || !matches!(tier, None | Some("Standard"))
-        {
-            return Err(ErrorCode::InvalidArgument);
-        }
-        Ok(days as u32)
     }
 }
 
@@ -221,10 +216,10 @@ pub(crate) fn unhex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Archive B never silently maps an unsupported class to STANDARD.
+/// Only STANDARD is offered; any other class is rejected, never silently mapped.
 pub fn storage_class(value: Option<&str>) -> Result<&'static str> {
     match value {
-        None | Some("GLACIER") => Ok("GLACIER"),
+        None | Some("STANDARD") => Ok("STANDARD"),
         _ => Err(ErrorCode::InvalidRequest),
     }
 }

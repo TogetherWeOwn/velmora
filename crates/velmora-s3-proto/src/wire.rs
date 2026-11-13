@@ -1,8 +1,12 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/wire.rs. License: MIT.
-// Copied verbatim except: this header only.
+// Copied verbatim except: this header; the `restore` subresource is removed from the
+// accepted query keys (S3 STANDARD semantics); object keys over 1024 bytes or with C0
+// controls / U+FFFE / U+FFFF (not representable in XML 1.0) are rejected.
 
 use super::{ErrorCode, Policy, Result};
+
+pub const MAX_KEY_BYTES: usize = 1024;
 
 /// Parsed once from the raw HTTP origin-form target, never through a URL parser.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +47,15 @@ impl Target {
         let key = key
             .map(|k| String::from_utf8(decode(k)?).map_err(|_| ErrorCode::InvalidRequest))
             .transpose()?;
+        // S3's key limit; also keeps every listing token under its size cap.
+        // Keys XML 1.0 cannot carry are refused so they are never stored.
+        if key.as_ref().is_some_and(|k| {
+            k.len() > MAX_KEY_BYTES
+                || k.chars()
+                    .any(|c| c < ' ' || matches!(c, '\u{fffe}' | '\u{ffff}'))
+        }) {
+            return Err(ErrorCode::InvalidArgument);
+        }
         let mut pairs = Vec::new();
         let mut encoded_query = Vec::new();
         if !query.is_empty() {
@@ -118,7 +131,6 @@ impl Target {
                     | "uploads"
                     | "uploadId"
                     | "partNumber"
-                    | "restore"
                     | "location"
                     | "delete"
                     | "list-type"

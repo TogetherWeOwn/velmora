@@ -1,6 +1,9 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/read.rs. License: MIT.
-// Copied verbatim except: this header only.
+// Copied verbatim except: this header; for S3 STANDARD semantics `plan_read` loses its
+// `available` parameter and the `!available -> InvalidObjectState` branch, emits
+// `x-amz-storage-class: STANDARD`, and two doc comments drop cold-archive wording;
+// `StoredChecksum::algorithm()` is added for the commit renderers.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
@@ -64,6 +67,9 @@ impl StoredChecksum {
         })
     }
 
+    pub fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
     pub fn value(&self) -> &str {
         &self.value
     }
@@ -79,7 +85,7 @@ impl StoredChecksum {
     }
 }
 
-/// Persist verbatim with G. Restore must not regenerate ETags or last-modified.
+/// Persist verbatim with G. Reads must not regenerate ETags or last-modified.
 /// This is a reference value type, not a durable catalogue implementation.
 #[derive(Clone, Debug)]
 pub struct ObjectMetadata {
@@ -312,15 +318,13 @@ pub struct ReadPlan {
 }
 
 /// Call only after authentication/authorization and resolving the exact G.
-/// `available` is a CURRENT logical-reference+G lease, never a physical hit.
-/// Preconditions and range validation intentionally precede cold state. HEAD
-/// never downloads, grants a lease, or starts a restore.
+/// Preconditions and range validation precede any body fetch. HEAD never
+/// downloads.
 pub fn plan_read(
     metadata: &ObjectMetadata,
     head: bool,
     conditions: &Conditions,
     range: Option<&str>,
-    available: bool,
     checksum_mode: bool,
 ) -> Result<ReadPlan> {
     if !conditions.evaluate(metadata)? {
@@ -343,16 +347,13 @@ pub fn plan_read(
     let range = range
         .map(|v| ByteRange::parse(v, metadata.length))
         .transpose()?;
-    if !head && !available {
-        return Err(ErrorCode::InvalidObjectState);
-    }
     let length = range.map_or(metadata.length, ByteRange::length);
     let mut headers = metadata.content_headers.clone();
     headers.extend([
         ("content-length".into(), length.to_string()),
         ("etag".into(), metadata.etag.clone()),
         ("last-modified".into(), format_date(metadata.modified)),
-        ("x-amz-storage-class".into(), "GLACIER".into()),
+        ("x-amz-storage-class".into(), "STANDARD".into()),
         ("accept-ranges".into(), "bytes".into()),
     ]);
     if let Some(r) = range {

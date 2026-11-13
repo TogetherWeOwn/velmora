@@ -1,6 +1,7 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/auth.rs. License: MIT.
-// Copied verbatim except: test fixture path `../../tests/fixtures/published-crypto.json` -> `../tests/fixtures/published-crypto.json` (line 245); this header.
+// Copied verbatim except: test fixture path `../../tests/fixtures/published-crypto.json` -> `../tests/fixtures/published-crypto.json` (line 245); this header;
+// added (not from qerith): `SINGLE_VALUE_HEADERS` and the signed comma-value check in `verify`.
 
 use chrono::NaiveDateTime;
 use hmac::{Hmac, KeyInit, Mac};
@@ -9,6 +10,37 @@ use sha2::{Digest, Sha256};
 use super::{canonical_request, decimal, hex, unhex, ErrorCode, Headers, Policy, Result, Target};
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+
+/// Headers whose commas are taken literally. Any other signed header whose value
+/// contains a comma is rejected: an edge that merges duplicate fields into one
+/// `", "`-joined value makes a merged duplicate indistinguishable from a literal
+/// comma. The standard headers listed here are safe to take literally: the
+/// signature binds exactly the value string the server then uses. A merged
+/// duplicate usually canonicalises differently from the client's signed fields
+/// (`a, b` vs `a,b`) and fails closed with SignatureDoesNotMatch; where it does
+/// match (`public` plus an empty field merges to `public,`), the verified string
+/// is the one acted on, so nothing unsigned is ever accepted.
+pub const SINGLE_VALUE_HEADERS: [&str; 19] = [
+    "host",
+    "content-type",
+    "content-md5",
+    "content-length",
+    "range",
+    "x-amz-date",
+    "x-amz-content-sha256",
+    "x-amz-security-token",
+    "x-amz-copy-source",
+    "expires",
+    "date",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-match",
+    "if-none-match",
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthMode {
@@ -163,6 +195,12 @@ pub fn verify(
     }
 
     let names: Vec<_> = signed.split(';').collect();
+    // Possibly merged duplicates are refused before any signature work.
+    if names.iter().any(|name| {
+        !SINGLE_VALUE_HEADERS.contains(name) && headers.get(name).is_some_and(|v| v.contains(','))
+    }) {
+        return Err(ErrorCode::InvalidRequest);
+    }
     if !presigned && !names.contains(&"x-amz-date") {
         return Err(ErrorCode::InvalidRequest);
     }

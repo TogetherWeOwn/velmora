@@ -1,6 +1,9 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/tests/s3_contract.rs. License: MIT.
 // Copied verbatim except: line 1 `use qerith_core::s3::*;` -> `use velmora_s3_proto::*;`, which rustfmt then sorts after `use serde_json::Value;`; this header.
+// Changed for S3 STANDARD semantics: the cold-archive (restore/unavailable) cases are
+// removed, `plan_read` lost its `available` argument, and storage-class assertions
+// expect STANDARD.
 
 use serde_json::Value;
 use velmora_s3_proto::*;
@@ -18,8 +21,6 @@ fn limits() -> Limits {
         header_count: 64,
         query_pairs: 64,
         upload_bytes: 1024,
-        min_restore_days: 1,
-        max_restore_days: 7,
         clock_skew_seconds: 900,
         presign_seconds: 60,
     }
@@ -384,7 +385,7 @@ fn unknown_integrity_encryption_tokens_and_policy_fields_fail_closed() {
         ("x-amz-object-lock-mode", "GOVERNANCE"),
         ("x-amz-acl", "public-read"),
         ("x-amz-unknown", "value"),
-        ("x-amz-storage-class", "STANDARD"),
+        ("x-amz-storage-class", "GLACIER"),
         ("x-amz-checksum-mode", "DISABLED"),
     ] {
         let mut f = fields(&v);
@@ -442,9 +443,11 @@ fn unknown_integrity_encryption_tokens_and_policy_fields_fail_closed() {
         .unwrap_err(),
         ErrorCode::InvalidRequest
     );
-    assert_eq!(storage_class(None), Ok("GLACIER"));
-    assert_eq!(storage_class(Some("GLACIER")), Ok("GLACIER"));
-    assert!(storage_class(Some("glacier")).is_err());
+    assert_eq!(storage_class(None), Ok("STANDARD"));
+    assert_eq!(storage_class(Some("STANDARD")), Ok("STANDARD"));
+    for class in ["standard", "GLACIER", "DEEP_ARCHIVE", "STANDARD_IA", ""] {
+        assert_eq!(storage_class(Some(class)), Err(ErrorCode::InvalidRequest));
+    }
 }
 
 #[test]
@@ -520,23 +523,16 @@ fn repeated_etag_conditions_combine_in_order_before_cold_state() {
             canonical_request("GET", &t, &single, &signed, EMPTY_SHA, false).unwrap()
         );
         for head in [false, true] {
-            for available in [false, true] {
-                let c = Conditions::from_headers(&repeated);
-                let result = plan_read(&m, head, &c, None, available, false).map(|p| p.status);
-                let expected = if name == "If-Match" && !matches {
-                    Err(ErrorCode::PreconditionFailed)
-                } else if name == "If-None-Match" && matches {
-                    Ok(304)
-                } else if !head && !available {
-                    Err(ErrorCode::InvalidObjectState)
-                } else {
-                    Ok(200)
-                };
-                assert_eq!(
-                    result, expected,
-                    "{name}: {joined}, head={head}, available={available}"
-                );
-            }
+            let c = Conditions::from_headers(&repeated);
+            let result = plan_read(&m, head, &c, None, false).map(|p| p.status);
+            let expected = if name == "If-Match" && !matches {
+                Err(ErrorCode::PreconditionFailed)
+            } else if name == "If-None-Match" && matches {
+                Ok(304)
+            } else {
+                Ok(200)
+            };
+            assert_eq!(result, expected, "{name}: {joined}, head={head}");
         }
     }
     for name in [
@@ -721,7 +717,7 @@ fn authenticated_metadata_survives_commit_and_read_without_whitespace_folding() 
         .unwrap();
         for head in [false, true] {
             for range in [None, Some("bytes=0-1")] {
-                let plan = plan_read(&m, head, &Conditions::default(), range, true, false).unwrap();
+                let plan = plan_read(&m, head, &Conditions::default(), range, false).unwrap();
                 for (k, value) in &expected {
                     assert_eq!(header(&plan, k), Some(*value), "{name}: {k}");
                 }
@@ -785,28 +781,18 @@ fn condition_precedence_and_range_validation_precede_cold_state() {
         if_unmodified_since: Some("Thu, 23 May 2013 00:00:00 GMT".into()),
         ..Default::default()
     };
-    assert_eq!(
-        plan_read(&m, false, &c, None, false, false).unwrap_err(),
-        ErrorCode::InvalidObjectState
-    );
-    assert_eq!(
-        plan_read(&m, false, &c, None, true, false).unwrap().status,
-        200
-    );
+    assert_eq!(plan_read(&m, false, &c, None, false).unwrap().status, 200);
     let c = Conditions {
         if_none_match: Some("\"different\"".into()),
         if_modified_since: Some("Sat, 25 May 2013 00:00:00 GMT".into()),
         ..Default::default()
     };
-    assert_eq!(
-        plan_read(&m, false, &c, None, true, false).unwrap().status,
-        200
-    );
+    assert_eq!(plan_read(&m, false, &c, None, false).unwrap().status, 200);
     let c = Conditions {
         if_none_match: Some("W/\"opaque,not-md5\"".into()),
         ..Default::default()
     };
-    let p = plan_read(&m, false, &c, Some("bytes=99-"), false, false).unwrap();
+    let p = plan_read(&m, false, &c, Some("bytes=99-"), false).unwrap();
     assert_eq!(p.status, 304);
     assert!(p.body.is_none());
     let c = Conditions {
@@ -814,24 +800,16 @@ fn condition_precedence_and_range_validation_precede_cold_state() {
         ..Default::default()
     };
     assert_eq!(
-        plan_read(&m, false, &c, None, false, false).unwrap_err(),
+        plan_read(&m, false, &c, None, false).unwrap_err(),
         ErrorCode::PreconditionFailed
     );
     let c = Conditions {
         if_match: Some("\"other\", \"opaque,not-md5\"".into()),
         ..Default::default()
     };
-    assert!(plan_read(&m, true, &c, None, false, false).is_ok());
+    assert!(plan_read(&m, true, &c, None, false).is_ok());
     assert_eq!(
-        plan_read(
-            &m,
-            false,
-            &Conditions::default(),
-            Some("bytes=99-"),
-            false,
-            false
-        )
-        .unwrap_err(),
+        plan_read(&m, false, &Conditions::default(), Some("bytes=99-"), false).unwrap_err(),
         ErrorCode::InvalidRange
     );
     assert_eq!(
@@ -840,22 +818,13 @@ fn condition_precedence_and_range_validation_precede_cold_state() {
             false,
             &Conditions::default(),
             Some("bytes=0-1,3-4"),
-            false,
             false
         )
         .unwrap_err(),
         ErrorCode::InvalidRequest
     );
     assert_eq!(
-        plan_read(
-            &m,
-            true,
-            &Conditions::default(),
-            Some("bytes=99-"),
-            false,
-            false
-        )
-        .unwrap_err(),
+        plan_read(&m, true, &Conditions::default(), Some("bytes=99-"), false).unwrap_err(),
         ErrorCode::InvalidRange
     );
 }
@@ -870,7 +839,7 @@ fn range_goldens_and_head_are_bodyless() {
         ("bytes=-99", 0, 9),
         ("bytes=2-999", 2, 9),
     ] {
-        let plan = plan_read(&m, false, &Conditions::default(), Some(value), true, false).unwrap();
+        let plan = plan_read(&m, false, &Conditions::default(), Some(value), false).unwrap();
         assert_eq!(plan.status, 206);
         assert_eq!(plan.body, Some(ByteRange { start, end }));
         assert_eq!(
@@ -881,7 +850,7 @@ fn range_goldens_and_head_are_bodyless() {
             header(&plan, "content-range"),
             Some(format!("bytes {start}-{end}/10").as_str())
         );
-        let head = plan_read(&m, true, &Conditions::default(), Some(value), false, false).unwrap();
+        let head = plan_read(&m, true, &Conditions::default(), Some(value), false).unwrap();
         assert_eq!(head.status, 200);
         assert!(head.body.is_none());
         assert_eq!(header(&head, "content-range"), None);
@@ -906,12 +875,10 @@ fn range_goldens_and_head_are_bodyless() {
         ByteRange::parse("bytes=0-", u64::MAX).unwrap().length(),
         u64::MAX
     );
-    assert!(
-        plan_read(&m, true, &Conditions::default(), None, false, false)
-            .unwrap()
-            .body
-            .is_none()
-    );
+    assert!(plan_read(&m, true, &Conditions::default(), None, false)
+        .unwrap()
+        .body
+        .is_none());
     assert_eq!(m.generation(), "immutable-generation");
     assert_eq!(m.length(), 10);
 }
@@ -930,23 +897,15 @@ fn opaque_etag_and_checksum_type_are_preserved_not_reinterpreted() {
         let kind = checksum.checksum_type();
         let value = checksum.value().to_owned();
         let m = metadata(Some(checksum));
-        let plan = plan_read(&m, false, &Conditions::default(), None, true, true).unwrap();
+        let plan = plan_read(&m, false, &Conditions::default(), None, true).unwrap();
         assert_eq!(header(&plan, "etag"), Some("\"opaque,not-md5\""));
         assert_eq!(header(&plan, "x-amz-checksum-type"), Some(kind));
         assert_eq!(header(&plan, "x-amz-checksum-sha256"), Some(value.as_str()));
         assert_eq!(header(&plan, "content-encoding"), Some("customer-envelope"));
-        let range = plan_read(
-            &m,
-            false,
-            &Conditions::default(),
-            Some("bytes=0-1"),
-            true,
-            true,
-        )
-        .unwrap();
+        let range = plan_read(&m, false, &Conditions::default(), Some("bytes=0-1"), true).unwrap();
         assert_eq!(header(&range, "x-amz-checksum-type"), None);
         assert_eq!(header(&range, "x-amz-checksum-sha256"), None);
-        let head = plan_read(&m, true, &Conditions::default(), None, false, true).unwrap();
+        let head = plan_read(&m, true, &Conditions::default(), None, true).unwrap();
         assert_eq!(header(&head, "x-amz-checksum-type"), Some(kind));
     }
     assert!(ObjectMetadata::new("g".into(), 1, "not-quoted".into(), NOW, vec![], None).is_err());
@@ -959,45 +918,6 @@ fn opaque_etag_and_checksum_type_are_preserved_not_reinterpreted() {
         None
     )
     .is_err());
-}
-
-#[test]
-fn restore_xml_rejects_unknown_fields_and_unqualified_days_tiers() {
-    for xml in ["<RestoreRequest><Days>1</Days></RestoreRequest>",
-        "<RestoreRequest xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Days>7</Days><GlacierJobParameters><Tier>Standard</Tier></GlacierJobParameters></RestoreRequest>"] {
-        assert!(parse_restore(xml.as_bytes(),&policy()).is_ok());
-    }
-    for xml in ["", "<RestoreRequest>", "<RestoreRequest><Days>1</Tier></RestoreRequest>",
-        "<RestoreRequest><Days>0</Days></RestoreRequest>","<RestoreRequest><Days>8</Days></RestoreRequest>",
-        "<RestoreRequest><Days>+1</Days></RestoreRequest>","<RestoreRequest><Days>1.5</Days></RestoreRequest>",
-        "<RestoreRequest><Days>1</Days><Days>1</Days></RestoreRequest>",
-        "<RestoreRequest><Days>1</Days><GlacierJobParameters><Tier>Expedited</Tier></GlacierJobParameters></RestoreRequest>",
-        "<RestoreRequest><Days>1</Days><Type>SELECT</Type></RestoreRequest>",
-        "<RestoreRequest><Days>1</Days><OutputLocation>elsewhere</OutputLocation></RestoreRequest>",
-        "<!DOCTYPE RestoreRequest [<!ENTITY x '1'>]><RestoreRequest><Days>&x;</Days></RestoreRequest>",
-        "<RestoreRequest attr=\"ignored\"><Days>1</Days></RestoreRequest>",
-        "<RestoreRequest><Days>1</Days></RestoreRequest><RestoreRequest><Days>1</Days></RestoreRequest>"] {
-        assert!(parse_restore(xml.as_bytes(),&policy()).is_err(),"{xml}");
-    }
-    assert_eq!(
-        RestoreStatus::Pending.header(NOW).unwrap(),
-        Some("ongoing-request=\"true\"".into())
-    );
-    assert_eq!(RestoreStatus::Unavailable.header(NOW).unwrap(), None);
-    assert_eq!(
-        RestoreStatus::Available { expiry: NOW }
-            .header(NOW)
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        RestoreStatus::Available {
-            expiry: NOW + 86400
-        }
-        .header(NOW)
-        .unwrap(),
-        Some("ongoing-request=\"false\", expiry-date=\"Sat, 25 May 2013 00:00:00 GMT\"".into())
-    );
 }
 
 #[test]
@@ -1066,7 +986,7 @@ fn all_http_date_forms_enforce_conditions_before_cold_state() {
             ..Default::default()
         };
         assert_eq!(
-            plan_read(&m, false, &c, None, false, false).unwrap().status,
+            plan_read(&m, false, &c, None, false).unwrap().status,
             304,
             "{value}"
         );
@@ -1081,7 +1001,7 @@ fn all_http_date_forms_enforce_conditions_before_cold_state() {
             ..Default::default()
         };
         assert_eq!(
-            plan_read(&m, false, &c, None, false, false).unwrap_err(),
+            plan_read(&m, false, &c, None, false).unwrap_err(),
             ErrorCode::PreconditionFailed,
             "{value}"
         );
@@ -1103,22 +1023,17 @@ fn pre_epoch_dates_enforce_conditions_before_cold_state() {
             ..Default::default()
         };
         for head in [false, true] {
-            for available in [false, true] {
-                assert_eq!(
-                    plan_read(&m, head, &c, None, available, false).unwrap_err(),
-                    ErrorCode::PreconditionFailed,
-                    "{value}: head={head}, available={available}"
-                );
-            }
+            assert_eq!(
+                plan_read(&m, head, &c, None, false).unwrap_err(),
+                ErrorCode::PreconditionFailed,
+                "{value}: head={head}"
+            );
         }
         let c = Conditions {
             if_match: Some(m.etag().into()),
             ..c
         };
-        assert_eq!(
-            plan_read(&m, false, &c, None, true, false).unwrap().status,
-            200
-        );
+        assert_eq!(plan_read(&m, false, &c, None, false).unwrap().status, 200);
     }
     let m = ObjectMetadata::new("g".into(), 10, "\"opaque\"".into(), -2, vec![], None).unwrap();
     let value = "Wed, 31 Dec 1969 23:59:59 GMT";
@@ -1126,18 +1041,12 @@ fn pre_epoch_dates_enforce_conditions_before_cold_state() {
         if_modified_since: Some(value.into()),
         ..Default::default()
     };
-    assert_eq!(
-        plan_read(&m, false, &c, None, false, false).unwrap().status,
-        304
-    );
+    assert_eq!(plan_read(&m, false, &c, None, false).unwrap().status, 304);
     let c = Conditions {
         if_unmodified_since: Some(value.into()),
         ..Default::default()
     };
-    assert_eq!(
-        plan_read(&m, false, &c, None, true, false).unwrap().status,
-        200
-    );
+    assert_eq!(plan_read(&m, false, &c, None, false).unwrap().status, 200);
     for value in [
         "Thu, 31 Dec 1969 23:59:59 GMT",
         "Wed, 31 Dec 1969 23:59:59 UTC",
@@ -1150,7 +1059,7 @@ fn pre_epoch_dates_enforce_conditions_before_cold_state() {
             ..Default::default()
         };
         assert_eq!(
-            plan_read(&metadata(None), false, &c, None, true, false)
+            plan_read(&metadata(None), false, &c, None, false)
                 .unwrap()
                 .status,
             200,
@@ -1175,19 +1084,10 @@ fn signed_or_expanded_http_date_years_are_ignored() {
         };
         for head in [false, true] {
             assert_eq!(
-                plan_read(&metadata(None), head, &c, None, true, false)
+                plan_read(&metadata(None), head, &c, None, false)
                     .unwrap()
                     .status,
                 200,
-                "{value}"
-            );
-            assert_eq!(
-                plan_read(&metadata(None), head, &c, None, false, false).map(|p| p.status),
-                if head {
-                    Ok(200)
-                } else {
-                    Err(ErrorCode::InvalidObjectState)
-                },
                 "{value}"
             );
         }
@@ -1205,17 +1105,8 @@ fn signed_or_expanded_http_date_years_are_ignored() {
         };
         for head in [false, true] {
             assert_eq!(
-                plan_read(&m, head, &c, None, true, false).unwrap().status,
+                plan_read(&m, head, &c, None, false).unwrap().status,
                 200,
-                "{value}"
-            );
-            assert_eq!(
-                plan_read(&m, head, &c, None, false, false).map(|p| p.status),
-                if head {
-                    Ok(200)
-                } else {
-                    Err(ErrorCode::InvalidObjectState)
-                },
                 "{value}"
             );
         }
@@ -1240,7 +1131,7 @@ fn not_modified_retains_corresponding_cache_policy() {
         if_none_match: Some("\"opaque\"".into()),
         ..Default::default()
     };
-    let p = plan_read(&m, false, &c, None, false, false).unwrap();
+    let p = plan_read(&m, false, &c, None, false).unwrap();
     assert_eq!(p.status, 304);
     assert!(p.body.is_none());
     assert_eq!(header(&p, "cache-control"), Some("private, no-store"));
@@ -1248,37 +1139,9 @@ fn not_modified_retains_corresponding_cache_policy() {
 }
 
 #[test]
-fn restore_declaration_is_unique_validated_and_before_the_root() {
-    let root = "<RestoreRequest><Days>1</Days></RestoreRequest>";
-    assert_eq!(
-        parse_restore(
-            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{root}").as_bytes(),
-            &policy()
-        ),
-        Ok(1)
-    );
-    for prefix in [
-        "<?xml version=\"1.0\"?><?xml version=\"1.0\"?>",
-        "<?xml version=\"2.0\"?>",
-        "<?xml encoding=\"UTF-8\"?>",
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
-    ] {
-        assert!(
-            parse_restore(format!("{prefix}{root}").as_bytes(), &policy()).is_err(),
-            "{prefix}"
-        );
-    }
-    assert!(parse_restore(
-        format!("{root}<?xml version=\"1.0\"?>").as_bytes(),
-        &policy()
-    )
-    .is_err());
-}
-
-#[test]
 fn explicit_policy_is_required_and_errors_are_s3_xml_except_head() {
     let mut l = limits();
-    l.max_restore_days = 0;
+    l.clock_skew_seconds = 0;
     assert!(Policy::new("s3.invalid".into(), "r".into(), l).is_err());
     let mut l = limits();
     l.presign_seconds = 604801;
@@ -1290,7 +1153,7 @@ fn explicit_policy_is_required_and_errors_are_s3_xml_except_head() {
         (ErrorCode::PreconditionFailed, 412),
         (ErrorCode::BadDigest, 400),
         (ErrorCode::NoSuchKey, 404),
-        (ErrorCode::RestoreAlreadyInProgress, 409),
+        (ErrorCode::BucketNotEmpty, 409),
         (ErrorCode::NotImplemented, 501),
         (ErrorCode::SlowDown, 503),
     ] {
