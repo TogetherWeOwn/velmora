@@ -1,4 +1,4 @@
-//! Versioned, portable ciphertext archive contract: identities only.
+//! Versioned, portable ciphertext archive contract.
 //!
 //! In a complete archive implementation, callers durably record intent before
 //! I/O and each remote session, part, and result before acknowledging it. These
@@ -287,6 +287,97 @@ pub trait Sink {
     /// A later error can leave an earlier prefix: stage invisibly, never publish
     /// or serve a prefix as a complete object. Cancellation does not undo writes.
     fn write<'a>(&'a mut self, bytes: &'a [u8]) -> impl Future<Output = Result<()>> + 'a;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    pub write: bool,
+    pub range: bool,
+    pub reconcile: bool,
+    pub physical_delete: bool,
+    pub max_part_bytes: usize,
+}
+
+/// Observations only, never an eviction permit or a live durability guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteProof {
+    pub record: ObjectRecord,
+    pub acknowledged: bool,
+    pub full_ciphertext_readback: bool,
+    /// NNTP observation has no independence or authenticated client proof.
+    pub backend: Backend,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reconciled {
+    Verified(Box<WriteProof>),
+    /// Proven not committed at observation time, not safe to race a pending
+    /// request. A transport must settle all issued requests before returning it.
+    Absent,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbortOutcome {
+    IncompleteRemoved,
+    /// Already posted or committed bytes cannot be recalled by abort.
+    Irreversible,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// Configured transport is available; no object durability is implied.
+    Available,
+    Unavailable,
+}
+
+/// No destructive delete method: logical tombstones belong to the catalogue;
+/// physical retirement requires its independently fenced, retained-copy protocol.
+/// There are no implicit retries, timers, alternate-account or cache fallbacks.
+/// Implementations must enforce current control throughout each operation and
+/// its I/O; a control passed to a method is not itself an enforcement mechanism.
+#[allow(async_fn_in_trait)]
+pub trait ArchiveProvider {
+    fn capabilities(&self) -> Capabilities;
+    async fn begin(&mut self, intent: &WriteIntent, control: &impl Control)
+        -> Result<WriteSession>;
+    async fn write_part(
+        &mut self,
+        session: &WriteSession,
+        index: usize,
+        bytes: &[u8],
+        control: &impl Control,
+    ) -> Result<PartReceipt>;
+    async fn commit(
+        &mut self,
+        session: &WriteSession,
+        receipts: &[PartReceipt],
+        control: &impl Control,
+    ) -> Result<WriteProof>;
+    async fn abort(
+        &mut self,
+        session: &WriteSession,
+        control: &impl Control,
+    ) -> Result<AbortOutcome>;
+    async fn stat(
+        &mut self,
+        record: &ObjectRecord,
+        control: &impl Control,
+    ) -> Result<ObjectIdentity>;
+    async fn read_range(
+        &mut self,
+        record: &ObjectRecord,
+        range: Range,
+        sink: &mut impl Sink,
+        control: &impl Control,
+    ) -> Result<()>;
+    async fn reconcile(
+        &mut self,
+        session: &WriteSession,
+        control: &impl Control,
+    ) -> Result<Reconciled>;
+    async fn health(&mut self, target: &Target, control: &impl Control) -> Result<Health>;
 }
 
 /// SHA-256 of the supplied bytes, without any authentication claim.

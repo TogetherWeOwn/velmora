@@ -1,5 +1,13 @@
 # Archive identities v1
 
+The archive boundary concerns opaque ciphertext objects and bounded transfer.
+Media authentication and commitment-before-decrypt remain separate obligations;
+an archive hash or receipt does not establish valid media or authorize a download.
+The product owns authentication, account admission, durable jobs, cancellation,
+retention and publication. Temporary or delivery caches are not permanent archive
+fallbacks. Client-facing REST, MCP and S3 interfaces are independent ingress
+adapters, not outbound archive transports.
+
 Write-target policy belongs to the product, separate from old-object read
 routing. Resolve an old object's backend, account, locator, version and crypto
 identity from its trusted record, not today's write selection. Missing or
@@ -40,7 +48,26 @@ cannot undo remote effects. `Sink` declares that only complete-part-verified
 ciphertext is emitted in blocks of at most 64 KiB; callers must stage prefixes
 invisibly because an error or cancellation can leave an incomplete output.
 
+`ArchiveProvider` declares capabilities, begin, part write, commit, abort,
+stat, range read, reconcile and health. Except for capabilities, operations are
+async and take trusted control; the trait is generic, not object-safe, and does
+not require `Send`. No method has a default implementation. A write proof is an
+observation, not an eviction permit or durability guarantee; an absent reconcile
+result is valid only after issued requests settle. No physical deletion or
+eviction operation is provided.
+
+Implementations must check authority before and after I/O and enforce it while
+I/O is pending. Begin, part write, commit and reconcile require `Write`; abort
+requires `AbortIncomplete`; stat and range read require `Read`; health requires
+`Health`. Proof readback remains under the enclosing write authority as well as
+read authority; sink writes remain under read authority. A lost response
+or cancellation after a possible remote effect is uncertain: preserve the same
+intent and session, reconcile before a bounded retry, and never automatically
+abort, reallocate or report success. No alternate account or cache fallback is
+permitted.
+
 These are interface obligations, not an implementation of authorization,
-revocation, transport closure or output verification. Provider adapters,
-consumer integration and the complete provider trait are still pending; no
-physical deletion or eviction API is provided.
+revocation, transport closure or output verification. Provider adapters and
+consumer integration are still pending. Each first implementation of an operation
+must include its positive and negative tenant/action isolation and event-driven
+revocation tests alongside the operation.
