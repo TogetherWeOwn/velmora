@@ -346,7 +346,6 @@ where
             provider,
             PermitClass::Background,
             &holder,
-            pool.suspect(provider),
         )
         .await?
         .ok_or(Stop::NoPermit)?;

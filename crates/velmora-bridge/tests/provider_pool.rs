@@ -295,6 +295,29 @@ async fn read_while_the_only_source_cools_is_retryable() {
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
 }
 
+/// A cooling provider that no longer retains the missing article is not
+/// worth waiting for: the answer is "unavailable", not "retry".
+#[tokio::test]
+async fn cooling_provider_past_its_retention_is_not_waited_for() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let (s, plan) = rig.posted_on(12, &[1]).await;
+    rig.servers[1].hide(&plan[0].message_id).await;
+    rig.bridge.cfg.providers[0].retention_days = Some(10);
+    rig.bridge.clock.advance_secs(11 * DAY_SECS);
+    let now = rig.bridge.clock.now();
+    for _ in 0..3 {
+        let failed = rig.bridge.catalog.provider_failed("p0", now);
+        failed.await.unwrap();
+    }
+    assert!(rig.cooling(0).await);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Unavailable);
+
+    // Inside its retention the same cooling provider is worth a retry.
+    rig.bridge.cfg.providers[0].retention_days = Some(12);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Interrupted);
+}
+
 // ---------------------------------------------------------------------------
 // Posting
 // ---------------------------------------------------------------------------

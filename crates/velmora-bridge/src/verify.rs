@@ -152,7 +152,6 @@ where
                 provider,
                 PermitClass::Background,
                 &holder,
-                pool.suspect(provider),
             )
             .await?
             else {

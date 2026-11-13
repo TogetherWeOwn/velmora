@@ -56,13 +56,6 @@ impl<'a> Pool<'a> {
             .is_some_and(|l| l.cooldown_until > self.now)
     }
 
-    /// Whether the provider has failures on record, so that a good
-    /// session is worth a write to clear them.
-    pub(crate) fn suspect(&self, p: &ProviderConfig) -> bool {
-        self.state(&p.id)
-            .is_some_and(|l| l.failures > 0 || l.cooldowns > 0)
-    }
-
     /// Slots the provider could still hand out: under its own limit and,
     /// in a pool, under what the pool's accounts hold together.
     fn free(&self, p: &ProviderConfig) -> u32 {

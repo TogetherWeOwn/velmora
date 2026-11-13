@@ -727,7 +727,6 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             provider,
             PermitClass::Background,
             &holder,
-            false,
         )
         .await?
         else {

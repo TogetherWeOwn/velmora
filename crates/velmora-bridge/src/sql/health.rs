@@ -4,7 +4,7 @@
 //! strike. [`FAILURE_THRESHOLD`] strikes in a row start a cooldown; so
 //! does a single strike right after a cooldown, and each cooldown in a row
 //! doubles the next up to [`COOLDOWN_MAX_MS`]. One good session clears it
-//! all. Writes happen on a change of state only, and each is a single
+//! all. A row changes on a change of state only, and each write is a single
 //! statement guarded by the state it expects: a report that arrives while
 //! the provider is cooling changes nothing, so parallel jobs that fail
 //! together cannot stack cooldowns.

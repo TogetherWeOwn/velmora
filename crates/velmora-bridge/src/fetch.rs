@@ -32,8 +32,6 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     pub(crate) provider: &'a ProviderConfig,
     permit: Permit,
     session: Option<N::Session>,
-    /// The provider has failures on record (see [`Pool::suspect`]).
-    suspect: bool,
     /// How the last connect or command went; `None` = nothing ran.
     healthy: Option<bool>,
 }
@@ -69,7 +67,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         provider: &'a ProviderConfig,
         class: PermitClass,
         holder: &str,
-        suspect: bool,
     ) -> Result<Option<Self>> {
         let permit = catalog
             .acquire_permit(provider, class, holder, clock.now())
@@ -81,7 +78,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             provider,
             permit,
             session: None,
-            suspect,
             healthy: None,
         }))
     }
@@ -151,8 +147,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// permit token, so a holder that lost its slot frees nothing.
     ///
     /// A session whose last word from the provider was a failure is one
-    /// strike against it. A good session is written down only when it
-    /// clears earlier strikes.
+    /// strike against it; a good session clears the strikes. The catalogue
+    /// decides on the provider's state at that moment, so a session that
+    /// started before another one failed still clears that failure.
     pub(crate) async fn close(mut self) {
         if let Some(session) = self.session.take() {
             session.quit().await;
@@ -162,7 +159,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         let now = self.clock.now();
         let _ = match self.healthy {
             Some(false) => self.catalog.provider_failed(id, now).await,
-            Some(true) if self.suspect => self.catalog.provider_recovered(id, now).await,
+            Some(true) => self.catalog.provider_recovered(id, now).await,
             _ => Ok(()),
         };
         // A failed release is safe: the permit expires on its own.
@@ -363,9 +360,8 @@ where
         let now = self.clock.now();
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
         let readers: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.read).collect();
-        // A cooling provider may hold what the others lack: retry later.
-        let mut interrupted = pool.cooling_until(&readers).is_some();
-        for provider in pool.order(readers) {
+        let mut interrupted = false;
+        for provider in pool.order(readers.clone()) {
             if !have.contains(&false) {
                 break;
             }
@@ -383,7 +379,6 @@ where
                 provider,
                 PermitClass::Read,
                 &holder,
-                pool.suspect(provider),
             )
             .await?
             else {
@@ -412,6 +407,15 @@ where
             }
         }
         if have.contains(&false) {
+            // A cooling provider that retains a missing article may hold
+            // what the others lack: retry later.
+            let missing = |p: &ProviderConfig| {
+                plan.iter()
+                    .any(|a| !have[a.idx as usize] && p.retains(a.posted_at, now))
+            };
+            let waiting: Vec<&ProviderConfig> =
+                readers.into_iter().filter(|p| missing(p)).collect();
+            interrupted |= pool.cooling_until(&waiting).is_some();
             return Ok(if interrupted {
                 ColdFetch::Interrupted
             } else if busy {
