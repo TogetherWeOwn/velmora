@@ -205,6 +205,7 @@ impl Fx {
             inflight_budget_bytes: BUDGET,
             gc_mode,
             maintenance,
+            server_side_copy: false,
             dev_trust_http: false,
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),

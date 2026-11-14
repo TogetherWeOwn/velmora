@@ -339,6 +339,7 @@ fn config(maintenance: &str) -> BridgeConfig {
         ("INFLIGHT_BUDGET_BYTES", "50331648".to_string()),
         ("GC_MODE", "disposable".to_string()),
         ("MAINTENANCE", maintenance.to_string()),
+        ("SERVER_SIDE_COPY", "on".to_string()),
         (
             "ADMIN_TOKEN",
             "multipart-test-admin-token-0123456789abcdef".to_string(),

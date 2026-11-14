@@ -325,8 +325,11 @@ pub fn precheck(
         _ if !has_s3_credential(req) => return Err(IngressError::AccessDenied),
         _ => {}
     }
+    // A copy names its source in a header and has no body, so it need not
+    // declare a length. The handler refuses one that declares a body.
+    let copy = header(req, "x-amz-copy-source").is_some();
     match route {
-        Route::PutObject { .. } | Route::UploadPart { .. } => {
+        Route::PutObject { .. } | Route::UploadPart { .. } if !copy => {
             upload_lengths(&req.headers, cfg.max_extent_bytes)?;
         }
         _ => {

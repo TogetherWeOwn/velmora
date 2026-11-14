@@ -141,6 +141,7 @@ impl Fx {
             inflight_budget_bytes: BUDGET,
             gc_mode: GcMode::Disposable,
             maintenance,
+            server_side_copy: false,
             dev_trust_http: false,
             providers,
             admin_token: Secret::new(TOKEN.to_string()),

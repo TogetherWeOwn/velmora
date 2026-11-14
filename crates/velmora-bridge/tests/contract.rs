@@ -251,6 +251,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.kek_active, 1);
     assert_eq!(cfg.gc_mode, GcMode::Off);
     assert_eq!(cfg.maintenance, Maintenance::Off);
+    assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
 
@@ -262,6 +263,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.safety_min_age_secs, 0);
     assert_eq!(cfg.verify_delay_secs, 1);
     assert_eq!(cfg.gc_mode, GcMode::Disposable);
+    assert!(cfg.server_side_copy);
     assert!(cfg.dev_trust_http);
     assert!(!cfg.providers[0].tls);
 }
@@ -325,6 +327,10 @@ fn config_rejects_invalid_and_unsafe_values() {
     assert_eq!(set(&prod, "ENVIRONMENT", "staging"), invalid("ENVIRONMENT"));
     assert_eq!(set(&prod, "GC_MODE", "on"), invalid("GC_MODE"));
     assert_eq!(set(&prod, "MAINTENANCE", "yes"), invalid("MAINTENANCE"));
+    assert_eq!(
+        set(&prod, "SERVER_SIDE_COPY", "1"),
+        invalid("SERVER_SIDE_COPY")
+    );
     assert_eq!(
         set(&dev, "DEV_TRUST_HTTP", "true"),
         invalid("DEV_TRUST_HTTP")

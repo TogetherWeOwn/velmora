@@ -788,6 +788,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         inflight_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         maintenance: Maintenance::Off,
+        server_side_copy: true,
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),

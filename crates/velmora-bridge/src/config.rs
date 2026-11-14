@@ -104,6 +104,10 @@ pub struct BridgeConfig {
     pub inflight_budget_bytes: u64,
     pub gc_mode: GcMode,
     pub maintenance: Maintenance,
+    /// Serve CopyObject. Off until the version that is rolled back to
+    /// also reads extent references: an older Worker cannot read a copy
+    /// and does not know that the source's extents are shared.
+    pub server_side_copy: bool,
     /// Accept `http://` as if it were HTTPS (`wrangler dev` only).
     pub dev_trust_http: bool,
     pub providers: Vec<ProviderConfig>,
@@ -239,6 +243,12 @@ impl BridgeConfig {
             _ => return Err(ConfigError::Invalid("MAINTENANCE".into())),
         };
 
+        let server_side_copy = match required(&get, "SERVER_SIDE_COPY")?.as_str() {
+            "off" => false,
+            "on" => true,
+            _ => return Err(ConfigError::Invalid("SERVER_SIDE_COPY".into())),
+        };
+
         let dev_trust_http = match get("DEV_TRUST_HTTP").as_deref() {
             None | Some("") | Some("0") => false,
             Some("1") => true,
@@ -276,6 +286,7 @@ impl BridgeConfig {
             inflight_budget_bytes,
             gc_mode,
             maintenance,
+            server_side_copy,
             dev_trust_http,
             providers,
             admin_token: Secret::new(admin_token),

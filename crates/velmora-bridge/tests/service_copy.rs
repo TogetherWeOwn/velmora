@@ -470,3 +470,74 @@ async fn collector_refuses_an_extent_a_copy_references() {
     read.expect(200);
     assert_eq!(read.body, body);
 }
+
+/// Without `SERVER_SIDE_COPY` no copy is created: a Worker that is rolled
+/// back to must be able to read every object that exists.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_is_refused_while_it_is_switched_off() {
+    let mut cfg = config(Vec::new());
+    cfg.server_side_copy = false;
+    let rig = rig_with(NoNntp, cfg);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", &pattern(1, 1000))
+        .await
+        .expect(200);
+    let r = copy(&rig, &signer, &source("a"), "b", &[]).await;
+    r.expect_error(501, "NotImplemented");
+    assert!(r.text().contains("not enabled"), "{}", r.text());
+    assert_eq!(get(&rig, &signer, "b").await.status, 404);
+    assert_eq!(rig.count("generations"), 1);
+    assert_eq!(rig.count("generation_extents"), 1);
+}
+
+/// A copy keeps the checksum stored with its source and computes none.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_cannot_compute_another_checksum() {
+    use base64::Engine as _;
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let body = pattern(1, 1000);
+    let sum = base64::engine::general_purpose::STANDARD.encode(sha256(&body));
+    rig.put(&signer, BUCKET, "bare", &body).await.expect(200);
+    rig.call(
+        &signer,
+        Method::Put,
+        &path(BUCKET, "summed"),
+        &[],
+        &[("x-amz-checksum-sha256", &sum)],
+        &body,
+    )
+    .await
+    .expect(200);
+
+    let sha = [("x-amz-checksum-algorithm", "SHA256")];
+    // The source has that checksum: it is the copy's as well.
+    let r = copy(&rig, &signer, &source("summed"), "b", &sha).await;
+    r.expect(200);
+    assert_eq!(r.values("ChecksumSHA256"), std::slice::from_ref(&sum));
+    // The source has none, or another one.
+    copy(&rig, &signer, &source("bare"), "c", &sha)
+        .await
+        .expect_error(501, "NotImplemented");
+    copy(
+        &rig,
+        &signer,
+        &source("summed"),
+        "c",
+        &[("x-amz-checksum-algorithm", "CRC32")],
+    )
+    .await
+    .expect_error(501, "NotImplemented");
+    // A checksum value has no bytes to be checked against.
+    copy(
+        &rig,
+        &signer,
+        &source("summed"),
+        "c",
+        &[("x-amz-checksum-sha256", &sum)],
+    )
+    .await
+    .expect_error(400, "InvalidRequest");
+    assert_eq!(get(&rig, &signer, "c").await.status, 404);
+    assert_eq!(rig.count("generations"), 3);
+}

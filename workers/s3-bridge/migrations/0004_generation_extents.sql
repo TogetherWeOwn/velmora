@@ -31,6 +31,12 @@ SELECT generation_id, seq, id, plain_offset FROM extents
 -- it: once when a committed extent is inserted (single PUT), once when a
 -- staged part is adopted (multipart Complete). Current code writes the
 -- same row itself; `OR IGNORE` makes the two agree.
+--
+-- That covers what an older Worker writes. It does not make a copy
+-- readable by one: an older Worker sees a copy as a generation without
+-- extents and treats the source's extents as the source's alone. Copies
+-- are therefore not created until `SERVER_SIDE_COPY` is turned on, in a
+-- release after the one that ships this migration.
 CREATE TRIGGER generation_extents_on_insert AFTER INSERT ON extents
 WHEN NEW.generation_id IS NOT NULL AND NEW.seq IS NOT NULL AND NEW.plain_offset IS NOT NULL
 BEGIN

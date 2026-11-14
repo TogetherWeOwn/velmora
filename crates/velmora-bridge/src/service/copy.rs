@@ -5,15 +5,18 @@
 //! its conditions were checked. From then on the extents are in service
 //! for as long as either generation is live.
 //!
+//! Served only when `SERVER_SIDE_COPY` is on (see `BridgeConfig`).
+//!
 //! Not served, each `501 NotImplemented`:
 //! - a source in another bucket. Its file keys are wrapped under that
 //!   bucket's data key, so the copy would need a second wrapped key per
 //!   extent;
-//! - a source `versionId`. There is no versioning.
+//! - a source `versionId`. There is no versioning;
+//! - a checksum algorithm other than the one stored with the source.
 
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
-use velmora_s3_proto::{Conditions, ErrorCode, ObjectMetadata, Target};
+use velmora_s3_proto::{ChecksumAlgorithm, Conditions, ErrorCode, ObjectMetadata, Target};
 
 use super::common::{
     internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
@@ -120,6 +123,13 @@ where
     T: Clock,
 {
     let (bucket, key) = authed.object()?;
+    if !bridge.cfg.server_side_copy {
+        return Err(S3Response::error(
+            501,
+            "NotImplemented",
+            "Server-side copy is not enabled.",
+        ));
+    }
     // A copy has no body; one that was sent would be silently dropped.
     if declared.is_some_and(|len| len != 0) {
         return Err(s3_error(ErrorCode::InvalidRequest));
@@ -127,6 +137,22 @@ where
     if authed.headers.get("x-amz-copy-source-range").is_some() {
         return Err(s3_error(ErrorCode::InvalidRequest));
     }
+    // No bytes arrive, so there is nothing a checksum value could be
+    // checked against.
+    if ChecksumAlgorithm::ALL
+        .iter()
+        .any(|a| authed.headers.get(a.header()).is_some())
+    {
+        return Err(s3_error(ErrorCode::InvalidRequest));
+    }
+    let wanted = authed
+        .headers
+        .get("x-amz-checksum-algorithm")
+        .or_else(|| authed.headers.get("x-amz-sdk-checksum-algorithm"))
+        .map(|name| {
+            ChecksumAlgorithm::from_name(name).ok_or_else(|| s3_error(ErrorCode::InvalidRequest))
+        })
+        .transpose()?;
     let replacement = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
     let replace = match authed.headers.get("x-amz-metadata-directive") {
         None | Some("COPY") => false,
@@ -145,6 +171,15 @@ where
 
     for _ in 0..ATTEMPTS {
         let (from, _) = source_object(bridge, authed, bucket, &source).await?;
+        // The copy keeps the checksum stored with the source. Computing
+        // another one would mean reading every byte.
+        if wanted.is_some_and(|a| stored_checksum(&from).map(|c| c.algorithm()) != Some(a)) {
+            return Err(S3Response::error(
+                501,
+                "NotImplemented",
+                "A copy keeps the checksum of its source; computing another is not implemented.",
+            ));
+        }
         let now = bridge.clock.now();
         let mut rand = [0u8; 8];
         SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;

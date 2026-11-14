@@ -571,6 +571,7 @@ impl Rig {
             ("INFLIGHT_BUDGET_BYTES", "50331648"),
             ("GC_MODE", "disposable"),
             ("MAINTENANCE", "off"),
+            ("SERVER_SIDE_COPY", "on"),
             ("ADMIN_TOKEN", ADMIN_TOKEN),
         ]
         .into_iter()

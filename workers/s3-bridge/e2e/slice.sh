@@ -587,12 +587,20 @@ fi
 # ---------------------------------------------------------------------------
 
 STEP=5c-move
-log "step $STEP"
-run_aws "MOVE a/small.bin to a/moved.bin" "${S3[@]}" mv "s3://$SB/a/small.bin" "s3://$SB/a/moved.bin" >/dev/null
-run_aws "GET a/moved.bin" "${S3[@]}" cp "s3://$SB/a/moved.bin" "$T/got-moved.bin" >/dev/null
-same_bytes "GET a/moved.bin equals the upload" "$T/small.bin" "$T/got-moved.bin"
-expect_err "HEAD a/small.bin after the move" '\(404\)' \
-  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
+SMALL_KEY=a/small.bin
+# The shipped production vars keep SERVER_SIDE_COPY off; the dev ones turn
+# it on. E2E_COPY=1 runs the step against a remote that has it on.
+if [[ ${E2E_COPY:-$([[ $MODE == local ]] && echo 1 || echo 0)} == 1 ]]; then
+  log "step $STEP"
+  run_aws "MOVE a/small.bin to a/moved.bin" "${S3[@]}" mv "s3://$SB/a/small.bin" "s3://$SB/a/moved.bin" >/dev/null
+  run_aws "GET a/moved.bin" "${S3[@]}" cp "s3://$SB/a/moved.bin" "$T/got-moved.bin" >/dev/null
+  same_bytes "GET a/moved.bin equals the upload" "$T/small.bin" "$T/got-moved.bin"
+  expect_err "HEAD a/small.bin after the move" '\(404\)' \
+    "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
+  SMALL_KEY=a/moved.bin
+else
+  log "step $STEP skipped (E2E_COPY is not 1)"
+fi
 
 # ---------------------------------------------------------------------------
 # 6 delete
@@ -600,9 +608,9 @@ expect_err "HEAD a/small.bin after the move" '\(404\)' \
 
 STEP=6-delete
 log "step $STEP"
-run_aws "DELETE a/moved.bin" "${S3[@]}" rm "s3://$SB/a/moved.bin" >/dev/null
-expect_err "HEAD a/moved.bin after delete" '\(404\)' \
-  "${S3API[@]}" head-object --bucket "$SB" --key a/moved.bin
+run_aws "DELETE $SMALL_KEY" "${S3[@]}" rm "s3://$SB/$SMALL_KEY" >/dev/null
+expect_err "HEAD $SMALL_KEY after delete" '\(404\)' \
+  "${S3API[@]}" head-object --bucket "$SB" --key "$SMALL_KEY"
 
 # ---------------------------------------------------------------------------
 # 7 dispatcher recovery
