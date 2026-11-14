@@ -453,6 +453,11 @@ pub trait Catalog {
         limit: u32,
         now: UnixMs,
     ) -> Result<u64>;
+    /// Re-arms cancelled obligations of extents that a live generation
+    /// references. Only a Worker from before extent references leaves
+    /// one, after a rollback. One call looks at the next `limit` outbox
+    /// rows, in a rotation over all of them. Returns how many it re-armed.
+    async fn revive_referenced(&self, limit: u32, now: UnixMs) -> Result<u64>;
 
     // hot tier
     /// Pinned and evictable byte totals (`GET /_admin/status`).

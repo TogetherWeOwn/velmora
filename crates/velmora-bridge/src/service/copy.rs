@@ -29,7 +29,8 @@ use crate::ports::{
 };
 use crate::recovery::{copy_id, write_generation};
 use crate::types::{
-    Body, Bucket, CopyGeneration, ExtentRow, GenerationRow, GenerationState, S3Response,
+    Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
+    S3Response,
 };
 
 /// Times the copy is re-planned when the source changes under it.
@@ -180,6 +181,8 @@ where
         ));
     }
 
+    // The id of the attempt before this one, which lost its guard.
+    let mut lost: Option<GenerationId> = None;
     for _ in 0..ATTEMPTS {
         let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
         // The copy keeps the checksum stored with the source. Computing
@@ -208,7 +211,9 @@ where
             (from.content_json.clone(), from.user_meta_json.clone())
         };
         let generation = GenerationRow {
-            id: copy_id(now, &from.id, newest.as_ref(), rand),
+            // Also after the attempt that lost: should its record have
+            // survived its delete after all, it sorts before this one.
+            id: copy_id(now, &from.id, newest.as_ref().max(lost.as_ref()), rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,
@@ -260,10 +265,12 @@ where
         // The source was overwritten or deleted since it was read, or
         // the destination got a generation this id does not sort after.
         // Nothing was published under this id, so its record must not
-        // publish it in a replay either.
+        // publish it in a replay either. A record that cannot be removed
+        // ends the request: no copy was made, and the caller is told so.
         discard_refused(bridge, &copy.generation, refused)
             .await
             .map_err(|_| internal())?;
+        lost = Some(copy.generation.id);
         // Plan again against what is live now.
     }
     Err(unavailable())

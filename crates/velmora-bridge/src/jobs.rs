@@ -341,6 +341,16 @@ where
         // Buried first, so an exhausted row is not sent once more.
         report.buried = self.catalog.bury_exhausted(MAX_ATTEMPTS, now).await?;
 
+        // A cancelled posting of an extent that a live generation
+        // references is armed again: an older Worker can leave one after
+        // a rollback. The rows moved here are due at once and sent below.
+        // Like the re-drive that follows, an extra that must not stop
+        // the send.
+        match self.catalog.revive_referenced(REDRIVE_LIMIT, now).await {
+            Ok(n) => report.redriven = n,
+            Err(_) => report.redrive_failed = true,
+        }
+
         // A `done` extent whose safety copy is held was short of backbones
         // when it was verified. Once enough are configured it is verified
         // again; the rows moved here are due at once and sent below.
@@ -356,7 +366,7 @@ where
                 self.catalog
                     .redrive_underverified(&labels, required, REDRIVE_LIMIT, now);
             match redriven.await {
-                Ok(n) => report.redriven = n,
+                Ok(n) => report.redriven += n,
                 Err(_) => report.redrive_failed = true,
             }
         }
