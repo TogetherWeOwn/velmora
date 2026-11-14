@@ -19,11 +19,15 @@
 //! with neither a pinned copy nor an article plan record. A generation
 //! with such an extent is published all the same, so that a read of it
 //! fails loudly instead of answering "no such key"; the last call of a
-//! replay reports the live ones as `damaged`.
+//! replay reports the live ones as `damaged`. The one exception: such a
+//! generation does not replace an older live generation of its key. It
+//! is the record of a write that was never acknowledged far more often
+//! than the loss of an acknowledged one, so the older object stays and
+//! the record is reported as `damaged_unpublished`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
+use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{
     article_key, read_article_plan, read_generation, read_tombstone, start_after,
     GenerationManifest, GENERATION_PREFIX, TOMBSTONE_PREFIX,
@@ -64,6 +68,19 @@ pub enum ReplayProbe {
     Present,
     /// Absent, and a newer generation of the key is live.
     Superseded,
+}
+
+/// What the catalogue did with a manifest's generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayPublish {
+    Published,
+    /// Already present, a newer generation of the key is live, or the
+    /// extents do not tile it. Nothing was written.
+    Refused,
+    /// An older generation of the key is live, and this one has an
+    /// extent with neither a pinned copy nor an article plan. Nothing
+    /// was written.
+    Damaged,
 }
 
 /// One extent of a manifest with what the blob store says about it.
@@ -140,6 +157,9 @@ pub struct ReplayReport {
     /// is missing, its key was shredded or it belongs to another
     /// generation, or it lost a race).
     pub unpublishable: Vec<String>,
+    /// Not published: an extent of the generation has no copy anywhere,
+    /// and an older generation of the key is live. That one stays.
+    pub damaged_unpublished: Vec<String>,
     /// Not replayed: the catalogue has another bucket under the name of
     /// the record's bucket. The first ids of `other_bucket_total`.
     pub other_bucket_total: u32,
@@ -337,13 +357,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     .replay_publish(&generation, &placements, now)
                     .await?
                 {
-                    Guard::Applied(()) => report.published += 1,
+                    ReplayPublish::Published => report.published += 1,
+                    ReplayPublish::Damaged => report.damaged_unpublished.push(id),
                     // The extents of an object can be shared, so a second
                     // record of one object is published like any other
                     // manifest, over the first. What is refused and has a
                     // live twin was published before: by an earlier run,
                     // or because a newer record of the object is live.
-                    Guard::Lost => match self.live_twin(&generation, &placements).await? {
+                    ReplayPublish::Refused => match self.live_twin(&generation, &placements).await?
+                    {
                         Some(_) => report.duplicate += 1,
                         None => report.unpublishable.push(id),
                     },

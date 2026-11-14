@@ -78,7 +78,7 @@ use crate::ports::{
     Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
-use crate::replay::{ReplayExtent, ReplayProbe};
+use crate::replay::{ReplayExtent, ReplayProbe, ReplayPublish};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
@@ -401,7 +401,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         g: &GenerationRow,
         placements: &[ExtentPlacement],
         now: UnixMs,
-    ) -> Result<Guard<()>> {
+    ) -> Result<ReplayPublish> {
         replay::replay_publish(self, g, placements, now).await
     }
 

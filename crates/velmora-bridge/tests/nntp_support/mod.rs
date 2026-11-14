@@ -939,7 +939,7 @@ impl Catalog for MemCatalog {
         _: &GenerationRow,
         _: &[velmora_bridge::ExtentPlacement],
         _: UnixMs,
-    ) -> Result<Guard<()>> {
+    ) -> Result<velmora_bridge::replay::ReplayPublish> {
         unused()
     }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {

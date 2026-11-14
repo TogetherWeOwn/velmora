@@ -11,7 +11,7 @@
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 use crate::recovery::{Recorded, Unpublished};
-use crate::replay::{ReplayExtent, ReplayProbe};
+use crate::replay::{ReplayExtent, ReplayProbe, ReplayPublish};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
@@ -525,14 +525,14 @@ pub trait Catalog {
     /// nor an article plan: their number and the first `limit` ids.
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;
     /// Publishes the generation over the extents `replay_extents` left.
-    /// `Lost` = already present, a newer generation of the key is live,
-    /// or the extents do not tile it; nothing was written.
+    /// A generation with an extent that has no copy anywhere does not
+    /// replace an older live one.
     async fn replay_publish(
         &self,
         g: &GenerationRow,
         placements: &[ExtentPlacement],
         now: UnixMs,
-    ) -> Result<Guard<()>>;
+    ) -> Result<ReplayPublish>;
 
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()>;
