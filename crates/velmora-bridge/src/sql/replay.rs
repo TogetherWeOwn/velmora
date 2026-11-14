@@ -250,10 +250,14 @@ async fn has_lost_extent<S: Sql>(
 /// Step 2. `Refused` = the generation is already there, a newer
 /// generation of the key is live, or the extents do not tile it (one of
 /// them is missing, in another bucket, still a part of an upload under
-/// another generation's name, or its key was shredded). `Damaged` = an
-/// older generation of the key is live and this one cannot be read in
-/// full: a record that lingers from a write that failed must not take
-/// the place of a good object.
+/// another generation's name, or its key was shredded). `Damaged` = the
+/// catalogue knows an older generation of the key, live or not, and
+/// this one cannot be read in full: a record that lingers from a write
+/// that failed must not take the place of a good object, nor that of a
+/// delete. The rule looks at rows that stay, not at what is live at the
+/// moment, so a second replay over the same records decides the same:
+/// tombstones are applied after the manifests, and the object that was
+/// live when this generation was refused may be deleted by then.
 pub(super) async fn replay_publish<S: Sql>(
     c: &SqlCatalog<S>,
     g: &GenerationRow,
@@ -330,12 +334,12 @@ pub(super) async fn replay_publish<S: Sql>(
             uint(g.size)?,
         ],
     ));
-    // A generation that cannot be read in full replaces nothing. With no
-    // older generation live it is published, so that the key answers
-    // with an error and not with "no such key".
+    // A generation that cannot be read in full replaces nothing. On a
+    // key without an older generation it is published, so that the key
+    // answers with an error and not with "no such key".
     stmts.push((
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
-           WHERE bucket_id = ?2 AND key = ?3) \
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations \
+           WHERE bucket_id = ?2 AND key = ?3 AND id < ?1) \
          AND EXISTS (SELECT 1 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
           WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' \
             AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))",
@@ -393,15 +397,15 @@ pub(super) async fn replay_publish<S: Sql>(
         Err(BridgeError::GuardFailed) => {
             // Which guard refused it. Nothing else writes during a
             // replay, so the catalogue is as the batch found it.
-            let older_live = c
+            let older = c
                 .sql
                 .query(
-                    "SELECT 1 FROM objects WHERE bucket_id = ?1 AND key = ?2 \
-                       AND generation_id < ?3",
+                    "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
+                       AND id < ?3 LIMIT 1",
                     &[bucket(), text(&g.key), gen_id()],
                 )
                 .await?;
-            if !older_live.is_empty() && has_lost_extent(c, placements).await? {
+            if !older.is_empty() && has_lost_extent(c, placements).await? {
                 Ok(ReplayPublish::Damaged)
             } else {
                 Ok(ReplayPublish::Refused)
