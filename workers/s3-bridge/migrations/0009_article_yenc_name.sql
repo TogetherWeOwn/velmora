@@ -10,7 +10,9 @@
 -- from the message-id), so a repost of it stays byte-identical.
 -- A Worker from before this migration neither writes nor reads the
 -- column: after a rollback to one, its new plans are NULL rows in the
--- old form, and it would repost a non-NULL row in the old form. The
+-- old form, and it would repost a non-NULL row in the old form. An older
+-- Worker that takes over a named row also writes m/art/<extent> again
+-- without yenc_name, so a later replay restores those rows as NULL. The
 -- payload bytes, and so every read and verify, are the same either way.
 ALTER TABLE articles ADD COLUMN yenc_name TEXT
   CHECK (yenc_name IS NULL OR (length(yenc_name) BETWEEN 1 AND 64 AND yenc_name NOT GLOB '*[^0-9a-z]*'));

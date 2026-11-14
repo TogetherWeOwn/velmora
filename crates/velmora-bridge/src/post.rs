@@ -54,8 +54,8 @@ use crate::ports::{
 };
 use crate::recovery::write_article_plan;
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent, JobOutcome,
-    OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
+    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
 };
 
 impl<T: Transport> NntpSession for NntpClient<T> {
@@ -209,9 +209,6 @@ fn payload_of<'a>(cipher: &'a [u8], row: &ArticleRow) -> Option<&'a [u8]> {
     cipher.get(start..start.checked_add(len)?)
 }
 
-/// Longest stored yEnc name a row may carry (the catalogue's CHECK).
-const MAX_YENC_NAME_LEN: usize = 64;
-
 /// Renders the complete article for a stored row. Everything on the wire
 /// is a function of the stored row and the ciphertext, so a repost is
 /// byte-identical.
@@ -229,17 +226,8 @@ const MAX_YENC_NAME_LEN: usize = 64;
 /// the stored length and SHA-256 (`fetch::check_payload`).
 fn render_article(row: &ArticleRow, total: u32, file_size: u64, payload: &[u8]) -> Result<Vec<u8>> {
     let params = match &row.yenc_name {
-        Some(name) => {
-            let valid = !name.is_empty()
-                && name.len() <= MAX_YENC_NAME_LEN
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
-            if !valid {
-                return Err(BridgeError::Invalid("stored yEnc name is malformed"));
-            }
-            SegmentParams::single(name.clone())
-        }
+        Some(name) if valid_yenc_name(name) => SegmentParams::single(name.clone()),
+        Some(_) => return Err(BridgeError::Invalid("stored yEnc name is malformed")),
         None => SegmentParams {
             name: row
                 .message_id

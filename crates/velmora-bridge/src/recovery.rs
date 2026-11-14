@@ -51,8 +51,8 @@ use velmora::rng::SystemRng;
 use crate::crypto::{open_manifest, seal_manifest};
 use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow, ExtentState,
-    GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow,
+    ExtentState, GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
 };
 
 /// Every recovery record lives under this prefix.
@@ -480,7 +480,13 @@ impl ArticleManifest {
                     cipher_offset: a.cipher_offset,
                     cipher_len: a.cipher_len,
                     payload_sha256: digest(&a.payload_sha256)?,
-                    yenc_name: a.yenc_name.clone(),
+                    // The catalogue would refuse any other name, and a
+                    // replay's insert skips a refused row without a word:
+                    // such a record is unreadable instead.
+                    yenc_name: match &a.yenc_name {
+                        Some(name) if !valid_yenc_name(name) => return Err(ERR_RECORD),
+                        name => name.clone(),
+                    },
                     state,
                     provider_id: None,
                     posted_at: None,

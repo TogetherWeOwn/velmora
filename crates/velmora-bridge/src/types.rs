@@ -643,6 +643,21 @@ pub struct ArticleRow {
     pub posted_at: Option<UnixMs>,
 }
 
+/// Longest yEnc name an article row may carry (the catalogue's CHECK).
+pub const MAX_YENC_NAME_LEN: usize = 64;
+
+/// A stored yEnc name is 1 to [`MAX_YENC_NAME_LEN`] lowercase ASCII
+/// letters and digits, as the `articles.yenc_name` CHECK requires. The
+/// post stage renders only such a name, and a plan record with any other
+/// is not read.
+pub fn valid_yenc_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_YENC_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+}
+
 /// `verifications` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationRow {

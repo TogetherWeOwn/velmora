@@ -1964,3 +1964,100 @@ async fn a_complete_refused_for_its_parts_is_not_taken_for_an_id_race() {
         .expect_error(400, "InvalidPart");
     assert!(records(&rig).is_empty(), "the refused record is removed");
 }
+
+// ---------------------------------------------------------------------------
+// Article plans: each row's yEnc form
+// ---------------------------------------------------------------------------
+
+/// Stores a plan record for the only extent of `key`, one row per
+/// article, row `i` under `names[i]`. Returns the extent and the plan.
+async fn plan_record(
+    rig: &Rig,
+    bucket: &Bucket,
+    key: &str,
+    names: &[Option<&str>],
+) -> (ExtentRow, Vec<ArticleRow>) {
+    let (_, extents) = rig.live(bucket, key).await.unwrap();
+    let extent = extents[0].clone();
+    let spans = velmora_bridge::articles::article_spans(extent.cipher_size);
+    assert_eq!(spans.len(), names.len());
+    let plan: Vec<ArticleRow> = (0u32..)
+        .zip(spans.iter().zip(names))
+        .map(|(idx, (span, name))| ArticleRow {
+            extent_id: extent.id.clone(),
+            idx,
+            message_id: format!("{idx}k7q2m9x4v1z8c3b6n5j0h2g4f6d8s1a3@example.invalid"),
+            newsgroup: "alt.binaries.test".into(),
+            headers: format!("Subject: s{idx}\r\n").into_bytes(),
+            cipher_offset: span.start,
+            cipher_len: span.len,
+            payload_sha256: [idx as u8; 32],
+            yenc_name: name.map(str::to_owned),
+            state: ArticleState::Planned,
+            provider_id: None,
+            posted_at: None,
+        })
+        .collect();
+    velmora_bridge::recovery::write_article_plan(
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &extent,
+        &plan,
+    )
+    .await
+    .unwrap();
+    (extent, plan)
+}
+
+/// A replay through the SQL catalogue restores each row's yEnc name: a
+/// standalone row keeps its own, an older multi-part row stays NULL, so
+/// each reposts in the form it was posted in.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_plan_keeps_each_rows_yenc_form() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![7u8; 1_000_000];
+    rig.put(&signer, BUCKET, "two-articles", &body)
+        .await
+        .expect(200);
+    let (extent, plan) =
+        plan_record(&rig, &bucket, "two-articles", &[Some("k3v9q0zx7m2a"), None]).await;
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.article_plans, 1, "{report:?}");
+    assert!(report.unreadable.is_empty(), "{report:?}");
+
+    let rows = rig.bridge.catalog.articles(&extent.id).await.unwrap();
+    let names: Vec<_> = rows.iter().map(|a| a.yenc_name.clone()).collect();
+    assert_eq!(names, [Some("k3v9q0zx7m2a".to_string()), None]);
+    let ids: Vec<_> = rows.iter().map(|a| a.message_id.clone()).collect();
+    let want: Vec<_> = plan.iter().map(|a| a.message_id.clone()).collect();
+    assert_eq!(ids, want);
+}
+
+/// A plan record whose yEnc name the catalogue would refuse is reported
+/// unreadable, not skipped without a word by the replay's insert.
+#[tokio::test(flavor = "current_thread")]
+async fn a_plan_record_with_a_bad_yenc_name_is_unreadable() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![7u8; 1_000_000];
+    rig.put(&signer, BUCKET, "two-articles", &body)
+        .await
+        .expect(200);
+    let (extent, _) = plan_record(&rig, &bucket, "two-articles", &[None, Some("Not Valid")]).await;
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(report.article_plans, 0, "{report:?}");
+    assert_eq!(report.unreadable, [format!("m/art/{}", extent.id.as_str())]);
+    assert!(rig
+        .bridge
+        .catalog
+        .articles(&extent.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
