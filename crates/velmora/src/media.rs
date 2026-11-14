@@ -1021,6 +1021,51 @@ impl ChunkReader<'_> {
         }
     }
 
+    /// Prechecks and authenticates one complete, exclusively owned sealed chunk.
+    ///
+    /// `index` and the exact ciphertext-plus-tag length are validated against
+    /// this reader's trusted plaintext size before `precheck` is called. The
+    /// callback receives an immutable view of every sealed byte, including the
+    /// tag. If it fails, its error is returned without any AEAD call or
+    /// plaintext output. The caller is responsible for choosing and trusting
+    /// whatever expected digest or other policy the callback checks. When
+    /// fetching article 0, the caller must also check its wire header against
+    /// the record using [`ChunkReader::check_wire_header`]; this operation
+    /// accepts only the sealed chunk and does not check the wire header.
+    ///
+    /// After a successful callback, the existing STREAM AEAD opens **that same
+    /// owned buffer in place**, immediately: there is no reread, replacement,
+    /// copy, resize, or mutation between the callback and the open. The final
+    /// flag is derived from the trusted size and index, not supplied by the
+    /// caller. Plaintext is returned only after authentication, in a zeroizing
+    /// buffer. Authentication failure releases no plaintext.
+    ///
+    /// An empty object has one final chunk at index 0, consisting of its
+    /// 16-byte tag; it is prechecked and authenticated before returning an
+    /// empty buffer. A full final chunk is final without an extra empty chunk.
+    pub fn open_chunk_with_precheck(
+        &self,
+        index: u64,
+        sealed: Vec<u8>,
+        precheck: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let mut sealed = Zeroizing::new(sealed);
+        let out_of_range = || media_error("chunk range out of bounds");
+        let plain_len = chunk_plain_len(self.plaintext_size, index).ok_or_else(out_of_range)?;
+        let sealed_len = usize::try_from(plain_len)
+            .ok()
+            .and_then(|n| n.checked_add(TAG_SIZE as usize))
+            .ok_or_else(out_of_range)?;
+        if sealed.len() != sealed_len {
+            return Err(media_error("incorrect sealed chunk length"));
+        }
+        precheck(&sealed)?;
+        let last = index + 1 == chunk_count(self.plaintext_size);
+        let len = self.verified.stream.open(index, last, &mut sealed)?.len();
+        sealed.truncate(len);
+        Ok(sealed)
+    }
+
     /// Reads one sealed chunk and opens it; returns the verified plaintext.
     fn open_chunk(
         &self,
@@ -1229,6 +1274,59 @@ mod tests {
         let ok = VerifiedHeader::verify(&profile, KeyMode::Random, &key, &header).unwrap();
         ok.reader(100).unwrap().verify_all(&object).unwrap();
         assert_eq!(opens(), before + 1);
+    }
+
+    #[test]
+    fn precheck_precedes_same_buffer_open_and_failures_release_nothing() {
+        let profile = Profile::nntune();
+        let key = FileKey::from_bytes([3; 32]);
+        let sealer = Sealer::random(&profile, &key, &mut Fixed(4)).unwrap();
+        let header = sealer.header();
+        let object = sealer.seal_to_vec(&[0x5a; 10]).unwrap();
+        let verified = VerifiedHeader::verify(&profile, KeyMode::Random, &key, &header).unwrap();
+        let reader = verified.reader(10).unwrap();
+        let sealed = object[HEADER_SIZE as usize..].to_vec();
+        let before = opens();
+
+        assert!(reader
+            .open_chunk_with_precheck(0, sealed.clone(), |_| {
+                assert_eq!(opens(), before);
+                Err(media_error("precheck rejected"))
+            })
+            .is_err());
+        assert_eq!(opens(), before);
+        for (index, bytes) in [
+            (1, sealed.clone()),
+            (u64::MAX, sealed.clone()),
+            (0, sealed[..sealed.len() - 1].to_vec()),
+        ] {
+            assert!(reader
+                .open_chunk_with_precheck(index, bytes, |_| panic!(
+                    "invalid geometry reached precheck"
+                ))
+                .is_err());
+        }
+        assert_eq!(opens(), before);
+
+        let ptr = sealed.as_ptr();
+        let plain = reader
+            .open_chunk_with_precheck(0, sealed, |bytes| {
+                assert_eq!(opens(), before);
+                assert_eq!(bytes.as_ptr(), ptr);
+                assert_eq!(bytes, &object[HEADER_SIZE as usize..]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(opens(), before + 1);
+        assert_eq!(plain.as_ptr(), ptr);
+        assert_eq!(&plain[..], &[0x5a; 10]);
+
+        let mut tampered = object[HEADER_SIZE as usize..].to_vec();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(reader
+            .open_chunk_with_precheck(0, tampered, |_| Ok(()))
+            .is_err());
+        assert_eq!(opens(), before + 2);
     }
 
     #[test]
