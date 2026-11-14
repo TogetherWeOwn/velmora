@@ -40,11 +40,7 @@ async fn head_bucket_answers_for_a_granted_bucket_only() {
 
     // A read-only grant may probe too.
     let ro = rig
-        .key(
-            "AKIDREADONLY00000001",
-            "ro-secret-0123456789abcdef",
-            KeyStatus::Active,
-        )
+        .key("AKIDREADONLY00000001", secret(), KeyStatus::Active)
         .await;
     rig.grant("AKIDREADONLY00000001", &other, Perm::Ro).await;
     let resp = rig
@@ -92,7 +88,7 @@ async fn head_bucket_requires_a_valid_signature() {
     req.headers.retain(|(n, _)| n != "authorization");
     assert_eq!(rig.send(req).await.status, 403);
 
-    let wrong = Signer::new(AKID, "not-the-secret-0123456789abcdef");
+    let wrong = Signer::new(AKID, &format!("{}-other", secret()));
     let resp = rig
         .call(&wrong, Method::Head, &format!("/{BUCKET}"), &[], &[], b"")
         .await;
@@ -181,11 +177,7 @@ async fn signed_create_bucket_only_confirms_an_owned_bucket() {
 
     // Read-only is not write.
     let ro = rig
-        .key(
-            "AKIDREADONLY00000001",
-            "ro-secret-0123456789abcdef",
-            KeyStatus::Active,
-        )
+        .key("AKIDREADONLY00000001", secret(), KeyStatus::Active)
         .await;
     rig.grant("AKIDREADONLY00000001", &other, Perm::Ro).await;
     let resp = rig
