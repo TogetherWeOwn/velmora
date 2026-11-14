@@ -9,6 +9,7 @@ mod admin;
 mod common;
 mod delete;
 mod get;
+pub use get::READ_STAMP_MS;
 mod list;
 mod multipart;
 mod put;

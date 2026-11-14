@@ -864,7 +864,7 @@ async fn release_needs_fresh_evidence() {
     let r = fx.claim(&o, OutboxStage::Release, week).await.unwrap();
 
     // The verify-stage pass still counts for status, but it is a week old:
-    // it does not authorize deleting the safety copy.
+    // it does not authorize unpinning the safety copy.
     assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
     let before = fx.dump().await;
     assert_eq!(

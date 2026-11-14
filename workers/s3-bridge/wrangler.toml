@@ -26,6 +26,7 @@ NEWSGROUPS = "alt.binaries.test"   # posting here is proven by the provider prob
 VELMORA_KEK_ACTIVE = "1"
 INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
 GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
+HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
 
 [[d1_databases]]

@@ -226,6 +226,7 @@ impl Fx {
             kek_active: 1,
             inflight_budget_bytes: BUDGET,
             gc_mode,
+            hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             dev_trust_http: false,
             providers,
@@ -498,13 +499,21 @@ async fn post_verify_release_over_fake_nntp() {
     let posted = "SELECT COUNT(*) FROM articles WHERE state = 'posted'";
     assert_eq!(fx.scalar(posted, &[]).await, "3");
 
-    // The pinned copy went only after the read-back; the cache is kept.
-    assert!(!fx.has_safety(&o));
+    // The release deletes nothing: the copy stays in R2, now evictable.
+    assert!(fx.has_safety(&o));
+    assert_eq!(
+        fx.extent(&o, "hot_safety_bytes").await,
+        fx.extent(&o, "cipher_size").await
+    );
     assert!(fx.has_cache(&o));
-    // The release deleted that one blob: the recovery records stay.
+    // The recovery records stay beside it.
     assert_eq!(
         fx.bridge.safety.inner.keys(),
-        [article_key(&o.extent), "m/g_seeded".to_string()]
+        [
+            article_key(&o.extent),
+            "m/g_seeded".to_string(),
+            o.extent.safety_key()
+        ]
     );
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.len(), 1);
@@ -1027,10 +1036,12 @@ async fn dispatch_does_no_blob_or_nntp_io() {
         DispatchReport {
             enqueued: 1,
             gc_enqueued: true,
+            evict_enqueued: false,
             buried: 0,
             permits_seeded: true,
             redriven: 0,
             redrive_failed: false,
+            evict_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -1280,7 +1291,7 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     fx.pump().await;
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
-    assert!(!fx.has_safety(&o));
+    assert!(fx.has_safety(&o));
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.iter().filter(|s| s.counts).count(), 2);
     // Nothing was posted twice.
@@ -1340,7 +1351,7 @@ async fn release_with_a_backbone_that_never_has_the_extent() {
 
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
-    assert!(!fx.has_safety(&o));
+    assert!(fx.has_safety(&o));
     let evidence = fx.extent(&o, "release_evidence").await;
     let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
     assert_eq!(evidence.as_array().unwrap().len(), 2);
