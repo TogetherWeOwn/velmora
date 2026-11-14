@@ -1,12 +1,9 @@
-# velmora
-
-Shared Usenet data-plane engine in Rust, for native targets and for
-`wasm32-unknown-unknown` (Cloudflare Workers via `workers-rs`).
+# Development notes
 
 | Crate | Library | What |
 |---|---|---|
-| [`crates/velmora`](crates/velmora/README.md) | `velmora` | NNTP client and transports (native rustls, Workers sockets), pinned/cancellable fetch policy, yEnc (SIMD + scalar), NZB parser, `velmora.media.v1` media encryption (age STREAM + key commitment), PAR2 parse/verify/create and Linux repair, segment identity, posting article assembly |
-| [`crates/velmora-test-nntp`](crates/velmora-test-nntp/README.md) | `velmora_test_nntp` | Synthetic in-process NNTP server and fixture corpus, so no CI run touches real Usenet |
+| [`crates/velmora`](../crates/velmora/README.md) | `velmora` | NNTP client and transports (native rustls, Workers sockets), pinned/cancellable fetch policy, yEnc (SIMD + scalar), NZB parser, `velmora.media.v1` media encryption (age STREAM + key commitment), PAR2 parse/verify/create and Linux repair, segment identity, posting article assembly |
+| [`crates/velmora-test-nntp`](../crates/velmora-test-nntp/README.md) | `velmora_test_nntp` | Synthetic in-process NNTP server and fixture corpus, so no CI run touches real Usenet |
 
 ## Scope
 
@@ -43,7 +40,7 @@ velmora = { git = "https://github.com/TogetherWeOwn/velmora", rev = "<full 40-ch
 - `worker-transport`: Workers `connect()` socket transport (wasm32).
 - `worker-pinned-tls`: opt-in, qualification-only peer-pinned Worker TLS;
   no runtime activation or physical-close qualification is implied. See
-  [preservation and qualification boundaries](docs/transport-preservation.md).
+  [preservation and qualification boundaries](transport-preservation.md).
 
 The default native-TLS and no-default-feature core retain Rust 1.89 support.
 Worker features require Rust 1.91 because the locked Worker SDK 0.8.7 requires
@@ -59,4 +56,4 @@ features, `cargo check --target wasm32-unknown-unknown` (scalar,
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](../LICENSE).
