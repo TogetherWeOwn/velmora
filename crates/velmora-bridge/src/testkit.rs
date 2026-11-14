@@ -43,8 +43,8 @@ pub const MIGRATION_0004: &str =
 pub const MIGRATION_0005: &str =
     include_str!("../../../workers/s3-bridge/migrations/0005_generation_extents.sql");
 /// The class of a held permit (background job or read).
-pub const MIGRATION_0008: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0008_permit_class.sql");
+pub const MIGRATION_0006: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0006_permit_class.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -132,7 +132,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0003)?;
         db.apply(MIGRATION_0004)?;
         db.apply(MIGRATION_0005)?;
-        db.apply(MIGRATION_0008)?;
+        db.apply(MIGRATION_0006)?;
         Ok(db)
     }
 

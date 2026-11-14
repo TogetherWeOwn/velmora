@@ -1,6 +1,5 @@
 -- Provider permits: which held slots belong to background jobs.
--- Additive only. Numbered after the migrations other open changes add
--- (0006, 0007); none of them touches this table.
+-- Additive only.
 
 -- Set on every acquire: 1 = taken by a background job (post, verify,
 -- repost, drill), 0 = taken by a read. A provider with an address limit
