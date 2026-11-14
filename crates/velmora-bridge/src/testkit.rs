@@ -38,10 +38,13 @@ pub const MIGRATION_0003: &str =
 /// Hot-tier accounting: evictable bytes, last read, eviction fence.
 pub const MIGRATION_0004: &str =
     include_str!("../../../workers/s3-bridge/migrations/0004_hot_tier.sql");
+/// Extent references per generation (copies share extents).
+pub const MIGRATION_0005: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0005_generation_extents.sql");
 
 /// The newest tombstone of each deleted key.
-pub const MIGRATION_0005: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0005_key_tombstones.sql");
+pub const MIGRATION_0006: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0006_key_tombstones.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -129,6 +132,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0003)?;
         db.apply(MIGRATION_0004)?;
         db.apply(MIGRATION_0005)?;
+        db.apply(MIGRATION_0006)?;
         Ok(db)
     }
 

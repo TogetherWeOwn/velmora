@@ -14,7 +14,8 @@ use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 14] = [
+    "generation_extents",
     "outbox",
     "key_tombstones",
     "verifications",
@@ -64,7 +65,11 @@ fn wipe(rig: &Rig) {
 /// Loads the export back. Tables go in parent-first order.
 fn import(rig: &Rig) {
     for t in TABLES.iter().rev() {
-        sql(rig, &format!("INSERT INTO {t} SELECT * FROM bak_{t};"));
+        // The `extents` rows have already written their own references.
+        sql(
+            rig,
+            &format!("INSERT OR IGNORE INTO {t} SELECT * FROM bak_{t};"),
+        );
     }
 }
 
@@ -552,6 +557,279 @@ async fn records_alone_rebuild_the_catalogue() {
     assert_eq!(dump(&rig), settled);
 }
 
+// ---------------------------------------------------------------------------
+// Copies: two generations share extents
+// ---------------------------------------------------------------------------
+
+async fn copy(rig: &Rig, signer: &Signer, from: &str, to: &str) -> Resp {
+    let source = format!("/{BUCKET}/{from}");
+    rig.call(
+        signer,
+        Method::Put,
+        &path(BUCKET, to),
+        &[],
+        &[("x-amz-copy-source", source.as_str())],
+        b"",
+    )
+    .await
+}
+
+fn count(rig: &Rig, query: &str) -> i64 {
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.query_row(query, [], |r| r.get(0)).unwrap())
+}
+
+/// Open GC rows for an extent a live object references.
+const LIVE_IN_GC: &str = "SELECT COUNT(*) FROM gc WHERE done_at IS NULL AND extent_id IN \
+     (SELECT ge.extent_id FROM generation_extents ge \
+        JOIN objects o ON o.generation_id = ge.generation_id)";
+/// Extents of live objects whose posting obligation is at its first stage.
+const LIVE_POSTING: &str = "SELECT COUNT(DISTINCT ge.extent_id) FROM generation_extents ge \
+     JOIN objects o ON o.generation_id = ge.generation_id \
+     JOIN outbox x ON x.extent_id = ge.extent_id WHERE x.stage = 'post'";
+
+/// A copy is rebuilt with its shared extents, and it stays when the
+/// source it was made from is deleted or overwritten.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_outlives_its_source_through_a_replay() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    tick(&rig);
+    let big = multipart(&rig, &signer, "big", 5).await;
+    tick(&rig);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    tick(&rig);
+    copy(&rig, &signer, "big", "big-copy").await.expect(200);
+    tick(&rig);
+    // A copy of a copy, and a copy that is itself removed again.
+    copy(&rig, &signer, "dst", "dst-2").await.expect(200);
+    tick(&rig);
+    copy(&rig, &signer, "src", "short-lived").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "short-lived").await.expect(204);
+    tick(&rig);
+    delete(&rig, &signer, "src").await.expect(204);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "big", b"replaced")
+        .await
+        .expect(200);
+    tick(&rig);
+    let live_before = rig.live(&bucket, "big-copy").await.unwrap();
+    let head = rig.head(&signer, BUCKET, "big-copy").await;
+    assert_eq!(rig.count("extents"), 4);
+
+    wipe(&rig);
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 1,
+    };
+    let (report, _) = replay(&rig, UnixMs(0), limits).await;
+    assert_eq!(report.manifests, 7, "{report:?}");
+    assert_eq!(report.published, 7, "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (2, 2), "{report:?}");
+    assert_eq!(report.damaged_total, 0);
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "src").await.expect(404);
+    get(&rig, &signer, "short-lived").await.expect(404);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(
+        get(&rig, &signer, "dst-2").await.expect(200).body,
+        b"payload"
+    );
+    assert_eq!(
+        get(&rig, &signer, "big").await.expect(200).body,
+        b"replaced"
+    );
+    assert_eq!(get(&rig, &signer, "big-copy").await.expect(200).body, big);
+    assert_eq!(rig.live(&bucket, "big-copy").await.unwrap(), live_before);
+    let head_after = rig.head(&signer, BUCKET, "big-copy").await;
+    assert_eq!(head_after.header("etag"), head.header("etag"));
+
+    // No extent was duplicated, every live one is in service and back in
+    // the pipeline, and none waits for garbage collection.
+    assert_eq!(rig.count("extents"), 4);
+    assert_eq!(rig.count("generations"), 7);
+    assert_eq!(rig.count("objects"), 4);
+    assert_eq!(count(&rig, LIVE_IN_GC), 0);
+    assert_eq!(count(&rig, LIVE_POSTING), 4);
+    assert_eq!(rig.count("gc"), 0);
+
+    // The same replay again changes nothing.
+    let settled = dump(&rig);
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(
+        (again.published, again.present, again.deleted),
+        (0, 7, 0),
+        "{again:?}"
+    );
+    assert_eq!(dump(&rig), settled);
+
+    // The reference count is intact: the extent goes when its last
+    // reference does, not before.
+    delete(&rig, &signer, "dst").await.expect(204);
+    assert_eq!(rig.count("gc"), 0);
+    assert_eq!(
+        get(&rig, &signer, "dst-2").await.expect(200).body,
+        b"payload"
+    );
+    delete(&rig, &signer, "dst-2").await.expect(204);
+    assert_eq!(rig.count("gc"), 3);
+}
+
+/// A copy's record describes its extents in full: it rebuilds the copy
+/// when the source's record is gone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_is_rebuilt_without_the_record_of_its_source() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    let (source, _) = rig.live(&bucket, "src").await.unwrap();
+    tick(&rig);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    let live_before = rig.live(&bucket, "dst").await.unwrap();
+    rig.bridge
+        .safety
+        .delete(&recovery::generation_key(&source.id))
+        .await
+        .unwrap();
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (1, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "src").await.expect(404);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    let (generation, extents) = rig.live(&bucket, "dst").await.unwrap();
+    assert_eq!(generation, live_before.0);
+    assert_eq!(extents[0].id, live_before.1[0].id);
+    assert_eq!(count(&rig, LIVE_POSTING), 1);
+}
+
+/// A replay over an export taken before the copy adds the copy to the
+/// extents the catalogue already holds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_made_after_the_export_is_replayed_onto_it() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    tick(&rig);
+    export(&rig);
+    let since = rig.now();
+    tick(&rig);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "src").await.expect(204);
+
+    wipe(&rig);
+    import(&rig);
+    let (report, _) = replay(&rig, since, ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (1, 1), "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (1, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    get(&rig, &signer, "src").await.expect(404);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(rig.count("extents"), 1);
+    assert_eq!(rig.count("gc"), 0);
+    assert_eq!(count(&rig, LIVE_POSTING), 1);
+}
+
+/// The record that retires the source can sort before the copy's: the
+/// writer of the newer source had a clock that was behind. The replay
+/// retires the source first and still publishes the copy over its
+/// extent, back in service and back in the pipeline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let start = rig.now();
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(60);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    // Overwritten later, by an isolate whose clock says it is earlier.
+    rig.bridge.clock.set(UnixMs(start.0 + 1000));
+    rig.put(&signer, BUCKET, "src", b"newer").await.expect(200);
+    rig.bridge.clock.advance_secs(120);
+    assert_eq!(rig.count("gc"), 0);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (3, 3), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+    assert_eq!(report.damaged_total, 0);
+
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "src").await.expect(200).body, b"newer");
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(count(&rig, LIVE_POSTING), 2);
+
+    // The rows queued when the source was retired are still open. The
+    // collector refuses each of them while the copy is live.
+    assert_eq!(count(&rig, LIVE_IN_GC), 3);
+    rig.bridge.clock.advance_secs(8 * 86_400);
+    let due = rig
+        .bridge
+        .catalog
+        .gc_due(rig.now(), 100, false)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 3);
+    for row in &due {
+        assert_eq!(
+            rig.bridge.catalog.gc_begin(row, rig.now()).await.unwrap(),
+            GcStep::Skipped
+        );
+    }
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+}
+
+/// A copy onto an existing key is the newest generation of that key by
+/// id, also when the copying isolate's clock is behind the one that wrote
+/// the destination. A replay therefore ends with the copy, not with the
+/// object it replaced.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_stays_over_the_object_it_replaced() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let start = rig.now();
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(60);
+    rig.put(&signer, BUCKET, "dst", b"replaced")
+        .await
+        .expect(200);
+    let (replaced, _) = rig.live(&bucket, "dst").await.unwrap();
+    rig.bridge.clock.set(UnixMs(start.0 + 1000));
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    let (copied, _) = rig.live(&bucket, "dst").await.unwrap();
+    assert!(copied.id > replaced.id, "{copied:?} {replaced:?}");
+    rig.bridge.clock.advance_secs(120);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (3, 3), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(rig.live(&bucket, "dst").await.unwrap().0, copied);
+}
+
 /// A record older than a live generation of its key is not published
 /// over it when the older generation is unknown to the catalogue.
 #[tokio::test(flavor = "current_thread")]
@@ -568,7 +846,9 @@ async fn an_older_record_never_replaces_a_newer_object() {
     rig.put(&signer2, BUCKET, "k", b"new").await.expect(200);
     sql(
         &rig,
-        "DELETE FROM outbox; DELETE FROM gc; DELETE FROM extents WHERE generation_id IN \
+        "DELETE FROM outbox; DELETE FROM gc; DELETE FROM generation_extents WHERE generation_id IN \
+               (SELECT id FROM generations WHERE state <> 'live'); \
+               DELETE FROM extents WHERE generation_id IN \
                (SELECT id FROM generations WHERE state <> 'live'); \
                DELETE FROM generations WHERE state <> 'live';",
     );
@@ -1017,4 +1297,150 @@ async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
     });
     assert_eq!(collected, 0);
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// Random histories inside one millisecond replay to the same answers
+// ---------------------------------------------------------------------------
+
+/// splitmix64: the histories below are the same on every run.
+struct Dice(u64);
+
+impl Dice {
+    fn roll(&mut self, sides: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % sides
+    }
+}
+
+const DICE_KEYS: [&str; 4] = ["k0", "k1", "k2", "k3"];
+
+/// One random write: a PUT, a copy (onto another key, or onto itself
+/// with new metadata), a delete or a one-part multipart upload. The
+/// clock mostly stands still, so ids are minted in one millisecond;
+/// now and then it moves a little, also backwards (an isolate whose
+/// clock is behind).
+async fn random_write(
+    rig: &Rig,
+    signer: &Signer,
+    dice: &mut Dice,
+    n: usize,
+    log: &mut Vec<String>,
+) {
+    match dice.roll(8) {
+        0 => rig.bridge.clock.advance_ms(1),
+        1 => rig.bridge.clock.advance_ms(-2),
+        _ => {}
+    }
+    let key = DICE_KEYS[dice.roll(4) as usize];
+    let body = format!("body {n}");
+    let status = match dice.roll(6) {
+        0 | 1 => {
+            log.push(format!("put {key}"));
+            rig.put(signer, BUCKET, key, body.as_bytes()).await.status
+        }
+        2 => {
+            let from = DICE_KEYS[dice.roll(4) as usize];
+            log.push(format!("copy {from} -> {key}"));
+            let source = format!("/{BUCKET}/{from}");
+            let tag = n.to_string();
+            let mut headers = vec![("x-amz-copy-source", source.as_str())];
+            if from == key || dice.roll(2) == 0 {
+                headers.push(("x-amz-metadata-directive", "REPLACE"));
+                headers.push(("x-amz-meta-n", tag.as_str()));
+            }
+            rig.call(signer, Method::Put, &path(BUCKET, key), &[], &headers, b"")
+                .await
+                .status
+        }
+        3 | 4 => {
+            log.push(format!("delete {key}"));
+            delete(rig, signer, key).await.status
+        }
+        _ => {
+            log.push(format!("complete {key}"));
+            let id = create_upload(rig, signer, key).await;
+            let etag = upload_part(rig, signer, key, &id, 1, body.as_bytes()).await;
+            complete(rig, signer, key, &id, &[etag]).await.status
+        }
+    };
+    // A copy of a key that is not there answers 404; nothing else fails.
+    assert!(matches!(status, 200 | 204 | 404), "{status}: {log:?}");
+}
+
+/// What a client sees of every key.
+async fn answers(
+    rig: &Rig,
+    signer: &Signer,
+) -> Vec<(u16, Vec<u8>, Option<String>, Option<String>)> {
+    let mut all = Vec::new();
+    for key in DICE_KEYS {
+        let got = get(rig, signer, key).await;
+        let live = got.status == 200;
+        all.push((
+            got.status,
+            if live { got.body.clone() } else { Vec::new() },
+            got.header("x-amz-meta-n")
+                .filter(|_| live)
+                .map(str::to_owned),
+            got.header("etag").filter(|_| live).map(str::to_owned),
+        ));
+    }
+    all
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
+    for seed in 0..150u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        for n in 0..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        let signer = reissue_key(&rig).await;
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_across_an_export_replay_to_the_same_answers() {
+    for seed in 1000..1300u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        let cut = 5 + dice.roll(30) as usize;
+        for n in 0..cut {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        export(&rig);
+        // The restore point lies before the export by more than any
+        // clock in the history runs behind.
+        let since = rig.now().plus_ms(-1000);
+        log.push("export".into());
+        for n in cut..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        import(&rig);
+        let (report, _) = replay(&rig, since, ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
 }

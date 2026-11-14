@@ -1,8 +1,9 @@
 //! Catalogue recovery records (DESIGN §A.8).
 //!
 //! The catalogue database can be lost or rolled back. Every acknowledged
-//! PutObject, CompleteMultipartUpload and DeleteObject is therefore also
-//! written to `SAFETY`, sealed, **before** its catalogue batch runs:
+//! PutObject, CopyObject, CompleteMultipartUpload and DeleteObject is
+//! therefore also written to `SAFETY`, sealed, **before** its catalogue
+//! batch runs:
 //!
 //! | Blob key | Record | Written |
 //! |---|---|---|
@@ -115,6 +116,24 @@ pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> Generati
 /// it. The one delete of a record there is (see the module doc).
 pub async fn discard_generation<B: BlobStore>(safety: &B, id: &GenerationId) -> Result<()> {
     safety.delete(&generation_key(id)).await
+}
+
+/// The id of a copy of `source` onto a key whose newest id (its live
+/// generation or its last tombstone) is `newest`. It always sorts after
+/// both, also when this isolate's clock is behind the ones that minted
+/// them: a replay then applies the source first and never puts what the
+/// copy replaced back over it.
+pub fn copy_id(
+    now: UnixMs,
+    source: &GenerationId,
+    newest: Option<&GenerationId>,
+    rand: [u8; 8],
+) -> GenerationId {
+    let floor = match newest {
+        Some(n) if n > source => n,
+        _ => source,
+    };
+    id_after(now, Some(floor), rand)
 }
 
 // ---------------------------------------------------------------------------
