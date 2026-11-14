@@ -1554,7 +1554,7 @@ async fn the_migration_applies_to_a_catalogue_with_extents() {
             .unwrap();
         }
     });
-    db.apply(MIGRATION_0005).unwrap();
+    db.apply(MIGRATION_0004).unwrap();
 
     let new_columns: Vec<(i64, i64, Option<i64>, i64)> = db.with_conn(|c| {
         let mut stmt = c
