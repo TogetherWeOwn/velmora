@@ -54,7 +54,9 @@ Limits to know:
     migration `0007_key_floors.sql` was applied: the catalogue has no
     mark for it, a DeleteObject that finds nothing live records
     nothing, and a replay publishes the record. A PutObject followed by
-    a DeleteObject of the key, made now, covers it.
+    a DeleteObject of the key, made now, covers it, provided the clock
+    has not moved back since the failed write: without a mark, the
+    order of the new ids against the record's rests on the clock alone.
 - Replay order is id order. Before a record is stored, the catalogue
   raises the floor of the key to the record's id, in a statement of its
   own, and it accepts a publication or a tombstone only if its id sorts

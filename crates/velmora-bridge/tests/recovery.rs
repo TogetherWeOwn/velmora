@@ -1188,7 +1188,10 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     tick(&rig);
     rig.put(&signer, BUCKET, "k", b"again").await.expect(200);
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert_eq!(report.damaged_unpublished, lost[..1], "only `j` is left");
+    // The two failed writes can share a millisecond, so the order of
+    // their ids says nothing about which key each one is on.
+    let on = |key: &str| lost.iter().find(|r| r.key == key).cloned().unwrap();
+    assert_eq!(report.damaged_unpublished, [on("j")], "only `j` is left");
     wipe(&rig);
     let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
     report.damaged_unpublished.sort();
@@ -1196,7 +1199,7 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     let signer = reissue_key(&rig).await;
     assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"again");
     let (again, _) = rig.live(&bucket, "k").await.unwrap();
-    assert!(again.id.as_str() > lost[1].id.as_str());
+    assert!(again.id.as_str() > on("k").id.as_str());
     tick(&rig);
     delete(&rig, &signer, "k").await.expect(204);
     let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
