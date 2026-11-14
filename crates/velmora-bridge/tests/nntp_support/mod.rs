@@ -761,6 +761,9 @@ impl Catalog for MemCatalog {
     async fn redrive_underverified(&self, _: &[String], _: u32, _: u32, _: UnixMs) -> Result<u64> {
         unused()
     }
+    async fn revive_referenced(&self, _: u32, _: UnixMs) -> Result<u64> {
+        unused()
+    }
     async fn due(&self, _: UnixMs, _: u32) -> Result<Vec<DueRow>> {
         unused()
     }
