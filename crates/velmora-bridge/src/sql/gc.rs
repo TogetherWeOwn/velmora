@@ -1,9 +1,15 @@
 //! Garbage-collection rows (catalogue lane B).
 //!
 //! GC rows are only ever queued for extents that left service: a replaced,
-//! unlisted or aborted upload part, or an extent of a retired generation.
-//! `gc_begin` still re-checks that at execution time and refuses to act on
-//! an extent a live generation or an open upload references.
+//! unlisted or aborted upload part, or an extent of a retired generation
+//! that no other live generation references. `gc_begin` still re-checks
+//! that at execution time and refuses to act on an extent any live
+//! generation or an open upload references. An extent that left service
+//! cannot come back while requests and jobs run: a copy is only published
+//! from a generation that is live in the same batch. A restore replay can
+//! bring one back (a copy's record sorts after the record that retired
+//! its source); nothing collects while a restore runs, and afterwards the
+//! re-check here refuses the rows the replay left open.
 
 use super::uploads::{guarded, ms, text, Cols, Stmt};
 use super::SqlCatalog;
@@ -14,13 +20,18 @@ use crate::types::{BlobStoreKind, ExtentId, GcAction, GcRow, GcStep, Result, Uni
 /// newer work out of the bounded `gc_due` window.
 const SKIP_RETRY_MS: i64 = 60 * 60 * 1000;
 
-/// True while the extent `?1` must not be touched.
+/// True while the extent `?1` must not be touched: a live generation
+/// references it (its own, or a copy), or an open upload does.
 macro_rules! in_use {
     () => {
-        "(EXISTS (SELECT 1 FROM extents e JOIN generations g ON g.id = e.generation_id \
-                  WHERE e.id = ?1 AND g.state = 'live') \
-          OR EXISTS (SELECT 1 FROM upload_parts p JOIN uploads u ON u.id = p.upload_id \
-                     WHERE p.extent_id = ?1 AND u.state = 'open'))"
+        concat!(
+            "(EXISTS (SELECT 1 FROM extents e JOIN generations g ON g.id = e.generation_id \
+                      WHERE e.id = ?1 AND g.state = 'live') OR ",
+            live_ref!("?1"),
+            " OR ",
+            part_ref!("?1"),
+            ")"
+        )
     };
 }
 
@@ -98,10 +109,28 @@ pub(super) async fn gc_begin<S: Sql>(
                     &ident(),
                 )
                 .await?;
-            match rows.into_iter().next() {
+            let free = match rows.into_iter().next() {
                 Some(r) => Cols::new(r).num::<i64>()? != 0,
                 None => false,
+            };
+            if free && row.action == GcAction::DeleteCache {
+                // The cache fill stops being counted before its blob is
+                // deleted, never after: a cold read that fills the cache
+                // while this delete runs records its copy after this
+                // statement, so the copy stays counted. It is this order
+                // that protects the fill, not the sequence. (A count left
+                // for a blob that the delete then removed is corrected by
+                // the next eviction.) The sequence is bumped only so that
+                // every change to the counts ends outstanding listings.
+                c.sql
+                    .exec(
+                        "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
+                         WHERE id = ?1 AND hot_cache_bytes > 0",
+                        &[text(row.extent_id.as_str())],
+                    )
+                    .await?;
             }
+            free
         }
         GcAction::ShredKey | GcAction::DropArticlesMeta => {
             let apply = if row.action == GcAction::ShredKey {
@@ -151,12 +180,15 @@ pub(super) async fn gc_begin<S: Sql>(
 }
 
 /// Closes a blob row after its delete; a safety delete also records that
-/// the extent no longer has a safety copy.
+/// the extent no longer has a safety copy and ends the hot-tier count of
+/// it. (The count of a cache fill ended in `gc_begin`, before the delete.)
 pub(super) async fn gc_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
     c.sql
         .batch(vec![
             (
-                "UPDATE extents SET safety_state = 'deleted' WHERE id = (SELECT extent_id FROM gc \
+                "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
+                   evict_seq = evict_seq + 1 \
+                 WHERE id = (SELECT extent_id FROM gc \
                  WHERE id = ?1 AND action = 'delete_safety' AND done_at IS NULL)",
                 vec![SqlValue::Int(id)],
             ),

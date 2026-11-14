@@ -15,6 +15,7 @@ use velmora::rng::SystemRng;
 use velmora_bridge::config::{BridgeConfig, Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{wrap_bdk, wrap_secret, DataKey};
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
@@ -99,6 +100,24 @@ pub struct Blobs {
     pub fail_put: Cell<bool>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
+    /// This many deletes of a recovery record fail.
+    pub fail_record_deletes: Cell<u32>,
+    /// Deleting this key fails.
+    pub fail_delete: RefCell<Option<String>>,
+    /// Called once, with the key, at the start of the next delete.
+    pub before_delete: Hook,
+    /// Called once, with the key, at the start of the next put.
+    pub before_put: Hook,
+}
+
+/// Something that happens in the middle of an operation on a store.
+pub type Hook = RefCell<Option<Box<dyn FnOnce(&str)>>>;
+
+fn fire(hook: &Hook, key: &str) {
+    let hook = hook.borrow_mut().take();
+    if let Some(hook) = hook {
+        hook(key);
+    }
 }
 
 impl std::ops::Deref for Blobs {
@@ -110,6 +129,7 @@ impl std::ops::Deref for Blobs {
 
 impl BlobStore for Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        fire(&self.before_put, key);
         let refused = self
             .fail_put_prefix
             .borrow()
@@ -127,7 +147,19 @@ impl BlobStore for Blobs {
         self.inner.head(key).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
+        fire(&self.before_delete, key);
+        if self.fail_delete.borrow().as_deref() == Some(key) {
+            return Err(BridgeError::Blob("store down".into()));
+        }
         self.inner.delete(key).await
+    }
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        let left = self.fail_record_deletes.get();
+        if left > 0 {
+            self.fail_record_deletes.set(left - 1);
+            return Err(BridgeError::Blob("store down".into()));
+        }
+        self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
         self.inner.list(prefix, start_after, limit).await
@@ -138,6 +170,36 @@ impl BlobStore for Blobs {
 pub struct FailSql {
     pub inner: RusqliteSql,
     pub fail_writes: Cell<bool>,
+    /// Fails the next batch that publishes a generation, once.
+    pub fail_publish: Cell<Option<PublishFault>>,
+    fail_next_batch: Cell<bool>,
+    /// Fails every statement (read or write) whose text contains the
+    /// string, after letting the given number of them through.
+    pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+}
+
+/// How a publication batch fails: D1 may answer with an error before it
+/// wrote anything, or after it committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishFault {
+    NotApplied,
+    Applied,
+    /// Not applied, and the batch after it fails as well.
+    Down,
+}
+
+impl FailSql {
+    fn refused(&self, sql: &str) -> bool {
+        let mut rule = self.fail_matching.borrow_mut();
+        match rule.as_mut() {
+            Some((text, pass)) if sql.contains(*text) => {
+                let refuse = *pass == 0;
+                *pass = pass.saturating_sub(1);
+                refuse
+            }
+            _ => false,
+        }
+    }
 }
 
 impl std::ops::Deref for FailSql {
@@ -149,10 +211,13 @@ impl std::ops::Deref for FailSql {
 
 impl Sql for FailSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        if self.refused(sql) {
+            return Err(BridgeError::Sql("database down".into()));
+        }
         self.inner.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        if self.fail_writes.get() {
+        if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
         self.inner.exec(sql, params).await
@@ -160,6 +225,28 @@ impl Sql for FailSql {
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if self.fail_writes.get() {
             return Err(BridgeError::Sql("database down".into()));
+        }
+        if self.fail_next_batch.take() {
+            return Err(BridgeError::Sql("no answer".into()));
+        }
+        let publishes = stmts
+            .iter()
+            .any(|(sql, _)| sql.starts_with("INSERT INTO generations"));
+        if publishes {
+            match self.fail_publish.take() {
+                Some(PublishFault::NotApplied) => {
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Down) => {
+                    self.fail_next_batch.set(true);
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Applied) => {
+                    self.inner.batch(stmts).await?;
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                None => {}
+            }
         }
         self.inner.batch(stmts).await
     }
@@ -182,7 +269,9 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
+        hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
+        server_side_copy: true,
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
@@ -213,6 +302,9 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
             catalog: SqlCatalog::new(FailSql {
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
+                fail_publish: Cell::new(None),
+                fail_next_batch: Cell::new(false),
+                fail_matching: RefCell::new(None),
             }),
             safety: Blobs::default(),
             cache: Blobs::default(),

@@ -7,8 +7,10 @@
 //! `uploads.revision`, so `revision = R` pins the exact part set a Complete
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
+use super::objects::{clear_tombstone, guard_newest};
 use super::SqlCatalog;
-use crate::ports::{Guard, Row, Sql, SqlValue, UploadTarget};
+use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
+use crate::recovery::Recorded;
 use crate::types::{
     BridgeError, BucketId, CompleteUpload, ExtentId, ExtentRow, ExtentState, GenerationId,
     GenerationState, Result, UnixMs, UploadId, UploadPartRow, UploadRow, UploadState,
@@ -112,6 +114,28 @@ pub(super) async fn guarded<S: Sql>(c: &SqlCatalog<S>, stmts: Vec<Stmt>) -> Resu
     match c.sql.batch(stmts).await {
         Ok(_) => Ok(Guard::Applied(())),
         Err(BridgeError::GuardFailed) => Ok(Guard::Lost),
+        Err(e) => Err(e),
+    }
+}
+
+/// Runs the batch that publishes the generation `id`. It runs only
+/// against the proof of that generation's recovery record, and turns the
+/// proof into the one that deletes only when the guard failed and
+/// nothing was written.
+pub(super) async fn published<S: Sql>(
+    c: &SqlCatalog<S>,
+    stmts: Vec<Stmt>,
+    id: &GenerationId,
+    record: Recorded,
+) -> Result<PublishOutcome> {
+    if record.generation() != id {
+        return Err(BridgeError::Invalid(
+            "the recovery record is of another generation",
+        ));
+    }
+    match c.sql.batch(stmts).await {
+        Ok(_) => Ok(PublishOutcome::Applied),
+        Err(BridgeError::GuardFailed) => Ok(PublishOutcome::Refused(record.refused())),
         Err(e) => Err(e),
     }
 }
@@ -352,7 +376,8 @@ pub(super) async fn complete_upload<S: Sql>(
     revision: u64,
     digest: &[u8; 32],
     commit: &CompleteUpload,
-) -> Result<Guard<()>> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &commit.generation;
     let now = commit.now;
     let in_order = commit
@@ -375,7 +400,7 @@ pub(super) async fn complete_upload<S: Sql>(
     let gen_id = || text(g.id.as_str());
     let key = || vec![text(t.bucket.as_str()), text(t.key)];
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(11 + commit.placements.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(13 + commit.placements.len());
     let mut guard = target(t);
     guard.push(int(revision)?);
     stmts.push((
@@ -383,6 +408,8 @@ pub(super) async fn complete_upload<S: Sql>(
          WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
         guard,
     ));
+    stmts.push(guard_newest(t.bucket, t.key, &g.id));
+    stmts.push(clear_tombstone(t.bucket, t.key, &g.id));
     stmts.push((
         "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
            content_json, user_meta_json, extent_count, created_at, retired_at) \
@@ -416,9 +443,17 @@ pub(super) async fn complete_upload<S: Sql>(
             ],
         ));
     }
+    // The references reads go through. `OR IGNORE`: the migration's
+    // trigger records the same rows for the adoptions above.
+    stmts.push((
+        "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+         SELECT generation_id, seq, id, plain_offset FROM extents WHERE generation_id = ?1",
+        vec![gen_id()],
+    ));
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-           (SELECT COUNT(*) FROM extents WHERE generation_id = ?1) <> ?2 \
+           (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
+           OR (SELECT COUNT(*) FROM extents WHERE generation_id = ?1) <> ?2 \
            OR (SELECT COALESCE(SUM(plain_size), 0) FROM extents WHERE generation_id = ?1) <> ?3 \
            OR EXISTS (SELECT 1 FROM (SELECT plain_offset, SUM(plain_size) OVER (ORDER BY seq \
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
@@ -438,30 +473,11 @@ pub(super) async fn complete_upload<S: Sql>(
     // After adoption: whatever is still staged was not listed.
     stmts.push(gc_staged_parts(t.id, None, now));
     // Retire the generation the live pointer names, before moving it.
-    let mut retire_gc = key();
-    retire_gc.extend([ms(now), ms(now.plus_ms(SHRED_GRACE_MS))]);
-    stmts.push((
-        "INSERT INTO gc(extent_id, action, due_at) \
-         SELECT e.id, a.action, a.due_at FROM objects o \
-         JOIN extents e ON e.generation_id = o.generation_id \
-         JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
-               UNION ALL SELECT 'delete_safety', ?3 \
-               UNION ALL SELECT 'shred_key', ?4) a \
-         WHERE o.bucket_id = ?1 AND o.key = ?2",
-        retire_gc,
-    ));
-    let mut retire = key();
-    retire.push(ms(now));
-    stmts.push((
-        "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
-         WHERE stage NOT IN ('done', 'cancelled') AND generation_id = \
-           (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
-        retire.clone(),
-    ));
-    stmts.push((
-        "UPDATE generations SET state = 'superseded', retired_at = ?3 WHERE id = \
-           (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
-        retire,
+    stmts.extend(super::objects::retire_live(
+        t.bucket,
+        t.key,
+        GenerationState::Superseded,
+        now,
     ));
     let mut pointer = key();
     pointer.push(gen_id());
@@ -483,5 +499,39 @@ pub(super) async fn complete_upload<S: Sql>(
          WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
         receipt,
     ));
-    guarded(c, stmts).await
+    if record.generation() != &g.id {
+        return Err(BridgeError::Invalid(
+            "the recovery record is of another generation",
+        ));
+    }
+    let failed = match c.sql.batch(stmts).await {
+        Ok(_) => return Ok(PublishOutcome::Applied),
+        Err(BridgeError::GuardFailed) => return Ok(PublishOutcome::Refused(record.refused())),
+        Err(e) => e,
+    };
+    // The outcome is unknown: the batch may have applied, or may still.
+    // Moving the upload to its next revision settles it. If that applies,
+    // the upload was still open at `revision`, so the batch had not
+    // applied, and its own guard on `revision` fails from here on. Then
+    // nothing is published under this id, and its record may go, so
+    // that a replay cannot publish an upload the client aborts later.
+    let mut open_at = target(t);
+    open_at.push(int(revision)?);
+    let fence = vec![
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
+             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
+            open_at.clone(),
+        ),
+        (
+            "UPDATE uploads SET revision = revision + 1 \
+             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
+            open_at,
+        ),
+    ];
+    match c.sql.batch(fence).await {
+        Ok(_) => Ok(PublishOutcome::Fenced(record.refused())),
+        // Still unknown, or it had applied: the record stays.
+        Err(_) => Err(failed),
+    }
 }

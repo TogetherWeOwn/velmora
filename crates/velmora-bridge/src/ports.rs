@@ -10,14 +10,15 @@
 
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
+use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayProbe};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
-    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId,
-    UploadPartRow, UploadRow, VerificationRow,
+    CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
+    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, Job, JobExtent, KekBytes,
+    ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig,
+    ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow, UploadRow, VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,8 +87,14 @@ pub trait BlobStore {
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
-    /// Idempotent.
+    /// Idempotent. Refuses a recovery record (any key under `m/`) with
+    /// [`crate::recovery::ERR_RECORD_DELETE`] before the store is asked:
+    /// no caller can remove one through this method.
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Removes the record of a generation that the catalogue refused to
+    /// publish. The only delete of a key under `m/`; the argument exists
+    /// only for a record this request wrote and did not publish.
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()>;
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
@@ -206,6 +213,20 @@ pub enum Guard<T> {
     Lost,
 }
 
+/// Outcome of a publication batch. The batch takes the proof of the
+/// generation's recovery record and turns it into an [`Unpublished`] only
+/// when it wrote nothing, so only then can the record be discarded.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Applied,
+    /// The guard failed; the batch wrote nothing.
+    Refused(Unpublished),
+    /// CompleteMultipartUpload only. The batch failed with an unknown
+    /// outcome and the upload was then moved to its next revision: the
+    /// batch had not applied, and its guard can never pass again.
+    Fenced(Unpublished),
+}
+
 // Fenced methods return Ok(false) (or None) when the lease token no longer
 // matches: the caller stops and acks.
 
@@ -227,9 +248,24 @@ pub trait Catalog {
         bucket: &BucketId,
         key: &str,
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>>;
-    /// Single PUT; one batch (DESIGN §A.3 step 6).
-    async fn commit_generation(&self, c: &CommitGeneration) -> Result<()>;
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
+    /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
+    /// live generation or its last tombstone carries a newer id; nothing
+    /// was written. The caller takes a newer id and tries again.
+    async fn commit_generation(
+        &self,
+        c: &CommitGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
+    /// The newest id on `(bucket, key)`: its live generation or its last
+    /// tombstone. A publication must sort after it.
+    async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;
+    /// Publishes a generation that references the extents of the source
+    /// generation; no extent is written. `Refused` = the source is no
+    /// longer the live object of its key, or the destination key's live
+    /// generation or last tombstone carries a newer id; nothing was
+    /// published.
+    async fn copy_generation(&self, c: &CopyGeneration, record: Recorded)
+        -> Result<PublishOutcome>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
     /// tombstone written for this delete. `false` = nothing was live, or
@@ -272,7 +308,8 @@ pub trait Catalog {
         revision: u64,
         digest: &[u8; 32],
         c: &CompleteUpload,
-    ) -> Result<Guard<()>>;
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
     /// The extent rows of the upload's current parts, in no order.
     async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>>;
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>>;
@@ -301,7 +338,9 @@ pub trait Catalog {
     async fn set_cursor(&self, l: &Lease, cursor: u32, now: UnixMs) -> Result<bool>;
     /// No permit: frees the lease without consuming an attempt.
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool>;
-    /// Extent + bucket + generation state.
+    /// Extent + bucket + generation state: `live` while any live
+    /// generation references the extent, else the state of the generation
+    /// it was written for.
     async fn job_extent(
         &self,
         extent: &ExtentId,
@@ -338,8 +377,8 @@ pub trait Catalog {
 
     // gc
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>>;
-    /// Re-checks that no live generation uses the extent; applies
-    /// catalogue-only actions.
+    /// Re-checks that no live generation and no open upload references
+    /// the extent; applies catalogue-only actions.
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep>;
     /// After the blob delete that `GcStep::DeleteBlob` asked for.
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()>;
@@ -356,6 +395,18 @@ pub trait Catalog {
         extents: &[ReplayExtent],
         now: UnixMs,
     ) -> Result<()>;
+    /// Extents whose row says the pinned copy is held, in id order after
+    /// `after`.
+    async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>>;
+    /// A replay starts: writes are refused until [`Self::restore_finish`].
+    /// Returns the mark of this replay: later than that of every replay
+    /// before it.
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs>;
+    /// The replay with the mark `run` ran to its end. `false` = another
+    /// replay was started since; that one is not ended by this.
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool>;
+    /// Whether a replay was started and has not ended.
+    async fn restore_pending(&self) -> Result<bool>;
     /// Live generations with an extent that has neither a pinned copy
     /// nor an article plan: their number and the first `limit` ids.
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;
@@ -391,7 +442,7 @@ pub trait Catalog {
     /// One good session: clears failures and the cooldown history, unless
     /// the provider is cooling now.
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;
-    /// Sends live `done` extents back to verify: safety copy still
+    /// Sends `done` extents of live generations back to verify: safety copy still
     /// `held`, fewer than `required` of `backbones` counting. One call
     /// looks at the next `limit` held extents, in a rotation over all of
     /// them. Returns how many moved.
@@ -402,6 +453,61 @@ pub trait Catalog {
         limit: u32,
         now: UnixMs,
     ) -> Result<u64>;
+
+    // hot tier
+    /// Pinned and evictable byte totals (`GET /_admin/status`).
+    async fn hot_stats(&self) -> Result<HotStats>;
+    /// Bytes R2 holds that may be evicted: released safety copies and
+    /// cache fills. One index scan over the evictable extents.
+    async fn evictable_bytes(&self) -> Result<u64>;
+    /// Extents with evictable bytes, least recently read first.
+    async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
+    /// Starts an eviction in one statement that re-checks the extent:
+    /// `true` only if it is exactly as listed (sequence, byte counts,
+    /// pinned or not). With `x.pinned` only the cache fill is claimed.
+    async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Ends an eviction after the blob deletes. `false` when a hot copy
+    /// was recorded since `begin_evict`; the counts then stand.
+    async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Counts the extent's cache fill and stamps the read. Called before
+    /// and after the cache write.
+    async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
+    /// Stamps a read unless the last stamp is younger than `min_gap_ms`.
+    /// `from_cache`: the read was served from the cache fill, which is
+    /// counted by the same write if it was not.
+    /// Returns the stamp the extent has afterwards.
+    async fn touch_read(
+        &self,
+        extent: &ExtentId,
+        now: UnixMs,
+        min_gap_ms: i64,
+        from_cache: bool,
+    ) -> Result<UnixMs>;
+    /// Whether no evictable total was recorded in the last `every_ms`.
+    async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool>;
+    /// Records that the dispatcher took the evictable total at `now`.
+    async fn hot_checked(&self, now: UnixMs) -> Result<()>;
+    /// Records what a drain step leaves for the next one, before the
+    /// step sends that job.
+    async fn hot_drain_set(&self, left: u64) -> Result<()>;
+    /// Takes up a drain where the last step left it: `true` once per
+    /// `hot_drain_set(left)`. A duplicate of the job, or one from a drain
+    /// that another has replaced, gets `false` and must do nothing.
+    async fn hot_drain_claim(&self, left: u64) -> Result<bool>;
+    /// The extent's eviction fencing token now. Read it before deleting
+    /// blobs outside an eviction (admin evict) and pass it to `hot_forget`.
+    async fn hot_seq(&self, extent: &ExtentId) -> Result<u64>;
+    /// After blob deletes outside an eviction: stops counting the named
+    /// copies, unless a hot copy was recorded or an eviction ran since
+    /// `seq` was read (`false`; the counts stand, since the copy they
+    /// count may exist).
+    async fn hot_forget(
+        &self,
+        extent: &ExtentId,
+        seq: u64,
+        safety: bool,
+        cache: bool,
+    ) -> Result<bool>;
 }
 
 // ---------------------------------------------------------------------------

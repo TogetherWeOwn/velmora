@@ -34,7 +34,8 @@ use std::rc::Rc;
 use sha2::{Digest, Sha256};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{
-    parse_complete, CommitResult, MultipartChecksum, PartEvidence, UploadMetadata,
+    copy_part_response, parse_complete, CommitResult, MultipartChecksum, PartEvidence,
+    UploadMetadata,
 };
 use velmora_s3_proto::{
     verify, Authority, ChecksumAlgorithm, Credential, ErrorCode, Headers, Limits, Policy, Target,
@@ -44,16 +45,20 @@ use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
 use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
-use crate::ingress::{read_upload, upload_lengths, IngressError, UploadReadError};
-use crate::ports::{
-    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
+use crate::ingress::{
+    body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
+    UploadReadError,
 };
-use crate::recovery::{generation_key, write_generation};
+use crate::ports::{
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
+    PublishOutcome, UploadTarget,
+};
+use crate::recovery::{id_after, write_generation};
+use crate::service::common::discard_refused;
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationId, GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState,
-    JOB_VERSION,
+    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
+    S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, JOB_VERSION,
 };
 
 /// Smallest non-final part.
@@ -87,11 +92,19 @@ enum Fail {
     Ingress(IngressError),
     /// Catalogue, blob, crypto or RNG failure: `500 InternalError`.
     Internal,
+    /// An answer a shared helper already rendered.
+    Response(S3Response),
 }
 
 impl From<ErrorCode> for Fail {
     fn from(e: ErrorCode) -> Self {
         Fail::S3(e)
+    }
+}
+
+impl From<S3Response> for Fail {
+    fn from(resp: S3Response) -> Self {
+        Fail::Response(resp)
     }
 }
 
@@ -175,6 +188,7 @@ impl Fail {
             Fail::S3(code) => s3_error(code),
             Fail::Ingress(e) => e.response(),
             Fail::Internal => s3_error(ErrorCode::InternalError),
+            Fail::Response(resp) => resp,
         }
     }
 }
@@ -413,6 +427,10 @@ where
     )?;
     // `authorize` passed, so the bucket exists and the grant is `rw`.
     let bucket = bucket.ok_or(ErrorCode::AccessDenied)?;
+    // A replay that was started and did not end: see `restore_gate`.
+    if bridge.catalog.restore_pending().await? {
+        return Err(ErrorCode::SlowDown.into());
+    }
     let key = target
         .key
         .clone()
@@ -611,11 +629,10 @@ where
 {
     let a = authenticate(bridge, &req).await?;
     refuse_conditional(&a.headers)?;
-    // UploadPartCopy is a different operation.
-    if a.headers.get("x-amz-copy-source").is_some()
-        || a.headers.get("x-amz-copy-source-range").is_some()
-    {
-        return Err(ErrorCode::NotImplemented.into());
+    // UploadPartCopy is this request with a source header and no body.
+    let copy = a.headers.get("x-amz-copy-source").is_some();
+    if !copy && a.headers.get("x-amz-copy-source-range").is_some() {
+        return Err(ErrorCode::InvalidRequest.into());
     }
     let number = part_number(&a.target)?;
     let id = upload_id(&a.target)?;
@@ -634,12 +651,17 @@ where
     // Plaintext and ciphertext live together while sealing: the charge
     // covers both and is held until the ciphertext has been handed over.
     // For aws-chunked bodies every length below is the decoded one.
-    let lengths = upload_lengths(&req.headers, bridge.cfg.max_extent_bytes)?;
-    let declared = lengths.decoded;
-    let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
-    let charge = bridge.budget.charge_body(declared).await?;
-    let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
-    validator.finish()?;
+    let (body, charge) = if copy {
+        copied_part(bridge, &a, &req.headers, req.body).await?
+    } else {
+        let lengths = upload_lengths(&req.headers, bridge.cfg.max_extent_bytes)?;
+        let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
+        let charge = bridge.budget.charge_body(lengths.decoded).await?;
+        let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
+        validator.finish()?;
+        (body, charge)
+    };
+    let declared = body.len() as u64;
 
     let bdk = unwrap_bdk(
         &bridge.kek,
@@ -704,6 +726,7 @@ where
         .put_upload_part(&target, &part, &extent, now)
         .await?
     {
+        Guard::Applied(()) if copy => Ok(from_proto(copy_part_response(&etag, now.0)?)),
         Guard::Applied(()) => Ok(S3Response {
             status: 200,
             headers: vec![("etag".into(), etag)],
@@ -717,6 +740,76 @@ where
             Err(ErrorCode::NoSuchUpload.into())
         }
     }
+}
+
+/// `x-amz-copy-source-range`: `bytes=first-last`, both ends given and
+/// inside an object of `size` bytes. Returns the start and the length.
+fn copy_range(value: &str, size: u64) -> Outcome<(u64, u64)> {
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    value
+        .strip_prefix("bytes=")
+        .and_then(|range| range.split_once('-'))
+        .and_then(|(first, last)| Some((number(first)?, number(last)?)))
+        .filter(|(first, last)| first <= last && *last < size)
+        .map(|(first, last)| (first, last - first + 1))
+        .ok_or_else(|| ErrorCode::InvalidArgument.into())
+}
+
+/// The bytes UploadPartCopy names: a range of a live object in the same
+/// bucket (see `copy.rs`), or all of it. They are read the way a GET
+/// reads them, authenticated extent by extent, and the caller seals them
+/// as a new extent of this upload. A part is one extent, so the range
+/// is capped like an uploaded part.
+///
+/// The source's extents are not referenced, whatever the range: a part
+/// row would then keep an extent of another object in service, which the
+/// part garbage collection does not account for.
+async fn copied_part<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    a: &Authed,
+    raw: &[(String, String)],
+    sent: crate::types::Body,
+) -> Outcome<(Vec<u8>, Charge)>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    // A copy has no body; one that was sent would be silently dropped.
+    // It can come without a declared length, so the stream is asked too.
+    if declared_length(raw)?.is_some_and(|len| len != 0) || !body_is_empty(sent).await {
+        return Err(ErrorCode::InvalidRequest.into());
+    }
+    // Nor bytes a checksum value could be checked against.
+    if ChecksumAlgorithm::ALL
+        .iter()
+        .any(|alg| a.headers.get(alg.header()).is_some())
+    {
+        return Err(ErrorCode::InvalidRequest.into());
+    }
+    let key = super::copy::source_key(&a.headers, &a.policy, &a.bucket)?;
+    let (source, extents) = super::copy::source_object(bridge, &a.headers, &a.bucket, &key).await?;
+    let (start, len) = match a.headers.get("x-amz-copy-source-range") {
+        Some(range) => copy_range(range, source.size)?,
+        None => (0, source.size),
+    };
+    if len > bridge.cfg.max_extent_bytes {
+        return Err(ErrorCode::EntityTooLarge.into());
+    }
+    // The read holds what it needs piece by piece and hands back the
+    // charge for the plaintext. Charging for the seal before the read
+    // would leave a full-size extent no room to be read in.
+    let (body, mut charge) = super::get::read_range(bridge, &a.bucket, extents, start, len).await?;
+    // Plaintext and ciphertext live together while sealing.
+    charge.absorb(bridge.budget.charge(len).await?);
+    Ok((body, charge))
 }
 
 // ---------------------------------------------------------------------------
@@ -882,8 +975,12 @@ where
         }
         let publication = plan(&listed, &parts)?;
         let now = bridge.clock.now();
+        // The id sorts after everything already on the key, so the order
+        // of ids on a key is the order of its commits; the batch checks
+        // it again, against whatever commits in between.
+        let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
         let generation = GenerationRow {
-            id: GenerationId::mint(now, random()?),
+            id: id_after(now, newest.as_ref(), random()?),
             bucket_id: a.bucket.id.clone(),
             key: a.key.clone(),
             state: GenerationState::Live,
@@ -928,7 +1025,7 @@ where
             lost_at = Some(upload.revision);
             continue;
         }
-        write_generation(
+        let record = write_generation(
             &bridge.safety,
             &bridge.kek,
             &a.bucket,
@@ -939,10 +1036,10 @@ where
         drop(extents);
         match bridge
             .catalog
-            .complete_upload(&target, upload.revision, &digest, &commit)
+            .complete_upload(&target, upload.revision, &digest, &commit, record)
             .await?
         {
-            Guard::Applied(()) => {
+            PublishOutcome::Applied => {
                 // The outbox rows are the durable obligation; a lost
                 // notification is picked up by the dispatcher.
                 for p in &commit.placements {
@@ -956,15 +1053,24 @@ where
                 }
                 return complete_response(&a, publication.etag, now.0);
             }
-            Guard::Lost => {
+            PublishOutcome::Refused(record) => {
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
                 // record left behind replays as a PUT that failed.
-                let _ = bridge
-                    .safety
-                    .delete(&generation_key(&commit.generation.id))
-                    .await;
-                lost_at = Some(upload.revision);
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                // Refused for the id (the key took a newer one since it
+                // was read) or for the upload. Only the second is judged
+                // by the revision on the next turn.
+                let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
+                let outrun = newest.is_some_and(|n| n >= commit.generation.id);
+                lost_at = (!outrun).then_some(upload.revision);
+            }
+            PublishOutcome::Fenced(record) => {
+                // The catalogue failed, then showed that nothing was
+                // published. Without its record this attempt cannot come
+                // back in a replay, also after the client aborts.
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                return Err(Fail::Internal);
             }
         }
     }

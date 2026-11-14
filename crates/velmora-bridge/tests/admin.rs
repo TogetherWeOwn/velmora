@@ -15,6 +15,7 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, unwrap_secret, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
+use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -140,7 +141,9 @@ impl Fx {
             kek_active: 1,
             inflight_budget_bytes: BUDGET,
             gc_mode: GcMode::Disposable,
+            hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
+            server_side_copy: false,
             dev_trust_http: false,
             providers,
             admin_token: Secret::new(TOKEN.to_string()),
@@ -330,7 +333,7 @@ impl Fx {
             .await
             .unwrap();
         b.catalog
-            .commit_generation(&CommitGeneration {
+            .publish(&CommitGeneration {
                 generation: generation.clone(),
                 extents: vec![extent],
                 now,

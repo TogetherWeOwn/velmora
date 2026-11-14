@@ -275,7 +275,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         if !post {
             return Err(wrong_method());
         }
-        mutable(bridge)?;
+        mutable(bridge).await?;
         let (bucket, key) = object_target(target)?;
         let include_safety = flag(&req.raw_target, "include_safety");
         return evict(bridge, bucket, &key, include_safety).await;
@@ -284,7 +284,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         if !post {
             return Err(wrong_method());
         }
-        mutable(bridge)?;
+        mutable(bridge).await?;
         let (bucket, key) = object_target(target)?;
         return drill(bridge, bucket, &key).await;
     }
@@ -292,7 +292,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     match rest {
         "/status" if get => status(bridge).await,
         "/buckets" if post => {
-            mutable(bridge)?;
+            mutable(bridge).await?;
             let body: CreateBucketBody = read_json(bridge, req).await?;
             let bucket = create_bucket(bridge, &body.name, body.disposable).await?;
             Ok(ok(&json!({
@@ -302,7 +302,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             })))
         }
         "/keys" if post => {
-            mutable(bridge)?;
+            mutable(bridge).await?;
             let body: CreateKeyBody = read_json(bridge, req).await?;
             create_key(bridge, &body).await
         }
@@ -323,18 +323,26 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     }
 }
 
-/// Refuses a mutation while the catalogue is being restored.
-fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+/// Refuses a mutation while the catalogue is being restored: under
+/// maintenance, and until a replay that was started has ended.
+async fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<()> {
-    match bridge.cfg.maintenance {
-        Maintenance::Off => Ok(()),
-        Maintenance::Restore => Err(fail(
+    if bridge.cfg.maintenance == Maintenance::Restore {
+        return Err(fail(
             503,
             "ServiceUnavailable",
             "Maintenance: no changes are accepted.",
-        )),
+        ));
     }
+    if bridge.catalog.restore_pending().await.or_internal()? {
+        return Err(fail(
+            503,
+            "ServiceUnavailable",
+            "A replay of the recovery records is not finished: no changes are accepted.",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -371,11 +379,39 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             if margin < 0 {
                 return Err(bad());
             }
-            ReplayCursor::start(crate::types::UnixMs(since.saturating_sub(margin).max(0)))
+            let from = crate::types::UnixMs(since.saturating_sub(margin).max(0));
+            // From here until the last step, the catalogue refuses
+            // writes, whatever MAINTENANCE says.
+            let run = bridge
+                .catalog
+                .restore_begin(from, bridge.clock.now())
+                .await
+                .or_internal()?;
+            ReplayCursor {
+                run_ms: run.0,
+                ..ReplayCursor::start(from)
+            }
         }
         _ => return Err(bad()),
     };
+    let run = crate::types::UnixMs(cursor.run_ms);
     let report = bridge.replay_step(cursor).await.or_internal()?;
+    // Only the replay that is recorded as under way is ended: the last
+    // step of an older cursor must not open the catalogue for writes
+    // while a replay that was started after it still runs.
+    if report.next.is_none()
+        && !bridge
+            .catalog
+            .restore_finish(run, bridge.clock.now())
+            .await
+            .or_internal()?
+    {
+        return Err(fail(
+            409,
+            "OperationAborted",
+            "This cursor is of an earlier replay. The replay that was started last is not finished.",
+        ));
+    }
     let value = serde_json::to_value(&report)
         .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;
     Ok(ok(&value))
@@ -457,7 +493,7 @@ pub(super) async fn create_bucket_s3<
     if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
         return IngressError::AccessDenied.response();
     }
-    if mutable(bridge).is_err() {
+    if mutable(bridge).await.is_err() {
         return S3Response::error(503, "ServiceUnavailable", "Maintenance.");
     }
     match create_bucket(bridge, bucket, false).await {
@@ -689,11 +725,20 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
     for x in &status.extents {
+        // Read before any delete: a cold read that fills the cache while
+        // this runs changes it, and its copy then stays counted.
+        let seq = bridge.catalog.hot_seq(&x.extent_id).await.or_internal()?;
         delete_blob(&bridge.cache, &x.extent_id.cache_key())
             .await
             .or_internal()?;
         evicted += 1;
+        // The deleted copies leave the hot-tier count.
+        let forget = |seq: u64, safety: bool| async move {
+            let done = bridge.catalog.hot_forget(&x.extent_id, seq, safety, true);
+            done.await.or_internal().map(|_| ())
+        };
         if !include_safety {
+            forget(seq, false).await?;
             continue;
         }
         let gone = match x.safety_state {
@@ -709,9 +754,10 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
                         .await
                         .or_internal()?
             }
-            // A release job is between its decision and its delete.
+            // A release job is between its decision and its end.
             SafetyState::Releasing => false,
-            // Already given up: the delete only removes a leftover.
+            // No longer pinned: the copy is only cache (a released one
+            // still serves reads until it is evicted).
             SafetyState::Released | SafetyState::Deleted => true,
         };
         if gone {
@@ -722,6 +768,10 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         } else {
             safety_kept += 1;
         }
+        // Giving up a held copy changed the state, which bumped the
+        // token once: that bump is this request's own.
+        let own_bump = u64::from(gone && x.safety_state == SafetyState::Held);
+        forget(seq + own_bump, gone).await?;
     }
     Ok(ok(&json!({
         "evicted": evicted,
@@ -894,6 +944,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
+    let replaying = bridge.catalog.restore_pending().await.or_internal()?;
     let now = bridge.clock.now();
     let load = bridge.catalog.provider_load(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
@@ -919,13 +970,26 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     for (stage, n) in &stats.by_stage {
         outbox.insert(stage.as_str().to_string(), json!(n));
     }
+    let hot = bridge.catalog.hot_stats().await.or_internal()?;
     let cfg = &bridge.cfg;
     Ok(ok(&json!({
+        // R2 as a hot tier. Pinned bytes are safety copies not yet
+        // released; they are never evicted and are outside the cap.
+        "hot": {
+            "pinned_bytes": hot.pinned_bytes,
+            "pinned_extents": hot.pinned_extents,
+            "evictable_bytes": hot.evictable_bytes,
+            "evictable_extents": hot.evictable_extents,
+            "cap_bytes": cfg.hot_cap_bytes,
+            "low_watermark_bytes": crate::jobs::low_watermark(cfg.hot_cap_bytes),
+        },
         "environment": if cfg.is_dev() { "dev" } else { "prod" },
         "maintenance": match cfg.maintenance {
             Maintenance::Off => "off",
             Maintenance::Restore => "restore",
         },
+        // A replay was started and did not end: writes are refused.
+        "replay_unfinished": replaying,
         "gc_mode": match cfg.gc_mode {
             crate::config::GcMode::Off => "off",
             crate::config::GcMode::Disposable => "disposable",

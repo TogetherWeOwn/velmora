@@ -7,19 +7,23 @@
 //!    like the parts of an open upload), their article plans exist, and
 //!    an extent whose pinned copy is gone says so.
 //! 2. [`replay_publish`], once: one guarded batch that publishes the
-//!    generation exactly like a multipart Complete adopts its parts.
+//!    generation. An extent no generation holds yet is adopted, exactly
+//!    like a multipart Complete adopts its parts. An extent another
+//!    generation already holds (the two share it through a copy) gets a
+//!    second reference in `generation_extents` and is otherwise left as
+//!    it is. Which of the two manifests comes first does not matter.
 //!
 //! A generation row therefore exists only when the whole generation was
 //! published, which is what makes "already present" a safe reason to
 //! skip a manifest.
 
-use super::objects::{ms, opt, retire_live, text, uint};
+use super::objects::{clear_tombstone, ms, opt, retire_live, text, uint};
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
-    ArticleRow, BridgeError, Bucket, ExtentPlacement, GenerationId, GenerationRow, GenerationState,
-    Result, SafetyState, UnixMs,
+    ArticleRow, BridgeError, Bucket, ExtentId, ExtentPlacement, GenerationId, GenerationRow,
+    GenerationState, Result, SafetyState, UnixMs,
 };
 
 type Stmt = (&'static str, Vec<SqlValue>);
@@ -136,7 +140,7 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
         // back, so what is left of the pipeline has nothing to do. Reads
         // verify every byte against the digests either way.
         out.push((
-            "UPDATE extents SET safety_state = 'deleted' \
+            "UPDATE extents SET safety_state = 'deleted', evict_seq = evict_seq + 1 \
              WHERE id = ?1 AND safety_state IN ('held', 'releasing')",
             vec![id()],
         ));
@@ -183,8 +187,9 @@ pub(super) async fn replay_damaged<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
 ) -> Result<(u64, Vec<GenerationId>)> {
-    const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM extents e \
-         WHERE e.generation_id = o.generation_id AND e.safety_state = 'deleted' \
+    const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM generation_extents ge \
+         JOIN extents e ON e.id = ge.extent_id \
+         WHERE ge.generation_id = o.generation_id AND e.safety_state = 'deleted' \
            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))";
     let count = c
         .sql
@@ -211,9 +216,91 @@ pub(super) async fn replay_damaged<S: Sql>(
     Ok((count, ids))
 }
 
+/// Ids of extents whose row says a pinned copy exists.
+pub(super) async fn held_extents<S: Sql>(
+    c: &SqlCatalog<S>,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<ExtentId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT id FROM extents WHERE id > ?1 AND safety_state IN ('held', 'releasing') \
+             ORDER BY id LIMIT ?2",
+            &[text(after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.as_slice() {
+            [SqlValue::Text(id)] => ids.push(ExtentId::new(id.clone())),
+            _ => return Err(BridgeError::Sql("row decode: held extent".into())),
+        }
+    }
+    Ok(ids)
+}
+
+pub(super) async fn restore_begin<S: Sql>(
+    c: &SqlCatalog<S>,
+    since: UnixMs,
+    now: UnixMs,
+) -> Result<UnixMs> {
+    // The mark is the start time, moved past the mark of the replay
+    // before it when the two fall into one millisecond.
+    let rows = c
+        .sql
+        .query(
+            "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
+             VALUES (1, 'replaying', ?1, ?2, NULL) \
+             ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
+               started_at = max(excluded.started_at, restore_state.started_at + 1), \
+               finished_at = NULL \
+             RETURNING started_at",
+            &[ms(since), ms(now)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(run)]) => Ok(UnixMs(*run)),
+        _ => Err(BridgeError::Sql("row decode: restore mark".into())),
+    }
+}
+
+pub(super) async fn restore_finish<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+    now: UnixMs,
+) -> Result<bool> {
+    // Ending the same replay twice is the same as ending it once.
+    let changed = c
+        .sql
+        .exec(
+            "UPDATE restore_state SET state = 'complete', \
+               finished_at = COALESCE(finished_at, ?1) \
+             WHERE id = 1 AND started_at = ?2",
+            &[ms(now), ms(run)],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
+pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'",
+            &[],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(n)]) => Ok(*n != 0),
+        _ => Err(BridgeError::Sql("row decode: restore state".into())),
+    }
+}
+
 /// Step 2. `Lost` = the generation is already there, a newer generation
 /// of the key is live, or the extents do not tile it (one of them is
-/// held by another generation).
+/// missing, in another bucket, still a part of an upload under another
+/// generation's name, or its key was shredded).
 pub(super) async fn replay_publish<S: Sql>(
     c: &SqlCatalog<S>,
     g: &GenerationRow,
@@ -230,30 +317,15 @@ pub(super) async fn replay_publish<S: Sql>(
     }
     let gen_id = || text(g.id.as_str());
     let bucket = || text(g.bucket_id.as_str());
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(9 + placements.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(10 + 2 * placements.len());
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
          OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
                     AND generation_id > ?1)",
         vec![gen_id(), bucket(), text(&g.key)],
     ));
-    stmts.push((
-        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-           content_json, user_meta_json, extent_count, created_at, retired_at) \
-         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)",
-        vec![
-            gen_id(),
-            bucket(),
-            text(&g.key),
-            uint(g.size)?,
-            text(&g.etag),
-            opt(g.checksum_json.as_deref(), text),
-            text(&g.content_json),
-            text(&g.user_meta_json),
-            SqlValue::Int(i64::from(g.extent_count)),
-            ms(g.created_at),
-        ],
-    ));
+    stmts.push(clear_tombstone(&g.bucket_id, &g.key, &g.id));
+    stmts.push(insert_live(g)?);
     for p in placements {
         stmts.push((
             "UPDATE extents SET generation_id = ?1, seq = ?2, plain_offset = ?3, \
@@ -267,16 +339,37 @@ pub(super) async fn replay_publish<S: Sql>(
                 bucket(),
             ],
         ));
+        // An extent another generation holds is shared with it: this
+        // generation is a copy of that one, or that one of this. The
+        // adoption above already wrote the reference for an extent it
+        // took (trigger `generation_extents_on_adopt`), and such an
+        // extent no longer matches here.
+        stmts.push((
+            "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT ?1, ?2, e.id, ?3 FROM extents e \
+              WHERE e.id = ?4 AND e.bucket_id = ?5 AND e.state = 'committed' \
+                AND e.generation_id <> ?1",
+            vec![
+                gen_id(),
+                SqlValue::Int(i64::from(p.seq)),
+                uint(p.plain_offset)?,
+                text(p.extent_id.as_str()),
+                bucket(),
+            ],
+        ));
     }
-    // The adopted extents tile the object exactly, each with its key.
+    // The referenced extents tile the object exactly, each with its key.
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-           (SELECT COUNT(*) FROM extents WHERE generation_id = ?1 \
-              AND wrapped_file_key IS NOT NULL) <> ?2 \
-           OR (SELECT COALESCE(SUM(plain_size), 0) FROM extents WHERE generation_id = ?1) <> ?3 \
-           OR EXISTS (SELECT 1 FROM (SELECT plain_offset, SUM(plain_size) OVER (ORDER BY seq \
+           (SELECT COUNT(*) FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             WHERE ge.generation_id = ?1 AND e.wrapped_file_key IS NOT NULL) <> ?2 \
+           OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM generation_extents ge \
+                 JOIN extents e ON e.id = ge.extent_id WHERE ge.generation_id = ?1) <> ?3 \
+           OR EXISTS (SELECT 1 FROM (SELECT ge.plain_offset AS plain_offset, \
+                SUM(e.plain_size) OVER (ORDER BY ge.seq \
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
-                FROM extents WHERE generation_id = ?1) \
+                FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+               WHERE ge.generation_id = ?1) \
               WHERE plain_offset <> COALESCE(expected, 0))",
         vec![
             gen_id(),
@@ -286,11 +379,30 @@ pub(super) async fn replay_publish<S: Sql>(
     ));
     // An extent whose pinned copy is held goes through post and verify
     // again: posting a planned article twice is harmless, and the read
-    // back is the evidence a release needs.
+    // back is the evidence a release needs. The obligation stays under
+    // the generation the extent was first written for.
     stmts.push((
         "INSERT OR IGNORE INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-         SELECT id, generation_id, CASE safety_state WHEN 'held' THEN 'post' ELSE 'done' END, \
-                ?2, ?2 FROM extents WHERE generation_id = ?1",
+         SELECT e.id, e.generation_id, \
+                CASE e.safety_state WHEN 'held' THEN 'post' ELSE 'done' END, ?2, ?2 \
+           FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1",
+        vec![gen_id(), ms(now)],
+    ));
+    // A shared extent can have left service earlier in this replay: the
+    // generation it was written for was retired by a manifest that sorts
+    // before this one. It is back in service now, so its obligation runs
+    // again. Its open GC rows stay; the collector refuses them for as
+    // long as a live generation references the extent. Nothing collects
+    // while a restore runs, so no delete is under way.
+    stmts.push((
+        "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
+                                          WHERE e.id = outbox.extent_id) \
+                                   WHEN 'held' THEN 'post' ELSE 'done' END, \
+                attempts = 0, next_at = ?2, lease_owner = NULL, lease_until = NULL, \
+                updated_at = ?2 \
+          WHERE stage = 'cancelled' AND extent_id IN \
+                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
         vec![gen_id(), ms(now)],
     ));
     stmts.extend(retire_live(
@@ -309,4 +421,25 @@ pub(super) async fn replay_publish<S: Sql>(
         Err(BridgeError::GuardFailed) => Ok(Guard::Lost),
         Err(e) => Err(e),
     }
+}
+
+/// The row of `g` as the live generation it describes.
+fn insert_live(g: &GenerationRow) -> Result<Stmt> {
+    Ok((
+        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+           content_json, user_meta_json, extent_count, created_at, retired_at) \
+         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)",
+        vec![
+            text(g.id.as_str()),
+            text(g.bucket_id.as_str()),
+            text(&g.key),
+            uint(g.size)?,
+            text(&g.etag),
+            opt(g.checksum_json.as_deref(), text),
+            text(&g.content_json),
+            text(&g.user_meta_json),
+            SqlValue::Int(i64::from(g.extent_count)),
+            ms(g.created_at),
+        ],
+    ))
 }

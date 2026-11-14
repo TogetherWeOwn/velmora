@@ -571,6 +571,7 @@ impl Rig {
             ("INFLIGHT_BUDGET_BYTES", "50331648"),
             ("GC_MODE", "disposable"),
             ("MAINTENANCE", "off"),
+            ("SERVER_SIDE_COPY", "on"),
             ("ADMIN_TOKEN", ADMIN_TOKEN),
         ]
         .into_iter()
@@ -1460,6 +1461,217 @@ async fn slice_acceptance() {
     );
 }
 
+/// A copy shares the extents of its source. Deleting or overwriting the
+/// source, before or after posting, must leave the copy readable from
+/// Usenet alone, and garbage collection must wait for the last reference.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_outlives_its_source() {
+    let rig = Rig::new().await;
+    let small = test_bytes(3, MIB);
+    let big = test_bytes(4, BIG_LEN);
+    let gc = Job::Gc { v: JOB_VERSION };
+
+    let s = "copy 0 setup";
+    rig.setup_buckets_and_key(s).await;
+    let slice = rig.bucket_id("slice").await;
+    let r = rig.put("/slice/c/small.bin", &small).await;
+    expect_status(s, "PUT c/small.bin", 200, &r);
+    let r = rig.multipart_put(s, "/slice/c/big.bin", &big, PART).await;
+    expect_status(s, "CompleteMultipartUpload c/big.bin", 200, &r);
+    let mut shared = Vec::new();
+    for key in ["c/small.bin", "c/big.bin"] {
+        let (_, extents) = rig
+            .bridge
+            .catalog
+            .live_object(&slice, key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fail(s, "live object", key, "none"));
+        shared.extend(extents.into_iter().map(|x| x.id));
+    }
+    expect_eq(s, "extents of both sources", 4, shared.len());
+
+    let s = "copy 1 copy";
+    for (from, to) in [
+        ("/slice/c/small.bin", "/slice/d/small-copy.bin"),
+        ("/slice/c/big.bin", "/slice/d/big-copy.bin"),
+    ] {
+        let r = rig
+            .s3(
+                Method::Put,
+                to,
+                &[],
+                &[("x-amz-copy-source", from)],
+                Vec::new(),
+            )
+            .await;
+        expect_status(s, &format!("CopyObject {from} to {to}"), 200, &r);
+        expect(
+            s,
+            "the copy answers with a CopyObjectResult",
+            r.text().contains("<CopyObjectResult>"),
+            r.summary(),
+        );
+    }
+    expect_eq(
+        s,
+        "no extent was written for the copies",
+        4,
+        rig.sql_count("SELECT count(*) FROM extents"),
+    );
+    let r = rig.get("/slice/d/big-copy.bin").await;
+    expect_status(s, "GET d/big-copy.bin", 200, &r);
+    expect_bytes(s, "GET d/big-copy.bin body", &big, &r.body);
+    let r = rig
+        .s3(
+            Method::Get,
+            "/slice/d/big-copy.bin",
+            &[],
+            &[("range", "bytes=5242870-5242889")],
+            Vec::new(),
+        )
+        .await;
+    expect_status(
+        s,
+        "range GET across an extent boundary of the copy",
+        206,
+        &r,
+    );
+    expect_bytes(s, "range body", &big[5_242_870..5_242_890], &r.body);
+
+    // The sources go before anything was posted: one deleted, one
+    // overwritten. Posting must carry on for the copies.
+    let s = "copy 2 sources-gone";
+    let r = rig
+        .s3(Method::Delete, "/slice/c/small.bin", &[], &[], Vec::new())
+        .await;
+    expect_eq(s, "DELETE c/small.bin status", 204, r.status);
+    let other = test_bytes(5, 4096);
+    let r = rig.put("/slice/c/big.bin", &other).await;
+    expect_status(s, "overwrite c/big.bin", 200, &r);
+    expect_eq(
+        s,
+        "posting obligations cancelled",
+        0,
+        rig.sql_count("SELECT count(*) FROM outbox WHERE stage = 'cancelled'"),
+    );
+    expect_eq(
+        s,
+        "garbage-collection rows queued",
+        0,
+        rig.sql_count("SELECT count(*) FROM gc"),
+    );
+    rig.pump(s).await;
+    for key in ["d/small-copy.bin", "d/big-copy.bin"] {
+        let st = rig.status(s, "slice", key).await;
+        for x in &st.extents {
+            expect(
+                s,
+                &format!(
+                    "{key}: extent {} is posted, verified and counted",
+                    x.extent_id.as_str()
+                ),
+                matches!(x.stage, Some(OutboxStage::Release | OutboxStage::Done))
+                    && x.backbones.iter().any(|b| b.counts),
+                format!("{:?} {:?}", x.stage, x.backbones),
+            );
+        }
+    }
+    rig.bridge.clock.advance_secs(2 * 86_400);
+    expect_eq(
+        s,
+        "garbage-collection job",
+        JobOutcome::Ack,
+        rig.bridge.run_job(&gc).await,
+    );
+
+    // Only Usenet holds the bytes now.
+    let s = "copy 3 cold-read";
+    for key in ["d/small-copy.bin", "d/big-copy.bin"] {
+        let ev = rig
+            .admin_json(
+                s,
+                Method::Post,
+                &format!("/evict/slice/{key}?include_safety=1"),
+                None,
+            )
+            .await;
+        expect(
+            s,
+            &format!("evict {key} .evicted > 0"),
+            ev["evicted"].as_u64().is_some_and(|n| n > 0),
+            &ev,
+        );
+    }
+    for id in &shared {
+        expect(
+            s,
+            &format!("extent {} is gone from CACHE and SAFETY", id.as_str()),
+            !rig.bridge.cache.contains(&id.cache_key())
+                && !rig.bridge.safety.contains(&id.safety_key()),
+            "still stored",
+        );
+    }
+    let bodies_before = rig.n.bodies.get();
+    let r = rig.get("/slice/d/small-copy.bin").await;
+    expect_status(s, "cold GET d/small-copy.bin", 200, &r);
+    expect_bytes(s, "cold GET d/small-copy.bin body", &small, &r.body);
+    let r = rig.get("/slice/d/big-copy.bin").await;
+    expect_status(s, "cold GET d/big-copy.bin", 200, &r);
+    expect_bytes(s, "cold GET d/big-copy.bin body", &big, &r.body);
+    expect(
+        s,
+        "the cold GETs read article bodies over NNTP",
+        rig.n.bodies.get() > bodies_before,
+        format!("{} BODY commands", rig.n.bodies.get() - bodies_before),
+    );
+    let r = rig.get("/slice/c/small.bin").await;
+    expect_error(s, "GET the deleted source", 404, "NoSuchKey", &r);
+    let r = rig.get("/slice/c/big.bin").await;
+    expect_bytes(s, "GET the overwritten source", &other, &r.body);
+
+    // The last references go: now the extents are collected.
+    let s = "copy 4 last-reference";
+    for key in ["/slice/d/small-copy.bin", "/slice/d/big-copy.bin"] {
+        let r = rig.s3(Method::Delete, key, &[], &[], Vec::new()).await;
+        expect_eq(s, &format!("DELETE {key} status"), 204, r.status);
+    }
+    expect_eq(
+        s,
+        "extents with garbage-collection rows",
+        4,
+        rig.sql_count("SELECT count(DISTINCT extent_id) FROM gc"),
+    );
+    rig.bridge.clock.advance_secs(2 * 86_400);
+    expect_eq(
+        s,
+        "garbage-collection job",
+        JobOutcome::Ack,
+        rig.bridge.run_job(&gc).await,
+    );
+    expect_eq(
+        s,
+        "open garbage-collection rows",
+        0,
+        rig.sql_count("SELECT count(*) FROM gc WHERE done_at IS NULL"),
+    );
+    for id in &shared {
+        expect(
+            s,
+            &format!("extent {} is gone from CACHE", id.as_str()),
+            !rig.bridge.cache.contains(&id.cache_key()),
+            "still cached",
+        );
+    }
+    expect_eq(
+        s,
+        "wrapped file keys left (the overwrite's extent)",
+        1,
+        rig.sql_count("SELECT count(*) FROM extents WHERE wrapped_file_key IS NOT NULL"),
+    );
+}
+
 /// The fake enforces `max_connections = max_conns` for the poster login.
 /// Posts, verifies and a cold read run concurrently; the bridge's permits
 /// must keep the open sessions at or under the cap, and the server must
@@ -1614,6 +1826,19 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
     // already posted and verifies them again without posting twice.
     let s = "recovery catalogue-only loss";
     let posted_before = rig.server.posted_ids().await.len();
+    // A release keeps the copy in R2 until the hot tier evicts it. Evict
+    // all that may go, so that the replay meets extents with a copy
+    // (still pinned) and without one.
+    let all = u64::MAX / 2;
+    rig.bridge
+        .catalog
+        .hot_drain_set(all)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::hot_drain_set", "Ok", e));
+    rig.bridge
+        .evict_batch(all)
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
     let pinned = extents
         .iter()
         .filter(|id| rig.bridge.safety.contains(&format!("x/{id}")))
@@ -1625,7 +1850,7 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
         pinned > 0 && released > 0,
         format!("{pinned} pinned, {released} released"),
     );
-    let wipe = "DELETE FROM outbox; DELETE FROM verifications; DELETE FROM articles; \
+    let wipe = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM key_tombstones; DELETE FROM verifications; DELETE FROM articles; \
                 DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
                 DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
                 DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";

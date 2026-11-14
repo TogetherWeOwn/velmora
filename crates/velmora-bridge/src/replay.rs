@@ -29,7 +29,8 @@ use crate::recovery::{
     GenerationManifest, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
 use crate::types::{
-    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
+    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, GenerationRow,
+    Result, UnixMs,
 };
 
 /// How much one call does. The default keeps a call far below a Worker
@@ -44,6 +45,8 @@ pub struct ReplayLimits {
 
 /// Damaged generations the last call lists by id.
 const DAMAGED_LISTED: u32 = 100;
+const OTHER_BUCKET_LISTED: usize = 100;
+const HELD_MISSING_LISTED: usize = 100;
 
 impl Default for ReplayLimits {
     fn default() -> Self {
@@ -79,6 +82,8 @@ pub struct ReplayExtent {
 pub enum ReplayPhase {
     Manifests,
     Tombstones,
+    /// Extents the catalogue says are pinned, checked against the store.
+    Held,
 }
 
 /// Resume point of a replay. Opaque to the caller: send back what the
@@ -93,6 +98,10 @@ pub struct ReplayCursor {
     pub after: String,
     /// Extents already handled of the record after `after`.
     pub extent: u32,
+    /// The replay this cursor belongs to, as the restore route recorded
+    /// it when the replay started. Only that replay is ended by it.
+    #[serde(default)]
+    pub run_ms: i64,
 }
 
 impl ReplayCursor {
@@ -103,6 +112,7 @@ impl ReplayCursor {
             phase: ReplayPhase::Manifests,
             after: start_after(GENERATION_PREFIX, since),
             extent: 0,
+            run_ms: 0,
         }
     }
 }
@@ -128,9 +138,28 @@ pub struct ReplayReport {
     pub tombstones: u32,
     /// Tombstones that removed a live object.
     pub deleted: u32,
-    /// Not published: the catalogue refused the generation (its extents
-    /// belong to another generation, or it lost a race).
+    /// Refused, and nothing is missing: a newer live generation of the
+    /// key holds the same extents in the same order. A Complete that
+    /// was sent again after an unanswered one leaves two records of one
+    /// object. Replayed together they are published one over the other,
+    /// and the object stands under the id of the later one.
+    pub duplicate: u32,
+    /// Not published: the catalogue refused the generation (an extent
+    /// is missing, its key was shredded or it belongs to another
+    /// generation, or it lost a race).
     pub unpublishable: Vec<String>,
+    /// Not replayed: the catalogue has another bucket under the name of
+    /// the record's bucket. The first ids of `other_bucket_total`.
+    pub other_bucket_total: u32,
+    pub other_bucket: Vec<String>,
+    /// Extents whose row says the pinned copy is held, checked.
+    pub held_checked: u32,
+    /// Of those, the ones whose pinned copy is gone: the catalogue is
+    /// older than their release, and this replay did not reach their
+    /// records. A replay from 0 repairs them. `held_missing` holds the
+    /// first extent ids of each call.
+    pub held_missing_total: u32,
+    pub held_missing: Vec<String>,
     /// Set by the last call: live generations with an extent that has no
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
@@ -166,6 +195,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         let next = match cursor.phase {
             ReplayPhase::Manifests => self.replay_manifests(cursor, limits, &mut report).await?,
             ReplayPhase::Tombstones => self.replay_tombstones(cursor, limits, &mut report).await?,
+            ReplayPhase::Held => self.replay_held(cursor, limits, &mut report).await?,
         };
         report.next = next;
         Ok(report)
@@ -234,6 +264,19 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             return Ok(true);
         }
         let bucket = m.bucket();
+        // A bucket made again under the same name since the export has
+        // another id and another data key. Nothing of the record can go
+        // into it, and its rows cannot go in beside it: the name is
+        // unique. The operator decides which of the two stays.
+        if let Some(named) = self.catalog.bucket_by_name(&bucket.name).await? {
+            if named.id != bucket.id {
+                report.other_bucket_total += 1;
+                if report.other_bucket.len() < OTHER_BUCKET_LISTED {
+                    report.other_bucket.push(generation.id.as_str().to_owned());
+                }
+                return Ok(true);
+            }
+        }
         let now = self.clock.now();
         let mut at = cursor.extent as usize;
         while at < m.extents.len() {
@@ -312,11 +355,40 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     .await?
                 {
                     Guard::Applied(()) => report.published += 1,
-                    Guard::Lost => report.unpublishable.push(id),
+                    // The extents of an object can be shared, so a second
+                    // record of one object is published like any other
+                    // manifest, over the first. What is refused and has a
+                    // live twin was published before: by an earlier run,
+                    // or because a newer record of the object is live.
+                    Guard::Lost => match self.live_twin(&generation, &placements).await? {
+                        Some(_) => report.duplicate += 1,
+                        None => report.unpublishable.push(id),
+                    },
                 }
             }
         }
         Ok(true)
+    }
+
+    /// The id of the live generation of the key, if it is the same
+    /// object as `g`: the same extents at the same places.
+    async fn live_twin(
+        &self,
+        g: &GenerationRow,
+        placements: &[ExtentPlacement],
+    ) -> Result<Option<GenerationId>> {
+        let Some((live, extents)) = self.catalog.live_object(&g.bucket_id, &g.key).await? else {
+            return Ok(None);
+        };
+        let same = live.size == g.size
+            && live.etag == g.etag
+            && extents.len() == placements.len()
+            && extents.iter().zip(placements).all(|(e, p)| {
+                e.id == p.extent_id
+                    && e.seq == Some(p.seq)
+                    && e.plain_offset == Some(p.plain_offset)
+            });
+        Ok(same.then_some(live.id))
     }
 
     async fn replay_tombstones(
@@ -354,6 +426,40 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             cursor = finished(cursor, name);
         }
         if names.len() as u64 == u64::from(limits.records) {
+            return Ok(Some(cursor));
+        }
+        Ok(Some(ReplayCursor {
+            phase: ReplayPhase::Held,
+            after: String::new(),
+            extent: 0,
+            ..cursor
+        }))
+    }
+
+    /// A replay from a restore point does not read the records of older
+    /// extents. If the catalogue is older than the release of one of
+    /// them, its row still says `held` while the pinned copy is gone,
+    /// and the pipeline would wait for a copy that never comes. This
+    /// finds them; it changes nothing.
+    async fn replay_held(
+        &self,
+        mut cursor: ReplayCursor,
+        limits: ReplayLimits,
+        report: &mut ReplayReport,
+    ) -> Result<Option<ReplayCursor>> {
+        let limit = u32::try_from(limits.extents).unwrap_or(u32::MAX);
+        let ids = self.catalog.held_extents(&cursor.after, limit).await?;
+        for id in &ids {
+            report.held_checked += 1;
+            if self.safety.head(&id.safety_key()).await?.is_none() {
+                report.held_missing_total += 1;
+                if report.held_missing.len() < HELD_MISSING_LISTED {
+                    report.held_missing.push(id.as_str().to_owned());
+                }
+            }
+            cursor.after = id.as_str().to_owned();
+        }
+        if ids.len() as u64 == u64::from(limit) {
             return Ok(Some(cursor));
         }
         let (total, ids) = self.catalog.replay_damaged(DAMAGED_LISTED).await?;

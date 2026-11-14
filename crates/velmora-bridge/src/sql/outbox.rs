@@ -221,20 +221,24 @@ pub(super) async fn job_extent<S: Sql>(
     extent: &ExtentId,
     generation: &GenerationId,
 ) -> Result<Option<JobExtent>> {
+    // The extent is in service while any live generation references it,
+    // not only the one it was written for (which the outbox row names).
+    let sql = concat!(
+        "SELECT e.id, e.bucket_id, e.generation_id, e.state, e.seq, e.plain_offset, \
+           e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
+           e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
+           e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, \
+           b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
+           CASE WHEN ",
+        live_ref!("e.id"),
+        " THEN 'live' ELSE g.state END \
+         FROM extents e JOIN buckets b ON b.id = e.bucket_id \
+         JOIN generations g ON g.id = e.generation_id \
+         WHERE e.id = ?1 AND e.generation_id = ?2"
+    );
     let rows = c
         .sql
-        .query(
-            "SELECT e.id, e.bucket_id, e.generation_id, e.state, e.seq, e.plain_offset, \
-               e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
-               e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-               e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, \
-               b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
-               g.state \
-             FROM extents e JOIN buckets b ON b.id = e.bucket_id \
-             JOIN generations g ON g.id = e.generation_id \
-             WHERE e.id = ?1 AND e.generation_id = ?2",
-            &[text(extent.as_str()), text(generation.as_str())],
-        )
+        .query(sql, &[text(extent.as_str()), text(generation.as_str())])
         .await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
@@ -476,8 +480,8 @@ pub(super) async fn backbone_status<S: Sql>(
     Ok(out)
 }
 
-/// Authorizes deleting the safety copy. One batch whose guard requires:
-/// the release lease still holds, the generation is live, the copy is
+/// Authorizes unpinning the safety copy (it becomes evictable). One batch whose guard requires:
+/// the release lease still holds, a live generation references the extent, the copy is
 /// `held` (or `releasing`, when re-driven), and at least `required`
 /// backbones count with a row recorded under this claim (between the claim
 /// time and `now`). The lease must also be unexpired: an expired lease may
@@ -498,8 +502,9 @@ pub(super) async fn begin_release<S: Sql>(
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
         held!(),
         " AND lease_until >= ?6) \
-         OR NOT EXISTS (SELECT 1 FROM generations WHERE id = ?2 AND state = 'live') \
-         OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
+         OR NOT ",
+        live_ref!("?1"),
+        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
               AND safety_state IN ('held', 'releasing')) \
          OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
               WHERE v.extent_id = ?1 AND v.verified_at <= ?6 \
@@ -515,14 +520,17 @@ pub(super) async fn begin_release<S: Sql>(
             lease_params(l, [SqlValue::Int(i64::from(required)), ms(now)])?,
         ),
         (
-            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2 WHERE id = ?1",
+            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+               evict_seq = evict_seq + 1 WHERE id = ?1",
             vec![text(l.extent.as_str()), text(evidence_json)],
         ),
     ];
     super::uploads::guarded(c, stmts).await
 }
 
-/// After the safety copy was deleted: `releasing` → `released`, row done.
+/// `releasing` → `released`, row done. The safety copy stays in R2: from
+/// here on it is evictable, and counted as such. A never-read extent
+/// starts its eviction order at its upload time.
 pub(super) async fn finish_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -544,7 +552,11 @@ pub(super) async fn finish_release<S: Sql>(
     let stmts = vec![
         (guard, lease_params(l, [ms(now)])?),
         (
-            "UPDATE extents SET safety_state = 'released', released_at = ?2 WHERE id = ?1",
+            "UPDATE extents SET safety_state = 'released', released_at = ?2, \
+               hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1",
             vec![text(l.extent.as_str()), ms(now)],
         ),
         // Last: after this the lease no longer holds.
@@ -598,7 +610,7 @@ pub(super) async fn bury_exhausted<S: Sql>(
 }
 
 /// Sends `done` extents that a release could not be decided for back to
-/// verify: the generation is live, the safety copy is still `held`, and
+/// verify: a live generation references the extent, the safety copy is still `held`, and
 /// fewer than `required` of the configured `backbones` count. The row
 /// restarts as a fresh obligation (cursor and attempts at zero) and the
 /// lease token moves on. One statement, so a row is moved once.
@@ -643,10 +655,10 @@ pub(super) async fn redrive_underverified<S: Sql>(
         " WHERE stage = 'done' AND extent_id IN ( \
            SELECT e.id FROM extents e INDEXED BY extents_held \
              JOIN outbox o ON o.extent_id = e.id \
-             JOIN generations g ON g.id = o.generation_id \
             WHERE e.safety_state = 'held' AND e.id > ?4 AND e.id <= ?5 \
-              AND o.stage = 'done' AND g.state = 'live' \
-              AND (SELECT COUNT(*) FROM verifications v \
+              AND o.stage = 'done' AND ",
+        live_ref!("e.id"),
+        " AND (SELECT COUNT(*) FROM verifications v \
                     WHERE v.extent_id = e.id \
                       AND v.backbone IN (SELECT value FROM json_each(?2)) AND ",
         latest!(),

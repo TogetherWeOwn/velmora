@@ -739,6 +739,18 @@ pub struct CommitGeneration {
     pub now: UnixMs,
 }
 
+/// Input of a copy publication batch: the new generation, and the
+/// generation whose extents it references. The source must still be the
+/// live object of `(generation.bucket_id, source_key)` when the batch
+/// runs; `generation` repeats its size, ETag and extent count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyGeneration {
+    pub generation: GenerationRow,
+    pub source: GenerationId,
+    pub source_key: String,
+    pub now: UnixMs,
+}
+
 /// Where one staged part extent lands in the completed object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtentPlacement {
@@ -767,6 +779,42 @@ pub struct OutboxStats {
     pub dead: u64,
     /// Last `Catalog::record_dispatch` (`meta.last_dispatch_at`).
     pub last_dispatch_at: Option<UnixMs>,
+}
+
+/// Hot-tier totals. Pinned bytes are safety copies that are not yet
+/// released; evictable bytes are released safety copies and cache fills.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct HotStats {
+    pub pinned_bytes: u64,
+    pub pinned_extents: u64,
+    pub evictable_bytes: u64,
+    pub evictable_extents: u64,
+}
+
+/// An evictable extent as the catalogue listed it. `begin_evict` refuses
+/// it if anything here has changed since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictCandidate {
+    pub extent: ExtentId,
+    /// Bytes of the released safety copy still in R2.
+    pub safety_bytes: u64,
+    /// Bytes of the cache fill in R2.
+    pub cache_bytes: u64,
+    /// `extents.evict_seq` when listed.
+    pub seq: u64,
+    /// The safety copy was pinned when listed: only the cache fill may
+    /// go, and the eviction must not touch the safety copy.
+    pub pinned: bool,
+}
+
+impl EvictCandidate {
+    /// Bytes an eviction of this candidate frees.
+    pub fn evictable_bytes(&self) -> u64 {
+        match self.pinned {
+            true => self.cache_bytes,
+            false => self.safety_bytes.saturating_add(self.cache_bytes),
+        }
+    }
 }
 
 db_enum!(
@@ -843,6 +891,14 @@ pub enum Job {
     Gc {
         v: u8,
     },
+    /// Hot-tier eviction. `remaining` is the number of bytes a drain
+    /// still has to evict, carried from one step to the next so that only
+    /// its first step totals the evictable bytes. 0 starts a drain: the
+    /// job totals them and acts only if they exceed the cap.
+    Evict {
+        v: u8,
+        remaining: u64,
+    },
 }
 
 impl Job {
@@ -868,12 +924,16 @@ pub enum JobOutcome {
 pub struct DispatchReport {
     pub enqueued: u32,
     pub gc_enqueued: bool,
+    /// Evictable bytes exceeded the hot-tier cap: an eviction job was sent.
+    pub evict_enqueued: bool,
     pub buried: u64,
     pub permits_seeded: bool,
     /// `done` extents with too few verified backbones sent back to verify.
     pub redriven: u64,
     /// The re-drive failed; the rest of the run went on without it.
     pub redrive_failed: bool,
+    /// The hot-tier check failed; the rest of the run went on without it.
+    pub evict_failed: bool,
 }
 
 // ---------------------------------------------------------------------------

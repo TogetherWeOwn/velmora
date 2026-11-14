@@ -583,14 +583,66 @@ if [[ $MODE == remote ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 5c move within the bucket (CopyObject, then DeleteObject of the source)
+# ---------------------------------------------------------------------------
+
+STEP=5c-move
+SMALL_KEY=a/small.bin
+# The shipped production vars keep SERVER_SIDE_COPY off; the dev ones turn
+# it on. E2E_COPY=1 runs the step against a remote that has it on.
+if [[ ${E2E_COPY:-$([[ $MODE == local ]] && echo 1 || echo 0)} == 1 ]]; then
+  log "step $STEP"
+  run_aws "MOVE a/small.bin to a/moved.bin" "${S3[@]}" mv "s3://$SB/a/small.bin" "s3://$SB/a/moved.bin" >/dev/null
+  run_aws "GET a/moved.bin" "${S3[@]}" cp "s3://$SB/a/moved.bin" "$T/got-moved.bin" >/dev/null
+  same_bytes "GET a/moved.bin equals the upload" "$T/small.bin" "$T/got-moved.bin"
+  expect_err "HEAD a/small.bin after the move" '\(404\)' \
+    "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
+  SMALL_KEY=a/moved.bin
+else
+  log "step $STEP skipped (E2E_COPY is not 1)"
+fi
+
+# ---------------------------------------------------------------------------
+# 5d assemble an object from ranges of two others (UploadPartCopy)
+# ---------------------------------------------------------------------------
+
+STEP=5d-part-copy
+log "step $STEP"
+# Part 1 starts inside one extent of a/big.bin and ends inside the next.
+PC_FROM=8388000
+PC_LEN=5300000
+json=$(run_aws "CreateMultipartUpload a/assembled.bin" "${S3API[@]}" --output json create-multipart-upload \
+  --bucket "$SB" --key a/assembled.bin)
+PC_ID=$(jq -er .UploadId <<<"$json") || fail "an UploadId" "a string" "$json"
+json=$(run_aws "UploadPartCopy 1 (range of a/big.bin)" "${S3API[@]}" --output json upload-part-copy \
+  --bucket "$SB" --key a/assembled.bin --upload-id "$PC_ID" --part-number 1 \
+  --copy-source "$SB/a/big.bin" --copy-source-range "bytes=$PC_FROM-$((PC_FROM + PC_LEN - 1))")
+PC_E1=$(jq -er .CopyPartResult.ETag <<<"$json") || fail "a part ETag" "a string" "$json"
+json=$(run_aws "UploadPartCopy 2 (all of $SMALL_KEY)" "${S3API[@]}" --output json upload-part-copy \
+  --bucket "$SB" --key a/assembled.bin --upload-id "$PC_ID" --part-number 2 \
+  --copy-source "$SB/$SMALL_KEY")
+PC_E2=$(jq -er .CopyPartResult.ETag <<<"$json") || fail "a part ETag" "a string" "$json"
+run_aws "CompleteMultipartUpload a/assembled.bin" "${S3API[@]}" complete-multipart-upload \
+  --bucket "$SB" --key a/assembled.bin --upload-id "$PC_ID" --multipart-upload \
+  "$(jq -nc --arg a "$PC_E1" --arg b "$PC_E2" \
+    '{Parts: [{PartNumber: 1, ETag: $a}, {PartNumber: 2, ETag: $b}]}')" >/dev/null
+dd if="$T/big.bin" of="$T/assembled-want.bin" bs=1M iflag=skip_bytes,count_bytes \
+  skip="$PC_FROM" count="$PC_LEN" status=none
+cat "$T/small.bin" >>"$T/assembled-want.bin"
+run_aws "GET a/assembled.bin" "${S3[@]}" cp "s3://$SB/a/assembled.bin" "$T/assembled.bin" >/dev/null
+same_bytes "GET a/assembled.bin equals the two ranges" "$T/assembled-want.bin" "$T/assembled.bin"
+run_aws "DELETE a/assembled.bin" "${S3[@]}" rm "s3://$SB/a/assembled.bin" >/dev/null
+rm -f "$T/assembled-want.bin" "$T/assembled.bin"
+
+# ---------------------------------------------------------------------------
 # 6 delete
 # ---------------------------------------------------------------------------
 
 STEP=6-delete
 log "step $STEP"
-run_aws "DELETE a/small.bin" "${S3[@]}" rm "s3://$SB/a/small.bin" >/dev/null
-expect_err "HEAD a/small.bin after delete" '\(404\)' \
-  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
+run_aws "DELETE $SMALL_KEY" "${S3[@]}" rm "s3://$SB/$SMALL_KEY" >/dev/null
+expect_err "HEAD $SMALL_KEY after delete" '\(404\)' \
+  "${S3API[@]}" head-object --bucket "$SB" --key "$SMALL_KEY"
 
 # ---------------------------------------------------------------------------
 # 7 dispatcher recovery

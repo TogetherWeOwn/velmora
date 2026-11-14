@@ -3,8 +3,11 @@
 //! HEAD answers from the catalogue alone. GET serves each extent from the
 //! cache, else the safety copy, else Usenet (which fills the cache before
 //! any byte is released). Whatever the source, only plaintext whose
-//! sealed chunks authenticated is returned.
+//! sealed chunks authenticated is returned. A read stamps the extent's
+//! `last_read_at`, at most once an hour: the hot-tier eviction order.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,8 +22,62 @@ use crate::fetch::{cold_poll_ms, ColdFetch, COLD_WAIT_MS};
 use crate::ingress::{ByteBudget, Charge};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
-    BridgeError, Bucket, ByteSpan, ExtentRow, RespBody, Result, S3Request, S3Response,
+    BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
 };
+
+/// Least time between two `last_read_at` writes for one extent. The
+/// eviction order only needs to be this fine.
+pub const READ_STAMP_MS: i64 = 3_600_000;
+/// Extents whose last stamp this isolate remembers.
+const STAMP_MEMO: usize = 4096;
+
+thread_local! {
+    /// The `last_read_at` this isolate last saw per extent, so that a hot
+    /// extent costs one catalogue statement an hour instead of one per
+    /// read. The catalogue applies the same gap across isolates.
+    static STAMPED: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+}
+
+/// Records that `extent` served a read, for the eviction order. Best
+/// effort: a failed stamp never fails the read. `from_cache`: the bytes
+/// came from the cache fill; the same write counts a fill that the
+/// catalogue did not know about.
+async fn stamp_read<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    extent: &ExtentId,
+    from_cache: bool,
+) where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let now = bridge.clock.now();
+    let recent = STAMPED.with(|memo| {
+        memo.borrow()
+            .get(extent.as_str())
+            .is_some_and(|&at| (0..READ_STAMP_MS).contains(&(now.0 - at)))
+    });
+    if recent {
+        return;
+    }
+    let stamped = bridge
+        .catalog
+        .touch_read(extent, now, READ_STAMP_MS, from_cache);
+    if let Ok(at) = stamped.await {
+        // Another isolate may have stamped it: remember the stamp the
+        // catalogue holds, not the time of this read.
+        STAMPED.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= STAMP_MEMO {
+                memo.clear();
+            }
+            memo.insert(extent.as_str().to_owned(), at.0);
+        });
+    }
+}
 
 /// The part of one extent a read needs: `len` plaintext bytes from
 /// plaintext offset `off` within the extent.
@@ -223,6 +280,68 @@ async fn read<
     Ok(resp)
 }
 
+/// Plaintext `[start, start + len)` of an object, in memory, for a copy
+/// that seals it again. Every byte comes through [`read_piece`], so it was
+/// authenticated exactly as a GET would have it. Comes with the charge
+/// for the result. Nothing else may be held for it while it runs: one
+/// full-size extent needs most of an isolate's budget to be read.
+pub(super) async fn read_range<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    extents: Vec<ExtentRow>,
+    start: u64,
+    len: u64,
+) -> core::result::Result<(Vec<u8>, Charge), S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let todo = pieces(extents, start, len).ok_or_else(internal)?;
+    // A cold extent comes back whole and needs twice its size while it
+    // does. Beside the pieces already held that can be more than the
+    // budget has, however long the read waits. Such an extent is read
+    // once on its own first: that leaves it in the cache, and the read
+    // below then needs room for its piece only.
+    let mut held = 0u64;
+    for piece in &todo {
+        let cold = piece.extent.cipher_size.saturating_mul(2);
+        if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
+            drop(
+                read_piece(bridge, bucket, piece)
+                    .await
+                    .map_err(|fail| fail.response())?,
+            );
+        }
+        held = held.saturating_add(piece.len);
+    }
+    let mut parts = Vec::with_capacity(todo.len());
+    for piece in &todo {
+        parts.push(
+            read_piece(bridge, bucket, piece)
+                .await
+                .map_err(|fail| fail.response())?,
+        );
+    }
+    if parts.len() == 1 {
+        return parts.pop().ok_or_else(internal);
+    }
+    // Several pieces: they and the joined copy are live together.
+    let held = bridge
+        .budget
+        .charge(len)
+        .await
+        .map_err(|_| ReadFail::Busy.response())?;
+    let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
+    for (bytes, _) in &parts {
+        out.extend_from_slice(bytes);
+    }
+    Ok((out, held))
+}
+
 /// Decrypts one piece from ciphertext `src` that starts at stream offset
 /// `base`. `None` if any chunk fails to authenticate.
 fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) -> Option<Vec<u8>> {
@@ -259,7 +378,8 @@ fn retain(budget: &ByteBudget, work: Charge, plain: Vec<u8>) -> Option<(Vec<u8>,
     Some((plain, held))
 }
 
-/// The piece's plaintext from the cache or else the safety copy. A copy
+/// The piece's plaintext from the cache or else the safety copy, and
+/// whether it came from the cache. A copy
 /// that is absent, short or fails authentication is skipped, never
 /// served: the next source is tried instead. The caller holds a charge
 /// for the ciphertext span and the plaintext.
@@ -268,7 +388,7 @@ async fn warm_piece<C, B, N, J, K, T>(
     bucket: &Bucket,
     piece: &Piece,
     span: ByteSpan,
-) -> Option<Vec<u8>>
+) -> Option<(Vec<u8>, bool)>
 where
     C: Catalog,
     B: BlobStore,
@@ -278,13 +398,13 @@ where
     T: Clock,
 {
     let extent = &piece.extent;
-    for (store, key) in [
-        (&bridge.cache, extent.id.cache_key()),
-        (&bridge.safety, extent.id.safety_key()),
+    for (store, key, from_cache) in [
+        (&bridge.cache, extent.id.cache_key(), true),
+        (&bridge.safety, extent.id.safety_key(), false),
     ] {
         if let Some(src) = warm(store, &key, span).await {
             if let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) {
-                return Some(plain);
+                return Some((plain, from_cache));
             }
         }
     }
@@ -319,8 +439,10 @@ where
             .charge(span.len.saturating_add(piece.len))
             .await
             .map_err(|_| ReadFail::Busy)?;
-        if let Some(plain) = warm_piece(bridge, bucket, piece, span).await {
-            return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
+        if let Some((plain, from_cache)) = warm_piece(bridge, bucket, piece, span).await {
+            let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
+            stamp_read(bridge, &extent.id, from_cache).await;
+            return Ok(held);
         }
     }
 
@@ -378,8 +500,10 @@ where
                 break charge;
             }
         };
-        if let Some(plain) = warm_piece(bridge, bucket, piece, span).await {
-            return retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal);
+        if let Some((plain, from_cache)) = warm_piece(bridge, bucket, piece, span).await {
+            let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
+            stamp_read(bridge, &extent.id, from_cache).await;
+            return Ok(held);
         }
     }
 }

@@ -14,9 +14,11 @@ use std::rc::Rc;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
-    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, MAX_EXTENT_BYTES_LIMIT,
+    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
+    MAX_EXTENT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Recorded;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, MIGRATION_0001,
@@ -251,18 +253,29 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.newsgroups, vec!["alt.binaries.test".to_string()]);
     assert_eq!(cfg.kek_active, 1);
     assert_eq!(cfg.gc_mode, GcMode::Off);
+    assert_eq!(cfg.hot_cap_bytes, 100 * 1024 * 1024 * 1024);
+    assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     assert_eq!(cfg.maintenance, Maintenance::Off);
+    assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
 
     // The dev environment is complete on its own (envs do not inherit vars).
-    let cfg = load(&with_secrets(dev, PROVIDER_PLAIN)).unwrap();
+    let cfg = load(&with_secrets(dev.clone(), PROVIDER_PLAIN)).unwrap();
     assert_eq!(cfg.environment, Environment::Dev);
     assert!(cfg.is_dev());
     assert_eq!(cfg.required_backbones, 1);
     assert_eq!(cfg.safety_min_age_secs, 0);
     assert_eq!(cfg.verify_delay_secs, 1);
     assert_eq!(cfg.gc_mode, GcMode::Disposable);
+    assert!(cfg.server_side_copy);
+    // Absent or empty is the default; any other size is taken as given.
+    assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
+    let mut sized = with_secrets(dev, PROVIDER_PLAIN);
+    for (value, want) in [("", DEFAULT_HOT_CAP_BYTES), ("0", 0), (" 4096 ", 4096)] {
+        sized.insert("HOT_CAP_BYTES".to_string(), value.to_string());
+        assert_eq!(load(&sized).unwrap().hot_cap_bytes, want, "{value:?}");
+    }
     assert!(cfg.dev_trust_http);
     assert!(!cfg.providers[0].tls);
 }
@@ -274,6 +287,12 @@ fn missing_secret_fails_closed() {
     for name in full.keys() {
         let mut vars = full.clone();
         vars.remove(name);
+        // The one setting with a default: without it the cap is 100 GiB.
+        // No value of it can cost data, so there is nothing to fail closed.
+        if name == "HOT_CAP_BYTES" {
+            assert_eq!(load(&vars).unwrap().hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
+            continue;
+        }
         assert_eq!(
             load(&vars).unwrap_err(),
             ConfigError::Missing(name.clone()),
@@ -320,7 +339,14 @@ fn config_rejects_invalid_and_unsafe_values() {
     // Shape and range.
     assert_eq!(set(&prod, "ENVIRONMENT", "staging"), invalid("ENVIRONMENT"));
     assert_eq!(set(&prod, "GC_MODE", "on"), invalid("GC_MODE"));
+    for bad in ["100GiB", "-1", "1.5", "9223372036854775808"] {
+        assert_eq!(set(&prod, "HOT_CAP_BYTES", bad), invalid("HOT_CAP_BYTES"));
+    }
     assert_eq!(set(&prod, "MAINTENANCE", "yes"), invalid("MAINTENANCE"));
+    assert_eq!(
+        set(&prod, "SERVER_SIDE_COPY", "1"),
+        invalid("SERVER_SIDE_COPY")
+    );
     assert_eq!(
         set(&dev, "DEV_TRUST_HTTP", "true"),
         invalid("DEV_TRUST_HTTP")
@@ -481,6 +507,13 @@ fn job_json_is_small_and_strict() {
     let gc = Job::Gc { v: JOB_VERSION };
     assert_eq!(gc.to_json(), r#"{"t":"gc","v":1}"#);
     assert!(Job::from_json(r#"{"t":"gc","v":1,"x":0}"#).is_err());
+    let evict = Job::Evict {
+        v: JOB_VERSION,
+        remaining: 4096,
+    };
+    assert_eq!(evict.to_json(), r#"{"t":"evict","v":1,"remaining":4096}"#);
+    assert_eq!(Job::from_json(&evict.to_json()).unwrap(), evict);
+    assert!(Job::from_json(r#"{"t":"evict","v":1}"#).is_err());
     assert!(Job::from_json(r#"{"t":"nope","v":1}"#).is_err());
 }
 
@@ -610,13 +643,16 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "buckets",
             "extents",
             "gc",
+            "generation_extents",
             "generations",
             "grants",
+            "key_tombstones",
             "meta",
             "objects",
             "outbox",
             "provider_health",
             "provider_permits",
+            "restore_state",
             "scan_cursors",
             "tx_guard",
             "upload_parts",
@@ -660,7 +696,18 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
-    assert!(changed.iter().all(|n| *n == 1), "{changed:?}");
+    // The committed extent (statement 5) also gets its reference row
+    // in `generation_extents`, written by the migration's trigger.
+    let want: Vec<u64> = (0..changed.len()).map(|n| 1 + u64::from(n == 5)).collect();
+    assert_eq!(changed, want);
+    let refs = db
+        .query(
+            "SELECT generation_id, seq, extent_id, plain_offset FROM generation_extents",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(refs, vec![vec![text("g_1"), i(0), text("x_1"), i(0)]]);
 
     let back = db
         .query(
@@ -892,8 +939,9 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.access_key(akid).await;
     let _ = c.grant(akid, b).await;
     let _ = c.live_object(b, "a/k").await;
-    let _ = c.commit_generation(&commit).await;
-    let _ = c.delete_object(b, "a/k", T0).await;
+    let _ = c
+        .commit_generation(&commit, Recorded::for_test(&commit.generation.id))
+        .await;
     let _ = c.list(b, &query).await;
     let _ = c.object_status(b, "a/k").await;
     let _ = c
@@ -902,7 +950,15 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.create_upload(&upload).await;
     let _ = c.upload(&target).await;
     let _ = c.put_upload_part(&target, &part, &extent, T0).await;
-    let _ = c.complete_upload(&target, 1, &[0; 32], &complete).await;
+    let _ = c
+        .complete_upload(
+            &target,
+            1,
+            &[0; 32],
+            &complete,
+            Recorded::for_test(&complete.generation.id),
+        )
+        .await;
     let _ = c.abort_upload(&target, T0).await;
     let _ = c
         .claim(&extent.id, &gen.id, OutboxStage::Post, "owner-1", T0)

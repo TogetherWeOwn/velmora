@@ -14,8 +14,10 @@ use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
-const TABLES: [&str; 12] = [
+const TABLES: [&str; 14] = [
+    "generation_extents",
     "outbox",
+    "key_tombstones",
     "verifications",
     "articles",
     "upload_parts",
@@ -63,7 +65,11 @@ fn wipe(rig: &Rig) {
 /// Loads the export back. Tables go in parent-first order.
 fn import(rig: &Rig) {
     for t in TABLES.iter().rev() {
-        sql(rig, &format!("INSERT INTO {t} SELECT * FROM bak_{t};"));
+        // The `extents` rows have already written their own references.
+        sql(
+            rig,
+            &format!("INSERT OR IGNORE INTO {t} SELECT * FROM bak_{t};"),
+        );
     }
 }
 
@@ -99,6 +105,12 @@ fn add(total: &mut ReplayReport, step: ReplayReport) {
     total.safety_missing += step.safety_missing;
     total.tombstones += step.tombstones;
     total.deleted += step.deleted;
+    total.duplicate += step.duplicate;
+    total.other_bucket_total += step.other_bucket_total;
+    total.other_bucket.extend(step.other_bucket);
+    total.held_checked += step.held_checked;
+    total.held_missing_total += step.held_missing_total;
+    total.held_missing.extend(step.held_missing);
     total.unpublishable.extend(step.unpublishable);
     total.unreadable.extend(step.unreadable);
     total.damaged_total = step.damaged_total;
@@ -241,6 +253,9 @@ async fn manifest_write_failure_commits_nothing() {
     tick(&rig);
     let upload = create_upload(&rig, &signer, "mp").await;
     let etag = upload_part(&rig, &signer, "mp", &upload, 1, b"part one").await;
+    // A first read stamps the extent's last read time; the reads below
+    // fall within the same hour and write nothing.
+    assert_eq!(get(&rig, &signer, "kept").await.expect(200).body, b"kept");
     let before = dump(&rig);
     let records_before = records(&rig);
 
@@ -367,17 +382,92 @@ async fn recovery_records_survive_gc_and_eviction() {
     rig.send(evict).await.expect(200);
     assert_eq!(records(&rig), kept, "eviction deleted no record");
 
-    // The one function every blob delete goes through refuses a record,
-    // whatever asks.
+    // A delete of a record is refused whatever asks: by the function
+    // that release, collection and evict delete through, and by the
+    // store itself for a caller that goes around it.
     for key in kept.iter().map(String::as_str).chain(["m/", "m/art/x"]) {
         for store in [&rig.bridge.safety, &rig.bridge.cache] {
             assert!(matches!(
                 delete_blob(store, key).await,
                 Err(BridgeError::Invalid(_))
             ));
+            assert!(matches!(
+                store.delete(key).await,
+                Err(BridgeError::Invalid(_))
+            ));
         }
     }
     assert_eq!(records(&rig), kept);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_refused_publication_gives_its_record_up() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let (live, extents) = rig
+        .bridge
+        .catalog
+        .live_object(&bucket.id, "k")
+        .await
+        .unwrap()
+        .unwrap();
+    let kept = records(&rig);
+
+    // A generation that sorts before the live one, recorded and offered.
+    let mut older = live.clone();
+    older.id = GenerationId::mint(UnixMs(rig.now().0 - 1000), [1; 8]);
+    let mut rows = extents.clone();
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.id = ExtentId::mint([i as u8; 13]);
+        row.generation_id = Some(older.id.clone());
+    }
+    let commit = CommitGeneration {
+        generation: older,
+        extents: rows,
+        now: rig.now(),
+    };
+    let write = || {
+        velmora_bridge::recovery::write_generation(
+            &rig.bridge.safety,
+            &rig.bridge.kek,
+            &bucket,
+            &commit.generation,
+            &commit.extents,
+        )
+    };
+
+    // The proof of one generation publishes no other.
+    let mut other = commit.clone();
+    other.generation.id = GenerationId::mint(UnixMs(rig.now().0 + 1000), [2; 8]);
+    for row in &mut other.extents {
+        row.generation_id = Some(other.generation.id.clone());
+    }
+    let proof = write().await.unwrap();
+    assert!(matches!(
+        rig.bridge.catalog.commit_generation(&other, proof).await,
+        Err(BridgeError::Invalid(_))
+    ));
+    assert_eq!(rig.count("generations"), 1);
+
+    // Refused: the proof comes back, and it is what removes the record.
+    let proof = write().await.unwrap();
+    assert_eq!(records(&rig).len(), kept.len() + 1);
+    let PublishOutcome::Refused(refused) = rig
+        .bridge
+        .catalog
+        .commit_generation(&commit, proof)
+        .await
+        .unwrap()
+    else {
+        panic!("an id older than the live one was published");
+    };
+    assert_eq!(refused.generation(), &commit.generation.id);
+    velmora_bridge::recovery::discard_generation(&rig.bridge.safety, &refused)
+        .await
+        .unwrap();
+    assert_eq!(records(&rig), kept);
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"v1");
 }
 
 // ---------------------------------------------------------------------------
@@ -539,13 +629,285 @@ async fn records_alone_rebuild_the_catalogue() {
     // The same replay again, in one call per phase.
     let settled = dump(&rig);
     let (again, calls) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert_eq!(calls, 2);
+    assert_eq!(calls, 3);
     assert_eq!(
         (again.published, again.present, again.deleted),
         (0, 6, 0),
         "{again:?}"
     );
     assert_eq!(dump(&rig), settled);
+}
+
+// ---------------------------------------------------------------------------
+// Copies: two generations share extents
+// ---------------------------------------------------------------------------
+
+async fn copy(rig: &Rig, signer: &Signer, from: &str, to: &str) -> Resp {
+    let source = format!("/{BUCKET}/{from}");
+    rig.call(
+        signer,
+        Method::Put,
+        &path(BUCKET, to),
+        &[],
+        &[("x-amz-copy-source", source.as_str())],
+        b"",
+    )
+    .await
+}
+
+fn count(rig: &Rig, query: &str) -> i64 {
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.query_row(query, [], |r| r.get(0)).unwrap())
+}
+
+/// Open GC rows for an extent a live object references.
+const LIVE_IN_GC: &str = "SELECT COUNT(*) FROM gc WHERE done_at IS NULL AND extent_id IN \
+     (SELECT ge.extent_id FROM generation_extents ge \
+        JOIN objects o ON o.generation_id = ge.generation_id)";
+/// Extents of live objects whose posting obligation is at its first stage.
+const LIVE_POSTING: &str = "SELECT COUNT(DISTINCT ge.extent_id) FROM generation_extents ge \
+     JOIN objects o ON o.generation_id = ge.generation_id \
+     JOIN outbox x ON x.extent_id = ge.extent_id WHERE x.stage = 'post'";
+
+/// A copy is rebuilt with its shared extents, and it stays when the
+/// source it was made from is deleted or overwritten.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_outlives_its_source_through_a_replay() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    tick(&rig);
+    let big = multipart(&rig, &signer, "big", 5).await;
+    tick(&rig);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    tick(&rig);
+    copy(&rig, &signer, "big", "big-copy").await.expect(200);
+    tick(&rig);
+    // A copy of a copy, and a copy that is itself removed again.
+    copy(&rig, &signer, "dst", "dst-2").await.expect(200);
+    tick(&rig);
+    copy(&rig, &signer, "src", "short-lived").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "short-lived").await.expect(204);
+    tick(&rig);
+    delete(&rig, &signer, "src").await.expect(204);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "big", b"replaced")
+        .await
+        .expect(200);
+    tick(&rig);
+    let live_before = rig.live(&bucket, "big-copy").await.unwrap();
+    let head = rig.head(&signer, BUCKET, "big-copy").await;
+    assert_eq!(rig.count("extents"), 4);
+
+    wipe(&rig);
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 1,
+    };
+    let (report, _) = replay(&rig, UnixMs(0), limits).await;
+    assert_eq!(report.manifests, 7, "{report:?}");
+    assert_eq!(report.published, 7, "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (2, 2), "{report:?}");
+    assert_eq!(report.damaged_total, 0);
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "src").await.expect(404);
+    get(&rig, &signer, "short-lived").await.expect(404);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(
+        get(&rig, &signer, "dst-2").await.expect(200).body,
+        b"payload"
+    );
+    assert_eq!(
+        get(&rig, &signer, "big").await.expect(200).body,
+        b"replaced"
+    );
+    assert_eq!(get(&rig, &signer, "big-copy").await.expect(200).body, big);
+    assert_eq!(rig.live(&bucket, "big-copy").await.unwrap(), live_before);
+    let head_after = rig.head(&signer, BUCKET, "big-copy").await;
+    assert_eq!(head_after.header("etag"), head.header("etag"));
+
+    // No extent was duplicated, every live one is in service and back in
+    // the pipeline, and none waits for garbage collection.
+    assert_eq!(rig.count("extents"), 4);
+    assert_eq!(rig.count("generations"), 7);
+    assert_eq!(rig.count("objects"), 4);
+    assert_eq!(count(&rig, LIVE_IN_GC), 0);
+    assert_eq!(count(&rig, LIVE_POSTING), 4);
+    assert_eq!(rig.count("gc"), 0);
+
+    // The same replay again changes nothing.
+    let settled = dump(&rig);
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(
+        (again.published, again.present, again.deleted),
+        (0, 7, 0),
+        "{again:?}"
+    );
+    assert_eq!(dump(&rig), settled);
+
+    // The reference count is intact: the extent goes when its last
+    // reference does, not before.
+    delete(&rig, &signer, "dst").await.expect(204);
+    assert_eq!(rig.count("gc"), 0);
+    assert_eq!(
+        get(&rig, &signer, "dst-2").await.expect(200).body,
+        b"payload"
+    );
+    delete(&rig, &signer, "dst-2").await.expect(204);
+    assert_eq!(rig.count("gc"), 3);
+}
+
+/// A copy's record describes its extents in full: it rebuilds the copy
+/// when the source's record is gone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_is_rebuilt_without_the_record_of_its_source() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    let (source, _) = rig.live(&bucket, "src").await.unwrap();
+    tick(&rig);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    let live_before = rig.live(&bucket, "dst").await.unwrap();
+    assert!(rig
+        .bridge
+        .safety
+        .lose(&recovery::generation_key(&source.id)));
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (1, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "src").await.expect(404);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    let (generation, extents) = rig.live(&bucket, "dst").await.unwrap();
+    assert_eq!(generation, live_before.0);
+    assert_eq!(extents[0].id, live_before.1[0].id);
+    assert_eq!(count(&rig, LIVE_POSTING), 1);
+}
+
+/// A replay over an export taken before the copy adds the copy to the
+/// extents the catalogue already holds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_made_after_the_export_is_replayed_onto_it() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    tick(&rig);
+    export(&rig);
+    let since = rig.now();
+    tick(&rig);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "src").await.expect(204);
+
+    wipe(&rig);
+    import(&rig);
+    let (report, _) = replay(&rig, since, ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (1, 1), "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (1, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    get(&rig, &signer, "src").await.expect(404);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(rig.count("extents"), 1);
+    assert_eq!(rig.count("gc"), 0);
+    assert_eq!(count(&rig, LIVE_POSTING), 1);
+}
+
+/// The record that retires the source can sort before the copy's: the
+/// writer of the newer source had a clock that was behind. The replay
+/// retires the source first and still publishes the copy over its
+/// extent, back in service and back in the pipeline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let start = rig.now();
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(60);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    // Overwritten later, by an isolate whose clock says it is earlier.
+    rig.bridge.clock.set(UnixMs(start.0 + 1000));
+    rig.put(&signer, BUCKET, "src", b"newer").await.expect(200);
+    rig.bridge.clock.advance_secs(120);
+    assert_eq!(rig.count("gc"), 0);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (3, 3), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+    assert_eq!(report.damaged_total, 0);
+
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "src").await.expect(200).body, b"newer");
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(count(&rig, LIVE_POSTING), 2);
+
+    // The rows queued when the source was retired are still open. The
+    // collector refuses each of them while the copy is live.
+    assert_eq!(count(&rig, LIVE_IN_GC), 3);
+    rig.bridge.clock.advance_secs(8 * 86_400);
+    let due = rig
+        .bridge
+        .catalog
+        .gc_due(rig.now(), 100, false)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 3);
+    for row in &due {
+        assert_eq!(
+            rig.bridge.catalog.gc_begin(row, rig.now()).await.unwrap(),
+            GcStep::Skipped
+        );
+    }
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+}
+
+/// A copy onto an existing key is the newest generation of that key by
+/// id, also when the copying isolate's clock is behind the one that wrote
+/// the destination. A replay therefore ends with the copy, not with the
+/// object it replaced.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_stays_over_the_object_it_replaced() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let start = rig.now();
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(60);
+    rig.put(&signer, BUCKET, "dst", b"replaced")
+        .await
+        .expect(200);
+    let (replaced, _) = rig.live(&bucket, "dst").await.unwrap();
+    rig.bridge.clock.set(UnixMs(start.0 + 1000));
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    let (copied, _) = rig.live(&bucket, "dst").await.unwrap();
+    assert!(copied.id > replaced.id, "{copied:?} {replaced:?}");
+    rig.bridge.clock.advance_secs(120);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (3, 3), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(rig.live(&bucket, "dst").await.unwrap().0, copied);
 }
 
 /// A record older than a live generation of its key is not published
@@ -564,7 +926,9 @@ async fn an_older_record_never_replaces_a_newer_object() {
     rig.put(&signer2, BUCKET, "k", b"new").await.expect(200);
     sql(
         &rig,
-        "DELETE FROM outbox; DELETE FROM gc; DELETE FROM extents WHERE generation_id IN \
+        "DELETE FROM outbox; DELETE FROM gc; DELETE FROM generation_extents WHERE generation_id IN \
+               (SELECT id FROM generations WHERE state <> 'live'); \
+               DELETE FROM extents WHERE generation_id IN \
                (SELECT id FROM generations WHERE state <> 'live'); \
                DELETE FROM generations WHERE state <> 'live';",
     );
@@ -800,9 +1164,42 @@ async fn restore_route_runs_only_in_maintenance() {
             assert_eq!(report["damaged_total"], 0);
             break;
         }
+        // Started and not ended: the catalogue says so.
+        assert_eq!(restore_state(&restoring), ["replaying"]);
         body = json!({ "cursor": report["next"] });
     }
-    assert_eq!((published, deleted, calls), (2, 1, 2));
+    assert_eq!(restore_state(&restoring), ["complete"]);
+    assert_eq!((published, deleted, calls), (2, 1, 3));
+
+    // A cursor of this replay that arrives after another replay was
+    // started does not end the other one.
+    let first = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    first.expect(200);
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    let second = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    second.expect(200);
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert_ne!(first["next"]["run_ms"], second["next"]["run_ms"]);
+    let finish = |mut body: Value| {
+        let restoring = &restoring;
+        async move {
+            loop {
+                let r = admin(restoring, "/restore", body).await;
+                if r.status != 200 {
+                    return r.status;
+                }
+                let report: Value = serde_json::from_slice(&r.body).unwrap();
+                if report["next"].is_null() {
+                    return 200;
+                }
+                body = json!({ "cursor": report["next"] });
+            }
+        }
+    };
+    assert_eq!(finish(json!({ "cursor": first["next"] })).await, 409);
+    assert_eq!(restore_state(&restoring), ["replaying"]);
+    assert_eq!(finish(json!({ "cursor": second["next"] })).await, 200);
+    assert_eq!(restore_state(&restoring), ["complete"]);
     assert_eq!(restoring.count("objects"), 1);
     assert_eq!(restoring.count("generations"), 2);
 
@@ -810,4 +1207,796 @@ async fn restore_route_runs_only_in_maintenance() {
     let signer = reissue_key(&restoring).await;
     let put = restoring.put(&signer, BUCKET, "c", b"c").await;
     assert_eq!(put.status, 503, "{}", put.text());
+}
+
+// ---------------------------------------------------------------------------
+// The order of ids on a key is the order of its commits
+// ---------------------------------------------------------------------------
+
+/// What every key answers now; then the catalogue is lost and rebuilt
+/// from the records alone, and every key must answer the same.
+async fn replay_answers_the_same(rig: &Rig, signer: &Signer, keys: &[&str]) {
+    let mut before = Vec::new();
+    for key in keys {
+        let got = get(rig, signer, key).await;
+        before.push((got.status, got.body.clone()));
+    }
+    wipe(rig);
+    let (report, _) = replay(rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(
+        report.unpublishable.is_empty() && report.unreadable.is_empty(),
+        "{report:?}"
+    );
+    let signer = reissue_key(rig).await;
+    for (key, (status, body)) in keys.iter().zip(before) {
+        let got = get(rig, &signer, key).await;
+        assert_eq!(got.status, status, "{key} after the replay");
+        if status == 200 {
+            assert_eq!(got.body, body, "{key} after the replay");
+        }
+    }
+}
+
+fn live_ids(rig: &Rig) -> Vec<String> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT generation_id FROM objects ORDER BY key")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_overwrite_from_a_slow_clock_stays_on_top_in_a_replay() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let v1 = live_ids(&rig).remove(0);
+    // The isolate that takes the overwrite runs half a second behind.
+    rig.bridge.clock.advance_ms(-500);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2 > v1, "{v2} sorts after {v1}");
+    // The record of the first try is gone: one record per generation.
+    assert_eq!(
+        records(&rig)
+            .iter()
+            .filter(|r| r.starts_with(GENERATION_PREFIX))
+            .count(),
+        2
+    );
+    rig.bridge.clock.advance_ms(2000);
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"v2");
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_after_a_delete_sorts_after_the_tombstone() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    rig.bridge.clock.advance_ms(-500);
+    delete(&rig, &signer, "k").await.expect(204);
+    let tombstone = records(&rig)
+        .into_iter()
+        .find_map(|r| r.strip_prefix(TOMBSTONE_PREFIX).map(str::to_owned))
+        .unwrap();
+    rig.bridge.clock.advance_ms(100);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2 > tombstone, "{v2} sorts after {tombstone}");
+    // The key lives again: the catalogue keeps no tombstone for it.
+    assert_eq!(rig.count("key_tombstones"), 0);
+    rig.bridge.clock.advance_ms(2000);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn writes_in_one_millisecond_replay_in_commit_order() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    // The clock does not move: every id below is minted in the same
+    // millisecond, where only random bytes would order them.
+    let keys: Vec<String> = (0..12).map(|i| format!("k{i}")).collect();
+    for key in &keys {
+        rig.put(&signer, BUCKET, key, b"v1").await.expect(200);
+        rig.put(&signer, BUCKET, key, b"v2").await.expect(200);
+        rig.put(&signer, BUCKET, key, b"v3").await.expect(200);
+    }
+    rig.put(&signer, BUCKET, "gone", b"v1").await.expect(200);
+    delete(&rig, &signer, "gone").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v1").await.expect(200);
+    delete(&rig, &signer, "back").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v2").await.expect(200);
+    delete(&rig, &signer, "back").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v3").await.expect(200);
+    assert_eq!(get(&rig, &signer, "gone").await.status, 404);
+    assert_eq!(get(&rig, &signer, "back").await.expect(200).body, b"v3");
+    assert_eq!(
+        rig.count("key_tombstones"),
+        1,
+        "only the deleted key has one"
+    );
+
+    let mut all: Vec<&str> = keys.iter().map(String::as_str).collect();
+    all.extend(["gone", "back"]);
+    for key in &keys {
+        assert_eq!(get(&rig, &signer, key).await.expect(200).body, b"v3");
+    }
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &all).await;
+    assert_eq!(rig.count("key_tombstones"), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_from_a_slow_clock_stays_on_top_in_a_replay() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let first = pattern(3, 5 * MIB);
+    let last = pattern(4, 1024);
+    let etags = vec![
+        upload_part(&rig, &signer, "big", &id, 1, &first).await,
+        upload_part(&rig, &signer, "big", &id, 2, &last).await,
+    ];
+    tick(&rig);
+    rig.put(&signer, BUCKET, "big", b"small").await.expect(200);
+    let put = live_ids(&rig).remove(0);
+    rig.bridge.clock.advance_ms(-500);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    let completed = live_ids(&rig).remove(0);
+    assert!(completed > put, "{completed} sorts after {put}");
+    rig.bridge.clock.advance_ms(2000);
+    assert_eq!(
+        get(&rig, &signer, "big").await.expect(200).body,
+        [first, last].concat()
+    );
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+// ---------------------------------------------------------------------------
+// An upload that the export saw open, completed after it
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let first = pattern(3, 5 * MIB);
+    let last = pattern(4, 1024);
+    let etags = vec![
+        upload_part(&rig, &signer, "big", &id, 1, &first).await,
+        upload_part(&rig, &signer, "big", &id, 2, &last).await,
+    ];
+    tick(&rig);
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    tick(&rig);
+    wipe(&rig);
+    import(&rig);
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let whole = [first, last].concat();
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+
+    // The export still says the upload is open. The client's Abort of
+    // it must not queue the published extents for collection.
+    rig.call(
+        &signer,
+        Method::Delete,
+        &path(BUCKET, "big"),
+        &[("uploadId", id.as_str())],
+        &[],
+        b"",
+    )
+    .await;
+    let collected: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM gc WHERE extent_id IN (SELECT e.id FROM extents e \
+               JOIN objects o ON o.generation_id = e.generation_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(collected, 0);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// A Complete whose publication the catalogue did not answer
+// ---------------------------------------------------------------------------
+
+async fn abort(rig: &Rig, signer: &Signer, key: &str, id: &str) -> Resp {
+    rig.call(
+        signer,
+        Method::Delete,
+        &path(BUCKET, key),
+        &[("uploadId", id)],
+        &[],
+        b"",
+    )
+    .await
+}
+
+async fn two_parts(rig: &Rig, signer: &Signer, key: &str) -> (String, Vec<String>, Vec<u8>) {
+    let id = create_upload(rig, signer, key).await;
+    let first = pattern(5, 5 * MIB);
+    let last = pattern(6, 1024);
+    let etags = vec![
+        upload_part(rig, signer, key, &id, 1, &first).await,
+        upload_part(rig, signer, key, &id, 2, &last).await,
+    ];
+    (id, etags, [first, last].concat())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_complete_that_is_then_aborted_does_not_come_back() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    tick(&rig);
+
+    // The catalogue fails before it wrote anything. Complete shows that
+    // nothing was published, and takes its record back.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig), before);
+    get(&rig, &signer, "big").await.expect(404);
+
+    tick(&rig);
+    abort(&rig, &signer, "big", &id).await.expect(204);
+    tick(&rig);
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 0, "{report:?}");
+    let generations: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM generations", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(generations, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_record_of_a_failed_complete_is_deleted_again_when_the_store_fails() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    tick(&rig);
+
+    let fail = |deletes: u32| {
+        rig.bridge.safety.fail_record_deletes.set(deletes);
+        rig.bridge
+            .catalog
+            .sql
+            .fail_publish
+            .set(Some(PublishFault::NotApplied));
+    };
+    // Two failures of the store: the third delete removes the record.
+    fail(2);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig), before);
+    assert_eq!(rig.bridge.safety.fail_record_deletes.get(), 0);
+
+    // A store that stays down leaves the record: the known remainder.
+    tick(&rig);
+    fail(3);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig).len(), before.len() + 1);
+    assert_eq!(rig.bridge.safety.fail_record_deletes.get(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_complete_can_be_sent_again() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_that_applied_without_an_answer_keeps_its_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The catalogue committed, and the answer was lost. The upload is
+    // no longer open, so nothing shows that the batch did not apply.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Applied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig).len(), before + 1);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_records_of_one_object_are_not_reported_as_a_loss() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The catalogue answers neither the publication nor the question
+    // whether it applied, so the record of this attempt stays.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Down));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(records(&rig).len(), before + 2);
+    tick(&rig);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    // Both records are published, the later over the earlier: they
+    // share the extents.
+    assert_eq!((report.published, report.duplicate), (2, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+/// A Complete that got no answer leaves its record; a delete of the key
+/// lands; the Complete is sent again and succeeds. The object must
+/// stand under the id of the second record, or the tombstone, which
+/// sorts between the two, removes it in a replay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "big", b"first").await.expect(200);
+    tick(&rig);
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Down));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    delete(&rig, &signer, "big").await.expect(204);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    tick(&rig);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    let live: String = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT generation_id FROM objects", [], |r| r.get(0))
+            .unwrap()
+    });
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.duplicate), (3, 0), "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (1, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    let (restored, generations): (String, i64) = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT (SELECT generation_id FROM objects), \
+                    (SELECT COUNT(*) FROM generations WHERE state = 'live')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!((restored, generations), (live, 1));
+
+    // A second replay over the result changes nothing.
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((again.published, again.deleted), (0, 0), "{again:?}");
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// A bucket that was made again under the same name
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn records_of_a_bucket_whose_name_is_taken_are_reported_and_skipped() {
+    let rig = rig();
+    let (old, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "b", b"two").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "b").await.expect(204);
+    tick(&rig);
+    wipe(&rig);
+
+    // Before the replay, somebody makes the bucket again.
+    let mut new = rig.bucket("vault-again", true).await;
+    assert_ne!(new.id, old.id);
+    sql(
+        &rig,
+        "UPDATE buckets SET name = 'vault' WHERE name = 'vault-again'",
+    );
+    new.name = BUCKET.to_string();
+    let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
+    rig.grant(AKID, &new, Perm::Rw).await;
+    rig.put(&signer, BUCKET, "c", b"three").await.expect(200);
+    tick(&rig);
+
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.other_bucket_total, 2, "{report:?}");
+    assert_eq!(report.other_bucket.len(), 2, "{report:?}");
+    assert_eq!((report.published, report.present), (0, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    get(&rig, &signer, "a").await.expect(404);
+    assert_eq!(get(&rig, &signer, "c").await.expect(200).body, b"three");
+}
+
+// ---------------------------------------------------------------------------
+// A replay that was started and did not end
+// ---------------------------------------------------------------------------
+
+fn restore_state(rig: &Rig) -> Vec<String> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c.prepare("SELECT state FROM restore_state").unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unfinished_replay_refuses_writes_without_maintenance() {
+    // Maintenance is off in this rig, as after a deploy that came too
+    // early.
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+
+    let run = rig
+        .bridge
+        .catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap();
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    delete(&rig, &signer, "a").await.expect(503);
+    copy(&rig, &signer, "a", "copy").await.expect(503);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(503);
+    let r = rig
+        .call(
+            &signer,
+            Method::Post,
+            &path(BUCKET, "other"),
+            &[("uploads", "")],
+            &[],
+            b"",
+        )
+        .await;
+    assert_eq!(r.status, 503, "{}", r.text());
+    // Nothing was recorded, and reads go on.
+    assert_eq!(records(&rig), before);
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
+
+    // Neither do the admin routes that change something, the queue
+    // jobs, or the dispatcher.
+    admin(&rig, "/buckets", json!({ "name": "second" }))
+        .await
+        .expect(503);
+    admin(&rig, "/evict/vault/a?include_safety=1", json!({}))
+        .await
+        .expect(503);
+    let outbox = || -> (String, String, String, i64) {
+        rig.bridge.catalog.sql.with_conn(|c| {
+            c.query_row(
+                "SELECT extent_id, generation_id, stage, attempts FROM outbox \
+                 ORDER BY extent_id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        })
+    };
+    let row = outbox();
+    assert_eq!(row.2, "post");
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: ExtentId::new(row.0.clone()),
+        generation: GenerationId::new(row.1.clone()),
+        stage: OutboxStage::Post,
+    };
+    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(outbox(), row);
+    assert_eq!(
+        rig.bridge.dispatch().await.unwrap(),
+        DispatchReport::default()
+    );
+    assert_eq!(rig.count("buckets"), 1);
+
+    // The end of another replay does not end this one.
+    assert!(!rig
+        .bridge
+        .catalog
+        .restore_finish(UnixMs(run.0 - 1), rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    assert!(rig
+        .bridge
+        .catalog
+        .restore_finish(run, rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["complete"]);
+    assert!(rig.bridge.dispatch().await.unwrap().permits_seeded);
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+
+    // A second restore arms the gate again, under a later mark, also
+    // within the same millisecond.
+    let second = rig
+        .bridge
+        .catalog
+        .restore_begin(UnixMs(5), rig.now())
+        .await
+        .unwrap();
+    assert!(second > run);
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
+}
+
+// ---------------------------------------------------------------------------
+// A catalogue that is older than the release of a pinned copy
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_copy_released_after_the_export_is_found() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "old", b"old").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "old").await.unwrap();
+    tick(&rig);
+    rig.put(&signer, BUCKET, "kept", b"kept").await.expect(200);
+    tick(&rig);
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+
+    // After the export the pipeline released the pinned copy of `old`.
+    // The export still says it is held.
+    for x in &extents {
+        rig.bridge
+            .safety
+            .inner
+            .delete(&x.id.safety_key())
+            .await
+            .unwrap();
+    }
+    wipe(&rig);
+    import(&rig);
+
+    // A replay from the restore point does not read the record of
+    // `old`, and reports the extent.
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 2, "{report:?}");
+    assert_eq!(report.held_missing_total, 1, "{report:?}");
+    assert_eq!(report.held_missing, [extents[0].id.as_str()]);
+
+    // A replay from 0 reads it and sets the row right.
+    let (report, _) = replay(
+        &rig,
+        UnixMs(0),
+        ReplayLimits {
+            records: 1,
+            extents: 1,
+        },
+    )
+    .await;
+    assert_eq!(report.held_checked, 1, "{report:?}");
+    assert_eq!(report.held_missing_total, 0, "{report:?}");
+    assert_eq!(report.safety_missing, 1, "{report:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Random histories inside one millisecond replay to the same answers
+// ---------------------------------------------------------------------------
+
+/// splitmix64: the histories below are the same on every run.
+struct Dice(u64);
+
+impl Dice {
+    fn roll(&mut self, sides: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % sides
+    }
+}
+
+const DICE_KEYS: [&str; 4] = ["k0", "k1", "k2", "k3"];
+
+/// One random write: a PUT, a copy (onto another key, or onto itself
+/// with new metadata), a delete or a one-part multipart upload. The
+/// clock mostly stands still, so ids are minted in one millisecond;
+/// now and then it moves a little, also backwards (an isolate whose
+/// clock is behind).
+async fn random_write(
+    rig: &Rig,
+    signer: &Signer,
+    dice: &mut Dice,
+    n: usize,
+    log: &mut Vec<String>,
+) {
+    match dice.roll(8) {
+        0 => rig.bridge.clock.advance_ms(1),
+        1 => rig.bridge.clock.advance_ms(-2),
+        _ => {}
+    }
+    let key = DICE_KEYS[dice.roll(4) as usize];
+    let body = format!("body {n}");
+    let status = match dice.roll(6) {
+        0 | 1 => {
+            log.push(format!("put {key}"));
+            rig.put(signer, BUCKET, key, body.as_bytes()).await.status
+        }
+        2 => {
+            let from = DICE_KEYS[dice.roll(4) as usize];
+            log.push(format!("copy {from} -> {key}"));
+            let source = format!("/{BUCKET}/{from}");
+            let tag = n.to_string();
+            let mut headers = vec![("x-amz-copy-source", source.as_str())];
+            if from == key || dice.roll(2) == 0 {
+                headers.push(("x-amz-metadata-directive", "REPLACE"));
+                headers.push(("x-amz-meta-n", tag.as_str()));
+            }
+            rig.call(signer, Method::Put, &path(BUCKET, key), &[], &headers, b"")
+                .await
+                .status
+        }
+        3 | 4 => {
+            log.push(format!("delete {key}"));
+            delete(rig, signer, key).await.status
+        }
+        _ => {
+            log.push(format!("complete {key}"));
+            let id = create_upload(rig, signer, key).await;
+            let etag = upload_part(rig, signer, key, &id, 1, body.as_bytes()).await;
+            complete(rig, signer, key, &id, &[etag]).await.status
+        }
+    };
+    // A copy of a key that is not there answers 404; nothing else fails.
+    assert!(matches!(status, 200 | 204 | 404), "{status}: {log:?}");
+}
+
+/// What a client sees of every key.
+async fn answers(
+    rig: &Rig,
+    signer: &Signer,
+) -> Vec<(u16, Vec<u8>, Option<String>, Option<String>)> {
+    let mut all = Vec::new();
+    for key in DICE_KEYS {
+        let got = get(rig, signer, key).await;
+        let live = got.status == 200;
+        all.push((
+            got.status,
+            if live { got.body.clone() } else { Vec::new() },
+            got.header("x-amz-meta-n")
+                .filter(|_| live)
+                .map(str::to_owned),
+            got.header("etag").filter(|_| live).map(str::to_owned),
+        ));
+    }
+    all
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
+    for seed in 0..150u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        for n in 0..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        let signer = reissue_key(&rig).await;
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_across_an_export_replay_to_the_same_answers() {
+    for seed in 1000..1300u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        let cut = 5 + dice.roll(30) as usize;
+        for n in 0..cut {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        export(&rig);
+        // The restore point lies before the export by more than any
+        // clock in the history runs behind.
+        let since = rig.now().plus_ms(-1000);
+        log.push("export".into());
+        for n in cut..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        import(&rig);
+        let (report, _) = replay(&rig, since, ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
 }

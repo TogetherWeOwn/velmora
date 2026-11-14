@@ -18,10 +18,14 @@ use rusqlite::{params_from_iter, Connection};
 use sha2::{Digest, Sha256};
 
 use crate::ports::{
-    BlobMeta, BlobStore, Clock, JobSink, Kek, Row, Sql, SqlValue, MAX_QUEUE_DELAY_SECS,
-    MAX_SQL_PARAMS,
+    BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
+    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
 };
-use crate::types::{BridgeError, BucketId, ByteSpan, ExtentId, Job, KekBytes, Result, UnixMs};
+use crate::recovery::{is_record_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
+use crate::types::{
+    BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
+    Job, KekBytes, Result, UnixMs,
+};
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
 pub const MIGRATION_0001: &str =
@@ -34,6 +38,21 @@ pub const MIGRATION_0002: &str =
 /// The index behind the re-drive of under-verified extents.
 pub const MIGRATION_0003: &str =
     include_str!("../../../workers/s3-bridge/migrations/0003_extents_held.sql");
+
+/// Hot-tier accounting: evictable bytes, last read, eviction fence.
+pub const MIGRATION_0004: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0004_hot_tier.sql");
+/// Extent references per generation (copies share extents).
+pub const MIGRATION_0005: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0005_generation_extents.sql");
+
+/// The newest tombstone of each deleted key.
+pub const MIGRATION_0006: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0006_key_tombstones.sql");
+
+/// The mark of an unfinished catalogue replay.
+pub const MIGRATION_0007: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0007_restore_state.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -119,6 +138,10 @@ impl RusqliteSql {
         db.apply(MIGRATION_0001)?;
         db.apply(MIGRATION_0002)?;
         db.apply(MIGRATION_0003)?;
+        db.apply(MIGRATION_0004)?;
+        db.apply(MIGRATION_0005)?;
+        db.apply(MIGRATION_0006)?;
+        db.apply(MIGRATION_0007)?;
         Ok(db)
     }
 
@@ -213,6 +236,12 @@ impl MemBlobStore {
         self.blobs.borrow().get(key).cloned()
     }
 
+    /// Loses a blob behind the store's back, a recovery record as well:
+    /// the store itself never deletes one. `false` = it was not there.
+    pub fn lose(&self, key: &str) -> bool {
+        self.blobs.borrow_mut().remove(key).is_some()
+    }
+
     /// Overwrites stored bytes (tamper tests).
     pub fn corrupt(&self, key: &str, f: impl FnOnce(&mut Vec<u8>)) -> bool {
         match self.blobs.borrow_mut().get_mut(key) {
@@ -268,7 +297,15 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
+        if is_record_key(key) {
+            return Err(ERR_RECORD_DELETE);
+        }
         self.blobs.borrow_mut().remove(key);
+        Ok(())
+    }
+
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        self.blobs.borrow_mut().remove(&refused.key());
         Ok(())
     }
 
@@ -442,3 +479,59 @@ impl Kek for TestKek {
         self.keys.get(&v)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Publishing without a record
+// ---------------------------------------------------------------------------
+
+/// Catalogue tests publish rows that no request recorded. These
+/// make the proof the catalogue asks for ([`Recorded::for_test`]) and
+/// answer as a guarded batch does.
+#[allow(async_fn_in_trait)]
+pub trait PublishUnrecorded: Catalog {
+    async fn publish(&self, c: &CommitGeneration) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(match self.commit_generation(c, record).await? {
+            PublishOutcome::Applied => Guard::Applied(()),
+            PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+        })
+    }
+
+    async fn publish_copy(&self, c: &CopyGeneration) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(match self.copy_generation(c, record).await? {
+            PublishOutcome::Applied => Guard::Applied(()),
+            PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+        })
+    }
+
+    async fn publish_upload(
+        &self,
+        t: &UploadTarget<'_>,
+        revision: u64,
+        digest: &[u8; 32],
+        c: &CompleteUpload,
+    ) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(
+            match self.complete_upload(t, revision, digest, c, record).await? {
+                PublishOutcome::Applied => Guard::Applied(()),
+                PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
+            },
+        )
+    }
+
+    /// DeleteObject without its tombstone record: retires what is live
+    /// under an id minted after the newest one on the key.
+    /// `false` = nothing was retired.
+    async fn delete_now(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<bool> {
+        let Some(newest) = self.newest_id(bucket, key).await? else {
+            return Ok(false);
+        };
+        let tombstone = tombstone_id(now, &newest, [0xff; 8]);
+        self.delete_object_before(bucket, key, &tombstone, now)
+            .await
+    }
+}
+
+impl<C: Catalog> PublishUnrecorded for C {}

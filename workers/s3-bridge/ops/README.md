@@ -6,7 +6,7 @@ kept outside it:
 
 1. **Recovery records** in the `SAFETY` bucket, written by the Worker
    before every commit and never deleted:
-   - `m/<generation id>`: one per PutObject or CompleteMultipartUpload.
+   - `m/<generation id>`: one per PutObject, CopyObject or CompleteMultipartUpload.
      Bucket (id, name, wrapped key), object key, metadata and every extent
      (sizes, offsets, digests, media header, wrapped file key).
    - `m/del/<tombstone id>`: one per DeleteObject that removed an object.
@@ -27,7 +27,7 @@ the records do not hold (access keys, grants, verification history).
 
 | State | From the export | From the records |
 |---|---|---|
-| Acknowledged PutObject, CompleteMultipartUpload, DeleteObject | up to the export | all of them |
+| Acknowledged PutObject, CopyObject, CompleteMultipartUpload, DeleteObject | up to the export | all of them |
 | Buckets | yes | those with at least one write |
 | Article plans | yes | for every extent that reached posting |
 | Access keys and grants | yes | no: issue them again |
@@ -43,12 +43,12 @@ Limits to know:
 
 - A write that failed after its record was stored can become visible
   after a replay. S3 allows this (the request had no definite outcome).
-- Replay order is id order, and an id carries the time its request
-  started. Two requests on one key that overlapped in time (two writes,
-  or a write and a delete) may come back in the other order; either
-  order is a valid outcome for overlapping requests. This relies on
-  clocks of two Worker instances differing by less than a request
-  takes. Requests that did not overlap are replayed in their order.
+- Replay order is id order, and on one key that is the order in which
+  the writes and deletes were committed. An id is minted after the
+  request body is read; the catalogue then refuses a publication whose
+  id does not sort after the live generation and the last delete of the
+  key, and the request is published under a later id instead. The
+  order does not depend on the clocks of Worker instances.
 - An extent restored from its article plan record alone (no pinned
   copy) is assumed posted: the record is written before the first POST,
   so a replay cannot tell an extent that was fully posted from one whose
@@ -60,6 +60,27 @@ Limits to know:
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
   lists it under `damaged`.
+- A CompleteMultipartUpload that got no answer from the catalogue and
+  was sent again can leave two records of one object. The replay
+  publishes one and counts the other in `duplicate`; nothing is missing.
+  The object stands under the id of the later record, so a delete that
+  came between the two attempts does not remove it.
+- The record of a publication that the catalogue refused is deleted
+  again, three tries in all. If the store fails every one, the record
+  stays and a replay publishes it: an object appears that no client was
+  told exists (a refused PUT, or a multipart upload that was aborted
+  afterwards). Nothing is lost by it; delete such an object by hand.
+- If a bucket was made again under the name of a lost one before the
+  replay, the two have different ids and data keys. The replay does not
+  touch the new bucket: it skips the records of the old one and lists
+  them under `other_bucket`. Which of the two keeps the name is for the
+  operator to decide; the records of the old one stay in the store.
+- A pinned copy is deleted once its extent was read back from Usenet
+  and `SAFETY_MIN_AGE_SECS` have passed. A catalogue from before that
+  moment still says `held` for the extent, and a replay from the restore
+  point does not read records that old. The replay checks every `held`
+  row against the store at its end and counts the ones without a copy
+  in `held_missing_total`; a replay from `0` sets them right.
 - An empty bucket that never had a write is not in the records.
 
 ## Routine: export
@@ -90,9 +111,25 @@ exists: restore it to a timestamp, then replay from that timestamp.
 4. `VELMORA_ADMIN_TOKEN_FILE=<file> ops/catalog-replay.sh <base-url> <restore point>`.
    It prints the counts. Exit status 2 means damage was found: read the
    lists before going on.
-5. Check: `GET /_admin/status`, a listing, and a GET of a recent object.
+   - Use restore point `0` if the database copy is older than
+     `SAFETY_MIN_AGE_SECS`, or if the replay ends with
+     `held_missing_total` above 0. It reads every record, so it takes
+     longer; it is always correct.
+5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
+   listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
    database was rebuilt from the records alone.
+
+From the first call of the replay to its last, the catalogue itself
+refuses every write with 503, also when `MAINTENANCE` is already `off`:
+a catalogue that holds a part of the records must not take new writes.
+The same holds for the admin routes that change something, the queue
+jobs and the cron. If a replay was stopped, run it again to its end.
+Starting a replay again makes the earlier one void: a step sent with a
+cursor of the earlier one can still run, but its last step answers 409
+and the catalogue stays closed until the replay that was started last
+has ended. This does not notice a
+replay that was never started: step 4 is not optional after step 2.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.

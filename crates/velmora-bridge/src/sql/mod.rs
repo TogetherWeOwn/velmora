@@ -7,7 +7,7 @@
 //! | module | methods |
 //! |---|---|
 //! | `auth` | buckets, access keys, grants |
-//! | `objects` | live object, commit, delete, list, admin status, safety CAS |
+//! | `objects` | live object, commit, copy, delete, list, admin status, safety CAS |
 //! | `uploads` | multipart (guarded batches, receipt) |
 //! | `outbox` | leases, article plan, verification, release, dispatcher reads |
 //! | `gc` | due rows, begin, done |
@@ -15,10 +15,56 @@
 //! | `health` | provider load, failures and cooldown |
 //! | `recovery` | tombstone-ordered delete, upload extent rows |
 //! | `replay` | recovery replay: extents, article plans, publication |
+//!
+//! An extent is in service while a live generation references it through
+//! `generation_extents`, or a part of an open upload names it. A copy adds
+//! such a reference, so every statement that retires a generation, queues
+//! or runs garbage collection, or decides a release asks that question
+//! (`live_ref!`, `part_ref!`) instead of looking at the one generation the
+//! extent was first written for.
+
+/// True while a live generation references the extent `$x` (an SQL
+/// expression). With `except`, references from that generation do not
+/// count: it is the one being retired.
+macro_rules! live_ref {
+    ($x:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM generation_extents lr \
+               JOIN generations lg ON lg.id = lr.generation_id \
+              WHERE lr.extent_id = ",
+            $x,
+            " AND lg.state = 'live')"
+        )
+    };
+    ($x:literal, except $g:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM generation_extents lr \
+               JOIN generations lg ON lg.id = lr.generation_id \
+              WHERE lr.extent_id = ",
+            $x,
+            " AND lg.state = 'live' AND lg.id <> ",
+            $g,
+            ")"
+        )
+    };
+}
+
+/// True while a part of an open upload references the extent `$x`.
+macro_rules! part_ref {
+    ($x:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM upload_parts pr JOIN uploads pu ON pu.id = pr.upload_id \
+              WHERE pr.extent_id = ",
+            $x,
+            " AND pu.state = 'open')"
+        )
+    };
+}
 
 mod auth;
 mod gc;
 mod health;
+mod hot;
 mod objects;
 mod outbox;
 mod permits;
@@ -26,14 +72,19 @@ mod recovery;
 mod replay;
 mod uploads;
 
-use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, SqlValue, UploadTarget};
+pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
+
+use crate::ports::{
+    Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
+};
+use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage,
-    OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow,
-    UploadRow, VerificationRow,
+    CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
+    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage,
+    ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result,
+    SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -82,11 +133,22 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         objects::live_object(self, bucket, key).await
     }
-    async fn commit_generation(&self, c: &CommitGeneration) -> Result<()> {
-        objects::commit_generation(self, c).await
+    async fn commit_generation(
+        &self,
+        c: &CommitGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        objects::commit_generation(self, c, record).await
     }
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
-        objects::delete_object(self, bucket, key, now).await
+    async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
+        objects::newest_id(self, bucket, key).await
+    }
+    async fn copy_generation(
+        &self,
+        c: &CopyGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        objects::copy_generation(self, c, record).await
     }
     async fn delete_object_before(
         &self,
@@ -137,8 +199,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         revision: u64,
         digest: &[u8; 32],
         c: &CompleteUpload,
-    ) -> Result<Guard<()>> {
-        uploads::complete_upload(self, t, revision, digest, c).await
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        uploads::complete_upload(self, t, revision, digest, c, record).await
     }
     async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
         recovery::upload_extents(self, t).await
@@ -288,6 +351,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<()> {
         replay::replay_extents(self, bucket, extents, now).await
     }
+    async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
+        replay::held_extents(self, after, limit).await
+    }
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
+        replay::restore_begin(self, since, now).await
+    }
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
+        replay::restore_finish(self, run, now).await
+    }
+    async fn restore_pending(&self) -> Result<bool> {
+        replay::restore_pending(self).await
+    }
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)> {
         replay::replay_damaged(self, limit).await
     }
@@ -338,5 +413,58 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<u64> {
         outbox::redrive_underverified(self, backbones, required, limit, now).await
+    }
+
+    // hot tier
+    async fn hot_stats(&self) -> Result<HotStats> {
+        hot::hot_stats(self).await
+    }
+    async fn evictable_bytes(&self) -> Result<u64> {
+        hot::evictable_bytes(self).await
+    }
+    async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
+        hot::evict_candidates(self, limit).await
+    }
+    async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::begin_evict(self, x).await
+    }
+    async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::finish_evict(self, x).await
+    }
+    async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
+        hot::record_cache_fill(self, extent, now).await
+    }
+    async fn touch_read(
+        &self,
+        extent: &ExtentId,
+        now: UnixMs,
+        min_gap_ms: i64,
+        from_cache: bool,
+    ) -> Result<UnixMs> {
+        hot::touch_read(self, extent, now, min_gap_ms, from_cache).await
+    }
+    async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool> {
+        hot::hot_check_due(self, now, every_ms).await
+    }
+    async fn hot_checked(&self, now: UnixMs) -> Result<()> {
+        hot::hot_checked(self, now).await
+    }
+    async fn hot_drain_set(&self, left: u64) -> Result<()> {
+        hot::hot_drain_set(self, left).await
+    }
+    async fn hot_drain_claim(&self, left: u64) -> Result<bool> {
+        hot::hot_drain_claim(self, left).await
+    }
+    async fn hot_seq(&self, extent: &ExtentId) -> Result<u64> {
+        hot::hot_seq(self, extent).await
+    }
+    async fn hot_forget(
+        &self,
+        extent: &ExtentId,
+        seq: u64,
+        safety: bool,
+        cache: bool,
+    ) -> Result<bool> {
+        hot::hot_forget(self, extent, seq, safety, cache).await
     }
 }
