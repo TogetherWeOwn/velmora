@@ -28,7 +28,8 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
 GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
-# Optional vars and their defaults:
+POST_SOCKETS = "8"                   # sockets per post job, spread over the posting tier (measured: 4 sockets gave 2.8 MiB/s)
+# Optional vars and their defaults (production sets POST_SOCKETS explicitly):
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
