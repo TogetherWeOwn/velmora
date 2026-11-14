@@ -39,13 +39,13 @@ pub(super) fn ms(t: UnixMs) -> SqlValue {
     SqlValue::Int(t.0)
 }
 
-fn uint(v: u64) -> Result<SqlValue> {
+pub(super) fn uint(v: u64) -> Result<SqlValue> {
     i64::try_from(v)
         .map(SqlValue::Int)
         .map_err(|_| BridgeError::Invalid("integer exceeds the catalogue range"))
 }
 
-fn opt<T>(v: Option<T>, f: impl FnOnce(T) -> SqlValue) -> SqlValue {
+pub(super) fn opt<T>(v: Option<T>, f: impl FnOnce(T) -> SqlValue) -> SqlValue {
     v.map_or(SqlValue::Null, f)
 }
 

@@ -22,10 +22,9 @@ use super::common::{
     internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
-use crate::recovery::{generation_key, write_generation};
+use crate::recovery::{copy_id, generation_key, write_generation};
 use crate::types::{
-    Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
-    S3Response,
+    Body, Bucket, CopyGeneration, ExtentRow, GenerationRow, GenerationState, S3Response,
 };
 
 /// Times the copy is re-planned when the source changes under it.
@@ -193,7 +192,7 @@ where
             (from.content_json.clone(), from.user_meta_json.clone())
         };
         let generation = GenerationRow {
-            id: GenerationId::mint(now, rand),
+            id: copy_id(now, &from.id, rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,

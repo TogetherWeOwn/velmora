@@ -14,6 +14,7 @@
 //! | `permits` | provider connection slots, pool-shared limits |
 //! | `health` | provider load, failures and cooldown |
 //! | `recovery` | tombstone-ordered delete, upload extent rows |
+//! | `replay` | recovery replay: extents, article plans, publication |
 //!
 //! An extent is in service while a live generation references it through
 //! `generation_extents`, or a part of an open upload names it. A copy adds
@@ -67,13 +68,15 @@ mod objects;
 mod outbox;
 mod permits;
 mod recovery;
+mod replay;
 mod uploads;
 
 use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, SqlValue, UploadTarget};
+use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
-    CompleteUpload, CopyGeneration, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage,
+    CompleteUpload, CopyGeneration, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow,
+    GcStep, GenerationId, GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage,
     OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow,
     UploadRow, VerificationRow,
 };
@@ -319,6 +322,30 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()> {
         gc::gc_done(self, id, now).await
+    }
+
+    // recovery replay
+    async fn replay_probe(&self, g: &GenerationRow) -> Result<ReplayProbe> {
+        replay::replay_probe(self, g).await
+    }
+    async fn replay_extents(
+        &self,
+        bucket: &Bucket,
+        extents: &[ReplayExtent],
+        now: UnixMs,
+    ) -> Result<()> {
+        replay::replay_extents(self, bucket, extents, now).await
+    }
+    async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)> {
+        replay::replay_damaged(self, limit).await
+    }
+    async fn replay_publish(
+        &self,
+        g: &GenerationRow,
+        placements: &[ExtentPlacement],
+        now: UnixMs,
+    ) -> Result<Guard<()>> {
+        replay::replay_publish(self, g, placements, now).await
     }
 
     // provider permits
