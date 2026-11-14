@@ -93,7 +93,7 @@ if [[ $MODE == local ]]; then
   [[ -n $PORT ]] || fail "local base URL" "http(s)://127.0.0.1:<port>" "$BASE"
 fi
 
-for tool in aws curl jq openssl; do
+for tool in aws curl jq openssl python3; do
   command -v "$tool" >/dev/null || fail "prerequisite" "$tool on PATH" "not found"
 done
 
@@ -443,6 +443,28 @@ run_aws "GET a/big.bin" "${S3[@]}" cp "s3://$SB/a/big.bin" "$T/got-big.bin" >/de
 same_bytes "GET a/big.bin equals the upload" "$T/big.bin" "$T/got-big.bin"
 run_aws "GET a/small.bin" "${S3[@]}" cp "s3://$SB/a/small.bin" "$T/got-small.bin" >/dev/null
 same_bytes "GET a/small.bin equals the upload" "$T/small.bin" "$T/got-small.bin"
+
+# ---------------------------------------------------------------------------
+# 1b a signed Accept-Encoding (rclone's default; aws-cli never signs it)
+# ---------------------------------------------------------------------------
+
+STEP=1b-signed-accept-encoding
+log "step $STEP"
+# The edge (and wrangler dev) rewrites Accept-Encoding before the Worker
+# runs; the Worker verifies against the client's own value. The helper reads
+# the 0600 credentials file itself and prints only status and error code.
+SIGV4_GET=(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/small.bin")
+got=$("${SIGV4_GET[@]}" gzip gzip "$T/got-ae.bin" 2>&1) ||
+  fail "GET a/small.bin with Accept-Encoding: gzip signed" "the helper exits 0" "$got"
+[[ $got == "200 -" ]] ||
+  fail "GET a/small.bin with Accept-Encoding: gzip signed" "200" "$got"
+same_bytes "GET with a signed Accept-Encoding equals the upload" "$T/small.bin" "$T/got-ae.bin"
+# Signed one value, sent another: refused, never served.
+got=$("${SIGV4_GET[@]}" gzip identity "$T/got-ae.bin" 2>&1) ||
+  fail "GET a/small.bin, signed gzip, sent identity" "the helper exits 0" "$got"
+[[ $got == "403 SignatureDoesNotMatch" ]] ||
+  fail "GET a/small.bin, signed gzip, sent identity" "403 SignatureDoesNotMatch" "$got"
+rm -f "$T/got-ae.bin"
 
 # ---------------------------------------------------------------------------
 # 2 HEAD / LIST / multipart ETag shape / a key with reserved characters
