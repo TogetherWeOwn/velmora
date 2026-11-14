@@ -6,7 +6,9 @@
 
 mod service_support;
 
+use serde_json::{json, Value};
 use service_support::*;
+use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{delete_blob, GENERATION_PREFIX, TOMBSTONE_PREFIX};
 use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
@@ -668,4 +670,105 @@ async fn a_record_is_bound_to_its_name() {
     assert_eq!(report.published, 0);
     assert_eq!(report.unreadable, [name_one, name_two]);
     assert_eq!(rig.count("generations"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The admin route
+// ---------------------------------------------------------------------------
+
+async fn admin(rig: &Rig, path: &str, body: Value) -> Resp {
+    let mut req = Req {
+        method: Method::Post,
+        target: format!("/_admin{path}"),
+        headers: Vec::new(),
+        body: body.to_string().into_bytes(),
+    };
+    req.set_header("host", HOST);
+    req.set_header("content-length", &req.body.len().to_string());
+    req.set_header(
+        "authorization",
+        &format!("Bearer {}", rig.bridge.cfg.admin_token.expose()),
+    );
+    rig.send(req).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_route_runs_only_in_maintenance() {
+    // A serving bridge writes two objects and deletes one.
+    let serving = rig();
+    let (_, signer) = serving.standard(BUCKET).await;
+    serving.put(&signer, BUCKET, "a", b"a").await.expect(200);
+    tick(&serving);
+    serving.put(&signer, BUCKET, "b", b"b").await.expect(200);
+    tick(&serving);
+    delete(&serving, &signer, "b").await.expect(204);
+
+    let refused = admin(&serving, "/restore", json!({ "since_ms": 0 })).await;
+    refused.expect(409);
+    assert!(refused.text().contains("NotInMaintenance"));
+
+    // A bridge in maintenance over the same blobs and an empty catalogue.
+    let mut cfg = config(Vec::new());
+    cfg.maintenance = Maintenance::Restore;
+    let restoring = rig_with(NoNntp, cfg);
+    for key in serving.bridge.safety.keys() {
+        let blob = serving.bridge.safety.stored(&key).unwrap();
+        let meta = BlobMeta {
+            bucket: &blob.bucket,
+            extent: &blob.extent,
+            cipher_sha256: &blob.cipher_sha256,
+        };
+        restoring
+            .bridge
+            .safety
+            .put(&key, blob.bytes.clone(), &meta)
+            .await
+            .unwrap();
+    }
+
+    let mut req = Req {
+        method: Method::Post,
+        target: "/_admin/restore".to_string(),
+        headers: Vec::new(),
+        body: b"{\"since_ms\":0}".to_vec(),
+    };
+    req.set_header("host", HOST);
+    req.set_header("content-length", "14");
+    restoring.send(req).await.expect(401);
+    for bad in [
+        json!({}),
+        json!({ "since_ms": -1 }),
+        json!({ "since_ms": 0, "margin_ms": -1 }),
+        json!({ "since_ms": 0, "cursor": { "since_ms": 0, "phase": "manifests", "after": "", "extent": 0 } }),
+        json!({ "since_ms": 0, "other": 1 }),
+    ] {
+        let r = admin(&restoring, "/restore", bad.clone()).await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.text());
+    }
+
+    let mut body = json!({ "since_ms": 0 });
+    let (mut published, mut deleted, mut calls) = (0, 0, 0);
+    loop {
+        calls += 1;
+        let r = admin(&restoring, "/restore", body).await;
+        r.expect(200);
+        let report: Value = serde_json::from_slice(&r.body).unwrap();
+        published += report["published"].as_u64().unwrap();
+        deleted += report["deleted"].as_u64().unwrap();
+        // Counts and ids only: never an object key.
+        assert!(!r.text().contains("\"key\""));
+        if report["next"].is_null() {
+            assert_eq!(report["damaged_total"], 0);
+            break;
+        }
+        body = json!({ "cursor": report["next"] });
+    }
+    assert_eq!((published, deleted, calls), (2, 1, 2));
+    assert_eq!(restoring.count("objects"), 1);
+    assert_eq!(restoring.count("generations"), 2);
+
+    // Maintenance still refuses everything else.
+    let signer = reissue_key(&restoring).await;
+    let put = restoring.put(&signer, BUCKET, "c", b"c").await;
+    assert_eq!(put.status, 503, "{}", put.text());
 }
