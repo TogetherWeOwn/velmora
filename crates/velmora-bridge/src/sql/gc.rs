@@ -5,8 +5,11 @@
 //! that no other live generation references. `gc_begin` still re-checks
 //! that at execution time and refuses to act on an extent any live
 //! generation or an open upload references. An extent that left service
-//! cannot come back: a copy is only published from a generation that is
-//! live in the same batch.
+//! cannot come back while requests and jobs run: a copy is only published
+//! from a generation that is live in the same batch. A restore replay can
+//! bring one back (a copy's record sorts after the record that retired
+//! its source); nothing collects while a restore runs, and afterwards the
+//! re-check here refuses the rows the replay left open.
 
 use super::uploads::{guarded, ms, text, Cols, Stmt};
 use super::SqlCatalog;

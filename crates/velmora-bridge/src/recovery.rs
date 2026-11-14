@@ -1,8 +1,9 @@
 //! Catalogue recovery records (DESIGN §A.8).
 //!
 //! The catalogue database can be lost or rolled back. Every acknowledged
-//! PutObject, CompleteMultipartUpload and DeleteObject is therefore also
-//! written to `SAFETY`, sealed, **before** its catalogue batch runs:
+//! PutObject, CopyObject, CompleteMultipartUpload and DeleteObject is
+//! therefore also written to `SAFETY`, sealed, **before** its catalogue
+//! batch runs:
 //!
 //! | Blob key | Record | Written |
 //! |---|---|---|
@@ -94,8 +95,20 @@ fn minted_ms(id: &GenerationId) -> Option<i64> {
 /// generation. It always sorts after `live`, also when this isolate's
 /// clock is behind the one that minted `live`.
 pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> GenerationId {
-    let after_live = minted_ms(live).map_or(now.0, |ms| ms.saturating_add(1));
-    GenerationId::mint(UnixMs(now.0.max(after_live)), rand)
+    id_after(now, live, rand)
+}
+
+/// The id of a copy of `source`. It always sorts after `source`, also
+/// when this isolate's clock is behind the one that minted `source`: a
+/// replay then applies the source first, and a copy onto the source's
+/// own key is the newer generation of that key.
+pub fn copy_id(now: UnixMs, source: &GenerationId, rand: [u8; 8]) -> GenerationId {
+    id_after(now, source, rand)
+}
+
+fn id_after(now: UnixMs, older: &GenerationId, rand: [u8; 8]) -> GenerationId {
+    let after = minted_ms(older).map_or(now.0, |ms| ms.saturating_add(1));
+    GenerationId::mint(UnixMs(now.0.max(after)), rand)
 }
 
 // ---------------------------------------------------------------------------
