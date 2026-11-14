@@ -1181,9 +1181,10 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     assert_eq!(get(&rig, &signer, "j").await.expect(200).body, b"good");
 
     // The runbook's way out. A PUT on the key that is acknowledged ends
-    // the report in a replay over a catalogue that has the PUT. A
-    // rebuild from the records alone lists the record again, and the key
-    // ends with the object of that PUT all the same.
+    // the report in a replay over a catalogue where the object of that
+    // PUT is live. A rebuild from the records alone lists the record
+    // again, and the key ends with the object of that PUT all the same.
+    // So does a replay after a delete of the key.
     tick(&rig);
     rig.put(&signer, BUCKET, "k", b"again").await.expect(200);
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
@@ -1196,6 +1197,12 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"again");
     let (again, _) = rig.live(&bucket, "k").await.unwrap();
     assert!(again.id.as_str() > lost[1].id.as_str());
+    tick(&rig);
+    delete(&rig, &signer, "k").await.expect(204);
+    let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    report.damaged_unpublished.sort();
+    assert_eq!(report.damaged_unpublished, lost, "`k` is listed again");
+    get(&rig, &signer, "k").await.expect(404);
 
     // The floor of a key is its refused record: a write and a delete
     // from a clock that runs behind sort after it.

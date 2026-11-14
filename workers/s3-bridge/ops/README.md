@@ -79,10 +79,11 @@ Limits to know:
   lists it under `damaged`. The exception: when the key has an older
   generation, live or deleted, the key stays as the older records leave
   it and the record is listed under `damaged_unpublished`, in every
-  replay, with its id, the name of its bucket and its key. Such a record is far more often what a failed write left
-  behind (a CompleteMultipartUpload whose parts were then collected)
-  than an acknowledged object that lost its data, and the replay cannot
-  tell the two apart. If it was acknowledged, the key answers with the
+  replay, with its id, the name of its bucket and its key. Such a
+  record is far more often what a failed write left behind (a
+  CompleteMultipartUpload whose parts were then collected) than an
+  acknowledged object that lost its data, and the replay cannot tell
+  the two apart. If it was acknowledged, the key answers with the
   object before it, or with 404 after a delete before it, instead of an
   error.
   - What to do about one: find out whether the write was acknowledged
@@ -92,12 +93,16 @@ Limits to know:
     - Acknowledged: the object is lost. Put it again from its source,
       or tell its owner.
   - The record stays in `SAFETY` either way, and no command removes it.
-    A PutObject on the key that is acknowledged ends the report for
-    replays over a catalogue that holds that write. A replay into an
-    empty database reads the record first and lists it again; the key
-    ends with the newer object all the same. Until then every replay
-    that reads the record exits with status 2: compare the list with
-    the one of the replay before.
+    A replay leaves it out only while the key has a live object that
+    is newer than the record, so a PutObject on the key ends the report
+    for replays over a catalogue where that object is live. The record
+    is listed again after a DeleteObject of the key, and by a replay
+    into an empty database, which reads the record before the newer
+    ones; the key ends as the newer records say all the same.
+  - Every replay that lists such a record exits with status 2, and for
+    a record that stays listed that does not end. Exit status 2 from
+    this list alone is then no new damage: compare the list with the
+    list of the replay before.
 - A CompleteMultipartUpload that got no answer from the catalogue and
   was sent again can leave two records of one object. The replay
   publishes one and counts the other in `duplicate`; nothing is missing.

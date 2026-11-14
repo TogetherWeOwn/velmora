@@ -24,7 +24,8 @@
 //! live or deleted. It is the record of a write that was never
 //! acknowledged far more often than the loss of an acknowledged one, so
 //! the key stays as the older records leave it and the record is
-//! reported as `damaged_unpublished`.
+//! reported as `damaged_unpublished`. Those entries carry the name of
+//! the bucket and the object key beside the id; no other list does.
 
 use serde::{Deserialize, Serialize};
 
