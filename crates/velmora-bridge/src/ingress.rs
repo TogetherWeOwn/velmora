@@ -185,6 +185,41 @@ pub fn origin_form(url: &str) -> Result<&str, IngressError> {
     Ok(target)
 }
 
+/// Puts back the `Accept-Encoding` value the client sent, so a client that
+/// signed it (rclone does by default) verifies.
+///
+/// Cloudflare's edge overwrites an incoming `Accept-Encoding` with its own
+/// value (`gzip, br` in production, `br, gzip` under `wrangler dev`) before
+/// the Worker runs. It reports the client's value, lightly normalised
+/// (lowercased, codings it knows reordered, a repeated field cut to the first),
+/// as `request.cf.clientAcceptEncoding`. That value is runtime metadata: a
+/// client cannot set it except through its own `Accept-Encoding` header.
+///
+/// `client` is that value, or `None` when the runtime has none. When it is a
+/// non-empty string, every `Accept-Encoding` field is replaced by exactly that
+/// one value. Otherwise the headers stay as received. That covers no client
+/// header, a coding the edge does not report, and a runtime that does not
+/// rewrite.
+///
+/// Why this keeps SigV4 sound:
+/// - Only this one header changes. The target, every other header and the
+///   payload hash are verified exactly as received.
+/// - There is exactly one value to verify against, so no candidate search
+///   gives an attacker extra tries.
+/// - Nothing is relaxed in the verifier. A request without a valid signature
+///   is refused as before, and a signed value that differs from the restored
+///   one fails with `SignatureDoesNotMatch`.
+/// - The comma rule still applies: a multi-coding value is refused as
+///   possibly merged.
+/// - velmora never acts on `Accept-Encoding`.
+pub fn restore_accept_encoding(headers: &mut Vec<(String, String)>, client: Option<&str>) {
+    let Some(client) = client.filter(|v| !v.is_empty()) else {
+        return;
+    };
+    headers.retain(|(n, _)| !n.eq_ignore_ascii_case("accept-encoding"));
+    headers.push(("accept-encoding".to_owned(), client.to_owned()));
+}
+
 /// `true` when the runtime's URL says `https`. Only the runtime's own URL is
 /// trusted, never `X-Forwarded-Proto` or `Forwarded`.
 pub fn is_https(url: &str) -> bool {
