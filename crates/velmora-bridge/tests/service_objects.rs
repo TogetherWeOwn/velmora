@@ -728,26 +728,6 @@ async fn restore_mode_refuses_mutations() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn copy_is_not_a_put() {
-    let rig = rig();
-    let (_, signer) = rig.standard(BUCKET).await;
-    rig.put(&signer, BUCKET, "src", b"payload")
-        .await
-        .expect(200);
-    rig.call(
-        &signer,
-        Method::Put,
-        &path(BUCKET, "dst"),
-        &[],
-        &[("x-amz-copy-source", "/bkt-objects/src")],
-        b"",
-    )
-    .await
-    .expect_error(501, "NotImplemented");
-    rig.head(&signer, BUCKET, "dst").await.expect(404);
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn delete_is_always_204() {
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;

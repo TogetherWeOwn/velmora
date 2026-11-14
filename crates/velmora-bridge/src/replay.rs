@@ -130,14 +130,15 @@ pub struct ReplayReport {
     pub tombstones: u32,
     /// Tombstones that removed a live object.
     pub deleted: u32,
-    /// Not published as a second object, and nothing is missing: the
-    /// live generation of the key holds the same extents in the same
-    /// order. A Complete that was sent again after an unanswered one
-    /// leaves two records of one object; the object stands under the id
-    /// of the later one.
+    /// Refused, and nothing is missing: a newer live generation of the
+    /// key holds the same extents in the same order. A Complete that
+    /// was sent again after an unanswered one leaves two records of one
+    /// object. Replayed together they are published one over the other,
+    /// and the object stands under the id of the later one.
     pub duplicate: u32,
-    /// Not published: the catalogue refused the generation (its extents
-    /// belong to another generation, or it lost a race).
+    /// Not published: the catalogue refused the generation (an extent
+    /// is missing, its key was shredded or it belongs to another
+    /// generation, or it lost a race).
     pub unpublishable: Vec<String>,
     /// Not replayed: the catalogue has another bucket under the name of
     /// the record's bucket. The first ids of `other_bucket_total`.
@@ -337,17 +338,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     .await?
                 {
                     Guard::Applied(()) => report.published += 1,
+                    // The extents of an object can be shared, so a second
+                    // record of one object is published like any other
+                    // manifest, over the first. What is refused and has a
+                    // live twin was published before: by an earlier run,
+                    // or because a newer record of the object is live.
                     Guard::Lost => match self.live_twin(&generation, &placements).await? {
-                        // An earlier record of the same object was
-                        // published. This one is the later of the two,
-                        // so the object goes under its id: a tombstone
-                        // between the two must not delete it.
-                        Some(older) if older < generation.id => {
-                            match self.catalog.replay_rebind(&generation, &older).await? {
-                                Guard::Applied(()) => report.duplicate += 1,
-                                Guard::Lost => report.unpublishable.push(id),
-                            }
-                        }
                         Some(_) => report.duplicate += 1,
                         None => report.unpublishable.push(id),
                     },
