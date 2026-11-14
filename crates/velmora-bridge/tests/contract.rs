@@ -1508,12 +1508,21 @@ fn provider_hosts_fail_closed() {
         r#""hosts":["us nntp"]"#,
         r#""hosts":["-us.nntp.invalid"]"#,
         r#""hosts":["user@us.nntp.invalid"]"#,
+        r#""hosts":["us-.nntp.invalid"]"#,
+        r#""hosts":["us..nntp.invalid"]"#,
+        r#""hosts":[".us.nntp.invalid"]"#,
+        r#""hosts":["us.nntp.invalid."]"#,
     ] {
         assert_eq!(one(bad), invalid, "{bad}");
     }
-    let long = format!(r#""hosts":["{}"]"#, "a".repeat(254));
-    assert_eq!(one(&long), invalid);
-    // No host twice, whatever its case, and not `host` again.
+    // A label is at most 63 bytes, the name at most 253.
+    let label = |n: usize| format!(r#""hosts":["{}.nntp.invalid"]"#, "a".repeat(n));
+    assert!(one(&label(63)).is_ok());
+    assert_eq!(one(&label(64)), invalid);
+    assert!(one(&format!(r#""hosts":["{}"]"#, labels_of(4))).is_ok()); // 251 bytes
+    let long = format!(r#""hosts":["{}.a.b"]"#, labels_of(4));
+    assert_eq!(one(&long), invalid); // 255 bytes
+                                     // No host twice, whatever its case, and not `host` again.
     assert_eq!(
         one(r#""hosts":["us.nntp.invalid","US.nntp.invalid"]"#),
         invalid
@@ -1526,6 +1535,11 @@ fn provider_hosts_fail_closed() {
     };
     assert!(one(&names(velmora_bridge::config::MAX_HOSTS)).is_ok());
     assert_eq!(one(&names(velmora_bridge::config::MAX_HOSTS + 1)), invalid);
+}
+
+/// `n` labels of 62 bytes, joined with dots.
+fn labels_of(n: usize) -> String {
+    (0..n).map(|_| "a".repeat(62)).collect::<Vec<_>>().join(".")
 }
 
 /// The local fake server is one plaintext loopback host: `hosts` is for

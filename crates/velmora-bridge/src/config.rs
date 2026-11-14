@@ -191,13 +191,19 @@ fn valid_s3_host(h: &str) -> bool {
     name_ok && port_ok
 }
 
-/// A DNS name of `[A-Za-z0-9.-]`: an entry of a provider's `hosts`.
+/// A DNS name: at most 253 bytes of dot-separated labels, each 1 to 63
+/// of `[A-Za-z0-9-]` and not starting or ending with `-`. An entry of a
+/// provider's `hosts`.
 fn valid_host_name(h: &str) -> bool {
-    !h.is_empty()
-        && h.len() <= 253
-        && !h.starts_with(['.', '-'])
-        && h.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    h.len() <= 253
+        && h.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 /// A provider's `hosts`: at most [`MAX_HOSTS`] valid names, none twice
