@@ -72,6 +72,7 @@ while :; do
               "held_checked","held_missing_total") as $k
         ($t[0]; .[$k] = ((.[$k] // 0) + $s[$k]))
     | .unpublishable = ((.unpublishable // []) + $s.unpublishable)
+    | .damaged_unpublished = ((.damaged_unpublished // []) + $s.damaged_unpublished)
     | .unreadable = ((.unreadable // []) + $s.unreadable)
     | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
     | .held_missing = ((.held_missing // []) + $s.held_missing)
@@ -91,7 +92,7 @@ if [ "$(jq -r '.held_missing_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: run it again with restore point 0 before leaving maintenance" >&2
   exit 2
 fi
-if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
+if [ "$(jq -r '(.unpublishable | length) + (.damaged_unpublished | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
   exit 2
 fi
