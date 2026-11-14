@@ -7,7 +7,8 @@
 //! `uploads.revision`, so `revision = R` pins the exact part set a Complete
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
-use super::objects::{clear_tombstone, guard_newest};
+use super::objects::{clear_floor, guard_newest};
+use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
 use crate::recovery::Recorded;
@@ -135,7 +136,9 @@ pub(super) async fn published<S: Sql>(
     }
     match c.sql.batch(stmts).await {
         Ok(_) => Ok(PublishOutcome::Applied),
-        Err(BridgeError::GuardFailed) => Ok(PublishOutcome::Refused(record.refused())),
+        Err(BridgeError::GuardFailed) => Ok(PublishOutcome::Refused(
+            record.refused(super::GuardRefused(())),
+        )),
         Err(e) => Err(e),
     }
 }
@@ -408,8 +411,9 @@ pub(super) async fn complete_upload<S: Sql>(
          WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
         guard,
     ));
+    stmts.push(guard_no_replay());
     stmts.push(guard_newest(t.bucket, t.key, &g.id));
-    stmts.push(clear_tombstone(t.bucket, t.key, &g.id));
+    stmts.push(clear_floor(t.bucket, t.key, &g.id));
     stmts.push((
         "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
            content_json, user_meta_json, extent_count, created_at, retired_at) \
@@ -506,7 +510,11 @@ pub(super) async fn complete_upload<S: Sql>(
     }
     let failed = match c.sql.batch(stmts).await {
         Ok(_) => return Ok(PublishOutcome::Applied),
-        Err(BridgeError::GuardFailed) => return Ok(PublishOutcome::Refused(record.refused())),
+        Err(BridgeError::GuardFailed) => {
+            return Ok(PublishOutcome::Refused(
+                record.refused(super::GuardRefused(())),
+            ))
+        }
         Err(e) => e,
     };
     // The outcome is unknown: the batch may have applied, or may still.
@@ -530,7 +538,9 @@ pub(super) async fn complete_upload<S: Sql>(
         ),
     ];
     match c.sql.batch(fence).await {
-        Ok(_) => Ok(PublishOutcome::Fenced(record.refused())),
+        Ok(_) => Ok(PublishOutcome::Fenced(
+            record.refused(super::GuardRefused(())),
+        )),
         // Still unknown, or it had applied: the record stays.
         Err(_) => Err(failed),
     }

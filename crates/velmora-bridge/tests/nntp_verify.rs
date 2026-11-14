@@ -706,6 +706,34 @@ async fn a_repost_larger_than_the_budget_still_runs() {
     assert_eq!(rig.bridge.budget.in_use(), 0);
 }
 
+/// A verify run reads from a provider and reposts on it: one invocation,
+/// so one address. On an account that allows one address the repost goes
+/// through, and every slot of the run carries the same name.
+#[tokio::test]
+async fn verify_and_its_repost_are_one_address() {
+    let mut rig = two_posting_backbones().await;
+    for p in &mut rig.bridge.cfg.providers {
+        p.max_ips = Some(1);
+    }
+    let (s, plan) = rig.waited_out_the_grace(36).await;
+    rig.bridge.catalog.granted.borrow_mut().clear();
+    rig.bridge.catalog.holder_peak.borrow_mut().clear();
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+
+    assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    let granted = rig.bridge.catalog.granted.borrow();
+    // The check that found the articles missing, and the repost.
+    let on_second = granted.iter().filter(|(p, _)| p == "p1").count();
+    assert!(on_second >= 2, "{granted:?}");
+    let names: std::collections::BTreeSet<&str> =
+        granted.iter().map(|(_, holder)| holder.as_str()).collect();
+    assert_eq!(names.len(), 1, "{granted:?}");
+    assert!(names.iter().all(|name| name.starts_with("job:")));
+}
+
 /// The repost is accepted, and the backbone still answers 430 for the
 /// articles on the read that follows. They are not posted a second time
 /// in the round: the backbone is recorded as `missing`.
@@ -822,7 +850,9 @@ async fn an_article_the_posting_provider_lost_is_posted_there_again() {
 
 /// An obligation that was cancelled after its repost and revived starts
 /// over at the post stage with its cursor at zero. The articles are on
-/// the backbone by then: nothing is posted again, by either stage.
+/// the backbone by then: nothing is posted again, by either stage. The
+/// post stage goes straight on to verify without a provider slot, so it
+/// does so even while other jobs hold every one of them.
 #[tokio::test]
 async fn a_revived_extent_is_not_posted_again() {
     let rig = two_posting_backbones().await;
@@ -839,10 +869,28 @@ async fn a_revived_extent_is_not_posted_again() {
     });
     rig.bridge.clock.advance_secs(3600);
     rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    // Another job holds every background slot of both posting providers.
+    let now = rig.bridge.clock.now();
+    let mut held = Vec::new();
+    for provider in &rig.bridge.cfg.providers {
+        while let Some(permit) = rig
+            .bridge
+            .catalog
+            .acquire_permit(provider, PermitClass::Background, "other", now)
+            .await
+            .unwrap()
+        {
+            held.push(permit);
+        }
+    }
+    assert!(held.len() >= 2);
     assert_eq!(rig.run(&s, OutboxStage::Post).await, JobOutcome::Ack);
     // The post stage needed no provider at all.
     assert!(rig.bridge.nntp.calls().is_empty());
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    for permit in held {
+        rig.bridge.catalog.release_permit(&permit).await.unwrap();
+    }
     rig.bridge.clock.advance_secs(3600);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);

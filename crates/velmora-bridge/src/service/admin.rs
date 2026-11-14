@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 use crate::articles::article_spans;
 use crate::config::{Maintenance, REAL_DATA_READY};
 use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
-use crate::fetch::{read_articles, ProviderSession};
+use crate::fetch::{read_articles, request_holder, ProviderSession};
 use crate::ingress::{self, check_admin_bearer, IngressError};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PermitClass,
@@ -372,8 +372,33 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     body: RestoreBody,
 ) -> Admin<S3Response> {
     let bad = || fail(400, "InvalidArgument", "Send since_ms or cursor.");
+    let earlier = || {
+        fail(
+            409,
+            "OperationAborted",
+            "This cursor is of an earlier replay. The replay that was started last is not finished.",
+        )
+    };
     let cursor = match (body.cursor, body.since_ms) {
-        (Some(cursor), None) if body.margin_ms.is_none() => cursor,
+        (Some(cursor), None) if body.margin_ms.is_none() => {
+            // The catalogue knows how far the replay has come. A cursor
+            // that is ahead of it (made up, or of another restore
+            // point) would end the replay with records left out.
+            let progress = bridge
+                .catalog
+                .restore_progress(crate::types::UnixMs(cursor.run_ms))
+                .await
+                .or_internal()?
+                .ok_or_else(earlier)?;
+            if !cursor.follows(&progress) {
+                return Err(fail(
+                    400,
+                    "InvalidArgument",
+                    "This cursor is ahead of the replay. Send `next` of the last response.",
+                ));
+            }
+            cursor
+        }
         (None, Some(since)) if since >= 0 => {
             let margin = body.margin_ms.unwrap_or(RESTORE_MARGIN_MS);
             if margin < 0 {
@@ -396,21 +421,27 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     };
     let run = crate::types::UnixMs(cursor.run_ms);
     let report = bridge.replay_step(cursor).await.or_internal()?;
-    // Only the replay that is recorded as under way is ended: the last
-    // step of an older cursor must not open the catalogue for writes
-    // while a replay that was started after it still runs.
-    if report.next.is_none()
-        && !bridge
+    match &report.next {
+        // Recorded before the caller gets it: the next call may start
+        // from here and no further.
+        Some(next) => bridge
             .catalog
-            .restore_finish(run, bridge.clock.now())
+            .restore_advance(run, &next.mark())
             .await
-            .or_internal()?
-    {
-        return Err(fail(
-            409,
-            "OperationAborted",
-            "This cursor is of an earlier replay. The replay that was started last is not finished.",
-        ));
+            .or_internal()?,
+        // Only the replay that is recorded as under way is ended: the
+        // last step of an older cursor must not open the catalogue for
+        // writes while a replay that was started after it still runs.
+        None => {
+            if !bridge
+                .catalog
+                .restore_finish(run, bridge.clock.now())
+                .await
+                .or_internal()?
+            {
+                return Err(earlier());
+            }
+        }
     }
     let value = serde_json::to_value(&report)
         .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;
@@ -818,7 +849,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let mut have = vec![false; plan.len()];
     let mut busy = false;
     let mut last_provider = String::new();
-    let holder = format!("drill:{}", extent.id);
+    let holder = request_holder("drill")?;
     for provider in bridge.cfg.providers.iter().filter(|p| p.read && p.enabled) {
         let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
         if wanted.is_empty() {
@@ -829,11 +860,13 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             &bridge.nntp,
             &bridge.clock,
             provider,
-            PermitClass::Background,
+            // A drill runs inside a request, as a read does: the short
+            // permit and the short calls of one.
+            PermitClass::Read,
             &holder,
         )
         .await?
-        else {
+        .map(|s| s.with_timer(bridge.budget.sleeper())) else {
             busy = true;
             continue;
         };
@@ -959,7 +992,11 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
                 "backbone": p.backbone,
                 "priority": p.priority,
                 "enabled": p.enabled,
+                "max_conns": p.max_conns,
+                // `null` = no address limit: `max_conns` alone.
+                "max_ips": p.max_ips,
                 "held": l.map_or(0, |l| l.held),
+                "holders": l.map_or(0, |l| l.holders),
                 "failures": l.map_or(0, |l| l.failures),
                 "cooling": l.is_some_and(|l| l.cooldown_until > now),
                 "cooldown_until": l.map_or(0, |l| l.cooldown_until.0),

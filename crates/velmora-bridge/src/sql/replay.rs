@@ -17,10 +17,10 @@
 //! published, which is what makes "already present" a safe reason to
 //! skip a manifest.
 
-use super::objects::{clear_tombstone, ms, opt, retire_live, text, uint};
+use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
-use crate::replay::{ReplayExtent, ReplayProbe};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, RestoreProgress};
 use crate::types::{
     ArticleRow, BridgeError, Bucket, ExtentId, ExtentPlacement, GenerationId, GenerationRow,
     GenerationState, Result, SafetyState, UnixMs,
@@ -254,7 +254,8 @@ pub(super) async fn restore_begin<S: Sql>(
              VALUES (1, 'replaying', ?1, ?2, NULL) \
              ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
                started_at = max(excluded.started_at, restore_state.started_at + 1), \
-               finished_at = NULL \
+               finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
+               reached_extent = NULL \
              RETURNING started_at",
             &[ms(since), ms(now)],
         )
@@ -297,6 +298,72 @@ pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
     }
 }
 
+/// Fails the batch it is in while a replay is under way. Every batch
+/// that publishes or deletes for a client carries it: the gate at the
+/// start of a request is read before the batch runs, and a replay that
+/// started in between must not find a write committed under it.
+pub(super) fn guard_no_replay() -> Stmt {
+    (
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete')",
+        Vec::new(),
+    )
+}
+
+pub(super) async fn restore_progress<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+) -> Result<Option<RestoreProgress>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT since_ms, reached_phase, reached_after, reached_extent \
+             FROM restore_state WHERE id = 1 AND started_at = ?1",
+            &[ms(run)],
+        )
+        .await?;
+    let bad = || BridgeError::Sql("row decode: restore progress".into());
+    match rows.first().map(Vec::as_slice) {
+        None => Ok(None),
+        Some([SqlValue::Int(since), SqlValue::Null, _, _]) => Ok(Some(RestoreProgress {
+            since: UnixMs(*since),
+            reached: None,
+        })),
+        Some(
+            [SqlValue::Int(since), SqlValue::Int(phase), SqlValue::Text(after), SqlValue::Int(extent)],
+        ) => Ok(Some(RestoreProgress {
+            since: UnixMs(*since),
+            reached: Some(ReplayMark {
+                phase: u8::try_from(*phase).map_err(|_| bad())?,
+                after: after.clone(),
+                extent: u32::try_from(*extent).map_err(|_| bad())?,
+            }),
+        })),
+        Some(_) => Err(bad()),
+    }
+}
+
+pub(super) async fn restore_advance<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+    next: &ReplayMark,
+) -> Result<()> {
+    c.sql
+        .exec(
+            "UPDATE restore_state SET reached_phase = ?2, reached_after = ?3, reached_extent = ?4 \
+             WHERE id = 1 AND started_at = ?1 AND (reached_phase IS NULL \
+               OR (reached_phase, reached_after, reached_extent) < (?2, ?3, ?4))",
+            &[
+                ms(run),
+                SqlValue::Int(i64::from(next.phase)),
+                text(&next.after),
+                SqlValue::Int(i64::from(next.extent)),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Step 2. `Lost` = the generation is already there, a newer generation
 /// of the key is live, or the extents do not tile it (one of them is
 /// missing, in another bucket, still a part of an upload under another
@@ -324,7 +391,7 @@ pub(super) async fn replay_publish<S: Sql>(
                     AND generation_id > ?1)",
         vec![gen_id(), bucket(), text(&g.key)],
     ));
-    stmts.push(clear_tombstone(&g.bucket_id, &g.key, &g.id));
+    stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(insert_live(g)?);
     for p in placements {
         stmts.push((

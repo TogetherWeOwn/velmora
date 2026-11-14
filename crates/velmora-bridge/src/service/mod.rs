@@ -6,6 +6,7 @@
 //! slice is `NotImplemented`.
 
 mod admin;
+mod bucket;
 mod common;
 mod copy;
 mod delete;
@@ -28,8 +29,15 @@ pub enum Route<'a> {
         rest: &'a str,
     },
     ListBuckets,
-    /// Admin-only in the slice.
+    /// Created with the admin bearer. Signed with an access key it only
+    /// answers `BucketAlreadyOwnedByYou` for a bucket the key may write.
     CreateBucket {
+        bucket: &'a str,
+    },
+    HeadBucket {
+        bucket: &'a str,
+    },
+    GetBucketLocation {
         bucket: &'a str,
     },
     ListObjects {
@@ -180,6 +188,8 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
         return match (method, sub.as_slice()) {
             (Method::Get, []) => Route::ListObjects { bucket },
             (Method::Put, []) => Route::CreateBucket { bucket },
+            (Method::Head, []) => Route::HeadBucket { bucket },
+            (Method::Get, ["location"]) => Route::GetBucketLocation { bucket },
             _ => Route::NotImplemented,
         };
     };
@@ -215,7 +225,15 @@ where
         match classify(&req.method, &target) {
             Route::Admin { rest } => admin::handle(&self, req, rest).await,
             Route::ListBuckets => list::list_buckets(&self, req).await,
-            Route::CreateBucket { bucket } => admin::create_bucket_s3(&self, req, bucket).await,
+            Route::CreateBucket { bucket } => {
+                if bucket::is_sigv4(&req) {
+                    bucket::create_bucket_signed(&self, req).await
+                } else {
+                    admin::create_bucket_s3(&self, req, bucket).await
+                }
+            }
+            Route::HeadBucket { .. } => bucket::head_bucket(&self, req).await,
+            Route::GetBucketLocation { .. } => bucket::get_bucket_location(&self, req).await,
             Route::ListObjects { bucket } => list::list_objects(&self, req, bucket).await,
             Route::PutObject { bucket, key } => put::put_object(&self, req, bucket, key).await,
             Route::GetObject { bucket, key } => get::get_object(&self, req, bucket, key).await,
@@ -366,7 +384,16 @@ mod tests {
             (Put, "/b/k?uploadId=u", Route::NotImplemented),
             (Post, "/b/k", Route::NotImplemented),
             (Delete, "/b", Route::NotImplemented),
-            (Head, "/b", Route::NotImplemented),
+            (Head, "/b", Route::HeadBucket { bucket: "b" }),
+            (Head, "/b/", Route::HeadBucket { bucket: "b" }),
+            (Get, "/b?location", Route::GetBucketLocation { bucket: "b" }),
+            (
+                Get,
+                "/b/?location=",
+                Route::GetBucketLocation { bucket: "b" },
+            ),
+            (Put, "/b?location", Route::NotImplemented),
+            (Get, "/b/k?location", Route::NotImplemented),
             (Other("PATCH".into()), "/b/k", Route::NotImplemented),
             (Get, "b/k", Route::NotImplemented),
             // Only `/` is the service root.

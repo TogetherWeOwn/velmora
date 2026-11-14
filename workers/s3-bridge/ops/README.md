@@ -9,7 +9,7 @@ kept outside it:
    - `m/<generation id>`: one per PutObject, CopyObject or CompleteMultipartUpload.
      Bucket (id, name, wrapped key), object key, metadata and every extent
      (sizes, offsets, digests, media header, wrapped file key).
-   - `m/del/<tombstone id>`: one per DeleteObject that removed an object.
+   - `m/del/<tombstone id>`: one per DeleteObject that found an object.
    - `m/art/<extent id>`: the article plan of an extent (message ids,
      newsgroup, headers, spans, digests), written before its first POST.
 
@@ -42,13 +42,20 @@ extents from Usenet.
 Limits to know:
 
 - A write that failed after its record was stored can become visible
-  after a replay. S3 allows this (the request had no definite outcome).
+  after a replay: one whose catalogue batch failed (the client got a
+  500 and cannot know the outcome), or one that was refused and whose
+  record could not be removed. It becomes visible only in its place in
+  the order: every write and delete that was acknowledged on the key
+  after it sorts after it and stays on top. It is visible after a replay
+  only when nothing was acknowledged on the key after it.
 - Replay order is id order, and on one key that is the order in which
-  the writes and deletes were committed. An id is minted after the
-  request body is read; the catalogue then refuses a publication whose
-  id does not sort after the live generation and the last delete of the
-  key, and the request is published under a later id instead. The
-  order does not depend on the clocks of Worker instances.
+  the records were stored. Before a record is stored, the catalogue
+  raises the floor of the key to the record's id, in a statement of its
+  own; every later id on the key is minted above the live generation
+  and the floor, and the catalogue refuses a publication that sorts
+  below either. This holds whatever became of the earlier request (a
+  delete that found nothing left to delete, a batch that failed) and
+  does not depend on the clocks of Worker instances.
 - An extent restored from its article plan record alone (no pinned
   copy) is assumed posted: the record is written before the first POST,
   so a replay cannot tell an extent that was fully posted from one whose
@@ -67,9 +74,14 @@ Limits to know:
   came between the two attempts does not remove it.
 - The record of a publication that the catalogue refused is deleted
   again, three tries in all. If the store fails every one, the record
-  stays and a replay publishes it: an object appears that no client was
-  told exists (a refused PUT, or a multipart upload that was aborted
-  afterwards). Nothing is lost by it; delete such an object by hand.
+  stays and a replay publishes it in its place in the order, as in the
+  first limit above. A refused PUT or copy answers 500 then. A
+  CompleteMultipartUpload goes on and can answer that the upload does
+  not exist (it was aborted): after a replay the key then holds an
+  object that the client was told was not made, in place of the object
+  the key held before, unless a write or delete was acknowledged on the
+  key afterwards. Compare the replay's object list with what is expected
+  and delete or overwrite such an object by hand.
 - If a bucket was made again under the name of a lost one before the
   replay, the two have different ids and data keys. The replay does not
   touch the new bucket: it skips the records of the old one and lists
@@ -91,6 +103,12 @@ in the bucket `velmora-catalog-export` (create it once with
 for example daily. It prints the **restore point**, which is also the
 object's name. D1 does not answer queries while an export runs.
 
+Take a fresh export after every deploy that applied a migration. An
+export carries the schema of its day and the list of the migrations
+that were applied (`d1_migrations`), so an older one can still be
+loaded and brought up to date (restore, step 2); a fresh one does not
+depend on that.
+
 D1 Time Travel (30 days) is the faster tool when the database still
 exists: restore it to a timestamp, then replay from that timestamp.
 
@@ -101,12 +119,25 @@ exists: restore it to a timestamp, then replay from that timestamp.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
-   - Export: create an empty database (do not apply the migrations: the
-     export carries the schema), download the newest
-     `d1/<db>/<restore point>.sql` and load it with
-     `npx wrangler d1 execute <db> --remote --file <file>`.
-   - Nothing: create a database and apply the migrations. The restore
-     point is `0`.
+   - Export: create an empty database (do not apply the migrations
+     first: the export carries the schema and the list of applied
+     migrations), download the newest `d1/<db>/<restore point>.sql` and
+     load it with `npx wrangler d1 execute <db> --remote --file <file>`.
+   - Nothing: create a database. The restore point is `0`.
+
+   Then, in every case, bring the schema up to date and close the
+   catalogue:
+
+   ```
+   npx wrangler d1 migrations apply <db> --remote
+   npx wrangler d1 execute <db> --remote --file ops/restore-arm.sql
+   ```
+
+   The first applies the migrations the copy does not have yet (all of
+   them on a new database, none on a current copy). The second records
+   a replay as started. From then on the catalogue refuses every write
+   until a replay has run to its end, whatever `MAINTENANCE` says: a
+   deploy that switches maintenance off too early still answers 503.
 3. If the Worker secret is gone too: `ops/kek-restore.sh <escrow file>`.
 4. `VELMORA_ADMIN_TOKEN_FILE=<file> ops/catalog-replay.sh <base-url> <restore point>`.
    It prints the counts. Exit status 2 means damage was found: read the
@@ -128,8 +159,14 @@ jobs and the cron. If a replay was stopped, run it again to its end.
 Starting a replay again makes the earlier one void: a step sent with a
 cursor of the earlier one can still run, but its last step answers 409
 and the catalogue stays closed until the replay that was started last
-has ended. This does not notice a
-replay that was never started: step 4 is not optional after step 2.
+has ended. A database that was brought back without the last command
+of step 2 is not closed: nothing in it says that a replay is due.
+
+The catalogue refuses the commit as well, not only the request: a write
+that was already under way when a replay started answers 503 and
+publishes nothing. A DeleteObject in that place answers 503 too; its
+tombstone can stay on record, as that of any delete that failed, and
+the replay then applies it.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.
@@ -142,6 +179,11 @@ does one bounded step and answers with counts and `next`. Send
 one hour: records that much older than the restore point are replayed
 too), then `{"cursor": <next>}` until `next` is null. The answer names
 generation ids and record names, never object keys.
+
+The catalogue keeps the place the replay has come to. A cursor that is
+ahead of it (a later phase, a later record, another restore point)
+answers 400, so no part of the records can be left out; a cursor that
+is behind repeats a step, which changes nothing.
 
 ## KEK
 

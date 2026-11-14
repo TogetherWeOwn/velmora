@@ -46,14 +46,18 @@ pub const MIGRATION_0004: &str =
 /// Extent references per generation (copies share extents).
 pub const MIGRATION_0005: &str =
     include_str!("../../../workers/s3-bridge/migrations/0005_generation_extents.sql");
-
-/// The newest tombstone of each deleted key.
+/// The class of a held permit (background job or read).
 pub const MIGRATION_0006: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0006_key_tombstones.sql");
+    include_str!("../../../workers/s3-bridge/migrations/0006_permit_class.sql");
+
+/// The floor of each key: the newest id a recovery record was stored
+/// under.
+pub const MIGRATION_0007: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0007_key_floors.sql");
 
 /// The mark of an unfinished catalogue replay.
-pub const MIGRATION_0007: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0007_restore_state.sql");
+pub const MIGRATION_0008: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0008_restore_state.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -143,6 +147,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0005)?;
         db.apply(MIGRATION_0006)?;
         db.apply(MIGRATION_0007)?;
+        db.apply(MIGRATION_0008)?;
         Ok(db)
     }
 

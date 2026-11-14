@@ -3,6 +3,7 @@
 //! Complete records before it publishes.
 
 use super::objects::{extent_row, retire_live, text, EXTENT_COLS};
+use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Sql, UploadTarget};
 use crate::types::{
@@ -11,24 +12,33 @@ use crate::types::{
 
 /// Retires the live generation of `(bucket, key)` if its id sorts before
 /// `before`. One batch: the guard and the delete see the same pointer.
+/// `client` = the delete of a client, which changes nothing while a
+/// replay is under way; the replay itself applies its tombstones without
+/// that guard.
 pub(super) async fn delete_object_before<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &BucketId,
     key: &str,
     before: &GenerationId,
     now: UnixMs,
+    client: bool,
 ) -> Result<bool> {
-    let mut stmts = vec![(
+    let mut stmts = Vec::new();
+    if client {
+        stmts.push(guard_no_replay());
+    }
+    stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects \
          WHERE bucket_id = ?1 AND key = ?2 AND generation_id < ?3)",
         vec![text(bucket.as_str()), text(key), text(before.as_str())],
-    )];
-    // The tombstone is the newest id of the key from here on: a later
-    // publication must sort after it.
+    ));
+    // The service raised the floor to the tombstone before it stored
+    // the record. Here again for a caller that applies a tombstone it
+    // did not write; rolled back with the batch when nothing is deleted.
     stmts.push((
-        "INSERT INTO key_tombstones(bucket_id, key, tombstone_id) VALUES (?1, ?2, ?3) \
+        "INSERT INTO key_floors(bucket_id, key, floor_id) VALUES (?1, ?2, ?3) \
          ON CONFLICT(bucket_id, key) DO UPDATE SET \
-           tombstone_id = max(tombstone_id, excluded.tombstone_id)",
+           floor_id = max(floor_id, excluded.floor_id)",
         vec![text(bucket.as_str()), text(key), text(before.as_str())],
     ));
     stmts.extend(retire_live(bucket, key, GenerationState::Deleted, now));

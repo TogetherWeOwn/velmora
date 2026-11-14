@@ -78,7 +78,7 @@ use crate::ports::{
     Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
-use crate::replay::{ReplayExtent, ReplayProbe};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, RestoreProgress};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
@@ -89,6 +89,13 @@ use crate::types::{
 
 /// `meta` key the guard self-test writes inside its failing batch.
 const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
+
+/// Says that a publication batch failed its guard and wrote nothing.
+/// The field is private to this module: only the catalogue code in it
+/// can make one, and [`Recorded::refused`] asks for it, so no other code
+/// in the crate can turn the proof of a record into the one that
+/// deletes it.
+pub(crate) struct GuardRefused(());
 
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
@@ -143,6 +150,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
     }
+    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
+        objects::raise_floor(self, bucket, key, id).await
+    }
     async fn copy_generation(
         &self,
         c: &CopyGeneration,
@@ -157,7 +167,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         before: &GenerationId,
         now: UnixMs,
     ) -> Result<bool> {
-        recovery::delete_object_before(self, bucket, key, before, now).await
+        recovery::delete_object_before(self, bucket, key, before, now, true).await
+    }
+    async fn replay_tombstone(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        id: &GenerationId,
+        now: UnixMs,
+    ) -> Result<bool> {
+        objects::raise_floor(self, bucket, key, id).await?;
+        recovery::delete_object_before(self, bucket, key, id, now, false).await
     }
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage> {
         objects::list(self, bucket, q).await
@@ -378,6 +398,12 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await
+    }
+    async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>> {
+        replay::restore_progress(self, run).await
+    }
+    async fn restore_advance(&self, run: UnixMs, next: &ReplayMark) -> Result<()> {
+        replay::restore_advance(self, run, next).await
     }
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)> {
         replay::replay_damaged(self, limit).await

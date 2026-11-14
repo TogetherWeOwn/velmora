@@ -208,6 +208,7 @@ impl Fx {
             post: true,
             read: true,
             max_conns: 2,
+            max_ips: None,
             priority: 0,
             retention_days: None,
             pool: None,
@@ -1397,7 +1398,7 @@ impl Fx {
         let (source, _) = cat.live_object(&bucket.id, from).await.unwrap().unwrap();
         let now = self.clock.now();
         let generation = GenerationRow {
-            id: recovery::copy_id(now, &source.id, None, [self.next(); 8]),
+            id: recovery::id_after(now, Some(&source.id), [self.next(); 8]),
             key: key.to_owned(),
             created_at: now,
             ..source.clone()
