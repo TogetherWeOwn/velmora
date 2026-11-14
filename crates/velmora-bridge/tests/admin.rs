@@ -122,6 +122,7 @@ impl Fx {
             post: true,
             read: true,
             max_conns: 2,
+            max_ips: None,
             priority: 0,
             retention_days: None,
             pool: None,
@@ -1216,6 +1217,10 @@ async fn status_reports_provider_health_without_credentials() {
         (Some(0), Some(0))
     );
     assert_eq!(one["cooling"], false);
+    // The limits, as configured: no address limit is `null`.
+    assert_eq!(one["max_conns"], p.max_conns);
+    assert!(one["max_ips"].is_null());
+    assert_eq!(one["holders"], 0);
 
     // A held slot and three failed sessions show up.
     let permit = fx
@@ -1230,7 +1235,7 @@ async fn status_reports_provider_health_without_credentials() {
     }
     let r = fx.get("/status").await;
     let one = r.json()["providers"][0].clone();
-    assert_eq!(one["held"], 1);
+    assert_eq!((&one["held"], &one["holders"]), (&json!(1), &json!(1)));
     assert_eq!(one["cooling"], true);
     assert_eq!(one["cooldown_until"], now.0 + 60_000);
     let body = r.text();
@@ -1238,4 +1243,29 @@ async fn status_reports_provider_health_without_credentials() {
         assert!(!body.contains(secret), "status leaks provider details");
     }
     fx.bridge.catalog.release_permit(&permit).await.unwrap();
+}
+
+/// The address limit of a provider and the number of jobs and requests
+/// that hold slots there are in the status.
+#[tokio::test]
+async fn status_reports_the_address_limit_and_its_holders() {
+    let mut fx = Fx::new().await;
+    Rc::get_mut(&mut fx.bridge)
+        .expect("one owner")
+        .cfg
+        .providers[0]
+        .max_ips = Some(2);
+    let now = fx.bridge.clock.now();
+    let p = fx.bridge.cfg.providers[0].clone();
+    for holder in ["a", "a", "b"] {
+        let permit = fx
+            .bridge
+            .catalog
+            .acquire_permit(&p, PermitClass::Read, holder, now);
+        // Two slots in the fixture: the third is refused.
+        assert_eq!(permit.await.unwrap().is_some(), holder == "a");
+    }
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(one["max_ips"], 2);
+    assert_eq!((&one["held"], &one["holders"]), (&json!(2), &json!(1)));
 }

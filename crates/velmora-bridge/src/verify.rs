@@ -21,7 +21,7 @@
 
 use serde::Serialize;
 
-use crate::fetch::{read_articles, ProviderSession, ReadTally};
+use crate::fetch::{job_holder, read_articles, ProviderSession, ReadTally};
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
@@ -136,7 +136,7 @@ where
         plan: &[ArticleRow],
         providers: &[&'p ProviderConfig],
     ) -> Staged<(&'p ProviderConfig, ReadTally)> {
-        let holder = format!("verify:{}", lease.extent);
+        let holder = job_holder(lease);
         let rows: Vec<&ArticleRow> = plan.iter().collect();
         let now = self.clock.now();
         let oldest = plan.iter().filter_map(|a| a.posted_at).min();
@@ -148,7 +148,7 @@ where
             fresh = expired;
         }
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
-        let usable = pool.order(fresh.clone());
+        let usable = pool.order(fresh.clone(), PermitClass::Background);
         if usable.is_empty() {
             if let Some(until) = pool.cooling_until(&fresh) {
                 return Err(Stop::Cooling(until));

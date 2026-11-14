@@ -745,3 +745,157 @@ async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
     assert_eq!(posted, on_server);
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
+
+/// An account that allows one source address and six connections: one
+/// job is one address, and it posts on as many sockets as `POST_SOCKETS`
+/// and the connection limit give it.
+#[tokio::test]
+async fn one_address_carries_every_socket_of_a_job() {
+    let mut rig = rig(&[spec("bb0", 6)]).await;
+    rig.bridge.cfg.providers[0].max_ips = Some(1);
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.bridge.nntp.connects(), 4);
+    assert_eq!(rig.bridge.nntp.peak(), 4);
+    assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 4);
+    assert_eq!(rig.bridge.catalog.holder_peak.borrow()["p0"], 1);
+
+    // More sockets than the account has connections: all six. No read
+    // can connect from a second address, so none is kept back for one.
+    rig.bridge.cfg.post_sockets = 8;
+    let s = rig.seed(2, &marked_plaintext(PLAIN_LEN)).await;
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(rig.bridge.nntp.peak(), 6);
+    assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 6);
+    assert_eq!(rig.bridge.catalog.holder_peak.borrow()["p0"], 1);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// Three jobs at once on an account with one address: one of them posts,
+/// on all its sockets, and the others are put off without an attempt,
+/// although the account has connections to spare. They run once the
+/// address is free.
+#[tokio::test]
+async fn overlapping_jobs_share_addresses_not_only_connections() {
+    let mut rig = rig(&[spec("bb0", 12)]).await;
+    rig.bridge.cfg.providers[0].max_ips = Some(1);
+    let mut seeded = Vec::new();
+    for n in 1..=3 {
+        seeded.push(rig.seed(n, &marked_plaintext(PLAIN_LEN)).await);
+    }
+
+    let outcomes = tokio::join!(
+        rig.run_post(&seeded[0]),
+        rig.run_post(&seeded[1]),
+        rig.run_post(&seeded[2]),
+    );
+    let outcomes = [outcomes.0, outcomes.1, outcomes.2];
+    assert_eq!(outcomes[0], JobOutcome::Ack);
+    for (outcome, s) in outcomes.iter().zip(&seeded).skip(1) {
+        assert!(
+            matches!(outcome, JobOutcome::Retry { delay_secs } if (15..=60).contains(delay_secs))
+        );
+        let outbox = rig.bridge.catalog.outbox(&s.extent);
+        assert_eq!((outbox.stage, outbox.attempts), (OutboxStage::Post, 0));
+        assert_eq!(outbox.last_error, None);
+    }
+    assert_eq!(rig.bridge.catalog.holder_peak.borrow()["p0"], 1);
+    assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 4);
+    assert_eq!(rig.bridge.nntp.peak(), 4);
+    assert_eq!(rig.bridge.nntp.connects(), 4);
+    assert_eq!(rig.servers[0].posted_count().await, 10);
+
+    rig.bridge.clock.advance_secs(60);
+    assert_eq!(rig.run_post(&seeded[1]).await, JobOutcome::Ack);
+    assert_eq!(rig.servers[0].posted_count().await, 20);
+}
+
+/// With three addresses, two go to jobs and one stays for reads: two
+/// jobs post at once on four sockets each, and the third waits.
+#[tokio::test]
+async fn jobs_leave_an_address_for_reads() {
+    let mut rig = rig(&[spec("bb0", 16)]).await;
+    rig.bridge.cfg.providers[0].max_ips = Some(3);
+    let mut seeded = Vec::new();
+    for n in 1..=3 {
+        seeded.push(rig.seed(n, &marked_plaintext(PLAIN_LEN)).await);
+    }
+
+    let (a, b, c) = tokio::join!(
+        rig.run_post(&seeded[0]),
+        rig.run_post(&seeded[1]),
+        rig.run_post(&seeded[2]),
+    );
+    assert_eq!([a, b], [JobOutcome::Ack, JobOutcome::Ack]);
+    assert!(matches!(c, JobOutcome::Retry { .. }));
+    assert_eq!(rig.bridge.catalog.outbox(&seeded[2].extent).attempts, 0);
+    assert_eq!(rig.bridge.catalog.holder_peak.borrow()["p0"], 2);
+    assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 8);
+    assert_eq!(rig.bridge.nntp.peak(), 8);
+}
+
+/// The one address of an account passes to someone else while a job is
+/// posting on two sockets. The job stops at its next renewal: it does
+/// not dial again and takes no slot back, which would make it a second
+/// address.
+#[tokio::test]
+async fn a_job_that_lost_its_address_stops() {
+    let mut rig = rig(&[spec("bb0", 6)]).await;
+    rig.bridge.cfg.providers[0].max_ips = Some(1);
+    rig.bridge.cfg.post_sockets = 2;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    let release = rig.bridge.nntp.park_next_post();
+    let calls_then = Cell::new(0);
+
+    let revoke = async || {
+        let renewals = rig.bridge.catalog.renewals.get();
+        rig.bridge.catalog.revoke_permits();
+        rig.bridge.clock.advance_secs(30);
+        calls_then.set(rig.bridge.nntp.calls().len());
+        for _ in 0..1_000_000 {
+            if rig.bridge.catalog.renewals.get() != renewals {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        release.set(true);
+    };
+    let outcome = rig.run_post_and(&s, 0, 2, revoke).await;
+
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    assert!(release.get(), "the permits were never taken over");
+    assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, 0);
+    let calls = rig.bridge.nntp.calls();
+    assert_eq!(calls.len(), calls_then.get(), "{calls:?}");
+    assert_eq!(rig.bridge.nntp.connects(), 2);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    // The address is still the other holder's: the job has no slot.
+    let load = rig
+        .bridge
+        .catalog
+        .provider_load(rig.bridge.clock.now())
+        .await
+        .unwrap();
+    assert_eq!((load[0].held, load[0].holders), (2, 1));
+    assert!(rig.plan(&s).await.iter().any(|a| a.posted_at.is_none()));
+
+    // The next run of the same job and stage is another invocation, so
+    // another address: it has a name of its own, and waits for the
+    // address like anybody else.
+    let first = rig.bridge.catalog.granted.borrow().clone();
+    rig.bridge.clock.advance_secs(600);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let granted = rig.bridge.catalog.granted.borrow();
+    let names = |all: &[(String, String)]| -> BTreeSet<String> {
+        all.iter().map(|(_, holder)| holder.clone()).collect()
+    };
+    let (before, after) = (names(&first), names(&granted[first.len()..]));
+    assert_eq!((before.len(), after.len()), (1, 1), "{granted:?}");
+    assert!(before.is_disjoint(&after), "{granted:?}");
+    let job = format!("job:{}:", s.extent);
+    assert!(before.union(&after).all(|name| name.starts_with(&job)));
+}

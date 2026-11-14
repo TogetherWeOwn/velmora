@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 use crate::articles::article_spans;
 use crate::config::{Maintenance, REAL_DATA_READY};
 use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
-use crate::fetch::{read_articles, ProviderSession};
+use crate::fetch::{read_articles, request_holder, ProviderSession};
 use crate::ingress::{self, check_admin_bearer, IngressError};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PermitClass,
@@ -783,7 +783,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let mut have = vec![false; plan.len()];
     let mut busy = false;
     let mut last_provider = String::new();
-    let holder = format!("drill:{}", extent.id);
+    let holder = request_holder("drill")?;
     for provider in bridge.cfg.providers.iter().filter(|p| p.read && p.enabled) {
         let wanted: Vec<&ArticleRow> = plan.iter().filter(|a| !have[a.idx as usize]).collect();
         if wanted.is_empty() {
@@ -923,7 +923,11 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
                 "backbone": p.backbone,
                 "priority": p.priority,
                 "enabled": p.enabled,
+                "max_conns": p.max_conns,
+                // `null` = no address limit: `max_conns` alone.
+                "max_ips": p.max_ips,
                 "held": l.map_or(0, |l| l.held),
+                "holders": l.map_or(0, |l| l.holders),
                 "failures": l.map_or(0, |l| l.failures),
                 "cooling": l.is_some_and(|l| l.cooldown_until > now),
                 "cooldown_until": l.map_or(0, |l| l.cooldown_until.0),

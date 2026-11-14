@@ -202,6 +202,7 @@ impl Fx {
             post: true,
             read: true,
             max_conns: 2,
+            max_ips: None,
             priority: 0,
             retention_days: None,
             pool: None,

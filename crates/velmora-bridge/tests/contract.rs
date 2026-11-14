@@ -1426,11 +1426,38 @@ fn old_provider_config_parses_with_pool_defaults() {
     assert_eq!(p.retention_days, None);
     assert_eq!(p.pool, None);
     assert_eq!(p.pool_max_conns, None);
+    assert_eq!(p.max_ips, None);
     assert!(p.enabled);
     // No retention limit: every article is in reach, whatever its age.
     let now = UnixMs(1_800_000_000_000);
     assert!(p.retains(Some(UnixMs(0)), now));
     assert!(p.retains(None, now));
+}
+
+/// `max_ips` is the number of source addresses an account may be
+/// connected from at once. It is optional, at least one, and no more
+/// than the largest connection limit; it may be larger than the
+/// account's own `max_conns`, where it limits nothing.
+#[test]
+fn provider_address_limit_parses_and_fails_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+
+    let providers = providers_of(&[
+        provider_json("a", r#""max_ips":1"#),
+        provider_json("b", r#""max_ips":64"#),
+        provider_json("c", r#""max_ips":null"#),
+        provider_json("d", ""),
+    ])
+    .unwrap();
+    let limits: Vec<Option<u32>> = providers.iter().map(|p| p.max_ips).collect();
+    assert_eq!(limits, [Some(1), Some(64), None, None]);
+
+    for bad in ["0", "65", "100000", "-1", "1.5", r#""4""#, "true"] {
+        assert_eq!(one(&format!(r#""max_ips":{bad}"#)), invalid, "{bad}");
+    }
+    // The setting is not a secret, and shows when a provider is printed.
+    assert!(format!("{:?}", providers[0]).contains("max_ips: Some(1)"));
 }
 
 #[test]

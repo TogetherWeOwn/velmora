@@ -9,7 +9,9 @@
 //!   on `STAT`) fails the job as `dup-unconfirmed`; it is retried later
 //!   with the same message-id.
 //! - A job posts over several connections at once, spread over the
-//!   `post` providers of one priority tier. Each article is posted once,
+//!   `post` providers of one priority tier, all under one permit holder:
+//!   a provider that limits source addresses (`max_ips`) counts the job
+//!   once. Each article is posted once,
 //!   to one provider; the other backbones get it by propagation, which
 //!   the verify stage checks (and repairs, see `verify`).
 //! - A provider that refuses the post or cannot be reached hands its
@@ -40,7 +42,7 @@ use velmora::transport::Transport;
 use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
-use crate::fetch::{report_health, ProviderSession};
+use crate::fetch::{job_holder, report_health, ProviderSession};
 use crate::jobs::JOB_OVERHEAD_BYTES;
 use crate::pool::Pool;
 use crate::ports::{
@@ -259,11 +261,11 @@ where
             self.load_planned(lease, extent).await?;
             return self.to_verify(lease).await;
         }
-        let holder = format!("post:{}", extent.id);
+        let holder = job_holder(lease);
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
         let cooling = pool.cooling_until(&posters);
-        let order = pool.order(posters);
+        let order = pool.order(posters, PermitClass::Background);
         // A slot first. Loading and hashing the extent is the expensive
         // part of the job: one that would only find every slot of its
         // first tier taken gives its lease back before it, not after.
@@ -424,7 +426,7 @@ where
         cooling: Option<UnixMs>,
         first: ProviderSession<'a, C, N, T>,
     ) -> core::result::Result<(), Stop> {
-        let holder = format!("post:{}", extent.id);
+        let holder = job_holder(lease);
         let mut first = Some(first);
         let mut failed = None;
         // Per article: a POST of it may have landed on a provider that
@@ -501,8 +503,11 @@ where
     /// Opens up to `post_sockets` posting sessions (never more than
     /// `articles`) over `providers`, one provider after the other in
     /// turns, so the sockets spread over every provider with a free slot.
-    /// The flag says whether a provider had no slot at all. `first` is a
-    /// session of one of them that the job holds already: it counts.
+    /// Every slot is taken under the one `holder` of the job run, so on a
+    /// provider with `max_ips` the job counts as one address however many
+    /// sockets it opens there. The flag says whether a provider had no
+    /// slot at all. `first` is a session of one of them that the job
+    /// holds already: it counts.
     pub(crate) async fn open_sessions<'a>(
         &'a self,
         providers: &[&'a ProviderConfig],
@@ -594,7 +599,7 @@ where
             return Ok(false);
         }
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
-        let order = pool.order(providers.to_vec());
+        let order = pool.order(providers.to_vec(), PermitClass::Background);
         if order.is_empty() {
             return match pool.cooling_until(providers) {
                 Some(until) => Err(Stop::Cooling(until)),
@@ -604,7 +609,7 @@ where
         let todo: Vec<usize> = (0..plan.len())
             .filter(|at| missing.contains(&plan[*at].idx))
             .collect();
-        let holder = format!("repost:{}", extent.id);
+        let holder = job_holder(lease);
         let (sessions, _) = self
             .open_sessions(&order, &holder, todo.len(), None)
             .await?;

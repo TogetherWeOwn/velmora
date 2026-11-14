@@ -197,7 +197,7 @@ if [[ $MODE == local ]]; then
     {
       printf 'VELMORA_KEK_1=%s\n' "$KEK"
       printf 'ADMIN_TOKEN=%s\n' "$ADMIN_TOKEN"
-      printf 'NNTP_PROVIDERS=[{"id":"fake1","host":"127.0.0.1","port":%s,"tls":false,"user":"slice","pass":"%s","backbone":"fake","post":true,"read":true,"max_conns":2}]\n' \
+      printf 'NNTP_PROVIDERS=[{"id":"fake1","host":"127.0.0.1","port":%s,"tls":false,"user":"slice","pass":"%s","backbone":"fake","post":true,"read":true,"max_conns":2,"max_ips":2}]\n' \
         "$FAKESRV_PORT" "$NNTP_PASS"
       # The host clients sign is this run's port, not the default in wrangler.toml.
       printf 'S3_HOST=%s:%s\n' "$HOST" "$PORT"

@@ -30,6 +30,7 @@ HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (un
 MAINTENANCE = "off"                  # off | restore
 # Optional vars and their defaults:
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
+#     A job is one source address to a provider, however many connections it holds there.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 
 # off | on. Turn on only in a release after the one that added extent
@@ -67,10 +68,13 @@ max_batch_size = 1
 # Secondary bound only; provider_permits is the real gate. Kept small on
 # purpose: the measured providers limit the source addresses an account
 # may connect from at once (1 to 4), not only its connections, and
-# parallel invocations mostly leave from different addresses. Throughput
-# comes from sockets per job (POST_SOCKETS), which share one address. A
-# job without a slot, refused at login, or without room in the isolate's
-# byte budget is deferred, not failed.
+# parallel invocations mostly leave from different addresses. A provider's
+# `max_ips` (in NNTP_PROVIDERS) is that limit: at most so many jobs and
+# requests hold connections there at once, and `max_conns` bounds the
+# connections they hold together. Throughput comes from sockets per job
+# (POST_SOCKETS), which share one address. A job without a slot, refused
+# at login, or without room in the isolate's byte budget is deferred, not
+# failed.
 max_concurrency = 3
 max_retries = 20
 retry_delay = 60

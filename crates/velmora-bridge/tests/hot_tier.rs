@@ -88,6 +88,7 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
         post: true,
         read: true,
         max_conns: 2,
+        max_ips: None,
         priority: 0,
         retention_days: None,
         pool: None,

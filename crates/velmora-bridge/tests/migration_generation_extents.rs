@@ -11,6 +11,7 @@ mod service_support;
 use service_support::*;
 use velmora_bridge::testkit::{
     RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
+    MIGRATION_0006,
 };
 use velmora_bridge::*;
 
@@ -166,7 +167,8 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
     assert_eq!(written.len(), 6);
     assert_eq!(rig.count("extents"), 7);
 
-    // Back to the schema of migration 0004, data kept.
+    // Back to the schema of migration 0004, data kept. (The catalogue
+    // also has the later migrations that do not touch these tables.)
     let db: &RusqliteSql = &rig.bridge.catalog.sql;
     db.apply(UNDO_0005).unwrap();
     let old = RusqliteSql::open_in_memory().unwrap();
@@ -175,6 +177,7 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0002,
         MIGRATION_0003,
         MIGRATION_0004,
+        MIGRATION_0006,
     ] {
         old.apply(migration).unwrap();
     }
