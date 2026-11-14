@@ -287,9 +287,7 @@ where
                 .count(),
         };
         let asked = self.clock.now();
-        let (mut held, _) = self
-            .open_sessions(first_tier, &holder, todo, Vec::new())
-            .await?;
+        let (mut held, _) = self.open_sessions(first_tier, &holder, todo).await?;
         let permits_ms = self.clock.now().0 - asked.0;
         crate::trace::note(&lease.extent, |t| {
             t.permits_ms = permits_ms;
@@ -299,25 +297,26 @@ where
         if held.is_empty() {
             return Err(Stop::NoPermit);
         }
+        // One renewal confirms the lease and every permit before any
+        // connect, as `Round::keep` does. A lease that is gone stops the
+        // job here, before it reads the extent.
+        let kept_at = match self.renew_held(lease, &held).await {
+            Ok(kept_at) => kept_at,
+            Err(stop) => {
+                close_all(held).await;
+                return Err(stop);
+            }
+        };
         // The sockets connect while the extent is read, checked and
         // planned and its record stored. Nothing is posted before that
-        // record is durable: posting starts only once both are done.
-        let ((kept_at, refused), loaded) = join(
-            self.connect_all(lease, &mut held),
+        // record is durable: posting starts only once both are done. The
+        // round renews before its first call once `kept_at` is older than
+        // the renewal interval, as after any renewal.
+        let (refused, loaded) = join(
+            self.connect_all(lease, &mut held, kept_at),
             self.load_planned(lease, extent, stored),
         )
         .await;
-        // Nothing renews the permits while the extent loads. After a load
-        // so slow that they could lapse before the round renews them, no
-        // connection is kept on them: the round connects again.
-        let lapse_ms = i64::from(PERMIT_SECS) * 1000 - POST_RESERVE_MS;
-        let kept_at = match kept_at {
-            Some(at) if self.clock.now().0 - at.0 >= lapse_ms => {
-                held.iter_mut().for_each(ProviderSession::discard);
-                None
-            }
-            kept => kept,
-        };
         let (cipher, mut plan) = match loaded {
             Ok(loaded) => loaded,
             Err(stop) => {
@@ -348,11 +347,32 @@ where
         advanced
     }
 
-    /// Connects every held session at once, after one renewal that
-    /// confirms the lease and all their permits, as [`Round::keep`] does
-    /// before any connect. Returns the time of that renewal when it
-    /// confirmed all of them (the first round counts it as its own), and
-    /// the providers that refused a login for their limit.
+    /// Renews the lease and the permits of `sessions` in one round trip.
+    /// `Ok(Some(at))`: both were confirmed at `at` by a renewal that came
+    /// back within the renewal interval (as in `Round::kept`), so the
+    /// sessions may connect now and the first round counts it as its own.
+    /// `Ok(None)`: not confirmed in time (a slow catalogue, a lost
+    /// permit); nothing connects early and the round renews first.
+    /// `Err(Fenced)`: the lease is gone.
+    async fn renew_held<'a>(
+        &self,
+        lease: &Lease,
+        sessions: &[ProviderSession<'a, C, N, T>],
+    ) -> core::result::Result<Option<UnixMs>, Stop> {
+        let now = self.clock.now();
+        let permits: Vec<Permit> = sessions.iter().map(|s| s.permit().clone()).collect();
+        let confirmed = match self.catalog.renew_all(lease, &permits, now).await {
+            Ok((false, _)) => return Err(Stop::Fenced),
+            Ok((true, held)) => held.len() == permits.len() && held.iter().all(|h| *h),
+            Err(_) => false,
+        };
+        let in_time = (0..KEEP_EVERY_MS).contains(&(self.clock.now().0 - now.0));
+        Ok((confirmed && in_time).then_some(now))
+    }
+
+    /// Connects every held session at once when `kept_at` says a renewal
+    /// confirmed the lease and their permits ([`Self::renew_held`]).
+    /// Returns the providers that refused a login for their limit.
     ///
     /// A session whose login the provider refused for its limit ("no
     /// slot") is ended at once and its slot given back, as the round
@@ -363,18 +383,11 @@ where
         &self,
         lease: &Lease,
         sessions: &mut Vec<ProviderSession<'a, C, N, T>>,
-    ) -> (Option<UnixMs>, Vec<&'a str>) {
-        let now = self.clock.now();
-        let permits: Vec<Permit> = sessions.iter().map(|s| s.permit().clone()).collect();
-        match self.catalog.renew_all(lease, &permits, now).await {
-            Ok((true, held)) if held.len() == permits.len() && held.iter().all(|h| *h) => {}
-            _ => return (None, Vec::new()),
-        }
-        // As in `Round::kept`: a renewal that itself took too long does
-        // not leave the reserve a connect needs.
-        if !(0..KEEP_EVERY_MS).contains(&(self.clock.now().0 - now.0)) {
-            return (None, Vec::new());
-        }
+        kept_at: Option<UnixMs>,
+    ) -> Vec<&'a str> {
+        let Some(now) = kept_at else {
+            return Vec::new();
+        };
         // A connect ends within `NNTP_CALL_SECS` like any call, and the
         // round could not end before it either: it would wait for the
         // article that socket had taken.
@@ -400,7 +413,7 @@ where
             }
             close_all(out.into_iter().map(|(s, _)| s).collect()).await;
         }
-        (Some(now), by)
+        by
     }
 
     /// Every article is recorded as posted: the extent goes on to verify.
@@ -581,9 +594,8 @@ where
                         (opened.sessions, opened.kept_at)
                     }
                     None => {
-                        let (sessions, without) = self
-                            .open_sessions(&untried, &holder, todo.len(), Vec::new())
-                            .await?;
+                        let (sessions, without) =
+                            self.open_sessions(&untried, &holder, todo.len()).await?;
                         no_slot = without;
                         (sessions, None)
                     }
@@ -645,33 +657,29 @@ where
     /// Every slot is taken under the one `holder` of the job run, so on a
     /// provider with `max_ips` the job counts as one address however many
     /// sockets it opens there. The flag says whether a provider had no
-    /// slot at all. `held` are sessions of them that the job holds
-    /// already: they count.
+    /// slot at all.
     ///
-    /// The slots still missing are asked for in passes, one catalogue call
-    /// each, all calls of a pass at once, in turns over the providers. A
-    /// provider that has given the job no slot yet is asked for one per
-    /// pass, so a full provider costs one call, not one per socket. A
-    /// provider that refuses is not asked again, and what it did not give
-    /// goes to the others in the next pass.
+    /// The slots are asked for in passes, one catalogue call each, all
+    /// calls of a pass at once, in turns over the providers. A provider
+    /// that has given the job no slot yet is asked for one per pass, so a
+    /// provider with no free slot costs one call. One that gave a slot
+    /// is asked for its full turn in the next pass, and each slot it no
+    /// longer has costs a refused call. A provider that refuses is not
+    /// asked again, and what it did not give goes to the others in the
+    /// next pass.
     pub(crate) async fn open_sessions<'a>(
         &'a self,
         providers: &[&'a ProviderConfig],
         holder: &str,
         articles: usize,
-        held: Vec<ProviderSession<'a, C, N, T>>,
     ) -> Result<(Vec<ProviderSession<'a, C, N, T>>, bool)> {
         let wanted = usize::try_from(self.cfg.post_sockets)
             .unwrap_or(1)
             .clamp(1, articles.max(1));
         let mut busy = false;
         let mut open: Vec<&ProviderConfig> = providers.to_vec();
-        // The next socket goes to the provider after the last one held.
-        let mut turn = held
-            .last()
-            .and_then(|last| providers.iter().position(|p| p.id == last.provider.id))
-            .map_or(0, |at| at + 1);
-        let mut sessions = held;
+        let mut turn = 0;
+        let mut sessions: Vec<ProviderSession<'a, C, N, T>> = Vec::new();
         while sessions.len() < wanted && !open.is_empty() {
             let need = wanted - sessions.len();
             let mut asked: Vec<&ProviderConfig> = Vec::with_capacity(need);
@@ -774,9 +782,7 @@ where
             .filter(|at| missing.contains(&plan[*at].idx))
             .collect();
         let holder = job_holder(lease);
-        let (sessions, _) = self
-            .open_sessions(&order, &holder, todo.len(), Vec::new())
-            .await?;
+        let (sessions, _) = self.open_sessions(&order, &holder, todo.len()).await?;
         if sessions.is_empty() {
             return Err(Stop::NoPermit);
         }
