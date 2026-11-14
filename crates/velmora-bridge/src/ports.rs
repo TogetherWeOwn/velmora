@@ -554,8 +554,8 @@ pub trait Catalog {
     /// nor an article plan: their number and the first `limit` ids.
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;
     /// Publishes the generation over the extents `replay_extents` left.
-    /// A generation with an extent that has no copy anywhere does not
-    /// replace an older live one.
+    /// A generation with an extent that has no copy anywhere is not
+    /// published on a key that has an older generation.
     async fn replay_publish(
         &self,
         g: &GenerationRow,
