@@ -603,6 +603,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5d assemble an object from ranges of two others (UploadPartCopy)
+# ---------------------------------------------------------------------------
+
+STEP=5d-part-copy
+log "step $STEP"
+# Part 1 starts inside one extent of a/big.bin and ends inside the next.
+PC_FROM=8388000
+PC_LEN=5300000
+json=$(run_aws "CreateMultipartUpload a/assembled.bin" "${S3API[@]}" --output json create-multipart-upload \
+  --bucket "$SB" --key a/assembled.bin)
+PC_ID=$(jq -er .UploadId <<<"$json") || fail "an UploadId" "a string" "$json"
+json=$(run_aws "UploadPartCopy 1 (range of a/big.bin)" "${S3API[@]}" --output json upload-part-copy \
+  --bucket "$SB" --key a/assembled.bin --upload-id "$PC_ID" --part-number 1 \
+  --copy-source "$SB/a/big.bin" --copy-source-range "bytes=$PC_FROM-$((PC_FROM + PC_LEN - 1))")
+PC_E1=$(jq -er .CopyPartResult.ETag <<<"$json") || fail "a part ETag" "a string" "$json"
+json=$(run_aws "UploadPartCopy 2 (all of $SMALL_KEY)" "${S3API[@]}" --output json upload-part-copy \
+  --bucket "$SB" --key a/assembled.bin --upload-id "$PC_ID" --part-number 2 \
+  --copy-source "$SB/$SMALL_KEY")
+PC_E2=$(jq -er .CopyPartResult.ETag <<<"$json") || fail "a part ETag" "a string" "$json"
+run_aws "CompleteMultipartUpload a/assembled.bin" "${S3API[@]}" complete-multipart-upload \
+  --bucket "$SB" --key a/assembled.bin --upload-id "$PC_ID" --multipart-upload \
+  "$(jq -nc --arg a "$PC_E1" --arg b "$PC_E2" \
+    '{Parts: [{PartNumber: 1, ETag: $a}, {PartNumber: 2, ETag: $b}]}')" >/dev/null
+dd if="$T/big.bin" of="$T/assembled-want.bin" bs=1M iflag=skip_bytes,count_bytes \
+  skip="$PC_FROM" count="$PC_LEN" status=none
+cat "$T/small.bin" >>"$T/assembled-want.bin"
+run_aws "GET a/assembled.bin" "${S3[@]}" cp "s3://$SB/a/assembled.bin" "$T/assembled.bin" >/dev/null
+same_bytes "GET a/assembled.bin equals the two ranges" "$T/assembled-want.bin" "$T/assembled.bin"
+run_aws "DELETE a/assembled.bin" "${S3[@]}" rm "s3://$SB/a/assembled.bin" >/dev/null
+rm -f "$T/assembled-want.bin" "$T/assembled.bin"
+
+# ---------------------------------------------------------------------------
 # 6 delete
 # ---------------------------------------------------------------------------
 
