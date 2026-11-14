@@ -22,8 +22,8 @@ MAX_EXTENT_BYTES = "16777216"
 REQUIRED_BACKBONES = "2"
 SAFETY_MIN_AGE_SECS = "604800"
 VERIFY_DELAY_SECS = "120"
-# One group per article, drawn at random. Each was posted to and read back
-# on every provider account by the provider probe.
+# One group per article, drawn at random. Each was posted to from every
+# posting account and read back by message-id on every account.
 NEWSGROUPS = "alt.binaries.boneless,alt.binaries.misc,alt.binaries.multimedia,alt.binaries.test"
 VELMORA_KEK_ACTIVE = "1"
 INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
