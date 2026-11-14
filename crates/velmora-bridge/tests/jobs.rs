@@ -500,10 +500,14 @@ async fn post_verify_release_over_fake_nntp() {
         fx.extent(&o, "cipher_size").await
     );
     assert!(fx.has_cache(&o));
-    // The release deleted that one blob: the recovery records stay.
+    // The recovery records stay beside it.
     assert_eq!(
         fx.bridge.safety.inner.keys(),
-        [article_key(&o.extent), "m/g_seeded".to_string()]
+        [
+            article_key(&o.extent),
+            "m/g_seeded".to_string(),
+            o.extent.safety_key()
+        ]
     );
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.len(), 1);
