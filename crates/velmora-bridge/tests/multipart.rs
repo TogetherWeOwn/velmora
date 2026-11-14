@@ -339,6 +339,7 @@ fn config(maintenance: &str) -> BridgeConfig {
         ("INFLIGHT_BUDGET_BYTES", "50331648".to_string()),
         ("GC_MODE", "disposable".to_string()),
         ("MAINTENANCE", maintenance.to_string()),
+        ("SERVER_SIDE_COPY", "on".to_string()),
         (
             "ADMIN_TOKEN",
             "multipart-test-admin-token-0123456789abcdef".to_string(),
@@ -1218,7 +1219,7 @@ async fn upload_part_refuses_bad_input_and_stores_nothing() {
         ))
         .await;
     assert_eq!(r.outcome(), "400 EntityTooLarge");
-    // UploadPartCopy is not built.
+    // UploadPartCopy from a key that does not exist.
     let r = rig
         .send(sign(
             RW_KEY,
@@ -1229,7 +1230,7 @@ async fn upload_part_refuses_bad_input_and_stores_nothing() {
             Vec::new(),
         ))
         .await;
-    assert_eq!(r.outcome(), "501 NotImplemented");
+    assert_eq!(r.outcome(), "404 NoSuchKey");
 
     assert!(rig.bridge.safety.keys().is_empty());
     assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 0);

@@ -325,8 +325,11 @@ pub fn precheck(
         _ if !has_s3_credential(req) => return Err(IngressError::AccessDenied),
         _ => {}
     }
+    // A copy names its source in a header and has no body, so it need not
+    // declare a length. The handler refuses one that declares a body.
+    let copy = header(req, "x-amz-copy-source").is_some();
     match route {
-        Route::PutObject { .. } | Route::UploadPart { .. } => {
+        Route::PutObject { .. } | Route::UploadPart { .. } if !copy => {
             upload_lengths(&req.headers, cfg.max_extent_bytes)?;
         }
         _ => {
@@ -470,6 +473,15 @@ impl Charge {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Takes over what `other` holds, so that one charge stands for both.
+    /// A charge against another budget is released instead.
+    pub fn absorb(&mut self, mut other: Charge) {
+        if Rc::ptr_eq(&self.state, &other.state) {
+            self.bytes = self.bytes.saturating_add(other.bytes);
+            other.bytes = 0;
+        }
+    }
 }
 
 impl fmt::Debug for Charge {
@@ -490,6 +502,24 @@ impl Drop for Charge {
 // ---------------------------------------------------------------------------
 // Counted read
 // ---------------------------------------------------------------------------
+
+/// For a request that takes no body: whether none was sent.
+///
+/// A body can arrive without a `Content-Length` (chunked transfer), so
+/// the header alone does not answer this. The stream is read until its
+/// first byte or its end and nothing is kept. A stream that fails counts
+/// as a body.
+pub async fn body_is_empty(body: Body) -> bool {
+    let Body::Stream { mut stream, .. } = body else {
+        return true;
+    };
+    while let Some(chunk) = stream.next().await {
+        if !chunk.is_ok_and(|bytes| bytes.is_empty()) {
+            return false;
+        }
+    }
+    true
+}
 
 /// Reads the body only after the budget charge: at most `declared_len + 1`
 /// bytes, whatever the stream does. Short is `IncompleteBody` (as is a
