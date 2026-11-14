@@ -178,6 +178,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let mut attempts = 0;
     let generation_id = loop {
         let record = write_generation(
+            &bridge.catalog,
             &bridge.safety,
             &bridge.kek,
             bucket,

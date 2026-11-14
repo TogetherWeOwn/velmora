@@ -4,7 +4,10 @@
 //! `ingress::origin_form`. `Request::url()` parses through `url::Url`, which
 //! resolves dot segments and rewrites backslashes, so it would verify a
 //! different key than the client signed; clippy bans it in this crate.
-//! Header values pass through untouched. The body stays an unread stream:
+//! Header values pass through untouched, with one exception: an
+//! `Accept-Encoding` the edge rewrote is replaced by the client's own value
+//! from `request.cf.clientAcceptEncoding` (`ingress::restore_accept_encoding`),
+//! so a client that signed it verifies. The body stays an unread stream:
 //! only `ingress::read_capped` or `ingress::read_upload` reads it, after auth
 //! and the budget charge.
 

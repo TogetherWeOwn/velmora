@@ -217,9 +217,9 @@ async fn put_is_not_acked_when_the_database_is_down() {
     assert_eq!(rig.count("outbox"), 0);
     assert!(rig.bridge.jobs.inner.sent().is_empty());
     // The safety copy was written before the catalogue was asked: what
-    // is left is an unreferenced blob, never a row without bytes. Its
-    // recovery record was written first as well: the commit may have
-    // applied for all the handler knows.
+    // is left is an unreferenced blob, never a row without bytes. No
+    // recovery record: the floor of the key could not be raised for it,
+    // and a record is stored only above a floor that stands.
     let mut kinds: Vec<String> = rig
         .bridge
         .safety
@@ -228,9 +228,19 @@ async fn put_is_not_acked_when_the_database_is_down() {
         .map(|k| k[..2].to_owned())
         .collect();
     kinds.sort();
-    assert_eq!(kinds, ["m/", "x/"]);
+    assert_eq!(kinds, ["x/"]);
     assert_eq!(rig.bridge.budget.in_use(), 0);
     rig.head(&signer, BUCKET, "k").await.expect(404);
+
+    // Only the batch fails: the record was stored before it and stays,
+    // since the batch may have applied for all the handler knows.
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"payload")
+        .await
+        .expect_error(500, "InternalError");
+    assert_eq!(rig.count("generations"), 0);
+    let keys = rig.bridge.safety.keys();
+    assert_eq!(keys.iter().filter(|k| k.starts_with("m/")).count(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

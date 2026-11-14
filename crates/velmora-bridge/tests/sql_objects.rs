@@ -1671,6 +1671,51 @@ async fn a_commit_under_an_older_or_equal_id_is_refused() {
     assert_eq!(fx.cat.publish(&later).await.unwrap(), Guard::Applied(()));
 }
 
+/// The floor is raised before a record is stored, by a statement of its
+/// own: it only goes up, it holds back every id below it, and the
+/// publication that raised it passes and takes it away.
+#[tokio::test(flavor = "current_thread")]
+async fn a_commit_must_not_sort_below_the_floor_of_the_key() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    // A bucket the catalogue does not have gets no floor, and no error.
+    let nowhere = BucketId::new("b_nowhere".to_owned());
+    let stray = GenerationId::mint(T0, [1; 8]);
+    fx.cat.raise_floor(&nowhere, "k", &stray).await.unwrap();
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
+
+    // The record of a write that was never published.
+    let failed = fx.commit(&b.id, "k", 1, T0.plus_ms(50));
+    let floor = failed.generation.id.clone();
+    fx.cat.raise_floor(&b.id, "k", &floor).await.unwrap();
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(floor.clone())
+    );
+    // A lower id does not lower it, and is refused.
+    let older = fx.commit(&b.id, "k", 1, T0.plus_ms(20));
+    let id = &older.generation.id;
+    fx.cat.raise_floor(&b.id, "k", id).await.unwrap();
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(floor.clone())
+    );
+    assert_eq!(fx.cat.publish(&older).await.unwrap(), Guard::Lost);
+    assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
+    // Another key is not held back.
+    fx.put(&b.id, "k2", T0).await;
+
+    // The id the floor was raised for passes, and the floor goes.
+    assert_eq!(fx.cat.publish(&failed).await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
+    // A floor under the live generation holds nothing back.
+    fx.cat.raise_floor(&b.id, "k", id).await.unwrap();
+    assert_eq!(fx.cat.newest_id(&b.id, "k").await.unwrap(), Some(floor));
+    let newer = fx.commit(&b.id, "k", 1, T0.plus_ms(51));
+    assert_eq!(fx.cat.publish(&newer).await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
     let fx = Fx::new();
@@ -1685,7 +1730,7 @@ async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
         .delete_object_before(&b.id, "k", &v1.generation.id, T0.plus_ms(1))
         .await
         .unwrap());
-    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 0);
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
 
     let tombstone = GenerationId::mint(T0.plus_ms(50), [9; 8]);
     assert!(fx
@@ -1707,21 +1752,21 @@ async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
     equal.generation.id = tombstone.clone();
     assert_eq!(fx.cat.publish(&equal).await.unwrap(), Guard::Lost);
     assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
-    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 1);
 
     // After it: published, and the tombstone row has done its work.
     let newer = fx.commit(&b.id, "k", 1, T0.plus_ms(51));
     assert_eq!(fx.cat.publish(&newer).await.unwrap(), Guard::Applied(()));
-    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 0);
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
     assert_eq!(
         fx.cat.newest_id(&b.id, "k").await.unwrap(),
         Some(newer.generation.id.clone())
     );
 }
 
-const BEFORE_0006: &str = "DROP TRIGGER key_tombstones_on_delete; DROP TABLE key_tombstones;";
+const BEFORE_0006: &str = "DROP TRIGGER key_floors_on_delete; DROP TABLE key_floors;";
 
-/// What a Worker from before `key_tombstones` does for a delete: it
+/// What a Worker from before `key_floors` does for a delete: it
 /// retires the generation and writes no tombstone row.
 fn delete_like_an_older_worker(fx: &Fx, id: &GenerationId, now: UnixMs) {
     let sql = format!(
@@ -1734,7 +1779,7 @@ fn delete_like_an_older_worker(fx: &Fx, id: &GenerationId, now: UnixMs) {
     fx.cat.sql.db.apply(&sql).unwrap();
 }
 
-/// A catalogue from before `key_tombstones`: its deletes are known only
+/// A catalogue from before `key_floors`: its deletes are known only
 /// to the recovery records. The migration gives every deleted key a
 /// boundary above them, so that a publication from a clock that runs
 /// behind still sorts after the old tombstone.
@@ -1756,7 +1801,7 @@ async fn the_migration_fences_keys_deleted_before_it() {
     db.apply(BEFORE_0006).unwrap();
     db.apply(velmora_bridge::testkit::MIGRATION_0006).unwrap();
 
-    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 1);
     assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());
     let boundary = fx.cat.newest_id(&b.id, "gone").await.unwrap().unwrap();
     assert!(boundary > old_tombstone);
@@ -1800,12 +1845,16 @@ async fn a_delete_that_writes_no_tombstone_row_is_fenced() {
     delete_like_an_older_worker(&fx, &plain.generation.id, now);
     let bound = fx.cat.newest_id(&b.id, "plain").await.unwrap().unwrap();
     assert!(bound >= tombstone, "{bound:?} {tombstone:?}");
-    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 2);
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 2);
 
-    // Under an id at or below the bound nothing is published.
+    // Under an id below the bound nothing is published. (The bound
+    // itself is the one id of its millisecond that would pass: the
+    // suffix a tombstone has with 64 random bits all set.)
+    let below = recovery::tombstone_id(now, &plain.generation.id, [0xfe; 8]);
+    assert!(below < bound);
     let mut again = fx.commit(&b.id, "plain", 1, now);
-    again.extents[0].generation_id = Some(tombstone.clone());
-    again.generation.id = tombstone;
+    again.extents[0].generation_id = Some(below.clone());
+    again.generation.id = below;
     assert_eq!(fx.cat.publish(&again).await.unwrap(), Guard::Lost);
 }
 
