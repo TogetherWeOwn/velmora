@@ -355,12 +355,30 @@ where
         Ok(over)
     }
 
-    /// The whole cron handler: bounded catalogue reads and queue sends
-    /// only.
+    /// The whole cron handler: bounded catalogue reads and queue sends,
+    /// plus the rollback stamp (one list call of one key and one small
+    /// put in the safety bucket).
     pub async fn dispatch(&self) -> Result<DispatchReport> {
         let mut report = DispatchReport::default();
-        if self.cfg.maintenance == Maintenance::Restore || self.catalog.restore_pending().await? {
+        if self.cfg.maintenance == Maintenance::Restore {
             return Ok(report);
+        }
+        if self.catalog.restore_pending().await? {
+            // Said on every run until the replay has ended.
+            report.rolled_back = self.catalog.stamp().await?.rolled_back;
+            return Ok(report);
+        }
+        // The rollback stamp, before anything else: on a catalogue that
+        // was restored to an earlier point this run must send no job. A
+        // check that could not be made ends the run as well.
+        match self.stamp_advance().await? {
+            None => {
+                report.rolled_back = true;
+                return Ok(report);
+            }
+            // The check passed. A stamp object that could not be put is
+            // made up for by the next run.
+            Some(counter) => report.stamp_failed = self.stamp_store(counter).await.is_err(),
         }
         let now = self.clock.now();
 

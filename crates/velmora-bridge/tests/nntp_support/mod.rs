@@ -937,7 +937,19 @@ impl Catalog for MemCatalog {
     async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<UnixMs> {
         unused()
     }
-    async fn restore_finish(&self, _: UnixMs, _: UnixMs) -> Result<bool> {
+    async fn restore_finish(&self, _: UnixMs, _: UnixMs, _: u64) -> Result<bool> {
+        unused()
+    }
+    async fn stamp(&self) -> Result<velmora_bridge::stamp::StampRow> {
+        Ok(velmora_bridge::stamp::StampRow {
+            counter: None,
+            rolled_back: false,
+        })
+    }
+    async fn stamp_advance(&self, _: Option<u64>) -> Result<bool> {
+        Ok(true)
+    }
+    async fn stamp_rolled_back(&self, _: UnixMs) -> Result<()> {
         unused()
     }
     async fn restore_pending(&self) -> Result<bool> {
@@ -1192,6 +1204,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
         server_side_copy: true,
+        catalogue_id: "main".to_string(),
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),

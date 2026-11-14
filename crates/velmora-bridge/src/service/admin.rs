@@ -433,9 +433,12 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
         // last step of an older cursor must not open the catalogue for
         // writes while a replay that was started after it still runs.
         None => {
+            // The catalogue holds every record again: its stamp counter
+            // is brought level with the newest stamp object.
+            let stamp = bridge.stamp_top().await.or_internal()?;
             if !bridge
                 .catalog
-                .restore_finish(run, bridge.clock.now())
+                .restore_finish(run, bridge.clock.now(), stamp)
                 .await
                 .or_internal()?
             {
@@ -979,6 +982,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
     let replaying = bridge.catalog.restore_pending().await.or_internal()?;
+    let stamp = bridge.catalog.stamp().await.or_internal()?;
     let now = bridge.clock.now();
     let load = bridge.catalog.provider_load(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
@@ -1026,8 +1030,10 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
             Maintenance::Off => "off",
             Maintenance::Restore => "restore",
         },
-        // A replay was started and did not end: writes are refused.
+        // A replay was started and did not end, or the catalogue was
+        // found behind its rollback stamp: writes are refused.
         "replay_unfinished": replaying,
+        "catalogue_rolled_back": stamp.rolled_back,
         "gc_mode": match cfg.gc_mode {
             crate::config::GcMode::Off => "off",
             crate::config::GcMode::Disposable => "disposable",

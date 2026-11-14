@@ -147,6 +147,7 @@ impl Fx {
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             server_side_copy: false,
+            catalogue_id: "main".to_string(),
             dev_trust_http: false,
             providers,
             admin_token: Secret::new(TOKEN.to_string()),

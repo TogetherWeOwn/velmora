@@ -89,12 +89,24 @@ pub fn start_after(prefix: &str, since: UnixMs) -> String {
     format!("{prefix}{ms:013x}")
 }
 
+/// Reserved for tenant keys. It lies under [`RECORD_PREFIX`], so no
+/// delete removes such a key, and none of the record kinds above match
+/// it, so a replay does not read one as a record.
+pub const TENANT_KEY_PREFIX: &str = "m/tk/";
+
 /// Whether `key` names a recovery record.
 pub fn is_record_key(key: &str) -> bool {
     key.starts_with(RECORD_PREFIX)
 }
 
-/// What a store answers to a delete of a recovery record.
+/// Whether `key` is one that no delete may remove: a recovery record
+/// (which includes [`TENANT_KEY_PREFIX`]) or a rollback stamp.
+pub fn is_protected_key(key: &str) -> bool {
+    is_record_key(key) || crate::stamp::is_stamp_key(key)
+}
+
+/// What a store answers to a delete of a recovery record or of a
+/// rollback stamp.
 pub const ERR_RECORD_DELETE: BridgeError =
     BridgeError::Invalid("recovery records are never deleted");
 
@@ -103,7 +115,7 @@ pub const ERR_RECORD_DELETE: BridgeError =
 /// the catalogue row that asked for the delete says; the store refuses
 /// them too ([`BlobStore::delete`]).
 pub async fn delete_blob<B: BlobStore>(store: &B, key: &str) -> Result<()> {
-    if is_record_key(key) {
+    if is_protected_key(key) {
         return Err(ERR_RECORD_DELETE);
     }
     store.delete(key).await

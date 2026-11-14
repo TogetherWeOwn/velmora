@@ -410,8 +410,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
         replay::restore_begin(self, since, now).await
     }
-    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
-        replay::restore_finish(self, run, now).await
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs, stamp: u64) -> Result<bool> {
+        replay::restore_finish(self, run, now, stamp).await
+    }
+    async fn stamp(&self) -> Result<crate::stamp::StampRow> {
+        replay::stamp(self).await
+    }
+    async fn stamp_advance(&self, from: Option<u64>) -> Result<bool> {
+        replay::stamp_advance(self, from).await
+    }
+    async fn stamp_rolled_back(&self, now: UnixMs) -> Result<()> {
+        replay::stamp_rolled_back(self, now).await
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await

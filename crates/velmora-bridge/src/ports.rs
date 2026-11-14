@@ -87,9 +87,11 @@ pub trait BlobStore {
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
-    /// Idempotent. Refuses a recovery record (any key under `m/`) with
-    /// [`crate::recovery::ERR_RECORD_DELETE`] before the store is asked:
-    /// no caller can remove one through this method.
+    /// Idempotent. Refuses a recovery record (any key under `m/`, which
+    /// includes the tenant keys under `m/tk/`) and a rollback stamp (any
+    /// key under `rs/`) with [`crate::recovery::ERR_RECORD_DELETE`]
+    /// before the store is asked: no caller can remove one through this
+    /// method.
     async fn delete(&self, key: &str) -> Result<()>;
     /// Removes the record of a generation that the catalogue refused to
     /// publish. The only delete of a key under `m/`; the argument exists
@@ -531,9 +533,22 @@ pub trait Catalog {
     async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs>;
     /// The replay with the mark `run` ran to its end. `false` = another
     /// replay was started since; that one is not ended by this.
-    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool>;
-    /// Whether a replay was started and has not ended.
+    /// In the same batch the rollback stamp is made level: the counter
+    /// becomes at least `stamp` (the newest stamp object) and a recorded
+    /// rollback is cleared.
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs, stamp: u64) -> Result<bool>;
+    /// Whether writes and jobs must be refused: a replay was started and
+    /// has not ended, or a rollback of the catalogue was found and no
+    /// replay has ended since.
     async fn restore_pending(&self) -> Result<bool>;
+    /// The rollback stamp row ([`crate::stamp`]).
+    async fn stamp(&self) -> Result<crate::stamp::StampRow>;
+    /// Moves the stamp counter from `from` to the next value (`None` =
+    /// creates the row at 1). `false` = the counter is not at `from`, or
+    /// a rollback is recorded: nothing changed.
+    async fn stamp_advance(&self, from: Option<u64>) -> Result<bool>;
+    /// Records that the catalogue was found behind its stamp.
+    async fn stamp_rolled_back(&self, now: UnixMs) -> Result<()>;
     /// The replay with the mark `run`: its restore point and how far it
     /// has come. `None` = `run` is not the replay that was started last.
     async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>>;

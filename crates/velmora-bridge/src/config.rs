@@ -125,6 +125,11 @@ pub struct BridgeConfig {
     /// fills). Pinned bytes are outside it: uploads are never throttled.
     pub hot_cap_bytes: u64,
     pub maintenance: Maintenance,
+    /// Names this catalogue in the keys of its rollback stamp
+    /// (`rs/<catalogue id>/<counter>`). Two catalogues over one safety
+    /// bucket need two ids. Never change it for a catalogue in use: its
+    /// stamp objects would no longer be found.
+    pub catalogue_id: String,
     /// Serve CopyObject. Off until the version that is rolled back to
     /// also reads extent references: an older Worker cannot read a copy
     /// and does not know that the source's extents are shared.
@@ -186,6 +191,17 @@ fn valid_s3_host(h: &str) -> bool {
             && p.parse::<u32>().is_ok_and(|n| (1..=65_535).contains(&n))
     });
     name_ok && port_ok
+}
+
+/// The catalogue id when `CATALOGUE_ID` is not set.
+pub const DEFAULT_CATALOGUE_ID: &str = "main";
+
+/// `[a-z0-9_-]{1,32}`: one path segment of a blob key.
+fn valid_catalogue_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 fn valid_newsgroup(g: &str) -> bool {
@@ -301,6 +317,15 @@ impl BridgeConfig {
             _ => return Err(ConfigError::Invalid("MAINTENANCE".into())),
         };
 
+        // Optional: absent or empty is the default.
+        let catalogue_id = match get("CATALOGUE_ID") {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => DEFAULT_CATALOGUE_ID.to_string(),
+        };
+        if !valid_catalogue_id(&catalogue_id) {
+            return Err(ConfigError::Invalid("CATALOGUE_ID".into()));
+        }
+
         let server_side_copy = match required(&get, "SERVER_SIDE_COPY")?.as_str() {
             "off" => false,
             "on" => true,
@@ -347,6 +372,7 @@ impl BridgeConfig {
             gc_mode,
             hot_cap_bytes,
             maintenance,
+            catalogue_id,
             server_side_copy,
             dev_trust_http,
             providers,

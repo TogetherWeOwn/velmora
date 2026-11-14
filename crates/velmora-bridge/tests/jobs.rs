@@ -70,11 +70,18 @@ impl GuardedBlob {
     fn check(&self) {
         assert!(!self.forbid.get(), "blob store touched");
     }
+    /// The rollback stamp is the one thing the dispatcher may put and
+    /// list.
+    fn check_unless_stamp(&self, key: &str) {
+        if !velmora_bridge::stamp::is_stamp_key(key) {
+            self.check();
+        }
+    }
 }
 
 impl BlobStore for GuardedBlob {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
-        self.check();
+        self.check_unless_stamp(key);
         if self
             .no_put
             .borrow()
@@ -105,7 +112,7 @@ impl BlobStore for GuardedBlob {
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
-        self.check();
+        self.check_unless_stamp(prefix);
         self.inner.list(prefix, start_after, limit).await
     }
 }
@@ -232,6 +239,7 @@ impl Fx {
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             server_side_copy: false,
+            catalogue_id: "main".to_string(),
             dev_trust_http: false,
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
@@ -1046,6 +1054,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             redriven: 0,
             redrive_failed: false,
             evict_failed: false,
+            rolled_back: false,
+            stamp_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

@@ -279,6 +279,13 @@ fn config_loads_from_documented_vars() {
         sized.insert("HOT_CAP_BYTES".to_string(), value.to_string());
         assert_eq!(load(&sized).unwrap().hot_cap_bytes, want, "{value:?}");
     }
+    // The catalogue id is one path segment of the stamp keys.
+    assert_eq!(cfg.catalogue_id, "main");
+    for (value, want) in [("", Some("main")), (" eu-1 ", Some("eu-1")), ("a/b", None)] {
+        sized.insert("CATALOGUE_ID".to_string(), value.to_string());
+        let got = load(&sized).ok().map(|c| c.catalogue_id);
+        assert_eq!(got.as_deref(), want, "{value:?}");
+    }
     assert!(cfg.dev_trust_http);
     assert!(!cfg.providers[0].tls);
 }
@@ -684,6 +691,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "provider_health",
             "provider_permits",
             "restore_state",
+            "rollback_stamp",
             "scan_cursors",
             "tx_guard",
             "upload_parts",

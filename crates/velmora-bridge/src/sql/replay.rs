@@ -18,9 +18,11 @@
 //! skip a manifest.
 
 use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
+use super::uploads::int;
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
+use crate::stamp::StampRow;
 use crate::types::{
     ArticleRow, BridgeError, Bucket, ExtentId, ExtentPlacement, GenerationId, GenerationRow,
     GenerationState, Result, SafetyState, UnixMs,
@@ -270,25 +272,102 @@ pub(super) async fn restore_finish<S: Sql>(
     c: &SqlCatalog<S>,
     run: UnixMs,
     now: UnixMs,
+    stamp: u64,
 ) -> Result<bool> {
     // Ending the same replay twice is the same as ending it once.
+    // The stamp is made level in the same batch, and only when this is
+    // the replay that ends: the catalogue now holds every record, so it
+    // is no longer behind. The counter never moves down.
     let changed = c
         .sql
-        .exec(
-            "UPDATE restore_state SET state = 'complete', \
-               finished_at = COALESCE(finished_at, ?1) \
-             WHERE id = 1 AND started_at = ?2",
-            &[ms(now), ms(run)],
+        .batch(vec![
+            (
+                "UPDATE restore_state SET state = 'complete', \
+                   finished_at = COALESCE(finished_at, ?1) \
+                 WHERE id = 1 AND started_at = ?2",
+                vec![ms(now), ms(run)],
+            ),
+            (
+                "INSERT INTO rollback_stamp(id, counter, rolled_back_at) \
+                 SELECT 1, ?1, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
+                   WHERE id = 1 AND started_at = ?2 AND state = 'complete') \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   counter = max(counter, excluded.counter), rolled_back_at = NULL",
+                vec![int(stamp)?, ms(run)],
+            ),
+        ])
+        .await?;
+    Ok(changed.first() == Some(&1))
+}
+
+pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>) -> Result<StampRow> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT counter, rolled_back_at IS NOT NULL FROM rollback_stamp WHERE id = 1",
+            &[],
         )
         .await?;
+    match rows.first().map(Vec::as_slice) {
+        None => Ok(StampRow {
+            counter: None,
+            rolled_back: false,
+        }),
+        Some([SqlValue::Int(counter), SqlValue::Int(rolled)]) => Ok(StampRow {
+            counter: Some(
+                u64::try_from(*counter)
+                    .map_err(|_| BridgeError::Sql("row decode: stamp counter".into()))?,
+            ),
+            rolled_back: *rolled != 0,
+        }),
+        _ => Err(BridgeError::Sql("row decode: rollback stamp".into())),
+    }
+}
+
+pub(super) async fn stamp_advance<S: Sql>(c: &SqlCatalog<S>, from: Option<u64>) -> Result<bool> {
+    let changed = match from {
+        None => {
+            c.sql
+                .exec(
+                    "INSERT INTO rollback_stamp(id, counter) VALUES (1, 1) \
+                     ON CONFLICT(id) DO NOTHING",
+                    &[],
+                )
+                .await?
+        }
+        Some(from) => {
+            c.sql
+                .exec(
+                    "UPDATE rollback_stamp SET counter = counter + 1 \
+                     WHERE id = 1 AND counter = ?1 AND rolled_back_at IS NULL",
+                    &[int(from)?],
+                )
+                .await?
+        }
+    };
     Ok(changed == 1)
+}
+
+pub(super) async fn stamp_rolled_back<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
+    // Without a row the counter is 0: behind every stamp object.
+    c.sql
+        .exec(
+            "INSERT INTO rollback_stamp(id, counter, rolled_back_at) VALUES (1, 0, ?1) \
+             ON CONFLICT(id) DO UPDATE SET \
+               rolled_back_at = COALESCE(rolled_back_at, excluded.rolled_back_at)",
+            &[ms(now)],
+        )
+        .await?;
+    Ok(())
 }
 
 pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
     let rows = c
         .sql
         .query(
-            "SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'",
+            "SELECT (SELECT COUNT(*) FROM restore_state WHERE state <> 'complete') \
+                  + (SELECT COUNT(*) FROM rollback_stamp \
+                     WHERE id = 1 AND rolled_back_at IS NOT NULL)",
             &[],
         )
         .await?;
@@ -298,14 +377,16 @@ pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
     }
 }
 
-/// Fails the batch it is in while a replay is under way. Every batch
+/// Fails the batch it is in while a replay is under way, or while a
+/// rollback of the catalogue was found and not yet replayed. Every batch
 /// that publishes or deletes for a client carries it: the gate at the
 /// start of a request is read before the batch runs, and a replay that
 /// started in between must not find a write committed under it.
 pub(super) fn guard_no_replay() -> Stmt {
     (
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
-           (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete')",
+           (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete') \
+           OR EXISTS (SELECT 1 FROM rollback_stamp WHERE id = 1 AND rolled_back_at IS NOT NULL)",
         Vec::new(),
     )
 }
