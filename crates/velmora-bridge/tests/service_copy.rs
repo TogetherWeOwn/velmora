@@ -785,3 +785,31 @@ async fn copy_retry_sorts_after_the_attempt_that_lost() {
     assert_eq!(keys.len(), records + 1);
     assert!(keys.contains(&made) && !keys.contains(&lost));
 }
+
+/// A delete of the lost record that fails is tried again: a store that
+/// answers on the third try does not fail the copy.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_retries_the_delete_of_a_lost_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(1);
+    let records = rig.bridge.safety.keys().len();
+
+    let lost = Rc::new(RefCell::new(String::new()));
+    let seen = lost.clone();
+    lose_the_guard(&rig, move |bridge, key| {
+        *seen.borrow_mut() = key.to_owned();
+        bridge.safety.fail_deletes.set(2);
+    });
+    copy(&rig, &signer, &source("src"), "dst", &[])
+        .await
+        .expect(200);
+    assert_eq!(rig.bridge.safety.fail_deletes.get(), 0);
+    let keys = rig.bridge.safety.keys();
+    assert_eq!(keys.len(), records + 1);
+    assert!(!keys.contains(&lost.borrow()));
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+}

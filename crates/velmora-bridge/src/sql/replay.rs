@@ -333,8 +333,8 @@ pub(super) async fn replay_publish<S: Sql>(
                                           WHERE e.id = outbox.extent_id) \
                                    WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
                                    ELSE 'done' END, \
-                attempts = 0, next_at = ?2, lease_owner = NULL, lease_until = NULL, \
-                updated_at = ?2 \
+                attempts = 0, cursor = 0, last_error = NULL, next_at = ?2, updated_at = ?2, \
+                lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL \
           WHERE stage = 'cancelled' AND extent_id IN \
                 (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
         vec![gen_id(), ms(now)],

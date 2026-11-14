@@ -729,9 +729,11 @@ pub(super) async fn revive_referenced<S: Sql>(
                                           WHERE e.id = outbox.extent_id) \
                                    WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
                                    ELSE 'done' END, \
-                attempts = 0, next_at = ?1, lease_owner = NULL, lease_until = NULL, \
-                updated_at = ?1 \
-          WHERE rowid > ?2 AND rowid <= ?3 AND stage = 'cancelled' AND ",
+                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, ",
+        unlease!(),
+        // `+stage`: the window is found by rowid. Through the stage
+        // index the statement would visit every cancelled row there is.
+        " WHERE rowid > ?2 AND rowid <= ?3 AND +stage = 'cancelled' AND ",
         live_ref!("outbox.extent_id")
     );
     let revived = c
