@@ -27,8 +27,7 @@ use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
-pub const LEASE_SECS: u32 = 600;
-pub const PERMIT_SECS: u32 = 120;
+pub use velmora_bridge::{LEASE_SECS, PERMIT_SECS};
 pub const USER: &str = "testuser";
 pub const PASS: &str = "testpass";
 
@@ -46,9 +45,42 @@ pub struct TcpConnector {
     live: Rc<Cell<u32>>,
     peak: Rc<Cell<u32>>,
     connects: Cell<u32>,
+    slow: Rc<RefCell<Option<Slow>>>,
+}
+
+/// Calls that take time on the test clock, and when each one started.
+struct Slow {
+    clock: FixedClock,
+    ms: i64,
+    calls: Vec<(&'static str, UnixMs)>,
+}
+
+fn begin(slow: &RefCell<Option<Slow>>, what: &'static str) {
+    if let Some(slow) = slow.borrow_mut().as_mut() {
+        slow.calls.push((what, slow.clock.now()));
+    }
+}
+
+fn end(slow: &RefCell<Option<Slow>>) {
+    if let Some(slow) = slow.borrow().as_ref() {
+        slow.clock.advance_ms(slow.ms);
+    }
 }
 
 impl TcpConnector {
+    /// From now on every connect, lookup and POST takes `ms` on `clock`.
+    pub fn slow(&self, clock: &FixedClock, ms: i64) {
+        *self.slow.borrow_mut() = Some(Slow {
+            clock: clock.clone(),
+            ms,
+            calls: Vec::new(),
+        });
+    }
+    /// The slow calls so far: what, and the time each started.
+    pub fn calls(&self) -> Vec<(&'static str, UnixMs)> {
+        let slow = self.slow.borrow();
+        slow.as_ref().map(|s| s.calls.clone()).unwrap_or_default()
+    }
     /// Most sessions ever open at once.
     pub fn peak(&self) -> u32 {
         self.peak.get()
@@ -86,6 +118,7 @@ pub async fn dial(cfg: &NntpConfig) -> Result<NntpClient<NativeTlsTransport>> {
 pub struct CountedSession {
     inner: Option<NntpClient<NativeTlsTransport>>,
     live: Rc<Cell<u32>>,
+    slow: Rc<RefCell<Option<Slow>>>,
 }
 
 impl Drop for CountedSession {
@@ -102,10 +135,16 @@ impl CountedSession {
 
 impl NntpSession for CountedSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
-        NntpSession::post(self.client(), message_id, article).await
+        begin(&self.slow, "post");
+        let posted = NntpSession::post(self.client(), message_id, article).await;
+        end(&self.slow);
+        posted
     }
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
-        NntpSession::stat(self.client(), message_id).await
+        begin(&self.slow, "stat");
+        let found = NntpSession::stat(self.client(), message_id).await;
+        end(&self.slow);
+        found
     }
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
         NntpSession::body(self.client(), message_id, out).await
@@ -121,13 +160,17 @@ impl NntpConnector for TcpConnector {
     type Session = CountedSession;
 
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
-        let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await?;
+        begin(&self.slow, "connect");
+        let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
+        end(&self.slow);
+        let client = client?;
         self.connects.set(self.connects.get() + 1);
         self.live.set(self.live.get() + 1);
         self.peak.set(self.peak.get().max(self.live.get()));
         Ok(CountedSession {
             inner: Some(client),
             live: Rc::clone(&self.live),
+            slow: Rc::clone(&self.slow),
         })
     }
 }
@@ -171,7 +214,8 @@ struct Health {
     until: i64,
 }
 
-/// A takeover injected at the `mark_posted` call of one article index.
+/// A takeover injected at the catalogue write that marks one article
+/// index posted (alone or in a batch).
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
     /// Another job takes the lease before the write: the write is fenced.
@@ -191,9 +235,17 @@ pub struct MemCatalog {
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
     pub fault: Cell<Option<Fault>>,
+    /// `renew_all` calls so far (one per renewal tick of a post job).
+    pub renewals: Cell<u32>,
+    /// The time of each `renew_all`.
+    pub renewed_at: RefCell<Vec<UnixMs>>,
+    /// `mark_posted_many` calls so far.
+    pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
     pub permit_refusals: Cell<u32>,
+    /// Permits another holder gives back right after the next refusal.
+    pub free_after_refusal: RefCell<Vec<Permit>>,
 }
 
 impl MemCatalog {
@@ -229,6 +281,13 @@ impl MemCatalog {
 
     pub fn verifications(&self, extent: &ExtentId) -> Vec<VerificationRow> {
         self.entries.borrow()[extent].verifications.clone()
+    }
+
+    /// Every held slot passes to someone else: its holder's permit is dead.
+    pub fn revoke_permits(&self) {
+        for slot in self.slots.borrow_mut().values_mut().flatten() {
+            slot.token += 1;
+        }
     }
 
     pub fn edit(&self, extent: &ExtentId, f: impl FnOnce(&mut Entry)) {
@@ -564,6 +623,12 @@ impl Catalog for MemCatalog {
         let free = (0..limit(p.max_conns) as usize).find(|&i| slots[i].until < now.0);
         let Some(i) = free.filter(|_| !pool_full) else {
             self.permit_refusals.set(self.permit_refusals.get() + 1);
+            for freed in self.free_after_refusal.borrow_mut().drain(..) {
+                let slot = &mut all.get_mut(&freed.provider).expect("seeded")[freed.slot as usize];
+                if slot.token == freed.token {
+                    slot.until = 0;
+                }
+            }
             return Ok(None);
         };
         slots[i].token += 1;
@@ -578,6 +643,70 @@ impl Catalog for MemCatalog {
             slot: i as u32,
             token: slots[i].token,
         }))
+    }
+
+    async fn mark_posted_many(
+        &self,
+        l: &Lease,
+        posted: &[(u32, &str)],
+        now: UnixMs,
+    ) -> Result<bool> {
+        self.mark_batches.set(self.mark_batches.get() + 1);
+        if self.fail_mark_posted.get() > 0 {
+            self.fail_mark_posted.set(self.fail_mark_posted.get() - 1);
+            return Err(BridgeError::Sql("injected mark_posted failure".into()));
+        }
+        let fault = self.fault.get();
+        let has = |i: u32| posted.iter().any(|(idx, _)| *idx == i);
+        let steal = |e: &mut Entry| {
+            e.outbox.token += 1;
+            e.outbox.lease_until = Some(now.plus_secs(LEASE_SECS));
+        };
+        if matches!(fault, Some(Fault::StealLeaseBefore(i)) if has(i)) {
+            self.fault.set(None);
+            self.edit(&l.extent, steal);
+        }
+        // All or nothing, like the fenced SQL batch.
+        let written = self
+            .fenced(l, |e| {
+                for (idx, provider) in posted {
+                    let a = &mut e.articles[*idx as usize];
+                    a.state = ArticleState::Posted;
+                    a.provider_id = Some(provider.to_string());
+                    a.posted_at = Some(now);
+                }
+            })
+            .is_some();
+        match fault {
+            Some(Fault::StealLeaseAfter(i)) if has(i) => {
+                self.fault.set(None);
+                self.edit(&l.extent, steal);
+            }
+            Some(Fault::RevokePermitAfter(i)) if has(i) => {
+                self.fault.set(None);
+                for slot in self.slots.borrow_mut().values_mut().flatten() {
+                    slot.token += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(written)
+    }
+
+    async fn renew_all(
+        &self,
+        l: &Lease,
+        permits: &[Permit],
+        now: UnixMs,
+    ) -> Result<(bool, Vec<bool>)> {
+        self.renewals.set(self.renewals.get() + 1);
+        self.renewed_at.borrow_mut().push(now);
+        let lease = self.renew(l, now).await?;
+        let mut held = Vec::new();
+        for p in permits {
+            held.push(self.renew_permit(p, now).await?);
+        }
+        Ok((lease, held))
     }
 
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
@@ -880,6 +1009,8 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
+        post_sockets: 4,
+        propagation_grace_secs: 21_600,
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
@@ -1080,6 +1211,37 @@ impl Rig {
         let lease = self.claim(s, OutboxStage::Post).await;
         let job = self.job(s).await;
         self.bridge.post_stage(&lease, &job).await
+    }
+
+    /// Claims the post stage and runs it; as soon as server `server`
+    /// holds `stored` articles, `then` runs in the middle of the job.
+    pub async fn run_post_and(
+        &self,
+        s: &Seeded,
+        server: usize,
+        stored: usize,
+        then: impl AsyncFnOnce(),
+    ) -> JobOutcome {
+        let lease = self.claim(s, OutboxStage::Post).await;
+        let job = self.job(s).await;
+        // A job that ends before `stored` articles are there is returned
+        // as it is: `then` does not run and nothing waits for ever.
+        let done = Cell::new(false);
+        let post = async {
+            let outcome = self.bridge.post_stage(&lease, &job).await;
+            done.set(true);
+            outcome
+        };
+        let mid = async {
+            while self.servers[server].posted_count().await < stored {
+                if done.get() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            then().await;
+        };
+        tokio::join!(post, mid).0
     }
 
     /// Claims `stage` and runs it once.
