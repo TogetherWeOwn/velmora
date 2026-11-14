@@ -28,6 +28,8 @@ struct Probe {
     batches: Cell<u32>,
     /// Statements of the most recent batch, in order.
     last_batch: RefCell<Vec<&'static str>>,
+    /// Every statement run on its own, in order.
+    ran: RefCell<Vec<String>>,
 }
 
 fn check_params(params: &[SqlValue]) {
@@ -47,6 +49,7 @@ impl Sql for Probe {
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         check_params(params);
         self.execs.set(self.execs.get() + 1);
+        self.ran.borrow_mut().push(sql.to_owned());
         self.db.exec(sql, params).await
     }
     async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
@@ -75,6 +78,7 @@ impl Fx {
                 execs: Cell::new(0),
                 batches: Cell::new(0),
                 last_batch: RefCell::new(vec![]),
+                ran: RefCell::new(vec![]),
             }),
             next_id: Cell::new(1),
         }
@@ -443,6 +447,41 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
         .delete_now(&b.id, "live", T0.plus_ms(12))
         .await
         .unwrap();
+}
+
+/// The periodic revival reads its window of the outbox by rowid. Through
+/// the stage index it would visit every cancelled row on every pass.
+#[tokio::test(flavor = "current_thread")]
+async fn revival_reads_only_its_window_of_the_outbox() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    fx.put(&b.id, "k", T0).await;
+    fx.cat.revive_referenced(500, T0).await.unwrap();
+    let ran = fx.cat.sql.ran.borrow().clone();
+    let revive: Vec<_> = ran
+        .iter()
+        .filter(|s| s.starts_with("UPDATE outbox"))
+        .collect();
+    assert_eq!(revive.len(), 1, "{ran:?}");
+    let plan = fx.cat.sql.db.with_conn(|c| {
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", revive[0]))
+            .unwrap();
+        let mut rows = stmt.raw_query();
+        let mut lines = vec![];
+        while let Some(row) = rows.next().unwrap() {
+            lines.push(row.get::<_, String>(3).unwrap());
+        }
+        lines.join("\n")
+    });
+    assert!(
+        plan.contains("SEARCH outbox USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
+        "{plan}"
+    );
+    assert!(
+        !plan.contains("outbox_due") && !plan.contains("SCAN"),
+        "{plan}"
+    );
 }
 
 /// Retiring a generation must not read the whole outbox: the cancel is
@@ -839,6 +878,16 @@ async fn copy_references_the_extents_of_a_live_source_only() {
             .unwrap(),
         Guard::Applied(())
     );
+
+    // A source that has fewer references than its row claims: the copy
+    // would read short, so it is not made.
+    let whole = fx.commit(&b.id, "whole", 3, t1);
+    fx.cat.publish(&whole).await.unwrap();
+    fx.run(&format!(
+        "DELETE FROM generation_extents WHERE generation_id = '{}' AND seq = 2",
+        whole.generation.id.as_str()
+    ));
+    refused(&fx, copy_of(&fx, &whole.generation, "short", t1.plus_ms(1))).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
