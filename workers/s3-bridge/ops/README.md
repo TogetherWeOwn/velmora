@@ -69,13 +69,15 @@ Limits to know:
   `unreadable` and its extent is restored without a plan.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
-  lists it under `damaged`. The exception: when an older object is live
-  under the key, that one stays and the record is listed under
-  `damaged_unpublished`. Such a record is far more often what a failed
-  write left behind (a CompleteMultipartUpload whose parts were then
-  collected) than an acknowledged object that lost its data, and the
-  replay cannot tell the two apart. If it was acknowledged, the key
-  answers with the object before it instead of an error.
+  lists it under `damaged`. The exception: when the key has an older
+  generation, live or deleted, the key stays as the older records leave
+  it and the record is listed under `damaged_unpublished`, in every
+  replay. Such a record is far more often what a failed write left
+  behind (a CompleteMultipartUpload whose parts were then collected)
+  than an acknowledged object that lost its data, and the replay cannot
+  tell the two apart. If it was acknowledged, the key answers with the
+  object before it, or with 404 after a delete before it, instead of an
+  error.
 - A CompleteMultipartUpload that got no answer from the catalogue and
   was sent again can leave two records of one object. The replay
   publishes one and counts the other in `duplicate`; nothing is missing.

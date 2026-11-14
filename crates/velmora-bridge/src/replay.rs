@@ -20,10 +20,11 @@
 //! with such an extent is published all the same, so that a read of it
 //! fails loudly instead of answering "no such key"; the last call of a
 //! replay reports the live ones as `damaged`. The one exception: such a
-//! generation does not replace an older live generation of its key. It
-//! is the record of a write that was never acknowledged far more often
-//! than the loss of an acknowledged one, so the older object stays and
-//! the record is reported as `damaged_unpublished`.
+//! generation is not published on a key that has an older generation,
+//! live or deleted. It is the record of a write that was never
+//! acknowledged far more often than the loss of an acknowledged one, so
+//! the key stays as the older records leave it and the record is
+//! reported as `damaged_unpublished`.
 
 use serde::{Deserialize, Serialize};
 
@@ -78,9 +79,9 @@ pub enum ReplayPublish {
     /// Already present, a newer generation of the key is live, or the
     /// extents do not tile it. Nothing was written.
     Refused,
-    /// An older generation of the key is live, and this one has an
-    /// extent with neither a pinned copy nor an article plan. Nothing
-    /// was written.
+    /// The catalogue knows an older generation of the key, and this one
+    /// has an extent with neither a pinned copy nor an article plan.
+    /// Nothing was written.
     Damaged,
 }
 
@@ -210,7 +211,8 @@ pub struct ReplayReport {
     /// generation, or it lost a race).
     pub unpublishable: Vec<String>,
     /// Not published: an extent of the generation has no copy anywhere,
-    /// and an older generation of the key is live. That one stays.
+    /// and the key has an older generation. The key stays as the older
+    /// records leave it.
     pub damaged_unpublished: Vec<String>,
     /// Not replayed: the catalogue has another bucket under the name of
     /// the record's bucket. The first ids of `other_bucket_total`.
@@ -419,7 +421,21 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     .await?
                 {
                     ReplayPublish::Published => report.published += 1,
-                    ReplayPublish::Damaged => report.damaged_unpublished.push(id),
+                    ReplayPublish::Damaged => {
+                        // Its id stays the floor of the key, as after a
+                        // write that failed: whatever is acknowledged
+                        // on the key from now on sorts after the record,
+                        // also if its data is found again.
+                        self.catalog
+                            .raise_floor(
+                                &generation.bucket_id,
+                                &generation.key,
+                                &generation.id,
+                                true,
+                            )
+                            .await?;
+                        report.damaged_unpublished.push(id);
+                    }
                     // The extents of an object can be shared, so a second
                     // record of one object is published like any other
                     // manifest, over the first. What is refused and has a

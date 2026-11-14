@@ -1132,6 +1132,58 @@ async fn a_record_without_its_extents_does_not_replace_a_good_object() {
     assert_eq!(report.damaged, [lingering.as_str()], "{report:?}");
 }
 
+/// A good object, a delete, then a record whose extents are gone. The
+/// tombstone removes the object after the record was refused; a second
+/// replay must not take the empty key for one without a history and
+/// publish the record. And what is acknowledged after the replay sorts
+/// after the refused record, also from a clock that runs behind.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"good").await.expect(200);
+    rig.put(&signer, BUCKET, "j", b"good").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "k").await.expect(204);
+    tick(&rig);
+    let mut lost = Vec::new();
+    for key in ["j", "k"] {
+        rig.put(&signer, BUCKET, key, b"lost").await.expect(200);
+        let (generation, extents) = rig.live(&bucket, key).await.unwrap();
+        for x in &extents {
+            assert!(rig.bridge.safety.lose(&x.id.safety_key()));
+            let plan = velmora_bridge::recovery::article_key(&x.id);
+            rig.bridge.safety.lose(&plan);
+        }
+        lost.push(generation.id.as_str().to_owned());
+    }
+    lost.sort();
+
+    wipe(&rig);
+    for _ in 0..3 {
+        let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        report.damaged_unpublished.sort();
+        assert_eq!(report.damaged_unpublished, lost, "{report:?}");
+        assert_eq!(report.damaged_total, 0, "{report:?}");
+        assert_eq!(live_ids(&rig).len(), 1, "only `j` is live");
+    }
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "k").await.expect(404);
+    assert_eq!(get(&rig, &signer, "j").await.expect(200).body, b"good");
+
+    // The floor of a key is its refused record: a write and a delete
+    // from a clock that runs behind sort after it.
+    rig.bridge.clock.advance_ms(-1500);
+    for key in ["j", "k"] {
+        rig.put(&signer, BUCKET, key, b"new").await.expect(200);
+        let (new, _) = rig.live(&bucket, key).await.unwrap();
+        assert!(new.id.as_str() > lost[1].as_str(), "{new:?} after {lost:?}");
+        delete(&rig, &signer, key).await.expect(204);
+        let newest = tombstones(&rig).into_iter().max().unwrap();
+        assert!(&newest["m/del/".len()..] > new.id.as_str(), "{newest}");
+    }
+}
+
 /// An article plan record that does not open is reported and does not
 /// stop the replay: the extent comes back without a plan, from its
 /// pinned copy.
