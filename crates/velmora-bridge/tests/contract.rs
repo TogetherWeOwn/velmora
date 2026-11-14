@@ -15,7 +15,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
-    MAX_EXTENT_BYTES_LIMIT,
+    DEFAULT_POST_SOCKETS, MAX_EXTENT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::recovery::Recorded;
@@ -258,8 +258,9 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
-    // Optional settings fall back to their defaults.
-    assert_eq!(cfg.post_sockets, 4);
+    // Production posts on six sockets per job, so that two post jobs fit
+    // one isolate (see below); the grace keeps its default.
+    assert_eq!(cfg.post_sockets, 6);
     assert_eq!(cfg.propagation_grace_secs, 21_600);
 
     // The dev environment is complete on its own (envs do not inherit vars).
@@ -293,6 +294,13 @@ fn missing_secret_fails_closed() {
         // No value of it can cost data, so there is nothing to fail closed.
         if name == "HOT_CAP_BYTES" {
             assert_eq!(load(&vars).unwrap().hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
+            continue;
+        }
+        // Sockets per post job: absent or blank is the default of four.
+        if name == "POST_SOCKETS" {
+            assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
+            vars.insert(name.clone(), "  ".into());
+            assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
             continue;
         }
         assert_eq!(
@@ -935,6 +943,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         provider: "p1".into(),
         slot: 0,
         token: 1,
+        class: PermitClass::Read,
     };
     let query = ListQuery {
         prefix: "a/".into(),
@@ -1438,11 +1447,38 @@ fn old_provider_config_parses_with_pool_defaults() {
     assert_eq!(p.retention_days, None);
     assert_eq!(p.pool, None);
     assert_eq!(p.pool_max_conns, None);
+    assert_eq!(p.max_ips, None);
     assert!(p.enabled);
     // No retention limit: every article is in reach, whatever its age.
     let now = UnixMs(1_800_000_000_000);
     assert!(p.retains(Some(UnixMs(0)), now));
     assert!(p.retains(None, now));
+}
+
+/// `max_ips` is the number of source addresses an account may be
+/// connected from at once. It is optional, at least one, and no more
+/// than the largest connection limit; it may be larger than the
+/// account's own `max_conns`, where it limits nothing.
+#[test]
+fn provider_address_limit_parses_and_fails_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+
+    let providers = providers_of(&[
+        provider_json("a", r#""max_ips":1"#),
+        provider_json("b", r#""max_ips":64"#),
+        provider_json("c", r#""max_ips":null"#),
+        provider_json("d", ""),
+    ])
+    .unwrap();
+    let limits: Vec<Option<u32>> = providers.iter().map(|p| p.max_ips).collect();
+    assert_eq!(limits, [Some(1), Some(64), None, None]);
+
+    for bad in ["0", "65", "100000", "-1", "1.5", r#""4""#, "true"] {
+        assert_eq!(one(&format!(r#""max_ips":{bad}"#)), invalid, "{bad}");
+    }
+    // The setting is not a secret, and shows when a provider is printed.
+    assert!(format!("{:?}", providers[0]).contains("max_ips: Some(1)"));
 }
 
 #[test]
@@ -1545,4 +1581,29 @@ fn provider_pool_settings_fail_closed() {
         .collect();
     assert_eq!(providers_of(&many), invalid);
     assert!(providers_of(&many[..32]).is_ok());
+}
+
+/// The shipped `POST_SOCKETS` lets two post jobs of full-size extents and
+/// a verify job share one isolate's byte budget. The queue's invocations
+/// share isolates, so with a larger setting every post job but one waits.
+#[test]
+fn two_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
+    use velmora::media::{FileKey, Profile, Sealer};
+    use velmora::rng::SystemRng;
+    use velmora_bridge::jobs::job_bytes;
+
+    let (prod, _) = wrangler_vars();
+    let budget: u64 = prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap();
+    let sockets: u32 = prod["POST_SOCKETS"].parse().unwrap();
+    let max_extent: usize = prod["MAX_EXTENT_BYTES"].parse().unwrap();
+    let key = FileKey::generate(&mut SystemRng).unwrap();
+    let sealer = Sealer::random(&Profile::drive(), &key, &mut SystemRng).unwrap();
+    let cipher_size = sealer.seal_to_vec(&vec![0u8; max_extent]).unwrap().len() as u64;
+
+    let post = job_bytes(OutboxStage::Post, cipher_size, sockets);
+    let verify = job_bytes(OutboxStage::Verify, cipher_size, sockets);
+    assert!(
+        2 * post + verify <= budget,
+        "two post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+    );
 }

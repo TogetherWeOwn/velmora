@@ -376,6 +376,13 @@ pub struct ProviderConfig {
     pub read: bool,
     /// Concurrent connections allowed; the number of permit slots.
     pub max_conns: u32,
+    /// Source addresses the account may be connected from at once. One
+    /// job or request (one Worker invocation) leaves from one address
+    /// with all its connections, so this caps the jobs and requests that
+    /// hold connections on the provider together, each with as many as
+    /// `max_conns` leaves. `None` = no such limit: `max_conns` alone.
+    #[serde(default)]
+    pub max_ips: Option<u32>,
     /// Tier, `0` = tried first. Providers of one tier share the load.
     #[serde(default)]
     pub priority: u8,
@@ -416,12 +423,34 @@ impl ProviderConfig {
     }
 }
 
+impl ProviderConfig {
+    /// Connections background jobs may hold together: one is left for a
+    /// cold read when the provider allows two or more. Not on an account
+    /// with one address, where a read cannot connect next to a job
+    /// anyway and a connection kept back would only be lost.
+    pub fn background_conns(&self) -> u32 {
+        let reserve = self.max_conns >= 2 && self.max_ips != Some(1);
+        self.max_conns - u32::from(reserve)
+    }
+
+    /// Addresses background jobs may use together: one is left for a
+    /// cold read when the provider allows two or more. `None` = the
+    /// provider has no address limit.
+    pub fn background_ips(&self) -> Option<u32> {
+        self.max_ips.map(|max| max - u32::from(max >= 2))
+    }
+}
+
 /// One provider's connection load and health (`Catalog::provider_load`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProviderLoad {
     pub provider_id: String,
     /// Connection slots held now.
     pub held: u32,
+    /// Jobs and requests that hold those slots: one source address each.
+    pub holders: u32,
+    /// The background jobs among `holders`.
+    pub background_holders: u32,
     /// Slots ever handed out; the least-used provider wins a tie.
     pub uses: u64,
     /// Failed sessions in a row since the last good one or cooldown.
@@ -447,6 +476,7 @@ impl fmt::Debug for ProviderConfig {
             .field("post", &self.post)
             .field("read", &self.read)
             .field("max_conns", &self.max_conns)
+            .field("max_ips", &self.max_ips)
             .field("priority", &self.priority)
             .field("retention_days", &self.retention_days)
             .field("pool", &self.pool)

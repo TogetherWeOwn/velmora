@@ -6,10 +6,13 @@
 //! decoded, and compared with the SHA-256 stored in its plan row before
 //! anything uses its bytes.
 
+use futures_util::future::{join_all, select, Either};
+use velmora::rng::{FillRandom, SystemRng};
 use velmora::transport::is_article_limit_error;
 use velmora::yenc::decode_part_to;
 
 use crate::articles::article_spans;
+use crate::ingress::Sleeper;
 use crate::pool::Pool;
 use crate::ports::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
@@ -34,6 +37,41 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     session: Option<N::Session>,
     /// How the last connect or command went; `None` = nothing ran.
     healthy: Option<bool>,
+    /// The host's timer, if the caller has one: bounds a renewal.
+    timer: Option<Sleeper>,
+}
+
+/// The permit holder of a job run. One claim of an outbox row is one
+/// Worker invocation, whose connections all leave from one address: every
+/// slot the run takes, on any provider and for any step (post, verify,
+/// repost), carries this name, and a provider with `max_ips` counts the
+/// run once. A later run of the job claims again, so it gets a new name.
+pub(crate) fn job_holder(lease: &Lease) -> String {
+    format!(
+        "job:{}:{}:{}",
+        lease.extent,
+        lease.stage.as_str(),
+        lease.token
+    )
+}
+
+/// A permit holder for work done inside one request (a cold read, a
+/// drill): `kind` and 128 random bits, so no two requests share a name
+/// and each counts as an address of its own.
+pub(crate) fn request_holder(kind: &str) -> Result<String> {
+    let mut id = [0u8; 16];
+    SystemRng.fill_bytes(&mut id)?;
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{kind}:{hex}"))
+}
+
+/// Whether the text of a `481` says the account is at its connection
+/// limit (`481 … exceeded maximum number of connections per user`), and
+/// not that the login is wrong. Only that wording: any other `481` stays
+/// a failed login.
+fn is_connection_limit(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("exceeded maximum number of connections")
 }
 
 /// Whether an error says the provider itself is in trouble: a failed
@@ -59,7 +97,10 @@ fn is_provider_fault(e: &BridgeError) -> bool {
 
 impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// Takes a slot for `provider`. `None` = every slot of this class is
-    /// held: the caller backs off without opening a socket.
+    /// held, or the provider's addresses are all in use by other holders:
+    /// the caller backs off without opening a socket. `holder` names the
+    /// caller's invocation ([`job_holder`], [`request_holder`]); a caller
+    /// that opens several sessions passes the same name for each.
     pub(crate) async fn open(
         catalog: &'a C,
         nntp: &'a N,
@@ -79,13 +120,25 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             permit,
             session: None,
             healthy: None,
+            timer: None,
         }))
+    }
+
+    /// With the host's timer, a renewal that is bounded for the permit's
+    /// class ([`PermitClass::renew_secs`]) is given up when the bound
+    /// passes, and not only found late once it returns: a catalogue call
+    /// that hangs cannot keep the socket open past the slot's expiry.
+    pub(crate) fn with_timer(mut self, timer: Option<&Sleeper>) -> Self {
+        self.timer = timer.cloned();
+        self
     }
 
     /// Renews the job's lease (if it has one) and then the permit. Call it
     /// before every article and before every reconnect: no POST, read or
     /// new socket happens on a lease or a slot that now belongs to someone
-    /// else. On a lost permit the socket is dropped at once.
+    /// else. On a lost permit the socket is dropped at once, and so it is
+    /// when the renewal of a read's permit did not come back in time
+    /// ([`PermitClass::renew_secs`]).
     pub(crate) async fn keep(&mut self, lease: Option<&Lease>) -> core::result::Result<(), Stop> {
         let now = self.clock.now();
         if let Some(lease) = lease {
@@ -93,9 +146,34 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
                 return Err(Stop::Fenced);
             }
         }
-        match self.catalog.renew_permit(&self.permit, now).await {
-            Ok(true) => Ok(()),
-            Ok(false) => {
+        let renewed = {
+            let renewal = self.catalog.renew_permit(&self.permit, now);
+            match (self.permit.class.renew_secs(), &self.timer) {
+                (Some(secs), Some(sleep)) => {
+                    let renewal = core::pin::pin!(renewal);
+                    // Started only if the renewal does not return at once.
+                    let limit = core::pin::pin!(async { sleep(secs * 1000).await });
+                    match select(renewal, limit).await {
+                        Either::Left((renewed, _)) => renewed,
+                        // Given up. If it lands after all, the slot is
+                        // extended once and then released or left to
+                        // expire: nothing here counts on it.
+                        Either::Right(_) => Ok(false),
+                    }
+                }
+                _ => renewal.await,
+            }
+        };
+        // The new expiry counts from `now`. A renewal that took too long
+        // has used up the time the next call needs. Without a timer, or
+        // with one that fired late, this is the only check.
+        let late =
+            self.permit.class.renew_secs().is_some_and(|secs| {
+                self.clock.now().0.saturating_sub(now.0) > i64::from(secs) * 1000
+            });
+        match renewed {
+            Ok(true) if !late => Ok(()),
+            Ok(_) => {
                 self.session = None;
                 Err(Stop::NoPermit)
             }
@@ -107,9 +185,15 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// The live session, connecting first when there is none. A provider
-    /// that refuses the connection or the login with `502` or `482` ("too
-    /// many connections") is reported as "no slot": no strike, and the
-    /// caller waits as it does for a permit.
+    /// that refuses the connection or the login with `502` or `482` is
+    /// reported as "no slot": no strike, and the caller waits as it does
+    /// for a permit. Those are the replies of an account at a limit: "too
+    /// many connections", and the address limit (`502 max number of
+    /// simultaneous IPs (3) reached`, `482 Already connected from
+    /// different IP`), which another client of the account or an address
+    /// the provider still counts can cause below `max_ips`. A `481` is
+    /// one of them only when its text states the connection limit; any
+    /// other `481` is a failed login and a strike.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
@@ -117,6 +201,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
                 Err(BridgeError::Nntp(
                     velmora::Error::NoPermission(_) | velmora::Error::NntpReply { code: 482, .. },
                 )) => {
+                    return Err(Stop::NoPermit);
+                }
+                Err(BridgeError::Nntp(velmora::Error::AuthFailed(text)))
+                    if is_connection_limit(&text) =>
+                {
                     return Err(Stop::NoPermit);
                 }
                 Err(e) => {
@@ -127,6 +216,12 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             self.session = Some(session);
         }
         self.session.as_mut().ok_or(Stop::fail(FailClass::Internal))
+    }
+
+    /// Whether a session is open: `false` = the next
+    /// [`session`](Self::session) connects first.
+    pub(crate) fn connected(&self) -> bool {
+        self.session.is_some()
     }
 
     /// The slot this session holds.
@@ -162,6 +257,36 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         let (catalog, clock, id) = (self.catalog, self.clock, self.provider.id.as_str());
         let healthy = self.finish().await;
         report_health(catalog, clock, id, healthy).await;
+    }
+
+    /// Ends every session and frees its slot, then reports each
+    /// provider's health once: one session that went well clears its
+    /// strikes, otherwise the first failure is one strike. Several
+    /// sockets that failed together are one strike, not one each.
+    pub(crate) async fn close_all(sessions: Vec<Self>) {
+        let Some(first) = sessions.first() else {
+            return;
+        };
+        let (catalog, clock) = (first.catalog, first.clock);
+        let ended = join_all(sessions.into_iter().map(|session| {
+            let id = session.provider.id.as_str();
+            async move { (id, session.finish().await) }
+        }))
+        .await;
+        let mut ids: Vec<&str> = Vec::new();
+        for (id, _) in &ended {
+            if !ids.contains(id) {
+                ids.push(id);
+            }
+        }
+        for id in ids {
+            let mine = || ended.iter().filter(|e| e.0 == id);
+            let healthy = match mine().any(|e| e.1 == Some(true)) {
+                true => Some(true),
+                false => mine().find_map(|e| e.1),
+            };
+            report_health(catalog, clock, id, healthy).await;
+        }
     }
 
     /// [`close`](Self::close) without the health report: ends the session,
@@ -231,8 +356,12 @@ fn check_payload(row: &ArticleRow, wire: &[u8]) -> Checked {
 
 /// One `BODY`, checked. A `430` leaves the session in use. Any session
 /// error drops the session and resumes at the same message-id on a new
-/// one, while `reconnects` lasts; the lease and the permit are renewed
-/// before each reconnect.
+/// one, while `reconnects` lasts.
+///
+/// The lease and the permit are renewed before each connect and again
+/// after it, before the `BODY`: each of the two may take a whole call
+/// ([`PermitClass::call_secs`]), and a permit is not counted on for more
+/// than one call past its last renewal.
 async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
     lease: Option<&Lease>,
@@ -242,10 +371,22 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
 ) -> core::result::Result<Checked, Stop> {
     loop {
         wire.clear();
-        let result = match session.session().await {
-            Ok(s) => s.body(&row.message_id, wire).await,
+        let fresh = !session.connected();
+        let connected = match session.session().await {
+            Ok(_) => Ok(()),
             Err(Stop::Session(e)) => Err(e),
             Err(stop) => return Err(stop),
+        };
+        if fresh && connected.is_ok() {
+            session.keep(lease).await?;
+        }
+        let result = match connected {
+            Ok(()) => match session.session().await {
+                Ok(s) => s.body(&row.message_id, wire).await,
+                Err(Stop::Session(e)) => Err(e),
+                Err(stop) => return Err(stop),
+            },
+            Err(e) => Err(e),
         };
         let err = match result {
             Ok(found) => {
@@ -315,7 +456,10 @@ pub(crate) async fn read_articles<C: Catalog, N: NntpConnector, T: Clock>(
 /// Longest a cold read keeps retrying while every provider slot it could
 /// use is taken, before `503 SlowDown`. Clients fan one download out into
 /// many concurrent range reads, more than a provider has connections.
-pub const COLD_WAIT_MS: u32 = 25_000;
+/// It is longer than a read's permit: a waiter outlasts the slot of a
+/// read that was dropped and released nothing.
+pub const COLD_WAIT_MS: u32 = 40_000;
+const _: () = assert!(COLD_WAIT_MS > crate::ports::READ_PERMIT_SECS * 1000);
 
 /// Base poll interval while a cold read waits for a provider slot.
 pub const COLD_POLL_MS: u32 = 50;
@@ -383,12 +527,12 @@ where
         let mut cipher = vec![0u8; size];
         let mut have = vec![false; plan.len()];
         let mut busy = false;
-        let holder = format!("get:{}", extent.id);
+        let holder = request_holder("get")?;
         let now = self.clock.now();
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
         let readers: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.read).collect();
         let mut interrupted = false;
-        let mut order = pool.order(readers.clone());
+        let mut order = pool.order(readers.clone(), PermitClass::Read);
         if order.is_empty() {
             // Every reader is cooling: a read is worth one attempt on the
             // provider that is due back first.
@@ -430,7 +574,7 @@ where
                 &holder,
             )
             .await?
-            else {
+            .map(|s| s.with_timer(self.budget.sleeper())) else {
                 busy = true;
                 continue;
             };
