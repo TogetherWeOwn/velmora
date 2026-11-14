@@ -10,13 +10,14 @@
 
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
+use crate::replay::{ReplayExtent, ReplayProbe};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep, GenerationId,
-    GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage,
-    OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow,
-    UploadRow, VerificationRow,
+    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
+    GenerationId, GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
+    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId,
+    UploadPartRow, UploadRow, VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -342,6 +343,31 @@ pub trait Catalog {
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep>;
     /// After the blob delete that `GcStep::DeleteBlob` asked for.
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()>;
+
+    // recovery replay (DESIGN §A.8); every call is idempotent
+    /// Where a manifest's generation stands in this catalogue.
+    async fn replay_probe(&self, g: &GenerationRow) -> Result<ReplayProbe>;
+    /// Makes the bucket, the extents (new ones staged, without a
+    /// generation) and their article plans exist, and records a pinned
+    /// copy that is gone.
+    async fn replay_extents(
+        &self,
+        bucket: &Bucket,
+        extents: &[ReplayExtent],
+        now: UnixMs,
+    ) -> Result<()>;
+    /// Live generations with an extent that has neither a pinned copy
+    /// nor an article plan: their number and the first `limit` ids.
+    async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;
+    /// Publishes the generation over the extents `replay_extents` left.
+    /// `Lost` = already present, a newer generation of the key is live,
+    /// or the extents do not tile it; nothing was written.
+    async fn replay_publish(
+        &self,
+        g: &GenerationRow,
+        placements: &[ExtentPlacement],
+        now: UnixMs,
+    ) -> Result<Guard<()>>;
 
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()>;
