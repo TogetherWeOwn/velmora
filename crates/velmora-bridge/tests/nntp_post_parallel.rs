@@ -578,3 +578,112 @@ async fn a_provider_that_was_busy_and_then_failed_does_not_hold_the_job() {
     assert!(all_posted_by(&plan, "p2"));
     assert_eq!(rig.servers[2].posted_count().await, 10);
 }
+
+/// The reply to a POST is lost, and after the reconnect the provider
+/// neither shows the article yet nor takes it again. The article may be
+/// on its way to the other backbones all the same, so the backup
+/// provider is asked for it before it is sent there.
+#[tokio::test]
+async fn a_lost_reply_is_remembered_across_providers() {
+    let mut rig = spread_rig().await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.bridge.cfg.post_sockets = 1;
+    let s = rig.seed(1, &marked_plaintext(400_000)).await;
+    rig.servers[0].drop_next_posts(1).await;
+    rig.servers[0].set_stat_lag(true).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+
+    let refuse = async || rig.servers[0].set_posting_allowed(false).await;
+    assert_eq!(rig.run_post_and(&s, 0, 1, refuse).await, JobOutcome::Ack);
+
+    let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
+    assert_eq!(
+        calls,
+        ["connect", "post", "connect", "stat", "post", "connect", "stat", "post"]
+    );
+    let plan = rig.plan(&s).await;
+    assert_eq!(plan.len(), 1);
+    assert!(all_posted_by(&plan, "p1"));
+}
+
+/// The catalogue fails while a job records its first article. The job
+/// stops, and what the provider had accepted by then is still recorded
+/// on the way out, under the same fenced lease.
+#[tokio::test]
+async fn accepted_articles_are_recorded_after_a_catalogue_failure() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    rig.bridge.cfg.post_sockets = 1;
+    let s = rig.seed(1, &marked_plaintext(1_400_000)).await;
+    // Slow calls: the job records what it has between two articles.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 25_000);
+    rig.bridge.catalog.fail_mark_posted.set(1);
+
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+
+    let plan = rig.plan(&s).await;
+    assert!(plan.len() >= 2);
+    let posted = plan.iter().filter(|a| a.state == ArticleState::Posted);
+    assert_eq!(posted.count(), 1);
+    assert_eq!(rig.servers[0].posted_count().await, 1);
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 2);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The same, with the lease lost instead: nothing is recorded, on the
+/// way out either.
+#[tokio::test]
+async fn a_stale_lease_records_nothing_on_the_way_out() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    rig.bridge.cfg.post_sockets = 1;
+    let s = rig.seed(1, &marked_plaintext(1_400_000)).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 25_000);
+    rig.bridge
+        .catalog
+        .fault
+        .set(Some(Fault::StealLeaseBefore(0)));
+
+    rig.run_post(&s).await;
+
+    let plan = rig.plan(&s).await;
+    assert!(plan.iter().all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.servers[0].posted_count().await, 1);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// Every slot of the first tier is taken: the job gives its lease back
+/// before it loads the extent, and no plan is written.
+#[tokio::test]
+async fn a_job_without_a_slot_does_not_load_the_extent() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let p0 = &rig.bridge.cfg.providers[0];
+    let now = rig.bridge.clock.now();
+    let mut held = Vec::new();
+    while let Some(permit) = rig
+        .bridge
+        .catalog
+        .acquire_permit(p0, PermitClass::Background, "other", now)
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+    }
+    let reads = rig.bridge.safety.gets();
+
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert!(rig.plan(&s).await.is_empty());
+    assert_eq!(rig.bridge.nntp.connects(), 0);
+    // The backup tier was not touched, and the job holds nothing.
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    for permit in held {
+        rig.bridge.catalog.release_permit(&permit).await.unwrap();
+    }
+    // The job was put off, not failed: it runs when it is due again.
+    assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, 0);
+    rig.bridge.clock.advance_secs(600);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+}

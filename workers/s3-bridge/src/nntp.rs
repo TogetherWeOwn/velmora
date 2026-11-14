@@ -85,15 +85,23 @@ impl NntpSession for WorkerSession {
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
-        match self.0.body_to(message_id, out).await {
-            Ok(()) => Ok(BodyOutcome::Found),
-            Err(velmora::Error::ArticleNotFound(_)) => Ok(BodyOutcome::Missing),
-            Err(e) => Err(e.into()),
-        }
+        within_call(async {
+            match self.0.body_to(message_id, out).await {
+                Ok(()) => Ok(BodyOutcome::Found),
+                Err(velmora::Error::ArticleNotFound(_)) => Ok(BodyOutcome::Missing),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
     async fn quit(self) {
-        self.0.quit().await;
+        // A goodbye nobody answers must not hold the job either.
+        let _ = within_call(async {
+            self.0.quit().await;
+            Ok(())
+        })
+        .await;
     }
 }
 

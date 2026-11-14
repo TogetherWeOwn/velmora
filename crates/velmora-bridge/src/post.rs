@@ -15,9 +15,12 @@
 //! - A provider that refuses the post or cannot be reached hands its
 //!   articles to the other providers of the tier, then to the next tier,
 //!   again under the stored message-ids: failover never mints an id.
-//! - The lease and every provider permit are renewed on a timer while
-//!   the job posts, and no POST starts unless both were confirmed
+//! - The lease and every provider permit are renewed on demand: before
+//!   each call to a provider, when the last renewal is older than a set
+//!   age. There is no timer; no call starts unless both were confirmed
 //!   recently enough to outlast it.
+//! - A job takes a slot on its first tier before it loads the extent,
+//!   and gives its lease back at once when there is none.
 //! - Every catalogue write carries the fenced [`Lease`]. A stale lease
 //!   stops the job at once.
 
@@ -248,26 +251,36 @@ where
         lease: &Lease,
         extent: &ExtentRow,
     ) -> core::result::Result<(), Stop> {
-        let cipher = self
-            .safety
-            .get(&extent.id.safety_key(), None)
-            .await?
-            .ok_or(Stop::fail(FailClass::BlobError))?;
-        // Only the exact sealed ciphertext is ever posted.
-        if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
-            return Err(Stop::fail(FailClass::Corrupt));
-        }
-        let mut plan = self.stored_plan(lease, extent, &cipher).await?;
-        // The message-ids exist nowhere but the catalogue until this
-        // record is stored: without it, a lost catalogue could not find
-        // the extent on Usenet. Nothing is posted before it is durable.
-        write_article_plan(&self.safety, &self.kek, extent, &plan)
-            .await
-            .map_err(|_| Stop::fail(FailClass::BlobError))?;
-
+        let holder = format!("post:{}", extent.id);
+        let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
+        let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
+        let cooling = pool.cooling_until(&posters);
+        let order = pool.order(posters);
+        // A slot first. Loading and hashing the extent is the expensive
+        // part of the job: one that would only find every slot of its
+        // first tier taken gives its lease back before it, not after.
+        let Some(first_tier) = order.chunk_by(|a, b| a.priority == b.priority).next() else {
+            return Err(match cooling {
+                Some(until) => Stop::Cooling(until),
+                None => Stop::fail(FailClass::Internal),
+            });
+        };
+        let (mut held, _) = self.open_sessions(first_tier, &holder, 1, None).await?;
+        let Some(first) = held.pop() else {
+            return Err(Stop::NoPermit);
+        };
+        let (cipher, mut plan) = match self.load_planned(lease, extent).await {
+            Ok(loaded) => loaded,
+            Err(stop) => {
+                first.close().await;
+                return Err(stop);
+            }
+        };
         if plan.iter().any(|a| a.state == ArticleState::Planned) {
-            self.post_with_failover(lease, extent, &mut plan, &cipher)
+            self.post_with_failover(lease, extent, &mut plan, &cipher, &order, cooling, first)
                 .await?;
+        } else {
+            first.close().await;
         }
 
         let now = self.clock.now();
@@ -289,6 +302,32 @@ where
         // notification that is lost here.
         let _ = self.jobs.send(&next, delay.min(MAX_QUEUE_DELAY_SECS)).await;
         Ok(())
+    }
+
+    /// The verified ciphertext of the extent and its stored article plan,
+    /// with the recovery record of the plan written.
+    async fn load_planned(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+    ) -> core::result::Result<(Vec<u8>, Vec<ArticleRow>), Stop> {
+        let cipher = self
+            .safety
+            .get(&extent.id.safety_key(), None)
+            .await?
+            .ok_or(Stop::fail(FailClass::BlobError))?;
+        // Only the exact sealed ciphertext is ever posted.
+        if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
+            return Err(Stop::fail(FailClass::Corrupt));
+        }
+        let plan = self.stored_plan(lease, extent, &cipher).await?;
+        // The message-ids exist nowhere but the catalogue until this
+        // record is stored: without it, a lost catalogue could not find
+        // the extent on Usenet. Nothing is posted before it is durable.
+        write_article_plan(&self.safety, &self.kek, extent, &plan)
+            .await
+            .map_err(|_| Stop::fail(FailClass::BlobError))?;
+        Ok((cipher, plan))
     }
 
     /// The authoritative stored plan, created first when the extent has
@@ -359,21 +398,26 @@ where
     /// A lower tier is a backup for failure, not overflow: it is reached
     /// only when every provider of the tiers above was tried and failed.
     /// While one of them is merely busy the job waits for a slot.
-    async fn post_with_failover(
-        &self,
+    ///
+    /// `order` is the posting providers in pool order and `first` a
+    /// session the job already holds on its first tier.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_with_failover<'a>(
+        &'a self,
         lease: &Lease,
         extent: &ExtentRow,
         plan: &mut [ArticleRow],
         cipher: &[u8],
+        order: &[&'a ProviderConfig],
+        cooling: Option<UnixMs>,
+        first: ProviderSession<'a, C, N, T>,
     ) -> core::result::Result<(), Stop> {
         let holder = format!("post:{}", extent.id);
-        let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
-        let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
-        let cooling = pool.cooling_until(&posters);
-        let order = pool.order(posters);
+        let mut first = Some(first);
         let mut failed = None;
-        // A connection failed during a post: the article may have landed.
-        let mut unknown = false;
+        // Per article: a POST of it may have landed on a provider that
+        // then failed, so the next provider is asked before it is sent.
+        let mut unknown = vec![false; plan.len()];
         for tier in order.chunk_by(|a, b| a.priority == b.priority) {
             // Providers of the tier that have not posted for this job yet.
             let mut untried: Vec<&ProviderConfig> = tier.to_vec();
@@ -388,7 +432,9 @@ where
                 let todo: Vec<usize> = (0..plan.len())
                     .filter(|at| plan[*at].state == ArticleState::Planned)
                     .collect();
-                let (sessions, without) = self.open_sessions(&untried, &holder, todo.len()).await?;
+                let (sessions, without) = self
+                    .open_sessions(&untried, &holder, todo.len(), first.take())
+                    .await?;
                 no_slot = without;
                 if sessions.is_empty() {
                     break;
@@ -398,8 +444,11 @@ where
                 untried.retain(|p| !sessions.iter().any(|s| s.provider.id == p.id));
                 let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan);
                 let ended = round
-                    .run(sessions, todo.iter().map(|at| (*at, unknown)), true)
+                    .run(sessions, todo.iter().map(|at| (*at, unknown[*at])), true)
                     .await;
+                for (flag, landed) in unknown.iter_mut().zip(&ended.unknown) {
+                    *flag |= *landed;
+                }
                 for (row, marked) in plan.iter_mut().zip(&ended.marked) {
                     if *marked {
                         row.state = ArticleState::Posted;
@@ -410,7 +459,11 @@ where
                     None if plan.iter().all(|a| a.state == ArticleState::Posted) => return Ok(()),
                     None => return Err(Stop::fail(FailClass::Internal)),
                     Some(stop @ Stop::Fail(FailClass::PostRefused | FailClass::NntpError, _)) => {
-                        unknown |= matches!(stop, Stop::Fail(FailClass::NntpError, _));
+                        // A connection failed: what this provider took,
+                        // now or in an earlier run, is not known.
+                        if matches!(stop, Stop::Fail(FailClass::NntpError, _)) {
+                            unknown.fill(true);
+                        }
                         // The first failure is the one reported.
                         failed.get_or_insert(stop);
                     }
@@ -436,12 +489,14 @@ where
     /// Opens up to `post_sockets` posting sessions (never more than
     /// `articles`) over `providers`, one provider after the other in
     /// turns, so the sockets spread over every provider with a free slot.
-    /// The flag says whether a provider had no slot at all.
+    /// The flag says whether a provider had no slot at all. `first` is a
+    /// session of one of them that the job holds already: it counts.
     pub(crate) async fn open_sessions<'a>(
         &'a self,
         providers: &[&'a ProviderConfig],
         holder: &str,
         articles: usize,
+        first: Option<ProviderSession<'a, C, N, T>>,
     ) -> Result<(Vec<ProviderSession<'a, C, N, T>>, bool)> {
         let wanted = usize::try_from(self.cfg.post_sockets)
             .unwrap_or(1)
@@ -450,6 +505,12 @@ where
         let mut busy = false;
         let mut open: Vec<&ProviderConfig> = providers.to_vec();
         let mut turn = 0;
+        if let Some(first) = first {
+            // The next socket goes to the provider after this one.
+            let at = providers.iter().position(|p| p.id == first.provider.id);
+            turn = at.map_or(0, |at| at + 1);
+            sessions.push(first);
+        }
         while sessions.len() < wanted && !open.is_empty() {
             let provider = open[turn % open.len()];
             let opened = ProviderSession::open(
@@ -532,7 +593,9 @@ where
             .filter(|at| missing.contains(&plan[*at].idx))
             .collect();
         let holder = format!("repost:{}", extent.id);
-        let (sessions, _) = self.open_sessions(&order, &holder, todo.len()).await?;
+        let (sessions, _) = self
+            .open_sessions(&order, &holder, todo.len(), None)
+            .await?;
         if sessions.is_empty() {
             return Err(Stop::NoPermit);
         }
@@ -587,9 +650,12 @@ struct Socket {
 }
 
 struct RoundState<'a> {
-    /// Articles nobody has accepted yet: positions in the plan, each with
-    /// its `unknown` flag.
-    queue: VecDeque<(usize, bool)>,
+    /// Articles nobody has accepted yet: positions in the plan.
+    queue: VecDeque<usize>,
+    /// Per plan position: a POST of the article may have landed without
+    /// anyone knowing (a lost reply, a broken connection), so it is
+    /// looked up before it is sent again, on any provider.
+    unknown: Vec<bool>,
     /// Articles a socket is posting right now.
     in_flight: usize,
     /// Sockets waiting for an article that may come back to the queue.
@@ -613,13 +679,15 @@ pub(crate) struct Ended {
     pub(crate) stop: Option<Stop>,
     /// Per plan position: recorded as posted in the catalogue.
     pub(crate) marked: Vec<bool>,
+    /// Per plan position: a POST may have landed (see [`post_one`]).
+    pub(crate) unknown: Vec<bool>,
     /// A socket found no slot: its permit was gone, or the provider
     /// refused the login because the account is at its limit.
     pub(crate) busy: bool,
 }
 
 /// One pass of a job over its open sockets. The sockets share the queue,
-/// the renewal timer and the pending catalogue writes; the job runs on
+/// the time of the last renewal and the pending catalogue writes; the job runs on
 /// one thread, so the state is only ever borrowed between two awaits.
 pub(crate) struct Round<'a, C: Catalog, T: Clock> {
     catalog: &'a C,
@@ -655,6 +723,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             tick: Mutex::new(()),
             state: RefCell::new(RoundState {
                 queue: VecDeque::new(),
+                unknown: vec![false; plan.len()],
                 in_flight: 0,
                 idle: Vec::new(),
                 kept_at: None,
@@ -681,7 +750,10 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         let mut providers: Vec<&'a str> = Vec::new();
         {
             let mut state = self.state.borrow_mut();
-            state.queue = todo.collect();
+            for (at, unknown) in todo {
+                state.queue.push_back(at);
+                state.unknown[at] |= unknown;
+            }
             for session in &sessions {
                 let provider = session.provider.id.as_str();
                 if !providers.contains(&provider) {
@@ -697,7 +769,10 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             .enumerate()
             .map(|(slot, session)| self.work(slot, session));
         let ended = join_all(work).await;
-        self.flush().await;
+        // Also after the catalogue failed once: what the providers
+        // accepted is recorded if the catalogue answers now. The write is
+        // fenced like every other, so a stale lease still writes nothing.
+        self.flush(true).await;
 
         // One strike or one recovery per provider, however many sockets:
         // a provider that answered one socket in order is in order.
@@ -730,6 +805,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         Ended {
             stop,
             marked: state.marked,
+            unknown: state.unknown,
             busy,
         }
     }
@@ -745,16 +821,26 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
     ) -> (&'a str, Option<Stop>, Option<bool>) {
         let provider = session.provider.id.as_str();
         let stop = loop {
-            let Some((at, unknown)) = self.take(provider).await else {
+            let Some(at) = self.take(provider).await else {
                 break None;
             };
-            let posted = self.post_at(slot, &mut session, at, unknown).await;
+            let posted = self.post_at(slot, &mut session, at).await;
             let mut state = self.state.borrow_mut();
             state.in_flight -= 1;
             // Whatever happened, a waiting socket has to look again.
             state.idle.drain(..).for_each(Waker::wake);
             match posted {
-                Ok(()) => state.accepted[at] = Some(provider),
+                Ok(()) => {
+                    // The provider has the article, so it is recorded.
+                    state.accepted[at] = Some(provider);
+                    // The slot went to someone else during the call (a
+                    // renewal by another socket found it gone): nothing
+                    // more is sent on this socket.
+                    if state.sockets[slot].permit.is_none() {
+                        session.discard();
+                        break Some(Stop::NoPermit);
+                    }
+                }
                 Err(stop) => {
                     let stop = match stop {
                         Stop::Session(e) => e.into(),
@@ -762,7 +848,8 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                     };
                     // A broken connection: the article may have landed.
                     let landed = matches!(stop, Stop::Fail(FailClass::NntpError, _));
-                    state.queue.push_front((at, unknown || landed));
+                    state.unknown[at] |= landed;
+                    state.queue.push_front(at);
                     // Only "no slot" and a broken connection are this
                     // socket's own trouble; any other verdict would be
                     // repeated to every socket of the provider.
@@ -781,7 +868,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
     /// The next article for a socket of `provider`. With an empty queue
     /// it waits while another socket is still posting, because that
     /// article may come back; `None` = nothing is left for this socket.
-    async fn take(&self, provider: &str) -> Option<(usize, bool)> {
+    async fn take(&self, provider: &str) -> Option<usize> {
         poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
             if state.fatal.is_some() || state.closed.contains(&provider) {
@@ -805,7 +892,6 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         slot: usize,
         session: &mut ProviderSession<'a, C, N, T>,
         at: usize,
-        unknown: bool,
     ) -> core::result::Result<(), Stop> {
         let row = &self.plan[at];
         let total = u32::try_from(self.plan.len()).map_err(|_| Stop::fail(FailClass::Internal))?;
@@ -815,7 +901,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             .ok_or(Stop::fail(FailClass::Internal))?;
         let article = render_article(row, total, self.extent.cipher_size, payload)
             .map_err(|_| Stop::fail(FailClass::Internal))?;
-        post_one(self, slot, session, row, &article, unknown).await
+        post_one(self, slot, session, at, &article).await
     }
 
     /// Call it before every connect, lookup and POST. It returns
@@ -889,15 +975,21 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 _ => state.fatal = Some(Fatal::Catalog),
             }
         }
-        self.flush().await;
+        self.flush(false).await;
     }
 
     /// Records the articles accepted so far as posted, all in one fenced
-    /// write. A stale lease writes nothing and stops the round.
-    async fn flush(&self) {
+    /// write. A stale lease writes nothing and stops the round. `last` =
+    /// the round is over: one more try even after a catalogue failure.
+    async fn flush(&self, last: bool) {
         let due: Vec<(usize, u32, &str)> = {
             let state = self.state.borrow();
-            if state.fatal.is_some() || !self.record.get() {
+            let stopped = match state.fatal {
+                None => false,
+                Some(Fatal::Catalog) => !last,
+                Some(Fatal::Fenced) => true,
+            };
+            if stopped || !self.record.get() {
                 return;
             }
             (0..self.plan.len())
@@ -969,12 +1061,15 @@ async fn post_one<'a, C: Catalog, N: NntpConnector, T: Clock>(
     round: &Round<'a, C, T>,
     slot: usize,
     session: &mut ProviderSession<'a, C, N, T>,
-    row: &ArticleRow,
+    at: usize,
     article: &[u8],
-    mut unknown: bool,
 ) -> core::result::Result<(), Stop> {
+    let row = &round.plan[at];
     let mut attempt = 1;
     loop {
+        // The flag is the round's, not this call's: it stays with the
+        // article when this socket gives up on it.
+        let unknown = round.state.borrow().unknown[at];
         let result = match exchange(round, slot, session, row, article, unknown).await {
             Ok(result) => result,
             Err(Stop::Session(e)) => Err(e),
@@ -991,10 +1086,12 @@ async fn post_one<'a, C: Catalog, N: NntpConnector, T: Clock>(
         session.note_err(&err);
         // Any session error: never reuse the session.
         session.discard();
+        if matches!(&err, BridgeError::Nntp(e) if is_retryable_post_error(e)) {
+            round.state.borrow_mut().unknown[at] = true;
+        }
         match err {
             BridgeError::Nntp(e) if is_retryable_post_error(&e) && attempt < MAX_POST_ATTEMPTS => {
                 attempt += 1;
-                unknown = true;
                 round.keep(slot, session).await?;
             }
             // The server says "duplicate" (or a bare "posting failed") but

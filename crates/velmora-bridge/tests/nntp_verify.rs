@@ -706,6 +706,46 @@ async fn a_repost_larger_than_the_budget_still_runs() {
     assert_eq!(rig.bridge.budget.in_use(), 0);
 }
 
+/// The repost is accepted, and the backbone still answers 430 for the
+/// articles on the read that follows. They are not posted a second time
+/// in the round: the backbone is recorded as `missing`.
+#[tokio::test]
+async fn an_accepted_repost_that_stays_missing_is_not_posted_again() {
+    let rig = two_posting_backbones().await;
+    let (s, plan) = rig.waited_out_the_grace(34).await;
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    assert_eq!(rig.rows(&s).len(), 1);
+
+    // The provider took the articles and does not serve them.
+    let ids = plan.iter().map(|a| a.message_id.clone());
+    rig.servers[1].set_hidden(ids).await;
+    rig.bridge.clock.advance_secs(delay);
+    // From here on every call to a provider is logged.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    let last = rig.run(&s, OutboxStage::Verify).await;
+
+    assert_eq!(retry_delay(&last), REVERIFY_SECS);
+    let calls = rig.bridge.nntp.calls();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(|c| c.0 != "post"),
+        "posted a second time: {calls:?}"
+    );
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    let rows = rig.rows(&s);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[1].backbone.as_str(), rows[1].result),
+        ("bb1", VerifyResult::Missing)
+    );
+    assert_eq!(rig.outbox(&s).cursor, 0);
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
 /// With no grace at all the first read that finds articles missing posts
 /// them.
 #[tokio::test]
