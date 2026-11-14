@@ -372,8 +372,33 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     body: RestoreBody,
 ) -> Admin<S3Response> {
     let bad = || fail(400, "InvalidArgument", "Send since_ms or cursor.");
+    let earlier = || {
+        fail(
+            409,
+            "OperationAborted",
+            "This cursor is of an earlier replay. The replay that was started last is not finished.",
+        )
+    };
     let cursor = match (body.cursor, body.since_ms) {
-        (Some(cursor), None) if body.margin_ms.is_none() => cursor,
+        (Some(cursor), None) if body.margin_ms.is_none() => {
+            // The catalogue knows how far the replay has come. A cursor
+            // that is ahead of it (made up, or of another restore
+            // point) would end the replay with records left out.
+            let progress = bridge
+                .catalog
+                .restore_progress(crate::types::UnixMs(cursor.run_ms))
+                .await
+                .or_internal()?
+                .ok_or_else(earlier)?;
+            if !cursor.follows(&progress) {
+                return Err(fail(
+                    400,
+                    "InvalidArgument",
+                    "This cursor is ahead of the replay. Send `next` of the last response.",
+                ));
+            }
+            cursor
+        }
         (None, Some(since)) if since >= 0 => {
             let margin = body.margin_ms.unwrap_or(RESTORE_MARGIN_MS);
             if margin < 0 {
@@ -396,21 +421,27 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     };
     let run = crate::types::UnixMs(cursor.run_ms);
     let report = bridge.replay_step(cursor).await.or_internal()?;
-    // Only the replay that is recorded as under way is ended: the last
-    // step of an older cursor must not open the catalogue for writes
-    // while a replay that was started after it still runs.
-    if report.next.is_none()
-        && !bridge
+    match &report.next {
+        // Recorded before the caller gets it: the next call may start
+        // from here and no further.
+        Some(next) => bridge
             .catalog
-            .restore_finish(run, bridge.clock.now())
+            .restore_advance(run, &next.mark())
             .await
-            .or_internal()?
-    {
-        return Err(fail(
-            409,
-            "OperationAborted",
-            "This cursor is of an earlier replay. The replay that was started last is not finished.",
-        ));
+            .or_internal()?,
+        // Only the replay that is recorded as under way is ended: the
+        // last step of an older cursor must not open the catalogue for
+        // writes while a replay that was started after it still runs.
+        None => {
+            if !bridge
+                .catalog
+                .restore_finish(run, bridge.clock.now())
+                .await
+                .or_internal()?
+            {
+                return Err(earlier());
+            }
+        }
     }
     let value = serde_json::to_value(&report)
         .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;

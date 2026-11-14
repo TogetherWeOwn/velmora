@@ -11,7 +11,7 @@
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 use crate::recovery::{Recorded, Unpublished};
-use crate::replay::{ReplayExtent, ReplayProbe};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, RestoreProgress};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
@@ -290,9 +290,10 @@ pub trait Catalog {
         -> Result<PublishOutcome>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
-    /// tombstone written for this delete. `false` = nothing was live, or
-    /// the live generation is newer than the tombstone. A replay of the
-    /// tombstone decides the same way.
+    /// tombstone written for this delete. `false` = nothing was changed:
+    /// nothing was live, the live generation is newer than the
+    /// tombstone, or a replay of the recovery records is under way. A
+    /// replay applies the tombstone with [`Self::replay_tombstone`].
     async fn delete_object_before(
         &self,
         bucket: &BucketId,
@@ -446,6 +447,22 @@ pub trait Catalog {
     async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool>;
     /// Whether a replay was started and has not ended.
     async fn restore_pending(&self) -> Result<bool>;
+    /// The replay with the mark `run`: its restore point and how far it
+    /// has come. `None` = `run` is not the replay that was started last.
+    async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>>;
+    /// The replay with the mark `run` has come as far as `next`. Never
+    /// moves the place backwards.
+    async fn restore_advance(&self, run: UnixMs, next: &ReplayMark) -> Result<()>;
+    /// Applies a tombstone record in a replay: raises the floor of the
+    /// key to `id`, then retires the live generation if its id sorts
+    /// before `id`. `true` = a generation was retired.
+    async fn replay_tombstone(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        id: &GenerationId,
+        now: UnixMs,
+    ) -> Result<bool>;
     /// Live generations with an extent that has neither a pinned copy
     /// nor an article plan: their number and the first `limit` ids.
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;

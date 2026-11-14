@@ -103,6 +103,12 @@ in the bucket `velmora-catalog-export` (create it once with
 for example daily. It prints the **restore point**, which is also the
 object's name. D1 does not answer queries while an export runs.
 
+Take a fresh export after every deploy that applied a migration. An
+export carries the schema of its day and the list of the migrations
+that were applied (`d1_migrations`), so an older one can still be
+loaded and brought up to date (restore, step 2); a fresh one does not
+depend on that.
+
 D1 Time Travel (30 days) is the faster tool when the database still
 exists: restore it to a timestamp, then replay from that timestamp.
 
@@ -113,12 +119,25 @@ exists: restore it to a timestamp, then replay from that timestamp.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
-   - Export: create an empty database (do not apply the migrations: the
-     export carries the schema), download the newest
-     `d1/<db>/<restore point>.sql` and load it with
-     `npx wrangler d1 execute <db> --remote --file <file>`.
-   - Nothing: create a database and apply the migrations. The restore
-     point is `0`.
+   - Export: create an empty database (do not apply the migrations
+     first: the export carries the schema and the list of applied
+     migrations), download the newest `d1/<db>/<restore point>.sql` and
+     load it with `npx wrangler d1 execute <db> --remote --file <file>`.
+   - Nothing: create a database. The restore point is `0`.
+
+   Then, in every case, bring the schema up to date and close the
+   catalogue:
+
+   ```
+   npx wrangler d1 migrations apply <db> --remote
+   npx wrangler d1 execute <db> --remote --file ops/restore-arm.sql
+   ```
+
+   The first applies the migrations the copy does not have yet (all of
+   them on a new database, none on a current copy). The second records
+   a replay as started. From then on the catalogue refuses every write
+   until a replay has run to its end, whatever `MAINTENANCE` says: a
+   deploy that switches maintenance off too early still answers 503.
 3. If the Worker secret is gone too: `ops/kek-restore.sh <escrow file>`.
 4. `VELMORA_ADMIN_TOKEN_FILE=<file> ops/catalog-replay.sh <base-url> <restore point>`.
    It prints the counts. Exit status 2 means damage was found: read the
@@ -140,8 +159,14 @@ jobs and the cron. If a replay was stopped, run it again to its end.
 Starting a replay again makes the earlier one void: a step sent with a
 cursor of the earlier one can still run, but its last step answers 409
 and the catalogue stays closed until the replay that was started last
-has ended. This does not notice a
-replay that was never started: step 4 is not optional after step 2.
+has ended. A database that was brought back without the last command
+of step 2 is not closed: nothing in it says that a replay is due.
+
+The catalogue refuses the commit as well, not only the request: a write
+that was already under way when a replay started answers 503 and
+publishes nothing. A DeleteObject in that place answers 503 too; its
+tombstone can stay on record, as that of any delete that failed, and
+the replay then applies it.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.
@@ -154,6 +179,11 @@ does one bounded step and answers with counts and `next`. Send
 one hour: records that much older than the restore point are replayed
 too), then `{"cursor": <next>}` until `next` is null. The answer names
 generation ids and record names, never object keys.
+
+The catalogue keeps the place the replay has come to. A cursor that is
+ahead of it (a later phase, a later record, another restore point)
+answers 400, so no part of the records can be left out; a cursor that
+is behind repeats a step, which changes nothing.
 
 ## KEK
 

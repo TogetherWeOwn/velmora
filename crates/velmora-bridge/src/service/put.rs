@@ -207,6 +207,9 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         discard_refused(bridge, &commit.generation, refused)
             .await
             .map_err(|_| internal())?;
+        // Refused as well when a replay started after this request
+        // passed the gate.
+        restore_gate(bridge).await?;
         attempts += 1;
         if attempts == COMMIT_ATTEMPTS {
             return Err(s3_error(ErrorCode::SlowDown));

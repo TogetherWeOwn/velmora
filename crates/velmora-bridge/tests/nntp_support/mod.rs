@@ -824,6 +824,28 @@ impl Catalog for MemCatalog {
     async fn restore_pending(&self) -> Result<bool> {
         Ok(false)
     }
+    async fn restore_progress(
+        &self,
+        _: UnixMs,
+    ) -> Result<Option<velmora_bridge::replay::RestoreProgress>> {
+        unused()
+    }
+    async fn restore_advance(
+        &self,
+        _: UnixMs,
+        _: &velmora_bridge::replay::ReplayMark,
+    ) -> Result<()> {
+        unused()
+    }
+    async fn replay_tombstone(
+        &self,
+        _: &BucketId,
+        _: &str,
+        _: &GenerationId,
+        _: UnixMs,
+    ) -> Result<bool> {
+        unused()
+    }
     async fn replay_damaged(&self, _: u32) -> Result<(u64, Vec<GenerationId>)> {
         unused()
     }

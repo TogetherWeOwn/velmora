@@ -1061,9 +1061,14 @@ where
                 // under everything that follows it on the key, which
                 // the floor raised for it holds to a later id.
                 let _ = discard_refused(bridge, &commit.generation, record).await;
-                // Refused for the id (the key took a newer one since it
-                // was read) or for the upload. Only the second is judged
-                // by the revision on the next turn.
+                // Refused as well when a replay started after this
+                // request passed the gate.
+                if bridge.catalog.restore_pending().await? {
+                    return Err(ErrorCode::SlowDown.into());
+                }
+                // Otherwise refused for the id (the key took a newer one
+                // since it was read) or for the upload. Only the second
+                // is judged by the revision on the next turn.
                 let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
                 // The floor is this id itself unless something newer
                 // came: only a higher one outran it.
