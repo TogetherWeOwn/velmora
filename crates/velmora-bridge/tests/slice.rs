@@ -1527,6 +1527,250 @@ async fn permits_never_exceed_max_conns() {
     );
 }
 
+/// Catalogue recovery with nothing but Usenet and the recovery records:
+/// after posting, the catalogue, the cache and every pinned
+/// extent are lost. A replay rebuilds the catalogue and the objects are
+/// read back from NNTP, byte for byte.
+#[tokio::test(flavor = "current_thread")]
+async fn rebuild_from_usenet_after_losing_the_catalogue() {
+    use velmora_bridge::replay::ReplayCursor;
+
+    let rig = Rig::new().await;
+    let s = "recovery setup";
+    rig.setup_buckets_and_key(s).await;
+    let small = test_bytes(11, 300_000);
+    let big = test_bytes(12, BIG_LEN);
+    expect_status(
+        s,
+        "PUT a/small.bin",
+        200,
+        &rig.put("/slice/a/small.bin", &small).await,
+    );
+    rig.bridge.clock.advance_ms(1000);
+    let r = rig.multipart_put(s, "/slice/a/big.bin", &big, PART).await;
+    expect_status(s, "Complete a/big.bin", 200, &r);
+    rig.bridge.clock.advance_ms(1000);
+    expect_status(
+        s,
+        "PUT a/gone.bin",
+        200,
+        &rig.put("/slice/a/gone.bin", &small).await,
+    );
+    rig.bridge.clock.advance_ms(1000);
+    let r = rig
+        .s3(Method::Delete, "/slice/a/gone.bin", &[], &[], Vec::new())
+        .await;
+    expect_eq(s, "DELETE a/gone.bin status", 204, r.status);
+    let records_before_posting: BTreeSet<String> = rig
+        .bridge
+        .safety
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with("m/"))
+        .collect();
+
+    // Post, verify, release: the records stay and every posted extent
+    // has an article plan record.
+    let s = "recovery post-and-release";
+    rig.pump(s).await;
+    let extents: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare(
+                "SELECT e.id FROM extents e JOIN objects o ON o.generation_id = e.generation_id",
+            )
+            .expect("extents");
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("extents")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("extents");
+        ids
+    });
+    expect_eq(s, "live extents", 4, extents.len());
+    for id in &extents {
+        expect(
+            s,
+            &format!("extent {id} has an article plan record"),
+            rig.bridge.safety.contains(&format!("m/art/{id}")),
+            "absent",
+        );
+    }
+    let records: BTreeSet<String> = rig
+        .bridge
+        .safety
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with("m/"))
+        .collect();
+    expect(
+        s,
+        "release deleted no recovery record",
+        records.is_superset(&records_before_posting),
+        format!("{:?}", records_before_posting.difference(&records)),
+    );
+
+    // First lose the catalogue alone. The replay puts every extent back
+    // at the first stage of the pipeline, which finds the articles
+    // already posted and verifies them again without posting twice.
+    let s = "recovery catalogue-only loss";
+    let posted_before = rig.server.posted_ids().await.len();
+    let pinned = extents
+        .iter()
+        .filter(|id| rig.bridge.safety.contains(&format!("x/{id}")))
+        .count() as i64;
+    let released = extents.len() as i64 - pinned;
+    expect(
+        s,
+        "some live extents were released and some are still pinned",
+        pinned > 0 && released > 0,
+        format!("{pinned} pinned, {released} released"),
+    );
+    let wipe = "DELETE FROM outbox; DELETE FROM verifications; DELETE FROM articles; \
+                DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
+                DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
+                DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.execute_batch(wipe).expect("wipe"));
+    let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+    let mut published = 0;
+    while let Some(at) = cursor {
+        let mut report = rig
+            .bridge
+            .replay_step(at)
+            .await
+            .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+        published += report.published;
+        cursor = report.next.take();
+    }
+    expect_eq(s, "generations published", 3, published);
+    expect_eq(
+        s,
+        "pinned live extents back in the pipeline",
+        pinned,
+        rig.sql_count(
+            "SELECT COUNT(*) FROM outbox o JOIN objects l ON l.generation_id = o.generation_id \
+             WHERE o.stage = 'post'",
+        ),
+    );
+    rig.pump(s).await;
+    expect_eq(s, "dead outbox rows", 0, rig.outbox_dead());
+    expect_eq(
+        s,
+        "articles on the server (nothing posted twice)",
+        posted_before,
+        rig.server.posted_ids().await.len(),
+    );
+    expect_eq(
+        s,
+        "pinned live extents verified again",
+        pinned,
+        rig.sql_count(
+            "SELECT COUNT(DISTINCT v.extent_id) FROM verifications v \
+             JOIN extents e ON e.id = v.extent_id \
+             JOIN objects l ON l.generation_id = e.generation_id",
+        ),
+    );
+
+    // Then lose the catalogue, the cache and whatever SAFETY holds
+    // besides the records.
+    let s = "recovery loss";
+    for key in rig.bridge.cache.keys() {
+        rig.bridge.cache.delete(&key).await.expect("cache delete");
+    }
+    for key in rig.bridge.safety.keys() {
+        if !key.starts_with("m/") {
+            rig.bridge.safety.delete(&key).await.expect("safety delete");
+        }
+    }
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.execute_batch(wipe).expect("wipe"));
+    expect_eq(
+        s,
+        "catalogue rows after the loss",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM generations")
+            + rig.sql_count("SELECT COUNT(*) FROM articles"),
+    );
+
+    let s = "recovery replay";
+    let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+    let (mut published, mut plans, mut deleted) = (0, 0, 0);
+    let mut damaged = u64::MAX;
+    while let Some(at) = cursor {
+        let mut report = rig
+            .bridge
+            .replay_step(at)
+            .await
+            .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+        published += report.published;
+        plans += report.article_plans;
+        deleted += report.deleted;
+        damaged = report.damaged_total;
+        expect(
+            s,
+            "every record opens and publishes",
+            report.unreadable.is_empty() && report.unpublishable.is_empty(),
+            format!("{report:?}"),
+        );
+        cursor = report.next.take();
+    }
+    expect_eq(s, "generations published", 3, published);
+    expect_eq(s, "extents with an article plan record", 4, plans);
+    expect_eq(s, "objects deleted by a tombstone", 1, deleted);
+    expect_eq(s, "damaged generations", 0, damaged);
+    expect_eq(
+        s,
+        "no restored extent waits in the pipeline",
+        0,
+        rig.outbox_open(),
+    );
+
+    // The key and its grants are issued again, then S3 reads work.
+    let s = "recovery read-back";
+    let key = rig
+        .admin_json(
+            s,
+            Method::Post,
+            "/keys",
+            Some(serde_json::json!({"buckets": ["slice"], "perm": "rw"})),
+        )
+        .await;
+    *rig.signer.borrow_mut() = Some(Signer {
+        akid: key["access_key_id"].as_str().expect("akid").to_string(),
+        secret: key["secret"].as_str().expect("secret").to_string(),
+        host: S3_HOST.to_string(),
+        region: REGION.to_string(),
+    });
+    let bodies_before = rig.n.bodies.get();
+    let r = rig.get("/slice/a/small.bin").await;
+    expect_status(s, "GET a/small.bin", 200, &r);
+    expect_bytes(s, "GET a/small.bin body", &small, &r.body);
+    let r = rig.get("/slice/a/big.bin").await;
+    expect_status(s, "GET a/big.bin", 200, &r);
+    expect_bytes(s, "GET a/big.bin body", &big, &r.body);
+    expect(
+        s,
+        "the reads came from NNTP",
+        rig.n.bodies.get() > bodies_before,
+        format!("{} BODY commands", rig.n.bodies.get() - bodies_before),
+    );
+    let r = rig.get("/slice/a/gone.bin").await;
+    expect_error(s, "GET a/gone.bin stays deleted", 404, "NoSuchKey", &r);
+    // Nothing is left for the pipeline: a released extent comes back as
+    // done, and its verification history is the scrub's to rebuild.
+    let s = "recovery dispatch";
+    rig.bridge.clock.advance_secs(CRON_SECS);
+    if let Err(e) = rig.bridge.dispatch().await {
+        fail(s, "Bridge::dispatch", "Ok", e);
+    }
+    rig.pump(s).await;
+    expect_eq(s, "dead outbox rows", 0, rig.outbox_dead());
+}
+
 #[test]
 fn signer_matches_the_published_aws_example() {
     // The GetObject example of the AWS SigV4 documentation: us-east-1,

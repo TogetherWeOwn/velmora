@@ -8,6 +8,7 @@ mod service_support;
 
 use service_support::*;
 use velmora_bridge::recovery::{delete_blob, GENERATION_PREFIX, TOMBSTONE_PREFIX};
+use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
@@ -30,6 +31,40 @@ const TABLES: [&str; 12] = [
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn sql(rig: &Rig, script: &str) {
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.execute_batch(script).unwrap());
+}
+
+/// Copies every table aside (the export).
+fn export(rig: &Rig) {
+    for t in TABLES {
+        sql(
+            rig,
+            &format!("DROP TABLE IF EXISTS bak_{t}; CREATE TABLE bak_{t} AS SELECT * FROM {t};"),
+        );
+    }
+}
+
+/// Deletes every catalogue row (the loss).
+fn wipe(rig: &Rig) {
+    for t in TABLES {
+        sql(rig, &format!("DELETE FROM {t};"));
+    }
+    for t in TABLES {
+        assert_eq!(rig.count(t), 0, "{t} is empty after the wipe");
+    }
+}
+
+/// Loads the export back. Tables go in parent-first order.
+fn import(rig: &Rig) {
+    for t in TABLES.iter().rev() {
+        sql(rig, &format!("INSERT INTO {t} SELECT * FROM bak_{t};"));
+    }
+}
+
 /// Everything the catalogue says, for "nothing changed" checks.
 fn dump(rig: &Rig) -> String {
     let mut out = String::new();
@@ -50,6 +85,37 @@ fn dump(rig: &Rig) -> String {
         });
     }
     out
+}
+
+fn add(total: &mut ReplayReport, step: ReplayReport) {
+    total.manifests += step.manifests;
+    total.published += step.published;
+    total.present += step.present;
+    total.superseded += step.superseded;
+    total.extents += step.extents;
+    total.article_plans += step.article_plans;
+    total.safety_missing += step.safety_missing;
+    total.tombstones += step.tombstones;
+    total.deleted += step.deleted;
+    total.unpublishable.extend(step.unpublishable);
+    total.unreadable.extend(step.unreadable);
+    total.damaged_total = step.damaged_total;
+    total.damaged = step.damaged;
+}
+
+/// Replays to the end. Returns the summed report and the number of calls.
+async fn replay(rig: &Rig, since: UnixMs, limits: ReplayLimits) -> (ReplayReport, u32) {
+    let mut total = ReplayReport::default();
+    let mut cursor = Some(ReplayCursor::start(since));
+    let mut calls = 0;
+    while let Some(at) = cursor {
+        calls += 1;
+        assert!(calls < 10_000, "the replay does not end");
+        let mut step = rig.bridge.replay_step_within(at, limits).await.unwrap();
+        cursor = step.next.take();
+        add(&mut total, step);
+    }
+    (total, calls)
 }
 
 async fn get(rig: &Rig, signer: &Signer, key: &str) -> Resp {
@@ -120,6 +186,19 @@ async fn complete(rig: &Rig, signer: &Signer, key: &str, id: &str, etags: &[Stri
     .await
 }
 
+/// A two-extent object: parts of 5 MiB and 1 KiB.
+async fn multipart(rig: &Rig, signer: &Signer, key: &str, seed: u8) -> Vec<u8> {
+    let first = pattern(seed, 5 * MIB);
+    let last = pattern(seed.wrapping_add(1), 1024);
+    let id = create_upload(rig, signer, key).await;
+    let etags = vec![
+        upload_part(rig, signer, key, &id, 1, &first).await,
+        upload_part(rig, signer, key, &id, 2, &last).await,
+    ];
+    complete(rig, signer, key, &id, &etags).await.expect(200);
+    [first, last].concat()
+}
+
 fn records(rig: &Rig) -> Vec<String> {
     rig.bridge
         .safety
@@ -127,6 +206,21 @@ fn records(rig: &Rig) -> Vec<String> {
         .into_iter()
         .filter(|k| k.starts_with("m/"))
         .collect()
+}
+
+/// The access key and its grant are not in the recovery records: an
+/// operator issues them again.
+async fn reissue_key(rig: &Rig) -> Signer {
+    let bucket = rig
+        .bridge
+        .catalog
+        .bucket_by_name(BUCKET)
+        .await
+        .unwrap()
+        .expect("the replay restored the bucket");
+    let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
+    rig.grant(AKID, &bucket, Perm::Rw).await;
+    signer
 }
 
 fn tick(rig: &Rig) {
@@ -287,3 +381,291 @@ async fn recovery_records_survive_gc_and_eviction() {
 // ---------------------------------------------------------------------------
 // Export, later writes, loss, restore
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn export_plus_replay_restores_later_writes() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"a-old").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "b", b"b").await.expect(200);
+    tick(&rig);
+    let big = multipart(&rig, &signer, "big", 1).await;
+    tick(&rig);
+
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+
+    rig.put(&signer, BUCKET, "a", b"a-new").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "c", b"c").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "b").await.expect(204);
+    tick(&rig);
+    let late = multipart(&rig, &signer, "late", 7).await;
+    tick(&rig);
+    let truth = dump(&rig);
+
+    wipe(&rig);
+    import(&rig);
+    // The export alone is the old state.
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"a-old");
+    get(&rig, &signer, "b").await.expect(200);
+    get(&rig, &signer, "c").await.expect(404);
+
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.published, 3, "a-new, c and late: {report:?}");
+    assert_eq!((report.tombstones, report.deleted), (1, 1), "{report:?}");
+    assert_eq!(report.damaged_total, 0);
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"a-new");
+    get(&rig, &signer, "b").await.expect(404);
+    assert_eq!(get(&rig, &signer, "c").await.expect(200).body, b"c");
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, big);
+    assert_eq!(get(&rig, &signer, "late").await.expect(200).body, late);
+    // Every table equals the catalogue before the loss, but for clock
+    // columns the replay stamps and the upload that was open.
+    for t in ["buckets", "objects", "access_keys", "grants", "articles"] {
+        let rows = |d: &str| -> Vec<String> {
+            d.lines()
+                .filter(|l| l.starts_with(&format!("{t}|")))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(rows(&dump(&rig)), rows(&truth), "{t}");
+    }
+    for t in ["generations", "extents", "outbox"] {
+        let was = truth.lines().filter(|l| l.starts_with(&format!("{t}|")));
+        assert_eq!(rig.count(t), was.count() as i64, "{t}");
+    }
+
+    // A second replay changes nothing.
+    let settled = dump(&rig);
+    let (again, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!((again.published, again.deleted), (0, 0), "{again:?}");
+    assert_eq!(again.present, 3);
+    assert_eq!(dump(&rig), settled);
+}
+
+// ---------------------------------------------------------------------------
+// Total loss: the records alone rebuild the catalogue
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn records_alone_rebuild_the_catalogue() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"a-old").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "a", b"a-new").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "gone", b"gone").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "gone").await.expect(204);
+    tick(&rig);
+    // Deleted and written again: the tombstone is older than the object.
+    rig.put(&signer, BUCKET, "back", b"first").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "back").await.expect(204);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "back", b"second")
+        .await
+        .expect(200);
+    tick(&rig);
+    let big = multipart(&rig, &signer, "dir/big", 3).await;
+    let head = rig.head(&signer, BUCKET, "dir/big").await;
+    let live_before = rig.live(&bucket, "dir/big").await.unwrap();
+
+    wipe(&rig);
+    // One record and one extent per call: every resume point is used.
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 1,
+    };
+    let (report, calls) = replay(&rig, UnixMs(0), limits).await;
+    assert!(calls > 8, "{calls} calls");
+    assert_eq!(report.manifests, 6, "{report:?}");
+    assert_eq!(report.published, 6, "{report:?}");
+    assert_eq!(report.extents, 7);
+    assert_eq!((report.tombstones, report.deleted), (2, 1), "{report:?}");
+    assert_eq!(report.damaged_total, 0);
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"a-new");
+    get(&rig, &signer, "gone").await.expect(404);
+    assert_eq!(get(&rig, &signer, "back").await.expect(200).body, b"second");
+    assert_eq!(get(&rig, &signer, "dir/big").await.expect(200).body, big);
+    let head_after = rig.head(&signer, BUCKET, "dir/big").await;
+    assert_eq!(head_after.header("etag"), head.header("etag"));
+    assert_eq!(
+        head_after.header("content-length"),
+        head.header("content-length")
+    );
+    assert_eq!(rig.live(&bucket, "dir/big").await.unwrap(), live_before);
+    let listed = rig
+        .call(
+            &signer,
+            Method::Get,
+            &format!("/{BUCKET}"),
+            &[("list-type", "2")],
+            &[],
+            b"",
+        )
+        .await;
+    assert_eq!(listed.expect(200).values("Key"), ["a", "back", "dir/big"]);
+
+    // History is back too: the overwritten and the deleted generations
+    // are retired, and their extents wait for garbage collection.
+    assert_eq!(rig.count("generations"), 6);
+    assert_eq!(rig.count("objects"), 3);
+    assert!(rig.count("gc") > 0);
+    // Every live extent is back in the pipeline, at its first stage.
+    let posting: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM outbox o JOIN objects l ON l.generation_id = o.generation_id \
+             WHERE o.stage = 'post'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(posting, 4);
+
+    // The same replay again, in one call per phase.
+    let settled = dump(&rig);
+    let (again, calls) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(calls, 2);
+    assert_eq!(
+        (again.published, again.present, again.deleted),
+        (0, 6, 0),
+        "{again:?}"
+    );
+    assert_eq!(dump(&rig), settled);
+}
+
+/// A record older than a live generation of its key is not published
+/// over it when the older generation is unknown to the catalogue.
+#[tokio::test(flavor = "current_thread")]
+async fn an_older_record_never_replaces_a_newer_object() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"old").await.expect(200);
+    tick(&rig);
+    wipe(&rig);
+    // The catalogue restarts empty and only the newer write reaches it.
+    let (first, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(first.published, 1);
+    let signer2 = reissue_key(&rig).await;
+    rig.put(&signer2, BUCKET, "k", b"new").await.expect(200);
+    sql(
+        &rig,
+        "DELETE FROM outbox; DELETE FROM gc; DELETE FROM extents WHERE generation_id IN \
+               (SELECT id FROM generations WHERE state <> 'live'); \
+               DELETE FROM generations WHERE state <> 'live';",
+    );
+    assert_eq!(rig.count("generations"), 1);
+
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(
+        (report.published, report.present, report.superseded),
+        (0, 1, 1),
+        "{report:?}"
+    );
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"new");
+    assert_eq!(rig.count("generations"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Damage is reported, never hidden
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_extent_and_a_broken_record_are_reported() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "fine", b"fine").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "lost", b"lost").await.expect(200);
+    let (lost_generation, lost_extents) = rig.live(&bucket, "lost").await.unwrap();
+    tick(&rig);
+    rig.put(&signer, BUCKET, "torn", b"torn").await.expect(200);
+    let (torn_generation, _) = rig.live(&bucket, "torn").await.unwrap();
+
+    // The extent of `lost` has no copy anywhere, and the record of
+    // `torn` does not open.
+    for x in &lost_extents {
+        rig.bridge
+            .safety
+            .inner
+            .delete(&x.id.safety_key())
+            .await
+            .unwrap();
+        rig.bridge
+            .cache
+            .inner
+            .delete(&x.id.cache_key())
+            .await
+            .unwrap();
+    }
+    let torn_record = format!("m/{}", torn_generation.id.as_str());
+    assert!(rig.bridge.safety.corrupt(&torn_record, |b| {
+        let last = b.len() - 1;
+        b[last] ^= 1;
+    }));
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 2, "{report:?}");
+    assert_eq!(report.unreadable, [torn_record]);
+    assert_eq!(report.safety_missing, 1);
+    assert_eq!(report.damaged_total, 1);
+    assert_eq!(report.damaged, [lost_generation.id.as_str()]);
+
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "fine").await.expect(200).body, b"fine");
+    // Known to exist, and unreadable: an error, not "no such key".
+    let lost = get(&rig, &signer, "lost").await;
+    assert!(
+        lost.status >= 500 || lost.stream_error.is_some(),
+        "{}",
+        lost.status
+    );
+    rig.head(&signer, BUCKET, "lost").await.expect(200);
+    get(&rig, &signer, "torn").await.expect(404);
+}
+
+/// A record sealed under another key or stored under another name does
+/// not open.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_is_bound_to_its_name() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"one").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "two", b"two").await.expect(200);
+    let (one, _) = rig.live(&bucket, "one").await.unwrap();
+    let (two, _) = rig.live(&bucket, "two").await.unwrap();
+    let (name_one, name_two) = (
+        format!("m/{}", one.id.as_str()),
+        format!("m/{}", two.id.as_str()),
+    );
+    // Swap the two records.
+    let a = rig.bridge.safety.stored(&name_one).unwrap().bytes;
+    let b = rig.bridge.safety.stored(&name_two).unwrap().bytes;
+    assert!(rig.bridge.safety.corrupt(&name_one, |x| *x = b));
+    assert!(rig.bridge.safety.corrupt(&name_two, |x| *x = a));
+    // No plaintext of the object's name or bucket in a record.
+    let sealed = rig.bridge.safety.stored(&name_one).unwrap().bytes;
+    for word in [&b"vault"[..], b"one", b"two", b"bdk_wrapped"] {
+        assert!(!sealed.windows(word.len()).any(|w| w == word));
+    }
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 0);
+    assert_eq!(report.unreadable, [name_one, name_two]);
+    assert_eq!(rig.count("generations"), 0);
+}

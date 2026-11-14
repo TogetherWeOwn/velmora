@@ -603,6 +603,28 @@ impl Catalog for MemCatalog {
     async fn upload_extents(&self, _: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
         unused()
     }
+    async fn replay_probe(&self, _: &GenerationRow) -> Result<velmora_bridge::replay::ReplayProbe> {
+        unused()
+    }
+    async fn replay_extents(
+        &self,
+        _: &Bucket,
+        _: &[velmora_bridge::replay::ReplayExtent],
+        _: UnixMs,
+    ) -> Result<()> {
+        unused()
+    }
+    async fn replay_damaged(&self, _: u32) -> Result<(u64, Vec<GenerationId>)> {
+        unused()
+    }
+    async fn replay_publish(
+        &self,
+        _: &GenerationRow,
+        _: &[velmora_bridge::ExtentPlacement],
+        _: UnixMs,
+    ) -> Result<Guard<()>> {
+        unused()
+    }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {
         unused()
     }
