@@ -52,12 +52,11 @@ use crate::ingress::{
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
 };
-use crate::recovery::{generation_key, write_generation};
+use crate::recovery::{generation_key, id_after, write_generation};
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationId, GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState,
-    JOB_VERSION,
+    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
+    S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, JOB_VERSION,
 };
 
 /// Smallest non-final part.
@@ -970,8 +969,12 @@ where
         }
         let publication = plan(&listed, &parts)?;
         let now = bridge.clock.now();
+        // The id sorts after everything already on the key, so the order
+        // of ids on a key is the order of its commits; the batch checks
+        // it again, against whatever commits in between.
+        let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
         let generation = GenerationRow {
-            id: GenerationId::mint(now, random()?),
+            id: id_after(now, newest.as_ref(), random()?),
             bucket_id: a.bucket.id.clone(),
             key: a.key.clone(),
             state: GenerationState::Live,
@@ -1052,7 +1055,12 @@ where
                     .safety
                     .delete(&generation_key(&commit.generation.id))
                     .await;
-                lost_at = Some(upload.revision);
+                // Refused for the id (the key took a newer one since it
+                // was read) or for the upload. Only the second is judged
+                // by the revision on the next turn.
+                let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
+                let outrun = newest.is_some_and(|n| n >= commit.generation.id);
+                lost_at = (!outrun).then_some(upload.revision);
             }
         }
     }

@@ -302,8 +302,8 @@ async fn commit_guard_failure_makes_nothing_visible() {
     let c = fx.commit(&b.id, "k", 2, T0);
 
     fx.cat.sql.lose_guard.set(true);
-    let err = fx.cat.commit_generation(&c).await.unwrap_err();
-    assert!(matches!(err, BridgeError::GuardFailed), "{err:?}");
+    let lost = fx.cat.commit_generation(&c).await.unwrap();
+    assert_eq!(lost, Guard::Lost);
     fx.cat.sql.lose_guard.set(false);
 
     assert_eq!(fx.footprint(), [0, 0, 0, 0, 0]);
@@ -327,10 +327,7 @@ async fn failed_overwrite_keeps_the_old_generation_live() {
     // Guard lost after every statement ran.
     let v2 = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
     fx.cat.sql.lose_guard.set(true);
-    assert!(matches!(
-        fx.cat.commit_generation(&v2).await,
-        Err(BridgeError::GuardFailed)
-    ));
+    assert_eq!(fx.cat.commit_generation(&v2).await.unwrap(), Guard::Lost);
     fx.cat.sql.lose_guard.set(false);
 
     // A statement in the middle fails (extent id already taken).
@@ -1629,4 +1626,249 @@ async fn set_safety_state_is_a_compare_and_set() {
     );
     let status = fx.cat.object_status(&b.id, "k").await.unwrap().unwrap();
     assert_eq!(status.extents[0].safety_state, Deleted);
+}
+
+// ---------------------------------------------------------------------------
+// Ids on one key are in commit order
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_commit_under_an_older_or_equal_id_is_refused() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let v1 = fx.put(&b.id, "k", T0.plus_ms(10)).await;
+    let before = fx.footprint();
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(v1.generation.id.clone())
+    );
+
+    // Older by the clock; and in the same millisecond with random bytes
+    // that sort first (the fixture counts its seeds up, so a later one
+    // sorts after: build the smaller one by hand).
+    let older = fx.commit(&b.id, "k", 1, T0);
+    assert_eq!(fx.cat.commit_generation(&older).await.unwrap(), Guard::Lost);
+    let mut same_ms = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
+    let id = GenerationId::mint(T0.plus_ms(10), [0; 8]);
+    assert!(id < v1.generation.id);
+    same_ms.extents[0].generation_id = Some(id.clone());
+    same_ms.generation.id = id;
+    assert_eq!(
+        fx.cat.commit_generation(&same_ms).await.unwrap(),
+        Guard::Lost
+    );
+    // The id of the live generation itself: refused, not a key clash.
+    let mut again = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
+    again.extents[0].generation_id = Some(v1.generation.id.clone());
+    again.generation.id = v1.generation.id.clone();
+    assert_eq!(fx.cat.commit_generation(&again).await.unwrap(), Guard::Lost);
+    assert_eq!(fx.footprint(), before);
+
+    // Another key and another bucket are not held back by this one.
+    let other = fx.bucket("beta").await;
+    fx.put(&b.id, "k2", T0).await;
+    fx.put(&other.id, "k", T0).await;
+    // A later one in the same millisecond is in order.
+    let later = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
+    assert!(later.generation.id > v1.generation.id);
+    assert_eq!(
+        fx.cat.commit_generation(&later).await.unwrap(),
+        Guard::Applied(())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let v1 = fx.put(&b.id, "k", T0).await;
+    assert_eq!(fx.cat.newest_id(&b.id, "nope").await.unwrap(), None);
+
+    // A tombstone that does not sort after the live generation deletes
+    // nothing and is not remembered.
+    assert!(!fx
+        .cat
+        .delete_object_before(&b.id, "k", &v1.generation.id, T0.plus_ms(1))
+        .await
+        .unwrap());
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 0);
+
+    let tombstone = GenerationId::mint(T0.plus_ms(50), [9; 8]);
+    assert!(fx
+        .cat
+        .delete_object_before(&b.id, "k", &tombstone, T0.plus_ms(50))
+        .await
+        .unwrap());
+    assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
+    // The row holds the tombstone or a bound in its millisecond.
+    let newest = fx.cat.newest_id(&b.id, "k").await.unwrap().unwrap();
+    assert!(newest >= tombstone);
+    assert_eq!(newest.as_str()[..15], tombstone.as_str()[..15]);
+
+    // Older than the tombstone, and the tombstone's own id: refused.
+    let older = fx.commit(&b.id, "k", 1, T0.plus_ms(20));
+    assert_eq!(fx.cat.commit_generation(&older).await.unwrap(), Guard::Lost);
+    let mut equal = fx.commit(&b.id, "k", 1, T0.plus_ms(50));
+    equal.extents[0].generation_id = Some(tombstone.clone());
+    equal.generation.id = tombstone.clone();
+    assert_eq!(fx.cat.commit_generation(&equal).await.unwrap(), Guard::Lost);
+    assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
+
+    // After it: published, and the tombstone row has done its work.
+    let newer = fx.commit(&b.id, "k", 1, T0.plus_ms(51));
+    assert_eq!(
+        fx.cat.commit_generation(&newer).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 0);
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(newer.generation.id.clone())
+    );
+}
+
+const BEFORE_0006: &str = "DROP TRIGGER key_tombstones_on_delete; DROP TABLE key_tombstones;";
+
+/// What a Worker from before `key_tombstones` does for a delete: it
+/// retires the generation and writes no tombstone row.
+fn delete_like_an_older_worker(fx: &Fx, id: &GenerationId, now: UnixMs) {
+    let sql = format!(
+        "UPDATE generations SET state = 'deleted', retired_at = {} WHERE id = '{}'; \
+         DELETE FROM objects WHERE generation_id = '{}';",
+        now.0,
+        id.as_str(),
+        id.as_str()
+    );
+    fx.cat.sql.db.apply(&sql).unwrap();
+}
+
+/// A catalogue from before `key_tombstones`: its deletes are known only
+/// to the recovery records. The migration gives every deleted key a
+/// boundary above them, so that a publication from a clock that runs
+/// behind still sorts after the old tombstone.
+#[tokio::test]
+async fn the_migration_fences_keys_deleted_before_it() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    fx.put(&b.id, "kept", T0).await;
+    fx.put(&b.id, "gone", T0).await;
+    let old_tombstone = GenerationId::mint(T0.plus_ms(500), [9; 8]);
+    assert!(fx
+        .cat
+        .delete_object_before(&b.id, "gone", &old_tombstone, T0.plus_ms(500))
+        .await
+        .unwrap());
+
+    // Back to the schema before the migration, then the migration.
+    let db = &fx.cat.sql.db;
+    db.apply(BEFORE_0006).unwrap();
+    db.apply(velmora_bridge::testkit::MIGRATION_0006).unwrap();
+
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
+    assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());
+    let boundary = fx.cat.newest_id(&b.id, "gone").await.unwrap().unwrap();
+    assert!(boundary > old_tombstone);
+    assert_eq!(boundary.as_str().len(), old_tombstone.as_str().len());
+
+    // A clock 100 ms behind the old delete: refused under its own time,
+    // published under the id the PUT path mints from the boundary.
+    let behind = fx.commit(&b.id, "gone", 1, T0.plus_ms(400));
+    assert_eq!(
+        fx.cat.commit_generation(&behind).await.unwrap(),
+        Guard::Lost
+    );
+    let id = recovery::id_after(T0.plus_ms(400), Some(&boundary), [1; 8]);
+    assert!(id > boundary && id > old_tombstone);
+    let mut after = fx.commit(&b.id, "gone", 1, T0.plus_ms(400));
+    after.extents[0].generation_id = Some(id.clone());
+    after.generation.id = id;
+    assert_eq!(
+        fx.cat.commit_generation(&after).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert!(fx.cat.live_object(&b.id, "gone").await.unwrap().is_some());
+}
+
+/// The older Worker keeps serving between the migration and its
+/// replacement. Its deletes write no row; the trigger does, with a bound
+/// at or above the tombstone the delete minted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_that_writes_no_tombstone_row_is_fenced() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+
+    // The generation is from a clock one hour ahead of the delete: the
+    // tombstone is one millisecond after the generation.
+    let ahead = fx.put(&b.id, "ahead", T0.plus_ms(3_600_000)).await;
+    let tombstone = recovery::tombstone_id(T0, &ahead.generation.id, [0xff; 8]);
+    delete_like_an_older_worker(&fx, &ahead.generation.id, T0);
+    let bound = fx.cat.newest_id(&b.id, "ahead").await.unwrap().unwrap();
+    assert!(bound >= tombstone, "{bound:?} {tombstone:?}");
+    assert_eq!(bound.as_str().len(), tombstone.as_str().len());
+
+    // The delete is the later of the two: the tombstone is in its
+    // millisecond.
+    let plain = fx.put(&b.id, "plain", T0).await;
+    let now = T0.plus_ms(7_200_000);
+    let tombstone = recovery::tombstone_id(now, &plain.generation.id, [0xff; 8]);
+    delete_like_an_older_worker(&fx, &plain.generation.id, now);
+    let bound = fx.cat.newest_id(&b.id, "plain").await.unwrap().unwrap();
+    assert!(bound >= tombstone, "{bound:?} {tombstone:?}");
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 2);
+
+    // Under an id at or below the bound nothing is published.
+    let mut again = fx.commit(&b.id, "plain", 1, now);
+    again.extents[0].generation_id = Some(tombstone.clone());
+    again.generation.id = tombstone;
+    assert_eq!(fx.cat.commit_generation(&again).await.unwrap(), Guard::Lost);
+}
+
+/// Ids from a clock that ran far ahead: the boundary of the migration is
+/// above their tombstones too, not only above its own time.
+#[tokio::test(flavor = "current_thread")]
+async fn the_migration_fences_deletes_with_ids_far_ahead() {
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let wall = UnixMs(i64::try_from(wall).unwrap());
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    fx.cat.sql.db.apply(BEFORE_0006).unwrap();
+
+    // One hour ahead of this machine when the generation was minted.
+    let ahead = fx.commit(&b.id, "ahead", 1, wall.plus_ms(3_600_000));
+    // One hour ahead when the delete ran.
+    let plain = fx.commit(&b.id, "plain", 1, T0);
+    let late = wall.plus_ms(3_600_000);
+    let tombstones = [
+        recovery::tombstone_id(T0, &ahead.generation.id, [0xff; 8]),
+        recovery::tombstone_id(late, &plain.generation.id, [0xff; 8]),
+    ];
+    for (c, now) in [(&ahead, T0), (&plain, late)] {
+        let g = &c.generation;
+        let sql = format!(
+            "INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
+               user_meta_json, extent_count, created_at, retired_at) \
+             VALUES ('{}', '{}', '{}', 'deleted', 0, 'e', '{{}}', '{{}}', 0, {}, {});",
+            g.id.as_str(),
+            b.id.as_str(),
+            g.key,
+            T0.0,
+            now.0
+        );
+        fx.cat.sql.db.apply(&sql).unwrap();
+    }
+    fx.cat
+        .sql
+        .db
+        .apply(velmora_bridge::testkit::MIGRATION_0006)
+        .unwrap();
+
+    for (key, tombstone) in ["ahead", "plain"].into_iter().zip(tombstones) {
+        let bound = fx.cat.newest_id(&b.id, key).await.unwrap().unwrap();
+        assert!(bound >= tombstone, "{key}: {bound:?} {tombstone:?}");
+        assert!(tombstone > GenerationId::mint(wall.plus_ms(600_000), [0xff; 8]));
+    }
 }

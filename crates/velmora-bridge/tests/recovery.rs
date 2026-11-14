@@ -14,9 +14,10 @@ use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 14] = [
     "generation_extents",
     "outbox",
+    "key_tombstones",
     "verifications",
     "articles",
     "upload_parts",
@@ -1140,4 +1141,353 @@ async fn restore_route_runs_only_in_maintenance() {
     let signer = reissue_key(&restoring).await;
     let put = restoring.put(&signer, BUCKET, "c", b"c").await;
     assert_eq!(put.status, 503, "{}", put.text());
+}
+
+// ---------------------------------------------------------------------------
+// The order of ids on a key is the order of its commits
+// ---------------------------------------------------------------------------
+
+/// What every key answers now; then the catalogue is lost and rebuilt
+/// from the records alone, and every key must answer the same.
+async fn replay_answers_the_same(rig: &Rig, signer: &Signer, keys: &[&str]) {
+    let mut before = Vec::new();
+    for key in keys {
+        let got = get(rig, signer, key).await;
+        before.push((got.status, got.body.clone()));
+    }
+    wipe(rig);
+    let (report, _) = replay(rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(
+        report.unpublishable.is_empty() && report.unreadable.is_empty(),
+        "{report:?}"
+    );
+    let signer = reissue_key(rig).await;
+    for (key, (status, body)) in keys.iter().zip(before) {
+        let got = get(rig, &signer, key).await;
+        assert_eq!(got.status, status, "{key} after the replay");
+        if status == 200 {
+            assert_eq!(got.body, body, "{key} after the replay");
+        }
+    }
+}
+
+fn live_ids(rig: &Rig) -> Vec<String> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT generation_id FROM objects ORDER BY key")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_overwrite_from_a_slow_clock_stays_on_top_in_a_replay() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let v1 = live_ids(&rig).remove(0);
+    // The isolate that takes the overwrite runs half a second behind.
+    rig.bridge.clock.advance_ms(-500);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2 > v1, "{v2} sorts after {v1}");
+    // The record of the first try is gone: one record per generation.
+    assert_eq!(
+        records(&rig)
+            .iter()
+            .filter(|r| r.starts_with(GENERATION_PREFIX))
+            .count(),
+        2
+    );
+    rig.bridge.clock.advance_ms(2000);
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"v2");
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_after_a_delete_sorts_after_the_tombstone() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    rig.bridge.clock.advance_ms(-500);
+    delete(&rig, &signer, "k").await.expect(204);
+    let tombstone = records(&rig)
+        .into_iter()
+        .find_map(|r| r.strip_prefix(TOMBSTONE_PREFIX).map(str::to_owned))
+        .unwrap();
+    rig.bridge.clock.advance_ms(100);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2 > tombstone, "{v2} sorts after {tombstone}");
+    // The key lives again: the catalogue keeps no tombstone for it.
+    assert_eq!(rig.count("key_tombstones"), 0);
+    rig.bridge.clock.advance_ms(2000);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn writes_in_one_millisecond_replay_in_commit_order() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    // The clock does not move: every id below is minted in the same
+    // millisecond, where only random bytes would order them.
+    let keys: Vec<String> = (0..12).map(|i| format!("k{i}")).collect();
+    for key in &keys {
+        rig.put(&signer, BUCKET, key, b"v1").await.expect(200);
+        rig.put(&signer, BUCKET, key, b"v2").await.expect(200);
+        rig.put(&signer, BUCKET, key, b"v3").await.expect(200);
+    }
+    rig.put(&signer, BUCKET, "gone", b"v1").await.expect(200);
+    delete(&rig, &signer, "gone").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v1").await.expect(200);
+    delete(&rig, &signer, "back").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v2").await.expect(200);
+    delete(&rig, &signer, "back").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v3").await.expect(200);
+    assert_eq!(get(&rig, &signer, "gone").await.status, 404);
+    assert_eq!(get(&rig, &signer, "back").await.expect(200).body, b"v3");
+    assert_eq!(
+        rig.count("key_tombstones"),
+        1,
+        "only the deleted key has one"
+    );
+
+    let mut all: Vec<&str> = keys.iter().map(String::as_str).collect();
+    all.extend(["gone", "back"]);
+    for key in &keys {
+        assert_eq!(get(&rig, &signer, key).await.expect(200).body, b"v3");
+    }
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &all).await;
+    assert_eq!(rig.count("key_tombstones"), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_from_a_slow_clock_stays_on_top_in_a_replay() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let first = pattern(3, 5 * MIB);
+    let last = pattern(4, 1024);
+    let etags = vec![
+        upload_part(&rig, &signer, "big", &id, 1, &first).await,
+        upload_part(&rig, &signer, "big", &id, 2, &last).await,
+    ];
+    tick(&rig);
+    rig.put(&signer, BUCKET, "big", b"small").await.expect(200);
+    let put = live_ids(&rig).remove(0);
+    rig.bridge.clock.advance_ms(-500);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    let completed = live_ids(&rig).remove(0);
+    assert!(completed > put, "{completed} sorts after {put}");
+    rig.bridge.clock.advance_ms(2000);
+    assert_eq!(
+        get(&rig, &signer, "big").await.expect(200).body,
+        [first, last].concat()
+    );
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+// ---------------------------------------------------------------------------
+// An upload that the export saw open, completed after it
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let first = pattern(3, 5 * MIB);
+    let last = pattern(4, 1024);
+    let etags = vec![
+        upload_part(&rig, &signer, "big", &id, 1, &first).await,
+        upload_part(&rig, &signer, "big", &id, 2, &last).await,
+    ];
+    tick(&rig);
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    tick(&rig);
+    wipe(&rig);
+    import(&rig);
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let whole = [first, last].concat();
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+
+    // The export still says the upload is open. The client's Abort of
+    // it must not queue the published extents for collection.
+    rig.call(
+        &signer,
+        Method::Delete,
+        &path(BUCKET, "big"),
+        &[("uploadId", id.as_str())],
+        &[],
+        b"",
+    )
+    .await;
+    let collected: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM gc WHERE extent_id IN (SELECT e.id FROM extents e \
+               JOIN objects o ON o.generation_id = e.generation_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(collected, 0);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// Random histories inside one millisecond replay to the same answers
+// ---------------------------------------------------------------------------
+
+/// splitmix64: the histories below are the same on every run.
+struct Dice(u64);
+
+impl Dice {
+    fn roll(&mut self, sides: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % sides
+    }
+}
+
+const DICE_KEYS: [&str; 4] = ["k0", "k1", "k2", "k3"];
+
+/// One random write: a PUT, a copy (onto another key, or onto itself
+/// with new metadata), a delete or a one-part multipart upload. The
+/// clock mostly stands still, so ids are minted in one millisecond;
+/// now and then it moves a little, also backwards (an isolate whose
+/// clock is behind).
+async fn random_write(
+    rig: &Rig,
+    signer: &Signer,
+    dice: &mut Dice,
+    n: usize,
+    log: &mut Vec<String>,
+) {
+    match dice.roll(8) {
+        0 => rig.bridge.clock.advance_ms(1),
+        1 => rig.bridge.clock.advance_ms(-2),
+        _ => {}
+    }
+    let key = DICE_KEYS[dice.roll(4) as usize];
+    let body = format!("body {n}");
+    let status = match dice.roll(6) {
+        0 | 1 => {
+            log.push(format!("put {key}"));
+            rig.put(signer, BUCKET, key, body.as_bytes()).await.status
+        }
+        2 => {
+            let from = DICE_KEYS[dice.roll(4) as usize];
+            log.push(format!("copy {from} -> {key}"));
+            let source = format!("/{BUCKET}/{from}");
+            let tag = n.to_string();
+            let mut headers = vec![("x-amz-copy-source", source.as_str())];
+            if from == key || dice.roll(2) == 0 {
+                headers.push(("x-amz-metadata-directive", "REPLACE"));
+                headers.push(("x-amz-meta-n", tag.as_str()));
+            }
+            rig.call(signer, Method::Put, &path(BUCKET, key), &[], &headers, b"")
+                .await
+                .status
+        }
+        3 | 4 => {
+            log.push(format!("delete {key}"));
+            delete(rig, signer, key).await.status
+        }
+        _ => {
+            log.push(format!("complete {key}"));
+            let id = create_upload(rig, signer, key).await;
+            let etag = upload_part(rig, signer, key, &id, 1, body.as_bytes()).await;
+            complete(rig, signer, key, &id, &[etag]).await.status
+        }
+    };
+    // A copy of a key that is not there answers 404; nothing else fails.
+    assert!(matches!(status, 200 | 204 | 404), "{status}: {log:?}");
+}
+
+/// What a client sees of every key.
+async fn answers(
+    rig: &Rig,
+    signer: &Signer,
+) -> Vec<(u16, Vec<u8>, Option<String>, Option<String>)> {
+    let mut all = Vec::new();
+    for key in DICE_KEYS {
+        let got = get(rig, signer, key).await;
+        let live = got.status == 200;
+        all.push((
+            got.status,
+            if live { got.body.clone() } else { Vec::new() },
+            got.header("x-amz-meta-n")
+                .filter(|_| live)
+                .map(str::to_owned),
+            got.header("etag").filter(|_| live).map(str::to_owned),
+        ));
+    }
+    all
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
+    for seed in 0..150u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        for n in 0..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        let signer = reissue_key(&rig).await;
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_across_an_export_replay_to_the_same_answers() {
+    for seed in 1000..1300u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        let cut = 5 + dice.roll(30) as usize;
+        for n in 0..cut {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        export(&rig);
+        // The restore point lies before the export by more than any
+        // clock in the history runs behind.
+        let since = rig.now().plus_ms(-1000);
+        log.push("export".into());
+        for n in cut..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        import(&rig);
+        let (report, _) = replay(&rig, since, ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
 }

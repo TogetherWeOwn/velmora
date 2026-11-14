@@ -756,7 +756,10 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         unused()
     }
-    async fn commit_generation(&self, _: &CommitGeneration) -> Result<()> {
+    async fn commit_generation(&self, _: &CommitGeneration) -> Result<Guard<()>> {
+        unused()
+    }
+    async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
     async fn copy_generation(&self, _: &velmora_bridge::CopyGeneration) -> Result<Guard<()>> {

@@ -1850,7 +1850,7 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
         pinned > 0 && released > 0,
         format!("{pinned} pinned, {released} released"),
     );
-    let wipe = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM verifications; DELETE FROM articles; \
+    let wipe = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM key_tombstones; DELETE FROM verifications; DELETE FROM articles; \
                 DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
                 DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
                 DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";

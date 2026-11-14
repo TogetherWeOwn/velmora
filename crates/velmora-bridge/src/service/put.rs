@@ -9,19 +9,26 @@ use std::rc::Rc;
 
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
-use velmora_s3_proto::{StoredChecksum, UploadValidator};
+use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, checksum_json, from_proto, internal, metadata_json, mutation_gate, s3_error,
 };
 use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
-use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
-use crate::recovery::write_generation;
+use crate::ports::{
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
+};
+use crate::recovery::{discard_generation, id_after, write_generation};
 use crate::types::{
     CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
     GenerationState, Job, OutboxStage, S3Request, S3Response, SafetyState, JOB_VERSION,
 };
+
+/// How often a PUT is published before it answers `SlowDown`: once
+/// under the id it minted, then under ids minted after whatever was
+/// newer on the key.
+const COMMIT_ATTEMPTS: u32 = 4;
 
 /// Key mode of a per-extent random file key.
 const KEY_MODE_RANDOM: u8 = 1;
@@ -163,25 +170,57 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     // The recovery record is durable before the catalogue batch: an
     // acknowledged PUT can be replayed into a restored catalogue. If this
     // write fails, nothing is published.
-    let commit = CommitGeneration {
+    let mut commit = CommitGeneration {
         generation,
         extents: vec![extent],
         now,
     };
-    write_generation(
-        &bridge.safety,
-        &bridge.kek,
-        bucket,
-        &commit.generation,
-        &commit.extents,
-    )
-    .await
-    .map_err(|_| internal())?;
-    bridge
-        .catalog
-        .commit_generation(&commit)
+    let mut attempts = 0;
+    let generation_id = loop {
+        write_generation(
+            &bridge.safety,
+            &bridge.kek,
+            bucket,
+            &commit.generation,
+            &commit.extents,
+        )
         .await
         .map_err(|_| internal())?;
+        match bridge
+            .catalog
+            .commit_generation(&commit)
+            .await
+            .map_err(|_| internal())?
+        {
+            Guard::Applied(()) => break commit.generation.id.clone(),
+            Guard::Lost => {}
+        }
+        // The key already carries a newer id: a commit that landed after
+        // this id was minted, or one minted by a clock ahead of this
+        // one. Publishing under the older id would let a replay of the
+        // records put the other one on top. Nothing was published, so
+        // the record goes, and the PUT is tried again under an id that
+        // sorts after everything on the key.
+        discard_generation(&bridge.safety, &commit.generation.id)
+            .await
+            .map_err(|_| internal())?;
+        attempts += 1;
+        if attempts == COMMIT_ATTEMPTS {
+            return Err(s3_error(ErrorCode::SlowDown));
+        }
+        let newest = bridge
+            .catalog
+            .newest_id(&bucket.id, key)
+            .await
+            .map_err(|_| internal())?;
+        rng.fill_bytes(&mut generation_rand)
+            .map_err(|_| internal())?;
+        let id = id_after(bridge.clock.now(), newest.as_ref(), generation_rand);
+        for e in &mut commit.extents {
+            e.generation_id = Some(id.clone());
+        }
+        commit.generation.id = id;
+    };
     drop(charge);
 
     // The commit wrote the posting obligation; the queue message is only a

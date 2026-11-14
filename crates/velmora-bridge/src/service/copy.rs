@@ -191,18 +191,14 @@ where
                 "A copy keeps the checksum of its source; computing another is not implemented.",
             ));
         }
-        // The generation this copy replaces, so that the copy's id sorts
-        // after it. The batch holds the copy to that.
-        let replaced = if source == key {
-            None
-        } else {
-            bridge
-                .catalog
-                .live_object(&bucket.id, key)
-                .await
-                .map_err(|_| internal())?
-                .map(|(g, _)| g.id)
-        };
+        // The newest id on the destination key, a live generation or a
+        // tombstone, so that the copy's id sorts after it. The batch
+        // holds the copy to that.
+        let newest = bridge
+            .catalog
+            .newest_id(&bucket.id, key)
+            .await
+            .map_err(|_| internal())?;
         let now = bridge.clock.now();
         let mut rand = [0u8; 8];
         SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
@@ -214,7 +210,7 @@ where
         let generation = GenerationRow {
             // Also after the attempt that lost: should its record have
             // survived its delete after all, it sorts before this one.
-            id: copy_id(now, &from.id, replaced.as_ref().max(lost.as_ref()), rand),
+            id: copy_id(now, &from.id, newest.as_ref().max(lost.as_ref()), rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,
