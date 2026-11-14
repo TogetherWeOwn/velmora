@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
 use crate::recovery::{
-    read_article_plan, read_generation, read_tombstone, start_after, GenerationManifest,
-    GENERATION_PREFIX, TOMBSTONE_PREFIX,
+    article_key, read_article_plan, read_generation, read_tombstone, start_after,
+    GenerationManifest, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
 use crate::types::{
     ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
@@ -243,7 +243,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             let end = m.extents.len().min(at + *budget);
             let mut chunk = Vec::with_capacity(end - at);
             for index in at..end {
-                let row = m.extent(index)?;
+                let mut row = m.extent(index)?;
                 let safety_present = self.safety.head(&row.id.safety_key()).await?.is_some();
                 // A plan in an existing catalogue row is kept; this one
                 // fills the gap when the row or its plan is missing.
@@ -252,8 +252,31 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 } else {
                     ArticleState::Posted
                 };
-                let plan = match read_article_plan(&self.safety, &self.kek, &row.id).await? {
-                    Some(record) => Some(record.rows(state)?),
+                // A plan record that does not open must not stop the
+                // replay: it is reported and the extent is restored
+                // without a plan. A store that cannot be reached still
+                // fails the call, so that the caller retries.
+                let record = match read_article_plan(&self.safety, &self.kek, &row.id).await {
+                    Ok(record) => record,
+                    Err(crate::types::BridgeError::Blob(e)) => {
+                        return Err(crate::types::BridgeError::Blob(e))
+                    }
+                    Err(_) => {
+                        report.unreadable.push(article_key(&row.id));
+                        None
+                    }
+                };
+                let plan = match record {
+                    Some(record) => match record.rows(state) {
+                        Ok(rows) => {
+                            row.plan_rev = record.plan_rev;
+                            Some(rows)
+                        }
+                        Err(_) => {
+                            report.unreadable.push(article_key(&row.id));
+                            None
+                        }
+                    },
                     None => None,
                 };
                 report.extents += 1;
