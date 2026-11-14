@@ -35,6 +35,7 @@ use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PermitClass,
 };
 use crate::post::Stop;
+use crate::recovery::delete_blob;
 use crate::types::{
     AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
     KeyStatus, Method, OutboxStage, Perm, RespBody, S3Request, S3Response, SafetyState,
@@ -631,9 +632,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
     for x in &status.extents {
-        bridge
-            .cache
-            .delete(&x.extent_id.cache_key())
+        delete_blob(&bridge.cache, &x.extent_id.cache_key())
             .await
             .or_internal()?;
         evicted += 1;
@@ -659,9 +658,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             SafetyState::Released | SafetyState::Deleted => true,
         };
         if gone {
-            bridge
-                .safety
-                .delete(&x.extent_id.safety_key())
+            delete_blob(&bridge.safety, &x.extent_id.safety_key())
                 .await
                 .or_internal()?;
             safety_deleted += 1;
