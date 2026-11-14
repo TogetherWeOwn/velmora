@@ -908,9 +908,6 @@ impl Catalog for MemCatalog {
     ) -> Result<PublishOutcome> {
         unused()
     }
-    async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
-        unused()
-    }
     async fn delete_object_before(
         &self,
         _: &BucketId,
@@ -934,6 +931,40 @@ impl Catalog for MemCatalog {
     ) -> Result<()> {
         unused()
     }
+    async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {
+        unused()
+    }
+    async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<UnixMs> {
+        unused()
+    }
+    async fn restore_finish(&self, _: UnixMs, _: UnixMs) -> Result<bool> {
+        unused()
+    }
+    async fn restore_pending(&self) -> Result<bool> {
+        Ok(false)
+    }
+    async fn restore_progress(
+        &self,
+        _: UnixMs,
+    ) -> Result<Option<velmora_bridge::replay::RestoreProgress>> {
+        unused()
+    }
+    async fn restore_advance(
+        &self,
+        _: UnixMs,
+        _: &velmora_bridge::replay::ReplayMark,
+    ) -> Result<()> {
+        unused()
+    }
+    async fn replay_tombstone(
+        &self,
+        _: &BucketId,
+        _: &str,
+        _: &GenerationId,
+        _: UnixMs,
+    ) -> Result<bool> {
+        unused()
+    }
     async fn replay_damaged(&self, _: u32) -> Result<(u64, Vec<GenerationId>)> {
         unused()
     }
@@ -942,7 +973,7 @@ impl Catalog for MemCatalog {
         _: &GenerationRow,
         _: &[velmora_bridge::ExtentPlacement],
         _: UnixMs,
-    ) -> Result<Guard<()>> {
+    ) -> Result<velmora_bridge::replay::ReplayPublish> {
         unused()
     }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {

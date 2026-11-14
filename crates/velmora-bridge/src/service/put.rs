@@ -12,14 +12,15 @@ use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
-    authenticate, checksum_json, from_proto, internal, metadata_json, mutation_gate, s3_error,
+    authenticate, checksum_json, discard_refused, from_proto, internal, metadata_json,
+    mutation_gate, restore_gate, s3_error,
 };
 use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
-use crate::recovery::{discard_generation, id_after, write_generation};
+use crate::recovery::{id_after, write_generation};
 use crate::types::{
     CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
     GenerationState, Job, OutboxStage, S3Request, S3Response, SafetyState, JOB_VERSION,
@@ -62,6 +63,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
+    restore_gate(bridge).await?;
     // CopyObject is this request shape with a source header and no body.
     if authed.headers.get("x-amz-copy-source").is_some() {
         let declared = crate::ingress::declared_length(&req.headers).map_err(|e| e.response())?;
@@ -194,7 +196,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             .map_err(|_| internal())?
         {
             PublishOutcome::Applied => break commit.generation.id.clone(),
-            PublishOutcome::Refused(record) => record,
+            PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
         // The key already carries a newer id: a commit that landed after
         // this id was minted, or one minted by a clock ahead of this
@@ -202,9 +204,12 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         // records put the other one on top. Nothing was published, so
         // the record goes, and the PUT is tried again under an id that
         // sorts after everything on the key.
-        discard_generation(&bridge.safety, &refused)
+        discard_refused(bridge, &commit.generation, refused)
             .await
             .map_err(|_| internal())?;
+        // Refused as well when a replay started after this request
+        // passed the gate.
+        restore_gate(bridge).await?;
         attempts += 1;
         if attempts == COMMIT_ATTEMPTS {
             return Err(s3_error(ErrorCode::SlowDown));

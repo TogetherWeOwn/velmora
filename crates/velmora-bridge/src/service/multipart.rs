@@ -53,7 +53,8 @@ use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
     PublishOutcome, UploadTarget,
 };
-use crate::recovery::{discard_generation, id_after, write_generation};
+use crate::recovery::{id_after, write_generation};
+use crate::service::common::discard_refused;
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
     GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
@@ -426,6 +427,10 @@ where
     )?;
     // `authorize` passed, so the bucket exists and the grant is `rw`.
     let bucket = bucket.ok_or(ErrorCode::AccessDenied)?;
+    // A replay that was started and did not end: see `restore_gate`.
+    if bridge.catalog.restore_pending().await? {
+        return Err(ErrorCode::SlowDown.into());
+    }
     let key = target
         .key
         .clone()
@@ -1055,15 +1060,27 @@ where
                 // record left behind replays as a PUT that failed, and
                 // under everything that follows it on the key, which
                 // the floor raised for it holds to a later id.
-                let _ = discard_generation(&bridge.safety, &record).await;
-                // Refused for the id (the key took a newer one since it
-                // was read) or for the upload. Only the second is judged
-                // by the revision on the next turn.
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                // Refused as well when a replay started after this
+                // request passed the gate.
+                if bridge.catalog.restore_pending().await? {
+                    return Err(ErrorCode::SlowDown.into());
+                }
+                // Otherwise refused for the id (the key took a newer one
+                // since it was read) or for the upload. Only the second
+                // is judged by the revision on the next turn.
                 let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
                 // The floor is this id itself unless something newer
                 // came: only a higher one outran it.
                 let outrun = newest.is_some_and(|n| n > commit.generation.id);
                 lost_at = (!outrun).then_some(upload.revision);
+            }
+            PublishOutcome::Fenced(record) => {
+                // The catalogue failed, then showed that nothing was
+                // published. Without its record this attempt cannot come
+                // back in a replay, also after the client aborts.
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                return Err(Fail::Internal);
             }
         }
     }

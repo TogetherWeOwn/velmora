@@ -7,6 +7,7 @@
 //! live without a pointer. Statements are fixed-shape, one row each, and
 //! stay far below the 100-bound-parameter limit.
 
+use super::replay::guard_no_replay;
 use super::uploads::published;
 use super::SqlCatalog;
 use crate::ports::{PublishOutcome, Row, Sql, SqlValue};
@@ -518,6 +519,7 @@ pub(super) async fn commit_generation<S: Sql>(
     }
 
     let mut stmts: Vec<Stmt> = Vec::with_capacity(7 + 3 * commit.extents.len());
+    stmts.push(guard_no_replay());
     stmts.push(guard_newest(&g.bucket_id, &g.key, &g.id));
     stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(generation_insert(g)?);
@@ -586,6 +588,7 @@ pub(super) async fn copy_generation<S: Sql>(
                 SqlValue::Int(i64::from(g.extent_count)),
             ],
         ),
+        guard_no_replay(),
         // The copy is the newest id of its key as well, as for a PUT.
         guard_newest(&g.bucket_id, &g.key, &g.id),
         clear_floor(&g.bucket_id, &g.key, &g.id),
@@ -616,21 +619,6 @@ pub(super) async fn copy_generation<S: Sql>(
     ));
     stmts.push(pointer_upsert(g));
     published(c, stmts, &g.id, record).await
-}
-
-/// Idempotent: deleting a key with no live object changes nothing.
-pub(super) async fn delete_object<S: Sql>(
-    c: &SqlCatalog<S>,
-    bucket: &BucketId,
-    key: &str,
-    now: UnixMs,
-) -> Result<()> {
-    let mut stmts = retire_live(bucket, key, GenerationState::Deleted, now);
-    stmts.push((
-        "DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2",
-        vec![text(bucket.as_str()), text(key)],
-    ));
-    c.sql.batch(stmts).await.map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

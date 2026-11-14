@@ -683,6 +683,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "outbox",
             "provider_health",
             "provider_permits",
+            "restore_state",
             "scan_cursors",
             "tx_guard",
             "upload_parts",
@@ -974,7 +975,6 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c
         .commit_generation(&commit, Recorded::for_test(&commit.generation.id))
         .await;
-    let _ = c.delete_object(b, "a/k", T0).await;
     let _ = c.list(b, &query).await;
     let _ = c.object_status(b, "a/k").await;
     let _ = c

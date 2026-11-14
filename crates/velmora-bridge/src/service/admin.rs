@@ -275,7 +275,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         if !post {
             return Err(wrong_method());
         }
-        mutable(bridge)?;
+        mutable(bridge).await?;
         let (bucket, key) = object_target(target)?;
         let include_safety = flag(&req.raw_target, "include_safety");
         return evict(bridge, bucket, &key, include_safety).await;
@@ -284,7 +284,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         if !post {
             return Err(wrong_method());
         }
-        mutable(bridge)?;
+        mutable(bridge).await?;
         let (bucket, key) = object_target(target)?;
         return drill(bridge, bucket, &key).await;
     }
@@ -292,7 +292,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     match rest {
         "/status" if get => status(bridge).await,
         "/buckets" if post => {
-            mutable(bridge)?;
+            mutable(bridge).await?;
             let body: CreateBucketBody = read_json(bridge, req).await?;
             let bucket = create_bucket(bridge, &body.name, body.disposable).await?;
             Ok(ok(&json!({
@@ -302,7 +302,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             })))
         }
         "/keys" if post => {
-            mutable(bridge)?;
+            mutable(bridge).await?;
             let body: CreateKeyBody = read_json(bridge, req).await?;
             create_key(bridge, &body).await
         }
@@ -323,18 +323,26 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     }
 }
 
-/// Refuses a mutation while the catalogue is being restored.
-fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+/// Refuses a mutation while the catalogue is being restored: under
+/// maintenance, and until a replay that was started has ended.
+async fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<()> {
-    match bridge.cfg.maintenance {
-        Maintenance::Off => Ok(()),
-        Maintenance::Restore => Err(fail(
+    if bridge.cfg.maintenance == Maintenance::Restore {
+        return Err(fail(
             503,
             "ServiceUnavailable",
             "Maintenance: no changes are accepted.",
-        )),
+        ));
     }
+    if bridge.catalog.restore_pending().await.or_internal()? {
+        return Err(fail(
+            503,
+            "ServiceUnavailable",
+            "A replay of the recovery records is not finished: no changes are accepted.",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -364,18 +372,77 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     body: RestoreBody,
 ) -> Admin<S3Response> {
     let bad = || fail(400, "InvalidArgument", "Send since_ms or cursor.");
+    let earlier = || {
+        fail(
+            409,
+            "OperationAborted",
+            "This cursor is of an earlier replay. The replay that was started last is not finished.",
+        )
+    };
     let cursor = match (body.cursor, body.since_ms) {
-        (Some(cursor), None) if body.margin_ms.is_none() => cursor,
+        (Some(cursor), None) if body.margin_ms.is_none() => {
+            // The catalogue knows how far the replay has come. A cursor
+            // that is ahead of it (made up, or of another restore
+            // point) would end the replay with records left out.
+            let progress = bridge
+                .catalog
+                .restore_progress(crate::types::UnixMs(cursor.run_ms))
+                .await
+                .or_internal()?
+                .ok_or_else(earlier)?;
+            if !cursor.follows(&progress) {
+                return Err(fail(
+                    400,
+                    "InvalidArgument",
+                    "This cursor is ahead of the replay. Send `next` of the last response.",
+                ));
+            }
+            cursor
+        }
         (None, Some(since)) if since >= 0 => {
             let margin = body.margin_ms.unwrap_or(RESTORE_MARGIN_MS);
             if margin < 0 {
                 return Err(bad());
             }
-            ReplayCursor::start(crate::types::UnixMs(since.saturating_sub(margin).max(0)))
+            let from = crate::types::UnixMs(since.saturating_sub(margin).max(0));
+            // From here until the last step, the catalogue refuses
+            // writes, whatever MAINTENANCE says.
+            let run = bridge
+                .catalog
+                .restore_begin(from, bridge.clock.now())
+                .await
+                .or_internal()?;
+            ReplayCursor {
+                run_ms: run.0,
+                ..ReplayCursor::start(from)
+            }
         }
         _ => return Err(bad()),
     };
+    let run = crate::types::UnixMs(cursor.run_ms);
     let report = bridge.replay_step(cursor).await.or_internal()?;
+    match &report.next {
+        // Recorded before the caller gets it: the next call may start
+        // from here and no further.
+        Some(next) => bridge
+            .catalog
+            .restore_advance(run, &next.mark())
+            .await
+            .or_internal()?,
+        // Only the replay that is recorded as under way is ended: the
+        // last step of an older cursor must not open the catalogue for
+        // writes while a replay that was started after it still runs.
+        None => {
+            if !bridge
+                .catalog
+                .restore_finish(run, bridge.clock.now())
+                .await
+                .or_internal()?
+            {
+                return Err(earlier());
+            }
+        }
+    }
     let value = serde_json::to_value(&report)
         .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;
     Ok(ok(&value))
@@ -458,7 +525,7 @@ pub(super) async fn create_bucket_s3<
     if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
         return IngressError::AccessDenied.response();
     }
-    if mutable(bridge).is_err() {
+    if mutable(bridge).await.is_err() {
         return S3Response::error(503, "ServiceUnavailable", "Maintenance.");
     }
     match create_bucket(bridge, bucket, false).await {
@@ -911,6 +978,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
+    let replaying = bridge.catalog.restore_pending().await.or_internal()?;
     let now = bridge.clock.now();
     let load = bridge.catalog.provider_load(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
@@ -958,6 +1026,8 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
             Maintenance::Off => "off",
             Maintenance::Restore => "restore",
         },
+        // A replay was started and did not end: writes are refused.
+        "replay_unfinished": replaying,
         "gc_mode": match cfg.gc_mode {
             crate::config::GcMode::Off => "off",
             crate::config::GcMode::Disposable => "disposable",

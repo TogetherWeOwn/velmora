@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use velmora::rng::{FillRandom, SystemRng};
 
-use super::common::{authenticate, internal, mutation_gate};
+use super::common::{authenticate, internal, mutation_gate, restore_gate, unavailable};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone};
 use crate::types::{RespBody, S3Request, S3Response};
@@ -35,6 +35,7 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
+    restore_gate(bridge).await?;
     let live = bridge
         .catalog
         .live_object(&bucket.id, key)
@@ -90,12 +91,28 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     )
     .await
     .map_err(|_| internal())?;
-    bridge
+    let deleted = bridge
         .catalog
         .delete_object_before(&bucket.id, key, &tombstone, now)
         .await
         .map_err(|_| internal())?;
-    Ok(no_content())
+    if deleted {
+        return Ok(no_content());
+    }
+    // Nothing was changed. Either nothing older than the tombstone is
+    // live any more (another delete was faster, or a PUT that sorts
+    // after the tombstone), and the delete holds. Or a replay started
+    // after this request passed the gate: then the object is still
+    // live under its older id, and the delete was not done.
+    let live = bridge
+        .catalog
+        .live_object(&bucket.id, key)
+        .await
+        .map_err(|_| internal())?;
+    match live {
+        Some((live, _)) if live.id < tombstone => Err(unavailable()),
+        _ => Ok(no_content()),
+    }
 }
 
 fn no_content() -> S3Response {

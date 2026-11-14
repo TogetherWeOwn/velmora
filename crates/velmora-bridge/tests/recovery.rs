@@ -9,7 +9,9 @@ mod service_support;
 use serde_json::{json, Value};
 use service_support::*;
 use velmora_bridge::config::Maintenance;
-use velmora_bridge::recovery::{delete_blob, GENERATION_PREFIX, TOMBSTONE_PREFIX};
+use velmora_bridge::recovery::{
+    delete_blob, tombstone_id, write_tombstone, GENERATION_PREFIX, TOMBSTONE_PREFIX,
+};
 use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
@@ -105,7 +107,14 @@ fn add(total: &mut ReplayReport, step: ReplayReport) {
     total.safety_missing += step.safety_missing;
     total.tombstones += step.tombstones;
     total.deleted += step.deleted;
+    total.duplicate += step.duplicate;
+    total.other_bucket_total += step.other_bucket_total;
+    total.other_bucket.extend(step.other_bucket);
+    total.held_checked += step.held_checked;
+    total.held_missing_total += step.held_missing_total;
+    total.held_missing.extend(step.held_missing);
     total.unpublishable.extend(step.unpublishable);
+    total.damaged_unpublished.extend(step.damaged_unpublished);
     total.unreadable.extend(step.unreadable);
     total.damaged_total = step.damaged_total;
     total.damaged = step.damaged;
@@ -632,7 +641,7 @@ async fn records_alone_rebuild_the_catalogue() {
     // The same replay again, in one call per phase.
     let settled = dump(&rig);
     let (again, calls) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert_eq!(calls, 2);
+    assert_eq!(calls, 3);
     assert_eq!(
         (again.published, again.present, again.deleted),
         (0, 6, 0),
@@ -1053,6 +1062,128 @@ async fn a_lost_extent_and_a_broken_record_are_reported() {
     get(&rig, &signer, "torn").await.expect(404);
 }
 
+/// The record of a Complete that failed can linger after its parts are
+/// gone. A replay does not put it over the object the key holds: a
+/// generation that cannot be read replaces nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_without_its_extents_does_not_replace_a_good_object() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "big", b"good").await.expect(200);
+    let (good, _) = rig.live(&bucket, "big").await.unwrap();
+    tick(&rig);
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+
+    // The Complete is refused and the store keeps its record.
+    rig.bridge.safety.fail_record_deletes.set(3);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    let lingering = records(&rig).into_iter().max().unwrap()["m/".len()..].to_owned();
+    assert!(lingering.as_str() > good.id.as_str());
+
+    // The parts are collected before they were posted: no pinned copy,
+    // no article plan.
+    let parts: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT id FROM extents WHERE generation_id IS NULL")
+            .unwrap();
+        let ids = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        ids.map(|id| id.unwrap()).collect()
+    });
+    assert_eq!(parts.len(), 2);
+    for part in &parts {
+        let id = velmora_bridge::ExtentId::new(part.clone());
+        assert!(rig.bridge.safety.lose(&id.safety_key()));
+        // Not posted yet, so no article plan record was written.
+        assert!(!rig
+            .bridge
+            .safety
+            .contains(&velmora_bridge::recovery::article_key(&id)));
+    }
+
+    // The second replay runs over what the first one left.
+    wipe(&rig);
+    for _ in 0..2 {
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert_eq!(
+            report.damaged_unpublished,
+            [lingering.as_str()],
+            "{report:?}"
+        );
+        assert!(report.unpublishable.is_empty(), "{report:?}");
+        assert_eq!(report.damaged_total, 0, "{report:?}");
+        assert_eq!(live_ids(&rig), [good.id.as_str()]);
+    }
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, b"good");
+
+    // With nothing older live it is published, and reads fail loudly.
+    wipe(&rig);
+    assert!(rig.bridge.safety.lose(&format!("m/{}", good.id.as_str())));
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(report.damaged_unpublished.is_empty(), "{report:?}");
+    assert_eq!(report.damaged, [lingering.as_str()], "{report:?}");
+}
+
+/// A good object, a delete, then a record whose extents are gone. The
+/// tombstone removes the object after the record was refused; a second
+/// replay must not take the empty key for one without a history and
+/// publish the record. And what is acknowledged after the replay sorts
+/// after the refused record, also from a clock that runs behind.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"good").await.expect(200);
+    rig.put(&signer, BUCKET, "j", b"good").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "k").await.expect(204);
+    tick(&rig);
+    let mut lost = Vec::new();
+    for key in ["j", "k"] {
+        rig.put(&signer, BUCKET, key, b"lost").await.expect(200);
+        let (generation, extents) = rig.live(&bucket, key).await.unwrap();
+        for x in &extents {
+            assert!(rig.bridge.safety.lose(&x.id.safety_key()));
+            let plan = velmora_bridge::recovery::article_key(&x.id);
+            rig.bridge.safety.lose(&plan);
+        }
+        lost.push(generation.id.as_str().to_owned());
+    }
+    lost.sort();
+
+    wipe(&rig);
+    for _ in 0..3 {
+        let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        report.damaged_unpublished.sort();
+        assert_eq!(report.damaged_unpublished, lost, "{report:?}");
+        assert_eq!(report.damaged_total, 0, "{report:?}");
+        assert_eq!(live_ids(&rig).len(), 1, "only `j` is live");
+    }
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "k").await.expect(404);
+    assert_eq!(get(&rig, &signer, "j").await.expect(200).body, b"good");
+
+    // The floor of a key is its refused record: a write and a delete
+    // from a clock that runs behind sort after it.
+    rig.bridge.clock.advance_ms(-1500);
+    for key in ["j", "k"] {
+        rig.put(&signer, BUCKET, key, b"new").await.expect(200);
+        let (new, _) = rig.live(&bucket, key).await.unwrap();
+        assert!(new.id.as_str() > lost[1].as_str(), "{new:?} after {lost:?}");
+        delete(&rig, &signer, key).await.expect(204);
+        let newest = tombstones(&rig).into_iter().max().unwrap();
+        assert!(&newest["m/del/".len()..] > new.id.as_str(), "{newest}");
+    }
+}
+
 /// An article plan record that does not open is reported and does not
 /// stop the replay: the extent comes back without a plan, from its
 /// pinned copy.
@@ -1214,9 +1345,42 @@ async fn restore_route_runs_only_in_maintenance() {
             assert_eq!(report["damaged_total"], 0);
             break;
         }
+        // Started and not ended: the catalogue says so.
+        assert_eq!(restore_state(&restoring), ["replaying"]);
         body = json!({ "cursor": report["next"] });
     }
-    assert_eq!((published, deleted, calls), (2, 1, 2));
+    assert_eq!(restore_state(&restoring), ["complete"]);
+    assert_eq!((published, deleted, calls), (2, 1, 3));
+
+    // A cursor of this replay that arrives after another replay was
+    // started does not end the other one.
+    let first = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    first.expect(200);
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    let second = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    second.expect(200);
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert_ne!(first["next"]["run_ms"], second["next"]["run_ms"]);
+    let finish = |mut body: Value| {
+        let restoring = &restoring;
+        async move {
+            loop {
+                let r = admin(restoring, "/restore", body).await;
+                if r.status != 200 {
+                    return r.status;
+                }
+                let report: Value = serde_json::from_slice(&r.body).unwrap();
+                if report["next"].is_null() {
+                    return 200;
+                }
+                body = json!({ "cursor": report["next"] });
+            }
+        }
+    };
+    assert_eq!(finish(json!({ "cursor": first["next"] })).await, 409);
+    assert_eq!(restore_state(&restoring), ["replaying"]);
+    assert_eq!(finish(json!({ "cursor": second["next"] })).await, 200);
+    assert_eq!(restore_state(&restoring), ["complete"]);
     assert_eq!(restoring.count("objects"), 1);
     assert_eq!(restoring.count("generations"), 2);
 
@@ -1429,6 +1593,671 @@ async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// A Complete whose publication the catalogue did not answer
+// ---------------------------------------------------------------------------
+
+async fn abort(rig: &Rig, signer: &Signer, key: &str, id: &str) -> Resp {
+    rig.call(
+        signer,
+        Method::Delete,
+        &path(BUCKET, key),
+        &[("uploadId", id)],
+        &[],
+        b"",
+    )
+    .await
+}
+
+async fn two_parts(rig: &Rig, signer: &Signer, key: &str) -> (String, Vec<String>, Vec<u8>) {
+    let id = create_upload(rig, signer, key).await;
+    let first = pattern(5, 5 * MIB);
+    let last = pattern(6, 1024);
+    let etags = vec![
+        upload_part(rig, signer, key, &id, 1, &first).await,
+        upload_part(rig, signer, key, &id, 2, &last).await,
+    ];
+    (id, etags, [first, last].concat())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_complete_that_is_then_aborted_does_not_come_back() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    tick(&rig);
+
+    // The catalogue fails before it wrote anything. Complete shows that
+    // nothing was published, and takes its record back.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig), before);
+    get(&rig, &signer, "big").await.expect(404);
+
+    tick(&rig);
+    abort(&rig, &signer, "big", &id).await.expect(204);
+    tick(&rig);
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 0, "{report:?}");
+    let generations: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM generations", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(generations, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_record_of_a_failed_complete_is_deleted_again_when_the_store_fails() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    tick(&rig);
+
+    let fail = |deletes: u32| {
+        rig.bridge.safety.fail_record_deletes.set(deletes);
+        rig.bridge
+            .catalog
+            .sql
+            .fail_publish
+            .set(Some(PublishFault::NotApplied));
+    };
+    // Two failures of the store: the third delete removes the record.
+    fail(2);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig), before);
+    assert_eq!(rig.bridge.safety.fail_record_deletes.get(), 0);
+
+    // A store that stays down leaves the record: the known remainder.
+    tick(&rig);
+    fail(3);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig).len(), before.len() + 1);
+    assert_eq!(rig.bridge.safety.fail_record_deletes.get(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_complete_can_be_sent_again() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_that_applied_without_an_answer_keeps_its_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The catalogue committed, and the answer was lost. The upload is
+    // no longer open, so nothing shows that the batch did not apply.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Applied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig).len(), before + 1);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_records_of_one_object_are_not_reported_as_a_loss() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The catalogue answers neither the publication nor the question
+    // whether it applied, so the record of this attempt stays.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Down));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(records(&rig).len(), before + 2);
+    tick(&rig);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    // Both records are published, the later over the earlier: they
+    // share the extents.
+    assert_eq!((report.published, report.duplicate), (2, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+/// A Complete that got no answer leaves its record; a delete of the key
+/// lands; the Complete is sent again and succeeds. The object must
+/// stand under the id of the second record, or the tombstone, which
+/// sorts between the two, removes it in a replay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "big", b"first").await.expect(200);
+    tick(&rig);
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Down));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    delete(&rig, &signer, "big").await.expect(204);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    tick(&rig);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    let live: String = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT generation_id FROM objects", [], |r| r.get(0))
+            .unwrap()
+    });
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.duplicate), (3, 0), "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (1, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    let (restored, generations): (String, i64) = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT (SELECT generation_id FROM objects), \
+                    (SELECT COUNT(*) FROM generations WHERE state = 'live')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!((restored, generations), (live, 1));
+
+    // A second replay over the result changes nothing.
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((again.published, again.deleted), (0, 0), "{again:?}");
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// A bucket that was made again under the same name
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn records_of_a_bucket_whose_name_is_taken_are_reported_and_skipped() {
+    let rig = rig();
+    let (old, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "b", b"two").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "b").await.expect(204);
+    tick(&rig);
+    wipe(&rig);
+
+    // Before the replay, somebody makes the bucket again.
+    let mut new = rig.bucket("vault-again", true).await;
+    assert_ne!(new.id, old.id);
+    sql(
+        &rig,
+        "UPDATE buckets SET name = 'vault' WHERE name = 'vault-again'",
+    );
+    new.name = BUCKET.to_string();
+    let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
+    rig.grant(AKID, &new, Perm::Rw).await;
+    rig.put(&signer, BUCKET, "c", b"three").await.expect(200);
+    tick(&rig);
+
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.other_bucket_total, 2, "{report:?}");
+    assert_eq!(report.other_bucket.len(), 2, "{report:?}");
+    assert_eq!((report.published, report.present), (0, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    get(&rig, &signer, "a").await.expect(404);
+    assert_eq!(get(&rig, &signer, "c").await.expect(200).body, b"three");
+}
+
+// ---------------------------------------------------------------------------
+// A replay that was started and did not end
+// ---------------------------------------------------------------------------
+
+fn restore_state(rig: &Rig) -> Vec<String> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c.prepare("SELECT state FROM restore_state").unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unfinished_replay_refuses_writes_without_maintenance() {
+    // Maintenance is off in this rig, as after a deploy that came too
+    // early.
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+
+    let run = rig
+        .bridge
+        .catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap();
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    delete(&rig, &signer, "a").await.expect(503);
+    copy(&rig, &signer, "a", "copy").await.expect(503);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(503);
+    let r = rig
+        .call(
+            &signer,
+            Method::Post,
+            &path(BUCKET, "other"),
+            &[("uploads", "")],
+            &[],
+            b"",
+        )
+        .await;
+    assert_eq!(r.status, 503, "{}", r.text());
+    // Nothing was recorded, and reads go on.
+    assert_eq!(records(&rig), before);
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
+
+    // Neither do the admin routes that change something, the queue
+    // jobs, or the dispatcher.
+    admin(&rig, "/buckets", json!({ "name": "second" }))
+        .await
+        .expect(503);
+    admin(&rig, "/evict/vault/a?include_safety=1", json!({}))
+        .await
+        .expect(503);
+    let outbox = || -> (String, String, String, i64) {
+        rig.bridge.catalog.sql.with_conn(|c| {
+            c.query_row(
+                "SELECT extent_id, generation_id, stage, attempts FROM outbox \
+                 ORDER BY extent_id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        })
+    };
+    let row = outbox();
+    assert_eq!(row.2, "post");
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: ExtentId::new(row.0.clone()),
+        generation: GenerationId::new(row.1.clone()),
+        stage: OutboxStage::Post,
+    };
+    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(outbox(), row);
+    assert_eq!(
+        rig.bridge.dispatch().await.unwrap(),
+        DispatchReport::default()
+    );
+    assert_eq!(rig.count("buckets"), 1);
+
+    // The end of another replay does not end this one.
+    assert!(!rig
+        .bridge
+        .catalog
+        .restore_finish(UnixMs(run.0 - 1), rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    assert!(rig
+        .bridge
+        .catalog
+        .restore_finish(run, rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["complete"]);
+    assert!(rig.bridge.dispatch().await.unwrap().permits_seeded);
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+
+    // A second restore arms the gate again, under a later mark, also
+    // within the same millisecond.
+    let second = rig
+        .bridge
+        .catalog
+        .restore_begin(UnixMs(5), rig.now())
+        .await
+        .unwrap();
+    assert!(second > run);
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
+}
+
+/// The runbook closes a database that was just brought back with one
+/// statement file, before any replay has run. It must hold with
+/// maintenance off, over an empty table and over the row of a finished
+/// replay, and make the cursors of that replay void.
+#[tokio::test(flavor = "current_thread")]
+async fn the_runbook_statement_closes_a_restored_catalogue() {
+    const ARM: &str = include_str!("../../../workers/s3-bridge/ops/restore-arm.sql");
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    let arm = || {
+        rig.bridge
+            .catalog
+            .sql
+            .with_conn(|c| c.execute_batch(ARM).unwrap())
+    };
+    let catalog = &rig.bridge.catalog;
+
+    arm();
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    delete(&rig, &signer, "a").await.expect(503);
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
+    // Twice is as good as once.
+    arm();
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+
+    // A replay that runs to its end opens it.
+    let run = catalog.restore_begin(UnixMs(0), rig.now()).await.unwrap();
+    replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(catalog.restore_finish(run, rig.now()).await.unwrap());
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
+
+    // Brought back once more (the row of the finished replay came with
+    // the copy): closed again, and the old replay cannot end the new
+    // state.
+    arm();
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
+    assert_eq!(catalog.restore_progress(run).await.unwrap(), None);
+    assert!(!catalog.restore_finish(run, rig.now()).await.unwrap());
+    assert_eq!(restore_state(&rig), ["replaying"]);
+}
+
+/// A request that passed the gate before a replay started must not
+/// commit under it: the batch itself is refused, and the client is told
+/// to come back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    let live = live_ids(&rig);
+
+    // The replay starts when the request stores its first blob: after
+    // its gate, before its batch.
+    let arm = || {
+        let bridge = rig.bridge.clone();
+        let hook = move |_: &str| {
+            bridge.catalog.sql.with_conn(|c| {
+                let q = "INSERT INTO restore_state(id, state, since_ms, started_at) \
+                         VALUES (1, 'replaying', 0, 1)";
+                c.execute(q, []).unwrap()
+            });
+        };
+        rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    };
+    let disarm = || {
+        assert_eq!(restore_state(&rig), ["replaying"], "the hook ran");
+        rig.bridge
+            .catalog
+            .sql
+            .with_conn(|c| c.execute("DELETE FROM restore_state", []).unwrap());
+    };
+
+    arm();
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    disarm();
+    arm();
+    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    disarm();
+    arm();
+    copy(&rig, &signer, "a", "copy").await.expect(503);
+    disarm();
+    arm();
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(503);
+    disarm();
+    // Nothing was published, and no record of these writes is left.
+    assert_eq!(live_ids(&rig), live);
+    assert_eq!(records(&rig), before);
+
+    // A delete answers 503 as well, and the object stays. Its tombstone
+    // is on record, as that of any delete that failed.
+    arm();
+    delete(&rig, &signer, "a").await.expect(503);
+    disarm();
+    assert_eq!(live_ids(&rig), live);
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
+
+    // With no replay under way, each of them goes through.
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
+    copy(&rig, &signer, "a", "copy").await.expect(200);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    delete(&rig, &signer, "a").await.expect(204);
+    get(&rig, &signer, "a").await.expect(404);
+}
+
+/// The restore route takes a cursor only up to the place the replay has
+/// come to. A cursor that is ahead (a later phase, a later record,
+/// another restore point) would end the replay with records left out,
+/// and open the catalogue for writes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cursor_ahead_of_the_replay_is_refused() {
+    let serving = rig();
+    let (_, signer) = serving.standard(BUCKET).await;
+    serving.put(&signer, BUCKET, "a", b"a").await.expect(200);
+    tick(&serving);
+    serving.put(&signer, BUCKET, "b", b"b").await.expect(200);
+    tick(&serving);
+    delete(&serving, &signer, "b").await.expect(204);
+
+    let mut cfg = config(Vec::new());
+    cfg.maintenance = Maintenance::Restore;
+    let restoring = rig_with(NoNntp, cfg);
+    for key in serving.bridge.safety.keys() {
+        let blob = serving.bridge.safety.stored(&key).unwrap();
+        let meta = BlobMeta {
+            bucket: &blob.bucket,
+            extent: &blob.extent,
+            cipher_sha256: &blob.cipher_sha256,
+        };
+        restoring
+            .bridge
+            .safety
+            .put(&key, blob.bytes.clone(), &meta)
+            .await
+            .unwrap();
+    }
+    let step = |body: Value| {
+        let restoring = &restoring;
+        async move {
+            let r = admin(restoring, "/restore", body).await;
+            let report: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            (r.status, report)
+        }
+    };
+
+    let (status, first) = step(json!({ "since_ms": 0, "margin_ms": 0 })).await;
+    assert_eq!(status, 200);
+    let next = first["next"].clone();
+    assert_eq!(next["phase"], "tombstones");
+    let with = |field: &str, value: Value| {
+        let mut cursor = next.clone();
+        cursor[field] = value;
+        json!({ "cursor": cursor })
+    };
+    for ahead in [
+        // A phase the replay has not come to.
+        with("phase", json!("held")),
+        // A record further on in this phase.
+        with("after", json!("m/del/zzzz")),
+        with("extent", json!(1)),
+        // A later restore point: fewer records.
+        with("since_ms", json!(1)),
+    ] {
+        let (status, _) = step(ahead.clone()).await;
+        assert_eq!(status, 400, "{ahead}");
+        assert_eq!(restore_state(&restoring), ["replaying"]);
+    }
+    // Nothing of the tombstone phase has run.
+    assert_eq!(restoring.count("objects"), 2);
+    // Another replay's mark.
+    let (status, _) = step(with("run_ms", json!(1))).await;
+    assert_eq!(status, 409);
+
+    // A cursor that is behind repeats a step and changes nothing: the
+    // place on record stays where it was.
+    let behind = json!({ "cursor": {
+        "since_ms": 0, "phase": "manifests", "after": "", "extent": 0,
+        "run_ms": next["run_ms"],
+    }});
+    let (status, again) = step(behind).await;
+    assert_eq!(status, 200);
+    assert_eq!(again["next"], next);
+    assert_eq!(again["published"], 0);
+    assert_eq!(again["present"], 2);
+
+    // Neither does the place on record move backwards.
+    let run = UnixMs(next["run_ms"].as_i64().unwrap());
+    let catalog = &restoring.bridge.catalog;
+    let reached = catalog.restore_progress(run).await.unwrap().unwrap();
+    assert_eq!(reached.reached.as_ref().map(|m| m.phase), Some(1));
+    let back = velmora_bridge::replay::ReplayMark {
+        phase: 0,
+        after: "m/gen/zzzz".into(),
+        extent: 9,
+    };
+    catalog.restore_advance(run, &back).await.unwrap();
+    assert_eq!(catalog.restore_progress(run).await.unwrap(), Some(reached));
+
+    // From the place on record, the replay runs to its end.
+    let mut body = json!({ "cursor": next });
+    loop {
+        let (status, report) = step(body).await;
+        assert_eq!(status, 200);
+        if report["next"].is_null() {
+            break;
+        }
+        // A cursor the route handed out is taken once more, also after
+        // the replay went past it.
+        body = json!({ "cursor": report["next"] });
+    }
+    assert_eq!(restore_state(&restoring), ["complete"]);
+    assert_eq!(restoring.count("objects"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// A catalogue that is older than the release of a pinned copy
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_copy_released_after_the_export_is_found() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "old", b"old").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "old").await.unwrap();
+    tick(&rig);
+    rig.put(&signer, BUCKET, "kept", b"kept").await.expect(200);
+    tick(&rig);
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+
+    // After the export the pipeline released the pinned copy of `old`.
+    // The export still says it is held.
+    for x in &extents {
+        rig.bridge
+            .safety
+            .inner
+            .delete(&x.id.safety_key())
+            .await
+            .unwrap();
+    }
+    wipe(&rig);
+    import(&rig);
+
+    // A replay from the restore point does not read the record of
+    // `old`, and reports the extent.
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 2, "{report:?}");
+    assert_eq!(report.held_missing_total, 1, "{report:?}");
+    assert_eq!(report.held_missing, [extents[0].id.as_str()]);
+
+    // A replay from 0 reads it and sets the row right.
+    let (report, _) = replay(
+        &rig,
+        UnixMs(0),
+        ReplayLimits {
+            records: 1,
+            extents: 1,
+        },
+    )
+    .await;
+    assert_eq!(report.held_checked, 1, "{report:?}");
+    assert_eq!(report.held_missing_total, 0, "{report:?}");
+    assert_eq!(report.safety_missing, 1, "{report:?}");
+}
+
+// ---------------------------------------------------------------------------
 // Random histories inside one millisecond replay to the same answers
 // ---------------------------------------------------------------------------
 
@@ -1570,6 +2399,189 @@ async fn random_histories_across_an_export_replay_to_the_same_answers() {
             report.unpublishable.is_empty() && report.unreadable.is_empty(),
             "seed {seed}: {report:?}"
         );
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
+}
+
+/// Clears what a fault left armed, so the next request starts clean.
+async fn disarm(rig: &Rig) {
+    let sql = &rig.bridge.catalog.sql;
+    sql.fail_publish.set(None);
+    sql.fail_batches.set(0);
+    rig.bridge.safety.fail_record_deletes.set(0);
+    // `Down` fails the batch after the publication too: this is it.
+    let _ = sql.batch(Vec::new()).await;
+}
+
+/// The first half of a DeleteObject, as the service does it: the
+/// tombstone is on record and the batch has not run. `None` = nothing
+/// to delete.
+async fn begin_delete(
+    rig: &Rig,
+    bucket: &BucketId,
+    key: &str,
+    dice: &mut Dice,
+) -> Option<GenerationId> {
+    let catalog = &rig.bridge.catalog;
+    let seen = match catalog.live_object(bucket, key).await.unwrap() {
+        Some((live, _)) => live.id,
+        None => catalog.unpublished_floor(bucket, key).await.unwrap()?,
+    };
+    let newest = catalog.newest_id(bucket, key).await.unwrap();
+    let newest = newest.map_or(seen.clone(), |n| n.max(seen));
+    let now = rig.now();
+    let id = tombstone_id(now, &newest, dice.roll(u64::MAX).to_be_bytes());
+    let (safety, kek) = (&rig.bridge.safety, &rig.bridge.kek);
+    write_tombstone(catalog, safety, kek, bucket, key, &id, now)
+        .await
+        .unwrap();
+    Some(id)
+}
+
+/// One random request with a random fault: a publication batch that
+/// fails before or after it applied, or with the batch after it; a
+/// batch that fails; a store that does not delete a refused record; a
+/// clock that runs well behind. A delete can stop after its tombstone
+/// and finish later, or never.
+async fn random_faulty_write(
+    rig: &Rig,
+    signer: &Signer,
+    bucket: &BucketId,
+    dice: &mut Dice,
+    n: usize,
+    begun: &mut Vec<(&'static str, GenerationId)>,
+    log: &mut Vec<String>,
+) {
+    disarm(rig).await;
+    match dice.roll(8) {
+        0 => rig.bridge.clock.advance_ms(1),
+        1 => rig.bridge.clock.advance_ms(-2),
+        2 => rig.bridge.clock.advance_ms(-40),
+        _ => {}
+    }
+    let key = DICE_KEYS[dice.roll(4) as usize];
+    let body = format!("body {n}");
+    let op = dice.roll(8);
+    // A Complete arms its fault after the upload exists.
+    let upload = match op {
+        7 => {
+            let id = create_upload(rig, signer, key).await;
+            let etag = upload_part(rig, signer, key, &id, 1, body.as_bytes()).await;
+            Some((id, etag))
+        }
+        _ => None,
+    };
+    let sql = &rig.bridge.catalog.sql;
+    let fault = match dice.roll(10) {
+        0 => {
+            sql.fail_publish.set(Some(PublishFault::NotApplied));
+            "not applied"
+        }
+        1 => {
+            sql.fail_publish.set(Some(PublishFault::Applied));
+            "applied"
+        }
+        2 => {
+            sql.fail_publish.set(Some(PublishFault::Down));
+            "down"
+        }
+        3 => {
+            sql.fail_publish.set(Some(PublishFault::NotApplied));
+            rig.bridge.safety.fail_record_deletes.set(3);
+            "not applied, record stays"
+        }
+        4 => {
+            rig.bridge.safety.fail_record_deletes.set(3);
+            "record stays"
+        }
+        5 => {
+            sql.fail_batches.set(1 + dice.roll(2) as u32);
+            "batch fails"
+        }
+        _ => "",
+    };
+    match (op, upload) {
+        (0..=2, _) => {
+            log.push(format!("put {key} [{fault}]"));
+            rig.put(signer, BUCKET, key, body.as_bytes()).await;
+        }
+        (3, _) => {
+            let from = DICE_KEYS[dice.roll(4) as usize];
+            log.push(format!("copy {from} -> {key} [{fault}]"));
+            let source = format!("/{BUCKET}/{from}");
+            let tag = n.to_string();
+            let mut headers = vec![("x-amz-copy-source", source.as_str())];
+            if from == key || dice.roll(2) == 0 {
+                headers.push(("x-amz-metadata-directive", "REPLACE"));
+                headers.push(("x-amz-meta-n", tag.as_str()));
+            }
+            rig.call(signer, Method::Put, &path(BUCKET, key), &[], &headers, b"")
+                .await;
+        }
+        (4, _) => {
+            log.push(format!("delete {key} [{fault}]"));
+            delete(rig, signer, key).await;
+        }
+        (5, _) => {
+            disarm(rig).await;
+            if let Some(id) = begin_delete(rig, bucket, key, dice).await {
+                log.push(format!("delete {key} begins"));
+                begun.push((key, id));
+            }
+        }
+        (6, _) if !begun.is_empty() => {
+            let (key, id) = begun.swap_remove(dice.roll(begun.len() as u64) as usize);
+            log.push(format!("delete {key} finishes [{fault}]"));
+            let _ = rig
+                .bridge
+                .catalog
+                .delete_object_before(bucket, key, &id, rig.now())
+                .await;
+        }
+        (_, Some((id, etag))) => {
+            log.push(format!("complete {key} [{fault}]"));
+            complete(rig, signer, key, &id, &[etag]).await;
+        }
+        _ => {}
+    }
+}
+
+/// Whatever failed on a key and whatever was left half done, the next
+/// acknowledged write or delete of the key decides what a replay
+/// restores: it sorts after every record stored before it.
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_with_faults_replay_to_the_same_answers() {
+    for seed in 2000..2200u64 {
+        let rig = rig();
+        let (bucket, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        let mut begun = Vec::new();
+        for n in 0..40 {
+            random_faulty_write(
+                &rig, &signer, &bucket.id, &mut dice, n, &mut begun, &mut log,
+            )
+            .await;
+        }
+        disarm(&rig).await;
+        for key in DICE_KEYS {
+            let status = if dice.roll(2) == 0 {
+                log.push(format!("last: put {key}"));
+                rig.put(&signer, BUCKET, key, b"last").await.status
+            } else {
+                log.push(format!("last: delete {key}"));
+                delete(&rig, &signer, key).await.status
+            };
+            assert!(matches!(status, 200 | 204), "seed {seed}: {status} {log:?}");
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?} {log:?}"
+        );
+        let signer = reissue_key(&rig).await;
         assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
     }
 }
