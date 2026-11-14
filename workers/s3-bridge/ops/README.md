@@ -160,9 +160,9 @@ a catalogue that holds a part of the records must not take new writes.
 The same holds for the admin routes that change something, the queue
 jobs and the cron. If a replay was stopped, run it again to its end.
 Starting a replay again makes the earlier one void: a step sent with a
-cursor of the earlier one can still run, but its last step answers 409
-and the catalogue stays closed until the replay that was started last
-has ended. A database that was brought back without the last command
+cursor of the earlier one answers 409 and does nothing, and the
+catalogue stays closed until the replay that was started last has
+ended. A database that was brought back without the last command
 of step 2 is not closed: nothing in it says that a replay is due.
 
 The catalogue refuses the commit as well, not only the request: a write
