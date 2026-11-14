@@ -924,7 +924,13 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         match read {
             Ok(tally) if tally.ok > 0 => last_provider.clone_from(&provider.id),
             Ok(_) => {}
-            Err(Stop::NoPermit | Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+            Err(
+                Stop::NoPermit
+                | Stop::Refused
+                | Stop::Cooling(_)
+                | Stop::Fail(..)
+                | Stop::Session(_),
+            ) => {
                 busy = true;
             }
             Err(Stop::Fenced | Stop::Catalog) => {

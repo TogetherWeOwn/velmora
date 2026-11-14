@@ -469,12 +469,69 @@ async fn a_strike_keeps_its_reason_until_a_good_session() {
         .unwrap();
     let later = load_of(&c, "p1", now).await.unwrap();
     assert_eq!((later.failures, later.fault), (1, None));
+
+    // A version from before the reason clears the strikes and leaves
+    // the reason: a provider with no strike has none.
+    c.sql
+        .apply(
+            "UPDATE provider_health SET failures = 0, cooldowns = 0, cooldown_until = 0, \
+               last_failure_reason = 'login_refused'",
+        )
+        .unwrap();
+    let stale = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!((stale.healthy(), stale.fault), (true, None));
+}
+
+/// A refused login waits longer between tries than any other fault, up
+/// to six hours: an account that is closed for days is asked a handful
+/// of times a day. The other faults stop at fifteen minutes.
+#[tokio::test]
+async fn a_refused_login_cools_down_for_up_to_six_hours() {
+    for (fault, minutes) in [
+        (
+            ProviderFault::LoginRefused,
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 360, 360],
+        ),
+        (ProviderFault::ConnectRefused, vec![1, 2, 4, 8, 15, 15]),
+        (ProviderFault::SessionFailed, vec![1, 2, 4, 8, 15, 15]),
+    ] {
+        let c = catalog();
+        let mut now = T0;
+        for _ in 0..2 {
+            c.provider_failed("p1", fault, now).await.unwrap();
+        }
+        for wait in minutes {
+            c.provider_failed("p1", fault, now).await.unwrap();
+            let l = load_of(&c, "p1", now).await.unwrap();
+            assert_eq!(l.cooldown_until, now.plus_ms(wait * MINUTE_MS), "{fault:?}");
+            now = l.cooldown_until;
+        }
+    }
+
+    // The cap follows the newest fault: a login refused for hours that
+    // then fails another way is back to fifteen minutes.
+    let c = catalog();
+    let mut now = T0;
+    for _ in 0..2 {
+        let failed = c.provider_failed("p1", ProviderFault::LoginRefused, now);
+        failed.await.unwrap();
+    }
+    for _ in 0..8 {
+        let failed = c.provider_failed("p1", ProviderFault::LoginRefused, now);
+        failed.await.unwrap();
+        now = load_of(&c, "p1", now).await.unwrap().cooldown_until;
+    }
+    let failed = c.provider_failed("p1", ProviderFault::SessionFailed, now);
+    failed.await.unwrap();
+    let l = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!(l.cooldown_until, now.plus_ms(15 * MINUTE_MS));
 }
 
 /// The codes are stable: they are stored and shown.
 #[test]
 fn fault_codes_are_stable() {
     for (fault, code) in [
+        (ProviderFault::ConnectRefused, "connect_refused"),
         (ProviderFault::LoginRefused, "login_refused"),
         (ProviderFault::SessionFailed, "session_failed"),
     ] {

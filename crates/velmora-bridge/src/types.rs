@@ -481,9 +481,13 @@ impl ProviderConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFault {
-    /// The provider refused the connection or the login, and not because
-    /// the account was at a connection limit: the account is denied,
-    /// suspended, out of quota, or its credentials are no longer taken.
+    /// The provider refused the connection at its greeting, before any
+    /// login, and not for a connection limit: the service or the address
+    /// is turned away.
+    ConnectRefused,
+    /// The provider refused the login, and not because the account was
+    /// at a connection limit: the account is denied, suspended, out of
+    /// quota, or its credentials are no longer taken.
     LoginRefused,
     /// Any other failure of a session: no connection, a broken one, a
     /// reply out of protocol.
@@ -491,8 +495,15 @@ pub enum ProviderFault {
 }
 
 impl ProviderFault {
+    const ALL: [ProviderFault; 3] = [
+        ProviderFault::ConnectRefused,
+        ProviderFault::LoginRefused,
+        ProviderFault::SessionFailed,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
+            ProviderFault::ConnectRefused => "connect_refused",
             ProviderFault::LoginRefused => "login_refused",
             ProviderFault::SessionFailed => "session_failed",
         }
@@ -500,9 +511,16 @@ impl ProviderFault {
 
     /// The fault a stored code names; `None` for an unknown code.
     pub fn parse(code: &str) -> Option<ProviderFault> {
-        [ProviderFault::LoginRefused, ProviderFault::SessionFailed]
-            .into_iter()
-            .find(|f| f.as_str() == code)
+        Self::ALL.into_iter().find(|f| f.as_str() == code)
+    }
+
+    /// The provider answered and turned the caller away, at the greeting
+    /// or at the login. Asking again at once gets the same answer.
+    pub fn is_refusal(self) -> bool {
+        match self {
+            ProviderFault::ConnectRefused | ProviderFault::LoginRefused => true,
+            ProviderFault::SessionFailed => false,
+        }
     }
 }
 

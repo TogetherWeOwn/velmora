@@ -73,28 +73,42 @@ enum Refusal {
     /// The account (or the address) is at its limit of connections: "no
     /// slot". It ends when a connection is closed.
     Limit,
-    /// Anything else: the account is denied, suspended, out of quota, or
-    /// the login is wrong. Waiting for a slot does not end it.
-    Account,
+    /// Anything else: the service or the address is turned away at the
+    /// greeting, or the account is denied, suspended, out of quota, or
+    /// the login is wrong. Waiting for a slot does not end it. The fault
+    /// says at which of the two the provider refused.
+    Account(ProviderFault),
 }
 
-/// Sorts a failed connect that is the provider's refusal by reply: a
-/// `502`, a `481`/`480` or a `482`, at the greeting or in the login.
-/// The reply text decides ([`velmora::nntp::is_limit_reply`]): only one
-/// that states a connection limit is [`Refusal::Limit`]. `None` = not
-/// such a refusal (no connection, another reply code).
+/// Sorts a failed connect that is the provider's refusal.
+///
+/// - A reply that states a connection limit
+///   ([`velmora::nntp::is_limit_reply`]) is [`Refusal::Limit`], whatever
+///   its code and whether it came at the greeting or in the login.
+/// - Any other `502`, `480`, `481` or `482` is [`Refusal::Account`].
+/// - `None` = not such a refusal (no connection, another reply code).
+///
+/// The login gives `NoPermission`, `AuthFailed` and, for every other
+/// code, a plain reply whose text is replaced
+/// ([`velmora::nntp::REDACTED_REPLY`]). A plain reply with the server's
+/// own text is the greeting's: the connector hands a refused greeting on
+/// that way, a `502` too ([`crate::hosts::DialError::classify`]).
 fn refusal(e: &BridgeError) -> Option<Refusal> {
+    use velmora::nntp::{is_limit_reply, REDACTED_REPLY};
     use velmora::Error as E;
-    let text = match e {
-        BridgeError::Nntp(
-            E::NoPermission(text) | E::AuthFailed(text) | E::NntpReply { code: 482, text },
-        ) => text,
+    let (code, text, login) = match e {
+        BridgeError::Nntp(E::NoPermission(text)) => (502, text, true),
+        BridgeError::Nntp(E::AuthFailed(text)) => (481, text, true),
+        BridgeError::Nntp(E::NntpReply { code, text }) => (*code, text, text == REDACTED_REPLY),
         _ => return None,
     };
-    Some(match velmora::nntp::is_limit_reply(text) {
-        true => Refusal::Limit,
-        false => Refusal::Account,
-    })
+    if is_limit_reply(text) {
+        return Some(Refusal::Limit);
+    }
+    matches!(code, 480..=482 | 502).then_some(Refusal::Account(match login {
+        true => ProviderFault::LoginRefused,
+        false => ProviderFault::ConnectRefused,
+    }))
 }
 
 /// Whether an error says the provider itself is in trouble: a failed
@@ -208,39 +222,51 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }
     }
 
-    /// The live session, connecting first when there is none. A provider
-    /// that refuses the connection or the login with `502`, `482` or
-    /// `481` and a text that states a connection limit is reported as "no
-    /// slot": no strike, and the caller waits as it does for a permit.
-    /// Those are the replies of an account at a limit: "too many
-    /// connections", and the address limit (`502 max number of
+    /// The live session, connecting first when there is none.
+    ///
+    /// A provider that refuses the connection or the login with a text
+    /// that states a connection limit is reported as "no slot"
+    /// ([`Stop::NoPermit`]): no strike, and the caller waits as it does
+    /// for a permit. Those are the replies of an account at a limit:
+    /// "too many connections", and the address limit (`502 max number of
     /// simultaneous IPs (3) reached`, `482 Already connected from
     /// different IP`), which another client of the account or an address
     /// the provider still counts can cause below `max_ips`.
     ///
-    /// Any other refusal with those codes is about the account itself
-    /// (denied, suspended, out of quota, a wrong login). It is a strike
-    /// ([`ProviderFault::LoginRefused`]) and a session error, so the
-    /// caller goes on to another provider as after any failed connect:
-    /// waiting for a slot would never end.
+    /// Any other refusal with `502`, `480`, `481` or `482` is about the
+    /// account itself (denied, suspended, out of quota, a wrong login) or
+    /// the service. It is a strike, with the stage as its reason
+    /// ([`ProviderFault::LoginRefused`], [`ProviderFault::ConnectRefused`]),
+    /// and [`Stop::Refused`]: asking again at once gets the same answer,
+    /// so the caller does not reconnect and goes on to another provider.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
                 Ok(session) => session,
                 Err(e) => {
-                    match refusal(&e) {
-                        Some(Refusal::Limit) => return Err(Stop::NoPermit),
-                        Some(Refusal::Account) => {
-                            self.health = Some(Err(ProviderFault::LoginRefused));
+                    return Err(match refusal(&e) {
+                        Some(Refusal::Limit) => Stop::NoPermit,
+                        Some(Refusal::Account(fault)) => {
+                            self.health = Some(Err(fault));
+                            Stop::Refused
                         }
-                        None => self.note_err(&e),
-                    }
-                    return Err(Stop::Session(e));
+                        None => {
+                            self.note_err(&e);
+                            Stop::Session(e)
+                        }
+                    });
                 }
             };
             self.session = Some(session);
         }
         self.session.as_mut().ok_or(Stop::fail(FailClass::Internal))
+    }
+
+    /// Takes back the strike of a refused connect
+    /// ([`Stop::Refused`]): the caller knows it for a limit, because
+    /// another of its sockets is logged in to the same provider.
+    pub(crate) fn forgive_refusal(&mut self) {
+        self.health = forgiven(self.health);
     }
 
     /// Whether a session is open: `false` = the next
@@ -265,10 +291,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// Records a failed connect or command, if it is the provider's fault.
-    /// A strike that already has a reason keeps it: the caller of a
-    /// failed [`session`](Self::session) reports the same error again.
     pub(crate) fn note_err(&mut self, e: &BridgeError) {
-        if is_provider_fault(e) && !matches!(self.health, Some(Err(_))) {
+        if is_provider_fault(e) {
             self.health = Some(Err(ProviderFault::SessionFailed));
         }
     }
@@ -334,6 +358,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
 /// order, `Err` = one strike, and why.
 pub(crate) type Health = Option<core::result::Result<(), ProviderFault>>;
 
+/// `health` without the strike of a refused connect: nothing ran.
+pub(crate) fn forgiven(health: Health) -> Health {
+    match health {
+        Some(Err(fault)) if fault.is_refusal() => None,
+        health => health,
+    }
+}
+
 /// Records how a provider's session went (`None` = nothing ran).
 pub(crate) async fn report_health<C: Catalog, T: Clock>(
     catalog: &C,
@@ -387,7 +419,9 @@ fn check_payload(row: &ArticleRow, wire: &[u8]) -> Checked {
 
 /// One `BODY`, checked. A `430` leaves the session in use. Any session
 /// error drops the session and resumes at the same message-id on a new
-/// one, while `reconnects` lasts.
+/// one, while `reconnects` lasts. A connect the provider refused is not
+/// tried again: the pass ends with [`Stop::NoPermit`] or
+/// [`Stop::Refused`].
 ///
 /// The lease and the permit are renewed before each connect and again
 /// after it, before the `BODY`: each of the two may take a whole call
@@ -566,7 +600,9 @@ where
         let mut order = pool.order(readers.clone(), PermitClass::Read);
         if order.is_empty() {
             // Every reader is cooling: a read is worth one attempt on the
-            // provider that is due back first.
+            // provider that is due back first, unless that one refused
+            // the login. A refused account answers no read: it is asked
+            // again when its cooldown ends, not on every read.
             order.extend(pool.soonest_cooling(&readers));
         }
         // An article past every reader's stated retention may still be
@@ -621,8 +657,9 @@ where
                 Ok(_) => asked.push(provider.id.as_str()),
                 // The provider is at its connection limit.
                 Err(Stop::NoPermit) => busy = true,
-                // The read broke off: this provider may still have the rest.
-                Err(Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+                // The read broke off, or the provider refused the account:
+                // it may still have the rest.
+                Err(Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_) | Stop::Refused) => {
                     interrupted = true;
                 }
                 Err(Stop::Fenced | Stop::Catalog) => {
@@ -675,5 +712,94 @@ where
             let _ = count().await;
         }
         Ok(ColdFetch::Filled(cipher))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velmora::nntp::{REDACTED_LIMIT, REDACTED_REPLY};
+    use velmora::Error as E;
+
+    fn plain(code: u16, text: &str) -> BridgeError {
+        BridgeError::Nntp(E::NntpReply {
+            code,
+            text: text.into(),
+        })
+    }
+
+    const LOGIN: Option<Refusal> = Some(Refusal::Account(ProviderFault::LoginRefused));
+    const GREETING: Option<Refusal> = Some(Refusal::Account(ProviderFault::ConnectRefused));
+
+    /// A refused connect that states a connection limit is a limit
+    /// whatever its code and its stage: the login's `AuthFailed` and
+    /// `NoPermission`, what the login leaves of any other code, and the
+    /// greeting's plain reply.
+    #[test]
+    fn a_stated_limit_is_a_limit_under_any_code() {
+        let limit = "Too many connections for user";
+        for e in [
+            E::NoPermission(limit.into()).into(),
+            E::AuthFailed(limit.into()).into(),
+            plain(480, limit),
+            plain(481, limit),
+            plain(482, limit),
+            plain(502, limit),
+            plain(400, limit),
+            plain(482, REDACTED_LIMIT),
+            plain(400, REDACTED_LIMIT),
+            plain(451, REDACTED_LIMIT),
+            plain(503, REDACTED_LIMIT),
+        ] {
+            assert_eq!(refusal(&e), Some(Refusal::Limit), "{e:?}");
+        }
+    }
+
+    /// Any other refusal is the account's, and the reason says where the
+    /// provider refused: at the login, or at the greeting before it.
+    #[test]
+    fn a_refusal_is_sorted_by_its_stage() {
+        let account = "Account suspended";
+        assert_eq!(refusal(&E::NoPermission(account.into()).into()), LOGIN);
+        assert_eq!(refusal(&E::AuthFailed(account.into()).into()), LOGIN);
+        assert_eq!(refusal(&E::NoPermission(String::new()).into()), LOGIN);
+        // What the login leaves of a `482` without a limit.
+        assert_eq!(refusal(&plain(482, REDACTED_REPLY)), LOGIN);
+        // The server's own words: the greeting.
+        for code in [480, 481, 482, 502] {
+            assert_eq!(refusal(&plain(code, account)), GREETING, "{code}");
+            assert_eq!(refusal(&plain(code, "")), GREETING, "{code}");
+        }
+    }
+
+    /// Another code without a stated limit, a connection that broke and a
+    /// reply to a command are no refusal: `is_provider_fault` decides.
+    #[test]
+    fn another_failure_is_not_a_refusal() {
+        for e in [
+            plain(400, "Service temporarily unavailable"),
+            plain(400, REDACTED_REPLY),
+            plain(451, REDACTED_REPLY),
+            plain(500, "What?"),
+            plain(503, REDACTED_REPLY),
+            E::Io(std::io::Error::other("reset")).into(),
+            E::ArticleNotFound("a@x".into()).into(),
+            BridgeError::Invalid("permit is for another provider"),
+        ] {
+            assert_eq!(refusal(&e), None, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_strike_of_a_refusal_is_forgiven() {
+        let strike = |fault| Some(Err(fault));
+        assert_eq!(forgiven(strike(ProviderFault::LoginRefused)), None);
+        assert_eq!(forgiven(strike(ProviderFault::ConnectRefused)), None);
+        assert_eq!(
+            forgiven(strike(ProviderFault::SessionFailed)),
+            strike(ProviderFault::SessionFailed)
+        );
+        assert_eq!(forgiven(Some(Ok(()))), Some(Ok(())));
+        assert_eq!(forgiven(None), None);
     }
 }

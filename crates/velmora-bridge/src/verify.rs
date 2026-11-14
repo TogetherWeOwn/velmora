@@ -154,6 +154,7 @@ where
                 return Err(Stop::Cooling(until));
             }
         }
+        let mut refused = false;
         for provider in usable {
             let Some(mut session) = ProviderSession::open(
                 &self.catalog,
@@ -169,9 +170,17 @@ where
             };
             let tally = read_articles(&mut session, Some(lease), &rows, |_, _| {}).await;
             session.close().await;
-            return Ok((provider, tally?));
+            match tally {
+                // The provider refused the account: the next one of the
+                // backbone is asked.
+                Err(Stop::Refused) => refused = true,
+                tally => return Ok((provider, tally?)),
+            }
         }
-        Err(Stop::NoPermit)
+        Err(match refused {
+            true => Stop::Refused,
+            false => Stop::NoPermit,
+        })
     }
 
     async fn record(

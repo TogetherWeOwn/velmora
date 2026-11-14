@@ -456,6 +456,65 @@ async fn same_backbone_counts_once() {
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
 }
 
+/// The first account of a backbone refuses the login for the account
+/// itself: the verify reads the backbone through its other account in
+/// the same job, and the first takes a strike. With every account of
+/// the backbone refusing, the job waits without spending an attempt.
+#[tokio::test]
+async fn verify_reads_a_backbone_through_its_next_account_when_one_is_refused() {
+    let mut rig = shared_backbone_rig().await;
+    rig.bridge.cfg.providers[0].priority = 0;
+    rig.bridge.cfg.providers[1].priority = 1;
+    let (s, _) = rig.posted(19).await;
+    rig.propagate(&s, 0, 1).await;
+    let mut held = Vec::new();
+    for i in [0, 1] {
+        let addr = rig.servers[i].addr();
+        let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+        held.push([dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()]);
+    }
+    let refuse = Some("502 Account suspended");
+    rig.servers[0].set_limit_reply(refuse).await;
+    rig.servers[1].set_limit_reply(refuse).await;
+
+    // Both refuse: nothing was read, nothing is spent.
+    let attempts = rig.outbox(&s).attempts;
+    let outcome = rig.run(&s, OutboxStage::Verify).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    let outbox = rig.outbox(&s);
+    assert_eq!(
+        (outbox.attempts, outbox.stage),
+        (attempts, OutboxStage::Verify)
+    );
+    assert!(rig.rows(&s).is_empty());
+
+    // The second account is free again: it answers for the backbone.
+    for client in held.pop().unwrap() {
+        client.quit().await;
+    }
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.outbox.next_at = UnixMs(0);
+        e.outbox.lease_until = None;
+    });
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.rows(&s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].provider_id.as_str(), rows[0].result),
+        ("p1", VerifyResult::Ok)
+    );
+    let now = rig.bridge.clock.now();
+    let load = rig.bridge.catalog.provider_load(now).await.unwrap();
+    let p0 = load.iter().find(|l| l.provider_id == "p0").unwrap();
+    assert_eq!(
+        (p0.failures, p0.fault),
+        (2, Some(ProviderFault::LoginRefused))
+    );
+    for client in held.pop().unwrap() {
+        client.quit().await;
+    }
+}
+
 /// Two spellings of one backbone label are still one backbone.
 #[tokio::test]
 async fn backbone_labels_ignore_case_and_spaces() {

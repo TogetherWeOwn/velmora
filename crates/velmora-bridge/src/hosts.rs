@@ -97,7 +97,7 @@ pub enum DialError {
     /// connection.
     Unreachable(BridgeError),
     /// The host refused at its greeting (`400`, `502`, …): what a probe
-    /// counts as not ready.
+    /// counts as not ready. Always a plain reply with its code.
     Refused(BridgeError),
     /// The account's answer after the greeting (a refused login, a full
     /// account), or the configuration's: another endpoint would not do
@@ -112,14 +112,20 @@ impl DialError {
         if host_failure(&e) {
             return DialError::Unreachable(e);
         }
-        let refusal = matches!(
-            e,
-            BridgeError::Nntp(velmora::Error::NoPermission(_) | velmora::Error::NntpReply { .. })
-        );
-        if refusal && !greeted {
-            DialError::Refused(e)
-        } else {
-            DialError::Account(e)
+        match e {
+            // A greeting `502` is handed on as a plain reply with its
+            // code, like every other refused greeting: `NoPermission` is
+            // then always what the login said.
+            BridgeError::Nntp(velmora::Error::NoPermission(text)) if !greeted => {
+                DialError::Refused(BridgeError::Nntp(velmora::Error::NntpReply {
+                    code: 502,
+                    text,
+                }))
+            }
+            BridgeError::Nntp(velmora::Error::NntpReply { .. }) if !greeted => {
+                DialError::Refused(e)
+            }
+            e => DialError::Account(e),
         }
     }
 
@@ -734,7 +740,7 @@ mod tests {
         let err = run(picker.connect_host(&p, &n)).unwrap_err();
         assert!(matches!(
             err,
-            BridgeError::Nntp(velmora::Error::NoPermission(_))
+            BridgeError::Nntp(velmora::Error::NntpReply { code: 502, .. })
         ));
         assert_eq!(picker.chosen("p6", n.now()).as_deref(), Some("b"));
         n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
@@ -816,13 +822,17 @@ mod tests {
     #[test]
     fn a_greeting_refusal_is_the_hosts_and_a_login_refusal_the_accounts() {
         let no = || BridgeError::Nntp(velmora::Error::NoPermission("502".into()));
-        assert!(matches!(
-            DialError::classify(no(), false),
-            DialError::Refused(_)
-        ));
+        // The greeting's `502` goes on as a plain reply with its text,
+        // so `NoPermission` is always the login's.
+        match DialError::classify(no(), false) {
+            DialError::Refused(BridgeError::Nntp(velmora::Error::NntpReply { code, text })) => {
+                assert_eq!((code, text.as_str()), (502, "502"));
+            }
+            _ => panic!("a greeting 502 is the host's refusal"),
+        }
         assert!(matches!(
             DialError::classify(no(), true),
-            DialError::Account(_)
+            DialError::Account(BridgeError::Nntp(velmora::Error::NoPermission(_)))
         ));
         let busy = || {
             BridgeError::Nntp(velmora::Error::NntpReply {

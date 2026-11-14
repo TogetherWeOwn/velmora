@@ -12,7 +12,7 @@
 //! a connection may be opened.
 
 use crate::ports::{Catalog, PermitClass};
-use crate::types::{ProviderConfig, ProviderLoad, Result, UnixMs};
+use crate::types::{ProviderConfig, ProviderFault, ProviderLoad, Result, UnixMs};
 
 /// A snapshot of the pool at `now`.
 pub(crate) struct Pool<'a> {
@@ -116,7 +116,9 @@ impl<'a> Pool<'a> {
     }
 
     /// The enabled cooling provider among `candidates` whose cooldown
-    /// ends first.
+    /// ends first, for one attempt before its time. A provider that
+    /// cools because it refused the login is not among them: it is asked
+    /// again only when its cooldown ends.
     pub(crate) fn soonest_cooling<'c>(
         &self,
         candidates: &[&'c ProviderConfig],
@@ -125,6 +127,22 @@ impl<'a> Pool<'a> {
             .iter()
             .copied()
             .filter(|p| p.enabled && self.cooling(p))
+            .filter(|p| self.fault(p) != Some(ProviderFault::LoginRefused))
             .min_by_key(|p| self.state(&p.id).map(|l| l.cooldown_until))
+    }
+
+    /// The ids of the `candidates` whose last strike was a refusal of
+    /// the connection or the login, and no good session since. The next
+    /// connect is a probe of whether they still refuse.
+    pub(crate) fn refusing<'c>(&self, candidates: &[&'c ProviderConfig]) -> Vec<&'c str> {
+        candidates
+            .iter()
+            .filter(|p| self.fault(p).is_some_and(ProviderFault::is_refusal))
+            .map(|p| p.id.as_str())
+            .collect()
+    }
+
+    fn fault(&self, p: &ProviderConfig) -> Option<ProviderFault> {
+        self.state(&p.id).and_then(|l| l.fault)
     }
 }
