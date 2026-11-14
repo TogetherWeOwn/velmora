@@ -357,6 +357,119 @@ async fn old_workers_cannot_take_a_shared_extent_out_of_service() {
     db.batch(vec![(SHRED, vec![shared.clone()])]).await.unwrap();
 }
 
+/// The schema stops an older Worker only while the generation an extent
+/// was first written for is live. Once the current Worker has retired
+/// that generation and a copy keeps the extent in service, the older
+/// Worker can cancel its posting. The periodic re-drive arms it again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_posting_cancelled_after_its_first_generation_retired_is_revived() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = pattern(1, 200_000);
+    rig.put(&signer, BUCKET, "src", &body).await.expect(200);
+    rig.put(&signer, BUCKET, "solo", &pattern(2, 1000))
+        .await
+        .expect(200);
+    let copy = [("x-amz-copy-source", &*format!("/{BUCKET}/src"))];
+    rig.call(&signer, Method::Put, &path(BUCKET, "dst"), &[], &copy, b"")
+        .await
+        .expect(200);
+    // The current Worker retires the source; the copy keeps its extent.
+    rig.call(&signer, Method::Delete, &path(BUCKET, "src"), &[], &[], b"")
+        .await
+        .expect(204);
+    // And an object of its own, whose posting is rightly cancelled.
+    rig.call(
+        &signer,
+        Method::Delete,
+        &path(BUCKET, "solo"),
+        &[],
+        &[],
+        b"",
+    )
+    .await
+    .expect(204);
+    let (_, shared) = rig.live(&bucket, "dst").await.unwrap();
+    let shared = SqlValue::Text(shared[0].id.as_str().to_owned());
+    assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 1);
+    assert_eq!(rig.count("outbox WHERE stage = 'post'"), 1);
+
+    // The older Worker's cancel, for the shared extent: not refused.
+    let db = &rig.bridge.catalog.sql;
+    db.batch(vec![(
+        "UPDATE outbox SET stage = 'cancelled', attempts = 4, updated_at = 1 \
+          WHERE stage NOT IN ('done', 'cancelled') AND extent_id = ?1",
+        vec![shared.clone()],
+    )])
+    .await
+    .unwrap();
+    assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 2);
+
+    // One pass of the re-drive: the referenced extent is posted again,
+    // the unreferenced one stays cancelled.
+    let now = rig.now();
+    assert_eq!(
+        rig.bridge
+            .catalog
+            .revive_referenced(500, now)
+            .await
+            .unwrap(),
+        1
+    );
+    let revived = db
+        .query(
+            "SELECT stage, attempts, next_at FROM outbox WHERE extent_id = ?1",
+            std::slice::from_ref(&shared),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        revived,
+        vec![vec![
+            SqlValue::Text("post".to_owned()),
+            SqlValue::Int(0),
+            SqlValue::Int(now.0)
+        ]]
+    );
+    assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 1);
+    assert_eq!(
+        rig.bridge
+            .catalog
+            .revive_referenced(500, now)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // The scan is a rotation: with a window of one row it still reaches
+    // every row, and starts over at the end.
+    db.batch(vec![(
+        "UPDATE outbox SET stage = 'cancelled' WHERE extent_id = ?1",
+        vec![shared.clone()],
+    )])
+    .await
+    .unwrap();
+    // A release that was begun and not finished is taken up where it
+    // stopped: only the release stage unpins the safety copy.
+    db.batch(vec![(
+        "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1 WHERE id = ?1",
+        vec![shared.clone()],
+    )])
+    .await
+    .unwrap();
+    let mut total = 0;
+    for _ in 0..rig.count("outbox") + 1 {
+        total += rig.bridge.catalog.revive_referenced(1, now).await.unwrap();
+    }
+    assert_eq!(total, 1);
+    assert_eq!(rig.count("outbox WHERE stage = 'release'"), 1);
+    let read = rig
+        .call(&signer, Method::Get, &path(BUCKET, "dst"), &[], &[], b"")
+        .await;
+    read.expect(200);
+    assert!(read.body == body);
+}
+
 /// A live generation that does not have the extents it claims stops the
 /// migration before it creates anything.
 #[tokio::test(flavor = "current_thread")]

@@ -101,6 +101,8 @@ pub struct Blobs {
     pub fail_put_prefix: RefCell<Option<String>>,
     /// Deleting this key fails.
     pub fail_delete: RefCell<Option<String>>,
+    /// The next this many deletes fail.
+    pub fail_deletes: Cell<u32>,
     /// Called once, with the key, at the start of the next delete.
     pub before_delete: Hook,
     /// Called once, with the key, at the start of the next put.
@@ -146,6 +148,10 @@ impl BlobStore for Blobs {
     async fn delete(&self, key: &str) -> Result<()> {
         fire(&self.before_delete, key);
         if self.fail_delete.borrow().as_deref() == Some(key) {
+            return Err(BridgeError::Blob("store down".into()));
+        }
+        if self.fail_deletes.get() > 0 {
+            self.fail_deletes.set(self.fail_deletes.get() - 1);
             return Err(BridgeError::Blob("store down".into()));
         }
         self.inner.delete(key).await

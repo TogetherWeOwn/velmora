@@ -743,11 +743,77 @@ pub(super) async fn redrive_underverified<S: Sql>(
     Ok(moved)
 }
 
+/// Re-arms cancelled obligations of extents that a live generation
+/// references. Current code never leaves one: it cancels a posting only
+/// with the extent's last reference. A Worker from before extent
+/// references can, after a rollback: it knows an extent by the generation
+/// it was first written for alone, and the schema stops it only while
+/// that generation is live. The row restarts at the stage its safety copy
+/// is at: `post` while held, `release` when a release was begun and not
+/// finished, `done` otherwise. One call looks at the next `limit` outbox
+/// rows, in a rotation over all of them, so its cost does not grow with
+/// the table.
+pub(super) async fn revive_referenced<S: Sql>(
+    c: &SqlCatalog<S>,
+    limit: u32,
+    now: UnixMs,
+) -> Result<u64> {
+    let after = c
+        .sql
+        .query("SELECT v FROM scan_cursors WHERE k = 'revive'", &[])
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| Cols::new(row).text())
+        .transpose()?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let window = c
+        .sql
+        .query(
+            "SELECT rowid FROM outbox WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+            &[SqlValue::Int(after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let full = window.len() >= limit as usize;
+    let last = match window.into_iter().next_back() {
+        Some(row) => Cols::new(row).num::<i64>()?,
+        None => {
+            set_scan_cursor(c, "revive", "0").await?;
+            return Ok(0);
+        }
+    };
+    let sql = concat!(
+        "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
+                                          WHERE e.id = outbox.extent_id) \
+                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
+                                   ELSE 'done' END, \
+                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, ",
+        unlease!(),
+        // `+stage`: the window is found by rowid. Through the stage
+        // index the statement would visit every cancelled row there is.
+        " WHERE rowid > ?2 AND rowid <= ?3 AND +stage = 'cancelled' AND ",
+        live_ref!("outbox.extent_id")
+    );
+    let revived = c
+        .sql
+        .exec(sql, &[ms(now), SqlValue::Int(after), SqlValue::Int(last)])
+        .await?;
+    // A short window was the end of the table: start over next time.
+    let next = if full { last } else { 0 };
+    set_scan_cursor(c, "revive", &next.to_string()).await?;
+    Ok(revived)
+}
+
 async fn set_redrive_cursor<S: Sql>(c: &SqlCatalog<S>, at: &str) -> Result<()> {
+    set_scan_cursor(c, "redrive", at).await
+}
+
+async fn set_scan_cursor<S: Sql>(c: &SqlCatalog<S>, k: &str, at: &str) -> Result<()> {
     c.sql
         .exec(
-            "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('redrive', ?1)",
-            &[text(at)],
+            "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES (?1, ?2)",
+            &[text(k), text(at)],
         )
         .await?;
     Ok(())

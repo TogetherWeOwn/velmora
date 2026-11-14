@@ -1381,3 +1381,78 @@ async fn dispatch_survives_a_failed_redrive() {
     assert_eq!((report.redriven, report.enqueued), (0, 1));
     assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Post));
 }
+
+impl Fx {
+    /// Copies the object to `key`, deletes the original, and cancels the
+    /// posting of the extent the copy now holds alone: what a Worker from
+    /// before extent references can leave behind after a rollback.
+    async fn cancelled_under_a_copy(&self, bucket: &Bucket, from: &str, key: &str, o: &Obj) {
+        let cat = &self.bridge.catalog;
+        let (source, _) = cat.live_object(&bucket.id, from).await.unwrap().unwrap();
+        let now = self.clock.now();
+        let generation = GenerationRow {
+            id: recovery::copy_id(now, &source.id, None, [self.next(); 8]),
+            key: key.to_owned(),
+            created_at: now,
+            ..source.clone()
+        };
+        let copy = CopyGeneration {
+            generation,
+            source: source.id,
+            source_key: from.to_owned(),
+            now,
+        };
+        assert_eq!(
+            cat.copy_generation(&copy).await.unwrap(),
+            Guard::Applied(())
+        );
+        cat.delete_object(&bucket.id, from, now).await.unwrap();
+        assert_eq!(self.outbox(o, "stage").await, "post");
+        let sql = "UPDATE outbox SET stage = 'cancelled' WHERE extent_id = ?1";
+        self.sql
+            .exec(sql, &[text(o.extent.as_str())])
+            .await
+            .unwrap();
+    }
+}
+
+/// The dispatcher arms a cancelled posting again when a live copy still
+/// references the extent, and sends it in the same run.
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_revives_a_cancelled_posting_under_a_live_copy() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.cancelled_under_a_copy(&bucket, "k", "copy", &o).await;
+
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert!(!report.redrive_failed);
+    assert_eq!((report.redriven, report.enqueued), (1, 1));
+    assert_eq!(fx.outbox(&o, "stage").await, "post");
+    assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Post));
+
+    // Nothing is left to revive.
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!(report.redriven, 0);
+}
+
+/// A revival that fails is reported; the rows that are due still go out.
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_survives_a_failed_revival() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.cancelled_under_a_copy(&bucket, "k", "copy", &o).await;
+    let due = fx.put(&bucket, "due", &plaintext()).await;
+    fx.make_due(&due).await;
+    // Only the revival's own write is refused.
+    let sql = "CREATE TRIGGER no_revive BEFORE UPDATE OF stage ON outbox \
+               WHEN OLD.stage = 'cancelled' BEGIN SELECT RAISE(ABORT, 'down'); END";
+    fx.sql.exec(sql, &[]).await.unwrap();
+
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert!(report.redrive_failed);
+    assert_eq!(report.enqueued, 1);
+    assert_eq!(fx.bridge.jobs.sent()[0].job, due.job(OutboxStage::Post));
+    assert_eq!(fx.outbox(&o, "stage").await, "cancelled");
+}
