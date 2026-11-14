@@ -366,6 +366,19 @@ impl fmt::Debug for Secret {
 pub struct ProviderConfig {
     pub id: String,
     pub host: String,
+    /// More host names of the same account, on the same `port`. With them
+    /// the bridge picks one endpoint of `host` and these per isolate (see
+    /// `host_select` and `hosts::HostPicker`) and falls back to the others
+    /// when it cannot be reached. Empty = `host` only.
+    ///
+    /// Rollout: deploy a Worker that knows this field before the secret
+    /// carries it; an older Worker refuses the whole secret. Rollback:
+    /// take `hosts` (and `host_select`) out of the secret first.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// How the endpoint is picked when `hosts` is set.
+    #[serde(default)]
+    pub host_select: HostSelect,
     pub port: u16,
     pub tls: bool,
     pub user: String,
@@ -403,6 +416,21 @@ pub struct ProviderConfig {
     pub enabled: bool,
 }
 
+/// How a provider with several endpoints (`host` and `hosts`) picks the
+/// one it connects to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostSelect {
+    /// The endpoint with the quickest TLS handshake and greeting, measured
+    /// once per isolate.
+    #[default]
+    Fastest,
+    /// The configuration order, with no measuring: `host` first, then
+    /// `hosts`, the next one when one cannot be reached. For a provider
+    /// whose nearest server is not its fastest one.
+    Ordered,
+}
+
 fn enabled_by_default() -> bool {
     true
 }
@@ -424,6 +452,13 @@ impl ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Every host name of the account: `host`, then `hosts`, in order.
+    pub fn endpoints(&self) -> Vec<&str> {
+        core::iter::once(self.host.as_str())
+            .chain(self.hosts.iter().map(String::as_str))
+            .collect()
+    }
+
     /// Connections background jobs may hold together: one is left for a
     /// cold read when the provider allows two or more. Not on an account
     /// with one address, where a read cannot connect next to a job
@@ -468,6 +503,8 @@ impl fmt::Debug for ProviderConfig {
         f.debug_struct("ProviderConfig")
             .field("id", &self.id)
             .field("host", &"<redacted>")
+            .field("hosts", &self.hosts.len())
+            .field("host_select", &self.host_select)
             .field("port", &self.port)
             .field("tls", &self.tls)
             .field("user", &"<redacted>")
