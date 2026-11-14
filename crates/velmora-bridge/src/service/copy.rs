@@ -16,7 +16,9 @@
 
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
-use velmora_s3_proto::{ChecksumAlgorithm, Conditions, ErrorCode, ObjectMetadata, Target};
+use velmora_s3_proto::{
+    ChecksumAlgorithm, Conditions, ErrorCode, Headers, ObjectMetadata, Policy, Target,
+};
 
 use super::common::{
     internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
@@ -36,9 +38,12 @@ const ATTEMPTS: usize = 3;
 ///
 /// The value is `/bucket/key` or `bucket/key`, percent-encoded like a
 /// request path, so it is parsed by the same rules.
-pub(super) fn source_key(authed: &Authed, bucket: &Bucket) -> Result<String, S3Response> {
-    let value = authed
-        .headers
+pub(super) fn source_key(
+    headers: &Headers,
+    policy: &Policy,
+    bucket: &Bucket,
+) -> Result<String, S3Response> {
+    let value = headers
         .get("x-amz-copy-source")
         .ok_or_else(|| s3_error(ErrorCode::InvalidRequest))?;
     let raw = if value.starts_with('/') {
@@ -46,7 +51,7 @@ pub(super) fn source_key(authed: &Authed, bucket: &Bucket) -> Result<String, S3R
     } else {
         format!("/{value}")
     };
-    let source = Target::parse(&raw, &authed.policy).map_err(s3_error)?;
+    let source = Target::parse(&raw, policy).map_err(s3_error)?;
     if let Some((name, _)) = source.query().first() {
         return Err(if name == b"versionId" {
             S3Response::not_implemented()
@@ -75,7 +80,7 @@ pub(super) fn source_key(authed: &Authed, bucket: &Bucket) -> Result<String, S3R
 /// `x-amz-copy-source-if-*` conditions held.
 pub(super) async fn source_object<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
-    authed: &Authed,
+    headers: &Headers,
     bucket: &Bucket,
     key: &str,
 ) -> Result<(GenerationRow, Vec<ExtentRow>), S3Response>
@@ -104,7 +109,7 @@ where
         stored_checksum(&generation),
     )
     .map_err(|_| internal())?;
-    Conditions::from_copy_source(&authed.headers)
+    Conditions::from_copy_source(headers)
         .check_copy_source(&metadata)
         .map_err(s3_error)?;
     Ok((generation, extents))
@@ -164,7 +169,7 @@ where
         Some("REPLACE") => true,
         Some(_) => return Err(s3_error(ErrorCode::InvalidArgument)),
     };
-    let source = source_key(authed, bucket)?;
+    let source = source_key(&authed.headers, &authed.policy, bucket)?;
     if source == key && !replace {
         return Err(S3Response::error(
             400,
@@ -175,7 +180,7 @@ where
     }
 
     for _ in 0..ATTEMPTS {
-        let (from, extents) = source_object(bridge, authed, bucket, &source).await?;
+        let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
         // The copy keeps the checksum stored with the source. Computing
         // another one would mean reading every byte.
         if wanted.is_some_and(|a| stored_checksum(&from).map(|c| c.algorithm()) != Some(a)) {
