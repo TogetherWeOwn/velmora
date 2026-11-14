@@ -314,9 +314,12 @@ fn page(rows: &[&str], query: &str, batch: usize, queries: usize) -> String {
     let mut exhausted = false;
     for _ in 0..queries {
         let after = list.after().map(str::to_owned);
+        // Like the catalogue: seek past an already delivered group.
+        let skip = list.skip_prefix().map(str::to_owned);
         let found: Vec<_> = rows
             .iter()
             .filter(|k| k.starts_with(list.prefix()) && after.as_deref().is_none_or(|a| **k > a))
+            .filter(|k| skip.as_deref().is_none_or(|p| !k.starts_with(p)))
             .take(batch)
             .collect();
         for k in &found {
@@ -408,7 +411,8 @@ fn listing_pages_match_a_reference_listing() {
                 Some(i) => k[..prefix.len() + i + delimiter.len()].to_owned(),
                 None => k.to_string(),
             };
-            if !(entry.ends_with(delimiter) && !delimiter.is_empty() && *entry <= *start_after)
+            // As at S3: a group is skipped only when it is the marker itself.
+            if !(entry.ends_with(delimiter) && !delimiter.is_empty() && *entry == *start_after)
                 && out.last() != Some(&entry)
             {
                 out.push(entry);
@@ -424,7 +428,7 @@ fn listing_pages_match_a_reference_listing() {
         ("z", "z"),
     ] {
         for (delimiter, d_q) in [("", ""), ("/", "%2F"), ("b", "b")] {
-            for start_after in ["", "a/1", "a/", "b/9"] {
+            for start_after in ["", "a/1", "a/", "a/b/", "b/9"] {
                 for (batch, queries, max) in [(1000, 200, 1000), (1, 1, 1), (2, 3, 2), (1, 200, 3)]
                 {
                     let mut q = format!("&prefix={p_q}&delimiter={d_q}&max-keys={max}");
@@ -808,9 +812,12 @@ fn page_v1(rows: &[&str], query: &str, batch: usize, queries: usize) -> String {
     let mut exhausted = false;
     for _ in 0..queries {
         let after = list.after().map(str::to_owned);
+        // Like the catalogue: seek past an already delivered group.
+        let skip = list.skip_prefix().map(str::to_owned);
         let found: Vec<_> = rows
             .iter()
             .filter(|k| k.starts_with(list.prefix()) && after.as_deref().is_none_or(|a| **k > a))
+            .filter(|k| skip.as_deref().is_none_or(|p| !k.starts_with(p)))
             .take(batch)
             .collect();
         for k in &found {
@@ -886,7 +893,8 @@ fn v1_listing_pages_match_a_reference_listing() {
                 Some(i) => k[..prefix.len() + i + delimiter.len()].to_owned(),
                 None => k.to_string(),
             };
-            if !(entry.ends_with(delimiter) && !delimiter.is_empty() && *entry <= *marker)
+            // As at S3: a group is skipped only when it is the marker itself.
+            if !(entry.ends_with(delimiter) && !delimiter.is_empty() && *entry == *marker)
                 && out.last() != Some(&entry)
             {
                 out.push(entry);
@@ -902,7 +910,7 @@ fn v1_listing_pages_match_a_reference_listing() {
         ("z", "z"),
     ] {
         for (delimiter, d_q) in [("", ""), ("/", "%2F"), ("b", "b")] {
-            for marker in ["", "a/1", "a/", "b/9"] {
+            for marker in ["", "a/1", "a/", "a/b/", "b/9"] {
                 for (batch, queries, max) in [(1000, 200, 1000), (1, 1, 1), (2, 3, 2), (1, 200, 3)]
                 {
                     let mut q = format!("prefix={p_q}&delimiter={d_q}&max-keys={max}");
@@ -941,7 +949,7 @@ fn v1_listing_xml_fields() {
         1,
     );
     assert!(
-        xml.contains("<Marker>0</Marker><NextMarker>a/1</NextMarker><MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated><Delimiter>/</Delimiter><CommonPrefixes><Prefix>a/</Prefix></CommonPrefixes>"),
+        xml.contains("<Marker>0</Marker><NextMarker>a/</NextMarker><MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated><Delimiter>/</Delimiter><CommonPrefixes><Prefix>a/</Prefix></CommonPrefixes>"),
         "{xml}"
     );
     // encoding-type=url encodes Marker, NextMarker and keys.
@@ -952,7 +960,7 @@ fn v1_listing_xml_fields() {
         1,
     );
     assert!(
-        xml.contains("<Marker>a%20</Marker><NextMarker>a%20b%2F1</NextMarker>"),
+        xml.contains("<Marker>a%20</Marker><NextMarker>a%20b%2F</NextMarker>"),
         "{xml}"
     );
     // An empty marker is no marker.
@@ -991,28 +999,42 @@ fn fetch_owner_is_accepted_and_changes_nothing() {
     }
 }
 
-/// A V1 page resuming inside a group seeks past it (no rescan of members).
+/// As at S3, only a marker that is a CommonPrefix itself skips that group
+/// (and the page starts seeking past it); a hand-chosen marker inside a group
+/// rolls the later members into the group again.
 #[test]
-fn v1_marker_inside_a_group_skips_the_group() {
+fn v1_marker_skips_a_group_only_when_it_is_the_group() {
     for (query, want) in [
-        ("delimiter=%2F&marker=a%2F1", Some("a/")),
         ("delimiter=%2F&marker=a%2F", Some("a/")),
-        ("delimiter=%2F&marker=a%2Fb%2F1&prefix=a%2F", Some("a/b/")),
+        ("delimiter=%2F&marker=a%2Fb%2F&prefix=a%2F", Some("a/b/")),
+        ("delimiter=%2F&marker=a%2F5", None),
+        ("delimiter=%2F&marker=a%2Fb%2F", None),
         ("delimiter=%2F&marker=a", None),
-        ("marker=a%2F1", None),
-        ("delimiter=%2F&marker=a%2F1&prefix=b", None),
+        ("marker=a%2F", None),
+        ("delimiter=%2F&marker=a%2F&prefix=b", None),
     ] {
         let t = Target::parse(&format!("/bucket?{query}"), &policy()).unwrap();
         let list = ListObjectsV2::parse_v1(&t).unwrap();
         assert_eq!(list.skip_prefix(), want, "{query}");
     }
-    // Rows of the skipped group are not emitted.
-    let xml = page_v1(
-        &["a/1", "a/2", "a/3", "b"],
-        "delimiter=%2F&marker=a%2F1",
-        1000,
-        1,
+    let rows = ["a/1", "a/5", "a/6", "a/7", "b"];
+    // marker=a/5: a/6 and a/7 roll into a/ again.
+    let xml = page_v1(&rows, "delimiter=%2F&marker=a%2F5", 1000, 1);
+    assert_eq!(
+        between(&xml, "<CommonPrefixes><Prefix>", "</Prefix>"),
+        ["a/"]
     );
     assert_eq!(between(&xml, "<Key>", "</Key>"), ["b"]);
-    assert!(!xml.contains("<CommonPrefixes>"));
+    // marker=a/ (a resumed page): the group is not repeated.
+    let xml = page_v1(&rows, "delimiter=%2F&marker=a%2F", 1000, 1);
+    assert!(!xml.contains("<CommonPrefixes>"), "{xml}");
+    assert_eq!(between(&xml, "<Key>", "</Key>"), ["b"]);
+    // V2 start-after follows the same rule.
+    let xml = page(&rows, "&delimiter=%2F&start-after=a%2F5", 1000, 1);
+    assert_eq!(
+        between(&xml, "<CommonPrefixes><Prefix>", "</Prefix>"),
+        ["a/"]
+    );
+    let xml = page(&rows, "&delimiter=%2F&start-after=a%2F", 1000, 1);
+    assert!(!xml.contains("<CommonPrefixes>"), "{xml}");
 }

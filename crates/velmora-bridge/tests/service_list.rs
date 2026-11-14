@@ -476,21 +476,30 @@ async fn list_objects_v1_pages_by_marker() {
     }
     assert_eq!(got, ["a/", "b", "c/", "d e", "z"]);
 
-    // A marker inside a common prefix skips the rest of that group.
-    let resp = rig
-        .call(
-            &signer,
-            Method::Get,
-            &format!("/{BUCKET}"),
-            &[("delimiter", "/"), ("marker", "a/1"), ("prefix", "")],
-            &[],
-            b"",
-        )
-        .await;
-    resp.expect(200);
-    assert_eq!(resp.values("Marker"), ["a/1"]);
-    assert_eq!(resp.values("Key"), ["b", "d e", "z"]);
-    assert!(!resp.text().contains("<Prefix>a/</Prefix>"));
+    // As at S3: a marker inside a group rolls the later members into the
+    // group again; only the group itself as marker skips it.
+    for (marker, prefixes) in [("a/1", vec!["a/", "c/"]), ("a/", vec!["c/"])] {
+        let resp = rig
+            .call(
+                &signer,
+                Method::Get,
+                &format!("/{BUCKET}"),
+                &[("delimiter", "/"), ("marker", marker), ("prefix", "")],
+                &[],
+                b"",
+            )
+            .await;
+        resp.expect(200);
+        assert_eq!(resp.values("Marker"), [marker]);
+        assert_eq!(resp.values("Key"), ["b", "d e", "z"]);
+        let text = resp.text();
+        let got: Vec<String> = text
+            .split("<CommonPrefixes><Prefix>")
+            .skip(1)
+            .map(|r| r.split("</Prefix>").next().unwrap().to_string())
+            .collect();
+        assert_eq!(got, prefixes, "marker {marker}");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -183,8 +183,9 @@ pub struct ListObjectsV2 {
     scanned: usize,
     entries: Vec<(Entry, Cursor)>,
     /// ListObjects V1: `marker` is held as `start_after` (same semantics:
-    /// keys and CommonPrefixes at or before it are skipped) and the page
-    /// resumes by `NextMarker` instead of a token.
+    /// keys after it are listed; a CommonPrefix is skipped only when it is
+    /// the marker itself) and the page resumes by `NextMarker` instead of a
+    /// token.
     v1: bool,
 }
 
@@ -217,7 +218,7 @@ impl ListObjectsV2 {
             Some(t) => resolve_token(token_key, t, &scope)?,
             None => Cursor {
                 after: scope.start_after.clone().unwrap_or_default(),
-                skip_prefix: None,
+                skip_prefix: marker_group(&scope),
             },
         };
         Ok(Self {
@@ -254,20 +255,7 @@ impl ListObjectsV2 {
             start_after: marker.map(str::to_owned),
             url_encoding: encoding.is_some(),
         };
-        // A marker inside a group (`NextMarker` after a CommonPrefix is a
-        // member key) starts with that group already emitted, so the caller
-        // seeks past its remaining members instead of scanning them. The
-        // group sorts at or before the marker, so it would be dropped anyway.
-        let plen = scope.prefix.len();
-        let skip_prefix = scope
-            .start_after
-            .as_deref()
-            .filter(|m| !scope.delimiter.is_empty() && m.starts_with(&scope.prefix))
-            .and_then(|m| {
-                m[plen..]
-                    .find(&scope.delimiter)
-                    .map(|i| m[..plen + i + scope.delimiter.len()].to_owned())
-            });
+        let skip_prefix = marker_group(&scope);
         Ok(Self {
             has_after: scope.start_after.is_some(),
             cursor: Cursor {
@@ -331,12 +319,11 @@ impl ListObjectsV2 {
                     .map(|i| row.key[..plen + i + self.scope.delimiter.len()].to_owned())
             })
             .flatten();
-        if common.as_ref().is_some_and(|p| {
-            self.scope
-                .start_after
-                .as_ref()
-                .is_some_and(|a| p.as_str() <= a.as_str())
-        }) {
+        // As at S3, a group is skipped only when the marker (start-after) is
+        // that CommonPrefix itself, which is what a resumed page sends. A
+        // marker inside a group (`a/5`) still rolls later members (`a/6`)
+        // into `a/`.
+        if common.is_some() && common == self.scope.start_after {
             return Ok(());
         }
         self.cursor = Cursor {
@@ -390,13 +377,22 @@ impl ListObjectsV2 {
                 field(scope.start_after.as_deref().unwrap_or(""))?
             );
             // S3 sends NextMarker only with a delimiter; without one the
-            // last key is the marker. `cursor.after` is the last key scanned,
+            // last key is the marker. After a CommonPrefix the marker is the
+            // prefix itself, so the next page skips the whole group (and the
+            // caller seeks past it); otherwise it is the last key scanned,
             // which is also right for a page cut short by the query budget.
             if truncated && !scope.delimiter.is_empty() {
-                head.push_str(&format!(
-                    "<NextMarker>{}</NextMarker>",
-                    field(&self.cursor.after)?
-                ));
+                let next = self
+                    .cursor
+                    .skip_prefix
+                    .as_deref()
+                    .unwrap_or(&self.cursor.after);
+                // A page that names its own marker would loop the client;
+                // a caller that seeks past `skip_prefix` never gets here.
+                if scope.start_after.as_deref() == Some(next) {
+                    return Err(ErrorCode::InternalError);
+                }
+                head.push_str(&format!("<NextMarker>{}</NextMarker>", field(next)?));
             }
             head.push_str(&format!(
                 "<MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>"
@@ -452,6 +448,18 @@ impl ListObjectsV2 {
         out.push_str("</ListBucketResult>");
         Ok(xml_response(out))
     }
+}
+
+/// The marker (start-after) when it is exactly one CommonPrefix under the
+/// request's prefix and delimiter, i.e. a resumed page's `NextMarker`. That
+/// group is already delivered, so a page starts with it skipped and the
+/// caller seeks past its members.
+fn marker_group(scope: &TokenScope) -> Option<String> {
+    let marker = scope.start_after.as_deref()?;
+    let d = scope.delimiter.as_str();
+    let rest = marker.strip_prefix(scope.prefix.as_str())?;
+    (!d.is_empty() && rest.find(d) == Some(rest.len().checked_sub(d.len())?))
+        .then(|| marker.to_owned())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
