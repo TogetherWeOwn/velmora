@@ -60,8 +60,8 @@ pub const MIGRATION_0008: &str =
     include_str!("../../../workers/s3-bridge/migrations/0008_restore_state.sql");
 
 /// The rollback stamp counter.
-pub const MIGRATION_0009: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0009_rollback_stamp.sql");
+pub const MIGRATION_0010: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0010_rollback_stamp.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -152,7 +152,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0006)?;
         db.apply(MIGRATION_0007)?;
         db.apply(MIGRATION_0008)?;
-        db.apply(MIGRATION_0009)?;
+        db.apply(MIGRATION_0010)?;
         Ok(db)
     }
 
