@@ -21,12 +21,13 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
+    discard_refused, internal, metadata_json, s3_error, stored_checksum, stored_headers,
+    unavailable, Authed,
 };
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
-use crate::recovery::{copy_id, discard_generation, write_generation};
+use crate::recovery::{copy_id, write_generation};
 use crate::types::{
     Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
     S3Response,
@@ -259,23 +260,16 @@ where
                     .map(super::common::from_proto)
                     .map_err(|_| internal());
             }
-            PublishOutcome::Refused(record) => record,
+            PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
         // The source was overwritten or deleted since it was read, or
         // the destination got a generation this id does not sort after.
         // Nothing was published under this id, so its record must not
         // publish it in a replay either. A record that cannot be removed
         // ends the request: no copy was made, and the caller is told so.
-        let mut removed = false;
-        for _ in 0..ATTEMPTS {
-            if discard_generation(&bridge.safety, &refused).await.is_ok() {
-                removed = true;
-                break;
-            }
-        }
-        if !removed {
-            return Err(internal());
-        }
+        discard_refused(bridge, &copy.generation, refused)
+            .await
+            .map_err(|_| internal())?;
         lost = Some(copy.generation.id);
         // Plan again against what is live now.
     }

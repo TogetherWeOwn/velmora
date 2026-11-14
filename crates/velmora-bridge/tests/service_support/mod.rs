@@ -100,6 +100,8 @@ pub struct Blobs {
     pub fail_put: Cell<bool>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
+    /// This many deletes of a recovery record fail.
+    pub fail_record_deletes: Cell<u32>,
     /// Deleting this key fails.
     pub fail_delete: RefCell<Option<String>>,
     /// The next this many deletes fail.
@@ -166,6 +168,11 @@ impl BlobStore for Blobs {
             self.fail_deletes.set(self.fail_deletes.get() - 1);
             return Err(BridgeError::Blob("store down".into()));
         }
+        let left = self.fail_record_deletes.get();
+        if left > 0 {
+            self.fail_record_deletes.set(left - 1);
+            return Err(BridgeError::Blob("store down".into()));
+        }
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
@@ -177,9 +184,22 @@ impl BlobStore for Blobs {
 pub struct FailSql {
     pub inner: RusqliteSql,
     pub fail_writes: Cell<bool>,
+    /// Fails the next batch that publishes a generation, once.
+    pub fail_publish: Cell<Option<PublishFault>>,
+    fail_next_batch: Cell<bool>,
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
     pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+}
+
+/// How a publication batch fails: D1 may answer with an error before it
+/// wrote anything, or after it committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishFault {
+    NotApplied,
+    Applied,
+    /// Not applied, and the batch after it fails as well.
+    Down,
 }
 
 impl FailSql {
@@ -219,6 +239,28 @@ impl Sql for FailSql {
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if self.fail_writes.get() {
             return Err(BridgeError::Sql("database down".into()));
+        }
+        if self.fail_next_batch.take() {
+            return Err(BridgeError::Sql("no answer".into()));
+        }
+        let publishes = stmts
+            .iter()
+            .any(|(sql, _)| sql.starts_with("INSERT INTO generations"));
+        if publishes {
+            match self.fail_publish.take() {
+                Some(PublishFault::NotApplied) => {
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Down) => {
+                    self.fail_next_batch.set(true);
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Applied) => {
+                    self.inner.batch(stmts).await?;
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                None => {}
+            }
         }
         self.inner.batch(stmts).await
     }
@@ -276,6 +318,8 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
             catalog: SqlCatalog::new(FailSql {
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
+                fail_publish: Cell::new(None),
+                fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
             }),
             safety: Blobs::default(),

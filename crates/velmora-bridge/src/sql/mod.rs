@@ -150,9 +150,6 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<PublishOutcome> {
         objects::copy_generation(self, c, record).await
     }
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
-        objects::delete_object(self, bucket, key, now).await
-    }
     async fn delete_object_before(
         &self,
         bucket: &BucketId,

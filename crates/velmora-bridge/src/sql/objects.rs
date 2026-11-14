@@ -534,21 +534,6 @@ pub(super) async fn copy_generation<S: Sql>(
     published(c, stmts, &g.id, record).await
 }
 
-/// Idempotent: deleting a key with no live object changes nothing.
-pub(super) async fn delete_object<S: Sql>(
-    c: &SqlCatalog<S>,
-    bucket: &BucketId,
-    key: &str,
-    now: UnixMs,
-) -> Result<()> {
-    let mut stmts = retire_live(bucket, key, GenerationState::Deleted, now);
-    stmts.push((
-        "DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2",
-        vec![text(bucket.as_str()), text(key)],
-    ));
-    c.sql.batch(stmts).await.map(|_| ())
-}
-
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------

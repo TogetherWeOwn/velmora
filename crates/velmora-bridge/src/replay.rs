@@ -29,7 +29,8 @@ use crate::recovery::{
     GenerationManifest, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
 use crate::types::{
-    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
+    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, GenerationRow,
+    Result, UnixMs,
 };
 
 /// How much one call does. The default keeps a call far below a Worker
@@ -44,6 +45,7 @@ pub struct ReplayLimits {
 
 /// Damaged generations the last call lists by id.
 const DAMAGED_LISTED: u32 = 100;
+const OTHER_BUCKET_LISTED: usize = 100;
 
 impl Default for ReplayLimits {
     fn default() -> Self {
@@ -128,9 +130,20 @@ pub struct ReplayReport {
     pub tombstones: u32,
     /// Tombstones that removed a live object.
     pub deleted: u32,
+    /// Refused, and nothing is missing: a newer live generation of the
+    /// key holds the same extents in the same order. A Complete that
+    /// was sent again after an unanswered one leaves two records of one
+    /// object. Replayed together they are published one over the other,
+    /// and the object stands under the id of the later one.
+    pub duplicate: u32,
     /// Not published: the catalogue refused the generation (an extent
-    /// is missing or its key was shredded, or it lost a race).
+    /// is missing, its key was shredded or it belongs to another
+    /// generation, or it lost a race).
     pub unpublishable: Vec<String>,
+    /// Not replayed: the catalogue has another bucket under the name of
+    /// the record's bucket. The first ids of `other_bucket_total`.
+    pub other_bucket_total: u32,
+    pub other_bucket: Vec<String>,
     /// Set by the last call: live generations with an extent that has no
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
@@ -234,6 +247,19 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             return Ok(true);
         }
         let bucket = m.bucket();
+        // A bucket made again under the same name since the export has
+        // another id and another data key. Nothing of the record can go
+        // into it, and its rows cannot go in beside it: the name is
+        // unique. The operator decides which of the two stays.
+        if let Some(named) = self.catalog.bucket_by_name(&bucket.name).await? {
+            if named.id != bucket.id {
+                report.other_bucket_total += 1;
+                if report.other_bucket.len() < OTHER_BUCKET_LISTED {
+                    report.other_bucket.push(generation.id.as_str().to_owned());
+                }
+                return Ok(true);
+            }
+        }
         let now = self.clock.now();
         let mut at = cursor.extent as usize;
         while at < m.extents.len() {
@@ -312,11 +338,40 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     .await?
                 {
                     Guard::Applied(()) => report.published += 1,
-                    Guard::Lost => report.unpublishable.push(id),
+                    // The extents of an object can be shared, so a second
+                    // record of one object is published like any other
+                    // manifest, over the first. What is refused and has a
+                    // live twin was published before: by an earlier run,
+                    // or because a newer record of the object is live.
+                    Guard::Lost => match self.live_twin(&generation, &placements).await? {
+                        Some(_) => report.duplicate += 1,
+                        None => report.unpublishable.push(id),
+                    },
                 }
             }
         }
         Ok(true)
+    }
+
+    /// The id of the live generation of the key, if it is the same
+    /// object as `g`: the same extents at the same places.
+    async fn live_twin(
+        &self,
+        g: &GenerationRow,
+        placements: &[ExtentPlacement],
+    ) -> Result<Option<GenerationId>> {
+        let Some((live, extents)) = self.catalog.live_object(&g.bucket_id, &g.key).await? else {
+            return Ok(None);
+        };
+        let same = live.size == g.size
+            && live.etag == g.etag
+            && extents.len() == placements.len()
+            && extents.iter().zip(placements).all(|(e, p)| {
+                e.id == p.extent_id
+                    && e.seq == Some(p.seq)
+                    && e.plain_offset == Some(p.plain_offset)
+            });
+        Ok(same.then_some(live.id))
     }
 
     async fn replay_tombstones(

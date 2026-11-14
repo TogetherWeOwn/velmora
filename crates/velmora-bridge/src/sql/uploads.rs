@@ -499,5 +499,39 @@ pub(super) async fn complete_upload<S: Sql>(
          WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
         receipt,
     ));
-    published(c, stmts, &g.id, record).await
+    if record.generation() != &g.id {
+        return Err(BridgeError::Invalid(
+            "the recovery record is of another generation",
+        ));
+    }
+    let failed = match c.sql.batch(stmts).await {
+        Ok(_) => return Ok(PublishOutcome::Applied),
+        Err(BridgeError::GuardFailed) => return Ok(PublishOutcome::Refused(record.refused())),
+        Err(e) => e,
+    };
+    // The outcome is unknown: the batch may have applied, or may still.
+    // Moving the upload to its next revision settles it. If that applies,
+    // the upload was still open at `revision`, so the batch had not
+    // applied, and its own guard on `revision` fails from here on. Then
+    // nothing is published under this id, and its record may go, so
+    // that a replay cannot publish an upload the client aborts later.
+    let mut open_at = target(t);
+    open_at.push(int(revision)?);
+    let fence = vec![
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
+             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
+            open_at.clone(),
+        ),
+        (
+            "UPDATE uploads SET revision = revision + 1 \
+             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
+            open_at,
+        ),
+    ];
+    match c.sql.batch(fence).await {
+        Ok(_) => Ok(PublishOutcome::Fenced(record.refused())),
+        // Still unknown, or it had applied: the record stays.
+        Err(_) => Err(failed),
+    }
 }

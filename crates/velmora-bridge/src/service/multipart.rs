@@ -53,7 +53,8 @@ use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
     PublishOutcome, UploadTarget,
 };
-use crate::recovery::{discard_generation, id_after, write_generation};
+use crate::recovery::{id_after, write_generation};
+use crate::service::common::discard_refused;
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
     GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
@@ -1052,13 +1053,20 @@ where
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
                 // record left behind replays as a PUT that failed.
-                let _ = discard_generation(&bridge.safety, &record).await;
+                let _ = discard_refused(bridge, &commit.generation, record).await;
                 // Refused for the id (the key took a newer one since it
                 // was read) or for the upload. Only the second is judged
                 // by the revision on the next turn.
                 let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
                 let outrun = newest.is_some_and(|n| n >= commit.generation.id);
                 lost_at = (!outrun).then_some(upload.revision);
+            }
+            PublishOutcome::Fenced(record) => {
+                // The catalogue failed, then showed that nothing was
+                // published. Without its record this attempt cannot come
+                // back in a replay, also after the client aborts.
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                return Err(Fail::Internal);
             }
         }
     }

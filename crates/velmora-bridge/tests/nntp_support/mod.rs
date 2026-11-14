@@ -770,9 +770,6 @@ impl Catalog for MemCatalog {
     ) -> Result<PublishOutcome> {
         unused()
     }
-    async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
-        unused()
-    }
     async fn delete_object_before(
         &self,
         _: &BucketId,

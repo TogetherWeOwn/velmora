@@ -105,6 +105,9 @@ fn add(total: &mut ReplayReport, step: ReplayReport) {
     total.safety_missing += step.safety_missing;
     total.tombstones += step.tombstones;
     total.deleted += step.deleted;
+    total.duplicate += step.duplicate;
+    total.other_bucket_total += step.other_bucket_total;
+    total.other_bucket.extend(step.other_bucket);
     total.unpublishable.extend(step.unpublishable);
     total.unreadable.extend(step.unreadable);
     total.damaged_total = step.damaged_total;
@@ -1418,6 +1421,278 @@ async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
     });
     assert_eq!(collected, 0);
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// A Complete whose publication the catalogue did not answer
+// ---------------------------------------------------------------------------
+
+async fn abort(rig: &Rig, signer: &Signer, key: &str, id: &str) -> Resp {
+    rig.call(
+        signer,
+        Method::Delete,
+        &path(BUCKET, key),
+        &[("uploadId", id)],
+        &[],
+        b"",
+    )
+    .await
+}
+
+async fn two_parts(rig: &Rig, signer: &Signer, key: &str) -> (String, Vec<String>, Vec<u8>) {
+    let id = create_upload(rig, signer, key).await;
+    let first = pattern(5, 5 * MIB);
+    let last = pattern(6, 1024);
+    let etags = vec![
+        upload_part(rig, signer, key, &id, 1, &first).await,
+        upload_part(rig, signer, key, &id, 2, &last).await,
+    ];
+    (id, etags, [first, last].concat())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_complete_that_is_then_aborted_does_not_come_back() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    tick(&rig);
+
+    // The catalogue fails before it wrote anything. Complete shows that
+    // nothing was published, and takes its record back.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig), before);
+    get(&rig, &signer, "big").await.expect(404);
+
+    tick(&rig);
+    abort(&rig, &signer, "big", &id).await.expect(204);
+    tick(&rig);
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 0, "{report:?}");
+    let generations: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT COUNT(*) FROM generations", [], |r| r.get(0))
+            .unwrap()
+    });
+    assert_eq!(generations, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_record_of_a_failed_complete_is_deleted_again_when_the_store_fails() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+    tick(&rig);
+
+    let fail = |deletes: u32| {
+        rig.bridge.safety.fail_record_deletes.set(deletes);
+        rig.bridge
+            .catalog
+            .sql
+            .fail_publish
+            .set(Some(PublishFault::NotApplied));
+    };
+    // Two failures of the store: the third delete removes the record.
+    fail(2);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig), before);
+    assert_eq!(rig.bridge.safety.fail_record_deletes.get(), 0);
+
+    // A store that stays down leaves the record: the known remainder.
+    tick(&rig);
+    fail(3);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig).len(), before.len() + 1);
+    assert_eq!(rig.bridge.safety.fail_record_deletes.get(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_complete_can_be_sent_again() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_that_applied_without_an_answer_keeps_its_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The catalogue committed, and the answer was lost. The upload is
+    // no longer open, so nothing shows that the batch did not apply.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Applied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert_eq!(records(&rig).len(), before + 1);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_records_of_one_object_are_not_reported_as_a_loss() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The catalogue answers neither the publication nor the question
+    // whether it applied, so the record of this attempt stays.
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Down));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(records(&rig).len(), before + 2);
+    tick(&rig);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    // Both records are published, the later over the earlier: they
+    // share the extents.
+    assert_eq!((report.published, report.duplicate), (2, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+/// A Complete that got no answer leaves its record; a delete of the key
+/// lands; the Complete is sent again and succeeds. The object must
+/// stand under the id of the second record, or the tombstone, which
+/// sorts between the two, removes it in a replay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "big", b"first").await.expect(200);
+    tick(&rig);
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::Down));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    tick(&rig);
+    delete(&rig, &signer, "big").await.expect(204);
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    tick(&rig);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    let live: String = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT generation_id FROM objects", [], |r| r.get(0))
+            .unwrap()
+    });
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.duplicate), (3, 0), "{report:?}");
+    assert_eq!((report.tombstones, report.deleted), (1, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    let (restored, generations): (String, i64) = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT (SELECT generation_id FROM objects), \
+                    (SELECT COUNT(*) FROM generations WHERE state = 'live')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    });
+    assert_eq!((restored, generations), (live, 1));
+
+    // A second replay over the result changes nothing.
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((again.published, again.deleted), (0, 0), "{again:?}");
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// A bucket that was made again under the same name
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn records_of_a_bucket_whose_name_is_taken_are_reported_and_skipped() {
+    let rig = rig();
+    let (old, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "b", b"two").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "b").await.expect(204);
+    tick(&rig);
+    wipe(&rig);
+
+    // Before the replay, somebody makes the bucket again.
+    let mut new = rig.bucket("vault-again", true).await;
+    assert_ne!(new.id, old.id);
+    sql(
+        &rig,
+        "UPDATE buckets SET name = 'vault' WHERE name = 'vault-again'",
+    );
+    new.name = BUCKET.to_string();
+    let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
+    rig.grant(AKID, &new, Perm::Rw).await;
+    rig.put(&signer, BUCKET, "c", b"three").await.expect(200);
+    tick(&rig);
+
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.other_bucket_total, 2, "{report:?}");
+    assert_eq!(report.other_bucket.len(), 2, "{report:?}");
+    assert_eq!((report.published, report.present), (0, 1), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    get(&rig, &signer, "a").await.expect(404);
+    assert_eq!(get(&rig, &signer, "c").await.expect(200).body, b"three");
 }
 
 // ---------------------------------------------------------------------------

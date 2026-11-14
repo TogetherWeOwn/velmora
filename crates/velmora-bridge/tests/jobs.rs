@@ -1409,7 +1409,7 @@ impl Fx {
             now,
         };
         assert_eq!(cat.publish_copy(&copy).await.unwrap(), Guard::Applied(()));
-        cat.delete_object(&bucket.id, from, now).await.unwrap();
+        cat.delete_now(&bucket.id, from, now).await.unwrap();
         assert_eq!(self.outbox(o, "stage").await, "post");
         let sql = "UPDATE outbox SET stage = 'cancelled' WHERE extent_id = ?1";
         self.sql

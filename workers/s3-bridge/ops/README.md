@@ -60,6 +60,21 @@ Limits to know:
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
   lists it under `damaged`.
+- A CompleteMultipartUpload that got no answer from the catalogue and
+  was sent again can leave two records of one object. The replay
+  publishes one and counts the other in `duplicate`; nothing is missing.
+  The object stands under the id of the later record, so a delete that
+  came between the two attempts does not remove it.
+- The record of a publication that the catalogue refused is deleted
+  again, three tries in all. If the store fails every one, the record
+  stays and a replay publishes it: an object appears that no client was
+  told exists (a refused PUT, or a multipart upload that was aborted
+  afterwards). Nothing is lost by it; delete such an object by hand.
+- If a bucket was made again under the name of a lost one before the
+  replay, the two have different ids and data keys. The replay does not
+  touch the new bucket: it skips the records of the old one and lists
+  them under `other_bucket`. Which of the two keeps the name is for the
+  operator to decide; the records of the old one stay in the store.
 - An empty bucket that never had a write is not in the records.
 
 ## Routine: export

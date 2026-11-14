@@ -236,6 +236,10 @@ pub enum PublishOutcome {
     Applied,
     /// The guard failed; the batch wrote nothing.
     Refused(Unpublished),
+    /// CompleteMultipartUpload only. The batch failed with an unknown
+    /// outcome and the upload was then moved to its next revision: the
+    /// batch had not applied, and its guard can never pass again.
+    Fenced(Unpublished),
 }
 
 // Fenced methods return Ok(false) (or None) when the lease token no longer
@@ -277,7 +281,6 @@ pub trait Catalog {
     /// published.
     async fn copy_generation(&self, c: &CopyGeneration, record: Recorded)
         -> Result<PublishOutcome>;
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
     /// tombstone written for this delete. `false` = nothing was live, or
