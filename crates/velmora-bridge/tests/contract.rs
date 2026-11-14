@@ -249,7 +249,15 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
     assert_eq!(cfg.safety_min_age_secs, 604_800);
     assert_eq!(cfg.verify_delay_secs, 120);
-    assert_eq!(cfg.newsgroups, vec!["alt.binaries.test".to_string()]);
+    assert_eq!(
+        cfg.newsgroups,
+        [
+            "alt.binaries.boneless",
+            "alt.binaries.misc",
+            "alt.binaries.multimedia",
+            "alt.binaries.test"
+        ]
+    );
     assert_eq!(cfg.kek_active, 1);
     assert_eq!(cfg.gc_mode, GcMode::Off);
     assert_eq!(cfg.hot_cap_bytes, 100 * 1024 * 1024 * 1024);
