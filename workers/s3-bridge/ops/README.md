@@ -9,7 +9,7 @@ kept outside it:
    - `m/<generation id>`: one per PutObject, CopyObject or CompleteMultipartUpload.
      Bucket (id, name, wrapped key), object key, metadata and every extent
      (sizes, offsets, digests, media header, wrapped file key).
-   - `m/del/<tombstone id>`: one per DeleteObject that removed an object.
+   - `m/del/<tombstone id>`: one per DeleteObject that found an object.
    - `m/art/<extent id>`: the article plan of an extent (message ids,
      newsgroup, headers, spans, digests), written before its first POST.
 
@@ -42,13 +42,20 @@ extents from Usenet.
 Limits to know:
 
 - A write that failed after its record was stored can become visible
-  after a replay. S3 allows this (the request had no definite outcome).
+  after a replay: one whose catalogue batch failed (the client got a
+  500 and cannot know the outcome), or one that was refused and whose
+  record could not be removed. It becomes visible only in its place in
+  the order: every write and delete that was acknowledged on the key
+  after it sorts after it and stays on top. It is visible after a replay
+  only when nothing was acknowledged on the key after it.
 - Replay order is id order, and on one key that is the order in which
-  the writes and deletes were committed. An id is minted after the
-  request body is read; the catalogue then refuses a publication whose
-  id does not sort after the live generation and the last delete of the
-  key, and the request is published under a later id instead. The
-  order does not depend on the clocks of Worker instances.
+  the records were stored. Before a record is stored, the catalogue
+  raises the floor of the key to the record's id, in a statement of its
+  own; every later id on the key is minted above the live generation
+  and the floor, and the catalogue refuses a publication that sorts
+  below either. This holds whatever became of the earlier request (a
+  delete that found nothing left to delete, a batch that failed) and
+  does not depend on the clocks of Worker instances.
 - An extent restored from its article plan record alone (no pinned
   copy) is assumed posted: the record is written before the first POST,
   so a replay cannot tell an extent that was fully posted from one whose
@@ -67,9 +74,14 @@ Limits to know:
   came between the two attempts does not remove it.
 - The record of a publication that the catalogue refused is deleted
   again, three tries in all. If the store fails every one, the record
-  stays and a replay publishes it: an object appears that no client was
-  told exists (a refused PUT, or a multipart upload that was aborted
-  afterwards). Nothing is lost by it; delete such an object by hand.
+  stays and a replay publishes it in its place in the order, as in the
+  first limit above. A refused PUT or copy answers 500 then. A
+  CompleteMultipartUpload goes on and can answer that the upload does
+  not exist (it was aborted): after a replay the key then holds an
+  object that the client was told was not made, in place of the object
+  the key held before, unless a write or delete was acknowledged on the
+  key afterwards. Compare the replay's object list with what is expected
+  and delete or overwrite such an object by hand.
 - If a bucket was made again under the name of a lost one before the
   replay, the two have different ids and data keys. The replay does not
   touch the new bucket: it skips the records of the old one and lists

@@ -17,7 +17,7 @@
 //! published, which is what makes "already present" a safe reason to
 //! skip a manifest.
 
-use super::objects::{clear_tombstone, ms, opt, retire_live, text, uint};
+use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
 use crate::replay::{ReplayExtent, ReplayProbe};
@@ -243,7 +243,7 @@ pub(super) async fn replay_publish<S: Sql>(
                     AND generation_id > ?1)",
         vec![gen_id(), bucket(), text(&g.key)],
     ));
-    stmts.push(clear_tombstone(&g.bucket_id, &g.key, &g.id));
+    stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(insert_live(g)?);
     for p in placements {
         stmts.push((

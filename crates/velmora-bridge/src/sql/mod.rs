@@ -90,6 +90,13 @@ use crate::types::{
 /// `meta` key the guard self-test writes inside its failing batch.
 const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
 
+/// Says that a publication batch failed its guard and wrote nothing.
+/// The field is private to this module: only the catalogue code in it
+/// can make one, and [`Recorded::refused`] asks for it, so no other code
+/// in the crate can turn the proof of a record into the one that
+/// deletes it.
+pub(crate) struct GuardRefused(());
+
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
     pub sql: S,
@@ -142,6 +149,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
+    }
+    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
+        objects::raise_floor(self, bucket, key, id).await
     }
     async fn copy_generation(
         &self,

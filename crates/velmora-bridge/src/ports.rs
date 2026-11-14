@@ -264,20 +264,27 @@ pub trait Catalog {
         key: &str,
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>>;
     /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
-    /// live generation or its last tombstone carries a newer id; nothing
+    /// live generation carries a newer id or its floor a higher one; nothing
     /// was written. The caller takes a newer id and tries again.
     async fn commit_generation(
         &self,
         c: &CommitGeneration,
         record: Recorded,
     ) -> Result<PublishOutcome>;
-    /// The newest id on `(bucket, key)`: its live generation or its last
-    /// tombstone. A publication must sort after it.
+    /// The newest id on `(bucket, key)`: its live generation or its
+    /// floor. A publication or a tombstone must sort after it.
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;
+    /// Raises the floor of `(bucket, key)` to `id`, if it is lower: the
+    /// highest id a recovery record of the key may be stored under. The
+    /// record writers call it before they store anything
+    /// ([`crate::recovery::write_generation`],
+    /// [`crate::recovery::write_tombstone`]), and it stands whatever
+    /// becomes of the write: every later id on the key sorts after `id`.
+    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()>;
     /// Publishes a generation that references the extents of the source
     /// generation; no extent is written. `Refused` = the source is no
     /// longer the live object of its key, or the destination key's live
-    /// generation or last tombstone carries a newer id; nothing was
+    /// generation carries a newer id or its floor a higher one; nothing was
     /// published.
     async fn copy_generation(&self, c: &CopyGeneration, record: Recorded)
         -> Result<PublishOutcome>;
