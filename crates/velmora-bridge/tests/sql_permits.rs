@@ -444,49 +444,81 @@ async fn acquire_as(
     c.acquire_permit(p, class, holder, now).await.unwrap()
 }
 
-/// The live slots of a provider at `now`: `(slot, holder)`.
-async fn live_slots(c: &SqlCatalog<RusqliteSql>, id: &str, now: UnixMs) -> Vec<(u32, String)> {
+/// The live slots of a provider at `now`: `(slot, holder, background)`.
+async fn live_slots(
+    c: &SqlCatalog<RusqliteSql>,
+    id: &str,
+    now: UnixMs,
+) -> Vec<(u32, String, bool)> {
     let sql = format!(
-        "SELECT slot, holder FROM provider_permits \
+        "SELECT slot, holder, background FROM provider_permits \
          WHERE provider_id = '{id}' AND lease_until >= {} ORDER BY slot",
         now.0
     );
     let rows = c.sql.query(&sql, &[]).await.unwrap();
     rows.into_iter()
-        .map(|row| match (&row[0], &row[1]) {
-            (SqlValue::Int(slot), SqlValue::Text(holder)) => (*slot as u32, holder.clone()),
+        .map(|row| match (&row[0], &row[1], &row[2]) {
+            (SqlValue::Int(slot), SqlValue::Text(holder), SqlValue::Int(job)) => {
+                (*slot as u32, holder.clone(), *job == 1)
+            }
             other => panic!("a live slot without a holder: {other:?}"),
         })
         .collect()
 }
 
-fn holders_of(live: &[(u32, String)]) -> BTreeSet<&str> {
-    live.iter().map(|(_, h)| h.as_str()).collect()
+fn holders_of(live: &[(u32, String, bool)]) -> BTreeSet<&str> {
+    live.iter().map(|(_, h, _)| h.as_str()).collect()
 }
 
-/// One job on an account that allows one address takes as many slots as
-/// the connection limit leaves it, and nobody else gets one meanwhile,
-/// although slots are free.
+/// The holders with a slot that a background job took.
+fn jobs_of(live: &[(u32, String, bool)]) -> BTreeSet<&str> {
+    let jobs = live.iter().filter(|(_, _, job)| *job);
+    jobs.map(|(_, h, _)| h.as_str()).collect()
+}
+
+/// One job on an account that allows one address takes slots up to the
+/// connection limit, and nobody else gets one meanwhile, although slots
+/// are free.
 #[tokio::test]
 async fn one_holder_takes_several_slots_and_a_second_holder_none() {
     let c = catalog();
     let p = capped("p1", 6, 1);
-    // Five of six: the sixth connection is the read reserve.
-    for n in 0..5 {
+    for n in 0..4 {
         let got = acquire_as(&c, &p, PermitClass::Background, "job-a", T0).await;
         assert_eq!(got.map(|permit| permit.slot), Some(n));
     }
-    assert!(acquire_as(&c, &p, PermitClass::Background, "job-a", T0)
-        .await
-        .is_none());
     for class in [PermitClass::Background, PermitClass::Read] {
         assert!(acquire_as(&c, &p, class, "job-b", T0).await.is_none());
     }
-    assert_eq!(held(&c, T0).await, 5);
-    // The reserved slot is free, and the holder of the address may use it.
-    let read = acquire_as(&c, &p, PermitClass::Read, "job-a", T0).await;
-    assert_eq!(read.map(|permit| permit.slot), Some(5));
+    assert_eq!(held(&c, T0).await, 4);
     assert_eq!(holders_of(&live_slots(&c, "p1", T0).await).len(), 1);
+}
+
+/// The connection that background jobs leave to reads. An account with
+/// one address has none: a read cannot connect next to the job, so the
+/// job takes every connection. With two addresses or no limit, the last
+/// connection is the reads'.
+#[tokio::test]
+async fn no_connection_is_kept_back_on_an_account_with_one_address() {
+    let c = catalog();
+    for (id, max_ips, for_jobs) in [("p1", Some(1), 6), ("p2", Some(2), 5), ("p3", None, 5)] {
+        let mut p = provider(id, 6);
+        p.max_ips = max_ips;
+        assert_eq!(p.background_conns(), for_jobs, "{id}");
+        let mut got = 0;
+        while acquire_as(&c, &p, PermitClass::Background, "job-a", T0)
+            .await
+            .is_some()
+        {
+            got += 1;
+        }
+        assert_eq!(got, for_jobs, "{id}");
+        // What is left is for a read.
+        let read = acquire_as(&c, &p, PermitClass::Read, "job-a", T0).await;
+        assert_eq!(read.is_some(), for_jobs < 6, "{id}");
+    }
+    // One connection is one connection, whatever the address limit.
+    assert_eq!(capped("p4", 1, 4).background_conns(), 1);
 }
 
 /// A long mixed schedule of acquires, renewals, releases and expiries by
@@ -519,16 +551,21 @@ async fn addresses_and_connections_stay_under_their_limits() {
                         0 => PermitClass::Read,
                         _ => PermitClass::Background,
                     };
-                    let (conns, ips) = match class {
-                        PermitClass::Read => (max_conns, max_ips),
-                        PermitClass::Background => {
-                            (max_conns - reserve(max_conns), max_ips - reserve(max_ips))
-                        }
+                    let job = class == PermitClass::Background;
+                    // Jobs leave a connection, except on one address.
+                    let conns = match job && max_ips != 1 {
+                        true => max_conns - reserve(max_conns),
+                        false => max_conns,
                     };
                     let before = live_slots(&c, "p1", now).await;
                     let known = holders_of(&before).contains(holder.as_str());
-                    let address = known || (holders_of(&before).len() as u32) < ips;
-                    let slot = (0..conns).any(|s| !before.iter().any(|(live, _)| *live == s));
+                    let room = (holders_of(&before).len() as u32) < max_ips;
+                    // Jobs leave an address too, counted over jobs only.
+                    let job_room = !job
+                        || jobs_of(&before).contains(holder.as_str())
+                        || (jobs_of(&before).len() as u32) < max_ips - reserve(max_ips);
+                    let address = (known || room) && job_room;
+                    let slot = (0..conns).any(|s| !before.iter().any(|(live, ..)| *live == s));
                     let got = acquire_as(&c, &p, class, &holder, now).await;
                     assert_eq!(
                         got.is_some(),
@@ -545,7 +582,12 @@ async fn addresses_and_connections_stay_under_their_limits() {
                 8 if !permits.is_empty() => {
                     let at = next(permits.len() as u64) as usize;
                     // A renewal of an expired or re-taken slot is refused.
-                    if !c.renew_permit(&permits[at], now).await.unwrap() {
+                    // So is one that is late: it carries a time at which
+                    // the slot was live, and comes after an acquire that
+                    // found it expired.
+                    let stale = now.plus_ms(-(next(200_000) as i64));
+                    let at_time = if next(2) == 0 { now } else { stale };
+                    if !c.renew_permit(&permits[at], at_time).await.unwrap() {
                         permits.swap_remove(at);
                     }
                 }
@@ -555,6 +597,8 @@ async fn addresses_and_connections_stay_under_their_limits() {
             assert!(live.len() <= max_conns as usize, "step {step}: {live:?}");
             let holders = holders_of(&live).len();
             assert!(holders <= max_ips as usize, "step {step}: {live:?}");
+            let jobs = jobs_of(&live).len() as u32;
+            assert!(jobs <= max_ips - reserve(max_ips), "step {step}: {live:?}");
             peak_slots = peak_slots.max(live.len());
             peak_holders = peak_holders.max(holders);
             shared |= live.len() > holders;
@@ -694,6 +738,130 @@ async fn background_jobs_leave_an_address_for_reads() {
     );
 }
 
+/// The address that jobs leave free is for reads, and a read that uses
+/// it takes nothing from the jobs: with two addresses, one read in
+/// flight and one job run side by side. A second job waits, read or no
+/// read, and a second read gets in only while no job has the other
+/// address.
+#[tokio::test]
+async fn a_read_in_flight_does_not_take_the_address_of_the_jobs() {
+    let c = catalog();
+    let p = capped("p1", 8, 2);
+    let read = acquire_as(&c, &p, PermitClass::Read, "get-a", T0)
+        .await
+        .unwrap();
+    let job = acquire_as(&c, &p, PermitClass::Background, "job-a", T0)
+        .await
+        .unwrap();
+    let live = live_slots(&c, "p1", T0).await;
+    assert_eq!((holders_of(&live).len(), jobs_of(&live).len()), (2, 1));
+    // Both addresses are in use.
+    for (class, holder) in [
+        (PermitClass::Background, "job-b"),
+        (PermitClass::Read, "get-b"),
+    ] {
+        assert!(acquire_as(&c, &p, class, holder, T0).await.is_none());
+    }
+    // Without the read, the second job still waits: the free address is
+    // not the jobs'. A read takes it.
+    c.release_permit(&read).await.unwrap();
+    assert!(acquire_as(&c, &p, PermitClass::Background, "job-b", T0)
+        .await
+        .is_none());
+    assert!(acquire_as(&c, &p, PermitClass::Read, "get-b", T0)
+        .await
+        .is_some());
+    // Without the job, reads may have both addresses, and then a job
+    // waits for one of them.
+    c.release_permit(&job).await.unwrap();
+    assert!(acquire_as(&c, &p, PermitClass::Read, "get-c", T0)
+        .await
+        .is_some());
+    assert!(acquire_as(&c, &p, PermitClass::Background, "job-b", T0)
+        .await
+        .is_none());
+}
+
+/// A holder counts as a job only through a slot that it took as one. A
+/// read that is on the provider cannot take a slot as a job past the
+/// jobs' limit, and a slot that a read takes over is a read's.
+#[tokio::test]
+async fn the_class_is_recorded_per_slot() {
+    let c = catalog();
+    let p = capped("p1", 8, 2);
+    assert!(acquire_as(&c, &p, PermitClass::Background, "job-a", T0)
+        .await
+        .is_some());
+    assert!(acquire_as(&c, &p, PermitClass::Read, "get-a", T0)
+        .await
+        .is_some());
+    // `get-a` has its address, and the jobs have all of theirs.
+    assert!(acquire_as(&c, &p, PermitClass::Background, "get-a", T0)
+        .await
+        .is_none());
+    assert!(acquire_as(&c, &p, PermitClass::Read, "job-a", T0)
+        .await
+        .is_some());
+
+    // The job's slot expires and a read takes it over: no job is left.
+    let p = capped("p2", 2, 2);
+    assert!(acquire_as(&c, &p, PermitClass::Background, "job-a", T0)
+        .await
+        .is_some());
+    assert_eq!(jobs_of(&live_slots(&c, "p2", T0).await).len(), 1);
+    let later = T0.plus_ms(TTL_MS + 1);
+    for holder in ["get-a", "get-b"] {
+        assert!(acquire_as(&c, &p, PermitClass::Read, holder, later)
+            .await
+            .is_some());
+    }
+    let live = live_slots(&c, "p2", later).await;
+    assert_eq!((holders_of(&live).len(), jobs_of(&live).len()), (2, 0));
+}
+
+/// A renewal carries the time its caller read before the round trip. If
+/// it arrives after the slot expired and another holder was let in, it
+/// must not bring the old holder back: that would be an address too
+/// many. The acquire that let the new holder in freed the expired slots.
+#[tokio::test]
+async fn a_late_renewal_cannot_revive_an_expired_holder() {
+    let c = catalog();
+    let p = capped("p1", 6, 1);
+    let a0 = acquire_as(&c, &p, PermitClass::Read, "a", T0)
+        .await
+        .unwrap();
+    let a1 = acquire_as(&c, &p, PermitClass::Read, "a", T0)
+        .await
+        .unwrap();
+    // `a` reads the clock while its slots are live, and stalls.
+    let read_by_a = T0.plus_ms(TTL_MS);
+    let later = T0.plus_ms(TTL_MS + 1);
+    let b = acquire_as(&c, &p, PermitClass::Background, "b", later)
+        .await
+        .unwrap();
+    // `b` took one slot of `a`. The other is free too, not just expired.
+    for lost in [&a0, &a1] {
+        assert!(!c.renew_permit(lost, read_by_a).await.unwrap());
+    }
+    let live = live_slots(&c, "p1", later).await;
+    assert_eq!(holders_of(&live), BTreeSet::from(["b"]));
+    assert!(c.renew_permit(&b, later).await.unwrap());
+
+    // Without an address limit nothing depends on it, and a slot that
+    // nobody took can still be renewed late.
+    let open = provider("p2", 2);
+    acquire_as(&c, &open, PermitClass::Read, "a", T0)
+        .await
+        .unwrap();
+    let kept = acquire_as(&c, &open, PermitClass::Read, "a", T0)
+        .await
+        .unwrap();
+    assert!(acquire_as(&c, &open, PermitClass::Read, "b", later)
+        .await
+        .is_some());
+    assert!(c.renew_permit(&kept, read_by_a).await.unwrap());
+}
+
 /// Each provider counts its own holders: a job that is on one provider
 /// is no address on another, and the same job is one address on each.
 #[tokio::test]
@@ -746,18 +914,27 @@ async fn provider_load_counts_live_holders() {
     acquire_as(&c, &p, PermitClass::Read, "a", T0)
         .await
         .unwrap();
-    let b = acquire_as(&c, &p, PermitClass::Read, "b", T0)
+    let b = acquire_as(&c, &p, PermitClass::Background, "b", T0)
+        .await
+        .unwrap();
+    acquire_as(&c, &p, PermitClass::Background, "b", T0)
         .await
         .unwrap();
     let load = load_of(&c, "p1", T0).await.unwrap();
-    assert_eq!((load.held, load.holders), (3, 2));
+    assert_eq!((load.held, load.holders), (4, 2));
+    // `b` is one background holder, on two slots.
+    assert_eq!(load.background_holders, 1);
 
     c.release_permit(&b).await.unwrap();
     let later = T0.plus_ms(60_000);
     assert!(c.renew_permit(&a, later).await.unwrap());
     let load = load_of(&c, "p1", later).await.unwrap();
-    assert_eq!((load.held, load.holders), (2, 1));
+    assert_eq!((load.held, load.holders), (3, 2));
     // Expired slots have no holder.
+    let expired = T0.plus_ms(TTL_MS + 1);
+    let load = load_of(&c, "p1", expired).await.unwrap();
+    assert_eq!((load.held, load.holders), (1, 1));
+    assert_eq!(load.background_holders, 0);
     let load = load_of(&c, "p1", later.plus_ms(TTL_MS + 1)).await.unwrap();
     assert_eq!((load.held, load.holders), (0, 0));
 }
@@ -801,19 +978,20 @@ async fn an_acquire_under_every_limit_is_one_statement() {
     let sent = || (c.sql.queries.get(), c.sql.others.get());
     let seeded = sent();
 
+    // One statement decides. The one before it only frees expired slots.
     let granted = c.acquire_permit(&p, PermitClass::Read, "a", T0).await;
     assert!(granted.unwrap().is_some());
-    assert_eq!(sent(), (seeded.0 + 1, seeded.1));
+    assert_eq!(sent(), (seeded.0 + 1, seeded.1 + 1));
     c.acquire_permit(&p, PermitClass::Read, "b", T0)
         .await
         .unwrap()
         .unwrap();
     // Refused for the address limit: one statement, and no write of the
-    // slots (the seeding insert adds none).
+    // slots (nothing has expired, and the seeding insert adds none).
     let before = sent();
     let refused = c.acquire_permit(&p, PermitClass::Read, "c", T0).await;
     assert!(refused.unwrap().is_none());
-    assert_eq!(sent(), (before.0 + 1, before.1 + 1));
+    assert_eq!(sent(), (before.0 + 1, before.1 + 2));
     let slots = c
         .sql
         .db
@@ -821,4 +999,13 @@ async fn an_acquire_under_every_limit_is_one_statement() {
         .await
         .unwrap();
     assert_eq!(slots[0][0], SqlValue::Int(4));
+
+    // No address limit: the take alone.
+    p.id = "p2".into();
+    p.max_ips = None;
+    c.seed_permits(core::slice::from_ref(&p)).await.unwrap();
+    let before = sent();
+    let granted = c.acquire_permit(&p, PermitClass::Read, "c", T0).await;
+    assert!(granted.unwrap().is_some());
+    assert_eq!(sent(), (before.0 + 1, before.1));
 }

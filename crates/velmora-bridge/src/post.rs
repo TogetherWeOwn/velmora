@@ -265,7 +265,7 @@ where
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
         let cooling = pool.cooling_until(&posters);
-        let order = pool.order(posters);
+        let order = pool.order(posters, PermitClass::Background);
         // A slot first. Loading and hashing the extent is the expensive
         // part of the job: one that would only find every slot of its
         // first tier taken gives its lease back before it, not after.
@@ -599,7 +599,7 @@ where
             return Ok(false);
         }
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
-        let order = pool.order(providers.to_vec());
+        let order = pool.order(providers.to_vec(), PermitClass::Background);
         if order.is_empty() {
             return match pool.cooling_until(providers) {
                 Some(until) => Err(Stop::Cooling(until)),

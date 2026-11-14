@@ -31,13 +31,15 @@ pub(super) async fn provider_load<S: Sql>(
         .sql
         .query(
             "SELECT provider_id, SUM(held), SUM(uses), MAX(failures), MAX(cooldowns), \
-               MAX(cooldown_until), COUNT(DISTINCT live_holder) FROM ( \
+               MAX(cooldown_until), COUNT(DISTINCT live_holder), \
+               COUNT(DISTINCT live_job) FROM ( \
                SELECT provider_id, lease_until >= ?1 AS held, token AS uses, 0 AS failures, \
                  0 AS cooldowns, 0 AS cooldown_until, \
-                 CASE WHEN lease_until >= ?1 THEN holder END AS live_holder \
+                 CASE WHEN lease_until >= ?1 THEN holder END AS live_holder, \
+                 CASE WHEN lease_until >= ?1 AND background = 1 THEN holder END AS live_job \
                  FROM provider_permits \
                UNION ALL \
-               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL \
+               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL, NULL \
                  FROM provider_health) \
              GROUP BY provider_id ORDER BY provider_id",
             &[ms(now)],
@@ -54,6 +56,7 @@ pub(super) async fn provider_load<S: Sql>(
             cooldowns: r.num()?,
             cooldown_until: UnixMs(r.num()?),
             holders: r.num()?,
+            background_holders: r.num()?,
         });
     }
     Ok(out)

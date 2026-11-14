@@ -61,6 +61,15 @@ pub(crate) fn request_holder(kind: &str) -> Result<String> {
     Ok(format!("{kind}:{hex}"))
 }
 
+/// Whether the text of a `481` says the account is at its connection
+/// limit (`481 … exceeded maximum number of connections per user`), and
+/// not that the login is wrong. Only that wording: any other `481` stays
+/// a failed login.
+fn is_connection_limit(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("exceeded maximum number of connections")
+}
+
 /// Whether an error says the provider itself is in trouble: a failed
 /// connect or login, a broken connection, an unexpected reply. A missing
 /// article, a refused or duplicate POST, "too many connections" and an
@@ -141,7 +150,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// many connections", and the address limit (`502 max number of
     /// simultaneous IPs (3) reached`, `482 Already connected from
     /// different IP`), which another client of the account or an address
-    /// the provider still counts can cause below `max_ips`.
+    /// the provider still counts can cause below `max_ips`. A `481` is
+    /// one of them only when its text states the connection limit; any
+    /// other `481` is a failed login and a strike.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
@@ -149,6 +160,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
                 Err(BridgeError::Nntp(
                     velmora::Error::NoPermission(_) | velmora::Error::NntpReply { code: 482, .. },
                 )) => {
+                    return Err(Stop::NoPermit);
+                }
+                Err(BridgeError::Nntp(velmora::Error::AuthFailed(text)))
+                    if is_connection_limit(&text) =>
+                {
                     return Err(Stop::NoPermit);
                 }
                 Err(e) => {
@@ -420,7 +436,7 @@ where
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
         let readers: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.read).collect();
         let mut interrupted = false;
-        let mut order = pool.order(readers.clone());
+        let mut order = pool.order(readers.clone(), PermitClass::Read);
         if order.is_empty() {
             // Every reader is cooling: a read is worth one attempt on the
             // provider that is due back first.

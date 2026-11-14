@@ -148,7 +148,7 @@ where
             fresh = expired;
         }
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
-        let usable = pool.order(fresh.clone());
+        let usable = pool.order(fresh.clone(), PermitClass::Background);
         if usable.is_empty() {
             if let Some(until) = pool.cooling_until(&fresh) {
                 return Err(Stop::Cooling(until));

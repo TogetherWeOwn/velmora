@@ -763,12 +763,13 @@ async fn one_address_carries_every_socket_of_a_job() {
     assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 4);
     assert_eq!(rig.bridge.catalog.holder_peak.borrow()["p0"], 1);
 
-    // More sockets than the account has for background work: all five.
+    // More sockets than the account has connections: all six. No read
+    // can connect from a second address, so none is kept back for one.
     rig.bridge.cfg.post_sockets = 8;
     let s = rig.seed(2, &marked_plaintext(PLAIN_LEN)).await;
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
-    assert_eq!(rig.bridge.nntp.peak(), 5);
-    assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 5);
+    assert_eq!(rig.bridge.nntp.peak(), 6);
+    assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 6);
     assert_eq!(rig.bridge.catalog.holder_peak.borrow()["p0"], 1);
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
@@ -881,4 +882,20 @@ async fn a_job_that_lost_its_address_stops() {
         .unwrap();
     assert_eq!((load[0].held, load[0].holders), (2, 1));
     assert!(rig.plan(&s).await.iter().any(|a| a.posted_at.is_none()));
+
+    // The next run of the same job and stage is another invocation, so
+    // another address: it has a name of its own, and waits for the
+    // address like anybody else.
+    let first = rig.bridge.catalog.granted.borrow().clone();
+    rig.bridge.clock.advance_secs(600);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let granted = rig.bridge.catalog.granted.borrow();
+    let names = |all: &[(String, String)]| -> BTreeSet<String> {
+        all.iter().map(|(_, holder)| holder.clone()).collect()
+    };
+    let (before, after) = (names(&first), names(&granted[first.len()..]));
+    assert_eq!((before.len(), after.len()), (1, 1), "{granted:?}");
+    assert!(before.is_disjoint(&after), "{granted:?}");
+    let job = format!("job:{}:", s.extent);
+    assert!(before.union(&after).all(|name| name.starts_with(&job)));
 }

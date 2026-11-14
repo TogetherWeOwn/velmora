@@ -81,6 +81,7 @@ impl Rig {
             provider_id: id,
             held: 0,
             holders: 0,
+            background_holders: 0,
             uses: 0,
             failures: 0,
             cooldowns: 0,
@@ -290,6 +291,8 @@ async fn login_refused_for_the_address_limit_is_no_slot_not_a_fault() {
         "502 max number of simultaneous IPs (3) reached",
         "502 (max number of simultaneous IP addresses reached: 4)",
         "482 Already connected from different IP",
+        "481 Exceeded maximum number of connections per user",
+        "481 exceeded MAXIMUM number of connections (20)",
     ] {
         let mut rig = pool_rig(2).await;
         rig.set_priorities(&[0, 1]);
@@ -360,6 +363,98 @@ async fn a_provider_with_no_address_left_is_asked_last() {
     let before = rig.uses(0).await;
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
     assert_eq!(rig.uses(0).await, before + 1);
+}
+
+/// A `481` that does not name a connection limit is a refused login: it
+/// counts against the provider, and after three of them it cools down.
+#[tokio::test]
+async fn a_481_without_a_connection_limit_is_a_failed_login() {
+    for reply in ["481 Authentication failed", "481 Too many bad logins"] {
+        let mut rig = pool_rig(2).await;
+        rig.set_priorities(&[0, 1]);
+        let (s, _) = rig.posted_on(24, &[1]).await;
+        rig.servers[0].set_limit_reply(Some(reply)).await;
+        let addr = rig.servers[0].addr();
+        let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+        let _held = [dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()];
+
+        for strike in 1..=3u32 {
+            assert!(!rig.cooling(0).await, "{reply}");
+            // The read is served by the provider below.
+            assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+            let load = rig.load(0).await;
+            assert_eq!(load.failures + 3 * load.cooldowns, strike, "{reply}");
+        }
+        assert!(rig.cooling(0).await, "{reply}");
+    }
+}
+
+/// Two cold reads at once are two requests, so two addresses: on an
+/// account that allows one, the second is told "busy" although a
+/// connection is free. Without the limit both are served.
+#[tokio::test]
+async fn two_reads_at_once_are_two_addresses() {
+    for max_ips in [Some(1), None] {
+        let mut rig = pool_rig(1).await;
+        let (s, _) = rig.posted_on(25, &[]).await;
+        rig.bridge.cfg.providers[0].max_conns = 4;
+        rig.bridge.cfg.providers[0].max_ips = max_ips;
+        rig.bridge.catalog.granted.borrow_mut().clear();
+
+        let (first, second) = tokio::join!(rig.fetch(&s), rig.fetch(&s));
+
+        let filled = ColdFetch::Filled(s.cipher.clone());
+        let busy = [&first, &second]
+            .iter()
+            .filter(|got| ***got == ColdFetch::Busy)
+            .count();
+        let served = [&first, &second]
+            .iter()
+            .filter(|got| ***got == filled)
+            .count();
+        let expected = if max_ips.is_some() { (1, 1) } else { (2, 0) };
+        assert_eq!((served, busy), expected, "max_ips {max_ips:?}");
+        // Each request that got a slot has a name of its own.
+        let granted = rig.bridge.catalog.granted.borrow();
+        let names: std::collections::BTreeSet<&str> =
+            granted.iter().map(|(_, holder)| holder.as_str()).collect();
+        assert_eq!(names.len(), served, "{granted:?}");
+        assert!(names.iter().all(|name| name.starts_with("get:")));
+        assert_eq!(rig.bridge.nntp.live(), 0);
+    }
+}
+
+/// Jobs have one address fewer than reads. While a job is on a provider
+/// that allows two, the next job is sent to the other provider of the
+/// tier without being refused a slot first, and a read still starts
+/// with the provider that has more room.
+#[tokio::test]
+async fn a_provider_with_no_address_left_for_jobs_is_asked_last_by_jobs() {
+    let mut rig = pool_rig(2).await;
+    let (s, _) = rig.posted_on(3, &[1]).await;
+    rig.bridge.cfg.providers[0].max_conns = 8;
+    rig.bridge.cfg.providers[0].max_ips = Some(2);
+    // One socket a job, so that a refusal can only be for the address.
+    rig.bridge.cfg.post_sockets = 1;
+    let now = rig.bridge.clock.now();
+    let catalog = &rig.bridge.catalog;
+    let p0 = &rig.bridge.cfg.providers[0];
+    let job = catalog.acquire_permit(p0, PermitClass::Background, "job:other", now);
+    job.await.unwrap().expect("free slot");
+    let load = rig.load(0).await;
+    assert_eq!((load.holders, load.background_holders), (1, 1));
+    let refused = catalog.permit_refusals.get();
+    let on_first = rig.servers[0].posted_count().await;
+
+    let before = rig.uses(0).await;
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert_eq!(rig.uses(0).await, before + 1);
+
+    let to_post = rig.seed(4, &marked_plaintext(PLAIN_LEN)).await;
+    let plan = rig.post(&to_post).await;
+    assert!(plan.iter().all(|a| a.provider_id.as_deref() == Some("p1")));
+    assert_eq!(rig.servers[0].posted_count().await, on_first);
+    assert_eq!(catalog.permit_refusals.get(), refused);
 }
 
 // ---------------------------------------------------------------------------

@@ -221,6 +221,8 @@ struct Slot {
     pool: Option<String>,
     /// Who took the slot last.
     holder: String,
+    /// Whether a background job took it.
+    background: bool,
 }
 
 /// A provider's strikes, as `provider_health` keeps them.
@@ -262,6 +264,8 @@ pub struct MemCatalog {
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
     /// Most holders ever live at once, per provider.
     pub holder_peak: RefCell<BTreeMap<String, u32>>,
+    /// Every slot handed out: the provider and the holder's name.
+    pub granted: RefCell<Vec<(String, String)>>,
     pub permit_refusals: Cell<u32>,
     /// Permits another holder gives back right after the next refusal.
     pub free_after_refusal: RefCell<Vec<Permit>>,
@@ -622,9 +626,11 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         self.seed_permits(core::slice::from_ref(p)).await?;
-        let limit = |max: u32| match class {
-            PermitClass::Background => max - u32::from(max >= 2),
-            PermitClass::Read => max,
+        let background = class == PermitClass::Background;
+        let limit = |max: u32| max - u32::from(background && max >= 2);
+        let conns = match class {
+            PermitClass::Background => p.background_conns(),
+            PermitClass::Read => p.max_conns,
         };
         let mut all = self.slots.borrow_mut();
         // Held slots of the whole pool count against its shared limit.
@@ -640,16 +646,30 @@ impl Catalog for MemCatalog {
             _ => false,
         };
         let slots = all.get_mut(&p.id).expect("seeded");
-        // As in `sql::permits`: a holder with a live slot adds no address.
-        let live: std::collections::BTreeSet<&str> = slots
-            .iter()
-            .filter(|s| s.until >= now.0)
-            .map(|s| s.holder.as_str())
-            .collect();
-        let no_address = p
-            .max_ips
-            .is_some_and(|max| !live.contains(holder) && live.len() >= limit(max) as usize);
-        let free = (0..limit(p.max_conns) as usize).find(|&i| slots[i].until < now.0);
+        // As in `sql::permits`: expired slots are freed first, a holder
+        // with a live slot adds no address, and background holders have
+        // a limit of their own.
+        if p.max_ips.is_some() {
+            for slot in slots.iter_mut().filter(|s| s.until < now.0) {
+                slot.until = 0;
+            }
+        }
+        let holders = |jobs_only: bool| -> std::collections::BTreeSet<&str> {
+            slots
+                .iter()
+                .filter(|s| s.until >= now.0 && (s.background || !jobs_only))
+                .map(|s| s.holder.as_str())
+                .collect()
+        };
+        let (live, jobs) = (holders(false), holders(true));
+        let address =
+            live.contains(holder) || p.max_ips.is_none_or(|max| live.len() < max as usize);
+        let job_address = !background
+            || jobs.contains(holder)
+            || p.background_ips()
+                .is_none_or(|max| jobs.len() < max as usize);
+        let no_address = !(address && job_address);
+        let free = (0..conns as usize).find(|&i| slots[i].until < now.0);
         let Some(i) = free.filter(|_| !pool_full && !no_address) else {
             self.permit_refusals.set(self.permit_refusals.get() + 1);
             for freed in self.free_after_refusal.borrow_mut().drain(..) {
@@ -664,6 +684,10 @@ impl Catalog for MemCatalog {
         slots[i].until = now.plus_secs(PERMIT_SECS).0;
         slots[i].pool.clone_from(&p.pool);
         slots[i].holder = holder.to_string();
+        slots[i].background = background;
+        self.granted
+            .borrow_mut()
+            .push((p.id.clone(), holder.to_string()));
         let held = slots.iter().filter(|s| s.until >= now.0).count() as u32;
         let mut peak = self.permit_peak.borrow_mut();
         let peak = peak.entry(p.id.clone()).or_default();
@@ -750,7 +774,8 @@ impl Catalog for MemCatalog {
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
-        if slot.token != p.token {
+        // A freed slot is not extended, as in `sql::permits`.
+        if slot.token != p.token || slot.until == 0 {
             return Ok(false);
         }
         slot.until = now.plus_secs(PERMIT_SECS).0;
@@ -892,6 +917,12 @@ impl Catalog for MemCatalog {
                     holders: s
                         .iter()
                         .filter(|s| s.until >= now.0)
+                        .map(|s| s.holder.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len() as u32,
+                    background_holders: s
+                        .iter()
+                        .filter(|s| s.until >= now.0 && s.background)
                         .map(|s| s.holder.as_str())
                         .collect::<std::collections::BTreeSet<_>>()
                         .len() as u32,
@@ -1261,10 +1292,17 @@ impl Rig {
             outcome
         };
         let mid = async {
+            // Bounded: a job that neither ends nor stores `stored`
+            // articles fails the test instead of hanging it.
+            let started = std::time::Instant::now();
             while self.servers[server].posted_count().await < stored {
                 if done.get() {
                     return;
                 }
+                assert!(
+                    started.elapsed().as_secs() < 120,
+                    "the job neither ended nor stored {stored} articles"
+                );
                 tokio::task::yield_now().await;
             }
             then().await;
