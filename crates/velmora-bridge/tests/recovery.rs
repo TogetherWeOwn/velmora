@@ -12,7 +12,7 @@ use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{
     delete_blob, tombstone_id, write_tombstone, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
-use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::replay::{RecordRef, ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
@@ -1112,9 +1112,14 @@ async fn a_record_without_its_extents_does_not_replace_a_good_object() {
     wipe(&rig);
     for _ in 0..2 {
         let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        // Listed with its bucket and key.
         assert_eq!(
             report.damaged_unpublished,
-            [lingering.as_str()],
+            [RecordRef {
+                id: lingering.clone(),
+                bucket: BUCKET.to_owned(),
+                key: "big".to_owned(),
+            }],
             "{report:?}"
         );
         assert!(report.unpublishable.is_empty(), "{report:?}");
@@ -1155,7 +1160,11 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
             let plan = velmora_bridge::recovery::article_key(&x.id);
             rig.bridge.safety.lose(&plan);
         }
-        lost.push(generation.id.as_str().to_owned());
+        lost.push(RecordRef {
+            id: generation.id.as_str().to_owned(),
+            bucket: BUCKET.to_owned(),
+            key: key.to_owned(),
+        });
     }
     lost.sort();
 
@@ -1171,13 +1180,43 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     get(&rig, &signer, "k").await.expect(404);
     assert_eq!(get(&rig, &signer, "j").await.expect(200).body, b"good");
 
+    // The runbook's way out. A PUT on the key that is acknowledged ends
+    // the report in a replay over a catalogue where the object of that
+    // PUT is live. A rebuild from the records alone lists the record
+    // again, and the key ends with the object of that PUT all the same.
+    // So does a replay after a delete of the key.
+    tick(&rig);
+    rig.put(&signer, BUCKET, "k", b"again").await.expect(200);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    // The two failed writes can share a millisecond, so the order of
+    // their ids says nothing about which key each one is on.
+    let on = |key: &str| lost.iter().find(|r| r.key == key).cloned().unwrap();
+    assert_eq!(report.damaged_unpublished, [on("j")], "only `j` is left");
+    wipe(&rig);
+    let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    report.damaged_unpublished.sort();
+    assert_eq!(report.damaged_unpublished, lost, "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"again");
+    let (again, _) = rig.live(&bucket, "k").await.unwrap();
+    assert!(again.id.as_str() > on("k").id.as_str());
+    tick(&rig);
+    delete(&rig, &signer, "k").await.expect(204);
+    let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    report.damaged_unpublished.sort();
+    assert_eq!(report.damaged_unpublished, lost, "`k` is listed again");
+    get(&rig, &signer, "k").await.expect(404);
+
     // The floor of a key is its refused record: a write and a delete
     // from a clock that runs behind sort after it.
     rig.bridge.clock.advance_ms(-1500);
     for key in ["j", "k"] {
         rig.put(&signer, BUCKET, key, b"new").await.expect(200);
         let (new, _) = rig.live(&bucket, key).await.unwrap();
-        assert!(new.id.as_str() > lost[1].as_str(), "{new:?} after {lost:?}");
+        assert!(
+            new.id.as_str() > lost[1].id.as_str(),
+            "{new:?} after {lost:?}"
+        );
         delete(&rig, &signer, key).await.expect(204);
         let newest = tombstones(&rig).into_iter().max().unwrap();
         assert!(&newest["m/del/".len()..] > new.id.as_str(), "{newest}");
@@ -2871,6 +2910,68 @@ async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
     delete(&rig, &signer, "k").await.expect(204);
     assert_eq!(tombstones(&rig).len(), 3);
     replay_answers_the_same(&rig, &signer, &["src", "k"]).await;
+}
+
+/// A delete has raised the floor of the key to its tombstone and has
+/// not stored it yet. A PUT fails now, with its record stored: the
+/// record sorts above the tombstone, so the tombstone does not cover it,
+/// and the delete must not take the mark of the record off the floor
+/// when it finishes. The next delete then leaves a tombstone above the
+/// record, and a replay does not publish the failed write.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"good").await.expect(200);
+    tick(&rig);
+
+    let safety = &rig.bridge.safety;
+    safety
+        .hold_put_prefix
+        .replace(Some(TOMBSTONE_PREFIX.to_owned()));
+    let first = delete(&rig, &signer, "k");
+    let failed_put = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        assert!(tombstones(&rig).is_empty(), "the tombstone is not stored");
+        // A PUT takes its first id from the clock alone. One in the
+        // millisecond of the tombstone would sort above or below it as
+        // its random part falls; this one is later.
+        tick(&rig);
+        rig.bridge.catalog.sql.fail_batches.set(1);
+        rig.put(&signer, BUCKET, "k", b"failed")
+            .await
+            .expect_error(500, "InternalError");
+        safety.hold_put_prefix.replace(None);
+        newest_record(&rig).0
+    };
+    let (first, failed) = tokio::join!(first, failed_put);
+    first.expect(204);
+    let stored = tombstones(&rig);
+    assert_eq!(stored.len(), 1);
+    assert!(
+        failed.as_str() > &stored[0][TOMBSTONE_PREFIX.len()..],
+        "the record of the failed write sorts above the tombstone"
+    );
+    assert!(live_ids(&rig).is_empty());
+
+    // The key is empty, and the delete still has something to record.
+    delete(&rig, &signer, "k").await.expect(204);
+    let stored = tombstones(&rig);
+    assert_eq!(stored.len(), 2, "a tombstone above the failed write");
+    assert!(stored
+        .iter()
+        .any(|t| &t[TOMBSTONE_PREFIX.len()..] > failed.as_str()));
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 2, "and only one");
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(report.damaged_unpublished.is_empty(), "{report:?}");
+    assert!(live_ids(&rig).is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "k").await.expect(404);
 }
 
 /// The delete of a key with nothing live runs the catalogue batch as

@@ -48,6 +48,15 @@ Limits to know:
   the order: every write and delete that was acknowledged on the key
   after it sorts after it and stays on top. It is visible after a replay
   only when nothing was acknowledged on the key after it.
+  - A DeleteObject of such a key, also when nothing is live on it,
+    leaves a tombstone above the record, so the delete holds in a
+    replay. The exception is a record of a write that failed before the
+    migration `0007_key_floors.sql` was applied: the catalogue has no
+    mark for it, a DeleteObject that finds nothing live records
+    nothing, and a replay publishes the record. A PutObject followed by
+    a DeleteObject of the key, made now, covers it, provided the clock
+    has not moved back since the failed write: without a mark, the
+    order of the new ids against the record's rests on the clock alone.
 - Replay order is id order. Before a record is stored, the catalogue
   raises the floor of the key to the record's id, in a statement of its
   own, and it accepts a publication or a tombstone only if its id sorts
@@ -72,12 +81,30 @@ Limits to know:
   lists it under `damaged`. The exception: when the key has an older
   generation, live or deleted, the key stays as the older records leave
   it and the record is listed under `damaged_unpublished`, in every
-  replay. Such a record is far more often what a failed write left
-  behind (a CompleteMultipartUpload whose parts were then collected)
-  than an acknowledged object that lost its data, and the replay cannot
-  tell the two apart. If it was acknowledged, the key answers with the
+  replay, with its id, the name of its bucket and its key. Such a
+  record is far more often what a failed write left behind (a
+  CompleteMultipartUpload whose parts were then collected) than an
+  acknowledged object that lost its data, and the replay cannot tell
+  the two apart. If it was acknowledged, the key answers with the
   object before it, or with 404 after a delete before it, instead of an
   error.
+  - What to do about one: find out whether the write was acknowledged
+    (the client's log, the application that owns the key).
+    - Not acknowledged (a failed upload): nothing. The key holds what it
+      should.
+    - Acknowledged: the object is lost. Put it again from its source,
+      or tell its owner.
+  - The record stays in `SAFETY` either way, and no command removes it.
+    A replay leaves it out only while the key has a live object that
+    is newer than the record, so a PutObject on the key ends the report
+    for replays over a catalogue where that object is live. The record
+    is listed again after a DeleteObject of the key, and by a replay
+    into an empty database, which reads the record before the newer
+    ones; the key ends as the newer records say all the same.
+  - Every replay that lists such a record exits with status 2, and for
+    a record that stays listed that does not end. Exit status 2 from
+    this list alone is then no new damage: compare the list with the
+    list of the replay before.
 - A CompleteMultipartUpload that got no answer from the catalogue and
   was sent again can leave two records of one object. The replay
   publishes one and counts the other in `duplicate`; nothing is missing.

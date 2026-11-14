@@ -110,6 +110,10 @@ pub struct Blobs {
     pub before_delete: Hook,
     /// Called once, with the key, at the start of the next put.
     pub before_put: Hook,
+    /// A put of a key with this prefix waits until this is cleared.
+    pub hold_put_prefix: RefCell<Option<String>>,
+    /// A put is waiting.
+    pub held: Cell<bool>,
 }
 
 /// Something that happens in the middle of an operation on a store.
@@ -132,6 +136,14 @@ impl std::ops::Deref for Blobs {
 impl BlobStore for Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
         fire(&self.before_put, key);
+        let holds = |key: &str| {
+            let prefix = self.hold_put_prefix.borrow();
+            prefix.as_deref().is_some_and(|p| key.starts_with(p))
+        };
+        while holds(key) {
+            self.held.set(true);
+            tokio::task::yield_now().await;
+        }
         let refused = self
             .fail_put_prefix
             .borrow()
