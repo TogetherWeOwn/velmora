@@ -2932,6 +2932,10 @@ async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
             tokio::task::yield_now().await;
         }
         assert!(tombstones(&rig).is_empty(), "the tombstone is not stored");
+        // A PUT takes its first id from the clock alone. One in the
+        // millisecond of the tombstone would sort above or below it as
+        // its random part falls; this one is later.
+        tick(&rig);
         rig.bridge.catalog.sql.fail_batches.set(1);
         rig.put(&signer, BUCKET, "k", b"failed")
             .await
