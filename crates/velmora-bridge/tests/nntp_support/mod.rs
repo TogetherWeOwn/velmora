@@ -892,7 +892,13 @@ impl Catalog for MemCatalog {
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
-    async fn raise_floor(&self, _: &BucketId, _: &str, _: &GenerationId) -> Result<()> {
+    async fn settle_floor(&self, _: &BucketId, _: &str, _: &GenerationId) -> Result<()> {
+        unused()
+    }
+    async fn unpublished_floor(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
+        unused()
+    }
+    async fn raise_floor(&self, _: &BucketId, _: &str, _: &GenerationId, _: bool) -> Result<()> {
         unused()
     }
     async fn copy_generation(

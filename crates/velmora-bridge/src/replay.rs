@@ -336,7 +336,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     let (bucket, id) = (BucketId::new(t.bucket_id), GenerationId::new(t.id));
                     // Also when it deletes nothing here: a write after
                     // the replay sorts after every tombstone on record.
-                    self.catalog.raise_floor(&bucket, &t.key, &id).await?;
+                    self.catalog
+                        .raise_floor(&bucket, &t.key, &id, false)
+                        .await?;
+                    self.catalog.settle_floor(&bucket, &t.key, &id).await?;
                     let deleted = self
                         .catalog
                         .delete_object_before(&bucket, &t.key, &id, now)
