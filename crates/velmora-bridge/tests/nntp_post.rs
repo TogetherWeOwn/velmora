@@ -296,11 +296,16 @@ async fn stale_lease_stops_before_any_post() {
     rig.bridge.clock.advance_secs(LEASE_SECS + 1);
     let current = rig.claim(&s, OutboxStage::Post).await;
     let job = rig.job(&s).await;
+    let gets = rig.bridge.safety.gets();
 
     assert_eq!(rig.bridge.post_stage(&stale, &job).await, JobOutcome::Ack);
     assert!(rig.plan(&s).await.is_empty());
     assert_eq!(rig.server().posted_count().await, 0);
     assert_eq!(rig.bridge.nntp.connects(), 0);
+    // The renewal before the connects finds the lease gone: the job stops
+    // before it reads the extent, and its slot is free again.
+    assert_eq!(rig.bridge.safety.gets(), gets);
+    assert_eq!(rig.bridge.nntp.live(), 0);
     let outbox = rig.bridge.catalog.outbox(&s.extent);
     assert_eq!(outbox.token, current.token);
     assert_eq!(outbox.stage, OutboxStage::Post);

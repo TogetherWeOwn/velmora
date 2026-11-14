@@ -259,10 +259,6 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         report_health(catalog, clock, id, healthy).await;
     }
 
-    /// [`close`](Self::close) without the health report: ends the session,
-    /// frees the slot and returns how the session went. Several sessions
-    /// of one job on one provider are one strike or one recovery, which
-    /// the caller reports once with [`report_health`].
     /// Ends every session and frees its slot, then reports each
     /// provider's health once: one session that went well clears its
     /// strikes, otherwise the first failure is one strike. Several
@@ -293,6 +289,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }
     }
 
+    /// [`close`](Self::close) without the health report: ends the session,
+    /// frees the slot and returns how the session went. Several sessions
+    /// of one job on one provider are one strike or one recovery, which
+    /// the caller reports once with [`report_health`].
     pub(crate) async fn finish(mut self) -> Option<bool> {
         if let Some(session) = self.session.take() {
             session.quit().await;
