@@ -1052,7 +1052,7 @@ where
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
                 // record left behind replays as a PUT that failed.
-                let _ = discard_generation(&bridge.safety, record).await;
+                let _ = discard_generation(&bridge.safety, &record).await;
                 // Refused for the id (the key took a newer one since it
                 // was read) or for the upload. Only the second is judged
                 // by the revision on the next turn.

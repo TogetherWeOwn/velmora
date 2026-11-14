@@ -185,7 +185,7 @@ pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> Generati
 /// Removes the record of a generation whose publication batch was
 /// refused: nothing was published under the id, so nothing may replay
 /// it. The one delete of a record there is (see the module doc).
-pub async fn discard_generation<B: BlobStore>(safety: &B, refused: Unpublished) -> Result<()> {
+pub async fn discard_generation<B: BlobStore>(safety: &B, refused: &Unpublished) -> Result<()> {
     safety.delete_record(refused).await
 }
 

@@ -115,7 +115,7 @@ impl BlobStore for R2Blobs {
         self.bucket.delete(key).await.map_err(blob_err("delete"))
     }
 
-    async fn delete_record(&self, refused: Unpublished) -> Result<()> {
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
         self.bucket
             .delete(refused.key())
             .await

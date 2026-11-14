@@ -299,7 +299,7 @@ impl BlobStore for MemBlobStore {
         Ok(())
     }
 
-    async fn delete_record(&self, refused: Unpublished) -> Result<()> {
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
         self.blobs.borrow_mut().remove(&refused.key());
         Ok(())
     }

@@ -201,7 +201,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         // records put the other one on top. Nothing was published, so
         // the record goes, and the PUT is tried again under an id that
         // sorts after everything on the key.
-        discard_generation(&bridge.safety, refused)
+        discard_generation(&bridge.safety, &refused)
             .await
             .map_err(|_| internal())?;
         attempts += 1;

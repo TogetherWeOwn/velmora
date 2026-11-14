@@ -94,7 +94,7 @@ pub trait BlobStore {
     /// Removes the record of a generation that the catalogue refused to
     /// publish. The only delete of a key under `m/`; the argument exists
     /// only for a record this request wrote and did not publish.
-    async fn delete_record(&self, refused: Unpublished) -> Result<()>;
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()>;
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
@@ -438,6 +438,11 @@ pub trait Catalog {
         limit: u32,
         now: UnixMs,
     ) -> Result<u64>;
+    /// Re-arms cancelled obligations of extents that a live generation
+    /// references. Only a Worker from before extent references leaves
+    /// one, after a rollback. One call looks at the next `limit` outbox
+    /// rows, in a rotation over all of them. Returns how many it re-armed.
+    async fn revive_referenced(&self, limit: u32, now: UnixMs) -> Result<u64>;
 
     // hot tier
     /// Pinned and evictable byte totals (`GET /_admin/status`).
