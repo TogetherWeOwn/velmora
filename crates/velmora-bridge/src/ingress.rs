@@ -212,6 +212,17 @@ pub fn origin_form(url: &str) -> Result<&str, IngressError> {
 /// - The comma rule still applies: a multi-coding value is refused as
 ///   possibly merged.
 /// - velmora never acts on `Accept-Encoding`.
+///
+/// Rules for anyone touching this later:
+/// - The restored value is an authentication input only. It must never drive
+///   response compression, caching, a cache key or `Vary`: it is the client's
+///   claim, and the edge negotiates the response encoding itself.
+/// - The signature binds the edge-normalised value, not the client's raw
+///   bytes. A client that signed a value the edge reports differently fails
+///   closed: `GZIP` reported as `gzip`, or a repeated field cut to the first,
+///   is `SignatureDoesNotMatch`; a multi-coding value such as `br, gzip`
+///   (reported as `gzip, br`) is already refused by the comma guard with
+///   `InvalidRequest` before the signature is checked.
 pub fn restore_accept_encoding(headers: &mut Vec<(String, String)>, client: Option<&str>) {
     let Some(client) = client.filter(|v| !v.is_empty()) else {
         return;
