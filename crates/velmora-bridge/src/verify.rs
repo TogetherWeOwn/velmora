@@ -9,9 +9,14 @@
 //! Rules:
 //! - Only a complete pass over all articles is recorded. A transport
 //!   failure records nothing and the job retries.
-//! - A `430` is not loss by itself: a fresh article can be invisible for a
-//!   while. Missing articles are retried after 2 min, 10 min, 1 h and 6 h
-//!   before a `missing` result is recorded.
+//! - A `430` is not loss by itself: an article is posted to one provider
+//!   and reaches the other backbones by propagation. Missing articles are
+//!   read again after 2 min, 10 min, 1 h and 6 h before a `missing` result
+//!   is recorded.
+//! - An article a backbone still lacks when the propagation grace is over
+//!   (`PROPAGATION_GRACE_SECS` after posting) is posted straight to a
+//!   provider of that backbone, under its stored message-id, while the
+//!   safety copy exists; the backbone is then read again.
 //! - A corrupt article is recorded at once.
 
 use serde::Serialize;
@@ -35,6 +40,9 @@ pub const MISSING_BACKOFF_SECS: [u32; 4] = [120, 600, 3600, 21_600];
 pub const REVERIFY_SECS: u32 = 21_600;
 /// `Lease::cursor` = `backbone index * CURSOR_STEPS + missing retries used`.
 const CURSOR_STEPS: u32 = 8;
+/// In place of the retries used: the missing articles were posted to the
+/// backbone itself, and the next read is the one that is recorded.
+const REPOSTED: u32 = CURSOR_STEPS - 1;
 
 type Staged<V> = core::result::Result<V, Stop>;
 
@@ -51,7 +59,7 @@ struct Evidence<'a> {
 
 /// A backbone label as it is compared and recorded: trimmed, lower case.
 /// Two spellings of one backbone must never count as two copies.
-fn label(backbone: &str) -> String {
+pub(crate) fn label(backbone: &str) -> String {
     backbone.trim().to_lowercase()
 }
 
@@ -227,18 +235,68 @@ where
         let _ = self.jobs.send(&job, delay_secs).await;
     }
 
+    /// A backbone lacks articles. `Some` = the wait before it is read
+    /// again; `None` = record the result now.
+    ///
+    /// Until the propagation grace is over the articles may still arrive
+    /// on their own, so the backbone is only read again. Once it is over
+    /// they are posted straight to a provider of this backbone, once per
+    /// round, and read again; what that read finds is recorded.
+    async fn missing_wait(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+        plan: &[ArticleRow],
+        backbone: &str,
+        missing: &[u32],
+    ) -> Staged<Option<u32>> {
+        let retries = lease.cursor % CURSOR_STEPS;
+        if retries == REPOSTED {
+            return Ok(None);
+        }
+        let now = self.clock.now();
+        let grace_ends = plan
+            .iter()
+            .filter_map(|a| a.posted_at)
+            .max()
+            .map(|at| at.plus_secs(self.cfg.propagation_grace_secs))
+            .filter(|ends| *ends > now);
+        if grace_ends.is_none() {
+            let posters: Vec<&ProviderConfig> = self
+                .cfg
+                .providers
+                .iter()
+                .filter(|p| p.post && p.enabled && label(&p.backbone) == backbone)
+                .collect();
+            if self.repost(lease, extent, plan, missing, &posters).await? {
+                self.cursor(lease, lease.cursor - retries + REPOSTED)
+                    .await?;
+                return Ok(Some(self.cfg.verify_delay_secs.max(1)));
+            }
+        }
+        let Some(&wait) = MISSING_BACKOFF_SECS.get(retries as usize) else {
+            return Ok(None);
+        };
+        self.cursor(lease, lease.cursor + 1).await?;
+        // Never past the end of the grace: the repost is due then.
+        let left = grace_ends.map(|ends| (ends.0 - now.0).saturating_add(999).div_euclid(1000));
+        let left = left.map_or(u32::MAX, |secs| u32::try_from(secs).unwrap_or(u32::MAX));
+        Ok(Some(wait.min(left.max(1))))
+    }
+
     async fn verify_extent(&self, lease: &Lease, extent: &ExtentRow) -> Staged<()> {
         let plan = self.posted_plan(extent).await?;
         let groups = backbones(&self.cfg.providers);
         let index = (lease.cursor / CURSOR_STEPS) as usize;
-        let retries = (lease.cursor % CURSOR_STEPS) as usize;
 
-        if let Some((_, providers)) = groups.get(index) {
+        if let Some((name, providers)) = groups.get(index) {
             let (provider, tally) = self.read_backbone(lease, &plan, providers).await?;
             if result_of(&tally) == VerifyResult::Missing {
-                if let Some(&wait) = MISSING_BACKOFF_SECS.get(retries) {
+                let wait = self
+                    .missing_wait(lease, extent, &plan, name, &tally.missing)
+                    .await?;
+                if let Some(wait) = wait {
                     // Not recorded yet: read this backbone again later.
-                    self.cursor(lease, lease.cursor + 1).await?;
                     return Err(Stop::Fail(FailClass::MissingPending, Some(wait)));
                 }
             }

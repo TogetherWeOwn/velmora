@@ -129,6 +129,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         self.session.as_mut().ok_or(Stop::fail(FailClass::Internal))
     }
 
+    /// The slot this session holds.
+    pub(crate) fn permit(&self) -> &Permit {
+        &self.permit
+    }
+
     /// Drops the session without reuse or `QUIT` (after any session error).
     pub(crate) fn discard(&mut self) {
         self.session = None;
@@ -153,21 +158,40 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// strike against it; a good session clears the strikes. The catalogue
     /// decides on the provider's state at that moment, so a session that
     /// started before another one failed still clears that failure.
-    pub(crate) async fn close(mut self) {
+    pub(crate) async fn close(self) {
+        let (catalog, clock, id) = (self.catalog, self.clock, self.provider.id.as_str());
+        let healthy = self.finish().await;
+        report_health(catalog, clock, id, healthy).await;
+    }
+
+    /// [`close`](Self::close) without the health report: ends the session,
+    /// frees the slot and returns how the session went. Several sessions
+    /// of one job on one provider are one strike or one recovery, which
+    /// the caller reports once with [`report_health`].
+    pub(crate) async fn finish(mut self) -> Option<bool> {
         if let Some(session) = self.session.take() {
             session.quit().await;
         }
-        // Health is advice: a write that fails here costs nothing.
-        let id = self.provider.id.as_str();
-        let now = self.clock.now();
-        let _ = match self.healthy {
-            Some(false) => self.catalog.provider_failed(id, now).await,
-            Some(true) => self.catalog.provider_recovered(id, now).await,
-            _ => Ok(()),
-        };
         // A failed release is safe: the permit expires on its own.
         let _ = self.catalog.release_permit(&self.permit).await;
+        self.healthy
     }
+}
+
+/// Records how a provider's session went (`None` = nothing ran).
+pub(crate) async fn report_health<C: Catalog, T: Clock>(
+    catalog: &C,
+    clock: &T,
+    id: &str,
+    healthy: Option<bool>,
+) {
+    let now = clock.now();
+    // Health is advice: a write that fails here costs nothing.
+    let _ = match healthy {
+        Some(false) => catalog.provider_failed(id, now).await,
+        Some(true) => catalog.provider_recovered(id, now).await,
+        None => Ok(()),
+    };
 }
 
 /// Reconnects one pass over a provider may spend on broken sessions.

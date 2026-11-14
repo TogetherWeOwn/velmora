@@ -10,15 +10,15 @@
 
 use super::uploads::{int, ms, text, Cols, Stmt};
 use super::SqlCatalog;
-use crate::ports::{Guard, Lease, Sql, SqlValue};
+use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, LEASE_SECS};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, BridgeError, Bucket, BucketId, DueRow, ExtentId,
     ExtentRow, ExtentState, FailClass, GenerationId, GenerationState, JobExtent, OutboxStage,
     OutboxStats, Result, SafetyState, UnixMs, VerificationRow, VerifyResult,
 };
 
-/// Lease length. Jobs renew before each article.
-const LEASE_MS: i64 = 600_000;
+/// Lease length. Jobs renew on a timer and before each read article.
+const LEASE_MS: i64 = LEASE_SECS as i64 * 1000;
 
 // `outbox.updated_at` is the time of the row's last lease transition
 // (claim, advance, fail, defer, done, cancel). `renew` and `set_cursor`
@@ -146,9 +146,34 @@ pub(super) async fn claim<S: Sql>(
     }))
 }
 
+const RENEW: &str = concat!("UPDATE outbox SET lease_until = ?5 WHERE ", held!());
+
 pub(super) async fn renew<S: Sql>(c: &SqlCatalog<S>, l: &Lease, now: UnixMs) -> Result<bool> {
-    let sql = concat!("UPDATE outbox SET lease_until = ?5 WHERE ", held!());
-    fenced(c, sql, l, [ms(now.plus_ms(LEASE_MS))]).await
+    fenced(c, RENEW, l, [ms(now.plus_ms(LEASE_MS))]).await
+}
+
+/// [`renew`] and one permit renewal per permit, as one batch. No guard:
+/// every statement is fenced by its own token, so each result stands
+/// alone.
+pub(super) async fn renew_all<S: Sql>(
+    c: &SqlCatalog<S>,
+    l: &Lease,
+    permits: &[Permit],
+    now: UnixMs,
+) -> Result<(bool, Vec<bool>)> {
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(permits.len() + 1);
+    stmts.push((RENEW, lease_params(l, [ms(now.plus_ms(LEASE_MS))])?));
+    for p in permits {
+        stmts.push(super::permits::renew_stmt(p, now)?);
+    }
+    let changed = c.sql.batch(stmts).await?;
+    if changed.len() != permits.len() + 1 {
+        return Err(BridgeError::Sql("renewal batch result count".into()));
+    }
+    Ok((
+        changed[0] > 0,
+        changed[1..].iter().map(|n| *n > 0).collect(),
+    ))
 }
 
 /// Moves the row to `to` and gives the lease up. Attempts and cursor
@@ -385,6 +410,40 @@ pub(super) async fn mark_posted<S: Sql>(
     );
     let extra = [SqlValue::Int(i64::from(idx)), text(provider), ms(now)];
     fenced(c, sql, l, extra).await
+}
+
+/// Marks every listed article posted, or none: the batch is led by the
+/// lease guard, so a stale lease writes nothing.
+pub(super) async fn mark_posted_many<S: Sql>(
+    c: &SqlCatalog<S>,
+    l: &Lease,
+    posted: &[(u32, &str)],
+    now: UnixMs,
+) -> Result<bool> {
+    if posted.is_empty() {
+        return renew_check(c, l).await;
+    }
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(posted.len() + 1);
+    stmts.push((held_guard!(), lease_params(l, [])?));
+    for (idx, provider) in posted {
+        stmts.push((
+            "UPDATE articles SET state = 'posted', provider_id = ?3, posted_at = ?4 \
+             WHERE extent_id = ?1 AND idx = ?2",
+            vec![
+                text(l.extent.as_str()),
+                SqlValue::Int(i64::from(*idx)),
+                text(provider),
+                ms(now),
+            ],
+        ));
+    }
+    fenced_batch(c, stmts).await
+}
+
+/// Whether the lease still holds its row (a read; nothing is extended).
+async fn renew_check<S: Sql>(c: &SqlCatalog<S>, l: &Lease) -> Result<bool> {
+    let sql = concat!("SELECT 1 FROM outbox WHERE ", held!());
+    Ok(!c.sql.query(sql, &lease_params(l, [])?).await?.is_empty())
 }
 
 // ---------------------------------------------------------------------------
