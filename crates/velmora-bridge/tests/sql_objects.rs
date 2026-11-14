@@ -1779,7 +1779,7 @@ async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
     );
 }
 
-const BEFORE_0006: &str = "DROP TRIGGER key_floors_on_delete; DROP TABLE key_floors;";
+const BEFORE_0007: &str = "DROP TRIGGER key_floors_on_delete; DROP TABLE key_floors;";
 
 /// What a Worker from before `key_floors` does for a delete: it
 /// retires the generation and writes no tombstone row.
@@ -1813,8 +1813,8 @@ async fn the_migration_fences_keys_deleted_before_it() {
 
     // Back to the schema before the migration, then the migration.
     let db = &fx.cat.sql.db;
-    db.apply(BEFORE_0006).unwrap();
-    db.apply(velmora_bridge::testkit::MIGRATION_0006).unwrap();
+    db.apply(BEFORE_0007).unwrap();
+    db.apply(velmora_bridge::testkit::MIGRATION_0007).unwrap();
 
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 1);
     assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());
@@ -1890,7 +1890,7 @@ async fn the_migration_fences_deletes_with_ids_far_ahead() {
     let wall = UnixMs(i64::try_from(wall).unwrap());
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
-    fx.cat.sql.db.apply(BEFORE_0006).unwrap();
+    fx.cat.sql.db.apply(BEFORE_0007).unwrap();
 
     // One hour ahead of this machine when the generation was minted.
     let ahead = fx.commit(&b.id, "ahead", 1, wall.plus_ms(3_600_000));
@@ -1918,7 +1918,7 @@ async fn the_migration_fences_deletes_with_ids_far_ahead() {
     fx.cat
         .sql
         .db
-        .apply(velmora_bridge::testkit::MIGRATION_0006)
+        .apply(velmora_bridge::testkit::MIGRATION_0007)
         .unwrap();
 
     for (key, tombstone) in ["ahead", "plain"].into_iter().zip(tombstones) {

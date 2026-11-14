@@ -26,7 +26,23 @@ use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
-pub use velmora_bridge::{LEASE_SECS, PERMIT_SECS};
+pub use velmora_bridge::LEASE_SECS;
+
+thread_local! {
+    /// What the job did, in the order it began: `connect`, `post`,
+    /// `plan` (the plan stored in the catalogue) and `acquire` (a slot
+    /// asked for). One log per test thread.
+    static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn note_event(event: &'static str) {
+    EVENTS.with(|e| e.borrow_mut().push(event));
+}
+
+/// The events of this test so far.
+pub fn events() -> Vec<&'static str> {
+    EVENTS.with(|e| e.borrow().clone())
+}
 pub const USER: &str = "testuser";
 pub const PASS: &str = "testpass";
 
@@ -68,7 +84,8 @@ fn end(slow: &RefCell<Option<Slow>>) {
 }
 
 impl TcpConnector {
-    /// From now on every connect, lookup and POST takes `ms` on `clock`.
+    /// From now on every connect, lookup, read and POST takes `ms` on
+    /// `clock`.
     pub fn slow(&self, clock: &FixedClock, ms: i64) {
         *self.slow.borrow_mut() = Some(Slow {
             clock: clock.clone(),
@@ -143,6 +160,7 @@ impl CountedSession {
 
 impl NntpSession for CountedSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
+        note_event("post");
         begin(&self.slow, "post");
         let posted = NntpSession::post(self.client(), message_id, article).await;
         let parked = self.park.borrow_mut().take();
@@ -161,7 +179,10 @@ impl NntpSession for CountedSession {
         found
     }
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
-        NntpSession::body(self.client(), message_id, out).await
+        begin(&self.slow, "body");
+        let found = NntpSession::body(self.client(), message_id, out).await;
+        end(&self.slow);
+        found
     }
     async fn quit(mut self) {
         if let Some(client) = self.inner.take() {
@@ -174,6 +195,7 @@ impl NntpConnector for TcpConnector {
     type Session = CountedSession;
 
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
+        note_event("connect");
         begin(&self.slow, "connect");
         let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
         end(&self.slow);
@@ -219,6 +241,10 @@ struct Slot {
     until: i64,
     /// The pool the slot was last taken under.
     pool: Option<String>,
+    /// Who took the slot last.
+    holder: String,
+    /// Whether a background job took it.
+    background: bool,
 }
 
 /// A provider's strikes, as `provider_health` keeps them.
@@ -254,13 +280,34 @@ pub struct MemCatalog {
     pub renewals: Cell<u32>,
     /// The time of each `renew_all`.
     pub renewed_at: RefCell<Vec<UnixMs>>,
+    /// Permit renewals never come back.
+    pub renew_hangs: Cell<bool>,
+    /// Every permit renewal takes this long on the clock.
+    pub renew_takes: RefCell<Option<(FixedClock, i64)>>,
+    /// The time of each permit renewal that held.
+    pub permit_renewed_at: RefCell<Vec<UnixMs>>,
     /// `mark_posted_many` calls so far.
     pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
+    /// Most holders ever live at once, per provider.
+    pub holder_peak: RefCell<BTreeMap<String, u32>>,
+    /// Every slot handed out: the provider and the holder's name.
+    pub granted: RefCell<Vec<(String, String)>>,
     pub permit_refusals: Cell<u32>,
     /// Permits another holder gives back right after the next refusal.
     pub free_after_refusal: RefCell<Vec<Permit>>,
+    /// Each slot request waits for the runtime once before it is
+    /// answered, as a catalogue round trip does, so that requests made
+    /// together are seen in flight together (`acquire_peak`).
+    pub acquire_takes_a_turn: Cell<bool>,
+    acquire_in_flight: Cell<u32>,
+    /// Most slot requests ever in flight at once.
+    pub acquire_peak: Cell<u32>,
+    /// The next `renew_all` takes this long on this clock.
+    pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
+    /// `provider_failed` calls so far (strikes reported).
+    pub failures_reported: Cell<u32>,
 }
 
 impl MemCatalog {
@@ -302,6 +349,7 @@ impl MemCatalog {
     pub fn revoke_permits(&self) {
         for slot in self.slots.borrow_mut().values_mut().flatten() {
             slot.token += 1;
+            slot.holder = "someone else".into();
         }
     }
 
@@ -442,6 +490,7 @@ impl Catalog for MemCatalog {
         l: &Lease,
         rows: &[ArticleRow],
     ) -> Result<Option<Vec<ArticleRow>>> {
+        note_event("plan");
         Ok(self.fenced(l, |e| {
             if e.articles.is_empty() {
                 e.articles = rows.to_vec();
@@ -613,13 +662,24 @@ impl Catalog for MemCatalog {
         &self,
         p: &ProviderConfig,
         class: PermitClass,
-        _holder: &str,
+        holder: &str,
         now: UnixMs,
     ) -> Result<Option<Permit>> {
+        note_event("acquire");
+        if self.acquire_takes_a_turn.get() {
+            let in_flight = self.acquire_in_flight.get() + 1;
+            self.acquire_in_flight.set(in_flight);
+            self.acquire_peak
+                .set(self.acquire_peak.get().max(in_flight));
+            tokio::task::yield_now().await;
+            self.acquire_in_flight.set(self.acquire_in_flight.get() - 1);
+        }
         self.seed_permits(core::slice::from_ref(p)).await?;
-        let limit = |max: u32| match class {
-            PermitClass::Background => max - u32::from(max >= 2),
-            PermitClass::Read => max,
+        let background = class == PermitClass::Background;
+        let limit = |max: u32| max - u32::from(background && max >= 2);
+        let conns = match class {
+            PermitClass::Background => p.background_conns(),
+            PermitClass::Read => p.max_conns,
         };
         let mut all = self.slots.borrow_mut();
         // Held slots of the whole pool count against its shared limit.
@@ -635,8 +695,31 @@ impl Catalog for MemCatalog {
             _ => false,
         };
         let slots = all.get_mut(&p.id).expect("seeded");
-        let free = (0..limit(p.max_conns) as usize).find(|&i| slots[i].until < now.0);
-        let Some(i) = free.filter(|_| !pool_full) else {
+        // As in `sql::permits`: expired slots are freed first, a holder
+        // with a live slot adds no address, and background holders have
+        // a limit of their own.
+        if p.max_ips.is_some() {
+            for slot in slots.iter_mut().filter(|s| s.until < now.0) {
+                slot.until = 0;
+            }
+        }
+        let holders = |jobs_only: bool| -> std::collections::BTreeSet<&str> {
+            slots
+                .iter()
+                .filter(|s| s.until >= now.0 && (s.background || !jobs_only))
+                .map(|s| s.holder.as_str())
+                .collect()
+        };
+        let (live, jobs) = (holders(false), holders(true));
+        let address =
+            live.contains(holder) || p.max_ips.is_none_or(|max| live.len() < max as usize);
+        let job_address = !background
+            || jobs.contains(holder)
+            || p.background_ips()
+                .is_none_or(|max| jobs.len() < max as usize);
+        let no_address = !(address && job_address);
+        let free = (0..conns as usize).find(|&i| slots[i].until < now.0);
+        let Some(i) = free.filter(|_| !pool_full && !no_address) else {
             self.permit_refusals.set(self.permit_refusals.get() + 1);
             for freed in self.free_after_refusal.borrow_mut().drain(..) {
                 let slot = &mut all.get_mut(&freed.provider).expect("seeded")[freed.slot as usize];
@@ -647,16 +730,30 @@ impl Catalog for MemCatalog {
             return Ok(None);
         };
         slots[i].token += 1;
-        slots[i].until = now.plus_secs(PERMIT_SECS).0;
+        slots[i].until = now.plus_secs(class.permit_secs()).0;
         slots[i].pool.clone_from(&p.pool);
+        slots[i].holder = holder.to_string();
+        slots[i].background = background;
+        self.granted
+            .borrow_mut()
+            .push((p.id.clone(), holder.to_string()));
         let held = slots.iter().filter(|s| s.until >= now.0).count() as u32;
         let mut peak = self.permit_peak.borrow_mut();
         let peak = peak.entry(p.id.clone()).or_default();
         *peak = (*peak).max(held);
+        let holders: std::collections::BTreeSet<&str> = slots
+            .iter()
+            .filter(|s| s.until >= now.0)
+            .map(|s| s.holder.as_str())
+            .collect();
+        let mut peak = self.holder_peak.borrow_mut();
+        let peak = peak.entry(p.id.clone()).or_default();
+        *peak = (*peak).max(holders.len() as u32);
         Ok(Some(Permit {
             provider: p.id.clone(),
             slot: i as u32,
             token: slots[i].token,
+            class,
         }))
     }
 
@@ -715,6 +812,9 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
         self.renewals.set(self.renewals.get() + 1);
+        if let Some((clock, ms)) = self.slow_next_renewal.borrow_mut().take() {
+            clock.advance_ms(ms);
+        }
         self.renewed_at.borrow_mut().push(now);
         let lease = self.renew(l, now).await?;
         let mut held = Vec::new();
@@ -725,12 +825,25 @@ impl Catalog for MemCatalog {
     }
 
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
+        if self.renew_hangs.get() {
+            std::future::pending::<()>().await;
+        }
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
-        if slot.token != p.token {
+        // A freed or expired slot is not extended, as in `sql::permits`.
+        if slot.token != p.token || slot.until < now.0 {
             return Ok(false);
         }
-        slot.until = now.plus_secs(PERMIT_SECS).0;
+        self.permit_renewed_at.borrow_mut().push(now);
+        if let Some((clock, ms)) = self.renew_takes.borrow().as_ref() {
+            clock.advance_ms(*ms);
+        }
+        // By the class the slot was taken for, as in `sql::permits`.
+        let class = match slot.background {
+            true => PermitClass::Background,
+            false => PermitClass::Read,
+        };
+        slot.until = now.plus_secs(class.permit_secs()).0;
         Ok(true)
     }
 
@@ -872,6 +985,18 @@ impl Catalog for MemCatalog {
                 ProviderLoad {
                     provider_id: id.clone(),
                     held: s.iter().filter(|s| s.until >= now.0).count() as u32,
+                    holders: s
+                        .iter()
+                        .filter(|s| s.until >= now.0)
+                        .map(|s| s.holder.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len() as u32,
+                    background_holders: s
+                        .iter()
+                        .filter(|s| s.until >= now.0 && s.background)
+                        .map(|s| s.holder.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len() as u32,
                     uses: s.iter().map(|s| s.token).sum(),
                     failures: h.failures,
                     cooldowns: h.cooldowns,
@@ -882,6 +1007,7 @@ impl Catalog for MemCatalog {
     }
 
     async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+        self.failures_reported.set(self.failures_reported.get() + 1);
         let mut health = self.health.borrow_mut();
         let h = health.entry(provider.to_string()).or_default();
         if h.until > now.0 {
@@ -997,6 +1123,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             post: spec.post,
             read: true,
             max_conns: spec.max_conns,
+            max_ips: None,
             priority: 0,
             retention_days: None,
             pool: None,
@@ -1237,10 +1364,17 @@ impl Rig {
             outcome
         };
         let mid = async {
+            // Bounded: a job that neither ends nor stores `stored`
+            // articles fails the test instead of hanging it.
+            let started = std::time::Instant::now();
             while self.servers[server].posted_count().await < stored {
                 if done.get() {
                     return;
                 }
+                assert!(
+                    started.elapsed().as_secs() < 120,
+                    "the job neither ended nor stored {stored} articles"
+                );
                 tokio::task::yield_now().await;
             }
             then().await;
