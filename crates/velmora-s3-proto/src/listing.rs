@@ -254,11 +254,25 @@ impl ListObjectsV2 {
             start_after: marker.map(str::to_owned),
             url_encoding: encoding.is_some(),
         };
+        // A marker inside a group (`NextMarker` after a CommonPrefix is a
+        // member key) starts with that group already emitted, so the caller
+        // seeks past its remaining members instead of scanning them. The
+        // group sorts at or before the marker, so it would be dropped anyway.
+        let plen = scope.prefix.len();
+        let skip_prefix = scope
+            .start_after
+            .as_deref()
+            .filter(|m| !scope.delimiter.is_empty() && m.starts_with(&scope.prefix))
+            .and_then(|m| {
+                m[plen..]
+                    .find(&scope.delimiter)
+                    .map(|i| m[..plen + i + scope.delimiter.len()].to_owned())
+            });
         Ok(Self {
             has_after: scope.start_after.is_some(),
             cursor: Cursor {
                 after: scope.start_after.clone().unwrap_or_default(),
-                skip_prefix: None,
+                skip_prefix,
             },
             scope,
             max_keys,

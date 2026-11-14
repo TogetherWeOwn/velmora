@@ -990,3 +990,29 @@ fn fetch_owner_is_accepted_and_changes_nothing() {
         assert_eq!(with, without);
     }
 }
+
+/// A V1 page resuming inside a group seeks past it (no rescan of members).
+#[test]
+fn v1_marker_inside_a_group_skips_the_group() {
+    for (query, want) in [
+        ("delimiter=%2F&marker=a%2F1", Some("a/")),
+        ("delimiter=%2F&marker=a%2F", Some("a/")),
+        ("delimiter=%2F&marker=a%2Fb%2F1&prefix=a%2F", Some("a/b/")),
+        ("delimiter=%2F&marker=a", None),
+        ("marker=a%2F1", None),
+        ("delimiter=%2F&marker=a%2F1&prefix=b", None),
+    ] {
+        let t = Target::parse(&format!("/bucket?{query}"), &policy()).unwrap();
+        let list = ListObjectsV2::parse_v1(&t).unwrap();
+        assert_eq!(list.skip_prefix(), want, "{query}");
+    }
+    // Rows of the skipped group are not emitted.
+    let xml = page_v1(
+        &["a/1", "a/2", "a/3", "b"],
+        "delimiter=%2F&marker=a%2F1",
+        1000,
+        1,
+    );
+    assert_eq!(between(&xml, "<Key>", "</Key>"), ["b"]);
+    assert!(!xml.contains("<CommonPrefixes>"));
+}
