@@ -15,7 +15,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
-    MAX_EXTENT_BYTES_LIMIT,
+    DEFAULT_POST_SOCKETS, MAX_EXTENT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
@@ -257,8 +257,8 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
-    // Optional settings fall back to their defaults.
-    assert_eq!(cfg.post_sockets, 4);
+    // Production posts on eight sockets per job; the grace keeps its default.
+    assert_eq!(cfg.post_sockets, 8);
     assert_eq!(cfg.propagation_grace_secs, 21_600);
 
     // The dev environment is complete on its own (envs do not inherit vars).
@@ -292,6 +292,13 @@ fn missing_secret_fails_closed() {
         // No value of it can cost data, so there is nothing to fail closed.
         if name == "HOT_CAP_BYTES" {
             assert_eq!(load(&vars).unwrap().hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
+            continue;
+        }
+        // Sockets per post job: absent or blank is the default of four.
+        if name == "POST_SOCKETS" {
+            assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
+            vars.insert(name.clone(), "  ".into());
+            assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
             continue;
         }
         assert_eq!(
