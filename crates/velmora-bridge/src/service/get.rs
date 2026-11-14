@@ -223,6 +223,37 @@ async fn read<
     Ok(resp)
 }
 
+/// Plaintext `[start, start + len)` of an object, in memory, for a copy
+/// that seals it again. Every byte comes through [`read_piece`], so it was
+/// authenticated exactly as a GET would have it. The caller holds the
+/// charge for the result; each piece's own charge ends once it is
+/// appended.
+pub(super) async fn read_range<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    extents: Vec<ExtentRow>,
+    start: u64,
+    len: u64,
+) -> core::result::Result<Vec<u8>, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let todo = pieces(extents, start, len).ok_or_else(internal)?;
+    let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
+    for piece in &todo {
+        let (bytes, _charge) = read_piece(bridge, bucket, piece)
+            .await
+            .map_err(|fail| fail.response())?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
 /// Decrypts one piece from ciphertext `src` that starts at stream offset
 /// `base`. `None` if any chunk fails to authenticate.
 fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) -> Option<Vec<u8>> {

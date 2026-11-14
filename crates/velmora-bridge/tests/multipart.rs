@@ -1218,7 +1218,7 @@ async fn upload_part_refuses_bad_input_and_stores_nothing() {
         ))
         .await;
     assert_eq!(r.outcome(), "400 EntityTooLarge");
-    // UploadPartCopy is not built.
+    // UploadPartCopy from a key that does not exist.
     let r = rig
         .send(sign(
             RW_KEY,
@@ -1229,7 +1229,7 @@ async fn upload_part_refuses_bad_input_and_stores_nothing() {
             Vec::new(),
         ))
         .await;
-    assert_eq!(r.outcome(), "501 NotImplemented");
+    assert_eq!(r.outcome(), "404 NoSuchKey");
 
     assert!(rig.bridge.safety.keys().is_empty());
     assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 0);
