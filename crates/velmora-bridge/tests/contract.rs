@@ -1493,6 +1493,32 @@ fn provider_hosts_parse_and_extend_host() {
     );
 }
 
+/// `host_select` is `fastest` (the default) or `ordered`.
+#[test]
+fn provider_host_select_parses_and_fails_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let hosts = r#""hosts":["us.nntp.invalid"]"#;
+    let providers = providers_of(&[
+        provider_json("a", hosts),
+        provider_json("b", &format!(r#"{hosts},"host_select":"fastest""#)),
+        provider_json("c", &format!(r#"{hosts},"host_select":"ordered""#)),
+    ])
+    .unwrap();
+    let modes: Vec<HostSelect> = providers.iter().map(|p| p.host_select).collect();
+    assert_eq!(
+        modes,
+        [
+            HostSelect::Fastest,
+            HostSelect::Fastest,
+            HostSelect::Ordered
+        ]
+    );
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+    for bad in [r#""Ordered""#, r#""nearest""#, "1", "null", "true"] {
+        assert_eq!(one(&format!(r#""host_select":{bad}"#)), invalid, "{bad}");
+    }
+}
+
 #[test]
 fn provider_hosts_fail_closed() {
     let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
@@ -1512,12 +1538,16 @@ fn provider_hosts_fail_closed() {
         r#""hosts":["us..nntp.invalid"]"#,
         r#""hosts":[".us.nntp.invalid"]"#,
         r#""hosts":["us.nntp.invalid."]"#,
+        r#""hosts":["localhost"]"#,
+        r#""hosts":["192.0.2.1"]"#,
+        r#""hosts":["news.123"]"#,
     ] {
         assert_eq!(one(bad), invalid, "{bad}");
     }
     // A label is at most 63 bytes, the name at most 253.
     let label = |n: usize| format!(r#""hosts":["{}.nntp.invalid"]"#, "a".repeat(n));
     assert!(one(&label(63)).is_ok());
+    assert!(one(r#""hosts":["news.example","n1.example.co"]"#).is_ok());
     assert_eq!(one(&label(64)), invalid);
     assert!(one(&format!(r#""hosts":["{}"]"#, labels_of(4))).is_ok()); // 251 bytes
     let long = format!(r#""hosts":["{}.a.b"]"#, labels_of(4));

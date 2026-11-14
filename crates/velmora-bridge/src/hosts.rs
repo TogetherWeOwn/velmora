@@ -1,26 +1,37 @@
-//! Nearest-host selection for a provider with several host names.
+//! Endpoint selection for a provider with several host names.
 //!
 //! A provider may list more host names of one account (`hosts`, next to
-//! `host`): the regional servers of one service. The fastest from where
-//! the code runs is not known in advance, and a queue consumer has no
-//! `request.cf` to guess from, so it is measured:
+//! `host`): the regional servers of one service. Which one to use is set
+//! per provider by `host_select`:
 //!
-//! - **On first use in an isolate** the connector probes up to
-//!   [`PROBE_HOSTS`] endpoints one after the other: the time to TLS and a
-//!   `200`/`201` greeting, then `QUIT` (not timed). A probe is cut once it
-//!   is slower than the best so far, or after [`PROBE_TIMEOUT_MS`]. The
-//!   fastest wins; a tie goes to the earlier one. A host that greets with
-//!   a refusal (`400`, `502`) does not win.
-//! - **The winner is kept** for [`HOST_PICK_TTL_MS`] per provider per
-//!   isolate. Connects in that time go straight to it: no probing on
-//!   every connect.
-//! - **Fallback:** a connect that fails at the transport (socket, TLS,
-//!   timeout, a dropped connection) moves on to the next endpoint, in
-//!   configuration order; one that gets through becomes the winner for
-//!   [`SHORT_PICK_TTL_MS`], so that one failure does not pin a slower
-//!   host for long. A
-//!   reply from the provider (a refused login, a full account) is the
-//!   account's answer, not the host's, and is returned as it is.
+//! - **`fastest`** (the default): the nearest server, measured, since a
+//!   queue consumer has no `request.cf` to guess from. On first use in an
+//!   isolate the connector probes up to [`PROBE_HOSTS`] endpoints one
+//!   after the other: the time to TLS and a `200`/`201` greeting, then
+//!   `QUIT` (not timed). A probe is cut once it is slower than the best so
+//!   far, or after [`PROBE_TIMEOUT_MS`]. The fastest wins; a tie goes to
+//!   the earlier one. A host that greets with a refusal (`400`, `502`)
+//!   does not win. The winner is kept for [`HOST_PICK_TTL_MS`] per
+//!   provider per isolate: no probing on every connect.
+//! - **`ordered`**: no probe. `host` first, then `hosts`, in order. For a
+//!   provider whose nearest server is not its fastest for posting.
+//!
+//! In both modes:
+//!
+//! - **Fallback:** a connect that cannot reach its host (socket, TLS,
+//!   timeout, a dropped connection) or that the host refuses at its
+//!   greeting moves on to the next endpoint, in configuration order. The
+//!   one that gets through is used for [`SHORT_PICK_TTL_MS`], so that one
+//!   failure does not pin a slower host for long. A reply after the
+//!   greeting (a refused login, a full account) is the account's answer,
+//!   not the host's: it is returned as it is, with no second connection.
+//! - **A pick that goes bad is replaced:** when the endpoint tried first
+//!   cannot be reached, its pick is dropped, so the next connect probes
+//!   (or starts over in order). When it fails in any other way, its pick
+//!   is kept at most [`SHORT_PICK_TTL_MS`] more.
+//! - **No answer at all** keeps the configuration order for
+//!   [`SHORT_PICK_TTL_MS`]: a provider that is down is not probed on every
+//!   connect.
 //! - **Concurrent connects** of one isolate do not probe again while a
 //!   probe runs: they wait for its result, at most [`PROBE_WAIT_MS`]. A
 //!   probe whose connect is dropped withdraws itself, so nobody waits for
@@ -29,34 +40,38 @@
 //! Probing runs inside the caller's `connect`, so under its permit, one
 //! socket at a time, from the address of the same invocation: it counts
 //! against `max_conns` and `max_ips` like the connect it is part of. A
-//! provider with one host name is never probed.
+//! provider with one host name is never probed and connects as before.
 
 // No `Send` bound is intended, as in `ports`: workers-rs futures are `!Send`.
 #![allow(async_fn_in_trait)]
 
+use core::fmt;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 
 use velmora::transport::Transport;
 
-use crate::types::{BridgeError, ProviderConfig, Result, UnixMs};
+use crate::types::{BridgeError, HostSelect, ProviderConfig, Result, UnixMs};
 
-/// Endpoints probed at most: `host` and the first `hosts` entries. Later
-/// entries are fallbacks only.
+/// Endpoints one probe measures at most, in configuration order.
 pub const PROBE_HOSTS: usize = 4;
 
 /// Longest one probe may take, in milliseconds.
 pub const PROBE_TIMEOUT_MS: u32 = 2_000;
 
-/// How long a winner is kept, in milliseconds (10 minutes).
+/// How long a probe's winner is kept, in milliseconds (10 minutes).
 pub const HOST_PICK_TTL_MS: i64 = 600_000;
 
-/// How long a pick is kept that no probe made: the configuration order
-/// when no endpoint answered (the provider may be down, and probing it on
-/// every connect would only add delay), or the endpoint a fallback got
-/// through to.
+/// How long a pick is kept that no probe made, in milliseconds: the
+/// configuration order when no endpoint answered a probe, the endpoint a
+/// fallback got through to, and at most a pick that failed other than by
+/// being unreachable.
 pub const SHORT_PICK_TTL_MS: i64 = 60_000;
+
+/// Longest a probe's goodbye (`QUIT`, close) may take, in milliseconds.
+/// It is not part of the measured time.
+pub const PROBE_GOODBYE_MS: u32 = 1_000;
 
 /// Longest a connect waits for another connect's probe of the same
 /// provider, in milliseconds: the longest a whole probe may run (every
@@ -72,12 +87,48 @@ pub const PROBE_POLL_MS: u32 = 50;
 /// to, in seconds. The last endpoint runs under the caller's bound only.
 pub const HOST_CONNECT_SECS: u32 = 10;
 
-/// Longest a probe's goodbye (`QUIT`, close) may take, in milliseconds.
-/// It is not part of the measured time.
-pub const PROBE_GOODBYE_MS: u32 = 1_000;
-
 /// Longest greeting line a probe reads, in bytes.
 const MAX_GREETING_BYTES: usize = 512;
+
+/// Why one dial failed, which decides whether another endpoint is tried.
+#[derive(Debug)]
+pub enum DialError {
+    /// The host could not be reached: socket, TLS, timeout, a dropped
+    /// connection.
+    Unreachable(BridgeError),
+    /// The host refused at its greeting (`400`, `502`, …): what a probe
+    /// counts as not ready.
+    Refused(BridgeError),
+    /// The account's answer after the greeting (a refused login, a full
+    /// account), or the configuration's: another endpoint would not do
+    /// better.
+    Account(BridgeError),
+}
+
+impl DialError {
+    /// Sorts a failed handshake. `greeted` = the server's greeting was
+    /// accepted (the handshake got as far as the login).
+    pub fn classify(e: BridgeError, greeted: bool) -> DialError {
+        if host_failure(&e) {
+            return DialError::Unreachable(e);
+        }
+        let refusal = matches!(
+            e,
+            BridgeError::Nntp(velmora::Error::NoPermission(_) | velmora::Error::NntpReply { .. })
+        );
+        if refusal && !greeted {
+            DialError::Refused(e)
+        } else {
+            DialError::Account(e)
+        }
+    }
+
+    pub fn into_inner(self) -> BridgeError {
+        match self {
+            DialError::Unreachable(e) | DialError::Refused(e) | DialError::Account(e) => e,
+        }
+    }
+}
 
 /// What a connector does for [`HostPicker::connect`].
 pub trait Dialer {
@@ -88,10 +139,35 @@ pub trait Dialer {
     async fn probe(&self, host: &str, limit_ms: u32) -> Option<u32>;
     /// The whole handshake on `host`. `bounded` = give up after
     /// [`HOST_CONNECT_SECS`] (another endpoint is left to try).
-    async fn dial(&self, host: &str, bounded: bool) -> Result<Self::Session>;
+    async fn dial(
+        &self,
+        host: &str,
+        bounded: bool,
+    ) -> core::result::Result<Self::Session, DialError>;
     /// Waits `ms` milliseconds.
     async fn pause(&self, ms: u32);
     fn now(&self) -> UnixMs;
+}
+
+/// Which endpoint a connect got, for the connect log: an index into
+/// `host` and `hosts` (`0` = `host`), never the name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Picked {
+    pub endpoint: usize,
+    /// This connect ran the probe.
+    pub probed: bool,
+    /// The endpoint tried first failed, and this is a later one.
+    pub fallback: bool,
+}
+
+impl fmt::Display for Picked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "endpoint={} probed={} fallback={}",
+            self.endpoint, self.probed, self.fallback
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,14 +178,14 @@ enum Pick {
     Chosen { host: String, until: UnixMs },
 }
 
-/// The winners of one isolate, by provider id.
+/// The picks of one isolate, by provider id.
 #[derive(Debug, Default)]
 pub struct HostPicker {
     picks: RefCell<BTreeMap<String, Pick>>,
 }
 
 /// Whether a failed connect says the host cannot be reached (try the
-/// next one), rather than that the account refused (do not).
+/// next one), rather than that the host or account refused.
 pub fn host_failure(e: &BridgeError) -> bool {
     match e {
         // `InvalidInput` is the transport policy refusing the
@@ -133,27 +209,53 @@ impl HostPicker {
         }
     }
 
-    /// Connects to the fastest reachable endpoint of `provider`.
-    pub async fn connect<D: Dialer>(&self, provider: &ProviderConfig, d: &D) -> Result<D::Session> {
+    /// Connects to an endpoint of `provider` as its `host_select` says.
+    pub async fn connect<D: Dialer>(
+        &self,
+        provider: &ProviderConfig,
+        d: &D,
+    ) -> Result<(D::Session, Picked)> {
         let endpoints = provider.endpoints();
         if endpoints.len() == 1 {
-            return d.dial(endpoints[0], false).await;
+            let session = d
+                .dial(endpoints[0], false)
+                .await
+                .map_err(DialError::into_inner)?;
+            let picked = Picked {
+                endpoint: 0,
+                probed: false,
+                fallback: false,
+            };
+            return Ok((session, picked));
         }
-        let order = self.order(provider, &endpoints, d).await;
+        let (order, probed) = self.order(provider, &endpoints, d).await;
         let mut failure = None;
-        for (i, host) in order.iter().enumerate() {
+        for (i, &endpoint) in order.iter().enumerate() {
+            let host = endpoints[endpoint];
             let last = i + 1 == order.len();
             match d.dial(host, !last).await {
                 Ok(session) => {
                     if i > 0 {
-                        // The preferred host failed and this one answered:
-                        // used for now, probed again soon.
+                        // The first endpoint failed and this one answered:
+                        // used for now, picked again soon.
                         self.choose(&provider.id, host, d.now(), SHORT_PICK_TTL_MS);
                     }
-                    return Ok(session);
+                    let picked = Picked {
+                        endpoint,
+                        probed,
+                        fallback: i > 0,
+                    };
+                    return Ok((session, picked));
                 }
-                Err(e) if host_failure(&e) => failure = Some(e),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if i == 0 {
+                        self.demote(&provider.id, host, &e, d.now());
+                    }
+                    match e {
+                        DialError::Account(e) => return Err(e),
+                        other => failure = Some(other.into_inner()),
+                    }
+                }
             }
         }
         // `order` holds every endpoint, at least two.
@@ -170,21 +272,43 @@ impl HostPicker {
         );
     }
 
-    /// Every endpoint, the one to try first in front and the others in
-    /// configuration order.
-    async fn order<'e, D: Dialer>(
+    /// The endpoint tried first failed: a pick of it that cannot be
+    /// reached is dropped, one that failed otherwise is kept at most
+    /// [`SHORT_PICK_TTL_MS`] more.
+    fn demote(&self, provider: &str, host: &str, e: &DialError, now: UnixMs) {
+        let mut picks = self.picks.borrow_mut();
+        let Some(Pick::Chosen {
+            host: picked,
+            until,
+        }) = picks.get_mut(provider)
+        else {
+            return;
+        };
+        if picked != host {
+            return;
+        }
+        if matches!(e, DialError::Unreachable(_)) {
+            picks.remove(provider);
+        } else {
+            *until = UnixMs(until.0.min(now.0.saturating_add(SHORT_PICK_TTL_MS)));
+        }
+    }
+
+    /// Every endpoint index, the one to try first in front and the others
+    /// in configuration order; and whether this connect probed.
+    async fn order<D: Dialer>(
         &self,
         provider: &ProviderConfig,
-        endpoints: &[&'e str],
+        endpoints: &[&str],
         d: &D,
-    ) -> Vec<&'e str> {
-        let first = loop {
+    ) -> (Vec<usize>, bool) {
+        let (first, probed) = loop {
             let now = d.now();
             let pick = self.picks.borrow().get(&provider.id).cloned();
             match pick {
                 Some(Pick::Chosen { host, until }) if until > now => {
                     if let Some(i) = endpoints.iter().position(|e| *e == host) {
-                        break i;
+                        break (i, false);
                     }
                 }
                 // A probe from the future (the clock stepped back) is lost.
@@ -196,17 +320,14 @@ impl HostPicker {
                 }
                 _ => {}
             }
-            break self.probe(provider, endpoints, d).await;
+            break match provider.host_select {
+                HostSelect::Ordered => (0, false),
+                HostSelect::Fastest => (self.probe(provider, endpoints, d).await, true),
+            };
         };
-        let mut order = vec![endpoints[first]];
-        order.extend(
-            endpoints
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != first)
-                .map(|(_, e)| *e),
-        );
-        order
+        let mut order = vec![first];
+        order.extend((0..endpoints.len()).filter(|i| *i != first));
+        (order, probed)
     }
 
     /// Probes the endpoints and records the winner; its index.
@@ -354,6 +475,20 @@ mod tests {
         finish_probe: RefCell<Option<(std::rc::Rc<HostPicker>, &'static str)>>,
         /// Probes and pauses give the executor a turn, as real I/O does.
         yields: bool,
+        /// Hosts whose greeting is a `502` (to a dial; a probe of such a
+        /// host is set with `probe_ms`).
+        greets_502: RefCell<Vec<&'static str>>,
+    }
+
+    trait ConnectHost {
+        async fn connect_host(&self, p: &ProviderConfig, n: &Net) -> Result<String>;
+    }
+
+    impl ConnectHost for HostPicker {
+        /// `connect`, its session (the host's name) only.
+        async fn connect_host(&self, p: &ProviderConfig, n: &Net) -> Result<String> {
+            self.connect(p, n).await.map(|(session, _)| session)
+        }
     }
 
     impl Net {
@@ -389,17 +524,21 @@ mod tests {
                 }
             }
         }
-        async fn dial(&self, host: &str, bounded: bool) -> Result<String> {
+        async fn dial(&self, host: &str, bounded: bool) -> core::result::Result<String, DialError> {
             self.calls
                 .borrow_mut()
                 .push(format!("dial {host} {bounded}"));
             if self.down.borrow().contains(&host) {
-                return Err(timed_out());
+                return Err(DialError::classify(timed_out(), false));
+            }
+            if self.greets_502.borrow().contains(&host) {
+                let e = BridgeError::Nntp(velmora::Error::NoPermission("502".into()));
+                return Err(DialError::classify(e, false));
             }
             if self.refuses.contains(&host) {
-                return Err(BridgeError::Nntp(velmora::Error::NoPermission(
-                    "502".into(),
-                )));
+                // A login refused for the account's limit, after the greeting.
+                let e = BridgeError::Nntp(velmora::Error::NoPermission("502".into()));
+                return Err(DialError::classify(e, true));
             }
             Ok(host.to_string())
         }
@@ -434,7 +573,7 @@ mod tests {
     fn one_host_is_dialled_without_a_probe() {
         let n = net(&[]);
         let picker = HostPicker::new();
-        let s = run(picker.connect(&provider("a", &[]), &n)).unwrap();
+        let s = run(picker.connect_host(&provider("a", &[]), &n)).unwrap();
         assert_eq!(s, "a");
         assert_eq!(n.calls(), ["dial a false"]);
         assert_eq!(picker.chosen("p6", n.now()), None);
@@ -444,7 +583,7 @@ mod tests {
     fn the_fastest_host_wins_and_slower_probes_are_cut_at_the_best() {
         let n = net(&[("a", Some(400)), ("b", Some(150)), ("c", Some(300))]);
         let picker = HostPicker::new();
-        let s = run(picker.connect(&provider("a", &["b", "c"]), &n)).unwrap();
+        let s = run(picker.connect_host(&provider("a", &["b", "c"]), &n)).unwrap();
         assert_eq!(s, "b");
         assert_eq!(
             n.calls(),
@@ -458,7 +597,7 @@ mod tests {
         let n = net(&[("a", Some(200)), ("b", Some(200))]);
         let picker = HostPicker::new();
         assert_eq!(
-            run(picker.connect(&provider("a", &["b"]), &n)).unwrap(),
+            run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
             "a"
         );
     }
@@ -468,16 +607,16 @@ mod tests {
         let n = net(&[("a", Some(400)), ("b", Some(150))]);
         let picker = HostPicker::new();
         let p = provider("a", &["b"]);
-        run(picker.connect(&p, &n)).unwrap();
+        run(picker.connect_host(&p, &n)).unwrap();
         assert_eq!(n.probes(), 2);
         // Within the TTL: straight to the winner, no probe.
         n.now.set(n.now.get() + HOST_PICK_TTL_MS - 1_000);
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "b");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "b");
         assert_eq!(n.probes(), 2);
         assert_eq!(n.calls().last().unwrap(), "dial b true");
         // After it: probed again.
         n.now.set(n.now.get() + 2_000);
-        run(picker.connect(&p, &n)).unwrap();
+        run(picker.connect_host(&p, &n)).unwrap();
         assert_eq!(n.probes(), 4);
     }
 
@@ -485,10 +624,10 @@ mod tests {
     fn the_cache_is_per_provider() {
         let n = net(&[("a", Some(400)), ("b", Some(150))]);
         let picker = HostPicker::new();
-        run(picker.connect(&provider("a", &["b"]), &n)).unwrap();
+        run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap();
         let mut other = provider("a", &["b"]);
         other.id = "p7".into();
-        run(picker.connect(&other, &n)).unwrap();
+        run(picker.connect_host(&other, &n)).unwrap();
         assert_eq!(n.probes(), 4);
     }
 
@@ -497,21 +636,21 @@ mod tests {
         let n = net(&[("a", Some(300)), ("b", Some(100)), ("c", Some(200))]);
         let picker = HostPicker::new();
         let p = provider("a", &["b", "c"]);
-        run(picker.connect(&p, &n)).unwrap();
+        run(picker.connect_host(&p, &n)).unwrap();
         n.down.borrow_mut().push("b");
         n.calls.borrow_mut().clear();
         // `b` is down: `a` (configuration order) is next and gets through.
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "a");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "a");
         assert_eq!(n.calls(), ["dial b true", "dial a true"]);
         assert_eq!(picker.chosen("p6", n.now()).as_deref(), Some("a"));
         // The new winner is used without a probe...
         n.calls.borrow_mut().clear();
-        run(picker.connect(&p, &n)).unwrap();
+        run(picker.connect_host(&p, &n)).unwrap();
         assert_eq!(n.calls(), ["dial a true"]);
         // ...but only briefly: one failure does not pin it for the TTL.
         n.down.borrow_mut().clear();
         n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "b");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "b");
         assert_eq!(n.probes(), 3);
     }
 
@@ -520,7 +659,7 @@ mod tests {
         let n = net(&[("a", Some(100)), ("b", Some(200))]);
         n.down.borrow_mut().extend(["a", "b"]);
         let picker = HostPicker::new();
-        let err = run(picker.connect(&provider("a", &["b"]), &n)).unwrap_err();
+        let err = run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap_err();
         assert!(host_failure(&err));
         assert_eq!(
             n.calls(),
@@ -533,11 +672,149 @@ mod tests {
         let mut n = net(&[("a", Some(100)), ("b", Some(200))]);
         n.refuses = vec!["a"];
         let picker = HostPicker::new();
-        let err = run(picker.connect(&provider("a", &["b"]), &n)).unwrap_err();
+        let err = run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap_err();
         assert!(!host_failure(&err));
         // No second connection: `b` would only be refused the same way.
         assert_eq!(n.calls().last().unwrap(), "dial a true");
+        // The pick stands, but only briefly: it failed.
         assert_eq!(picker.chosen("p6", n.now()).as_deref(), Some("a"));
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
+        assert_eq!(picker.chosen("p6", n.now()), None);
+    }
+
+    /// Scenario A: the winner starts refusing at its greeting (maintenance,
+    /// a blocked address range on that farm). A probe would not count it,
+    /// so a dial does not either: the next endpoint is tried, takes over
+    /// briefly, and nothing is returned that would strike the provider.
+    #[test]
+    fn a_winner_that_refuses_at_its_greeting_falls_back_and_is_replaced() {
+        let n = net(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b"]);
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "b");
+        n.greets_502.borrow_mut().push("b");
+        n.calls.borrow_mut().clear();
+        let (session, picked) = run(picker.connect(&p, &n)).unwrap();
+        assert_eq!(session, "a");
+        assert_eq!(
+            picked,
+            Picked {
+                endpoint: 0,
+                probed: false,
+                fallback: true
+            }
+        );
+        assert_eq!(n.calls(), ["dial b true", "dial a false"]);
+        assert_eq!(picker.chosen("p6", n.now()).as_deref(), Some("a"));
+        // Briefly: then the probe runs again.
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
+        assert_eq!(picker.chosen("p6", n.now()), None);
+    }
+
+    /// Scenario A, every endpoint refusing at its greeting: the last
+    /// refusal is returned as it is (for the provider, what a one-host
+    /// provider would return), and the pick is kept only briefly.
+    #[test]
+    fn every_endpoint_refusing_at_its_greeting_returns_the_refusal() {
+        let n = net(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b"]);
+        run(picker.connect_host(&p, &n)).unwrap();
+        n.greets_502.borrow_mut().extend(["a", "b"]);
+        let err = run(picker.connect_host(&p, &n)).unwrap_err();
+        assert!(matches!(
+            err,
+            BridgeError::Nntp(velmora::Error::NoPermission(_))
+        ));
+        assert_eq!(picker.chosen("p6", n.now()).as_deref(), Some("b"));
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
+        assert_eq!(picker.chosen("p6", n.now()), None);
+    }
+
+    /// Scenario B: the winner cannot be reached and neither can the
+    /// fallback. The pick is dropped, so the next connect probes again
+    /// instead of trying the dead winner first for the rest of its TTL.
+    #[test]
+    fn an_unreachable_winner_is_dropped_even_when_the_fallback_fails_too() {
+        let n = net(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b"]);
+        run(picker.connect_host(&p, &n)).unwrap();
+        n.down.borrow_mut().extend(["a", "b"]);
+        assert!(host_failure(&run(picker.connect_host(&p, &n)).unwrap_err()));
+        assert_eq!(picker.chosen("p6", n.now()), None);
+        n.down.borrow_mut().clear();
+        n.calls.borrow_mut().clear();
+        let (_, picked) = run(picker.connect(&p, &n)).unwrap();
+        assert!(picked.probed);
+        assert_eq!(n.probes(), 2);
+    }
+
+    /// `ordered`: no probe ever; `host` first, the next on failure, and
+    /// back to `host` once the short pick ends.
+    #[test]
+    fn ordered_dials_in_configuration_order_without_probing() {
+        let n = net(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        let mut p = provider("a", &["b"]);
+        p.host_select = HostSelect::Ordered;
+        let (session, picked) = run(picker.connect(&p, &n)).unwrap();
+        assert_eq!(session, "a");
+        assert_eq!(
+            picked,
+            Picked {
+                endpoint: 0,
+                probed: false,
+                fallback: false
+            }
+        );
+        n.down.borrow_mut().push("a");
+        let (session, picked) = run(picker.connect(&p, &n)).unwrap();
+        assert_eq!(
+            (session.as_str(), picked.endpoint, picked.fallback),
+            ("b", 1, true)
+        );
+        // `b` is used while the short pick lasts, then `a` again.
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "b");
+        n.down.borrow_mut().clear();
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "a");
+        assert_eq!(n.probes(), 0);
+    }
+
+    /// The probe's verdict and the dial's agree: a `502` greeting is the
+    /// host's refusal, a `502` at the login is the account's.
+    #[test]
+    fn a_greeting_refusal_is_the_hosts_and_a_login_refusal_the_accounts() {
+        let no = || BridgeError::Nntp(velmora::Error::NoPermission("502".into()));
+        assert!(matches!(
+            DialError::classify(no(), false),
+            DialError::Refused(_)
+        ));
+        assert!(matches!(
+            DialError::classify(no(), true),
+            DialError::Account(_)
+        ));
+        let busy = || {
+            BridgeError::Nntp(velmora::Error::NntpReply {
+                code: 400,
+                text: "busy".into(),
+            })
+        };
+        assert!(matches!(
+            DialError::classify(busy(), false),
+            DialError::Refused(_)
+        ));
+        assert!(matches!(
+            DialError::classify(timed_out(), true),
+            DialError::Unreachable(_)
+        ));
+        let auth = BridgeError::Nntp(velmora::Error::AuthFailed("481".into()));
+        assert!(matches!(
+            DialError::classify(auth, true),
+            DialError::Account(_)
+        ));
+        assert!(!ready(Some(502)) && !ready(Some(400)));
     }
 
     #[test]
@@ -545,15 +822,15 @@ mod tests {
         let n = net(&[("a", None), ("b", None)]);
         let picker = HostPicker::new();
         let p = provider("a", &["b"]);
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "a");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "a");
         assert_eq!(n.probes(), 2);
         // Not probed on every connect...
         n.now.set(n.now.get() + SHORT_PICK_TTL_MS - 1_000);
-        run(picker.connect(&p, &n)).unwrap();
+        run(picker.connect_host(&p, &n)).unwrap();
         assert_eq!(n.probes(), 2);
         // ...but again after the short TTL.
         n.now.set(n.now.get() + 2_000);
-        run(picker.connect(&p, &n)).unwrap();
+        run(picker.connect_host(&p, &n)).unwrap();
         assert_eq!(n.probes(), 4);
     }
 
@@ -568,12 +845,12 @@ mod tests {
         ]);
         let picker = HostPicker::new();
         let p = provider("a", &["b", "c", "d", "e"]);
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "d");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "d");
         assert_eq!(n.probes(), PROBE_HOSTS);
         assert!(!n.calls().iter().any(|c| c.starts_with("probe e")));
         n.down.borrow_mut().extend(["a", "b", "c", "d"]);
         n.calls.borrow_mut().clear();
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "e");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "e");
         assert_eq!(
             n.calls(),
             [
@@ -597,7 +874,7 @@ mod tests {
             .insert("p6".into(), Pick::Probing(n.now()));
         *n.finish_probe.borrow_mut() = Some((picker.clone(), "b"));
         assert_eq!(
-            run(picker.connect(&provider("a", &["b"]), &n)).unwrap(),
+            run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
             "b"
         );
         assert_eq!(n.paused.get(), PROBE_POLL_MS);
@@ -615,7 +892,7 @@ mod tests {
             .picks
             .borrow_mut()
             .insert("p6".into(), Pick::Probing(n.now()));
-        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "b");
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "b");
         assert!(n.paused.get() as i64 >= PROBE_WAIT_MS - i64::from(PROBE_POLL_MS));
         assert!((n.paused.get() as i64) < PROBE_WAIT_MS + i64::from(PROBE_POLL_MS));
         assert_eq!(n.probes(), 2);
@@ -627,20 +904,21 @@ mod tests {
         let picker = HostPicker::new();
         picker.choose("p6", "gone", n.now(), HOST_PICK_TTL_MS);
         assert_eq!(
-            run(picker.connect(&provider("a", &["b"]), &n)).unwrap(),
+            run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
             "b"
         );
         assert_eq!(n.probes(), 2);
     }
 
     /// A probe at every limit ends before its waiters give up on it, and
-    /// waiting for it still leaves a read time to connect.
+    /// a read that waited the whole time still has 5 s of its call bound
+    /// left to connect (the call bound cuts a longer connect).
     #[test]
-    fn the_wait_covers_a_whole_probe_and_fits_a_read() {
+    fn the_wait_covers_a_whole_probe_and_leaves_a_read_time() {
         let probe = PROBE_HOSTS as i64 * i64::from(PROBE_TIMEOUT_MS + PROBE_GOODBYE_MS);
         assert!(probe < PROBE_WAIT_MS);
         let read_ms = i64::from(crate::ports::READ_CALL_SECS) * 1000;
-        assert!(PROBE_WAIT_MS + i64::from(HOST_CONNECT_SECS) * 1000 / 2 < read_ms);
+        assert!(read_ms - PROBE_WAIT_MS >= 5_000);
     }
 
     #[test]
@@ -765,9 +1043,9 @@ mod tests {
         let picker = HostPicker::new();
         let p = provider("a", &["b"]);
         let (x, y, z) = tokio::join!(
-            picker.connect(&p, &n),
-            picker.connect(&p, &n),
-            picker.connect(&p, &n)
+            picker.connect_host(&p, &n),
+            picker.connect_host(&p, &n),
+            picker.connect_host(&p, &n)
         );
         assert_eq!(
             (x.unwrap(), y.unwrap(), z.unwrap()),
@@ -775,6 +1053,9 @@ mod tests {
         );
         assert_eq!(n.probes(), 2, "{:?}", n.calls());
         assert!(n.paused.get() > 0);
+        // One connect probed; the others used its pick.
+        let picks = tokio::join!(picker.connect(&p, &n), picker.connect(&p, &n));
+        assert!(!picks.0.unwrap().1.probed && !picks.1.unwrap().1.probed);
     }
 
     /// A connect dropped mid-probe (its caller gave up) withdraws its
@@ -785,7 +1066,7 @@ mod tests {
         let picker = HostPicker::new();
         let p = provider("a", &["b"]);
         {
-            let first = picker.connect(&p, &n);
+            let first = picker.connect_host(&p, &n);
             let mut first = std::pin::pin!(first);
             assert!(first.as_mut().now_or_never().is_none());
             assert!(matches!(
@@ -794,7 +1075,7 @@ mod tests {
             ));
         }
         assert!(picker.picks.borrow().get("p6").is_none());
-        assert_eq!(picker.connect(&p, &n).await.unwrap(), "b");
+        assert_eq!(picker.connect_host(&p, &n).await.unwrap(), "b");
         assert_eq!(n.paused.get(), 0);
         assert_eq!(n.probes(), 3);
     }
@@ -810,7 +1091,7 @@ mod tests {
             .borrow_mut()
             .insert("p6".into(), Pick::Probing(UnixMs(n.now().0 + 60_000)));
         assert_eq!(
-            run(picker.connect(&provider("a", &["b"]), &n)).unwrap(),
+            run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
             "b"
         );
         assert_eq!(n.paused.get(), 0);

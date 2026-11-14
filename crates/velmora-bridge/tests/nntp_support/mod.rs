@@ -1117,6 +1117,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             id: format!("p{i}"),
             host: server.addr().ip().to_string(),
             hosts: Vec::new(),
+            host_select: Default::default(),
             port: server.addr().port(),
             tls: false,
             user: USER.to_string(),

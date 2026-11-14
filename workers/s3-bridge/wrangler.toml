@@ -99,6 +99,8 @@ dead_letter_queue = "velmora-dlq"
 crons = ["*/5 * * * *"]
 
 # secrets (wrangler secret put, value on stdin): VELMORA_KEK_1, NNTP_PROVIDERS, ADMIN_TOKEN
+# NNTP_PROVIDERS refuses unknown fields: deploy a Worker before the secret uses a new provider field
+# (`hosts`, `host_select`), and take such fields out of the secret before rolling the Worker back.
 
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on" }

@@ -19,6 +19,7 @@
 //! session errors are the engine's own: their `Debug` redacts auth reply
 //! text, but `Display` may carry a runtime I/O message or a server reply.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -27,7 +28,9 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
-use velmora_bridge::hosts::{self, Dialer, HostPicker, HOST_CONNECT_SECS, PROBE_GOODBYE_MS};
+use velmora_bridge::hosts::{
+    self, DialError, Dialer, HostPicker, Picked, HOST_CONNECT_SECS, PROBE_GOODBYE_MS,
+};
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
     Result, UnixMs, QUIT_SECS,
@@ -156,10 +159,15 @@ impl WorkerConnector {
     }
 }
 
-impl NntpConnector for WorkerConnector {
-    type Session = WorkerSession;
-
-    async fn connect(&self, provider: &ProviderConfig, permit: &Permit) -> Result<WorkerSession> {
+impl WorkerConnector {
+    /// `connect`, and which endpoint it got. A provider with several
+    /// endpoints logs the pick when this connect probed or fell back: the
+    /// endpoint's index, never its name.
+    pub async fn connect_traced(
+        &self,
+        provider: &ProviderConfig,
+        permit: &Permit,
+    ) -> Result<(WorkerSession, Picked)> {
         if permit.provider != provider.id {
             return Err(BridgeError::Invalid("permit is for another provider"));
         }
@@ -169,7 +177,28 @@ impl NntpConnector for WorkerConnector {
         }
         let class = permit.class;
         let dial = Dial { provider, class };
-        within_call(class.call_secs(), self.hosts.connect(provider, &dial)).await
+        let (session, picked) =
+            within_call(class.call_secs(), self.hosts.connect(provider, &dial)).await?;
+        if picked.probed || picked.fallback {
+            log_pick(&provider.id, &picked);
+        }
+        Ok((session, picked))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn log_pick(provider: &str, picked: &Picked) {
+    worker::console_log!("nntp connect provider={provider} {picked}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn log_pick(_provider: &str, _picked: &Picked) {}
+
+impl NntpConnector for WorkerConnector {
+    type Session = WorkerSession;
+
+    async fn connect(&self, provider: &ProviderConfig, permit: &Permit) -> Result<WorkerSession> {
+        Ok(self.connect_traced(provider, permit).await?.0)
     }
 }
 
@@ -212,21 +241,32 @@ impl Dialer for Dial<'_> {
         }
     }
 
-    async fn dial(&self, host: &str, bounded: bool) -> Result<WorkerSession> {
-        let cfg = nntp_config(self.provider, host)?;
-        let socket = open(&cfg)?;
+    async fn dial(
+        &self,
+        host: &str,
+        bounded: bool,
+    ) -> core::result::Result<WorkerSession, DialError> {
+        let cfg = nntp_config(self.provider, host).map_err(DialError::Account)?;
+        let socket = open(&cfg).map_err(DialError::Unreachable)?;
         let class = self.class;
+        // Set when the engine is about to log in: the greeting was
+        // accepted. A refusal before that is the host's, as a probe
+        // would count it; one after it is the account's.
+        let greeted = Cell::new(false);
         let handshake = async {
-            Ok(WorkerSession(
-                NntpClient::connect(socket, &cfg).await?,
-                class,
-            ))
+            let client = NntpClient::connect_with_auth_guard(socket, &cfg, || {
+                greeted.set(true);
+                Ok(())
+            })
+            .await?;
+            Ok(WorkerSession(client, class))
         };
-        if bounded {
+        let out = if bounded {
             within_call(HOST_CONNECT_SECS, handshake).await
         } else {
             handshake.await
-        }
+        };
+        out.map_err(|e| DialError::classify(e, greeted.get()))
     }
 
     async fn pause(&self, ms: u32) {

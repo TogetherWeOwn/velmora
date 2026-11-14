@@ -74,6 +74,7 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         id: "p0".to_string(),
         host: server.addr().ip().to_string(),
         hosts: Vec::new(),
+        host_select: Default::default(),
         port: server.addr().port(),
         tls: false,
         user: USER.to_string(),
