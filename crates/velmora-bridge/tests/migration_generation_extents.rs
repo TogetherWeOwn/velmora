@@ -17,6 +17,16 @@ use velmora_bridge::*;
 const BUCKET: &str = "bkt-migrate";
 const KEYS: [&str; 3] = ["one", "big", "over"];
 
+/// Takes a catalogue back to the schema of migration 0003, data kept.
+const UNDO_0004: &str = "DROP TRIGGER generation_extents_on_insert; \
+     DROP TRIGGER generation_extents_on_adopt; \
+     DROP TRIGGER generations_keep_shared_extents; \
+     DROP TRIGGER extents_keep_key_in_service; \
+     DROP TRIGGER articles_keep_in_service; \
+     DROP INDEX gc_open_by_extent; \
+     DROP INDEX upload_parts_by_extent; \
+     DROP TABLE generation_extents;";
+
 fn schema(db: &RusqliteSql) -> Vec<(String, String, Option<String>)> {
     db.with_conn(|c| {
         let mut stmt = c
@@ -158,13 +168,7 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
 
     // Back to the schema of migration 0003, data kept.
     let db: &RusqliteSql = &rig.bridge.catalog.sql;
-    db.apply(
-        "DROP TRIGGER generation_extents_on_insert; \
-         DROP TRIGGER generation_extents_on_adopt; \
-         DROP INDEX upload_parts_by_extent; \
-         DROP TABLE generation_extents;",
-    )
-    .unwrap();
+    db.apply(UNDO_0004).unwrap();
     let old = RusqliteSql::open_in_memory().unwrap();
     for migration in [MIGRATION_0001, MIGRATION_0002, MIGRATION_0003] {
         old.apply(migration).unwrap();
@@ -216,4 +220,172 @@ async fn old_writers_still_publish_readable_objects() {
     assert_eq!(now.len(), 2);
     assert_eq!(now[0], extents[0]);
     assert_eq!((now[1].seq, now[1].plain_offset), (Some(1), Some(1000)));
+}
+
+/// What a Worker from before the migration runs to retire the live
+/// generation of `(?1, ?2)`: garbage-collection rows and cancelled
+/// postings for the extents first written for it, then the state.
+const OLD_RETIRE: [&str; 3] = [
+    "INSERT INTO gc(extent_id, action, due_at) \
+     SELECT e.id, a.action, a.due_at FROM objects o \
+     JOIN extents e ON e.generation_id = o.generation_id \
+     JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
+           UNION ALL SELECT 'delete_safety', ?3 \
+           UNION ALL SELECT 'shred_key', ?3) a \
+     WHERE o.bucket_id = ?1 AND o.key = ?2",
+    "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
+     WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN \
+       (SELECT e.id FROM objects o JOIN extents e ON e.generation_id = o.generation_id \
+        WHERE o.bucket_id = ?1 AND o.key = ?2)",
+    "UPDATE generations SET state = 'deleted', retired_at = ?3 WHERE id = \
+       (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
+];
+
+/// Runs [`OLD_RETIRE`] as that Worker does: one batch.
+async fn old_retire(rig: &Rig, bucket: &Bucket, key: &str) -> Result<Vec<u64>> {
+    let args = || {
+        vec![
+            SqlValue::Text(bucket.id.as_str().to_owned()),
+            SqlValue::Text(key.to_owned()),
+            SqlValue::Int(rig.now().0),
+        ]
+    };
+    let stmts = OLD_RETIRE.iter().map(|sql| (*sql, args())).collect();
+    rig.bridge.catalog.sql.batch(stmts).await
+}
+
+/// After a rollback, a Worker from before the migration does not know
+/// that a copy shares the extents of its source. The statements with
+/// which it would take them out of service fail; the ones that touch
+/// nothing shared still work.
+#[tokio::test(flavor = "current_thread")]
+async fn old_workers_cannot_take_a_shared_extent_out_of_service() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = pattern(1, 200_000);
+    rig.put(&signer, BUCKET, "src", &body).await.expect(200);
+    rig.put(&signer, BUCKET, "solo", &pattern(2, 1000))
+        .await
+        .expect(200);
+    rig.call(
+        &signer,
+        Method::Put,
+        &path(BUCKET, "dst"),
+        &[],
+        &[("x-amz-copy-source", &format!("/{BUCKET}/src"))],
+        b"",
+    )
+    .await
+    .expect(200);
+    let (_, shared) = rig.live(&bucket, "src").await.unwrap();
+    let shared = SqlValue::Text(shared[0].id.as_str().to_owned());
+    let (_, solo) = rig.live(&bucket, "solo").await.unwrap();
+    let solo = SqlValue::Text(solo[0].id.as_str().to_owned());
+    let db = &rig.bridge.catalog.sql;
+    db.with_conn(|c| {
+        c.execute(
+            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, \
+               cipher_offset, cipher_len, payload_sha256, state) \
+             SELECT id, 0, id, 'g', x'', 0, 1, x'', 'planned' FROM extents",
+            [],
+        )
+        .unwrap()
+    });
+    let pending = rig.count("outbox WHERE stage NOT IN ('done', 'cancelled')");
+    assert!(pending >= 2);
+
+    // Retiring the source: refused, and the batch leaves nothing behind.
+    let refused = old_retire(&rig, &bucket, "src").await.unwrap_err();
+    assert!(
+        format!("{refused:?}").contains("referenced by another live generation"),
+        "{refused:?}"
+    );
+    assert_eq!(rig.count("gc"), 0);
+    assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 0);
+    assert!(rig.live(&bucket, "src").await.is_some());
+
+    // The collector's writes, for an extent in service: refused.
+    const SHRED: &str = "UPDATE extents SET wrapped_file_key = NULL WHERE id = ?1";
+    const DROP_ARTICLES: &str = "DELETE FROM articles WHERE extent_id = ?1";
+    for sql in [SHRED, DROP_ARTICLES] {
+        for extent in [&shared, &solo] {
+            let refused = db.batch(vec![(sql, vec![extent.clone()])]).await;
+            let refused = refused.unwrap_err();
+            assert!(format!("{refused:?}").contains("in service"), "{refused:?}");
+        }
+    }
+    assert_eq!(rig.count("extents WHERE wrapped_file_key IS NULL"), 0);
+    assert_eq!(rig.count("articles"), 2);
+
+    // An object nothing else references retires as it always did.
+    old_retire(&rig, &bucket, "solo").await.unwrap();
+    assert_eq!(rig.count("gc"), 3);
+    assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 1);
+    for sql in [SHRED, DROP_ARTICLES] {
+        db.batch(vec![(sql, vec![solo.clone()])]).await.unwrap();
+    }
+
+    // So does the copy: no extent was first written for it, so nothing
+    // is queued. After it, the source is the only reference and goes too.
+    old_retire(&rig, &bucket, "dst").await.unwrap();
+    assert_eq!(rig.count("gc"), 3);
+    let read = rig
+        .call(&signer, Method::Get, &path(BUCKET, "src"), &[], &[], b"")
+        .await;
+    read.expect(200);
+    assert!(read.body == body);
+    old_retire(&rig, &bucket, "src").await.unwrap();
+    assert_eq!(rig.count("gc"), 6);
+    db.batch(vec![(SHRED, vec![shared.clone()])]).await.unwrap();
+}
+
+/// A live generation that does not have the extents it claims stops the
+/// migration before it creates anything.
+#[tokio::test(flavor = "current_thread")]
+async fn migration_stops_when_a_live_object_would_come_out_short() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", &pattern(1, 1000))
+        .await
+        .expect(200);
+    multipart(
+        &rig,
+        &signer,
+        "big",
+        &[&pattern(2, 5 * MIB), &pattern(3, 70_000)],
+        true,
+    )
+    .await;
+    let (big, _) = rig.live(&bucket, "big").await.unwrap();
+    let db: &RusqliteSql = &rig.bridge.catalog.sql;
+    db.apply(UNDO_0004).unwrap();
+    let old = schema(db);
+
+    // The second extent of "big" has lost its place.
+    let damage = |seq: &str| {
+        db.with_conn(|c| {
+            c.execute(
+                &format!("UPDATE extents SET seq = {seq} WHERE generation_id = ?1 AND seq = 1"),
+                [big.id.as_str()],
+            )
+            .unwrap()
+        })
+    };
+    assert_eq!(damage("NULL"), 1);
+    assert!(db.apply(MIGRATION_0004).is_err());
+    assert_eq!(schema(db), old);
+
+    // A retired generation in that state holds nothing a reader needs.
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE generations SET state = 'superseded' WHERE id = ?1",
+                [big.id.as_str()],
+            )
+        })
+        .unwrap();
+    db.apply(MIGRATION_0004).unwrap();
+    assert_eq!(rig.count("generation_extents"), 2);
 }

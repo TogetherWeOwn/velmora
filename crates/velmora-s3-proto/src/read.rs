@@ -170,6 +170,13 @@ impl Conditions {
     /// Whether a copy may read `metadata` as its source. A copy has no
     /// `304`: every condition that does not hold is `PreconditionFailed`.
     pub fn check_copy_source(&self, metadata: &ObjectMetadata) -> Result<()> {
+        // A GET ignores a date it cannot read. A copy writes, so it must
+        // not go ahead on a condition it did not understand.
+        for date in [&self.if_modified_since, &self.if_unmodified_since] {
+            if date.as_deref().is_some_and(|d| http_date(d).is_none()) {
+                return Err(ErrorCode::InvalidArgument);
+            }
+        }
         if self.evaluate(metadata)? {
             Ok(())
         } else {

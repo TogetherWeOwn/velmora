@@ -384,6 +384,15 @@ async fn requests_the_copy_cannot_honour_store_nothing() {
     )
     .await
     .expect_error(400, "InvalidRequest");
+    // A source condition that cannot be read is not skipped.
+    for name in [
+        "x-amz-copy-source-if-modified-since",
+        "x-amz-copy-source-if-unmodified-since",
+    ] {
+        copy(&rig, &signer, &source("a"), "b", &[(name, "yesterday")])
+            .await
+            .expect_error(400, "InvalidArgument");
+    }
     // A conditional on the destination is refused like on any write.
     copy(&rig, &signer, &source("a"), "b", &[("if-none-match", "*")])
         .await
@@ -551,4 +560,80 @@ async fn copy_cannot_compute_another_checksum() {
     .expect_error(400, "InvalidRequest");
     assert_eq!(get(&rig, &signer, "c").await.status, 404);
     assert_eq!(rig.count("generations"), 3);
+}
+
+/// Finishes a one-part multipart upload of `body` onto `key`.
+async fn multipart_onto(rig: &Rig, signer: &Signer, key: &str, body: &[u8]) {
+    let object = path(BUCKET, key);
+    let created = rig
+        .call(signer, Method::Post, &object, &[("uploads", "")], &[], b"")
+        .await;
+    created.expect(200);
+    let id = created.values("UploadId").remove(0);
+    let part = rig
+        .call(
+            signer,
+            Method::Put,
+            &object,
+            &[("partNumber", "1"), ("uploadId", &id)],
+            &[],
+            body,
+        )
+        .await;
+    part.expect(200);
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         </CompleteMultipartUpload>",
+        part.header("etag").unwrap()
+    );
+    rig.call(
+        signer,
+        Method::Post,
+        &object,
+        &[("uploadId", &id)],
+        &[("content-type", "application/xml")],
+        xml.as_bytes(),
+    )
+    .await
+    .expect(200);
+}
+
+/// A multipart Complete retires the generation it replaces like any
+/// other write: an extent the other side of a copy references stays.
+#[tokio::test(flavor = "current_thread")]
+async fn multipart_complete_over_either_side_of_a_copy_keeps_the_extent() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = pattern(6, 300_000);
+    rig.put(&signer, BUCKET, "src", &body).await.expect(200);
+    let (_, extents) = rig.live(&bucket, "src").await.unwrap();
+    let extent = extents[0].id.clone();
+    for key in ["a", "b"] {
+        copy(&rig, &signer, &source("src"), key, &[])
+            .await
+            .expect(200);
+    }
+
+    // Over the source, then over one copy: the other copy still reads.
+    let first = pattern(7, 20_000);
+    multipart_onto(&rig, &signer, "src", &first).await;
+    let second = pattern(8, 30_000);
+    multipart_onto(&rig, &signer, "a", &second).await;
+    assert_eq!(open_gc(&rig, &extent), 0);
+    assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 0);
+    collect_garbage(&rig).await;
+    assert!(rig.bridge.safety.contains(&extent.safety_key()));
+    assert_eq!(get(&rig, &signer, "src").await.body, first);
+    assert_eq!(get(&rig, &signer, "a").await.body, second);
+    let read = get(&rig, &signer, "b").await;
+    read.expect(200);
+    assert_eq!(read.body, body);
+
+    // Over the last reference: the extent leaves service.
+    multipart_onto(&rig, &signer, "b", &pattern(9, 10_000)).await;
+    assert_eq!(open_gc(&rig, &extent), 3);
+    collect_garbage(&rig).await;
+    assert!(!rig.bridge.safety.contains(&extent.safety_key()));
+    assert_eq!(get(&rig, &signer, "src").await.body, first);
+    assert_eq!(get(&rig, &signer, "a").await.body, second);
 }
