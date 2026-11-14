@@ -4,7 +4,8 @@
 // accepted query keys (S3 STANDARD semantics); object keys over 1024 bytes or with C0
 // controls / U+FFFE / U+FFFF (not representable in XML 1.0) are rejected; the
 // CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted;
-// the SDK's `x-id` operation hint is accepted as a query parameter.
+// the SDK's `x-id` operation hint is accepted as a query parameter;
+// `x-amz-bucket-object-lock-enabled: false` is accepted (Object Lock is not offered).
 
 use super::{ErrorCode, Policy, Result};
 
@@ -325,9 +326,15 @@ impl Headers {
                         | "x-amz-copy-source-if-none-match"
                         | "x-amz-copy-source-if-modified-since"
                         | "x-amz-copy-source-if-unmodified-since"
+                        | "x-amz-bucket-object-lock-enabled"
                 )
             {
                 return Err(ErrorCode::InvalidRequest);
+            }
+            // rclone sends `false` on CreateBucket. Object Lock is not
+            // offered, so asking for it is refused, never ignored.
+            if k == "x-amz-bucket-object-lock-enabled" && !v.eq_ignore_ascii_case("false") {
+                return Err(ErrorCode::NotImplemented);
             }
             if k == "x-amz-storage-class" {
                 super::storage_class(Some(v))?;
