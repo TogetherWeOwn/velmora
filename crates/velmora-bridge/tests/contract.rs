@@ -257,8 +257,9 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
-    // Production posts on eight sockets per job; the grace keeps its default.
-    assert_eq!(cfg.post_sockets, 8);
+    // Production posts on six sockets per job, so that two post jobs fit
+    // one isolate (see below); the grace keeps its default.
+    assert_eq!(cfg.post_sockets, 6);
     assert_eq!(cfg.propagation_grace_secs, 21_600);
 
     // The dev environment is complete on its own (envs do not inherit vars).
@@ -1567,4 +1568,29 @@ fn provider_pool_settings_fail_closed() {
         .collect();
     assert_eq!(providers_of(&many), invalid);
     assert!(providers_of(&many[..32]).is_ok());
+}
+
+/// The shipped `POST_SOCKETS` lets two post jobs of full-size extents and
+/// a verify job share one isolate's byte budget. The queue's invocations
+/// share isolates, so with a larger setting every post job but one waits.
+#[test]
+fn two_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
+    use velmora::media::{FileKey, Profile, Sealer};
+    use velmora::rng::SystemRng;
+    use velmora_bridge::jobs::job_bytes;
+
+    let (prod, _) = wrangler_vars();
+    let budget: u64 = prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap();
+    let sockets: u32 = prod["POST_SOCKETS"].parse().unwrap();
+    let max_extent: usize = prod["MAX_EXTENT_BYTES"].parse().unwrap();
+    let key = FileKey::generate(&mut SystemRng).unwrap();
+    let sealer = Sealer::random(&Profile::drive(), &key, &mut SystemRng).unwrap();
+    let cipher_size = sealer.seal_to_vec(&vec![0u8; max_extent]).unwrap().len() as u64;
+
+    let post = job_bytes(OutboxStage::Post, cipher_size, sockets);
+    let verify = job_bytes(OutboxStage::Verify, cipher_size, sockets);
+    assert!(
+        2 * post + verify <= budget,
+        "two post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+    );
 }

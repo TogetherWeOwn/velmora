@@ -49,6 +49,18 @@ pub const INFRA_RETRY_SECS: u32 = 60;
 /// wire and one decoded.
 pub(crate) const JOB_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 
+/// What a job of `stage` charges to the isolate's byte budget for an
+/// extent of `cipher_size` bytes. Only the post stage holds the whole
+/// extent, and one rendered article per socket; verify and release hold
+/// one article at a time (a repost charges for itself).
+pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64 {
+    match stage {
+        OutboxStage::Post => cipher_size
+            .saturating_add(JOB_OVERHEAD_BYTES.max(u64::from(post_sockets) * POST_SOCKET_BYTES)),
+        _ => JOB_OVERHEAD_BYTES,
+    }
+}
+
 /// Where a drain stops: 90 % of the cap, so that a tier sitting at the
 /// cap is not evicted a little on every run.
 pub fn low_watermark(cap: u64) -> u64 {
@@ -109,6 +121,7 @@ where
             return JobOutcome::Ack;
         }
         let owner = format!("job:{stage}");
+        let started = self.clock.now();
         let lease = match self
             .catalog
             .claim(extent, generation, stage, &owner, self.clock.now())
@@ -120,6 +133,9 @@ where
             Ok(None) => return JobOutcome::Ack,
             Err(_) => return RETRY,
         };
+        if stage == OutboxStage::Post {
+            crate::trace::begin(extent, started);
+        }
         let row = match self.catalog.job_extent(extent, generation).await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -128,17 +144,14 @@ where
             }
             Err(e) => return settle(&self.catalog, &self.clock, &lease, e.into()).await,
         };
-        // Only the post stage holds the whole extent; verify and release
-        // hold one article at a time (a repost charges for itself).
-        let bytes = match stage {
-            OutboxStage::Post => row.extent.cipher_size.saturating_add(
-                JOB_OVERHEAD_BYTES.max(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES),
-            ),
-            _ => JOB_OVERHEAD_BYTES,
-        };
+        let bytes = job_bytes(stage, row.extent.cipher_size, self.cfg.post_sockets);
         // A job larger than the whole budget still has to run: alone.
         let bytes = bytes.min(self.budget.capacity());
-        let Ok(_charge) = self.budget.charge(bytes).await else {
+        let waited_from = self.clock.now();
+        let charged = self.budget.charge(bytes).await;
+        let wait_ms = self.clock.now().0 - waited_from.0;
+        crate::trace::note(extent, |t| t.wait_ms = wait_ms);
+        let Ok(_charge) = charged else {
             // No memory right now is not a failure of the extent: give the
             // lease back without spending an attempt.
             return settle(&self.catalog, &self.clock, &lease, Stop::NoPermit).await;

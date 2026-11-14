@@ -582,5 +582,8 @@ async fn mismatched_safety_bytes_are_not_posted() {
     );
     assert!(rig.plan(&s).await.is_empty());
     assert_eq!(rig.server().posted_count().await, 0);
-    assert_eq!(rig.bridge.nntp.connects(), 0);
+    // The sockets connect while the extent is read; a job that finds it
+    // corrupt posts nothing and ends every one of them.
+    assert!(rig.bridge.nntp.connects() <= rig.bridge.cfg.post_sockets);
+    assert_eq!(rig.bridge.nntp.live(), 0);
 }

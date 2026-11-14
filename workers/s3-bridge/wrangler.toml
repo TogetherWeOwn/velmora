@@ -28,7 +28,13 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
 GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
-POST_SOCKETS = "8"                   # sockets per post job, spread over the posting tier (measured: 4 sockets gave 2.8 MiB/s)
+# Sockets per post job, spread over the posting tier. A post job charges
+# its extent (16 MiB) plus 1 MiB per socket to the isolate's byte budget,
+# and the queue's invocations share isolates. At 6, two post jobs and a
+# verify job fit the 48 MiB budget at once; at 8 only one post job fits
+# and the others wait for it (measured on a test deployment: 3.6 MiB/s
+# at 8, 5.2 MiB/s at 6).
+POST_SOCKETS = "6"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
