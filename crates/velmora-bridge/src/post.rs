@@ -847,7 +847,11 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                     state.accepted[at] = Some(provider);
                     // The slot went to someone else during the call (a
                     // renewal by another socket found it gone): nothing
-                    // more is sent on this socket.
+                    // more is sent on this socket. The check before the
+                    // next call (`keep`) would stop the socket as well,
+                    // so no test can tell this exit from that one by its
+                    // outcome; it drops the socket at once, without
+                    // taking another article from the queue first.
                     if state.sockets[slot].permit.is_none() {
                         session.discard();
                         break Some(Stop::NoPermit);

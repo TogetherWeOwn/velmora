@@ -4,7 +4,7 @@
 
 mod nntp_support;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 
 use nntp_support::*;
@@ -686,4 +686,52 @@ async fn a_job_without_a_slot_does_not_load_the_extent() {
     rig.bridge.clock.advance_secs(600);
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
     assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+}
+
+/// Two sockets. While one has a POST in flight, the permits are taken
+/// over and the other socket's renewal finds them gone. The first socket
+/// makes no call after its POST returns, and the article that POST
+/// delivered is recorded: marking is fenced by the lease, not the permit.
+#[tokio::test]
+async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    rig.bridge.cfg.post_sockets = 2;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    // The first POST to be answered stays in flight.
+    let release = rig.bridge.nntp.park_next_post();
+    let calls_then = Cell::new(0);
+
+    let revoke = async || {
+        let renewals = rig.bridge.catalog.renewals.get();
+        rig.bridge.catalog.revoke_permits();
+        // Old enough for the other socket to renew before its next call.
+        rig.bridge.clock.advance_secs(30);
+        calls_then.set(rig.bridge.nntp.calls().len());
+        while rig.bridge.catalog.renewals.get() == renewals {
+            tokio::task::yield_now().await;
+        }
+        release.set(true);
+    };
+    let outcome = rig.run_post_and(&s, 0, 2, revoke).await;
+
+    // Put off for a slot, not failed.
+    assert!(matches!(outcome, JobOutcome::Retry { .. }));
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!((outbox.stage, outbox.attempts), (OutboxStage::Post, 0));
+    assert!(release.get(), "the permits were never taken over");
+    // No call began after the takeover, on either socket.
+    let calls = rig.bridge.nntp.calls();
+    assert_eq!(calls.len(), calls_then.get(), "{calls:?}");
+    // Every article a provider took is recorded, the parked one included.
+    let plan = rig.plan(&s).await;
+    let on_server = stored(&rig, 0).await;
+    assert!(on_server.len() >= 2 && on_server.len() < plan.len());
+    let posted: BTreeSet<String> = plan
+        .iter()
+        .filter(|a| a.state == ArticleState::Posted)
+        .map(|a| format!("<{}>", a.message_id))
+        .collect();
+    assert_eq!(posted, on_server);
+    assert_eq!(rig.bridge.nntp.live(), 0);
 }
