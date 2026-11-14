@@ -22,7 +22,7 @@ use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
     UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
 };
-use crate::recovery::{is_record_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
+use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
     Job, KekBytes, Result, UnixMs,
@@ -61,6 +61,10 @@ pub const MIGRATION_0008: &str =
 /// Each article's own yEnc name (standalone single-part articles).
 pub const MIGRATION_0009: &str =
     include_str!("../../../workers/s3-bridge/migrations/0009_article_yenc_name.sql");
+
+/// The rollback stamp counter.
+pub const MIGRATION_0010: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0010_rollback_stamp.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -152,6 +156,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0007)?;
         db.apply(MIGRATION_0008)?;
         db.apply(MIGRATION_0009)?;
+        db.apply(MIGRATION_0010)?;
         Ok(db)
     }
 
@@ -314,7 +319,7 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        if is_record_key(key) {
+        if is_protected_key(key) {
             return Err(ERR_RECORD_DELETE);
         }
         self.blobs.borrow_mut().remove(key);

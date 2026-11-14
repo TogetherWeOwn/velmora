@@ -87,9 +87,11 @@ pub trait BlobStore {
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
-    /// Idempotent. Refuses a recovery record (any key under `m/`) with
-    /// [`crate::recovery::ERR_RECORD_DELETE`] before the store is asked:
-    /// no caller can remove one through this method.
+    /// Idempotent. Refuses a recovery record (any key under `m/`, which
+    /// includes the tenant keys under `m/tk/`) and a rollback stamp (any
+    /// key under `rs/`) with [`crate::recovery::ERR_RECORD_DELETE`]
+    /// before the store is asked: no caller can remove one through this
+    /// method.
     async fn delete(&self, key: &str) -> Result<()>;
     /// Removes the record of a generation that the catalogue refused to
     /// publish. The only delete of a key under `m/`; the argument exists
@@ -526,14 +528,56 @@ pub trait Catalog {
     /// `after`.
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>>;
     /// A replay starts: writes are refused until [`Self::restore_finish`].
-    /// Returns the mark of this replay: later than that of every replay
-    /// before it.
-    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs>;
+    /// `Ok` = the mark of this replay: later than that of every replay
+    /// before it. `Err` = refused: a replay from the restore point in
+    /// the `Err` has not ended, and `since` is later than that point.
+    async fn restore_begin(
+        &self,
+        since: UnixMs,
+        now: UnixMs,
+    ) -> Result<std::result::Result<UnixMs, UnixMs>>;
     /// The replay with the mark `run` ran to its end. `false` = another
     /// replay was started since; that one is not ended by this.
-    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool>;
-    /// Whether a replay was started and has not ended.
+    /// In the same batch the rollback stamp is made level: the counter
+    /// becomes at least `stamp` (the newest stamp object) and a recorded
+    /// rollback is cleared. Only the call that ends the replay does
+    /// that; a repeated call for a replay that has ended does not.
+    /// `seen` is the counter the caller read when it chose `stamp`: if
+    /// the catalogue holds another one by now (it was brought back to
+    /// an earlier point in between), nothing is changed and the answer
+    /// is `false`.
+    async fn restore_finish(
+        &self,
+        run: UnixMs,
+        now: UnixMs,
+        stamp: u64,
+        seen: Option<u64>,
+        catalogue: &str,
+    ) -> Result<bool>;
+    /// Whether writes and jobs must be refused: a replay was started and
+    /// has not ended, or a rollback of the catalogue was found and no
+    /// replay has ended since.
     async fn restore_pending(&self) -> Result<bool>;
+    /// The rollback stamp row ([`crate::stamp`]). `catalogue` is the id
+    /// this Worker keys the stamp objects by; the row keeps the id it
+    /// was created with. [`crate::stamp::ERR_CATALOGUE_ID`] = the two
+    /// differ.
+    async fn stamp(&self, catalogue: &str) -> Result<crate::stamp::StampRow>;
+    /// Moves the stamp counter from `from` to the next value (`None` =
+    /// creates the row at 1). `false` = the counter is not at `from`, or
+    /// a rollback is recorded: nothing changed.
+    async fn stamp_advance(&self, from: Option<u64>, catalogue: &str) -> Result<bool>;
+    /// Records that the catalogue was found behind its stamp, if its
+    /// counter is still `seen` (`None` = there is no row) and no
+    /// rollback is on record. `false` = nothing was recorded: the
+    /// counter moved since the caller read it, or another caller
+    /// recorded the rollback. The caller reads again.
+    async fn stamp_rolled_back(
+        &self,
+        seen: Option<u64>,
+        now: UnixMs,
+        catalogue: &str,
+    ) -> Result<bool>;
     /// The replay with the mark `run`: its restore point and how far it
     /// has come. `None` = `run` is not the replay that was started last.
     async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>>;

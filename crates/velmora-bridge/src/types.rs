@@ -1022,6 +1022,10 @@ pub struct DispatchReport {
     pub redrive_failed: bool,
     /// The hot-tier check failed; the rest of the run went on without it.
     pub evict_failed: bool,
+    /// The catalogue is behind its rollback stamp: nothing else was done.
+    pub rolled_back: bool,
+    /// The rollback stamp was not raised; the rest of the run went on.
+    pub stamp_failed: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -1930,6 +1930,7 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         .catalog
         .restore_begin(UnixMs(0), rig.now())
         .await
+        .unwrap()
         .unwrap();
     rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
     rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
@@ -1992,14 +1993,20 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
     assert!(!rig
         .bridge
         .catalog
-        .restore_finish(UnixMs(run.0 - 1), rig.now())
+        .restore_finish(
+            UnixMs(run.0 - 1),
+            rig.now(),
+            0,
+            stamp_seen(&rig).await,
+            "main"
+        )
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["replaying"]);
     assert!(rig
         .bridge
         .catalog
-        .restore_finish(run, rig.now())
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["complete"]);
@@ -2016,6 +2023,7 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         .catalog
         .restore_begin(UnixMs(5), rig.now())
         .await
+        .unwrap()
         .unwrap();
     assert!(second > run);
     assert_eq!(restore_state(&rig), ["replaying"]);
@@ -2050,9 +2058,16 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
     rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
 
     // A replay that runs to its end opens it.
-    let run = catalog.restore_begin(UnixMs(0), rig.now()).await.unwrap();
+    let run = catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap()
+        .unwrap();
     replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert!(catalog.restore_finish(run, rig.now()).await.unwrap());
+    assert!(catalog
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
+        .await
+        .unwrap());
     rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
 
     // Brought back once more (the row of the finished replay came with
@@ -2062,7 +2077,10 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
     assert_eq!(restore_state(&rig), ["replaying"]);
     rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
     assert_eq!(catalog.restore_progress(run).await.unwrap(), None);
-    assert!(!catalog.restore_finish(run, rig.now()).await.unwrap());
+    assert!(!catalog
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
+        .await
+        .unwrap());
     assert_eq!(restore_state(&rig), ["replaying"]);
 }
 
@@ -3173,4 +3191,9 @@ async fn a_plan_record_with_a_bad_yenc_name_is_unreadable() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// The stamp counter as the last step of a replay would read it.
+async fn stamp_seen(rig: &Rig) -> Option<u64> {
+    rig.bridge.catalog.stamp("main").await.unwrap().counter
 }

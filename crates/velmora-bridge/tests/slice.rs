@@ -1899,13 +1899,14 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
     );
 
     // Then lose the catalogue, the cache and whatever SAFETY holds
-    // besides the records.
+    // besides the records and the rollback stamps (no delete removes
+    // either).
     let s = "recovery loss";
     for key in rig.bridge.cache.keys() {
         rig.bridge.cache.delete(&key).await.expect("cache delete");
     }
     for key in rig.bridge.safety.keys() {
-        if !key.starts_with("m/") {
+        if !velmora_bridge::recovery::is_protected_key(&key) {
             rig.bridge.safety.delete(&key).await.expect("safety delete");
         }
     }

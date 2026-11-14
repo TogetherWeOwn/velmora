@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use velmora_bridge::recovery::{is_record_key, Unpublished, ERR_RECORD_DELETE};
+use velmora_bridge::recovery::{is_protected_key, Unpublished, ERR_RECORD_DELETE};
 use velmora_bridge::{BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
 use worker::{Bucket, Range};
 
@@ -109,7 +109,7 @@ impl BlobStore for R2Blobs {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        if is_record_key(key) {
+        if is_protected_key(key) {
             return Err(ERR_RECORD_DELETE);
         }
         self.bucket.delete(key).await.map_err(blob_err("delete"))

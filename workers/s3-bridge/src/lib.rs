@@ -182,6 +182,14 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     };
     match bridge.dispatch().await {
         Ok(report) => {
+            if report.rolled_back {
+                console_error!(
+                    "dispatch: the catalogue is behind its rollback stamp; writes are refused until a replay has ended"
+                );
+            }
+            if report.stamp_failed {
+                console_error!("dispatch: the rollback stamp was not raised");
+            }
             if report.redrive_failed {
                 console_error!("dispatch: re-drive failed");
             }

@@ -407,11 +407,36 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
         replay::held_extents(self, after, limit).await
     }
-    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
+    async fn restore_begin(
+        &self,
+        since: UnixMs,
+        now: UnixMs,
+    ) -> Result<std::result::Result<UnixMs, UnixMs>> {
         replay::restore_begin(self, since, now).await
     }
-    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
-        replay::restore_finish(self, run, now).await
+    async fn restore_finish(
+        &self,
+        run: UnixMs,
+        now: UnixMs,
+        stamp: u64,
+        seen: Option<u64>,
+        catalogue: &str,
+    ) -> Result<bool> {
+        replay::restore_finish(self, run, now, stamp, seen, catalogue).await
+    }
+    async fn stamp(&self, catalogue: &str) -> Result<crate::stamp::StampRow> {
+        replay::stamp(self, catalogue).await
+    }
+    async fn stamp_advance(&self, from: Option<u64>, catalogue: &str) -> Result<bool> {
+        replay::stamp_advance(self, from, catalogue).await
+    }
+    async fn stamp_rolled_back(
+        &self,
+        seen: Option<u64>,
+        now: UnixMs,
+        catalogue: &str,
+    ) -> Result<bool> {
+        replay::stamp_rolled_back(self, seen, now, catalogue).await
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await

@@ -197,8 +197,11 @@ jobs and the cron. If a replay was stopped, run it again to its end.
 Starting a replay again makes the earlier one void: a step sent with a
 cursor of the earlier one answers 409 and does nothing, and the
 catalogue stays closed until the replay that was started last has
-ended. A database that was brought back without the last command
-of step 2 is not closed: nothing in it says that a replay is due.
+ended. A replay that is started while another one has not ended must
+start from the same restore point or an earlier one; a later one
+answers 409. A database that was brought back without the last command
+of step 2 is not closed at once: nothing in it says that a replay is
+due. The rollback stamp (below) closes it at the next cron run.
 
 The catalogue refuses the commit as well, not only the request: a write
 that was already under way when a replay started answers 503 and
@@ -217,6 +220,94 @@ into a catalogue that holds a part of the records.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.
+
+## The rollback stamp
+
+It finds a catalogue that was brought back to an earlier point without
+the steps above (a Time Travel restore or an import with the Worker
+serving).
+
+- The catalogue holds a counter (`rollback_stamp`). `SAFETY` holds one
+  small object per value the counter has reached:
+  `rs/<catalogue id>/<counter, 20 digits>`. The objects are only put; no
+  delete removes one. The body is the time of the raise in milliseconds.
+- The counter is raised by every cron run, and by a write that must be
+  covered at once, after its commit and before its `200`. A cron run
+  whose raise loses to such a write goes on without a raise of its own.
+- A restore takes the counter back and leaves the objects. **A counter
+  behind the newest object, or no counter while an object exists, means
+  the catalogue was rolled back.** The cron run checks this before it
+  does anything else, and before it moves the counter. It checks it
+  while a replay is on record as unfinished too. Garbage collection and
+  eviction check it themselves before they delete anything.
+- When it is found: `GET /_admin/status` shows
+  `"catalogue_rolled_back": true` (and `replay_unfinished: true`), the
+  cron logs it on every run, every write answers 503, and the jobs and
+  the cron do nothing. Reads are served.
+- **Way out: the restore above, from step 1.** In step 2 the database
+  is already "brought back"; run the two commands. The restore point is
+  the time the database was restored to, with one exception: if the
+  database came back with a replay on record as unfinished (after the
+  arming statement of step 2, `SELECT since_ms FROM restore_state` is
+  not `-1`), the restore point is that replay's, not a later one. The catalogue holds
+  the records up to that point at most. The route enforces it: a first
+  call with a later `since_ms` answers 409 and names the value to send
+  (`unfinished_since_ms`, with `margin_ms` 0). A second exception, which
+  the route cannot see: if the row is already `replaying` with
+  `since_ms` `-1` before you run the arming statement (check with
+  `SELECT state, since_ms FROM restore_state` first), the database was
+  restored a second time, to a point after an earlier arming and before
+  that replay's first call. The time of this restore is then too late:
+  take the restore point from the stamp object as described next, not
+  from the bookmark time. If the time is not known,
+  take the body of the stamp object of the counter the catalogue holds
+  (`SELECT counter FROM rollback_stamp`) minus one cron interval, or
+  `0`. The last step of the replay sets the counter level with the
+  newest object and opens the catalogue.
+- Only a replay that is started after the rollback does that. The last
+  step of a replay that was started before it answers 409
+  (`The catalogue was rolled back after this replay started`) and leaves
+  the catalogue closed, whether that replay had ended or was still
+  running at the point the database went back to: start a new replay
+  with `since_ms`. The route tells the two apart by the time in the
+  newest stamp object, so it also refuses in one harmless case: a raise
+  that was under way at the moment the replay was started. Start the
+  replay again then.
+- `CATALOGUE_ID` (default `main`) is the `<catalogue id>` of the keys.
+  Two catalogues over one `SAFETY` bucket need two ids. Do not change it
+  for a catalogue in use: its objects would no longer be found, and a
+  rollback would go unseen. The row keeps the id it was created with,
+  so a Worker with another id refuses to use the stamp: the cron run
+  fails before it sends a job, garbage collection and eviction retry,
+  no stamp is raised, and `GET /_admin/status` shows
+  `"catalogue_id_mismatch": true` with `"catalogue_rolled_back": null`.
+  Put the id back.
+- A new, empty database over a `SAFETY` bucket that already has stamp
+  objects of its id counts as rolled back. That is the restore case
+  "Nothing"; run the replay.
+- A database restored from an export made before this table existed has
+  no counter. The same holds: the replay sets it.
+
+What the stamp does not see. In both cases the catalogue is rolled back
+to a point after the last raise and before a commit, so counter and
+newest object are level and nothing closes:
+
+- **A.** A handler is killed between its commit and its raise. The
+  write was not acknowledged. The window ends with the next raise, at
+  the latest the next cron run (5 minutes).
+- **B.** The raise fails after the commit (the counter cannot be moved,
+  or three puts of the object fail). The write is answered `200`,
+  because it is committed. The window ends with the next raise that
+  succeeds. The cron logs `the rollback stamp was not raised` while its
+  own raise fails.
+- Writes that do not raise on their own are covered by the cron run
+  only: a rollback to a point after the last cron run is not seen.
+
+For all of these the rule stays: after any restore of the database,
+run the restore steps above. The recovery records of every acknowledged
+PutObject, CompleteMultipartUpload, CopyObject and DeleteObject are in
+`SAFETY`, where a database restore cannot reach them, and the replay
+brings them back.
 
 ## The route
 
