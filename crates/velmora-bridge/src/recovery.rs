@@ -13,10 +13,17 @@
 //!
 //! Generation and tombstone ids start with their mint time, so the blob
 //! keys list in time order and a replay can start at a restore point.
-//! On one key the ids are also in commit order: a publication is refused
-//! unless its id sorts after the live generation and the last tombstone
-//! of the key ([`id_after`]), so replaying the records in id order
-//! rebuilds what the catalogue served, whatever the clocks said.
+//! On one key the ids are also in commit order. Before a record is
+//! stored, the catalogue raises the key's floor to the record's id
+//! ([`Catalog::raise_floor`], inside [`write_generation`] and
+//! [`write_tombstone`]), and a publication is refused unless its id
+//! sorts after the live generation and is not below the floor
+//! ([`id_after`]). Every id therefore sorts after every record stored
+//! on the key before it: also after the tombstone of a delete that found
+//! nothing left to delete, and after the record of a write whose batch
+//! failed or whose record could not be removed. Replaying the records in
+//! id order then rebuilds what the catalogue served, whatever the clocks
+//! said and whatever became of the other writes.
 //! Records are key-bearing copies: they hold wrapped keys, never plain
 //! ones, and they open only under the KEK version that sealed them.
 //!
@@ -26,14 +33,16 @@
 //! request whose batch was refused (a definite failure, answered as one)
 //! removes the record it has just written, because nothing was published
 //! under that id. A record of a request that failed with an unknown
-//! outcome stays, and a replay may publish it.
+//! outcome stays, and so does one whose removal failed. A replay
+//! publishes such a record, in its place in the order: under every write
+//! and delete acknowledged after it.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 
 use crate::crypto::{open_manifest, seal_manifest};
-use crate::ports::{BlobMeta, BlobStore, Kek};
+use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
 use crate::types::{
     ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow, ExtentState,
     GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
@@ -96,7 +105,7 @@ fn minted_ms(id: &GenerationId) -> Option<i64> {
 }
 
 /// An id that sorts after `newest`, the newest id already on the key
-/// (a live generation or a tombstone): at least one millisecond later,
+/// (its live generation or its floor): at least one millisecond later,
 /// also when this isolate's clock is behind the one that minted it.
 pub fn id_after(now: UnixMs, newest: Option<&GenerationId>, rand: [u8; 8]) -> GenerationId {
     let floor = newest
@@ -105,10 +114,11 @@ pub fn id_after(now: UnixMs, newest: Option<&GenerationId>, rand: [u8; 8]) -> Ge
     GenerationId::mint(UnixMs(now.0.max(floor)), rand)
 }
 
-/// The id of the tombstone for a delete that saw `live` as the live
-/// generation. It always sorts after `live`.
-pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> GenerationId {
-    id_after(now, Some(live), rand)
+/// The id of the tombstone for a delete that saw `newest` as the newest
+/// id of the key ([`Catalog::newest_id`], at or above the live
+/// generation). It always sorts after it.
+pub fn tombstone_id(now: UnixMs, newest: &GenerationId, rand: [u8; 8]) -> GenerationId {
+    id_after(now, Some(newest), rand)
 }
 
 /// Removes the record of a generation whose publication batch was
@@ -116,24 +126,6 @@ pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> Generati
 /// it. The one delete of a record there is (see the module doc).
 pub async fn discard_generation<B: BlobStore>(safety: &B, id: &GenerationId) -> Result<()> {
     safety.delete(&generation_key(id)).await
-}
-
-/// The id of a copy of `source` onto a key whose newest id (its live
-/// generation or its last tombstone) is `newest`. It always sorts after
-/// both, also when this isolate's clock is behind the ones that minted
-/// them: a replay then applies the source first and never puts what the
-/// copy replaced back over it.
-pub fn copy_id(
-    now: UnixMs,
-    source: &GenerationId,
-    newest: Option<&GenerationId>,
-    rand: [u8; 8],
-) -> GenerationId {
-    let floor = match newest {
-        Some(n) if n > source => n,
-        _ => source,
-    };
-    id_after(now, Some(floor), rand)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,9 +458,11 @@ async fn read<B: BlobStore, K: Kek, R: for<'de> Deserialize<'de>>(
         .map_err(|_| ERR_RECORD)
 }
 
-/// Writes `m/<generation_id>`. The caller publishes the generation only
-/// after this returned `Ok`.
-pub async fn write_generation<B: BlobStore, K: Kek>(
+/// Writes `m/<generation_id>`, after it raised the floor of the key to
+/// the id. The caller publishes the generation only after this returned
+/// `Ok`.
+pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
+    catalog: &C,
     safety: &B,
     kek: &K,
     bucket: &Bucket,
@@ -476,6 +470,9 @@ pub async fn write_generation<B: BlobStore, K: Kek>(
     extents: &[ExtentRow],
 ) -> Result<()> {
     let record = GenerationManifest::new(bucket, generation, extents)?;
+    catalog
+        .raise_floor(&bucket.id, &generation.key, &generation.id)
+        .await?;
     let name = generation_key(&generation.id);
     write(
         safety,
@@ -488,8 +485,10 @@ pub async fn write_generation<B: BlobStore, K: Kek>(
     .await
 }
 
-/// Writes `m/del/<id>`. The caller deletes only after this returned `Ok`.
-pub async fn write_tombstone<B: BlobStore, K: Kek>(
+/// Writes `m/del/<id>`, after it raised the floor of the key to the id.
+/// The caller deletes only after this returned `Ok`.
+pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
+    catalog: &C,
     safety: &B,
     kek: &K,
     bucket: &BucketId,
@@ -497,6 +496,7 @@ pub async fn write_tombstone<B: BlobStore, K: Kek>(
     id: &GenerationId,
     now: UnixMs,
 ) -> Result<()> {
+    catalog.raise_floor(bucket, key, id).await?;
     let record = Tombstone {
         v: RECORD_VERSION,
         id: id.as_str().to_owned(),

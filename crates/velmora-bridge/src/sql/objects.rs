@@ -354,31 +354,62 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
     ))
 }
 
+/// Raises the floor of `(bucket, key)` to `id` if it is lower. Called
+/// before a recovery record with that id is stored, in a statement of
+/// its own: whatever happens to the record's own batch afterwards, every
+/// later id on the key is minted above it ([`newest_id`]) and held to
+/// that ([`guard_newest`]). A floor raised for a write that then fails
+/// costs nothing.
+pub(super) async fn raise_floor<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+    id: &GenerationId,
+) -> Result<()> {
+    c.sql
+        .exec(
+            // Nothing for a bucket the catalogue does not have (a replay
+            // can read a tombstone of one): nothing is published there.
+            "INSERT INTO key_floors(bucket_id, key, floor_id) \
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
+             ON CONFLICT(bucket_id, key) DO UPDATE SET \
+               floor_id = max(floor_id, excluded.floor_id)",
+            &[text(bucket.as_str()), text(key), text(id.as_str())],
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Guard of every publication: `id` sorts after the live generation of
-/// `(bucket, key)` and after the key's newest tombstone. Ids on one key
+/// `(bucket, key)` and is not below the key's floor, the highest id a
+/// recovery record of the key was ever stored under (the publication
+/// raised it to its own id before it stored its record). Ids on one key
 /// are then in commit order, the order a replay of the recovery records
-/// rebuilds; a clock that runs behind cannot publish "into the past".
+/// rebuilds; a clock that runs behind cannot publish "into the past",
+/// and neither can a write that sorts before the record of a delete or
+/// of a write that failed. The floor itself passes: it is this
+/// publication's own id, or an id only 64 equal random bits could repeat.
 pub(super) fn guard_newest(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
     (
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
            WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3) \
-         OR EXISTS (SELECT 1 FROM key_tombstones \
-           WHERE bucket_id = ?1 AND key = ?2 AND tombstone_id >= ?3)",
+         OR EXISTS (SELECT 1 FROM key_floors \
+           WHERE bucket_id = ?1 AND key = ?2 AND floor_id > ?3)",
         vec![text(bucket.as_str()), text(key), text(id.as_str())],
     )
 }
 
-/// The key lives again under `id`: the tombstone it sorts after has
-/// nothing left to hold back, the live pointer does it from here.
-pub(super) fn clear_tombstone(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
+/// The key lives under `id`: a floor at or below it has nothing left to
+/// hold back, the live pointer does it from here.
+pub(super) fn clear_floor(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
     (
-        "DELETE FROM key_tombstones WHERE bucket_id = ?1 AND key = ?2 AND tombstone_id < ?3",
+        "DELETE FROM key_floors WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3",
         vec![text(bucket.as_str()), text(key), text(id.as_str())],
     )
 }
 
 /// The newest id in the history of `(bucket, key)`: the live generation
-/// or the last tombstone, whichever sorts later.
+/// or the floor, whichever sorts later.
 pub(super) async fn newest_id<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &BucketId,
@@ -389,7 +420,7 @@ pub(super) async fn newest_id<S: Sql>(
         .query(
             "SELECT max(id) FROM (SELECT generation_id AS id FROM objects \
                WHERE bucket_id = ?1 AND key = ?2 \
-             UNION ALL SELECT tombstone_id FROM key_tombstones \
+             UNION ALL SELECT floor_id FROM key_floors \
                WHERE bucket_id = ?1 AND key = ?2)",
             &[text(bucket.as_str()), text(key)],
         )
@@ -433,7 +464,7 @@ pub(super) async fn commit_generation<S: Sql>(
 
     let mut stmts: Vec<Stmt> = Vec::with_capacity(7 + 3 * commit.extents.len());
     stmts.push(guard_newest(&g.bucket_id, &g.key, &g.id));
-    stmts.push(clear_tombstone(&g.bucket_id, &g.key, &g.id));
+    stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(generation_insert(g)?);
     for e in &commit.extents {
         stmts.push(extent_insert(e, &g.id)?);
@@ -501,7 +532,7 @@ pub(super) async fn copy_generation<S: Sql>(
         ),
         // The copy is the newest id of its key as well, as for a PUT.
         guard_newest(&g.bucket_id, &g.key, &g.id),
-        clear_tombstone(&g.bucket_id, &g.key, &g.id),
+        clear_floor(&g.bucket_id, &g.key, &g.id),
         generation_insert(g)?,
         (
             "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \

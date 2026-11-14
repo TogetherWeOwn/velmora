@@ -1020,6 +1020,7 @@ where
             continue;
         }
         write_generation(
+            &bridge.catalog,
             &bridge.safety,
             &bridge.kek,
             &a.bucket,
@@ -1050,7 +1051,9 @@ where
             Guard::Lost => {
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
-                // record left behind replays as a PUT that failed.
+                // record left behind replays as a PUT that failed, and
+                // under everything that follows it on the key, which
+                // the floor raised for it holds to a later id.
                 let _ = bridge
                     .safety
                     .delete(&generation_key(&commit.generation.id))
@@ -1059,7 +1062,9 @@ where
                 // was read) or for the upload. Only the second is judged
                 // by the revision on the next turn.
                 let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
-                let outrun = newest.is_some_and(|n| n >= commit.generation.id);
+                // The floor is this id itself unless something newer
+                // came: only a higher one outran it.
+                let outrun = newest.is_some_and(|n| n > commit.generation.id);
                 lost_at = (!outrun).then_some(upload.revision);
             }
         }

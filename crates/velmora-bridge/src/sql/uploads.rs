@@ -7,7 +7,7 @@
 //! `uploads.revision`, so `revision = R` pins the exact part set a Complete
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
-use super::objects::{clear_tombstone, guard_newest};
+use super::objects::{clear_floor, guard_newest};
 use super::SqlCatalog;
 use crate::ports::{Guard, Row, Sql, SqlValue, UploadTarget};
 use crate::types::{
@@ -385,7 +385,7 @@ pub(super) async fn complete_upload<S: Sql>(
         guard,
     ));
     stmts.push(guard_newest(t.bucket, t.key, &g.id));
-    stmts.push(clear_tombstone(t.bucket, t.key, &g.id));
+    stmts.push(clear_floor(t.bucket, t.key, &g.id));
     stmts.push((
         "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
            content_json, user_meta_json, extent_count, created_at, retired_at) \

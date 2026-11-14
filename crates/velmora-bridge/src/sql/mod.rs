@@ -136,6 +136,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
     }
+    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
+        objects::raise_floor(self, bucket, key, id).await
+    }
     async fn copy_generation(&self, c: &CopyGeneration) -> Result<Guard<()>> {
         objects::copy_generation(self, c).await
     }

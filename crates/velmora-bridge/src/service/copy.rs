@@ -24,10 +24,9 @@ use super::common::{
     internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
-use crate::recovery::{copy_id, generation_key, write_generation};
+use crate::recovery::{generation_key, id_after, write_generation};
 use crate::types::{
-    Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
-    S3Response,
+    Body, Bucket, CopyGeneration, ExtentRow, GenerationRow, GenerationState, S3Response,
 };
 
 /// Times the copy is re-planned when the source changes under it.
@@ -178,8 +177,6 @@ where
         ));
     }
 
-    // The id of the attempt before this one, which lost its guard.
-    let mut lost: Option<GenerationId> = None;
     for _ in 0..ATTEMPTS {
         let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
         // The copy keeps the checksum stored with the source. Computing
@@ -191,9 +188,13 @@ where
                 "A copy keeps the checksum of its source; computing another is not implemented.",
             ));
         }
-        // The newest id on the destination key, a live generation or a
-        // tombstone, so that the copy's id sorts after it. The batch
-        // holds the copy to that.
+        // The newest id on the destination key, its live generation or
+        // its floor, so that the copy's id sorts after it. The batch
+        // holds the copy to that. The floor also covers the attempt that
+        // lost: should its record have survived, it sorts before this
+        // one. The id of the source does not matter: a replay applies
+        // the two records in either order (`sql/replay.rs`), and a copy
+        // onto its own source finds it as the newest id of the key.
         let newest = bridge
             .catalog
             .newest_id(&bucket.id, key)
@@ -208,9 +209,7 @@ where
             (from.content_json.clone(), from.user_meta_json.clone())
         };
         let generation = GenerationRow {
-            // Also after the attempt that lost: should its record have
-            // survived its delete after all, it sorts before this one.
-            id: copy_id(now, &from.id, newest.as_ref().max(lost.as_ref()), rand),
+            id: id_after(now, newest.as_ref(), rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,
@@ -235,9 +234,16 @@ where
         // for a PUT. It describes every extent in full, so a replay can
         // rebuild the copy when the source it shares them with is gone.
         // The extents have the same places in the copy as in the source.
-        write_generation(&bridge.safety, &bridge.kek, bucket, &generation, &extents)
-            .await
-            .map_err(|_| internal())?;
+        write_generation(
+            &bridge.catalog,
+            &bridge.safety,
+            &bridge.kek,
+            bucket,
+            &generation,
+            &extents,
+        )
+        .await
+        .map_err(|_| internal())?;
         drop(extents);
         let id = generation.id.clone();
         let record = generation_key(&id);
@@ -272,7 +278,6 @@ where
         if !removed {
             return Err(internal());
         }
-        lost = Some(id);
         // Plan again against what is live now.
     }
     Err(unavailable())

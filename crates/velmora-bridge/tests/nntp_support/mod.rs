@@ -778,6 +778,9 @@ impl Catalog for MemCatalog {
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
+    async fn raise_floor(&self, _: &BucketId, _: &str, _: &GenerationId) -> Result<()> {
+        unused()
+    }
     async fn copy_generation(&self, _: &velmora_bridge::CopyGeneration) -> Result<Guard<()>> {
         unused()
     }

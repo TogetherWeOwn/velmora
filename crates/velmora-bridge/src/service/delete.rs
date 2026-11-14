@@ -44,15 +44,29 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     else {
         return Ok(no_content());
     };
+    // The newest id on the key: the live generation, or a floor above
+    // it, left by the record of a write or a delete that did not commit.
+    // The tombstone sorts after that record too, so a replay cannot
+    // apply it over this delete.
+    let newest = bridge
+        .catalog
+        .newest_id(&bucket.id, key)
+        .await
+        .map_err(|_| internal())?
+        .map_or(live.id.clone(), |n| n.max(live.id.clone()));
     let now = bridge.clock.now();
     let mut rand = [0u8; 8];
     SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
     // The tombstone is durable before the catalogue batch, so an
     // acknowledged delete stays deleted in a restored catalogue. It
     // covers every generation older than itself; a generation published
-    // after it (a racing PUT) survives, here and in a replay.
-    let tombstone = tombstone_id(now, &live.id, rand);
+    // after it (a racing PUT) survives, here and in a replay. The floor
+    // of the key is raised to the tombstone before the record is stored:
+    // when the batch below finds nothing left to delete (another delete
+    // was faster), the record stays, and every later write sorts after it.
+    let tombstone = tombstone_id(now, &newest, rand);
     write_tombstone(
+        &bridge.catalog,
         &bridge.safety,
         &bridge.kek,
         &bucket.id,
