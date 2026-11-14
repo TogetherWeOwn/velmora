@@ -19,8 +19,8 @@
 
 use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::SqlCatalog;
-use crate::ports::{Guard, Sql, SqlValue};
-use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, RestoreProgress};
+use crate::ports::{Sql, SqlValue};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::types::{
     ArticleRow, BridgeError, Bucket, ExtentId, ExtentPlacement, GenerationId, GenerationRow,
     GenerationState, Result, SafetyState, UnixMs,
@@ -364,16 +364,50 @@ pub(super) async fn restore_advance<S: Sql>(
     Ok(())
 }
 
-/// Step 2. `Lost` = the generation is already there, a newer generation
-/// of the key is live, or the extents do not tile it (one of them is
-/// missing, in another bucket, still a part of an upload under another
-/// generation's name, or its key was shredded).
+/// An extent with neither a pinned copy nor an article plan.
+const NO_COPY: &str = "e.safety_state = 'deleted' \
+     AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id)";
+
+/// Extent ids per statement of [`has_lost_extent`].
+const LOST_CHUNK: usize = 50;
+
+/// Whether one of the extents has no copy anywhere.
+async fn has_lost_extent<S: Sql>(
+    c: &SqlCatalog<S>,
+    placements: &[ExtentPlacement],
+) -> Result<bool> {
+    for chunk in placements.chunks(LOST_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let rows = c
+            .sql
+            .query(
+                &format!("SELECT 1 FROM extents e WHERE e.id IN ({marks}) AND {NO_COPY} LIMIT 1"),
+                &chunk
+                    .iter()
+                    .map(|p| text(p.extent_id.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        if !rows.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Step 2. `Refused` = the generation is already there, a newer
+/// generation of the key is live, or the extents do not tile it (one of
+/// them is missing, in another bucket, still a part of an upload under
+/// another generation's name, or its key was shredded). `Damaged` = an
+/// older generation of the key is live and this one cannot be read in
+/// full: a record that lingers from a write that failed must not take
+/// the place of a good object.
 pub(super) async fn replay_publish<S: Sql>(
     c: &SqlCatalog<S>,
     g: &GenerationRow,
     placements: &[ExtentPlacement],
     now: UnixMs,
-) -> Result<Guard<()>> {
+) -> Result<ReplayPublish> {
     if g.state != GenerationState::Live
         || g.retired_at.is_some()
         || usize::try_from(g.extent_count).ok() != Some(placements.len())
@@ -444,6 +478,17 @@ pub(super) async fn replay_publish<S: Sql>(
             uint(g.size)?,
         ],
     ));
+    // A generation that cannot be read in full replaces nothing. With no
+    // older generation live it is published, so that the key answers
+    // with an error and not with "no such key".
+    stmts.push((
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
+           WHERE bucket_id = ?2 AND key = ?3) \
+         AND EXISTS (SELECT 1 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' \
+            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))",
+        vec![gen_id(), bucket(), text(&g.key)],
+    ));
     // An extent whose pinned copy is held goes through post and verify
     // again: posting a planned article twice is harmless, and the read
     // back is the evidence a release needs. The obligation stays under
@@ -492,8 +537,24 @@ pub(super) async fn replay_publish<S: Sql>(
         vec![bucket(), text(&g.key), gen_id()],
     ));
     match c.sql.batch(stmts).await {
-        Ok(_) => Ok(Guard::Applied(())),
-        Err(BridgeError::GuardFailed) => Ok(Guard::Lost),
+        Ok(_) => Ok(ReplayPublish::Published),
+        Err(BridgeError::GuardFailed) => {
+            // Which guard refused it. Nothing else writes during a
+            // replay, so the catalogue is as the batch found it.
+            let older_live = c
+                .sql
+                .query(
+                    "SELECT 1 FROM objects WHERE bucket_id = ?1 AND key = ?2 \
+                       AND generation_id < ?3",
+                    &[bucket(), text(&g.key), gen_id()],
+                )
+                .await?;
+            if !older_live.is_empty() && has_lost_extent(c, placements).await? {
+                Ok(ReplayPublish::Damaged)
+            } else {
+                Ok(ReplayPublish::Refused)
+            }
+        }
         Err(e) => Err(e),
     }
 }

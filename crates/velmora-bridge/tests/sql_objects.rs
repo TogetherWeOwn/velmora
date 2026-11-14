@@ -1655,6 +1655,46 @@ async fn a_commit_under_an_older_or_equal_id_is_refused() {
     assert_eq!(fx.cat.publish(&later).await.unwrap(), Guard::Applied(()));
 }
 
+/// The mark for a generation record that may never have been published
+/// is set with the floor, kept by a tombstone below the floor, and
+/// cleared by one at or above it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tombstone_settles_only_the_records_below_it() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let id = |ms: i64| GenerationId::mint(T0.plus_ms(ms), [7; 8]);
+    let floor = || fx.cat.unpublished_floor(&b.id, "k");
+    assert_eq!(floor().await.unwrap(), None);
+
+    // A tombstone alone leaves nothing to cover.
+    fx.cat
+        .raise_floor(&b.id, "k", &id(10), false)
+        .await
+        .unwrap();
+    assert_eq!(floor().await.unwrap(), None);
+    // A generation record does, also one below the floor.
+    fx.cat.raise_floor(&b.id, "k", &id(5), true).await.unwrap();
+    assert_eq!(floor().await.unwrap(), Some(id(10)));
+    fx.cat.raise_floor(&b.id, "k", &id(30), true).await.unwrap();
+    assert_eq!(floor().await.unwrap(), Some(id(30)));
+    // Raising the floor for a tombstone does not cover it yet.
+    fx.cat
+        .raise_floor(&b.id, "k", &id(20), false)
+        .await
+        .unwrap();
+    assert_eq!(floor().await.unwrap(), Some(id(30)));
+
+    // A tombstone below the newest record does not cover that record.
+    fx.cat.settle_floor(&b.id, "k", &id(20)).await.unwrap();
+    assert_eq!(floor().await.unwrap(), Some(id(30)));
+    fx.cat.settle_floor(&b.id, "other", &id(40)).await.unwrap();
+    assert_eq!(floor().await.unwrap(), Some(id(30)));
+    fx.cat.settle_floor(&b.id, "k", &id(40)).await.unwrap();
+    assert_eq!(floor().await.unwrap(), None);
+    // The floor itself stays where it was.
+    assert_eq!(fx.cat.newest_id(&b.id, "k").await.unwrap(), Some(id(30)));
+}
+
 /// The floor is raised before a record is stored, by a statement of its
 /// own: it only goes up, it holds back every id below it, and the
 /// publication that raised it passes and takes it away.
@@ -1665,13 +1705,16 @@ async fn a_commit_must_not_sort_below_the_floor_of_the_key() {
     // A bucket the catalogue does not have gets no floor, and no error.
     let nowhere = BucketId::new("b_nowhere".to_owned());
     let stray = GenerationId::mint(T0, [1; 8]);
-    fx.cat.raise_floor(&nowhere, "k", &stray).await.unwrap();
+    fx.cat
+        .raise_floor(&nowhere, "k", &stray, false)
+        .await
+        .unwrap();
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
 
     // The record of a write that was never published.
     let failed = fx.commit(&b.id, "k", 1, T0.plus_ms(50));
     let floor = failed.generation.id.clone();
-    fx.cat.raise_floor(&b.id, "k", &floor).await.unwrap();
+    fx.cat.raise_floor(&b.id, "k", &floor, false).await.unwrap();
     assert_eq!(
         fx.cat.newest_id(&b.id, "k").await.unwrap(),
         Some(floor.clone())
@@ -1679,7 +1722,7 @@ async fn a_commit_must_not_sort_below_the_floor_of_the_key() {
     // A lower id does not lower it, and is refused.
     let older = fx.commit(&b.id, "k", 1, T0.plus_ms(20));
     let id = &older.generation.id;
-    fx.cat.raise_floor(&b.id, "k", id).await.unwrap();
+    fx.cat.raise_floor(&b.id, "k", id, false).await.unwrap();
     assert_eq!(
         fx.cat.newest_id(&b.id, "k").await.unwrap(),
         Some(floor.clone())
@@ -1693,7 +1736,7 @@ async fn a_commit_must_not_sort_below_the_floor_of_the_key() {
     assert_eq!(fx.cat.publish(&failed).await.unwrap(), Guard::Applied(()));
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
     // A floor under the live generation holds nothing back.
-    fx.cat.raise_floor(&b.id, "k", id).await.unwrap();
+    fx.cat.raise_floor(&b.id, "k", id, false).await.unwrap();
     assert_eq!(fx.cat.newest_id(&b.id, "k").await.unwrap(), Some(floor));
     let newer = fx.commit(&b.id, "k", 1, T0.plus_ms(51));
     assert_eq!(fx.cat.publish(&newer).await.unwrap(), Guard::Applied(()));

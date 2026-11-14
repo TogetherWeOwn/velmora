@@ -69,7 +69,13 @@ Limits to know:
   `unreadable` and its extent is restored without a plan.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
-  lists it under `damaged`.
+  lists it under `damaged`. The exception: when an older object is live
+  under the key, that one stays and the record is listed under
+  `damaged_unpublished`. Such a record is far more often what a failed
+  write left behind (a CompleteMultipartUpload whose parts were then
+  collected) than an acknowledged object that lost its data, and the
+  replay cannot tell the two apart. If it was acknowledged, the key
+  answers with the object before it instead of an error.
 - A CompleteMultipartUpload that got no answer from the catalogue and
   was sent again can leave two records of one object. The replay
   publishes one and counts the other in `duplicate`; nothing is missing.
@@ -168,8 +174,17 @@ of step 2 is not closed: nothing in it says that a replay is due.
 The catalogue refuses the commit as well, not only the request: a write
 that was already under way when a replay started answers 503 and
 publishes nothing. A DeleteObject in that place answers 503 too; its
-tombstone can stay on record, as that of any delete that failed, and
-the replay then applies it.
+tombstone can stay on record, and the replay then applies it. The same
+holds at any time for a DeleteObject whose catalogue batch failed
+(500): its tombstone stays, and a later replay applies it. The object
+the client still sees is then gone after a replay, unless a write was
+acknowledged on the key after the failed delete.
+
+No rollback while `restore_state` is `replaying` (`replay_unfinished`
+is `true`): do not roll the Worker back to an earlier version, and do
+not restore the database to an earlier point without step 2. A Worker
+version from before this gate does not read the row and takes writes
+into a catalogue that holds a part of the records.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.

@@ -11,7 +11,7 @@
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 use crate::recovery::{Recorded, Unpublished};
-use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, RestoreProgress};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
@@ -352,7 +352,22 @@ pub trait Catalog {
     /// ([`crate::recovery::write_generation`],
     /// [`crate::recovery::write_tombstone`]), and it stands whatever
     /// becomes of the write: every later id on the key sorts after `id`.
-    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()>;
+    /// `generation` = the record is a generation manifest, which a
+    /// replay publishes if nothing on record sorts after it.
+    async fn raise_floor(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        id: &GenerationId,
+        generation: bool,
+    ) -> Result<()>;
+    /// The tombstone `id` of the key is stored. It covers the generation
+    /// records the floor was raised for, unless the floor is above it.
+    async fn settle_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()>;
+    /// The floor of the key, if a generation record may exist under it
+    /// that was never published and that no tombstone covers.
+    async fn unpublished_floor(&self, bucket: &BucketId, key: &str)
+        -> Result<Option<GenerationId>>;
     /// Publishes a generation that references the extents of the source
     /// generation; no extent is written. `Refused` = the source is no
     /// longer the live object of its key, or the destination key's live
@@ -539,14 +554,14 @@ pub trait Catalog {
     /// nor an article plan: their number and the first `limit` ids.
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;
     /// Publishes the generation over the extents `replay_extents` left.
-    /// `Lost` = already present, a newer generation of the key is live,
-    /// or the extents do not tile it; nothing was written.
+    /// A generation with an extent that has no copy anywhere does not
+    /// replace an older live one.
     async fn replay_publish(
         &self,
         g: &GenerationRow,
         placements: &[ExtentPlacement],
         now: UnixMs,
-    ) -> Result<Guard<()>>;
+    ) -> Result<ReplayPublish>;
 
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()>;

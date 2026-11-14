@@ -361,8 +361,40 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
 /// its own: whatever happens to the record's own batch afterwards, every
 /// later id on the key is minted above it ([`newest_id`]) and held to
 /// that ([`guard_newest`]). A floor raised for a write that then fails
-/// costs nothing.
+/// costs nothing. `generation` = the record is a generation manifest:
+/// the floor then also says that a record may exist that was never
+/// published ([`unpublished_floor`]).
 pub(super) async fn raise_floor<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+    id: &GenerationId,
+    generation: bool,
+) -> Result<()> {
+    c.sql
+        .exec(
+            // Nothing for a bucket the catalogue does not have (a replay
+            // can read a tombstone of one): nothing is published there.
+            "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
+             ON CONFLICT(bucket_id, key) DO UPDATE SET \
+               floor_id = max(floor_id, excluded.floor_id), \
+               unpublished = max(unpublished, excluded.unpublished)",
+            &[
+                text(bucket.as_str()),
+                text(key),
+                text(id.as_str()),
+                SqlValue::Int(i64::from(generation)),
+            ],
+        )
+        .await
+        .map(|_| ())
+}
+
+/// The tombstone `id` of `(bucket, key)` is stored: it covers every
+/// record the floor was raised for so far, if the floor is not above it.
+/// A record whose floor is raised after this sets the mark again.
+pub(super) async fn settle_floor<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &BucketId,
     key: &str,
@@ -370,16 +402,37 @@ pub(super) async fn raise_floor<S: Sql>(
 ) -> Result<()> {
     c.sql
         .exec(
-            // Nothing for a bucket the catalogue does not have (a replay
-            // can read a tombstone of one): nothing is published there.
-            "INSERT INTO key_floors(bucket_id, key, floor_id) \
-             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
-             ON CONFLICT(bucket_id, key) DO UPDATE SET \
-               floor_id = max(floor_id, excluded.floor_id)",
+            "UPDATE key_floors SET unpublished = 0 \
+             WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3 AND unpublished <> 0",
             &[text(bucket.as_str()), text(key), text(id.as_str())],
         )
         .await
         .map(|_| ())
+}
+
+/// The floor of `(bucket, key)` if a generation record may exist under
+/// it that no tombstone covers: the record of a write that was not
+/// published and was not removed. While the key has a live generation,
+/// that one is on top of such a record; without one, a replay would
+/// publish the record, so a delete of the key must leave a tombstone.
+pub(super) async fn unpublished_floor<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+) -> Result<Option<GenerationId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT floor_id FROM key_floors \
+             WHERE bucket_id = ?1 AND key = ?2 AND unpublished <> 0",
+            &[text(bucket.as_str()), text(key)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Text(id)]) => Ok(Some(GenerationId::new(id.clone()))),
+        None => Ok(None),
+        Some(_) => Err(BridgeError::Sql("unpublished_floor: unexpected row".into())),
+    }
 }
 
 /// Guard of every publication: `id` sorts after the live generation of

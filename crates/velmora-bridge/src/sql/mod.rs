@@ -78,7 +78,7 @@ use crate::ports::{
     Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
-use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, RestoreProgress};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
@@ -150,8 +150,24 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
     }
-    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
-        objects::raise_floor(self, bucket, key, id).await
+    async fn raise_floor(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        id: &GenerationId,
+        generation: bool,
+    ) -> Result<()> {
+        objects::raise_floor(self, bucket, key, id, generation).await
+    }
+    async fn settle_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
+        objects::settle_floor(self, bucket, key, id).await
+    }
+    async fn unpublished_floor(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+    ) -> Result<Option<GenerationId>> {
+        objects::unpublished_floor(self, bucket, key).await
     }
     async fn copy_generation(
         &self,
@@ -176,7 +192,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         id: &GenerationId,
         now: UnixMs,
     ) -> Result<bool> {
-        objects::raise_floor(self, bucket, key, id).await?;
+        objects::raise_floor(self, bucket, key, id, false).await?;
+        objects::settle_floor(self, bucket, key, id).await?;
         recovery::delete_object_before(self, bucket, key, id, now, false).await
     }
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage> {
@@ -413,7 +430,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         g: &GenerationRow,
         placements: &[ExtentPlacement],
         now: UnixMs,
-    ) -> Result<Guard<()>> {
+    ) -> Result<ReplayPublish> {
         replay::replay_publish(self, g, placements, now).await
     }
 
