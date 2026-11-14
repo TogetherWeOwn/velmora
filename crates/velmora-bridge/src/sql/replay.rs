@@ -77,7 +77,8 @@ fn bucket_insert(b: &Bucket) -> Stmt {
 fn article_insert(a: &ArticleRow) -> Result<Stmt> {
     Ok((
         "INSERT OR IGNORE INTO articles(extent_id, idx, message_id, newsgroup, headers, \
-           cipher_offset, cipher_len, payload_sha256, state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+           cipher_offset, cipher_len, payload_sha256, yenc_name, state) \
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         vec![
             text(a.extent_id.as_str()),
             SqlValue::Int(i64::from(a.idx)),
@@ -87,6 +88,7 @@ fn article_insert(a: &ArticleRow) -> Result<Stmt> {
             uint(a.cipher_offset)?,
             uint(a.cipher_len)?,
             SqlValue::Blob(a.payload_sha256.to_vec()),
+            opt(a.yenc_name.as_deref(), text),
             text(a.state.as_str()),
         ],
     ))

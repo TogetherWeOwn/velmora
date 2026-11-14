@@ -54,8 +54,8 @@ use crate::ports::{
 };
 use crate::recovery::write_article_plan;
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent, JobOutcome,
-    OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
+    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
 };
 
 impl<T: Transport> NntpSession for NntpClient<T> {
@@ -210,22 +210,37 @@ fn payload_of<'a>(cipher: &'a [u8], row: &ArticleRow) -> Option<&'a [u8]> {
 }
 
 /// Renders the complete article for a stored row. Everything on the wire
-/// is a function of the stored row and the ciphertext (the yEnc name is
-/// the head of the message-id), so a repost is byte-identical.
+/// is a function of the stored row and the ciphertext, so a repost is
+/// byte-identical.
+///
+/// A row with its own yEnc name is a standalone single-part yEnc file:
+/// `=ybegin line=128 size=<payload> name=<name>`, the payload, then
+/// `=yend size=<payload> crc32=<payload crc>`. No part number, no range
+/// and no extent size: nothing on the wire ties the articles of one
+/// extent together. A row without one was planned before standalone
+/// articles and keeps the multi-part form it was posted in: part
+/// `idx + 1` of `total`, the extent's ciphertext range, `size=` of the
+/// whole extent, and the name taken from the head of the message-id.
+///
+/// Reads never depend on the form: they decode either one and accept only
+/// the stored length and SHA-256 (`fetch::check_payload`).
 fn render_article(row: &ArticleRow, total: u32, file_size: u64, payload: &[u8]) -> Result<Vec<u8>> {
-    let name: String = row
-        .message_id
-        .chars()
-        .take_while(char::is_ascii_alphanumeric)
-        .take(OBFUSCATED_YENC_NAME_LEN)
-        .collect();
-    let params = SegmentParams {
-        name,
-        part: row.idx + 1,
-        total,
-        begin: row.cipher_offset + 1,
-        end: row.cipher_offset + row.cipher_len,
-        file_size,
+    let params = match &row.yenc_name {
+        Some(name) if valid_yenc_name(name) => SegmentParams::single(name.clone()),
+        Some(_) => return Err(BridgeError::Invalid("stored yEnc name is malformed")),
+        None => SegmentParams {
+            name: row
+                .message_id
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .take(OBFUSCATED_YENC_NAME_LEN)
+                .collect(),
+            part: row.idx + 1,
+            total,
+            begin: row.cipher_offset + 1,
+            end: row.cipher_offset + row.cipher_len,
+            file_size,
+        },
     };
     let mut body = Vec::with_capacity(payload.len() + payload.len() / 16 + 512);
     encode_segment(&mut body, &params, payload)?;
@@ -504,6 +519,7 @@ where
                     cipher_offset: span.start,
                     cipher_len: span.len,
                     payload_sha256: [0; 32],
+                    yenc_name: Some(meta.yenc_name),
                     state: ArticleState::Planned,
                     provider_id: None,
                     posted_at: None,
