@@ -1614,6 +1614,13 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
     // already posted and verifies them again without posting twice.
     let s = "recovery catalogue-only loss";
     let posted_before = rig.server.posted_ids().await.len();
+    // A release keeps the copy in R2 until the hot tier evicts it. Evict
+    // all that may go, so that the replay meets extents with a copy
+    // (still pinned) and without one.
+    rig.bridge
+        .evict_batch(u64::MAX)
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
     let pinned = extents
         .iter()
         .filter(|id| rig.bridge.safety.contains(&format!("x/{id}")))
