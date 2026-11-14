@@ -244,6 +244,23 @@ where
     T: Clock,
 {
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
+    // A cold extent comes back whole and needs twice its size while it
+    // does. Beside the pieces already held that can be more than the
+    // budget has, however long the read waits. Such an extent is read
+    // once on its own first: that leaves it in the cache, and the read
+    // below then needs room for its piece only.
+    let mut held = 0u64;
+    for piece in &todo {
+        let cold = piece.extent.cipher_size.saturating_mul(2);
+        if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
+            drop(
+                read_piece(bridge, bucket, piece)
+                    .await
+                    .map_err(|fail| fail.response())?,
+            );
+        }
+        held = held.saturating_add(piece.len);
+    }
     let mut parts = Vec::with_capacity(todo.len());
     for piece in &todo {
         parts.push(
