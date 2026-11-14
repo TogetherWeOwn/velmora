@@ -7,6 +7,7 @@
 //! live without a pointer. Statements are fixed-shape, one row each, and
 //! stay far below the 100-bound-parameter limit.
 
+use super::uploads::guarded;
 use super::SqlCatalog;
 use crate::ports::{Guard, Row, Sql, SqlValue};
 use crate::types::{
@@ -353,14 +354,146 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
     ))
 }
 
+/// Raises the floor of `(bucket, key)` to `id` if it is lower. Called
+/// before a recovery record with that id is stored, in a statement of
+/// its own: whatever happens to the record's own batch afterwards, every
+/// later id on the key is minted above it ([`newest_id`]) and held to
+/// that ([`guard_newest`]). A floor raised for a write that then fails
+/// costs nothing. `generation` = the record is a generation manifest:
+/// the floor then also says that a record may exist that was never
+/// published ([`unpublished_floor`]).
+pub(super) async fn raise_floor<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+    id: &GenerationId,
+    generation: bool,
+) -> Result<()> {
+    c.sql
+        .exec(
+            // Nothing for a bucket the catalogue does not have (a replay
+            // can read a tombstone of one): nothing is published there.
+            "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
+             ON CONFLICT(bucket_id, key) DO UPDATE SET \
+               floor_id = max(floor_id, excluded.floor_id), \
+               unpublished = max(unpublished, excluded.unpublished)",
+            &[
+                text(bucket.as_str()),
+                text(key),
+                text(id.as_str()),
+                SqlValue::Int(i64::from(generation)),
+            ],
+        )
+        .await
+        .map(|_| ())
+}
+
+/// The tombstone `id` of `(bucket, key)` is stored: it covers every
+/// record the floor was raised for so far, if the floor is not above it.
+/// A record whose floor is raised after this sets the mark again.
+pub(super) async fn settle_floor<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+    id: &GenerationId,
+) -> Result<()> {
+    c.sql
+        .exec(
+            "UPDATE key_floors SET unpublished = 0 \
+             WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3 AND unpublished <> 0",
+            &[text(bucket.as_str()), text(key), text(id.as_str())],
+        )
+        .await
+        .map(|_| ())
+}
+
+/// The floor of `(bucket, key)` if a generation record may exist under
+/// it that no tombstone covers: the record of a write that was not
+/// published and was not removed. While the key has a live generation,
+/// that one is on top of such a record; without one, a replay would
+/// publish the record, so a delete of the key must leave a tombstone.
+pub(super) async fn unpublished_floor<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+) -> Result<Option<GenerationId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT floor_id FROM key_floors \
+             WHERE bucket_id = ?1 AND key = ?2 AND unpublished <> 0",
+            &[text(bucket.as_str()), text(key)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Text(id)]) => Ok(Some(GenerationId::new(id.clone()))),
+        None => Ok(None),
+        Some(_) => Err(BridgeError::Sql("unpublished_floor: unexpected row".into())),
+    }
+}
+
+/// Guard of every publication: `id` sorts after the live generation of
+/// `(bucket, key)` and is not below the key's floor, the highest id a
+/// recovery record of the key was ever stored under (the publication
+/// raised it to its own id before it stored its record). Ids on one key
+/// are then in commit order, the order a replay of the recovery records
+/// rebuilds; a clock that runs behind cannot publish "into the past",
+/// and neither can a write that sorts before the record of a delete or
+/// of a write that failed. The floor itself passes: it is this
+/// publication's own id, or an id only 64 equal random bits could repeat.
+pub(super) fn guard_newest(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
+    (
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
+           WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3) \
+         OR EXISTS (SELECT 1 FROM key_floors \
+           WHERE bucket_id = ?1 AND key = ?2 AND floor_id > ?3)",
+        vec![text(bucket.as_str()), text(key), text(id.as_str())],
+    )
+}
+
+/// The key lives under `id`: a floor at or below it has nothing left to
+/// hold back, the live pointer does it from here.
+pub(super) fn clear_floor(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
+    (
+        "DELETE FROM key_floors WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3",
+        vec![text(bucket.as_str()), text(key), text(id.as_str())],
+    )
+}
+
+/// The newest id in the history of `(bucket, key)`: the live generation
+/// or the floor, whichever sorts later.
+pub(super) async fn newest_id<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+) -> Result<Option<GenerationId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT max(id) FROM (SELECT generation_id AS id FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2 \
+             UNION ALL SELECT floor_id FROM key_floors \
+               WHERE bucket_id = ?1 AND key = ?2)",
+            &[text(bucket.as_str()), text(key)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Text(id)]) => Ok(Some(GenerationId::new(id.clone()))),
+        Some([SqlValue::Null]) | None => Ok(None),
+        Some(_) => Err(BridgeError::Sql("newest_id: unexpected row".into())),
+    }
+}
+
 /// Publishes one new generation of a single PUT. One batch: the new
 /// generation with its extents and posting obligations, the previous
 /// generation retired with GC rows, and the live pointer moved. Any
-/// failing statement leaves the catalogue exactly as it was.
+/// failing statement leaves the catalogue exactly as it was. `Lost` =
+/// the key already has a newer id ([`guard_newest`]).
 pub(super) async fn commit_generation<S: Sql>(
     c: &SqlCatalog<S>,
     commit: &CommitGeneration,
-) -> Result<()> {
+) -> Result<Guard<()>> {
     let g = &commit.generation;
     // The extents must tile the object exactly, in order: a gap or an
     // overlap here would be served as wrong bytes later. Each must still
@@ -382,7 +515,9 @@ pub(super) async fn commit_generation<S: Sql>(
         ));
     }
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(5 + 3 * commit.extents.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(7 + 3 * commit.extents.len());
+    stmts.push(guard_newest(&g.bucket_id, &g.key, &g.id));
+    stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(generation_insert(g)?);
     for e in &commit.extents {
         stmts.push(extent_insert(e, &g.id)?);
@@ -406,7 +541,7 @@ pub(super) async fn commit_generation<S: Sql>(
         commit.now,
     ));
     stmts.push(pointer_upsert(g));
-    c.sql.batch(stmts).await.map(|_| ())
+    guarded(c, stmts).await
 }
 
 /// Publishes a copy: a new generation that references the extents of the
@@ -448,18 +583,9 @@ pub(super) async fn copy_generation<S: Sql>(
                 SqlValue::Int(i64::from(g.extent_count)),
             ],
         ),
-        // The copy is the newest generation of its key by id as well: a
-        // replay of the recovery records orders a key's generations by
-        // id, and must not put the replaced one back over the copy.
-        (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS ( \
-               SELECT 1 FROM objects WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3)",
-            vec![
-                text(g.bucket_id.as_str()),
-                text(&g.key),
-                text(g.id.as_str()),
-            ],
-        ),
+        // The copy is the newest id of its key as well, as for a PUT.
+        guard_newest(&g.bucket_id, &g.key, &g.id),
+        clear_floor(&g.bucket_id, &g.key, &g.id),
         generation_insert(g)?,
         (
             "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
@@ -486,7 +612,7 @@ pub(super) async fn copy_generation<S: Sql>(
         copy.now,
     ));
     stmts.push(pointer_upsert(g));
-    super::uploads::guarded(c, stmts).await
+    guarded(c, stmts).await
 }
 
 /// Idempotent: deleting a key with no live object changes nothing.

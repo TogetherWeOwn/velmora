@@ -9,7 +9,7 @@ kept outside it:
    - `m/<generation id>`: one per PutObject, CopyObject or CompleteMultipartUpload.
      Bucket (id, name, wrapped key), object key, metadata and every extent
      (sizes, offsets, digests, media header, wrapped file key).
-   - `m/del/<tombstone id>`: one per DeleteObject that removed an object.
+   - `m/del/<tombstone id>`: one per DeleteObject that found an object.
    - `m/art/<extent id>`: the article plan of an extent (message ids,
      newsgroup, headers, spans, digests), written before its first POST.
 
@@ -42,13 +42,23 @@ extents from Usenet.
 Limits to know:
 
 - A write that failed after its record was stored can become visible
-  after a replay. S3 allows this (the request had no definite outcome).
-- Replay order is id order, and an id carries the time its request
-  started. Two requests on one key that overlapped in time (two writes,
-  or a write and a delete) may come back in the other order; either
-  order is a valid outcome for overlapping requests. This relies on
-  clocks of two Worker instances differing by less than a request
-  takes. Requests that did not overlap are replayed in their order.
+  after a replay: one whose catalogue batch failed (the client got a
+  500 and cannot know the outcome), or one that was refused and whose
+  record could not be removed. It becomes visible only in its place in
+  the order: every write and delete that was acknowledged on the key
+  after it sorts after it and stays on top. It is visible after a replay
+  only when nothing was acknowledged on the key after it.
+- Replay order is id order. Before a record is stored, the catalogue
+  raises the floor of the key to the record's id, in a statement of its
+  own, and it accepts a publication or a tombstone only if its id sorts
+  after the live generation and is not below the floor. So everything
+  that is acknowledged on a key sorts after every record that was
+  stored on the key before it, whatever became of that record's own
+  request (a DeleteObject that found nothing left to delete, a batch
+  that failed). A request whose id sorts lower (its Worker's clock is
+  behind) is refused and tries again under a later id; a record such an
+  attempt leaves behind sorts below what was acknowledged and changes
+  nothing. None of this depends on the clocks of Worker instances.
 - An extent restored from its article plan record alone (no pinned
   copy) is assumed posted: the record is written before the first POST,
   so a replay cannot tell an extent that was fully posted from one whose

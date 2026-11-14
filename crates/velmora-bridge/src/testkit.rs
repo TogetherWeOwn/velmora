@@ -46,6 +46,11 @@ pub const MIGRATION_0005: &str =
 pub const MIGRATION_0006: &str =
     include_str!("../../../workers/s3-bridge/migrations/0006_permit_class.sql");
 
+/// The floor of each key: the newest id a recovery record was stored
+/// under.
+pub const MIGRATION_0007: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0007_key_floors.sql");
+
 // ---------------------------------------------------------------------------
 // RusqliteSql
 // ---------------------------------------------------------------------------
@@ -133,6 +138,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0004)?;
         db.apply(MIGRATION_0005)?;
         db.apply(MIGRATION_0006)?;
+        db.apply(MIGRATION_0007)?;
         Ok(db)
     }
 

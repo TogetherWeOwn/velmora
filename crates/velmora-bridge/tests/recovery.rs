@@ -14,9 +14,10 @@ use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
-const TABLES: [&str; 13] = [
+const TABLES: [&str; 14] = [
     "generation_extents",
     "outbox",
+    "key_floors",
     "verifications",
     "articles",
     "upload_parts",
@@ -279,7 +280,15 @@ async fn manifest_write_failure_commits_nothing() {
         .expect_error(500, "InternalError");
     assert_eq!(get(&rig, &signer, "kept").await.expect(200).body, b"kept");
 
-    assert_eq!(dump(&rig), before, "no catalogue row changed");
+    // Each of them raised the floor of its key before the store refused
+    // the record, and that is all: the next id on the key sorts after
+    // the one that failed.
+    let rows = |dump: String| -> Vec<String> {
+        let rows = dump.lines().filter(|l| !l.starts_with("key_floors|"));
+        rows.map(str::to_owned).collect()
+    };
+    assert_eq!(rows(dump(&rig)), rows(before), "no catalogue row changed");
+    assert_eq!(rig.count("key_floors"), 3, "k, kept and mp");
     assert_eq!(records(&rig), records_before, "no record was written");
     assert_eq!(rig.bridge.budget.in_use(), 0);
 
@@ -1140,4 +1149,743 @@ async fn restore_route_runs_only_in_maintenance() {
     let signer = reissue_key(&restoring).await;
     let put = restoring.put(&signer, BUCKET, "c", b"c").await;
     assert_eq!(put.status, 503, "{}", put.text());
+}
+
+// ---------------------------------------------------------------------------
+// The order of ids on a key is the order of its commits
+// ---------------------------------------------------------------------------
+
+/// What every key answers now; then the catalogue is lost and rebuilt
+/// from the records alone, and every key must answer the same.
+async fn replay_answers_the_same(rig: &Rig, signer: &Signer, keys: &[&str]) {
+    let mut before = Vec::new();
+    for key in keys {
+        let got = get(rig, signer, key).await;
+        before.push((got.status, got.body.clone()));
+    }
+    wipe(rig);
+    let (report, _) = replay(rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(
+        report.unpublishable.is_empty() && report.unreadable.is_empty(),
+        "{report:?}"
+    );
+    let signer = reissue_key(rig).await;
+    for (key, (status, body)) in keys.iter().zip(before) {
+        let got = get(rig, &signer, key).await;
+        assert_eq!(got.status, status, "{key} after the replay");
+        if status == 200 {
+            assert_eq!(got.body, body, "{key} after the replay");
+        }
+    }
+}
+
+fn live_ids(rig: &Rig) -> Vec<String> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT generation_id FROM objects ORDER BY key")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_overwrite_from_a_slow_clock_stays_on_top_in_a_replay() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let v1 = live_ids(&rig).remove(0);
+    // The isolate that takes the overwrite runs half a second behind.
+    rig.bridge.clock.advance_ms(-500);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2 > v1, "{v2} sorts after {v1}");
+    // The record of the first try is gone: one record per generation.
+    assert_eq!(
+        records(&rig)
+            .iter()
+            .filter(|r| r.starts_with(GENERATION_PREFIX))
+            .count(),
+        2
+    );
+    rig.bridge.clock.advance_ms(2000);
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"v2");
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_after_a_delete_sorts_after_the_tombstone() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    rig.bridge.clock.advance_ms(-500);
+    delete(&rig, &signer, "k").await.expect(204);
+    let tombstone = records(&rig)
+        .into_iter()
+        .find_map(|r| r.strip_prefix(TOMBSTONE_PREFIX).map(str::to_owned))
+        .unwrap();
+    rig.bridge.clock.advance_ms(100);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2 > tombstone, "{v2} sorts after {tombstone}");
+    // The key lives again: the catalogue keeps no tombstone for it.
+    assert_eq!(rig.count("key_floors"), 0);
+    rig.bridge.clock.advance_ms(2000);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn writes_in_one_millisecond_replay_in_commit_order() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    // The clock does not move: every id below is minted in the same
+    // millisecond, where only random bytes would order them.
+    let keys: Vec<String> = (0..12).map(|i| format!("k{i}")).collect();
+    for key in &keys {
+        rig.put(&signer, BUCKET, key, b"v1").await.expect(200);
+        rig.put(&signer, BUCKET, key, b"v2").await.expect(200);
+        rig.put(&signer, BUCKET, key, b"v3").await.expect(200);
+    }
+    rig.put(&signer, BUCKET, "gone", b"v1").await.expect(200);
+    delete(&rig, &signer, "gone").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v1").await.expect(200);
+    delete(&rig, &signer, "back").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v2").await.expect(200);
+    delete(&rig, &signer, "back").await.expect(204);
+    rig.put(&signer, BUCKET, "back", b"v3").await.expect(200);
+    assert_eq!(get(&rig, &signer, "gone").await.status, 404);
+    assert_eq!(get(&rig, &signer, "back").await.expect(200).body, b"v3");
+    assert_eq!(rig.count("key_floors"), 1, "only the deleted key has one");
+
+    let mut all: Vec<&str> = keys.iter().map(String::as_str).collect();
+    all.extend(["gone", "back"]);
+    for key in &keys {
+        assert_eq!(get(&rig, &signer, key).await.expect(200).body, b"v3");
+    }
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &all).await;
+    // The replay raises a floor for every tombstone it reads: "gone", and
+    // "back", whose floor sits under its live generation and holds
+    // nothing back.
+    assert_eq!(rig.count("key_floors"), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_from_a_slow_clock_stays_on_top_in_a_replay() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let first = pattern(3, 5 * MIB);
+    let last = pattern(4, 1024);
+    let etags = vec![
+        upload_part(&rig, &signer, "big", &id, 1, &first).await,
+        upload_part(&rig, &signer, "big", &id, 2, &last).await,
+    ];
+    tick(&rig);
+    rig.put(&signer, BUCKET, "big", b"small").await.expect(200);
+    let put = live_ids(&rig).remove(0);
+    rig.bridge.clock.advance_ms(-500);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    let completed = live_ids(&rig).remove(0);
+    assert!(completed > put, "{completed} sorts after {put}");
+    rig.bridge.clock.advance_ms(2000);
+    assert_eq!(
+        get(&rig, &signer, "big").await.expect(200).body,
+        [first, last].concat()
+    );
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+// ---------------------------------------------------------------------------
+// An upload that the export saw open, completed after it
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let first = pattern(3, 5 * MIB);
+    let last = pattern(4, 1024);
+    let etags = vec![
+        upload_part(&rig, &signer, "big", &id, 1, &first).await,
+        upload_part(&rig, &signer, "big", &id, 2, &last).await,
+    ];
+    tick(&rig);
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    tick(&rig);
+    wipe(&rig);
+    import(&rig);
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let whole = [first, last].concat();
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+
+    // The export still says the upload is open. The client's Abort of
+    // it must not queue the published extents for collection.
+    rig.call(
+        &signer,
+        Method::Delete,
+        &path(BUCKET, "big"),
+        &[("uploadId", id.as_str())],
+        &[],
+        b"",
+    )
+    .await;
+    let collected: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM gc WHERE extent_id IN (SELECT e.id FROM extents e \
+               JOIN objects o ON o.generation_id = e.generation_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(collected, 0);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+// ---------------------------------------------------------------------------
+// Random histories inside one millisecond replay to the same answers
+// ---------------------------------------------------------------------------
+
+/// splitmix64: the histories below are the same on every run.
+struct Dice(u64);
+
+impl Dice {
+    fn roll(&mut self, sides: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % sides
+    }
+}
+
+const DICE_KEYS: [&str; 4] = ["k0", "k1", "k2", "k3"];
+
+/// One random write: a PUT, a copy (onto another key, or onto itself
+/// with new metadata), a delete or a one-part multipart upload. The
+/// clock mostly stands still, so ids are minted in one millisecond;
+/// now and then it moves a little, also backwards (an isolate whose
+/// clock is behind).
+async fn random_write(
+    rig: &Rig,
+    signer: &Signer,
+    dice: &mut Dice,
+    n: usize,
+    log: &mut Vec<String>,
+) {
+    match dice.roll(8) {
+        0 => rig.bridge.clock.advance_ms(1),
+        1 => rig.bridge.clock.advance_ms(-2),
+        _ => {}
+    }
+    let key = DICE_KEYS[dice.roll(4) as usize];
+    let body = format!("body {n}");
+    let status = match dice.roll(6) {
+        0 | 1 => {
+            log.push(format!("put {key}"));
+            rig.put(signer, BUCKET, key, body.as_bytes()).await.status
+        }
+        2 => {
+            let from = DICE_KEYS[dice.roll(4) as usize];
+            log.push(format!("copy {from} -> {key}"));
+            let source = format!("/{BUCKET}/{from}");
+            let tag = n.to_string();
+            let mut headers = vec![("x-amz-copy-source", source.as_str())];
+            if from == key || dice.roll(2) == 0 {
+                headers.push(("x-amz-metadata-directive", "REPLACE"));
+                headers.push(("x-amz-meta-n", tag.as_str()));
+            }
+            rig.call(signer, Method::Put, &path(BUCKET, key), &[], &headers, b"")
+                .await
+                .status
+        }
+        3 | 4 => {
+            log.push(format!("delete {key}"));
+            delete(rig, signer, key).await.status
+        }
+        _ => {
+            log.push(format!("complete {key}"));
+            let id = create_upload(rig, signer, key).await;
+            let etag = upload_part(rig, signer, key, &id, 1, body.as_bytes()).await;
+            complete(rig, signer, key, &id, &[etag]).await.status
+        }
+    };
+    // A copy of a key that is not there answers 404; nothing else fails.
+    assert!(matches!(status, 200 | 204 | 404), "{status}: {log:?}");
+}
+
+/// What a client sees of every key.
+async fn answers(
+    rig: &Rig,
+    signer: &Signer,
+) -> Vec<(u16, Vec<u8>, Option<String>, Option<String>)> {
+    let mut all = Vec::new();
+    for key in DICE_KEYS {
+        let got = get(rig, signer, key).await;
+        let live = got.status == 200;
+        all.push((
+            got.status,
+            if live { got.body.clone() } else { Vec::new() },
+            got.header("x-amz-meta-n")
+                .filter(|_| live)
+                .map(str::to_owned),
+            got.header("etag").filter(|_| live).map(str::to_owned),
+        ));
+    }
+    all
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
+    for seed in 0..150u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        for n in 0..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        let signer = reissue_key(&rig).await;
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn random_histories_across_an_export_replay_to_the_same_answers() {
+    for seed in 1000..1300u64 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        let mut dice = Dice(seed);
+        let mut log = Vec::new();
+        let cut = 5 + dice.roll(30) as usize;
+        for n in 0..cut {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        export(&rig);
+        // The restore point lies before the export by more than any
+        // clock in the history runs behind.
+        let since = rig.now().plus_ms(-1000);
+        log.push("export".into());
+        for n in cut..40 {
+            random_write(&rig, &signer, &mut dice, n, &mut log).await;
+        }
+        let before = answers(&rig, &signer).await;
+        wipe(&rig);
+        import(&rig);
+        let (report, _) = replay(&rig, since, ReplayLimits::default()).await;
+        assert!(
+            report.unpublishable.is_empty() && report.unreadable.is_empty(),
+            "seed {seed}: {report:?}"
+        );
+        assert_eq!(answers(&rig, &signer).await, before, "seed {seed}: {log:?}");
+    }
+}
+
+/// Two deletes that both saw the same live generation: the first one
+/// commits, the second one stores its tombstone and then finds nothing
+/// left to delete. Both are acknowledged. A PUT after them must sort
+/// after both tombstones, or a replay applies the second tombstone to it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_sorts_after_a_tombstone_whose_delete_found_nothing() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let bucket = bucket.id;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let v1 = GenerationId::new(live_ids(&rig).remove(0));
+    rig.bridge.clock.advance_ms(10);
+    let now_b = UnixMs(rig.bridge.clock.now().0 + 1);
+    let t_b = recovery::tombstone_id(now_b, &v1, [0xff; 8]);
+    recovery::write_tombstone(
+        &rig.bridge.catalog,
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &bucket,
+        "k",
+        &t_b,
+        now_b,
+    )
+    .await
+    .unwrap();
+    delete(&rig, &signer, "k").await.expect(204);
+    let cat = &rig.bridge.catalog;
+    assert!(!cat
+        .delete_object_before(&bucket, "k", &t_b, now_b)
+        .await
+        .unwrap());
+    rig.bridge.clock.advance_ms(1);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+/// The newest generation record there is, and how many there are.
+fn newest_record(rig: &Rig) -> (String, usize) {
+    let all = records(rig);
+    let ids = all
+        .iter()
+        .filter(|r| !r[GENERATION_PREFIX.len()..].contains('/'));
+    let ids: Vec<&String> = ids.collect();
+    let newest = ids.iter().max().unwrap();
+    (newest[GENERATION_PREFIX.len()..].to_owned(), ids.len())
+}
+
+/// A PUT whose record is stored and whose batch then fails for the
+/// database answers 500, and its record stays: nobody knows whether the
+/// batch went through. An acknowledged PUT after it, from an isolate
+/// whose clock is behind, must still sort after that record, or a replay
+/// publishes the failed write over it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_sorts_after_the_record_of_a_put_whose_commit_failed() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "over", b"v1").await.expect(200);
+    rig.bridge.clock.advance_ms(10);
+    for key in ["new", "over"] {
+        let (_, before) = newest_record(&rig);
+        rig.bridge.catalog.sql.fail_batches.set(1);
+        rig.put(&signer, BUCKET, key, b"failed")
+            .await
+            .expect_error(500, "InternalError");
+        let (failed, after) = newest_record(&rig);
+        assert_eq!(after, before + 1, "the record of the failed PUT stays");
+
+        // The next writer's clock is half a second behind.
+        rig.bridge.clock.advance_ms(-500);
+        rig.put(&signer, BUCKET, key, b"v2").await.expect(200);
+        let live = rig.bridge.catalog.sql.with_conn(|c| {
+            let q = "SELECT generation_id FROM objects WHERE key = ?1";
+            c.query_row(q, [key], |r| r.get::<_, String>(0)).unwrap()
+        });
+        assert!(live > failed, "{key}: {live} sorts after {failed}");
+        rig.bridge.clock.advance_ms(1000);
+    }
+    replay_answers_the_same(&rig, &signer, &["new", "over"]).await;
+}
+
+/// The same for a copy whose batch failed for the database.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_sorts_after_the_record_of_a_copy_whose_commit_failed() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
+    rig.bridge.clock.advance_ms(10);
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    copy(&rig, &signer, "src", "dst")
+        .await
+        .expect_error(500, "InternalError");
+    let (failed, _) = newest_record(&rig);
+    rig.bridge.clock.advance_ms(-500);
+    rig.put(&signer, BUCKET, "dst", b"put").await.expect(200);
+    let ids = live_ids(&rig);
+    assert!(ids[0] > failed, "{} sorts after {failed}", ids[0]);
+    rig.bridge.clock.advance_ms(1000);
+    replay_answers_the_same(&rig, &signer, &["src", "dst"]).await;
+}
+
+/// A copy whose batch was refused because its source changed removes
+/// its record, and here the store refuses that. The copy fails; its
+/// record stays. A PUT on the destination from a slower clock sorts
+/// after it all the same.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_sorts_after_the_record_a_refused_copy_could_not_remove() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
+    rig.bridge.clock.advance_ms(10);
+    let (_, before) = newest_record(&rig);
+
+    let etag = |rig: &Rig, etag: &str| {
+        rig.bridge.catalog.sql.with_conn(|c| {
+            let q = "UPDATE generations SET etag = ?1 WHERE key = 'src'";
+            c.execute(q, [etag]).unwrap()
+        });
+    };
+    let source = rig.live(&bucket, "src").await.unwrap().0.etag;
+    let bridge = rig.bridge.clone();
+    let hook = move |key: &str| {
+        // The source changes between the read and the batch, and the
+        // record written here cannot be removed afterwards.
+        bridge.catalog.sql.with_conn(|c| {
+            let q = "UPDATE generations SET etag = '\"changed\"' WHERE key = 'src'";
+            c.execute(q, []).unwrap()
+        });
+        *bridge.safety.fail_delete.borrow_mut() = Some(key.to_owned());
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    copy(&rig, &signer, "src", "dst")
+        .await
+        .expect_error(500, "InternalError");
+    let (orphan, after) = newest_record(&rig);
+    assert_eq!(after, before + 1, "the record of the refused copy stays");
+    *rig.bridge.safety.fail_delete.borrow_mut() = None;
+    etag(&rig, &source);
+
+    rig.bridge.clock.advance_ms(-500);
+    rig.put(&signer, BUCKET, "dst", b"put").await.expect(200);
+    let ids = live_ids(&rig);
+    assert!(ids[0] > orphan, "{} sorts after {orphan}", ids[0]);
+    rig.bridge.clock.advance_ms(1000);
+    replay_answers_the_same(&rig, &signer, &["src", "dst"]).await;
+}
+
+/// A Complete whose batch was refused because the upload changed removes
+/// its record as a best effort. When that fails and the request then
+/// ends in an error, the record stays, and a PUT on the key from a
+/// slower clock sorts after it all the same.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_sorts_after_the_record_a_refused_complete_could_not_remove() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let etag = upload_part(&rig, &signer, "big", &id, 1, b"part one").await;
+    rig.bridge.clock.advance_ms(10);
+
+    let bridge = rig.bridge.clone();
+    let hook = move |key: &str| {
+        // The upload changes between the read and the batch; the record
+        // cannot be removed; and the next read of the upload fails.
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute("UPDATE uploads SET revision = revision + 1", [])
+                .unwrap()
+        });
+        *bridge.safety.fail_delete.borrow_mut() = Some(key.to_owned());
+        let sql = &bridge.catalog.sql;
+        sql.fail_matching.replace(Some(("FROM uploads", 0)));
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    complete(&rig, &signer, "big", &id, std::slice::from_ref(&etag))
+        .await
+        .expect_error(500, "InternalError");
+    rig.bridge.catalog.sql.fail_matching.replace(None);
+    *rig.bridge.safety.fail_delete.borrow_mut() = None;
+    let (orphan, records) = newest_record(&rig);
+    assert_eq!(records, 1, "the record of the refused Complete stays");
+    get(&rig, &signer, "big").await.expect(404);
+
+    rig.bridge.clock.advance_ms(-500);
+    rig.put(&signer, BUCKET, "big", b"put").await.expect(200);
+    let ids = live_ids(&rig);
+    assert!(ids[0] > orphan, "{} sorts after {orphan}", ids[0]);
+    rig.bridge.clock.advance_ms(1000);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
+/// A delete after a write that failed with its record stored: the
+/// tombstone sorts after that record, so a replay cannot publish the
+/// failed write over the acknowledged delete.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_sorts_after_the_record_of_a_put_whose_commit_failed() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    rig.bridge.clock.advance_ms(10);
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    let (failed, _) = newest_record(&rig);
+    rig.bridge.clock.advance_ms(-500);
+    delete(&rig, &signer, "k").await.expect(204);
+    let tombstone = records(&rig)
+        .into_iter()
+        .find_map(|r| r.strip_prefix(TOMBSTONE_PREFIX).map(str::to_owned))
+        .unwrap();
+    assert!(tombstone > failed, "{tombstone} sorts after {failed}");
+    rig.bridge.clock.advance_ms(1000);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+fn tombstones(rig: &Rig) -> Vec<String> {
+    records(rig)
+        .into_iter()
+        .filter(|r| r.starts_with(TOMBSTONE_PREFIX))
+        .collect()
+}
+
+/// A delete of a key with nothing live, after a write that failed with
+/// its record stored: the delete is acknowledged, so a replay must not
+/// publish the failed write. The delete leaves a tombstone above that
+/// record, once: a repeated delete of the key records nothing more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_of_nothing_live_covers_the_record_of_a_failed_put() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    // A key that was never written and one that is: no tombstone.
+    delete(&rig, &signer, "k").await.expect(204);
+    assert!(tombstones(&rig).is_empty());
+
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    let (failed, _) = newest_record(&rig);
+    // From a clock that runs behind, all the same.
+    rig.bridge.clock.advance_ms(-500);
+    delete(&rig, &signer, "k").await.expect(204);
+    let written = tombstones(&rig);
+    assert_eq!(written.len(), 1);
+    let tombstone = written[0].strip_prefix(TOMBSTONE_PREFIX).unwrap();
+    assert!(
+        tombstone > failed.as_str(),
+        "{tombstone} sorts after {failed}"
+    );
+    delete(&rig, &signer, "k").await.expect(204);
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig), written, "nothing more to cover");
+    rig.bridge.clock.advance_ms(1000);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+
+    // After the replay the same holds: nothing live, nothing to cover.
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig), written);
+}
+
+/// The same for a copy and for a write that failed after a delete: each
+/// failed write is covered by the next acknowledged delete.
+#[tokio::test(flavor = "current_thread")]
+async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 1);
+
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    copy(&rig, &signer, "src", "k")
+        .await
+        .expect_error(500, "InternalError");
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 2);
+
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 3);
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 3);
+    replay_answers_the_same(&rig, &signer, &["src", "k"]).await;
+}
+
+/// The delete of a key with nothing live runs the catalogue batch as
+/// well: a PUT that is published under an id below the tombstone, after
+/// the delete looked and before its batch, is deleted here as it is in
+/// a replay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_published_under_the_tombstone_of_such_a_delete_is_deleted() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    // The PUT lands when the delete stores its tombstone: its id is
+    // above the record of the failed write and below the tombstone,
+    // which is minted one millisecond after the floor at the least.
+    let (failed, _) = newest_record(&rig);
+    let between = format!("{}ffffffffffffffff", &failed[..15]);
+    let bridge = rig.bridge.clone();
+    let hook = move |_: &str| {
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute(
+                "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+                   content_json, user_meta_json, extent_count, created_at) \
+                 SELECT ?1, bucket_id, key, 'live', 0, 'x', '{}', '{}', '{}', 0, 0 \
+                   FROM key_floors WHERE key = 'k'",
+                [&between],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO objects(bucket_id, key, generation_id) \
+                 SELECT bucket_id, key, id FROM generations WHERE key = 'k'",
+                [],
+            )
+            .unwrap()
+        });
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(rig.count("generations"), 1, "the hook ran");
+    assert!(live_ids(&rig).is_empty(), "deleted with the batch");
+    get(&rig, &signer, "k").await.expect(404);
+}
+
+/// A replay leaves the floors as the records say, also for a tombstone
+/// that deletes nothing in it: a PUT after the replay sorts after every
+/// tombstone on record, and a second replay keeps it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_after_a_replay_sorts_after_every_tombstone_on_record() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let bucket = bucket.id;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let v1 = GenerationId::new(live_ids(&rig).remove(0));
+    rig.bridge.clock.advance_ms(10);
+    // The second delete of two, as above: its tombstone is the later one.
+    let now_b = UnixMs(rig.bridge.clock.now().0 + 1);
+    let t_b = recovery::tombstone_id(now_b, &v1, [0xff; 8]);
+    let (cat, safety) = (&rig.bridge.catalog, &rig.bridge.safety);
+    recovery::write_tombstone(cat, safety, &rig.bridge.kek, &bucket, "k", &t_b, now_b)
+        .await
+        .unwrap();
+    delete(&rig, &signer, "k").await.expect(204);
+    assert!(!cat
+        .delete_object_before(&bucket, "k", &t_b, now_b)
+        .await
+        .unwrap());
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.tombstones, report.deleted), (2, 1), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    rig.bridge.clock.set(now_b);
+    rig.put(&signer, BUCKET, "k", b"v2").await.expect(200);
+    let v2 = live_ids(&rig).remove(0);
+    assert!(v2.as_str() > t_b.as_str(), "{v2} sorts after {t_b:?}");
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+}
+
+/// A Complete that the catalogue refuses while nothing changed the
+/// upload and nothing outran its id is not tried again: the parts are
+/// not adoptable. The floor the request raised for its own record does
+/// not count as a newer id on the key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_refused_for_its_parts_is_not_taken_for_an_id_race() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let id = create_upload(&rig, &signer, "big").await;
+    let etag = upload_part(&rig, &signer, "big", &id, 1, b"part one").await;
+    let bridge = rig.bridge.clone();
+    let hook = move |_: &str| {
+        // The part is no longer what was listed when the batch runs,
+        // and the upload itself says nothing of it.
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute("UPDATE extents SET plain_size = plain_size + 1", [])
+                .unwrap()
+        });
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    complete(&rig, &signer, "big", &id, std::slice::from_ref(&etag))
+        .await
+        .expect_error(400, "InvalidPart");
+    assert!(records(&rig).is_empty(), "the refused record is removed");
 }

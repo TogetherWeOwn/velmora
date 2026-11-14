@@ -168,6 +168,9 @@ pub struct FailSql {
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
     pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+    /// Fails this many batches, the next ones: a commit that does not
+    /// go through while single statements still do.
+    pub fail_batches: Cell<u32>,
 }
 
 impl FailSql {
@@ -206,6 +209,10 @@ impl Sql for FailSql {
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if self.fail_writes.get() {
+            return Err(BridgeError::Sql("database down".into()));
+        }
+        if self.fail_batches.get() > 0 {
+            self.fail_batches.set(self.fail_batches.get() - 1);
             return Err(BridgeError::Sql("database down".into()));
         }
         self.inner.batch(stmts).await
@@ -265,6 +272,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
                 fail_matching: RefCell::new(None),
+                fail_batches: Cell::new(0),
             }),
             safety: Blobs::default(),
             cache: Blobs::default(),

@@ -23,6 +23,15 @@ pub(super) async fn delete_object_before<S: Sql>(
          WHERE bucket_id = ?1 AND key = ?2 AND generation_id < ?3)",
         vec![text(bucket.as_str()), text(key), text(before.as_str())],
     )];
+    // The service raised the floor to the tombstone before it stored
+    // the record. Here again for a caller that applies a tombstone it
+    // did not write; rolled back with the batch when nothing is deleted.
+    stmts.push((
+        "INSERT INTO key_floors(bucket_id, key, floor_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET \
+           floor_id = max(floor_id, excluded.floor_id)",
+        vec![text(bucket.as_str()), text(key), text(before.as_str())],
+    ));
     stmts.extend(retire_live(bucket, key, GenerationState::Deleted, now));
     stmts.push((
         "DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2",
