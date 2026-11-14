@@ -10,6 +10,7 @@
 
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
+use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayProbe};
 pub use crate::types::Result;
 use crate::types::{
@@ -86,8 +87,14 @@ pub trait BlobStore {
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
-    /// Idempotent.
+    /// Idempotent. Refuses a recovery record (any key under `m/`) with
+    /// [`crate::recovery::ERR_RECORD_DELETE`] before the store is asked:
+    /// no caller can remove one through this method.
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Removes the record of a generation that the catalogue refused to
+    /// publish. The only delete of a key under `m/`; the argument exists
+    /// only for a record this request wrote and did not publish.
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()>;
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
@@ -293,6 +300,16 @@ pub enum Guard<T> {
     Lost,
 }
 
+/// Outcome of a publication batch. The batch takes the proof of the
+/// generation's recovery record and turns it into an [`Unpublished`] only
+/// when it wrote nothing, so only then can the record be discarded.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Applied,
+    /// The guard failed; the batch wrote nothing.
+    Refused(Unpublished),
+}
+
 // Fenced methods return Ok(false) (or None) when the lease token no longer
 // matches: the caller stops and acks.
 
@@ -317,7 +334,11 @@ pub trait Catalog {
     /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
     /// live generation carries a newer id or its floor a higher one; nothing
     /// was written. The caller takes a newer id and tries again.
-    async fn commit_generation(&self, c: &CommitGeneration) -> Result<Guard<()>>;
+    async fn commit_generation(
+        &self,
+        c: &CommitGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
     /// The newest id on `(bucket, key)`: its live generation or its
     /// floor. A publication or a tombstone must sort after it.
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;
@@ -344,11 +365,12 @@ pub trait Catalog {
     async fn unpublished_floor(&self, bucket: &BucketId, key: &str)
         -> Result<Option<GenerationId>>;
     /// Publishes a generation that references the extents of the source
-    /// generation; no extent is written. `Lost` = the source is no longer
-    /// the live object of its key, or the destination key's live
+    /// generation; no extent is written. `Refused` = the source is no
+    /// longer the live object of its key, or the destination key's live
     /// generation carries a newer id or its floor a higher one; nothing was
     /// published.
-    async fn copy_generation(&self, c: &CopyGeneration) -> Result<Guard<()>>;
+    async fn copy_generation(&self, c: &CopyGeneration, record: Recorded)
+        -> Result<PublishOutcome>;
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
@@ -392,7 +414,8 @@ pub trait Catalog {
         revision: u64,
         digest: &[u8; 32],
         c: &CompleteUpload,
-    ) -> Result<Guard<()>>;
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
     /// The extent rows of the upload's current parts, in no order.
     async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>>;
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>>;

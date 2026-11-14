@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
@@ -208,7 +208,7 @@ impl Fx {
             now: T0,
         };
         assert_eq!(
-            self.cat.complete_upload(&t, 1, &[n; 32], &c).await.unwrap(),
+            self.cat.publish_upload(&t, 1, &[n; 32], &c).await.unwrap(),
             Guard::Applied(())
         );
         Obj {

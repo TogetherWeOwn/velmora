@@ -21,6 +21,7 @@ use velmora::transports::NativeTlsTransport;
 use velmora::yenc::{encode_segment, SegmentParams};
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Recorded;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -885,7 +886,7 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         unused()
     }
-    async fn commit_generation(&self, _: &CommitGeneration) -> Result<Guard<()>> {
+    async fn commit_generation(&self, _: &CommitGeneration, _: Recorded) -> Result<PublishOutcome> {
         unused()
     }
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
@@ -900,7 +901,11 @@ impl Catalog for MemCatalog {
     async fn raise_floor(&self, _: &BucketId, _: &str, _: &GenerationId, _: bool) -> Result<()> {
         unused()
     }
-    async fn copy_generation(&self, _: &velmora_bridge::CopyGeneration) -> Result<Guard<()>> {
+    async fn copy_generation(
+        &self,
+        _: &velmora_bridge::CopyGeneration,
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
         unused()
     }
     async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
@@ -973,7 +978,8 @@ impl Catalog for MemCatalog {
         _: u64,
         _: &[u8; 32],
         _: &CompleteUpload,
-    ) -> Result<Guard<()>> {
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
         unused()
     }
     async fn abort_upload(&self, _: &UploadTarget<'_>, _: UnixMs) -> Result<Guard<()>> {

@@ -11,7 +11,7 @@
 use std::cell::Cell;
 
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
@@ -394,10 +394,7 @@ async fn wrong_target_is_unknown(
     );
     let c = fx.commit(wrong.bucket, wrong.key, &[(good_part, 500)]);
     assert_eq!(
-        fx.cat
-            .complete_upload(&wrong, 1, &DIGEST, &c)
-            .await
-            .unwrap(),
+        fx.cat.publish_upload(&wrong, 1, &DIGEST, &c).await.unwrap(),
         Guard::Lost
     );
     assert_eq!(fx.cat.abort_upload(&wrong, T0).await.unwrap(), Guard::Lost);
@@ -442,7 +439,7 @@ async fn complete_publishes_listed_parts_and_retires_the_rest() {
     let old_c = fx.commit(&fx.bucket, KEY, &[(&old_x, 100)]);
     assert_eq!(
         fx.cat
-            .complete_upload(&old_t, 1, &DIGEST, &old_c)
+            .publish_upload(&old_t, 1, &DIGEST, &old_c)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -457,7 +454,7 @@ async fn complete_publishes_listed_parts_and_retires_the_rest() {
     let c = fx.commit(&fx.bucket, KEY, &[(&x1, 500), (&x2, 700)]);
     assert_eq!(
         fx.cat
-            .complete_upload(&t, upload.revision, &DIGEST, &c)
+            .publish_upload(&t, upload.revision, &DIGEST, &c)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -553,7 +550,7 @@ async fn complete_refuses_extent_of_another_upload() {
         ] {
             let c = fx.commit(&fx.bucket, KEY, &extents);
             assert_eq!(
-                fx.cat.complete_upload(&t, 1, &DIGEST, &c).await.unwrap(),
+                fx.cat.publish_upload(&t, 1, &DIGEST, &c).await.unwrap(),
                 Guard::Lost
             );
         }
@@ -573,17 +570,14 @@ async fn complete_refuses_extent_of_another_upload() {
     let c = fx.commit(&fx.bucket, "victim", &[(&theirs, 500)]);
     assert_eq!(
         fx.cat
-            .complete_upload(&victim_t, 1, &DIGEST, &c)
+            .publish_upload(&victim_t, 1, &DIGEST, &c)
             .await
             .unwrap(),
         Guard::Applied(())
     );
     let steal = fx.commit(&fx.bucket, KEY, &[(&theirs, 500)]);
     assert_eq!(
-        fx.cat
-            .complete_upload(&t, 1, &DIGEST, &steal)
-            .await
-            .unwrap(),
+        fx.cat.publish_upload(&t, 1, &DIGEST, &steal).await.unwrap(),
         Guard::Lost
     );
     assert_eq!(
@@ -614,7 +608,7 @@ async fn complete_refuses_offsets_that_do_not_tile() {
     total.generation.size = 1199;
     for c in [gap, overlap, total] {
         assert_eq!(
-            fx.cat.complete_upload(&t, 2, &DIGEST, &c).await.unwrap(),
+            fx.cat.publish_upload(&t, 2, &DIGEST, &c).await.unwrap(),
             Guard::Lost
         );
     }
@@ -629,14 +623,14 @@ async fn complete_refuses_offsets_that_do_not_tile() {
     let empty = fx.commit(&fx.bucket, KEY, &[]);
     for c in [count, seq, wrong_key, empty] {
         assert!(matches!(
-            fx.cat.complete_upload(&t, 2, &DIGEST, &c).await,
+            fx.cat.publish_upload(&t, 2, &DIGEST, &c).await,
             Err(BridgeError::Invalid(_))
         ));
     }
 
     let ok = fx.commit(&fx.bucket, KEY, &[(&x1, 500), (&x2, 700)]);
     assert_eq!(
-        fx.cat.complete_upload(&t, 2, &DIGEST, &ok).await.unwrap(),
+        fx.cat.publish_upload(&t, 2, &DIGEST, &ok).await.unwrap(),
         Guard::Applied(())
     );
 }
@@ -652,7 +646,7 @@ async fn complete_retry_returns_receipt() {
     let (x1, _) = fx.part(&t, 1, 500).await;
     let c = fx.commit(&fx.bucket, KEY, &[(&x1, 500)]);
     assert_eq!(
-        fx.cat.complete_upload(&t, 1, &DIGEST, &c).await.unwrap(),
+        fx.cat.publish_upload(&t, 1, &DIGEST, &c).await.unwrap(),
         Guard::Applied(())
     );
 
@@ -663,7 +657,7 @@ async fn complete_retry_returns_receipt() {
     let later = fx.commit(&fx.bucket, KEY, &[(&y1, 900)]);
     assert_eq!(
         fx.cat
-            .complete_upload(&later_t, 1, &DIGEST, &later)
+            .publish_upload(&later_t, 1, &DIGEST, &later)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -696,7 +690,7 @@ async fn complete_retry_returns_receipt() {
         for retry in [c.clone(), fx.commit(&fx.bucket, KEY, &[(&x1, 500)])] {
             assert_eq!(
                 fx.cat
-                    .complete_upload(&t, revision, &DIGEST, &retry)
+                    .publish_upload(&t, revision, &DIGEST, &retry)
                     .await
                     .unwrap(),
                 Guard::Lost
@@ -739,7 +733,7 @@ async fn complete_vs_upload_part_race() {
     assert_eq!(g, Guard::Applied(()));
     assert_eq!(
         fx.cat
-            .complete_upload(&t, seen.revision, &DIGEST, &stale)
+            .publish_upload(&t, seen.revision, &DIGEST, &stale)
             .await
             .unwrap(),
         Guard::Lost,
@@ -755,7 +749,7 @@ async fn complete_vs_upload_part_race() {
     let fresh = fx.commit(&fx.bucket, KEY, &[(&x1b, 600), (&x2, 700)]);
     assert_eq!(
         fx.cat
-            .complete_upload(&t, seen.revision, &DIGEST, &fresh)
+            .publish_upload(&t, seen.revision, &DIGEST, &fresh)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -792,7 +786,7 @@ async fn complete_vs_abort_race() {
     );
     assert_eq!(
         fx.cat
-            .complete_upload(&t, seen.revision, &DIGEST, &c)
+            .publish_upload(&t, seen.revision, &DIGEST, &c)
             .await
             .unwrap(),
         Guard::Lost
@@ -800,7 +794,7 @@ async fn complete_vs_abort_race() {
     // Not even at the post-abort revision.
     assert_eq!(
         fx.cat
-            .complete_upload(&t, seen.revision + 1, &DIGEST, &c)
+            .publish_upload(&t, seen.revision + 1, &DIGEST, &c)
             .await
             .unwrap(),
         Guard::Lost
@@ -822,7 +816,7 @@ async fn complete_vs_abort_race() {
     let (y1, _) = fx.part(&t, 1, 500).await;
     let c = fx.commit(&fx.bucket, "second", &[(&y1, 500)]);
     assert_eq!(
-        fx.cat.complete_upload(&t, 1, &DIGEST, &c).await.unwrap(),
+        fx.cat.publish_upload(&t, 1, &DIGEST, &c).await.unwrap(),
         Guard::Applied(())
     );
     assert_eq!(fx.cat.abort_upload(&t, T0).await.unwrap(), Guard::Lost);
@@ -844,7 +838,7 @@ async fn failed_batch_writes_nothing() {
     assert_eq!(fx.part(&t, 1, 600).await.1, Guard::Lost);
     let c = fx.commit(&fx.bucket, KEY, &[(&x1, 500)]);
     assert_eq!(
-        fx.cat.complete_upload(&t, 1, &DIGEST, &c).await.unwrap(),
+        fx.cat.publish_upload(&t, 1, &DIGEST, &c).await.unwrap(),
         Guard::Lost
     );
     assert_eq!(fx.cat.abort_upload(&t, T0).await.unwrap(), Guard::Lost);
@@ -870,7 +864,7 @@ async fn publish(fx: &Fx, bucket: &BucketId, key: &str) -> (ExtentId, String) {
     let t = target(bucket, key, &id);
     let (x, _) = fx.part(&t, 1, 400).await;
     let c = fx.commit(bucket, key, &[(&x, 400)]);
-    let done = fx.cat.complete_upload(&t, 1, &DIGEST, &c).await.unwrap();
+    let done = fx.cat.publish_upload(&t, 1, &DIGEST, &c).await.unwrap();
     assert_eq!(done, Guard::Applied(()));
     (x, c.generation.id.to_string())
 }
@@ -892,7 +886,7 @@ async fn complete_loses_to_a_part_added_after_its_read() {
     assert_eq!(g, Guard::Applied(()));
     assert_eq!(
         fx.cat
-            .complete_upload(&t, seen.revision, &DIGEST, &stale)
+            .publish_upload(&t, seen.revision, &DIGEST, &stale)
             .await
             .unwrap(),
         Guard::Lost
@@ -997,7 +991,7 @@ async fn abort_touches_only_its_own_parts() {
     let c = fx.commit(&fx.bucket, KEY, &[(&x_theirs, 100)]);
     assert_eq!(
         fx.cat
-            .complete_upload(&t_theirs, seen.revision, &DIGEST, &c)
+            .publish_upload(&t_theirs, seen.revision, &DIGEST, &c)
             .await
             .unwrap(),
         Guard::Applied(())

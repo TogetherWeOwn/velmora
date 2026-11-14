@@ -7,9 +7,10 @@
 //! live without a pointer. Statements are fixed-shape, one row each, and
 //! stay far below the 100-bound-parameter limit.
 
-use super::uploads::guarded;
+use super::uploads::published;
 use super::SqlCatalog;
-use crate::ports::{Guard, Row, Sql, SqlValue};
+use crate::ports::{PublishOutcome, Row, Sql, SqlValue};
+use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
     ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
@@ -493,7 +494,8 @@ pub(super) async fn newest_id<S: Sql>(
 pub(super) async fn commit_generation<S: Sql>(
     c: &SqlCatalog<S>,
     commit: &CommitGeneration,
-) -> Result<Guard<()>> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &commit.generation;
     // The extents must tile the object exactly, in order: a gap or an
     // overlap here would be served as wrong bytes later. Each must still
@@ -541,7 +543,7 @@ pub(super) async fn commit_generation<S: Sql>(
         commit.now,
     ));
     stmts.push(pointer_upsert(g));
-    guarded(c, stmts).await
+    published(c, stmts, &g.id, record).await
 }
 
 /// Publishes a copy: a new generation that references the extents of the
@@ -559,7 +561,8 @@ pub(super) async fn commit_generation<S: Sql>(
 pub(super) async fn copy_generation<S: Sql>(
     c: &SqlCatalog<S>,
     copy: &CopyGeneration,
-) -> Result<Guard<()>> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &copy.generation;
     if g.state != GenerationState::Live || g.retired_at.is_some() || g.id == copy.source {
         return Err(BridgeError::Invalid(
@@ -612,7 +615,7 @@ pub(super) async fn copy_generation<S: Sql>(
         copy.now,
     ));
     stmts.push(pointer_upsert(g));
-    guarded(c, stmts).await
+    published(c, stmts, &g.id, record).await
 }
 
 /// Idempotent: deleting a key with no live object changes nothing.

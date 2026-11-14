@@ -15,6 +15,7 @@ use velmora::rng::SystemRng;
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk};
 use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
 use velmora_bridge::ingress::{ByteBudget, Sleeper, CHARGE_POLL_MS};
+use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -112,7 +113,7 @@ async fn commit_parts<N: NntpConnector + 'static>(
     };
     bridge
         .catalog
-        .commit_generation(&CommitGeneration {
+        .publish(&CommitGeneration {
             generation,
             extents: extents.clone(),
             now,
