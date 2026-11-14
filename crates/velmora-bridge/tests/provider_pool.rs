@@ -410,6 +410,160 @@ async fn posting_follows_priority() {
     assert_eq!(rig.servers[0].posted_count().await, 0);
 }
 
+/// The first provider refuses the post: the same articles, under the
+/// message-ids planned before the failure, go to the next provider.
+#[tokio::test]
+async fn post_fails_over_with_the_same_message_ids() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let s = rig.seed(8, &marked_plaintext(PLAIN_LEN)).await;
+
+    // Nobody accepts: the plan is stored, the job fails and will retry.
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.servers[1].set_posting_allowed(false).await;
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+    let planned = rig.plan(&s).await;
+    assert!(planned.len() >= 2);
+    assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
+    let ids = |rows: &[ArticleRow]| -> Vec<String> {
+        rows.iter().map(|a| a.message_id.clone()).collect()
+    };
+
+    // p1 accepts again; p0 still refuses.
+    rig.servers[1].set_posting_allowed(true).await;
+    rig.bridge.clock.advance_secs(3600);
+    let plan = rig.post(&s).await;
+    assert_eq!(ids(&plan), ids(&planned));
+    for (after, before) in plan.iter().zip(&planned) {
+        assert_eq!(after.headers, before.headers);
+        assert_eq!(after.state, ArticleState::Posted);
+        assert_eq!(after.provider_id.as_deref(), Some("p1"));
+    }
+    let wanted: Vec<&str> = plan.iter().map(|a| a.message_id.as_str()).collect();
+    assert_eq!(rig.servers[1].posted_count_for(&wanted).await, plan.len());
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    assert_eq!(rig.servers[0].posted_count().await, 0);
+    // A refused post says nothing about the provider's health.
+    assert_eq!(rig.load(0).await.failures, 0);
+}
+
+/// The first run leaves every article planned: p0 loses each reply (and
+/// its lookup finds nothing), p1 refuses. Then every planned article
+/// reaches p1 from elsewhere, byte for byte. Returns the plan.
+async fn planned_then_peered_to_p1(rig: &mut Rig, s: &Seeded) -> Vec<ArticleRow> {
+    rig.set_priorities(&[0, 1]);
+    rig.servers[1].set_posting_allowed(false).await;
+    rig.servers[0].set_stat_lag(true).await;
+    rig.servers[0].drop_next_posts(usize::MAX / 2).await;
+    assert!(matches!(rig.run_post(s).await, JobOutcome::Retry { .. }));
+    rig.servers[0].drop_next_posts(0).await;
+    rig.servers[0].set_stat_lag(false).await;
+    let planned = rig.plan(s).await;
+    assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
+
+    let mut peer = rig.raw_client(1).await;
+    rig.servers[1].set_posting_allowed(true).await;
+    for row in &planned {
+        let article = render(&planned, row, &s.cipher, false);
+        peer.post_article(&row.message_id, &article).await.unwrap();
+    }
+    peer.quit().await;
+    assert_eq!(rig.servers[1].posted_count().await, planned.len());
+    planned
+}
+
+/// The second provider already holds the articles (the first provider
+/// took them and they peered across) and the first one now refuses to
+/// post: the second answers "duplicate", which is confirmed, and each
+/// article is recorded once.
+#[tokio::test]
+async fn duplicate_on_the_failover_provider_confirms() {
+    let mut rig = pool_rig(2).await;
+    let s = rig.seed(9, &marked_plaintext(PLAIN_LEN)).await;
+    let planned = planned_then_peered_to_p1(&mut rig, &s).await;
+    let on_p0 = rig.servers[0].posted_count().await;
+
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.bridge.clock.advance_secs(3600);
+    let plan = rig.post(&s).await;
+    for (after, before) in plan.iter().zip(&planned) {
+        assert_eq!(after.message_id, before.message_id);
+        assert_eq!(after.state, ArticleState::Posted);
+        assert_eq!(after.provider_id.as_deref(), Some("p1"));
+    }
+    // Nothing was stored a second time, under any id.
+    assert_eq!(rig.servers[1].posted_count().await, planned.len());
+    assert_eq!(rig.servers[0].posted_count().await, on_p0);
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!(outbox.stage, OutboxStage::Verify);
+}
+
+/// The first provider's connection fails, so whether it took the
+/// articles is unknown. Before posting on the next provider the job
+/// looks the message-ids up there: they are present (peered across), so
+/// nothing is posted again. The second provider would refuse a POST.
+#[tokio::test]
+async fn failover_after_an_unknown_post_looks_the_article_up_first() {
+    let mut rig = pool_rig(2).await;
+    let s = rig.seed(13, &marked_plaintext(PLAIN_LEN)).await;
+    let planned = planned_then_peered_to_p1(&mut rig, &s).await;
+    let on_p0 = rig.servers[0].posted_count().await;
+
+    rig.servers[1].set_posting_allowed(false).await;
+    rig.unplug(0);
+    rig.bridge.clock.advance_secs(3600);
+    let plan = rig.post(&s).await;
+    for (after, before) in plan.iter().zip(&planned) {
+        assert_eq!(after.message_id, before.message_id);
+        assert_eq!(after.headers, before.headers);
+        assert_eq!(after.state, ArticleState::Posted);
+        assert_eq!(after.provider_id.as_deref(), Some("p1"));
+    }
+    assert_eq!(rig.servers[1].posted_count().await, planned.len());
+    assert_eq!(rig.servers[0].posted_count().await, on_p0);
+    // The unreachable provider took a strike for each failed session.
+    assert_eq!(rig.load(0).await.failures, 2);
+}
+
+/// A provider that fails half-way hands only the remaining articles to
+/// the next one: no article is posted to both.
+#[tokio::test]
+async fn failover_posts_only_what_is_still_planned() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let s = rig.seed(10, &marked_plaintext(PLAIN_LEN)).await;
+    // Plan first, so the article count is known.
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.servers[1].set_posting_allowed(false).await;
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+    let planned = rig.plan(&s).await;
+    assert!(planned.len() >= 2);
+
+    // p0 takes exactly one article and then refuses.
+    let first = &planned[0];
+    let mut peer = rig.raw_client(0).await;
+    rig.servers[0].set_posting_allowed(true).await;
+    let article = render(&planned, first, &s.cipher, false);
+    peer.post_article(&first.message_id, &article)
+        .await
+        .unwrap();
+    peer.quit().await;
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.servers[1].set_posting_allowed(true).await;
+
+    rig.bridge.clock.advance_secs(3600);
+    let plan = rig.post(&s).await;
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(rig.servers[0].posted_count().await, 1);
+    let on_p1 = rig.servers[1].posted_count().await;
+    let by_p1 = plan
+        .iter()
+        .filter(|a| a.provider_id.as_deref() == Some("p1"))
+        .count();
+    assert_eq!(on_p1, by_p1);
+    assert!(on_p1 == plan.len() || on_p1 == plan.len() - 1);
+}
+
 /// Posting spreads inside a tier like reading does: a provider whose
 /// slots are all in use is passed over for another one of the same tier.
 #[tokio::test]
@@ -480,6 +634,33 @@ async fn post_does_not_drop_a_tier_when_the_top_one_is_busy() {
     assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, attempts);
     assert_eq!(rig.servers[0].posted_count().await, 0);
     assert_eq!(rig.servers[1].posted_count().await, 0);
+}
+
+/// One provider of the top tier refuses the post and the other is only
+/// busy: the job waits for the busy one instead of using the backup tier.
+#[tokio::test]
+async fn failover_stays_in_a_tier_that_is_only_busy() {
+    let mut rig = pool_rig(3).await;
+    rig.set_priorities(&[0, 0, 1]);
+    rig.servers[0].set_posting_allowed(false).await;
+    let now = rig.bridge.clock.now();
+    let p1 = &rig.bridge.cfg.providers[1];
+    for _ in 0..2 {
+        let permit = rig
+            .bridge
+            .catalog
+            .acquire_permit(p1, PermitClass::Read, "t", now);
+        permit.await.unwrap().expect("free slot");
+    }
+    let s = rig.seed(12, &marked_plaintext(PLAIN_LEN)).await;
+    let attempts = rig.bridge.catalog.outbox(&s.extent).attempts;
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+    assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, attempts);
+    for server in &rig.servers {
+        assert_eq!(server.posted_count().await, 0);
+    }
+    assert!(rig.uses(0).await > 0, "p0 was not tried");
+    assert_eq!(rig.uses(2).await, 0);
 }
 
 /// Every provider that could post is cooling: the job waits for the

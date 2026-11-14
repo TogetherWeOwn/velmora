@@ -237,6 +237,27 @@ async fn post_reconnects_after_drop() {
     assert_eq!(rig.bridge.nntp.peak(), 1);
 }
 
+/// The provider stores every article but its reply never arrives. The
+/// outcome of such a POST is unknown, not failed: after the reconnect the
+/// message-id is looked up and the stored article is not sent again.
+#[tokio::test]
+async fn post_with_a_lost_reply_is_looked_up_not_reposted() {
+    let rig = simple_rig().await;
+    let s = rig.seed(15, &marked_plaintext(PLAIN_LEN)).await;
+
+    // Any re-send would lose its reply too and the job would fail.
+    rig.server().drop_next_posts(usize::MAX / 2).await;
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let plan = rig.plan(&s).await;
+    assert!(plan.len() >= 2);
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(rig.server().posted_ids().await, bracketed(&plan));
+    assert_eq!(rig.server().posted_count().await, plan.len());
+    // One reconnect per lost reply.
+    assert_eq!(rig.bridge.nntp.connects() as usize, plan.len() + 1);
+}
+
 /// Reconnects are bounded: after the last attempt the job fails as an NNTP
 /// error and a later job finishes with the same message-ids.
 #[tokio::test]
@@ -244,8 +265,11 @@ async fn post_reconnects_are_bounded() {
     let rig = simple_rig().await;
     let s = rig.seed(6, &marked_plaintext(PLAIN_LEN)).await;
 
+    // The lookup before each re-send finds nothing, so it is sent again.
+    rig.server().set_stat_lag(true).await;
     rig.server().drop_next_posts(3).await;
     assert_eq!(retry_delay(&rig.run_post(&s).await), 60);
+    rig.server().set_stat_lag(false).await;
     assert_eq!(rig.bridge.nntp.connects(), 3);
     let outbox = rig.bridge.catalog.outbox(&s.extent);
     assert_eq!(outbox.last_error, Some(FailClass::NntpError));

@@ -8,6 +8,9 @@
 //! - A duplicate reply the server cannot confirm (`435`/`441`, then `430`
 //!   on `STAT`) fails the job as `dup-unconfirmed`; it is retried later
 //!   with the same message-id.
+//! - A provider that refuses the post or cannot be reached hands the
+//!   remaining articles to the next `post` provider, again under the
+//!   stored message-ids: failover never mints an id.
 //! - Every catalogue write carries the fenced [`Lease`]. A stale lease
 //!   stops the job at once.
 
@@ -241,7 +244,7 @@ where
         let mut plan = self.stored_plan(lease, extent, &cipher).await?;
 
         if plan.iter().any(|a| a.state == ArticleState::Planned) {
-            self.post_through_pool(lease, extent, &mut plan, &cipher)
+            self.post_with_failover(lease, extent, &mut plan, &cipher)
                 .await?;
         }
 
@@ -320,12 +323,20 @@ where
         Ok(plan)
     }
 
-    /// Posts the planned articles through one `post` provider of the best
-    /// usable priority tier. Inside that tier the pool order applies and a
-    /// provider without a free slot is passed over for the next one. A
-    /// lower tier is a backup: it is never used because the tier above is
-    /// busy.
-    async fn post_through_pool(
+    /// Posts the planned articles through one `post` provider, tier by
+    /// priority tier. Inside a tier the pool order applies and a provider
+    /// without a free slot is passed over for the next one. When a
+    /// provider refuses the post or its connection fails, the articles
+    /// still planned go to the next one, **under the same stored
+    /// message-ids and headers**: a second provider that already has an
+    /// article answers "duplicate", which is confirmed and recorded once,
+    /// like any other accepted post.
+    ///
+    /// A lower tier is a backup for failure, not overflow: it is reached
+    /// only when every provider of the tiers above was tried and failed.
+    /// While one of them is merely busy the job waits for a slot. A
+    /// duplicate that cannot be confirmed waits for the same provider.
+    async fn post_with_failover(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
@@ -336,14 +347,18 @@ where
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
         let cooling = pool.cooling_until(&posters);
-        let order = pool.order(posters);
-        let Some(tier) = order.first().map(|p| p.priority) else {
-            return Err(match cooling {
-                Some(until) => Stop::Cooling(until),
-                None => Stop::fail(FailClass::Internal),
-            });
-        };
-        for provider in order.into_iter().take_while(|p| p.priority == tier) {
+        let mut failed = None;
+        // A connection failed during a post: the article may have landed.
+        let mut unknown = false;
+        let mut tier = None;
+        let mut busy = false;
+        for provider in pool.order(posters) {
+            if tier != Some(provider.priority) {
+                if busy {
+                    break;
+                }
+                tier = Some(provider.priority);
+            }
             let Some(mut session) = ProviderSession::open(
                 &self.catalog,
                 &self.nntp,
@@ -354,19 +369,41 @@ where
             )
             .await?
             else {
+                busy = true;
                 continue;
             };
             let posted = self
-                .post_planned(lease, extent, plan, cipher, &mut session)
+                .post_planned(lease, extent, plan, cipher, &mut session, unknown)
                 .await;
             session.close().await;
-            return posted;
+            match posted.map_err(|stop| match stop {
+                Stop::Session(e) => e.into(),
+                stop => stop,
+            }) {
+                Ok(()) => return Ok(()),
+                Err(stop @ Stop::Fail(FailClass::PostRefused | FailClass::NntpError, _)) => {
+                    unknown |= matches!(stop, Stop::Fail(FailClass::NntpError, _));
+                    // The first failure is the one reported.
+                    failed.get_or_insert(stop);
+                }
+                Err(stop) => return Err(stop),
+            }
         }
-        Err(Stop::NoPermit)
+        if busy {
+            // A healthy provider of the tier had no slot: wait for it.
+            return Err(Stop::NoPermit);
+        }
+        Err(match (failed, cooling) {
+            (Some(stop), _) => stop,
+            (None, Some(until)) => Stop::Cooling(until),
+            (None, None) => Stop::fail(FailClass::Internal),
+        })
     }
 
     /// Posts every article of `plan` that is still planned on `session`
     /// and marks each one posted, in the catalogue and in `plan`.
+    /// `unknown` = an earlier provider may hold these articles already
+    /// (see [`post_one`]).
     async fn post_planned(
         &self,
         lease: &Lease,
@@ -374,6 +411,7 @@ where
         plan: &mut [ArticleRow],
         cipher: &[u8],
         session: &mut ProviderSession<'_, C, N, T>,
+        unknown: bool,
     ) -> core::result::Result<(), Stop> {
         let total = u32::try_from(plan.len()).map_err(|_| Stop::fail(FailClass::Internal))?;
         for row in plan.iter_mut().filter(|a| a.state == ArticleState::Planned) {
@@ -383,7 +421,7 @@ where
                 .ok_or(Stop::fail(FailClass::Internal))?;
             let article = render_article(row, total, extent.cipher_size, payload)
                 .map_err(|_| Stop::fail(FailClass::Internal))?;
-            post_one(session, lease, row, &article).await?;
+            post_one(session, lease, row, &article, unknown).await?;
             let provider = session.provider.id.as_str();
             if !self
                 .catalog
@@ -403,21 +441,37 @@ where
 /// re-sent, at most [`MAX_POST_ATTEMPTS`] tries in all; the lease and the
 /// permit are renewed before each reconnect. A server verdict is never
 /// retried here.
+///
+/// A POST whose reply never arrived is **unknown**, not failed: the
+/// provider may have stored the article. So before the article is sent
+/// again, on the reconnected provider or (`unknown`) on a failover
+/// provider, the message-id is looked up with `STAT`. An article that is
+/// there counts as posted; only an absent one is posted again, under the
+/// same message-id.
 async fn post_one<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
     lease: &Lease,
     row: &ArticleRow,
     article: &[u8],
+    mut unknown: bool,
 ) -> core::result::Result<(), Stop> {
     let mut attempt = 1;
     loop {
         let result = match session.session().await {
-            Ok(s) => s.post(&row.message_id, article).await,
+            Ok(s) => match unknown {
+                true => match s.stat(&row.message_id).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => s.post(&row.message_id, article).await.map(|_| ()),
+                    Err(e) => Err(e),
+                },
+                false => s.post(&row.message_id, article).await.map(|_| ()),
+            },
             Err(Stop::Session(e)) => Err(e),
             Err(stop) => return Err(stop),
         };
         let err = match result {
-            Ok(PostOutcome::Posted | PostOutcome::Duplicate) => {
+            // Posted, a confirmed duplicate, or found by the lookup.
+            Ok(()) => {
                 session.note_ok();
                 return Ok(());
             }
@@ -429,6 +483,7 @@ async fn post_one<C: Catalog, N: NntpConnector, T: Clock>(
         match err {
             BridgeError::Nntp(e) if is_retryable_post_error(&e) && attempt < MAX_POST_ATTEMPTS => {
                 attempt += 1;
+                unknown = true;
                 session.keep(Some(lease)).await?;
             }
             // The server says "duplicate" (or a bare "posting failed") but

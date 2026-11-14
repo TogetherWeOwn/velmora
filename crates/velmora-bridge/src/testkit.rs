@@ -31,6 +31,10 @@ pub const MIGRATION_0001: &str =
 pub const MIGRATION_0002: &str =
     include_str!("../../../workers/s3-bridge/migrations/0002_provider_health.sql");
 
+/// The index behind the re-drive of under-verified extents.
+pub const MIGRATION_0003: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0003_extents_held.sql");
+
 // ---------------------------------------------------------------------------
 // RusqliteSql
 // ---------------------------------------------------------------------------
@@ -114,6 +118,7 @@ impl RusqliteSql {
         let db = Self::open_in_memory()?;
         db.apply(MIGRATION_0001)?;
         db.apply(MIGRATION_0002)?;
+        db.apply(MIGRATION_0003)?;
         Ok(db)
     }
 

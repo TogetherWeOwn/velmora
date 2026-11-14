@@ -870,6 +870,10 @@ pub struct DispatchReport {
     pub gc_enqueued: bool,
     pub buried: u64,
     pub permits_seeded: bool,
+    /// `done` extents with too few verified backbones sent back to verify.
+    pub redriven: u64,
+    /// The re-drive failed; the rest of the run went on without it.
+    pub redrive_failed: bool,
 }
 
 // ---------------------------------------------------------------------------

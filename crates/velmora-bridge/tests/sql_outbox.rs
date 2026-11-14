@@ -1590,3 +1590,149 @@ async fn cursor_and_labels_behave_as_the_jobs_expect() {
         .unwrap();
     assert_eq!(job.extent.safety_state, SafetyState::Held);
 }
+
+// ---------------------------------------------------------------------------
+// Re-drive
+// ---------------------------------------------------------------------------
+
+impl Fx {
+    /// Publishes an object, verifies it on `bb1` only and parks its outbox
+    /// row at `done` with the safety copy still held: what a deployment
+    /// with one backbone leaves behind.
+    async fn done_on_one_backbone(&self, key: &str) -> Obj {
+        let o = self.publish(&self.bucket, key).await;
+        let lease = self.posted(&o, 2, T0).await;
+        assert!(
+            self.verify(&lease, "bb1", "p1", T0, 2, 2, VerifyResult::Ok)
+                .await
+        );
+        assert!(self
+            .cat
+            .advance(&lease, OutboxStage::Done, T0, T0)
+            .await
+            .unwrap());
+        o
+    }
+
+    async fn redrive(&self, backbones: &[&str], required: u32, limit: u32, now: UnixMs) -> u64 {
+        let labels: Vec<String> = backbones.iter().map(|b| b.to_string()).collect();
+        self.cat
+            .redrive_underverified(&labels, required, limit, now)
+            .await
+            .unwrap()
+    }
+}
+
+/// A `done` extent whose safety copy is held and that counts on fewer
+/// backbones than required goes back to verify, as a fresh obligation.
+#[tokio::test]
+async fn redrive_requeues_underverified_done_extents() {
+    let fx = Fx::new().await;
+    let o = fx.done_on_one_backbone("k").await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert!(fx.cat.due(later, 100).await.unwrap().is_empty());
+
+    // Enough backbones count: nothing to do.
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 1, 100, later).await, 0);
+    // A backbone that is no longer configured does not count.
+    assert_eq!(fx.redrive(&["bb2"], 1, 100, later).await, 1);
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    assert_eq!(fx.outbox(&o, "attempts").await, "0");
+    assert_eq!(fx.outbox(&o, "cursor").await, "0");
+    assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
+    assert_eq!(fx.outbox(&o, "next_at").await, later.0.to_string());
+    assert_eq!(fx.cat.due(later, 100).await.unwrap().len(), 1);
+    // Moved once: the row is no longer `done`.
+    assert_eq!(fx.redrive(&["bb2"], 1, 100, later).await, 0);
+
+    // The verify job can claim it, and the earlier evidence is kept.
+    let lease = fx.claim(&o, OutboxStage::Verify, later).await.unwrap();
+    assert_eq!(fx.counting(&o).await, ["bb1"]);
+    assert!(
+        fx.verify(&lease, "bb2", "p2", later, 2, 2, VerifyResult::Ok)
+            .await
+    );
+    assert_eq!(fx.counting(&o).await, ["bb1", "bb2"]);
+}
+
+/// The second backbone arrives: two are required, one counts.
+#[tokio::test]
+async fn redrive_is_bounded_per_run() {
+    let fx = Fx::new().await;
+    let mut objs = Vec::new();
+    for i in 0..5 {
+        objs.push(fx.done_on_one_backbone(&format!("k{i}")).await);
+    }
+    let later = T0.plus_ms(HOUR_MS);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 1);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 0);
+    for o in &objs {
+        assert_eq!(fx.outbox(o, "stage").await, "verify");
+    }
+}
+
+/// The scan rotates: extents that need nothing do not hide later ones.
+#[tokio::test(flavor = "current_thread")]
+async fn redrive_window_moves_past_extents_that_need_nothing() {
+    let fx = Fx::new().await;
+    let mut objs = Vec::new();
+    for i in 0..5 {
+        objs.push(fx.done_on_one_backbone(&format!("k{i}")).await);
+    }
+    let later = T0.plus_ms(HOUR_MS);
+    // One backbone is enough: nothing moves, but the window advances.
+    assert_eq!(fx.redrive(&["bb1"], 1, 2, later).await, 0);
+    assert_eq!(fx.redrive(&["bb1"], 1, 2, later).await, 0);
+    // A second backbone is now required: the runs cover all five, the
+    // last three first and then, from the start again, the other two.
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 1);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 0);
+    for o in &objs {
+        assert_eq!(fx.outbox(o, "stage").await, "verify");
+    }
+}
+
+/// Rows that are not an open obligation stay where they are.
+#[tokio::test]
+async fn redrive_leaves_everything_else_alone() {
+    let fx = Fx::new().await;
+    let later = T0.plus_ms(HOUR_MS);
+
+    // Safety copy already released.
+    let released = fx.done_on_one_backbone("released").await;
+    fx.run(
+        "UPDATE extents SET safety_state = 'released' WHERE id = ?1",
+        &[text(released.extent.as_str())],
+    )
+    .await;
+    // Generation deleted.
+    let deleted = fx.done_on_one_backbone("deleted").await;
+    fx.run(
+        "UPDATE generations SET state = 'deleted' WHERE id = ?1",
+        &[text(deleted.generation.as_str())],
+    )
+    .await;
+    // Not finished: still at post, and at verify.
+    let posting = fx.publish(&fx.bucket, "posting").await;
+    let verifying = fx.publish(&fx.bucket, "verifying").await;
+    fx.posted(&verifying, 2, T0).await;
+    // Buried.
+    let dead = fx.done_on_one_backbone("dead").await;
+    fx.run(
+        "UPDATE outbox SET stage = 'dead' WHERE extent_id = ?1",
+        &[text(dead.extent.as_str())],
+    )
+    .await;
+
+    let before = fx.dump().await;
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 100, later).await, 0);
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.outbox(&posting, "stage").await, "post");
+    assert_eq!(fx.outbox(&released, "stage").await, "done");
+    assert_eq!(fx.outbox(&deleted, "stage").await, "done");
+}
