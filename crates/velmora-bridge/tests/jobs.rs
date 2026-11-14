@@ -237,6 +237,7 @@ impl Fx {
             newsgroups: vec!["alt.binaries.test".to_string()],
             kek_active: 1,
             inflight_budget_bytes: BUDGET,
+            job_budget_bytes: BUDGET,
             gc_mode,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
@@ -880,6 +881,46 @@ async fn job_waits_for_memory_without_spending_an_attempt() {
         JobOutcome::Ack
     );
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
+}
+
+/// A job charges against the job limit (`JOB_BUDGET_BYTES`), not the
+/// request limit: it runs beside other jobs that already hold almost the
+/// whole request limit, and waits once the job limit itself is full.
+#[tokio::test]
+async fn job_charges_against_the_job_limit() {
+    const MIB: u64 = 1024 * 1024;
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.job_budget_bytes = BUDGET / 2 * 3;
+    fx.bridge.budget = ByteBudget::new(BUDGET).with_job_capacity(BUDGET / 2 * 3);
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+
+    // Other jobs hold all but 1 MiB of the job limit: no room for this one.
+    let others = fx
+        .bridge
+        .budget
+        .try_charge_job(BUDGET / 2 * 3 - MIB)
+        .unwrap();
+    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let JobOutcome::Retry { delay_secs } = outcome else {
+        panic!("expected a retry, got {outcome:?}");
+    };
+    assert_eq!(fx.outbox(&o, "attempts").await, "0");
+    assert_eq!(fx.bridge.nntp.inner.connects(), 0);
+    drop(others);
+
+    // Other jobs hold all but 2 MiB of the request limit. Under that limit
+    // this job would not fit; under the job limit it does.
+    let others = fx.bridge.budget.try_charge_job(BUDGET - 2 * MIB).unwrap();
+    assert!(fx.bridge.budget.try_charge(4 * MIB).is_some());
+    fx.clock.advance_secs(delay_secs);
+    assert_eq!(
+        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        JobOutcome::Ack
+    );
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    assert!(fx.bridge.budget.peak() > BUDGET);
+    assert_eq!(fx.bridge.budget.in_use(), others.bytes());
 }
 
 #[tokio::test]

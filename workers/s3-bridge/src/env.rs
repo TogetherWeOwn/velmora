@@ -79,7 +79,9 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         ),
         kek,
         clock: WorkerClock,
-        budget: ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(sleeper()),
+        budget: ByteBudget::new(cfg.inflight_budget_bytes)
+            .with_job_capacity(cfg.job_budget_bytes)
+            .with_sleeper(sleeper()),
         cfg,
     })
 }

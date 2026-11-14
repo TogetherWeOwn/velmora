@@ -771,12 +771,15 @@ where
         // Unlike the rest of its stage, a repost holds the whole extent. A
         // repost larger than the budget still has to run, alone: next to
         // what its own stage already holds.
-        let room = self.budget.capacity().saturating_sub(JOB_OVERHEAD_BYTES);
+        let room = self
+            .budget
+            .job_capacity()
+            .saturating_sub(JOB_OVERHEAD_BYTES);
         let bytes = extent
             .cipher_size
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
             .min(room);
-        let Ok(_charge) = self.budget.charge(bytes).await else {
+        let Ok(_charge) = self.budget.charge_job(bytes).await else {
             return Err(Stop::NoPermit);
         };
         let cipher = match self.safety.get(&extent.id.safety_key(), None).await {

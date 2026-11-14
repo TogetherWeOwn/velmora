@@ -1220,6 +1220,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
+        job_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,

@@ -7,12 +7,17 @@
 
 use std::collections::HashMap;
 
+use futures_util::StreamExt;
+
 use velmora_bridge::recovery::{is_protected_key, Unpublished, ERR_RECORD_DELETE};
 use velmora_bridge::{BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
 use worker::{Bucket, Range};
 
 /// R2 range offsets travel as JS numbers (workers-rs panics above this).
 const MAX_SAFE_OFFSET: u64 = (1 << 53) - 1;
+
+/// The most a `get` reserves up front; a larger body grows as it arrives.
+const MAX_PRESIZE: u64 = 32 * 1024 * 1024;
 
 pub struct R2Blobs {
     bucket: Bucket,
@@ -94,11 +99,28 @@ impl BlobStore for R2Blobs {
         let body = object
             .body()
             .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
-        let bytes = body.bytes().await.map_err(blob_err("get body"))?;
-        if let Some(s) = span {
-            if bytes.len() as u64 != s.len {
-                return Err(BridgeError::Blob("r2: short range".into()));
+        // Read the body chunk by chunk into one buffer of the final size.
+        // Taking it as a single array buffer and copying that would hold
+        // the object twice, and the second copy is outside the byte budget.
+        let expected = span.map_or_else(|| object.size(), |s| s.len);
+        let mut bytes = Vec::with_capacity(expected.min(MAX_PRESIZE) as usize);
+        let mut stream = body.stream().map_err(blob_err("get body"))?;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(blob_err("get body"))?;
+            if (bytes.len() + chunk.len()) as u64 > expected {
+                return Err(BridgeError::Blob("r2: long body".into()));
             }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() as u64 != expected {
+            return Err(BridgeError::Blob(
+                if span.is_some() {
+                    "r2: short range"
+                } else {
+                    "r2: short body"
+                }
+                .into(),
+            ));
         }
         Ok(Some(bytes))
     }

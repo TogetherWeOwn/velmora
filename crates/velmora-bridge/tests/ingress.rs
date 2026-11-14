@@ -712,6 +712,92 @@ async fn byte_budget_caps_inflight() {
     assert!(budget.try_charge(u64::MAX).is_none());
 }
 
+/// Requests charge against the capacity, jobs against the job capacity,
+/// and a charge fits while the two shares sum to at most one.
+#[tokio::test]
+async fn byte_budget_weighs_requests_and_jobs() {
+    const MIB: u64 = 1024 * 1024;
+    let budget = ByteBudget::new(48 * MIB).with_job_capacity(72 * MIB);
+    assert_eq!(
+        (budget.capacity(), budget.job_capacity()),
+        (48 * MIB, 72 * MIB)
+    );
+
+    // Jobs alone: three 22 MiB post jobs and a 2 MiB job fit, a fourth
+    // post job does not; the limit is 72 MiB exactly.
+    let jobs: Vec<_> = (0..3)
+        .map(|_| budget.try_charge_job(22 * MIB).unwrap())
+        .collect();
+    let small = budget.try_charge_job(2 * MIB).unwrap();
+    assert!(budget.try_charge_job(22 * MIB).is_none());
+    let rest = budget.try_charge_job(4 * MIB).unwrap();
+    assert_eq!(budget.in_use(), 72 * MIB);
+    assert!(budget.try_charge_job(1).is_none());
+    // No request fits beside a full job limit.
+    assert!(budget.try_charge(1).is_none());
+    assert_eq!(
+        budget.charge_job(1).await.unwrap_err(),
+        IngressError::SlowDown
+    );
+    drop((jobs, small, rest));
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(budget.peak(), 72 * MIB);
+
+    // Requests alone keep the capacity: 48 MiB and not a byte more.
+    let requests = budget.charge_body(24 * MIB).await.unwrap();
+    assert!(budget.try_charge(1).is_none());
+    // No job fits beside a full capacity.
+    assert!(budget.try_charge_job(1).is_none());
+    drop(requests);
+
+    // A mix: a request byte weighs 1.5 job bytes. 16 MiB of requests
+    // (a third of the capacity) leave jobs two thirds of theirs, 48 MiB.
+    let request = budget.try_charge(16 * MIB).unwrap();
+    let jobs = budget.try_charge_job(48 * MIB).unwrap();
+    assert!(budget.try_charge_job(1).is_none());
+    assert!(budget.try_charge(1).is_none());
+    assert_eq!(budget.in_use(), 64 * MIB);
+    // One job fewer leaves room for 2/3 as many request bytes.
+    drop(jobs);
+    let jobs = budget.try_charge_job(24 * MIB).unwrap();
+    let more = budget.try_charge(16 * MIB).unwrap();
+    assert!(budget.try_charge(1).is_none());
+    assert!(budget.try_charge_job(1).is_none());
+
+    // One charge that took over another gives both kinds back.
+    let mut request = request;
+    request.absorb(jobs);
+    assert_eq!(request.bytes(), 40 * MIB);
+    drop((request, more));
+    assert_eq!(budget.in_use(), 0);
+
+    // A charge over its own limit can never fit and fails at once.
+    assert_eq!(
+        budget.charge(48 * MIB + 1).await.unwrap_err(),
+        IngressError::SlowDown
+    );
+    assert_eq!(
+        budget.charge_job(72 * MIB + 1).await.unwrap_err(),
+        IngressError::SlowDown
+    );
+    assert!(budget.try_charge_job(u64::MAX).is_none());
+    assert!(budget.charge_job(72 * MIB).await.is_ok());
+
+    // Without a job capacity the two kinds share the one limit, and a
+    // job capacity under the capacity is raised to it.
+    for budget in [
+        ByteBudget::new(48 * MIB),
+        ByteBudget::new(48 * MIB).with_job_capacity(MIB),
+    ] {
+        assert_eq!(budget.job_capacity(), 48 * MIB);
+        let job = budget.try_charge_job(40 * MIB).unwrap();
+        let request = budget.try_charge(8 * MIB).unwrap();
+        assert!(budget.try_charge(1).is_none());
+        assert!(budget.try_charge_job(1).is_none());
+        drop((job, request));
+    }
+}
+
 #[tokio::test]
 async fn byte_budget_releases_on_drop() {
     let budget = ByteBudget::new(100);

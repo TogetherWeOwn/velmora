@@ -26,21 +26,27 @@ VERIFY_DELAY_SECS = "120"
 # posting account and read back by message-id on every account.
 NEWSGROUPS = "alt.binaries.boneless,alt.binaries.misc,alt.binaries.multimedia,alt.binaries.test"
 VELMORA_KEK_ACTIVE = "1"
-INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
+INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may charge
+# What requests and background jobs may charge together, per isolate. A
+# job charges under this limit, a request under INFLIGHT_BUDGET_BYTES. It
+# may be up to 1.5 times INFLIGHT_BUDGET_BYTES: a request holds up to 1.5
+# bytes per byte it charges (the upload's ciphertext is copied once more
+# on its way to R2), a job holds about what it charges.
+JOB_BUDGET_BYTES = "75497472"        # 72 MiB per isolate
 GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
 # Sockets per post job, spread over the posting tier. A post job charges
 # its extent (16 MiB) plus 1 MiB per socket to the isolate's byte budget,
-# and the queue's invocations share isolates. At 6, two post jobs and a
-# verify job fit the 48 MiB budget at once; at 8 only one post job fits
-# and the others wait for it (measured on a test deployment: 3.6 MiB/s
-# at 8, 5.2 MiB/s at 6).
+# and the queue's invocations share isolates. At 6, three post jobs and a
+# verify job fit the 72 MiB job budget at once; at 8 only two post jobs
+# fit beside a verify job and the others wait for them.
 POST_SOCKETS = "6"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
+#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 
 # off | on. Turn on only in a release after the one that added extent
@@ -75,17 +81,18 @@ queue = "velmora-verify"
 [[queues.consumers]]
 queue = "velmora-post"
 max_batch_size = 1
-# Secondary bound only; provider_permits is the real gate. Kept small on
-# purpose: the measured providers limit the source addresses an account
-# may connect from at once (1 to 4), not only its connections, and
-# parallel invocations mostly leave from different addresses. A provider's
-# `max_ips` (in NNTP_PROVIDERS) is that limit: at most so many jobs and
-# requests hold connections there at once, and `max_conns` bounds the
-# connections they hold together. Throughput comes from sockets per job
-# (POST_SOCKETS), which share one address. A job without a slot, refused
-# at login, or without room in the isolate's byte budget is deferred, not
-# failed.
-max_concurrency = 3
+# Secondary bound only; provider_permits is the real gate. The measured
+# providers limit the source addresses an account may connect from at
+# once, not only its connections, and parallel invocations mostly leave
+# from different addresses. A provider's `max_ips` (in NNTP_PROVIDERS) is
+# that limit: at most so many jobs and requests hold connections there at
+# once, and `max_conns` bounds the connections they hold together. So
+# this number is useful only up to the address slots of the posting tier;
+# a job without a slot, refused at login, or without room in the
+# isolate's byte budget is deferred, not failed. A deferred job comes
+# back after 15 to 59 s, so more invocations than slots post no faster
+# (measured with 3 slots: 8 was no faster than 3).
+max_concurrency = 8
 max_retries = 20
 retry_delay = 60
 dead_letter_queue = "velmora-dlq"

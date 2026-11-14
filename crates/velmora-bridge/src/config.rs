@@ -98,6 +98,17 @@ pub const DEFAULT_HOT_CAP_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 /// the addresses an account connects from; each socket also holds one
 /// article in memory.
 pub const DEFAULT_POST_SOCKETS: u32 = 4;
+/// `JOB_BUDGET_BYTES` may be at most `INFLIGHT_BUDGET_BYTES` times this
+/// ratio (3/2).
+///
+/// A request holds up to 1.5 bytes for each byte it charges: an upload
+/// charges plaintext plus ciphertext and the ciphertext is copied once
+/// more when it is handed to the blob store. A job holds about what it
+/// charges. The budget weighs a request byte at `JOB_BUDGET_BYTES /
+/// INFLIGHT_BUDGET_BYTES` job bytes, so a ratio above 3/2 would only let
+/// jobs charge memory that requests alone could never reach.
+pub const MAX_JOB_BUDGET_NUM: u64 = 3;
+pub const MAX_JOB_BUDGET_DEN: u64 = 2;
 
 /// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.
 pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
@@ -123,6 +134,11 @@ pub struct BridgeConfig {
     pub newsgroups: Vec<String>,
     pub kek_active: u32,
     pub inflight_budget_bytes: u64,
+    /// What the isolate's background jobs and requests may charge to the
+    /// byte budget together (`JOB_BUDGET_BYTES`); a job charges under
+    /// this limit, a request under `inflight_budget_bytes`. Unset = the
+    /// same as `inflight_budget_bytes`.
+    pub job_budget_bytes: u64,
     pub gc_mode: GcMode,
     /// Cap on evictable bytes in R2 (released safety copies and cache
     /// fills). Pinned bytes are outside it: uploads are never throttled.
@@ -326,6 +342,19 @@ impl BridgeConfig {
         if inflight_budget_bytes < max_extent_bytes.saturating_mul(2) {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }
+        // Never under the request limit, and never more than half as much
+        // again (see `MAX_JOB_BUDGET_NUM`).
+        let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {
+            Some(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse()
+                .map_err(|_| ConfigError::Invalid("JOB_BUDGET_BYTES".into()))?,
+            _ => inflight_budget_bytes,
+        };
+        let job_budget_max = inflight_budget_bytes / MAX_JOB_BUDGET_DEN * MAX_JOB_BUDGET_NUM;
+        if job_budget_bytes < inflight_budget_bytes || job_budget_bytes > job_budget_max {
+            return Err(ConfigError::Invalid("JOB_BUDGET_BYTES".into()));
+        }
 
         let gc_mode = match required(&get, "GC_MODE")?.as_str() {
             "off" => GcMode::Off,
@@ -409,6 +438,7 @@ impl BridgeConfig {
             newsgroups,
             kek_active,
             inflight_budget_bytes,
+            job_budget_bytes,
             gc_mode,
             hot_cap_bytes,
             maintenance,
