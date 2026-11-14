@@ -11,7 +11,7 @@ mod service_support;
 use service_support::*;
 use velmora_bridge::testkit::{
     RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
-    MIGRATION_0006,
+    MIGRATION_0006, MIGRATION_0007,
 };
 use velmora_bridge::*;
 
@@ -178,6 +178,7 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0004,
         // Later migrations do not touch what 0005 adds; the undo keeps them.
         MIGRATION_0006,
+        MIGRATION_0007,
     ] {
         old.apply(migration).unwrap();
     }

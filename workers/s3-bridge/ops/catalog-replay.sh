@@ -68,11 +68,13 @@ while :; do
   jq -c --slurpfile t "$WORK/total.json" '
     . as $s
     | reduce ("manifests","published","present","superseded","extents","article_plans",
-              "safety_missing","tombstones","deleted","duplicate","other_bucket_total") as $k
+              "safety_missing","tombstones","deleted","duplicate","other_bucket_total",
+              "held_checked","held_missing_total") as $k
         ($t[0]; .[$k] = ((.[$k] // 0) + $s[$k]))
     | .unpublishable = ((.unpublishable // []) + $s.unpublishable)
     | .unreadable = ((.unreadable // []) + $s.unreadable)
     | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
+    | .held_missing = ((.held_missing // []) + $s.held_missing)
     | .damaged_total = $s.damaged_total
     | .damaged = $s.damaged' "$WORK/step.json" >"$WORK/total.next"
   mv "$WORK/total.next" "$WORK/total.json"
@@ -84,6 +86,11 @@ done
 
 echo "catalog-replay: complete after $calls calls"
 jq . "$WORK/total.json"
+if [ "$(jq -r '.held_missing_total' "$WORK/total.json")" != 0 ]; then
+  echo "catalog-replay: the catalogue is older than the release of some pinned copies" >&2
+  echo "catalog-replay: run it again with restore point 0 before leaving maintenance" >&2
+  exit 2
+fi
 if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
   exit 2

@@ -13,7 +13,7 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, checksum_json, discard_refused, from_proto, internal, metadata_json,
-    mutation_gate, s3_error,
+    mutation_gate, restore_gate, s3_error,
 };
 use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
@@ -63,6 +63,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
+    restore_gate(bridge).await?;
     // CopyObject is this request shape with a source header and no body.
     if authed.headers.get("x-amz-copy-source").is_some() {
         let declared = crate::ingress::declared_length(&req.headers).map_err(|e| e.response())?;

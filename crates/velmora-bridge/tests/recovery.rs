@@ -108,6 +108,9 @@ fn add(total: &mut ReplayReport, step: ReplayReport) {
     total.duplicate += step.duplicate;
     total.other_bucket_total += step.other_bucket_total;
     total.other_bucket.extend(step.other_bucket);
+    total.held_checked += step.held_checked;
+    total.held_missing_total += step.held_missing_total;
+    total.held_missing.extend(step.held_missing);
     total.unpublishable.extend(step.unpublishable);
     total.unreadable.extend(step.unreadable);
     total.damaged_total = step.damaged_total;
@@ -626,7 +629,7 @@ async fn records_alone_rebuild_the_catalogue() {
     // The same replay again, in one call per phase.
     let settled = dump(&rig);
     let (again, calls) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert_eq!(calls, 2);
+    assert_eq!(calls, 3);
     assert_eq!(
         (again.published, again.present, again.deleted),
         (0, 6, 0),
@@ -1208,9 +1211,42 @@ async fn restore_route_runs_only_in_maintenance() {
             assert_eq!(report["damaged_total"], 0);
             break;
         }
+        // Started and not ended: the catalogue says so.
+        assert_eq!(restore_state(&restoring), ["replaying"]);
         body = json!({ "cursor": report["next"] });
     }
-    assert_eq!((published, deleted, calls), (2, 1, 2));
+    assert_eq!(restore_state(&restoring), ["complete"]);
+    assert_eq!((published, deleted, calls), (2, 1, 3));
+
+    // A cursor of this replay that arrives after another replay was
+    // started does not end the other one.
+    let first = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    first.expect(200);
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    let second = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    second.expect(200);
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert_ne!(first["next"]["run_ms"], second["next"]["run_ms"]);
+    let finish = |mut body: Value| {
+        let restoring = &restoring;
+        async move {
+            loop {
+                let r = admin(restoring, "/restore", body).await;
+                if r.status != 200 {
+                    return r.status;
+                }
+                let report: Value = serde_json::from_slice(&r.body).unwrap();
+                if report["next"].is_null() {
+                    return 200;
+                }
+                body = json!({ "cursor": report["next"] });
+            }
+        }
+    };
+    assert_eq!(finish(json!({ "cursor": first["next"] })).await, 409);
+    assert_eq!(restore_state(&restoring), ["replaying"]);
+    assert_eq!(finish(json!({ "cursor": second["next"] })).await, 200);
+    assert_eq!(restore_state(&restoring), ["complete"]);
     assert_eq!(restoring.count("objects"), 1);
     assert_eq!(restoring.count("generations"), 2);
 
@@ -1693,6 +1729,177 @@ async fn records_of_a_bucket_whose_name_is_taken_are_reported_and_skipped() {
     assert!(report.unpublishable.is_empty(), "{report:?}");
     get(&rig, &signer, "a").await.expect(404);
     assert_eq!(get(&rig, &signer, "c").await.expect(200).body, b"three");
+}
+
+// ---------------------------------------------------------------------------
+// A replay that was started and did not end
+// ---------------------------------------------------------------------------
+
+fn restore_state(rig: &Rig) -> Vec<String> {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c.prepare("SELECT state FROM restore_state").unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unfinished_replay_refuses_writes_without_maintenance() {
+    // Maintenance is off in this rig, as after a deploy that came too
+    // early.
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig);
+
+    let run = rig
+        .bridge
+        .catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap();
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    delete(&rig, &signer, "a").await.expect(503);
+    copy(&rig, &signer, "a", "copy").await.expect(503);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(503);
+    let r = rig
+        .call(
+            &signer,
+            Method::Post,
+            &path(BUCKET, "other"),
+            &[("uploads", "")],
+            &[],
+            b"",
+        )
+        .await;
+    assert_eq!(r.status, 503, "{}", r.text());
+    // Nothing was recorded, and reads go on.
+    assert_eq!(records(&rig), before);
+    assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
+
+    // Neither do the admin routes that change something, the queue
+    // jobs, or the dispatcher.
+    admin(&rig, "/buckets", json!({ "name": "second" }))
+        .await
+        .expect(503);
+    admin(&rig, "/evict/vault/a?include_safety=1", json!({}))
+        .await
+        .expect(503);
+    let outbox = || -> (String, String, String, i64) {
+        rig.bridge.catalog.sql.with_conn(|c| {
+            c.query_row(
+                "SELECT extent_id, generation_id, stage, attempts FROM outbox \
+                 ORDER BY extent_id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        })
+    };
+    let row = outbox();
+    assert_eq!(row.2, "post");
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: ExtentId::new(row.0.clone()),
+        generation: GenerationId::new(row.1.clone()),
+        stage: OutboxStage::Post,
+    };
+    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(outbox(), row);
+    assert_eq!(
+        rig.bridge.dispatch().await.unwrap(),
+        DispatchReport::default()
+    );
+    assert_eq!(rig.count("buckets"), 1);
+
+    // The end of another replay does not end this one.
+    assert!(!rig
+        .bridge
+        .catalog
+        .restore_finish(UnixMs(run.0 - 1), rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    assert!(rig
+        .bridge
+        .catalog
+        .restore_finish(run, rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["complete"]);
+    assert!(rig.bridge.dispatch().await.unwrap().permits_seeded);
+    rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+
+    // A second restore arms the gate again, under a later mark, also
+    // within the same millisecond.
+    let second = rig
+        .bridge
+        .catalog
+        .restore_begin(UnixMs(5), rig.now())
+        .await
+        .unwrap();
+    assert!(second > run);
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
+}
+
+// ---------------------------------------------------------------------------
+// A catalogue that is older than the release of a pinned copy
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_copy_released_after_the_export_is_found() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "old", b"old").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "old").await.unwrap();
+    tick(&rig);
+    rig.put(&signer, BUCKET, "kept", b"kept").await.expect(200);
+    tick(&rig);
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+
+    // After the export the pipeline released the pinned copy of `old`.
+    // The export still says it is held.
+    for x in &extents {
+        rig.bridge
+            .safety
+            .inner
+            .delete(&x.id.safety_key())
+            .await
+            .unwrap();
+    }
+    wipe(&rig);
+    import(&rig);
+
+    // A replay from the restore point does not read the record of
+    // `old`, and reports the extent.
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 2, "{report:?}");
+    assert_eq!(report.held_missing_total, 1, "{report:?}");
+    assert_eq!(report.held_missing, [extents[0].id.as_str()]);
+
+    // A replay from 0 reads it and sets the row right.
+    let (report, _) = replay(
+        &rig,
+        UnixMs(0),
+        ReplayLimits {
+            records: 1,
+            extents: 1,
+        },
+    )
+    .await;
+    assert_eq!(report.held_checked, 1, "{report:?}");
+    assert_eq!(report.held_missing_total, 0, "{report:?}");
+    assert_eq!(report.safety_missing, 1, "{report:?}");
 }
 
 // ---------------------------------------------------------------------------

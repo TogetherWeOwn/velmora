@@ -22,8 +22,8 @@ use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
-    ArticleRow, BridgeError, Bucket, ExtentPlacement, GenerationId, GenerationRow, GenerationState,
-    Result, SafetyState, UnixMs,
+    ArticleRow, BridgeError, Bucket, ExtentId, ExtentPlacement, GenerationId, GenerationRow,
+    GenerationState, Result, SafetyState, UnixMs,
 };
 
 type Stmt = (&'static str, Vec<SqlValue>);
@@ -214,6 +214,87 @@ pub(super) async fn replay_damaged<S: Sql>(
         }
     }
     Ok((count, ids))
+}
+
+/// Ids of extents whose row says a pinned copy exists.
+pub(super) async fn held_extents<S: Sql>(
+    c: &SqlCatalog<S>,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<ExtentId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT id FROM extents WHERE id > ?1 AND safety_state IN ('held', 'releasing') \
+             ORDER BY id LIMIT ?2",
+            &[text(after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.as_slice() {
+            [SqlValue::Text(id)] => ids.push(ExtentId::new(id.clone())),
+            _ => return Err(BridgeError::Sql("row decode: held extent".into())),
+        }
+    }
+    Ok(ids)
+}
+
+pub(super) async fn restore_begin<S: Sql>(
+    c: &SqlCatalog<S>,
+    since: UnixMs,
+    now: UnixMs,
+) -> Result<UnixMs> {
+    // The mark is the start time, moved past the mark of the replay
+    // before it when the two fall into one millisecond.
+    let rows = c
+        .sql
+        .query(
+            "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
+             VALUES (1, 'replaying', ?1, ?2, NULL) \
+             ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
+               started_at = max(excluded.started_at, restore_state.started_at + 1), \
+               finished_at = NULL \
+             RETURNING started_at",
+            &[ms(since), ms(now)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(run)]) => Ok(UnixMs(*run)),
+        _ => Err(BridgeError::Sql("row decode: restore mark".into())),
+    }
+}
+
+pub(super) async fn restore_finish<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+    now: UnixMs,
+) -> Result<bool> {
+    // Ending the same replay twice is the same as ending it once.
+    let changed = c
+        .sql
+        .exec(
+            "UPDATE restore_state SET state = 'complete', \
+               finished_at = COALESCE(finished_at, ?1) \
+             WHERE id = 1 AND started_at = ?2",
+            &[ms(now), ms(run)],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
+pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'",
+            &[],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(n)]) => Ok(*n != 0),
+        _ => Err(BridgeError::Sql("row decode: restore state".into())),
+    }
 }
 
 /// Step 2. `Lost` = the generation is already there, a newer generation

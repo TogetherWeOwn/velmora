@@ -75,6 +75,12 @@ Limits to know:
   touch the new bucket: it skips the records of the old one and lists
   them under `other_bucket`. Which of the two keeps the name is for the
   operator to decide; the records of the old one stay in the store.
+- A pinned copy is deleted once its extent was read back from Usenet
+  and `SAFETY_MIN_AGE_SECS` have passed. A catalogue from before that
+  moment still says `held` for the extent, and a replay from the restore
+  point does not read records that old. The replay checks every `held`
+  row against the store at its end and counts the ones without a copy
+  in `held_missing_total`; a replay from `0` sets them right.
 - An empty bucket that never had a write is not in the records.
 
 ## Routine: export
@@ -105,9 +111,25 @@ exists: restore it to a timestamp, then replay from that timestamp.
 4. `VELMORA_ADMIN_TOKEN_FILE=<file> ops/catalog-replay.sh <base-url> <restore point>`.
    It prints the counts. Exit status 2 means damage was found: read the
    lists before going on.
-5. Check: `GET /_admin/status`, a listing, and a GET of a recent object.
+   - Use restore point `0` if the database copy is older than
+     `SAFETY_MIN_AGE_SECS`, or if the replay ends with
+     `held_missing_total` above 0. It reads every record, so it takes
+     longer; it is always correct.
+5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
+   listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
    database was rebuilt from the records alone.
+
+From the first call of the replay to its last, the catalogue itself
+refuses every write with 503, also when `MAINTENANCE` is already `off`:
+a catalogue that holds a part of the records must not take new writes.
+The same holds for the admin routes that change something, the queue
+jobs and the cron. If a replay was stopped, run it again to its end.
+Starting a replay again makes the earlier one void: a step sent with a
+cursor of the earlier one can still run, but its last step answers 409
+and the catalogue stays closed until the replay that was started last
+has ended. This does not notice a
+replay that was never started: step 4 is not optional after step 2.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.
