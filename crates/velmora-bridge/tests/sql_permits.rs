@@ -9,7 +9,7 @@ use velmora_bridge::*;
 const T0: UnixMs = UnixMs(1_762_992_000_123);
 /// How long a background job's slot lives, and a read's.
 const TTL_MS: i64 = 120_000;
-const READ_TTL_MS: i64 = 30_000;
+const READ_TTL_MS: i64 = 35_000;
 
 fn provider(id: &str, max_conns: u32) -> ProviderConfig {
     let json = format!(
@@ -907,9 +907,9 @@ async fn without_max_ips_only_connections_count() {
     assert_eq!((load.held, load.holders), (4, 4));
 }
 
-/// A read's slot lives 30 s and a job's 120 s, from the take and from
+/// A read's slot lives 35 s and a job's 120 s, from the take and from
 /// every renewal. The renewal goes by what the slot was taken for, not
-/// by who asks: a read that is cut off holds its address for 30 s.
+/// by who asks: a read that is cut off holds its address for 35 s.
 #[tokio::test]
 async fn a_slot_lives_as_long_as_its_class() {
     assert_eq!(

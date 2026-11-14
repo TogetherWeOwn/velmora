@@ -873,9 +873,8 @@ async fn concurrent_cold_range_reads_wait_for_a_provider_slot() {
 
 /// What a fake sleeper runs on each poll once the rig exists: gets the
 /// poll number, may inspect or change the rig.
-type PollHook = Rc<
-    RefCell<Option<Box<dyn Fn(u32, Rc<TestBridge<TcpConnector>>) -> LocalBoxFuture<'static, ()>>>>,
->;
+type OnPoll = Box<dyn Fn(u32, Rc<TestBridge<TcpConnector>>) -> LocalBoxFuture<'static, ()>>;
+type PollHook = Rc<RefCell<Option<OnPoll>>>;
 
 /// Sleeper that lets no real time pass. It adds up the milliseconds asked
 /// for, moves the rig's clock by them plus `overhead_ms` (the round trips
@@ -920,18 +919,27 @@ async fn hold_all_slots(rig: &Rig<TcpConnector>) -> Vec<Permit> {
     held
 }
 
+/// A poll hook under which the holders of `held` are at work: they renew
+/// on every poll, as a read does before every call to the provider.
+fn renewing(held: Vec<Permit>) -> OnPoll {
+    Box::new(move |_, bridge| {
+        let held = held.clone();
+        Box::pin(async move {
+            for permit in &held {
+                let now = bridge.clock.now();
+                assert!(bridge.catalog.renew_permit(permit, now).await.unwrap());
+            }
+        })
+    })
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cold_read_waits_for_a_slot_then_slows_down() {
     let asked = Rc::new(Cell::new(0u64));
     let polls = Rc::new(Cell::new(0u32));
     let weak = Rc::new(RefCell::new(Weak::new()));
-    let sleeper = fake_cold_sleeper(
-        asked.clone(),
-        polls.clone(),
-        weak.clone(),
-        PollHook::default(),
-        0,
-    );
+    let hook = PollHook::default();
+    let sleeper = fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone(), 0);
     let cold = cold_rig_with(4, Some(sleeper)).await;
     let rig = &cold.rig;
     *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
@@ -939,8 +947,10 @@ async fn cold_read_waits_for_a_slot_then_slows_down() {
     let extent = cold.put_and_post("cold.bin", &body).await;
     evict(rig, &extent).await;
 
-    // Other readers hold every slot for longer than the bound.
+    // Other readers hold every slot for longer than the bound. They are
+    // at work: they renew, as a read does before every call.
     let held = hold_all_slots(rig).await;
+    *hook.borrow_mut() = Some(renewing(held.clone()));
     let connects = rig.bridge.nntp.connects();
 
     let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
@@ -968,6 +978,39 @@ async fn cold_read_waits_for_a_slot_then_slows_down() {
     let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
     resp.expect(200);
     assert!(resp.body == body);
+}
+
+/// Readers that were cut off (their clients hung up) release nothing:
+/// their slots run out by themselves. A read that finds every slot held
+/// by them waits that out and is served; it does not give up first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiting_read_outlasts_the_slots_of_dropped_reads() {
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let weak = Rc::new(RefCell::new(Weak::new()));
+    let sleeper = fake_cold_sleeper(
+        asked.clone(),
+        polls.clone(),
+        weak.clone(),
+        PollHook::default(),
+        0,
+    );
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
+    let body = pattern(48, 300_000);
+    let extent = cold.put_and_post("cold.bin", &body).await;
+    evict(rig, &extent).await;
+
+    // Taken and never renewed or released.
+    let _dropped = hold_all_slots(rig).await;
+
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+    let permit_ms = u64::from(PermitClass::Read.permit_secs()) * 1000;
+    assert!(asked.get() >= permit_ms, "served after {} ms", asked.get());
+    assert!(asked.get() < u64::from(COLD_WAIT_MS));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1031,11 +1074,12 @@ async fn slow_polls_end_the_wait_by_the_clock() {
     let asked = Rc::new(Cell::new(0u64));
     let polls = Rc::new(Cell::new(0u32));
     let weak = Rc::new(RefCell::new(Weak::new()));
+    let hook = PollHook::default();
     let sleeper = fake_cold_sleeper(
         asked.clone(),
         polls.clone(),
         weak.clone(),
-        PollHook::default(),
+        hook.clone(),
         1_000,
     );
     let cold = cold_rig_with(4, Some(sleeper)).await;
@@ -1044,7 +1088,7 @@ async fn slow_polls_end_the_wait_by_the_clock() {
     let body = pattern(59, 300_000);
     let extent = cold.put_and_post("cold.bin", &body).await;
     evict(rig, &extent).await;
-    let _held = hold_all_slots(rig).await;
+    *hook.borrow_mut() = Some(renewing(hold_all_slots(rig).await));
 
     let start = rig.now();
     let resp = get(rig, &cold.signer, "cold.bin", &[]).await;

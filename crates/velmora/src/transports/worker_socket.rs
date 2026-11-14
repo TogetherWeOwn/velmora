@@ -10,11 +10,14 @@
 
 #![cfg(all(feature = "worker-transport", target_arch = "wasm32"))]
 
+use std::future::Future;
 use std::io;
 use std::pin::pin;
+use std::task::Context;
 use std::time::Duration;
 
 use futures_util::future::{self, Either};
+use futures_util::task::noop_waker_ref;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::{Delay, SecureTransport, Socket};
 
@@ -92,6 +95,19 @@ impl WorkerTransport {
     /// [`Socket::start_tls`], owned by the caller).
     pub fn from_socket(socket: Socket, timeout: Duration) -> Self {
         WorkerTransport { socket, timeout }
+    }
+}
+
+/// A transport that is dropped (a call that ran out of time, a session
+/// given up without a goodbye) closes its connection: the runtime would
+/// otherwise keep the socket, and the provider would keep counting it,
+/// until the invocation ends. `close()` is called and not awaited: the
+/// first poll makes the runtime's call, and its promise is let go.
+impl Drop for WorkerTransport {
+    fn drop(&mut self) {
+        let mut close = pin!(self.socket.close());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let _ = close.as_mut().poll(&mut cx);
     }
 }
 

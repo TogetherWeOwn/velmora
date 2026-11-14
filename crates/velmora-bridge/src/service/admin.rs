@@ -794,11 +794,13 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             &bridge.nntp,
             &bridge.clock,
             provider,
-            PermitClass::Background,
+            // A drill runs inside a request, as a read does: the short
+            // permit and the short calls of one.
+            PermitClass::Read,
             &holder,
         )
         .await?
-        else {
+        .map(|s| s.with_timer(bridge.budget.sleeper())) else {
             busy = true;
             continue;
         };

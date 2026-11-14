@@ -262,6 +262,8 @@ pub struct MemCatalog {
     pub renewals: Cell<u32>,
     /// The time of each `renew_all`.
     pub renewed_at: RefCell<Vec<UnixMs>>,
+    /// Permit renewals never come back.
+    pub renew_hangs: Cell<bool>,
     /// Every permit renewal takes this long on the clock.
     pub renew_takes: RefCell<Option<(FixedClock, i64)>>,
     /// The time of each permit renewal that held.
@@ -781,6 +783,9 @@ impl Catalog for MemCatalog {
     }
 
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
+        if self.renew_hangs.get() {
+            std::future::pending::<()>().await;
+        }
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
         // A freed or expired slot is not extended, as in `sql::permits`.

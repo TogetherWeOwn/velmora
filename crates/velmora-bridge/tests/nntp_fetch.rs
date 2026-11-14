@@ -5,7 +5,10 @@
 mod nntp_support;
 
 use nntp_support::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 use velmora_bridge::fetch::ColdFetch;
+use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::*;
 
 const PLAIN_LEN: usize = 1_500_000;
@@ -259,6 +262,40 @@ async fn a_read_does_not_count_on_a_slot_renewed_too_late() {
 
     *rig.bridge.catalog.renew_takes.borrow_mut() = Some((clock, limit));
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
+/// A renewal that does not come back is given up when its bound passes,
+/// by the host's timer: the read does not sit on a connection while the
+/// slot runs out behind a catalogue call that hangs.
+#[tokio::test]
+async fn a_read_gives_up_a_renewal_that_hangs() {
+    let mut rig = simple_rig().await;
+    let clock = rig.bridge.clock.clone();
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let sleeper: Sleeper = {
+        let (clock, asked) = (clock.clone(), asked.clone());
+        Rc::new(move |ms| {
+            asked.borrow_mut().push(ms);
+            clock.advance_ms(i64::from(ms));
+            Box::pin(async {})
+        })
+    };
+    rig.bridge.budget = ByteBudget::new(48 * 1024 * 1024).with_sleeper(sleeper);
+    let (s, _) = rig.posted_cold(11).await;
+    rig.bridge.nntp.slow(&clock, 0);
+
+    rig.bridge.catalog.renew_hangs.set(true);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Busy);
+    assert_eq!(*asked.borrow(), [READ_RENEW_SECS * 1000]);
+    assert!(rig.bridge.nntp.calls().is_empty());
+    let load = rig.bridge.catalog.provider_load(clock.now()).await.unwrap();
+    assert!(load.iter().all(|l| l.held == 0));
+
+    // A renewal that returns at once starts no timer.
+    rig.bridge.catalog.renew_hangs.set(false);
+    asked.borrow_mut().clear();
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert!(asked.borrow().is_empty());
 }
 
 /// Overlapping cold reads never hold more connections than the provider
