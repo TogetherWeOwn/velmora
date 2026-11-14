@@ -390,6 +390,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<u64> {
         outbox::redrive_underverified(self, backbones, required, limit, now).await
     }
+    async fn revive_referenced(&self, limit: u32, now: UnixMs) -> Result<u64> {
+        outbox::revive_referenced(self, limit, now).await
+    }
 
     // hot tier
     async fn hot_stats(&self) -> Result<HotStats> {

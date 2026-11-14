@@ -777,24 +777,71 @@ async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
     assert_eq!(count(&rig, LIVE_POSTING), 2);
 
-    // The rows queued when the source was retired are still open. The
-    // collector refuses each of them while the copy is live.
-    assert_eq!(count(&rig, LIVE_IN_GC), 3);
+    // The collection queued when the source was retired is called off:
+    // the copy brought the extent back into service.
+    assert_eq!(count(&rig, LIVE_IN_GC), 0);
+    assert_eq!(rig.count("gc WHERE done_at IS NULL"), 0);
+    assert_eq!(rig.count("gc"), 3);
     rig.bridge.clock.advance_secs(8 * 86_400);
-    let due = rig
-        .bridge
-        .catalog
-        .gc_due(rig.now(), 100, false)
-        .await
-        .unwrap();
-    assert_eq!(due.len(), 3);
-    for row in &due {
-        assert_eq!(
-            rig.bridge.catalog.gc_begin(row, rig.now()).await.unwrap(),
-            GcStep::Skipped
-        );
-    }
+    let due = rig.bridge.catalog.gc_due(rig.now(), 100, false);
+    assert!(due.await.unwrap().is_empty());
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+
+    // With its last reference the extent leaves service again, and that
+    // retirement queues its own rows.
+    delete(&rig, &signer, "dst").await.expect(204);
+    assert_eq!(rig.count("gc WHERE done_at IS NULL"), 3);
+    assert_eq!(rig.count("gc"), 6);
+}
+
+/// The extent a copy brings back into service can be one whose release
+/// was begun and not finished. Its obligation restarts at the release
+/// stage, the only one that finishes it, with a fresh lease token.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_takes_up_the_unfinished_release_of_its_extent() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let start = rig.now();
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    sql(
+        &rig,
+        "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1; \
+         UPDATE outbox SET stage = 'release', cursor = 2, attempts = 3, last_error = 'x', \
+           lease_owner = 'gone', lease_until = 1;",
+    );
+    export(&rig);
+    rig.bridge.clock.advance_secs(60);
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    // Overwritten later, by an isolate whose clock says it is earlier.
+    rig.bridge.clock.set(UnixMs(start.0 + 1000));
+    rig.put(&signer, BUCKET, "src", b"newer").await.expect(200);
+    rig.bridge.clock.advance_secs(120);
+
+    wipe(&rig);
+    import(&rig);
+    let token = count(&rig, "SELECT lease_token FROM outbox");
+    let (report, _) = replay(&rig, start, ReplayLimits::default()).await;
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+    assert_eq!(get(&rig, &signer, "src").await.expect(200).body, b"newer");
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+
+    const SHARED: &str = "FROM outbox o JOIN extents e ON e.id = o.extent_id \
+         WHERE e.safety_state = 'releasing'";
+    assert_eq!(
+        count(
+            &rig,
+            &format!(
+                "SELECT COUNT(*) {SHARED} AND o.stage = 'release' AND o.cursor = 0 \
+                   AND o.attempts = 0 AND o.last_error IS NULL AND o.lease_owner IS NULL \
+                   AND o.lease_until IS NULL"
+            )
+        ),
+        1
+    );
+    assert!(count(&rig, &format!("SELECT o.lease_token {SHARED}")) > token);
+    assert_eq!(count(&rig, LIVE_IN_GC), 0);
 }
 
 /// A copy onto an existing key is the newest generation of that key by

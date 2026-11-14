@@ -26,7 +26,8 @@ use super::common::{
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
 use crate::recovery::{copy_id, generation_key, write_generation};
 use crate::types::{
-    Body, Bucket, CopyGeneration, ExtentRow, GenerationRow, GenerationState, S3Response,
+    Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
+    S3Response,
 };
 
 /// Times the copy is re-planned when the source changes under it.
@@ -177,6 +178,8 @@ where
         ));
     }
 
+    // The id of the attempt before this one, which lost its guard.
+    let mut lost: Option<GenerationId> = None;
     for _ in 0..ATTEMPTS {
         let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
         // The copy keeps the checksum stored with the source. Computing
@@ -209,7 +212,9 @@ where
             (from.content_json.clone(), from.user_meta_json.clone())
         };
         let generation = GenerationRow {
-            id: copy_id(now, &from.id, replaced.as_ref(), rand),
+            // Also after the attempt that lost: should its record have
+            // survived its delete after all, it sorts before this one.
+            id: copy_id(now, &from.id, replaced.as_ref().max(lost.as_ref()), rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,
@@ -238,7 +243,8 @@ where
             .await
             .map_err(|_| internal())?;
         drop(extents);
-        let record = generation_key(&generation.id);
+        let id = generation.id.clone();
+        let record = generation_key(&id);
         let committed = bridge
             .catalog
             .copy_generation(&CopyGeneration {
@@ -258,8 +264,19 @@ where
         // The source was overwritten or deleted since it was read, or
         // the destination got a generation this id does not sort after.
         // Nothing was published under this id, so its record must not
-        // publish it in a replay either. Best effort, as for Complete.
-        let _ = bridge.safety.delete(&record).await;
+        // publish it in a replay either. A record that cannot be removed
+        // ends the request: no copy was made, and the caller is told so.
+        let mut removed = false;
+        for _ in 0..ATTEMPTS {
+            if bridge.safety.delete(&record).await.is_ok() {
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            return Err(internal());
+        }
+        lost = Some(id);
         // Plan again against what is live now.
     }
     Err(unavailable())
