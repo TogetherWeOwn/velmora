@@ -1037,8 +1037,20 @@ async fn object_status_evict_and_drill_after_release() {
 
     // Drill: read back from Usenet, decrypted and compared.
     let connects = fx.bridge.nntp.connects();
+    let slots = "SELECT group_concat(slot || ':' || token || ':' || background) \
+                 FROM (SELECT * FROM provider_permits ORDER BY slot)";
+    let before = fx.scalar(slots, &[]).await;
     let r = fx.post(&format!("/drill/{path}")).await;
     assert_eq!(r.status, 200);
+    // It ran inside a request, so the slot it took was a read's: the
+    // short permit, and the short calls.
+    let after = fx.scalar(slots, &[]).await;
+    let taken: Vec<&str> = after
+        .split(',')
+        .filter(|slot| !before.split(',').any(|b| b == *slot))
+        .collect();
+    assert_eq!(taken.len(), 1, "{before} -> {after}");
+    assert!(taken[0].ends_with(":0"), "{before} -> {after}");
     assert_eq!(
         r.json(),
         json!({

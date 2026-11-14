@@ -6,4 +6,6 @@
 -- counts its background holders apart, so that reads in flight do not
 -- use up the addresses left to jobs. Slots held when this is applied
 -- count as reads until they are released or expire.
+-- A Worker from before this migration does not write the column: after
+-- a rollback to one, held slots keep the value of their last holder.
 ALTER TABLE provider_permits ADD COLUMN background INTEGER NOT NULL DEFAULT 0;
