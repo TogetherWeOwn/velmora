@@ -319,14 +319,17 @@ where
     /// Refuses in one harmless case too: a raise that was already under
     /// way when the replay was started. Its object is later than the
     /// start, and a new replay is asked for.
-    pub(crate) async fn stamp_level(&self, run: UnixMs) -> Result<Option<u64>> {
+    ///
+    /// With the value comes the counter it was chosen from, for
+    /// [`Catalog::restore_finish`] to hold the catalogue to.
+    pub(crate) async fn stamp_level(&self, run: UnixMs) -> Result<Option<(u64, Option<u64>)>> {
         for _ in 0..ADVANCE_ATTEMPTS {
             let row = self.stamp_row().await?;
             let top = self.stamp_top(row.counter).await?;
             // Not behind: nothing to tell from the times. A replay that
             // has ended and whose last step is sent again is here.
             if top <= row.counter.unwrap_or(0) || self.stamp_time(top).await? <= run {
-                return Ok(Some(top));
+                return Ok(Some((top, row.counter)));
             }
             // `false` = a raise ran since the row was read, and the
             // newest object may be its own: read again.

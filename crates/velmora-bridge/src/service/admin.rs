@@ -455,7 +455,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             // Not if the catalogue is behind a stamp that was raised
             // after this replay started: it was rolled back since, and
             // this replay does not hold what was written before that.
-            let stamp = bridge
+            let (stamp, seen) = bridge
                 .stamp_level(run)
                 .await
                 .or_internal()?
@@ -464,7 +464,13 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             // is brought level with the newest stamp object.
             if !bridge
                 .catalog
-                .restore_finish(run, bridge.clock.now(), stamp, &bridge.cfg.catalogue_id)
+                .restore_finish(
+                    run,
+                    bridge.clock.now(),
+                    stamp,
+                    seen,
+                    &bridge.cfg.catalogue_id,
+                )
                 .await
                 .or_internal()?
             {

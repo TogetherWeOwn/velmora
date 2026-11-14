@@ -291,6 +291,7 @@ pub(super) async fn restore_finish<S: Sql>(
     run: UnixMs,
     now: UnixMs,
     stamp: u64,
+    seen: Option<u64>,
     catalogue: &str,
 ) -> Result<bool> {
     // Ending the same replay twice is the same as ending it once.
@@ -301,6 +302,14 @@ pub(super) async fn restore_finish<S: Sql>(
     // cursor may be an old one, sent again after the catalogue was
     // rolled back to a point after that replay: the rollback that was
     // found then stays on record. The counter never moves down.
+    // `stamp` was chosen from the counter `seen`. If the database was
+    // brought back to an earlier point since that read, the counter is
+    // another one: the stamp is left alone, and so is the state, which
+    // is changed only over a stamp that is level and not marked.
+    let seen = match seen {
+        Some(counter) => int(counter)?,
+        None => SqlValue::Null,
+    };
     let changed = c
         .sql
         .batch(vec![
@@ -308,15 +317,18 @@ pub(super) async fn restore_finish<S: Sql>(
                 "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
                  SELECT 1, ?1, ?3, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
                    WHERE id = 1 AND started_at = ?2 AND state = 'replaying') \
+                   AND (SELECT counter FROM rollback_stamp WHERE id = 1) IS ?4 \
                  ON CONFLICT(id) DO UPDATE SET \
                    counter = max(counter, excluded.counter), rolled_back_at = NULL",
-                vec![int(stamp)?, ms(run), text(catalogue)],
+                vec![int(stamp)?, ms(run), text(catalogue), seen],
             ),
             (
                 "UPDATE restore_state SET state = 'complete', \
                    finished_at = COALESCE(finished_at, ?1) \
-                 WHERE id = 1 AND started_at = ?2",
-                vec![ms(now), ms(run)],
+                 WHERE id = 1 AND started_at = ?2 AND (state = 'complete' OR EXISTS \
+                   (SELECT 1 FROM rollback_stamp WHERE id = 1 AND counter >= ?3 \
+                    AND rolled_back_at IS NULL))",
+                vec![ms(now), ms(run), int(stamp)?],
             ),
         ])
         .await?;

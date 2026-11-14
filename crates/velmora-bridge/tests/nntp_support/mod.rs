@@ -948,7 +948,14 @@ impl Catalog for MemCatalog {
     ) -> Result<std::result::Result<UnixMs, UnixMs>> {
         unused()
     }
-    async fn restore_finish(&self, _: UnixMs, _: UnixMs, _: u64, _: &str) -> Result<bool> {
+    async fn restore_finish(
+        &self,
+        _: UnixMs,
+        _: UnixMs,
+        _: u64,
+        _: Option<u64>,
+        _: &str,
+    ) -> Result<bool> {
         unused()
     }
     async fn stamp(&self, _: &str) -> Result<velmora_bridge::stamp::StampRow> {

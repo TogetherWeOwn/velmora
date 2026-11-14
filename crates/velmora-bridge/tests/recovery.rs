@@ -1954,14 +1954,20 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
     assert!(!rig
         .bridge
         .catalog
-        .restore_finish(UnixMs(run.0 - 1), rig.now(), 0, "main")
+        .restore_finish(
+            UnixMs(run.0 - 1),
+            rig.now(),
+            0,
+            stamp_seen(&rig).await,
+            "main"
+        )
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["replaying"]);
     assert!(rig
         .bridge
         .catalog
-        .restore_finish(run, rig.now(), 0, "main")
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["complete"]);
@@ -2020,7 +2026,7 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
         .unwrap();
     replay(&rig, UnixMs(0), ReplayLimits::default()).await;
     assert!(catalog
-        .restore_finish(run, rig.now(), 0, "main")
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
         .await
         .unwrap());
     rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
@@ -2033,7 +2039,7 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
     rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
     assert_eq!(catalog.restore_progress(run).await.unwrap(), None);
     assert!(!catalog
-        .restore_finish(run, rig.now(), 0, "main")
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["replaying"]);
@@ -3084,4 +3090,9 @@ async fn a_plan_record_with_a_bad_yenc_name_is_unreadable() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// The stamp counter as the last step of a replay would read it.
+async fn stamp_seen(rig: &Rig) -> Option<u64> {
+    rig.bridge.catalog.stamp("main").await.unwrap().counter
 }

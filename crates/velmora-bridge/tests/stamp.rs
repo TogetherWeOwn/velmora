@@ -510,7 +510,7 @@ async fn a_replay_that_did_not_end_leaves_the_catalogue_closed() {
         .unwrap()
         .unwrap();
     assert!(!catalog
-        .restore_finish(old, rig.now(), 2, "main")
+        .restore_finish(old, rig.now(), 2, row(&rig).await.counter, "main")
         .await
         .unwrap());
     assert!(row(&rig).await.rolled_back);
@@ -519,12 +519,12 @@ async fn a_replay_that_did_not_end_leaves_the_catalogue_closed() {
 
     // The end of the one under way does, and never moves the counter down.
     assert!(catalog
-        .restore_finish(run, rig.now(), 2, "main")
+        .restore_finish(run, rig.now(), 2, row(&rig).await.counter, "main")
         .await
         .unwrap());
     assert_eq!(row(&rig).await, level(2));
     assert!(catalog
-        .restore_finish(run, rig.now(), 1, "main")
+        .restore_finish(run, rig.now(), 1, row(&rig).await.counter, "main")
         .await
         .unwrap());
     assert_eq!(row(&rig).await, level(2));
@@ -692,6 +692,66 @@ async fn a_replay_starts_at_its_restore_point_after_the_runbook_statement() {
     begin(4001).await.expect(409);
 }
 
+/// The last step reads the stamp, then ends the replay. A database that
+/// is brought back in between, to a point where that replay had not
+/// ended, must not be opened with what was read before.
+#[tokio::test(flavor = "current_thread")]
+async fn the_end_of_a_replay_holds_the_catalogue_to_the_counter_it_read() {
+    let rig = rig();
+    rig.bridge.raise_stamp().await.unwrap();
+    let catalog = &rig.bridge.catalog;
+    let run = catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap()
+        .unwrap();
+    snapshot(&rig);
+    assert!(catalog
+        .restore_finish(run, rig.now(), 2, Some(1), "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, level(2));
+    assert!(!catalog.restore_pending().await.unwrap());
+
+    // The last step is sent again and reads the counter; then the
+    // database goes back.
+    let seen = row(&rig).await.counter;
+    rollback(&rig);
+    assert!(!catalog
+        .restore_finish(run, rig.now(), 2, seen, "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, level(1));
+    assert!(catalog.restore_pending().await.unwrap());
+    // No row where one was read is the same.
+    sql(&rig, "DELETE FROM rollback_stamp;");
+    assert!(!catalog
+        .restore_finish(run, rig.now(), 2, seen, "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await.counter, None);
+    assert!(catalog.restore_pending().await.unwrap());
+    // And a row where none was read.
+    rollback(&rig);
+    assert!(!catalog
+        .restore_finish(run, rig.now(), 2, None, "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, level(1));
+    assert!(catalog.restore_pending().await.unwrap());
+    // A level counter with a rollback on record does not open it either.
+    sql(
+        &rig,
+        "UPDATE rollback_stamp SET counter = 2, rolled_back_at = 1;",
+    );
+    assert!(!catalog
+        .restore_finish(run, rig.now(), 2, Some(1), "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, behind(2));
+    assert!(catalog.restore_pending().await.unwrap());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn the_end_of_a_replay_never_moves_the_counter_down() {
     let mut rig = rig();
@@ -718,7 +778,7 @@ async fn the_end_of_a_replay_never_moves_the_counter_down() {
         .unwrap()
         .unwrap();
     assert!(catalog
-        .restore_finish(run, rig.now(), 1, "main")
+        .restore_finish(run, rig.now(), 1, row(&rig).await.counter, "main")
         .await
         .unwrap());
     assert_eq!(row(&rig).await, level(4));
@@ -727,7 +787,7 @@ async fn the_end_of_a_replay_never_moves_the_counter_down() {
     // again: a rollback found since stays on record.
     sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = 1;");
     assert!(catalog
-        .restore_finish(run, rig.now(), 9, "main")
+        .restore_finish(run, rig.now(), 9, row(&rig).await.counter, "main")
         .await
         .unwrap());
     assert_eq!(row(&rig).await, behind(4));

@@ -542,11 +542,16 @@ pub trait Catalog {
     /// becomes at least `stamp` (the newest stamp object) and a recorded
     /// rollback is cleared. Only the call that ends the replay does
     /// that; a repeated call for a replay that has ended does not.
+    /// `seen` is the counter the caller read when it chose `stamp`: if
+    /// the catalogue holds another one by now (it was brought back to
+    /// an earlier point in between), nothing is changed and the answer
+    /// is `false`.
     async fn restore_finish(
         &self,
         run: UnixMs,
         now: UnixMs,
         stamp: u64,
+        seen: Option<u64>,
         catalogue: &str,
     ) -> Result<bool>;
     /// Whether writes and jobs must be refused: a replay was started and

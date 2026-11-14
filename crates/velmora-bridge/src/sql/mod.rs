@@ -419,9 +419,10 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         run: UnixMs,
         now: UnixMs,
         stamp: u64,
+        seen: Option<u64>,
         catalogue: &str,
     ) -> Result<bool> {
-        replay::restore_finish(self, run, now, stamp, catalogue).await
+        replay::restore_finish(self, run, now, stamp, seen, catalogue).await
     }
     async fn stamp(&self, catalogue: &str) -> Result<crate::stamp::StampRow> {
         replay::stamp(self, catalogue).await
