@@ -280,6 +280,68 @@ async fn read<
     Ok(resp)
 }
 
+/// Plaintext `[start, start + len)` of an object, in memory, for a copy
+/// that seals it again. Every byte comes through [`read_piece`], so it was
+/// authenticated exactly as a GET would have it. Comes with the charge
+/// for the result. Nothing else may be held for it while it runs: one
+/// full-size extent needs most of an isolate's budget to be read.
+pub(super) async fn read_range<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    extents: Vec<ExtentRow>,
+    start: u64,
+    len: u64,
+) -> core::result::Result<(Vec<u8>, Charge), S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let todo = pieces(extents, start, len).ok_or_else(internal)?;
+    // A cold extent comes back whole and needs twice its size while it
+    // does. Beside the pieces already held that can be more than the
+    // budget has, however long the read waits. Such an extent is read
+    // once on its own first: that leaves it in the cache, and the read
+    // below then needs room for its piece only.
+    let mut held = 0u64;
+    for piece in &todo {
+        let cold = piece.extent.cipher_size.saturating_mul(2);
+        if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
+            drop(
+                read_piece(bridge, bucket, piece)
+                    .await
+                    .map_err(|fail| fail.response())?,
+            );
+        }
+        held = held.saturating_add(piece.len);
+    }
+    let mut parts = Vec::with_capacity(todo.len());
+    for piece in &todo {
+        parts.push(
+            read_piece(bridge, bucket, piece)
+                .await
+                .map_err(|fail| fail.response())?,
+        );
+    }
+    if parts.len() == 1 {
+        return parts.pop().ok_or_else(internal);
+    }
+    // Several pieces: they and the joined copy are live together.
+    let held = bridge
+        .budget
+        .charge(len)
+        .await
+        .map_err(|_| ReadFail::Busy.response())?;
+    let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
+    for (bytes, _) in &parts {
+        out.extend_from_slice(bytes);
+    }
+    Ok((out, held))
+}
+
 /// Decrypts one piece from ciphertext `src` that starts at stream offset
 /// `base`. `None` if any chunk fails to authenticate.
 fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) -> Option<Vec<u8>> {
