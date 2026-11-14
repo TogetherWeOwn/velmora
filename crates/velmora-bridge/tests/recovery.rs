@@ -794,6 +794,38 @@ async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
 }
 
+/// A copy onto an existing key is the newest generation of that key by
+/// id, also when the copying isolate's clock is behind the one that wrote
+/// the destination. A replay therefore ends with the copy, not with the
+/// object it replaced.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_stays_over_the_object_it_replaced() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let start = rig.now();
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(60);
+    rig.put(&signer, BUCKET, "dst", b"replaced")
+        .await
+        .expect(200);
+    let (replaced, _) = rig.live(&bucket, "dst").await.unwrap();
+    rig.bridge.clock.set(UnixMs(start.0 + 1000));
+    copy(&rig, &signer, "src", "dst").await.expect(200);
+    let (copied, _) = rig.live(&bucket, "dst").await.unwrap();
+    assert!(copied.id > replaced.id, "{copied:?} {replaced:?}");
+    rig.bridge.clock.advance_secs(120);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.manifests, report.published), (3, 3), "{report:?}");
+    assert!(report.unpublishable.is_empty() && report.unreadable.is_empty());
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+    assert_eq!(rig.live(&bucket, "dst").await.unwrap().0, copied);
+}
+
 /// A record older than a live generation of its key is not published
 /// over it when the older generation is unknown to the catalogue.
 #[tokio::test(flavor = "current_thread")]

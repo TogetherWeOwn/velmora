@@ -836,6 +836,22 @@ async fn copy_references_the_extents_of_a_live_source_only() {
         fx.cat.copy_generation(&second).await.unwrap(),
         Guard::Applied(())
     );
+
+    // A copy onto a key whose live generation it does not sort after: a
+    // replay would put that generation back over the copy.
+    let newer = fx.commit(&b.id, "newer", 1, t1.plus_ms(60_000));
+    fx.cat.commit_generation(&newer).await.unwrap();
+    refused(&fx, copy_of(&fx, &copy.generation, "newer", t1)).await;
+    let mut same_id = copy_of(&fx, &copy.generation, "newer", t1);
+    same_id.generation.id = newer.generation.id.clone();
+    refused(&fx, same_id).await;
+    assert_eq!(
+        fx.cat
+            .copy_generation(&copy_of(&fx, &copy.generation, "newer", t1.plus_ms(60_001)))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

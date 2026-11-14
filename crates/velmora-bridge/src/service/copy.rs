@@ -188,6 +188,18 @@ where
                 "A copy keeps the checksum of its source; computing another is not implemented.",
             ));
         }
+        // The generation this copy replaces, so that the copy's id sorts
+        // after it. The batch holds the copy to that.
+        let replaced = if source == key {
+            None
+        } else {
+            bridge
+                .catalog
+                .live_object(&bucket.id, key)
+                .await
+                .map_err(|_| internal())?
+                .map(|(g, _)| g.id)
+        };
         let now = bridge.clock.now();
         let mut rand = [0u8; 8];
         SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
@@ -197,7 +209,7 @@ where
             (from.content_json.clone(), from.user_meta_json.clone())
         };
         let generation = GenerationRow {
-            id: copy_id(now, &from.id, rand),
+            id: copy_id(now, &from.id, replaced.as_ref(), rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,
@@ -243,8 +255,9 @@ where
                 .map(super::common::from_proto)
                 .map_err(|_| internal());
         }
-        // The source was overwritten or deleted since it was read, so
-        // nothing was published under this id and its record must not
+        // The source was overwritten or deleted since it was read, or
+        // the destination got a generation this id does not sort after.
+        // Nothing was published under this id, so its record must not
         // publish it in a replay either. Best effort, as for Complete.
         let _ = bridge.safety.delete(&record).await;
         // Plan again against what is live now.

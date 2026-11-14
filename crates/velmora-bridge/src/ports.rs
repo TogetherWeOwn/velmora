@@ -231,7 +231,9 @@ pub trait Catalog {
     async fn commit_generation(&self, c: &CommitGeneration) -> Result<()>;
     /// Publishes a generation that references the extents of the source
     /// generation; no extent is written. `Lost` = the source is no longer
-    /// the live object of its key, and nothing was published.
+    /// the live object of its key, or the live generation of the
+    /// destination key does not sort before the new one by id; nothing
+    /// was published.
     async fn copy_generation(&self, c: &CopyGeneration) -> Result<Guard<()>>;
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
     /// DeleteObject as the service runs it: retires the live generation
