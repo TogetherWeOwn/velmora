@@ -5,7 +5,7 @@
 //! - a disabled provider and one in a cooldown are left out;
 //! - the rest are tried by `priority` (`0` first);
 //! - inside a priority tier the provider with the most free slots goes
-//!   first, and a tie goes to the one that was handed the fewest slots so
+//!   first (one whose `max_ips` addresses are all in use has none), and a tie goes to the one that was handed the fewest slots so
 //!   far, which rotates idle providers of a tier.
 //!
 //! The order is a preference only. The permit gate still decides whether
@@ -56,9 +56,15 @@ impl<'a> Pool<'a> {
             .is_some_and(|l| l.cooldown_until > self.now)
     }
 
-    /// Slots the provider could still hand out: under its own limit and,
-    /// in a pool, under what the pool's accounts hold together.
+    /// Slots the provider could still hand out to a job that holds none
+    /// there: under its own limit and, in a pool, under what the pool's
+    /// accounts hold together; none while as many jobs hold slots as the
+    /// account may be connected from addresses.
     fn free(&self, p: &ProviderConfig) -> u32 {
+        let holders = self.state(&p.id).map_or(0, |l| l.holders);
+        if p.max_ips.is_some_and(|max| holders >= max) {
+            return 0;
+        }
         let own = p.max_conns.saturating_sub(self.held(&p.id));
         match (&p.pool, p.pool_max_conns) {
             (Some(pool), Some(max)) => {

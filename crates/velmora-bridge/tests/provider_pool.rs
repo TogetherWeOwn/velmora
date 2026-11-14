@@ -80,6 +80,7 @@ impl Rig {
         found.unwrap_or(ProviderLoad {
             provider_id: id,
             held: 0,
+            holders: 0,
             uses: 0,
             failures: 0,
             cooldowns: 0,
@@ -276,6 +277,89 @@ async fn login_refused_over_the_limit_is_no_slot_not_a_fault() {
         client.quit().await;
     }
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
+/// The replies providers give when the account is connected from as many
+/// source addresses as it may be. Each is "no slot", like a full
+/// account: the read reports "busy", the post waits without spending an
+/// attempt, nothing goes to a lower tier and the provider takes no
+/// strike, however often it happens.
+#[tokio::test]
+async fn login_refused_for_the_address_limit_is_no_slot_not_a_fault() {
+    for reply in [
+        "502 max number of simultaneous IPs (3) reached",
+        "502 (max number of simultaneous IP addresses reached: 4)",
+        "482 Already connected from different IP",
+    ] {
+        let mut rig = pool_rig(2).await;
+        rig.set_priorities(&[0, 1]);
+        let (s, _) = rig.posted_on(22, &[]).await;
+        let to_post = rig.seed(23, &marked_plaintext(PLAIN_LEN)).await;
+
+        // The account is in use from elsewhere: p0 refuses every login.
+        rig.servers[0].set_limit_reply(Some(reply)).await;
+        let addr = rig.servers[0].addr();
+        let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+        let held = [dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()];
+
+        // More often than the strikes that start a cooldown.
+        for _ in 0..5 {
+            assert_eq!(rig.fetch(&s).await, ColdFetch::Busy, "{reply}");
+            let outcome = rig.run_post(&to_post).await;
+            assert!(matches!(outcome, JobOutcome::Retry { .. }), "{reply}");
+            rig.bridge.clock.advance_secs(120);
+        }
+        let outbox = rig.bridge.catalog.outbox(&to_post.extent);
+        assert_eq!((outbox.attempts, &outbox.last_error), (0, &None), "{reply}");
+        assert_eq!(rig.servers[1].posted_count().await, 0, "{reply}");
+        let load = rig.load(0).await;
+        assert_eq!(
+            (load.failures, load.cooldowns, load.cooldown_until),
+            (0, 0, UnixMs(0)),
+            "{reply}"
+        );
+        assert_eq!(rig.bridge.nntp.live(), 0, "{reply}");
+
+        for client in held {
+            client.quit().await;
+        }
+        assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+        assert_eq!(rig.run_post(&to_post).await, JobOutcome::Ack);
+    }
+}
+
+/// A provider whose addresses are all in use is asked last in its tier,
+/// however many connections it has free: the read goes to the other
+/// provider at once instead of being refused a slot first.
+#[tokio::test]
+async fn a_provider_with_no_address_left_is_asked_last() {
+    let mut rig = pool_rig(2).await;
+    let (s, _) = rig.posted_on(2, &[1]).await;
+    rig.bridge.cfg.providers[0].max_conns = 8;
+    rig.bridge.cfg.providers[0].max_ips = Some(1);
+    let now = rig.bridge.clock.now();
+    let catalog = &rig.bridge.catalog;
+    // p0 has seven connections free and its one address in use; p1 has
+    // one connection free.
+    let mut busy = Vec::new();
+    for i in [0, 1] {
+        let p = &rig.bridge.cfg.providers[i];
+        let permit = catalog.acquire_permit(p, PermitClass::Read, "t", now);
+        busy.push(permit.await.unwrap().expect("free slot"));
+    }
+    let (refused, before) = (catalog.permit_refusals.get(), rig.uses(1).await);
+
+    for n in 1..=3 {
+        assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+        assert_eq!(rig.uses(1).await, before + n);
+    }
+    assert_eq!(catalog.permit_refusals.get(), refused);
+
+    // The address is free again: p0, with more room, goes first.
+    catalog.release_permit(&busy[0]).await.unwrap();
+    let before = rig.uses(0).await;
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert_eq!(rig.uses(0).await, before + 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -376,6 +376,13 @@ pub struct ProviderConfig {
     pub read: bool,
     /// Concurrent connections allowed; the number of permit slots.
     pub max_conns: u32,
+    /// Source addresses the account may be connected from at once. One
+    /// job or request (one Worker invocation) leaves from one address
+    /// with all its connections, so this caps the jobs and requests that
+    /// hold connections on the provider together, each with as many as
+    /// `max_conns` leaves. `None` = no such limit: `max_conns` alone.
+    #[serde(default)]
+    pub max_ips: Option<u32>,
     /// Tier, `0` = tried first. Providers of one tier share the load.
     #[serde(default)]
     pub priority: u8,
@@ -422,6 +429,8 @@ pub struct ProviderLoad {
     pub provider_id: String,
     /// Connection slots held now.
     pub held: u32,
+    /// Jobs and requests that hold those slots: one source address each.
+    pub holders: u32,
     /// Slots ever handed out; the least-used provider wins a tie.
     pub uses: u64,
     /// Failed sessions in a row since the last good one or cooldown.
@@ -447,6 +456,7 @@ impl fmt::Debug for ProviderConfig {
             .field("post", &self.post)
             .field("read", &self.read)
             .field("max_conns", &self.max_conns)
+            .field("max_ips", &self.max_ips)
             .field("priority", &self.priority)
             .field("retention_days", &self.retention_days)
             .field("pool", &self.pool)

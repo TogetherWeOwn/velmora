@@ -6,6 +6,7 @@
 //! decoded, and compared with the SHA-256 stored in its plan row before
 //! anything uses its bytes.
 
+use velmora::rng::{FillRandom, SystemRng};
 use velmora::transport::is_article_limit_error;
 use velmora::yenc::decode_part_to;
 
@@ -36,6 +37,30 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     healthy: Option<bool>,
 }
 
+/// The permit holder of a job run. One claim of an outbox row is one
+/// Worker invocation, whose connections all leave from one address: every
+/// slot the run takes, on any provider and for any step (post, verify,
+/// repost), carries this name, and a provider with `max_ips` counts the
+/// run once. A later run of the job claims again, so it gets a new name.
+pub(crate) fn job_holder(lease: &Lease) -> String {
+    format!(
+        "job:{}:{}:{}",
+        lease.extent,
+        lease.stage.as_str(),
+        lease.token
+    )
+}
+
+/// A permit holder for work done inside one request (a cold read, a
+/// drill): `kind` and 128 random bits, so no two requests share a name
+/// and each counts as an address of its own.
+pub(crate) fn request_holder(kind: &str) -> Result<String> {
+    let mut id = [0u8; 16];
+    SystemRng.fill_bytes(&mut id)?;
+    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{kind}:{hex}"))
+}
+
 /// Whether an error says the provider itself is in trouble: a failed
 /// connect or login, a broken connection, an unexpected reply. A missing
 /// article, a refused or duplicate POST, "too many connections" and an
@@ -59,7 +84,10 @@ fn is_provider_fault(e: &BridgeError) -> bool {
 
 impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// Takes a slot for `provider`. `None` = every slot of this class is
-    /// held: the caller backs off without opening a socket.
+    /// held, or the provider's addresses are all in use by other holders:
+    /// the caller backs off without opening a socket. `holder` names the
+    /// caller's invocation ([`job_holder`], [`request_holder`]); a caller
+    /// that opens several sessions passes the same name for each.
     pub(crate) async fn open(
         catalog: &'a C,
         nntp: &'a N,
@@ -107,9 +135,13 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// The live session, connecting first when there is none. A provider
-    /// that refuses the connection or the login with `502` or `482` ("too
-    /// many connections") is reported as "no slot": no strike, and the
-    /// caller waits as it does for a permit.
+    /// that refuses the connection or the login with `502` or `482` is
+    /// reported as "no slot": no strike, and the caller waits as it does
+    /// for a permit. Those are the replies of an account at a limit: "too
+    /// many connections", and the address limit (`502 max number of
+    /// simultaneous IPs (3) reached`, `482 Already connected from
+    /// different IP`), which another client of the account or an address
+    /// the provider still counts can cause below `max_ips`.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
@@ -383,7 +415,7 @@ where
         let mut cipher = vec![0u8; size];
         let mut have = vec![false; plan.len()];
         let mut busy = false;
-        let holder = format!("get:{}", extent.id);
+        let holder = request_holder("get")?;
         let now = self.clock.now();
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
         let readers: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.read).collect();

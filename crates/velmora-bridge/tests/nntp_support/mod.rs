@@ -219,6 +219,8 @@ struct Slot {
     until: i64,
     /// The pool the slot was last taken under.
     pool: Option<String>,
+    /// Who took the slot last.
+    holder: String,
 }
 
 /// A provider's strikes, as `provider_health` keeps them.
@@ -258,6 +260,8 @@ pub struct MemCatalog {
     pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
+    /// Most holders ever live at once, per provider.
+    pub holder_peak: RefCell<BTreeMap<String, u32>>,
     pub permit_refusals: Cell<u32>,
     /// Permits another holder gives back right after the next refusal.
     pub free_after_refusal: RefCell<Vec<Permit>>,
@@ -302,6 +306,7 @@ impl MemCatalog {
     pub fn revoke_permits(&self) {
         for slot in self.slots.borrow_mut().values_mut().flatten() {
             slot.token += 1;
+            slot.holder = "someone else".into();
         }
     }
 
@@ -613,7 +618,7 @@ impl Catalog for MemCatalog {
         &self,
         p: &ProviderConfig,
         class: PermitClass,
-        _holder: &str,
+        holder: &str,
         now: UnixMs,
     ) -> Result<Option<Permit>> {
         self.seed_permits(core::slice::from_ref(p)).await?;
@@ -635,8 +640,17 @@ impl Catalog for MemCatalog {
             _ => false,
         };
         let slots = all.get_mut(&p.id).expect("seeded");
+        // As in `sql::permits`: a holder with a live slot adds no address.
+        let live: std::collections::BTreeSet<&str> = slots
+            .iter()
+            .filter(|s| s.until >= now.0)
+            .map(|s| s.holder.as_str())
+            .collect();
+        let no_address = p
+            .max_ips
+            .is_some_and(|max| !live.contains(holder) && live.len() >= limit(max) as usize);
         let free = (0..limit(p.max_conns) as usize).find(|&i| slots[i].until < now.0);
-        let Some(i) = free.filter(|_| !pool_full) else {
+        let Some(i) = free.filter(|_| !pool_full && !no_address) else {
             self.permit_refusals.set(self.permit_refusals.get() + 1);
             for freed in self.free_after_refusal.borrow_mut().drain(..) {
                 let slot = &mut all.get_mut(&freed.provider).expect("seeded")[freed.slot as usize];
@@ -649,10 +663,19 @@ impl Catalog for MemCatalog {
         slots[i].token += 1;
         slots[i].until = now.plus_secs(PERMIT_SECS).0;
         slots[i].pool.clone_from(&p.pool);
+        slots[i].holder = holder.to_string();
         let held = slots.iter().filter(|s| s.until >= now.0).count() as u32;
         let mut peak = self.permit_peak.borrow_mut();
         let peak = peak.entry(p.id.clone()).or_default();
         *peak = (*peak).max(held);
+        let holders: std::collections::BTreeSet<&str> = slots
+            .iter()
+            .filter(|s| s.until >= now.0)
+            .map(|s| s.holder.as_str())
+            .collect();
+        let mut peak = self.holder_peak.borrow_mut();
+        let peak = peak.entry(p.id.clone()).or_default();
+        *peak = (*peak).max(holders.len() as u32);
         Ok(Some(Permit {
             provider: p.id.clone(),
             slot: i as u32,
@@ -866,6 +889,12 @@ impl Catalog for MemCatalog {
                 ProviderLoad {
                     provider_id: id.clone(),
                     held: s.iter().filter(|s| s.until >= now.0).count() as u32,
+                    holders: s
+                        .iter()
+                        .filter(|s| s.until >= now.0)
+                        .map(|s| s.holder.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len() as u32,
                     uses: s.iter().map(|s| s.token).sum(),
                     failures: h.failures,
                     cooldowns: h.cooldowns,
@@ -991,6 +1020,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             post: spec.post,
             read: true,
             max_conns: spec.max_conns,
+            max_ips: None,
             priority: 0,
             retention_days: None,
             pool: None,
