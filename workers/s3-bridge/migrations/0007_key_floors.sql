@@ -9,12 +9,18 @@
 -- records, which is the order a replay of them uses. A publication
 -- removes the floor it stands on: the live generation holds the line
 -- from there.
+-- `unpublished` = a generation record was stored under this floor or
+-- below it since the last tombstone of the key. It may never have been
+-- published, and then a replay would publish it. A DeleteObject that
+-- finds nothing live writes a tombstone all the same while this is set,
+-- and a tombstone at or above the floor clears it.
 -- Additive only.
 
 CREATE TABLE key_floors (
   bucket_id      TEXT NOT NULL REFERENCES buckets(id),
   key            TEXT NOT NULL,
   floor_id       TEXT NOT NULL,
+  unpublished    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (bucket_id, key)
 ) WITHOUT ROWID;
 

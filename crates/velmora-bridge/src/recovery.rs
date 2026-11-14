@@ -471,7 +471,7 @@ pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
 ) -> Result<()> {
     let record = GenerationManifest::new(bucket, generation, extents)?;
     catalog
-        .raise_floor(&bucket.id, &generation.key, &generation.id)
+        .raise_floor(&bucket.id, &generation.key, &generation.id, true)
         .await?;
     let name = generation_key(&generation.id);
     write(
@@ -496,7 +496,7 @@ pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
     id: &GenerationId,
     now: UnixMs,
 ) -> Result<()> {
-    catalog.raise_floor(bucket, key, id).await?;
+    catalog.raise_floor(bucket, key, id, false).await?;
     let record = Tombstone {
         v: RECORD_VERSION,
         id: id.as_str().to_owned(),
@@ -512,7 +512,10 @@ pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
         id.as_str(),
         &record,
     )
-    .await
+    .await?;
+    // On record: it covers every generation record of the key that was
+    // stored under a lower id and never published.
+    catalog.settle_floor(bucket, key, id).await
 }
 
 /// Writes `m/art/<extent_id>` from the plan the catalogue holds. An

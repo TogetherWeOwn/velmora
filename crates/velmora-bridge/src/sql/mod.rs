@@ -136,8 +136,24 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
     }
-    async fn raise_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
-        objects::raise_floor(self, bucket, key, id).await
+    async fn raise_floor(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        id: &GenerationId,
+        generation: bool,
+    ) -> Result<()> {
+        objects::raise_floor(self, bucket, key, id, generation).await
+    }
+    async fn settle_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
+        objects::settle_floor(self, bucket, key, id).await
+    }
+    async fn unpublished_floor(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+    ) -> Result<Option<GenerationId>> {
+        objects::unpublished_floor(self, bucket, key).await
     }
     async fn copy_generation(&self, c: &CopyGeneration) -> Result<Guard<()>> {
         objects::copy_generation(self, c).await
