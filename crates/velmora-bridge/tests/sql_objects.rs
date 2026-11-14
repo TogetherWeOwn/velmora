@@ -1494,7 +1494,7 @@ async fn the_migration_fences_keys_deleted_before_it() {
     // Back to the schema before the migration, then the migration.
     let db = &fx.cat.sql.db;
     db.apply("DROP TABLE key_tombstones;").unwrap();
-    db.apply(velmora_bridge::testkit::MIGRATION_0004).unwrap();
+    db.apply(velmora_bridge::testkit::MIGRATION_0005).unwrap();
 
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
     assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());

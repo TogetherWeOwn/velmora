@@ -15,10 +15,10 @@ use crate::replay::{ReplayExtent, ReplayProbe};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
-    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId,
-    UploadPartRow, UploadRow, VerificationRow,
+    CompleteUpload, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow,
+    GcStep, GenerationId, GenerationRow, HotStats, Job, JobExtent, KekBytes, ListPage, ListQuery,
+    ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState,
+    UnixMs, UploadId, UploadPartRow, UploadRow, VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -451,6 +451,61 @@ pub trait Catalog {
         limit: u32,
         now: UnixMs,
     ) -> Result<u64>;
+
+    // hot tier
+    /// Pinned and evictable byte totals (`GET /_admin/status`).
+    async fn hot_stats(&self) -> Result<HotStats>;
+    /// Bytes R2 holds that may be evicted: released safety copies and
+    /// cache fills. One index scan over the evictable extents.
+    async fn evictable_bytes(&self) -> Result<u64>;
+    /// Extents with evictable bytes, least recently read first.
+    async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
+    /// Starts an eviction in one statement that re-checks the extent:
+    /// `true` only if it is exactly as listed (sequence, byte counts,
+    /// pinned or not). With `x.pinned` only the cache fill is claimed.
+    async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Ends an eviction after the blob deletes. `false` when a hot copy
+    /// was recorded since `begin_evict`; the counts then stand.
+    async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Counts the extent's cache fill and stamps the read. Called before
+    /// and after the cache write.
+    async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
+    /// Stamps a read unless the last stamp is younger than `min_gap_ms`.
+    /// `from_cache`: the read was served from the cache fill, which is
+    /// counted by the same write if it was not.
+    /// Returns the stamp the extent has afterwards.
+    async fn touch_read(
+        &self,
+        extent: &ExtentId,
+        now: UnixMs,
+        min_gap_ms: i64,
+        from_cache: bool,
+    ) -> Result<UnixMs>;
+    /// Whether no evictable total was recorded in the last `every_ms`.
+    async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool>;
+    /// Records that the dispatcher took the evictable total at `now`.
+    async fn hot_checked(&self, now: UnixMs) -> Result<()>;
+    /// Records what a drain step leaves for the next one, before the
+    /// step sends that job.
+    async fn hot_drain_set(&self, left: u64) -> Result<()>;
+    /// Takes up a drain where the last step left it: `true` once per
+    /// `hot_drain_set(left)`. A duplicate of the job, or one from a drain
+    /// that another has replaced, gets `false` and must do nothing.
+    async fn hot_drain_claim(&self, left: u64) -> Result<bool>;
+    /// The extent's eviction fencing token now. Read it before deleting
+    /// blobs outside an eviction (admin evict) and pass it to `hot_forget`.
+    async fn hot_seq(&self, extent: &ExtentId) -> Result<u64>;
+    /// After blob deletes outside an eviction: stops counting the named
+    /// copies, unless a hot copy was recorded or an eviction ran since
+    /// `seq` was read (`false`; the counts stand, since the copy they
+    /// count may exist).
+    async fn hot_forget(
+        &self,
+        extent: &ExtentId,
+        seq: u64,
+        safety: bool,
+        cache: bool,
+    ) -> Result<bool>;
 }
 
 // ---------------------------------------------------------------------------

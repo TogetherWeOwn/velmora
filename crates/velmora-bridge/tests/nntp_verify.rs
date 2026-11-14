@@ -305,11 +305,15 @@ async fn release_waits_for_the_minimum_age() {
 
     rig.bridge.clock.set(T0.plus_secs(week));
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert!(!rig.bridge.safety.contains(&s.extent.safety_key()));
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
 }
 
 #[tokio::test]
-async fn release_deletes_the_safety_copy_on_fresh_evidence() {
+async fn release_unpins_the_safety_copy_on_fresh_evidence() {
     let rig = two_backbone_rig().await;
     let (s, _) = rig.verified_on_two(10).await;
     rig.bridge.clock.advance_secs(3600);
@@ -317,7 +321,7 @@ async fn release_deletes_the_safety_copy_on_fresh_evidence() {
 
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
 
-    assert!(!rig.bridge.safety.contains(&s.extent.safety_key()));
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
     let extent = rig.bridge.catalog.extent(&s.extent);
     assert_eq!(extent.safety_state, SafetyState::Released);
     assert_eq!(extent.released_at, Some(now));
@@ -384,7 +388,11 @@ async fn release_needs_fresh_evidence() {
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert!(!rig.bridge.safety.contains(&s.extent.safety_key()));
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
 }
 
 /// A corrupt article found at release time is recorded, which cancels the
@@ -477,7 +485,7 @@ async fn removed_backbone_does_not_count() {
     assert!(rig.safety_held(&s));
 }
 
-/// A job died between the release decision and the delete: the next job
+/// A job died between the release decision and its last step: the next job
 /// finishes the release without reading anything.
 #[tokio::test]
 async fn interrupted_release_is_finished() {
@@ -490,7 +498,7 @@ async fn interrupted_release_is_finished() {
 
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert_eq!(rig.bridge.nntp.connects(), connects);
-    assert!(!rig.bridge.safety.contains(&s.extent.safety_key()));
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
     assert_eq!(
         rig.bridge.catalog.extent(&s.extent).safety_state,
         SafetyState::Released
