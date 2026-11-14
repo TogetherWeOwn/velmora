@@ -144,6 +144,15 @@ pub struct CommitResult {
     pub modified_ms: i64,
 }
 
+/// The answer to UploadPartCopy: the ETag of the part that was stored.
+pub fn copy_part_response(etag: &str, modified_ms: i64) -> Result<Response> {
+    Ok(xml_response(format!(
+        "<CopyPartResult><LastModified>{}</LastModified><ETag>{}</ETag></CopyPartResult>",
+        iso_date_ms(modified_ms)?,
+        xml(etag)
+    )))
+}
+
 impl CommitResult {
     /// Render the committed destination, never a caller-selected replacement key.
     /// The policy host is trusted ingress configuration, not a request Host header.
