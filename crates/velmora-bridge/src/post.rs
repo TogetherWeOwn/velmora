@@ -30,6 +30,7 @@ use crate::ports::{
     BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
     NntpSession, PermitClass, MAX_QUEUE_DELAY_SECS,
 };
+use crate::recovery::write_article_plan;
 use crate::types::{
     ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent, JobOutcome,
     OutboxStage, ProviderConfig, Result, UnixMs, JOB_VERSION,
@@ -242,6 +243,12 @@ where
             return Err(Stop::fail(FailClass::Corrupt));
         }
         let mut plan = self.stored_plan(lease, extent, &cipher).await?;
+        // The message-ids exist nowhere but the catalogue until this
+        // record is stored: without it, a lost catalogue could not find
+        // the extent on Usenet. Nothing is posted before it is durable.
+        write_article_plan(&self.safety, &self.kek, extent, &plan)
+            .await
+            .map_err(|_| Stop::fail(FailClass::BlobError))?;
 
         if plan.iter().any(|a| a.state == ArticleState::Planned) {
             self.post_with_failover(lease, extent, &mut plan, &cipher)

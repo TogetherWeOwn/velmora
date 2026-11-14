@@ -657,7 +657,7 @@ async fn cold_read_refills_the_cache_from_usenet() {
 
     evict(rig, &extent).await;
     assert!(rig.bridge.cache.keys().is_empty());
-    assert!(rig.bridge.safety.keys().is_empty());
+    assert!(rig.bridge.safety.keys().iter().all(|k| k.starts_with("m/")));
     let connects = rig.bridge.nntp.connects();
 
     let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
@@ -669,7 +669,7 @@ async fn cold_read_refills_the_cache_from_usenet() {
     // The verified ciphertext is now in the cache, and only there.
     let cached = rig.bridge.cache.stored(&extent.id.cache_key()).unwrap();
     assert_eq!(sha256(&cached.bytes), extent.cipher_sha256);
-    assert!(rig.bridge.safety.keys().is_empty());
+    assert!(rig.bridge.safety.keys().iter().all(|k| k.starts_with("m/")));
 
     // The next reads are served from the cache without a session.
     let resp = get_range(rig, &cold.signer, "cold.bin", "bytes=999990-1000009").await;
@@ -807,7 +807,7 @@ async fn concurrent_cold_range_reads_wait_for_a_provider_slot() {
     assert!(rig.bridge.cache.keys().is_empty());
     let template = rig.live(&cold.bucket, "template").await.unwrap().1;
     evict(rig, &template[0]).await;
-    assert!(rig.bridge.safety.keys().is_empty());
+    assert!(rig.bridge.safety.keys().iter().all(|k| k.starts_with("m/")));
     let connects = rig.bridge.nntp.connects();
 
     let total = whole.len();

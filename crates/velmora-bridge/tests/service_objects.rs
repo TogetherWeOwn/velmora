@@ -217,8 +217,18 @@ async fn put_is_not_acked_when_the_database_is_down() {
     assert_eq!(rig.count("outbox"), 0);
     assert!(rig.bridge.jobs.inner.sent().is_empty());
     // The safety copy was written before the catalogue was asked: what
-    // is left is an unreferenced blob, never a row without bytes.
-    assert_eq!(rig.bridge.safety.keys().len(), 1);
+    // is left is an unreferenced blob, never a row without bytes. Its
+    // recovery record was written first as well: the commit may have
+    // applied for all the handler knows.
+    let mut kinds: Vec<String> = rig
+        .bridge
+        .safety
+        .keys()
+        .iter()
+        .map(|k| k[..2].to_owned())
+        .collect();
+    kinds.sort();
+    assert_eq!(kinds, ["m/", "x/"]);
     assert_eq!(rig.bridge.budget.in_use(), 0);
     rig.head(&signer, BUCKET, "k").await.expect(404);
 }
