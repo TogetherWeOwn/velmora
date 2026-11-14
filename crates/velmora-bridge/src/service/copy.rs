@@ -23,8 +23,10 @@ use velmora_s3_proto::{
 use super::common::{
     internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
-use crate::recovery::{copy_id, generation_key, write_generation};
+use crate::ports::{
+    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
+};
+use crate::recovery::{copy_id, discard_generation, write_generation};
 use crate::types::{
     Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
     S3Response,
@@ -235,28 +237,30 @@ where
         // for a PUT. It describes every extent in full, so a replay can
         // rebuild the copy when the source it shares them with is gone.
         // The extents have the same places in the copy as in the source.
-        write_generation(&bridge.safety, &bridge.kek, bucket, &generation, &extents)
+        let record = write_generation(&bridge.safety, &bridge.kek, bucket, &generation, &extents)
             .await
             .map_err(|_| internal())?;
         drop(extents);
-        let id = generation.id.clone();
-        let record = generation_key(&id);
-        let committed = bridge
+        let copy = CopyGeneration {
+            generation,
+            source: from.id,
+            source_key: source.clone(),
+            now,
+        };
+        let refused = match bridge
             .catalog
-            .copy_generation(&CopyGeneration {
-                generation,
-                source: from.id,
-                source_key: source.clone(),
-                now,
-            })
+            .copy_generation(&copy, record)
             .await
-            .map_err(|_| internal())?;
-        if committed == Guard::Applied(()) {
-            return result
-                .copy_response()
-                .map(super::common::from_proto)
-                .map_err(|_| internal());
-        }
+            .map_err(|_| internal())?
+        {
+            PublishOutcome::Applied => {
+                return result
+                    .copy_response()
+                    .map(super::common::from_proto)
+                    .map_err(|_| internal());
+            }
+            PublishOutcome::Refused(record) => record,
+        };
         // The source was overwritten or deleted since it was read, or
         // the destination got a generation this id does not sort after.
         // Nothing was published under this id, so its record must not
@@ -264,7 +268,7 @@ where
         // ends the request: no copy was made, and the caller is told so.
         let mut removed = false;
         for _ in 0..ATTEMPTS {
-            if bridge.safety.delete(&record).await.is_ok() {
+            if discard_generation(&bridge.safety, &refused).await.is_ok() {
                 removed = true;
                 break;
             }
@@ -272,7 +276,7 @@ where
         if !removed {
             return Err(internal());
         }
-        lost = Some(id);
+        lost = Some(copy.generation.id);
         // Plan again against what is live now.
     }
     Err(unavailable())

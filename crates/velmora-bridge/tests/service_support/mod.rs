@@ -15,6 +15,7 @@ use velmora::rng::SystemRng;
 use velmora_bridge::config::{BridgeConfig, Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{wrap_bdk, wrap_secret, DataKey};
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
@@ -155,6 +156,17 @@ impl BlobStore for Blobs {
             return Err(BridgeError::Blob("store down".into()));
         }
         self.inner.delete(key).await
+    }
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        // The faults of `delete` hold for the delete of a record too.
+        if self.fail_delete.borrow().as_deref() == Some(refused.key().as_str()) {
+            return Err(BridgeError::Blob("store down".into()));
+        }
+        if self.fail_deletes.get() > 0 {
+            self.fail_deletes.set(self.fail_deletes.get() - 1);
+            return Err(BridgeError::Blob("store down".into()));
+        }
+        self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
         self.inner.list(prefix, start_after, limit).await

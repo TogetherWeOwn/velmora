@@ -15,6 +15,7 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, unwrap_secret, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
+use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -335,7 +336,7 @@ impl Fx {
             .await
             .unwrap();
         b.catalog
-            .commit_generation(&CommitGeneration {
+            .publish(&CommitGeneration {
                 generation: generation.clone(),
                 extents: vec![extent],
                 now,

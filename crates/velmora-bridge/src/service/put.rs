@@ -17,7 +17,7 @@ use super::common::{
 use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{
-    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
 use crate::recovery::{discard_generation, id_after, write_generation};
 use crate::types::{
@@ -177,7 +177,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     };
     let mut attempts = 0;
     let generation_id = loop {
-        write_generation(
+        let record = write_generation(
             &bridge.safety,
             &bridge.kek,
             bucket,
@@ -186,22 +186,22 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         )
         .await
         .map_err(|_| internal())?;
-        match bridge
+        let refused = match bridge
             .catalog
-            .commit_generation(&commit)
+            .commit_generation(&commit, record)
             .await
             .map_err(|_| internal())?
         {
-            Guard::Applied(()) => break commit.generation.id.clone(),
-            Guard::Lost => {}
-        }
+            PublishOutcome::Applied => break commit.generation.id.clone(),
+            PublishOutcome::Refused(record) => record,
+        };
         // The key already carries a newer id: a commit that landed after
         // this id was minted, or one minted by a clock ahead of this
         // one. Publishing under the older id would let a replay of the
         // records put the other one on top. Nothing was published, so
         // the record goes, and the PUT is tried again under an id that
         // sorts after everything on the key.
-        discard_generation(&bridge.safety, &commit.generation.id)
+        discard_generation(&bridge.safety, &refused)
             .await
             .map_err(|_| internal())?;
         attempts += 1;
