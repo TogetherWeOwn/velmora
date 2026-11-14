@@ -130,10 +130,11 @@ pub struct ReplayReport {
     pub tombstones: u32,
     /// Tombstones that removed a live object.
     pub deleted: u32,
-    /// Not published, and nothing is missing: the live generation of
-    /// the key holds the same extents in the same order. A Complete
-    /// that was sent again after an unanswered one leaves two records
-    /// of one object.
+    /// Not published as a second object, and nothing is missing: the
+    /// live generation of the key holds the same extents in the same
+    /// order. A Complete that was sent again after an unanswered one
+    /// leaves two records of one object; the object stands under the id
+    /// of the later one.
     pub duplicate: u32,
     /// Not published: the catalogue refused the generation (its extents
     /// belong to another generation, or it lost a race).
@@ -336,38 +337,45 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     .await?
                 {
                     Guard::Applied(()) => report.published += 1,
-                    Guard::Lost
-                        if self
-                            .is_live_under_another_id(&generation, &placements)
-                            .await? =>
-                    {
-                        report.duplicate += 1;
-                    }
-                    Guard::Lost => report.unpublishable.push(id),
+                    Guard::Lost => match self.live_twin(&generation, &placements).await? {
+                        // An earlier record of the same object was
+                        // published. This one is the later of the two,
+                        // so the object goes under its id: a tombstone
+                        // between the two must not delete it.
+                        Some(older) if older < generation.id => {
+                            match self.catalog.replay_rebind(&generation, &older).await? {
+                                Guard::Applied(()) => report.duplicate += 1,
+                                Guard::Lost => report.unpublishable.push(id),
+                            }
+                        }
+                        Some(_) => report.duplicate += 1,
+                        None => report.unpublishable.push(id),
+                    },
                 }
             }
         }
         Ok(true)
     }
 
-    /// Whether the live generation of the key is the same object as
-    /// `g`: the same extents at the same places.
-    async fn is_live_under_another_id(
+    /// The id of the live generation of the key, if it is the same
+    /// object as `g`: the same extents at the same places.
+    async fn live_twin(
         &self,
         g: &GenerationRow,
         placements: &[ExtentPlacement],
-    ) -> Result<bool> {
+    ) -> Result<Option<GenerationId>> {
         let Some((live, extents)) = self.catalog.live_object(&g.bucket_id, &g.key).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(live.size == g.size
+        let same = live.size == g.size
             && live.etag == g.etag
             && extents.len() == placements.len()
             && extents.iter().zip(placements).all(|(e, p)| {
                 e.id == p.extent_id
                     && e.seq == Some(p.seq)
                     && e.plain_offset == Some(p.plain_offset)
-            }))
+            });
+        Ok(same.then_some(live.id))
     }
 
     async fn replay_tombstones(

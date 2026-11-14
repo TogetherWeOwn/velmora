@@ -1,6 +1,6 @@
 //! Objects, generations, listing and admin status (catalogue lane A).
 //!
-//! PublishOutcome and deletion are each one atomic [`Sql::batch`]. The
+//! Publication and deletion are each one atomic [`Sql::batch`]. The
 //! generation being replaced or deleted is resolved *inside* the batch
 //! (sub-selects on the live `objects` pointer), never read beforehand, so
 //! two racing writers cannot both retire the same generation or leave one
@@ -207,7 +207,7 @@ pub(super) async fn live_object<S: Sql>(
 }
 
 // ---------------------------------------------------------------------------
-// PublishOutcome and deletion
+// Publication and deletion
 // ---------------------------------------------------------------------------
 
 type Stmt = (&'static str, Vec<SqlValue>);

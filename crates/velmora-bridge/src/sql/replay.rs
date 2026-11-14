@@ -238,23 +238,7 @@ pub(super) async fn replay_publish<S: Sql>(
         vec![gen_id(), bucket(), text(&g.key)],
     ));
     stmts.push(clear_tombstone(&g.bucket_id, &g.key, &g.id));
-    stmts.push((
-        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-           content_json, user_meta_json, extent_count, created_at, retired_at) \
-         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)",
-        vec![
-            gen_id(),
-            bucket(),
-            text(&g.key),
-            uint(g.size)?,
-            text(&g.etag),
-            opt(g.checksum_json.as_deref(), text),
-            text(&g.content_json),
-            text(&g.user_meta_json),
-            SqlValue::Int(i64::from(g.extent_count)),
-            ms(g.created_at),
-        ],
-    ));
+    stmts.push(insert_live(g)?);
     for p in placements {
         stmts.push((
             "UPDATE extents SET generation_id = ?1, seq = ?2, plain_offset = ?3, \
@@ -305,6 +289,76 @@ pub(super) async fn replay_publish<S: Sql>(
          ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id",
         vec![bucket(), text(&g.key), gen_id()],
     ));
+    match c.sql.batch(stmts).await {
+        Ok(_) => Ok(Guard::Applied(())),
+        Err(BridgeError::GuardFailed) => Ok(Guard::Lost),
+        Err(e) => Err(e),
+    }
+}
+
+/// The row of `g` as the live generation it describes.
+fn insert_live(g: &GenerationRow) -> Result<Stmt> {
+    Ok((
+        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+           content_json, user_meta_json, extent_count, created_at, retired_at) \
+         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)",
+        vec![
+            text(g.id.as_str()),
+            text(g.bucket_id.as_str()),
+            text(&g.key),
+            uint(g.size)?,
+            text(&g.etag),
+            opt(g.checksum_json.as_deref(), text),
+            text(&g.content_json),
+            text(&g.user_meta_json),
+            SqlValue::Int(i64::from(g.extent_count)),
+            ms(g.created_at),
+        ],
+    ))
+}
+
+/// Two records of one object (see [`Catalog::replay_rebind`]). The id
+/// of a generation is what a tombstone is compared with, so the object
+/// has to stand under the id of its last record: a delete between the
+/// two must not remove it.
+pub(super) async fn replay_rebind<S: Sql>(
+    c: &SqlCatalog<S>,
+    g: &GenerationRow,
+    from: &GenerationId,
+) -> Result<Guard<()>> {
+    if g.state != GenerationState::Live || g.retired_at.is_some() {
+        return Err(BridgeError::Invalid(
+            "replay does not describe one live generation",
+        ));
+    }
+    let to = || text(g.id.as_str());
+    let old = || text(from.as_str());
+    let stmts: Vec<Stmt> = vec![
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
+             OR NOT EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
+                            AND generation_id = ?4 AND generation_id < ?1)",
+            vec![to(), text(g.bucket_id.as_str()), text(&g.key), old()],
+        ),
+        clear_tombstone(&g.bucket_id, &g.key, &g.id),
+        insert_live(g)?,
+        (
+            "UPDATE extents SET generation_id = ?1 WHERE generation_id = ?2",
+            vec![to(), old()],
+        ),
+        (
+            "UPDATE outbox SET generation_id = ?1 WHERE generation_id = ?2",
+            vec![to(), old()],
+        ),
+        (
+            "UPDATE objects SET generation_id = ?1 WHERE bucket_id = ?2 AND key = ?3",
+            vec![to(), text(g.bucket_id.as_str()), text(&g.key)],
+        ),
+        (
+            "DELETE FROM generations WHERE id = ?1",
+            vec![old()],
+        ),
+    ];
     match c.sql.batch(stmts).await {
         Ok(_) => Ok(Guard::Applied(())),
         Err(BridgeError::GuardFailed) => Ok(Guard::Lost),

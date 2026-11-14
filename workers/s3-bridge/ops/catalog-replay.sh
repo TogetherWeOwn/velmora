@@ -49,7 +49,9 @@ else
   body=$(jq -cn --argjson s "$SINCE" '{since_ms: $s}')
 fi
 
-total='{}'
+# The running total stays in a file: its lists can outgrow what one
+# command-line argument may hold.
+echo '{}' >"$WORK/total.json"
 calls=0
 while :; do
   calls=$((calls + 1))
@@ -63,16 +65,17 @@ while :; do
     echo "catalog-replay: run the same command again to continue" >&2
     exit 1
   fi
-  total=$(jq -c --argjson t "$total" '
+  jq -c --slurpfile t "$WORK/total.json" '
     . as $s
     | reduce ("manifests","published","present","superseded","extents","article_plans",
               "safety_missing","tombstones","deleted","duplicate","other_bucket_total") as $k
-        ($t; .[$k] = ((.[$k] // 0) + $s[$k]))
+        ($t[0]; .[$k] = ((.[$k] // 0) + $s[$k]))
     | .unpublishable = ((.unpublishable // []) + $s.unpublishable)
     | .unreadable = ((.unreadable // []) + $s.unreadable)
     | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
     | .damaged_total = $s.damaged_total
-    | .damaged = $s.damaged' "$WORK/step.json")
+    | .damaged = $s.damaged' "$WORK/step.json" >"$WORK/total.next"
+  mv "$WORK/total.next" "$WORK/total.json"
   if [ "$(jq -r '.next == null' "$WORK/step.json")" = true ]; then
     break
   fi
@@ -80,8 +83,8 @@ while :; do
 done
 
 echo "catalog-replay: complete after $calls calls"
-jq . <<<"$total"
-if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' <<<"$total")" != 0 ]; then
+jq . "$WORK/total.json"
+if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
   exit 2
 fi

@@ -15,7 +15,7 @@ use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::unwrap_secret;
 use crate::ingress::IngressError;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
-use crate::recovery::{discard_generation, Recorded};
+use crate::recovery::{discard_generation, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{Bucket, GenerationRow, KeyStatus, Perm, RespBody, S3Request, S3Response};
 
@@ -365,6 +365,10 @@ pub(super) fn stored_checksum(g: &GenerationRow) -> Option<StoredChecksum> {
 /// catalogue refused. The record of a published generation is never
 /// removed: if a row exists under the id after all (the refusal says it
 /// cannot), the record stays.
+///
+/// The delete is tried [`DISCARD_ATTEMPTS`] times. A record that is
+/// still there after that replays as an object nobody was told exists:
+/// never a lost one.
 pub(crate) async fn discard_refused<
     C: Catalog,
     B: BlobStore,
@@ -375,10 +379,20 @@ pub(crate) async fn discard_refused<
 >(
     bridge: &Bridge<C, B, N, J, K, T>,
     generation: &GenerationRow,
-    refused: Recorded,
+    refused: Unpublished,
 ) -> crate::types::Result<()> {
-    if bridge.catalog.replay_probe(generation).await? == ReplayProbe::Present {
-        return Ok(());
+    let mut last = Ok(());
+    for _ in 0..DISCARD_ATTEMPTS {
+        last = match bridge.catalog.replay_probe(generation).await {
+            Ok(ReplayProbe::Present) => return Ok(()),
+            Ok(_) => discard_generation(&bridge.safety, &refused).await,
+            Err(e) => Err(e),
+        };
+        if last.is_ok() {
+            break;
+        }
     }
-    discard_generation(&bridge.safety, refused).await
+    last
 }
+
+const DISCARD_ATTEMPTS: usize = 3;

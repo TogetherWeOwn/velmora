@@ -119,8 +119,9 @@ pub(super) async fn guarded<S: Sql>(c: &SqlCatalog<S>, stmts: Vec<Stmt>) -> Resu
 }
 
 /// Runs the batch that publishes the generation `id`. It runs only
-/// against the proof of that generation's recovery record, and hands the
-/// proof back only when the guard failed and nothing was written.
+/// against the proof of that generation's recovery record, and turns the
+/// proof into the one that deletes only when the guard failed and
+/// nothing was written.
 pub(super) async fn published<S: Sql>(
     c: &SqlCatalog<S>,
     stmts: Vec<Stmt>,
@@ -134,7 +135,7 @@ pub(super) async fn published<S: Sql>(
     }
     match c.sql.batch(stmts).await {
         Ok(_) => Ok(PublishOutcome::Applied),
-        Err(BridgeError::GuardFailed) => Ok(PublishOutcome::Refused(record)),
+        Err(BridgeError::GuardFailed) => Ok(PublishOutcome::Refused(record.refused())),
         Err(e) => Err(e),
     }
 }
@@ -516,7 +517,7 @@ pub(super) async fn complete_upload<S: Sql>(
     }
     let failed = match c.sql.batch(stmts).await {
         Ok(_) => return Ok(PublishOutcome::Applied),
-        Err(BridgeError::GuardFailed) => return Ok(PublishOutcome::Refused(record)),
+        Err(BridgeError::GuardFailed) => return Ok(PublishOutcome::Refused(record.refused())),
         Err(e) => e,
     };
     // The outcome is unknown: the batch may have applied, or may still.
@@ -540,7 +541,7 @@ pub(super) async fn complete_upload<S: Sql>(
         ),
     ];
     match c.sql.batch(fence).await {
-        Ok(_) => Ok(PublishOutcome::Fenced(record)),
+        Ok(_) => Ok(PublishOutcome::Fenced(record.refused())),
         // Still unknown, or it had applied: the record stays.
         Err(_) => Err(failed),
     }

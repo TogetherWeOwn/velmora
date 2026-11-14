@@ -626,6 +626,9 @@ impl Catalog for MemCatalog {
     ) -> Result<Guard<()>> {
         unused()
     }
+    async fn replay_rebind(&self, _: &GenerationRow, _: &GenerationId) -> Result<Guard<()>> {
+        unused()
+    }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {
         unused()
     }
