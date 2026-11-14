@@ -1521,18 +1521,12 @@ async fn the_migration_fences_keys_deleted_before_it() {
     // A clock 100 ms behind the old delete: refused under its own time,
     // published under the id the PUT path mints from the boundary.
     let behind = fx.commit(&b.id, "gone", 1, T0.plus_ms(400));
-    assert_eq!(
-        fx.cat.commit_generation(&behind).await.unwrap(),
-        Guard::Lost
-    );
+    assert_eq!(fx.cat.publish(&behind).await.unwrap(), Guard::Lost);
     let id = recovery::id_after(T0.plus_ms(400), Some(&boundary), [1; 8]);
     assert!(id > boundary && id > old_tombstone);
     let mut after = fx.commit(&b.id, "gone", 1, T0.plus_ms(400));
     after.extents[0].generation_id = Some(id.clone());
     after.generation.id = id;
-    assert_eq!(
-        fx.cat.commit_generation(&after).await.unwrap(),
-        Guard::Applied(())
-    );
+    assert_eq!(fx.cat.publish(&after).await.unwrap(), Guard::Applied(()));
     assert!(fx.cat.live_object(&b.id, "gone").await.unwrap().is_some());
 }

@@ -21,7 +21,7 @@ use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
     UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
 };
-use crate::recovery::{is_record_key, Recorded, ERR_RECORD_DELETE};
+use crate::recovery::{is_record_key, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, ExtentId, Job, KekBytes,
     Result, UnixMs,
@@ -284,7 +284,7 @@ impl BlobStore for MemBlobStore {
         Ok(())
     }
 
-    async fn delete_record(&self, refused: Recorded) -> Result<()> {
+    async fn delete_record(&self, refused: Unpublished) -> Result<()> {
         self.blobs.borrow_mut().remove(&refused.key());
         Ok(())
     }

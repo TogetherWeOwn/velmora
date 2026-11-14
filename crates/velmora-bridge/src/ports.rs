@@ -10,7 +10,7 @@
 
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
-use crate::recovery::Recorded;
+use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayProbe};
 pub use crate::types::Result;
 use crate::types::{
@@ -94,7 +94,7 @@ pub trait BlobStore {
     /// Removes the record of a generation that the catalogue refused to
     /// publish. The only delete of a key under `m/`; the argument exists
     /// only for a record this request wrote and did not publish.
-    async fn delete_record(&self, refused: Recorded) -> Result<()>;
+    async fn delete_record(&self, refused: Unpublished) -> Result<()>;
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
@@ -214,13 +214,13 @@ pub enum Guard<T> {
 }
 
 /// Outcome of a publication batch. The batch takes the proof of the
-/// generation's recovery record and gives it back only when it wrote
-/// nothing, so only then can the record be discarded.
+/// generation's recovery record and turns it into an [`Unpublished`] only
+/// when it wrote nothing, so only then can the record be discarded.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublishOutcome {
     Applied,
     /// The guard failed; the batch wrote nothing.
-    Refused(Recorded),
+    Refused(Unpublished),
 }
 
 // Fenced methods return Ok(false) (or None) when the lease token no longer
