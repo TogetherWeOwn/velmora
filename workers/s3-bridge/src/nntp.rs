@@ -9,6 +9,11 @@
 //!   `tls: false` outside `ENVIRONMENT=dev`, and the deployed runtime cannot
 //!   reach loopback.
 //!
+//! A provider with several host names (`hosts`) is connected through
+//! `velmora_bridge::hosts::HostPicker`: the fastest endpoint by a TLS and
+//! greeting probe, kept per isolate, with fallback to the others. The TLS
+//! policy is checked for every endpoint before any socket opens.
+//!
 //! Sessions read at most 1 MiB per article body. Policy refusals and
 //! socket-open failures are class-only (no host or credential). Later
 //! session errors are the engine's own: their `Debug` redacts auth reply
@@ -22,9 +27,10 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
+use velmora_bridge::hosts::{self, Dialer, HostPicker, HOST_CONNECT_SECS};
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
-    Result, QUIT_SECS,
+    Result, UnixMs, QUIT_SECS,
 };
 
 /// Largest article the bridge reads or posts (velmora articles are about
@@ -66,15 +72,31 @@ async fn within<T>(
 }
 
 /// Ends after `secs` on the runtime's timer.
-#[cfg(target_arch = "wasm32")]
 async fn after(secs: u32) {
-    worker::Delay::from(Duration::from_secs(u64::from(secs))).await;
+    after_ms(secs.saturating_mul(1000)).await
+}
+
+/// Ends after `ms` milliseconds on the runtime's timer.
+#[cfg(target_arch = "wasm32")]
+async fn after_ms(ms: u32) {
+    worker::Delay::from(Duration::from_millis(u64::from(ms))).await;
 }
 
 /// Native builds open no socket, so there is nothing to bound.
 #[cfg(not(target_arch = "wasm32"))]
-async fn after(_secs: u32) {
+async fn after_ms(_ms: u32) {
     std::future::pending().await
+}
+
+/// The runtime's clock. It moves on with I/O, which is what a probe times.
+#[cfg(target_arch = "wasm32")]
+fn now() -> UnixMs {
+    UnixMs(worker::Date::now().as_millis() as i64)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now() -> UnixMs {
+    UnixMs(0)
 }
 
 /// One authenticated session, and the class of the permit it was opened
@@ -120,11 +142,17 @@ impl NntpSession for WorkerSession {
     }
 }
 
-pub struct WorkerConnector;
+/// Opens sessions; keeps, per isolate, which host of a provider with
+/// several answered fastest.
+pub struct WorkerConnector {
+    hosts: HostPicker,
+}
 
 impl WorkerConnector {
     pub fn new() -> Self {
-        WorkerConnector
+        WorkerConnector {
+            hosts: HostPicker::new(),
+        }
     }
 }
 
@@ -135,16 +163,68 @@ impl NntpConnector for WorkerConnector {
         if permit.provider != provider.id {
             return Err(BridgeError::Invalid("permit is for another provider"));
         }
-        let cfg = nntp_config(provider)?;
-        let socket = open(&cfg)?;
+        // Every endpoint passes the policy before any socket opens.
+        for host in provider.endpoints() {
+            nntp_config(provider, host)?;
+        }
         let class = permit.class;
-        within_call(class.call_secs(), async {
+        let dial = Dial { provider, class };
+        within_call(class.call_secs(), self.hosts.connect(provider, &dial)).await
+    }
+}
+
+/// One `connect`'s access to the network, for the host picker. Its
+/// sockets are opened under the caller's permit, one at a time.
+struct Dial<'a> {
+    provider: &'a ProviderConfig,
+    class: PermitClass,
+}
+
+impl Dialer for Dial<'_> {
+    type Session = WorkerSession;
+
+    async fn probe(&self, host: &str, limit_ms: u32) -> Option<u32> {
+        let cfg = nntp_config(self.provider, host).ok()?;
+        let start = now();
+        // The socket is dropped, which closes it, at the end of this
+        // block: also after a probe that was cut off.
+        let answered = {
+            let mut socket = open(&cfg).ok()?;
+            within(after_ms(limit_ms), async {
+                Ok(hosts::greet(&mut socket).await)
+            })
+            .await
+        };
+        let ms = now().0.saturating_sub(start.0);
+        match answered {
+            Ok(true) => u32::try_from(ms).ok(),
+            _ => None,
+        }
+    }
+
+    async fn dial(&self, host: &str, bounded: bool) -> Result<WorkerSession> {
+        let cfg = nntp_config(self.provider, host)?;
+        let socket = open(&cfg)?;
+        let class = self.class;
+        let handshake = async {
             Ok(WorkerSession(
                 NntpClient::connect(socket, &cfg).await?,
                 class,
             ))
-        })
-        .await
+        };
+        if bounded {
+            within_call(HOST_CONNECT_SECS, handshake).await
+        } else {
+            handshake.await
+        }
+    }
+
+    async fn pause(&self, ms: u32) {
+        after_ms(ms).await
+    }
+
+    fn now(&self) -> UnixMs {
+        now()
     }
 }
 
@@ -161,11 +241,12 @@ fn refused(msg: String) -> BridgeError {
     )))
 }
 
-/// The engine config for one provider, after the TLS policy.
-fn nntp_config(p: &ProviderConfig) -> Result<NntpConfig> {
+/// The engine config for one provider on one of its hosts, after the TLS
+/// policy.
+fn nntp_config(p: &ProviderConfig, host: &str) -> Result<NntpConfig> {
     let with_auth = !p.user.is_empty();
     let cfg = NntpConfig {
-        host: p.host.clone(),
+        host: host.to_string(),
         port: p.port,
         tls: p.tls,
         allow_insecure_plaintext: !p.tls,
@@ -176,7 +257,7 @@ fn nntp_config(p: &ProviderConfig) -> Result<NntpConfig> {
         ..NntpConfig::default()
     };
     if !p.tls {
-        if !is_loopback(&p.host) {
+        if !is_loopback(host) {
             return Err(refused(
                 "transport_tls_required: plaintext only on loopback".into(),
             ));
@@ -281,27 +362,27 @@ mod tests {
 
     #[test]
     fn tls_provider_follows_the_pinned_policy() {
-        let cfg = nntp_config(&provider("news.example", 563, true)).unwrap();
+        let cfg = nntp_config(&provider("news.example", 563, true), "news.example").unwrap();
         assert!(cfg.tls && !cfg.allow_insecure_plaintext);
         assert_eq!(cfg.max_article_bytes, 1 << 20);
         assert_eq!(
             (cfg.username.as_deref(), cfg.password.as_deref()),
             (Some("u"), Some("pw"))
         );
-        assert!(nntp_config(&provider("news.example", 8080, true)).is_err());
+        assert!(nntp_config(&provider("news.example", 8080, true), "news.example").is_err());
     }
 
     #[test]
     fn plaintext_only_on_loopback_and_refusals_are_redacted() {
         for host in ["127.0.0.1", "localhost", "::1", "[::1]"] {
             assert!(
-                nntp_config(&provider(host, 11119, false))
+                nntp_config(&provider(host, 11119, false), host)
                     .unwrap()
                     .allow_insecure_plaintext
             );
         }
         for host in ["secret-host.example", "10.0.0.1", "127.0.0.1.example"] {
-            let err = nntp_config(&provider(host, 119, false)).unwrap_err();
+            let err = nntp_config(&provider(host, 119, false), host).unwrap_err();
             let text = format!("{err} {err:?}");
             assert!(!text.contains(host) && !text.contains("pw"), "{text}");
         }

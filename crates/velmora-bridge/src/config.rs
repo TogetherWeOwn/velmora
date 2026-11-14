@@ -27,6 +27,9 @@ pub const MAX_CONNS_LIMIT: u32 = 64;
 /// Most entries `NNTP_PROVIDERS` may hold.
 pub const MAX_PROVIDERS: usize = 32;
 
+/// Most entries a provider's `hosts` may hold (next to `host`).
+pub const MAX_HOSTS: usize = 8;
+
 /// Longest accepted provider `pool` name (bytes).
 pub const MAX_POOL_NAME_LEN: usize = 64;
 
@@ -186,6 +189,31 @@ fn valid_s3_host(h: &str) -> bool {
             && p.parse::<u32>().is_ok_and(|n| (1..=65_535).contains(&n))
     });
     name_ok && port_ok
+}
+
+/// A DNS name of `[A-Za-z0-9.-]`: an entry of a provider's `hosts`.
+fn valid_host_name(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && !h.starts_with(['.', '-'])
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
+/// A provider's `hosts`: at most [`MAX_HOSTS`] valid names, none twice
+/// and none the same as `host` (case does not make two hosts), and only
+/// on TLS: a plaintext provider is the local fake server, one host.
+fn hosts_ok(p: &ProviderConfig) -> bool {
+    if p.hosts.is_empty() {
+        return true;
+    }
+    if !p.tls || p.hosts.len() > MAX_HOSTS || !p.hosts.iter().all(|h| valid_host_name(h)) {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    p.endpoints()
+        .into_iter()
+        .all(|h| seen.insert(h.to_ascii_lowercase()))
 }
 
 fn valid_newsgroup(g: &str) -> bool {
@@ -385,7 +413,7 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
         // Stated, the address limit is a real one: `0` would shut the
         // provider out without saying so (`enabled` does that).
         let ips_ok = p.max_ips.is_none_or(|n| (1..=MAX_CONNS_LIMIT).contains(&n));
-        if !pool_ok || !ips_ok || p.retention_days == Some(0) {
+        if !pool_ok || !ips_ok || !hosts_ok(p) || p.retention_days == Some(0) {
             return Err(bad());
         }
         if p.id.is_empty()

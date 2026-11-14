@@ -60,6 +60,8 @@ pub struct TcpConnector {
     live: Rc<Cell<u32>>,
     peak: Rc<Cell<u32>>,
     connects: Cell<u32>,
+    /// The provider of every session opened, in order.
+    opened: RefCell<Vec<String>>,
     slow: Rc<RefCell<Option<Slow>>>,
     park: Rc<RefCell<Option<Rc<Cell<bool>>>>>,
 }
@@ -115,6 +117,10 @@ impl TcpConnector {
     /// Sessions opened so far.
     pub fn connects(&self) -> u32 {
         self.connects.get()
+    }
+    /// Sessions opened so far on provider `id`.
+    pub fn connects_to(&self, id: &str) -> usize {
+        self.opened.borrow().iter().filter(|p| *p == id).count()
     }
 }
 
@@ -201,6 +207,7 @@ impl NntpConnector for TcpConnector {
         end(&self.slow);
         let client = client?;
         self.connects.set(self.connects.get() + 1);
+        self.opened.borrow_mut().push(p.id.clone());
         self.live.set(self.live.get() + 1);
         self.peak.set(self.peak.get().max(self.live.get()));
         Ok(CountedSession {
@@ -1109,6 +1116,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         providers.push(ProviderConfig {
             id: format!("p{i}"),
             host: server.addr().ip().to_string(),
+            hosts: Vec::new(),
             port: server.addr().port(),
             tls: false,
             user: USER.to_string(),

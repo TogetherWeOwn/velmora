@@ -73,6 +73,7 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
     let mut cfg = config(vec![ProviderConfig {
         id: "p0".to_string(),
         host: server.addr().ip().to_string(),
+        hosts: Vec::new(),
         port: server.addr().port(),
         tls: false,
         user: USER.to_string(),

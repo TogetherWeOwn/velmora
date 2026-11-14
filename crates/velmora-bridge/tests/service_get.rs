@@ -555,6 +555,7 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
     ProviderConfig {
         id: "p0".to_string(),
         host: server.addr().ip().to_string(),
+        hosts: Vec::new(),
         port: server.addr().port(),
         tls: false,
         user: USER.to_string(),

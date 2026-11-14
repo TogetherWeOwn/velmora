@@ -1469,6 +1469,79 @@ fn provider_address_limit_parses_and_fails_closed() {
     assert!(format!("{:?}", providers[0]).contains("max_ips: Some(1)"));
 }
 
+/// `hosts` lists more host names of one account next to `host`. It is
+/// optional: an entry without it has `host` alone, as before.
+#[test]
+fn provider_hosts_parse_and_extend_host() {
+    let providers = providers_of(&[
+        provider_json("a", r#""hosts":["us.nntp.invalid","eu.nntp.invalid"]"#),
+        provider_json("b", r#""hosts":[]"#),
+        provider_json("c", ""),
+    ])
+    .unwrap();
+    assert_eq!(
+        providers[0].endpoints(),
+        ["nntp.invalid", "us.nntp.invalid", "eu.nntp.invalid"]
+    );
+    assert_eq!(providers[1].endpoints(), ["nntp.invalid"]);
+    assert_eq!(providers[2].endpoints(), ["nntp.invalid"]);
+    // Host names stay out of `Debug`, like `host`: only their number shows.
+    let shown = format!("{:?}", providers[0]);
+    assert!(
+        !shown.contains("us.nntp.invalid") && shown.contains("hosts: 2"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn provider_hosts_fail_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+
+    // Not a list of names.
+    for bad in [
+        r#""hosts":"us.nntp.invalid""#,
+        r#""hosts":[1]"#,
+        r#""hosts":null"#,
+        r#""hosts":[""]"#,
+        r#""hosts":["us.nntp.invalid:5563"]"#,
+        r#""hosts":["us nntp"]"#,
+        r#""hosts":["-us.nntp.invalid"]"#,
+        r#""hosts":["user@us.nntp.invalid"]"#,
+    ] {
+        assert_eq!(one(bad), invalid, "{bad}");
+    }
+    let long = format!(r#""hosts":["{}"]"#, "a".repeat(254));
+    assert_eq!(one(&long), invalid);
+    // No host twice, whatever its case, and not `host` again.
+    assert_eq!(
+        one(r#""hosts":["us.nntp.invalid","US.nntp.invalid"]"#),
+        invalid
+    );
+    assert_eq!(one(r#""hosts":["NNTP.invalid"]"#), invalid);
+    // At most `MAX_HOSTS`.
+    let names = |n: usize| -> String {
+        let list: Vec<String> = (0..n).map(|i| format!(r#""h{i}.nntp.invalid""#)).collect();
+        format!(r#""hosts":[{}]"#, list.join(","))
+    };
+    assert!(one(&names(velmora_bridge::config::MAX_HOSTS)).is_ok());
+    assert_eq!(one(&names(velmora_bridge::config::MAX_HOSTS + 1)), invalid);
+}
+
+/// The local fake server is one plaintext loopback host: `hosts` is for
+/// TLS providers only.
+#[test]
+fn provider_hosts_only_on_tls() {
+    let (_, dev) = wrangler_vars();
+    let plain = r#"[{"id":"p1","host":"127.0.0.1","hosts":["localhost"],"port":11119,"tls":false,"user":"","pass":"","backbone":"bb","post":true,"read":true,"max_conns":2}]"#;
+    assert_eq!(
+        load(&with_secrets(dev.clone(), plain)).map(|_| ()),
+        Err(ConfigError::Invalid("NNTP_PROVIDERS".into()))
+    );
+    let one_host = plain.replace(r#""hosts":["localhost"],"#, "");
+    assert!(load(&with_secrets(dev, &one_host)).is_ok());
+}
+
 #[test]
 fn provider_pool_settings_parse() {
     let pool = r#""pool":"bundle","pool_max_conns":3"#;

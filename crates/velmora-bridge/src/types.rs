@@ -366,6 +366,12 @@ impl fmt::Debug for Secret {
 pub struct ProviderConfig {
     pub id: String,
     pub host: String,
+    /// More host names of the same account, on the same `port`. The bridge
+    /// then connects to whichever of `host` and these answered fastest in
+    /// its isolate (`hosts::HostPicker`), and falls back to the others when
+    /// that one cannot be reached. Empty = `host` only.
+    #[serde(default)]
+    pub hosts: Vec<String>,
     pub port: u16,
     pub tls: bool,
     pub user: String,
@@ -424,6 +430,13 @@ impl ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Every host name of the account: `host`, then `hosts`, in order.
+    pub fn endpoints(&self) -> Vec<&str> {
+        core::iter::once(self.host.as_str())
+            .chain(self.hosts.iter().map(String::as_str))
+            .collect()
+    }
+
     /// Connections background jobs may hold together: one is left for a
     /// cold read when the provider allows two or more. Not on an account
     /// with one address, where a read cannot connect next to a job
@@ -468,6 +481,7 @@ impl fmt::Debug for ProviderConfig {
         f.debug_struct("ProviderConfig")
             .field("id", &self.id)
             .field("host", &"<redacted>")
+            .field("hosts", &self.hosts.len())
             .field("port", &self.port)
             .field("tls", &self.tls)
             .field("user", &"<redacted>")
