@@ -364,6 +364,17 @@ async fn requests_the_copy_cannot_honour_store_nothing() {
     )
     .await
     .expect_error(400, "InvalidRequest");
+    // Nor one that comes without a declared length (chunked transfer).
+    let mut chunked = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, "b"),
+        &[],
+        &[("x-amz-copy-source", &source("a"))],
+        b"body".to_vec(),
+    );
+    chunked.headers.retain(|(name, _)| name != "content-length");
+    rig.send(chunked).await.expect_error(400, "InvalidRequest");
     copy(
         &rig,
         &signer,

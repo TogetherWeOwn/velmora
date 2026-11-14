@@ -494,6 +494,24 @@ impl Drop for Charge {
 // Counted read
 // ---------------------------------------------------------------------------
 
+/// For a request that takes no body: whether none was sent.
+///
+/// A body can arrive without a `Content-Length` (chunked transfer), so
+/// the header alone does not answer this. The stream is read until its
+/// first byte or its end and nothing is kept. A stream that fails counts
+/// as a body.
+pub async fn body_is_empty(body: Body) -> bool {
+    let Body::Stream { mut stream, .. } = body else {
+        return true;
+    };
+    while let Some(chunk) = stream.next().await {
+        if !chunk.is_ok_and(|bytes| bytes.is_empty()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Reads the body only after the budget charge: at most `declared_len + 1`
 /// bytes, whatever the stream does. Short is `IncompleteBody` (as is a
 /// failed stream), long is `EntityTooLarge`; the surplus chunk is never

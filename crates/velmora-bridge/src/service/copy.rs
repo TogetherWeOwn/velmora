@@ -23,7 +23,8 @@ use super::common::{
 };
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
 use crate::types::{
-    Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState, S3Response,
+    Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
+    S3Response,
 };
 
 /// Times the copy is re-planned when the source changes under it.
@@ -113,6 +114,7 @@ pub(super) async fn copy_object<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     authed: &Authed,
     declared: Option<u64>,
+    body: Body,
 ) -> Result<S3Response, S3Response>
 where
     C: Catalog,
@@ -131,7 +133,8 @@ where
         ));
     }
     // A copy has no body; one that was sent would be silently dropped.
-    if declared.is_some_and(|len| len != 0) {
+    // It can come without a declared length, so the stream is asked too.
+    if declared.is_some_and(|len| len != 0) || !crate::ingress::body_is_empty(body).await {
         return Err(s3_error(ErrorCode::InvalidRequest));
     }
     if authed.headers.get("x-amz-copy-source-range").is_some() {
