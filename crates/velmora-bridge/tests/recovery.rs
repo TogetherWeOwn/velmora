@@ -242,6 +242,9 @@ async fn manifest_write_failure_commits_nothing() {
     tick(&rig);
     let upload = create_upload(&rig, &signer, "mp").await;
     let etag = upload_part(&rig, &signer, "mp", &upload, 1, b"part one").await;
+    // A first read stamps the extent's last read time; the reads below
+    // fall within the same hour and write nothing.
+    assert_eq!(get(&rig, &signer, "kept").await.expect(200).body, b"kept");
     let before = dump(&rig);
     let records_before = records(&rig);
 
