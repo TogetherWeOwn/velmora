@@ -790,6 +790,19 @@ pub struct EvictCandidate {
     pub cache_bytes: u64,
     /// `extents.evict_seq` when listed.
     pub seq: u64,
+    /// The safety copy was pinned when listed: only the cache fill may
+    /// go, and the eviction must not touch the safety copy.
+    pub pinned: bool,
+}
+
+impl EvictCandidate {
+    /// Bytes an eviction of this candidate frees.
+    pub fn evictable_bytes(&self) -> u64 {
+        match self.pinned {
+            true => self.cache_bytes,
+            false => self.safety_bytes.saturating_add(self.cache_bytes),
+        }
+    }
 }
 
 db_enum!(
@@ -866,12 +879,13 @@ pub enum Job {
     Gc {
         v: u8,
     },
-    /// Hot-tier eviction. `resume` continues a drain that an earlier job
-    /// started, down to the low watermark; without it the job only acts
-    /// when the evictable bytes exceed the cap.
+    /// Hot-tier eviction. `remaining` is the number of bytes a drain
+    /// still has to evict, carried from one step to the next so that only
+    /// its first step totals the evictable bytes. 0 starts a drain: the
+    /// job totals them and acts only if they exceed the cap.
     Evict {
         v: u8,
-        resume: bool,
+        remaining: u64,
     },
 }
 
@@ -906,6 +920,8 @@ pub struct DispatchReport {
     pub redriven: u64,
     /// The re-drive failed; the rest of the run went on without it.
     pub redrive_failed: bool,
+    /// The hot-tier check failed; the rest of the run went on without it.
+    pub evict_failed: bool,
 }
 
 // ---------------------------------------------------------------------------

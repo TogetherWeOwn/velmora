@@ -502,8 +502,14 @@ impl Catalog for MemCatalog {
     async fn record_cache_fill(&self, _: &ExtentId, _: UnixMs) -> Result<()> {
         Ok(())
     }
-    async fn touch_read(&self, _: &ExtentId, now: UnixMs, _: i64) -> Result<UnixMs> {
+    async fn touch_read(&self, _: &ExtentId, now: UnixMs, _: i64, _: bool) -> Result<UnixMs> {
         Ok(now)
+    }
+    async fn hot_check_due(&self, _: UnixMs, _: i64) -> Result<bool> {
+        Ok(false)
+    }
+    async fn hot_checked(&self, _: UnixMs) -> Result<()> {
+        Ok(())
     }
     async fn hot_seq(&self, _: &ExtentId) -> Result<u64> {
         Ok(0)

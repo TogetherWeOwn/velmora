@@ -171,10 +171,10 @@ mod tests {
             assert_eq!(lane(&extent_job(stage)), Lane::Verify);
         }
         assert_eq!(lane(&Job::Gc { v: JOB_VERSION }), Lane::Verify);
-        for resume in [false, true] {
+        for remaining in [0, 4096] {
             let evict = Job::Evict {
                 v: JOB_VERSION,
-                resume,
+                remaining,
             };
             assert_eq!(lane(&evict), Lane::Verify);
         }

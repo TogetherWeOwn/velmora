@@ -515,7 +515,8 @@ pub(super) async fn begin_release<S: Sql>(
             lease_params(l, [SqlValue::Int(i64::from(required)), ms(now)])?,
         ),
         (
-            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2 WHERE id = ?1",
+            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+               evict_seq = evict_seq + 1 WHERE id = ?1",
             vec![text(l.extent.as_str()), text(evidence_json)],
         ),
     ];

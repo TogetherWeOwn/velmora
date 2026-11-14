@@ -39,9 +39,14 @@ thread_local! {
 }
 
 /// Records that `extent` served a read, for the eviction order. Best
-/// effort: a failed stamp never fails the read.
-async fn stamp_read<C, B, N, J, K, T>(bridge: &Bridge<C, B, N, J, K, T>, extent: &ExtentId)
-where
+/// effort: a failed stamp never fails the read. `from_cache`: the bytes
+/// came from the cache fill; the same write counts a fill that the
+/// catalogue did not know about.
+async fn stamp_read<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    extent: &ExtentId,
+    from_cache: bool,
+) where
     C: Catalog,
     B: BlobStore,
     N: NntpConnector,
@@ -58,7 +63,9 @@ where
     if recent {
         return;
     }
-    let stamped = bridge.catalog.touch_read(extent, now, READ_STAMP_MS);
+    let stamped = bridge
+        .catalog
+        .touch_read(extent, now, READ_STAMP_MS, from_cache);
     if let Ok(at) = stamped.await {
         // Another isolate may have stamped it: remember the stamp the
         // catalogue holds, not the time of this read.
@@ -309,7 +316,8 @@ fn retain(budget: &ByteBudget, work: Charge, plain: Vec<u8>) -> Option<(Vec<u8>,
     Some((plain, held))
 }
 
-/// The piece's plaintext from the cache or else the safety copy. A copy
+/// The piece's plaintext from the cache or else the safety copy, and
+/// whether it came from the cache. A copy
 /// that is absent, short or fails authentication is skipped, never
 /// served: the next source is tried instead. The caller holds a charge
 /// for the ciphertext span and the plaintext.
@@ -318,7 +326,7 @@ async fn warm_piece<C, B, N, J, K, T>(
     bucket: &Bucket,
     piece: &Piece,
     span: ByteSpan,
-) -> Option<Vec<u8>>
+) -> Option<(Vec<u8>, bool)>
 where
     C: Catalog,
     B: BlobStore,
@@ -328,13 +336,13 @@ where
     T: Clock,
 {
     let extent = &piece.extent;
-    for (store, key) in [
-        (&bridge.cache, extent.id.cache_key()),
-        (&bridge.safety, extent.id.safety_key()),
+    for (store, key, from_cache) in [
+        (&bridge.cache, extent.id.cache_key(), true),
+        (&bridge.safety, extent.id.safety_key(), false),
     ] {
         if let Some(src) = warm(store, &key, span).await {
             if let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) {
-                return Some(plain);
+                return Some((plain, from_cache));
             }
         }
     }
@@ -369,9 +377,9 @@ where
             .charge(span.len.saturating_add(piece.len))
             .await
             .map_err(|_| ReadFail::Busy)?;
-        if let Some(plain) = warm_piece(bridge, bucket, piece, span).await {
+        if let Some((plain, from_cache)) = warm_piece(bridge, bucket, piece, span).await {
             let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
-            stamp_read(bridge, &extent.id).await;
+            stamp_read(bridge, &extent.id, from_cache).await;
             return Ok(held);
         }
     }
@@ -430,9 +438,9 @@ where
                 break charge;
             }
         };
-        if let Some(plain) = warm_piece(bridge, bucket, piece, span).await {
+        if let Some((plain, from_cache)) = warm_piece(bridge, bucket, piece, span).await {
             let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
-            stamp_read(bridge, &extent.id).await;
+            stamp_read(bridge, &extent.id, from_cache).await;
             return Ok(held);
         }
     }

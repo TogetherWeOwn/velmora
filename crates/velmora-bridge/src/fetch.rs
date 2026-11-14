@@ -461,15 +461,19 @@ where
             extent: &extent.id,
             cipher_sha256: &extent.cipher_sha256,
         };
-        let key = extent.id.cache_key();
-        self.cache.put(&key, cipher.clone(), &meta).await?;
-        // Counted after the write: an eviction that deleted the key in
-        // the meantime then cannot zero the count of this copy.
-        let counted = self.catalog.record_cache_fill(&extent.id, self.clock.now());
-        if counted.await.is_err() {
-            // An uncounted copy would never be evicted. The bytes are
-            // verified, so the read itself still succeeds.
-            let _ = self.cache.delete(&key).await;
+        // The fill is counted before it is written and again after:
+        // - before, so that a request cancelled right after the write
+        //   leaves a counted copy;
+        // - after, so that an eviction that ran between the two cannot
+        //   leave this copy uncounted.
+        // Without the first count nothing is written: an uncounted copy
+        // could outlive the cap. The bytes are verified either way, so
+        // the read itself succeeds.
+        let count = || self.catalog.record_cache_fill(&extent.id, self.clock.now());
+        if count().await.is_ok() {
+            let key = extent.id.cache_key();
+            self.cache.put(&key, cipher.clone(), &meta).await?;
+            let _ = count().await;
         }
         Ok(ColdFetch::Filled(cipher))
     }

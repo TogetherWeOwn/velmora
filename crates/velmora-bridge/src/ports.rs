@@ -407,22 +407,35 @@ pub trait Catalog {
     /// Pinned and evictable byte totals (`GET /_admin/status`).
     async fn hot_stats(&self) -> Result<HotStats>;
     /// Bytes R2 holds that may be evicted: released safety copies and
-    /// cache fills of extents that are not pinned.
+    /// cache fills. One index scan over the evictable extents.
     async fn evictable_bytes(&self) -> Result<u64>;
-    /// Evictable extents, least recently read first.
+    /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
     /// Starts an eviction in one statement that re-checks the extent:
-    /// `true` only if it is still evictable and unchanged since it was
-    /// listed. `false` for a pinned extent, whatever the caller believes.
+    /// `true` only if it is exactly as listed (sequence, byte counts,
+    /// pinned or not). With `x.pinned` only the cache fill is claimed.
     async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool>;
-    /// After the blob deletes: stops counting the bytes. `false` if a copy
-    /// was written since `begin_evict`; the counts then stand.
+    /// Ends an eviction after the blob deletes. `false` when a hot copy
+    /// was recorded since `begin_evict`; the counts then stand.
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
-    /// After a cold read wrote the cache copy: counts it, stamps the read.
+    /// Counts the extent's cache fill and stamps the read. Called before
+    /// and after the cache write.
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
-    /// Stamps a read unless the last stamp is less than `min_gap_ms` old.
+    /// Stamps a read unless the last stamp is younger than `min_gap_ms`.
+    /// `from_cache`: the read was served from the cache fill, which is
+    /// counted by the same write if it was not.
     /// Returns the stamp the extent has afterwards.
-    async fn touch_read(&self, extent: &ExtentId, now: UnixMs, min_gap_ms: i64) -> Result<UnixMs>;
+    async fn touch_read(
+        &self,
+        extent: &ExtentId,
+        now: UnixMs,
+        min_gap_ms: i64,
+        from_cache: bool,
+    ) -> Result<UnixMs>;
+    /// Whether no evictable total was recorded in the last `every_ms`.
+    async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool>;
+    /// Records that the dispatcher took the evictable total at `now`.
+    async fn hot_checked(&self, now: UnixMs) -> Result<()>;
     /// The extent's eviction fencing token now. Read it before deleting
     /// blobs outside an eviction (admin evict) and pass it to `hot_forget`.
     async fn hot_seq(&self, extent: &ExtentId) -> Result<u64>;

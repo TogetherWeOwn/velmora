@@ -506,9 +506,9 @@ fn job_json_is_small_and_strict() {
     assert!(Job::from_json(r#"{"t":"gc","v":1,"x":0}"#).is_err());
     let evict = Job::Evict {
         v: JOB_VERSION,
-        resume: true,
+        remaining: 4096,
     };
-    assert_eq!(evict.to_json(), r#"{"t":"evict","v":1,"resume":true}"#);
+    assert_eq!(evict.to_json(), r#"{"t":"evict","v":1,"remaining":4096}"#);
     assert_eq!(Job::from_json(&evict.to_json()).unwrap(), evict);
     assert!(Job::from_json(r#"{"t":"evict","v":1}"#).is_err());
     assert!(Job::from_json(r#"{"t":"nope","v":1}"#).is_err());

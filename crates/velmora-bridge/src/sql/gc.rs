@@ -98,10 +98,26 @@ pub(super) async fn gc_begin<S: Sql>(
                     &ident(),
                 )
                 .await?;
-            match rows.into_iter().next() {
+            let free = match rows.into_iter().next() {
                 Some(r) => Cols::new(r).num::<i64>()? != 0,
                 None => false,
+            };
+            if free && row.action == GcAction::DeleteCache {
+                // The cache fill stops being counted before its blob is
+                // deleted, never after: a cold read that fills the cache
+                // while this delete runs records its copy after this
+                // statement, so the copy stays counted. (A count left for
+                // a blob that the delete then removed is corrected by the
+                // next eviction.)
+                c.sql
+                    .exec(
+                        "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
+                         WHERE id = ?1 AND hot_cache_bytes > 0",
+                        &[text(row.extent_id.as_str())],
+                    )
+                    .await?;
             }
+            free
         }
         GcAction::ShredKey | GcAction::DropArticlesMeta => {
             let apply = if row.action == GcAction::ShredKey {
@@ -151,8 +167,8 @@ pub(super) async fn gc_begin<S: Sql>(
 }
 
 /// Closes a blob row after its delete; a safety delete also records that
-/// the extent no longer has a safety copy. Either delete ends the hot-tier
-/// count of that copy.
+/// the extent no longer has a safety copy and ends the hot-tier count of
+/// it. (The count of a cache fill ended in `gc_begin`, before the delete.)
 pub(super) async fn gc_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
     c.sql
         .batch(vec![
@@ -161,12 +177,6 @@ pub(super) async fn gc_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> 
                    evict_seq = evict_seq + 1 \
                  WHERE id = (SELECT extent_id FROM gc \
                  WHERE id = ?1 AND action = 'delete_safety' AND done_at IS NULL)",
-                vec![SqlValue::Int(id)],
-            ),
-            (
-                "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
-                 WHERE id = (SELECT extent_id FROM gc \
-                 WHERE id = ?1 AND action = 'delete_cache' AND done_at IS NULL)",
                 vec![SqlValue::Int(id)],
             ),
             (

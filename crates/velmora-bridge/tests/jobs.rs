@@ -1031,6 +1031,7 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             permits_seeded: true,
             redriven: 0,
             redrive_failed: false,
+            evict_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

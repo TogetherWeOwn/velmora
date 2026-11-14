@@ -37,6 +37,11 @@ pub const MAX_ATTEMPTS: u32 = 50;
 pub const GC_BATCH: u32 = 50;
 /// Extents one eviction job handles before it re-enqueues itself.
 pub const EVICT_BATCH: u32 = 50;
+/// Least time between two totals of the evictable bytes by the
+/// dispatcher. The total reads one index entry per evictable extent, so
+/// it is not taken on every run; the tier may sit over the cap for this
+/// long before a drain starts.
+pub const EVICT_CHECK_SECS: u32 = 1800;
 /// Retry delay when the catalogue, a blob store or the queue failed before
 /// anything could be recorded.
 pub const INFRA_RETRY_SECS: u32 = 60;
@@ -78,8 +83,8 @@ where
                 stage,
             } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
             Job::Gc { v } if *v == JOB_VERSION => self.run_gc().await,
-            Job::Evict { v, resume } if *v == JOB_VERSION => {
-                match self.evict_batch(*resume).await {
+            Job::Evict { v, remaining } if *v == JOB_VERSION => {
+                match self.evict_batch(*remaining).await {
                     Ok(_) => JobOutcome::Ack,
                     // Every step is idempotent, so the batch simply runs again.
                     Err(_) => RETRY,
@@ -192,19 +197,30 @@ where
 
     /// One bounded step of the hot-tier drain; returns the bytes it freed.
     ///
-    /// Acts when the evictable bytes exceed the cap (or, with `resume`,
-    /// the low watermark) and evicts least recently read extents until
-    /// the low watermark is reached or the batch is used up; then it
-    /// sends the next step. Pinned extents are not candidates, and
-    /// `begin_evict` refuses one even if this job believed otherwise.
-    pub async fn evict_batch(&self, resume: bool) -> Result<u64> {
-        let cap = self.cfg.hot_cap_bytes;
-        let low = low_watermark(cap);
-        let total = self.catalog.evictable_bytes().await?;
-        if total <= if resume { low } else { cap } {
-            return Ok(0);
+    /// `remaining == 0` starts a drain: the job totals the evictable
+    /// bytes and, if they exceed the cap, has the excess over the low
+    /// watermark to evict. Otherwise `remaining` is what an earlier step
+    /// left, and nothing is totalled. Least recently read extents go
+    /// first, until the excess is gone or the batch is used up; then the
+    /// rest is handed to the next step.
+    ///
+    /// The safety copy of a pinned extent is never deleted: `begin_evict`
+    /// claims it only for an extent that is not pinned in the very
+    /// statement that makes the claim.
+    ///
+    /// A step that is run twice (a retry after an error, a duplicate
+    /// delivery) can evict up to one batch more than was needed. That
+    /// costs later cold reads, never data.
+    pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+        let mut excess = remaining;
+        if excess == 0 {
+            let cap = self.cfg.hot_cap_bytes;
+            let total = self.catalog.evictable_bytes().await?;
+            if total <= cap {
+                return Ok(0);
+            }
+            excess = total - low_watermark(cap);
         }
-        let mut excess = total - low;
         let mut freed = 0u64;
         let rows = self.catalog.evict_candidates(EVICT_BATCH).await?;
         let mut more = rows.len() >= EVICT_BATCH as usize;
@@ -220,9 +236,10 @@ where
                     freed = freed.saturating_add(bytes);
                     excess = excess.saturating_sub(bytes);
                 }
-                // Another eviction job is at work on the same list (or a
-                // read just refilled the extent): leave the drain to it
-                // rather than evict past the low watermark together.
+                // Another eviction job is at work on the same list, or a
+                // read just refilled the extent. Stop here rather than
+                // evict past the low watermark together; if the tier is
+                // still over the cap, the dispatcher starts a new drain.
                 Ok(None) => {
                     more = false;
                     break;
@@ -240,31 +257,56 @@ where
             // once the cap is exceeded.
             let next = Job::Evict {
                 v: JOB_VERSION,
-                resume: true,
+                remaining: excess,
             };
             self.jobs.send(&next, 0).await?;
         }
         Ok(freed)
     }
 
-    /// Evicts one extent's R2 copies. `None` when the catalogue refused
-    /// the eviction; nothing was deleted then.
+    /// Evicts one extent's evictable R2 copies and returns the bytes it
+    /// freed. `None` when something else changed the extent meanwhile:
+    /// either the catalogue refused the eviction (nothing was deleted), or
+    /// it could not be finished as begun.
     async fn evict_one(&self, row: &EvictCandidate) -> Result<Option<u64>> {
         if !self.catalog.begin_evict(row).await? {
             return Ok(None);
         }
-        if row.safety_bytes > 0 {
-            self.safety.delete(&row.extent.safety_key()).await?;
+        // Both keys go whatever the counts say, so a copy the catalogue
+        // did not count goes too. The one exception is the safety copy of
+        // a pinned extent, which is not part of the claim.
+        if !row.pinned {
+            delete_blob(&self.safety, &row.extent.safety_key()).await?;
         }
-        if row.cache_bytes > 0 {
-            self.cache.delete(&row.extent.cache_key()).await?;
-        }
-        // A cold read may have refilled the cache since `begin_evict`;
-        // then the counts stand and nothing was freed for good.
+        delete_blob(&self.cache, &row.extent.cache_key()).await?;
+        // `false`: a cold read refilled the cache, or another eviction
+        // took the extent, since `begin_evict`. The counts stand, and
+        // what this drain still has to evict is no longer known.
         Ok(match self.catalog.finish_evict(row).await? {
-            true => Some(row.safety_bytes.saturating_add(row.cache_bytes)),
-            false => Some(0),
+            true => Some(row.evictable_bytes()),
+            false => None,
         })
+    }
+
+    /// The dispatcher's hot-tier check: at most one total per
+    /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap.
+    /// `GC_MODE` does not gate it: eviction removes no data.
+    async fn evict_check(&self, now: crate::types::UnixMs) -> Result<bool> {
+        let every_ms = i64::from(EVICT_CHECK_SECS) * 1000;
+        if !self.catalog.hot_check_due(now, every_ms).await? {
+            return Ok(false);
+        }
+        let over = self.catalog.evictable_bytes().await? > self.cfg.hot_cap_bytes;
+        if over {
+            let job = Job::Evict {
+                v: JOB_VERSION,
+                remaining: 0,
+            };
+            self.jobs.send(&job, 0).await?;
+        }
+        // Recorded last: a check that failed is due again on the next run.
+        self.catalog.hot_checked(now).await?;
+        Ok(over)
     }
 
     /// The whole cron handler: bounded catalogue reads and queue sends
@@ -326,15 +368,11 @@ where
             report.gc_enqueued = true;
         }
 
-        // One covering-index sum; the job does the work. `GC_MODE` does
-        // not gate it: eviction removes no data.
-        if self.catalog.evictable_bytes().await? > self.cfg.hot_cap_bytes {
-            let job = Job::Evict {
-                v: JOB_VERSION,
-                resume: false,
-            };
-            self.jobs.send(&job, 0).await?;
-            report.evict_enqueued = true;
+        // The hot-tier check is an extra, like the re-drive: its failure
+        // must not keep the run from being recorded.
+        match self.evict_check(now).await {
+            Ok(sent) => report.evict_enqueued = sent,
+            Err(_) => report.evict_failed = true,
         }
 
         self.catalog.record_dispatch(now).await?;

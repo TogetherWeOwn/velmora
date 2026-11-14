@@ -362,8 +362,20 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
         hot::record_cache_fill(self, extent, now).await
     }
-    async fn touch_read(&self, extent: &ExtentId, now: UnixMs, min_gap_ms: i64) -> Result<UnixMs> {
-        hot::touch_read(self, extent, now, min_gap_ms).await
+    async fn touch_read(
+        &self,
+        extent: &ExtentId,
+        now: UnixMs,
+        min_gap_ms: i64,
+        from_cache: bool,
+    ) -> Result<UnixMs> {
+        hot::touch_read(self, extent, now, min_gap_ms, from_cache).await
+    }
+    async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool> {
+        hot::hot_check_due(self, now, every_ms).await
+    }
+    async fn hot_checked(&self, now: UnixMs) -> Result<()> {
+        hot::hot_checked(self, now).await
     }
     async fn hot_seq(&self, extent: &ExtentId) -> Result<u64> {
         hot::hot_seq(self, extent).await

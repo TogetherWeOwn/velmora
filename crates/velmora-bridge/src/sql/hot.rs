@@ -1,48 +1,70 @@
 //! Hot-tier accounting and eviction (catalogue lane B).
 //!
-//! R2 holds two kinds of bytes for an extent. *Pinned* bytes are safety
-//! copies that are still `held` or `releasing`: not yet proven on enough
-//! backbones, or too young. *Evictable* bytes are released safety copies
-//! (`hot_safety_bytes`) and cache fills (`hot_cache_bytes`); Usenet holds
-//! the data, so R2 may drop them.
+//! R2 holds two kinds of copy of an extent:
+//! - the safety copy (`x/`). While the extent is `held` or `releasing` it
+//!   is *pinned*: not yet proven on enough backbones, or too young. Once
+//!   released it is evictable, and `hot_safety_bytes` counts it.
+//! - the cache fill (`c/`), counted by `hot_cache_bytes`. It only ever
+//!   comes from a verified read from Usenet, so it is evictable whatever
+//!   the state of the safety copy.
 //!
 //! The totals are recomputed from the rows, never kept as a counter, so
-//! they cannot drift from what the rows say and cannot go negative. Both
-//! sums run over a partial covering index: the evictable one reads one
-//! index entry per evictable extent, a number the cap itself bounds.
+//! they cannot drift from what the rows say and cannot go negative. The
+//! sums run over partial covering indexes.
 //!
 //! An eviction is fenced by `extents.evict_seq`:
-//! - `begin_evict` is one statement that re-checks that the extent is
-//!   still evictable and unchanged since it was listed, and bumps the
-//!   sequence. Two jobs cannot both begin, and a pinned extent never
-//!   begins.
+//! - `begin_evict` is one statement that re-checks the extent (pinned or
+//!   not, byte counts, sequence) against the listing and bumps the
+//!   sequence. Two jobs cannot both begin, and the safety copy of a
+//!   pinned extent is never part of an eviction.
 //! - The job deletes the blobs.
 //! - `finish_evict` zeroes the byte counts only if the sequence is still
 //!   the one `begin_evict` left. A cache fill in between bumps it, so the
 //!   fill stays counted.
 //!
-//! Whatever the interleaving, a blob that exists is counted. The reverse
-//! can happen (counted, already gone); the next eviction of that extent
-//! corrects it. Nothing moves an extent back to `held` or `releasing`.
+//! Every statement that changes `safety_state` bumps the sequence too, so
+//! a listing never survives a state change.
+//!
+//! The counts are a lower bound that repairs itself, in both directions:
+//! - counted but already gone (a delete raced a fill, or the bucket's
+//!   lifecycle rule expired the blob): the next eviction of the extent
+//!   zeroes the count;
+//! - a cache blob that exists but is not counted (written before these
+//!   columns existed, or by a request that was cancelled between its
+//!   write and its second count while an eviction or a garbage
+//!   collection of the same extent ran): a read served from it
+//!   counts it again (`touch_read`), and an eviction of the extent deletes
+//!   both keys whatever the counts say. One that is never read again and
+//!   never evicted is left to the cache bucket's lifecycle rule.
 
 use super::uploads::{int, ms, text, Cols};
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
 use crate::types::{EvictCandidate, ExtentId, HotStats, Result, UnixMs};
 
-/// True for an extent with bytes that may be evicted. The text matches
-/// the `extents_evictable` index.
-macro_rules! evictable {
-    () => {
-        "hot_safety_bytes + hot_cache_bytes > 0 AND safety_state NOT IN ('held', 'releasing')"
-    };
-}
-
 /// True for an extent whose safety copy is pinned. The text matches the
 /// `extents_pinned` index.
 macro_rules! pinned {
     () => {
         "safety_state IN ('held', 'releasing')"
+    };
+}
+
+/// True for an extent with bytes that may be evicted. The text matches
+/// the `extents_evictable` index.
+macro_rules! evictable {
+    () => {
+        "(hot_cache_bytes > 0 \
+          OR (hot_safety_bytes > 0 AND safety_state NOT IN ('held', 'releasing')))"
+    };
+}
+
+/// The evictable bytes of one row: the cache fill, and the safety copy
+/// unless it is pinned.
+macro_rules! evictable_bytes {
+    () => {
+        "hot_cache_bytes + CASE WHEN safety_state IN ('held', 'releasing') \
+                                THEN 0 ELSE hot_safety_bytes END"
     };
 }
 
@@ -58,17 +80,19 @@ async fn total<S: Sql>(c: &SqlCatalog<S>, sql: &str) -> Result<(u64, u64)> {
 }
 
 const EVICTABLE_TOTAL: &str = concat!(
-    "SELECT COALESCE(SUM(hot_safety_bytes + hot_cache_bytes), 0), COUNT(*) \
-     FROM extents WHERE ",
+    "SELECT COALESCE(SUM(",
+    evictable_bytes!(),
+    "), 0), COUNT(*) FROM extents WHERE ",
     evictable!()
 );
 const PINNED_TOTAL: &str = concat!(
-    "SELECT COALESCE(SUM(cipher_size + hot_cache_bytes), 0), COUNT(*) \
-     FROM extents WHERE ",
+    "SELECT COALESCE(SUM(cipher_size), 0), COUNT(*) FROM extents WHERE ",
     pinned!()
 );
 const CANDIDATES: &str = concat!(
-    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq FROM extents WHERE ",
+    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
+    pinned!(),
+    " FROM extents WHERE ",
     evictable!(),
     " ORDER BY last_read_at, id LIMIT ?1"
 );
@@ -90,8 +114,8 @@ pub(super) async fn evictable_bytes<S: Sql>(c: &SqlCatalog<S>) -> Result<u64> {
     Ok(evictable(c).await?.0)
 }
 
-/// Pinned and evictable totals. A cache fill of a pinned extent is not
-/// evicted, so it counts as pinned.
+/// Pinned and evictable totals. Pinned bytes are safety copies only: a
+/// cache fill is evictable even while the extent's safety copy is pinned.
 pub(super) async fn hot_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<HotStats> {
     let (pinned_bytes, pinned_extents) = total(c, PINNED_TOTAL).await?;
     let (evictable_bytes, evictable_extents) = evictable(c).await?;
@@ -103,7 +127,7 @@ pub(super) async fn hot_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<HotStats> {
     })
 }
 
-/// Evictable extents, least recently read first.
+/// Extents with evictable bytes, least recently read first.
 pub(super) async fn evict_candidates<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
@@ -120,24 +144,44 @@ pub(super) async fn evict_candidates<S: Sql>(
             safety_bytes: r.num()?,
             cache_bytes: r.num()?,
             seq: r.num()?,
+            pinned: r.num::<i64>()? != 0,
         });
     }
     Ok(out)
 }
 
-/// Starts an eviction: `true` only if the extent is still evictable and
-/// exactly as `x` describes it. One statement, so the check and the claim
-/// cannot be separated.
+/// Starts an eviction: `true` only if the extent is exactly as `x`
+/// describes it. One statement, so the check and the claim cannot be
+/// separated.
+///
+/// - `x.pinned == false` claims both copies and requires that the safety
+///   copy is not pinned now.
+/// - `x.pinned == true` claims the cache fill only and requires a counted
+///   one. The caller must not touch the safety copy.
 pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -> Result<bool> {
+    let sql = if x.pinned {
+        concat!(
+            "UPDATE extents SET evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND evict_seq = ?2 \
+               AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 \
+               AND hot_cache_bytes > 0 AND ",
+            pinned!()
+        )
+    } else {
+        concat!(
+            "UPDATE extents SET evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND evict_seq = ?2 \
+               AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 \
+               AND NOT ",
+            pinned!(),
+            " AND ",
+            evictable!()
+        )
+    };
     let changed = c
         .sql
         .exec(
-            concat!(
-                "UPDATE extents SET evict_seq = evict_seq + 1 \
-                 WHERE id = ?1 AND evict_seq = ?2 \
-                   AND hot_safety_bytes = ?3 AND hot_cache_bytes = ?4 AND ",
-                evictable!()
-            ),
+            sql,
             &[
                 text(x.extent.as_str()),
                 int(x.seq)?,
@@ -149,23 +193,32 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
     Ok(changed == 1)
 }
 
-/// After the blobs were deleted: the bytes are no longer counted. `false`
-/// if a copy was written since `begin_evict`; the counts then stand.
+/// Ends an eviction after the blobs are deleted: the claimed copies are
+/// no longer counted. `false` when a hot copy was recorded since
+/// `begin_evict`; the counts then stand.
 pub(super) async fn finish_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -> Result<bool> {
+    let sql = if x.pinned {
+        "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
+         WHERE id = ?1 AND evict_seq = ?2"
+    } else {
+        "UPDATE extents SET hot_safety_bytes = 0, hot_cache_bytes = 0, \
+           evict_seq = evict_seq + 1 \
+         WHERE id = ?1 AND evict_seq = ?2"
+    };
     let changed = c
         .sql
         .exec(
-            "UPDATE extents SET hot_safety_bytes = 0, hot_cache_bytes = 0, \
-               evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND evict_seq = ?2",
+            sql,
             &[text(x.extent.as_str()), int(x.seq.saturating_add(1))?],
         )
         .await?;
     Ok(changed == 1)
 }
 
-/// A cold read wrote the extent's ciphertext to the cache. Called after
-/// the write, so an eviction that ran meanwhile cannot zero the count.
+/// Counts the extent's cache fill and stamps the read that caused it.
+/// Called before the write (so that a request cancelled right after the
+/// write leaves a counted blob) and again after it (so that an eviction
+/// that ran in between does not leave it uncounted).
 pub(super) async fn record_cache_fill<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
@@ -185,21 +238,29 @@ pub(super) async fn record_cache_fill<S: Sql>(
 /// Stamps a read, unless the last stamp is less than `min_gap_ms` old.
 /// Returns the stamp the extent has afterwards, so the caller knows when
 /// the next write is due without asking again.
+///
+/// With `from_cache` the read was served from the cache fill, so one
+/// exists: the same write counts it if it was not counted.
 pub(super) async fn touch_read<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
     now: UnixMs,
     min_gap_ms: i64,
+    from_cache: bool,
 ) -> Result<UnixMs> {
     let changed = c
         .sql
         .exec(
-            "UPDATE extents SET last_read_at = ?2 \
+            "UPDATE extents SET last_read_at = ?2, \
+               evict_seq = evict_seq + \
+                 CASE WHEN ?4 = 1 AND hot_cache_bytes = 0 THEN 1 ELSE 0 END, \
+               hot_cache_bytes = CASE WHEN ?4 = 1 THEN cipher_size ELSE hot_cache_bytes END \
              WHERE id = ?1 AND (last_read_at IS NULL OR last_read_at <= ?3)",
             &[
                 text(extent.as_str()),
                 ms(now),
                 SqlValue::Int(now.0.saturating_sub(min_gap_ms)),
+                SqlValue::Int(i64::from(from_cache)),
             ],
         )
         .await?;
@@ -218,6 +279,34 @@ pub(super) async fn touch_read<S: Sql>(
         None => None,
     };
     Ok(stored.unwrap_or(now))
+}
+
+/// Whether the dispatcher's periodic total is due: none was taken in the
+/// last `every_ms`.
+pub(super) async fn hot_check_due<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+    every_ms: i64,
+) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT 1 FROM meta WHERE k = 'hot_checked_at' AND v > ?1 AND v <= ?2",
+            &[SqlValue::Int(now.0.saturating_sub(every_ms)), ms(now)],
+        )
+        .await?;
+    Ok(rows.is_empty())
+}
+
+/// Records that the periodic total was taken at `now`.
+pub(super) async fn hot_checked<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
+    c.sql
+        .exec(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('hot_checked_at', ?1)",
+            &[ms(now)],
+        )
+        .await?;
+    Ok(())
 }
 
 /// The extent's fencing token now (0 for an unknown extent). Read it
