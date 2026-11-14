@@ -933,6 +933,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         provider: "p1".into(),
         slot: 0,
         token: 1,
+        class: PermitClass::Read,
     };
     let query = ListQuery {
         prefix: "a/".into(),

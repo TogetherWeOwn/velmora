@@ -7,7 +7,9 @@ use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
+/// How long a background job's slot lives, and a read's.
 const TTL_MS: i64 = 120_000;
+const READ_TTL_MS: i64 = 30_000;
 
 fn provider(id: &str, max_conns: u32) -> ProviderConfig {
     let json = format!(
@@ -177,11 +179,11 @@ async fn expired_permit_is_reclaimed_and_fenced() {
     assert_eq!((stale.slot, stale.token), (0, 1));
 
     // Held through the whole TTL, including its last millisecond.
-    let expiry = T0.plus_ms(TTL_MS);
+    let expiry = T0.plus_ms(READ_TTL_MS);
     assert!(acquire(&c, &p, PermitClass::Read, expiry).await.is_none());
     // A renewal extends it from the renewal time.
     assert!(c.renew_permit(&stale, T0.plus_ms(1000)).await.unwrap());
-    let expiry = T0.plus_ms(1000 + TTL_MS);
+    let expiry = T0.plus_ms(1000 + READ_TTL_MS);
     assert!(acquire(&c, &p, PermitClass::Read, expiry).await.is_none());
 
     // Expired but not yet taken over: the holder may not extend it. It
@@ -628,12 +630,12 @@ async fn an_expired_holder_frees_its_address_and_cannot_come_back() {
         .await
         .unwrap();
     // Held up to and including the last millisecond of the permit.
-    for now in [T0, T0.plus_ms(TTL_MS)] {
+    for now in [T0, T0.plus_ms(READ_TTL_MS)] {
         assert!(acquire_as(&c, &p, PermitClass::Read, "b", now)
             .await
             .is_none());
     }
-    let later = T0.plus_ms(TTL_MS + 1);
+    let later = T0.plus_ms(READ_TTL_MS + 1);
     let b = acquire_as(&c, &p, PermitClass::Read, "b", later)
         .await
         .unwrap();
@@ -670,9 +672,9 @@ async fn a_holder_with_one_live_slot_keeps_its_address() {
     let kept = acquire_as(&c, &p, PermitClass::Read, "a", T0)
         .await
         .unwrap();
-    assert!(c.renew_permit(&kept, T0.plus_ms(100_000)).await.unwrap());
+    assert!(c.renew_permit(&kept, T0.plus_ms(20_000)).await.unwrap());
 
-    let later = T0.plus_ms(TTL_MS + 1);
+    let later = T0.plus_ms(READ_TTL_MS + 1);
     assert_eq!(live_slots(&c, "p1", later).await.len(), 1);
     assert!(acquire_as(&c, &p, PermitClass::Read, "b", later)
         .await
@@ -833,9 +835,17 @@ async fn a_late_renewal_cannot_revive_an_expired_holder() {
     let a1 = acquire_as(&c, &p, PermitClass::Read, "a", T0)
         .await
         .unwrap();
+    // It holds two more on a provider without an address limit.
+    let open = provider("p2", 2);
+    acquire_as(&c, &open, PermitClass::Read, "a", T0)
+        .await
+        .unwrap();
+    let kept = acquire_as(&c, &open, PermitClass::Read, "a", T0)
+        .await
+        .unwrap();
     // `a` reads the clock while its slots are live, and stalls.
-    let read_by_a = T0.plus_ms(TTL_MS);
-    let later = T0.plus_ms(TTL_MS + 1);
+    let read_by_a = T0.plus_ms(READ_TTL_MS);
+    let later = T0.plus_ms(READ_TTL_MS + 1);
     let b = acquire_as(&c, &p, PermitClass::Background, "b", later)
         .await
         .unwrap();
@@ -848,14 +858,8 @@ async fn a_late_renewal_cannot_revive_an_expired_holder() {
     assert!(c.renew_permit(&b, later).await.unwrap());
 
     // Without an address limit nothing depends on it, and a slot that
-    // nobody took can still be renewed late.
-    let open = provider("p2", 2);
-    acquire_as(&c, &open, PermitClass::Read, "a", T0)
-        .await
-        .unwrap();
-    let kept = acquire_as(&c, &open, PermitClass::Read, "a", T0)
-        .await
-        .unwrap();
+    // nobody took can still be renewed late. `b` coming in on `p1` freed
+    // the expired slots of `p1` only.
     assert!(acquire_as(&c, &open, PermitClass::Read, "b", later)
         .await
         .is_some());
@@ -903,6 +907,54 @@ async fn without_max_ips_only_connections_count() {
     assert_eq!((load.held, load.holders), (4, 4));
 }
 
+/// A read's slot lives 30 s and a job's 120 s, from the take and from
+/// every renewal. The renewal goes by what the slot was taken for, not
+/// by who asks: a read that is cut off holds its address for 30 s.
+#[tokio::test]
+async fn a_slot_lives_as_long_as_its_class() {
+    assert_eq!(
+        i64::from(PermitClass::Read.permit_secs()) * 1000,
+        READ_TTL_MS
+    );
+    assert_eq!(
+        i64::from(PermitClass::Background.permit_secs()) * 1000,
+        TTL_MS
+    );
+    let c = catalog();
+    let p = provider("p1", 2);
+    let read = acquire_as(&c, &p, PermitClass::Read, "get", T0)
+        .await
+        .unwrap();
+    let job = acquire_as(&c, &p, PermitClass::Background, "job", T0)
+        .await
+        .unwrap();
+    assert_eq!(
+        (read.class, job.class),
+        (PermitClass::Read, PermitClass::Background)
+    );
+    let live = |at: UnixMs| {
+        let c = &c;
+        async move { live_slots(c, "p1", at).await.len() }
+    };
+    assert_eq!(live(T0.plus_ms(READ_TTL_MS)).await, 2);
+    assert_eq!(live(T0.plus_ms(READ_TTL_MS + 1)).await, 1);
+    assert_eq!(live(T0.plus_ms(TTL_MS)).await, 1);
+    assert_eq!(live(T0.plus_ms(TTL_MS + 1)).await, 0);
+
+    // Renewed, each lives its own time from the renewal.
+    let t1 = T0.plus_ms(10_000);
+    assert!(c.renew_permit(&read, t1).await.unwrap());
+    assert!(c.renew_permit(&job, t1).await.unwrap());
+    assert_eq!(live(t1.plus_ms(READ_TTL_MS)).await, 2);
+    assert_eq!(live(t1.plus_ms(READ_TTL_MS + 1)).await, 1);
+    assert_eq!(live(t1.plus_ms(TTL_MS)).await, 1);
+    assert_eq!(live(t1.plus_ms(TTL_MS + 1)).await, 0);
+    // The read's slot is gone by the time the job's can still be kept.
+    let t2 = t1.plus_ms(READ_TTL_MS + 1);
+    assert!(!c.renew_permit(&read, t2).await.unwrap());
+    assert!(c.renew_permit(&job, t2).await.unwrap());
+}
+
 /// The load snapshot counts the holders of live slots, each once.
 #[tokio::test]
 async fn provider_load_counts_live_holders() {
@@ -926,16 +978,21 @@ async fn provider_load_counts_live_holders() {
     assert_eq!(load.background_holders, 1);
 
     c.release_permit(&b).await.unwrap();
-    let later = T0.plus_ms(60_000);
+    let later = T0.plus_ms(20_000);
     assert!(c.renew_permit(&a, later).await.unwrap());
     let load = load_of(&c, "p1", later).await.unwrap();
     assert_eq!((load.held, load.holders), (3, 2));
-    // Expired slots have no holder.
-    let expired = T0.plus_ms(TTL_MS + 1);
+    // Expired slots have no holder: the read slot that was not renewed
+    // goes first, then the renewed one, then the job's.
+    let load = load_of(&c, "p1", T0.plus_ms(READ_TTL_MS + 1))
+        .await
+        .unwrap();
+    assert_eq!((load.held, load.holders), (2, 2));
+    let expired = later.plus_ms(READ_TTL_MS + 1);
     let load = load_of(&c, "p1", expired).await.unwrap();
     assert_eq!((load.held, load.holders), (1, 1));
-    assert_eq!(load.background_holders, 0);
-    let load = load_of(&c, "p1", later.plus_ms(TTL_MS + 1)).await.unwrap();
+    assert_eq!(load.background_holders, 1);
+    let load = load_of(&c, "p1", T0.plus_ms(TTL_MS + 1)).await.unwrap();
     assert_eq!((load.held, load.holders), (0, 0));
 }
 

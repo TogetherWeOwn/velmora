@@ -21,8 +21,8 @@ use std::time::Duration;
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
 use velmora_bridge::{
-    BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, ProviderConfig, Result,
-    NNTP_CALL_SECS,
+    BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
+    Result,
 };
 
 /// Largest article the bridge reads or posts (velmora articles are about
@@ -43,10 +43,13 @@ type Socket = native::NoSocket;
 /// which poisons its session, and ends as a timed-out transport error:
 /// the caller reconnects and looks the article up before sending again.
 #[cfg(target_arch = "wasm32")]
-async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+async fn within_call<T>(
+    secs: u32,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     use futures_util::future::{select, Either};
     let call = std::pin::pin!(call);
-    let limit = Duration::from_secs(u64::from(NNTP_CALL_SECS));
+    let limit = Duration::from_secs(u64::from(secs));
     let delay = std::pin::pin!(worker::Delay::from(limit));
     match select(call, delay).await {
         Either::Left((out, _)) => out,
@@ -59,22 +62,26 @@ async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> R
 
 /// Native builds open no socket, so there is nothing to bound.
 #[cfg(not(target_arch = "wasm32"))]
-async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    let _ = NNTP_CALL_SECS;
+async fn within_call<T>(
+    _secs: u32,
+    call: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     call.await
 }
 
-/// One authenticated session. A thin wrapper: the port is foreign to this
-/// crate, so it cannot be implemented on `NntpClient` here.
-pub struct WorkerSession(NntpClient<Socket>);
+/// One authenticated session, and the class of the permit it was opened
+/// under, which bounds its calls. A thin wrapper: the port is foreign to
+/// this crate, so it cannot be implemented on `NntpClient` here.
+pub struct WorkerSession(NntpClient<Socket>, PermitClass);
 
 impl NntpSession for WorkerSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
-        within_call(async { Ok(self.0.post_article(message_id, article).await?) }).await
+        let call = async { Ok(self.0.post_article(message_id, article).await?) };
+        within_call(self.1.call_secs(), call).await
     }
 
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
-        within_call(async {
+        within_call(self.1.call_secs(), async {
             match self.0.stat(message_id).await {
                 Ok(_) => Ok(true),
                 Err(velmora::Error::ArticleNotFound(_)) => Ok(false),
@@ -85,7 +92,7 @@ impl NntpSession for WorkerSession {
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
-        within_call(async {
+        within_call(self.1.call_secs(), async {
             match self.0.body_to(message_id, out).await {
                 Ok(()) => Ok(BodyOutcome::Found),
                 Err(velmora::Error::ArticleNotFound(_)) => Ok(BodyOutcome::Missing),
@@ -97,7 +104,7 @@ impl NntpSession for WorkerSession {
 
     async fn quit(self) {
         // A goodbye nobody answers must not hold the job either.
-        let _ = within_call(async {
+        let _ = within_call(self.1.quit_secs(), async {
             self.0.quit().await;
             Ok(())
         })
@@ -122,7 +129,14 @@ impl NntpConnector for WorkerConnector {
         }
         let cfg = nntp_config(provider)?;
         let socket = open(&cfg)?;
-        within_call(async { Ok(WorkerSession(NntpClient::connect(socket, &cfg).await?)) }).await
+        let class = permit.class;
+        within_call(class.call_secs(), async {
+            Ok(WorkerSession(
+                NntpClient::connect(socket, &cfg).await?,
+                class,
+            ))
+        })
+        .await
     }
 }
 

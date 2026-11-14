@@ -26,7 +26,7 @@ use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
-pub use velmora_bridge::{LEASE_SECS, PERMIT_SECS};
+pub use velmora_bridge::LEASE_SECS;
 pub const USER: &str = "testuser";
 pub const PASS: &str = "testpass";
 
@@ -68,7 +68,8 @@ fn end(slow: &RefCell<Option<Slow>>) {
 }
 
 impl TcpConnector {
-    /// From now on every connect, lookup and POST takes `ms` on `clock`.
+    /// From now on every connect, lookup, read and POST takes `ms` on
+    /// `clock`.
     pub fn slow(&self, clock: &FixedClock, ms: i64) {
         *self.slow.borrow_mut() = Some(Slow {
             clock: clock.clone(),
@@ -161,7 +162,10 @@ impl NntpSession for CountedSession {
         found
     }
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
-        NntpSession::body(self.client(), message_id, out).await
+        begin(&self.slow, "body");
+        let found = NntpSession::body(self.client(), message_id, out).await;
+        end(&self.slow);
+        found
     }
     async fn quit(mut self) {
         if let Some(client) = self.inner.take() {
@@ -258,6 +262,8 @@ pub struct MemCatalog {
     pub renewals: Cell<u32>,
     /// The time of each `renew_all`.
     pub renewed_at: RefCell<Vec<UnixMs>>,
+    /// The time of each permit renewal that held.
+    pub permit_renewed_at: RefCell<Vec<UnixMs>>,
     /// `mark_posted_many` calls so far.
     pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
@@ -681,7 +687,7 @@ impl Catalog for MemCatalog {
             return Ok(None);
         };
         slots[i].token += 1;
-        slots[i].until = now.plus_secs(PERMIT_SECS).0;
+        slots[i].until = now.plus_secs(class.permit_secs()).0;
         slots[i].pool.clone_from(&p.pool);
         slots[i].holder = holder.to_string();
         slots[i].background = background;
@@ -704,6 +710,7 @@ impl Catalog for MemCatalog {
             provider: p.id.clone(),
             slot: i as u32,
             token: slots[i].token,
+            class,
         }))
     }
 
@@ -774,11 +781,17 @@ impl Catalog for MemCatalog {
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
-        // A freed slot is not extended, as in `sql::permits`.
-        if slot.token != p.token || slot.until == 0 {
+        // A freed or expired slot is not extended, as in `sql::permits`.
+        if slot.token != p.token || slot.until < now.0 {
             return Ok(false);
         }
-        slot.until = now.plus_secs(PERMIT_SECS).0;
+        self.permit_renewed_at.borrow_mut().push(now);
+        // By the class the slot was taken for, as in `sql::permits`.
+        let class = match slot.background {
+            true => PermitClass::Background,
+            false => PermitClass::Read,
+        };
+        slot.until = now.plus_secs(class.permit_secs()).0;
         Ok(true)
     }
 

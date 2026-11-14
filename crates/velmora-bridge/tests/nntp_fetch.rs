@@ -192,6 +192,52 @@ async fn cold_read_without_a_slot_is_busy() {
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
 }
 
+/// A read renews its slot before it connects and again before the first
+/// `BODY` on the new connection: every call to the provider starts on a
+/// slot renewed at that moment, so a slot is never counted on for more
+/// than one call. A read's slot lives only a little longer than that.
+#[tokio::test]
+async fn a_read_renews_its_slot_after_connecting() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted_cold(8).await;
+    assert!(plan.len() > 1);
+    let call_ms = 15_000;
+    assert!(call_ms / 1000 <= i64::from(PermitClass::Read.call_secs()));
+    rig.bridge.nntp.slow(&rig.bridge.clock, call_ms);
+    rig.bridge.catalog.permit_renewed_at.borrow_mut().clear();
+
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    let calls = rig.bridge.nntp.calls();
+    let renewed = rig.bridge.catalog.permit_renewed_at.borrow().clone();
+    assert_eq!(calls[0].0, "connect");
+    assert_eq!(calls[1].0, "body");
+    assert_eq!(calls[1].1, calls[0].1.plus_ms(call_ms));
+    assert_eq!(calls.len(), 1 + plan.len());
+    for (what, at) in &calls {
+        assert!(renewed.contains(at), "{what} at {at:?} on a stale slot");
+    }
+}
+
+/// A slot that ran out while the read was connecting is not used: the
+/// new connection is dropped without a `BODY`, and the caller is told to
+/// come back.
+#[tokio::test]
+async fn a_read_that_lost_its_slot_while_connecting_reads_nothing() {
+    let rig = simple_rig().await;
+    let (s, _) = rig.posted_cold(9).await;
+    let stall = i64::from(PermitClass::Read.permit_secs()) * 1000 + 1;
+    rig.bridge.nntp.slow(&rig.bridge.clock, stall);
+
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Busy);
+    let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["connect"]);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    assert_eq!(rig.cached(&s), None);
+
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
 /// Overlapping cold reads never hold more connections than the provider
 /// allows; reads may use every slot.
 #[tokio::test]

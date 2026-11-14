@@ -130,8 +130,20 @@ pub trait NntpSession {
 /// that no call outlasts the lease and the permit it started under.
 pub const NNTP_CALL_SECS: u32 = 80;
 
+/// The same bound under a permit of a read ([`PermitClass::Read`]): a
+/// cold read gives a `connect` or a `body` up after this long. It is
+/// short so that the permit can be ([`READ_PERMIT_SECS`]). One article
+/// in this time is about 40 KB/s; a provider slower than that fails the
+/// call, and the read goes on to the next one.
+pub const READ_CALL_SECS: u32 = 20;
+
+/// The longest a `quit` may take under a permit of a read: the goodbye
+/// comes after the last renewal, so it counts against the permit too.
+pub const READ_QUIT_SECS: u32 = 5;
+
 /// Opens sessions. No permit, no socket. A `connect` ends within
-/// [`NNTP_CALL_SECS`], and so does every call on its sessions.
+/// [`PermitClass::call_secs`] of the permit's class, and so does every
+/// call on its sessions; a `quit` ends within [`PermitClass::quit_secs`].
 pub trait NntpConnector {
     type Session: NntpSession;
     async fn connect(&self, provider: &ProviderConfig, permit: &Permit) -> Result<Self::Session>;
@@ -180,8 +192,19 @@ pub struct UploadTarget<'a> {
 /// lease it last renewed is still safe from a takeover.
 pub const LEASE_SECS: u32 = 600;
 
-/// How long an acquired or renewed provider permit holds its slot.
+/// How long an acquired or renewed provider permit of a background job
+/// holds its slot.
 pub const PERMIT_SECS: u32 = 120;
+
+/// How long an acquired or renewed permit of a read holds its slot. A
+/// read whose client went away is dropped where it waits and releases
+/// nothing, so this is how long its slot, and its source address, stay
+/// taken. A read renews before every `connect` and every `body`, so the
+/// permit has to outlast one such call and the `quit` after the last.
+pub const READ_PERMIT_SECS: u32 = 30;
+// The margin is for the catalogue round trips in between.
+const _: () = assert!(READ_PERMIT_SECS >= READ_CALL_SECS + READ_QUIT_SECS + 5);
+const _: () = assert!(READ_CALL_SECS <= NNTP_CALL_SECS && READ_PERMIT_SECS <= PERMIT_SECS);
 
 /// A claimed outbox row. Every later mutation carries it and writes only
 /// while `token` still matches.
@@ -204,6 +227,9 @@ pub struct Permit {
     pub provider: String,
     pub slot: u32,
     pub token: u64,
+    /// The class it was acquired for: how long it holds the slot, and
+    /// how long a call under it may take.
+    pub class: PermitClass,
 }
 
 /// Background jobs leave `READ_RESERVE` slots for cold GETs.
@@ -211,6 +237,34 @@ pub struct Permit {
 pub enum PermitClass {
     Background,
     Read,
+}
+
+impl PermitClass {
+    /// How long a permit of this class holds its slot after an acquire
+    /// or a renewal.
+    pub const fn permit_secs(self) -> u32 {
+        match self {
+            PermitClass::Background => PERMIT_SECS,
+            PermitClass::Read => READ_PERMIT_SECS,
+        }
+    }
+
+    /// The longest one `connect`, `post`, `stat` or `body` may take
+    /// under a permit of this class.
+    pub const fn call_secs(self) -> u32 {
+        match self {
+            PermitClass::Background => NNTP_CALL_SECS,
+            PermitClass::Read => READ_CALL_SECS,
+        }
+    }
+
+    /// The longest a `quit` may take under a permit of this class.
+    pub const fn quit_secs(self) -> u32 {
+        match self {
+            PermitClass::Background => NNTP_CALL_SECS,
+            PermitClass::Read => READ_QUIT_SECS,
+        }
+    }
 }
 
 /// Outcome of a guarded batch.

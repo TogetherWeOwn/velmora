@@ -32,19 +32,33 @@
 //! slot that had expired by the time another holder was let in, and put
 //! a holder too many on the provider. A freed slot cannot be renewed.
 //!
-//! A holder that goes away without releasing (a crash; a cold read whose
-//! client hung up, whose future is dropped where it waits and cannot
-//! release) keeps its slots and its address until they expire, up to
-//! [`PERMIT_SECS`]. On a provider with one address that keeps every
-//! other caller out for that long.
+//! # Lifetimes
+//!
+//! A slot lives as long as its class says ([`PermitClass::permit_secs`]),
+//! from the acquire and from every renewal: a background job's
+//! [`PERMIT_SECS`](crate::ports::PERMIT_SECS), a read's much shorter
+//! [`READ_PERMIT_SECS`](crate::ports::READ_PERMIT_SECS). The renewal
+//! takes the class from the row.
+//!
+//! A holder that goes away without releasing keeps its slots and its
+//! address until they expire. A crashed job is one case. A cold read
+//! whose client hung up is the other: the first piece of a response is
+//! read while the request is kept alive, so it finishes and releases,
+//! but the later pieces are read as the body is pulled, and their
+//! future is dropped where it waits and cannot release. That is why a
+//! read's slot is short-lived: on a provider with one address a dropped
+//! read keeps every other caller out for that long and no longer.
 
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
-use crate::ports::{Permit, PermitClass, Sql, SqlValue, PERMIT_SECS};
+use crate::ports::{Permit, PermitClass, Sql, SqlValue};
 use crate::types::{ProviderConfig, Result, UnixMs};
 
-/// Permit lifetime; holders renew on a timer or before each article.
-const PERMIT_TTL_MS: i64 = PERMIT_SECS as i64 * 1000;
+/// Permit lifetime of a class; holders renew on a timer or before each
+/// call to the provider.
+const fn ttl_ms(class: PermitClass) -> i64 {
+    class.permit_secs() as i64 * 1000
+}
 
 /// Slots of a pool that background jobs leave free for cold reads.
 fn read_reserve(max: u32) -> u32 {
@@ -149,7 +163,7 @@ pub(super) async fn acquire_permit<S: Sql>(
     let params = [
         text(&p.id),
         text(holder),
-        ms(now.plus_ms(PERMIT_TTL_MS)),
+        ms(now.plus_ms(ttl_ms(class))),
         SqlValue::Int(i64::from(conns)),
         ms(now),
         pool,
@@ -173,6 +187,7 @@ pub(super) async fn acquire_permit<S: Sql>(
                 provider: p.id.clone(),
                 slot: r.num()?,
                 token: r.num()?,
+                class,
             }));
         }
         if attempt == 1 || seed(c, p).await? == 0 {
@@ -215,12 +230,19 @@ pub(super) async fn renew_permit<S: Sql>(
     Ok(c.sql.exec(sql, &params).await? > 0)
 }
 
-/// The renewal of one permit as a statement, for batches.
+/// The renewal of one permit as a statement, for batches. The slot is
+/// extended by the lifetime of the class it was taken for, which the row
+/// records: a read cannot renew itself into the long lifetime of a job.
 pub(super) fn renew_stmt(p: &Permit, now: UnixMs) -> Result<super::uploads::Stmt> {
     let mut params = permit_params(p)?;
-    params.extend([ms(now.plus_ms(PERMIT_TTL_MS)), ms(now)]);
+    params.extend([
+        SqlValue::Int(ttl_ms(PermitClass::Background)),
+        ms(now),
+        SqlValue::Int(ttl_ms(PermitClass::Read)),
+    ]);
     Ok((
-        "UPDATE provider_permits SET lease_until = ?4 \
+        "UPDATE provider_permits \
+         SET lease_until = ?5 + CASE background WHEN 1 THEN ?4 ELSE ?6 END \
          WHERE provider_id = ?1 AND slot = ?2 AND token = ?3 AND lease_until >= ?5",
         params,
     ))

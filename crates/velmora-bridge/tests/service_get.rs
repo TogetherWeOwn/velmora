@@ -1083,7 +1083,9 @@ async fn each_extent_of_a_stream_gets_its_own_wait() {
             .await;
         evict(rig, extent).await;
     }
-    let _held = hold_all_slots(rig).await;
+    // The readers that hold the slots are at work all the while: they
+    // renew, as a read does before every call to the provider.
+    let held = hold_all_slots(rig).await;
 
     // Another reader's fill of extent i lands in the cache once 20 s
     // (first) and 40 s (second) have passed since the GET began.
@@ -1103,7 +1105,12 @@ async fn each_extent_of_a_stream_gets_its_own_wait() {
             .map(|(_, e, b)| (e.clone(), b.clone()))
             .collect();
         let bucket = bucket.clone();
+        let held = held.clone();
         Box::pin(async move {
+            for permit in &held {
+                let now = bridge.clock.now();
+                assert!(bridge.catalog.renew_permit(permit, now).await.unwrap());
+            }
             for (extent, blob) in due {
                 let meta = BlobMeta {
                     bucket: &bucket,

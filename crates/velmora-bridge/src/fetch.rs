@@ -177,6 +177,12 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         self.session.as_mut().ok_or(Stop::fail(FailClass::Internal))
     }
 
+    /// Whether a session is open: `false` = the next
+    /// [`session`](Self::session) connects first.
+    pub(crate) fn connected(&self) -> bool {
+        self.session.is_some()
+    }
+
     /// The slot this session holds.
     pub(crate) fn permit(&self) -> &Permit {
         &self.permit
@@ -279,8 +285,12 @@ fn check_payload(row: &ArticleRow, wire: &[u8]) -> Checked {
 
 /// One `BODY`, checked. A `430` leaves the session in use. Any session
 /// error drops the session and resumes at the same message-id on a new
-/// one, while `reconnects` lasts; the lease and the permit are renewed
-/// before each reconnect.
+/// one, while `reconnects` lasts.
+///
+/// The lease and the permit are renewed before each connect and again
+/// after it, before the `BODY`: each of the two may take a whole call
+/// ([`PermitClass::call_secs`]), and a permit is not counted on for more
+/// than one call past its last renewal.
 async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
     lease: Option<&Lease>,
@@ -290,10 +300,22 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
 ) -> core::result::Result<Checked, Stop> {
     loop {
         wire.clear();
-        let result = match session.session().await {
-            Ok(s) => s.body(&row.message_id, wire).await,
+        let fresh = !session.connected();
+        let connected = match session.session().await {
+            Ok(_) => Ok(()),
             Err(Stop::Session(e)) => Err(e),
             Err(stop) => return Err(stop),
+        };
+        if fresh && connected.is_ok() {
+            session.keep(lease).await?;
+        }
+        let result = match connected {
+            Ok(()) => match session.session().await {
+                Ok(s) => s.body(&row.message_id, wire).await,
+                Err(Stop::Session(e)) => Err(e),
+                Err(stop) => return Err(stop),
+            },
+            Err(e) => Err(e),
         };
         let err = match result {
             Ok(found) => {
