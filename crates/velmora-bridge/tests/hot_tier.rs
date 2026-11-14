@@ -1101,6 +1101,22 @@ async fn an_uncounted_cache_blob_is_evicted_or_counted_again() {
     assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), cipher);
     assert!(!hot.has_cache(&both) && !hot.has_safety(&both));
 
+    // The other way round: a safety copy that is not counted, beside a
+    // counted cache fill. It goes too.
+    let stray = hot.released("stray").await;
+    hot.uncounted_fill(&stray).await;
+    let catalog = &hot.bridge().catalog;
+    let now = hot.rig.now();
+    catalog.record_cache_fill(&stray.id, now).await.unwrap();
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+        &stray,
+    );
+    assert!(hot.has_safety(&stray));
+    assert_eq!(hot.evictable().await, cipher);
+    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), cipher);
+    assert!(!hot.has_cache(&stray) && !hot.has_safety(&stray));
+
     // Alone, with nothing counted: no eviction lists the extent.
     let alone = hot.released("alone").await;
     hot.uncounted_fill(&alone).await;
@@ -1628,4 +1644,30 @@ async fn admin_evict_of_a_held_extent_ends_its_counts() {
     assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(0));
     assert_eq!(hot.stats().await, HotStats::default());
     hot.get_ok("young").await;
+}
+
+/// A job that lists a pinned extent as not pinned is refused even when
+/// it claims the cache fill alone: granted, it would go on to delete the
+/// safety copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_extent_is_never_granted_as_unpinned() {
+    let hot = hot_with(|cfg| cfg.hot_cap_bytes = u64::MAX / 4).await;
+    let x = hot.put("probe").await;
+    let catalog = &hot.bridge().catalog;
+    let now = hot.rig.now();
+    hot.uncounted_fill(&x).await;
+    catalog.record_cache_fill(&x.id, now).await.unwrap();
+    assert_eq!(hot.text(&x, "safety_state"), "held");
+
+    let wrong = EvictCandidate {
+        pinned: false,
+        ..hot.as_candidate(&x, 0)
+    };
+    let seq = hot.num(&x, "evict_seq");
+    assert!(!catalog.begin_evict(&wrong).await.unwrap());
+    assert_eq!(hot.num(&x, "evict_seq"), seq);
+    // Listed truthfully, the cache fill alone is granted.
+    let right = hot.as_candidate(&x, 0);
+    assert!(right.pinned);
+    assert!(catalog.begin_evict(&right).await.unwrap());
 }

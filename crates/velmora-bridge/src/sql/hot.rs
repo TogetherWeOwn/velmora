@@ -25,10 +25,14 @@
 //! Every statement that changes `safety_state` bumps the sequence too, so
 //! a listing never survives a state change.
 //!
-//! The counts are a lower bound that repairs itself, in both directions:
-//! - counted but already gone (a delete raced a fill, or the bucket's
-//!   lifecycle rule expired the blob): the next eviction of the extent
-//!   zeroes the count;
+//! The counts are not exact, and they are not a bound in either
+//! direction. Each error is limited to one extent's bytes and repairs
+//! itself:
+//! - counted but already gone (a delete raced a fill, the bucket's
+//!   lifecycle rule expired the blob, or a read that was served from the
+//!   cache blob counted it with `touch_read` after an eviction of the
+//!   same extent had finished and deleted it): the next eviction of the
+//!   extent zeroes the count;
 //! - a cache blob that exists but is not counted (written before these
 //!   columns existed, or by a request that was cancelled between its
 //!   write and its second count while an eviction or a garbage

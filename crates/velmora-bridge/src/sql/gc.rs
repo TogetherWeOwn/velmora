@@ -106,9 +106,11 @@ pub(super) async fn gc_begin<S: Sql>(
                 // The cache fill stops being counted before its blob is
                 // deleted, never after: a cold read that fills the cache
                 // while this delete runs records its copy after this
-                // statement, so the copy stays counted. (A count left for
-                // a blob that the delete then removed is corrected by the
-                // next eviction.)
+                // statement, so the copy stays counted. It is this order
+                // that protects the fill, not the sequence. (A count left
+                // for a blob that the delete then removed is corrected by
+                // the next eviction.) The sequence is bumped only so that
+                // every change to the counts ends outstanding listings.
                 c.sql
                     .exec(
                         "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
