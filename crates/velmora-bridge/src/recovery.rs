@@ -51,8 +51,8 @@ use velmora::rng::SystemRng;
 use crate::crypto::{open_manifest, seal_manifest};
 use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow, ExtentState,
-    GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow,
+    ExtentState, GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
 };
 
 /// Every recovery record lives under this prefix.
@@ -303,6 +303,13 @@ pub struct ArticleRecord {
     pub cipher_len: u64,
     #[serde(with = "b64")]
     pub payload_sha256: Vec<u8>,
+    /// The article's own yEnc name (a standalone single-part article).
+    /// Absent in a record of a row planned before standalone articles,
+    /// and left out when the row has none, so such a record is the same
+    /// bytes as before and a replayed row reposts in the form it was
+    /// posted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yenc_name: Option<String>,
 }
 
 /// `m/art/<extent_id>`: where the extent's ciphertext is on Usenet.
@@ -453,6 +460,7 @@ impl ArticleManifest {
                     cipher_offset: a.cipher_offset,
                     cipher_len: a.cipher_len,
                     payload_sha256: a.payload_sha256.to_vec(),
+                    yenc_name: a.yenc_name.clone(),
                 })
                 .collect(),
         }
@@ -472,6 +480,13 @@ impl ArticleManifest {
                     cipher_offset: a.cipher_offset,
                     cipher_len: a.cipher_len,
                     payload_sha256: digest(&a.payload_sha256)?,
+                    // The catalogue would refuse any other name, and a
+                    // replay's insert skips a refused row without a word:
+                    // such a record is unreadable instead.
+                    yenc_name: match &a.yenc_name {
+                        Some(name) if !valid_yenc_name(name) => return Err(ERR_RECORD),
+                        name => name.clone(),
+                    },
                     state,
                     provider_id: None,
                     posted_at: None,

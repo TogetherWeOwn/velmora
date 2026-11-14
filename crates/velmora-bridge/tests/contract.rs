@@ -917,6 +917,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         cipher_offset: 0,
         cipher_len: 69,
         payload_sha256: [0; 32],
+        yenc_name: Some("k3v9q0zx7m2a".into()),
         state: ArticleState::Planned,
         provider_id: None,
         posted_at: None,

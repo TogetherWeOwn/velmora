@@ -670,9 +670,29 @@ pub struct ArticleRow {
     pub cipher_len: u64,
     /// SHA-256 of the decoded article payload.
     pub payload_sha256: [u8; 32],
+    /// The article's own random yEnc name: it is posted as one standalone
+    /// single-part yEnc file. `None` is a row planned before standalone
+    /// articles, posted (and reposted) in the multi-part form under a name
+    /// taken from the message-id. See `post::render_article`.
+    pub yenc_name: Option<String>,
     pub state: ArticleState,
     pub provider_id: Option<String>,
     pub posted_at: Option<UnixMs>,
+}
+
+/// Longest yEnc name an article row may carry (the catalogue's CHECK).
+pub const MAX_YENC_NAME_LEN: usize = 64;
+
+/// A stored yEnc name is 1 to [`MAX_YENC_NAME_LEN`] lowercase ASCII
+/// letters and digits, as the `articles.yenc_name` CHECK requires. The
+/// post stage renders only such a name, and a plan record with any other
+/// is not read.
+pub fn valid_yenc_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_YENC_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
 }
 
 /// `verifications` row.

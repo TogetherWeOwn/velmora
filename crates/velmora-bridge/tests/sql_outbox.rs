@@ -236,6 +236,9 @@ impl Fx {
                 cipher_offset: u64::from(idx) * 100,
                 cipher_len: 100,
                 payload_sha256: [idx as u8; 32],
+                // Both forms: a standalone article and an older
+                // multi-part one, which has no name of its own.
+                yenc_name: (idx % 2 == 0).then(|| format!("{idx}name")),
                 state: ArticleState::Planned,
                 provider_id: None,
                 posted_at: None,
@@ -635,6 +638,19 @@ async fn plan_articles_is_all_or_nothing_and_chunk_free() {
         fx.cat.plan_articles(&lease, &dup).await,
         Err(BridgeError::Sql(_))
     ));
+    // So does a yEnc name the schema refuses (empty, too long, or not
+    // lowercase alphanumeric).
+    for name in ["", "Upper", "has space", &"x".repeat(65)] {
+        let mut named = fx.plan(&o, "n", 3);
+        named[2].yenc_name = Some(name.to_string());
+        assert!(
+            matches!(
+                fx.cat.plan_articles(&lease, &named).await,
+                Err(BridgeError::Sql(_))
+            ),
+            "{name:?}"
+        );
+    }
     assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
     assert_eq!(
         fx.count("SELECT COUNT(*) FROM extents WHERE article_count IS NOT NULL")
