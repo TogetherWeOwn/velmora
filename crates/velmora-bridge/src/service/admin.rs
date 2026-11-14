@@ -411,7 +411,19 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                 .catalog
                 .restore_begin(from, bridge.clock.now())
                 .await
-                .or_internal()?;
+                .or_internal()?
+                .map_err(|unfinished| {
+                    // The catalogue holds the records up to that point
+                    // at most, whatever was restored since.
+                    json_response(
+                        409,
+                        &json!({
+                            "error": "OperationAborted",
+                            "message": "A replay from an earlier restore point is not finished. Start no later than it: send the since_ms of unfinished_since_ms with margin_ms 0, or an earlier since_ms.",
+                            "unfinished_since_ms": unfinished.0,
+                        }),
+                    )
+                })?;
             ReplayCursor {
                 run_ms: run.0,
                 ..ReplayCursor::start(from)
@@ -433,12 +445,26 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
         // last step of an older cursor must not open the catalogue for
         // writes while a replay that was started after it still runs.
         None => {
+            let rolled_back = || {
+                fail(
+                    409,
+                    "OperationAborted",
+                    "The catalogue was rolled back after this replay started. Start a new replay with since_ms.",
+                )
+            };
+            // Not if the catalogue is behind a stamp that was raised
+            // after this replay started: it was rolled back since, and
+            // this replay does not hold what was written before that.
+            let stamp = bridge
+                .stamp_level(run)
+                .await
+                .or_internal()?
+                .ok_or_else(rolled_back)?;
             // The catalogue holds every record again: its stamp counter
             // is brought level with the newest stamp object.
-            let stamp = bridge.stamp_top().await.or_internal()?;
             if !bridge
                 .catalog
-                .restore_finish(run, bridge.clock.now(), stamp)
+                .restore_finish(run, bridge.clock.now(), stamp, &bridge.cfg.catalogue_id)
                 .await
                 .or_internal()?
             {
@@ -447,12 +473,8 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             // The last step of a replay that had ended before, sent
             // again: it changed nothing. If the catalogue was rolled
             // back since, that replay does not cover it.
-            if bridge.catalog.stamp().await.or_internal()?.rolled_back {
-                return Err(fail(
-                    409,
-                    "OperationAborted",
-                    "The catalogue was rolled back after this replay ended. Start a new replay with since_ms.",
-                ));
+            if bridge.stamp_row().await.or_internal()?.rolled_back {
+                return Err(rolled_back());
             }
         }
     }
@@ -992,7 +1014,13 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
     let replaying = bridge.catalog.restore_pending().await.or_internal()?;
-    let stamp = bridge.catalog.stamp().await.or_internal()?;
+    // A stamp row of another catalogue id is said, not failed on: this
+    // is where the operator looks for it.
+    let (rolled_back, id_mismatch) = match bridge.stamp_row().await {
+        Ok(row) => (Some(row.rolled_back), false),
+        Err(e) if crate::stamp::is_catalogue_id_error(&e) => (None, true),
+        Err(e) => return Err(internal(&e)),
+    };
     let now = bridge.clock.now();
     let load = bridge.catalog.provider_load(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
@@ -1043,7 +1071,11 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         // A replay was started and did not end, or the catalogue was
         // found behind its rollback stamp: writes are refused.
         "replay_unfinished": replaying,
-        "catalogue_rolled_back": stamp.rolled_back,
+        // `null` = not known: see `catalogue_id_mismatch`.
+        "catalogue_rolled_back": rolled_back,
+        // `CATALOGUE_ID` is not the id this catalogue's stamp was raised
+        // under: no stamp is raised and no job runs until it is put right.
+        "catalogue_id_mismatch": id_mismatch,
         "gc_mode": match cfg.gc_mode {
             crate::config::GcMode::Off => "off",
             crate::config::GcMode::Disposable => "disposable",

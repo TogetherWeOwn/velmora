@@ -80,12 +80,32 @@ fn stamps(rig: &Rig) -> Vec<String> {
 }
 
 async fn row(rig: &Rig) -> StampRow {
-    rig.bridge.catalog.stamp().await.unwrap()
+    rig.bridge.catalog.stamp("main").await.unwrap()
 }
 
 /// The raise found the catalogue behind its stamp.
 fn refused(raised: Result<()>) -> bool {
     matches!(raised, Err(BridgeError::Invalid(why)) if ERR_ROLLED_BACK.to_string().contains(why))
+}
+
+fn behind(counter: u64) -> StampRow {
+    StampRow {
+        counter: Some(counter),
+        rolled_back: true,
+    }
+}
+
+/// Puts a stamp object as a raise would.
+async fn put_stamp(rig: &Rig, counter: u64) {
+    let bucket = BucketId::new("-");
+    let body = rig.now().0.to_string().into_bytes();
+    let meta = BlobMeta {
+        bucket: &bucket,
+        extent: &ExtentId::new("rollback-stamp"),
+        cipher_sha256: &sha256(&body),
+    };
+    let key = stamp_key("main", counter);
+    rig.bridge.safety.put(&key, body, &meta).await.unwrap();
 }
 
 fn level(counter: u64) -> StampRow {
@@ -133,8 +153,16 @@ fn maintenance(rig: &mut Rig, mode: Maintenance) {
 
 /// Runs the restore route to its end. Returns the body of its last call.
 async fn restore(rig: &Rig) -> Value {
+    restore_with(rig, || ()).await
+}
+
+/// The same; `before_step` runs before every call that carries a cursor.
+async fn restore_with(rig: &Rig, before_step: impl Fn()) -> Value {
     let mut body = json!({ "since_ms": 0 });
     loop {
+        if body.get("cursor").is_some() {
+            before_step();
+        }
         let r = admin(rig, Method::Post, "/restore", body.to_string().as_bytes()).await;
         r.expect(200);
         let report: Value = serde_json::from_slice(&r.body).unwrap();
@@ -207,8 +235,18 @@ async fn the_bucket_is_never_ahead_of_the_catalogue() {
     assert_eq!(stamps(&rig).len(), 2);
 
     // A move from a value the counter has left changes nothing.
-    assert!(!rig.bridge.catalog.stamp_advance(Some(3)).await.unwrap());
-    assert!(!rig.bridge.catalog.stamp_advance(None).await.unwrap());
+    assert!(!rig
+        .bridge
+        .catalog
+        .stamp_advance(Some(3), "main")
+        .await
+        .unwrap());
+    assert!(!rig
+        .bridge
+        .catalog
+        .stamp_advance(None, "main")
+        .await
+        .unwrap());
     assert_eq!(row(&rig).await, level(4));
 
     // The stamps of another catalogue over the same bucket do not count.
@@ -308,7 +346,11 @@ where
     let safety = &rig.bridge.safety;
     safety.hold_list.set(true);
     let between = async {
+        // Bounded: a `checked` that makes no list call fails the test.
+        let mut turns = 0;
         while !safety.list_held.get() {
+            turns += 1;
+            assert!(turns < HOLD_TURNS, "no list call was made");
             tokio::task::yield_now().await;
         }
         between.await;
@@ -457,17 +499,34 @@ async fn a_replay_that_did_not_end_leaves_the_catalogue_closed() {
 
     // The end of an older replay does not make the stamp level.
     let catalog = &rig.bridge.catalog;
-    let old = catalog.restore_begin(UnixMs(0), rig.now()).await.unwrap();
-    let run = catalog.restore_begin(UnixMs(0), rig.now()).await.unwrap();
-    assert!(!catalog.restore_finish(old, rig.now(), 2).await.unwrap());
+    let old = catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap()
+        .unwrap();
+    let run = catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!catalog
+        .restore_finish(old, rig.now(), 2, "main")
+        .await
+        .unwrap());
     assert!(row(&rig).await.rolled_back);
     assert_eq!(row(&rig).await.counter, Some(1));
     rig.put(&signer, BUCKET, "b", b"b").await.expect(503);
 
     // The end of the one under way does, and never moves the counter down.
-    assert!(catalog.restore_finish(run, rig.now(), 2).await.unwrap());
+    assert!(catalog
+        .restore_finish(run, rig.now(), 2, "main")
+        .await
+        .unwrap());
     assert_eq!(row(&rig).await, level(2));
-    assert!(catalog.restore_finish(run, rig.now(), 1).await.unwrap());
+    assert!(catalog
+        .restore_finish(run, rig.now(), 1, "main")
+        .await
+        .unwrap());
     assert_eq!(row(&rig).await, level(2));
     rig.put(&signer, BUCKET, "b", b"b").await.expect(200);
 
@@ -524,6 +583,323 @@ async fn the_last_call_of_an_ended_replay_does_not_clear_a_later_rollback() {
     restore(&rig).await;
     assert!(!row(&rig).await.rolled_back);
     assert_eq!(get(&rig, &signer, "b").await.expect(200).body, b"b");
+}
+
+/// A replay ran, and the catalogue was later rolled back to a point
+/// where that replay had not ended yet. The rest of that replay reads
+/// none of the records written after it: its last call must not open
+/// the catalogue, and the tick says what happened.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rollback_into_a_replay_is_not_cleared_by_that_replay() {
+    let mut rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
+    rig.bridge.dispatch().await.unwrap();
+    rig.bridge.clock.advance_ms(1000);
+
+    // The snapshot that stays is the one before the last call.
+    maintenance(&mut rig, Maintenance::Restore);
+    let last = restore_with(&rig, || snapshot(&rig)).await;
+    assert!(last.get("cursor").is_some(), "{last}");
+    maintenance(&mut rig, Maintenance::Off);
+
+    rig.bridge.clock.advance_ms(1000);
+    rig.put(&signer, BUCKET, "b", b"b").await.expect(200);
+    rig.bridge.dispatch().await.unwrap();
+    rig.bridge.dispatch().await.unwrap();
+    assert_eq!(row(&rig).await, level(3));
+
+    let last = last.to_string();
+    for tick_first in [true, false] {
+        rollback(&rig);
+        rig.bridge.jobs.inner.take();
+        assert_eq!(row(&rig).await, level(1));
+        get(&rig, &signer, "b").await.expect(404);
+        if tick_first {
+            // The replay is on record as not ended, so the tick sends
+            // nothing. It still looks at the bucket.
+            let report = rig.bridge.dispatch().await.unwrap();
+            assert!(report.rolled_back && !report.permits_seeded);
+            assert!(rig.bridge.jobs.inner.sent().is_empty());
+            assert_eq!(row(&rig).await, behind(1));
+        }
+        maintenance(&mut rig, Maintenance::Restore);
+        let refused = admin(&rig, Method::Post, "/restore", last.as_bytes()).await;
+        refused.expect(409);
+        assert!(refused.text().contains("rolled back"), "{}", refused.text());
+        assert_eq!(row(&rig).await, behind(1), "tick first: {tick_first}");
+        maintenance(&mut rig, Maintenance::Off);
+        rig.put(&signer, BUCKET, "c", b"c").await.expect(503);
+        get(&rig, &signer, "b").await.expect(404);
+    }
+    maintenance(&mut rig, Maintenance::Restore);
+
+    // A new replay must not start later than the one that did not end.
+    let later = json!({ "since_ms": 5000, "margin_ms": 0 }).to_string();
+    let refused = admin(&rig, Method::Post, "/restore", later.as_bytes()).await;
+    refused.expect(409);
+    let said: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(said["unfinished_since_ms"], 0, "{said}");
+    admin(&rig, Method::Post, "/restore", last.as_bytes())
+        .await
+        .expect(409);
+
+    restore(&rig).await;
+    maintenance(&mut rig, Maintenance::Off);
+    assert_eq!(row(&rig).await, level(3));
+    assert_eq!(get(&rig, &signer, "b").await.expect(200).body, b"b");
+    rig.put(&signer, BUCKET, "c", b"c").await.expect(200);
+    assert!(!rig.bridge.dispatch().await.unwrap().rolled_back);
+    // Once a replay has ended, the next one starts where it is told to.
+    maintenance(&mut rig, Maintenance::Restore);
+    admin(&rig, Method::Post, "/restore", later.as_bytes())
+        .await
+        .expect(200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_end_of_a_replay_never_moves_the_counter_down() {
+    let mut rig = rig();
+    rig.bridge.raise_stamp().await.unwrap();
+    rig.bridge.raise_stamp().await.unwrap();
+    // Two values whose objects could not be put: the newest object is
+    // behind the counter.
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = Some(STAMP_PREFIX.to_string());
+    assert!(rig.bridge.raise_stamp().await.is_err());
+    assert!(rig.bridge.raise_stamp().await.is_err());
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+    assert_eq!(row(&rig).await, level(4));
+    assert_eq!(stamps(&rig).len(), 2);
+
+    maintenance(&mut rig, Maintenance::Restore);
+    restore(&rig).await;
+    assert_eq!(row(&rig).await, level(4));
+
+    // The same in the catalogue alone, for a replay that is under way.
+    let catalog = &rig.bridge.catalog;
+    let run = catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(catalog
+        .restore_finish(run, rig.now(), 1, "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, level(4));
+
+    // And a replay that has ended changes no stamp when it is ended
+    // again: a rollback found since stays on record.
+    sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = 1;");
+    assert!(catalog
+        .restore_finish(run, rig.now(), 9, "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, behind(4));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_newest_stamp_is_found_over_many_list_pages() {
+    let mut rig = rig();
+    rig.bridge.raise_stamp().await.unwrap();
+    snapshot(&rig);
+    for counter in 2..=1101 {
+        put_stamp(&rig, counter).await;
+    }
+    rollback(&rig);
+    assert!(rig.bridge.catalogue_rolled_back().await.unwrap());
+
+    maintenance(&mut rig, Maintenance::Restore);
+    restore(&rig).await;
+    assert_eq!(row(&rig).await, level(1101));
+    assert!(!rig.bridge.catalogue_rolled_back().await.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Checks that fail, and checks beside something else
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_tick_whose_check_fails_sends_no_job() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
+    rig.bridge.raise_stamp().await.unwrap();
+    rig.bridge.jobs.inner.take();
+    // The tick has something to send.
+    sql(&rig, "UPDATE outbox SET next_at = 0;");
+
+    // The bucket cannot be listed.
+    rig.bridge.safety.fail_list.set(true);
+    assert!(rig.bridge.dispatch().await.is_err());
+    rig.bridge.safety.fail_list.set(false);
+    assert!(rig.bridge.jobs.inner.sent().is_empty());
+
+    // The stamp row cannot be read; every other statement works.
+    let only_the_row = Some(("SELECT counter, rolled_back_at", 0));
+    *rig.bridge.catalog.sql.fail_matching.borrow_mut() = only_the_row;
+    assert!(!rig.bridge.catalog.restore_pending().await.unwrap());
+    assert!(rig.bridge.dispatch().await.is_err());
+    *rig.bridge.catalog.sql.fail_matching.borrow_mut() = None;
+    assert!(rig.bridge.jobs.inner.sent().is_empty());
+    assert_eq!(row(&rig).await, level(1));
+
+    let report = rig.bridge.dispatch().await.unwrap();
+    assert!(report.enqueued > 0, "the tick had nothing to send");
+    assert!(!rig.bridge.jobs.inner.sent().is_empty());
+}
+
+/// The gate at the start of a request is read before its batch runs. A
+/// rollback that is recorded in between refuses the batch.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rollback_recorded_after_the_gate_refuses_the_commit() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bridge.raise_stamp().await.unwrap();
+
+    let bridge = rig.bridge.clone();
+    let hook = move |_: &str| {
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute("UPDATE rollback_stamp SET rolled_back_at = 1", [])
+                .unwrap()
+        });
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    rig.put(&signer, BUCKET, "a", b"a").await.expect(503);
+    assert_eq!(row(&rig).await, behind(1), "the hook ran");
+
+    sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = NULL;");
+    get(&rig, &signer, "a").await.expect(404);
+    rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_recorded_rollback_stops_the_counter() {
+    let rig = rig();
+    rig.bridge.raise_stamp().await.unwrap();
+    sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = 1;");
+    assert!(!rig
+        .bridge
+        .catalog
+        .stamp_advance(Some(1), "main")
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, behind(1));
+}
+
+/// A write raises the stamp between the tick's check and the tick's own
+/// raise. The check was made: the tick goes on, without a raise.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tick_that_loses_its_raise_to_a_write_goes_on() {
+    let rig = rig();
+    let bridge = &rig.bridge;
+    bridge.raise_stamp().await.unwrap();
+
+    bridge.safety.list_first.set(true);
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    let report = interleave(&rig, bridge.dispatch(), other).await.unwrap();
+    assert!(!report.rolled_back && !report.stamp_failed && report.permits_seeded);
+    assert_eq!(row(&rig).await, level(2));
+    assert_eq!(stamps(&rig).len(), 2);
+
+    // A raise that must put its own object tries again.
+    bridge.safety.list_first.set(true);
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    interleave(&rig, bridge.raise_stamp(), other).await.unwrap();
+    assert_eq!(row(&rig).await, level(4));
+    assert_eq!(stamps(&rig).len(), 4);
+
+    // Lost to a check that recorded a rollback: the tick ends.
+    bridge.jobs.inner.take();
+    bridge.safety.list_first.set(true);
+    let found = async { sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = 1;") };
+    let report = interleave(&rig, bridge.dispatch(), found).await.unwrap();
+    assert!(report.rolled_back && !report.permits_seeded);
+    assert!(bridge.jobs.inner.sent().is_empty());
+    assert_eq!(row(&rig).await, behind(4));
+}
+
+/// Garbage collection and eviction delete. Each looks at the bucket
+/// itself first, whatever the last tick saw.
+#[tokio::test(flavor = "current_thread")]
+async fn gc_and_eviction_check_the_stamp_before_they_delete() {
+    let rig = rig();
+    let bridge = &rig.bridge;
+    bridge.raise_stamp().await.unwrap();
+    snapshot(&rig);
+    bridge.raise_stamp().await.unwrap();
+    let gc = Job::Gc { v: JOB_VERSION };
+
+    rollback(&rig);
+    assert_eq!(bridge.run_job(&gc).await, JobOutcome::Ack);
+    assert_eq!(row(&rig).await, behind(1));
+    rollback(&rig);
+    assert_eq!(bridge.evict_batch(0).await.unwrap(), 0);
+    assert_eq!(row(&rig).await, behind(1));
+
+    // A check that cannot be made: the job comes back later.
+    rollback(&rig);
+    bridge.safety.fail_list.set(true);
+    assert_ne!(bridge.run_job(&gc).await, JobOutcome::Ack);
+    assert!(bridge.evict_batch(0).await.is_err());
+    assert_eq!(row(&rig).await, level(1));
+}
+
+/// The row keeps the id its objects are keyed by. Under another id the
+/// bucket would look empty and no rollback would ever be found.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stamp_of_another_catalogue_id_is_not_used() {
+    let mut rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
+    rig.bridge.raise_stamp().await.unwrap();
+    rig.bridge.jobs.inner.take();
+    sql(&rig, "UPDATE outbox SET next_at = 0;");
+
+    let set_id = |rig: &mut Rig, id: &str| {
+        Rc::get_mut(&mut rig.bridge).unwrap().cfg.catalogue_id = id.to_string();
+    };
+    set_id(&mut rig, "other");
+    let wrong_id = |e: BridgeError| velmora_bridge::stamp::is_catalogue_id_error(&e);
+    assert!(wrong_id(rig.bridge.raise_stamp().await.unwrap_err()));
+    assert!(wrong_id(
+        rig.bridge.catalogue_rolled_back().await.unwrap_err()
+    ));
+    assert!(wrong_id(rig.bridge.dispatch().await.unwrap_err()));
+    assert!(rig.bridge.jobs.inner.sent().is_empty());
+    assert_ne!(
+        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(rig.bridge.evict_batch(0).await.is_err());
+    assert_eq!(stamps(&rig), [stamp_key("main", 1)]);
+    let s = status(&rig).await;
+    assert_eq!(s["catalogue_id_mismatch"], true);
+    assert!(s["catalogue_rolled_back"].is_null(), "{s}");
+    maintenance(&mut rig, Maintenance::Restore);
+    let mut body = json!({ "since_ms": 0 }).to_string();
+    loop {
+        let r = admin(&rig, Method::Post, "/restore", body.as_bytes()).await;
+        if r.status != 200 {
+            r.expect(500);
+            break;
+        }
+        let report: Value = serde_json::from_slice(&r.body).unwrap();
+        assert!(
+            !report["next"].is_null(),
+            "the replay ended under another id"
+        );
+        body = json!({ "cursor": report["next"] }).to_string();
+    }
+    sql(&rig, "DELETE FROM restore_state;");
+    maintenance(&mut rig, Maintenance::Off);
+
+    set_id(&mut rig, "main");
+    rig.bridge.raise_stamp().await.unwrap();
+    assert_eq!(row(&rig).await, level(2));
+    let s = status(&rig).await;
+    assert_eq!(s["catalogue_id_mismatch"], false);
+    assert_eq!(s["catalogue_rolled_back"], false);
 }
 
 // ---------------------------------------------------------------------------

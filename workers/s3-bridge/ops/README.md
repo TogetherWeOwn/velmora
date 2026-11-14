@@ -170,7 +170,9 @@ jobs and the cron. If a replay was stopped, run it again to its end.
 Starting a replay again makes the earlier one void: a step sent with a
 cursor of the earlier one answers 409 and does nothing, and the
 catalogue stays closed until the replay that was started last has
-ended. A database that was brought back without the last command
+ended. A replay that is started while another one has not ended must
+start from the same restore point or an earlier one; a later one
+answers 409. A database that was brought back without the last command
 of step 2 is not closed at once: nothing in it says that a replay is
 due. The rollback stamp (below) closes it at the next cron run.
 
@@ -203,30 +205,49 @@ serving).
   `rs/<catalogue id>/<counter, 20 digits>`. The objects are only put; no
   delete removes one. The body is the time of the raise in milliseconds.
 - The counter is raised by every cron run, and by a write that must be
-  covered at once, after its commit and before its `200`.
+  covered at once, after its commit and before its `200`. A cron run
+  whose raise loses to such a write goes on without a raise of its own.
 - A restore takes the counter back and leaves the objects. **A counter
   behind the newest object, or no counter while an object exists, means
   the catalogue was rolled back.** The cron run checks this before it
-  does anything else, and before it moves the counter.
+  does anything else, and before it moves the counter. It checks it
+  while a replay is on record as unfinished too. Garbage collection and
+  eviction check it themselves before they delete anything.
 - When it is found: `GET /_admin/status` shows
   `"catalogue_rolled_back": true` (and `replay_unfinished: true`), the
   cron logs it on every run, every write answers 503, and the jobs and
   the cron do nothing. Reads are served.
 - **Way out: the restore above, from step 1.** In step 2 the database
   is already "brought back"; run the two commands. The restore point is
-  the time the database was restored to. If it is not known, take the
-  body of the stamp object of the counter the catalogue holds
+  the time the database was restored to, with one exception: if the
+  database came back with a replay on record as unfinished
+  (`SELECT state, since_ms FROM restore_state` says `replaying`), the
+  restore point is that replay's, not a later one. The catalogue holds
+  the records up to that point at most. The route enforces it: a first
+  call with a later `since_ms` answers 409 and names the value to send
+  (`unfinished_since_ms`, with `margin_ms` 0). If the time is not known,
+  take the body of the stamp object of the counter the catalogue holds
   (`SELECT counter FROM rollback_stamp`) minus one cron interval, or
   `0`. The last step of the replay sets the counter level with the
   newest object and opens the catalogue.
 - Only a replay that is started after the rollback does that. The last
-  call of a replay that had ended before, sent again, answers 409
-  (`The catalogue was rolled back after this replay ended`) and leaves
-  the catalogue closed: start a new replay.
+  step of a replay that was started before it answers 409
+  (`The catalogue was rolled back after this replay started`) and leaves
+  the catalogue closed, whether that replay had ended or was still
+  running at the point the database went back to: start a new replay
+  with `since_ms`. The route tells the two apart by the time in the
+  newest stamp object, so it also refuses in one harmless case: a raise
+  that was under way at the moment the replay was started. Start the
+  replay again then.
 - `CATALOGUE_ID` (default `main`) is the `<catalogue id>` of the keys.
   Two catalogues over one `SAFETY` bucket need two ids. Do not change it
   for a catalogue in use: its objects would no longer be found, and a
-  rollback would go unseen.
+  rollback would go unseen. The row keeps the id it was created with,
+  so a Worker with another id refuses to use the stamp: the cron run
+  fails before it sends a job, garbage collection and eviction retry,
+  no stamp is raised, and `GET /_admin/status` shows
+  `"catalogue_id_mismatch": true` with `"catalogue_rolled_back": null`.
+  Put the id back.
 - A new, empty database over a `SAFETY` bucket that already has stamp
   objects of its id counts as rolled back. That is the restore case
   "Nothing"; run the replay.

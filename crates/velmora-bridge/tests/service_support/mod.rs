@@ -104,6 +104,11 @@ pub struct Blobs {
     pub hold_list: Cell<bool>,
     /// A list call is waiting.
     pub list_held: Cell<bool>,
+    /// With `hold_list`: the held call reads its keys before it waits,
+    /// not after.
+    pub list_first: Cell<bool>,
+    /// Every list call fails.
+    pub fail_list: Cell<bool>,
     /// This many deletes of a recovery record fail.
     pub fail_record_deletes: Cell<u32>,
     /// Deleting this key fails.
@@ -115,6 +120,9 @@ pub struct Blobs {
     /// Called once, with the key, at the start of the next put.
     pub before_put: Hook,
 }
+
+/// How long a held call waits, in turns of the executor.
+pub const HOLD_TURNS: u32 = 100_000;
 
 /// Something that happens in the middle of an operation on a store.
 pub type Hook = RefCell<Option<Box<dyn FnOnce(&str)>>>;
@@ -180,13 +188,28 @@ impl BlobStore for Blobs {
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
-        if self.hold_list.take() {
-            self.list_held.set(true);
-            while self.list_held.get() {
-                tokio::task::yield_now().await;
-            }
+        if self.fail_list.get() {
+            return Err(BridgeError::Blob("list failed".into()));
         }
-        self.inner.list(prefix, start_after, limit).await
+        if !self.hold_list.take() {
+            return self.inner.list(prefix, start_after, limit).await;
+        }
+        let early = match self.list_first.take() {
+            true => Some(self.inner.list(prefix, start_after, limit).await),
+            false => None,
+        };
+        self.list_held.set(true);
+        // Bounded: a test that never lets go fails instead of hanging.
+        for _ in 0..HOLD_TURNS {
+            if !self.list_held.get() {
+                return match early {
+                    Some(keys) => keys,
+                    None => self.inner.list(prefix, start_after, limit).await,
+                };
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the held list call was never let go");
     }
 }
 

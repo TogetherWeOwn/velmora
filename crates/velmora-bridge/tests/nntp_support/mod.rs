@@ -941,22 +941,26 @@ impl Catalog for MemCatalog {
     async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {
         unused()
     }
-    async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<UnixMs> {
+    async fn restore_begin(
+        &self,
+        _: UnixMs,
+        _: UnixMs,
+    ) -> Result<std::result::Result<UnixMs, UnixMs>> {
         unused()
     }
-    async fn restore_finish(&self, _: UnixMs, _: UnixMs, _: u64) -> Result<bool> {
+    async fn restore_finish(&self, _: UnixMs, _: UnixMs, _: u64, _: &str) -> Result<bool> {
         unused()
     }
-    async fn stamp(&self) -> Result<velmora_bridge::stamp::StampRow> {
+    async fn stamp(&self, _: &str) -> Result<velmora_bridge::stamp::StampRow> {
         Ok(velmora_bridge::stamp::StampRow {
             counter: None,
             rolled_back: false,
         })
     }
-    async fn stamp_advance(&self, _: Option<u64>) -> Result<bool> {
+    async fn stamp_advance(&self, _: Option<u64>, _: &str) -> Result<bool> {
         Ok(true)
     }
-    async fn stamp_rolled_back(&self, _: Option<u64>, _: UnixMs) -> Result<bool> {
+    async fn stamp_rolled_back(&self, _: Option<u64>, _: UnixMs, _: &str) -> Result<bool> {
         unused()
     }
     async fn restore_pending(&self) -> Result<bool> {

@@ -248,9 +248,12 @@ pub(super) async fn restore_begin<S: Sql>(
     c: &SqlCatalog<S>,
     since: UnixMs,
     now: UnixMs,
-) -> Result<UnixMs> {
+) -> Result<std::result::Result<UnixMs, UnixMs>> {
     // The mark is the start time, moved past the mark of the replay
     // before it when the two fall into one millisecond.
+    // A replay that has not ended is replaced only by one that starts
+    // no later than it: the catalogue holds no more than the records up
+    // to that point, whatever was restored since.
     let rows = c
         .sql
         .query(
@@ -260,13 +263,24 @@ pub(super) async fn restore_begin<S: Sql>(
                started_at = max(excluded.started_at, restore_state.started_at + 1), \
                finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
                reached_extent = NULL \
+             WHERE restore_state.state = 'complete' \
+               OR excluded.since_ms <= restore_state.since_ms \
              RETURNING started_at",
             &[ms(since), ms(now)],
         )
         .await?;
     match rows.first().map(Vec::as_slice) {
-        Some([SqlValue::Int(run)]) => Ok(UnixMs(*run)),
-        _ => Err(BridgeError::Sql("row decode: restore mark".into())),
+        Some([SqlValue::Int(run)]) => return Ok(Ok(UnixMs(*run))),
+        Some(_) => return Err(BridgeError::Sql("row decode: restore mark".into())),
+        None => {}
+    }
+    let rows = c
+        .sql
+        .query("SELECT since_ms FROM restore_state WHERE id = 1", &[])
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(unfinished)]) => Ok(Err(UnixMs(*unfinished))),
+        _ => Err(BridgeError::Sql("row decode: restore point".into())),
     }
 }
 
@@ -275,6 +289,7 @@ pub(super) async fn restore_finish<S: Sql>(
     run: UnixMs,
     now: UnixMs,
     stamp: u64,
+    catalogue: &str,
 ) -> Result<bool> {
     // Ending the same replay twice is the same as ending it once.
     // The stamp is made level in the same batch, before the state is
@@ -288,12 +303,12 @@ pub(super) async fn restore_finish<S: Sql>(
         .sql
         .batch(vec![
             (
-                "INSERT INTO rollback_stamp(id, counter, rolled_back_at) \
-                 SELECT 1, ?1, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
+                "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
+                 SELECT 1, ?1, ?3, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
                    WHERE id = 1 AND started_at = ?2 AND state = 'replaying') \
                  ON CONFLICT(id) DO UPDATE SET \
                    counter = max(counter, excluded.counter), rolled_back_at = NULL",
-                vec![int(stamp)?, ms(run)],
+                vec![int(stamp)?, ms(run), text(catalogue)],
             ),
             (
                 "UPDATE restore_state SET state = 'complete', \
@@ -306,12 +321,13 @@ pub(super) async fn restore_finish<S: Sql>(
     Ok(changed.get(1) == Some(&1))
 }
 
-pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>) -> Result<StampRow> {
+pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>, catalogue: &str) -> Result<StampRow> {
     let rows = c
         .sql
         .query(
-            "SELECT counter, rolled_back_at IS NOT NULL FROM rollback_stamp WHERE id = 1",
-            &[],
+            "SELECT counter, rolled_back_at IS NOT NULL, catalogue_id = ?1 \
+             FROM rollback_stamp WHERE id = 1",
+            &[text(catalogue)],
         )
         .await?;
     match rows.first().map(Vec::as_slice) {
@@ -319,7 +335,10 @@ pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>) -> Result<StampRow> {
             counter: None,
             rolled_back: false,
         }),
-        Some([SqlValue::Int(counter), SqlValue::Int(rolled)]) => Ok(StampRow {
+        // The stamp objects of this database are under another id: the
+        // ones under `catalogue` say nothing about it.
+        Some([_, _, SqlValue::Int(0)]) => Err(crate::stamp::ERR_CATALOGUE_ID),
+        Some([SqlValue::Int(counter), SqlValue::Int(rolled), SqlValue::Int(_)]) => Ok(StampRow {
             counter: Some(
                 u64::try_from(*counter)
                     .map_err(|_| BridgeError::Sql("row decode: stamp counter".into()))?,
@@ -330,14 +349,18 @@ pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>) -> Result<StampRow> {
     }
 }
 
-pub(super) async fn stamp_advance<S: Sql>(c: &SqlCatalog<S>, from: Option<u64>) -> Result<bool> {
+pub(super) async fn stamp_advance<S: Sql>(
+    c: &SqlCatalog<S>,
+    from: Option<u64>,
+    catalogue: &str,
+) -> Result<bool> {
     let changed = match from {
         None => {
             c.sql
                 .exec(
-                    "INSERT INTO rollback_stamp(id, counter) VALUES (1, 1) \
+                    "INSERT INTO rollback_stamp(id, counter, catalogue_id) VALUES (1, 1, ?1) \
                      ON CONFLICT(id) DO NOTHING",
-                    &[],
+                    &[text(catalogue)],
                 )
                 .await?
         }
@@ -358,6 +381,7 @@ pub(super) async fn stamp_rolled_back<S: Sql>(
     c: &SqlCatalog<S>,
     seen: Option<u64>,
     now: UnixMs,
+    catalogue: &str,
 ) -> Result<bool> {
     // Only while the counter is what the caller compared the stamp
     // objects with. A raise that ran in between moved it and put an
@@ -367,9 +391,9 @@ pub(super) async fn stamp_rolled_back<S: Sql>(
         None => {
             c.sql
                 .exec(
-                    "INSERT INTO rollback_stamp(id, counter, rolled_back_at) VALUES (1, 0, ?1) \
-                     ON CONFLICT(id) DO NOTHING",
-                    &[ms(now)],
+                    "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
+                     VALUES (1, 0, ?2, ?1) ON CONFLICT(id) DO NOTHING",
+                    &[ms(now), text(catalogue)],
                 )
                 .await?
         }

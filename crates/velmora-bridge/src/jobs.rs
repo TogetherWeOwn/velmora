@@ -21,6 +21,7 @@ use crate::config::{GcMode, Maintenance};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector};
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
+use crate::stamp::Advance;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
     GenerationId, Job, JobOutcome, OutboxStage, Result, JOB_VERSION,
@@ -199,6 +200,12 @@ where
     }
 
     async fn gc_batch(&self, disposable_only: bool) -> Result<()> {
+        // Nothing is deleted on a catalogue that is behind its stamp:
+        // its rows may name as garbage what a later commit used. A check
+        // that could not be made retries the job.
+        if self.catalogue_rolled_back().await? {
+            return Ok(());
+        }
         let now = self.clock.now();
         let rows = self.catalog.gc_due(now, GC_BATCH, disposable_only).await?;
         // One row that fails must not hold up the rows behind it. The row
@@ -252,6 +259,11 @@ where
     /// cap. Only a first step that is retried after an error totals the
     /// tier again and goes on from there.
     pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+        // As in garbage collection: no delete on a catalogue that is
+        // behind its stamp.
+        if self.catalogue_rolled_back().await? {
+            return Ok(0);
+        }
         let mut excess = remaining;
         if excess == 0 {
             let cap = self.cfg.hot_cap_bytes;
@@ -364,21 +376,29 @@ where
             return Ok(report);
         }
         if self.catalog.restore_pending().await? {
-            // Said on every run until the replay has ended.
-            report.rolled_back = self.catalog.stamp().await?.rolled_back;
+            // Said on every run until the replay has ended. Checked
+            // against the bucket here too: a catalogue that was restored
+            // to a point where a replay ran is found now, not only by
+            // the last step of that replay.
+            report.rolled_back = self.catalogue_rolled_back().await?;
             return Ok(report);
         }
         // The rollback stamp, before anything else: on a catalogue that
         // was restored to an earlier point this run must send no job. A
         // check that could not be made ends the run as well.
-        match self.stamp_advance().await? {
-            None => {
+        match self.stamp_advance(false).await? {
+            Advance::RolledBack => {
                 report.rolled_back = true;
                 return Ok(report);
             }
             // The check passed. A stamp object that could not be put is
             // made up for by the next run.
-            Some(counter) => report.stamp_failed = self.stamp_store(counter).await.is_err(),
+            Advance::Raised(counter) => {
+                report.stamp_failed = self.stamp_store(counter).await.is_err();
+            }
+            // The check passed and a write raised the stamp meanwhile:
+            // the run goes on without a raise of its own.
+            Advance::Checked => {}
         }
         let now = self.clock.now();
 
