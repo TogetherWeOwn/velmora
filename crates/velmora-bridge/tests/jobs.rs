@@ -11,11 +11,13 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use nntp_support::{TcpConnector, PASS, USER};
+use sha2::Digest as _;
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS};
+use velmora_bridge::recovery::delete_blob;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
@@ -85,6 +87,10 @@ impl BlobStore for GuardedBlob {
             return Err(BridgeError::Blob("delete failed".to_string()));
         }
         self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.check();
+        self.inner.list(prefix, start_after, limit).await
     }
 }
 
@@ -445,6 +451,17 @@ async fn post_verify_release_over_fake_nntp() {
     let o = fx.put(&bucket, "a/big.bin", &plaintext()).await;
     assert_eq!(fx.outbox(&o, "stage").await, "post");
     assert!(fx.has_safety(&o));
+    let seeded = BlobMeta {
+        bucket: &bucket.id,
+        extent: &o.extent,
+        cipher_sha256: &sha2::Sha256::digest(b"record").into(),
+    };
+    let record = b"record".to_vec();
+    fx.bridge
+        .safety
+        .put("m/g_seeded", record, &seeded)
+        .await
+        .unwrap();
 
     fx.bridge
         .jobs
@@ -467,6 +484,14 @@ async fn post_verify_release_over_fake_nntp() {
     // The pinned copy went only after the read-back; the cache is kept.
     assert!(!fx.has_safety(&o));
     assert!(fx.has_cache(&o));
+    // The release deleted that one blob: the recovery record stays, and
+    // no delete of it gets through.
+    assert_eq!(fx.bridge.safety.inner.keys(), ["m/g_seeded".to_string()]);
+    assert!(matches!(
+        delete_blob(&fx.bridge.safety, "m/g_seeded").await,
+        Err(BridgeError::Invalid(_))
+    ));
+    assert!(fx.bridge.safety.inner.contains("m/g_seeded"));
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.len(), 1);
     assert!(status[0].counts && status[0].articles_ok == 3);

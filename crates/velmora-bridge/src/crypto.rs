@@ -127,6 +127,9 @@ const BDK_DOMAIN: &str = "velmora/bdk/v1";
 const FILE_KEY_DOMAIN: &str = "velmora/fk/v1";
 const ACCESS_KEY_DOMAIN: &str = "velmora/ak/v1";
 const LIST_TOKEN_INFO: &[u8] = b"velmora/list-token/v1";
+const MANIFEST_DOMAIN: &str = "velmora/manifest/v1";
+/// A sealed recovery record starts with the KEK version, big-endian.
+const MANIFEST_VERSION_LEN: usize = 4;
 const AAD_SEPARATOR: char = '|';
 
 // Every error below is a fixed string: no key, nonce, id or ciphertext byte
@@ -143,6 +146,7 @@ const ERR_EXTENT_BUCKET: BridgeError = BridgeError::Crypto("extent belongs to an
 const ERR_SHREDDED: BridgeError = BridgeError::Crypto("extent key shredded");
 const ERR_SPAN: BridgeError = BridgeError::Crypto("ciphertext span does not cover the range");
 const ERR_AUTH: BridgeError = BridgeError::Crypto("extent authentication failed");
+const ERR_MANIFEST: BridgeError = BridgeError::Crypto("recovery record authentication failed");
 
 // ---------------------------------------------------------------------------
 // Key types
@@ -469,6 +473,59 @@ impl fmt::Debug for ListTokenKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ListTokenKey(<redacted>)")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery records
+// ---------------------------------------------------------------------------
+
+/// The key that seals recovery records under one KEK version:
+/// `HKDF-SHA256(KEK, "velmora/manifest/v1")`.
+fn manifest_key(kek: &KekBytes) -> Zeroizing<[u8; KEY_LEN]> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    Hkdf::<Sha256>::new(None, kek.expose())
+        .expand(MANIFEST_DOMAIN.as_bytes(), key.as_mut())
+        .expect("HKDF-SHA256 output of 32 bytes");
+    key
+}
+
+fn manifest_aad(name: &str, kek_version: u32) -> Result<String> {
+    Ok(format!(
+        "{MANIFEST_DOMAIN}|{}|{kek_version}",
+        binding_id(name)?
+    ))
+}
+
+/// Seals a catalogue recovery record under the **active** KEK:
+/// `kek_version (u32 BE) ‖ 0x01 ‖ nonce ‖ ct ‖ tag`. `name` is the blob
+/// key the record is stored under; a record moved to another name does
+/// not open.
+pub fn seal_manifest<K: Kek, R: FillRandom>(
+    kek: &K,
+    name: &str,
+    plaintext: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>> {
+    let (version, key) = kek.active();
+    let aad = manifest_aad(name, version)?;
+    let sealed = wrap_bytes(&manifest_key(key), &aad, plaintext, rng)?;
+    let mut out = Vec::with_capacity(MANIFEST_VERSION_LEN + sealed.len());
+    out.extend_from_slice(&version.to_be_bytes());
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+/// Opens a record sealed by [`seal_manifest`] under `name`. Every failure
+/// (length, KEK version, name, any changed byte) is an error and returns
+/// no plaintext.
+pub fn open_manifest<K: Kek>(kek: &K, name: &str, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let Some((version, body)) = sealed.split_first_chunk::<MANIFEST_VERSION_LEN>() else {
+        return Err(ERR_MANIFEST);
+    };
+    let version = u32::from_be_bytes(*version);
+    let key = kek_version(kek, version)?;
+    let aad = manifest_aad(name, version)?;
+    unwrap_bytes(&manifest_key(key), &aad, body).map_err(|_| ERR_MANIFEST)
 }
 
 // ---------------------------------------------------------------------------

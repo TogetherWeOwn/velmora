@@ -87,6 +87,9 @@ pub trait BlobStore {
     async fn head(&self, key: &str) -> Result<Option<u64>>;
     /// Idempotent.
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Up to `limit` keys that start with `prefix` and sort after
+    /// `start_after`, in key order. Fewer than `limit` = no more keys.
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
 }
 
 // ---------------------------------------------------------------------------
