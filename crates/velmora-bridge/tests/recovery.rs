@@ -888,6 +888,36 @@ async fn restore_route_runs_only_in_maintenance() {
     }
     assert_eq!(restore_state(&restoring), ["complete"]);
     assert_eq!((published, deleted, calls), (2, 1, 3));
+
+    // A cursor of this replay that arrives after another replay was
+    // started does not end the other one.
+    let first = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    first.expect(200);
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    let second = admin(&restoring, "/restore", json!({ "since_ms": 0 })).await;
+    second.expect(200);
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert_ne!(first["next"]["run_ms"], second["next"]["run_ms"]);
+    let finish = |mut body: Value| {
+        let restoring = &restoring;
+        async move {
+            loop {
+                let r = admin(restoring, "/restore", body).await;
+                if r.status != 200 {
+                    return r.status;
+                }
+                let report: Value = serde_json::from_slice(&r.body).unwrap();
+                if report["next"].is_null() {
+                    return 200;
+                }
+                body = json!({ "cursor": report["next"] });
+            }
+        }
+    };
+    assert_eq!(finish(json!({ "cursor": first["next"] })).await, 409);
+    assert_eq!(restore_state(&restoring), ["replaying"]);
+    assert_eq!(finish(json!({ "cursor": second["next"] })).await, 200);
+    assert_eq!(restore_state(&restoring), ["complete"]);
     assert_eq!(restoring.count("objects"), 1);
     assert_eq!(restoring.count("generations"), 2);
 
@@ -1392,7 +1422,8 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
     let (id, etags, _) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig);
 
-    rig.bridge
+    let run = rig
+        .bridge
         .catalog
         .restore_begin(UnixMs(0), rig.now())
         .await
@@ -1418,19 +1449,71 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
     assert_eq!(records(&rig), before);
     assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
 
-    rig.bridge.catalog.restore_finish(rig.now()).await.unwrap();
+    // Neither do the admin routes that change something, the queue
+    // jobs, or the dispatcher.
+    admin(&rig, "/buckets", json!({ "name": "second" }))
+        .await
+        .expect(503);
+    admin(&rig, "/evict/vault/a?include_safety=1", json!({}))
+        .await
+        .expect(503);
+    let outbox = || -> (String, String, String, i64) {
+        rig.bridge.catalog.sql.with_conn(|c| {
+            c.query_row(
+                "SELECT extent_id, generation_id, stage, attempts FROM outbox \
+                 ORDER BY extent_id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+        })
+    };
+    let row = outbox();
+    assert_eq!(row.2, "post");
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: ExtentId::new(row.0.clone()),
+        generation: GenerationId::new(row.1.clone()),
+        stage: OutboxStage::Post,
+    };
+    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+    assert_eq!(outbox(), row);
+    assert_eq!(
+        rig.bridge.dispatch().await.unwrap(),
+        DispatchReport::default()
+    );
+    assert_eq!(rig.count("buckets"), 1);
+
+    // The end of another replay does not end this one.
+    assert!(!rig
+        .bridge
+        .catalog
+        .restore_finish(UnixMs(run.0 - 1), rig.now())
+        .await
+        .unwrap());
+    assert_eq!(restore_state(&rig), ["replaying"]);
+    assert!(rig
+        .bridge
+        .catalog
+        .restore_finish(run, rig.now())
+        .await
+        .unwrap());
     assert_eq!(restore_state(&rig), ["complete"]);
+    assert!(rig.bridge.dispatch().await.unwrap().permits_seeded);
     rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
     complete(&rig, &signer, "big", &id, &etags)
         .await
         .expect(200);
 
-    // A second restore arms the gate again.
-    rig.bridge
+    // A second restore arms the gate again, under a later mark, also
+    // within the same millisecond.
+    let second = rig
+        .bridge
         .catalog
         .restore_begin(UnixMs(5), rig.now())
         .await
         .unwrap();
+    assert!(second > run);
     assert_eq!(restore_state(&rig), ["replaying"]);
     rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
 }

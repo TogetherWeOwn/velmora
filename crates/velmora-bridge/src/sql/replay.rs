@@ -239,28 +239,43 @@ pub(super) async fn restore_begin<S: Sql>(
     c: &SqlCatalog<S>,
     since: UnixMs,
     now: UnixMs,
-) -> Result<()> {
-    c.sql
-        .exec(
+) -> Result<UnixMs> {
+    // The mark is the start time, moved past the mark of the replay
+    // before it when the two fall into one millisecond.
+    let rows = c
+        .sql
+        .query(
             "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
              VALUES (1, 'replaying', ?1, ?2, NULL) \
              ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
-               started_at = excluded.started_at, finished_at = NULL",
+               started_at = max(excluded.started_at, restore_state.started_at + 1), \
+               finished_at = NULL \
+             RETURNING started_at",
             &[ms(since), ms(now)],
         )
-        .await
-        .map(|_| ())
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(run)]) => Ok(UnixMs(*run)),
+        _ => Err(BridgeError::Sql("row decode: restore mark".into())),
+    }
 }
 
-pub(super) async fn restore_finish<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
-    c.sql
+pub(super) async fn restore_finish<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+    now: UnixMs,
+) -> Result<bool> {
+    // Ending the same replay twice is the same as ending it once.
+    let changed = c
+        .sql
         .exec(
-            "UPDATE restore_state SET state = 'complete', finished_at = ?1 \
-             WHERE id = 1 AND state = 'replaying'",
-            &[ms(now)],
+            "UPDATE restore_state SET state = 'complete', \
+               finished_at = COALESCE(finished_at, ?1) \
+             WHERE id = 1 AND started_at = ?2",
+            &[ms(now), ms(run)],
         )
-        .await
-        .map(|_| ())
+        .await?;
+    Ok(changed == 1)
 }
 
 pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {

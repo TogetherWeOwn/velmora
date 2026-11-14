@@ -618,14 +618,14 @@ impl Catalog for MemCatalog {
     async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {
         unused()
     }
-    async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<()> {
+    async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<UnixMs> {
         unused()
     }
-    async fn restore_finish(&self, _: UnixMs) -> Result<()> {
+    async fn restore_finish(&self, _: UnixMs, _: UnixMs) -> Result<bool> {
         unused()
     }
     async fn restore_pending(&self) -> Result<bool> {
-        unused()
+        Ok(false)
     }
     async fn replay_damaged(&self, _: u32) -> Result<(u64, Vec<GenerationId>)> {
         unused()

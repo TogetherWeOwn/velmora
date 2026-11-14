@@ -395,7 +395,8 @@ pub(crate) async fn discard_refused<
     last
 }
 
-<<<<<<< HEAD
+const DISCARD_ATTEMPTS: usize = 3;
+
 /// Refuses a mutation while a replay of the recovery records is under
 /// way: the catalogue then holds only a part of them, and a write could
 /// be published under an id that a record still to come overrides.
@@ -417,6 +418,3 @@ pub(super) async fn restore_gate<
         Err(_) => Err(internal()),
     }
 }
-=======
-const DISCARD_ATTEMPTS: usize = 3;
->>>>>>> bridge/h9-low-fixes

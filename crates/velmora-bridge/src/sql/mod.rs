@@ -299,11 +299,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
         replay::held_extents(self, after, limit).await
     }
-    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<()> {
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
         replay::restore_begin(self, since, now).await
     }
-    async fn restore_finish(&self, now: UnixMs) -> Result<()> {
-        replay::restore_finish(self, now).await
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
+        replay::restore_finish(self, run, now).await
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await

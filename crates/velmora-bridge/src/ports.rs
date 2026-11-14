@@ -390,9 +390,12 @@ pub trait Catalog {
     /// `after`.
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>>;
     /// A replay starts: writes are refused until [`Self::restore_finish`].
-    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<()>;
-    /// The replay that was started ran to its end.
-    async fn restore_finish(&self, now: UnixMs) -> Result<()>;
+    /// Returns the mark of this replay: later than that of every replay
+    /// before it.
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs>;
+    /// The replay with the mark `run` ran to its end. `false` = another
+    /// replay was started since; that one is not ended by this.
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool>;
     /// Whether a replay was started and has not ended.
     async fn restore_pending(&self) -> Result<bool>;
     /// Live generations with an extent that has neither a pinned copy

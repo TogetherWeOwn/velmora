@@ -123,7 +123,12 @@ exists: restore it to a timestamp, then replay from that timestamp.
 From the first call of the replay to its last, the catalogue itself
 refuses every write with 503, also when `MAINTENANCE` is already `off`:
 a catalogue that holds a part of the records must not take new writes.
-If a replay was stopped, run it again to its end. This does not notice a
+The same holds for the admin routes that change something, the queue
+jobs and the cron. If a replay was stopped, run it again to its end.
+Starting a replay again makes the earlier one void: a step sent with a
+cursor of the earlier one can still run, but its last step answers 409
+and the catalogue stays closed until the replay that was started last
+has ended. This does not notice a
 replay that was never started: step 4 is not optional after step 2.
 
 The replay is idempotent. It can be stopped, repeated, or run over a

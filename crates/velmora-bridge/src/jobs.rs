@@ -57,6 +57,14 @@ where
             // once maintenance ends.
             return JobOutcome::Ack;
         }
+        // The same while a replay of the recovery records is not
+        // finished: the catalogue holds only a part of them, and a job
+        // could release or delete what a record still to come needs.
+        match self.catalog.restore_pending().await {
+            Ok(false) => {}
+            Ok(true) => return JobOutcome::Ack,
+            Err(_) => return RETRY,
+        }
         match job {
             Job::Extent {
                 v,
@@ -174,7 +182,7 @@ where
     /// only.
     pub async fn dispatch(&self) -> Result<DispatchReport> {
         let mut report = DispatchReport::default();
-        if self.cfg.maintenance == Maintenance::Restore {
+        if self.cfg.maintenance == Maintenance::Restore || self.catalog.restore_pending().await? {
             return Ok(report);
         }
         let now = self.clock.now();

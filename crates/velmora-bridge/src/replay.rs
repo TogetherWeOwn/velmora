@@ -98,6 +98,10 @@ pub struct ReplayCursor {
     pub after: String,
     /// Extents already handled of the record after `after`.
     pub extent: u32,
+    /// The replay this cursor belongs to, as the restore route recorded
+    /// it when the replay started. Only that replay is ended by it.
+    #[serde(default)]
+    pub run_ms: i64,
 }
 
 impl ReplayCursor {
@@ -108,6 +112,7 @@ impl ReplayCursor {
             phase: ReplayPhase::Manifests,
             after: start_after(GENERATION_PREFIX, since),
             extent: 0,
+            run_ms: 0,
         }
     }
 }
