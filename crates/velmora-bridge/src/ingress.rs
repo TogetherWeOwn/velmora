@@ -473,6 +473,15 @@ impl Charge {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Takes over what `other` holds, so that one charge stands for both.
+    /// A charge against another budget is released instead.
+    pub fn absorb(&mut self, mut other: Charge) {
+        if Rc::ptr_eq(&self.state, &other.state) {
+            self.bytes = self.bytes.saturating_add(other.bytes);
+            other.bytes = 0;
+        }
+    }
 }
 
 impl fmt::Debug for Charge {
