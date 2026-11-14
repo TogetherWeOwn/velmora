@@ -229,6 +229,18 @@ pub trait Catalog {
     /// Single PUT; one batch (DESIGN §A.3 step 6).
     async fn commit_generation(&self, c: &CommitGeneration) -> Result<()>;
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
+    /// DeleteObject as the service runs it: retires the live generation
+    /// of the key only if its id sorts before `before`, the id of the
+    /// tombstone written for this delete. `false` = nothing was live, or
+    /// the live generation is newer than the tombstone. A replay of the
+    /// tombstone decides the same way.
+    async fn delete_object_before(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        before: &GenerationId,
+        now: UnixMs,
+    ) -> Result<bool>;
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage>;
     /// Admin view.
     async fn object_status(&self, bucket: &BucketId, key: &str) -> Result<Option<ObjectStatus>>;
@@ -260,6 +272,8 @@ pub trait Catalog {
         digest: &[u8; 32],
         c: &CompleteUpload,
     ) -> Result<Guard<()>>;
+    /// The extent rows of the upload's current parts, in no order.
+    async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>>;
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>>;
 
     // outbox: claim returns the fencing token; everything after takes the Lease

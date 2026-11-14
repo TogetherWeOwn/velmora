@@ -591,6 +591,18 @@ impl Catalog for MemCatalog {
     async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
         unused()
     }
+    async fn delete_object_before(
+        &self,
+        _: &BucketId,
+        _: &str,
+        _: &GenerationId,
+        _: UnixMs,
+    ) -> Result<bool> {
+        unused()
+    }
+    async fn upload_extents(&self, _: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
+        unused()
+    }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {
         unused()
     }

@@ -214,7 +214,12 @@ type Stmt = (&'static str, Vec<SqlValue>);
 /// `(bucket, key)`: GC rows for its extents, its posting obligations
 /// cancelled, and its state flipped. They must run before the pointer is
 /// moved or removed, and all are no-ops when the key has no live object.
-fn retire_live(bucket: &BucketId, key: &str, to: GenerationState, now: UnixMs) -> Vec<Stmt> {
+pub(super) fn retire_live(
+    bucket: &BucketId,
+    key: &str,
+    to: GenerationState,
+    now: UnixMs,
+) -> Vec<Stmt> {
     let b = || text(bucket.as_str());
     vec![
         (

@@ -28,7 +28,7 @@
 //! then list no part checksums in Complete), and Complete refuses a
 //! client-supplied object checksum or a `COMPOSITE` type with `501`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
@@ -48,6 +48,7 @@ use crate::ingress::{read_upload, upload_lengths, IngressError, UploadReadError}
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
 };
+use crate::recovery::{generation_key, write_generation};
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
     GenerationId, GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody,
@@ -901,6 +902,33 @@ where
             placements: publication.placements,
             now,
         };
+        // The recovery record is durable before the publication batch.
+        // It describes the staged extents as this generation will hold
+        // them; the batch applies only if the upload is unchanged.
+        let mut staged: HashMap<ExtentId, ExtentRow> = bridge
+            .catalog
+            .upload_extents(&target)
+            .await?
+            .into_iter()
+            .map(|e| (e.id.clone(), e))
+            .collect();
+        let mut extents = Vec::with_capacity(commit.placements.len());
+        for p in &commit.placements {
+            let mut row = staged.remove(&p.extent_id).ok_or(Fail::Internal)?;
+            row.seq = Some(p.seq);
+            row.plain_offset = Some(p.plain_offset);
+            extents.push(row);
+        }
+        drop(staged);
+        write_generation(
+            &bridge.safety,
+            &bridge.kek,
+            &a.bucket,
+            &commit.generation,
+            &extents,
+        )
+        .await?;
+        drop(extents);
         match bridge
             .catalog
             .complete_upload(&target, upload.revision, &digest, &commit)
@@ -920,7 +948,16 @@ where
                 }
                 return complete_response(&a, publication.etag, now.0);
             }
-            Guard::Lost => lost_at = Some(upload.revision),
+            Guard::Lost => {
+                // Nothing was published under this id, so its record
+                // must not publish it in a replay either. Best effort: a
+                // record left behind replays as a PUT that failed.
+                let _ = bridge
+                    .safety
+                    .delete(&generation_key(&commit.generation.id))
+                    .await;
+                lost_at = Some(upload.revision);
+            }
         }
     }
     Err(ErrorCode::SlowDown.into())
