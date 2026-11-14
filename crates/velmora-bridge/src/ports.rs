@@ -436,6 +436,13 @@ pub trait Catalog {
     async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool>;
     /// Records that the dispatcher took the evictable total at `now`.
     async fn hot_checked(&self, now: UnixMs) -> Result<()>;
+    /// Records what a drain step leaves for the next one, before the
+    /// step sends that job.
+    async fn hot_drain_set(&self, left: u64) -> Result<()>;
+    /// Takes up a drain where the last step left it: `true` once per
+    /// `hot_drain_set(left)`. A duplicate of the job, or one from a drain
+    /// that another has replaced, gets `false` and must do nothing.
+    async fn hot_drain_claim(&self, left: u64) -> Result<bool>;
     /// The extent's eviction fencing token now. Read it before deleting
     /// blobs outside an eviction (admin evict) and pass it to `hot_forget`.
     async fn hot_seq(&self, extent: &ExtentId) -> Result<u64>;

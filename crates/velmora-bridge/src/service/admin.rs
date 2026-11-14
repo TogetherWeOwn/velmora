@@ -698,12 +698,12 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             .or_internal()?;
         evicted += 1;
         // The deleted copies leave the hot-tier count.
-        let forget = |safety: bool| async move {
+        let forget = |seq: u64, safety: bool| async move {
             let done = bridge.catalog.hot_forget(&x.extent_id, seq, safety, true);
             done.await.or_internal().map(|_| ())
         };
         if !include_safety {
-            forget(false).await?;
+            forget(seq, false).await?;
             continue;
         }
         let gone = match x.safety_state {
@@ -733,7 +733,10 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         } else {
             safety_kept += 1;
         }
-        forget(gone).await?;
+        // Giving up a held copy changed the state, which bumped the
+        // token once: that bump is this request's own.
+        let own_bump = u64::from(gone && x.safety_state == SafetyState::Held);
+        forget(seq + own_bump, gone).await?;
     }
     Ok(ok(&json!({
         "evicted": evicted,

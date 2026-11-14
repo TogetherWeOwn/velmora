@@ -1617,8 +1617,14 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
     // A release keeps the copy in R2 until the hot tier evicts it. Evict
     // all that may go, so that the replay meets extents with a copy
     // (still pinned) and without one.
+    let all = u64::MAX / 2;
     rig.bridge
-        .evict_batch(u64::MAX)
+        .catalog
+        .hot_drain_set(all)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::hot_drain_set", "Ok", e));
+    rig.bridge
+        .evict_batch(all)
         .await
         .unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
     let pinned = extents

@@ -239,6 +239,16 @@ impl Hot {
         assert_eq!(self.bridge().run_job(job).await, JobOutcome::Ack);
     }
 
+    /// Runs a later step of a drain as the step before it would have
+    /// left it: recorded in the catalogue, then sent.
+    async fn run_resumed(&self, remaining: u64) {
+        let catalog = &self.bridge().catalog;
+        catalog.hot_drain_set(remaining).await.unwrap();
+        self.run(&resume(remaining)).await;
+        // The step took the record with it.
+        assert!(!catalog.hot_drain_claim(remaining).await.unwrap());
+    }
+
     /// The dispatcher's report, with its hot-tier check due; only the
     /// eviction job it sent is run.
     async fn dispatch_and_evict(&self) -> (DispatchReport, u32) {
@@ -509,11 +519,56 @@ async fn nothing_is_evicted_at_or_under_the_cap() {
     // A drain that is already under way does not total the tier again:
     // it evicts what the step before it left, oldest first, and stops.
     hot.set_cap(100 * cipher);
-    hot.run(&resume(1)).await;
+    hot.run_resumed(1).await;
     let kept: Vec<bool> = xs.iter().map(|x| hot.has_safety(x)).collect();
     assert_eq!(kept, [false, true, true]);
     assert_eq!(hot.evictable().await, 2 * cipher);
     assert!(hot.sent_evictions().is_empty());
+}
+
+/// A queue may deliver a job twice. The second delivery of a later step
+/// carries a stale amount to evict; it must not act on it, or it would
+/// start a whole drain of its own.
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_delivered_twice_evicts_once() {
+    let hot = hot_with(|cfg| cfg.hot_cap_bytes = u64::MAX / 4).await;
+    let n = 2 * EVICT_BATCH as usize + 5;
+    let mut xs = Vec::new();
+    for i in 0..n {
+        let x = hot.put(&format!("twice-{i:03}")).await;
+        hot.mark_released(&x);
+        xs.push(x);
+    }
+    hot.discard_jobs();
+    let cipher = xs[0].cipher_size;
+    let batch = u64::from(EVICT_BATCH);
+    let left = |hot: &Hot| xs.iter().filter(|x| hot.has_safety(x)).count() as u64;
+
+    // A step that was never recorded does nothing at all.
+    let step = resume((batch + 2) * cipher);
+    hot.run(&step).await;
+    assert_eq!(left(&hot), n as u64);
+    assert!(hot.sent_evictions().is_empty());
+
+    // Recorded, it evicts one batch and hands on the rest.
+    let catalog = &hot.bridge().catalog;
+    catalog.hot_drain_set((batch + 2) * cipher).await.unwrap();
+    hot.run(&step).await;
+    assert_eq!(left(&hot), n as u64 - batch);
+    let next = hot.sent_evictions();
+    assert_eq!(next, [resume(2 * cipher)]);
+
+    // Delivered again, before or after the step it sent: nothing.
+    hot.run(&step).await;
+    assert_eq!(left(&hot), n as u64 - batch);
+    hot.run(&next[0]).await;
+    assert_eq!(left(&hot), n as u64 - batch - 2);
+    for job in [&step, &next[0], &step] {
+        hot.run(job).await;
+    }
+    assert_eq!(left(&hot), n as u64 - batch - 2);
+    assert!(hot.sent_evictions().is_empty());
+    assert_eq!(hot.evictable().await, left(&hot) * cipher);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -541,7 +596,7 @@ async fn pinned_extents_are_never_evicted_however_far_over_the_cap() {
     assert!(!report.evict_enqueued);
     assert_eq!(runs, 0);
     hot.run(&EVICT).await;
-    hot.run(&resume(10 * cipher)).await;
+    hot.run_resumed(10 * cipher).await;
     untouched(&hot);
 
     // Even with a byte count that claims otherwise, in either pinned
@@ -565,7 +620,7 @@ async fn pinned_extents_are_never_evicted_however_far_over_the_cap() {
             assert_eq!(hot.num(x, "evict_seq"), seq);
         }
         hot.run(&EVICT).await;
-        hot.run(&resume(10 * cipher)).await;
+        hot.run_resumed(10 * cipher).await;
         untouched(&hot);
 
         // With a cache fill beside it, the fill is evictable and goes;
@@ -1085,6 +1140,20 @@ async fn an_uncounted_cache_blob_is_evicted_or_counted_again() {
     hot.get_ok("warm").await;
     assert_eq!(hot.num(&warm, "last_read_at"), Some(hot.rig.now().0));
     assert_eq!(hot.num(&warm, "hot_cache_bytes"), Some(0));
+
+    // An uncounted fill is counted by the first isolate that reads from
+    // it, even when the stamp is fresh (as it is right after the fill's
+    // own first count).
+    hot.uncounted_fill(&warm).await;
+    let catalog = &hot.bridge().catalog;
+    let now = hot.rig.now().plus_secs(60);
+    let stamp = catalog.touch_read(&warm.id, now, READ_STAMP_MS, false);
+    assert_eq!(stamp.await.unwrap(), hot.rig.now());
+    assert_eq!(hot.num(&warm, "hot_cache_bytes"), Some(0));
+    let stamp = catalog.touch_read(&warm.id, now, READ_STAMP_MS, true);
+    assert_eq!(stamp.await.unwrap(), now);
+    assert_eq!(hot.num(&warm, "hot_cache_bytes"), Some(cipher as i64));
+    assert_eq!(hot.evictable().await, 2 * cipher);
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,12 +1279,16 @@ async fn nothing_is_evicted_during_a_restore() {
     let cipher = xs[0].cipher_size;
     hot.cfg_mut().maintenance = Maintenance::Restore;
 
+    let catalog = &hot.bridge().catalog;
+    catalog.hot_drain_set(3 * cipher).await.unwrap();
     for job in [EVICT, resume(3 * cipher)] {
         hot.run(&job).await;
         assert!(xs.iter().all(|x| hot.has_safety(x)));
         assert_eq!(hot.evictable().await, 3 * cipher);
         assert!(hot.sent_evictions().is_empty());
     }
+    // The step was put aside whole: its record is still there.
+    assert!(catalog.hot_drain_claim(3 * cipher).await.unwrap());
 
     hot.cfg_mut().maintenance = Maintenance::Off;
     hot.run(&EVICT).await;
@@ -1352,6 +1425,7 @@ async fn a_fill_racing_the_collection_of_its_cache_blob_stays_counted() {
     assert!(!hot.has_safety(&x));
     assert_eq!(hot.num(&x, "hot_safety_bytes"), Some(0));
     assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(cipher));
+    catalog.hot_drain_set(1).await.unwrap();
     assert_eq!(bridge.evict_batch(1).await.unwrap(), cipher as u64);
     assert!(!hot.has_cache(&x));
     assert_eq!(hot.stats().await, HotStats::default());
@@ -1444,7 +1518,7 @@ async fn a_listing_does_not_survive_a_state_change() {
     // Back in `held`, the copy is pinned whatever was counted before.
     assert_eq!(hot.evictable().await, 0);
     hot.run(&EVICT).await;
-    hot.run(&resume(cipher)).await;
+    hot.run_resumed(cipher).await;
     assert!(hot.has_safety(&x));
 }
 
@@ -1515,4 +1589,43 @@ async fn the_migration_applies_to_a_catalogue_with_extents() {
     assert!(catalog.begin_evict(&listed[0]).await.unwrap());
     assert!(catalog.finish_evict(&listed[0]).await.unwrap());
     assert_eq!(catalog.evictable_bytes().await.unwrap(), 0);
+}
+
+/// Admin evict of a held extent changes its state, which bumps the
+/// fence; the counts of what it deleted must end all the same.
+#[tokio::test(flavor = "current_thread")]
+async fn admin_evict_of_a_held_extent_ends_its_counts() {
+    let hot = hot_with(|cfg| {
+        cfg.safety_min_age_secs = WEEK_SECS;
+        cfg.hot_cap_bytes = u64::MAX / 4;
+    })
+    .await;
+    // Posted and verified, but too young to release.
+    let x = hot.put("young").await;
+    hot.pump().await;
+    assert_eq!(hot.text(&x, "safety_state"), "held");
+    hot.uncounted_fill(&x).await;
+    let catalog = &hot.bridge().catalog;
+    catalog
+        .record_cache_fill(&x.id, hot.rig.now())
+        .await
+        .unwrap();
+    assert_eq!(hot.evictable().await, x.cipher_size);
+
+    let token = hot.bridge().cfg.admin_token.expose().to_string();
+    let evict = Req {
+        method: Method::Post,
+        target: format!("/_admin/evict/{BUCKET}/young?include_safety=1"),
+        headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
+        body: Vec::new(),
+    };
+    let resp = hot.rig.send(evict).await;
+    resp.expect(200);
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(body["safety_deleted"], 1);
+    assert!(!hot.has_safety(&x) && !hot.has_cache(&x));
+    assert_eq!(hot.text(&x, "safety_state"), "deleted");
+    assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(0));
+    assert_eq!(hot.stats().await, HotStats::default());
+    hot.get_ok("young").await;
 }

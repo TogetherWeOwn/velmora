@@ -33,7 +33,8 @@
 //!   columns existed, or by a request that was cancelled between its
 //!   write and its second count while an eviction or a garbage
 //!   collection of the same extent ran): a read served from it
-//!   counts it again (`touch_read`), and an eviction of the extent deletes
+//!   counts it again (`touch_read`; an isolate asks at most once an hour
+//!   per extent), and an eviction of the extent deletes
 //!   both keys whatever the counts say. One that is never read again and
 //!   never evicted is left to the cache bucket's lifecycle rule.
 
@@ -240,7 +241,8 @@ pub(super) async fn record_cache_fill<S: Sql>(
 /// the next write is due without asking again.
 ///
 /// With `from_cache` the read was served from the cache fill, so one
-/// exists: the same write counts it if it was not counted.
+/// exists: the same write counts it if it was not counted, and an
+/// uncounted one is counted whatever the age of the stamp.
 pub(super) async fn touch_read<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
@@ -255,7 +257,8 @@ pub(super) async fn touch_read<S: Sql>(
                evict_seq = evict_seq + \
                  CASE WHEN ?4 = 1 AND hot_cache_bytes = 0 THEN 1 ELSE 0 END, \
                hot_cache_bytes = CASE WHEN ?4 = 1 THEN cipher_size ELSE hot_cache_bytes END \
-             WHERE id = ?1 AND (last_read_at IS NULL OR last_read_at <= ?3)",
+             WHERE id = ?1 AND (last_read_at IS NULL OR last_read_at <= ?3 \
+                                OR (?4 = 1 AND hot_cache_bytes = 0))",
             &[
                 text(extent.as_str()),
                 ms(now),
@@ -307,6 +310,33 @@ pub(super) async fn hot_checked<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Resul
         )
         .await?;
     Ok(())
+}
+
+/// Records what a drain step leaves for the next one.
+pub(super) async fn hot_drain_set<S: Sql>(c: &SqlCatalog<S>, left: u64) -> Result<()> {
+    c.sql
+        .exec(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('hot_drain_left', ?1)",
+            &[int(left)?],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Takes up the drain where the last step left it. One statement, so
+/// only one delivery of the job that carries `left` gets `true`.
+pub(super) async fn hot_drain_claim<S: Sql>(c: &SqlCatalog<S>, left: u64) -> Result<bool> {
+    if left == 0 {
+        return Ok(false);
+    }
+    let changed = c
+        .sql
+        .exec(
+            "UPDATE meta SET v = 0 WHERE k = 'hot_drain_left' AND v = ?1",
+            &[int(left)?],
+        )
+        .await?;
+    Ok(changed == 1)
 }
 
 /// The extent's fencing token now (0 for an unknown extent). Read it

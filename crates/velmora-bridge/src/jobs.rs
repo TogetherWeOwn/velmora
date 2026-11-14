@@ -208,9 +208,12 @@ where
     /// claims it only for an extent that is not pinned in the very
     /// statement that makes the claim.
     ///
-    /// A step that is run twice (a retry after an error, a duplicate
-    /// delivery) can evict up to one batch more than was needed. That
-    /// costs later cold reads, never data.
+    /// A later step acts only once, however often its job is delivered:
+    /// it must claim what the step before it recorded. So a duplicate, or
+    /// the retry of a later step that failed part way, does nothing, and
+    /// the dispatcher starts a new drain if the tier is still over the
+    /// cap. Only a first step that is retried after an error totals the
+    /// tier again and goes on from there.
     pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
         let mut excess = remaining;
         if excess == 0 {
@@ -220,6 +223,10 @@ where
                 return Ok(0);
             }
             excess = total - low_watermark(cap);
+        } else if !self.catalog.hot_drain_claim(remaining).await? {
+            // A second delivery of a step that already ran, or a step of
+            // a drain that another one replaced: its `remaining` is stale.
+            return Ok(0);
         }
         let mut freed = 0u64;
         let rows = self.catalog.evict_candidates(EVICT_BATCH).await?;
@@ -253,8 +260,10 @@ where
             return Err(e);
         }
         if excess > 0 && more {
-            // If this send is lost, the dispatcher starts a new drain
-            // once the cap is exceeded.
+            // The next step runs once: it has to claim this record. If the
+            // send is lost, the dispatcher starts a new drain once the
+            // cap is exceeded.
+            self.catalog.hot_drain_set(excess).await?;
             let next = Job::Evict {
                 v: JOB_VERSION,
                 remaining: excess,

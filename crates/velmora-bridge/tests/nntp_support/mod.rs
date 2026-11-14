@@ -511,6 +511,12 @@ impl Catalog for MemCatalog {
     async fn hot_checked(&self, _: UnixMs) -> Result<()> {
         Ok(())
     }
+    async fn hot_drain_set(&self, _: u64) -> Result<()> {
+        Ok(())
+    }
+    async fn hot_drain_claim(&self, _: u64) -> Result<bool> {
+        Ok(false)
+    }
     async fn hot_seq(&self, _: &ExtentId) -> Result<u64> {
         Ok(0)
     }

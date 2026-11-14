@@ -377,6 +377,12 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn hot_checked(&self, now: UnixMs) -> Result<()> {
         hot::hot_checked(self, now).await
     }
+    async fn hot_drain_set(&self, left: u64) -> Result<()> {
+        hot::hot_drain_set(self, left).await
+    }
+    async fn hot_drain_claim(&self, left: u64) -> Result<bool> {
+        hot::hot_drain_claim(self, left).await
+    }
     async fn hot_seq(&self, extent: &ExtentId) -> Result<u64> {
         hot::hot_seq(self, extent).await
     }
