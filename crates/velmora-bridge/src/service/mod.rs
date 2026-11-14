@@ -7,6 +7,7 @@
 
 mod admin;
 mod common;
+mod copy;
 mod delete;
 mod get;
 pub use get::READ_STAMP_MS;
@@ -66,7 +67,7 @@ pub enum Route<'a> {
         bucket: &'a str,
         key: &'a str,
     },
-    /// Recognised S3 shape outside the slice (versioning, ACLs, copy, …).
+    /// Recognised S3 shape outside the slice (versioning, ACLs, …).
     NotImplemented,
 }
 

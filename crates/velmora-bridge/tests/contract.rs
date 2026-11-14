@@ -254,6 +254,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.hot_cap_bytes, 100 * 1024 * 1024 * 1024);
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     assert_eq!(cfg.maintenance, Maintenance::Off);
+    assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
 
@@ -265,6 +266,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.safety_min_age_secs, 0);
     assert_eq!(cfg.verify_delay_secs, 1);
     assert_eq!(cfg.gc_mode, GcMode::Disposable);
+    assert!(cfg.server_side_copy);
     // Absent or empty is the default; any other size is taken as given.
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     let mut sized = with_secrets(dev, PROVIDER_PLAIN);
@@ -344,6 +346,10 @@ fn config_rejects_invalid_and_unsafe_values() {
         assert_eq!(set(&prod, "HOT_CAP_BYTES", bad), invalid("HOT_CAP_BYTES"));
     }
     assert_eq!(set(&prod, "MAINTENANCE", "yes"), invalid("MAINTENANCE"));
+    assert_eq!(
+        set(&prod, "SERVER_SIDE_COPY", "1"),
+        invalid("SERVER_SIDE_COPY")
+    );
     assert_eq!(
         set(&dev, "DEV_TRUST_HTTP", "true"),
         invalid("DEV_TRUST_HTTP")
@@ -640,6 +646,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "buckets",
             "extents",
             "gc",
+            "generation_extents",
             "generations",
             "grants",
             "meta",
@@ -690,7 +697,18 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
-    assert!(changed.iter().all(|n| *n == 1), "{changed:?}");
+    // The committed extent (statement 5) also gets its reference row
+    // in `generation_extents`, written by the migration's trigger.
+    let want: Vec<u64> = (0..changed.len()).map(|n| 1 + u64::from(n == 5)).collect();
+    assert_eq!(changed, want);
+    let refs = db
+        .query(
+            "SELECT generation_id, seq, extent_id, plain_offset FROM generation_extents",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(refs, vec![vec![text("g_1"), i(0), text("x_1"), i(0)]]);
 
     let back = db
         .query(

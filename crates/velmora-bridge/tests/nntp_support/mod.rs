@@ -630,6 +630,9 @@ impl Catalog for MemCatalog {
     async fn commit_generation(&self, _: &CommitGeneration) -> Result<()> {
         unused()
     }
+    async fn copy_generation(&self, _: &velmora_bridge::CopyGeneration) -> Result<Guard<()>> {
+        unused()
+    }
     async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
         unused()
     }
@@ -862,6 +865,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
+        server_side_copy: true,
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),

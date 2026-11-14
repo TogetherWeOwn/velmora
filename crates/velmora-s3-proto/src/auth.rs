@@ -1,7 +1,8 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/auth.rs. License: MIT.
 // Copied verbatim except: test fixture path `../../tests/fixtures/published-crypto.json` -> `../tests/fixtures/published-crypto.json` (line 245); this header;
-// added (not from qerith): `SINGLE_VALUE_HEADERS` and the signed comma-value check in `verify`;
+// added (not from qerith): `SINGLE_VALUE_HEADERS` (with the copy-source conditions) and the
+// signed comma-value check in `verify`;
 // the `STREAMING-*` (aws-chunked) payload values, the streaming seed in `VerifiedRequest`
 // and the `signing_key`/`sign` helpers.
 
@@ -23,7 +24,7 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// (`a, b` vs `a,b`) and fails closed with SignatureDoesNotMatch; where it does
 /// match (`public` plus an empty field merges to `public,`), the verified string
 /// is the one acted on, so nothing unsigned is ever accepted.
-pub const SINGLE_VALUE_HEADERS: [&str; 19] = [
+pub const SINGLE_VALUE_HEADERS: [&str; 23] = [
     "host",
     "content-type",
     "content-md5",
@@ -33,6 +34,10 @@ pub const SINGLE_VALUE_HEADERS: [&str; 19] = [
     "x-amz-content-sha256",
     "x-amz-security-token",
     "x-amz-copy-source",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
     "expires",
     "date",
     "if-modified-since",

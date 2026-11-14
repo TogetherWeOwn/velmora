@@ -6,7 +6,7 @@ kept outside it:
 
 1. **Recovery records** in the `SAFETY` bucket, written by the Worker
    before every commit and never deleted:
-   - `m/<generation id>`: one per PutObject or CompleteMultipartUpload.
+   - `m/<generation id>`: one per PutObject, CopyObject or CompleteMultipartUpload.
      Bucket (id, name, wrapped key), object key, metadata and every extent
      (sizes, offsets, digests, media header, wrapped file key).
    - `m/del/<tombstone id>`: one per DeleteObject that removed an object.
@@ -27,7 +27,7 @@ the records do not hold (access keys, grants, verification history).
 
 | State | From the export | From the records |
 |---|---|---|
-| Acknowledged PutObject, CompleteMultipartUpload, DeleteObject | up to the export | all of them |
+| Acknowledged PutObject, CopyObject, CompleteMultipartUpload, DeleteObject | up to the export | all of them |
 | Buckets | yes | those with at least one write |
 | Article plans | yes | for every extent that reached posting |
 | Access keys and grants | yes | no: issue them again |
