@@ -414,7 +414,8 @@ pub(super) async fn commit_generation<S: Sql>(
 /// batch:
 /// - guard: the source is still the live object of its key, so its
 ///   extents are in service and the row the caller read is the one copied;
-/// - the new generation and its references. No extent, key or posting
+/// - the new generation and its references, and a guard that there are
+///   as many as the generation claims. No extent, key or posting
 ///   obligation is written: the extents keep the ones they have;
 /// - the destination's previous generation retired. When the destination
 ///   is the source key, that is the source itself, and its extents stay in
@@ -465,6 +466,17 @@ pub(super) async fn copy_generation<S: Sql>(
              SELECT ?1, seq, extent_id, plain_offset FROM generation_extents \
               WHERE generation_id = ?2",
             vec![text(g.id.as_str()), source()],
+        ),
+        // The copy has every reference its row claims, as a completed
+        // upload is held to: a source with fewer than it claims is never
+        // copied into an object that reads short.
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2",
+            vec![
+                text(g.id.as_str()),
+                SqlValue::Int(i64::from(g.extent_count)),
+            ],
         ),
     ];
     stmts.extend(retire_live(

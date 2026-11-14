@@ -852,6 +852,16 @@ async fn copy_references_the_extents_of_a_live_source_only() {
             .unwrap(),
         Guard::Applied(())
     );
+
+    // A source that has fewer references than its row claims: the copy
+    // would read short, so it is not made.
+    let whole = fx.commit(&b.id, "whole", 3, t1);
+    fx.cat.commit_generation(&whole).await.unwrap();
+    fx.run(&format!(
+        "DELETE FROM generation_extents WHERE generation_id = '{}' AND seq = 2",
+        whole.generation.id.as_str()
+    ));
+    refused(&fx, copy_of(&fx, &whole.generation, "short", t1.plus_ms(1))).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

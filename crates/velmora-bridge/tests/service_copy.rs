@@ -4,6 +4,9 @@
 
 mod service_support;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use service_support::*;
 use velmora_bridge::*;
 
@@ -698,4 +701,87 @@ async fn copy_without_its_recovery_record_commits_nothing() {
         .await
         .expect(200);
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+}
+
+/// The record of a copy that lost its guard, and what a test does to the
+/// source while that record is written.
+fn lose_the_guard(rig: &Rig, then: impl FnOnce(&TestBridge<NoNntp>, &str) + 'static) {
+    let bridge = rig.bridge.clone();
+    let hook = move |key: &str| {
+        assert!(key.starts_with("m/"), "{key}");
+        // The source changes between the read and the batch.
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute(
+                "UPDATE generations SET etag = '\"changed\"' WHERE key = 'src'",
+                [],
+            )
+            .unwrap()
+        });
+        then(&bridge, key);
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+}
+
+/// A copy that lost its guard has written a recovery record for a
+/// generation that was never published. When the record cannot be
+/// removed, the request ends with an error instead of trying again.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_that_cannot_remove_a_lost_record_fails() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(1);
+    let generations = rig.count("generations");
+
+    lose_the_guard(&rig, |bridge, key| {
+        *bridge.safety.fail_delete.borrow_mut() = Some(key.to_owned());
+    });
+    copy(&rig, &signer, &source("src"), "dst", &[])
+        .await
+        .expect_error(500, "InternalError");
+    assert!(rig.live(&bucket, "dst").await.is_none());
+    assert_eq!(rig.count("generations"), generations);
+
+    // The store answers again: the copy is made.
+    *rig.bridge.safety.fail_delete.borrow_mut() = None;
+    copy(&rig, &signer, &source("src"), "dst", &[])
+        .await
+        .expect(200);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+}
+
+/// The attempt after a lost guard takes an id after the lost one, also
+/// when the clock went back in between. A record of the lost attempt
+/// that survived would be replayed before the copy, never over it.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_retry_sorts_after_the_attempt_that_lost() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.bridge.clock.advance_secs(60);
+    let back = UnixMs(rig.now().0 - 10_000);
+    let records = rig.bridge.safety.keys().len();
+
+    let lost = Rc::new(RefCell::new(String::new()));
+    let seen = lost.clone();
+    lose_the_guard(&rig, move |bridge, key| {
+        *seen.borrow_mut() = key.to_owned();
+        bridge.clock.set(back);
+    });
+    copy(&rig, &signer, &source("src"), "dst", &[])
+        .await
+        .expect(200);
+
+    let (made, _) = rig.live(&bucket, "dst").await.unwrap();
+    let made = recovery::generation_key(&made.id);
+    let lost = lost.borrow().clone();
+    assert!(!lost.is_empty() && made > lost, "{made} {lost}");
+    // The lost record is gone; the copy's is there.
+    let keys = rig.bridge.safety.keys();
+    assert_eq!(keys.len(), records + 1);
+    assert!(keys.contains(&made) && !keys.contains(&lost));
 }

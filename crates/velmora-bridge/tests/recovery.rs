@@ -777,24 +777,21 @@ async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
     assert_eq!(count(&rig, LIVE_POSTING), 2);
 
-    // The rows queued when the source was retired are still open. The
-    // collector refuses each of them while the copy is live.
-    assert_eq!(count(&rig, LIVE_IN_GC), 3);
+    // The collection queued when the source was retired is called off:
+    // the copy brought the extent back into service.
+    assert_eq!(count(&rig, LIVE_IN_GC), 0);
+    assert_eq!(rig.count("gc WHERE done_at IS NULL"), 0);
+    assert_eq!(rig.count("gc"), 3);
     rig.bridge.clock.advance_secs(8 * 86_400);
-    let due = rig
-        .bridge
-        .catalog
-        .gc_due(rig.now(), 100, false)
-        .await
-        .unwrap();
-    assert_eq!(due.len(), 3);
-    for row in &due {
-        assert_eq!(
-            rig.bridge.catalog.gc_begin(row, rig.now()).await.unwrap(),
-            GcStep::Skipped
-        );
-    }
+    let due = rig.bridge.catalog.gc_due(rig.now(), 100, false);
+    assert!(due.await.unwrap().is_empty());
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
+
+    // With its last reference the extent leaves service again, and that
+    // retirement queues its own rows.
+    delete(&rig, &signer, "dst").await.expect(204);
+    assert_eq!(rig.count("gc WHERE done_at IS NULL"), 3);
+    assert_eq!(rig.count("gc"), 6);
 }
 
 /// A copy onto an existing key is the newest generation of that key by

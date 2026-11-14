@@ -326,9 +326,8 @@ pub(super) async fn replay_publish<S: Sql>(
     // A shared extent can have left service earlier in this replay: the
     // generation it was written for was retired by a manifest that sorts
     // before this one. It is back in service now, so its obligation runs
-    // again. Its open GC rows stay; the collector refuses them for as
-    // long as a live generation references the extent. Nothing collects
-    // while a restore runs, so no delete is under way.
+    // again, and the collection queued for it is called off below.
+    // Nothing collects while a restore runs, so no delete is under way.
     stmts.push((
         "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
                                           WHERE e.id = outbox.extent_id) \
@@ -336,6 +335,14 @@ pub(super) async fn replay_publish<S: Sql>(
                 attempts = 0, next_at = ?2, lease_owner = NULL, lease_until = NULL, \
                 updated_at = ?2 \
           WHERE stage = 'cancelled' AND extent_id IN \
+                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
+        vec![gen_id(), ms(now)],
+    ));
+    // Its open GC rows are closed: they were queued for a retirement
+    // that this reference undoes. When the extent really leaves service,
+    // the retirement that takes its last reference queues fresh rows.
+    stmts.push((
+        "UPDATE gc SET done_at = ?2 WHERE done_at IS NULL AND extent_id IN \
                 (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
         vec![gen_id(), ms(now)],
     ));

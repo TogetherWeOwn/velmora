@@ -336,6 +336,13 @@ where
         // A `done` extent whose safety copy is held was short of backbones
         // when it was verified. Once enough are configured it is verified
         // again; the rows moved here are due at once and sent below.
+        // So is a cancelled posting of an extent that a live generation
+        // references: an older Worker can leave one after a rollback.
+        // Like the re-drive below, an extra that must not stop the send.
+        match self.catalog.revive_referenced(REDRIVE_LIMIT, now).await {
+            Ok(n) => report.redriven = n,
+            Err(_) => report.redrive_failed = true,
+        }
         let labels: Vec<String> = backbones(&self.cfg.providers)
             .into_iter()
             .map(|(label, _)| label)
@@ -348,7 +355,7 @@ where
                 self.catalog
                     .redrive_underverified(&labels, required, REDRIVE_LIMIT, now);
             match redriven.await {
-                Ok(n) => report.redriven = n,
+                Ok(n) => report.redriven += n,
                 Err(_) => report.redrive_failed = true,
             }
         }
