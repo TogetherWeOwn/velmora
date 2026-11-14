@@ -4,6 +4,7 @@ mod nntp_support;
 
 use nntp_support::*;
 use velmora_bridge::config::Environment;
+use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::verify::{MISSING_BACKOFF_SECS, REVERIFY_SECS};
 use velmora_bridge::*;
 
@@ -685,6 +686,24 @@ async fn missing_after_the_grace_is_posted_to_the_backbone_that_lacks_it() {
         rig.bridge.catalog.extent(&s.extent).safety_state,
         SafetyState::Released
     );
+}
+
+/// A repost that is larger than the whole budget runs alone, next to the
+/// charge its own verify job already holds: it is not put off for ever.
+#[tokio::test]
+async fn a_repost_larger_than_the_budget_still_runs() {
+    let mut rig = two_posting_backbones().await;
+    rig.bridge.budget = ByteBudget::new(4 * 1024 * 1024);
+    let (s, plan) = rig.waited_out_the_grace(31).await;
+    // What the dispatcher charges for a verify job.
+    let stage = rig.bridge.budget.try_charge(2 * 1024 * 1024).unwrap();
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    drop(stage);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
 }
 
 /// With no grace at all the first read that finds articles missing posts

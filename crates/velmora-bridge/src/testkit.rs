@@ -12,6 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection};
@@ -295,15 +296,16 @@ impl BlobStore for MemBlobStore {
 // FixedClock
 // ---------------------------------------------------------------------------
 
-/// A clock that moves only when told to.
+/// A clock that moves only when told to. A clone shows the same time.
+#[derive(Clone)]
 pub struct FixedClock {
-    now: Cell<UnixMs>,
+    now: Rc<Cell<UnixMs>>,
 }
 
 impl FixedClock {
     pub fn new(now: UnixMs) -> Self {
         FixedClock {
-            now: Cell::new(now),
+            now: Rc::new(Cell::new(now)),
         }
     }
 

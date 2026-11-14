@@ -44,9 +44,42 @@ pub struct TcpConnector {
     live: Rc<Cell<u32>>,
     peak: Rc<Cell<u32>>,
     connects: Cell<u32>,
+    slow: Rc<RefCell<Option<Slow>>>,
+}
+
+/// Calls that take time on the test clock, and when each one started.
+struct Slow {
+    clock: FixedClock,
+    ms: i64,
+    calls: Vec<(&'static str, UnixMs)>,
+}
+
+fn begin(slow: &RefCell<Option<Slow>>, what: &'static str) {
+    if let Some(slow) = slow.borrow_mut().as_mut() {
+        slow.calls.push((what, slow.clock.now()));
+    }
+}
+
+fn end(slow: &RefCell<Option<Slow>>) {
+    if let Some(slow) = slow.borrow().as_ref() {
+        slow.clock.advance_ms(slow.ms);
+    }
 }
 
 impl TcpConnector {
+    /// From now on every connect, lookup and POST takes `ms` on `clock`.
+    pub fn slow(&self, clock: &FixedClock, ms: i64) {
+        *self.slow.borrow_mut() = Some(Slow {
+            clock: clock.clone(),
+            ms,
+            calls: Vec::new(),
+        });
+    }
+    /// The slow calls so far: what, and the time each started.
+    pub fn calls(&self) -> Vec<(&'static str, UnixMs)> {
+        let slow = self.slow.borrow();
+        slow.as_ref().map(|s| s.calls.clone()).unwrap_or_default()
+    }
     /// Most sessions ever open at once.
     pub fn peak(&self) -> u32 {
         self.peak.get()
@@ -84,6 +117,7 @@ pub async fn dial(cfg: &NntpConfig) -> Result<NntpClient<NativeTlsTransport>> {
 pub struct CountedSession {
     inner: Option<NntpClient<NativeTlsTransport>>,
     live: Rc<Cell<u32>>,
+    slow: Rc<RefCell<Option<Slow>>>,
 }
 
 impl Drop for CountedSession {
@@ -100,10 +134,16 @@ impl CountedSession {
 
 impl NntpSession for CountedSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
-        NntpSession::post(self.client(), message_id, article).await
+        begin(&self.slow, "post");
+        let posted = NntpSession::post(self.client(), message_id, article).await;
+        end(&self.slow);
+        posted
     }
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
-        NntpSession::stat(self.client(), message_id).await
+        begin(&self.slow, "stat");
+        let found = NntpSession::stat(self.client(), message_id).await;
+        end(&self.slow);
+        found
     }
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
         NntpSession::body(self.client(), message_id, out).await
@@ -119,13 +159,17 @@ impl NntpConnector for TcpConnector {
     type Session = CountedSession;
 
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
-        let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await?;
+        begin(&self.slow, "connect");
+        let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
+        end(&self.slow);
+        let client = client?;
         self.connects.set(self.connects.get() + 1);
         self.live.set(self.live.get() + 1);
         self.peak.set(self.peak.get().max(self.live.get()));
         Ok(CountedSession {
             inner: Some(client),
             live: Rc::clone(&self.live),
+            slow: Rc::clone(&self.slow),
         })
     }
 }
@@ -192,6 +236,8 @@ pub struct MemCatalog {
     pub fault: Cell<Option<Fault>>,
     /// `renew_all` calls so far (one per renewal tick of a post job).
     pub renewals: Cell<u32>,
+    /// The time of each `renew_all`.
+    pub renewed_at: RefCell<Vec<UnixMs>>,
     /// `mark_posted_many` calls so far.
     pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
@@ -645,6 +691,7 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
         self.renewals.set(self.renewals.get() + 1);
+        self.renewed_at.borrow_mut().push(now);
         let lease = self.renew(l, now).await?;
         let mut held = Vec::new();
         for p in permits {

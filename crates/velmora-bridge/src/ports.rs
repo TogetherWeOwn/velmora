@@ -124,7 +124,14 @@ pub trait NntpSession {
     async fn quit(self);
 }
 
-/// Opens sessions. No permit, no socket.
+/// The longest one `connect`, `post` or `stat` may take, whatever its
+/// per-operation timeouts add up to: a connector gives the call up with
+/// a transport error once this is over. A posting job counts on it, so
+/// that no call outlasts the lease and the permit it started under.
+pub const NNTP_CALL_SECS: u32 = 80;
+
+/// Opens sessions. No permit, no socket. A `connect` ends within
+/// [`NNTP_CALL_SECS`], and so do `post` and `stat` on its sessions.
 pub trait NntpConnector {
     type Session: NntpSession;
     async fn connect(&self, provider: &ProviderConfig, permit: &Permit) -> Result<Self::Session>;

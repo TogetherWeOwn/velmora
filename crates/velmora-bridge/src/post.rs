@@ -38,10 +38,12 @@ use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
 use crate::fetch::{report_health, ProviderSession};
+use crate::jobs::JOB_OVERHEAD_BYTES;
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
-    NntpSession, Permit, PermitClass, LEASE_SECS, MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
+    NntpSession, Permit, PermitClass, LEASE_SECS, MAX_QUEUE_DELAY_SECS, NNTP_CALL_SECS,
+    PERMIT_SECS,
 };
 use crate::recovery::write_article_plan;
 use crate::types::{
@@ -373,36 +375,48 @@ where
         // A connection failed during a post: the article may have landed.
         let mut unknown = false;
         for tier in order.chunk_by(|a, b| a.priority == b.priority) {
-            let todo: Vec<usize> = (0..plan.len())
-                .filter(|at| plan[*at].state == ArticleState::Planned)
-                .collect();
-            let (sessions, busy) = self.open_sessions(tier, &holder, todo.len()).await?;
-            if sessions.is_empty() {
-                // A healthy provider of the tier had no slot: wait for it.
-                return Err(Stop::NoPermit);
-            }
-            let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan);
-            let ended = round
-                .run(sessions, todo.iter().map(|at| (*at, unknown)), true)
-                .await;
-            for (row, marked) in plan.iter_mut().zip(&ended.marked) {
-                if *marked {
-                    row.state = ArticleState::Posted;
+            // Providers of the tier that have not posted for this job yet.
+            let mut untried: Vec<&ProviderConfig> = tier.to_vec();
+            // A provider of the tier had no slot, in the catalogue or at
+            // its own login.
+            let mut busy = false;
+            loop {
+                let todo: Vec<usize> = (0..plan.len())
+                    .filter(|at| plan[*at].state == ArticleState::Planned)
+                    .collect();
+                let (sessions, no_slot) = self.open_sessions(&untried, &holder, todo.len()).await?;
+                busy |= no_slot;
+                if sessions.is_empty() {
+                    break;
                 }
-            }
-            match ended.stop {
-                None if plan.iter().all(|a| a.state == ArticleState::Posted) => return Ok(()),
-                None => return Err(Stop::fail(FailClass::Internal)),
-                Some(stop @ Stop::Fail(FailClass::PostRefused | FailClass::NntpError, _)) => {
-                    if busy {
-                        // Another provider of the tier may still do it.
-                        return Err(Stop::NoPermit);
+                // Each provider gets one round: one that failed is not
+                // asked again in this job, the rest of the tier is.
+                untried.retain(|p| !sessions.iter().any(|s| s.provider.id == p.id));
+                let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan);
+                let ended = round
+                    .run(sessions, todo.iter().map(|at| (*at, unknown)), true)
+                    .await;
+                for (row, marked) in plan.iter_mut().zip(&ended.marked) {
+                    if *marked {
+                        row.state = ArticleState::Posted;
                     }
-                    unknown |= matches!(stop, Stop::Fail(FailClass::NntpError, _));
-                    // The first failure is the one reported.
-                    failed.get_or_insert(stop);
                 }
-                Some(stop) => return Err(stop),
+                busy |= ended.busy;
+                match ended.stop {
+                    None if plan.iter().all(|a| a.state == ArticleState::Posted) => return Ok(()),
+                    None => return Err(Stop::fail(FailClass::Internal)),
+                    Some(stop @ Stop::Fail(FailClass::PostRefused | FailClass::NntpError, _)) => {
+                        unknown |= matches!(stop, Stop::Fail(FailClass::NntpError, _));
+                        // The first failure is the one reported.
+                        failed.get_or_insert(stop);
+                    }
+                    Some(stop) => return Err(stop),
+                }
+            }
+            if busy {
+                // A healthy provider of the tier had no slot: wait for it
+                // rather than spend an attempt or fall to a backup.
+                return Err(Stop::NoPermit);
             }
         }
         Err(match (failed, cooling) {
@@ -481,11 +495,14 @@ where
         if providers.is_empty() || extent.safety_state != SafetyState::Held {
             return Ok(false);
         }
-        // Unlike the rest of its stage, a repost holds the whole extent.
+        // Unlike the rest of its stage, a repost holds the whole extent. A
+        // repost larger than the budget still has to run, alone: next to
+        // what its own stage already holds.
+        let room = self.budget.capacity().saturating_sub(JOB_OVERHEAD_BYTES);
         let bytes = extent
             .cipher_size
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
-            .min(self.budget.capacity());
+            .min(room);
         let Ok(_charge) = self.budget.charge(bytes).await else {
             return Err(Stop::NoPermit);
         };
@@ -531,10 +548,11 @@ pub(crate) const POST_SOCKET_BYTES: u64 = 1024 * 1024;
 /// The lease and every permit of a posting job are renewed together, in
 /// one catalogue round trip, once the last renewal is this old.
 const KEEP_EVERY_MS: i64 = 20_000;
-/// The longest a POST may take (the transport gives one operation 60 s)
-/// plus a margin. No POST starts with less than this left on the lease
-/// or on its permit.
+/// The longest one call to the connector may take ([`NNTP_CALL_SECS`])
+/// plus a margin. No connect, lookup or POST starts with less than this
+/// left on the lease or on its permit.
 const POST_RESERVE_MS: i64 = 90_000;
+const _: () = assert!(POST_RESERVE_MS >= NNTP_CALL_SECS as i64 * 1000 + 10_000);
 // A renewal at most `KEEP_EVERY_MS` old leaves the reserve on both.
 const _: () = assert!(PERMIT_SECS as i64 * 1000 - KEEP_EVERY_MS >= POST_RESERVE_MS);
 const _: () = assert!(LEASE_SECS >= PERMIT_SECS);
@@ -588,6 +606,9 @@ pub(crate) struct Ended {
     pub(crate) stop: Option<Stop>,
     /// Per plan position: recorded as posted in the catalogue.
     pub(crate) marked: Vec<bool>,
+    /// A socket found no slot: its permit was gone, or the provider
+    /// refused the login because the account is at its limit.
+    pub(crate) busy: bool,
 }
 
 /// One pass of a job over its open sockets. The sockets share the queue,
@@ -681,6 +702,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             };
             report_health(self.catalog, self.clock, provider, healthy).await;
         }
+        let busy = ended.iter().any(|e| matches!(e.1, Some(Stop::NoPermit)));
         let state = self.state.into_inner();
         let left = state.queue.len() + state.in_flight;
         let stop = match (state.fatal, left) {
@@ -701,6 +723,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         Ended {
             stop,
             marked: state.marked,
+            busy,
         }
     }
 
@@ -788,7 +811,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         post_one(self, slot, session, row, &article, unknown).await
     }
 
-    /// Call it before every POST and before every reconnect. It returns
+    /// Call it before every connect, lookup and POST. It returns
     /// `Ok` only while the lease and the permit of `slot` were both
     /// confirmed by the catalogue less than [`KEEP_EVERY_MS`] ago, which
     /// leaves [`POST_RESERVE_MS`] on each: no POST and no new socket
@@ -890,6 +913,39 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
     }
 }
 
+/// One try at one article: connect if there is no session, look the
+/// message-id up when the article may be there already, then POST. Each
+/// of the three is one call to the connector, which ends within
+/// [`NNTP_CALL_SECS`]; the lease and the permit are checked again
+/// ([`Round::keep`]) before the lookup and before the POST, so every
+/// call starts with [`POST_RESERVE_MS`] left however long the calls
+/// before it took. The inner result is the session's own verdict.
+async fn exchange<'a, C: Catalog, N: NntpConnector, T: Clock>(
+    round: &Round<'a, C, T>,
+    slot: usize,
+    session: &mut ProviderSession<'a, C, N, T>,
+    row: &ArticleRow,
+    article: &[u8],
+    unknown: bool,
+) -> core::result::Result<Result<()>, Stop> {
+    session.session().await?;
+    round.keep(slot, session).await?;
+    if unknown {
+        match session.session().await?.stat(&row.message_id).await {
+            Ok(true) => return Ok(Ok(())),
+            Ok(false) => {}
+            Err(e) => return Ok(Err(e)),
+        }
+        round.keep(slot, session).await?;
+    }
+    let posted = session
+        .session()
+        .await?
+        .post(&row.message_id, article)
+        .await;
+    Ok(posted.map(|_| ()))
+}
+
 /// POSTs one article. `Posted` and a confirmed `Duplicate` both mean the
 /// provider has it. A stale connection is replaced and the same article
 /// re-sent, at most [`MAX_POST_ATTEMPTS`] tries in all; the lease and the
@@ -912,15 +968,8 @@ async fn post_one<'a, C: Catalog, N: NntpConnector, T: Clock>(
 ) -> core::result::Result<(), Stop> {
     let mut attempt = 1;
     loop {
-        let result = match session.session().await {
-            Ok(s) => match unknown {
-                true => match s.stat(&row.message_id).await {
-                    Ok(true) => Ok(()),
-                    Ok(false) => s.post(&row.message_id, article).await.map(|_| ()),
-                    Err(e) => Err(e),
-                },
-                false => s.post(&row.message_id, article).await.map(|_| ()),
-            },
+        let result = match exchange(round, slot, session, row, article, unknown).await {
+            Ok(result) => result,
             Err(Stop::Session(e)) => Err(e),
             Err(stop) => return Err(stop),
         };

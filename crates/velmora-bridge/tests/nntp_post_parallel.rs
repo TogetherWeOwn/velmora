@@ -405,3 +405,112 @@ async fn spread_post_with_a_stale_lease_writes_nothing() {
     );
     assert!(rig.bridge.jobs.sent().is_empty());
 }
+
+/// A job with one article opens one socket. When the provider it picked
+/// refuses the post, the other provider of the same tier gets it, in the
+/// same run, whichever of the two refuses.
+#[tokio::test]
+async fn one_article_reaches_the_other_provider_of_the_tier() {
+    for refusing in [0, 1] {
+        let rig = spread_rig().await;
+        let s = rig.seed(1, &[7; 1000]).await;
+        rig.servers[refusing].set_posting_allowed(false).await;
+
+        assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+        let plan = rig.plan(&s).await;
+        assert_eq!(plan.len(), 1);
+        assert!(all_posted_by(&plan, &format!("p{}", 1 - refusing)));
+        assert_eq!(rig.servers[refusing].posted_count().await, 0);
+        assert_eq!(stored(&rig, 1 - refusing).await, id_set(&plan));
+        assert_eq!(rig.bridge.nntp.live(), 0);
+    }
+}
+
+/// More providers in the tier than sockets in the job: the providers
+/// that got no socket in the first round are asked when the first fail.
+#[tokio::test]
+async fn providers_beyond_the_socket_limit_are_asked_too() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5), spec("bb2", 5)]).await;
+    rig.bridge.cfg.post_sockets = 2;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    // Whichever two come first, at least one of them refuses.
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.servers[1].set_posting_allowed(false).await;
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let plan = rig.plan(&s).await;
+    assert!(all_posted_by(&plan, "p2"));
+    assert_eq!(stored(&rig, 2).await, id_set(&plan));
+    assert!(rig.bridge.nntp.peak() <= 2);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// One provider of the tier is at its account limit (its login is
+/// refused), the other refuses the post. The busy one may still do the
+/// work later: the job waits for it without spending an attempt, and
+/// does not fall to the backup tier.
+#[tokio::test]
+async fn a_login_refused_for_the_limit_defers_the_job() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5), spec("bb2", 5)]).await;
+    rig.bridge.cfg.providers[2].priority = 1;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let addr = rig.servers[0].addr();
+    let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+    // Something else holds every connection of the first account.
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(dial(&cfg).await.unwrap());
+    }
+    rig.servers[1].set_posting_allowed(false).await;
+
+    let outcome = rig.run_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { delay_secs } if delay_secs < 120));
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!((outbox.stage, outbox.attempts), (OutboxStage::Post, 0));
+    assert_eq!(outbox.last_error, None);
+    for server in &rig.servers {
+        assert_eq!(server.posted_count().await, 0);
+    }
+    assert_eq!(rig.bridge.nntp.live(), 0);
+
+    // The account has room again: the same job finishes on it.
+    for client in held {
+        client.quit().await;
+    }
+    rig.bridge.clock.advance_secs(120);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[2].posted_count().await, 0);
+}
+
+/// Every call to the provider is slow, each well inside its own time
+/// limit, and together they take longer than a permit lasts. The lease
+/// and the permits are renewed between the calls of one article, not
+/// only between articles: no connect, lookup or POST starts on a renewal
+/// older than the timer.
+#[tokio::test]
+async fn slow_calls_never_start_on_an_old_renewal() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    rig.bridge.cfg.post_sockets = 1;
+    let s = rig.seed(1, &marked_plaintext(1_400_000)).await;
+    // The first reply is lost: that article is looked up after a reconnect.
+    rig.servers[0].drop_next_posts(1).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 55_000);
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let calls = rig.bridge.nntp.calls();
+    let renewed = rig.bridge.catalog.renewed_at.borrow().clone();
+    for what in ["connect", "stat", "post"] {
+        assert!(calls.iter().any(|c| c.0 == what), "no {what} was made");
+    }
+    // In all they took longer than a permit lasts.
+    assert!(calls.len() as i64 * 55_000 > i64::from(PERMIT_SECS) * 1000);
+    for (what, at) in calls {
+        let fresh = renewed.iter().any(|r| (0..20_000).contains(&(at.0 - r.0)));
+        assert!(fresh, "{what} at {} started on an old renewal", at.0 - T0.0);
+    }
+    let plan = rig.plan(&s).await;
+    assert!(all_posted_by(&plan, "p0"));
+    assert_eq!(stored(&rig, 0).await, id_set(&plan));
+}

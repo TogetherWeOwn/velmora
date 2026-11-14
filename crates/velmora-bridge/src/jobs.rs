@@ -47,7 +47,7 @@ pub const EVICT_CHECK_SECS: u32 = 1800;
 pub const INFRA_RETRY_SECS: u32 = 60;
 /// Working memory of a job besides the extent itself: one article on the
 /// wire and one decoded.
-const JOB_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const JOB_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Where a drain stops: 90 % of the cap, so that a tier sitting at the
 /// cap is not evicted a little on every run.
