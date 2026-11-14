@@ -20,10 +20,10 @@
 use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
-use crate::replay::{ReplayExtent, ReplayProbe, ReplayPublish};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::types::{
-    ArticleRow, BridgeError, Bucket, ExtentPlacement, GenerationId, GenerationRow, GenerationState,
-    Result, SafetyState, UnixMs,
+    ArticleRow, BridgeError, Bucket, ExtentId, ExtentPlacement, GenerationId, GenerationRow,
+    GenerationState, Result, SafetyState, UnixMs,
 };
 
 type Stmt = (&'static str, Vec<SqlValue>);
@@ -214,6 +214,154 @@ pub(super) async fn replay_damaged<S: Sql>(
         }
     }
     Ok((count, ids))
+}
+
+/// Ids of extents whose row says a pinned copy exists.
+pub(super) async fn held_extents<S: Sql>(
+    c: &SqlCatalog<S>,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<ExtentId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT id FROM extents WHERE id > ?1 AND safety_state IN ('held', 'releasing') \
+             ORDER BY id LIMIT ?2",
+            &[text(after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row.as_slice() {
+            [SqlValue::Text(id)] => ids.push(ExtentId::new(id.clone())),
+            _ => return Err(BridgeError::Sql("row decode: held extent".into())),
+        }
+    }
+    Ok(ids)
+}
+
+pub(super) async fn restore_begin<S: Sql>(
+    c: &SqlCatalog<S>,
+    since: UnixMs,
+    now: UnixMs,
+) -> Result<UnixMs> {
+    // The mark is the start time, moved past the mark of the replay
+    // before it when the two fall into one millisecond.
+    let rows = c
+        .sql
+        .query(
+            "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
+             VALUES (1, 'replaying', ?1, ?2, NULL) \
+             ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
+               started_at = max(excluded.started_at, restore_state.started_at + 1), \
+               finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
+               reached_extent = NULL \
+             RETURNING started_at",
+            &[ms(since), ms(now)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(run)]) => Ok(UnixMs(*run)),
+        _ => Err(BridgeError::Sql("row decode: restore mark".into())),
+    }
+}
+
+pub(super) async fn restore_finish<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+    now: UnixMs,
+) -> Result<bool> {
+    // Ending the same replay twice is the same as ending it once.
+    let changed = c
+        .sql
+        .exec(
+            "UPDATE restore_state SET state = 'complete', \
+               finished_at = COALESCE(finished_at, ?1) \
+             WHERE id = 1 AND started_at = ?2",
+            &[ms(now), ms(run)],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
+pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'",
+            &[],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(n)]) => Ok(*n != 0),
+        _ => Err(BridgeError::Sql("row decode: restore state".into())),
+    }
+}
+
+/// Fails the batch it is in while a replay is under way. Every batch
+/// that publishes or deletes for a client carries it: the gate at the
+/// start of a request is read before the batch runs, and a replay that
+/// started in between must not find a write committed under it.
+pub(super) fn guard_no_replay() -> Stmt {
+    (
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete')",
+        Vec::new(),
+    )
+}
+
+pub(super) async fn restore_progress<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+) -> Result<Option<RestoreProgress>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT since_ms, reached_phase, reached_after, reached_extent \
+             FROM restore_state WHERE id = 1 AND started_at = ?1",
+            &[ms(run)],
+        )
+        .await?;
+    let bad = || BridgeError::Sql("row decode: restore progress".into());
+    match rows.first().map(Vec::as_slice) {
+        None => Ok(None),
+        Some([SqlValue::Int(since), SqlValue::Null, _, _]) => Ok(Some(RestoreProgress {
+            since: UnixMs(*since),
+            reached: None,
+        })),
+        Some(
+            [SqlValue::Int(since), SqlValue::Int(phase), SqlValue::Text(after), SqlValue::Int(extent)],
+        ) => Ok(Some(RestoreProgress {
+            since: UnixMs(*since),
+            reached: Some(ReplayMark {
+                phase: u8::try_from(*phase).map_err(|_| bad())?,
+                after: after.clone(),
+                extent: u32::try_from(*extent).map_err(|_| bad())?,
+            }),
+        })),
+        Some(_) => Err(bad()),
+    }
+}
+
+pub(super) async fn restore_advance<S: Sql>(
+    c: &SqlCatalog<S>,
+    run: UnixMs,
+    next: &ReplayMark,
+) -> Result<()> {
+    c.sql
+        .exec(
+            "UPDATE restore_state SET reached_phase = ?2, reached_after = ?3, reached_extent = ?4 \
+             WHERE id = 1 AND started_at = ?1 AND (reached_phase IS NULL \
+               OR (reached_phase, reached_after, reached_extent) < (?2, ?3, ?4))",
+            &[
+                ms(run),
+                SqlValue::Int(i64::from(next.phase)),
+                text(&next.after),
+                SqlValue::Int(i64::from(next.extent)),
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 /// An extent with neither a pinned copy nor an article plan.

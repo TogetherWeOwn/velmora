@@ -51,6 +51,7 @@ pub struct ReplayLimits {
 /// Damaged generations the last call lists by id.
 const DAMAGED_LISTED: u32 = 100;
 const OTHER_BUCKET_LISTED: usize = 100;
+const HELD_MISSING_LISTED: usize = 100;
 
 impl Default for ReplayLimits {
     fn default() -> Self {
@@ -99,6 +100,8 @@ pub struct ReplayExtent {
 pub enum ReplayPhase {
     Manifests,
     Tombstones,
+    /// Extents the catalogue says are pinned, checked against the store.
+    Held,
 }
 
 /// Resume point of a replay. Opaque to the caller: send back what the
@@ -113,9 +116,57 @@ pub struct ReplayCursor {
     pub after: String,
     /// Extents already handled of the record after `after`.
     pub extent: u32,
+    /// The replay this cursor belongs to, as the restore route recorded
+    /// it when the replay started. Only that replay is ended by it.
+    #[serde(default)]
+    pub run_ms: i64,
+}
+
+/// A place in a replay, in the order the replay goes through the
+/// records: the phase, then the blob key, then the extent.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReplayMark {
+    /// 0 = manifests, 1 = tombstones, 2 = held extents.
+    pub phase: u8,
+    pub after: String,
+    pub extent: u32,
+}
+
+/// What the catalogue holds of a replay that was started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreProgress {
+    /// Records minted at or after this time are replayed.
+    pub since: UnixMs,
+    /// Where the next step starts. `None` = no step has finished.
+    pub reached: Option<ReplayMark>,
 }
 
 impl ReplayCursor {
+    /// The place this cursor starts a step from.
+    pub fn mark(&self) -> ReplayMark {
+        ReplayMark {
+            phase: match self.phase {
+                ReplayPhase::Manifests => 0,
+                ReplayPhase::Tombstones => 1,
+                ReplayPhase::Held => 2,
+            },
+            after: self.after.clone(),
+            extent: self.extent,
+        }
+    }
+
+    /// Whether a replay that has come as far as `progress` may take a
+    /// step from this cursor: it is of the same restore point and not
+    /// ahead of it. A cursor that is behind repeats what was done, which
+    /// changes nothing; one that is ahead would leave records out.
+    pub fn follows(&self, progress: &RestoreProgress) -> bool {
+        let reached = match &progress.reached {
+            Some(mark) => mark.clone(),
+            None => ReplayCursor::start(progress.since).mark(),
+        };
+        self.since_ms == progress.since.0 && self.mark() <= reached
+    }
+
     /// A replay of every record minted at or after `since`.
     pub fn start(since: UnixMs) -> Self {
         ReplayCursor {
@@ -123,6 +174,7 @@ impl ReplayCursor {
             phase: ReplayPhase::Manifests,
             after: start_after(GENERATION_PREFIX, since),
             extent: 0,
+            run_ms: 0,
         }
     }
 }
@@ -166,6 +218,14 @@ pub struct ReplayReport {
     /// the record's bucket. The first ids of `other_bucket_total`.
     pub other_bucket_total: u32,
     pub other_bucket: Vec<String>,
+    /// Extents whose row says the pinned copy is held, checked.
+    pub held_checked: u32,
+    /// Of those, the ones whose pinned copy is gone: the catalogue is
+    /// older than their release, and this replay did not reach their
+    /// records. A replay from 0 repairs them. `held_missing` holds the
+    /// first extent ids of each call.
+    pub held_missing_total: u32,
+    pub held_missing: Vec<String>,
     /// Set by the last call: live generations with an extent that has no
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
@@ -201,6 +261,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         let next = match cursor.phase {
             ReplayPhase::Manifests => self.replay_manifests(cursor, limits, &mut report).await?,
             ReplayPhase::Tombstones => self.replay_tombstones(cursor, limits, &mut report).await?,
+            ReplayPhase::Held => self.replay_held(cursor, limits, &mut report).await?,
         };
         report.next = next;
         Ok(report)
@@ -427,15 +488,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             match read_tombstone(&self.safety, &self.kek, name).await {
                 Ok(Some(t)) => {
                     let (bucket, id) = (BucketId::new(t.bucket_id), GenerationId::new(t.id));
-                    // Also when it deletes nothing here: a write after
-                    // the replay sorts after every tombstone on record.
-                    self.catalog
-                        .raise_floor(&bucket, &t.key, &id, false)
-                        .await?;
-                    self.catalog.settle_floor(&bucket, &t.key, &id).await?;
+                    // The floor is raised also when nothing is deleted
+                    // here: a write after the replay sorts after every
+                    // tombstone on record.
                     let deleted = self
                         .catalog
-                        .delete_object_before(&bucket, &t.key, &id, now)
+                        .replay_tombstone(&bucket, &t.key, &id, now)
                         .await?;
                     report.tombstones += 1;
                     report.deleted += u32::from(deleted);
@@ -449,6 +507,40 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             cursor = finished(cursor, name);
         }
         if names.len() as u64 == u64::from(limits.records) {
+            return Ok(Some(cursor));
+        }
+        Ok(Some(ReplayCursor {
+            phase: ReplayPhase::Held,
+            after: String::new(),
+            extent: 0,
+            ..cursor
+        }))
+    }
+
+    /// A replay from a restore point does not read the records of older
+    /// extents. If the catalogue is older than the release of one of
+    /// them, its row still says `held` while the pinned copy is gone,
+    /// and the pipeline would wait for a copy that never comes. This
+    /// finds them; it changes nothing.
+    async fn replay_held(
+        &self,
+        mut cursor: ReplayCursor,
+        limits: ReplayLimits,
+        report: &mut ReplayReport,
+    ) -> Result<Option<ReplayCursor>> {
+        let limit = u32::try_from(limits.extents).unwrap_or(u32::MAX);
+        let ids = self.catalog.held_extents(&cursor.after, limit).await?;
+        for id in &ids {
+            report.held_checked += 1;
+            if self.safety.head(&id.safety_key()).await?.is_none() {
+                report.held_missing_total += 1;
+                if report.held_missing.len() < HELD_MISSING_LISTED {
+                    report.held_missing.push(id.as_str().to_owned());
+                }
+            }
+            cursor.after = id.as_str().to_owned();
+        }
+        if ids.len() as u64 == u64::from(limit) {
             return Ok(Some(cursor));
         }
         let (total, ids) = self.catalog.replay_damaged(DAMAGED_LISTED).await?;

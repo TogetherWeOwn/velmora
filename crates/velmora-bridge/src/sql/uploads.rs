@@ -8,6 +8,7 @@
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
 use super::objects::{clear_floor, guard_newest};
+use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
 use crate::recovery::Recorded;
@@ -410,6 +411,7 @@ pub(super) async fn complete_upload<S: Sql>(
          WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
         guard,
     ));
+    stmts.push(guard_no_replay());
     stmts.push(guard_newest(t.bucket, t.key, &g.id));
     stmts.push(clear_floor(t.bucket, t.key, &g.id));
     stmts.push((

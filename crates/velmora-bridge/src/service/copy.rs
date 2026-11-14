@@ -21,8 +21,8 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    discard_refused, internal, metadata_json, s3_error, stored_checksum, stored_headers,
-    unavailable, Authed,
+    discard_refused, internal, metadata_json, restore_gate, s3_error, stored_checksum,
+    stored_headers, unavailable, Authed,
 };
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
@@ -276,6 +276,9 @@ where
         discard_refused(bridge, &copy.generation, refused)
             .await
             .map_err(|_| internal())?;
+        // Refused as well when a replay started after this request
+        // passed the gate.
+        restore_gate(bridge).await?;
         // Plan again against what is live now.
     }
     Err(unavailable())

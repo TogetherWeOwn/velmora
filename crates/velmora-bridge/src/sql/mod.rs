@@ -78,7 +78,7 @@ use crate::ports::{
     Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
-use crate::replay::{ReplayExtent, ReplayProbe, ReplayPublish};
+use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
@@ -183,7 +183,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         before: &GenerationId,
         now: UnixMs,
     ) -> Result<bool> {
-        recovery::delete_object_before(self, bucket, key, before, now).await
+        recovery::delete_object_before(self, bucket, key, before, now, true).await
+    }
+    async fn replay_tombstone(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        id: &GenerationId,
+        now: UnixMs,
+    ) -> Result<bool> {
+        objects::raise_floor(self, bucket, key, id, false).await?;
+        objects::settle_floor(self, bucket, key, id).await?;
+        recovery::delete_object_before(self, bucket, key, id, now, false).await
     }
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage> {
         objects::list(self, bucket, q).await
@@ -392,6 +403,24 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<()> {
         replay::replay_extents(self, bucket, extents, now).await
+    }
+    async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
+        replay::held_extents(self, after, limit).await
+    }
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
+        replay::restore_begin(self, since, now).await
+    }
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
+        replay::restore_finish(self, run, now).await
+    }
+    async fn restore_pending(&self) -> Result<bool> {
+        replay::restore_pending(self).await
+    }
+    async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>> {
+        replay::restore_progress(self, run).await
+    }
+    async fn restore_advance(&self, run: UnixMs, next: &ReplayMark) -> Result<()> {
+        replay::restore_advance(self, run, next).await
     }
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)> {
         replay::replay_damaged(self, limit).await

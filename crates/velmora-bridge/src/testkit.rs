@@ -55,6 +55,10 @@ pub const MIGRATION_0006: &str =
 pub const MIGRATION_0007: &str =
     include_str!("../../../workers/s3-bridge/migrations/0007_key_floors.sql");
 
+/// The mark of an unfinished catalogue replay.
+pub const MIGRATION_0008: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0008_restore_state.sql");
+
 // ---------------------------------------------------------------------------
 // RusqliteSql
 // ---------------------------------------------------------------------------
@@ -143,6 +147,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0005)?;
         db.apply(MIGRATION_0006)?;
         db.apply(MIGRATION_0007)?;
+        db.apply(MIGRATION_0008)?;
         Ok(db)
     }
 
