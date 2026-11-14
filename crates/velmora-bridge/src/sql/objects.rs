@@ -739,7 +739,10 @@ pub(super) async fn set_safety_state<S: Sql>(
     let changed = c
         .sql
         .exec(
-            "UPDATE extents SET safety_state = ?3 WHERE id = ?1 AND safety_state = ?2",
+            // Every change of state bumps the eviction fence, so an eviction
+            // listed before it is refused.
+            "UPDATE extents SET safety_state = ?3, evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND safety_state = ?2",
             &[
                 text(extent.as_str()),
                 text(from.as_str()),

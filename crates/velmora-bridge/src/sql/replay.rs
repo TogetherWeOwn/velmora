@@ -140,7 +140,7 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
         // back, so what is left of the pipeline has nothing to do. Reads
         // verify every byte against the digests either way.
         out.push((
-            "UPDATE extents SET safety_state = 'deleted' \
+            "UPDATE extents SET safety_state = 'deleted', evict_seq = evict_seq + 1 \
              WHERE id = ?1 AND safety_state IN ('held', 'releasing')",
             vec![id()],
         ));
