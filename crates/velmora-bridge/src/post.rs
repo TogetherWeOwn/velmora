@@ -251,6 +251,14 @@ where
         lease: &Lease,
         extent: &ExtentRow,
     ) -> core::result::Result<(), Stop> {
+        // A job that comes back to an extent it has posted already (a
+        // crash before the stage moved on, a revived obligation) needs no
+        // provider: it only writes the recovery record again.
+        let stored = self.catalog.articles(&extent.id).await?;
+        if !stored.is_empty() && stored.iter().all(|a| a.state == ArticleState::Posted) {
+            self.load_planned(lease, extent).await?;
+            return self.to_verify(lease).await;
+        }
         let holder = format!("post:{}", extent.id);
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
@@ -282,7 +290,11 @@ where
         } else {
             first.close().await;
         }
+        self.to_verify(lease).await
+    }
 
+    /// Every article is recorded as posted: the extent goes on to verify.
+    async fn to_verify(&self, lease: &Lease) -> core::result::Result<(), Stop> {
         let now = self.clock.now();
         let delay = self.cfg.verify_delay_secs;
         if !self

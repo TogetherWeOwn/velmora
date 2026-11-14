@@ -107,6 +107,8 @@ struct Spool {
     posting_allowed: bool,
     /// Remaining `POST`s to store and then drop without a reply.
     drop_posts: usize,
+    /// Remaining `POST`s to answer `240` and not store.
+    discard_posts: usize,
     /// Remaining `BODY` replies to cut mid-body.
     drop_bodies: usize,
     /// While true, `STAT` answers `430` for articles in the `POST` spool.
@@ -138,6 +140,7 @@ impl Shared {
             next_number,
             posting_allowed: config.posting_allowed,
             drop_posts: 0,
+            discard_posts: 0,
             drop_bodies: 0,
             stat_lag: false,
             limit_482: false,
@@ -300,6 +303,12 @@ impl TestNntpServer {
     /// a reply: the client cannot tell whether the article landed.
     pub async fn drop_next_posts(&self, n: usize) {
         self.shared.spool.lock().await.drop_posts = n;
+    }
+
+    /// The next `n` `POST`s are answered `240` and thrown away: the client
+    /// is told the article was taken and no command ever finds it.
+    pub async fn discard_next_posts(&self, n: usize) {
+        self.shared.spool.lock().await.discard_posts = n;
     }
 
     /// The next `n` `BODY` replies stop mid-body and close the connection.
@@ -707,6 +716,16 @@ async fn handle_connection(
                 let _ = writer.write_all(b"340 Send article\r\n").await;
                 match read_post_block(&mut lines, &mut shutdown).await {
                     PostBody::Complete(raw) => {
+                        // Runtime hook: accepted, and never stored.
+                        {
+                            let mut spool = shared.spool.lock().await;
+                            if spool.discard_posts > 0 {
+                                spool.discard_posts -= 1;
+                                drop(spool);
+                                let _ = writer.write_all(b"240 Article posted\r\n").await;
+                                continue;
+                            }
+                        }
                         let reply =
                             store_posted(&shared, authed.as_deref().unwrap_or("poster"), &raw)
                                 .await;

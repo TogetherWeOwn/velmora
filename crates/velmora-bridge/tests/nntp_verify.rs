@@ -746,6 +746,113 @@ async fn an_accepted_repost_that_stays_missing_is_not_posted_again() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+/// The posting provider answers 240 to a POST and throws the article
+/// away. Verify finds it missing on the backbone it was posted to, and
+/// once the grace is over posts exactly that article there again, under
+/// its stored message-id: once per round, until a read finds it.
+#[tokio::test]
+async fn an_article_the_posting_provider_lost_is_posted_there_again() {
+    let mut rig = rig(&[Spec {
+        backbone: "bb0",
+        post: true,
+        max_conns: 3,
+    }])
+    .await;
+    rig.bridge.cfg.required_backbones = 1;
+    let s = rig.seed(35, &marked_plaintext(PLAIN_LEN)).await;
+    rig.servers[0].discard_next_posts(1).await;
+    let plan = rig.post(&s).await;
+    // Recorded as posted, all of them; the provider has one fewer.
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(plan.len(), 3);
+    assert_eq!(rig.servers[0].posted_count().await, 2);
+
+    // Until the grace is over the backbone is only read.
+    let posted_at = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
+    let grace_ends = posted_at.plus_secs(rig.bridge.cfg.propagation_grace_secs);
+    while rig.bridge.clock.now() < grace_ends {
+        let wait = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+        rig.bridge.clock.advance_secs(wait);
+    }
+    assert_eq!(rig.servers[0].posted_count().await, 2);
+    assert!(rig.rows(&s).is_empty());
+
+    // From here on every call to the provider is logged.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    let posts = || {
+        let calls = rig.bridge.nntp.calls();
+        calls.iter().filter(|c| c.0 == "post").count()
+    };
+    // Round one: the provider throws the repost away as well.
+    rig.servers[0].discard_next_posts(1).await;
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    assert_eq!(posts(), 1);
+    rig.bridge.clock.advance_secs(delay);
+    let last = rig.run(&s, OutboxStage::Verify).await;
+    assert_eq!(retry_delay(&last), REVERIFY_SECS);
+    assert_eq!(posts(), 1, "posted twice in one round");
+    let rows = rig.rows(&s);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].backbone.as_str(), rows[0].result),
+        ("bb0", VerifyResult::Missing)
+    );
+    assert_eq!(rig.outbox(&s).cursor, 0);
+    assert!(rig.safety_held(&s));
+
+    // Round two: one more repost, and this one is kept.
+    rig.bridge.clock.advance_secs(REVERIFY_SECS);
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(posts(), 2);
+    assert_eq!(rig.servers[0].posted_count().await, 3);
+    rig.bridge.clock.advance_secs(delay);
+    rig.run(&s, OutboxStage::Verify).await;
+    assert_eq!(posts(), 2);
+    let rows = rig.rows(&s);
+    assert_eq!(rows.last().unwrap().result, VerifyResult::Ok);
+    // The same message-ids throughout, and the rows as they were.
+    assert_eq!(rig.plan(&s).await, plan);
+    let ids = rig.servers[0].posted_ids().await;
+    for row in &plan {
+        assert!(ids.contains(&format!("<{}>", row.message_id)));
+    }
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// An obligation that was cancelled after its repost and revived starts
+/// over at the post stage with its cursor at zero. The articles are on
+/// the backbone by then: nothing is posted again, by either stage.
+#[tokio::test]
+async fn a_revived_extent_is_not_posted_again() {
+    let rig = two_posting_backbones().await;
+    let (s, plan) = rig.waited_out_the_grace(36).await;
+    retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+
+    // What reviving a cancelled row does.
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.outbox.stage = OutboxStage::Post;
+        e.outbox.cursor = 0;
+        e.outbox.attempts = 0;
+    });
+    rig.bridge.clock.advance_secs(3600);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Post).await, JobOutcome::Ack);
+    // The post stage needed no provider at all.
+    assert!(rig.bridge.nntp.calls().is_empty());
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    rig.bridge.clock.advance_secs(3600);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    assert!(rig.bridge.nntp.calls().iter().all(|c| c.0 != "post"));
+    assert_eq!(rig.plan(&s).await, plan);
+    assert_eq!(rig.servers[0].posted_count().await, plan.len());
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+}
+
 /// With no grace at all the first read that finds articles missing posts
 /// them.
 #[tokio::test]
