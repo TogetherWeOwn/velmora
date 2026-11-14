@@ -68,7 +68,7 @@ while :; do
     case "$unfinished" in
     '' | *[!0-9]*)
       if [ "$status" = 409 ]; then
-        echo "catalog-replay: refused; the same command will be refused again, see the message above" >&2
+        echo "catalog-replay: refused; do what the message above says, then run the same command again" >&2
       else
         echo "catalog-replay: run the same command again to continue" >&2
       fi
