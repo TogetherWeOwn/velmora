@@ -662,25 +662,21 @@ async fn digest_mismatch_stores_nothing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn real_bucket_refused_while_not_ready() {
-    // This test describes the closed gate; opening it must revisit it.
-    const { assert!(!REAL_DATA_READY) }
+async fn real_bucket_takes_writes() {
+    // This test describes the open gate; closing it must revisit it.
+    const { assert!(REAL_DATA_READY) }
     let rig = rig();
     let real = rig.bucket("bkt-real", false).await;
     let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
     rig.grant(AKID, &real, Perm::Rw).await;
 
-    let req = signer.sign(
-        rig.now(),
-        Method::Put,
-        &path("bkt-real", "k"),
-        &[],
-        &[],
-        b"payload".to_vec(),
-    );
-    let (resp, polled) = rig.send_watched(req).await;
-    resp.expect_error(403, "AccessDenied");
-    assert!(!polled);
+    rig.put(&signer, "bkt-real", "k", b"payload")
+        .await
+        .expect(200);
+    let got = rig
+        .call(&signer, Method::Get, &path("bkt-real", "k"), &[], &[], b"")
+        .await;
+    assert_eq!(got.expect(200).body, b"payload");
     rig.call(
         &signer,
         Method::Delete,
@@ -690,16 +686,8 @@ async fn real_bucket_refused_while_not_ready() {
         b"",
     )
     .await
-    .expect_error(403, "AccessDenied");
-    assert_nothing_stored(&rig);
-
-    // Reads are not gated: there is simply nothing there.
+    .expect(204);
     rig.head(&signer, "bkt-real", "k").await.expect(404);
-
-    // A disposable bucket next to it takes the same write.
-    let scratch = rig.bucket(BUCKET, true).await;
-    rig.grant(AKID, &scratch, Perm::Rw).await;
-    rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
 }
 
 #[tokio::test(flavor = "current_thread")]

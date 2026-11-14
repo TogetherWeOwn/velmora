@@ -405,8 +405,7 @@ async fn create_bucket<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
             "Use 3-63 lower-case letters, digits and hyphens.",
         ));
     }
-    // Until catalogue recovery is proven, only data that may be lost is
-    // accepted.
+    // With the gate closed, only data that may be lost is accepted.
     if !disposable && !REAL_DATA_READY {
         return Err(fail(
             403,

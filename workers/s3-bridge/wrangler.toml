@@ -25,7 +25,7 @@ VERIFY_DELAY_SECS = "120"
 NEWSGROUPS = "alt.binaries.test"   # posting here is proven by the provider probe
 VELMORA_KEK_ACTIVE = "1"
 INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
-GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
+GC_MODE = "off"                      # off | disposable
 MAINTENANCE = "off"                  # off | restore
 
 [[d1_databases]]

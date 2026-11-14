@@ -158,8 +158,9 @@ fn guard_violation_rule_matches_sqlite_and_d1_text() {
 // Configuration
 // ---------------------------------------------------------------------------
 
-// The real-data gate stays closed until the catalogue recovery drill lands.
-const _: () = assert!(!REAL_DATA_READY, "real-data gate must stay closed");
+// The real-data gate is open: catalogue recovery landed and its drills
+// passed. Closing it again must be a deliberate change.
+const _: () = assert!(REAL_DATA_READY, "real-data gate is open");
 
 /// `[vars]` and `[env.dev] vars = { … }` of the shipped `wrangler.toml`.
 fn wrangler_vars() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
@@ -300,14 +301,9 @@ fn config_rejects_invalid_and_unsafe_values() {
     let invalid = |k: &str| ConfigError::Invalid(k.to_string());
 
     // Safety rules (the gate itself is pinned at compile time below).
-    assert!(matches!(
-        set(&prod, "GC_MODE", "full"),
-        ConfigError::Refused(_)
-    ));
-    assert!(matches!(
-        set(&dev, "GC_MODE", "full"),
-        ConfigError::Refused(_)
-    ));
+    // There is no full GC yet: the name is not a mode.
+    assert_eq!(set(&prod, "GC_MODE", "full"), invalid("GC_MODE"));
+    assert_eq!(set(&dev, "GC_MODE", "full"), invalid("GC_MODE"));
     assert!(matches!(
         set(&prod, "REQUIRED_BACKBONES", "1"),
         ConfigError::Refused(_)
