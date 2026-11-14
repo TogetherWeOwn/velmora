@@ -690,9 +690,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
     for x in &status.extents {
-        bridge
-            .cache
-            .delete(&x.extent_id.cache_key())
+        delete_blob(&bridge.cache, &x.extent_id.cache_key())
             .await
             .or_internal()?;
         evicted += 1;

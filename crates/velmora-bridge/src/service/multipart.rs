@@ -914,12 +914,20 @@ where
             .collect();
         let mut extents = Vec::with_capacity(commit.placements.len());
         for p in &commit.placements {
-            let mut row = staged.remove(&p.extent_id).ok_or(Fail::Internal)?;
+            let Some(mut row) = staged.remove(&p.extent_id) else {
+                break;
+            };
             row.seq = Some(p.seq);
             row.plain_offset = Some(p.plain_offset);
             extents.push(row);
         }
         drop(staged);
+        if extents.len() != commit.placements.len() {
+            // An UploadPart replaced a listed part after the upload was
+            // read. The batch would lose its guard: take the same path.
+            lost_at = Some(upload.revision);
+            continue;
+        }
         write_generation(
             &bridge.safety,
             &bridge.kek,

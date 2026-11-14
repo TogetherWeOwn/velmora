@@ -1724,6 +1724,14 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
     expect_eq(s, "damaged generations", 0, damaged);
     expect_eq(
         s,
+        "restored plans without the revision of their record",
+        0,
+        rig.sql_count(
+            "SELECT COUNT(*) FROM extents WHERE article_count IS NOT NULL AND plan_rev < 1",
+        ),
+    );
+    expect_eq(
+        s,
         "no restored extent waits in the pipeline",
         0,
         rig.outbox_open(),

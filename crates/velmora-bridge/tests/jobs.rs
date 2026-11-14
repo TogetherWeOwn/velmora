@@ -17,7 +17,7 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS};
-use velmora_bridge::recovery::{article_key, read_article_plan};
+use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
@@ -543,6 +543,9 @@ async fn no_post_before_the_article_plan_record() {
         .await
         .unwrap()
         .expect("the record exists");
+    // The record names the revision the catalogue gave the plan.
+    assert_eq!(fx.extent(&o, "plan_rev").await, "1");
+    assert_eq!(record.plan_rev, 1);
     let rows = record.rows(ArticleState::Planned).unwrap();
     assert_eq!(rows.len(), 3);
     for (row, was) in rows.iter().zip(&planned) {
@@ -561,6 +564,30 @@ async fn no_post_before_the_article_plan_record() {
             )
         );
     }
+
+    // A record that no longer opens is replaced by the next write.
+    let name = article_key(&o.extent);
+    assert!(fx.bridge.safety.inner.corrupt(&name, |b| b[8] ^= 1));
+    assert!(
+        read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
+            .await
+            .is_err()
+    );
+    let (_, extents) = fx
+        .bridge
+        .catalog
+        .live_object(&bucket.id, "a/big.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    write_article_plan(&fx.bridge.safety, &fx.bridge.kek, &extents[0], &planned)
+        .await
+        .unwrap();
+    let again = read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.rows(ArticleState::Planned).unwrap().len(), 3);
 }
 
 // ---------------------------------------------------------------------------

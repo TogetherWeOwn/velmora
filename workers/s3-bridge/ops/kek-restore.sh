@@ -33,13 +33,21 @@ while IFS= read -r line || [ -n "$line" ]; do
     echo "kek-restore: line $n is not VELMORA_KEK_<version>=<value>" >&2
     exit 1
   fi
-  # 32 bytes of base64: 43 characters and one pad.
-  if ! [[ "${line#*=}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
-    echo "kek-restore: the value of $name is not base64 of 32 bytes" >&2
+  # 32 bytes of base64: 43 characters and one pad, and the same text
+  # when the bytes are encoded again. The last character of a value
+  # with stray low bits decodes here and is refused by the Worker.
+  # `printf` is a builtin: the value is in no argv.
+  value=${line#*=}
+  value=${value%$'\r'}
+  if ! [[ "$value" =~ ^[A-Za-z0-9+/]{43}=$ ]] ||
+    [ "$(printf '%s' "$value" | base64 -d 2>/dev/null | wc -c)" -ne 32 ] ||
+    [ "$(printf '%s' "$value" | base64 -d 2>/dev/null | base64 -w 0)" != "$value" ]; then
+    echo "kek-restore: the value of $name is not canonical base64 of 32 bytes" >&2
     exit 1
   fi
   names+=("$name")
 done <"$FILE"
+unset value line
 [ "${#names[@]}" -gt 0 ] || { echo "kek-restore: the file names no KEK" >&2; exit 1; }
 
 LOG=$(mktemp)

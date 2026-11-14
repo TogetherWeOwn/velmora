@@ -122,10 +122,12 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
             out.push(article_insert(a)?);
         }
         out.push((
-            "UPDATE extents SET article_count = ?2 WHERE id = ?1 AND article_count IS NULL",
+            "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
+             WHERE id = ?1 AND article_count IS NULL",
             vec![
                 id(),
                 SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
+                SqlValue::Int(i64::from(e.plan_rev)),
             ],
         ));
     }

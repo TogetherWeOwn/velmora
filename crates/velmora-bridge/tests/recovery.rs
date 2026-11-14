@@ -639,6 +639,45 @@ async fn a_lost_extent_and_a_broken_record_are_reported() {
     get(&rig, &signer, "torn").await.expect(404);
 }
 
+/// An article plan record that does not open is reported and does not
+/// stop the replay: the extent comes back without a plan, from its
+/// pinned copy.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreadable_article_plan_does_not_stop_the_replay() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"one").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "one").await.unwrap();
+    tick(&rig);
+    rig.put(&signer, BUCKET, "two", b"two").await.expect(200);
+
+    let torn = format!("m/art/{}", extents[0].id.as_str());
+    let garbage = b"not a sealed record".to_vec();
+    let digest = sha256(&garbage);
+    let meta = BlobMeta {
+        bucket: &bucket.id,
+        extent: &extents[0].id,
+        cipher_sha256: &digest,
+    };
+    rig.bridge
+        .safety
+        .inner
+        .put(&torn, garbage, &meta)
+        .await
+        .unwrap();
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 2, "{report:?}");
+    assert_eq!(report.unreadable, [torn]);
+    assert_eq!(report.article_plans, 0);
+    assert_eq!(report.damaged_total, 0);
+
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "one").await.expect(200).body, b"one");
+    assert_eq!(get(&rig, &signer, "two").await.expect(200).body, b"two");
+}
+
 /// A record sealed under another key or stored under another name does
 /// not open.
 #[tokio::test(flavor = "current_thread")]
