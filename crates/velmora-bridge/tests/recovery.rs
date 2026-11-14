@@ -2062,6 +2062,123 @@ async fn a_delete_sorts_after_the_record_of_a_put_whose_commit_failed() {
     replay_answers_the_same(&rig, &signer, &["k"]).await;
 }
 
+fn tombstones(rig: &Rig) -> Vec<String> {
+    records(rig)
+        .into_iter()
+        .filter(|r| r.starts_with(TOMBSTONE_PREFIX))
+        .collect()
+}
+
+/// A delete of a key with nothing live, after a write that failed with
+/// its record stored: the delete is acknowledged, so a replay must not
+/// publish the failed write. The delete leaves a tombstone above that
+/// record, once: a repeated delete of the key records nothing more.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_of_nothing_live_covers_the_record_of_a_failed_put() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    // A key that was never written and one that is: no tombstone.
+    delete(&rig, &signer, "k").await.expect(204);
+    assert!(tombstones(&rig).is_empty());
+
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    let (failed, _) = newest_record(&rig);
+    // From a clock that runs behind, all the same.
+    rig.bridge.clock.advance_ms(-500);
+    delete(&rig, &signer, "k").await.expect(204);
+    let written = tombstones(&rig);
+    assert_eq!(written.len(), 1);
+    let tombstone = written[0].strip_prefix(TOMBSTONE_PREFIX).unwrap();
+    assert!(
+        tombstone > failed.as_str(),
+        "{tombstone} sorts after {failed}"
+    );
+    delete(&rig, &signer, "k").await.expect(204);
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig), written, "nothing more to cover");
+    rig.bridge.clock.advance_ms(1000);
+    replay_answers_the_same(&rig, &signer, &["k"]).await;
+
+    // After the replay the same holds: nothing live, nothing to cover.
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig), written);
+}
+
+/// The same for a copy and for a write that failed after a delete: each
+/// failed write is covered by the next acknowledged delete.
+#[tokio::test(flavor = "current_thread")]
+async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 1);
+
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    copy(&rig, &signer, "src", "k")
+        .await
+        .expect_error(500, "InternalError");
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 2);
+
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 3);
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 3);
+    replay_answers_the_same(&rig, &signer, &["src", "k"]).await;
+}
+
+/// The delete of a key with nothing live runs the catalogue batch as
+/// well: a PUT that is published under an id below the tombstone, after
+/// the delete looked and before its batch, is deleted here as it is in
+/// a replay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_put_published_under_the_tombstone_of_such_a_delete_is_deleted() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "k", b"failed")
+        .await
+        .expect_error(500, "InternalError");
+    // The PUT lands when the delete stores its tombstone: its id is
+    // above the record of the failed write and below the tombstone,
+    // which is minted one millisecond after the floor at the least.
+    let (failed, _) = newest_record(&rig);
+    let between = format!("{}ffffffffffffffff", &failed[..15]);
+    let bridge = rig.bridge.clone();
+    let hook = move |_: &str| {
+        bridge.catalog.sql.with_conn(|c| {
+            c.execute(
+                "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+                   content_json, user_meta_json, extent_count, created_at) \
+                 SELECT ?1, bucket_id, key, 'live', 0, 'x', '{}', '{}', '{}', 0, 0 \
+                   FROM key_floors WHERE key = 'k'",
+                [&between],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO objects(bucket_id, key, generation_id) \
+                 SELECT bucket_id, key, id FROM generations WHERE key = 'k'",
+                [],
+            )
+            .unwrap()
+        });
+    };
+    rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(rig.count("generations"), 1, "the hook ran");
+    assert!(live_ids(&rig).is_empty(), "deleted with the batch");
+    get(&rig, &signer, "k").await.expect(404);
+}
+
 /// A replay leaves the floors as the records say, also for a tombstone
 /// that deletes nothing in it: a PUT after the replay sorts after every
 /// tombstone on record, and a second replay keeps it.

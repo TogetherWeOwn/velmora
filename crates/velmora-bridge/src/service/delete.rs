@@ -35,14 +35,28 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
-    // Nothing live: nothing to delete and nothing to record.
-    let Some((live, _)) = bridge
+    let live = bridge
         .catalog
         .live_object(&bucket.id, key)
         .await
-        .map_err(|_| internal())?
-    else {
-        return Ok(no_content());
+        .map_err(|_| internal())?;
+    let seen = match live {
+        Some((live, _)) => live.id,
+        // Nothing live. A write that was not published may still have
+        // its record (its batch failed, or the record could not be
+        // removed): a replay would publish it, over this delete. The
+        // floor of the key says so, and then the delete leaves a
+        // tombstone as if the object were live. Otherwise there is
+        // nothing to delete and nothing to record.
+        None => match bridge
+            .catalog
+            .unpublished_floor(&bucket.id, key)
+            .await
+            .map_err(|_| internal())?
+        {
+            Some(floor) => floor,
+            None => return Ok(no_content()),
+        },
     };
     // The newest id on the key: the live generation, or a floor above
     // it, left by the record of a write or a delete that did not commit.
@@ -53,7 +67,7 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         .newest_id(&bucket.id, key)
         .await
         .map_err(|_| internal())?
-        .map_or(live.id.clone(), |n| n.max(live.id.clone()));
+        .map_or(seen.clone(), |n| n.max(seen.clone()));
     let now = bridge.clock.now();
     let mut rand = [0u8; 8];
     SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
