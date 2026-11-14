@@ -59,8 +59,11 @@ pub const HOST_PICK_TTL_MS: i64 = 600_000;
 pub const SHORT_PICK_TTL_MS: i64 = 60_000;
 
 /// Longest a connect waits for another connect's probe of the same
-/// provider, in milliseconds. A probe older than this is treated as lost.
-pub const PROBE_WAIT_MS: i64 = PROBE_HOSTS as i64 * PROBE_TIMEOUT_MS as i64 + 500;
+/// provider, in milliseconds: the longest a whole probe may run (every
+/// endpoint at its time limit and its goodbye limit), and a margin. A
+/// probe older than this is treated as lost.
+pub const PROBE_WAIT_MS: i64 =
+    PROBE_HOSTS as i64 * (PROBE_TIMEOUT_MS as i64 + PROBE_GOODBYE_MS as i64) + 500;
 
 /// How often a waiting connect looks again, in milliseconds.
 pub const PROBE_POLL_MS: u32 = 50;
@@ -628,6 +631,16 @@ mod tests {
             "b"
         );
         assert_eq!(n.probes(), 2);
+    }
+
+    /// A probe at every limit ends before its waiters give up on it, and
+    /// waiting for it still leaves a read time to connect.
+    #[test]
+    fn the_wait_covers_a_whole_probe_and_fits_a_read() {
+        let probe = PROBE_HOSTS as i64 * i64::from(PROBE_TIMEOUT_MS + PROBE_GOODBYE_MS);
+        assert!(probe < PROBE_WAIT_MS);
+        let read_ms = i64::from(crate::ports::READ_CALL_SECS) * 1000;
+        assert!(PROBE_WAIT_MS + i64::from(HOST_CONNECT_SECS) * 1000 / 2 < read_ms);
     }
 
     #[test]
