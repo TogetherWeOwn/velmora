@@ -21,10 +21,13 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
+    discard_refused, internal, metadata_json, s3_error, stored_checksum, stored_headers,
+    unavailable, Authed,
 };
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
-use crate::recovery::{copy_id, generation_key, write_generation};
+use crate::ports::{
+    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
+};
+use crate::recovery::{copy_id, write_generation};
 use crate::types::{
     Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
     S3Response,
@@ -191,18 +194,14 @@ where
                 "A copy keeps the checksum of its source; computing another is not implemented.",
             ));
         }
-        // The generation this copy replaces, so that the copy's id sorts
-        // after it. The batch holds the copy to that.
-        let replaced = if source == key {
-            None
-        } else {
-            bridge
-                .catalog
-                .live_object(&bucket.id, key)
-                .await
-                .map_err(|_| internal())?
-                .map(|(g, _)| g.id)
-        };
+        // The newest id on the destination key, a live generation or a
+        // tombstone, so that the copy's id sorts after it. The batch
+        // holds the copy to that.
+        let newest = bridge
+            .catalog
+            .newest_id(&bucket.id, key)
+            .await
+            .map_err(|_| internal())?;
         let now = bridge.clock.now();
         let mut rand = [0u8; 8];
         SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
@@ -214,7 +213,7 @@ where
         let generation = GenerationRow {
             // Also after the attempt that lost: should its record have
             // survived its delete after all, it sorts before this one.
-            id: copy_id(now, &from.id, replaced.as_ref().max(lost.as_ref()), rand),
+            id: copy_id(now, &from.id, newest.as_ref().max(lost.as_ref()), rand),
             bucket_id: bucket.id.clone(),
             key: key.to_owned(),
             state: GenerationState::Live,
@@ -239,44 +238,39 @@ where
         // for a PUT. It describes every extent in full, so a replay can
         // rebuild the copy when the source it shares them with is gone.
         // The extents have the same places in the copy as in the source.
-        write_generation(&bridge.safety, &bridge.kek, bucket, &generation, &extents)
+        let record = write_generation(&bridge.safety, &bridge.kek, bucket, &generation, &extents)
             .await
             .map_err(|_| internal())?;
         drop(extents);
-        let id = generation.id.clone();
-        let record = generation_key(&id);
-        let committed = bridge
+        let copy = CopyGeneration {
+            generation,
+            source: from.id,
+            source_key: source.clone(),
+            now,
+        };
+        let refused = match bridge
             .catalog
-            .copy_generation(&CopyGeneration {
-                generation,
-                source: from.id,
-                source_key: source.clone(),
-                now,
-            })
+            .copy_generation(&copy, record)
             .await
-            .map_err(|_| internal())?;
-        if committed == Guard::Applied(()) {
-            return result
-                .copy_response()
-                .map(super::common::from_proto)
-                .map_err(|_| internal());
-        }
+            .map_err(|_| internal())?
+        {
+            PublishOutcome::Applied => {
+                return result
+                    .copy_response()
+                    .map(super::common::from_proto)
+                    .map_err(|_| internal());
+            }
+            PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
+        };
         // The source was overwritten or deleted since it was read, or
         // the destination got a generation this id does not sort after.
         // Nothing was published under this id, so its record must not
         // publish it in a replay either. A record that cannot be removed
         // ends the request: no copy was made, and the caller is told so.
-        let mut removed = false;
-        for _ in 0..ATTEMPTS {
-            if bridge.safety.delete(&record).await.is_ok() {
-                removed = true;
-                break;
-            }
-        }
-        if !removed {
-            return Err(internal());
-        }
-        lost = Some(id);
+        discard_refused(bridge, &copy.generation, refused)
+            .await
+            .map_err(|_| internal())?;
+        lost = Some(copy.generation.id);
         // Plan again against what is live now.
     }
     Err(unavailable())

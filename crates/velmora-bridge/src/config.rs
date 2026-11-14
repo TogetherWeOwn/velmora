@@ -13,9 +13,10 @@ use crate::ports::Kek;
 use crate::types::{KekBytes, ProviderConfig, Secret};
 
 /// Real-data gate. While `false`, `create_bucket` refuses
-/// `disposable = false` and `GC_MODE=full` is rejected. Only the PR that
-/// lands the catalogue recovery protocol and its drill may flip it.
-pub const REAL_DATA_READY: bool = false;
+/// `disposable = false` and `GC_MODE=full` is rejected. Open since the
+/// catalogue recovery protocol landed and its drills passed (see
+/// `workers/s3-bridge/ops/README.md`).
+pub const REAL_DATA_READY: bool = true;
 
 /// Largest request body (one extent) the slice accepts. Raised when
 /// streaming bodies land.
@@ -47,7 +48,7 @@ pub enum Environment {
     Prod,
 }
 
-/// `GC_MODE`. `full` exists only once `REAL_DATA_READY` is true.
+/// `GC_MODE`. There is no `full` mode yet; it needs `REAL_DATA_READY`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GcMode {
     /// `gc` rows accumulate; nothing is deleted.

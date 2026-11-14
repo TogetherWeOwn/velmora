@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use velmora::rng::{FillRandom, SystemRng};
 
-use super::common::{authenticate, internal, mutation_gate};
+use super::common::{authenticate, internal, mutation_gate, restore_gate};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone};
 use crate::types::{RespBody, S3Request, S3Response};
@@ -35,6 +35,7 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
+    restore_gate(bridge).await?;
     // Nothing live: nothing to delete and nothing to record.
     let Some((live, _)) = bridge
         .catalog

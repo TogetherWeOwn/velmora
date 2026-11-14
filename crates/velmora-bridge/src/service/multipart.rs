@@ -50,14 +50,15 @@ use crate::ingress::{
     UploadReadError,
 };
 use crate::ports::{
-    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
+    PublishOutcome, UploadTarget,
 };
-use crate::recovery::{generation_key, write_generation};
+use crate::recovery::{id_after, write_generation};
+use crate::service::common::discard_refused;
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationId, GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState,
-    JOB_VERSION,
+    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
+    S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, JOB_VERSION,
 };
 
 /// Smallest non-final part.
@@ -426,6 +427,10 @@ where
     )?;
     // `authorize` passed, so the bucket exists and the grant is `rw`.
     let bucket = bucket.ok_or(ErrorCode::AccessDenied)?;
+    // A replay that was started and did not end: see `restore_gate`.
+    if bridge.catalog.restore_pending().await? {
+        return Err(ErrorCode::SlowDown.into());
+    }
     let key = target
         .key
         .clone()
@@ -970,8 +975,12 @@ where
         }
         let publication = plan(&listed, &parts)?;
         let now = bridge.clock.now();
+        // The id sorts after everything already on the key, so the order
+        // of ids on a key is the order of its commits; the batch checks
+        // it again, against whatever commits in between.
+        let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
         let generation = GenerationRow {
-            id: GenerationId::mint(now, random()?),
+            id: id_after(now, newest.as_ref(), random()?),
             bucket_id: a.bucket.id.clone(),
             key: a.key.clone(),
             state: GenerationState::Live,
@@ -1016,7 +1025,7 @@ where
             lost_at = Some(upload.revision);
             continue;
         }
-        write_generation(
+        let record = write_generation(
             &bridge.safety,
             &bridge.kek,
             &a.bucket,
@@ -1027,10 +1036,10 @@ where
         drop(extents);
         match bridge
             .catalog
-            .complete_upload(&target, upload.revision, &digest, &commit)
+            .complete_upload(&target, upload.revision, &digest, &commit, record)
             .await?
         {
-            Guard::Applied(()) => {
+            PublishOutcome::Applied => {
                 // The outbox rows are the durable obligation; a lost
                 // notification is picked up by the dispatcher.
                 for p in &commit.placements {
@@ -1044,15 +1053,24 @@ where
                 }
                 return complete_response(&a, publication.etag, now.0);
             }
-            Guard::Lost => {
+            PublishOutcome::Refused(record) => {
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
                 // record left behind replays as a PUT that failed.
-                let _ = bridge
-                    .safety
-                    .delete(&generation_key(&commit.generation.id))
-                    .await;
-                lost_at = Some(upload.revision);
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                // Refused for the id (the key took a newer one since it
+                // was read) or for the upload. Only the second is judged
+                // by the revision on the next turn.
+                let newest = bridge.catalog.newest_id(&a.bucket.id, &a.key).await?;
+                let outrun = newest.is_some_and(|n| n >= commit.generation.id);
+                lost_at = (!outrun).then_some(upload.revision);
+            }
+            PublishOutcome::Fenced(record) => {
+                // The catalogue failed, then showed that nothing was
+                // published. Without its record this attempt cannot come
+                // back in a replay, also after the client aborts.
+                let _ = discard_refused(bridge, &commit.generation, record).await;
+                return Err(Fail::Internal);
             }
         }
     }

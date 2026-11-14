@@ -74,7 +74,10 @@ mod uploads;
 
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
-use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, SqlValue, UploadTarget};
+use crate::ports::{
+    Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
+};
+use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
@@ -130,14 +133,22 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         objects::live_object(self, bucket, key).await
     }
-    async fn commit_generation(&self, c: &CommitGeneration) -> Result<()> {
-        objects::commit_generation(self, c).await
+    async fn commit_generation(
+        &self,
+        c: &CommitGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        objects::commit_generation(self, c, record).await
     }
-    async fn copy_generation(&self, c: &CopyGeneration) -> Result<Guard<()>> {
-        objects::copy_generation(self, c).await
+    async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
+        objects::newest_id(self, bucket, key).await
     }
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
-        objects::delete_object(self, bucket, key, now).await
+    async fn copy_generation(
+        &self,
+        c: &CopyGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        objects::copy_generation(self, c, record).await
     }
     async fn delete_object_before(
         &self,
@@ -188,8 +199,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         revision: u64,
         digest: &[u8; 32],
         c: &CompleteUpload,
-    ) -> Result<Guard<()>> {
-        uploads::complete_upload(self, t, revision, digest, c).await
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        uploads::complete_upload(self, t, revision, digest, c, record).await
     }
     async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
         recovery::upload_extents(self, t).await
@@ -354,6 +366,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<()> {
         replay::replay_extents(self, bucket, extents, now).await
+    }
+    async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
+        replay::held_extents(self, after, limit).await
+    }
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
+        replay::restore_begin(self, since, now).await
+    }
+    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
+        replay::restore_finish(self, run, now).await
+    }
+    async fn restore_pending(&self) -> Result<bool> {
+        replay::restore_pending(self).await
     }
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)> {
         replay::replay_damaged(self, limit).await

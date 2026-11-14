@@ -21,6 +21,7 @@ use velmora::transports::NativeTlsTransport;
 use velmora::yenc::{encode_segment, SegmentParams};
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Recorded;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -756,13 +757,17 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         unused()
     }
-    async fn commit_generation(&self, _: &CommitGeneration) -> Result<()> {
+    async fn commit_generation(&self, _: &CommitGeneration, _: Recorded) -> Result<PublishOutcome> {
         unused()
     }
-    async fn copy_generation(&self, _: &velmora_bridge::CopyGeneration) -> Result<Guard<()>> {
+    async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
-    async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
+    async fn copy_generation(
+        &self,
+        _: &velmora_bridge::CopyGeneration,
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
         unused()
     }
     async fn delete_object_before(
@@ -787,6 +792,18 @@ impl Catalog for MemCatalog {
         _: UnixMs,
     ) -> Result<()> {
         unused()
+    }
+    async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {
+        unused()
+    }
+    async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<UnixMs> {
+        unused()
+    }
+    async fn restore_finish(&self, _: UnixMs, _: UnixMs) -> Result<bool> {
+        unused()
+    }
+    async fn restore_pending(&self) -> Result<bool> {
+        Ok(false)
     }
     async fn replay_damaged(&self, _: u32) -> Result<(u64, Vec<GenerationId>)> {
         unused()
@@ -832,7 +849,8 @@ impl Catalog for MemCatalog {
         _: u64,
         _: &[u8; 32],
         _: &CompleteUpload,
-    ) -> Result<Guard<()>> {
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
         unused()
     }
     async fn abort_upload(&self, _: &UploadTarget<'_>, _: UnixMs) -> Result<Guard<()>> {

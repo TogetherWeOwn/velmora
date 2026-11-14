@@ -15,6 +15,7 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, unwrap_secret, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
+use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -251,8 +252,7 @@ impl Fx {
         self.bucket_row(name).await.expect("the bucket exists")
     }
 
-    /// A bucket for real data. The API refuses to make one, so the row is
-    /// written directly.
+    /// A bucket for real data, written directly.
     async fn real_bucket(&self, name: &str) -> Bucket {
         let id = BucketId::mint([self.next(); 8]);
         let bdk = DataKey::generate(&mut SystemRng).unwrap();
@@ -335,7 +335,7 @@ impl Fx {
             .await
             .unwrap();
         b.catalog
-            .commit_generation(&CommitGeneration {
+            .publish(&CommitGeneration {
                 generation: generation.clone(),
                 extents: vec![extent],
                 now,
@@ -546,20 +546,13 @@ async fn unknown_routes_and_methods_are_refused() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn real_bucket_refused_before_h9() {
+async fn real_bucket_is_made_only_when_asked_for() {
+    // This test describes the open gate; closing it must revisit it.
+    const { assert!(REAL_DATA_READY) }
     let fx = Fx::new().await;
-    if REAL_DATA_READY {
-        // The gate is open: there is nothing to refuse.
-        return;
-    }
 
-    let real = json!({ "name": "real-data", "disposable": false });
-    let r = fx.admin("POST", "/buckets", Some(real)).await;
-    assert_eq!(r.status, 403);
-    assert_eq!(r.json()["error"], "RealDataNotReady");
-    assert!(fx.bucket_row("real-data").await.is_none());
-
-    // Leaving the flag out is not a way around the gate.
+    // Leaving the flag out, or sending something that is not a boolean,
+    // makes no bucket of either kind.
     let r = fx
         .admin("POST", "/buckets", Some(json!({ "name": "real-data" })))
         .await;
@@ -572,16 +565,25 @@ async fn real_bucket_refused_before_h9() {
     }
     assert!(fx.bucket_row("real-data").await.is_none());
 
-    // S3 CreateBucket makes real buckets only: refused as well, with or
-    // without the admin token.
-    let auth = format!("Bearer {TOKEN}");
-    for auth in [None, Some("Bearer wrong"), Some(auth.as_str())] {
-        let r = fx.send("PUT", "/real-data", auth, None).await;
-        assert_eq!(r.status, 403, "PUT /real-data with {:?}", auth.is_some());
+    // S3 CreateBucket makes real buckets only, and only with the admin
+    // token.
+    for auth in [None, Some("Bearer wrong")] {
+        let r = fx.send("PUT", "/real-s3", auth, None).await;
+        assert_eq!(r.status, 403, "PUT /real-s3 with {:?}", auth.is_some());
         assert!(r.text().contains("<Code>AccessDenied</Code>"));
     }
-    assert!(fx.bucket_row("real-data").await.is_none());
     assert_eq!(fx.scalar("SELECT COUNT(*) FROM buckets", &[]).await, "0");
+    let auth = format!("Bearer {TOKEN}");
+    let r = fx.send("PUT", "/real-s3", Some(auth.as_str()), None).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let row = fx.bucket_row("real-s3").await.expect("the bucket exists");
+    assert!(!row.disposable);
+
+    let real = json!({ "name": "real-data", "disposable": false });
+    let r = fx.admin("POST", "/buckets", Some(real)).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let row = fx.bucket_row("real-data").await.expect("the bucket exists");
+    assert!(!row.disposable);
 }
 
 #[tokio::test]
@@ -849,7 +851,7 @@ async fn status_reports_outbox_dispatch_and_memory() {
     assert_eq!(r["last_dispatch_at"], Value::Null);
     assert_eq!(r["inflight_peak_bytes"], 0);
     assert_eq!(r["outbox"], json!({}));
-    assert_eq!(r["real_data_ready"], false);
+    assert_eq!(r["real_data_ready"], REAL_DATA_READY);
     assert_eq!(r["gc_mode"], "disposable");
     assert_eq!(r["required_backbones"], 1);
 

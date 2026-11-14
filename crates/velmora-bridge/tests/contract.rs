@@ -18,6 +18,7 @@ use velmora_bridge::config::{
     MAX_EXTENT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Recorded;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, MIGRATION_0001,
@@ -159,8 +160,9 @@ fn guard_violation_rule_matches_sqlite_and_d1_text() {
 // Configuration
 // ---------------------------------------------------------------------------
 
-// The real-data gate stays closed until the catalogue recovery drill lands.
-const _: () = assert!(!REAL_DATA_READY, "real-data gate must stay closed");
+// The real-data gate is open: catalogue recovery landed and its drills
+// passed. Closing it again must be a deliberate change.
+const _: () = assert!(REAL_DATA_READY, "real-data gate is open");
 
 /// `[vars]` and `[env.dev] vars = { … }` of the shipped `wrangler.toml`.
 fn wrangler_vars() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
@@ -321,14 +323,9 @@ fn config_rejects_invalid_and_unsafe_values() {
     let invalid = |k: &str| ConfigError::Invalid(k.to_string());
 
     // Safety rules (the gate itself is pinned at compile time below).
-    assert!(matches!(
-        set(&prod, "GC_MODE", "full"),
-        ConfigError::Refused(_)
-    ));
-    assert!(matches!(
-        set(&dev, "GC_MODE", "full"),
-        ConfigError::Refused(_)
-    ));
+    // There is no full GC yet: the name is not a mode.
+    assert_eq!(set(&prod, "GC_MODE", "full"), invalid("GC_MODE"));
+    assert_eq!(set(&dev, "GC_MODE", "full"), invalid("GC_MODE"));
     assert!(matches!(
         set(&prod, "REQUIRED_BACKBONES", "1"),
         ConfigError::Refused(_)
@@ -668,11 +665,13 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "generation_extents",
             "generations",
             "grants",
+            "key_tombstones",
             "meta",
             "objects",
             "outbox",
             "provider_health",
             "provider_permits",
+            "restore_state",
             "scan_cursors",
             "tx_guard",
             "upload_parts",
@@ -959,8 +958,9 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.access_key(akid).await;
     let _ = c.grant(akid, b).await;
     let _ = c.live_object(b, "a/k").await;
-    let _ = c.commit_generation(&commit).await;
-    let _ = c.delete_object(b, "a/k", T0).await;
+    let _ = c
+        .commit_generation(&commit, Recorded::for_test(&commit.generation.id))
+        .await;
     let _ = c.list(b, &query).await;
     let _ = c.object_status(b, "a/k").await;
     let _ = c
@@ -969,7 +969,15 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.create_upload(&upload).await;
     let _ = c.upload(&target).await;
     let _ = c.put_upload_part(&target, &part, &extent, T0).await;
-    let _ = c.complete_upload(&target, 1, &[0; 32], &complete).await;
+    let _ = c
+        .complete_upload(
+            &target,
+            1,
+            &[0; 32],
+            &complete,
+            Recorded::for_test(&complete.generation.id),
+        )
+        .await;
     let _ = c.abort_upload(&target, T0).await;
     let _ = c
         .claim(&extent.id, &gen.id, OutboxStage::Post, "owner-1", T0)

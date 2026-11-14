@@ -17,9 +17,11 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS};
-use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan};
+use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan, Unpublished};
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
+use velmora_bridge::testkit::{
+    FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
+};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -97,6 +99,10 @@ impl BlobStore for GuardedBlob {
             return Err(BridgeError::Blob("delete failed".to_string()));
         }
         self.inner.delete(key).await
+    }
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        self.check();
+        self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
         self.check();
@@ -358,7 +364,7 @@ impl Fx {
             .unwrap();
         self.bridge
             .catalog
-            .commit_generation(&CommitGeneration {
+            .publish(&CommitGeneration {
                 generation: generation.clone(),
                 extents: vec![extent],
                 now,
@@ -1402,11 +1408,8 @@ impl Fx {
             source_key: from.to_owned(),
             now,
         };
-        assert_eq!(
-            cat.copy_generation(&copy).await.unwrap(),
-            Guard::Applied(())
-        );
-        cat.delete_object(&bucket.id, from, now).await.unwrap();
+        assert_eq!(cat.publish_copy(&copy).await.unwrap(), Guard::Applied(()));
+        cat.delete_now(&bucket.id, from, now).await.unwrap();
         assert_eq!(self.outbox(o, "stage").await, "post");
         let sql = "UPDATE outbox SET stage = 'cancelled' WHERE extent_id = ?1";
         self.sql

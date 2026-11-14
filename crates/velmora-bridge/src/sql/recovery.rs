@@ -23,6 +23,14 @@ pub(super) async fn delete_object_before<S: Sql>(
          WHERE bucket_id = ?1 AND key = ?2 AND generation_id < ?3)",
         vec![text(bucket.as_str()), text(key), text(before.as_str())],
     )];
+    // The tombstone is the newest id of the key from here on: a later
+    // publication must sort after it.
+    stmts.push((
+        "INSERT INTO key_tombstones(bucket_id, key, tombstone_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET \
+           tombstone_id = max(tombstone_id, excluded.tombstone_id)",
+        vec![text(bucket.as_str()), text(key), text(before.as_str())],
+    ));
     stmts.extend(retire_live(bucket, key, GenerationState::Deleted, now));
     stmts.push((
         "DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2",

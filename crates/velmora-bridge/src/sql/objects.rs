@@ -7,8 +7,10 @@
 //! live without a pointer. Statements are fixed-shape, one row each, and
 //! stay far below the 100-bound-parameter limit.
 
+use super::uploads::published;
 use super::SqlCatalog;
-use crate::ports::{Guard, Row, Sql, SqlValue};
+use crate::ports::{PublishOutcome, Row, Sql, SqlValue};
+use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
     ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
@@ -353,14 +355,63 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
     ))
 }
 
+/// Guard of every publication: `id` sorts after the live generation of
+/// `(bucket, key)` and after the key's newest tombstone. Ids on one key
+/// are then in commit order, the order a replay of the recovery records
+/// rebuilds; a clock that runs behind cannot publish "into the past".
+pub(super) fn guard_newest(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
+    (
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
+           WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3) \
+         OR EXISTS (SELECT 1 FROM key_tombstones \
+           WHERE bucket_id = ?1 AND key = ?2 AND tombstone_id >= ?3)",
+        vec![text(bucket.as_str()), text(key), text(id.as_str())],
+    )
+}
+
+/// The key lives again under `id`: the tombstone it sorts after has
+/// nothing left to hold back, the live pointer does it from here.
+pub(super) fn clear_tombstone(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
+    (
+        "DELETE FROM key_tombstones WHERE bucket_id = ?1 AND key = ?2 AND tombstone_id < ?3",
+        vec![text(bucket.as_str()), text(key), text(id.as_str())],
+    )
+}
+
+/// The newest id in the history of `(bucket, key)`: the live generation
+/// or the last tombstone, whichever sorts later.
+pub(super) async fn newest_id<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+) -> Result<Option<GenerationId>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT max(id) FROM (SELECT generation_id AS id FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2 \
+             UNION ALL SELECT tombstone_id FROM key_tombstones \
+               WHERE bucket_id = ?1 AND key = ?2)",
+            &[text(bucket.as_str()), text(key)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Text(id)]) => Ok(Some(GenerationId::new(id.clone()))),
+        Some([SqlValue::Null]) | None => Ok(None),
+        Some(_) => Err(BridgeError::Sql("newest_id: unexpected row".into())),
+    }
+}
+
 /// Publishes one new generation of a single PUT. One batch: the new
 /// generation with its extents and posting obligations, the previous
 /// generation retired with GC rows, and the live pointer moved. Any
-/// failing statement leaves the catalogue exactly as it was.
+/// failing statement leaves the catalogue exactly as it was. `Lost` =
+/// the key already has a newer id ([`guard_newest`]).
 pub(super) async fn commit_generation<S: Sql>(
     c: &SqlCatalog<S>,
     commit: &CommitGeneration,
-) -> Result<()> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &commit.generation;
     // The extents must tile the object exactly, in order: a gap or an
     // overlap here would be served as wrong bytes later. Each must still
@@ -382,7 +433,9 @@ pub(super) async fn commit_generation<S: Sql>(
         ));
     }
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(5 + 3 * commit.extents.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(7 + 3 * commit.extents.len());
+    stmts.push(guard_newest(&g.bucket_id, &g.key, &g.id));
+    stmts.push(clear_tombstone(&g.bucket_id, &g.key, &g.id));
     stmts.push(generation_insert(g)?);
     for e in &commit.extents {
         stmts.push(extent_insert(e, &g.id)?);
@@ -406,7 +459,7 @@ pub(super) async fn commit_generation<S: Sql>(
         commit.now,
     ));
     stmts.push(pointer_upsert(g));
-    c.sql.batch(stmts).await.map(|_| ())
+    published(c, stmts, &g.id, record).await
 }
 
 /// Publishes a copy: a new generation that references the extents of the
@@ -424,7 +477,8 @@ pub(super) async fn commit_generation<S: Sql>(
 pub(super) async fn copy_generation<S: Sql>(
     c: &SqlCatalog<S>,
     copy: &CopyGeneration,
-) -> Result<Guard<()>> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &copy.generation;
     if g.state != GenerationState::Live || g.retired_at.is_some() || g.id == copy.source {
         return Err(BridgeError::Invalid(
@@ -448,18 +502,9 @@ pub(super) async fn copy_generation<S: Sql>(
                 SqlValue::Int(i64::from(g.extent_count)),
             ],
         ),
-        // The copy is the newest generation of its key by id as well: a
-        // replay of the recovery records orders a key's generations by
-        // id, and must not put the replaced one back over the copy.
-        (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS ( \
-               SELECT 1 FROM objects WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3)",
-            vec![
-                text(g.bucket_id.as_str()),
-                text(&g.key),
-                text(g.id.as_str()),
-            ],
-        ),
+        // The copy is the newest id of its key as well, as for a PUT.
+        guard_newest(&g.bucket_id, &g.key, &g.id),
+        clear_tombstone(&g.bucket_id, &g.key, &g.id),
         generation_insert(g)?,
         (
             "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
@@ -486,22 +531,7 @@ pub(super) async fn copy_generation<S: Sql>(
         copy.now,
     ));
     stmts.push(pointer_upsert(g));
-    super::uploads::guarded(c, stmts).await
-}
-
-/// Idempotent: deleting a key with no live object changes nothing.
-pub(super) async fn delete_object<S: Sql>(
-    c: &SqlCatalog<S>,
-    bucket: &BucketId,
-    key: &str,
-    now: UnixMs,
-) -> Result<()> {
-    let mut stmts = retire_live(bucket, key, GenerationState::Deleted, now);
-    stmts.push((
-        "DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2",
-        vec![text(bucket.as_str()), text(key)],
-    ));
-    c.sql.batch(stmts).await.map(|_| ())
+    published(c, stmts, &g.id, record).await
 }
 
 // ---------------------------------------------------------------------------
