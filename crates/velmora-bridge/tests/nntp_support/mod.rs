@@ -27,6 +27,22 @@ use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
 pub use velmora_bridge::LEASE_SECS;
+
+thread_local! {
+    /// What the job did, in the order it began: `connect`, `post`,
+    /// `plan` (the plan stored in the catalogue) and `acquire` (a slot
+    /// asked for). One log per test thread.
+    static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn note_event(event: &'static str) {
+    EVENTS.with(|e| e.borrow_mut().push(event));
+}
+
+/// The events of this test so far.
+pub fn events() -> Vec<&'static str> {
+    EVENTS.with(|e| e.borrow().clone())
+}
 pub const USER: &str = "testuser";
 pub const PASS: &str = "testpass";
 
@@ -144,6 +160,7 @@ impl CountedSession {
 
 impl NntpSession for CountedSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
+        note_event("post");
         begin(&self.slow, "post");
         let posted = NntpSession::post(self.client(), message_id, article).await;
         let parked = self.park.borrow_mut().take();
@@ -178,6 +195,7 @@ impl NntpConnector for TcpConnector {
     type Session = CountedSession;
 
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
+        note_event("connect");
         begin(&self.slow, "connect");
         let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
         end(&self.slow);
@@ -279,6 +297,17 @@ pub struct MemCatalog {
     pub permit_refusals: Cell<u32>,
     /// Permits another holder gives back right after the next refusal.
     pub free_after_refusal: RefCell<Vec<Permit>>,
+    /// Each slot request waits for the runtime once before it is
+    /// answered, as a catalogue round trip does, so that requests made
+    /// together are seen in flight together (`acquire_peak`).
+    pub acquire_takes_a_turn: Cell<bool>,
+    acquire_in_flight: Cell<u32>,
+    /// Most slot requests ever in flight at once.
+    pub acquire_peak: Cell<u32>,
+    /// The next `renew_all` takes this long on this clock.
+    pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
+    /// `provider_failed` calls so far (strikes reported).
+    pub failures_reported: Cell<u32>,
 }
 
 impl MemCatalog {
@@ -461,6 +490,7 @@ impl Catalog for MemCatalog {
         l: &Lease,
         rows: &[ArticleRow],
     ) -> Result<Option<Vec<ArticleRow>>> {
+        note_event("plan");
         Ok(self.fenced(l, |e| {
             if e.articles.is_empty() {
                 e.articles = rows.to_vec();
@@ -635,6 +665,15 @@ impl Catalog for MemCatalog {
         holder: &str,
         now: UnixMs,
     ) -> Result<Option<Permit>> {
+        note_event("acquire");
+        if self.acquire_takes_a_turn.get() {
+            let in_flight = self.acquire_in_flight.get() + 1;
+            self.acquire_in_flight.set(in_flight);
+            self.acquire_peak
+                .set(self.acquire_peak.get().max(in_flight));
+            tokio::task::yield_now().await;
+            self.acquire_in_flight.set(self.acquire_in_flight.get() - 1);
+        }
         self.seed_permits(core::slice::from_ref(p)).await?;
         let background = class == PermitClass::Background;
         let limit = |max: u32| max - u32::from(background && max >= 2);
@@ -773,6 +812,9 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
         self.renewals.set(self.renewals.get() + 1);
+        if let Some((clock, ms)) = self.slow_next_renewal.borrow_mut().take() {
+            clock.advance_ms(ms);
+        }
         self.renewed_at.borrow_mut().push(now);
         let lease = self.renew(l, now).await?;
         let mut held = Vec::new();
@@ -959,6 +1001,7 @@ impl Catalog for MemCatalog {
     }
 
     async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+        self.failures_reported.set(self.failures_reported.get() + 1);
         let mut health = self.health.borrow_mut();
         let h = health.entry(provider.to_string()).or_default();
         if h.until > now.0 {

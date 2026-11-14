@@ -20,6 +20,7 @@ pub mod recovery;
 pub mod replay;
 pub mod service;
 pub mod sql;
+pub mod trace;
 pub mod types;
 pub mod verify;
 

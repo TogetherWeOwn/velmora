@@ -531,10 +531,16 @@ async fn a_full_account_leaves_the_work_to_the_rest_of_the_tier() {
             held.push(dial(&cfg).await.unwrap());
         }
 
+        let connects = || events().iter().filter(|e| **e == "connect").count();
+        let before = connects();
         assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
         let plan = rig.plan(&s).await;
         assert!(all_posted_by(&plan, &format!("p{}", 1 - full)));
         assert_eq!(rig.servers[full].posted_count().await, 0);
+        // The first provider in order is asked first. When it is the full
+        // one: one login there, refused and not tried again, and one on
+        // the other.
+        assert_eq!(connects() - before, if full == 0 { 2 } else { 1 });
         assert_eq!(rig.bridge.nntp.live(), 0);
         for client in held {
             client.quit().await;
@@ -898,4 +904,131 @@ async fn a_job_that_lost_its_address_stops() {
     assert!(before.is_disjoint(&after), "{granted:?}");
     let job = format!("job:{}:", s.extent);
     assert!(before.union(&after).all(|name| name.starts_with(&job)));
+}
+
+/// A job asks for its slots in passes, all requests of a pass at once: a
+/// provider it has no slot from yet is asked for one, then the rest are
+/// asked for together. No request is made twice.
+#[tokio::test]
+async fn a_job_asks_for_its_slots_together() {
+    let two = rig(&[spec("bb0", 5), spec("bb0", 5)]).await;
+    two.bridge.catalog.acquire_takes_a_turn.set(true);
+    let s = two.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+
+    assert_eq!(two.run_post(&s).await, JobOutcome::Ack);
+
+    // One for each provider, then the other two together.
+    assert_eq!(two.bridge.catalog.acquire_peak.get(), 2);
+    let asked = events().iter().filter(|e| **e == "acquire").count();
+    assert_eq!(asked, 4);
+    let peak = two.bridge.catalog.permit_peak.borrow().clone();
+    assert_eq!((peak["p0"], peak["p1"]), (2, 2));
+    assert_eq!(two.bridge.catalog.permit_refusals.get(), 0);
+
+    // One provider (one of its five slots stays reserved for reads): one
+    // request, then three at once.
+    let one = rig(&[spec("bb0", 5)]).await;
+    one.bridge.catalog.acquire_takes_a_turn.set(true);
+    let s = one.seed(2, &marked_plaintext(PLAIN_LEN)).await;
+    assert_eq!(one.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(one.bridge.catalog.acquire_peak.get(), 3);
+    assert_eq!(one.bridge.catalog.permit_peak.borrow()["p0"], 4);
+}
+
+/// The sockets connect while the extent is read and planned, and nothing
+/// is posted before the plan is stored.
+#[tokio::test]
+async fn sockets_connect_while_the_extent_loads() {
+    let rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let events = events();
+    let plan = events.iter().position(|e| *e == "plan").expect("planned");
+    let connects: Vec<usize> = (0..events.len())
+        .filter(|i| events[*i] == "connect")
+        .collect();
+    assert_eq!(connects.len(), 4);
+    assert!(connects.iter().all(|at| *at < plan), "{events:?}");
+    let posts: Vec<usize> = (0..events.len()).filter(|i| events[*i] == "post").collect();
+    assert_eq!(posts.len(), 10);
+    assert!(posts.iter().all(|at| *at > plan), "{events:?}");
+    // The renewal the sockets connected under is the round's first.
+    assert_eq!(rig.bridge.catalog.renewals.get(), 1);
+    assert_eq!(rig.bridge.nntp.connects(), 4);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// A post job leaves one record of its phases for the log: counts and
+/// milliseconds, and nothing that names the extent.
+#[tokio::test]
+async fn a_post_job_leaves_its_timings() {
+    let rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let job = Job::Extent {
+        v: JOB_VERSION,
+        extent: s.extent.clone(),
+        generation: s.generation.clone(),
+        stage: OutboxStage::Post,
+    };
+
+    assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
+
+    let trace = trace::take(&s.extent).expect("a record");
+    assert_eq!((trace.sockets, trace.articles), (4, 10));
+    let line = trace.to_string();
+    assert!(!line.contains(s.extent.as_str()), "{line}");
+    assert!(line.contains("sockets=4 articles=10"), "{line}");
+    // Taken once.
+    assert_eq!(trace::take(&s.extent), None);
+}
+
+/// A renewal that takes too long leaves no time for a connect: the job
+/// connects nothing while the extent loads, and the round connects and
+/// posts after renewing again.
+#[tokio::test]
+async fn a_slow_renewal_leaves_the_connects_to_the_round() {
+    let rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    *rig.bridge.catalog.slow_next_renewal.borrow_mut() = Some((rig.bridge.clock.clone(), 25_000));
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let events = events();
+    let plan = events.iter().position(|e| *e == "plan").expect("planned");
+    let connects: Vec<usize> = (0..events.len())
+        .filter(|i| events[*i] == "connect")
+        .collect();
+    assert_eq!(connects.len(), 4);
+    assert!(connects.iter().all(|at| *at > plan), "{events:?}");
+    // The slow one, then the round's own.
+    assert_eq!(rig.bridge.catalog.renewals.get(), 2);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+}
+
+/// Sockets that could not connect while the extent loaded, of a job that
+/// then stops (the extent is corrupt), are one strike for their
+/// provider, not one each.
+#[tokio::test]
+async fn sockets_that_failed_together_are_one_strike() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    // Nothing listens on the provider's port any more.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    rig.bridge.cfg.providers[0].port = closed.local_addr().unwrap().port();
+    drop(closed);
+    rig.bridge
+        .safety
+        .corrupt(&s.extent.safety_key(), |b| b[100] ^= 1);
+
+    let outcome = rig.run_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+
+    assert_eq!(events().iter().filter(|e| **e == "connect").count(), 4);
+    assert_eq!(rig.bridge.catalog.failures_reported.get(), 1);
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).last_error,
+        Some(FailClass::Corrupt)
+    );
 }
