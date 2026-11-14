@@ -19,6 +19,7 @@
 mod auth;
 mod gc;
 mod health;
+mod hot;
 mod objects;
 mod outbox;
 mod permits;
@@ -26,14 +27,16 @@ mod recovery;
 mod replay;
 mod uploads;
 
+pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
+
 use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, SqlValue, UploadTarget};
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage,
-    OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow,
-    UploadRow, VerificationRow,
+    CompleteUpload, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow,
+    GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage, ListQuery, ObjectStatus,
+    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs,
+    UploadPartRow, UploadRow, VerificationRow,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -338,5 +341,31 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<u64> {
         outbox::redrive_underverified(self, backbones, required, limit, now).await
+    }
+
+    // hot tier
+    async fn hot_stats(&self) -> Result<HotStats> {
+        hot::hot_stats(self).await
+    }
+    async fn evictable_bytes(&self) -> Result<u64> {
+        hot::evictable_bytes(self).await
+    }
+    async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
+        hot::evict_candidates(self, limit).await
+    }
+    async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::begin_evict(self, x).await
+    }
+    async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::finish_evict(self, x).await
+    }
+    async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
+        hot::record_cache_fill(self, extent, now).await
+    }
+    async fn touch_read(&self, extent: &ExtentId, now: UnixMs, min_gap_ms: i64) -> Result<UnixMs> {
+        hot::touch_read(self, extent, now, min_gap_ms).await
+    }
+    async fn hot_forget(&self, extent: &ExtentId, safety: bool, cache: bool) -> Result<()> {
+        hot::hot_forget(self, extent, safety, cache).await
     }
 }

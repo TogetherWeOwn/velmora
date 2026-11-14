@@ -769,6 +769,29 @@ pub struct OutboxStats {
     pub last_dispatch_at: Option<UnixMs>,
 }
 
+/// Hot-tier totals. Pinned bytes are safety copies that are not yet
+/// released; evictable bytes are released safety copies and cache fills.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct HotStats {
+    pub pinned_bytes: u64,
+    pub pinned_extents: u64,
+    pub evictable_bytes: u64,
+    pub evictable_extents: u64,
+}
+
+/// An evictable extent as the catalogue listed it. `begin_evict` refuses
+/// it if anything here has changed since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictCandidate {
+    pub extent: ExtentId,
+    /// Bytes of the released safety copy still in R2.
+    pub safety_bytes: u64,
+    /// Bytes of the cache fill in R2.
+    pub cache_bytes: u64,
+    /// `extents.evict_seq` when listed.
+    pub seq: u64,
+}
+
 db_enum!(
     /// Failure class stored in `outbox.last_error`. A class only: provider
     /// reply text can carry credentials and is never stored.
@@ -843,6 +866,13 @@ pub enum Job {
     Gc {
         v: u8,
     },
+    /// Hot-tier eviction. `resume` continues a drain that an earlier job
+    /// started, down to the low watermark; without it the job only acts
+    /// when the evictable bytes exceed the cap.
+    Evict {
+        v: u8,
+        resume: bool,
+    },
 }
 
 impl Job {
@@ -868,6 +898,8 @@ pub enum JobOutcome {
 pub struct DispatchReport {
     pub enqueued: u32,
     pub gc_enqueued: bool,
+    /// Evictable bytes exceeded the hot-tier cap: an eviction job was sent.
+    pub evict_enqueued: bool,
     pub buried: u64,
     pub permits_seeded: bool,
     /// `done` extents with too few verified backbones sent back to verify.

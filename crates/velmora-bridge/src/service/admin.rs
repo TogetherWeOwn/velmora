@@ -694,7 +694,13 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             .await
             .or_internal()?;
         evicted += 1;
+        // The deleted copies leave the hot-tier count.
+        let forget = |safety: bool| async move {
+            let done = bridge.catalog.hot_forget(&x.extent_id, safety, true);
+            done.await.or_internal()
+        };
         if !include_safety {
+            forget(false).await?;
             continue;
         }
         let gone = match x.safety_state {
@@ -710,7 +716,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
                         .await
                         .or_internal()?
             }
-            // A release job is between its decision and its delete.
+            // A release job is between its decision and its end.
             SafetyState::Releasing => false,
             // Already given up: the delete only removes a leftover.
             SafetyState::Released | SafetyState::Deleted => true,
@@ -723,6 +729,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         } else {
             safety_kept += 1;
         }
+        forget(gone).await?;
     }
     Ok(ok(&json!({
         "evicted": evicted,
@@ -920,8 +927,19 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     for (stage, n) in &stats.by_stage {
         outbox.insert(stage.as_str().to_string(), json!(n));
     }
+    let hot = bridge.catalog.hot_stats().await.or_internal()?;
     let cfg = &bridge.cfg;
     Ok(ok(&json!({
+        // R2 as a hot tier. Pinned bytes are safety copies not yet
+        // released; they are never evicted and are outside the cap.
+        "hot": {
+            "pinned_bytes": hot.pinned_bytes,
+            "pinned_extents": hot.pinned_extents,
+            "evictable_bytes": hot.evictable_bytes,
+            "evictable_extents": hot.evictable_extents,
+            "cap_bytes": cfg.hot_cap_bytes,
+            "low_watermark_bytes": crate::jobs::low_watermark(cfg.hot_cap_bytes),
+        },
         "environment": if cfg.is_dev() { "dev" } else { "prod" },
         "maintenance": match cfg.maintenance {
             Maintenance::Off => "off",

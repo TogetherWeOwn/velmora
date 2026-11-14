@@ -151,13 +151,22 @@ pub(super) async fn gc_begin<S: Sql>(
 }
 
 /// Closes a blob row after its delete; a safety delete also records that
-/// the extent no longer has a safety copy.
+/// the extent no longer has a safety copy. Either delete ends the hot-tier
+/// count of that copy.
 pub(super) async fn gc_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
     c.sql
         .batch(vec![
             (
-                "UPDATE extents SET safety_state = 'deleted' WHERE id = (SELECT extent_id FROM gc \
+                "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
+                   evict_seq = evict_seq + 1 \
+                 WHERE id = (SELECT extent_id FROM gc \
                  WHERE id = ?1 AND action = 'delete_safety' AND done_at IS NULL)",
+                vec![SqlValue::Int(id)],
+            ),
+            (
+                "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
+                 WHERE id = (SELECT extent_id FROM gc \
+                 WHERE id = ?1 AND action = 'delete_cache' AND done_at IS NULL)",
                 vec![SqlValue::Int(id)],
             ),
             (

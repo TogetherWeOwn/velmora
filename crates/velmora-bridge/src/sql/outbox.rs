@@ -476,7 +476,7 @@ pub(super) async fn backbone_status<S: Sql>(
     Ok(out)
 }
 
-/// Authorizes deleting the safety copy. One batch whose guard requires:
+/// Authorizes unpinning the safety copy (it becomes evictable). One batch whose guard requires:
 /// the release lease still holds, the generation is live, the copy is
 /// `held` (or `releasing`, when re-driven), and at least `required`
 /// backbones count with a row recorded under this claim (between the claim
@@ -522,7 +522,9 @@ pub(super) async fn begin_release<S: Sql>(
     super::uploads::guarded(c, stmts).await
 }
 
-/// After the safety copy was deleted: `releasing` → `released`, row done.
+/// `releasing` → `released`, row done. The safety copy stays in R2: from
+/// here on it is evictable, and counted as such. A never-read extent
+/// starts its eviction order at its upload time.
 pub(super) async fn finish_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -544,7 +546,11 @@ pub(super) async fn finish_release<S: Sql>(
     let stmts = vec![
         (guard, lease_params(l, [ms(now)])?),
         (
-            "UPDATE extents SET safety_state = 'released', released_at = ?2 WHERE id = ?1",
+            "UPDATE extents SET safety_state = 'released', released_at = ?2, \
+               hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1",
             vec![text(l.extent.as_str()), ms(now)],
         ),
         // Last: after this the lease no longer holds.

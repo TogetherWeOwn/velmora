@@ -482,6 +482,33 @@ impl Catalog for MemCatalog {
             .is_some())
     }
 
+    // The hot tier is tested on the SQL catalogue; here nothing is ever
+    // evictable.
+    async fn hot_stats(&self) -> Result<HotStats> {
+        Ok(HotStats::default())
+    }
+    async fn evictable_bytes(&self) -> Result<u64> {
+        Ok(0)
+    }
+    async fn evict_candidates(&self, _: u32) -> Result<Vec<EvictCandidate>> {
+        Ok(Vec::new())
+    }
+    async fn begin_evict(&self, _: &EvictCandidate) -> Result<bool> {
+        Ok(false)
+    }
+    async fn finish_evict(&self, _: &EvictCandidate) -> Result<bool> {
+        Ok(false)
+    }
+    async fn record_cache_fill(&self, _: &ExtentId, _: UnixMs) -> Result<()> {
+        Ok(())
+    }
+    async fn touch_read(&self, _: &ExtentId, now: UnixMs, _: i64) -> Result<UnixMs> {
+        Ok(now)
+    }
+    async fn hot_forget(&self, _: &ExtentId, _: bool, _: bool) -> Result<()> {
+        Ok(())
+    }
+
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()> {
         let mut slots = self.slots.borrow_mut();
         for p in providers {
@@ -818,6 +845,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
+        hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
         dev_trust_http: false,
         providers,

@@ -171,6 +171,13 @@ mod tests {
             assert_eq!(lane(&extent_job(stage)), Lane::Verify);
         }
         assert_eq!(lane(&Job::Gc { v: JOB_VERSION }), Lane::Verify);
+        for resume in [false, true] {
+            let evict = Job::Evict {
+                v: JOB_VERSION,
+                resume,
+            };
+            assert_eq!(lane(&evict), Lane::Verify);
+        }
     }
 
     #[test]

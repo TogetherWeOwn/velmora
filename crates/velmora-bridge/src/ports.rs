@@ -14,10 +14,10 @@ use crate::replay::{ReplayExtent, ReplayProbe};
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
-    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId,
-    UploadPartRow, UploadRow, VerificationRow,
+    CompleteUpload, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow,
+    GcStep, GenerationId, GenerationRow, HotStats, Job, JobExtent, KekBytes, ListPage, ListQuery,
+    ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState,
+    UnixMs, UploadId, UploadPartRow, UploadRow, VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -402,6 +402,30 @@ pub trait Catalog {
         limit: u32,
         now: UnixMs,
     ) -> Result<u64>;
+
+    // hot tier
+    /// Pinned and evictable byte totals (`GET /_admin/status`).
+    async fn hot_stats(&self) -> Result<HotStats>;
+    /// Bytes R2 holds that may be evicted: released safety copies and
+    /// cache fills of extents that are not pinned.
+    async fn evictable_bytes(&self) -> Result<u64>;
+    /// Evictable extents, least recently read first.
+    async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
+    /// Starts an eviction in one statement that re-checks the extent:
+    /// `true` only if it is still evictable and unchanged since it was
+    /// listed. `false` for a pinned extent, whatever the caller believes.
+    async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// After the blob deletes: stops counting the bytes. `false` if a copy
+    /// was written since `begin_evict`; the counts then stand.
+    async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// After a cold read wrote the cache copy: counts it, stamps the read.
+    async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
+    /// Stamps a read unless the last stamp is less than `min_gap_ms` old.
+    /// Returns the stamp the extent has afterwards.
+    async fn touch_read(&self, extent: &ExtentId, now: UnixMs, min_gap_ms: i64) -> Result<UnixMs>;
+    /// After blob deletes outside an eviction (admin evict): stops
+    /// counting the named copies.
+    async fn hot_forget(&self, extent: &ExtentId, safety: bool, cache: bool) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
