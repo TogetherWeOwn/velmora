@@ -4,7 +4,13 @@
 # Local (base URL on 127.0.0.1 or localhost): starts fakesrv, applies the D1
 # migrations to a throwaway local state, writes a throwaway .dev.vars, starts
 # `wrangler dev --env dev --local --test-scheduled` on the URL's port, then
-# runs the steps. Step 7 restarts it with DEV_DROP_NOTIFY_N=1 so the next
+# runs the steps. An `https://` local URL serves TLS with a throwaway
+# self-signed certificate that aws-cli and curl are told to trust.
+#
+# aws-cli runs with its default checksum settings (CRC64NVME; over HTTPS the
+# bodies are aws-chunked with a trailing checksum, over HTTP the checksum is
+# a header). Step 0b repeats uploads with `when_required` (no checksum, no
+# aws-chunked), so both client settings are covered in every run. Step 7 restarts it with DEV_DROP_NOTIFY_N=1 so the next
 # queue send is lost, then calls the scheduled handler. Everything it started
 # or wrote is removed on exit.
 #
@@ -84,7 +90,7 @@ case $HOST in
   *) MODE=remote ;;
 esac
 if [[ $MODE == local ]]; then
-  [[ $SCHEME == http && -n $PORT ]] || fail "local base URL" "http://127.0.0.1:<port>" "$BASE"
+  [[ -n $PORT ]] || fail "local base URL" "http(s)://127.0.0.1:<port>" "$BASE"
 fi
 
 for tool in aws curl jq openssl; do
@@ -96,6 +102,8 @@ WRANGLER_PID=
 FAKESRV_PID=
 DEV_VARS_WRITTEN=0
 SECRETS=()
+# Extra curl arguments (the local TLS trust anchor).
+CURL_TLS=()
 
 # Kills a process and its whole process group (wrangler spawns workerd).
 stop_group() {
@@ -212,9 +220,21 @@ if [[ $MODE == local ]]; then
   wrangler_ready() {
     kill -0 "$WRANGLER_PID" 2>/dev/null || return 2
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/" || true)
+    code=$(curl -s "${CURL_TLS[@]}" -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/" || true)
     [[ $code != 000 ]]
   }
+
+  # Local TLS: a throwaway self-signed certificate for 127.0.0.1/localhost.
+  TLS_ARGS=()
+  if [[ $SCHEME == https ]]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$HOST" \
+      -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+      -keyout "$T/tls-key.pem" -out "$T/tls-cert.pem" >"$T/openssl.log" 2>&1 ||
+      { redacted_tail "$T/openssl.log"; fail "local TLS certificate" "openssl exits 0" "non-zero exit (log above)"; }
+    TLS_ARGS=(--local-protocol https --https-key-path "$T/tls-key.pem" --https-cert-path "$T/tls-cert.pem")
+    CURL_TLS=(--cacert "$T/tls-cert.pem")
+    export AWS_CA_BUNDLE="$T/tls-cert.pem"
+  fi
 
   # Starts `wrangler dev` on the persisted local state and waits until it
   # answers (or exits, which fails at once).
@@ -222,7 +242,7 @@ if [[ $MODE == local ]]; then
     local rc=0
     setsid npx --yes wrangler@4 dev --env dev --local --test-scheduled \
       --ip 127.0.0.1 --port "$PORT" --persist-to "$T/state" --show-interactive-dev-session=false \
-      >>"$T/wrangler.log" 2>&1 </dev/null &
+      "${TLS_ARGS[@]}" >>"$T/wrangler.log" 2>&1 </dev/null &
     WRANGLER_PID=$!
     poll "${READY_TIMEOUT_SECS:-1200}" 2 wrangler_ready || rc=$?
     if ! kill -0 "$WRANGLER_PID" 2>/dev/null; then
@@ -266,7 +286,7 @@ fi
 adm() {
   local what=$1 code
   shift
-  code=$(curl -sS -o "$T/adm.out" -w '%{http_code}' --max-time 300 -H @"$T/admin.hdr" "$@" 2>"$T/adm.err") ||
+  code=$(curl -sS "${CURL_TLS[@]}" -o "$T/adm.out" -w '%{http_code}' --max-time 300 -H @"$T/admin.hdr" "$@" 2>"$T/adm.err") ||
     fail "$what" "an HTTP answer" "curl: $(<"$T/adm.err")"
   if ((code < 200 || code >= 300)); then
     fail "$what" "HTTP 2xx" "HTTP $code $(<"$T/adm.out")"
@@ -277,7 +297,7 @@ adm() {
 # adm_try: like adm, but returns non-zero instead of failing (for polls).
 adm_try() {
   local code
-  code=$(curl -sS -o "$T/adm.out" -w '%{http_code}' --max-time 60 -H @"$T/admin.hdr" "$@" 2>/dev/null) || return 1
+  code=$(curl -sS "${CURL_TLS[@]}" -o "$T/adm.out" -w '%{http_code}' --max-time 60 -H @"$T/admin.hdr" "$@" 2>/dev/null) || return 1
   ((code >= 200 && code < 300)) || return 1
   cat "$T/adm.out"
 }
@@ -354,7 +374,8 @@ rm -f "$T/key.json"
 
 export AWS_SHARED_CREDENTIALS_FILE="$T/aws-credentials" AWS_CONFIG_FILE="$T/aws-config"
 export AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true AWS_PAGER=''
-export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+# The client's default checksum settings: no AWS_*_CHECKSUM_* override.
+unset AWS_REQUEST_CHECKSUM_CALCULATION AWS_RESPONSE_CHECKSUM_VALIDATION
 aws configure set default.s3.addressing_style path
 # Multipart stays at the aws-cli defaults: 8 MiB parts, 10 concurrent.
 S3=(aws s3 --endpoint-url "$BASE" --only-show-errors)
@@ -378,6 +399,39 @@ if [[ $MODE == local ]]; then
   json=$(adm "POST /_admin/dev/guard-selftest" -XPOST "$BASE/_admin/dev/guard-selftest")
   jcheck "guard self-test rolls back" '.rolled_back == true' "$json"
 fi
+# Prove which framing the default client used: aws-chunked with a trailing
+# checksum over HTTPS, a checksum header over HTTP. The debug log stays in
+# the 0600 scratch directory and only a fixed verdict is ever printed.
+if [[ $SCHEME == https ]]; then
+  WANT_FRAMING='aws-chunked.*STREAMING-UNSIGNED-PAYLOAD-TRAILER|STREAMING-UNSIGNED-PAYLOAD-TRAILER.*aws-chunked'
+else
+  WANT_FRAMING="'x-amz-checksum-crc64nvme'"
+fi
+"${S3API[@]}" put-object --bucket "$SB" --key a/framing.bin --body "$T/small.bin" --debug \
+  >/dev/null 2>"$T/framing.log" || fail "PUT a/framing.bin" "aws exits 0" "non-zero exit"
+grep -Eq -- "$WANT_FRAMING" "$T/framing.log" ||
+  fail "default client framing over $SCHEME" "request headers matching $WANT_FRAMING" "not found in the aws-cli debug log"
+rm -f "$T/framing.log"
+run_aws "DELETE a/framing.bin" "${S3API[@]}" delete-object --bucket "$SB" --key a/framing.bin >/dev/null
+# The default single PUT stored the client's CRC64NVME and returns it.
+json=$(run_aws "HEAD a/small.bin with checksum mode" "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin --checksum-mode ENABLED)
+jcheck "HEAD a/small.bin returns the stored CRC64NVME" '(.ChecksumCRC64NVME | type == "string") and (.ChecksumCRC64NVME | length == 12)' "$json"
+
+# ---------------------------------------------------------------------------
+# 0b the same uploads with checksums only when required (no aws-chunked)
+# ---------------------------------------------------------------------------
+
+STEP=0b-when-required
+log "step $STEP"
+WHEN_REQUIRED=(env AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required)
+head -c 20971520 /dev/urandom >"$T/mid.bin" # 20 MiB: 3 parts
+run_aws "PUT w/small.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "$T/small.bin" "s3://$SB/w/small.bin" >/dev/null
+run_aws "multipart PUT w/mid.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "$T/mid.bin" "s3://$SB/w/mid.bin" >/dev/null
+run_aws "GET w/small.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "s3://$SB/w/small.bin" "$T/got-w-small.bin" >/dev/null
+same_bytes "GET w/small.bin equals the upload" "$T/small.bin" "$T/got-w-small.bin"
+run_aws "GET w/mid.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "s3://$SB/w/mid.bin" "$T/got-w-mid.bin" >/dev/null
+same_bytes "GET w/mid.bin equals the upload" "$T/mid.bin" "$T/got-w-mid.bin"
+rm -f "$T/mid.bin" "$T/got-w-mid.bin" "$T/got-w-small.bin"
 
 # ---------------------------------------------------------------------------
 # 1 read-after-write (served from SAFETY)
@@ -570,12 +624,15 @@ if [[ $MODE == local ]]; then
     fail "a/lost.bin stays at post without a queue message" "stage post, 0 attempts for 10 s" "$json"
   fi
   cron_then_check() {
-    curl -sf --max-time 60 "$BASE/__scheduled?cron=*/5+*+*+*+*" >/dev/null || return 1
+    curl -sf "${CURL_TLS[@]}" --max-time 60 "$BASE/__scheduled?cron=*/5+*+*+*+*" >/dev/null || return 1
     stage_reached lost.bin
   }
-  if ! poll 90 2 cron_then_check; then
+  # 180 s, not 90: provider slots held by sessions of the stopped isolate
+  # stay claimed until their 120 s lease expires, and only then can the
+  # re-driven post job get a connection.
+  if ! poll 180 2 cron_then_check; then
     json=$(adm "GET /_admin/objects/$SB/a/lost.bin" "$BASE/_admin/objects/$SB/a/lost.bin")
-    fail "a/lost.bin recovered by the scheduled handler within 90 s" "jq: ($REACHED) and ($COUNTED)" "$json"
+    fail "a/lost.bin recovered by the scheduled handler within 180 s" "jq: ($REACHED) and ($COUNTED)" "$json"
   fi
 else
   # The drop counter is dev-only: prove the real cron runs after deploy,

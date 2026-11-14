@@ -327,6 +327,90 @@ fn oversized_declared_length_rejected_unread() {
 }
 
 #[test]
+fn aws_chunked_uploads_are_capped_by_the_decoded_length() {
+    let cfg = cfg(true);
+    let h = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let max = MAX.to_string();
+    let over = (MAX + 1).to_string();
+    let encoded = (MAX + 4096).to_string();
+    // Decoded at the cap, encoded above it or absent: accepted.
+    for pairs in [
+        vec![
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", max.as_str()),
+        ],
+        vec![
+            ("content-encoding", "gzip, aws-chunked"),
+            ("x-amz-decoded-content-length", max.as_str()),
+            ("content-length", encoded.as_str()),
+        ],
+    ] {
+        let lengths = ingress::upload_lengths(&h(&pairs), MAX).unwrap();
+        assert_eq!(lengths.decoded, MAX);
+        let mut all = vec![("authorization", SIGV4)];
+        all.extend(pairs.iter().copied());
+        let req = request(Method::Put, "/bucket/key", &all, Body::Empty);
+        assert_eq!(check(&req, &cfg, true), Ok(()), "{pairs:?}");
+    }
+    for (pairs, err) in [
+        (
+            vec![
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", over.as_str()),
+            ],
+            IngressError::EntityTooLarge,
+        ),
+        (
+            vec![
+                ("content-encoding", "aws-chunked"),
+                ("content-length", "10"),
+            ],
+            IngressError::MissingContentLength,
+        ),
+        (
+            vec![
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "11"),
+                ("content-length", "10"),
+            ],
+            IngressError::InvalidContentLength,
+        ),
+        (
+            vec![
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "+1"),
+            ],
+            IngressError::InvalidContentLength,
+        ),
+        // Without aws-chunked the decoded-length header does not count.
+        (
+            vec![("x-amz-decoded-content-length", "10")],
+            IngressError::MissingContentLength,
+        ),
+    ] {
+        assert_eq!(
+            ingress::upload_lengths(&h(&pairs), MAX),
+            Err(err),
+            "{pairs:?}"
+        );
+        let mut all = vec![("authorization", SIGV4)];
+        all.extend(pairs.iter().copied());
+        let req = request(
+            Method::Put,
+            "/bucket/key?partNumber=1&uploadId=u",
+            &all,
+            Body::Empty,
+        );
+        assert_eq!(check(&req, &cfg, true), Err(err), "{pairs:?}");
+    }
+}
+
+#[test]
 fn upload_without_content_length_is_411() {
     let cfg = cfg(true);
     for target in ["/bucket/key", "/bucket/key?partNumber=1&uploadId=u"] {

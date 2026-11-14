@@ -148,6 +148,9 @@ pub struct ChunkedDecoder {
     trailer: Option<Trailer>,
     trailer_signature: Option<[u8; 32]>,
     trailer_lines: usize,
+    /// The last trailer line ended in a bare LF; a CRLF right after it is
+    /// that line's terminator, not the blank line that ends the trailer.
+    bare_lf: bool,
     failed: bool,
 }
 
@@ -185,6 +188,7 @@ impl ChunkedDecoder {
             trailer: None,
             trailer_signature: None,
             trailer_lines: 0,
+            bare_lf: false,
             failed: false,
         })
     }
@@ -230,12 +234,16 @@ impl ChunkedDecoder {
     ) -> Result<&'a [u8]> {
         match self.state {
             State::Header | State::Trailer => {
-                let Some(rest) = self.take_line(input)? else {
+                let trailer = matches!(self.state, State::Trailer);
+                let Some((rest, bare)) = self.take_line(input, trailer)? else {
                     return Ok(&[]);
                 };
                 let line = std::mem::take(&mut self.line);
-                if matches!(self.state, State::Header) {
+                if !trailer {
                     self.header(&line)?;
+                } else if std::mem::replace(&mut self.bare_lf, bare) && line.is_empty() {
+                    // The CRLF that follows a bare-LF trailer line
+                    // (`name:value\n\r\n`, a documented variant).
                 } else {
                     self.trailer_line(&line)?;
                 }
@@ -280,7 +288,13 @@ impl ChunkedDecoder {
     }
 
     /// Accumulates one CRLF-terminated line; `None` while incomplete.
-    fn take_line<'a>(&mut self, input: &'a [u8]) -> Result<Option<&'a [u8]>> {
+    /// One line. Chunk headers must end in CRLF; a trailer line may also end
+    /// in a bare LF (`bare` = true), which some clients send before the CRLF.
+    fn take_line<'a>(
+        &mut self,
+        input: &'a [u8],
+        trailer: bool,
+    ) -> Result<Option<(&'a [u8], bool)>> {
         let end = input.iter().position(|&b| b == b'\n');
         let piece = &input[..end.map_or(input.len(), |i| i + 1)];
         if self.line.len() + piece.len() > MAX_LINE_BYTES + 2 {
@@ -288,14 +302,17 @@ impl ChunkedDecoder {
         }
         self.line.extend_from_slice(piece);
         let Some(i) = end else { return Ok(None) };
-        if self.line.len() < 2 || self.line[self.line.len() - 2] != b'\r' {
+        let crlf = self.line.len() >= 2 && self.line[self.line.len() - 2] == b'\r';
+        let bare = !crlf && trailer && self.line.len() >= 2;
+        if !crlf && !bare {
             return Err(ErrorCode::InvalidRequest);
         }
-        self.line.truncate(self.line.len() - 2);
+        self.line
+            .truncate(self.line.len() - if crlf { 2 } else { 1 });
         if self.line.contains(&b'\r') {
             return Err(ErrorCode::InvalidRequest);
         }
-        Ok(Some(&input[i + 1..]))
+        Ok(Some((&input[i + 1..], bare)))
     }
 
     fn header(&mut self, line: &[u8]) -> Result<()> {
@@ -714,6 +731,22 @@ mod tests {
         let (out, trailer) = unsigned(wire, 33).unwrap();
         assert_eq!(out, b"hello world, this is a test body\n");
         assert_eq!(trailer.unwrap().value, "bgGah9vCkZ4=");
+    }
+
+    #[test]
+    fn trailer_line_may_end_in_lf_before_crlf() {
+        // `name:value\n\r\n\r\n`, the documented trailing-LF variant.
+        let wire = b"3\r\nabc\r\n0\r\nx-amz-checksum-crc64nvme:AAAAAAAAAAA=\n\r\n\r\n";
+        let (_, trailer) = unsigned(wire, 3).unwrap();
+        assert_eq!(trailer.unwrap().value, "AAAAAAAAAAA=");
+        // A bare LF on its own is still not a blank line, and chunk headers
+        // stay strict CRLF.
+        for bad in [
+            &b"3\r\nabc\r\n0\r\nx-amz-checksum-crc64nvme:AAAAAAAAAAA=\n\n"[..],
+            &b"3\nabc\r\n0\r\nx-amz-checksum-crc64nvme:AAAAAAAAAAA=\r\n\r\n"[..],
+        ] {
+            assert!(unsigned(bad, 3).is_err());
+        }
     }
 
     #[test]

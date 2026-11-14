@@ -15,7 +15,7 @@ use super::common::{
     authenticate, checksum_json, from_proto, internal, metadata_json, mutation_gate, s3_error,
 };
 use crate::crypto::{seal_extent, unwrap_bdk};
-use crate::ingress::{declared_length, read_capped, require_length};
+use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
@@ -60,8 +60,10 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         return Err(S3Response::not_implemented());
     }
     let metadata = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
-    let declared = declared_length(&req.headers).map_err(|e| e.response())?;
-    let len = require_length(declared, bridge.cfg.max_extent_bytes).map_err(|e| e.response())?;
+    // For aws-chunked bodies every length below is the decoded one.
+    let lengths =
+        upload_lengths(&req.headers, bridge.cfg.max_extent_bytes).map_err(|e| e.response())?;
+    let len = lengths.decoded;
     let mut validator = UploadValidator::new(&authed.headers, &authed.verified, &authed.policy)
         .map_err(s3_error)?;
 
@@ -71,10 +73,12 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .charge_body(len)
         .await
         .map_err(|e| e.response())?;
-    let body = read_capped(req.body, len, &charge)
+    let body = read_upload(req.body, lengths, &charge, &mut validator)
         .await
-        .map_err(|e| e.response())?;
-    validator.push_decoded(&body).map_err(s3_error)?;
+        .map_err(|e| match e {
+            UploadReadError::Ingress(e) => e.response(),
+            UploadReadError::Proto(e) => s3_error(e),
+        })?;
     let decoded = validator.finish().map_err(s3_error)?;
 
     let now = bridge.clock.now();

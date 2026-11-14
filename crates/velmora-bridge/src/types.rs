@@ -919,7 +919,8 @@ impl Method {
 pub type ByteStream = LocalBoxStream<'static, Result<Vec<u8>>>;
 
 /// Request body. The adapter never buffers it; only
-/// `ingress::read_capped` does, after auth and the budget charge.
+/// `ingress::read_capped` or `ingress::read_upload` does, after auth and the
+/// budget charge.
 #[non_exhaustive]
 pub enum Body {
     Empty,
