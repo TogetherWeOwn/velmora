@@ -689,7 +689,9 @@ pub(super) async fn redrive_underverified<S: Sql>(
 /// with the extent's last reference. A Worker from before extent
 /// references can, after a rollback: it knows an extent by the generation
 /// it was first written for alone, and the schema stops it only while
-/// that generation is live. One call looks at the next `limit` outbox
+/// that generation is live. The row restarts at the stage its safety copy
+/// is at: `post` while held, `release` when a release was begun and not
+/// finished, `done` otherwise. One call looks at the next `limit` outbox
 /// rows, in a rotation over all of them, so its cost does not grow with
 /// the table.
 pub(super) async fn revive_referenced<S: Sql>(
@@ -725,7 +727,8 @@ pub(super) async fn revive_referenced<S: Sql>(
     let sql = concat!(
         "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
                                           WHERE e.id = outbox.extent_id) \
-                                   WHEN 'held' THEN 'post' ELSE 'done' END, \
+                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
+                                   ELSE 'done' END, \
                 attempts = 0, next_at = ?1, lease_owner = NULL, lease_until = NULL, \
                 updated_at = ?1 \
           WHERE rowid > ?2 AND rowid <= ?3 AND stage = 'cancelled' AND ",

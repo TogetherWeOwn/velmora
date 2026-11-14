@@ -449,11 +449,20 @@ async fn a_posting_cancelled_after_its_first_generation_retired_is_revived() {
     )])
     .await
     .unwrap();
+    // A release that was begun and not finished is taken up where it
+    // stopped: only the release stage unpins the safety copy.
+    db.batch(vec![(
+        "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1 WHERE id = ?1",
+        vec![shared.clone()],
+    )])
+    .await
+    .unwrap();
     let mut total = 0;
     for _ in 0..rig.count("outbox") + 1 {
         total += rig.bridge.catalog.revive_referenced(1, now).await.unwrap();
     }
     assert_eq!(total, 1);
+    assert_eq!(rig.count("outbox WHERE stage = 'release'"), 1);
     let read = rig
         .call(&signer, Method::Get, &path(BUCKET, "dst"), &[], &[], b"")
         .await;

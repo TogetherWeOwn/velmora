@@ -331,7 +331,8 @@ pub(super) async fn replay_publish<S: Sql>(
     stmts.push((
         "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
                                           WHERE e.id = outbox.extent_id) \
-                                   WHEN 'held' THEN 'post' ELSE 'done' END, \
+                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
+                                   ELSE 'done' END, \
                 attempts = 0, next_at = ?2, lease_owner = NULL, lease_until = NULL, \
                 updated_at = ?2 \
           WHERE stage = 'cancelled' AND extent_id IN \
