@@ -252,6 +252,21 @@ async fn requests_the_part_copy_cannot_honour_store_nothing() {
     ] {
         copy(range(&bad)).await.expect_error(400, "InvalidArgument");
     }
+    // A body, with or without a declared length (chunked transfer).
+    for declared in [true, false] {
+        let mut sent = signer.sign(
+            rig.now(),
+            Method::Put,
+            &path(BUCKET, "dst"),
+            &[("partNumber", "1"), ("uploadId", &id)],
+            &[("x-amz-copy-source", &src)],
+            b"body".to_vec(),
+        );
+        if !declared {
+            sent.headers.retain(|(name, _)| name != "content-length");
+        }
+        rig.send(sent).await.expect_error(400, "InvalidRequest");
+    }
     // Source conditions that do not hold.
     copy(vec![(
         "x-amz-copy-source-if-match",
@@ -420,4 +435,49 @@ async fn a_range_larger_than_one_extent_is_refused() {
         get(&rig, &signer, "dst").await.body,
         [&a[100..], &b[..]].concat()
     );
+}
+
+/// A part as large as an extent can be: the read and the seal each need
+/// twice its size, one after the other, and the isolate's budget holds
+/// only three times.
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_size_extent_is_copied_within_the_byte_budget() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let cap = rig.bridge.cfg.max_extent_bytes;
+    assert_eq!(rig.bridge.budget.capacity(), 3 * cap);
+    let body = pattern(8, cap as usize);
+    rig.put(&signer, BUCKET, "full", &body).await.expect(200);
+
+    let id = create(&rig, &signer, "dst").await;
+    let src = source("full");
+    let whole = part_copy(&rig, &signer, "dst", &id, 1, &[("x-amz-copy-source", &src)]).await;
+    whole.expect(200);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+    // Two pieces of one source extent each would not be a full part; a
+    // range that ends at the last byte is.
+    let range = format!("bytes=1-{}", cap - 1);
+    let tail = part_copy(
+        &rig,
+        &signer,
+        "dst",
+        &id,
+        2,
+        &[
+            ("x-amz-copy-source", &src),
+            ("x-amz-copy-source-range", &range),
+        ],
+    )
+    .await;
+    tail.expect(200);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+    assert!(rig.bridge.budget.peak() <= rig.bridge.budget.capacity());
+
+    let etags = [copied_etag(&whole), copied_etag(&tail)];
+    complete(&rig, &signer, "dst", &id, &etags)
+        .await
+        .expect(200);
+    let read = get(&rig, &signer, "dst").await;
+    read.expect(200);
+    assert!(read.body == [&body[..], &body[1..]].concat());
 }

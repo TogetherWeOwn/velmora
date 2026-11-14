@@ -46,7 +46,8 @@ use zeroize::Zeroizing;
 use crate::config::{BridgeConfig, Maintenance};
 use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
 use crate::ingress::{
-    declared_length, read_upload, upload_lengths, Charge, IngressError, UploadReadError,
+    body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
+    UploadReadError,
 };
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
@@ -645,7 +646,7 @@ where
     // covers both and is held until the ciphertext has been handed over.
     // For aws-chunked bodies every length below is the decoded one.
     let (body, charge) = if copy {
-        copied_part(bridge, &a, &req.headers).await?
+        copied_part(bridge, &a, &req.headers, req.body).await?
     } else {
         let lengths = upload_lengths(&req.headers, bridge.cfg.max_extent_bytes)?;
         let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
@@ -765,6 +766,7 @@ async fn copied_part<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     a: &Authed,
     raw: &[(String, String)],
+    sent: crate::types::Body,
 ) -> Outcome<(Vec<u8>, Charge)>
 where
     C: Catalog,
@@ -775,7 +777,8 @@ where
     T: Clock,
 {
     // A copy has no body; one that was sent would be silently dropped.
-    if declared_length(raw)?.is_some_and(|len| len != 0) {
+    // It can come without a declared length, so the stream is asked too.
+    if declared_length(raw)?.is_some_and(|len| len != 0) || !body_is_empty(sent).await {
         return Err(ErrorCode::InvalidRequest.into());
     }
     // Nor bytes a checksum value could be checked against.
@@ -794,8 +797,12 @@ where
     if len > bridge.cfg.max_extent_bytes {
         return Err(ErrorCode::EntityTooLarge.into());
     }
-    let charge = bridge.budget.charge_body(len).await?;
-    let body = super::get::read_range(bridge, &a.bucket, extents, start, len).await?;
+    // The read holds what it needs piece by piece and hands back the
+    // charge for the plaintext. Charging for the seal before the read
+    // would leave a full-size extent no room to be read in.
+    let (body, mut charge) = super::get::read_range(bridge, &a.bucket, extents, start, len).await?;
+    // Plaintext and ciphertext live together while sealing.
+    charge.absorb(bridge.budget.charge(len).await?);
     Ok((body, charge))
 }
 

@@ -225,16 +225,16 @@ async fn read<
 
 /// Plaintext `[start, start + len)` of an object, in memory, for a copy
 /// that seals it again. Every byte comes through [`read_piece`], so it was
-/// authenticated exactly as a GET would have it. The caller holds the
-/// charge for the result; each piece's own charge ends once it is
-/// appended.
+/// authenticated exactly as a GET would have it. Comes with the charge
+/// for the result. Nothing else may be held for it while it runs: one
+/// full-size extent needs most of an isolate's budget to be read.
 pub(super) async fn read_range<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
     extents: Vec<ExtentRow>,
     start: u64,
     len: u64,
-) -> core::result::Result<Vec<u8>, S3Response>
+) -> core::result::Result<(Vec<u8>, Charge), S3Response>
 where
     C: Catalog,
     B: BlobStore,
@@ -244,14 +244,28 @@ where
     T: Clock,
 {
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
-    let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
+    let mut parts = Vec::with_capacity(todo.len());
     for piece in &todo {
-        let (bytes, _charge) = read_piece(bridge, bucket, piece)
-            .await
-            .map_err(|fail| fail.response())?;
-        out.extend_from_slice(&bytes);
+        parts.push(
+            read_piece(bridge, bucket, piece)
+                .await
+                .map_err(|fail| fail.response())?,
+        );
     }
-    Ok(out)
+    if parts.len() == 1 {
+        return parts.pop().ok_or_else(internal);
+    }
+    // Several pieces: they and the joined copy are live together.
+    let held = bridge
+        .budget
+        .charge(len)
+        .await
+        .map_err(|_| ReadFail::Busy.response())?;
+    let mut out = Vec::with_capacity(usize::try_from(len).map_err(|_| internal())?);
+    for (bytes, _) in &parts {
+        out.extend_from_slice(bytes);
+    }
+    Ok((out, held))
 }
 
 /// Decrypts one piece from ciphertext `src` that starts at stream offset
