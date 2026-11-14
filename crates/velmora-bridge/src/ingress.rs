@@ -11,7 +11,14 @@
 //! 3. The handler authenticates (SigV4) from headers only.
 //! 4. [`ByteBudget::charge`] reserves `2 × declared_len`, waiting a bounded
 //!    time without reading the body, then `503 SlowDown`.
-//! 5. [`read_capped`] reads at most `declared_len + 1` bytes.
+//! 5. [`read_capped`] reads at most `declared_len + 1` bytes; uploads use
+//!    [`read_upload`], which decodes as it reads.
+//!
+//! For an `aws-chunked` upload the declared length is the **decoded** one,
+//! `x-amz-decoded-content-length`: the cap, the charge and the buffer are
+//! sized by it. `Content-Length`, when present, is the encoded length and
+//! is only checked against the bytes received (clients that stream with
+//! HTTP `Transfer-Encoding: chunked` send none).
 //!
 //! Transport: [`precheck`] refuses plain `http` unless `DEV_TRUST_HTTP`
 //! (dev only) is set, so every request that reaches a handler arrived over
@@ -25,6 +32,8 @@ use futures_util::future::LocalBoxFuture;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+
+use velmora_s3_proto::{is_aws_chunked, ErrorCode, UploadValidator};
 
 use crate::config::BridgeConfig;
 use crate::service::Route;
@@ -191,9 +200,14 @@ pub fn is_https(url: &str) -> bool {
 /// `Content-Length` as declared. `None` when absent. Repeated or merged
 /// values (`5, 5`) and anything but plain decimal digits are refused.
 pub fn declared_length(headers: &[(String, String)]) -> Result<Option<u64>, IngressError> {
+    strict_length(headers, "content-length")
+}
+
+/// A length header: absent, or exactly one plain decimal value.
+fn strict_length(headers: &[(String, String)], name: &str) -> Result<Option<u64>, IngressError> {
     let mut values = headers
         .iter()
-        .filter(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+        .filter(|(n, _)| n.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.trim());
     let Some(v) = values.next() else {
         return Ok(None);
@@ -218,6 +232,38 @@ pub fn require_length(declared: Option<u64>, max: u64) -> Result<u64, IngressErr
         return Err(IngressError::EntityTooLarge);
     }
     Ok(len)
+}
+
+/// The lengths of an upload body: what the client sends (`encoded`,
+/// `Content-Length`) and what it decodes to (`decoded`, the length the cap,
+/// the budget and the validator apply to).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadLengths {
+    pub encoded: Option<u64>,
+    pub decoded: u64,
+}
+
+/// The lengths of a body-carrying upload, checked against `max` before any
+/// byte is read. Identity framing needs `Content-Length` (`411`
+/// otherwise). `aws-chunked` needs `x-amz-decoded-content-length` (`411`
+/// otherwise) and may omit `Content-Length`.
+pub fn upload_lengths(
+    headers: &[(String, String)],
+    max: u64,
+) -> Result<UploadLengths, IngressError> {
+    let encoded = declared_length(headers)?;
+    let chunked = headers
+        .iter()
+        .any(|(n, v)| n.eq_ignore_ascii_case("content-encoding") && is_aws_chunked(v));
+    if !chunked {
+        let decoded = require_length(encoded, max)?;
+        return Ok(UploadLengths { encoded, decoded });
+    }
+    let decoded = require_length(strict_length(headers, "x-amz-decoded-content-length")?, max)?;
+    if encoded.is_some_and(|n| n < decoded) {
+        return Err(IngressError::InvalidContentLength);
+    }
+    Ok(UploadLengths { encoded, decoded })
 }
 
 fn header<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
@@ -279,12 +325,12 @@ pub fn precheck(
         _ if !has_s3_credential(req) => return Err(IngressError::AccessDenied),
         _ => {}
     }
-    let declared = declared_length(&req.headers)?;
     match route {
         Route::PutObject { .. } | Route::UploadPart { .. } => {
-            require_length(declared, cfg.max_extent_bytes)?;
+            upload_lengths(&req.headers, cfg.max_extent_bytes)?;
         }
         _ => {
+            let declared = declared_length(&req.headers)?;
             if declared.is_some_and(|n| n > cfg.max_extent_bytes) {
                 return Err(IngressError::EntityTooLarge);
             }
@@ -473,6 +519,60 @@ pub async fn read_capped(
     }
     if out.len() != cap {
         return Err(IngressError::IncompleteBody);
+    }
+    Ok(out)
+}
+
+/// Why [`read_upload`] failed: a transport/length refusal or a protocol
+/// error from the validator (framing, signature, digest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadReadError {
+    Ingress(IngressError),
+    Proto(ErrorCode),
+}
+
+impl From<IngressError> for UploadReadError {
+    fn from(e: IngressError) -> Self {
+        UploadReadError::Ingress(e)
+    }
+}
+
+impl From<ErrorCode> for UploadReadError {
+    fn from(e: ErrorCode) -> Self {
+        UploadReadError::Proto(e)
+    }
+}
+
+/// Reads an upload body through `validator`, only after the budget charge,
+/// and returns the decoded bytes. Only the decoded body is kept (at most
+/// `lengths.decoded` bytes, the validator refuses more); encoded bytes are
+/// dropped as they are decoded. With `Content-Length` the stream must carry
+/// exactly that many bytes: short is `IncompleteBody`, long is
+/// `EntityTooLarge`. The caller still calls `validator.finish()`.
+pub async fn read_upload(
+    body: Body,
+    lengths: UploadLengths,
+    charge: &Charge,
+    validator: &mut UploadValidator,
+) -> Result<Vec<u8>, UploadReadError> {
+    if charge.bytes() < lengths.decoded || validator.decoded_length() != lengths.decoded {
+        return Err(IngressError::Internal.into());
+    }
+    let cap = usize::try_from(lengths.decoded).map_err(|_| IngressError::EntityTooLarge)?;
+    let mut out = Vec::with_capacity(cap);
+    let mut received: u64 = 0;
+    if let Body::Stream { mut stream, .. } = body {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| IngressError::IncompleteBody)?;
+            received = received.saturating_add(chunk.len() as u64);
+            if lengths.encoded.is_some_and(|n| received > n) {
+                return Err(IngressError::EntityTooLarge.into());
+            }
+            validator.push_body(&chunk, &mut |decoded| out.extend_from_slice(decoded))?;
+        }
+    }
+    if lengths.encoded.is_some_and(|n| received != n) {
+        return Err(IngressError::IncompleteBody.into());
     }
     Ok(out)
 }

@@ -306,6 +306,9 @@ jobs:
   # ($FAKESRV_BIN), applies migrations --local (dev database
   # `velmora-catalog-dev`) and starts
   # `npx wrangler@4 dev --env dev --local --test-scheduled --port 8787`.
+  # It runs twice with aws-cli's default checksum settings: over HTTP (a
+  # CRC64NVME header) and over local HTTPS (aws-chunked bodies with a
+  # trailing checksum). Each run also covers `when_required` (step 0b).
   worker-e2e:
     name: worker e2e (wrangler dev)
     needs: changes
@@ -354,13 +357,20 @@ jobs:
       - name: Build fakesrv
         if: steps.script.outputs.present == 'true'
         run: cargo build --locked -p velmora-test-nntp --bin fakesrv
-      - name: Run the local slice
+      - name: Run the local slice (HTTP)
         if: steps.script.outputs.present == 'true'
         working-directory: workers/s3-bridge
         env:
           FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
           WRANGLER_SEND_METRICS: "false"
         run: bash e2e/slice.sh http://127.0.0.1:8787
+      - name: Run the local slice (HTTPS, aws-chunked)
+        if: steps.script.outputs.present == 'true'
+        working-directory: workers/s3-bridge
+        env:
+          FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
+          WRANGLER_SEND_METRICS: "false"
+        run: bash e2e/slice.sh https://127.0.0.1:8787
 
   ci-ok:
     name: ci-ok

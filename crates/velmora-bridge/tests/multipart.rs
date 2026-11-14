@@ -171,6 +171,21 @@ fn sign(
     extra: &[(&str, &str)],
     body: Vec<u8>,
 ) -> Req {
+    sign_as(akid, method, path, query, extra, body, None).0
+}
+
+/// [`sign`] with an explicit `x-amz-content-sha256` (a `STREAMING-*`
+/// value): no `Content-Length` is added. Returns the request and its
+/// signature, the seed of a chunk-signature chain.
+fn sign_as(
+    akid: &str,
+    method: Method,
+    path: &str,
+    query: &[(&str, &str)],
+    extra: &[(&str, &str)],
+    body: Vec<u8>,
+    streaming: Option<&str>,
+) -> (Req, String) {
     let canonical_uri = uri_encode(path, true);
     let mut q: Vec<(String, String)> = query
         .iter()
@@ -206,7 +221,7 @@ fn sign(
     let date = format!("{y:04}{mo:02}{d:02}");
     let stamp = format!("{date}T{:02}{:02}{:02}Z", t / 3600, t % 3600 / 60, t % 60);
 
-    let payload = hex(&sha256(&body));
+    let payload = streaming.map_or_else(|| hex(&sha256(&body)), str::to_owned);
     let mut signed: BTreeMap<String, String> = BTreeMap::new();
     signed.insert("host".into(), S3_HOST.into());
     signed.insert("x-amz-content-sha256".into(), payload.clone());
@@ -239,15 +254,18 @@ fn sign(
              Signature={signature}"
         ),
     ));
-    if !body.is_empty() {
+    if !body.is_empty() && streaming.is_none() {
         headers.push(("content-length".into(), body.len().to_string()));
     }
-    Req {
-        method,
-        target,
-        headers,
-        body,
-    }
+    (
+        Req {
+            method,
+            target,
+            headers,
+            body,
+        },
+        signature,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -411,12 +429,17 @@ impl Rig {
     }
 
     async fn send(&self, r: Req) -> Resp {
+        // Arrives in 1 MiB chunks, like a streamed request body.
+        self.send_in(r, MIB).await
+    }
+
+    async fn send_in(&self, r: Req, piece: usize) -> Resp {
         let body = if r.body.is_empty() {
             Body::Empty
         } else {
             let len = r.body.len() as u64;
-            // Arrives in 1 MiB chunks, like a streamed request body.
-            let chunks: Vec<Result<Vec<u8>>> = r.body.chunks(MIB).map(|c| Ok(c.to_vec())).collect();
+            let chunks: Vec<Result<Vec<u8>>> =
+                r.body.chunks(piece).map(|c| Ok(c.to_vec())).collect();
             Body::Stream {
                 declared_len: Some(len),
                 stream: stream::iter(chunks).boxed_local(),
@@ -1269,4 +1292,378 @@ async fn restore_maintenance_refuses_every_call() {
     }
     assert_eq!(rig.count("SELECT COUNT(*) FROM uploads").await, 0);
     assert!(rig.bridge.safety.keys().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// aws-chunked bodies (PutObject and UploadPart)
+// ---------------------------------------------------------------------------
+
+const SIGNED: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const SIGNED_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+const UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+fn b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn crc32c(data: &[u8]) -> [u8; 4] {
+    let mut table = [0u32; 256];
+    for (i, t) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 == 1 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            };
+        }
+        *t = c;
+    }
+    let mut c = !0u32;
+    for b in data {
+        c = table[((c ^ u32::from(*b)) & 0xff) as usize] ^ (c >> 8);
+    }
+    (!c).to_be_bytes()
+}
+
+/// The scope and timestamp `sign_as` uses.
+fn stamp_scope() -> (String, String) {
+    let secs = T0.0.div_euclid(1000);
+    let (y, mo, d) = civil_from_days(secs.div_euclid(86_400));
+    let t = secs.rem_euclid(86_400);
+    let date = format!("{y:04}{mo:02}{d:02}");
+    (
+        format!("{date}T{:02}{:02}{:02}Z", t / 3600, t % 3600 / 60, t % 60),
+        format!("{date}/{REGION}/s3/aws4_request"),
+    )
+}
+
+fn signing_key() -> Vec<u8> {
+    let (stamp, _) = stamp_scope();
+    let k = hmac(
+        format!("AWS4{SIGNING_SECRET}").as_bytes(),
+        &stamp.as_bytes()[..8],
+    );
+    let k = hmac(&k, REGION.as_bytes());
+    let k = hmac(&k, b"s3");
+    hmac(&k, b"aws4_request")
+}
+
+/// A signed aws-chunked body chained from `seed`, with an optional signed
+/// trailer.
+fn signed_chunks(
+    seed: &str,
+    data: &[u8],
+    chunk: usize,
+    trailer: Option<(&str, String)>,
+) -> Vec<u8> {
+    let (stamp, scope) = stamp_scope();
+    let key = signing_key();
+    let empty = hex(&sha256(b""));
+    let mut previous = seed.to_owned();
+    let mut out = Vec::new();
+    for c in data.chunks(chunk).chain([&b""[..]]) {
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{stamp}\n{scope}\n{previous}\n{empty}\n{}",
+            hex(&sha256(c))
+        );
+        previous = hex(&hmac(&key, sts.as_bytes()));
+        out.extend_from_slice(format!("{:x};chunk-signature={previous}\r\n", c.len()).as_bytes());
+        if !c.is_empty() {
+            out.extend_from_slice(c);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    if let Some((name, value)) = trailer {
+        let sts = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{stamp}\n{scope}\n{previous}\n{}",
+            hex(&sha256(format!("{name}:{value}\n").as_bytes()))
+        );
+        let sig = hex(&hmac(&key, sts.as_bytes()));
+        out.extend_from_slice(
+            format!("{name}:{value}\r\nx-amz-trailer-signature:{sig}\r\n").as_bytes(),
+        );
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// An unsigned aws-chunked body, the way aws-cli sends it.
+fn unsigned_chunks(data: &[u8], chunk: usize, trailer: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in data.chunks(chunk) {
+        out.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
+        out.extend_from_slice(c);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n");
+    if !trailer.is_empty() {
+        out.extend_from_slice(format!("{trailer}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// A streaming request: `extra` plus the aws-chunked headers, signed with
+/// `payload`. Returns the request without a body and the seed signature.
+fn chunked_req(
+    path: &str,
+    query: &[(&str, &str)],
+    payload: &str,
+    decoded: usize,
+    extra: &[(&str, &str)],
+) -> (Req, String) {
+    let decoded = decoded.to_string();
+    let mut all = vec![
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded.as_str()),
+    ];
+    all.extend_from_slice(extra);
+    sign_as(
+        RW_KEY,
+        Method::Put,
+        path,
+        query,
+        &all,
+        Vec::new(),
+        Some(payload),
+    )
+}
+
+fn with_body(mut r: Req, body: Vec<u8>, content_length: bool) -> Req {
+    if content_length {
+        r.headers
+            .push(("content-length".into(), body.len().to_string()));
+    } else {
+        r.headers
+            .push(("transfer-encoding".into(), "chunked".into()));
+    }
+    r.body = body;
+    r
+}
+
+#[tokio::test]
+async fn aws_chunked_put_and_upload_part_round_trip() {
+    let rig = Rig::new().await;
+
+    // PutObject as aws-cli sends it by default over HTTPS: unsigned
+    // trailer, CRC64NVME, HTTP chunked without Content-Length.
+    let small = b"hello world, this is a test body\n".to_vec();
+    let path = object_path("alpha", "small.txt");
+    let (r, _) = chunked_req(
+        &path,
+        &[],
+        UNSIGNED_TRAILER,
+        small.len(),
+        &[
+            ("x-amz-trailer", "x-amz-checksum-crc64nvme"),
+            ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+        ],
+    );
+    let body = unsigned_chunks(&small, 7, "x-amz-checksum-crc64nvme:bgGah9vCkZ4=");
+    let r = rig.send_in(with_body(r, body, false), 5).await;
+    assert_eq!(r.outcome(), "200", "{}", r.body);
+    assert_eq!(r.header("x-amz-checksum-crc64nvme"), Some("bgGah9vCkZ4="));
+    let (generation, plain) = rig.object(&rig.alpha, "small.txt").await.unwrap();
+    assert_eq!(plain, small);
+    // The trailer checksum is stored for GET/HEAD with checksum mode, and
+    // aws-chunked is not stored as a content coding.
+    let stored: serde_json::Value =
+        serde_json::from_str(generation.checksum_json.as_deref().unwrap()).unwrap();
+    assert_eq!(stored["algorithm"], "CRC64NVME");
+    assert_eq!(stored["value"], "bgGah9vCkZ4=");
+    assert!(!generation.content_json.contains("aws-chunked"));
+
+    // A full 16 MiB extent: the encoded body is larger than the cap, the
+    // decoded body is not. Signed chunks, with Content-Length.
+    let full = test_bytes(7, 16 * MIB);
+    let path = object_path("alpha", "full.bin");
+    let (r, seed) = chunked_req(&path, &[], SIGNED, full.len(), &[]);
+    let body = signed_chunks(&seed, &full, 64 * 1024, None);
+    assert!(body.len() > 16 * MIB);
+    let r = rig.send_in(with_body(r, body, true), 100_003).await;
+    assert_eq!(r.outcome(), "200", "{}", r.body);
+    assert_eq!(rig.object(&rig.alpha, "full.bin").await.unwrap().1, full);
+    // Charged by the decoded length (2 x 16 MiB), not the encoded one.
+    assert_eq!(rig.bridge.budget.peak(), 32 * MIB as u64);
+
+    // Multipart, as s3transfer sends it: Create names an algorithm.
+    let r = rig
+        .send(create_req(
+            RW_KEY,
+            "alpha",
+            KEY,
+            &[("x-amz-checksum-algorithm", "CRC32C")],
+        ))
+        .await;
+    assert_eq!(r.outcome(), "200", "{}", r.body);
+    let id = xml_value(&r.body, "UploadId").unwrap();
+    let path = object_path("alpha", KEY);
+    let one = test_bytes(1, 5 * MIB);
+    let two = test_bytes(2, 12345);
+    let q1 = [("partNumber", "1"), ("uploadId", id.as_str())];
+    let (r, _) = chunked_req(
+        &path,
+        &q1,
+        UNSIGNED_TRAILER,
+        one.len(),
+        &[("x-amz-trailer", "x-amz-checksum-crc32c")],
+    );
+    let body = unsigned_chunks(
+        &one,
+        MIB,
+        &format!("x-amz-checksum-crc32c:{}", b64(&crc32c(&one))),
+    );
+    let r = rig.send_in(with_body(r, body, false), 65_536).await;
+    assert_eq!(r.outcome(), "200", "{}", r.body);
+    let etag1 = r.header("etag").unwrap().to_string();
+    assert_eq!(etag1, format!("\"{}\"", hex(&md5::compute(&one).0)));
+    // No part checksum is echoed, so clients list none in Complete.
+    assert!(r
+        .headers
+        .iter()
+        .all(|(n, _)| !n.starts_with("x-amz-checksum")));
+    let q2 = [("partNumber", "2"), ("uploadId", id.as_str())];
+    let (r, seed) = chunked_req(
+        &path,
+        &q2,
+        SIGNED_TRAILER,
+        two.len(),
+        &[("x-amz-trailer", "x-amz-checksum-crc32c")],
+    );
+    let crc = b64(&crc32c(&two));
+    let body = signed_chunks(&seed, &two, 8192, Some(("x-amz-checksum-crc32c", crc)));
+    let r = rig.send_in(with_body(r, body, true), 999).await;
+    assert_eq!(r.outcome(), "200", "{}", r.body);
+    let etag2 = r.header("etag").unwrap().to_string();
+    let r = rig
+        .complete("alpha", KEY, &id, &[(1, &etag1), (2, &etag2)])
+        .await;
+    assert_eq!(r.outcome(), "200", "{}", r.body);
+    assert_eq!(
+        xml_value(&r.body, "ETag").unwrap(),
+        multipart_etag(&[&one, &two])
+    );
+    let (generation, plain) = rig.object(&rig.alpha, KEY).await.unwrap();
+    assert_eq!(plain, [one, two].concat());
+    assert_eq!(generation.checksum_json, None);
+}
+
+#[tokio::test]
+async fn aws_chunked_refusals_store_nothing() {
+    let rig = Rig::new().await;
+    let id = rig.create("alpha", KEY).await;
+    let path = object_path("alpha", KEY);
+    let q = [("partNumber", "1"), ("uploadId", id.as_str())];
+    let data = test_bytes(4, 20_000);
+
+    // A tampered chunk signature.
+    let (r, seed) = chunked_req(&path, &q, SIGNED, data.len(), &[]);
+    let mut body = signed_chunks(&seed, &data, 8192, None);
+    let at = body.iter().position(|&b| b == b'=').unwrap() + 1;
+    body[at] = if body[at] == b'0' { b'1' } else { b'0' };
+    let r = rig.send(with_body(r, body, true)).await;
+    assert_eq!(r.outcome(), "403 SignatureDoesNotMatch");
+
+    // A decoded length that does not match the chunks.
+    let (r, seed) = chunked_req(&path, &q, SIGNED, data.len() + 1, &[]);
+    let body = signed_chunks(&seed, &data, 8192, None);
+    let r = rig.send(with_body(r, body, false)).await;
+    assert_eq!(r.outcome(), "400 IncompleteBody");
+
+    // A trailer checksum that does not match the data.
+    let (r, _) = chunked_req(
+        &path,
+        &q,
+        UNSIGNED_TRAILER,
+        data.len(),
+        &[("x-amz-trailer", "x-amz-checksum-crc32c")],
+    );
+    let body = unsigned_chunks(
+        &data,
+        4096,
+        &format!("x-amz-checksum-crc32c:{}", b64(&crc32c(b"x"))),
+    );
+    let r = rig.send(with_body(r, body, false)).await;
+    assert_eq!(r.outcome(), "400 BadDigest");
+
+    // Unsigned streams must declare a checksum; these cases declare a
+    // correct one so they fail for their own reason.
+    let crc = [("x-amz-trailer", "x-amz-checksum-crc32c")];
+    let good_trailer = format!("x-amz-checksum-crc32c:{}", b64(&crc32c(&data)));
+
+    // The final 0-chunk never arrives.
+    let (r, _) = chunked_req(&path, &q, UNSIGNED_TRAILER, data.len(), &crc);
+    let mut body = unsigned_chunks(&data, 4096, &good_trailer);
+    let end = body.windows(5).rposition(|w| w == b"\r\n0\r\n").unwrap() + 2;
+    body.truncate(end);
+    let r = rig.send(with_body(r, body, false)).await;
+    assert_eq!(r.outcome(), "400 IncompleteBody");
+
+    // Content-Length longer than what is sent.
+    let (r, _) = chunked_req(&path, &q, UNSIGNED_TRAILER, data.len(), &crc);
+    let body = unsigned_chunks(&data, 4096, &good_trailer);
+    let mut r = with_body(r, body, true);
+    for (n, v) in &mut r.headers {
+        if n == "content-length" {
+            *v = (v.parse::<u64>().unwrap() + 1).to_string();
+        }
+    }
+    assert_eq!(rig.send(r).await.outcome(), "400 IncompleteBody");
+
+    // Over the cap by the decoded length, and no decoded length at all:
+    // refused before any byte is read.
+    let (r, _) = chunked_req(&path, &q, UNSIGNED_TRAILER, 16 * MIB + 1, &crc);
+    let r = rig.send(with_body(r, b"0\r\n\r\n".to_vec(), false)).await;
+    assert_eq!(r.outcome(), "400 EntityTooLarge");
+    let (r, _) = sign_as(
+        RW_KEY,
+        Method::Put,
+        &path,
+        &q,
+        &[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-trailer", "x-amz-checksum-crc32c"),
+        ],
+        Vec::new(),
+        Some(UNSIGNED_TRAILER),
+    );
+    let r = rig.send(with_body(r, b"0\r\n\r\n".to_vec(), false)).await;
+    assert_eq!(r.outcome(), "411 MissingContentLength");
+
+    // Complete with an object checksum, Create with COMPOSITE: 501.
+    let r = rig
+        .send(complete_req(
+            RW_KEY,
+            "alpha",
+            KEY,
+            &id,
+            &[(1, "\"00000000000000000000000000000000\"")],
+            &[("x-amz-checksum-crc32c", "AAAAAA==")],
+        ))
+        .await;
+    assert_eq!(r.outcome(), "501 NotImplemented");
+    let r = rig
+        .send(create_req(
+            RW_KEY,
+            "alpha",
+            "c.bin",
+            &[
+                ("x-amz-checksum-algorithm", "CRC32C"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+        ))
+        .await;
+    assert_eq!(r.outcome(), "501 NotImplemented");
+
+    // An unsigned stream that declares no checksum at all is refused.
+    let (r, _) = chunked_req(&path, &q, UNSIGNED_TRAILER, data.len(), &[]);
+    let body = unsigned_chunks(&data, 4096, "");
+    let r = rig.send(with_body(r, body, false)).await;
+    assert_eq!(r.outcome(), "400 InvalidRequest");
+
+    assert!(rig.bridge.safety.keys().is_empty());
+    assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 0);
+    assert_eq!(rig.count("SELECT COUNT(*) FROM upload_parts").await, 0);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
 }

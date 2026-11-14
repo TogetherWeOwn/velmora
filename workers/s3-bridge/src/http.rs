@@ -5,7 +5,8 @@
 //! resolves dot segments and rewrites backslashes, so it would verify a
 //! different key than the client signed; clippy bans it in this crate.
 //! Header values pass through untouched. The body stays an unread stream:
-//! only `ingress::read_capped` reads it, after auth and the budget charge.
+//! only `ingress::read_capped` or `ingress::read_upload` reads it, after auth
+//! and the budget charge.
 
 use futures_util::StreamExt;
 use velmora_bridge::ingress::{self, IngressError};

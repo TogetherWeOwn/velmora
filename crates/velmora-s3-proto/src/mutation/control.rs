@@ -309,17 +309,14 @@ pub fn completion_result(status: u16, bytes: &[u8], policy: &Policy) -> Result<S
     let mut seen = std::collections::BTreeSet::new();
     let mut etag = None;
     for field in &root.children {
-        if !matches!(
+        let known = matches!(
             field.name.as_str(),
-            "Location"
-                | "Bucket"
-                | "Key"
-                | "ETag"
-                | "ChecksumSHA256"
-                | "ChecksumCRC32"
-                | "ChecksumType"
-        ) || !seen.insert(field.name.as_str())
-        {
+            "Location" | "Bucket" | "Key" | "ETag" | "ChecksumType"
+        ) || field
+            .name
+            .strip_prefix("Checksum")
+            .is_some_and(|alg| crate::ChecksumAlgorithm::from_name(alg).is_some());
+        if !known || !seen.insert(field.name.as_str()) {
             return Err(ErrorCode::MalformedXML);
         }
         let text = field.leaf()?;

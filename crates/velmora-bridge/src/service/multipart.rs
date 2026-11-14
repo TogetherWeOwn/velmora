@@ -19,8 +19,14 @@
 //! - **Abort** closes the upload; its part extents go to garbage
 //!   collection.
 //!
-//! Conditional headers and multipart checksums are refused with
-//! `501 NotImplemented`, never ignored.
+//! Conditional headers are refused with `501 NotImplemented`, never
+//! ignored. Checksums: Create accepts `x-amz-checksum-algorithm` (type
+//! absent or `FULL_OBJECT`) because default SDK transfers send it; every
+//! part is verified against the checksum it carries (header or aws-chunked
+//! trailer). No checksum of the whole multipart object is computed or
+//! reported, so GET/HEAD return none, UploadPart does not echo one (clients
+//! then list no part checksums in Complete), and Complete refuses a
+//! client-supplied object checksum or a `COMPOSITE` type with `501`.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -31,14 +37,14 @@ use velmora_s3_proto::mutation::{
     parse_complete, CommitResult, MultipartChecksum, PartEvidence, UploadMetadata,
 };
 use velmora_s3_proto::{
-    verify, Authority, Credential, ErrorCode, Headers, Limits, Policy, Target, UploadValidator,
-    VerifiedRequest,
+    verify, Authority, ChecksumAlgorithm, Credential, ErrorCode, Headers, Limits, Policy, Target,
+    UploadValidator, VerifiedRequest,
 };
 use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
 use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
-use crate::ingress::{declared_length, read_capped, require_length, IngressError};
+use crate::ingress::{read_upload, upload_lengths, IngressError, UploadReadError};
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
 };
@@ -91,6 +97,15 @@ impl From<ErrorCode> for Fail {
 impl From<IngressError> for Fail {
     fn from(e: IngressError) -> Self {
         Fail::Ingress(e)
+    }
+}
+
+impl From<UploadReadError> for Fail {
+    fn from(e: UploadReadError) -> Self {
+        match e {
+            UploadReadError::Ingress(e) => Fail::Ingress(e),
+            UploadReadError::Proto(e) => Fail::S3(e),
+        }
     }
 }
 
@@ -468,11 +483,10 @@ where
     K: Kek,
     T: Clock,
 {
-    let declared = require_length(declared_length(&req.headers)?, max)?;
+    let lengths = upload_lengths(&req.headers, max)?;
     let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
-    let charge = bridge.budget.charge_body(declared).await?;
-    let body = read_capped(req.body, declared, &charge).await?;
-    validator.push_decoded(&body)?;
+    let charge = bridge.budget.charge_body(lengths.decoded).await?;
+    let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
     validator.finish()?;
     // Only the small, validated control document outlives the charge.
     drop(charge);
@@ -513,11 +527,12 @@ where
 {
     let a = authenticate(bridge, &req).await?;
     refuse_conditional(&a.headers)?;
-    // A checksum algorithm would have to be enforced per part and at
-    // Complete; that is not built, so the request is refused.
-    if ["x-amz-checksum-algorithm", "x-amz-checksum-type"]
-        .iter()
-        .any(|h| a.headers.get(h).is_some())
+    // Parts are verified against their own checksums; a whole-object
+    // checksum is never computed, so only the FULL_OBJECT shape (whose
+    // absence a client tolerates) is accepted, never COMPOSITE.
+    if a.headers
+        .get("x-amz-checksum-type")
+        .is_some_and(|t| t != "FULL_OBJECT")
     {
         return Err(ErrorCode::NotImplemented.into());
     }
@@ -617,11 +632,12 @@ where
 
     // Plaintext and ciphertext live together while sealing: the charge
     // covers both and is held until the ciphertext has been handed over.
-    let declared = require_length(declared_length(&req.headers)?, bridge.cfg.max_extent_bytes)?;
+    // For aws-chunked bodies every length below is the decoded one.
+    let lengths = upload_lengths(&req.headers, bridge.cfg.max_extent_bytes)?;
+    let declared = lengths.decoded;
     let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
     let charge = bridge.budget.charge_body(declared).await?;
-    let body = read_capped(req.body, declared, &charge).await?;
-    validator.push_decoded(&body)?;
+    let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
     validator.finish()?;
 
     let bdk = unwrap_bdk(
@@ -807,6 +823,14 @@ where
     let a = authenticate(bridge, &req).await?;
     // Before the body is read or anything is published.
     refuse_conditional(&a.headers)?;
+    // A whole-object checksum cannot be checked: none is computed.
+    if ChecksumAlgorithm::ALL
+        .iter()
+        .any(|c| a.headers.get(c.header()).is_some())
+        || a.headers.get("x-amz-checksum-type").is_some()
+    {
+        return Err(ErrorCode::NotImplemented.into());
+    }
     let id = upload_id(&a.target)?;
     let target = UploadTarget {
         bucket: &a.bucket.id,

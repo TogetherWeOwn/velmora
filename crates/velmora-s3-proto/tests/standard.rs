@@ -765,3 +765,27 @@ fn skip_prefix_exposes_the_emitted_common_prefix() {
     list.push(row("c")).unwrap();
     assert_eq!(list.skip_prefix(), None);
 }
+
+#[test]
+fn completion_result_parses_every_checksum_this_crate_renders() {
+    let t = Target::parse("/bucket/dir/a%20b%26c?uploadId=u", &policy()).unwrap();
+    for (alg, value) in [
+        (ChecksumAlgorithm::Crc32, "AAAAAA=="),
+        (ChecksumAlgorithm::Crc32c, "AAAAAA=="),
+        (ChecksumAlgorithm::Crc64Nvme, "AAAAAAAAAAA="),
+        (ChecksumAlgorithm::Sha1, "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        (
+            ChecksumAlgorithm::Sha256,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ),
+    ] {
+        let full = StoredChecksum::full(alg, value.into()).unwrap();
+        let r = commit(Some(full)).complete_response(&t, &policy()).unwrap();
+        assert_eq!(
+            velmora_s3_proto::mutation::completion_result(r.status, &r.body, &policy()),
+            Ok("\"abc-2\"".to_owned()),
+            "{}",
+            alg.name()
+        );
+    }
+}
