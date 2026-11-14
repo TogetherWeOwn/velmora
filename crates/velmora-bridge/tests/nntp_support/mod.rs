@@ -45,6 +45,7 @@ pub struct TcpConnector {
     peak: Rc<Cell<u32>>,
     connects: Cell<u32>,
     slow: Rc<RefCell<Option<Slow>>>,
+    park: Rc<RefCell<Option<Rc<Cell<bool>>>>>,
 }
 
 /// Calls that take time on the test clock, and when each one started.
@@ -74,6 +75,13 @@ impl TcpConnector {
             ms,
             calls: Vec::new(),
         });
+    }
+    /// The next POST to be answered does not return to the job until the
+    /// flag is set: the call stays in flight for as long as a test wants.
+    pub fn park_next_post(&self) -> Rc<Cell<bool>> {
+        let release = Rc::new(Cell::new(false));
+        *self.park.borrow_mut() = Some(Rc::clone(&release));
+        release
     }
     /// The slow calls so far: what, and the time each started.
     pub fn calls(&self) -> Vec<(&'static str, UnixMs)> {
@@ -118,6 +126,7 @@ pub struct CountedSession {
     inner: Option<NntpClient<NativeTlsTransport>>,
     live: Rc<Cell<u32>>,
     slow: Rc<RefCell<Option<Slow>>>,
+    park: Rc<RefCell<Option<Rc<Cell<bool>>>>>,
 }
 
 impl Drop for CountedSession {
@@ -136,6 +145,12 @@ impl NntpSession for CountedSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
         begin(&self.slow, "post");
         let posted = NntpSession::post(self.client(), message_id, article).await;
+        let parked = self.park.borrow_mut().take();
+        if let Some(release) = parked {
+            while !release.get() {
+                tokio::task::yield_now().await;
+            }
+        }
         end(&self.slow);
         posted
     }
@@ -170,6 +185,7 @@ impl NntpConnector for TcpConnector {
             inner: Some(client),
             live: Rc::clone(&self.live),
             slow: Rc::clone(&self.slow),
+            park: Rc::clone(&self.park),
         })
     }
 }

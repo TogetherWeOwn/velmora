@@ -7,9 +7,9 @@
 // scanning a catalogue port, the server-side `TokenPort` handle store is replaced
 // by a self-contained HMAC-tagged token whose key the caller supplies, and objects
 // render with StorageClass STANDARD. `max-keys` above 1000 is capped (as S3 does)
-// instead of rejected.
+// instead of rejected. ListObjects V1 (`marker`) is added on the same fold.
 
-//! ListObjectsV2 and ListBuckets: request parsing, the delimiter fold over rows
+//! ListObjectsV2, ListObjects (V1) and ListBuckets: request parsing, the delimiter fold over rows
 //! the caller fetches in key order, continuation tokens, and the XML renderers.
 //! Pure: no I/O and no key material of its own.
 
@@ -167,7 +167,8 @@ enum Entry {
     CommonPrefix(String),
 }
 
-/// One ListObjectsV2 page. The caller loops: query rows with
+/// One ListObjectsV2 page, or a V1 page from [`ListObjectsV2::parse_v1`].
+/// The caller loops: query rows with
 /// `key starts_with prefix() AND key > after()` in ascending key order, `push`
 /// each while `wants_more()`, then `finish(exhausted)`, where `exhausted` means
 /// the scan reached the end of the prefix range (false = the caller's query
@@ -181,6 +182,11 @@ pub struct ListObjectsV2 {
     has_after: bool,
     scanned: usize,
     entries: Vec<(Entry, Cursor)>,
+    /// ListObjects V1: `marker` is held as `start_after` (same semantics:
+    /// keys after it are listed; a CommonPrefix is skipped only when it is
+    /// the marker itself) and the page resumes by `NextMarker` instead of a
+    /// token.
+    v1: bool,
 }
 
 impl ListObjectsV2 {
@@ -192,6 +198,12 @@ impl ListObjectsV2 {
             .map_or(MAX_KEYS, |n| n.min(u64::from(MAX_KEYS)) as u32);
         let encoding = target.one("encoding-type")?;
         if !matches!(encoding, None | Some("url")) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        // minio-go (restic) always asks for owners. Objects carry no
+        // owner of their own here, so the field is accepted and the page
+        // renders without `Owner`, which S3 clients treat as absent.
+        if !matches!(target.one("fetch-owner")?, None | Some("true" | "false")) {
             return Err(ErrorCode::InvalidArgument);
         }
         let scope = TokenScope {
@@ -206,7 +218,7 @@ impl ListObjectsV2 {
             Some(t) => resolve_token(token_key, t, &scope)?,
             None => Cursor {
                 after: scope.start_after.clone().unwrap_or_default(),
-                skip_prefix: None,
+                skip_prefix: marker_group(&scope),
             },
         };
         Ok(Self {
@@ -217,6 +229,45 @@ impl ListObjectsV2 {
             cursor,
             scanned: 0,
             entries: Vec::new(),
+            v1: false,
+        })
+    }
+
+    /// ListObjects V1: `prefix`, `delimiter`, `marker`, `max-keys`,
+    /// `encoding-type`. No token: the next page starts after `NextMarker`
+    /// (or, without a delimiter, the last key), which the client sends back
+    /// as `marker`.
+    pub fn parse_v1(target: &Target) -> Result<Self> {
+        let max_keys = target
+            .one("max-keys")?
+            .map(decimal)
+            .transpose()?
+            .map_or(MAX_KEYS, |n| n.min(u64::from(MAX_KEYS)) as u32);
+        let encoding = target.one("encoding-type")?;
+        if !matches!(encoding, None | Some("url")) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        let marker = target.one("marker")?.filter(|m| !m.is_empty());
+        let scope = TokenScope {
+            bucket: target.bucket.clone(),
+            prefix: target.one("prefix")?.unwrap_or("").into(),
+            delimiter: target.one("delimiter")?.unwrap_or("").into(),
+            start_after: marker.map(str::to_owned),
+            url_encoding: encoding.is_some(),
+        };
+        let skip_prefix = marker_group(&scope);
+        Ok(Self {
+            has_after: scope.start_after.is_some(),
+            cursor: Cursor {
+                after: scope.start_after.clone().unwrap_or_default(),
+                skip_prefix,
+            },
+            scope,
+            max_keys,
+            token: None,
+            scanned: 0,
+            entries: Vec::new(),
+            v1: true,
         })
     }
 
@@ -268,12 +319,11 @@ impl ListObjectsV2 {
                     .map(|i| row.key[..plen + i + self.scope.delimiter.len()].to_owned())
             })
             .flatten();
-        if common.as_ref().is_some_and(|p| {
-            self.scope
-                .start_after
-                .as_ref()
-                .is_some_and(|a| p.as_str() <= a.as_str())
-        }) {
+        // As at S3, a group is skipped only when the marker (start-after) is
+        // that CommonPrefix itself, which is what a resumed page sends. A
+        // marker inside a group (`a/5`) still rolls later members (`a/6`)
+        // into `a/`.
+        if common.is_some() && common == self.scope.start_after {
             return Ok(());
         }
         self.cursor = Cursor {
@@ -319,19 +369,50 @@ impl ListObjectsV2 {
                 Err(ErrorCode::InvalidArgument)
             }
         };
-        let mut out = format!(
-            "<ListBucketResult xmlns=\"{NS}\"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
-            xml(&scope.bucket),
-            field(&scope.prefix)?,
-            self.entries.len()
-        );
+        let mut out = if self.v1 {
+            let mut head = format!(
+                "<ListBucketResult xmlns=\"{NS}\"><Name>{}</Name><Prefix>{}</Prefix><Marker>{}</Marker>",
+                xml(&scope.bucket),
+                field(&scope.prefix)?,
+                field(scope.start_after.as_deref().unwrap_or(""))?
+            );
+            // S3 sends NextMarker only with a delimiter; without one the
+            // last key is the marker. After a CommonPrefix the marker is the
+            // prefix itself, so the next page skips the whole group (and the
+            // caller seeks past it); otherwise it is the last key scanned,
+            // which is also right for a page cut short by the query budget.
+            if truncated && !scope.delimiter.is_empty() {
+                let next = self
+                    .cursor
+                    .skip_prefix
+                    .as_deref()
+                    .unwrap_or(&self.cursor.after);
+                // A page that names its own marker would loop the client;
+                // a caller that seeks past `skip_prefix` never gets here.
+                if scope.start_after.as_deref() == Some(next) {
+                    return Err(ErrorCode::InternalError);
+                }
+                head.push_str(&format!("<NextMarker>{}</NextMarker>", field(next)?));
+            }
+            head.push_str(&format!(
+                "<MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>"
+            ));
+            head
+        } else {
+            format!(
+                "<ListBucketResult xmlns=\"{NS}\"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
+                xml(&scope.bucket),
+                field(&scope.prefix)?,
+                self.entries.len()
+            )
+        };
         if !scope.delimiter.is_empty() {
             out.push_str(&format!(
                 "<Delimiter>{}</Delimiter>",
                 field(&scope.delimiter)?
             ));
         }
-        if let Some(start) = &scope.start_after {
+        if let (false, Some(start)) = (self.v1, &scope.start_after) {
             out.push_str(&format!("<StartAfter>{}</StartAfter>", field(start)?));
         }
         if scope.url_encoding {
@@ -358,7 +439,7 @@ impl ListObjectsV2 {
                 )),
             }
         }
-        if truncated {
+        if truncated && !self.v1 {
             out.push_str(&format!(
                 "<NextContinuationToken>{}</NextContinuationToken>",
                 xml(&issue_token(token_key, scope, &self.cursor)?)
@@ -367,6 +448,18 @@ impl ListObjectsV2 {
         out.push_str("</ListBucketResult>");
         Ok(xml_response(out))
     }
+}
+
+/// The marker (start-after) when it is exactly one CommonPrefix under the
+/// request's prefix and delimiter, i.e. a resumed page's `NextMarker`. That
+/// group is already delivered, so a page starts with it skipped and the
+/// caller seeks past its members.
+fn marker_group(scope: &TokenScope) -> Option<String> {
+    let marker = scope.start_after.as_deref()?;
+    let d = scope.delimiter.as_str();
+    let rest = marker.strip_prefix(scope.prefix.as_str())?;
+    (!d.is_empty() && rest.find(d) == Some(rest.len().checked_sub(d.len())?))
+        .then(|| marker.to_owned())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
