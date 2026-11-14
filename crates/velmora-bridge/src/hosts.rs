@@ -6,20 +6,25 @@
 //! `request.cf` to guess from, so it is measured:
 //!
 //! - **On first use in an isolate** the connector probes up to
-//!   [`PROBE_HOSTS`] endpoints one after the other: TLS and the greeting
-//!   line, then `QUIT`. A probe is cut once it is slower than the best so
-//!   far, or after [`PROBE_TIMEOUT_MS`]. The fastest wins; a tie goes to
-//!   the earlier one.
+//!   [`PROBE_HOSTS`] endpoints one after the other: the time to TLS and a
+//!   `200`/`201` greeting, then `QUIT` (not timed). A probe is cut once it
+//!   is slower than the best so far, or after [`PROBE_TIMEOUT_MS`]. The
+//!   fastest wins; a tie goes to the earlier one. A host that greets with
+//!   a refusal (`400`, `502`) does not win.
 //! - **The winner is kept** for [`HOST_PICK_TTL_MS`] per provider per
 //!   isolate. Connects in that time go straight to it: no probing on
 //!   every connect.
 //! - **Fallback:** a connect that fails at the transport (socket, TLS,
 //!   timeout, a dropped connection) moves on to the next endpoint, in
-//!   configuration order; one that gets through becomes the winner. A
+//!   configuration order; one that gets through becomes the winner for
+//!   [`SHORT_PICK_TTL_MS`], so that one failure does not pin a slower
+//!   host for long. A
 //!   reply from the provider (a refused login, a full account) is the
 //!   account's answer, not the host's, and is returned as it is.
 //! - **Concurrent connects** of one isolate do not probe again while a
-//!   probe runs: they wait for its result, at most [`PROBE_WAIT_MS`].
+//!   probe runs: they wait for its result, at most [`PROBE_WAIT_MS`]. A
+//!   probe whose connect is dropped withdraws itself, so nobody waits for
+//!   it.
 //!
 //! Probing runs inside the caller's `connect`, so under its permit, one
 //! socket at a time, from the address of the same invocation: it counts
@@ -47,10 +52,11 @@ pub const PROBE_TIMEOUT_MS: u32 = 2_000;
 /// How long a winner is kept, in milliseconds (10 minutes).
 pub const HOST_PICK_TTL_MS: i64 = 600_000;
 
-/// How long the default order is kept when no endpoint answered a probe:
-/// the provider may be down, and probing it on every connect would only
-/// add delay.
-pub const NO_ANSWER_TTL_MS: i64 = 60_000;
+/// How long a pick is kept that no probe made: the configuration order
+/// when no endpoint answered (the provider may be down, and probing it on
+/// every connect would only add delay), or the endpoint a fallback got
+/// through to.
+pub const SHORT_PICK_TTL_MS: i64 = 60_000;
 
 /// Longest a connect waits for another connect's probe of the same
 /// provider, in milliseconds. A probe older than this is treated as lost.
@@ -63,6 +69,10 @@ pub const PROBE_POLL_MS: u32 = 50;
 /// to, in seconds. The last endpoint runs under the caller's bound only.
 pub const HOST_CONNECT_SECS: u32 = 10;
 
+/// Longest a probe's goodbye (`QUIT`, close) may take, in milliseconds.
+/// It is not part of the measured time.
+pub const PROBE_GOODBYE_MS: u32 = 1_000;
+
 /// Longest greeting line a probe reads, in bytes.
 const MAX_GREETING_BYTES: usize = 512;
 
@@ -70,8 +80,8 @@ const MAX_GREETING_BYTES: usize = 512;
 pub trait Dialer {
     type Session;
     /// Opens a socket to `host`, reads the greeting, says `QUIT`. The
-    /// milliseconds that took, or `None` when there was no greeting
-    /// within `limit_ms`.
+    /// milliseconds until a `200`/`201` greeting ([`ready`]), or `None`
+    /// when there was none within `limit_ms`.
     async fn probe(&self, host: &str, limit_ms: u32) -> Option<u32>;
     /// The whole handshake on `host`. `bounded` = give up after
     /// [`HOST_CONNECT_SECS`] (another endpoint is left to try).
@@ -133,8 +143,9 @@ impl HostPicker {
             match d.dial(host, !last).await {
                 Ok(session) => {
                     if i > 0 {
-                        // The preferred host failed and this one answered.
-                        self.choose(&provider.id, host, d.now(), HOST_PICK_TTL_MS);
+                        // The preferred host failed and this one answered:
+                        // used for now, probed again soon.
+                        self.choose(&provider.id, host, d.now(), SHORT_PICK_TTL_MS);
                     }
                     return Ok(session);
                 }
@@ -173,7 +184,10 @@ impl HostPicker {
                         break i;
                     }
                 }
-                Some(Pick::Probing(since)) if now.0.saturating_sub(since.0) < PROBE_WAIT_MS => {
+                // A probe from the future (the clock stepped back) is lost.
+                Some(Pick::Probing(since))
+                    if (0..PROBE_WAIT_MS).contains(&now.0.saturating_sub(since.0)) =>
+                {
                     d.pause(PROBE_POLL_MS).await;
                     continue;
                 }
@@ -199,9 +213,17 @@ impl HostPicker {
         endpoints: &[&str],
         d: &D,
     ) -> usize {
+        let since = d.now();
         self.picks
             .borrow_mut()
-            .insert(provider.id.clone(), Pick::Probing(d.now()));
+            .insert(provider.id.clone(), Pick::Probing(since));
+        // Withdraws the mark if this connect is dropped mid-probe.
+        let mut guard = ProbeGuard {
+            picks: &self.picks,
+            provider: &provider.id,
+            since,
+            done: false,
+        };
         let mut best: Option<(usize, u32)> = None;
         for (i, host) in endpoints.iter().enumerate().take(PROBE_HOSTS) {
             // A host slower than the best so far cannot win: cut it there.
@@ -212,6 +234,7 @@ impl HostPicker {
                 }
             }
         }
+        guard.done = true;
         let now = d.now();
         match best {
             Some((i, _)) => {
@@ -219,39 +242,72 @@ impl HostPicker {
                 i
             }
             None => {
-                self.choose(&provider.id, endpoints[0], now, NO_ANSWER_TTL_MS);
+                self.choose(&provider.id, endpoints[0], now, SHORT_PICK_TTL_MS);
                 0
             }
         }
     }
 }
 
-/// The probe on an open socket: reads one reply line (the greeting) and
-/// says `QUIT`. `true` = a well-formed reply came. Its code is not
-/// judged: a host that answers is reachable, whatever it says to a
-/// session that has not logged in. The time limit is the caller's.
-pub async fn greet<T: Transport>(socket: &mut T) -> bool {
+/// Removes a provider's `Probing` mark when the probe that set it ends
+/// without a result (its future was dropped).
+struct ProbeGuard<'a> {
+    picks: &'a RefCell<BTreeMap<String, Pick>>,
+    provider: &'a str,
+    since: UnixMs,
+    done: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut picks = self.picks.borrow_mut();
+        if picks.get(self.provider) == Some(&Pick::Probing(self.since)) {
+            picks.remove(self.provider);
+        }
+    }
+}
+
+/// Reads one reply line from a fresh socket: the greeting's code, or
+/// `None` when no well-formed line came. The time limit is the caller's.
+pub async fn greeting<T: Transport>(socket: &mut T) -> Option<u16> {
     let mut line = Vec::with_capacity(64);
     let mut buf = [0u8; 128];
-    let answered = loop {
+    loop {
         match socket.read(&mut buf).await {
-            Ok(0) | Err(_) => break false,
+            Ok(0) | Err(_) => return None,
             Ok(n) => {
                 line.extend_from_slice(&buf[..n]);
                 if line.windows(2).any(|w| w == b"\r\n") {
-                    break line.len() >= 3 && line[..3].iter().all(u8::is_ascii_digit);
+                    let code = line.get(..3)?;
+                    if !code.iter().all(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    return core::str::from_utf8(code).ok()?.parse().ok();
                 }
                 if line.len() > MAX_GREETING_BYTES {
-                    break false;
+                    return None;
                 }
             }
         }
-    };
-    if answered {
+    }
+}
+
+/// Whether a greeting offers a session: `200` or `201`. A host that
+/// refuses at the greeting (`400`, `502`) is no candidate, however fast.
+pub fn ready(code: Option<u16>) -> bool {
+    matches!(code, Some(200 | 201))
+}
+
+/// Ends a probe: `QUIT` when the server spoke, then close. The time limit
+/// is the caller's ([`PROBE_GOODBYE_MS`]).
+pub async fn goodbye<T: Transport>(socket: &mut T, greeted: bool) {
+    if greeted {
         let _ = socket.write_all(b"QUIT\r\n").await;
     }
     let _ = socket.shutdown().await;
-    answered
 }
 
 /// `io::Error` for a probe or connect attempt that ran out of time.
@@ -293,6 +349,8 @@ mod tests {
         /// Finishes another connect's probe on the first pause: picks
         /// this host in that picker.
         finish_probe: RefCell<Option<(std::rc::Rc<HostPicker>, &'static str)>>,
+        /// Probes and pauses give the executor a turn, as real I/O does.
+        yields: bool,
     }
 
     impl Net {
@@ -313,6 +371,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("probe {host} {limit_ms}"));
+            if self.yields {
+                tokio::task::yield_now().await;
+            }
             let ms = self.probe_ms.get(host).copied().flatten();
             match ms {
                 Some(ms) if ms <= limit_ms => {
@@ -342,6 +403,9 @@ mod tests {
         async fn pause(&self, ms: u32) {
             if let Some((picker, host)) = self.finish_probe.borrow_mut().take() {
                 picker.choose("p6", host, self.now(), HOST_PICK_TTL_MS);
+            }
+            if self.yields {
+                tokio::task::yield_now().await;
             }
             self.paused.set(self.paused.get() + ms);
             self.now.set(self.now.get() + i64::from(ms));
@@ -437,10 +501,15 @@ mod tests {
         assert_eq!(run(picker.connect(&p, &n)).unwrap(), "a");
         assert_eq!(n.calls(), ["dial b true", "dial a true"]);
         assert_eq!(picker.chosen("p6", n.now()).as_deref(), Some("a"));
-        // The new winner is used without a probe.
+        // The new winner is used without a probe...
         n.calls.borrow_mut().clear();
         run(picker.connect(&p, &n)).unwrap();
         assert_eq!(n.calls(), ["dial a true"]);
+        // ...but only briefly: one failure does not pin it for the TTL.
+        n.down.borrow_mut().clear();
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS);
+        assert_eq!(run(picker.connect(&p, &n)).unwrap(), "b");
+        assert_eq!(n.probes(), 3);
     }
 
     #[test]
@@ -476,7 +545,7 @@ mod tests {
         assert_eq!(run(picker.connect(&p, &n)).unwrap(), "a");
         assert_eq!(n.probes(), 2);
         // Not probed on every connect...
-        n.now.set(n.now.get() + NO_ANSWER_TTL_MS - 1_000);
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS - 1_000);
         run(picker.connect(&p, &n)).unwrap();
         assert_eq!(n.probes(), 2);
         // ...but again after the short TTL.
@@ -625,28 +694,112 @@ mod tests {
     }
 
     #[test]
-    fn greet_reads_one_reply_line_and_says_quit() {
+    fn greeting_reads_one_reply_line_and_goodbye_says_quit() {
         let mut s = Script::new(vec![Ok(b"200 news.example rea"), Ok(b"dy\r\n")]);
-        assert!(run(greet(&mut s)));
+        let code = run(greeting(&mut s));
+        assert_eq!(code, Some(200));
+        assert!(ready(code));
+        run(goodbye(&mut s, code.is_some()));
         assert_eq!(s.written, b"QUIT\r\n");
         assert!(s.shut);
-        // A full account still answers: the host is reachable.
-        let mut s = Script::new(vec![Ok(b"502 too many connections\r\n")]);
-        assert!(run(greet(&mut s)));
+        assert!(ready(Some(201)));
+    }
+
+    /// A host that refuses at the greeting is no candidate: it would win
+    /// every probe (a refusal is quick) and serve no session.
+    #[test]
+    fn a_refusing_greeting_is_not_ready() {
+        for (line, code) in [
+            (&b"502 too many connections\r\n"[..], 502),
+            (&b"400 service unavailable\r\n"[..], 400),
+        ] {
+            let mut s = Script::new(vec![Ok(line)]);
+            assert_eq!(run(greeting(&mut s)), Some(code));
+            assert!(!ready(Some(code)));
+        }
+        assert!(!ready(None));
     }
 
     #[test]
-    fn greet_refuses_silence_garbage_and_errors() {
+    fn greeting_refuses_silence_garbage_and_errors() {
         for reads in [
             vec![],
             vec![Ok(&b"HTTP/1.1 400 Bad\r\n"[..])],
+            vec![Ok(&b"2\r\n"[..])],
             vec![Err(io::ErrorKind::ConnectionReset.into())],
             vec![Ok(&[b'2'; 600][..])],
         ] {
             let mut s = Script::new(reads);
-            assert!(!run(greet(&mut s)));
+            assert_eq!(run(greeting(&mut s)), None);
+            run(goodbye(&mut s, false));
             assert!(s.written.is_empty());
             assert!(s.shut);
         }
+    }
+
+    fn yielding(probes: &[(&'static str, Option<u32>)]) -> Net {
+        Net {
+            yields: true,
+            ..net(probes)
+        }
+    }
+
+    /// The connects of one post job start together: one probes, the
+    /// others wait for it, and every one lands on the winner.
+    #[tokio::test]
+    async fn concurrent_connects_probe_once() {
+        let n = yielding(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b"]);
+        let (x, y, z) = tokio::join!(
+            picker.connect(&p, &n),
+            picker.connect(&p, &n),
+            picker.connect(&p, &n)
+        );
+        assert_eq!(
+            (x.unwrap(), y.unwrap(), z.unwrap()),
+            ("b".into(), "b".into(), "b".into())
+        );
+        assert_eq!(n.probes(), 2, "{:?}", n.calls());
+        assert!(n.paused.get() > 0);
+    }
+
+    /// A connect dropped mid-probe (its caller gave up) withdraws its
+    /// mark: the next connect probes at once instead of waiting.
+    #[tokio::test]
+    async fn a_dropped_probe_does_not_hold_up_the_next_connect() {
+        let n = yielding(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b"]);
+        {
+            let first = picker.connect(&p, &n);
+            let mut first = std::pin::pin!(first);
+            assert!(first.as_mut().now_or_never().is_none());
+            assert!(matches!(
+                picker.picks.borrow().get("p6"),
+                Some(Pick::Probing(_))
+            ));
+        }
+        assert!(picker.picks.borrow().get("p6").is_none());
+        assert_eq!(picker.connect(&p, &n).await.unwrap(), "b");
+        assert_eq!(n.paused.get(), 0);
+        assert_eq!(n.probes(), 3);
+    }
+
+    /// A probe mark from the future (the clock stepped back) is lost, not
+    /// waited for.
+    #[test]
+    fn a_probe_from_the_future_is_not_waited_for() {
+        let n = net(&[("a", Some(400)), ("b", Some(150))]);
+        let picker = HostPicker::new();
+        picker
+            .picks
+            .borrow_mut()
+            .insert("p6".into(), Pick::Probing(UnixMs(n.now().0 + 60_000)));
+        assert_eq!(
+            run(picker.connect(&provider("a", &["b"]), &n)).unwrap(),
+            "b"
+        );
+        assert_eq!(n.paused.get(), 0);
     }
 }

@@ -27,7 +27,7 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
-use velmora_bridge::hosts::{self, Dialer, HostPicker, HOST_CONNECT_SECS};
+use velmora_bridge::hosts::{self, Dialer, HostPicker, HOST_CONNECT_SECS, PROBE_GOODBYE_MS};
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
     Result, UnixMs, QUIT_SECS,
@@ -188,17 +188,27 @@ impl Dialer for Dial<'_> {
         let start = now();
         // The socket is dropped, which closes it, at the end of this
         // block: also after a probe that was cut off.
-        let answered = {
+        let (code, ms) = {
             let mut socket = open(&cfg).ok()?;
-            within(after_ms(limit_ms), async {
-                Ok(hosts::greet(&mut socket).await)
+            let code = within(after_ms(limit_ms), async {
+                Ok(hosts::greeting(&mut socket).await)
             })
             .await
+            .ok()
+            .flatten();
+            // Timed to the greeting; the goodbye is not measured.
+            let ms = now().0.saturating_sub(start.0);
+            let _ = within(after_ms(PROBE_GOODBYE_MS), async {
+                hosts::goodbye(&mut socket, code.is_some()).await;
+                Ok(())
+            })
+            .await;
+            (code, ms)
         };
-        let ms = now().0.saturating_sub(start.0);
-        match answered {
-            Ok(true) => u32::try_from(ms).ok(),
-            _ => None,
+        if hosts::ready(code) {
+            u32::try_from(ms).ok()
+        } else {
+            None
         }
     }
 

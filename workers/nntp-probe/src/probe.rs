@@ -517,7 +517,7 @@ async fn probe_post(req: &Request, env: &Env) -> Result<Response> {
         steps.push(json!({"step": "quit", "ms": now_ms() - t}));
         return json_response(
             &json!({
-                "ok": true,
+                "ok": stat.is_ok(),
                 "summary": summary,
                 "readback": "skipped",
                 "steps": steps,
