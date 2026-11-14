@@ -11,6 +11,7 @@
 //! | `POST /_admin/evict/<bucket>/<key>[?include_safety=1]` | `200`; `403` for `include_safety` on a non-disposable bucket |
 //! | `POST /_admin/drill/<bucket>/<key>` | `200` read-back from Usenet only |
 //! | `GET /_admin/status` | `200` |
+//! | `POST /_admin/restore` `{since_ms[, margin_ms]}` or `{cursor}` | `200` with the counts of one replay step and `next`; `409` unless `MAINTENANCE=restore` |
 //! | `POST /_admin/dev/guard-selftest` | `200` in dev, `404` otherwise |
 //!
 //! Secrets: the access key secret exists in the `POST /_admin/keys`
@@ -36,6 +37,7 @@ use crate::ports::{
 };
 use crate::post::Stop;
 use crate::recovery::delete_blob;
+use crate::replay::ReplayCursor;
 use crate::types::{
     AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
     KeyStatus, Method, OutboxStage, Perm, RespBody, S3Request, S3Response, SafetyState,
@@ -304,7 +306,19 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             let body: CreateKeyBody = read_json(bridge, req).await?;
             create_key(bridge, &body).await
         }
-        "/status" | "/buckets" | "/keys" => Err(wrong_method()),
+        "/restore" if post => {
+            // The one mutation maintenance allows, and only maintenance.
+            if bridge.cfg.maintenance != Maintenance::Restore {
+                return Err(fail(
+                    409,
+                    "NotInMaintenance",
+                    "A restore runs only while MAINTENANCE=restore.",
+                ));
+            }
+            let body: RestoreBody = read_json(bridge, req).await?;
+            restore(bridge, body).await
+        }
+        "/status" | "/buckets" | "/keys" | "/restore" => Err(wrong_method()),
         _ => Err(not_found()),
     }
 }
@@ -321,6 +335,50 @@ fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Cl
             "Maintenance: no changes are accepted.",
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------------------
+
+/// Records minted this long before the restore point are replayed too: a
+/// request mints its generation id before it commits, so a record older
+/// than a catalogue export can belong to a commit newer than it.
+const RESTORE_MARGIN_MS: i64 = 60 * 60 * 1000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreBody {
+    /// First call: the restore point (the time of the catalogue export
+    /// that was loaded; `0` replays every record).
+    since_ms: Option<i64>,
+    margin_ms: Option<i64>,
+    /// Later calls: `next` of the previous response.
+    cursor: Option<ReplayCursor>,
+}
+
+/// One bounded replay step. The caller repeats it with `next` until
+/// `next` is null.
+async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    body: RestoreBody,
+) -> Admin<S3Response> {
+    let bad = || fail(400, "InvalidArgument", "Send since_ms or cursor.");
+    let cursor = match (body.cursor, body.since_ms) {
+        (Some(cursor), None) if body.margin_ms.is_none() => cursor,
+        (None, Some(since)) if since >= 0 => {
+            let margin = body.margin_ms.unwrap_or(RESTORE_MARGIN_MS);
+            if margin < 0 {
+                return Err(bad());
+            }
+            ReplayCursor::start(crate::types::UnixMs(since.saturating_sub(margin).max(0)))
+        }
+        _ => return Err(bad()),
+    };
+    let report = bridge.replay_step(cursor).await.or_internal()?;
+    let value = serde_json::to_value(&report)
+        .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;
+    Ok(ok(&value))
 }
 
 // ---------------------------------------------------------------------------
