@@ -371,11 +371,26 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             if margin < 0 {
                 return Err(bad());
             }
-            ReplayCursor::start(crate::types::UnixMs(since.saturating_sub(margin).max(0)))
+            let from = crate::types::UnixMs(since.saturating_sub(margin).max(0));
+            // From here until the last step, the catalogue refuses
+            // writes, whatever MAINTENANCE says.
+            bridge
+                .catalog
+                .restore_begin(from, bridge.clock.now())
+                .await
+                .or_internal()?;
+            ReplayCursor::start(from)
         }
         _ => return Err(bad()),
     };
     let report = bridge.replay_step(cursor).await.or_internal()?;
+    if report.next.is_none() {
+        bridge
+            .catalog
+            .restore_finish(bridge.clock.now())
+            .await
+            .or_internal()?;
+    }
     let value = serde_json::to_value(&report)
         .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;
     Ok(ok(&value))
@@ -895,6 +910,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
+    let replaying = bridge.catalog.restore_pending().await.or_internal()?;
     let now = bridge.clock.now();
     let load = bridge.catalog.provider_load(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
@@ -927,6 +943,8 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
             Maintenance::Off => "off",
             Maintenance::Restore => "restore",
         },
+        // A replay was started and did not end: writes are refused.
+        "replay_unfinished": replaying,
         "gc_mode": match cfg.gc_mode {
             crate::config::GcMode::Off => "off",
             crate::config::GcMode::Disposable => "disposable",

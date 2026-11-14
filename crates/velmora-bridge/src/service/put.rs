@@ -13,7 +13,7 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, checksum_json, discard_refused, from_proto, internal, metadata_json,
-    mutation_gate, s3_error,
+    mutation_gate, restore_gate, s3_error,
 };
 use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
@@ -63,6 +63,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
+    restore_gate(bridge).await?;
     // A copy has no body: storing it as a plain PUT would publish an
     // empty object under the destination key.
     if authed.headers.get("x-amz-copy-source").is_some() {

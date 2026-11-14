@@ -414,6 +414,10 @@ where
     )?;
     // `authorize` passed, so the bucket exists and the grant is `rw`.
     let bucket = bucket.ok_or(ErrorCode::AccessDenied)?;
+    // A replay that was started and did not end: see `restore_gate`.
+    if bridge.catalog.restore_pending().await? {
+        return Err(ErrorCode::SlowDown.into());
+    }
     let key = target
         .key
         .clone()

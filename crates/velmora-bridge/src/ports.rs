@@ -386,6 +386,15 @@ pub trait Catalog {
         extents: &[ReplayExtent],
         now: UnixMs,
     ) -> Result<()>;
+    /// Extents whose row says the pinned copy is held, in id order after
+    /// `after`.
+    async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>>;
+    /// A replay starts: writes are refused until [`Self::restore_finish`].
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<()>;
+    /// The replay that was started ran to its end.
+    async fn restore_finish(&self, now: UnixMs) -> Result<()>;
+    /// Whether a replay was started and has not ended.
+    async fn restore_pending(&self) -> Result<bool>;
     /// Live generations with an extent that has neither a pinned copy
     /// nor an article plan: their number and the first `limit` ids.
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)>;

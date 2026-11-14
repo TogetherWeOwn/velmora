@@ -382,3 +382,25 @@ pub(crate) async fn discard_refused<
     }
     discard_generation(&bridge.safety, refused).await
 }
+
+/// Refuses a mutation while a replay of the recovery records is under
+/// way: the catalogue then holds only a part of them, and a write could
+/// be published under an id that a record still to come overrides.
+/// `MAINTENANCE=restore` refuses the same requests earlier; this one
+/// still holds when maintenance is switched off before the replay ended.
+pub(super) async fn restore_gate<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+) -> Result<(), S3Response> {
+    match bridge.catalog.restore_pending().await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(unavailable()),
+        Err(_) => Err(internal()),
+    }
+}

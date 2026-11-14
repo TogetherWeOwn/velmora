@@ -42,6 +42,8 @@ pub const MIGRATION_0003: &str =
 /// The newest tombstone of each deleted key.
 pub const MIGRATION_0004: &str =
     include_str!("../../../workers/s3-bridge/migrations/0004_key_tombstones.sql");
+pub const MIGRATION_0005: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0005_restore_state.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -128,6 +130,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0002)?;
         db.apply(MIGRATION_0003)?;
         db.apply(MIGRATION_0004)?;
+        db.apply(MIGRATION_0005)?;
         Ok(db)
     }
 

@@ -296,6 +296,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<()> {
         replay::replay_extents(self, bucket, extents, now).await
     }
+    async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
+        replay::held_extents(self, after, limit).await
+    }
+    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<()> {
+        replay::restore_begin(self, since, now).await
+    }
+    async fn restore_finish(&self, now: UnixMs) -> Result<()> {
+        replay::restore_finish(self, now).await
+    }
+    async fn restore_pending(&self) -> Result<bool> {
+        replay::restore_pending(self).await
+    }
     async fn replay_damaged(&self, limit: u32) -> Result<(u64, Vec<GenerationId>)> {
         replay::replay_damaged(self, limit).await
     }
