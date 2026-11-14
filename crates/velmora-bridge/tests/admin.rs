@@ -1052,7 +1052,8 @@ async fn object_status_evict_and_drill_after_release() {
         "the drill read from NNTP"
     );
     // It filled no cache and restored no pinned copy.
-    assert!(fx.bridge.cache.keys().is_empty() && fx.bridge.safety.keys().is_empty());
+    assert!(fx.bridge.cache.keys().is_empty());
+    assert!(fx.bridge.safety.keys().iter().all(|k| k.starts_with("m/")));
     assert_eq!(fx.bridge.nntp.live(), 0);
     assert_eq!(fx.bridge.budget.in_use(), 0);
     let held = "SELECT COUNT(*) FROM provider_permits WHERE holder IS NOT NULL";

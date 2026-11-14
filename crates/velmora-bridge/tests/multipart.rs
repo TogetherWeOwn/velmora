@@ -876,7 +876,8 @@ async fn complete_vs_upload_part_race() {
     assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == old);
     // The refused part's blob stays as an orphan for garbage collection:
     // the handler never deletes from the safety store. No row names it.
-    assert_eq!(rig.bridge.safety.keys().len(), 2);
+    let pinned = rig.bridge.safety.keys();
+    assert_eq!(pinned.iter().filter(|k| k.starts_with("x/")).count(), 2);
     assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 1);
     assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 1);
 }

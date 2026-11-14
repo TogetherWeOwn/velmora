@@ -16,6 +16,7 @@ pub mod jobs;
 mod pool;
 pub mod ports;
 pub mod post;
+pub mod recovery;
 pub mod service;
 pub mod sql;
 pub mod types;

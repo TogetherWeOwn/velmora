@@ -110,6 +110,27 @@ impl BlobStore for R2Blobs {
     async fn delete(&self, key: &str) -> Result<()> {
         self.bucket.delete(key).await.map_err(blob_err("delete"))
     }
+
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut cursor: Option<String> = None;
+        // R2 may return a short page that is not the last one.
+        while (keys.len() as u64) < u64::from(limit) {
+            let want = limit - keys.len() as u32;
+            let mut req = self.bucket.list().prefix(prefix).limit(want);
+            req = match &cursor {
+                Some(c) => req.cursor(c.clone()),
+                None => req.start_after(start_after),
+            };
+            let page = req.execute().await.map_err(blob_err("list"))?;
+            keys.extend(page.objects().iter().map(worker::Object::key));
+            cursor = match (page.truncated(), page.cursor()) {
+                (true, Some(c)) => Some(c),
+                _ => break,
+            };
+        }
+        Ok(keys)
+    }
 }
 
 #[cfg(test)]

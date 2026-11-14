@@ -21,6 +21,7 @@ use crate::ports::{
     MAX_QUEUE_DELAY_SECS,
 };
 use crate::post::{settle, Stop};
+use crate::recovery::delete_blob;
 use crate::types::{
     ArticleRow, ArticleState, ExtentRow, FailClass, GenerationState, Job, JobExtent, JobOutcome,
     OutboxStage, ProviderConfig, SafetyState, UnixMs, VerificationRow, VerifyResult, JOB_VERSION,
@@ -384,7 +385,7 @@ where
         if !self.catalog.renew(lease, self.clock.now()).await? {
             return Err(Stop::Fenced);
         }
-        self.safety.delete(&extent.id.safety_key()).await?;
+        delete_blob(&self.safety, &extent.id.safety_key()).await?;
         match self.catalog.finish_release(lease, self.clock.now()).await? {
             true => Ok(()),
             false => Err(Stop::Fenced),
