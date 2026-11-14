@@ -174,8 +174,14 @@ impl fmt::Display for Picked {
 enum Pick {
     /// A connect is probing since this time.
     Probing(UnixMs),
-    /// Connect to this host first until the time.
-    Chosen { host: String, until: UnixMs },
+    /// Connect to this host first until the time. `answered` = a probe
+    /// or a connect found it reachable; `false` is the configuration
+    /// order kept after no endpoint answered a probe.
+    Chosen {
+        host: String,
+        until: UnixMs,
+        answered: bool,
+    },
 }
 
 /// The picks of one isolate, by provider id.
@@ -204,7 +210,7 @@ impl HostPicker {
     /// picked (tests and diagnostics).
     pub fn chosen(&self, provider: &str, now: UnixMs) -> Option<String> {
         match self.picks.borrow().get(provider) {
-            Some(Pick::Chosen { host, until }) if *until > now => Some(host.clone()),
+            Some(Pick::Chosen { host, until, .. }) if *until > now => Some(host.clone()),
             _ => None,
         }
     }
@@ -238,7 +244,7 @@ impl HostPicker {
                     if i > 0 {
                         // The first endpoint failed and this one answered:
                         // used for now, picked again soon.
-                        self.choose(&provider.id, host, d.now(), SHORT_PICK_TTL_MS);
+                        self.choose(&provider.id, host, d.now(), SHORT_PICK_TTL_MS, true);
                     }
                     let picked = Picked {
                         endpoint,
@@ -262,24 +268,28 @@ impl HostPicker {
         Err(failure.unwrap_or(BridgeError::Invalid("no endpoint")))
     }
 
-    fn choose(&self, provider: &str, host: &str, now: UnixMs, ttl: i64) {
+    fn choose(&self, provider: &str, host: &str, now: UnixMs, ttl: i64, answered: bool) {
         self.picks.borrow_mut().insert(
             provider.to_string(),
             Pick::Chosen {
                 host: host.to_string(),
                 until: UnixMs(now.0.saturating_add(ttl)),
+                answered,
             },
         );
     }
 
     /// The endpoint tried first failed: a pick of it that cannot be
-    /// reached is dropped, one that failed otherwise is kept at most
-    /// [`SHORT_PICK_TTL_MS`] more.
+    /// reached is dropped (so the next connect looks again), one that
+    /// failed otherwise is kept at most [`SHORT_PICK_TTL_MS`] more. The
+    /// order kept after a probe nobody answered stays for its short TTL:
+    /// an outage is not probed again on every connect.
     fn demote(&self, provider: &str, host: &str, e: &DialError, now: UnixMs) {
         let mut picks = self.picks.borrow_mut();
         let Some(Pick::Chosen {
             host: picked,
             until,
+            answered,
         }) = picks.get_mut(provider)
         else {
             return;
@@ -287,7 +297,7 @@ impl HostPicker {
         if picked != host {
             return;
         }
-        if matches!(e, DialError::Unreachable(_)) {
+        if matches!(e, DialError::Unreachable(_)) && *answered {
             picks.remove(provider);
         } else {
             *until = UnixMs(until.0.min(now.0.saturating_add(SHORT_PICK_TTL_MS)));
@@ -306,7 +316,7 @@ impl HostPicker {
             let now = d.now();
             let pick = self.picks.borrow().get(&provider.id).cloned();
             match pick {
-                Some(Pick::Chosen { host, until }) if until > now => {
+                Some(Pick::Chosen { host, until, .. }) if until > now => {
                     if let Some(i) = endpoints.iter().position(|e| *e == host) {
                         break (i, false);
                     }
@@ -362,11 +372,11 @@ impl HostPicker {
         let now = d.now();
         match best {
             Some((i, _)) => {
-                self.choose(&provider.id, endpoints[i], now, HOST_PICK_TTL_MS);
+                self.choose(&provider.id, endpoints[i], now, HOST_PICK_TTL_MS, true);
                 i
             }
             None => {
-                self.choose(&provider.id, endpoints[0], now, SHORT_PICK_TTL_MS);
+                self.choose(&provider.id, endpoints[0], now, SHORT_PICK_TTL_MS, false);
                 0
             }
         }
@@ -544,7 +554,7 @@ mod tests {
         }
         async fn pause(&self, ms: u32) {
             if let Some((picker, host)) = self.finish_probe.borrow_mut().take() {
-                picker.choose("p6", host, self.now(), HOST_PICK_TTL_MS);
+                picker.choose("p6", host, self.now(), HOST_PICK_TTL_MS, true);
             }
             if self.yields {
                 tokio::task::yield_now().await;
@@ -750,6 +760,25 @@ mod tests {
         assert_eq!(n.probes(), 2);
     }
 
+    /// An outage: no endpoint answers a probe and none can be reached.
+    /// The configuration order is kept for the short TTL, so the next
+    /// connect in that time dials again but does not probe again.
+    #[test]
+    fn an_outage_is_not_probed_on_every_connect() {
+        let n = net(&[("a", None), ("b", None)]);
+        n.down.borrow_mut().extend(["a", "b"]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b"]);
+        assert!(run(picker.connect_host(&p, &n)).is_err());
+        assert_eq!(n.probes(), 2);
+        n.now.set(n.now.get() + SHORT_PICK_TTL_MS - 1_000);
+        assert!(run(picker.connect_host(&p, &n)).is_err());
+        assert_eq!(n.probes(), 2, "{:?}", n.calls());
+        n.now.set(n.now.get() + 2_000);
+        assert!(run(picker.connect_host(&p, &n)).is_err());
+        assert_eq!(n.probes(), 4);
+    }
+
     /// `ordered`: no probe ever; `host` first, the next on failure, and
     /// back to `host` once the short pick ends.
     #[test]
@@ -902,7 +931,7 @@ mod tests {
     fn a_cached_host_no_longer_listed_is_probed_again() {
         let n = net(&[("a", Some(400)), ("b", Some(150))]);
         let picker = HostPicker::new();
-        picker.choose("p6", "gone", n.now(), HOST_PICK_TTL_MS);
+        picker.choose("p6", "gone", n.now(), HOST_PICK_TTL_MS, true);
         assert_eq!(
             run(picker.connect_host(&provider("a", &["b"]), &n)).unwrap(),
             "b"
