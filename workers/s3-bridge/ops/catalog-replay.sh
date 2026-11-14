@@ -62,7 +62,22 @@ while :; do
     echo "catalog-replay: call $calls answered $status:" >&2
     head -c 600 "$WORK/step.json" >&2 2>/dev/null || true
     echo >&2
-    echo "catalog-replay: run the same command again to continue" >&2
+    # A replay that is on record as unfinished started at an earlier
+    # restore point: the same command would answer 409 again.
+    unfinished=$(jq -r '.unfinished_since_ms // empty' "$WORK/step.json" 2>/dev/null) || unfinished=
+    case "$unfinished" in
+    '' | *[!0-9]*)
+      if [ "$status" = 409 ]; then
+        echo "catalog-replay: refused; the same command will be refused again, see the message above" >&2
+      else
+        echo "catalog-replay: run the same command again to continue" >&2
+      fi
+      ;;
+    *)
+      echo "catalog-replay: a replay from an earlier restore point is unfinished; run:" >&2
+      echo "catalog-replay:   ops/catalog-replay.sh $BASE $unfinished 0" >&2
+      ;;
+    esac
     exit 1
   fi
   jq -c --slurpfile t "$WORK/total.json" '

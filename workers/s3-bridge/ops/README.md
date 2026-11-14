@@ -225,7 +225,14 @@ serving).
   not `-1`), the restore point is that replay's, not a later one. The catalogue holds
   the records up to that point at most. The route enforces it: a first
   call with a later `since_ms` answers 409 and names the value to send
-  (`unfinished_since_ms`, with `margin_ms` 0). If the time is not known,
+  (`unfinished_since_ms`, with `margin_ms` 0). A second exception, which
+  the route cannot see: if the row is already `replaying` with
+  `since_ms` `-1` before you run the arming statement (check with
+  `SELECT state, since_ms FROM restore_state` first), the database was
+  restored a second time, to a point after an earlier arming and before
+  that replay's first call. The time of this restore is then too late:
+  take the restore point from the stamp object as described next, not
+  from the bookmark time. If the time is not known,
   take the body of the stamp object of the counter the catalogue holds
   (`SELECT counter FROM rollback_stamp`) minus one cron interval, or
   `0`. The last step of the replay sets the counter level with the
