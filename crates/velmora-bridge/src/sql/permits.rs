@@ -6,11 +6,11 @@
 
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
-use crate::ports::{Permit, PermitClass, Sql, SqlValue};
+use crate::ports::{Permit, PermitClass, Sql, SqlValue, PERMIT_SECS};
 use crate::types::{ProviderConfig, Result, UnixMs};
 
-/// Permit lifetime; holders renew before each article.
-const PERMIT_TTL_MS: i64 = 120_000;
+/// Permit lifetime; holders renew on a timer or before each article.
+const PERMIT_TTL_MS: i64 = PERMIT_SECS as i64 * 1000;
 
 /// Slots background jobs leave free for cold reads.
 fn read_reserve(max_conns: u32) -> u32 {
@@ -131,17 +131,19 @@ pub(super) async fn renew_permit<S: Sql>(
     p: &Permit,
     now: UnixMs,
 ) -> Result<bool> {
+    let (sql, params) = renew_stmt(p, now)?;
+    Ok(c.sql.exec(sql, &params).await? > 0)
+}
+
+/// The renewal of one permit as a statement, for batches.
+pub(super) fn renew_stmt(p: &Permit, now: UnixMs) -> Result<super::uploads::Stmt> {
     let mut params = permit_params(p)?;
     params.extend([ms(now.plus_ms(PERMIT_TTL_MS)), ms(now)]);
-    let changed = c
-        .sql
-        .exec(
-            "UPDATE provider_permits SET lease_until = ?4 \
-             WHERE provider_id = ?1 AND slot = ?2 AND token = ?3 AND lease_until >= ?5",
-            &params,
-        )
-        .await?;
-    Ok(changed > 0)
+    Ok((
+        "UPDATE provider_permits SET lease_until = ?4 \
+         WHERE provider_id = ?1 AND slot = ?2 AND token = ?3 AND lease_until >= ?5",
+        params,
+    ))
 }
 
 /// Frees the slot if this permit still owns it; otherwise does nothing.

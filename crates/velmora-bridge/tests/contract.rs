@@ -257,6 +257,9 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 1);
+    // Optional settings fall back to their defaults.
+    assert_eq!(cfg.post_sockets, 4);
+    assert_eq!(cfg.propagation_grace_secs, 21_600);
 
     // The dev environment is complete on its own (envs do not inherit vars).
     let cfg = load(&with_secrets(dev.clone(), PROVIDER_PLAIN)).unwrap();
@@ -338,6 +341,22 @@ fn config_rejects_invalid_and_unsafe_values() {
         set(&prod, "NNTP_PROVIDERS", PROVIDER_PLAIN),
         ConfigError::Refused(_)
     ));
+
+    // Optional settings: a value that is set must be valid.
+    for (name, bad) in [
+        ("POST_SOCKETS", "0"),
+        ("POST_SOCKETS", "9"),
+        ("POST_SOCKETS", "four"),
+        ("PROPAGATION_GRACE_SECS", "-1"),
+        ("PROPAGATION_GRACE_SECS", "6h"),
+    ] {
+        assert_eq!(set(&prod, name, bad), invalid(name), "{name}={bad}");
+    }
+    let mut tuned = prod.clone();
+    tuned.insert("POST_SOCKETS".into(), "8".into());
+    tuned.insert("PROPAGATION_GRACE_SECS".into(), "0".into());
+    let cfg = load(&tuned).unwrap();
+    assert_eq!((cfg.post_sockets, cfg.propagation_grace_secs), (8, 0));
 
     // Shape and range.
     assert_eq!(set(&prod, "ENVIRONMENT", "staging"), invalid("ENVIRONMENT"));

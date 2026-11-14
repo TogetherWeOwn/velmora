@@ -1736,3 +1736,127 @@ async fn redrive_leaves_everything_else_alone() {
     assert_eq!(fx.outbox(&released, "stage").await, "done");
     assert_eq!(fx.outbox(&deleted, "stage").await, "done");
 }
+
+fn poster(id: &str, max_conns: u32) -> ProviderConfig {
+    let json = format!(
+        "{{\"id\":\"{id}\",\"host\":\"news.example.invalid\",\"port\":563,\"tls\":true,\
+         \"user\":\"u\",\"pass\":\"p\",\"backbone\":\"bb\",\"post\":true,\"read\":true,\
+         \"max_conns\":{max_conns}}}"
+    );
+    serde_json::from_str(&json).unwrap()
+}
+
+/// A batch of posted articles is written as a whole under a live lease
+/// and not at all under a stale one.
+#[tokio::test]
+async fn mark_posted_many_is_fenced_and_all_or_nothing() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let stale = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let plan = fx.plan(&o, "first", 5);
+    fx.cat.plan_articles(&stale, &plan).await.unwrap().unwrap();
+
+    let c = &fx.cat;
+    let at = T0.plus_ms(5);
+    assert!(c
+        .mark_posted_many(&stale, &[(0, "p1"), (3, "p2")], at)
+        .await
+        .unwrap());
+    let rows = c.articles(&o.extent).await.unwrap();
+    let seen: Vec<_> = rows
+        .iter()
+        .map(|a| (a.state, a.provider_id.as_deref(), a.posted_at))
+        .collect();
+    let planned = (ArticleState::Planned, None, None);
+    assert_eq!(
+        seen,
+        [
+            (ArticleState::Posted, Some("p1"), Some(at)),
+            planned,
+            planned,
+            (ArticleState::Posted, Some("p2"), Some(at)),
+            planned,
+        ]
+    );
+    // Nothing to write: still an answer about the lease.
+    assert!(c.mark_posted_many(&stale, &[], at).await.unwrap());
+
+    let t1 = T0.plus_ms(LEASE_MS + 1);
+    let owner = fx.claim(&o, OutboxStage::Post, t1).await.unwrap();
+    let before = fx.dump().await;
+    assert!(!c
+        .mark_posted_many(&stale, &[(1, "p1"), (2, "p1"), (4, "p1")], t1)
+        .await
+        .unwrap());
+    assert!(!c.mark_posted_many(&stale, &[], t1).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(c.articles(&o.extent).await.unwrap(), rows);
+
+    // The owner writes the rest in one go.
+    assert!(c
+        .mark_posted_many(&owner, &[(1, "p1"), (2, "p1"), (4, "p1")], t1)
+        .await
+        .unwrap());
+    let rows = c.articles(&o.extent).await.unwrap();
+    assert!(rows.iter().all(|a| a.state == ArticleState::Posted));
+}
+
+/// One round trip renews the lease and every permit; each answer stands
+/// for itself.
+#[tokio::test]
+async fn renew_all_renews_the_lease_and_each_permit_on_its_own() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let c = &fx.cat;
+    let p = poster("p1", 3);
+    c.seed_permits(core::slice::from_ref(&p)).await.unwrap();
+    let lease = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let mut permits = Vec::new();
+    for _ in 0..2 {
+        let got = c.acquire_permit(&p, PermitClass::Background, "h", T0).await;
+        permits.push(got.unwrap().unwrap());
+    }
+
+    let t1 = T0.plus_secs(20);
+    assert_eq!(
+        c.renew_all(&lease, &permits, t1).await.unwrap(),
+        (true, vec![true, true])
+    );
+    assert_eq!(
+        fx.outbox(&o, "lease_until").await,
+        t1.plus_ms(LEASE_MS).0.to_string()
+    );
+    let until = fx
+        .count("SELECT MIN(lease_until) FROM provider_permits WHERE token > 0 AND lease_until > 0")
+        .await;
+    assert_eq!(until, t1.plus_secs(PERMIT_SECS).0);
+    // No permits: the lease alone.
+    assert_eq!(c.renew_all(&lease, &[], t1).await.unwrap(), (true, vec![]));
+
+    // One slot is given back and taken by someone else.
+    c.release_permit(&permits[0]).await.unwrap();
+    let other = c.acquire_permit(&p, PermitClass::Background, "o", t1).await;
+    assert_eq!(other.unwrap().unwrap().slot, permits[0].slot);
+    assert_eq!(
+        c.renew_all(&lease, &permits, t1).await.unwrap(),
+        (true, vec![false, true])
+    );
+
+    // The lease is taken over: the old holder learns it, and its live
+    // permit is still its own.
+    let t2 = t1.plus_ms(LEASE_MS + 1);
+    assert!(c
+        .renew_permit(&permits[1], t1.plus_secs(PERMIT_SECS))
+        .await
+        .unwrap());
+    let t_claim = t1.plus_ms(LEASE_MS + 1);
+    let owner = fx.claim(&o, OutboxStage::Post, t_claim).await.unwrap();
+    let live = [permits[1].clone()];
+    let before = fx.outbox(&o, "lease_until").await;
+    let (held, slots) = c.renew_all(&lease, &live, t2).await.unwrap();
+    assert!(!held);
+    // That permit ran out long ago: an expired slot is never extended.
+    assert_eq!(slots, vec![false]);
+    assert_eq!(fx.outbox(&o, "lease_until").await, before);
+    assert_eq!(fx.outbox(&o, "lease_token").await, owner.token.to_string());
+}
