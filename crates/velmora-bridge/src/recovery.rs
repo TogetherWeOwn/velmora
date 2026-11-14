@@ -26,9 +26,11 @@
 //!   one, after the record is stored.
 //! - **No delete removes a record.** [`BlobStore::delete`] refuses every
 //!   key under `m/`, in the store adapter itself. The one way to remove
-//!   a record is [`discard_generation`], and it takes the [`Recorded`]
-//!   that the catalogue hands back when it refused the publication (a
-//!   definite failure: nothing was published under that id). When the
+//!   a record is [`discard_generation`], and it takes an
+//!   [`Unpublished`]: what the catalogue makes of the [`Recorded`] when
+//!   it refused the publication (a definite failure: nothing was
+//!   published under that id). A `Recorded` alone does not delete, so a
+//!   record cannot be discarded before the catalogue was asked. When the
 //!   outcome is unknown the proof is gone with the call, so the record
 //!   stays, and a replay may publish it.
 
@@ -99,8 +101,8 @@ pub async fn delete_blob<B: BlobStore>(store: &B, key: &str) -> Result<()> {
 
 /// Proof that the recovery record of one generation is stored in
 /// `SAFETY`. [`write_generation`] is the only place that makes one; the
-/// catalogue publishes a generation only against it, and gives it back
-/// when it refused, which is what [`discard_generation`] takes.
+/// catalogue publishes a generation only against it, and turns it into
+/// an [`Unpublished`] when it refused.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Recorded {
     generation: GenerationId,
@@ -117,6 +119,14 @@ impl Recorded {
         generation_key(&self.generation)
     }
 
+    /// The catalogue refused the publication and wrote nothing under
+    /// the id. Only a catalogue implementation in this crate can say so.
+    pub(crate) fn refused(self) -> Unpublished {
+        Unpublished {
+            generation: self.generation,
+        }
+    }
+
     /// A proof without a record, for catalogue tests that publish rows
     /// directly. Never compiled into the Worker.
     #[cfg(feature = "testkit")]
@@ -124,6 +134,27 @@ impl Recorded {
         Recorded {
             generation: generation.clone(),
         }
+    }
+}
+
+/// Proof that a stored record belongs to a generation the catalogue
+/// refused to publish. Made only from a [`Recorded`] by a catalogue
+/// whose publication batch wrote nothing; it is what
+/// [`discard_generation`] takes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unpublished {
+    generation: GenerationId,
+}
+
+impl Unpublished {
+    /// The generation that was not published.
+    pub fn generation(&self) -> &GenerationId {
+        &self.generation
+    }
+
+    /// Blob key of the record.
+    pub fn key(&self) -> String {
+        generation_key(&self.generation)
     }
 }
 
@@ -153,7 +184,7 @@ pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> Generati
 /// Removes the record of a generation whose publication batch was
 /// refused: nothing was published under the id, so nothing may replay
 /// it. The one delete of a record there is (see the module doc).
-pub async fn discard_generation<B: BlobStore>(safety: &B, refused: Recorded) -> Result<()> {
+pub async fn discard_generation<B: BlobStore>(safety: &B, refused: &Unpublished) -> Result<()> {
     safety.delete_record(refused).await
 }
 

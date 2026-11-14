@@ -1473,3 +1473,44 @@ async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
         Some(newer.generation.id.clone())
     );
 }
+
+/// A catalogue from before `key_tombstones`: its deletes are known only
+/// to the recovery records. The migration gives every deleted key a
+/// boundary above them, so that a publication from a clock that runs
+/// behind still sorts after the old tombstone.
+#[tokio::test]
+async fn the_migration_fences_keys_deleted_before_it() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    fx.put(&b.id, "kept", T0).await;
+    fx.put(&b.id, "gone", T0).await;
+    let old_tombstone = GenerationId::mint(T0.plus_ms(500), [9; 8]);
+    assert!(fx
+        .cat
+        .delete_object_before(&b.id, "gone", &old_tombstone, T0.plus_ms(500))
+        .await
+        .unwrap());
+
+    // Back to the schema before the migration, then the migration.
+    let db = &fx.cat.sql.db;
+    db.apply("DROP TABLE key_tombstones;").unwrap();
+    db.apply(velmora_bridge::testkit::MIGRATION_0004).unwrap();
+
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
+    assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());
+    let boundary = fx.cat.newest_id(&b.id, "gone").await.unwrap().unwrap();
+    assert!(boundary > old_tombstone);
+    assert_eq!(boundary.as_str().len(), old_tombstone.as_str().len());
+
+    // A clock 100 ms behind the old delete: refused under its own time,
+    // published under the id the PUT path mints from the boundary.
+    let behind = fx.commit(&b.id, "gone", 1, T0.plus_ms(400));
+    assert_eq!(fx.cat.publish(&behind).await.unwrap(), Guard::Lost);
+    let id = recovery::id_after(T0.plus_ms(400), Some(&boundary), [1; 8]);
+    assert!(id > boundary && id > old_tombstone);
+    let mut after = fx.commit(&b.id, "gone", 1, T0.plus_ms(400));
+    after.extents[0].generation_id = Some(id.clone());
+    after.generation.id = id;
+    assert_eq!(fx.cat.publish(&after).await.unwrap(), Guard::Applied(()));
+    assert!(fx.cat.live_object(&b.id, "gone").await.unwrap().is_some());
+}

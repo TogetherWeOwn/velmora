@@ -319,6 +319,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Guard<()>> {
         replay::replay_publish(self, g, placements, now).await
     }
+    async fn replay_rebind(&self, g: &GenerationRow, from: &GenerationId) -> Result<Guard<()>> {
+        replay::replay_rebind(self, g, from).await
+    }
 
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()> {

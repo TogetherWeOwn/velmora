@@ -15,7 +15,7 @@ use velmora::rng::SystemRng;
 use velmora_bridge::config::{BridgeConfig, Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{wrap_bdk, wrap_secret, DataKey};
 use velmora_bridge::ingress::ByteBudget;
-use velmora_bridge::recovery::Recorded;
+use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
@@ -100,6 +100,8 @@ pub struct Blobs {
     pub fail_put: Cell<bool>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
+    /// This many deletes of a recovery record fail.
+    pub fail_record_deletes: Cell<u32>,
 }
 
 impl std::ops::Deref for Blobs {
@@ -130,7 +132,12 @@ impl BlobStore for Blobs {
     async fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key).await
     }
-    async fn delete_record(&self, refused: Recorded) -> Result<()> {
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        let left = self.fail_record_deletes.get();
+        if left > 0 {
+            self.fail_record_deletes.set(left - 1);
+            return Err(BridgeError::Blob("store down".into()));
+        }
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {

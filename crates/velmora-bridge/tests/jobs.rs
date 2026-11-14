@@ -17,7 +17,7 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS};
-use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan, Recorded};
+use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan, Unpublished};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
@@ -100,7 +100,7 @@ impl BlobStore for GuardedBlob {
         }
         self.inner.delete(key).await
     }
-    async fn delete_record(&self, refused: Recorded) -> Result<()> {
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
         self.check();
         self.inner.delete_record(refused).await
     }
