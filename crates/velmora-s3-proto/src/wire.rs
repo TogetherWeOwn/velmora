@@ -3,7 +3,8 @@
 // Copied verbatim except: this header; the `restore` subresource is removed from the
 // accepted query keys (S3 STANDARD semantics); object keys over 1024 bytes or with C0
 // controls / U+FFFE / U+FFFF (not representable in XML 1.0) are rejected; the
-// CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted.
+// CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted;
+// the SDK's `x-id` operation hint is accepted as a query parameter.
 
 use super::{ErrorCode, Policy, Result};
 
@@ -146,6 +147,11 @@ impl Target {
                     | "part-number-marker"
                     | "max-parts"
                     | "max-uploads"
+                    // The AWS SDKs (Go v2, JS v3) append `x-id=<Operation>`.
+                    // S3 ignores it for routing and so does the router; like
+                    // every query pair it stays in the canonical query, so it
+                    // is signed whenever it is sent.
+                    | "x-id"
             ) {
                 return Err(ErrorCode::InvalidRequest);
             }
