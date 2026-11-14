@@ -12,6 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection};
@@ -208,6 +209,7 @@ pub struct StoredBlob {
 #[derive(Default)]
 pub struct MemBlobStore {
     blobs: RefCell<BTreeMap<String, StoredBlob>>,
+    gets: Cell<u64>,
 }
 
 impl MemBlobStore {
@@ -217,6 +219,11 @@ impl MemBlobStore {
 
     pub fn contains(&self, key: &str) -> bool {
         self.blobs.borrow().contains_key(key)
+    }
+
+    /// `get` calls so far.
+    pub fn gets(&self) -> u64 {
+        self.gets.get()
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -258,6 +265,7 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        self.gets.set(self.gets.get() + 1);
         let blobs = self.blobs.borrow();
         let Some(blob) = blobs.get(key) else {
             return Ok(None);
@@ -304,15 +312,16 @@ impl BlobStore for MemBlobStore {
 // FixedClock
 // ---------------------------------------------------------------------------
 
-/// A clock that moves only when told to.
+/// A clock that moves only when told to. A clone shows the same time.
+#[derive(Clone)]
 pub struct FixedClock {
-    now: Cell<UnixMs>,
+    now: Rc<Cell<UnixMs>>,
 }
 
 impl FixedClock {
     pub fn new(now: UnixMs) -> Self {
         FixedClock {
-            now: Cell::new(now),
+            now: Rc::new(Cell::new(now)),
         }
     }
 

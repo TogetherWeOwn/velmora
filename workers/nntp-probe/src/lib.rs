@@ -15,7 +15,10 @@
 //! - `GET /probe/head?p=&mid=<id>[&mid=<id>...]` (at most 3): HEAD of each,
 //!   returning only `Path`, `Xref`, `Injection-Info`, `NNTP-Posting-Host`,
 //!   redacted.
-//! - `GET /probe/ramp?p=&n=<1-6>&hold=<0-15>`: opens `n` sessions at once,
+//! - `POST /probe/postrun?p=&n=<1-30>&secs=<1-60>&size=&max_mb=&arts=`: opens
+//!   `n` sockets and POSTs fresh random articles back to back on each until
+//!   the time or byte budget ends. Reports throughput and POST timings.
+//! - `GET /probe/ramp?p=&n=<1-30>&hold=<0-30>`: opens `n` sessions at once,
 //!   authenticates each, holds them `hold` seconds, checks they are still
 //!   alive with `DATE`, then QUITs. Reports per-session codes and timings.
 //! - `GET|PUT /raw/<anything>`: echoes the request target as seen.

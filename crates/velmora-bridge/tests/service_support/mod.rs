@@ -225,6 +225,8 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
+        post_sockets: 4,
+        propagation_grace_secs: 21_600,
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,

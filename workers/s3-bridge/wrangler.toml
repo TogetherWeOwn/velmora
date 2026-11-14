@@ -28,6 +28,10 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
 GC_MODE = "off"                      # off | disposable; "full" is rejected while REAL_DATA_READY=false
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
+# Optional vars and their defaults:
+#   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
+#   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
+
 # off | on. Turn on only in a release after the one that added extent
 # references (migration 0005): a rollback must never land on a Worker that
 # cannot read a copy or would collect the extents it shares.
@@ -60,7 +64,14 @@ queue = "velmora-verify"
 [[queues.consumers]]
 queue = "velmora-post"
 max_batch_size = 1
-max_concurrency = 2          # secondary bound only; provider_permits is the real gate
+# Secondary bound only; provider_permits is the real gate. Kept small on
+# purpose: the measured providers limit the source addresses an account
+# may connect from at once (1 to 4), not only its connections, and
+# parallel invocations mostly leave from different addresses. Throughput
+# comes from sockets per job (POST_SOCKETS), which share one address. A
+# job without a slot, refused at login, or without room in the isolate's
+# byte budget is deferred, not failed.
+max_concurrency = 3
 max_retries = 20
 retry_delay = 60
 dead_letter_queue = "velmora-dlq"
