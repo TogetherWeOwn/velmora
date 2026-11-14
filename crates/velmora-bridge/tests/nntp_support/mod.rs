@@ -26,8 +26,7 @@ use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
-pub const LEASE_SECS: u32 = 600;
-pub const PERMIT_SECS: u32 = 120;
+pub use velmora_bridge::{LEASE_SECS, PERMIT_SECS};
 pub const USER: &str = "testuser";
 pub const PASS: &str = "testpass";
 
@@ -170,7 +169,8 @@ struct Health {
     until: i64,
 }
 
-/// A takeover injected at the `mark_posted` call of one article index.
+/// A takeover injected at the catalogue write that marks one article
+/// index posted (alone or in a batch).
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
     /// Another job takes the lease before the write: the write is fenced.
@@ -190,6 +190,10 @@ pub struct MemCatalog {
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
     pub fault: Cell<Option<Fault>>,
+    /// `renew_all` calls so far (one per renewal tick of a post job).
+    pub renewals: Cell<u32>,
+    /// `mark_posted_many` calls so far.
+    pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
     pub permit_refusals: Cell<u32>,
@@ -228,6 +232,13 @@ impl MemCatalog {
 
     pub fn verifications(&self, extent: &ExtentId) -> Vec<VerificationRow> {
         self.entries.borrow()[extent].verifications.clone()
+    }
+
+    /// Every held slot passes to someone else: its holder's permit is dead.
+    pub fn revoke_permits(&self) {
+        for slot in self.slots.borrow_mut().values_mut().flatten() {
+            slot.token += 1;
+        }
     }
 
     pub fn edit(&self, extent: &ExtentId, f: impl FnOnce(&mut Entry)) {
@@ -579,6 +590,69 @@ impl Catalog for MemCatalog {
         }))
     }
 
+    async fn mark_posted_many(
+        &self,
+        l: &Lease,
+        posted: &[(u32, &str)],
+        now: UnixMs,
+    ) -> Result<bool> {
+        self.mark_batches.set(self.mark_batches.get() + 1);
+        if self.fail_mark_posted.get() > 0 {
+            self.fail_mark_posted.set(self.fail_mark_posted.get() - 1);
+            return Err(BridgeError::Sql("injected mark_posted failure".into()));
+        }
+        let fault = self.fault.get();
+        let has = |i: u32| posted.iter().any(|(idx, _)| *idx == i);
+        let steal = |e: &mut Entry| {
+            e.outbox.token += 1;
+            e.outbox.lease_until = Some(now.plus_secs(LEASE_SECS));
+        };
+        if matches!(fault, Some(Fault::StealLeaseBefore(i)) if has(i)) {
+            self.fault.set(None);
+            self.edit(&l.extent, steal);
+        }
+        // All or nothing, like the fenced SQL batch.
+        let written = self
+            .fenced(l, |e| {
+                for (idx, provider) in posted {
+                    let a = &mut e.articles[*idx as usize];
+                    a.state = ArticleState::Posted;
+                    a.provider_id = Some(provider.to_string());
+                    a.posted_at = Some(now);
+                }
+            })
+            .is_some();
+        match fault {
+            Some(Fault::StealLeaseAfter(i)) if has(i) => {
+                self.fault.set(None);
+                self.edit(&l.extent, steal);
+            }
+            Some(Fault::RevokePermitAfter(i)) if has(i) => {
+                self.fault.set(None);
+                for slot in self.slots.borrow_mut().values_mut().flatten() {
+                    slot.token += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(written)
+    }
+
+    async fn renew_all(
+        &self,
+        l: &Lease,
+        permits: &[Permit],
+        now: UnixMs,
+    ) -> Result<(bool, Vec<bool>)> {
+        self.renewals.set(self.renewals.get() + 1);
+        let lease = self.renew(l, now).await?;
+        let mut held = Vec::new();
+        for p in permits {
+            held.push(self.renew_permit(p, now).await?);
+        }
+        Ok((lease, held))
+    }
+
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots.get_mut(&p.provider).expect("seeded")[p.slot as usize];
@@ -856,6 +930,8 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
+        post_sockets: 4,
+        propagation_grace_secs: 21_600,
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
@@ -1055,6 +1131,26 @@ impl Rig {
         let lease = self.claim(s, OutboxStage::Post).await;
         let job = self.job(s).await;
         self.bridge.post_stage(&lease, &job).await
+    }
+
+    /// Claims the post stage and runs it; as soon as server `server`
+    /// holds `stored` articles, `then` runs in the middle of the job.
+    pub async fn run_post_and(
+        &self,
+        s: &Seeded,
+        server: usize,
+        stored: usize,
+        then: impl AsyncFnOnce(),
+    ) -> JobOutcome {
+        let lease = self.claim(s, OutboxStage::Post).await;
+        let job = self.job(s).await;
+        let mid = async {
+            while self.servers[server].posted_count().await < stored {
+                tokio::task::yield_now().await;
+            }
+            then().await;
+        };
+        tokio::join!(self.bridge.post_stage(&lease, &job), mid).0
     }
 
     /// Claims `stage` and runs it once.

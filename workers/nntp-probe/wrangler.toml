@@ -15,3 +15,16 @@ command = "worker-build --release"
 [vars]
 # Posting allow-list (comma-separated). Group names only, no credentials.
 NEWSGROUPS = "alt.binaries.test"
+
+# A second deployment pinned near a region, to measure from there:
+# `wrangler deploy --env us`. Secrets are per deployment. The response header
+# `cf-placement` names the data centre the invocation ran in; `x-probe-colo`
+# is then the data centre the request entered at.
+[env.us]
+name = "velmora-nntp-probe-us"
+
+[env.us.placement]
+region = "aws:us-east-1"
+
+[env.us.vars]
+NEWSGROUPS = "alt.binaries.test"

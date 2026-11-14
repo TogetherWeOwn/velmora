@@ -168,6 +168,14 @@ pub struct UploadTarget<'a> {
     pub id: &'a UploadId,
 }
 
+/// How long a claim or a renewal holds an outbox row. Every [`Catalog`]
+/// grants exactly this, so a job can tell from its own clock how long the
+/// lease it last renewed is still safe from a takeover.
+pub const LEASE_SECS: u32 = 600;
+
+/// How long an acquired or renewed provider permit holds its slot.
+pub const PERMIT_SECS: u32 = 120;
+
 /// A claimed outbox row. Every later mutation carries it and writes only
 /// while `token` still matches.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +323,23 @@ pub trait Catalog {
     ) -> Result<Option<Vec<ArticleRow>>>;
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>>;
     async fn mark_posted(&self, l: &Lease, idx: u32, provider: &str, now: UnixMs) -> Result<bool>;
+    /// Marks several articles posted in one atomic write; each entry is
+    /// `(idx, provider)`. `false` = fenced, and then nothing was written.
+    async fn mark_posted_many(
+        &self,
+        l: &Lease,
+        posted: &[(u32, &str)],
+        now: UnixMs,
+    ) -> Result<bool>;
+    /// Renews the lease and every permit in one round trip. `.0` = the
+    /// lease still holds; `.1[i]` = `permits[i]` is still held. Each
+    /// renewal stands on its own: a lost lease does not undo the permits.
+    async fn renew_all(
+        &self,
+        l: &Lease,
+        permits: &[Permit],
+        now: UnixMs,
+    ) -> Result<(bool, Vec<bool>)>;
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;

@@ -19,7 +19,7 @@
 
 use crate::config::{GcMode, Maintenance};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
-use crate::post::{settle, Stop};
+use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
@@ -129,9 +129,11 @@ where
             Err(e) => return settle(&self.catalog, &self.clock, &lease, e.into()).await,
         };
         // Only the post stage holds the whole extent; verify and release
-        // hold one article at a time.
+        // hold one article at a time (a repost charges for itself).
         let bytes = match stage {
-            OutboxStage::Post => row.extent.cipher_size.saturating_add(JOB_OVERHEAD_BYTES),
+            OutboxStage::Post => row.extent.cipher_size.saturating_add(
+                JOB_OVERHEAD_BYTES.max(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES),
+            ),
             _ => JOB_OVERHEAD_BYTES,
         };
         // A job larger than the whole budget still has to run: alone.

@@ -3,6 +3,7 @@
 use crate::discovery;
 
 use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures_util::future::{self, Either};
@@ -35,16 +36,28 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return json_response(&json!({"error": "unauthorized"}), 401);
     }
     let path = req.path();
-    match req.method() {
+    // Where this invocation ran: a number measured from one data centre
+    // says nothing about another.
+    let colo = req.cf().map(|cf| cf.colo());
+    let mut resp = match req.method() {
         Method::Post if path == "/probe/post" => probe_post(&req, &env).await,
+        Method::Post if path == "/probe/postrun" => probe_postrun(&req, &env).await,
         Method::Get if path == "/probe/body" => probe_body(&req, &env).await,
         Method::Get if path == "/probe/caps" => probe_caps(&req, &env).await,
         Method::Get if path == "/probe/head" => probe_head(&req, &env).await,
         Method::Get if path == "/probe/ramp" => probe_ramp(&req, &env).await,
         Method::Get | Method::Put if path.starts_with("/raw/") => raw(req).await,
         _ => json_response(&json!({"error": "not_found"}), 404),
+    }?;
+    if let Some(colo) = colo {
+        resp.headers_mut().set(COLO_HEADER, &colo)?;
     }
+    Ok(resp)
 }
+
+/// Response header with the Cloudflare data centre (`request.cf.colo`)
+/// the invocation ran in.
+const COLO_HEADER: &str = "x-probe-colo";
 
 // ---------------------------------------------------------------------------
 // Auth, config, helpers
@@ -640,15 +653,18 @@ const MAX_BLOCK_LINES: usize = 512;
 /// time cannot hold a session for `MAX_BLOCK_LINES` x the line timeout.
 const BLOCK_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Concurrent sessions per `/probe/ramp` call. The Workers runtime allows at
-/// most six open outbound sockets per invocation.
-const MAX_RAMP: u32 = 6;
+/// Concurrent sessions per `/probe/ramp` call. The Workers runtime documents
+/// six simultaneous open connections per invocation; the ramp shows what it
+/// does with more.
+const MAX_RAMP: u32 = 30;
 
 /// Longest hold in `/probe/ramp`, in seconds.
-const MAX_HOLD_SECS: u64 = 15;
+const MAX_HOLD_SECS: u64 = 30;
 
 struct Mini {
     io: BufReader<Socket>,
+    /// Remote address the runtime reports for the open socket, if any.
+    peer: Option<String>,
 }
 
 fn timed_out() -> std::io::Error {
@@ -694,24 +710,24 @@ impl Mini {
             .secure_transport(SecureTransport::On)
             .connect(cfg.host.clone(), cfg.port)
             .map_err(|_| json!({"step": "connect", "class": "socket_create"}))?;
-        if with_timeout(async {
+        let opened = with_timeout(async {
             socket
                 .opened()
                 .await
                 .map_err(|_| std::io::Error::other("open"))
         })
-        .await
-        .is_err()
-        {
+        .await;
+        let Ok(info) = opened else {
             // worker's Socket has no Drop; close it so a failed attempt
             // does not hold a socket (and a provider slot) until the
             // invocation ends.
             let mut socket = socket;
             let _ = socket.close().await;
             return Err(json!({"step": "connect_tls", "class": "socket_open"}));
-        }
+        };
         let mut mini = Mini {
             io: BufReader::new(socket),
+            peer: info.remote_address,
         };
         match mini.line().await {
             Ok(greeting) => Ok((mini, greeting)),
@@ -788,20 +804,29 @@ impl Mini {
         &mut self,
         cfg: &NntpConfig,
     ) -> std::result::Result<(Option<u16>, Option<u16>), Value> {
+        self.auth_with_reply(cfg).await.map(|(u, p, _)| (u, p))
+    }
+
+    /// As [`Mini::auth`], plus the last reply line: when the login is
+    /// refused, its text says why (too many connections, bad login, ...).
+    async fn auth_with_reply(
+        &mut self,
+        cfg: &NntpConfig,
+    ) -> std::result::Result<(Option<u16>, Option<u16>, Vec<u8>), Value> {
         let user = cfg.username.as_deref().unwrap_or_default();
         let pass = cfg.password.as_deref().unwrap_or_default();
-        let (u, _) = self
+        let (u, line) = self
             .command(&format!("AUTHINFO USER {user}"))
             .await
             .map_err(|e| io_error("authinfo_user", &e))?;
         if u != Some(381) {
-            return Ok((u, None));
+            return Ok((u, None, line));
         }
-        let (p, _) = self
+        let (p, line) = self
             .command(&format!("AUTHINFO PASS {pass}"))
             .await
             .map_err(|e| io_error("authinfo_pass", &e))?;
-        Ok((u, p))
+        Ok((u, p, line))
     }
 
     /// Best-effort QUIT, then always shut down and close the socket, even
@@ -836,6 +861,41 @@ fn bad_request(msg: &str) -> Result<Response> {
 // GET /probe/caps
 // ---------------------------------------------------------------------------
 
+/// Address records of `host` as Cloudflare's public resolver answers them
+/// from this data centre (DNS over HTTPS, JSON form). The provider's own
+/// address is public; it shows which server farm a geolocated name picks.
+/// `host` always comes from an operator-set secret, never from the request.
+async fn resolve(host: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    for kind in ["A", "AAAA"] {
+        let url = format!("https://cloudflare-dns.com/dns-query?name={host}&type={kind}");
+        let answer = async {
+            let headers = worker::Headers::new();
+            headers.set("accept", "application/dns-json")?;
+            let mut init = worker::RequestInit::new();
+            init.with_headers(headers);
+            let req = Request::new_with_init(&url, &init)?;
+            let mut resp = worker::Fetch::Request(req).send().await?;
+            resp.json::<Value>().await
+        }
+        .await;
+        let records: Vec<Value> = match answer {
+            Ok(v) => v["Answer"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|r| matches!(r["type"].as_u64(), Some(1 | 28)))
+                        .filter_map(|r| r["data"].as_str().map(|d| json!(d)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => vec![json!("lookup_failed")],
+        };
+        out.insert(kind.to_string(), Value::Array(records));
+    }
+    Value::Object(out)
+}
+
 async fn probe_caps(req: &Request, env: &Env) -> Result<Response> {
     let cfg = match nntp_config(req, env) {
         Ok(cfg) => cfg,
@@ -856,6 +916,8 @@ async fn probe_caps(req: &Request, env: &Env) -> Result<Response> {
         "posting_allowed_by_greeting": greeting_code.map(|c| c == 200),
         "greeting_text": text(&greeting, &values),
         "connect_tls_greeting_ms": t_greet - t0,
+        "peer": mini.peer.as_deref().map(|p| text(p.as_bytes(), &values)),
+        "resolved": resolve(&cfg.host).await,
     });
     let result: std::result::Result<(), Value> = async {
         let caps_pre = capabilities(&mut mini, &values).await?;
@@ -1014,7 +1076,12 @@ async fn probe_head(req: &Request, env: &Env) -> Result<Response> {
 // GET /probe/ramp?n=&hold=
 // ---------------------------------------------------------------------------
 
-async fn ramp_session(cfg: &NntpConfig, idx: u32, hold: Duration) -> Value {
+async fn ramp_session(
+    cfg: &NntpConfig,
+    values: &[(String, String)],
+    idx: u32,
+    hold: Duration,
+) -> Value {
     let t0 = now_ms();
     let (mut mini, greeting) = match Mini::open(cfg).await {
         Ok(v) => v,
@@ -1026,6 +1093,7 @@ async fn ramp_session(cfg: &NntpConfig, idx: u32, hold: Duration) -> Value {
         "i": idx,
         "greeting_code": greeting_code,
         "connect_tls_greeting_ms": t_greet - t0,
+        "peer": mini.peer.as_deref().map(|p| text(p.as_bytes(), values)),
     });
     if !matches!(greeting_code, Some(200 | 201)) {
         out["ok"] = json!(false);
@@ -1038,8 +1106,8 @@ async fn ramp_session(cfg: &NntpConfig, idx: u32, hold: Duration) -> Value {
             .command("MODE READER")
             .await
             .map_err(|e| io_error("mode_reader", &e))?;
-        let (u, p) = mini.auth(cfg).await?;
-        Ok::<_, Value>((mode, u, p))
+        let (u, p, line) = mini.auth_with_reply(cfg).await?;
+        Ok::<_, Value>((mode, u, p, line))
     }
     .await;
     match auth {
@@ -1049,7 +1117,10 @@ async fn ramp_session(cfg: &NntpConfig, idx: u32, hold: Duration) -> Value {
             mini.quit().await;
             return out;
         }
-        Ok((mode, u, p)) => {
+        Ok((mode, u, p, line)) => {
+            if !(p == Some(281) || u == Some(281)) {
+                out["refusal_text"] = json!(text(&line, values));
+            }
             out["mode_reader_code"] = json!(mode);
             out["authinfo_user_code"] = json!(u);
             out["authinfo_pass_code"] = json!(p);
@@ -1086,16 +1157,18 @@ async fn probe_ramp(req: &Request, env: &Env) -> Result<Response> {
     };
     let n = match query_param(req, "n").map(|s| s.parse::<u32>()) {
         Some(Ok(n)) if (1..=MAX_RAMP).contains(&n) => n,
-        _ => return bad_request("n must be 1-6"),
+        _ => return bad_request("n must be 1-30"),
     };
     let hold = match query_param(req, "hold").map(|s| s.parse::<u64>()) {
         None => 5,
         Some(Ok(h)) if h <= MAX_HOLD_SECS => h,
-        _ => return bad_request("hold must be 0-15"),
+        _ => return bad_request("hold must be 0-30"),
     };
     let t0 = now_ms();
+    let values = all_configured_values(env);
     let sessions =
-        future::join_all((0..n).map(|i| ramp_session(&cfg, i, Duration::from_secs(hold)))).await;
+        future::join_all((0..n).map(|i| ramp_session(&cfg, &values, i, Duration::from_secs(hold))))
+            .await;
     let succeeded = sessions.iter().filter(|s| s["ok"] == json!(true)).count();
     json_response(
         &json!({
@@ -1105,6 +1178,216 @@ async fn probe_ramp(req: &Request, env: &Env) -> Result<Response> {
             "hold_secs": hold,
             "sessions": sessions,
             "total_ms": now_ms() - t0,
+        }),
+        200,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// POST /probe/postrun?n=&secs=&size=&max_mb=&arts=
+// ---------------------------------------------------------------------------
+
+/// Most sockets one posting run opens. Above the runtime's six open
+/// connections on purpose: the run shows what the runtime does with more.
+const MAX_RUN_SOCKETS: u32 = 30;
+/// Longest posting run.
+const MAX_RUN_SECS: u64 = 60;
+/// Most payload one run may post, whatever the caller asks for.
+const MAX_RUN_MB: u64 = 400;
+
+/// What the sockets of one run share.
+struct RunShared {
+    /// Wall-clock end of the run.
+    deadline_ms: u64,
+    /// Payload bytes the run may still start to post.
+    budget: Cell<u64>,
+    size: u64,
+    /// Articles per socket before it idles to the deadline (0 = no cap).
+    arts: u32,
+    groups: Vec<String>,
+}
+
+fn build_random_article(shared: &RunShared) -> velmora::Result<(String, Vec<u8>)> {
+    let payload = make_payload("random", Some(shared.size))?;
+    let groups: Vec<&str> = shared.groups.iter().map(String::as_str).collect();
+    let ob = obfuscate_article(&mut SystemRng, (now_ms() / 1000) as i64, &groups)?;
+    let mut body = Vec::with_capacity(payload.len() + payload.len() / 32 + 256);
+    encode_segment(
+        &mut body,
+        &SegmentParams::single(ob.yenc_name.clone()),
+        &payload,
+    )?;
+    let article = assemble_article(&render_obfuscated_headers(&ob)?, &body)?;
+    Ok((ob.message_id, article))
+}
+
+/// One socket of a posting run: connect, then POST fresh random articles
+/// back to back until the deadline, the byte budget or the first error.
+/// With an article cap the socket then idles to the deadline and posts
+/// one last article, which shows it was still usable.
+async fn run_socket(cfg: &NntpConfig, idx: u32, shared: Rc<RunShared>) -> Value {
+    let mut steps = Vec::new();
+    let t0 = now_ms();
+    let mut session = match open_session(cfg, &mut steps).await {
+        Ok(s) => s,
+        Err(e) => return json!({"i": idx, "ok": false, "connect_error": e, "ms": now_ms() - t0}),
+    };
+    let connect_ms = now_ms() - t0;
+    let mut post_ms: Vec<u64> = Vec::new();
+    let mut wire_bytes = 0u64;
+    let mut duplicates = 0u32;
+    let mut error = None;
+    let mut first_post = None;
+    let mut last_reply = now_ms();
+    let mut lingered = false;
+    loop {
+        if shared.arts > 0 && post_ms.len() as u32 >= shared.arts {
+            if lingered {
+                break;
+            }
+            lingered = true;
+            let left = shared.deadline_ms.saturating_sub(now_ms());
+            Delay::from(Duration::from_millis(left)).await;
+        } else if now_ms() >= shared.deadline_ms {
+            break;
+        }
+        if shared.budget.get() < shared.size {
+            break;
+        }
+        shared.budget.set(shared.budget.get() - shared.size);
+        let (mid, article) = match build_random_article(&shared) {
+            Ok(a) => a,
+            Err(e) => {
+                error = Some(json!({"step": "build", "error": classify(&e, cfg)}));
+                break;
+            }
+        };
+        let t = now_ms();
+        first_post.get_or_insert(t);
+        match session.client.post_article(&mid, &article).await {
+            Ok(outcome) => {
+                last_reply = now_ms();
+                post_ms.push(last_reply - t);
+                wire_bytes += article.len() as u64;
+                if outcome == PostOutcome::Duplicate {
+                    duplicates += 1;
+                }
+            }
+            Err(e) => {
+                error = Some(json!({
+                    "step": "post",
+                    "after_posts": post_ms.len(),
+                    "ms": now_ms() - t,
+                    "error": classify(&e, cfg),
+                }));
+                break;
+            }
+        }
+    }
+    match error {
+        None => session.client.quit().await,
+        Some(_) => {
+            session.client.shutdown_unusable().await.ok();
+        }
+    }
+    let mut sorted = post_ms.clone();
+    sorted.sort_unstable();
+    let pct = |p: usize| sorted.get((sorted.len() * p / 100).min(sorted.len().saturating_sub(1)));
+    json!({
+        "i": idx,
+        "ok": error.is_none(),
+        "connect_auth_ms": connect_ms,
+        "posted": post_ms.len(),
+        "duplicates": duplicates,
+        "payload_bytes": post_ms.len() as u64 * shared.size,
+        "wire_bytes": wire_bytes,
+        "first_post_at": first_post,
+        "last_reply_at": last_reply,
+        "post_ms": {"min": sorted.first(), "p50": pct(50), "p90": pct(90), "max": sorted.last()},
+        "last_post_ms": post_ms.last(),
+        "error": error,
+    })
+}
+
+async fn probe_postrun(req: &Request, env: &Env) -> Result<Response> {
+    let cfg = match nntp_config(req, env) {
+        Ok(cfg) => cfg,
+        Err(e) => return config_error(e),
+    };
+    let num = |name: &str, default: u64| match query_param(req, name) {
+        None => Some(default),
+        Some(v) => v.parse::<u64>().ok(),
+    };
+    let n = match num("n", 1) {
+        Some(n) if (1..=u64::from(MAX_RUN_SOCKETS)).contains(&n) => n as u32,
+        _ => return bad_request("n must be 1-30"),
+    };
+    let secs = match num("secs", 10) {
+        Some(s) if (1..=MAX_RUN_SECS).contains(&s) => s,
+        _ => return bad_request("secs must be 1-60"),
+    };
+    let size = match num("size", velmora::article::ARTICLE_ZERO_PAYLOAD_BYTES) {
+        Some(s) if s > 0 && s <= MAX_PROBE_BYTES => s,
+        _ => return bad_request("size out of range"),
+    };
+    let max_mb = match num("max_mb", 50) {
+        Some(m) if (1..=MAX_RUN_MB).contains(&m) => m,
+        _ => return bad_request("max_mb must be 1-400"),
+    };
+    let arts = match num("arts", 0) {
+        Some(a) if a <= 1000 => a as u32,
+        _ => return bad_request("arts must be 0-1000"),
+    };
+    let groups: Vec<String> = env
+        .var("NEWSGROUPS")
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+        .split(',')
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    let t0 = now_ms();
+    let shared = Rc::new(RunShared {
+        deadline_ms: t0 + secs * 1000,
+        budget: Cell::new(max_mb * 1024 * 1024),
+        size,
+        arts,
+        groups,
+    });
+    let sockets = future::join_all((0..n).map(|i| run_socket(&cfg, i, Rc::clone(&shared)))).await;
+    let sum = |key: &str| sockets.iter().filter_map(|s| s[key].as_u64()).sum::<u64>();
+    let first = sockets
+        .iter()
+        .filter_map(|s| s["first_post_at"].as_u64())
+        .min();
+    let last = sockets
+        .iter()
+        .filter_map(|s| s["last_reply_at"].as_u64())
+        .max();
+    let window_ms = match (first, last) {
+        (Some(a), Some(b)) if b > a => b - a,
+        _ => 0,
+    };
+    let payload_bytes = sum("payload_bytes");
+    let mb_s = match window_ms {
+        0 => 0.0,
+        w => payload_bytes as f64 / 1_048_576.0 / (w as f64 / 1000.0),
+    };
+    json_response(
+        &json!({
+            "ok": sockets.iter().all(|s| s["ok"] == json!(true)),
+            "sockets_requested": n,
+            "sockets_ok": sockets.iter().filter(|s| s["ok"] == json!(true)).count(),
+            "secs": secs,
+            "article_payload_bytes": size,
+            "posted": sum("posted"),
+            "payload_bytes": payload_bytes,
+            "wire_bytes": sum("wire_bytes"),
+            "posting_window_ms": window_ms,
+            "payload_mib_per_s": (mb_s * 1000.0).round() / 1000.0,
+            "started_at": t0,
+            "total_ms": now_ms() - t0,
+            "sockets": sockets,
         }),
         200,
     )

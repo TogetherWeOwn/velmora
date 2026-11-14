@@ -90,6 +90,15 @@ impl std::error::Error for ConfigError {}
 /// `HOT_CAP_BYTES` when the variable is absent: 100 GiB.
 pub const DEFAULT_HOT_CAP_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
+/// Sockets of one post job when `POST_SOCKETS` is unset. The sockets of
+/// one job leave from one address, which matters for providers that limit
+/// the addresses an account connects from; each socket also holds one
+/// article in memory.
+pub const DEFAULT_POST_SOCKETS: u32 = 4;
+
+/// Propagation grace when `PROPAGATION_GRACE_SECS` is unset: six hours.
+pub const DEFAULT_PROPAGATION_GRACE_SECS: u32 = 21_600;
+
 /// Validated settings for one isolate.
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -101,6 +110,12 @@ pub struct BridgeConfig {
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
     pub verify_delay_secs: u32,
+    /// NNTP sockets one post job opens at most, over all its providers.
+    pub post_sockets: u32,
+    /// How long a posted article may take to reach another backbone on
+    /// its own. Past it, verification posts an article a backbone still
+    /// lacks straight to a provider of that backbone.
+    pub propagation_grace_secs: u32,
     /// Posting allow-list; the poster picks from it.
     pub newsgroups: Vec<String>,
     pub kek_active: u32,
@@ -120,6 +135,22 @@ fn required(get: &impl Fn(&str) -> Option<String>, name: &str) -> Result<String,
     match get(name) {
         Some(v) if !v.trim().is_empty() => Ok(v),
         _ => Err(ConfigError::Missing(name.to_string())),
+    }
+}
+
+/// An optional number in `min..=max`; unset or empty = `default`.
+fn number_or(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: u32,
+    (min, max): (u32, u32),
+) -> Result<u32, ConfigError> {
+    match get(name) {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<u32>() {
+            Ok(n) if (min..=max).contains(&n) => Ok(n),
+            _ => Err(ConfigError::Invalid(name.to_string())),
+        },
+        _ => Ok(default),
     }
 }
 
@@ -207,6 +238,14 @@ impl BridgeConfig {
         let safety_min_age_secs: u32 = number(&get, "SAFETY_MIN_AGE_SECS")?;
         let verify_delay_secs: u32 = number(&get, "VERIFY_DELAY_SECS")?;
 
+        let post_sockets = number_or(&get, "POST_SOCKETS", DEFAULT_POST_SOCKETS, (1, 8))?;
+        let propagation_grace_secs = number_or(
+            &get,
+            "PROPAGATION_GRACE_SECS",
+            DEFAULT_PROPAGATION_GRACE_SECS,
+            (0, u32::MAX),
+        )?;
+
         let newsgroups: Vec<String> = required(&get, "NEWSGROUPS")?
             .split(',')
             .map(|g| g.trim().to_string())
@@ -290,6 +329,8 @@ impl BridgeConfig {
             required_backbones,
             safety_min_age_secs,
             verify_delay_secs,
+            post_sockets,
+            propagation_grace_secs,
             newsgroups,
             kek_active,
             inflight_budget_bytes,

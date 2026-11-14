@@ -40,8 +40,26 @@ request.
 | `GET /probe/body?p=&mid=<message-id>` | New connection, `STAT` + `BODY` of an article (angle brackets optional), decoded SHA-256 and timings. Used for propagation and read latency. |
 | `GET /probe/caps?p=` | One connection: greeting code (200 = posting allowed, 201 = not), `CAPABILITIES` before and after auth, `MODE READER` and `AUTHINFO USER`/`PASS` codes, timings. |
 | `GET /probe/head?p=&mid=<id>[&mid=<id>]...` | One connection, `HEAD` of 1 to 3 articles. Returns only `Path`, `Xref`, `Injection-Info` and `NNTP-Posting-Host`, redacted, plus the first three Path elements and the Xref server name. |
-| `GET /probe/ramp?p=&n=<1-6>&hold=<0-15>` | Opens `n` sessions at once (the runtime allows six open sockets per invocation; run invocations in parallel to go higher), authenticates each, holds them `hold` seconds (default 5), sends `DATE` to check each is still alive, then `QUIT`s. Reports per-session greeting/AUTHINFO/DATE codes and timings. |
+| `POST /probe/postrun?p=&n=<1-30>&secs=<1-60>&size=<bytes>&max_mb=<1-400>&arts=<0-1000>` | Posting throughput. Opens `n` sockets at once and, on each, POSTs fresh random articles (default 721,120 B payload, a new message-id each) back to back until `secs` (default 10) have passed or the run has posted `max_mb` MiB of payload (default 50) in total. With `arts`, a socket stops after that many articles, idles to the deadline and posts one more, which shows the session was still usable. Reports per socket: connect time, article count, min/p50/p90/max POST time (command to final reply), the first error as a class and code; and for the run: payload MiB/s over the posting window. `n` may exceed the runtime's six open connections to show what happens then. |
+| `GET /probe/ramp?p=&n=<1-30>&hold=<0-30>` | Opens `n` sessions at once (an invocation's sockets leave from one address, parallel invocations mostly from different ones, which matters for providers that limit addresses per account), authenticates each, holds them `hold` seconds (default 5), sends `DATE` to check each is still alive, then `QUIT`s. Reports per-session greeting/AUTHINFO/DATE codes and timings. |
 | `GET\|PUT /raw/<anything>` | Echoes `req.inner().url()`, `req.url()` (parsed), `req.path()`, the parsed query and the header list as the Worker sees them. Values are echoed only for `x-amz-*`, `content-*`, `host`, `user-agent`, `accept`, `expect` and `range`; other headers are listed by name only. For `PUT`, the body is not read; the declared `content-length` is reported. |
+
+Every response carries `x-probe-colo`: the Cloudflare data centre the
+request entered at (`request.cf.colo`), which is also where the invocation
+runs unless the deployment is placed elsewhere. `wrangler deploy --env us`
+deploys a second copy pinned near `aws:us-east-1`; its responses carry
+Cloudflare's `cf-placement` header, which names the data centre the
+invocation ran in. Record both with every measurement; a number from one
+data centre says nothing about another.
+
+`/probe/caps` and `/probe/ramp` also report `peer`, the remote address the
+runtime gives for the open socket (redacted like any provider text; the
+runtime has been seen to return only the host name), and `/probe/caps` reports `resolved`, the
+A and AAAA records of the selected host as Cloudflare's public resolver
+answers them from that data centre. Provider addresses are public; they show
+which server farm a geolocated host name picks. A session `/probe/ramp` could
+not log in carries `refusal_text`, the provider's redacted reply line: it
+says whether the limit hit was connections or source addresses.
 
 Responses never contain credentials. Errors are reported as a class plus the
 numeric NNTP code; I/O errors from the engine routes also carry the runtime's

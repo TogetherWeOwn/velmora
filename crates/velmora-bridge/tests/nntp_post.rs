@@ -9,6 +9,10 @@ use velmora_bridge::*;
 
 /// Three articles: one full, one full, one short.
 const PLAIN_LEN: usize = 1_500_000;
+/// Enough articles for something to happen in the middle of a job.
+const LONG_PLAIN_LEN: usize = 6_500_000;
+/// The renewal interval of a post job.
+const RENEW_SECS: u32 = 20;
 
 fn bracketed(plan: &[ArticleRow]) -> Vec<String> {
     plan.iter().map(|a| format!("<{}>", a.message_id)).collect()
@@ -133,9 +137,10 @@ async fn posted_articles_carry_no_identifying_metadata() {
     client.quit().await;
 }
 
-/// The job dies after the POST and before the catalogue write. Its
-/// successor re-sends the same message-id, the server answers "duplicate",
-/// and the article is confirmed: no second copy, no new id.
+/// The job dies after the POSTs and before the catalogue write that
+/// records them. Its successor re-sends the same message-ids, the server
+/// answers "duplicate", and each article is confirmed: no second copy,
+/// no new id.
 #[tokio::test]
 async fn crash_after_post_reposts_the_same_id() {
     let rig = simple_rig().await;
@@ -145,7 +150,7 @@ async fn crash_after_post_reposts_the_same_id() {
     assert_eq!(retry_delay(&rig.run_post(&s).await), 60);
     let planned = rig.plan(&s).await;
     assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
-    assert_eq!(rig.server().posted_ids().await, bracketed(&planned)[..1]);
+    assert_eq!(rig.server().posted_ids().await, bracketed(&planned));
     // The dead job's lease still fences the row.
     assert!(rig.try_claim(&s, OutboxStage::Post).await.is_none());
 
@@ -186,7 +191,7 @@ async fn dup_unconfirmed_keeps_message_id() {
     let plan = rig.plan(&s).await;
     assert_eq!(ids(&plan), ids(&planned));
     assert_eq!(plan[0].state, ArticleState::Planned);
-    assert_eq!(rig.server().posted_count().await, 1);
+    assert_eq!(rig.server().posted_count().await, 3);
 
     rig.server().set_stat_lag(false).await;
     rig.bridge.clock.advance_secs(120);
@@ -305,35 +310,55 @@ async fn stale_lease_stops_before_any_post() {
     assert_eq!(rig.server().posted_count().await, 3);
 }
 
-/// The lease is taken over while the stage is posting: the next article
-/// is never sent.
+/// The lease runs out while the stage is posting and another job takes
+/// the row: the stale job posts no further article, records nothing and
+/// advances nothing. The new holder finishes under the same message-ids.
 #[tokio::test]
 async fn lease_lost_mid_stage_stops_posting() {
     let rig = simple_rig().await;
-    let s = rig.seed(8, &marked_plaintext(PLAIN_LEN)).await;
+    let s = rig.seed(8, &marked_plaintext(LONG_PLAIN_LEN)).await;
 
-    rig.bridge
-        .catalog
-        .fault
-        .set(Some(Fault::StealLeaseAfter(0)));
-    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let thief = std::cell::RefCell::new(None);
+    let outcome = rig
+        .run_post_and(&s, 0, 2, async || {
+            rig.bridge.clock.advance_secs(LEASE_SECS + 1);
+            *thief.borrow_mut() = rig.try_claim(&s, OutboxStage::Post).await;
+        })
+        .await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    let thief = thief.into_inner().expect("the expired lease is claimable");
 
     let plan = rig.plan(&s).await;
-    assert_eq!(rig.server().posted_ids().await, bracketed(&plan)[..1]);
-    assert_eq!(plan[0].state, ArticleState::Posted);
-    assert!(plan[1..].iter().all(|a| a.state == ArticleState::Planned));
+    assert!(plan.len() >= 8);
+    // At most the article already on the wire followed the takeover.
+    assert!(rig.server().posted_count().await <= 3);
+    assert!(plan.iter().all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 0);
     assert_eq!(rig.bridge.nntp.connects(), 1);
     assert_eq!(rig.bridge.nntp.live(), 0);
-    // Nothing was advanced or enqueued by the stale job.
+    // Nothing was advanced or enqueued by the stale job, and the new
+    // holder's lease is untouched.
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!(outbox.stage, OutboxStage::Post);
+    assert_eq!(outbox.token, thief.token);
+    assert!(rig.bridge.jobs.sent().is_empty());
+
+    let job = rig.job(&s).await;
+    assert_eq!(rig.bridge.post_stage(&thief, &job).await, JobOutcome::Ack);
+    let done = rig.plan(&s).await;
+    assert_eq!(ids(&done), ids(&plan));
+    assert!(done.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(rig.server().posted_count().await, plan.len());
     assert_eq!(
         rig.bridge.catalog.outbox(&s.extent).stage,
-        OutboxStage::Post
+        OutboxStage::Verify
     );
-    assert!(rig.bridge.jobs.sent().is_empty());
 }
 
-/// The lease is lost between a POST and its catalogue write: the write is
-/// refused, the job stops, and the successor confirms the same article.
+/// The lease is lost between the POSTs and the catalogue write that
+/// records them: the whole write is refused (not one article of the batch
+/// is marked), the job stops, and the successor confirms the same
+/// articles.
 #[tokio::test]
 async fn fenced_mark_posted_stops_and_successor_confirms() {
     let rig = simple_rig().await;
@@ -345,9 +370,13 @@ async fn fenced_mark_posted_stops_and_successor_confirms() {
         .set(Some(Fault::StealLeaseBefore(1)));
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
     let planned = rig.plan(&s).await;
-    assert_eq!(planned[1].state, ArticleState::Planned);
-    assert_eq!(planned[2].state, ArticleState::Planned);
-    assert_eq!(rig.server().posted_ids().await, bracketed(&planned)[..2]);
+    assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.server().posted_ids().await, bracketed(&planned));
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).stage,
+        OutboxStage::Post
+    );
+    assert!(rig.bridge.jobs.sent().is_empty());
 
     rig.bridge.clock.advance_secs(LEASE_SECS + 1);
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
@@ -376,24 +405,58 @@ async fn fenced_advance_leaves_the_stage_alone() {
     assert!(rig.bridge.jobs.sent().is_empty());
 }
 
-/// The permit slot is taken over mid-stage: the socket is dropped and the
-/// job is deferred, with nothing more posted on the lost slot.
+/// The permit slot is taken over mid-stage: at the next renewal the
+/// socket is dropped and the job is deferred, with nothing more posted on
+/// the lost slot. What was accepted before is recorded.
 #[tokio::test]
 async fn lost_permit_stops_posting() {
     let rig = simple_rig().await;
-    let s = rig.seed(24, &marked_plaintext(PLAIN_LEN)).await;
+    let s = rig.seed(24, &marked_plaintext(LONG_PLAIN_LEN)).await;
 
-    rig.bridge
-        .catalog
-        .fault
-        .set(Some(Fault::RevokePermitAfter(0)));
-    let delay = retry_delay(&rig.run_post(&s).await);
+    let outcome = rig
+        .run_post_and(&s, 0, 2, async || {
+            rig.bridge.catalog.revoke_permits();
+            rig.bridge.clock.advance_secs(RENEW_SECS);
+        })
+        .await;
+    let delay = retry_delay(&outcome);
     assert!((15..=60).contains(&delay), "delay {delay}");
-    assert_eq!(rig.server().posted_count().await, 1);
+    let stored = rig.server().posted_count().await;
+    assert!((2..=3).contains(&stored), "stored {stored}");
     assert_eq!(rig.bridge.nntp.live(), 0);
     let outbox = rig.bridge.catalog.outbox(&s.extent);
     assert_eq!(outbox.attempts, 0);
     assert_eq!(outbox.stage, OutboxStage::Post);
+    let plan = rig.plan(&s).await;
+    let posted = plan.iter().filter(|a| a.state == ArticleState::Posted);
+    assert_eq!(posted.count(), stored);
+}
+
+/// The lease and the permit are renewed on a timer, not per article, and
+/// the accepted articles are recorded in batches.
+#[tokio::test]
+async fn renews_on_a_timer_and_marks_in_batches() {
+    let rig = simple_rig().await;
+    let s = rig.seed(26, &marked_plaintext(LONG_PLAIN_LEN)).await;
+
+    let outcome = rig
+        .run_post_and(&s, 0, 2, async || {
+            rig.bridge.clock.advance_secs(RENEW_SECS);
+        })
+        .await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    let plan = rig.plan(&s).await;
+    assert!(plan.len() >= 8);
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    // Once before the first POST, once when the timer ran out.
+    assert_eq!(rig.bridge.catalog.renewals.get(), 2);
+    // At that renewal and at the end.
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 2);
+    // The renewal moved the lease forward; the stage then let it go.
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).stage,
+        OutboxStage::Verify
+    );
 }
 
 /// A repost is byte-identical to the first post: the provider lost the
@@ -443,14 +506,16 @@ async fn permits_never_exceed_max_conns() {
         rig.run_post(&seeded[3]),
     );
     let outcomes = [a, b, c, d];
-    // One slot stays reserved for reads: two background jobs at a time.
+    // One slot stays reserved for reads, and the first job takes the two
+    // that are left for its two sockets.
     assert_eq!(
         outcomes.iter().filter(|o| **o == JobOutcome::Ack).count(),
-        2
+        1
     );
     assert_eq!(rig.bridge.nntp.peak(), 2);
     assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 2);
-    assert_eq!(rig.bridge.catalog.permit_refusals.get(), 2);
+    // The third socket of the first job, and the three other jobs.
+    assert_eq!(rig.bridge.catalog.permit_refusals.get(), 4);
     assert_eq!(rig.bridge.nntp.connects(), 2);
 
     for (s, outcome) in seeded.iter().zip(&outcomes) {
