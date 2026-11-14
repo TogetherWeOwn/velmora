@@ -9,7 +9,9 @@
 //!   → [`Error::AuthFailed`]. A `482` is never stale credentials: on a
 //!   non-auth command it is an out-of-sequence protocol error, and on
 //!   `AUTHINFO` providers also use it for "too many connections". It
-//!   stays a generic [`Error::NntpReply`] with its code.
+//!   stays a generic [`Error::NntpReply`] with its code; from the login
+//!   its text is replaced, and says only whether it stated a connection
+//!   limit ([`REDACTED_LIMIT`], [`is_limit_reply`]).
 //! - `502` — no permission → [`Error::NoPermission`] (never a re-auth
 //!   signal). Reply text from the `AUTHINFO` exchange — including a
 //!   malformed reply line that never parses to a code — is redacted at
@@ -751,6 +753,24 @@ impl<T: Transport> NntpClient<T> {
     }
 }
 
+/// The text a `482` login reply over a connection limit is replaced by
+/// (see `auth_reply_error`). [`is_limit_reply`] accepts it.
+pub const REDACTED_LIMIT: &str = "<redacted: connection limit>";
+
+/// True when a refused connection or login says the account (or the
+/// address) is at its limit of connections: "too many connections",
+/// "exceeded maximum number of connections", "max number of simultaneous
+/// IPs reached", "already connected from different IP". Such a refusal
+/// ends when a connection is closed. Any other refusal ("access denied",
+/// "quota exceeded", "account disabled") is about the account itself and
+/// waiting for a slot does not end it.
+pub fn is_limit_reply(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    has(&["simultaneous", "concurrent", "already connected"])
+        || (text.contains("connection") && has(&["too many", "limit", "max", "exceed"]))
+}
+
 /// Maps a non-success `AUTHINFO USER`/`PASS` reply to an error, dropping
 /// the server reply text: `AuthFailed`/`NoPermission` redact at format
 /// time, and the generic arm replaces the text outright so no
@@ -758,11 +778,16 @@ impl<T: Transport> NntpClient<T> {
 /// [`Error::NoPermission`] — it is not proof of stale credentials and
 /// must not surface the re-auth code. `482` keeps its code in the generic
 /// arm: providers answer a login over the account's connection limit
-/// with it, so it is not proof of bad credentials either.
+/// with it, so it is not proof of bad credentials either. What is kept of
+/// its text is whether it states such a limit ([`REDACTED_LIMIT`]) or not.
 fn auth_reply_error(code: u16, text: String) -> Error {
     match code {
         480 | 481 => Error::AuthFailed(text),
         502 => Error::NoPermission(text),
+        482 if is_limit_reply(&text) => Error::NntpReply {
+            code,
+            text: REDACTED_LIMIT.into(),
+        },
         code => Error::NntpReply {
             code,
             text: "<redacted>".into(),
@@ -786,6 +811,67 @@ impl<T: Transport> NntpClient<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_that_states_a_connection_limit_is_a_limit_reply() {
+        for text in [
+            "Too many connections for user",
+            "too many connections from your host",
+            "Exceeded maximum number of connections per user",
+            "exceeded MAXIMUM number of connections (20)",
+            "max number of simultaneous IPs (3) reached",
+            "(max number of simultaneous IP addresses reached: 4)",
+            "Already connected from different IP",
+            "Connection limit reached",
+            "Max connections exceeded",
+            "too many concurrent sessions",
+            REDACTED_LIMIT,
+        ] {
+            assert!(is_limit_reply(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_of_the_account_is_not_a_limit_reply() {
+        for text in [
+            "",
+            "Access denied",
+            "Access denied: quota exceeded, see your account page",
+            "Account suspended",
+            "Account expired",
+            "Authentication failed",
+            "Authentication rejected",
+            "Authentication commands issued out of sequence",
+            "Download limit exceeded",
+            "Connection refused: account disabled",
+            "Permission denied",
+            "<redacted>",
+        ] {
+            assert!(!is_limit_reply(text), "{text:?}");
+        }
+    }
+
+    /// A `482` in the login keeps its code and loses its text; all that
+    /// stays is whether the text stated a connection limit.
+    #[test]
+    fn a_482_login_reply_keeps_only_whether_it_states_a_limit() {
+        let text_of = |reply: &str| match auth_reply_error(482, reply.into()) {
+            Error::NntpReply { code: 482, text } => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text_of("Too many connections for user"), REDACTED_LIMIT);
+        assert_eq!(
+            text_of("Already connected from different IP"),
+            REDACTED_LIMIT
+        );
+        assert_eq!(text_of("Authentication rejected for user7"), "<redacted>");
+        assert_eq!(text_of(""), "<redacted>");
+        // Other codes of the generic arm say nothing of a limit.
+        match auth_reply_error(500, "Too many connections".into()) {
+            Error::NntpReply { code: 500, text } => assert_eq!(text, "<redacted>"),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn envelope_accepts_zero_max_and_trailing_prose() {

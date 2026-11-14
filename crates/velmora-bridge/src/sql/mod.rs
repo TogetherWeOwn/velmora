@@ -83,8 +83,8 @@ use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
     FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage,
-    ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result,
-    SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
+    ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderFault,
+    ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -483,8 +483,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
         health::provider_load(self, now).await
     }
-    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
-        health::provider_failed(self, provider, now).await
+    async fn provider_failed(
+        &self,
+        provider: &str,
+        fault: ProviderFault,
+        now: UnixMs,
+    ) -> Result<()> {
+        health::provider_failed(self, provider, fault, now).await
     }
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()> {
         health::provider_recovered(self, provider, now).await

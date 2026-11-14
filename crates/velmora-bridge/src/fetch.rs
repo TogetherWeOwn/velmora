@@ -19,7 +19,9 @@ use crate::ports::{
     NntpSession, Permit, PermitClass,
 };
 use crate::post::{sha256, Stop};
-use crate::types::{ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, Result};
+use crate::types::{
+    ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, ProviderFault, Result,
+};
 
 /// One provider connection slot and the session opened under it.
 ///
@@ -35,8 +37,8 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     pub(crate) provider: &'a ProviderConfig,
     permit: Permit,
     session: Option<N::Session>,
-    /// How the last connect or command went; `None` = nothing ran.
-    healthy: Option<bool>,
+    /// How the last connect or command went ([`Health`]).
+    health: Health,
     /// The host's timer, if the caller has one: bounds a renewal.
     timer: Option<Sleeper>,
 }
@@ -65,19 +67,41 @@ pub(crate) fn request_holder(kind: &str) -> Result<String> {
     Ok(format!("{kind}:{hex}"))
 }
 
-/// Whether the text of a `481` says the account is at its connection
-/// limit (`481 … exceeded maximum number of connections per user`), and
-/// not that the login is wrong. Only that wording: any other `481` stays
-/// a failed login.
-fn is_connection_limit(text: &str) -> bool {
-    text.to_ascii_lowercase()
-        .contains("exceeded maximum number of connections")
+/// What a provider meant when it refused a connection or a login.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The account (or the address) is at its limit of connections: "no
+    /// slot". It ends when a connection is closed.
+    Limit,
+    /// Anything else: the account is denied, suspended, out of quota, or
+    /// the login is wrong. Waiting for a slot does not end it.
+    Account,
+}
+
+/// Sorts a failed connect that is the provider's refusal by reply: a
+/// `502`, a `481`/`480` or a `482`, at the greeting or in the login.
+/// The reply text decides ([`velmora::nntp::is_limit_reply`]): only one
+/// that states a connection limit is [`Refusal::Limit`]. `None` = not
+/// such a refusal (no connection, another reply code).
+fn refusal(e: &BridgeError) -> Option<Refusal> {
+    use velmora::Error as E;
+    let text = match e {
+        BridgeError::Nntp(
+            E::NoPermission(text) | E::AuthFailed(text) | E::NntpReply { code: 482, text },
+        ) => text,
+        _ => return None,
+    };
+    Some(match velmora::nntp::is_limit_reply(text) {
+        true => Refusal::Limit,
+        false => Refusal::Account,
+    })
 }
 
 /// Whether an error says the provider itself is in trouble: a failed
 /// connect or login, a broken connection, an unexpected reply. A missing
 /// article, a refused or duplicate POST, "too many connections" and an
-/// oversized body say nothing about its health.
+/// oversized body say nothing about its health. (A refused connect is
+/// sorted before this is asked: see [`refusal`].)
 fn is_provider_fault(e: &BridgeError) -> bool {
     use velmora::Error as E;
     match e {
@@ -119,7 +143,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             provider,
             permit,
             session: None,
-            healthy: None,
+            health: None,
             timer: None,
         }))
     }
@@ -185,31 +209,32 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// The live session, connecting first when there is none. A provider
-    /// that refuses the connection or the login with `502` or `482` is
-    /// reported as "no slot": no strike, and the caller waits as it does
-    /// for a permit. Those are the replies of an account at a limit: "too
-    /// many connections", and the address limit (`502 max number of
+    /// that refuses the connection or the login with `502`, `482` or
+    /// `481` and a text that states a connection limit is reported as "no
+    /// slot": no strike, and the caller waits as it does for a permit.
+    /// Those are the replies of an account at a limit: "too many
+    /// connections", and the address limit (`502 max number of
     /// simultaneous IPs (3) reached`, `482 Already connected from
     /// different IP`), which another client of the account or an address
-    /// the provider still counts can cause below `max_ips`. A `481` is
-    /// one of them only when its text states the connection limit; any
-    /// other `481` is a failed login and a strike.
+    /// the provider still counts can cause below `max_ips`.
+    ///
+    /// Any other refusal with those codes is about the account itself
+    /// (denied, suspended, out of quota, a wrong login). It is a strike
+    /// ([`ProviderFault::LoginRefused`]) and a session error, so the
+    /// caller goes on to another provider as after any failed connect:
+    /// waiting for a slot would never end.
     pub(crate) async fn session(&mut self) -> core::result::Result<&mut N::Session, Stop> {
         if self.session.is_none() {
             let session = match self.nntp.connect(self.provider, &self.permit).await {
                 Ok(session) => session,
-                Err(BridgeError::Nntp(
-                    velmora::Error::NoPermission(_) | velmora::Error::NntpReply { code: 482, .. },
-                )) => {
-                    return Err(Stop::NoPermit);
-                }
-                Err(BridgeError::Nntp(velmora::Error::AuthFailed(text)))
-                    if is_connection_limit(&text) =>
-                {
-                    return Err(Stop::NoPermit);
-                }
                 Err(e) => {
-                    self.note_err(&e);
+                    match refusal(&e) {
+                        Some(Refusal::Limit) => return Err(Stop::NoPermit),
+                        Some(Refusal::Account) => {
+                            self.health = Some(Err(ProviderFault::LoginRefused));
+                        }
+                        None => self.note_err(&e),
+                    }
                     return Err(Stop::Session(e));
                 }
             };
@@ -236,13 +261,15 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
 
     /// Records a command the provider answered in order (a `430` too).
     pub(crate) fn note_ok(&mut self) {
-        self.healthy = Some(true);
+        self.health = Some(Ok(()));
     }
 
     /// Records a failed connect or command, if it is the provider's fault.
+    /// A strike that already has a reason keeps it: the caller of a
+    /// failed [`session`](Self::session) reports the same error again.
     pub(crate) fn note_err(&mut self, e: &BridgeError) {
-        if is_provider_fault(e) {
-            self.healthy = Some(false);
+        if is_provider_fault(e) && !matches!(self.health, Some(Err(_))) {
+            self.health = Some(Err(ProviderFault::SessionFailed));
         }
     }
 
@@ -255,8 +282,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// started before another one failed still clears that failure.
     pub(crate) async fn close(self) {
         let (catalog, clock, id) = (self.catalog, self.clock, self.provider.id.as_str());
-        let healthy = self.finish().await;
-        report_health(catalog, clock, id, healthy).await;
+        let health = self.finish().await;
+        report_health(catalog, clock, id, health).await;
     }
 
     /// Ends every session and frees its slot, then reports each
@@ -281,11 +308,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         }
         for id in ids {
             let mine = || ended.iter().filter(|e| e.0 == id);
-            let healthy = match mine().any(|e| e.1 == Some(true)) {
-                true => Some(true),
+            let health = match mine().any(|e| e.1 == Some(Ok(()))) {
+                true => Some(Ok(())),
                 false => mine().find_map(|e| e.1),
             };
-            report_health(catalog, clock, id, healthy).await;
+            report_health(catalog, clock, id, health).await;
         }
     }
 
@@ -293,28 +320,32 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// frees the slot and returns how the session went. Several sessions
     /// of one job on one provider are one strike or one recovery, which
     /// the caller reports once with [`report_health`].
-    pub(crate) async fn finish(mut self) -> Option<bool> {
+    pub(crate) async fn finish(mut self) -> Health {
         if let Some(session) = self.session.take() {
             session.quit().await;
         }
         // A failed release is safe: the permit expires on its own.
         let _ = self.catalog.release_permit(&self.permit).await;
-        self.healthy
+        self.health
     }
 }
+
+/// How a session with a provider went: `None` = nothing ran, `Ok` = in
+/// order, `Err` = one strike, and why.
+pub(crate) type Health = Option<core::result::Result<(), ProviderFault>>;
 
 /// Records how a provider's session went (`None` = nothing ran).
 pub(crate) async fn report_health<C: Catalog, T: Clock>(
     catalog: &C,
     clock: &T,
     id: &str,
-    healthy: Option<bool>,
+    health: Health,
 ) {
     let now = clock.now();
     // Health is advice: a write that fails here costs nothing.
-    let _ = match healthy {
-        Some(false) => catalog.provider_failed(id, now).await,
-        Some(true) => catalog.provider_recovered(id, now).await,
+    let _ = match health {
+        Some(Err(fault)) => catalog.provider_failed(id, fault, now).await,
+        Some(Ok(())) => catalog.provider_recovered(id, now).await,
         None => Ok(()),
     };
 }

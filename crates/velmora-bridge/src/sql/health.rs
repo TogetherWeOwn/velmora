@@ -4,15 +4,17 @@
 //! strike. [`FAILURE_THRESHOLD`] strikes in a row start a cooldown; so
 //! does a single strike right after a cooldown, and each cooldown in a row
 //! doubles the next up to [`COOLDOWN_MAX_MS`]. One good session clears it
-//! all. A row changes on a change of state only, and each write is a single
-//! statement guarded by the state it expects: a report that arrives while
-//! the provider is cooling changes nothing, so parallel jobs that fail
+//! all. Each strike is stored with why it was one, as a code
+//! ([`ProviderFault`]); the good session clears that too. A row changes
+//! on a change of state only, and each write is a single statement
+//! guarded by the state it expects: a report that arrives while the
+//! provider is cooling changes nothing, so parallel jobs that fail
 //! together cannot stack cooldowns.
 
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
-use crate::types::{ProviderLoad, Result, UnixMs};
+use crate::types::{ProviderFault, ProviderLoad, Result, UnixMs};
 
 /// Failed sessions in a row that start the first cooldown.
 pub const FAILURE_THRESHOLD: u32 = 3;
@@ -32,14 +34,16 @@ pub(super) async fn provider_load<S: Sql>(
         .query(
             "SELECT provider_id, SUM(held), SUM(uses), MAX(failures), MAX(cooldowns), \
                MAX(cooldown_until), COUNT(DISTINCT live_holder), \
-               COUNT(DISTINCT live_job) FROM ( \
+               COUNT(DISTINCT live_job), MAX(reason) FROM ( \
                SELECT provider_id, lease_until >= ?1 AS held, token AS uses, 0 AS failures, \
                  0 AS cooldowns, 0 AS cooldown_until, \
                  CASE WHEN lease_until >= ?1 THEN holder END AS live_holder, \
-                 CASE WHEN lease_until >= ?1 AND background = 1 THEN holder END AS live_job \
+                 CASE WHEN lease_until >= ?1 AND background = 1 THEN holder END AS live_job, \
+                 NULL AS reason \
                  FROM provider_permits \
                UNION ALL \
-               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL, NULL \
+               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL, NULL, \
+                 last_failure_reason \
                  FROM provider_health) \
              GROUP BY provider_id ORDER BY provider_id",
             &[ms(now)],
@@ -57,6 +61,8 @@ pub(super) async fn provider_load<S: Sql>(
             cooldown_until: UnixMs(r.num()?),
             holders: r.num()?,
             background_holders: r.num()?,
+            // A code this version does not know reads as no reason.
+            fault: r.opt_text()?.as_deref().and_then(ProviderFault::parse),
         });
     }
     Ok(out)
@@ -65,6 +71,7 @@ pub(super) async fn provider_load<S: Sql>(
 pub(super) async fn provider_failed<S: Sql>(
     c: &SqlCatalog<S>,
     provider: &str,
+    fault: ProviderFault,
     now: UnixMs,
 ) -> Result<()> {
     // `trip` = this strike starts a cooldown. Right-hand sides read the
@@ -76,7 +83,7 @@ pub(super) async fn provider_failed<S: Sql>(
            cooldowns = CASE WHEN {TRIP} THEN MIN(cooldowns + 1, ?6) ELSE cooldowns END, \
            cooldown_until = CASE WHEN {TRIP} THEN ?2 + MIN(?4 << cooldowns, ?5) \
              ELSE cooldown_until END, \
-           last_failure_at = ?2 \
+           last_failure_at = ?2, last_failure_reason = ?7 \
          WHERE provider_id = ?1 AND cooldown_until <= ?2"
     );
     c.sql
@@ -95,6 +102,7 @@ pub(super) async fn provider_failed<S: Sql>(
                 SqlValue::Int(COOLDOWN_BASE_MS),
                 SqlValue::Int(COOLDOWN_MAX_MS),
                 SqlValue::Int(COOLDOWN_MAX_STEPS),
+                text(fault.as_str()),
             ],
         )
         .await?;
@@ -109,7 +117,7 @@ pub(super) async fn provider_recovered<S: Sql>(
     c.sql
         .exec(
             "UPDATE provider_health SET failures = 0, cooldowns = 0, cooldown_until = 0, \
-               last_ok_at = ?2 \
+               last_ok_at = ?2, last_failure_reason = NULL \
              WHERE provider_id = ?1 AND cooldown_until <= ?2 \
                AND (failures > 0 OR cooldowns > 0)",
             &[text(provider), ms(now)],

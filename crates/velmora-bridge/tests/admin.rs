@@ -1269,6 +1269,10 @@ async fn status_reports_provider_health_without_credentials() {
         (Some(0), Some(0))
     );
     assert_eq!(one["cooling"], false);
+    assert_eq!(
+        (&one["healthy"], &one["reason"]),
+        (&json!(true), &json!(null))
+    );
     // The limits, as configured: no address limit is `null`.
     assert_eq!(one["max_conns"], p.max_conns);
     assert!(one["max_ips"].is_null());
@@ -1282,14 +1286,30 @@ async fn status_reports_provider_health_without_credentials() {
         .await
         .unwrap()
         .unwrap();
-    for _ in 0..3 {
-        fx.bridge.catalog.provider_failed(&p.id, now).await.unwrap();
+    // The first strike already shows, with its reason as a code.
+    let failed = |fault| fx.bridge.catalog.provider_failed(&p.id, fault, now);
+    failed(ProviderFault::SessionFailed).await.unwrap();
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(
+        (&one["failures"], &one["cooling"]),
+        (&json!(1), &json!(false))
+    );
+    assert_eq!(
+        (&one["healthy"], &one["reason"]),
+        (&json!(false), &json!("session_failed"))
+    );
+    for _ in 0..2 {
+        failed(ProviderFault::LoginRefused).await.unwrap();
     }
     let r = fx.get("/status").await;
     let one = r.json()["providers"][0].clone();
     assert_eq!((&one["held"], &one["holders"]), (&json!(1), &json!(1)));
     assert_eq!(one["cooling"], true);
     assert_eq!(one["cooldown_until"], now.0 + 60_000);
+    assert_eq!(
+        (&one["healthy"], &one["reason"]),
+        (&json!(false), &json!("login_refused"))
+    );
     let body = r.text();
     for secret in [p.user.as_str(), p.pass.as_str(), p.host.as_str()] {
         assert!(!body.contains(secret), "status leaks provider details");

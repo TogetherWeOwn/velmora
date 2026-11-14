@@ -476,6 +476,36 @@ impl ProviderConfig {
     }
 }
 
+/// Why a session with a provider counts as a strike. The code is all
+/// that is stored and shown: never the provider's own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFault {
+    /// The provider refused the connection or the login, and not because
+    /// the account was at a connection limit: the account is denied,
+    /// suspended, out of quota, or its credentials are no longer taken.
+    LoginRefused,
+    /// Any other failure of a session: no connection, a broken one, a
+    /// reply out of protocol.
+    SessionFailed,
+}
+
+impl ProviderFault {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderFault::LoginRefused => "login_refused",
+            ProviderFault::SessionFailed => "session_failed",
+        }
+    }
+
+    /// The fault a stored code names; `None` for an unknown code.
+    pub fn parse(code: &str) -> Option<ProviderFault> {
+        [ProviderFault::LoginRefused, ProviderFault::SessionFailed]
+            .into_iter()
+            .find(|f| f.as_str() == code)
+    }
+}
+
 /// One provider's connection load and health (`Catalog::provider_load`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProviderLoad {
@@ -494,6 +524,16 @@ pub struct ProviderLoad {
     pub cooldowns: u32,
     /// The provider is skipped until this time (`0` = not cooling).
     pub cooldown_until: UnixMs,
+    /// Why the last strike was one; `None` once a good session cleared
+    /// the strikes.
+    pub fault: Option<ProviderFault>,
+}
+
+impl ProviderLoad {
+    /// No strike and no cooldown on record since the last good session.
+    pub fn healthy(&self) -> bool {
+        self.failures == 0 && self.cooldowns == 0
+    }
 }
 
 /// Redacts host and credentials: provider identity in logs is `id` and

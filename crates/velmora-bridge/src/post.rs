@@ -44,7 +44,7 @@ use velmora::transport::Transport;
 use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
-use crate::fetch::{job_holder, report_health, ProviderSession};
+use crate::fetch::{job_holder, report_health, Health, ProviderSession};
 use crate::jobs::JOB_OVERHEAD_BYTES;
 use crate::pool::Pool;
 use crate::ports::{
@@ -122,9 +122,10 @@ impl Stop {
 impl From<BridgeError> for Stop {
     fn from(e: BridgeError) -> Stop {
         match e {
-            // `440`, or a `502` in answer to a command: the provider
-            // refuses this account. Only a `502` to the connection itself
-            // means "no slot" (see `ProviderSession::session`).
+            // `440`, or a `502` in answer to a command or to the login:
+            // the provider refuses this account. Only a refused connect
+            // that states a connection limit means "no slot" (see
+            // `ProviderSession::session`).
             BridgeError::Nntp(
                 velmora::Error::PostProhibited(_) | velmora::Error::NoPermission(_),
             ) => Stop::fail(FailClass::PostRefused),
@@ -1007,11 +1008,11 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         // a provider that answered one socket in order is in order.
         for provider in providers {
             let mine = || ended.iter().filter(|e| e.0 == provider);
-            let healthy = match mine().any(|e| e.2 == Some(true)) {
-                true => Some(true),
+            let health = match mine().any(|e| e.2 == Some(Ok(()))) {
+                true => Some(Ok(())),
                 false => mine().find_map(|e| e.2),
             };
-            report_health(self.catalog, self.clock, provider, healthy).await;
+            report_health(self.catalog, self.clock, provider, health).await;
         }
         let busy = ended.iter().any(|e| matches!(e.1, Some(Stop::NoPermit)));
         let state = self.state.into_inner();
@@ -1047,7 +1048,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         &self,
         slot: usize,
         mut session: ProviderSession<'a, C, N, T>,
-    ) -> (&'a str, Option<Stop>, Option<bool>) {
+    ) -> (&'a str, Option<Stop>, Health) {
         let provider = session.provider.id.as_str();
         let stop = loop {
             let Some(at) = self.take(provider).await else {
@@ -1094,8 +1095,8 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             }
         };
         self.state.borrow_mut().sockets[slot].permit = None;
-        let healthy = session.finish().await;
-        (provider, stop, healthy)
+        let health = session.finish().await;
+        (provider, stop, health)
     }
 
     /// The next article for a socket of `provider`. With an empty queue
