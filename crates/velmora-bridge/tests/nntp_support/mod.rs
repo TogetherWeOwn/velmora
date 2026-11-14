@@ -908,9 +908,6 @@ impl Catalog for MemCatalog {
     ) -> Result<PublishOutcome> {
         unused()
     }
-    async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
-        unused()
-    }
     async fn delete_object_before(
         &self,
         _: &BucketId,
@@ -942,7 +939,7 @@ impl Catalog for MemCatalog {
         _: &GenerationRow,
         _: &[velmora_bridge::ExtentPlacement],
         _: UnixMs,
-    ) -> Result<Guard<()>> {
+    ) -> Result<velmora_bridge::replay::ReplayPublish> {
         unused()
     }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {

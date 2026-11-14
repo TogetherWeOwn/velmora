@@ -340,11 +340,7 @@ async fn failed_overwrite_keeps_the_old_generation_live() {
 
     // A failed delete is all-or-nothing too.
     fx.cat.sql.lose_guard.set(true);
-    assert!(fx
-        .cat
-        .delete_object(&b.id, "k", T0.plus_ms(30))
-        .await
-        .is_err());
+    assert!(!fx.cat.delete_now(&b.id, "k", T0.plus_ms(30)).await.unwrap());
     fx.cat.sql.lose_guard.set(false);
 
     assert_eq!(fx.footprint(), before);
@@ -379,10 +375,7 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
         .await
         .unwrap();
     assert_eq!(fx.writes(), (1, 0), "overwrite");
-    fx.cat
-        .delete_object(&b.id, "k", T0.plus_ms(2))
-        .await
-        .unwrap();
+    fx.cat.delete_now(&b.id, "k", T0.plus_ms(2)).await.unwrap();
     assert_eq!(fx.writes(), (1, 0), "delete");
     assert!(fx
         .cat
@@ -435,7 +428,7 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
     // Delete: the pointer removal fails.
     let err = fx
         .cat
-        .delete_object(&b.id, "live", T0.plus_ms(12))
+        .delete_now(&b.id, "live", T0.plus_ms(12))
         .await
         .unwrap_err();
     assert!(matches!(err, BridgeError::Sql(_)), "{err:?}");
@@ -451,7 +444,7 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
     fx.cat.publish(&fresh).await.unwrap();
     fx.cat.publish(&over).await.unwrap();
     fx.cat
-        .delete_object(&b.id, "live", T0.plus_ms(12))
+        .delete_now(&b.id, "live", T0.plus_ms(12))
         .await
         .unwrap();
 }
@@ -498,7 +491,7 @@ async fn outbox_cancel_does_not_scan_the_outbox() {
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
     fx.put(&b.id, "k", T0).await;
-    fx.cat.delete_object(&b.id, "k", T0).await.unwrap();
+    fx.cat.delete_now(&b.id, "k", T0).await.unwrap();
     let delete = fx.cat.sql.last_batch.borrow().clone();
     fx.put(&b.id, "k2", T0).await;
     fx.put(&b.id, "k2", T0.plus_ms(1)).await;
@@ -714,11 +707,11 @@ async fn delete_retires_generation_cancels_outbox_and_adds_gc_rows() {
 
     // Deleting a key that does not exist changes nothing.
     let before = fx.footprint();
-    fx.cat.delete_object(&b.id, "nope", T0).await.unwrap();
+    fx.cat.delete_now(&b.id, "nope", T0).await.unwrap();
     assert_eq!(fx.footprint(), before);
 
     let t1 = T0.plus_ms(7_000);
-    fx.cat.delete_object(&b.id, "k", t1).await.unwrap();
+    fx.cat.delete_now(&b.id, "k", t1).await.unwrap();
 
     assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
     assert!(fx.cat.object_status(&b.id, "k").await.unwrap().is_none());
@@ -751,10 +744,7 @@ async fn delete_retires_generation_cancels_outbox_and_adds_gc_rows() {
     );
 
     // A second delete is a no-op: no second set of GC rows.
-    fx.cat
-        .delete_object(&b.id, "k", t1.plus_ms(1))
-        .await
-        .unwrap();
+    fx.cat.delete_now(&b.id, "k", t1.plus_ms(1)).await.unwrap();
     assert_eq!(fx.int("SELECT COUNT(*) FROM gc"), 3);
 
     let (generation, _) = fx.cat.live_object(&b.id, "keep").await.unwrap().unwrap();
@@ -855,7 +845,7 @@ async fn copy_references_the_extents_of_a_live_source_only() {
 
     // A source that was overwritten or deleted since it was read.
     let stale = copy_of(&fx, &src.generation, "late", t1);
-    fx.cat.delete_object(&b.id, "src", t1).await.unwrap();
+    fx.cat.delete_now(&b.id, "src", t1).await.unwrap();
     refused(&fx, stale).await;
     assert_eq!(
         fx.int("SELECT COUNT(*) FROM gc"),
@@ -973,10 +963,7 @@ async fn same_key_in_two_buckets_is_independent() {
     let in_b = fx.put(&b.id, "k", T0).await;
 
     fx.put(&a.id, "k", T0.plus_ms(1)).await;
-    fx.cat
-        .delete_object(&a.id, "k", T0.plus_ms(2))
-        .await
-        .unwrap();
+    fx.cat.delete_now(&a.id, "k", T0.plus_ms(2)).await.unwrap();
 
     assert!(fx.cat.live_object(&a.id, "k").await.unwrap().is_none());
     let (generation, _) = fx.cat.live_object(&b.id, "k").await.unwrap().unwrap();
@@ -1342,11 +1329,8 @@ async fn keys_with_reserved_characters_round_trip() {
     assert_eq!(keys, ["dir/single"]);
 
     // Delete addresses the exact key only.
-    fx.cat
-        .delete_object(&b.id, "a b/c d.txt", T0)
-        .await
-        .unwrap();
-    fx.cat.delete_object(&b.id, "dir/", T0).await.unwrap();
+    fx.cat.delete_now(&b.id, "a b/c d.txt", T0).await.unwrap();
+    fx.cat.delete_now(&b.id, "dir/", T0).await.unwrap();
     let (keys, _, _) = page_all(&fx, &b.id, query("", None, 1000)).await;
     assert_eq!(keys.len(), all.len() - 1);
     assert!(fx

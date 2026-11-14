@@ -78,7 +78,7 @@ use crate::ports::{
     Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
 };
 use crate::recovery::Recorded;
-use crate::replay::{ReplayExtent, ReplayProbe};
+use crate::replay::{ReplayExtent, ReplayProbe, ReplayPublish};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
@@ -175,9 +175,6 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         record: Recorded,
     ) -> Result<PublishOutcome> {
         objects::copy_generation(self, c, record).await
-    }
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
-        objects::delete_object(self, bucket, key, now).await
     }
     async fn delete_object_before(
         &self,
@@ -404,7 +401,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         g: &GenerationRow,
         placements: &[ExtentPlacement],
         now: UnixMs,
-    ) -> Result<Guard<()>> {
+    ) -> Result<ReplayPublish> {
         replay::replay_publish(self, g, placements, now).await
     }
 

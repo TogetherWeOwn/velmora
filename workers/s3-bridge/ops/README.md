@@ -69,7 +69,35 @@ Limits to know:
   `unreadable` and its extent is restored without a plan.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
-  lists it under `damaged`.
+  lists it under `damaged`. The exception: when the key has an older
+  generation, live or deleted, the key stays as the older records leave
+  it and the record is listed under `damaged_unpublished`, in every
+  replay. Such a record is far more often what a failed write left
+  behind (a CompleteMultipartUpload whose parts were then collected)
+  than an acknowledged object that lost its data, and the replay cannot
+  tell the two apart. If it was acknowledged, the key answers with the
+  object before it, or with 404 after a delete before it, instead of an
+  error.
+- A CompleteMultipartUpload that got no answer from the catalogue and
+  was sent again can leave two records of one object. The replay
+  publishes one and counts the other in `duplicate`; nothing is missing.
+  The object stands under the id of the later record, so a delete that
+  came between the two attempts does not remove it.
+- The record of a publication that the catalogue refused is deleted
+  again, three tries in all. If the store fails every one, the record
+  stays and a replay publishes it in its place in the order, as in the
+  first limit above. A refused PUT or copy answers 500 then. A
+  CompleteMultipartUpload goes on and can answer that the upload does
+  not exist (it was aborted): after a replay the key then holds an
+  object that the client was told was not made, in place of the object
+  the key held before, unless a write or delete was acknowledged on the
+  key afterwards. Compare the replay's object list with what is expected
+  and delete or overwrite such an object by hand.
+- If a bucket was made again under the name of a lost one before the
+  replay, the two have different ids and data keys. The replay does not
+  touch the new bucket: it skips the records of the old one and lists
+  them under `other_bucket`. Which of the two keeps the name is for the
+  operator to decide; the records of the old one stay in the store.
 - An empty bucket that never had a write is not in the records.
 
 ## Routine: export
