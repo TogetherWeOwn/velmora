@@ -95,7 +95,7 @@ pub struct StampRow {
 pub(crate) enum Advance {
     /// The check passed and the counter was moved to this value.
     Raised(u64),
-    /// The check passed; another raise moved the counter first.
+    /// The check passed; another raise moved the counter up first.
     Checked,
     /// The catalogue is behind its stamp (now recorded).
     RolledBack,
@@ -225,14 +225,18 @@ where
             {
                 Ok(true) => return Ok(Advance::Raised(row.counter.map_or(1, |c| c + 1))),
                 Ok(false) if must_raise => {}
-                // Lost to another raise, or to a check that recorded a
-                // rollback: the row says which.
+                // The row says what the round was lost to. A recorded
+                // rollback; another raise, which moved the counter up;
+                // or a restore of the database between the check and
+                // here, which did not: the next round's check finds it.
                 Ok(false) => {
-                    return Ok(if self.stamp_row().await?.rolled_back {
-                        Advance::RolledBack
-                    } else {
-                        Advance::Checked
-                    });
+                    let now = self.stamp_row().await?;
+                    if now.rolled_back {
+                        return Ok(Advance::RolledBack);
+                    }
+                    if now.counter > row.counter {
+                        return Ok(Advance::Checked);
+                    }
                 }
                 Err(e) => last = e,
             }

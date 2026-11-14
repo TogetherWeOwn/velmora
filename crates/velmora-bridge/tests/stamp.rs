@@ -657,6 +657,41 @@ async fn a_rollback_into_a_replay_is_not_cleared_by_that_replay() {
         .expect(200);
 }
 
+/// The runbook closes a restored database with one statement file, then
+/// starts the replay from the restore point. That file must not look
+/// like a replay from the beginning that did not end; a replay that
+/// really did not end keeps its restore point through it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_starts_at_its_restore_point_after_the_runbook_statement() {
+    const ARM: &str = include_str!("../../../workers/s3-bridge/ops/restore-arm.sql");
+    let mut rig = rig();
+    maintenance(&mut rig, Maintenance::Restore);
+    let rig = &rig;
+    let begin = |since_ms: i64| async move {
+        let body = json!({ "since_ms": since_ms, "margin_ms": 0 }).to_string();
+        admin(rig, Method::Post, "/restore", body.as_bytes()).await
+    };
+
+    // No replay ever ran on this database.
+    sql(rig, ARM);
+    sql(rig, ARM);
+    begin(5000).await.expect(200);
+    // A replay ran to its end.
+    restore(rig).await;
+    sql(rig, ARM);
+    sql(rig, ARM);
+    begin(5000).await.expect(200);
+    // That one did not end.
+    sql(rig, ARM);
+    let refused = begin(5001).await;
+    refused.expect(409);
+    let said: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(said["unfinished_since_ms"], 5000, "{said}");
+    begin(5000).await.expect(200);
+    begin(4000).await.expect(200);
+    begin(4001).await.expect(409);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn the_end_of_a_replay_never_moves_the_counter_down() {
     let mut rig = rig();
@@ -809,14 +844,34 @@ async fn a_tick_that_loses_its_raise_to_a_write_goes_on() {
     assert_eq!(row(&rig).await, level(4));
     assert_eq!(stamps(&rig).len(), 4);
 
-    // Lost to a check that recorded a rollback: the tick ends.
+    // Lost to a restore of the database, which took the counter back:
+    // the check is made again and finds it.
     bridge.jobs.inner.take();
+    snapshot(&rig);
+    bridge.raise_stamp().await.unwrap();
     bridge.safety.list_first.set(true);
-    let found = async { sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = 1;") };
-    let report = interleave(&rig, bridge.dispatch(), found).await.unwrap();
+    let restored = async { rollback(&rig) };
+    let report = interleave(&rig, bridge.dispatch(), restored).await.unwrap();
     assert!(report.rolled_back && !report.permits_seeded);
     assert!(bridge.jobs.inner.sent().is_empty());
     assert_eq!(row(&rig).await, behind(4));
+    assert_eq!(stamps(&rig).len(), 5);
+
+    // Lost to a raise, after which a check recorded a rollback: the
+    // counter moved up, and the tick ends all the same.
+    sql(
+        &rig,
+        "UPDATE rollback_stamp SET counter = 5, rolled_back_at = NULL;",
+    );
+    bridge.safety.list_first.set(true);
+    let found = async {
+        let both = "UPDATE rollback_stamp SET counter = 6, rolled_back_at = 1;";
+        sql(&rig, both)
+    };
+    let report = interleave(&rig, bridge.dispatch(), found).await.unwrap();
+    assert!(report.rolled_back && !report.permits_seeded);
+    assert!(bridge.jobs.inner.sent().is_empty());
+    assert_eq!(row(&rig).await, behind(6));
 }
 
 /// Garbage collection and eviction delete. Each looks at the bucket

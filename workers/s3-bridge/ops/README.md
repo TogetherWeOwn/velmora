@@ -220,9 +220,9 @@ serving).
 - **Way out: the restore above, from step 1.** In step 2 the database
   is already "brought back"; run the two commands. The restore point is
   the time the database was restored to, with one exception: if the
-  database came back with a replay on record as unfinished
-  (`SELECT state, since_ms FROM restore_state` says `replaying`), the
-  restore point is that replay's, not a later one. The catalogue holds
+  database came back with a replay on record as unfinished (after the
+  arming statement of step 2, `SELECT since_ms FROM restore_state` is
+  not `-1`), the restore point is that replay's, not a later one. The catalogue holds
   the records up to that point at most. The route enforces it: a first
   call with a later `since_ms` answers 409 and names the value to send
   (`unfinished_since_ms`, with `margin_ms` 0). If the time is not known,

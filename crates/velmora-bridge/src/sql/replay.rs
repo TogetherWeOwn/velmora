@@ -253,7 +253,9 @@ pub(super) async fn restore_begin<S: Sql>(
     // before it when the two fall into one millisecond.
     // A replay that has not ended is replaced only by one that starts
     // no later than it: the catalogue holds no more than the records up
-    // to that point, whatever was restored since.
+    // to that point, whatever was restored since. A row that the
+    // runbook's arming statement wrote over no unfinished replay has no
+    // such point (`since_ms` -1).
     let rows = c
         .sql
         .query(
@@ -263,7 +265,7 @@ pub(super) async fn restore_begin<S: Sql>(
                started_at = max(excluded.started_at, restore_state.started_at + 1), \
                finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
                reached_extent = NULL \
-             WHERE restore_state.state = 'complete' \
+             WHERE restore_state.state = 'complete' OR restore_state.since_ms < 0 \
                OR excluded.since_ms <= restore_state.since_ms \
              RETURNING started_at",
             &[ms(since), ms(now)],
