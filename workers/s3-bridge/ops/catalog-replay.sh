@@ -71,6 +71,7 @@ while :; do
               "safety_missing","tombstones","deleted","duplicate","other_bucket_total") as $k
         ($t[0]; .[$k] = ((.[$k] // 0) + $s[$k]))
     | .unpublishable = ((.unpublishable // []) + $s.unpublishable)
+    | .damaged_unpublished = ((.damaged_unpublished // []) + $s.damaged_unpublished)
     | .unreadable = ((.unreadable // []) + $s.unreadable)
     | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
     | .damaged_total = $s.damaged_total
@@ -84,7 +85,7 @@ done
 
 echo "catalog-replay: complete after $calls calls"
 jq . "$WORK/total.json"
-if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
+if [ "$(jq -r '(.unpublishable | length) + (.damaged_unpublished | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
   exit 2
 fi
