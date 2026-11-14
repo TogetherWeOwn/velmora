@@ -397,6 +397,18 @@ async fn probe_post(req: &Request, env: &Env) -> Result<Response> {
             400,
         );
     }
+    // `readback=stat` skips the BODY read-back: on an account whose downloads
+    // draw from a purchased block, reading back costs quota.
+    let readback_body = match query_param(req, "readback").as_deref() {
+        None | Some("body") => true,
+        Some("stat") => false,
+        Some(_) => {
+            return json_response(
+                &json!({"ok": false, "error": "readback must be body or stat"}),
+                400,
+            )
+        }
+    };
     let groups_var = env
         .var("NEWSGROUPS")
         .map(|v| v.to_string())
@@ -498,6 +510,21 @@ async fn probe_post(req: &Request, env: &Env) -> Result<Response> {
             json!({"step": "stat", "ok": false, "error": classify(e, &cfg), "ms": now_ms() - t})
         }
     });
+
+    if !readback_body {
+        let t = now_ms();
+        session.client.quit().await;
+        steps.push(json!({"step": "quit", "ms": now_ms() - t}));
+        return json_response(
+            &json!({
+                "ok": true,
+                "summary": summary,
+                "readback": "skipped",
+                "steps": steps,
+            }),
+            200,
+        );
+    }
 
     // BODY + decode + compare
     let (body_step, readback) = read_body(client, &ob.message_id, &cfg).await;
@@ -656,7 +683,7 @@ const BLOCK_DEADLINE: Duration = Duration::from_secs(30);
 /// Concurrent sessions per `/probe/ramp` call. The Workers runtime documents
 /// six simultaneous open connections per invocation; the ramp shows what it
 /// does with more.
-const MAX_RAMP: u32 = 30;
+const MAX_RAMP: u32 = 60;
 
 /// Longest hold in `/probe/ramp`, in seconds.
 const MAX_HOLD_SECS: u64 = 30;
@@ -1163,7 +1190,7 @@ async fn probe_ramp(req: &Request, env: &Env) -> Result<Response> {
     };
     let n = match query_param(req, "n").map(|s| s.parse::<u32>()) {
         Some(Ok(n)) if (1..=MAX_RAMP).contains(&n) => n,
-        _ => return bad_request("n must be 1-30"),
+        _ => return bad_request("n must be 1-60"),
     };
     let hold = match query_param(req, "hold").map(|s| s.parse::<u64>()) {
         None => 5,
