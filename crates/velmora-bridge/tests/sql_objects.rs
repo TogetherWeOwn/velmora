@@ -298,8 +298,8 @@ async fn commit_guard_failure_makes_nothing_visible() {
     let c = fx.commit(&b.id, "k", 2, T0);
 
     fx.cat.sql.lose_guard.set(true);
-    let err = fx.cat.commit_generation(&c).await.unwrap_err();
-    assert!(matches!(err, BridgeError::GuardFailed), "{err:?}");
+    let lost = fx.cat.commit_generation(&c).await.unwrap();
+    assert_eq!(lost, Guard::Lost);
     fx.cat.sql.lose_guard.set(false);
 
     assert_eq!(fx.footprint(), [0, 0, 0, 0, 0]);
@@ -323,10 +323,7 @@ async fn failed_overwrite_keeps_the_old_generation_live() {
     // Guard lost after every statement ran.
     let v2 = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
     fx.cat.sql.lose_guard.set(true);
-    assert!(matches!(
-        fx.cat.commit_generation(&v2).await,
-        Err(BridgeError::GuardFailed)
-    ));
+    assert_eq!(fx.cat.commit_generation(&v2).await.unwrap(), Guard::Lost);
     fx.cat.sql.lose_guard.set(false);
 
     // A statement in the middle fails (extent id already taken).
@@ -1400,4 +1397,104 @@ async fn set_safety_state_is_a_compare_and_set() {
     );
     let status = fx.cat.object_status(&b.id, "k").await.unwrap().unwrap();
     assert_eq!(status.extents[0].safety_state, Deleted);
+}
+
+// ---------------------------------------------------------------------------
+// Ids on one key are in commit order
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_commit_under_an_older_or_equal_id_is_refused() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let v1 = fx.put(&b.id, "k", T0.plus_ms(10)).await;
+    let before = fx.footprint();
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(v1.generation.id.clone())
+    );
+
+    // Older by the clock; and in the same millisecond with random bytes
+    // that sort first (the fixture counts its seeds up, so a later one
+    // sorts after: build the smaller one by hand).
+    let older = fx.commit(&b.id, "k", 1, T0);
+    assert_eq!(fx.cat.commit_generation(&older).await.unwrap(), Guard::Lost);
+    let mut same_ms = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
+    let id = GenerationId::mint(T0.plus_ms(10), [0; 8]);
+    assert!(id < v1.generation.id);
+    same_ms.extents[0].generation_id = Some(id.clone());
+    same_ms.generation.id = id;
+    assert_eq!(
+        fx.cat.commit_generation(&same_ms).await.unwrap(),
+        Guard::Lost
+    );
+    // The id of the live generation itself: refused, not a key clash.
+    let mut again = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
+    again.extents[0].generation_id = Some(v1.generation.id.clone());
+    again.generation.id = v1.generation.id.clone();
+    assert_eq!(fx.cat.commit_generation(&again).await.unwrap(), Guard::Lost);
+    assert_eq!(fx.footprint(), before);
+
+    // Another key and another bucket are not held back by this one.
+    let other = fx.bucket("beta").await;
+    fx.put(&b.id, "k2", T0).await;
+    fx.put(&other.id, "k", T0).await;
+    // A later one in the same millisecond is in order.
+    let later = fx.commit(&b.id, "k", 1, T0.plus_ms(10));
+    assert!(later.generation.id > v1.generation.id);
+    assert_eq!(
+        fx.cat.commit_generation(&later).await.unwrap(),
+        Guard::Applied(())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_commit_must_sort_after_the_last_tombstone_of_the_key() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let v1 = fx.put(&b.id, "k", T0).await;
+    assert_eq!(fx.cat.newest_id(&b.id, "nope").await.unwrap(), None);
+
+    // A tombstone that does not sort after the live generation deletes
+    // nothing and is not remembered.
+    assert!(!fx
+        .cat
+        .delete_object_before(&b.id, "k", &v1.generation.id, T0.plus_ms(1))
+        .await
+        .unwrap());
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 0);
+
+    let tombstone = GenerationId::mint(T0.plus_ms(50), [9; 8]);
+    assert!(fx
+        .cat
+        .delete_object_before(&b.id, "k", &tombstone, T0.plus_ms(50))
+        .await
+        .unwrap());
+    assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(tombstone.clone())
+    );
+
+    // Older than the tombstone, and the tombstone's own id: refused.
+    let older = fx.commit(&b.id, "k", 1, T0.plus_ms(20));
+    assert_eq!(fx.cat.commit_generation(&older).await.unwrap(), Guard::Lost);
+    let mut equal = fx.commit(&b.id, "k", 1, T0.plus_ms(50));
+    equal.extents[0].generation_id = Some(tombstone.clone());
+    equal.generation.id = tombstone.clone();
+    assert_eq!(fx.cat.commit_generation(&equal).await.unwrap(), Guard::Lost);
+    assert!(fx.cat.live_object(&b.id, "k").await.unwrap().is_none());
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
+
+    // After it: published, and the tombstone row has done its work.
+    let newer = fx.commit(&b.id, "k", 1, T0.plus_ms(51));
+    assert_eq!(
+        fx.cat.commit_generation(&newer).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 0);
+    assert_eq!(
+        fx.cat.newest_id(&b.id, "k").await.unwrap(),
+        Some(newer.generation.id.clone())
+    );
 }

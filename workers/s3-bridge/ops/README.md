@@ -43,12 +43,12 @@ Limits to know:
 
 - A write that failed after its record was stored can become visible
   after a replay. S3 allows this (the request had no definite outcome).
-- Replay order is id order, and an id carries the time its request
-  started. Two requests on one key that overlapped in time (two writes,
-  or a write and a delete) may come back in the other order; either
-  order is a valid outcome for overlapping requests. This relies on
-  clocks of two Worker instances differing by less than a request
-  takes. Requests that did not overlap are replayed in their order.
+- Replay order is id order, and on one key that is the order in which
+  the writes and deletes were committed. An id is minted after the
+  request body is read; the catalogue then refuses a publication whose
+  id does not sort after the live generation and the last delete of the
+  key, and the request is published under a later id instead. The
+  order does not depend on the clocks of Worker instances.
 - An extent restored from its article plan record alone (no pinned
   copy) is assumed posted: the record is written before the first POST,
   so a replay cannot tell an extent that was fully posted from one whose

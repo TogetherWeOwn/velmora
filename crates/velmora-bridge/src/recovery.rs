@@ -12,6 +12,10 @@
 //!
 //! Generation and tombstone ids start with their mint time, so the blob
 //! keys list in time order and a replay can start at a restore point.
+//! On one key the ids are also in commit order: a publication is refused
+//! unless its id sorts after the live generation and the last tombstone
+//! of the key ([`id_after`]), so replaying the records in id order
+//! rebuilds what the catalogue served, whatever the clocks said.
 //! Records are key-bearing copies: they hold wrapped keys, never plain
 //! ones, and they open only under the KEK version that sealed them.
 //!
@@ -90,12 +94,27 @@ fn minted_ms(id: &GenerationId) -> Option<i64> {
     i64::from_str_radix(hex, 16).ok()
 }
 
+/// An id that sorts after `newest`, the newest id already on the key
+/// (a live generation or a tombstone): at least one millisecond later,
+/// also when this isolate's clock is behind the one that minted it.
+pub fn id_after(now: UnixMs, newest: Option<&GenerationId>, rand: [u8; 8]) -> GenerationId {
+    let floor = newest
+        .and_then(minted_ms)
+        .map_or(now.0, |ms| ms.saturating_add(1));
+    GenerationId::mint(UnixMs(now.0.max(floor)), rand)
+}
+
 /// The id of the tombstone for a delete that saw `live` as the live
-/// generation. It always sorts after `live`, also when this isolate's
-/// clock is behind the one that minted `live`.
+/// generation. It always sorts after `live`.
 pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> GenerationId {
-    let after_live = minted_ms(live).map_or(now.0, |ms| ms.saturating_add(1));
-    GenerationId::mint(UnixMs(now.0.max(after_live)), rand)
+    id_after(now, Some(live), rand)
+}
+
+/// Removes the record of a generation whose publication batch was
+/// refused: nothing was published under the id, so nothing may replay
+/// it. The one delete of a record there is (see the module doc).
+pub async fn discard_generation<B: BlobStore>(safety: &B, id: &GenerationId) -> Result<()> {
+    safety.delete(&generation_key(id)).await
 }
 
 // ---------------------------------------------------------------------------

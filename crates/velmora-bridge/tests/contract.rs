@@ -616,6 +616,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "gc",
             "generations",
             "grants",
+            "key_tombstones",
             "meta",
             "objects",
             "outbox",

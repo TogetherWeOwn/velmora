@@ -227,8 +227,13 @@ pub trait Catalog {
         bucket: &BucketId,
         key: &str,
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>>;
-    /// Single PUT; one batch (DESIGN §A.3 step 6).
-    async fn commit_generation(&self, c: &CommitGeneration) -> Result<()>;
+    /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
+    /// live generation or its last tombstone carries a newer id; nothing
+    /// was written. The caller takes a newer id and tries again.
+    async fn commit_generation(&self, c: &CommitGeneration) -> Result<Guard<()>>;
+    /// The newest id on `(bucket, key)`: its live generation or its last
+    /// tombstone. A publication must sort after it.
+    async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
