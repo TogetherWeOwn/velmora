@@ -100,6 +100,10 @@ pub struct Blobs {
     pub fail_put: Cell<bool>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
+    /// The next list call waits until `list_held` is cleared again.
+    pub hold_list: Cell<bool>,
+    /// A list call is waiting.
+    pub list_held: Cell<bool>,
     /// This many deletes of a recovery record fail.
     pub fail_record_deletes: Cell<u32>,
     /// Deleting this key fails.
@@ -176,6 +180,12 @@ impl BlobStore for Blobs {
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        if self.hold_list.take() {
+            self.list_held.set(true);
+            while self.list_held.get() {
+                tokio::task::yield_now().await;
+            }
+        }
         self.inner.list(prefix, start_after, limit).await
     }
 }

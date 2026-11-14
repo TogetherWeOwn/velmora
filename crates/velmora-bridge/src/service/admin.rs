@@ -444,6 +444,16 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             {
                 return Err(earlier());
             }
+            // The last step of a replay that had ended before, sent
+            // again: it changed nothing. If the catalogue was rolled
+            // back since, that replay does not cover it.
+            if bridge.catalog.stamp().await.or_internal()?.rolled_back {
+                return Err(fail(
+                    409,
+                    "OperationAborted",
+                    "The catalogue was rolled back after this replay ended. Start a new replay with since_ms.",
+                ));
+            }
         }
     }
     let value = serde_json::to_value(&report)

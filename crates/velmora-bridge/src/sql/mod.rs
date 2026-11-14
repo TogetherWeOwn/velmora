@@ -419,8 +419,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn stamp_advance(&self, from: Option<u64>) -> Result<bool> {
         replay::stamp_advance(self, from).await
     }
-    async fn stamp_rolled_back(&self, now: UnixMs) -> Result<()> {
-        replay::stamp_rolled_back(self, now).await
+    async fn stamp_rolled_back(&self, seen: Option<u64>, now: UnixMs) -> Result<bool> {
+        replay::stamp_rolled_back(self, seen, now).await
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await

@@ -275,29 +275,33 @@ pub(super) async fn restore_finish<S: Sql>(
     stamp: u64,
 ) -> Result<bool> {
     // Ending the same replay twice is the same as ending it once.
-    // The stamp is made level in the same batch, and only when this is
-    // the replay that ends: the catalogue now holds every record, so it
-    // is no longer behind. The counter never moves down.
+    // The stamp is made level in the same batch, before the state is
+    // changed and only while it says `replaying`: this call is then the
+    // one that ends the replay, and the catalogue holds every record.
+    // A second call for a replay that has ended changes no stamp. Its
+    // cursor may be an old one, sent again after the catalogue was
+    // rolled back to a point after that replay: the rollback that was
+    // found then stays on record. The counter never moves down.
     let changed = c
         .sql
         .batch(vec![
+            (
+                "INSERT INTO rollback_stamp(id, counter, rolled_back_at) \
+                 SELECT 1, ?1, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
+                   WHERE id = 1 AND started_at = ?2 AND state = 'replaying') \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   counter = max(counter, excluded.counter), rolled_back_at = NULL",
+                vec![int(stamp)?, ms(run)],
+            ),
             (
                 "UPDATE restore_state SET state = 'complete', \
                    finished_at = COALESCE(finished_at, ?1) \
                  WHERE id = 1 AND started_at = ?2",
                 vec![ms(now), ms(run)],
             ),
-            (
-                "INSERT INTO rollback_stamp(id, counter, rolled_back_at) \
-                 SELECT 1, ?1, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
-                   WHERE id = 1 AND started_at = ?2 AND state = 'complete') \
-                 ON CONFLICT(id) DO UPDATE SET \
-                   counter = max(counter, excluded.counter), rolled_back_at = NULL",
-                vec![int(stamp)?, ms(run)],
-            ),
         ])
         .await?;
-    Ok(changed.first() == Some(&1))
+    Ok(changed.get(1) == Some(&1))
 }
 
 pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>) -> Result<StampRow> {
@@ -348,17 +352,36 @@ pub(super) async fn stamp_advance<S: Sql>(c: &SqlCatalog<S>, from: Option<u64>) 
     Ok(changed == 1)
 }
 
-pub(super) async fn stamp_rolled_back<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
-    // Without a row the counter is 0: behind every stamp object.
-    c.sql
-        .exec(
-            "INSERT INTO rollback_stamp(id, counter, rolled_back_at) VALUES (1, 0, ?1) \
-             ON CONFLICT(id) DO UPDATE SET \
-               rolled_back_at = COALESCE(rolled_back_at, excluded.rolled_back_at)",
-            &[ms(now)],
-        )
-        .await?;
-    Ok(())
+pub(super) async fn stamp_rolled_back<S: Sql>(
+    c: &SqlCatalog<S>,
+    seen: Option<u64>,
+    now: UnixMs,
+) -> Result<bool> {
+    // Only while the counter is what the caller compared the stamp
+    // objects with. A raise that ran in between moved it and put an
+    // object of its own: that object is no sign of a rollback.
+    let changed = match seen {
+        // Without a row the counter is 0: behind every stamp object.
+        None => {
+            c.sql
+                .exec(
+                    "INSERT INTO rollback_stamp(id, counter, rolled_back_at) VALUES (1, 0, ?1) \
+                     ON CONFLICT(id) DO NOTHING",
+                    &[ms(now)],
+                )
+                .await?
+        }
+        Some(seen) => {
+            c.sql
+                .exec(
+                    "UPDATE rollback_stamp SET rolled_back_at = ?1 \
+                     WHERE id = 1 AND counter = ?2 AND rolled_back_at IS NULL",
+                    &[ms(now), int(seen)?],
+                )
+                .await?
+        }
+    };
+    Ok(changed == 1)
 }
 
 pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {

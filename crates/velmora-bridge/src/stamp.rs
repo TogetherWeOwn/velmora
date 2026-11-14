@@ -42,6 +42,8 @@ pub const STAMP_PREFIX: &str = "rs/";
 pub const ERR_ROLLED_BACK: BridgeError =
     BridgeError::Invalid("the catalogue is behind its rollback stamp");
 
+/// Every round found the counter moved by another raise.
+const MOVING: &str = "the rollback stamp counter kept moving";
 const ERR_STAMP_KEY: BridgeError = BridgeError::Invalid("a rollback stamp key is malformed");
 
 /// Rounds of read, check and compare-and-set before a raise gives up.
@@ -111,21 +113,38 @@ where
     /// `Err` = the check could not be made. A caller that would delete
     /// something treats that like `true`.
     pub async fn catalogue_rolled_back(&self) -> Result<bool> {
-        let row = self.catalog.stamp().await?;
-        if row.rolled_back {
-            return Ok(true);
+        for _ in 0..ADVANCE_ATTEMPTS {
+            let row = self.catalog.stamp().await?;
+            if row.rolled_back {
+                return Ok(true);
+            }
+            if !self.stamp_ahead(row.counter).await? {
+                return Ok(false);
+            }
+            if self.stamp_behind(row.counter).await? {
+                return Ok(true);
+            }
         }
-        if self.stamp_ahead(row.counter).await? {
-            self.catalog.stamp_rolled_back(self.clock.now()).await?;
-            return Ok(true);
-        }
-        Ok(false)
+        Err(BridgeError::Invalid(MOVING))
+    }
+
+    /// An object was seen after the one of `seen`. Records the rollback
+    /// if the counter still is `seen`. `false` = it is not: a raise ran
+    /// between the read of the counter and the list call, and the
+    /// object may be its own. Nothing is known then; the caller reads
+    /// again.
+    ///
+    /// With the counter unchanged the object proves a rollback: an
+    /// object is put only after the counter reached its value, and the
+    /// counter of a catalogue that was not restored never moves down.
+    async fn stamp_behind(&self, seen: Option<u64>) -> Result<bool> {
+        self.catalog.stamp_rolled_back(seen, self.clock.now()).await
     }
 
     /// Checks, then moves the counter by one. `None` = rolled back (and
     /// recorded); the counter was not moved.
     pub(crate) async fn stamp_advance(&self) -> Result<Option<u64>> {
-        let mut last = BridgeError::Invalid("the rollback stamp counter kept moving");
+        let mut last = BridgeError::Invalid(MOVING);
         for _ in 0..ADVANCE_ATTEMPTS {
             let row = match self.catalog.stamp().await {
                 Ok(row) => row,
@@ -139,8 +158,10 @@ where
             }
             // Never without the check: see the module text.
             if self.stamp_ahead(row.counter).await? {
-                self.catalog.stamp_rolled_back(self.clock.now()).await?;
-                return Ok(None);
+                if self.stamp_behind(row.counter).await? {
+                    return Ok(None);
+                }
+                continue;
             }
             // An answer that was lost may have moved the counter. The
             // next round starts from what the catalogue holds then; a

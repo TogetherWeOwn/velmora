@@ -219,6 +219,10 @@ serving).
   (`SELECT counter FROM rollback_stamp`) minus one cron interval, or
   `0`. The last step of the replay sets the counter level with the
   newest object and opens the catalogue.
+- Only a replay that is started after the rollback does that. The last
+  call of a replay that had ended before, sent again, answers 409
+  (`The catalogue was rolled back after this replay ended`) and leaves
+  the catalogue closed: start a new replay.
 - `CATALOGUE_ID` (default `main`) is the `<catalogue id>` of the keys.
   Two catalogues over one `SAFETY` bucket need two ids. Do not change it
   for a catalogue in use: its objects would no longer be found, and a

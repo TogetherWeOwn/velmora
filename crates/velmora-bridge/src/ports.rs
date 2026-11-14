@@ -535,7 +535,8 @@ pub trait Catalog {
     /// replay was started since; that one is not ended by this.
     /// In the same batch the rollback stamp is made level: the counter
     /// becomes at least `stamp` (the newest stamp object) and a recorded
-    /// rollback is cleared.
+    /// rollback is cleared. Only the call that ends the replay does
+    /// that; a repeated call for a replay that has ended does not.
     async fn restore_finish(&self, run: UnixMs, now: UnixMs, stamp: u64) -> Result<bool>;
     /// Whether writes and jobs must be refused: a replay was started and
     /// has not ended, or a rollback of the catalogue was found and no
@@ -547,8 +548,12 @@ pub trait Catalog {
     /// creates the row at 1). `false` = the counter is not at `from`, or
     /// a rollback is recorded: nothing changed.
     async fn stamp_advance(&self, from: Option<u64>) -> Result<bool>;
-    /// Records that the catalogue was found behind its stamp.
-    async fn stamp_rolled_back(&self, now: UnixMs) -> Result<()>;
+    /// Records that the catalogue was found behind its stamp, if its
+    /// counter is still `seen` (`None` = there is no row) and no
+    /// rollback is on record. `false` = nothing was recorded: the
+    /// counter moved since the caller read it, or another caller
+    /// recorded the rollback. The caller reads again.
+    async fn stamp_rolled_back(&self, seen: Option<u64>, now: UnixMs) -> Result<bool>;
     /// The replay with the mark `run`: its restore point and how far it
     /// has come. `None` = `run` is not the replay that was started last.
     async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>>;

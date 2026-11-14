@@ -131,15 +131,15 @@ fn maintenance(rig: &mut Rig, mode: Maintenance) {
     Rc::get_mut(&mut rig.bridge).unwrap().cfg.maintenance = mode;
 }
 
-/// Runs the restore route to its end.
-async fn restore(rig: &Rig) {
+/// Runs the restore route to its end. Returns the body of its last call.
+async fn restore(rig: &Rig) -> Value {
     let mut body = json!({ "since_ms": 0 });
     loop {
         let r = admin(rig, Method::Post, "/restore", body.to_string().as_bytes()).await;
         r.expect(200);
         let report: Value = serde_json::from_slice(&r.body).unwrap();
         if report["next"].is_null() {
-            return;
+            return body;
         }
         body = json!({ "cursor": report["next"] });
     }
@@ -297,6 +297,90 @@ async fn a_rollback_closes_writes_and_stops_jobs_until_a_replay_ends() {
     assert_eq!(status(&rig).await["catalogue_rolled_back"], false);
 }
 
+/// Runs `checked` up to its list call, lets `between` run to its end,
+/// then lets the list call go on: `checked` compares a counter it read
+/// before `between` with the objects that are there after it.
+async fn interleave<A, B>(rig: &Rig, checked: A, between: B) -> A::Output
+where
+    A: std::future::Future,
+    B: std::future::Future,
+{
+    let safety = &rig.bridge.safety;
+    safety.hold_list.set(true);
+    let between = async {
+        while !safety.list_held.get() {
+            tokio::task::yield_now().await;
+        }
+        between.await;
+        safety.list_held.set(false);
+    };
+    tokio::join!(checked, between).0
+}
+
+/// Two raises at once: one reads the counter, the other moves it and
+/// puts its object, then the first one lists. The object it sees is no
+/// sign of a rollback.
+#[tokio::test(flavor = "current_thread")]
+async fn a_raise_beside_another_raise_is_not_a_rollback() {
+    let rig = rig();
+    let bridge = &rig.bridge;
+    bridge.raise_stamp().await.unwrap();
+
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    interleave(&rig, bridge.raise_stamp(), other).await.unwrap();
+    assert_eq!(row(&rig).await, level(3));
+    assert_eq!(stamps(&rig).len(), 3);
+
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    assert!(!interleave(&rig, bridge.catalogue_rolled_back(), other)
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, level(4));
+
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    let report = interleave(&rig, bridge.dispatch(), other).await.unwrap();
+    assert!(!report.rolled_back && !report.stamp_failed && report.permits_seeded);
+    assert_eq!(row(&rig).await, level(6));
+    assert_eq!(stamps(&rig).len(), 6);
+}
+
+/// The same on a catalogue that has no counter yet.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_raise_beside_a_check_is_not_a_rollback() {
+    let rig = rig();
+    let bridge = &rig.bridge;
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    assert!(!interleave(&rig, bridge.catalogue_rolled_back(), other)
+        .await
+        .unwrap());
+    assert_eq!(row(&rig).await, level(1));
+
+    let rig = self::rig();
+    let bridge = &rig.bridge;
+    let other = async { bridge.raise_stamp().await.unwrap() };
+    interleave(&rig, bridge.raise_stamp(), other).await.unwrap();
+    assert_eq!(row(&rig).await, level(2));
+}
+
+/// A rollback that happens between the read and the list call is still
+/// found: the counter is what was read, and an object is after it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rollback_beside_a_check_is_found() {
+    let rig = rig();
+    let bridge = &rig.bridge;
+    bridge.raise_stamp().await.unwrap();
+    snapshot(&rig);
+    let lost = async {
+        // Moves the counter and comes back to the same value.
+        bridge.raise_stamp().await.unwrap();
+        rollback(&rig);
+    };
+    assert!(interleave(&rig, bridge.catalogue_rolled_back(), lost)
+        .await
+        .unwrap());
+    assert!(row(&rig).await.rolled_back);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_raise_on_a_rolled_back_catalogue_does_not_hide_it() {
     let rig = rig();
@@ -395,6 +479,51 @@ async fn a_replay_that_did_not_end_leaves_the_catalogue_closed() {
     maintenance(&mut rig, Maintenance::Restore);
     restore(&rig).await;
     assert_eq!(row(&rig).await, level(4));
+}
+
+/// A replay ended, and the catalogue was later rolled back to a point
+/// after it. The last call of that replay, sent again, is a cursor the
+/// catalogue knows; it reads no record. It must not open the catalogue.
+#[tokio::test(flavor = "current_thread")]
+async fn the_last_call_of_an_ended_replay_does_not_clear_a_later_rollback() {
+    let mut rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
+    maintenance(&mut rig, Maintenance::Restore);
+    let last = restore(&rig).await;
+    assert!(last.get("cursor").is_some(), "{last}");
+    // Sent again while nothing happened: the same answer, as before.
+    admin(&rig, Method::Post, "/restore", last.to_string().as_bytes())
+        .await
+        .expect(200);
+    maintenance(&mut rig, Maintenance::Off);
+    rig.bridge.dispatch().await.unwrap();
+    let before = row(&rig).await;
+
+    snapshot(&rig);
+    rig.put(&signer, BUCKET, "b", b"b").await.expect(200);
+    rig.bridge.dispatch().await.unwrap();
+    rollback(&rig);
+    assert!(rig.bridge.dispatch().await.unwrap().rolled_back);
+
+    maintenance(&mut rig, Maintenance::Restore);
+    let refused = admin(&rig, Method::Post, "/restore", last.to_string().as_bytes()).await;
+    refused.expect(409);
+    assert!(refused.text().contains("rolled back"), "{}", refused.text());
+    assert_eq!(
+        row(&rig).await,
+        StampRow {
+            rolled_back: true,
+            ..before
+        }
+    );
+    assert_eq!(status(&rig).await["catalogue_rolled_back"], true);
+    get(&rig, &signer, "b").await.expect(404);
+
+    // A new replay reads the records and opens it.
+    restore(&rig).await;
+    assert!(!row(&rig).await.rolled_back);
+    assert_eq!(get(&rig, &signer, "b").await.expect(200).body, b"b");
 }
 
 // ---------------------------------------------------------------------------

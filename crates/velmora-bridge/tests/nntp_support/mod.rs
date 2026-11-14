@@ -949,7 +949,7 @@ impl Catalog for MemCatalog {
     async fn stamp_advance(&self, _: Option<u64>) -> Result<bool> {
         Ok(true)
     }
-    async fn stamp_rolled_back(&self, _: UnixMs) -> Result<()> {
+    async fn stamp_rolled_back(&self, _: Option<u64>, _: UnixMs) -> Result<bool> {
         unused()
     }
     async fn restore_pending(&self) -> Result<bool> {
