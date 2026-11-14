@@ -1244,3 +1244,53 @@ fn errors_contain_no_key_bytes() {
         assert!(!text.contains("AKID"), "{text}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Recovery records
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recovery_record_opens_only_under_its_name_and_key() {
+    use velmora_bridge::crypto::{open_manifest, seal_manifest};
+
+    let old = TestKek::with_versions(1, &[(1, [0x11; 32])]);
+    let rotated = TestKek::with_versions(2, &[(1, [0x11; 32]), (2, [0x22; 32])]);
+    let other = TestKek::with_versions(1, &[(1, [0x33; 32])]);
+    let plain = b"{\"v\":1,\"key\":\"private/name.bin\"}";
+
+    let sealed = seal_manifest(&old, "m/g_1", plain, &mut SystemRng).unwrap();
+    assert_eq!(&sealed[..4], &1u32.to_be_bytes());
+    assert_eq!(&open_manifest(&old, "m/g_1", &sealed).unwrap()[..], plain);
+    // A record of an older KEK version still opens after a rotation, and
+    // a new one names the active version.
+    assert_eq!(
+        &open_manifest(&rotated, "m/g_1", &sealed).unwrap()[..],
+        plain
+    );
+    let newer = seal_manifest(&rotated, "m/g_2", plain, &mut SystemRng).unwrap();
+    assert_eq!(&newer[..4], &2u32.to_be_bytes());
+    assert!(open_manifest(&old, "m/g_2", &newer).is_err());
+
+    // Nothing of the plaintext shows, and two seals differ.
+    assert!(!sealed.windows(7).any(|w| w == b"private"));
+    assert_ne!(
+        sealed,
+        seal_manifest(&old, "m/g_1", plain, &mut SystemRng).unwrap()
+    );
+
+    let mut errors = vec![
+        open_manifest(&old, "m/g_2", &sealed).unwrap_err(),
+        open_manifest(&old, "m/del/g_1", &sealed).unwrap_err(),
+        open_manifest(&other, "m/g_1", &sealed).unwrap_err(),
+        open_manifest(&old, "m/g_1", &sealed[..3]).unwrap_err(),
+        open_manifest(&old, "m/g_1", &[]).unwrap_err(),
+    ];
+    for at in [0, 3, 4, 5, 30, sealed.len() - 1] {
+        let mut bad = sealed.clone();
+        bad[at] ^= 1;
+        errors.push(open_manifest(&old, "m/g_1", &bad).unwrap_err());
+    }
+    for err in &errors {
+        assert!(matches!(err, BridgeError::Crypto(_)), "{err:?}");
+    }
+}

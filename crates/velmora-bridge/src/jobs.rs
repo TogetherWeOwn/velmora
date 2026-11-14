@@ -15,6 +15,7 @@
 use crate::config::{GcMode, Maintenance};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::post::{settle, Stop};
+use crate::recovery::delete_blob;
 use crate::types::{
     BlobStoreKind, DispatchReport, ExtentId, FailClass, GcRow, GcStep, GenerationId, Job,
     JobOutcome, OutboxStage, Result, JOB_VERSION,
@@ -160,8 +161,8 @@ where
         match self.catalog.gc_begin(row, self.clock.now()).await? {
             GcStep::DeleteBlob { store, key } => {
                 match store {
-                    BlobStoreKind::Safety => self.safety.delete(&key).await?,
-                    BlobStoreKind::Cache => self.cache.delete(&key).await?,
+                    BlobStoreKind::Safety => delete_blob(&self.safety, &key).await?,
+                    BlobStoreKind::Cache => delete_blob(&self.cache, &key).await?,
                 }
                 self.catalog.gc_done(row.id, self.clock.now()).await
             }

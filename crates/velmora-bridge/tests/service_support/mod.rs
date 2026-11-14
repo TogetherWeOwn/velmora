@@ -122,6 +122,9 @@ impl BlobStore for Blobs {
     async fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key).await
     }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, start_after, limit).await
+    }
 }
 
 /// A database whose writes can be made to fail; reads keep working.

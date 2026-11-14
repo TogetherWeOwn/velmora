@@ -271,6 +271,19 @@ impl BlobStore for MemBlobStore {
         self.blobs.borrow_mut().remove(key);
         Ok(())
     }
+
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        let mut keys: Vec<String> = self
+            .blobs
+            .borrow()
+            .keys()
+            .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.truncate(limit as usize);
+        Ok(keys)
+    }
 }
 
 // ---------------------------------------------------------------------------
