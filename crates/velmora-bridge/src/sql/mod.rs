@@ -365,7 +365,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn touch_read(&self, extent: &ExtentId, now: UnixMs, min_gap_ms: i64) -> Result<UnixMs> {
         hot::touch_read(self, extent, now, min_gap_ms).await
     }
-    async fn hot_forget(&self, extent: &ExtentId, safety: bool, cache: bool) -> Result<()> {
-        hot::hot_forget(self, extent, safety, cache).await
+    async fn hot_seq(&self, extent: &ExtentId) -> Result<u64> {
+        hot::hot_seq(self, extent).await
+    }
+    async fn hot_forget(
+        &self,
+        extent: &ExtentId,
+        seq: u64,
+        safety: bool,
+        cache: bool,
+    ) -> Result<bool> {
+        hot::hot_forget(self, extent, seq, safety, cache).await
     }
 }

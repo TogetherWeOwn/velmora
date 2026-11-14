@@ -220,27 +220,49 @@ pub(super) async fn touch_read<S: Sql>(
     Ok(stored.unwrap_or(now))
 }
 
+/// The extent's fencing token now (0 for an unknown extent). Read it
+/// before deleting blobs outside an eviction, then pass it to `hot_forget`.
+pub(super) async fn hot_seq<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<u64> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT evict_seq FROM extents WHERE id = ?1",
+            &[text(extent.as_str())],
+        )
+        .await?;
+    match rows.into_iter().next() {
+        Some(row) => Cols::new(row).num(),
+        None => Ok(0),
+    }
+}
+
 /// Blobs were deleted outside an eviction (admin evict): stop counting
-/// them, and fence any eviction in flight.
+/// them, and fence any eviction in flight. `seq` is `hot_seq` from before
+/// the deletes: if a cold read recorded a fill (or an eviction ran) since
+/// then, the counts stand, because the copy they count may exist. `false`
+/// then.
 pub(super) async fn hot_forget<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
+    seq: u64,
     safety: bool,
     cache: bool,
-) -> Result<()> {
-    c.sql
+) -> Result<bool> {
+    let changed = c
+        .sql
         .exec(
             "UPDATE extents SET \
                hot_safety_bytes = CASE WHEN ?2 = 1 THEN 0 ELSE hot_safety_bytes END, \
                hot_cache_bytes = CASE WHEN ?3 = 1 THEN 0 ELSE hot_cache_bytes END, \
                evict_seq = evict_seq + 1 \
-             WHERE id = ?1",
+             WHERE id = ?1 AND evict_seq = ?4",
             &[
                 text(extent.as_str()),
                 SqlValue::Int(i64::from(safety)),
                 SqlValue::Int(i64::from(cache)),
+                int(seq)?,
             ],
         )
         .await?;
-    Ok(())
+    Ok(changed == 1)
 }

@@ -797,6 +797,20 @@ async fn garbage_collection_and_admin_evict_end_the_count() {
     assert!(!hot.has_safety(&a));
     assert_eq!(hot.evictable().await, 0);
 
+    // A cold read that fills the cache while an admin evict is between
+    // its deletes and its bookkeeping stays counted.
+    let catalog = &hot.bridge().catalog;
+    let seq = catalog.hot_seq(&a.id).await.unwrap();
+    hot.get_ok("admin").await;
+    assert!(hot.has_cache(&a));
+    assert!(!catalog.hot_forget(&a.id, seq, true, true).await.unwrap());
+    assert_eq!(hot.evictable().await, a.cipher_size);
+    let seq = catalog.hot_seq(&a.id).await.unwrap();
+    hot.bridge().cache.delete(&a.id.cache_key()).await.unwrap();
+    assert!(catalog.hot_forget(&a.id, seq, false, true).await.unwrap());
+    assert!(!catalog.hot_forget(&a.id, seq, false, true).await.unwrap());
+    assert_eq!(hot.evictable().await, 0);
+
     // A deleted object's copies leave through garbage collection.
     let b = hot.released("deleted").await;
     assert_eq!(hot.evictable().await, b.cipher_size);

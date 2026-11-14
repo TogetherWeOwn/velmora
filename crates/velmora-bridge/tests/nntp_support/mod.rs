@@ -505,8 +505,11 @@ impl Catalog for MemCatalog {
     async fn touch_read(&self, _: &ExtentId, now: UnixMs, _: i64) -> Result<UnixMs> {
         Ok(now)
     }
-    async fn hot_forget(&self, _: &ExtentId, _: bool, _: bool) -> Result<()> {
-        Ok(())
+    async fn hot_seq(&self, _: &ExtentId) -> Result<u64> {
+        Ok(0)
+    }
+    async fn hot_forget(&self, _: &ExtentId, _: u64, _: bool, _: bool) -> Result<bool> {
+        Ok(true)
     }
 
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()> {

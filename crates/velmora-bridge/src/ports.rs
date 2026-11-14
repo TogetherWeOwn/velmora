@@ -423,9 +423,20 @@ pub trait Catalog {
     /// Stamps a read unless the last stamp is less than `min_gap_ms` old.
     /// Returns the stamp the extent has afterwards.
     async fn touch_read(&self, extent: &ExtentId, now: UnixMs, min_gap_ms: i64) -> Result<UnixMs>;
-    /// After blob deletes outside an eviction (admin evict): stops
-    /// counting the named copies.
-    async fn hot_forget(&self, extent: &ExtentId, safety: bool, cache: bool) -> Result<()>;
+    /// The extent's eviction fencing token now. Read it before deleting
+    /// blobs outside an eviction (admin evict) and pass it to `hot_forget`.
+    async fn hot_seq(&self, extent: &ExtentId) -> Result<u64>;
+    /// After blob deletes outside an eviction: stops counting the named
+    /// copies, unless a hot copy was recorded or an eviction ran since
+    /// `seq` was read (`false`; the counts stand, since the copy they
+    /// count may exist).
+    async fn hot_forget(
+        &self,
+        extent: &ExtentId,
+        seq: u64,
+        safety: bool,
+        cache: bool,
+    ) -> Result<bool>;
 }
 
 // ---------------------------------------------------------------------------

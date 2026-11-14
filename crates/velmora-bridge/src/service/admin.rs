@@ -690,14 +690,17 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
     for x in &status.extents {
+        // Read before any delete: a cold read that fills the cache while
+        // this runs changes it, and its copy then stays counted.
+        let seq = bridge.catalog.hot_seq(&x.extent_id).await.or_internal()?;
         delete_blob(&bridge.cache, &x.extent_id.cache_key())
             .await
             .or_internal()?;
         evicted += 1;
         // The deleted copies leave the hot-tier count.
         let forget = |safety: bool| async move {
-            let done = bridge.catalog.hot_forget(&x.extent_id, safety, true);
-            done.await.or_internal()
+            let done = bridge.catalog.hot_forget(&x.extent_id, seq, safety, true);
+            done.await.or_internal().map(|_| ())
         };
         if !include_safety {
             forget(false).await?;
@@ -718,7 +721,8 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             }
             // A release job is between its decision and its end.
             SafetyState::Releasing => false,
-            // Already given up: the delete only removes a leftover.
+            // No longer pinned: the copy is only cache (a released one
+            // still serves reads until it is evicted).
             SafetyState::Released | SafetyState::Deleted => true,
         };
         if gone {
