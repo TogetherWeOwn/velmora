@@ -142,6 +142,19 @@ impl BlobStore for Blobs {
 pub struct FailSql {
     pub inner: RusqliteSql,
     pub fail_writes: Cell<bool>,
+    /// Fails the next batch that publishes a generation, once.
+    pub fail_publish: Cell<Option<PublishFault>>,
+    fail_next_batch: Cell<bool>,
+}
+
+/// How a publication batch fails: D1 may answer with an error before it
+/// wrote anything, or after it committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishFault {
+    NotApplied,
+    Applied,
+    /// Not applied, and the batch after it fails as well.
+    Down,
 }
 
 impl std::ops::Deref for FailSql {
@@ -164,6 +177,28 @@ impl Sql for FailSql {
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if self.fail_writes.get() {
             return Err(BridgeError::Sql("database down".into()));
+        }
+        if self.fail_next_batch.take() {
+            return Err(BridgeError::Sql("no answer".into()));
+        }
+        let publishes = stmts
+            .iter()
+            .any(|(sql, _)| sql.starts_with("INSERT INTO generations"));
+        if publishes {
+            match self.fail_publish.take() {
+                Some(PublishFault::NotApplied) => {
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Down) => {
+                    self.fail_next_batch.set(true);
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Applied) => {
+                    self.inner.batch(stmts).await?;
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                None => {}
+            }
         }
         self.inner.batch(stmts).await
     }
@@ -217,6 +252,8 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
             catalog: SqlCatalog::new(FailSql {
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
+                fail_publish: Cell::new(None),
+                fail_next_batch: Cell::new(false),
             }),
             safety: Blobs::default(),
             cache: Blobs::default(),

@@ -592,9 +592,6 @@ impl Catalog for MemCatalog {
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
-    async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
-        unused()
-    }
     async fn delete_object_before(
         &self,
         _: &BucketId,

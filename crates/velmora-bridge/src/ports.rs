@@ -221,6 +221,10 @@ pub enum PublishOutcome {
     Applied,
     /// The guard failed; the batch wrote nothing.
     Refused(Recorded),
+    /// CompleteMultipartUpload only. The batch failed with an unknown
+    /// outcome and the upload was then moved to its next revision: the
+    /// batch had not applied, and its guard can never pass again.
+    Fenced(Recorded),
 }
 
 // Fenced methods return Ok(false) (or None) when the lease token no longer
@@ -255,7 +259,6 @@ pub trait Catalog {
     /// The newest id on `(bucket, key)`: its live generation or its last
     /// tombstone. A publication must sort after it.
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
     /// tombstone written for this delete. `false` = nothing was live, or

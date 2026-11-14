@@ -95,9 +95,6 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
     }
-    async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
-        objects::delete_object(self, bucket, key, now).await
-    }
     async fn delete_object_before(
         &self,
         bucket: &BucketId,

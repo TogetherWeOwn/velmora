@@ -66,10 +66,11 @@ while :; do
   total=$(jq -c --argjson t "$total" '
     . as $s
     | reduce ("manifests","published","present","superseded","extents","article_plans",
-              "safety_missing","tombstones","deleted") as $k
+              "safety_missing","tombstones","deleted","duplicate","other_bucket_total") as $k
         ($t; .[$k] = ((.[$k] // 0) + $s[$k]))
     | .unpublishable = ((.unpublishable // []) + $s.unpublishable)
     | .unreadable = ((.unreadable // []) + $s.unreadable)
+    | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
     | .damaged_total = $s.damaged_total
     | .damaged = $s.damaged' "$WORK/step.json")
   if [ "$(jq -r '.next == null' "$WORK/step.json")" = true ]; then
@@ -80,7 +81,7 @@ done
 
 echo "catalog-replay: complete after $calls calls"
 jq . <<<"$total"
-if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total' <<<"$total")" != 0 ]; then
+if [ "$(jq -r '(.unpublishable | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' <<<"$total")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
   exit 2
 fi

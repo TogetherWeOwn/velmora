@@ -15,6 +15,8 @@ use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::unwrap_secret;
 use crate::ingress::IngressError;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::recovery::{discard_generation, Recorded};
+use crate::replay::ReplayProbe;
 use crate::types::{Bucket, GenerationRow, KeyStatus, Perm, RespBody, S3Request, S3Response};
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -357,4 +359,26 @@ pub(super) fn stored_checksum(g: &GenerationRow) -> Option<StoredChecksum> {
     }
     let algorithm = ChecksumAlgorithm::from_name(v.get("algorithm")?.as_str()?)?;
     StoredChecksum::full(algorithm, v.get("value")?.as_str()?.to_owned()).ok()
+}
+
+/// Removes the recovery record of a generation whose publication the
+/// catalogue refused. The record of a published generation is never
+/// removed: if a row exists under the id after all (the refusal says it
+/// cannot), the record stays.
+pub(crate) async fn discard_refused<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    generation: &GenerationRow,
+    refused: Recorded,
+) -> crate::types::Result<()> {
+    if bridge.catalog.replay_probe(generation).await? == ReplayProbe::Present {
+        return Ok(());
+    }
+    discard_generation(&bridge.safety, refused).await
 }

@@ -21,7 +21,7 @@ use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
     UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
 };
-use crate::recovery::{is_record_key, Recorded, ERR_RECORD_DELETE};
+use crate::recovery::{is_record_key, tombstone_id, Recorded, ERR_RECORD_DELETE};
 use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, ExtentId, Job, KekBytes,
     Result, UnixMs,
@@ -473,7 +473,7 @@ pub trait PublishUnrecorded: Catalog {
         let record = Recorded::for_test(&c.generation.id);
         Ok(match self.commit_generation(c, record).await? {
             PublishOutcome::Applied => Guard::Applied(()),
-            PublishOutcome::Refused(_) => Guard::Lost,
+            PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
         })
     }
 
@@ -488,9 +488,21 @@ pub trait PublishUnrecorded: Catalog {
         Ok(
             match self.complete_upload(t, revision, digest, c, record).await? {
                 PublishOutcome::Applied => Guard::Applied(()),
-                PublishOutcome::Refused(_) => Guard::Lost,
+                PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
             },
         )
+    }
+
+    /// DeleteObject without its tombstone record: retires what is live
+    /// under an id minted after the newest one on the key.
+    /// `false` = nothing was retired.
+    async fn delete_now(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<bool> {
+        let Some(newest) = self.newest_id(bucket, key).await? else {
+            return Ok(false);
+        };
+        let tombstone = tombstone_id(now, &newest, [0xff; 8]);
+        self.delete_object_before(bucket, key, &tombstone, now)
+            .await
     }
 }
 
