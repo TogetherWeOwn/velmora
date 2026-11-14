@@ -22,6 +22,7 @@ use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, ProviderConfig, Result,
+    NNTP_CALL_SECS,
 };
 
 /// Largest article the bridge reads or posts (velmora articles are about
@@ -36,33 +37,71 @@ type Socket = velmora::transports::WorkerTransport;
 #[cfg(not(target_arch = "wasm32"))]
 type Socket = native::NoSocket;
 
+/// The port's bound on one whole call. The per-operation timeout alone
+/// does not give it: a POST is several operations, each of which may
+/// take almost [`OP_TIMEOUT`]. A call that runs out of time is dropped,
+/// which poisons its session, and ends as a timed-out transport error:
+/// the caller reconnects and looks the article up before sending again.
+#[cfg(target_arch = "wasm32")]
+async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    use futures_util::future::{select, Either};
+    let call = std::pin::pin!(call);
+    let limit = Duration::from_secs(u64::from(NNTP_CALL_SECS));
+    let delay = std::pin::pin!(worker::Delay::from(limit));
+    match select(call, delay).await {
+        Either::Left((out, _)) => out,
+        Either::Right(_) => Err(BridgeError::Nntp(velmora::Error::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "nntp call ran out of time",
+        )))),
+    }
+}
+
+/// Native builds open no socket, so there is nothing to bound.
+#[cfg(not(target_arch = "wasm32"))]
+async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let _ = NNTP_CALL_SECS;
+    call.await
+}
+
 /// One authenticated session. A thin wrapper: the port is foreign to this
 /// crate, so it cannot be implemented on `NntpClient` here.
 pub struct WorkerSession(NntpClient<Socket>);
 
 impl NntpSession for WorkerSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
-        Ok(self.0.post_article(message_id, article).await?)
+        within_call(async { Ok(self.0.post_article(message_id, article).await?) }).await
     }
 
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
-        match self.0.stat(message_id).await {
-            Ok(_) => Ok(true),
-            Err(velmora::Error::ArticleNotFound(_)) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        within_call(async {
+            match self.0.stat(message_id).await {
+                Ok(_) => Ok(true),
+                Err(velmora::Error::ArticleNotFound(_)) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
-        match self.0.body_to(message_id, out).await {
-            Ok(()) => Ok(BodyOutcome::Found),
-            Err(velmora::Error::ArticleNotFound(_)) => Ok(BodyOutcome::Missing),
-            Err(e) => Err(e.into()),
-        }
+        within_call(async {
+            match self.0.body_to(message_id, out).await {
+                Ok(()) => Ok(BodyOutcome::Found),
+                Err(velmora::Error::ArticleNotFound(_)) => Ok(BodyOutcome::Missing),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
     async fn quit(self) {
-        self.0.quit().await;
+        // A goodbye nobody answers must not hold the job either.
+        let _ = within_call(async {
+            self.0.quit().await;
+            Ok(())
+        })
+        .await;
     }
 }
 
@@ -83,7 +122,7 @@ impl NntpConnector for WorkerConnector {
         }
         let cfg = nntp_config(provider)?;
         let socket = open(&cfg)?;
-        Ok(WorkerSession(NntpClient::connect(socket, &cfg).await?))
+        within_call(async { Ok(WorkerSession(NntpClient::connect(socket, &cfg).await?)) }).await
     }
 }
 

@@ -39,9 +39,22 @@ impl Rig {
 
     /// Posts through `p0`, copies the articles to every server in `to`
     /// and removes the safety copy: Usenet is the only source left.
-    async fn posted_on(&self, n: u8, to: &[usize]) -> (Seeded, Vec<ArticleRow>) {
+    async fn posted_on(&mut self, n: u8, to: &[usize]) -> (Seeded, Vec<ArticleRow>) {
         let s = self.seed(n, &marked_plaintext(PLAIN_LEN)).await;
+        // For the post alone every other provider is a backup, so that
+        // `p0` takes every article whatever tiers the test has set.
+        let tiers: Vec<u8> = self
+            .bridge
+            .cfg
+            .providers
+            .iter()
+            .map(|p| p.priority)
+            .collect();
+        for p in self.bridge.cfg.providers.iter_mut().skip(1) {
+            p.priority = u8::MAX;
+        }
         let plan = self.post(&s).await;
+        self.set_priorities(&tiers);
         assert!(plan.iter().all(|a| a.provider_id.as_deref() == Some("p0")));
         for &i in to {
             self.propagate(&s, 0, i).await;
@@ -124,7 +137,7 @@ async fn reads_follow_priority() {
 /// providers take turns.
 #[tokio::test]
 async fn reads_spread_inside_a_tier() {
-    let rig = pool_rig(3).await;
+    let mut rig = pool_rig(3).await;
     let (s, _) = rig.posted_on(2, &[1, 2]).await;
     let now = rig.bridge.clock.now();
     let catalog = &rig.bridge.catalog;
@@ -346,7 +359,7 @@ async fn read_while_the_only_source_cools_is_retryable() {
 /// provider that is due back first, instead of failing unasked.
 #[tokio::test]
 async fn read_tries_the_soonest_cooling_provider_when_all_cool() {
-    let rig = pool_rig(2).await;
+    let mut rig = pool_rig(2).await;
     let (s, _) = rig.posted_on(24, &[]).await;
     let now = rig.bridge.clock.now();
     // p1 trips twice (60 s, then 120 s from +60 s); p0 once at +100 s.

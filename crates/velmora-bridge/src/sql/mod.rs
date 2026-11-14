@@ -271,6 +271,22 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn mark_posted(&self, l: &Lease, idx: u32, provider: &str, now: UnixMs) -> Result<bool> {
         outbox::mark_posted(self, l, idx, provider, now).await
     }
+    async fn mark_posted_many(
+        &self,
+        l: &Lease,
+        posted: &[(u32, &str)],
+        now: UnixMs,
+    ) -> Result<bool> {
+        outbox::mark_posted_many(self, l, posted, now).await
+    }
+    async fn renew_all(
+        &self,
+        l: &Lease,
+        permits: &[Permit],
+        now: UnixMs,
+    ) -> Result<(bool, Vec<bool>)> {
+        outbox::renew_all(self, l, permits, now).await
+    }
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool> {
         outbox::record_verification(self, l, v).await
     }
