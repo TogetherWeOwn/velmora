@@ -48,14 +48,17 @@ Limits to know:
   the order: every write and delete that was acknowledged on the key
   after it sorts after it and stays on top. It is visible after a replay
   only when nothing was acknowledged on the key after it.
-- Replay order is id order, and on one key that is the order in which
-  the records were stored. Before a record is stored, the catalogue
+- Replay order is id order. Before a record is stored, the catalogue
   raises the floor of the key to the record's id, in a statement of its
-  own; every later id on the key is minted above the live generation
-  and the floor, and the catalogue refuses a publication that sorts
-  below either. This holds whatever became of the earlier request (a
-  delete that found nothing left to delete, a batch that failed) and
-  does not depend on the clocks of Worker instances.
+  own, and it accepts a publication or a tombstone only if its id sorts
+  after the live generation and is not below the floor. So everything
+  that is acknowledged on a key sorts after every record that was
+  stored on the key before it, whatever became of that record's own
+  request (a DeleteObject that found nothing left to delete, a batch
+  that failed). A request whose id sorts lower (its Worker's clock is
+  behind) is refused and tries again under a later id; a record such an
+  attempt leaves behind sorts below what was acknowledged and changes
+  nothing. None of this depends on the clocks of Worker instances.
 - An extent restored from its article plan record alone (no pinned
   copy) is assumed posted: the record is written before the first POST,
   so a replay cannot tell an extent that was fully posted from one whose
