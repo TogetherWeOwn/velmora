@@ -21,10 +21,15 @@ import urllib.parse
 
 def main():
     base, path, signed_ae, sent_ae, out = sys.argv[1:6]
-    creds = configparser.ConfigParser()
-    creds.read(os.environ["AWS_SHARED_CREDENTIALS_FILE"])
-    akid = creds["default"]["aws_access_key_id"]
-    secret = creds["default"]["aws_secret_access_key"]
+    # No interpolation (a `%` in a secret is literal), and no exception text:
+    # a parse error could quote part of the file, and slice.sh prints stderr.
+    try:
+        creds = configparser.ConfigParser(interpolation=None)
+        creds.read(os.environ["AWS_SHARED_CREDENTIALS_FILE"])
+        akid = creds["default"]["aws_access_key_id"]
+        secret = creds["default"]["aws_secret_access_key"]
+    except Exception:
+        sys.exit("credentials file unreadable")
     region = os.environ.get("AWS_DEFAULT_REGION", "auto")
     url = urllib.parse.urlsplit(base)
     host = url.netloc
