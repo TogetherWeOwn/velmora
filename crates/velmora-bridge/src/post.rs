@@ -9,7 +9,9 @@
 //!   on `STAT`) fails the job as `dup-unconfirmed`; it is retried later
 //!   with the same message-id.
 //! - A job posts over several connections at once, spread over the
-//!   `post` providers of one priority tier. Each article is posted once,
+//!   `post` providers of one priority tier, all under one permit holder:
+//!   a provider that limits source addresses (`max_ips`) counts the job
+//!   once. Each article is posted once,
 //!   to one provider; the other backbones get it by propagation, which
 //!   the verify stage checks (and repairs, see `verify`).
 //! - A provider that refuses the post or cannot be reached hands its
@@ -19,8 +21,10 @@
 //!   each call to a provider, when the last renewal is older than a set
 //!   age. There is no timer; no call starts unless both were confirmed
 //!   recently enough to outlast it.
-//! - A job takes a slot on its first tier before it loads the extent,
-//!   and gives its lease back at once when there is none.
+//! - A job takes its slots on its first tier before it loads the extent,
+//!   and gives its lease back at once when there is none. Its sockets
+//!   connect while the extent loads; the first POST waits for the stored
+//!   plan record.
 //! - Every catalogue write carries the fenced [`Lease`]. A stale lease
 //!   stops the job at once.
 
@@ -28,7 +32,7 @@ use core::cell::{Cell, RefCell};
 use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 
-use futures_util::future::{join_all, poll_fn};
+use futures_util::future::{join, join_all, poll_fn};
 use futures_util::lock::Mutex;
 use sha2::{Digest, Sha256};
 use velmora::article::{
@@ -40,7 +44,7 @@ use velmora::transport::Transport;
 use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
-use crate::fetch::{report_health, ProviderSession};
+use crate::fetch::{job_holder, report_health, ProviderSession};
 use crate::jobs::JOB_OVERHEAD_BYTES;
 use crate::pool::Pool;
 use crate::ports::{
@@ -256,15 +260,15 @@ where
         // provider: it only writes the recovery record again.
         let stored = self.catalog.articles(&extent.id).await?;
         if !stored.is_empty() && stored.iter().all(|a| a.state == ArticleState::Posted) {
-            self.load_planned(lease, extent).await?;
+            self.load_planned(lease, extent, stored).await?;
             return self.to_verify(lease).await;
         }
-        let holder = format!("post:{}", extent.id);
+        let holder = job_holder(lease);
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
         let cooling = pool.cooling_until(&posters);
-        let order = pool.order(posters);
-        // A slot first. Loading and hashing the extent is the expensive
+        let order = pool.order(posters, PermitClass::Background);
+        // The slots first. Loading and hashing the extent is the expensive
         // part of the job: one that would only find every slot of its
         // first tier taken gives its lease back before it, not after.
         let Some(first_tier) = order.chunk_by(|a, b| a.priority == b.priority).next() else {
@@ -273,24 +277,143 @@ where
                 None => Stop::fail(FailClass::Internal),
             });
         };
-        let (mut held, _) = self.open_sessions(first_tier, &holder, 1, None).await?;
-        let Some(first) = held.pop() else {
-            return Err(Stop::NoPermit);
+        // The articles left to post are known before the extent is read:
+        // every one of a new plan, the planned ones of a stored plan.
+        let todo = match stored.is_empty() {
+            true => article_spans(extent.cipher_size).len(),
+            false => stored
+                .iter()
+                .filter(|a| a.state == ArticleState::Planned)
+                .count(),
         };
-        let (cipher, mut plan) = match self.load_planned(lease, extent).await {
+        let asked = self.clock.now();
+        let (mut held, _) = self.open_sessions(first_tier, &holder, todo).await?;
+        let permits_ms = self.clock.now().0 - asked.0;
+        crate::trace::note(&lease.extent, |t| {
+            t.permits_ms = permits_ms;
+            t.sockets = u32::try_from(held.len()).unwrap_or(u32::MAX);
+            t.articles = u32::try_from(todo).unwrap_or(u32::MAX);
+        });
+        if held.is_empty() {
+            return Err(Stop::NoPermit);
+        }
+        // One renewal confirms the lease and every permit before any
+        // connect, as `Round::keep` does. A lease that is gone stops the
+        // job here, before it reads the extent.
+        let kept_at = match self.renew_held(lease, &held).await {
+            Ok(kept_at) => kept_at,
+            Err(stop) => {
+                close_all(held).await;
+                return Err(stop);
+            }
+        };
+        // The sockets connect while the extent is read, checked and
+        // planned and its record stored. Nothing is posted before that
+        // record is durable: posting starts only once both are done. The
+        // round renews before its first call once `kept_at` is older than
+        // the renewal interval, as after any renewal.
+        let (refused, loaded) = join(
+            self.connect_all(lease, &mut held, kept_at),
+            self.load_planned(lease, extent, stored),
+        )
+        .await;
+        let (cipher, mut plan) = match loaded {
             Ok(loaded) => loaded,
             Err(stop) => {
-                first.close().await;
+                close_all(held).await;
                 return Err(stop);
             }
         };
         if plan.iter().any(|a| a.state == ArticleState::Planned) {
-            self.post_with_failover(lease, extent, &mut plan, &cipher, &order, cooling, first)
-                .await?;
+            let started = self.clock.now();
+            let opened = Opened {
+                sessions: held,
+                kept_at,
+                refused,
+            };
+            let posted = self
+                .post_with_failover(lease, extent, &mut plan, &cipher, &order, cooling, opened)
+                .await;
+            let post_ms = self.clock.now().0 - started.0;
+            crate::trace::note(&lease.extent, |t| t.post_ms = post_ms);
+            posted?;
         } else {
-            first.close().await;
+            close_all(held).await;
         }
-        self.to_verify(lease).await
+        let advancing = self.clock.now();
+        let advanced = self.to_verify(lease).await;
+        let advance_ms = self.clock.now().0 - advancing.0;
+        crate::trace::note(&lease.extent, |t| t.advance_ms = advance_ms);
+        advanced
+    }
+
+    /// Renews the lease and the permits of `sessions` in one round trip.
+    /// `Ok(Some(at))`: both were confirmed at `at` by a renewal that came
+    /// back within the renewal interval (as in `Round::kept`), so the
+    /// sessions may connect now and the first round counts it as its own.
+    /// `Ok(None)`: not confirmed in time (a slow catalogue, a lost
+    /// permit); nothing connects early and the round renews first.
+    /// `Err(Fenced)`: the lease is gone.
+    async fn renew_held<'a>(
+        &self,
+        lease: &Lease,
+        sessions: &[ProviderSession<'a, C, N, T>],
+    ) -> core::result::Result<Option<UnixMs>, Stop> {
+        let now = self.clock.now();
+        let permits: Vec<Permit> = sessions.iter().map(|s| s.permit().clone()).collect();
+        let confirmed = match self.catalog.renew_all(lease, &permits, now).await {
+            Ok((false, _)) => return Err(Stop::Fenced),
+            Ok((true, held)) => held.len() == permits.len() && held.iter().all(|h| *h),
+            Err(_) => false,
+        };
+        let in_time = (0..KEEP_EVERY_MS).contains(&(self.clock.now().0 - now.0));
+        Ok((confirmed && in_time).then_some(now))
+    }
+
+    /// Connects every held session at once when `kept_at` says a renewal
+    /// confirmed the lease and their permits ([`Self::renew_held`]).
+    /// Returns the providers that refused a login for their limit.
+    ///
+    /// A session whose login the provider refused for its limit ("no
+    /// slot") is ended at once and its slot given back, as the round
+    /// would do. Any other failed connect is left to the round: the
+    /// session stays unconnected, and the round connects it again and
+    /// decides what the failure means, as it does for any session.
+    async fn connect_all<'a>(
+        &self,
+        lease: &Lease,
+        sessions: &mut Vec<ProviderSession<'a, C, N, T>>,
+        kept_at: Option<UnixMs>,
+    ) -> Vec<&'a str> {
+        let Some(now) = kept_at else {
+            return Vec::new();
+        };
+        // A connect ends within `NNTP_CALL_SECS` like any call, and the
+        // round could not end before it either: it would wait for the
+        // article that socket had taken.
+        let refused =
+            join_all(sessions.iter_mut().map(|session| async move {
+                matches!(session.session().await, Err(Stop::NoPermit))
+            }))
+            .await;
+        let connect_ms = self.clock.now().0 - now.0;
+        crate::trace::note(&lease.extent, |t| t.connect_ms = connect_ms);
+        let mut by: Vec<&'a str> = Vec::new();
+        if refused.iter().any(|r| *r) {
+            let (out, kept): (Vec<_>, Vec<_>) = sessions
+                .drain(..)
+                .zip(refused)
+                .partition(|(_, refused)| *refused);
+            sessions.extend(kept.into_iter().map(|(s, _)| s));
+            for (session, _) in &out {
+                let id = session.provider.id.as_str();
+                if !by.contains(&id) {
+                    by.push(id);
+                }
+            }
+            close_all(out.into_iter().map(|(s, _)| s).collect()).await;
+        }
+        by
     }
 
     /// Every article is recorded as posted: the extent goes on to verify.
@@ -322,7 +445,9 @@ where
         &self,
         lease: &Lease,
         extent: &ExtentRow,
+        stored: Vec<ArticleRow>,
     ) -> core::result::Result<(Vec<u8>, Vec<ArticleRow>), Stop> {
+        let started = self.clock.now();
         let cipher = self
             .safety
             .get(&extent.id.safety_key(), None)
@@ -332,27 +457,35 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Err(Stop::fail(FailClass::Corrupt));
         }
-        let plan = self.stored_plan(lease, extent, &cipher).await?;
+        let plan = self.stored_plan(lease, extent, &cipher, stored).await?;
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
         write_article_plan(&self.safety, &self.kek, extent, &plan)
             .await
             .map_err(|_| Stop::fail(FailClass::BlobError))?;
+        let load_ms = self.clock.now().0 - started.0;
+        crate::trace::note(&lease.extent, |t| t.load_ms = load_ms);
         Ok((cipher, plan))
     }
 
     /// The authoritative stored plan, created first when the extent has
     /// none. Whatever this job planned in memory is discarded: a planner
     /// that lost the insert race posts the winner's message-ids.
+    ///
+    /// `stored` is the plan this job read from the catalogue under its
+    /// lease. Only the lease holder writes a plan, so it is still the
+    /// stored one; a stale job that planned meanwhile is answered by the
+    /// fenced insert, which returns the plan that won.
     async fn stored_plan(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
         cipher: &[u8],
+        stored: Vec<ArticleRow>,
     ) -> core::result::Result<Vec<ArticleRow>, Stop> {
         let spans = article_spans(extent.cipher_size);
-        let mut plan = self.catalog.articles(&extent.id).await?;
+        let mut plan = stored;
         if plan.is_empty() {
             let groups: Vec<&str> = self.cfg.newsgroups.iter().map(String::as_str).collect();
             let now_secs = self.clock.now().secs().0;
@@ -411,8 +544,9 @@ where
     /// only when every provider of the tiers above was tried and failed.
     /// While one of them is merely busy the job waits for a slot.
     ///
-    /// `order` is the posting providers in pool order and `first` a
-    /// session the job already holds on its first tier.
+    /// `order` is the posting providers in pool order and `first` the
+    /// sessions the job already holds on its first tier: they are the
+    /// first round.
     #[allow(clippy::too_many_arguments)]
     async fn post_with_failover<'a>(
         &'a self,
@@ -422,9 +556,9 @@ where
         cipher: &[u8],
         order: &[&'a ProviderConfig],
         cooling: Option<UnixMs>,
-        first: ProviderSession<'a, C, N, T>,
+        first: Opened<'a, C, N, T>,
     ) -> core::result::Result<(), Stop> {
-        let holder = format!("post:{}", extent.id);
+        let holder = job_holder(lease);
         let mut first = Some(first);
         let mut failed = None;
         // Per article: a POST of it may have landed on a provider that
@@ -444,17 +578,36 @@ where
                 let todo: Vec<usize> = (0..plan.len())
                     .filter(|at| plan[*at].state == ArticleState::Planned)
                     .collect();
-                let (sessions, without) = self
-                    .open_sessions(&untried, &holder, todo.len(), first.take())
-                    .await?;
-                no_slot = without;
+                // The first round runs on the sessions the job opened
+                // before it loaded the extent; the renewal they were
+                // connected under is the round's first.
+                let (sessions, kept_at) = match first.take() {
+                    Some(opened) => {
+                        // A provider that refused a login is not asked
+                        // again in this job, as after a round.
+                        no_slot = false;
+                        busy |= !opened.refused.is_empty();
+                        untried.retain(|p| !opened.refused.contains(&p.id.as_str()));
+                        if opened.sessions.is_empty() {
+                            continue;
+                        }
+                        (opened.sessions, opened.kept_at)
+                    }
+                    None => {
+                        let (sessions, without) =
+                            self.open_sessions(&untried, &holder, todo.len()).await?;
+                        no_slot = without;
+                        (sessions, None)
+                    }
+                };
                 if sessions.is_empty() {
                     break;
                 }
                 // Each provider gets one round: one that failed is not
                 // asked again in this job, the rest of the tier is.
                 untried.retain(|p| !sessions.iter().any(|s| s.provider.id == p.id));
-                let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan);
+                let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan)
+                    .kept_at(kept_at);
                 let ended = round
                     .run(sessions, todo.iter().map(|at| (*at, unknown[*at])), true)
                     .await;
@@ -501,56 +654,80 @@ where
     /// Opens up to `post_sockets` posting sessions (never more than
     /// `articles`) over `providers`, one provider after the other in
     /// turns, so the sockets spread over every provider with a free slot.
-    /// The flag says whether a provider had no slot at all. `first` is a
-    /// session of one of them that the job holds already: it counts.
+    /// Every slot is taken under the one `holder` of the job run, so on a
+    /// provider with `max_ips` the job counts as one address however many
+    /// sockets it opens there. The flag says whether a provider had no
+    /// slot at all.
+    ///
+    /// The slots are asked for in passes, one catalogue call each, all
+    /// calls of a pass at once, in turns over the providers. A provider
+    /// that has given the job no slot yet is asked for one per pass, so a
+    /// provider with no free slot costs one call. One that gave a slot
+    /// is asked for its full turn in the next pass, and each slot it no
+    /// longer has costs a refused call. A provider that refuses is not
+    /// asked again, and what it did not give goes to the others in the
+    /// next pass.
     pub(crate) async fn open_sessions<'a>(
         &'a self,
         providers: &[&'a ProviderConfig],
         holder: &str,
         articles: usize,
-        first: Option<ProviderSession<'a, C, N, T>>,
     ) -> Result<(Vec<ProviderSession<'a, C, N, T>>, bool)> {
         let wanted = usize::try_from(self.cfg.post_sockets)
             .unwrap_or(1)
             .clamp(1, articles.max(1));
-        let mut sessions = Vec::new();
         let mut busy = false;
         let mut open: Vec<&ProviderConfig> = providers.to_vec();
         let mut turn = 0;
-        if let Some(first) = first {
-            // The next socket goes to the provider after this one.
-            let at = providers.iter().position(|p| p.id == first.provider.id);
-            turn = at.map_or(0, |at| at + 1);
-            sessions.push(first);
-        }
+        let mut sessions: Vec<ProviderSession<'a, C, N, T>> = Vec::new();
         while sessions.len() < wanted && !open.is_empty() {
-            let provider = open[turn % open.len()];
-            let opened = ProviderSession::open(
-                &self.catalog,
-                &self.nntp,
-                &self.clock,
-                provider,
-                PermitClass::Background,
-                holder,
-            )
-            .await;
-            match opened {
-                Ok(Some(session)) => {
-                    sessions.push(session);
-                    turn += 1;
+            let need = wanted - sessions.len();
+            let mut asked: Vec<&ProviderConfig> = Vec::with_capacity(need);
+            for i in 0..need * open.len() {
+                if asked.len() == need {
+                    break;
                 }
-                Ok(None) => {
-                    busy |= !sessions.iter().any(|s| s.provider.id == provider.id);
-                    open.remove(turn % open.len());
-                }
-                // Nothing may hold a slot the job will not use.
-                Err(e) => {
-                    for session in sessions {
-                        session.close().await;
-                    }
-                    return Err(e);
+                let provider = open[(turn + i) % open.len()];
+                let gave = sessions.iter().any(|s| s.provider.id == provider.id);
+                if gave || !asked.iter().any(|a| a.id == provider.id) {
+                    asked.push(provider);
                 }
             }
+            let opened = join_all(asked.iter().map(|provider| {
+                ProviderSession::open(
+                    &self.catalog,
+                    &self.nntp,
+                    &self.clock,
+                    provider,
+                    PermitClass::Background,
+                    holder,
+                )
+            }))
+            .await;
+            let mut failed = None;
+            let mut refused: Vec<&str> = Vec::new();
+            for (provider, opened) in asked.iter().zip(opened) {
+                match opened {
+                    Ok(Some(session)) => sessions.push(session),
+                    Ok(None) => refused.push(provider.id.as_str()),
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                    }
+                }
+            }
+            // Nothing may hold a slot the job will not use.
+            if let Some(e) = failed {
+                close_all(sessions).await;
+                return Err(e);
+            }
+            let next = asked.last().map(|p| p.id.as_str());
+            for id in refused {
+                busy |= !sessions.iter().any(|s| s.provider.id == id);
+                open.retain(|p| p.id != id);
+            }
+            turn = next
+                .and_then(|id| open.iter().position(|p| p.id == id))
+                .map_or(0, |at| at + 1);
         }
         Ok((sessions, busy))
     }
@@ -594,7 +771,7 @@ where
             return Ok(false);
         }
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
-        let order = pool.order(providers.to_vec());
+        let order = pool.order(providers.to_vec(), PermitClass::Background);
         if order.is_empty() {
             return match pool.cooling_until(providers) {
                 Some(until) => Err(Stop::Cooling(until)),
@@ -604,10 +781,8 @@ where
         let todo: Vec<usize> = (0..plan.len())
             .filter(|at| missing.contains(&plan[*at].idx))
             .collect();
-        let holder = format!("repost:{}", extent.id);
-        let (sessions, _) = self
-            .open_sessions(&order, &holder, todo.len(), None)
-            .await?;
+        let holder = job_holder(lease);
+        let (sessions, _) = self.open_sessions(&order, &holder, todo.len()).await?;
         if sessions.is_empty() {
             return Err(Stop::NoPermit);
         }
@@ -626,6 +801,24 @@ where
 
 /// A posting job holds one rendered article per socket.
 pub(crate) const POST_SOCKET_BYTES: u64 = 1024 * 1024;
+
+/// The sessions a job opened before it loaded its extent, the time of the
+/// renewal they were connected under (`None` = not connected yet), and
+/// the providers that refused a login for their limit meanwhile (their
+/// sessions are ended).
+struct Opened<'a, C: Catalog, N: NntpConnector, T: Clock> {
+    sessions: Vec<ProviderSession<'a, C, N, T>>,
+    kept_at: Option<UnixMs>,
+    refused: Vec<&'a str>,
+}
+
+/// Ends every session and frees its slot, with one health report per
+/// provider however many sessions it had, as at the end of a round.
+async fn close_all<C: Catalog, N: NntpConnector, T: Clock>(
+    sessions: Vec<ProviderSession<'_, C, N, T>>,
+) {
+    ProviderSession::close_all(sessions).await;
+}
 
 /// The lease and every permit of a posting job are renewed together, in
 /// one catalogue round trip, once the last renewal is this old.
@@ -746,6 +939,14 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 marked: vec![false; plan.len()],
             }),
         }
+    }
+
+    /// Counts a renewal at `at` that confirmed the lease and the permit of
+    /// every session the round will run on as the round's own, so that
+    /// its first call does not renew again. `None` changes nothing.
+    pub(crate) fn kept_at(self, at: Option<UnixMs>) -> Self {
+        self.state.borrow_mut().kept_at = at;
+        self
     }
 
     /// Posts the articles of `todo` (positions in the plan, each with its

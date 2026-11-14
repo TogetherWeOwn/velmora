@@ -14,15 +14,17 @@
 //! session errors are the engine's own: their `Debug` redacts auth reply
 //! text, but `Display` may carry a runtime I/O message or a server reply.
 
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use futures_util::future::{select, Either};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
 use velmora_bridge::{
-    BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, ProviderConfig, Result,
-    NNTP_CALL_SECS,
+    BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
+    Result, QUIT_SECS,
 };
 
 /// Largest article the bridge reads or posts (velmora articles are about
@@ -42,13 +44,19 @@ type Socket = native::NoSocket;
 /// take almost [`OP_TIMEOUT`]. A call that runs out of time is dropped,
 /// which poisons its session, and ends as a timed-out transport error:
 /// the caller reconnects and looks the article up before sending again.
-#[cfg(target_arch = "wasm32")]
-async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    use futures_util::future::{select, Either};
+async fn within_call<T>(secs: u32, call: impl Future<Output = Result<T>>) -> Result<T> {
+    within(after(secs), call).await
+}
+
+/// `call`, unless `limit` ends first. A call that is done when the limit
+/// is too counts as done.
+async fn within<T>(
+    limit: impl Future<Output = ()>,
+    call: impl Future<Output = Result<T>>,
+) -> Result<T> {
     let call = std::pin::pin!(call);
-    let limit = Duration::from_secs(u64::from(NNTP_CALL_SECS));
-    let delay = std::pin::pin!(worker::Delay::from(limit));
-    match select(call, delay).await {
+    let limit = std::pin::pin!(limit);
+    match select(call, limit).await {
         Either::Left((out, _)) => out,
         Either::Right(_) => Err(BridgeError::Nntp(velmora::Error::Io(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -57,24 +65,31 @@ async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> R
     }
 }
 
-/// Native builds open no socket, so there is nothing to bound.
-#[cfg(not(target_arch = "wasm32"))]
-async fn within_call<T>(call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    let _ = NNTP_CALL_SECS;
-    call.await
+/// Ends after `secs` on the runtime's timer.
+#[cfg(target_arch = "wasm32")]
+async fn after(secs: u32) {
+    worker::Delay::from(Duration::from_secs(u64::from(secs))).await;
 }
 
-/// One authenticated session. A thin wrapper: the port is foreign to this
-/// crate, so it cannot be implemented on `NntpClient` here.
-pub struct WorkerSession(NntpClient<Socket>);
+/// Native builds open no socket, so there is nothing to bound.
+#[cfg(not(target_arch = "wasm32"))]
+async fn after(_secs: u32) {
+    std::future::pending().await
+}
+
+/// One authenticated session, and the class of the permit it was opened
+/// under, which bounds its calls. A thin wrapper: the port is foreign to
+/// this crate, so it cannot be implemented on `NntpClient` here.
+pub struct WorkerSession(NntpClient<Socket>, PermitClass);
 
 impl NntpSession for WorkerSession {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
-        within_call(async { Ok(self.0.post_article(message_id, article).await?) }).await
+        let call = async { Ok(self.0.post_article(message_id, article).await?) };
+        within_call(self.1.call_secs(), call).await
     }
 
     async fn stat(&mut self, message_id: &str) -> Result<bool> {
-        within_call(async {
+        within_call(self.1.call_secs(), async {
             match self.0.stat(message_id).await {
                 Ok(_) => Ok(true),
                 Err(velmora::Error::ArticleNotFound(_)) => Ok(false),
@@ -85,7 +100,7 @@ impl NntpSession for WorkerSession {
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
-        within_call(async {
+        within_call(self.1.call_secs(), async {
             match self.0.body_to(message_id, out).await {
                 Ok(()) => Ok(BodyOutcome::Found),
                 Err(velmora::Error::ArticleNotFound(_)) => Ok(BodyOutcome::Missing),
@@ -97,7 +112,7 @@ impl NntpSession for WorkerSession {
 
     async fn quit(self) {
         // A goodbye nobody answers must not hold the job either.
-        let _ = within_call(async {
+        let _ = within_call(QUIT_SECS, async {
             self.0.quit().await;
             Ok(())
         })
@@ -122,7 +137,14 @@ impl NntpConnector for WorkerConnector {
         }
         let cfg = nntp_config(provider)?;
         let socket = open(&cfg)?;
-        within_call(async { Ok(WorkerSession(NntpClient::connect(socket, &cfg).await?)) }).await
+        let class = permit.class;
+        within_call(class.call_secs(), async {
+            Ok(WorkerSession(
+                NntpClient::connect(socket, &cfg).await?,
+                class,
+            ))
+        })
+        .await
     }
 }
 
@@ -219,6 +241,42 @@ mod tests {
             "backbone": "bb", "post": true, "read": true, "max_conns": 2
         }))
         .unwrap()
+    }
+
+    fn timed_out<T: std::fmt::Debug>(out: Option<Result<T>>) -> bool {
+        matches!(
+            out,
+            Some(Err(BridgeError::Nntp(velmora::Error::Io(e)))) if e.kind() == io::ErrorKind::TimedOut
+        )
+    }
+
+    /// A call that outlasts its limit ends as a timed-out transport
+    /// error; one that is done in time, or with the limit, is returned.
+    #[test]
+    fn a_call_is_cut_at_its_limit() {
+        use futures_util::FutureExt;
+        use std::future::{pending, ready};
+
+        let hung = within(ready(()), pending::<Result<u8>>());
+        assert!(timed_out(hung.now_or_never()));
+        let done = within(pending(), ready(Ok(7u8)));
+        assert!(matches!(done.now_or_never(), Some(Ok(7))));
+        let tie = within(ready(()), ready(Ok(7u8)));
+        assert!(matches!(tie.now_or_never(), Some(Ok(7))));
+        // Natively nothing is cut: there is no socket to hold.
+        let native = within_call(0, ready(Ok(7u8)));
+        assert!(matches!(native.now_or_never(), Some(Ok(7))));
+    }
+
+    /// The bounds the sessions are wired to: a read's calls are short
+    /// enough for its permit, and the goodbye is short for every class.
+    #[test]
+    fn the_bounds_follow_the_class_of_the_permit() {
+        use velmora_bridge::{NNTP_CALL_SECS, READ_CALL_SECS};
+        assert_eq!(PermitClass::Read.call_secs(), READ_CALL_SECS);
+        assert_eq!(PermitClass::Background.call_secs(), NNTP_CALL_SECS);
+        assert!(READ_CALL_SECS + QUIT_SECS < PermitClass::Read.permit_secs());
+        assert!(NNTP_CALL_SECS + QUIT_SECS < PermitClass::Background.permit_secs());
     }
 
     #[test]
