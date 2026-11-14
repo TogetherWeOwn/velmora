@@ -447,6 +447,18 @@ pub(super) async fn copy_generation<S: Sql>(
                 SqlValue::Int(i64::from(g.extent_count)),
             ],
         ),
+        // The copy is the newest generation of its key by id as well: a
+        // replay of the recovery records orders a key's generations by
+        // id, and must not put the replaced one back over the copy.
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS ( \
+               SELECT 1 FROM objects WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3)",
+            vec![
+                text(g.bucket_id.as_str()),
+                text(&g.key),
+                text(g.id.as_str()),
+            ],
+        ),
         generation_insert(g)?,
         (
             "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \

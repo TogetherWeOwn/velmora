@@ -98,12 +98,22 @@ pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> Generati
     id_after(now, live, rand)
 }
 
-/// The id of a copy of `source`. It always sorts after `source`, also
-/// when this isolate's clock is behind the one that minted `source`: a
-/// replay then applies the source first, and a copy onto the source's
-/// own key is the newer generation of that key.
-pub fn copy_id(now: UnixMs, source: &GenerationId, rand: [u8; 8]) -> GenerationId {
-    id_after(now, source, rand)
+/// The id of a copy of `source` that replaces `replaced`, the live
+/// generation of the destination key, if there is one. It always sorts
+/// after both, also when this isolate's clock is behind the ones that
+/// minted them: a replay then applies the source first and never puts
+/// the replaced generation back over the copy.
+pub fn copy_id(
+    now: UnixMs,
+    source: &GenerationId,
+    replaced: Option<&GenerationId>,
+    rand: [u8; 8],
+) -> GenerationId {
+    let newest = match replaced {
+        Some(r) if r > source => r,
+        _ => source,
+    };
+    id_after(now, newest, rand)
 }
 
 fn id_after(now: UnixMs, older: &GenerationId, rand: [u8; 8]) -> GenerationId {
