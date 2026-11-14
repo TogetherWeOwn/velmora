@@ -15,8 +15,13 @@
 //! Records are key-bearing copies: they hold wrapped keys, never plain
 //! ones, and they open only under the KEK version that sealed them.
 //!
-//! Nothing but an operator removes a record. Release, garbage collection
-//! and evict delete blobs through [`delete_blob`], which refuses `m/*`.
+//! No delete that the catalogue asks for removes a record: release,
+//! garbage collection and evict delete blobs through [`delete_blob`],
+//! which refuses `m/*`. The one other delete is by the writer itself: a
+//! request whose batch was refused (a definite failure, answered as one)
+//! removes the record it has just written, because nothing was published
+//! under that id. A record of a request that failed with an unknown
+//! outcome stays, and a replay may publish it.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -333,7 +338,9 @@ impl ArticleManifest {
         ArticleManifest {
             v: RECORD_VERSION,
             extent_id: extent.id.as_str().to_owned(),
-            plan_rev: extent.plan_rev,
+            // A stored plan has revision 1 or more; `extent` may have
+            // been read before the plan was stored.
+            plan_rev: extent.plan_rev.max(1),
             articles: plan
                 .iter()
                 .map(|a| ArticleRecord {
@@ -470,9 +477,10 @@ pub async fn write_tombstone<B: BlobStore, K: Kek>(
     .await
 }
 
-/// Writes `m/art/<extent_id>` unless it is already there (an extent's
-/// plan is stored once and never changes). The caller posts only after
-/// this returned `Ok`.
+/// Writes `m/art/<extent_id>` from the plan the catalogue holds. An
+/// extent's plan never changes, so a second write stores the same plan
+/// again; it also replaces a record that no longer opens. The caller
+/// posts only after this returned `Ok`.
 pub async fn write_article_plan<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
@@ -480,9 +488,6 @@ pub async fn write_article_plan<B: BlobStore, K: Kek>(
     plan: &[ArticleRow],
 ) -> Result<()> {
     let name = article_key(&extent.id);
-    if safety.head(&name).await?.is_some() {
-        return Ok(());
-    }
     let record = ArticleManifest::new(extent, plan);
     write(
         safety,
