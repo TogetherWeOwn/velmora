@@ -19,12 +19,15 @@
 mod auth;
 mod gc;
 mod health;
+mod hot;
 mod objects;
 mod outbox;
 mod permits;
 mod recovery;
 mod replay;
 mod uploads;
+
+pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
 use crate::ports::{
     Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
@@ -33,10 +36,10 @@ use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep,
-    GenerationId, GenerationRow, JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage,
-    OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow,
-    UploadRow, VerificationRow,
+    CompleteUpload, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow,
+    GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage, ListQuery, ObjectStatus,
+    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs,
+    UploadPartRow, UploadRow, VerificationRow,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -349,5 +352,58 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<u64> {
         outbox::redrive_underverified(self, backbones, required, limit, now).await
+    }
+
+    // hot tier
+    async fn hot_stats(&self) -> Result<HotStats> {
+        hot::hot_stats(self).await
+    }
+    async fn evictable_bytes(&self) -> Result<u64> {
+        hot::evictable_bytes(self).await
+    }
+    async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
+        hot::evict_candidates(self, limit).await
+    }
+    async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::begin_evict(self, x).await
+    }
+    async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::finish_evict(self, x).await
+    }
+    async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
+        hot::record_cache_fill(self, extent, now).await
+    }
+    async fn touch_read(
+        &self,
+        extent: &ExtentId,
+        now: UnixMs,
+        min_gap_ms: i64,
+        from_cache: bool,
+    ) -> Result<UnixMs> {
+        hot::touch_read(self, extent, now, min_gap_ms, from_cache).await
+    }
+    async fn hot_check_due(&self, now: UnixMs, every_ms: i64) -> Result<bool> {
+        hot::hot_check_due(self, now, every_ms).await
+    }
+    async fn hot_checked(&self, now: UnixMs) -> Result<()> {
+        hot::hot_checked(self, now).await
+    }
+    async fn hot_drain_set(&self, left: u64) -> Result<()> {
+        hot::hot_drain_set(self, left).await
+    }
+    async fn hot_drain_claim(&self, left: u64) -> Result<bool> {
+        hot::hot_drain_claim(self, left).await
+    }
+    async fn hot_seq(&self, extent: &ExtentId) -> Result<u64> {
+        hot::hot_seq(self, extent).await
+    }
+    async fn hot_forget(
+        &self,
+        extent: &ExtentId,
+        seq: u64,
+        safety: bool,
+        cache: bool,
+    ) -> Result<bool> {
+        hot::hot_forget(self, extent, seq, safety, cache).await
     }
 }

@@ -102,6 +102,22 @@ pub struct Blobs {
     pub fail_put_prefix: RefCell<Option<String>>,
     /// This many deletes of a recovery record fail.
     pub fail_record_deletes: Cell<u32>,
+    /// Deleting this key fails.
+    pub fail_delete: RefCell<Option<String>>,
+    /// Called once, with the key, at the start of the next delete.
+    pub before_delete: Hook,
+    /// Called once, with the key, at the start of the next put.
+    pub before_put: Hook,
+}
+
+/// Something that happens in the middle of an operation on a store.
+pub type Hook = RefCell<Option<Box<dyn FnOnce(&str)>>>;
+
+fn fire(hook: &Hook, key: &str) {
+    let hook = hook.borrow_mut().take();
+    if let Some(hook) = hook {
+        hook(key);
+    }
 }
 
 impl std::ops::Deref for Blobs {
@@ -113,6 +129,7 @@ impl std::ops::Deref for Blobs {
 
 impl BlobStore for Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        fire(&self.before_put, key);
         let refused = self
             .fail_put_prefix
             .borrow()
@@ -130,6 +147,10 @@ impl BlobStore for Blobs {
         self.inner.head(key).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
+        fire(&self.before_delete, key);
+        if self.fail_delete.borrow().as_deref() == Some(key) {
+            return Err(BridgeError::Blob("store down".into()));
+        }
         self.inner.delete(key).await
     }
     async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
@@ -152,6 +173,9 @@ pub struct FailSql {
     /// Fails the next batch that publishes a generation, once.
     pub fail_publish: Cell<Option<PublishFault>>,
     fail_next_batch: Cell<bool>,
+    /// Fails every statement (read or write) whose text contains the
+    /// string, after letting the given number of them through.
+    pub fail_matching: RefCell<Option<(&'static str, u32)>>,
 }
 
 /// How a publication batch fails: D1 may answer with an error before it
@@ -164,6 +188,20 @@ pub enum PublishFault {
     Down,
 }
 
+impl FailSql {
+    fn refused(&self, sql: &str) -> bool {
+        let mut rule = self.fail_matching.borrow_mut();
+        match rule.as_mut() {
+            Some((text, pass)) if sql.contains(*text) => {
+                let refuse = *pass == 0;
+                *pass = pass.saturating_sub(1);
+                refuse
+            }
+            _ => false,
+        }
+    }
+}
+
 impl std::ops::Deref for FailSql {
     type Target = RusqliteSql;
     fn deref(&self) -> &RusqliteSql {
@@ -173,10 +211,13 @@ impl std::ops::Deref for FailSql {
 
 impl Sql for FailSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        if self.refused(sql) {
+            return Err(BridgeError::Sql("database down".into()));
+        }
         self.inner.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        if self.fail_writes.get() {
+        if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
         self.inner.exec(sql, params).await
@@ -228,6 +269,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
+        hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
         dev_trust_http: false,
         providers,
@@ -261,6 +303,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_writes: Cell::new(false),
                 fail_publish: Cell::new(None),
                 fail_next_batch: Cell::new(false),
+                fail_matching: RefCell::new(None),
             }),
             safety: Blobs::default(),
             cache: Blobs::default(),
