@@ -109,8 +109,15 @@ async fn copy_is_a_new_generation_over_the_same_extent() {
     );
     assert_eq!(done.values("LastModified").len(), 1);
 
-    // Nothing was stored, sealed or queued for posting.
-    assert_eq!(rig.bridge.safety.keys(), blobs);
+    // Nothing was sealed or queued for posting. The one blob written is
+    // the copy's recovery record, checked below.
+    let stored: Vec<String> = rig
+        .bridge
+        .safety
+        .keys()
+        .into_iter()
+        .filter(|k| !blobs.contains(k))
+        .collect();
     assert_eq!(rig.count("extents"), 1);
     assert_eq!(rig.count("outbox"), 1);
     assert_eq!(rig.count("generations"), 2);
@@ -122,6 +129,21 @@ async fn copy_is_a_new_generation_over_the_same_extent() {
     assert_eq!(to_extents, from_extents);
     assert_eq!((to.size, &to.etag), (from.size, &from.etag));
     assert_eq!(to.created_at, rig.now());
+    // The record describes the shared extent in full, key included, so a
+    // replay does not need the source's record to rebuild the copy.
+    let name = recovery::generation_key(&to.id);
+    assert_eq!(stored, vec![name.clone()]);
+    let record = recovery::read_generation(&rig.bridge.safety, &rig.bridge.kek, &name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.generation.key, "dst/copy.bin");
+    assert_eq!(record.extents.len(), 1);
+    assert_eq!(record.extents[0].id, from_extents[0].id.as_str());
+    assert_eq!(
+        Some(&record.extents[0].wrapped_file_key),
+        from_extents[0].wrapped_file_key.as_ref()
+    );
 
     let read = get(&rig, &signer, "dst/copy.bin").await;
     read.expect(200);
@@ -643,4 +665,37 @@ async fn multipart_complete_over_either_side_of_a_copy_keeps_the_extent() {
     assert!(!rig.bridge.safety.contains(&extent.safety_key()));
     assert_eq!(get(&rig, &signer, "src").await.body, first);
     assert_eq!(get(&rig, &signer, "a").await.body, second);
+}
+
+/// A copy whose recovery record cannot be written publishes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_without_its_recovery_record_commits_nothing() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", b"payload")
+        .await
+        .expect(200);
+    rig.put(&signer, BUCKET, "dst", b"older").await.expect(200);
+    rig.bridge.clock.advance_secs(1);
+    let blobs = rig.bridge.safety.keys();
+
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = Some("m/".to_string());
+    copy(&rig, &signer, &source("src"), "new", &[])
+        .await
+        .expect_error(500, "InternalError");
+    copy(&rig, &signer, &source("src"), "dst", &[])
+        .await
+        .expect_error(500, "InternalError");
+    assert!(rig.live(&bucket, "new").await.is_none());
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"older");
+    assert_eq!(rig.count("generations"), 2);
+    assert_eq!(rig.count("generation_extents"), 2);
+    assert_eq!(rig.count("gc"), 0);
+    assert_eq!(rig.bridge.safety.keys(), blobs);
+
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+    copy(&rig, &signer, &source("src"), "dst", &[])
+        .await
+        .expect(200);
+    assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, b"payload");
 }

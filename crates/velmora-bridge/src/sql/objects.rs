@@ -142,6 +142,14 @@ fn generation_row(row: Row) -> Result<GenerationRow> {
     })
 }
 
+/// The `extents` columns in schema order, with the place the extent has
+/// in the generation it was first written for.
+pub(super) const EXTENT_COLS: &str =
+    "id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, \
+     media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, \
+     safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, \
+     created_at";
+
 /// One extent row: the `extents` columns in schema order.
 pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
     let mut c = Cols::new(row);

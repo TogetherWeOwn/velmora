@@ -38,13 +38,15 @@ database_name = "velmora-catalog"
 database_id = "<from wrangler d1 create>"
 migrations_dir = "migrations"
 
+# Production data lives in US East (ENAM). R2 honours a location hint only the
+# first time a bucket name is created, so the region is part of the name.
 [[r2_buckets]]
 binding = "SAFETY"
-bucket_name = "velmora-safety"
+bucket_name = "velmora-safety-enam"
 
 [[r2_buckets]]
 binding = "CACHE"
-bucket_name = "velmora-cache"
+bucket_name = "velmora-cache-enam"
 
 [[queues.producers]]
 binding = "POST_Q"

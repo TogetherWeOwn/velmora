@@ -24,6 +24,7 @@ use super::common::{
     internal, metadata_json, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector};
+use crate::recovery::{generation_key, write_generation};
 use crate::types::{
     Body, Bucket, CopyGeneration, ExtentRow, GenerationId, GenerationRow, GenerationState,
     S3Response,
@@ -178,7 +179,7 @@ where
     }
 
     for _ in 0..ATTEMPTS {
-        let (from, _) = source_object(bridge, &authed.headers, bucket, &source).await?;
+        let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
         // The copy keeps the checksum stored with the source. Computing
         // another one would mean reading every byte.
         if wanted.is_some_and(|a| stored_checksum(&from).map(|c| c.algorithm()) != Some(a)) {
@@ -218,6 +219,15 @@ where
             checksum: stored_checksum(&generation),
             modified_ms: now.0,
         };
+        // The recovery record is durable before the catalogue batch, as
+        // for a PUT. It describes every extent in full, so a replay can
+        // rebuild the copy when the source it shares them with is gone.
+        // The extents have the same places in the copy as in the source.
+        write_generation(&bridge.safety, &bridge.kek, bucket, &generation, &extents)
+            .await
+            .map_err(|_| internal())?;
+        drop(extents);
+        let record = generation_key(&generation.id);
         let committed = bridge
             .catalog
             .copy_generation(&CopyGeneration {
@@ -234,8 +244,11 @@ where
                 .map(super::common::from_proto)
                 .map_err(|_| internal());
         }
-        // The source was overwritten or deleted since it was read: plan
-        // again against what is live now.
+        // The source was overwritten or deleted since it was read, so
+        // nothing was published under this id and its record must not
+        // publish it in a replay either. Best effort, as for Complete.
+        let _ = bridge.safety.delete(&record).await;
+        // Plan again against what is live now.
     }
     Err(unavailable())
 }

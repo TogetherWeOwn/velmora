@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -97,6 +97,8 @@ impl JobSink for Jobs {
 pub struct Blobs {
     pub inner: MemBlobStore,
     pub fail_put: Cell<bool>,
+    /// Puts of keys with this prefix fail.
+    pub fail_put_prefix: RefCell<Option<String>>,
 }
 
 impl std::ops::Deref for Blobs {
@@ -108,7 +110,12 @@ impl std::ops::Deref for Blobs {
 
 impl BlobStore for Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
-        if self.fail_put.get() {
+        let refused = self
+            .fail_put_prefix
+            .borrow()
+            .as_deref()
+            .is_some_and(|p| key.starts_with(p));
+        if self.fail_put.get() || refused {
             return Err(BridgeError::Blob("store down".into()));
         }
         self.inner.put(key, bytes, meta).await
@@ -121,6 +128,9 @@ impl BlobStore for Blobs {
     }
     async fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, start_after, limit).await
     }
 }
 

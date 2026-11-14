@@ -148,7 +148,13 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         }
     }
     assert!(rig.bridge.cache.keys().is_empty());
-    assert!(rig.bridge.safety.keys().is_empty());
+    // Only recovery records are left: no ciphertext is held anywhere.
+    assert!(rig
+        .bridge
+        .safety
+        .keys()
+        .iter()
+        .all(|k| recovery::is_record_key(k)));
 
     let id = create(&rig, &signer, "dst").await;
     let range = format!("bytes=1-{CAP}");

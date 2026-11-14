@@ -17,6 +17,7 @@ use super::common::{
 use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::recovery::write_generation;
 use crate::types::{
     CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
     GenerationState, Job, OutboxStage, S3Request, S3Response, SafetyState, JOB_VERSION,
@@ -159,13 +160,26 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         )
         .await
         .map_err(|_| internal())?;
+    // The recovery record is durable before the catalogue batch: an
+    // acknowledged PUT can be replayed into a restored catalogue. If this
+    // write fails, nothing is published.
+    let commit = CommitGeneration {
+        generation,
+        extents: vec![extent],
+        now,
+    };
+    write_generation(
+        &bridge.safety,
+        &bridge.kek,
+        bucket,
+        &commit.generation,
+        &commit.extents,
+    )
+    .await
+    .map_err(|_| internal())?;
     bridge
         .catalog
-        .commit_generation(&CommitGeneration {
-            generation,
-            extents: vec![extent],
-            now,
-        })
+        .commit_generation(&commit)
         .await
         .map_err(|_| internal())?;
     drop(charge);

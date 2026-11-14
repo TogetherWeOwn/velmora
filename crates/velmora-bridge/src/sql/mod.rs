@@ -13,6 +13,7 @@
 //! | `gc` | due rows, begin, done |
 //! | `permits` | provider connection slots, pool-shared limits |
 //! | `health` | provider load, failures and cooldown |
+//! | `recovery` | tombstone-ordered delete, upload extent rows |
 //!
 //! An extent is in service while a live generation references it through
 //! `generation_extents`, or a part of an open upload names it. A copy adds
@@ -65,6 +66,7 @@ mod health;
 mod objects;
 mod outbox;
 mod permits;
+mod recovery;
 mod uploads;
 
 use crate::ports::{Catalog, Guard, Lease, Permit, PermitClass, Sql, SqlValue, UploadTarget};
@@ -131,6 +133,15 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
         objects::delete_object(self, bucket, key, now).await
     }
+    async fn delete_object_before(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        before: &GenerationId,
+        now: UnixMs,
+    ) -> Result<bool> {
+        recovery::delete_object_before(self, bucket, key, before, now).await
+    }
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage> {
         objects::list(self, bucket, q).await
     }
@@ -173,6 +184,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         c: &CompleteUpload,
     ) -> Result<Guard<()>> {
         uploads::complete_upload(self, t, revision, digest, c).await
+    }
+    async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
+        recovery::upload_extents(self, t).await
     }
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>> {
         uploads::abort_upload(self, t, now).await

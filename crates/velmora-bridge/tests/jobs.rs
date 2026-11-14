@@ -11,11 +11,13 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use nntp_support::{TcpConnector, PASS, USER};
+use sha2::Digest as _;
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS};
+use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
 use velmora_bridge::*;
@@ -58,6 +60,8 @@ struct GuardedBlob {
     forbid: Rc<Cell<bool>>,
     /// A key whose delete fails.
     broken: RefCell<Option<String>>,
+    /// Puts of keys with this prefix fail.
+    no_put: RefCell<Option<String>>,
 }
 
 impl GuardedBlob {
@@ -69,6 +73,14 @@ impl GuardedBlob {
 impl BlobStore for GuardedBlob {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
         self.check();
+        if self
+            .no_put
+            .borrow()
+            .as_deref()
+            .is_some_and(|p| key.starts_with(p))
+        {
+            return Err(BridgeError::Blob("put failed".to_string()));
+        }
         self.inner.put(key, bytes, meta).await
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
@@ -85,6 +97,10 @@ impl BlobStore for GuardedBlob {
             return Err(BridgeError::Blob("delete failed".to_string()));
         }
         self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.check();
+        self.inner.list(prefix, start_after, limit).await
     }
 }
 
@@ -217,6 +233,7 @@ impl Fx {
             inner: MemBlobStore::new(),
             forbid: Rc::clone(&forbid_io),
             broken: RefCell::new(None),
+            no_put: RefCell::new(None),
         };
         let bridge = Bridge {
             catalog: SqlCatalog::new(Shared(Rc::clone(&sql))),
@@ -446,6 +463,17 @@ async fn post_verify_release_over_fake_nntp() {
     let o = fx.put(&bucket, "a/big.bin", &plaintext()).await;
     assert_eq!(fx.outbox(&o, "stage").await, "post");
     assert!(fx.has_safety(&o));
+    let seeded = BlobMeta {
+        bucket: &bucket.id,
+        extent: &o.extent,
+        cipher_sha256: &sha2::Sha256::digest(b"record").into(),
+    };
+    let record = b"record".to_vec();
+    fx.bridge
+        .safety
+        .put("m/g_seeded", record, &seeded)
+        .await
+        .unwrap();
 
     fx.bridge
         .jobs
@@ -468,6 +496,11 @@ async fn post_verify_release_over_fake_nntp() {
     // The pinned copy went only after the read-back; the cache is kept.
     assert!(!fx.has_safety(&o));
     assert!(fx.has_cache(&o));
+    // The release deleted that one blob: the recovery records stay.
+    assert_eq!(
+        fx.bridge.safety.inner.keys(),
+        [article_key(&o.extent), "m/g_seeded".to_string()]
+    );
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.len(), 1);
     assert!(status[0].counts && status[0].articles_ok == 3);
@@ -479,6 +512,83 @@ async fn post_verify_release_over_fake_nntp() {
     assert!(fx.bridge.nntp.inner.peak() <= 2);
     let held = "SELECT COUNT(*) FROM provider_permits WHERE holder IS NOT NULL";
     assert_eq!(fx.scalar(held, &[]).await, "0");
+}
+
+/// The article plan record is stored before the first POST: while it
+/// cannot be written nothing is posted, and the record that is written
+/// later holds the plan the catalogue has.
+#[tokio::test]
+async fn no_post_before_the_article_plan_record() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "a/big.bin", &plaintext()).await;
+    *fx.bridge.safety.no_put.borrow_mut() = Some("m/art/".to_string());
+
+    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    assert_eq!(fx.server.posted_count().await, 0);
+    assert_eq!(fx.outbox(&o, "stage").await, "post");
+    assert!(!fx.bridge.safety.inner.contains(&article_key(&o.extent)));
+    // The plan itself is in the catalogue: the retry reuses it.
+    assert_eq!(fx.extent(&o, "article_count").await, "3");
+    let planned = fx.bridge.catalog.articles(&o.extent).await.unwrap();
+
+    *fx.bridge.safety.no_put.borrow_mut() = None;
+    fx.make_due(&o).await;
+    assert_eq!(
+        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        JobOutcome::Ack
+    );
+    assert_eq!(fx.server.posted_count().await, 3);
+    let record = read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
+        .await
+        .unwrap()
+        .expect("the record exists");
+    // The record names the revision the catalogue gave the plan.
+    assert_eq!(fx.extent(&o, "plan_rev").await, "1");
+    assert_eq!(record.plan_rev, 1);
+    let rows = record.rows(ArticleState::Planned).unwrap();
+    assert_eq!(rows.len(), 3);
+    for (row, was) in rows.iter().zip(&planned) {
+        assert_eq!(
+            (
+                &row.message_id,
+                row.cipher_offset,
+                row.cipher_len,
+                row.payload_sha256
+            ),
+            (
+                &was.message_id,
+                was.cipher_offset,
+                was.cipher_len,
+                was.payload_sha256
+            )
+        );
+    }
+
+    // A record that no longer opens is replaced by the next write.
+    let name = article_key(&o.extent);
+    assert!(fx.bridge.safety.inner.corrupt(&name, |b| b[8] ^= 1));
+    assert!(
+        read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
+            .await
+            .is_err()
+    );
+    let (_, extents) = fx
+        .bridge
+        .catalog
+        .live_object(&bucket.id, "a/big.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    write_article_plan(&fx.bridge.safety, &fx.bridge.kek, &extents[0], &planned)
+        .await
+        .unwrap();
+    let again = read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.rows(ArticleState::Planned).unwrap().len(), 3);
 }
 
 // ---------------------------------------------------------------------------
