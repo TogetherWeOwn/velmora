@@ -822,7 +822,9 @@ async fn an_article_the_posting_provider_lost_is_posted_there_again() {
 
 /// An obligation that was cancelled after its repost and revived starts
 /// over at the post stage with its cursor at zero. The articles are on
-/// the backbone by then: nothing is posted again, by either stage.
+/// the backbone by then: nothing is posted again, by either stage. The
+/// post stage goes straight on to verify without a provider slot, so it
+/// does so even while other jobs hold every one of them.
 #[tokio::test]
 async fn a_revived_extent_is_not_posted_again() {
     let rig = two_posting_backbones().await;
@@ -839,10 +841,28 @@ async fn a_revived_extent_is_not_posted_again() {
     });
     rig.bridge.clock.advance_secs(3600);
     rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    // Another job holds every background slot of both posting providers.
+    let now = rig.bridge.clock.now();
+    let mut held = Vec::new();
+    for provider in &rig.bridge.cfg.providers {
+        while let Some(permit) = rig
+            .bridge
+            .catalog
+            .acquire_permit(provider, PermitClass::Background, "other", now)
+            .await
+            .unwrap()
+        {
+            held.push(permit);
+        }
+    }
+    assert!(held.len() >= 2);
     assert_eq!(rig.run(&s, OutboxStage::Post).await, JobOutcome::Ack);
     // The post stage needed no provider at all.
     assert!(rig.bridge.nntp.calls().is_empty());
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    for permit in held {
+        rig.bridge.catalog.release_permit(&permit).await.unwrap();
+    }
     rig.bridge.clock.advance_secs(3600);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);

@@ -49,7 +49,7 @@ pub const MIGRATION_0005: &str =
 
 /// The newest tombstone of each deleted key.
 pub const MIGRATION_0006: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0006_key_tombstones.sql");
+    include_str!("../../../workers/s3-bridge/migrations/0006_key_floors.sql");
 
 /// The mark of an unfinished catalogue replay.
 pub const MIGRATION_0007: &str =

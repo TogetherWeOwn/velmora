@@ -1,4 +1,4 @@
-//! ListObjectsV2 and ListBuckets.
+//! ListObjectsV2, ListObjects (V1) and ListBuckets.
 //!
 //! The catalogue returns raw rows in key order; the protocol crate folds
 //! common prefixes and renders the page. Continuation tokens are tagged
@@ -88,17 +88,25 @@ async fn objects<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     let Some(bucket) = &authed.bucket else {
         return Err(s3_error(ErrorCode::InvalidRequest));
     };
-    // Only the V2 listing is served; V1 has different paging fields.
-    let v2 = authed
+    // `list-type=2` is V2; no `list-type` is V1 (marker paging). Any
+    // other value is not a listing this service knows.
+    let token_key = Zeroizing::new(list_token_key(bridge.kek.active().1).mac(TOKEN_LABEL));
+    let mut list_type = authed
         .target
         .query()
         .iter()
-        .any(|(k, v)| k == b"list-type" && v == b"2");
-    if !v2 {
-        return Err(S3Response::not_implemented());
+        .filter(|(k, _)| k == b"list-type")
+        .map(|(_, v)| v.as_slice());
+    let version = list_type.next();
+    if list_type.next().is_some() {
+        return Err(s3_error(ErrorCode::InvalidRequest));
     }
-    let token_key = Zeroizing::new(list_token_key(bridge.kek.active().1).mac(TOKEN_LABEL));
-    let mut page = ListObjectsV2::parse(&authed.target, &token_key[..]).map_err(s3_error)?;
+    let mut page = match version {
+        Some(b"2") => ListObjectsV2::parse(&authed.target, &token_key[..]),
+        None => ListObjectsV2::parse_v1(&authed.target),
+        Some(_) => return Err(S3Response::not_implemented()),
+    }
+    .map_err(s3_error)?;
 
     let mut exhausted = false;
     let mut queries = 0;
