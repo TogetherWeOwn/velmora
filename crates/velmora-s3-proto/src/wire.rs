@@ -5,7 +5,8 @@
 // controls / U+FFFE / U+FFFF (not representable in XML 1.0) are rejected; the
 // CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted;
 // the SDK's `x-id` operation hint is accepted as a query parameter;
-// `x-amz-bucket-object-lock-enabled: false` is accepted (Object Lock is not offered).
+// `x-amz-bucket-object-lock-enabled: false` is accepted (Object Lock is not offered);
+// the ListObjects V1 `marker` query key is accepted.
 
 use super::{ErrorCode, Policy, Result};
 
@@ -141,6 +142,7 @@ impl Target {
                     | "delimiter"
                     | "continuation-token"
                     | "start-after"
+                    | "marker"
                     | "max-keys"
                     | "encoding-type"
                     | "key-marker"

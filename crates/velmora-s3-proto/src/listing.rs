@@ -7,9 +7,9 @@
 // scanning a catalogue port, the server-side `TokenPort` handle store is replaced
 // by a self-contained HMAC-tagged token whose key the caller supplies, and objects
 // render with StorageClass STANDARD. `max-keys` above 1000 is capped (as S3 does)
-// instead of rejected.
+// instead of rejected. ListObjects V1 (`marker`) is added on the same fold.
 
-//! ListObjectsV2 and ListBuckets: request parsing, the delimiter fold over rows
+//! ListObjectsV2, ListObjects (V1) and ListBuckets: request parsing, the delimiter fold over rows
 //! the caller fetches in key order, continuation tokens, and the XML renderers.
 //! Pure: no I/O and no key material of its own.
 
@@ -167,7 +167,8 @@ enum Entry {
     CommonPrefix(String),
 }
 
-/// One ListObjectsV2 page. The caller loops: query rows with
+/// One ListObjectsV2 page, or a V1 page from [`ListObjectsV2::parse_v1`].
+/// The caller loops: query rows with
 /// `key starts_with prefix() AND key > after()` in ascending key order, `push`
 /// each while `wants_more()`, then `finish(exhausted)`, where `exhausted` means
 /// the scan reached the end of the prefix range (false = the caller's query
@@ -181,6 +182,10 @@ pub struct ListObjectsV2 {
     has_after: bool,
     scanned: usize,
     entries: Vec<(Entry, Cursor)>,
+    /// ListObjects V1: `marker` is held as `start_after` (same semantics:
+    /// keys and CommonPrefixes at or before it are skipped) and the page
+    /// resumes by `NextMarker` instead of a token.
+    v1: bool,
 }
 
 impl ListObjectsV2 {
@@ -217,6 +222,44 @@ impl ListObjectsV2 {
             cursor,
             scanned: 0,
             entries: Vec::new(),
+            v1: false,
+        })
+    }
+
+    /// ListObjects V1: `prefix`, `delimiter`, `marker`, `max-keys`,
+    /// `encoding-type`. No token: the next page starts after `NextMarker`
+    /// (or, without a delimiter, the last key), which the client sends back
+    /// as `marker`.
+    pub fn parse_v1(target: &Target) -> Result<Self> {
+        let max_keys = target
+            .one("max-keys")?
+            .map(decimal)
+            .transpose()?
+            .map_or(MAX_KEYS, |n| n.min(u64::from(MAX_KEYS)) as u32);
+        let encoding = target.one("encoding-type")?;
+        if !matches!(encoding, None | Some("url")) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        let marker = target.one("marker")?.filter(|m| !m.is_empty());
+        let scope = TokenScope {
+            bucket: target.bucket.clone(),
+            prefix: target.one("prefix")?.unwrap_or("").into(),
+            delimiter: target.one("delimiter")?.unwrap_or("").into(),
+            start_after: marker.map(str::to_owned),
+            url_encoding: encoding.is_some(),
+        };
+        Ok(Self {
+            has_after: scope.start_after.is_some(),
+            cursor: Cursor {
+                after: scope.start_after.clone().unwrap_or_default(),
+                skip_prefix: None,
+            },
+            scope,
+            max_keys,
+            token: None,
+            scanned: 0,
+            entries: Vec::new(),
+            v1: true,
         })
     }
 
@@ -319,19 +362,41 @@ impl ListObjectsV2 {
                 Err(ErrorCode::InvalidArgument)
             }
         };
-        let mut out = format!(
-            "<ListBucketResult xmlns=\"{NS}\"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
-            xml(&scope.bucket),
-            field(&scope.prefix)?,
-            self.entries.len()
-        );
+        let mut out = if self.v1 {
+            let mut head = format!(
+                "<ListBucketResult xmlns=\"{NS}\"><Name>{}</Name><Prefix>{}</Prefix><Marker>{}</Marker>",
+                xml(&scope.bucket),
+                field(&scope.prefix)?,
+                field(scope.start_after.as_deref().unwrap_or(""))?
+            );
+            // S3 sends NextMarker only with a delimiter; without one the
+            // last key is the marker. `cursor.after` is the last key scanned,
+            // which is also right for a page cut short by the query budget.
+            if truncated && !scope.delimiter.is_empty() {
+                head.push_str(&format!(
+                    "<NextMarker>{}</NextMarker>",
+                    field(&self.cursor.after)?
+                ));
+            }
+            head.push_str(&format!(
+                "<MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>"
+            ));
+            head
+        } else {
+            format!(
+                "<ListBucketResult xmlns=\"{NS}\"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{max}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
+                xml(&scope.bucket),
+                field(&scope.prefix)?,
+                self.entries.len()
+            )
+        };
         if !scope.delimiter.is_empty() {
             out.push_str(&format!(
                 "<Delimiter>{}</Delimiter>",
                 field(&scope.delimiter)?
             ));
         }
-        if let Some(start) = &scope.start_after {
+        if let (false, Some(start)) = (self.v1, &scope.start_after) {
             out.push_str(&format!("<StartAfter>{}</StartAfter>", field(start)?));
         }
         if scope.url_encoding {
@@ -358,7 +423,7 @@ impl ListObjectsV2 {
                 )),
             }
         }
-        if truncated {
+        if truncated && !self.v1 {
             out.push_str(&format!(
                 "<NextContinuationToken>{}</NextContinuationToken>",
                 xml(&issue_token(token_key, scope, &self.cursor)?)

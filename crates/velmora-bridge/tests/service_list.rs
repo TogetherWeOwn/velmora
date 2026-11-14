@@ -1,4 +1,4 @@
-//! ListObjectsV2 and ListBuckets over the SQL catalogue.
+//! ListObjectsV2, ListObjects (V1) and ListBuckets over the SQL catalogue.
 
 mod service_support;
 
@@ -358,12 +358,13 @@ async fn reserved_keys_are_listed_verbatim() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn only_list_objects_v2_is_served() {
+async fn only_list_objects_v1_and_v2_are_served() {
     let rig = rig();
     let (_, signer) = rig.standard(BUCKET).await;
+    // No list-type is V1 (served; see `list_objects_v1_pages_by_marker`).
     rig.call(&signer, Method::Get, "/bkt-list", &[], &[], b"")
         .await
-        .expect_error(501, "NotImplemented");
+        .expect(200);
     rig.call(
         &signer,
         Method::Get,
@@ -410,4 +411,104 @@ async fn list_buckets_shows_only_granted_buckets() {
             .await
             .expect_error(403, "AccessDenied");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_objects_v1_pages_by_marker() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let keys = ["a/1", "a/2", "b", "c/x", "c/y", "d e", "z"];
+    for k in keys {
+        rig.put(&signer, BUCKET, k, k.as_bytes()).await.expect(200);
+    }
+
+    // No delimiter: the client resumes after the last key.
+    let mut got = Vec::new();
+    let mut marker: Option<String> = None;
+    for _ in 0..20 {
+        let mut q = vec![("max-keys", "2")];
+        if let Some(m) = &marker {
+            q.push(("marker", m.as_str()));
+        }
+        let resp = rig
+            .call(&signer, Method::Get, &format!("/{BUCKET}"), &q, &[], b"")
+            .await;
+        resp.expect(200);
+        assert!(resp.values("KeyCount").is_empty());
+        assert!(resp.values("NextMarker").is_empty());
+        let page = resp.values("Key");
+        got.extend(page.clone());
+        if resp.values("IsTruncated") != ["true"] {
+            break;
+        }
+        marker = page.last().cloned();
+    }
+    assert_eq!(got, keys);
+
+    // Delimiter: NextMarker, and a common prefix appears once.
+    let mut got = Vec::new();
+    let mut marker: Option<String> = None;
+    for _ in 0..20 {
+        let mut q = vec![("max-keys", "1"), ("delimiter", "/")];
+        if let Some(m) = &marker {
+            q.push(("marker", m.as_str()));
+        }
+        let resp = rig
+            .call(&signer, Method::Get, &format!("/{BUCKET}"), &q, &[], b"")
+            .await;
+        resp.expect(200);
+        got.extend(resp.values("Key"));
+        let text = resp.text();
+        got.extend(
+            text.split("<CommonPrefixes><Prefix>")
+                .skip(1)
+                .map(|r| r.split("</Prefix>").next().unwrap().to_string()),
+        );
+        if resp.values("IsTruncated") != ["true"] {
+            assert!(resp.values("NextMarker").is_empty());
+            break;
+        }
+        marker = resp.values("NextMarker").pop();
+        assert!(
+            marker.is_some(),
+            "a truncated page with a delimiter names NextMarker"
+        );
+    }
+    assert_eq!(got, ["a/", "b", "c/", "d e", "z"]);
+
+    // A marker inside a common prefix skips the rest of that group.
+    let resp = rig
+        .call(
+            &signer,
+            Method::Get,
+            &format!("/{BUCKET}"),
+            &[("delimiter", "/"), ("marker", "a/1"), ("prefix", "")],
+            &[],
+            b"",
+        )
+        .await;
+    resp.expect(200);
+    assert_eq!(resp.values("Marker"), ["a/1"]);
+    assert_eq!(resp.values("Key"), ["b", "d e", "z"]);
+    assert!(!resp.text().contains("<Prefix>a/</Prefix>"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_objects_v1_needs_a_grant() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bucket("bkt-hidden", true).await;
+    rig.call(&signer, Method::Get, "/bkt-hidden", &[], &[], b"")
+        .await
+        .expect_error(403, "AccessDenied");
+    rig.call(
+        &signer,
+        Method::Get,
+        "/bkt-list",
+        &[("list-type", "2"), ("list-type", "2")],
+        &[],
+        b"",
+    )
+    .await
+    .expect(400);
 }
