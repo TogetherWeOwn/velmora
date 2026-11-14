@@ -62,8 +62,11 @@ async fn posts_the_stored_plan_and_no_plaintext() {
         let mut payload = vec![0u8; row.cipher_len as usize];
         let part = decode_part_to(&row.message_id, &article, &mut payload).unwrap();
         assert_eq!(part.written as u64, row.cipher_len);
-        assert_eq!(part.offset, row.cipher_offset);
-        assert_eq!(part.file_size, s.cipher.len() as u64);
+        // A standalone article: nothing on the wire places it in the
+        // extent. The catalogue alone knows where it goes.
+        assert!(!part.multipart);
+        assert_eq!(part.offset, 0);
+        assert_eq!(part.file_size, row.cipher_len);
         let start = row.cipher_offset as usize;
         assert_eq!(payload, s.cipher[start..start + payload.len()]);
         assert!(

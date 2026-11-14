@@ -209,23 +209,50 @@ fn payload_of<'a>(cipher: &'a [u8], row: &ArticleRow) -> Option<&'a [u8]> {
     cipher.get(start..start.checked_add(len)?)
 }
 
+/// Longest stored yEnc name a row may carry (the catalogue's CHECK).
+const MAX_YENC_NAME_LEN: usize = 64;
+
 /// Renders the complete article for a stored row. Everything on the wire
-/// is a function of the stored row and the ciphertext (the yEnc name is
-/// the head of the message-id), so a repost is byte-identical.
+/// is a function of the stored row and the ciphertext, so a repost is
+/// byte-identical.
+///
+/// A row with its own yEnc name is a standalone single-part yEnc file:
+/// `=ybegin line=128 size=<payload> name=<name>`, the payload, then
+/// `=yend size=<payload> crc32=<payload crc>`. No part number, no range
+/// and no extent size: nothing on the wire ties the articles of one
+/// extent together. A row without one was planned before standalone
+/// articles and keeps the multi-part form it was posted in: part
+/// `idx + 1` of `total`, the extent's ciphertext range, `size=` of the
+/// whole extent, and the name taken from the head of the message-id.
+///
+/// Reads never depend on the form: they decode either one and accept only
+/// the stored length and SHA-256 (`fetch::check_payload`).
 fn render_article(row: &ArticleRow, total: u32, file_size: u64, payload: &[u8]) -> Result<Vec<u8>> {
-    let name: String = row
-        .message_id
-        .chars()
-        .take_while(char::is_ascii_alphanumeric)
-        .take(OBFUSCATED_YENC_NAME_LEN)
-        .collect();
-    let params = SegmentParams {
-        name,
-        part: row.idx + 1,
-        total,
-        begin: row.cipher_offset + 1,
-        end: row.cipher_offset + row.cipher_len,
-        file_size,
+    let params = match &row.yenc_name {
+        Some(name) => {
+            let valid = !name.is_empty()
+                && name.len() <= MAX_YENC_NAME_LEN
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
+            if !valid {
+                return Err(BridgeError::Invalid("stored yEnc name is malformed"));
+            }
+            SegmentParams::single(name.clone())
+        }
+        None => SegmentParams {
+            name: row
+                .message_id
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .take(OBFUSCATED_YENC_NAME_LEN)
+                .collect(),
+            part: row.idx + 1,
+            total,
+            begin: row.cipher_offset + 1,
+            end: row.cipher_offset + row.cipher_len,
+            file_size,
+        },
     };
     let mut body = Vec::with_capacity(payload.len() + payload.len() / 16 + 512);
     encode_segment(&mut body, &params, payload)?;
@@ -504,6 +531,7 @@ where
                     cipher_offset: span.start,
                     cipher_len: span.len,
                     payload_sha256: [0; 32],
+                    yenc_name: Some(meta.yenc_name),
                     state: ArticleState::Planned,
                     provider_id: None,
                     posted_at: None,

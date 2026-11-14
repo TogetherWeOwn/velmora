@@ -54,6 +54,9 @@ pub const MIGRATION_0006: &str =
 /// under.
 pub const MIGRATION_0007: &str =
     include_str!("../../../workers/s3-bridge/migrations/0007_key_floors.sql");
+/// Each article's own yEnc name (standalone single-part articles).
+pub const MIGRATION_0009: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0009_article_yenc_name.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -143,6 +146,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0005)?;
         db.apply(MIGRATION_0006)?;
         db.apply(MIGRATION_0007)?;
+        db.apply(MIGRATION_0009)?;
         Ok(db)
     }
 

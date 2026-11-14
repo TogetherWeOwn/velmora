@@ -633,6 +633,11 @@ pub struct ArticleRow {
     pub cipher_len: u64,
     /// SHA-256 of the decoded article payload.
     pub payload_sha256: [u8; 32],
+    /// The article's own random yEnc name: it is posted as one standalone
+    /// single-part yEnc file. `None` is a row planned before standalone
+    /// articles, posted (and reposted) in the multi-part form under a name
+    /// taken from the message-id. See `post::render_article`.
+    pub yenc_name: Option<String>,
     pub state: ArticleState,
     pub provider_id: Option<String>,
     pub posted_at: Option<UnixMs>,

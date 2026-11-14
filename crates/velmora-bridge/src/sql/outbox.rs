@@ -316,7 +316,7 @@ pub(super) async fn articles<S: Sql>(
         .sql
         .query(
             "SELECT extent_id, idx, message_id, newsgroup, headers, cipher_offset, cipher_len, \
-               payload_sha256, state, provider_id, posted_at \
+               payload_sha256, yenc_name, state, provider_id, posted_at \
              FROM articles WHERE extent_id = ?1 ORDER BY idx",
             &[text(extent.as_str())],
         )
@@ -333,6 +333,7 @@ pub(super) async fn articles<S: Sql>(
             cipher_offset: r.num()?,
             cipher_len: r.num()?,
             payload_sha256: r.array()?,
+            yenc_name: r.opt_text()?,
             state: r.parsed(ArticleState::parse)?,
             provider_id: r.opt_text()?,
             posted_at: r.opt_num()?.map(UnixMs),
@@ -368,8 +369,8 @@ pub(super) async fn plan_articles<S: Sql>(
     for a in rows {
         stmts.push((
             "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, cipher_offset, \
-               cipher_len, payload_sha256, state) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'planned' \
+               cipher_len, payload_sha256, yenc_name, state) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'planned' \
              WHERE (SELECT article_count FROM extents WHERE id = ?1) IS NULL",
             vec![
                 text(a.extent_id.as_str()),
@@ -380,6 +381,7 @@ pub(super) async fn plan_articles<S: Sql>(
                 int(a.cipher_offset)?,
                 int(a.cipher_len)?,
                 SqlValue::Blob(a.payload_sha256.to_vec()),
+                a.yenc_name.as_deref().map_or(SqlValue::Null, text),
             ],
         ));
     }
