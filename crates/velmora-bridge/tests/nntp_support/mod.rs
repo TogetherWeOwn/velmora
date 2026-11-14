@@ -262,6 +262,8 @@ pub struct MemCatalog {
     pub renewals: Cell<u32>,
     /// The time of each `renew_all`.
     pub renewed_at: RefCell<Vec<UnixMs>>,
+    /// Every permit renewal takes this long on the clock.
+    pub renew_takes: RefCell<Option<(FixedClock, i64)>>,
     /// The time of each permit renewal that held.
     pub permit_renewed_at: RefCell<Vec<UnixMs>>,
     /// `mark_posted_many` calls so far.
@@ -786,6 +788,9 @@ impl Catalog for MemCatalog {
             return Ok(false);
         }
         self.permit_renewed_at.borrow_mut().push(now);
+        if let Some((clock, ms)) = self.renew_takes.borrow().as_ref() {
+            clock.advance_ms(*ms);
+        }
         // By the class the slot was taken for, as in `sql::permits`.
         let class = match slot.background {
             true => PermitClass::Background,

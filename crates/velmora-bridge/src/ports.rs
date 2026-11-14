@@ -196,14 +196,19 @@ pub const LEASE_SECS: u32 = 600;
 /// holds its slot.
 pub const PERMIT_SECS: u32 = 120;
 
+/// The longest the renewal of a read's permit may take. The new expiry
+/// counts from the time read before the catalogue round trip, so a slow
+/// round trip eats into the permit: after a slower one the read gives
+/// the slot up rather than count on what is left.
+pub const READ_RENEW_SECS: u32 = 5;
+
 /// How long an acquired or renewed permit of a read holds its slot. A
 /// read whose client went away is dropped where it waits and releases
 /// nothing, so this is how long its slot, and its source address, stay
 /// taken. A read renews before every `connect` and every `body`, so the
 /// permit has to outlast one such call and the `quit` after the last.
 pub const READ_PERMIT_SECS: u32 = 30;
-// The margin is for the catalogue round trips in between.
-const _: () = assert!(READ_PERMIT_SECS >= READ_CALL_SECS + READ_QUIT_SECS + 5);
+const _: () = assert!(READ_PERMIT_SECS >= READ_RENEW_SECS + READ_CALL_SECS + READ_QUIT_SECS);
 const _: () = assert!(READ_CALL_SECS <= NNTP_CALL_SECS && READ_PERMIT_SECS <= PERMIT_SECS);
 
 /// A claimed outbox row. Every later mutation carries it and writes only
@@ -255,6 +260,16 @@ impl PermitClass {
         match self {
             PermitClass::Background => NNTP_CALL_SECS,
             PermitClass::Read => READ_CALL_SECS,
+        }
+    }
+
+    /// The longest a renewal may take for the permit to be counted on
+    /// afterwards. `None`: no bound here; a background job renews on a
+    /// timer, with its own bounds.
+    pub const fn renew_secs(self) -> Option<u32> {
+        match self {
+            PermitClass::Background => None,
+            PermitClass::Read => Some(READ_RENEW_SECS),
         }
     }
 

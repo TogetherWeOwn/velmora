@@ -238,6 +238,29 @@ async fn a_read_that_lost_its_slot_while_connecting_reads_nothing() {
     assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
 }
 
+/// The new expiry of a renewed slot counts from before the catalogue
+/// round trip. A renewal that came back too late leaves less than a
+/// call's time on the slot: the read gives up there and opens nothing.
+#[tokio::test]
+async fn a_read_does_not_count_on_a_slot_renewed_too_late() {
+    let rig = simple_rig().await;
+    let (s, _) = rig.posted_cold(10).await;
+    let limit = i64::from(PermitClass::Read.renew_secs().unwrap()) * 1000;
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 0);
+
+    *rig.bridge.catalog.renew_takes.borrow_mut() = Some((clock.clone(), limit + 1));
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Busy);
+    assert!(rig.bridge.nntp.calls().is_empty());
+    assert_eq!(rig.cached(&s), None);
+    // The slot was given back, not left to run out.
+    let load = rig.bridge.catalog.provider_load(clock.now()).await.unwrap();
+    assert!(load.iter().all(|l| l.held == 0));
+
+    *rig.bridge.catalog.renew_takes.borrow_mut() = Some((clock, limit));
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+}
+
 /// Overlapping cold reads never hold more connections than the provider
 /// allows; reads may use every slot.
 #[tokio::test]

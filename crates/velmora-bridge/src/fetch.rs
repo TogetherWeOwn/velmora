@@ -122,7 +122,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// Renews the job's lease (if it has one) and then the permit. Call it
     /// before every article and before every reconnect: no POST, read or
     /// new socket happens on a lease or a slot that now belongs to someone
-    /// else. On a lost permit the socket is dropped at once.
+    /// else. On a lost permit the socket is dropped at once, and so it is
+    /// when the renewal of a read's permit came back too late
+    /// ([`PermitClass::renew_secs`]).
     pub(crate) async fn keep(&mut self, lease: Option<&Lease>) -> core::result::Result<(), Stop> {
         let now = self.clock.now();
         if let Some(lease) = lease {
@@ -130,9 +132,16 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
                 return Err(Stop::Fenced);
             }
         }
-        match self.catalog.renew_permit(&self.permit, now).await {
-            Ok(true) => Ok(()),
-            Ok(false) => {
+        let renewed = self.catalog.renew_permit(&self.permit, now).await;
+        // The new expiry counts from `now`. A renewal that took too long
+        // has used up the time the next call needs.
+        let late =
+            self.permit.class.renew_secs().is_some_and(|secs| {
+                self.clock.now().0.saturating_sub(now.0) > i64::from(secs) * 1000
+            });
+        match renewed {
+            Ok(true) if !late => Ok(()),
+            Ok(_) => {
                 self.session = None;
                 Err(Stop::NoPermit)
             }
