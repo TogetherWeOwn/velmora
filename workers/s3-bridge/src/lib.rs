@@ -159,8 +159,14 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
     };
     match bridge.dispatch().await {
-        Ok(report) if report.redrive_failed => console_error!("dispatch: re-drive failed"),
-        Ok(_) => {}
+        Ok(report) => {
+            if report.redrive_failed {
+                console_error!("dispatch: re-drive failed");
+            }
+            if report.evict_failed {
+                console_error!("dispatch: hot-tier check failed");
+            }
+        }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
     }
 }

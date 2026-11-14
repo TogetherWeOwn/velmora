@@ -2,7 +2,9 @@
 //!
 //! Verify proves, per backbone, that every article of an extent can be
 //! read back intact with `BODY` (a `STAT` only proves headers). Release
-//! deletes the safety copy, and only on evidence read in the same job.
+//! unpins the safety copy, and only on evidence read in the same job. The
+//! copy stays in R2 and keeps serving reads; from then on the hot-tier
+//! eviction may drop it.
 //!
 //! Rules:
 //! - Only a complete pass over all articles is recorded. A transport
@@ -21,7 +23,6 @@ use crate::ports::{
     MAX_QUEUE_DELAY_SECS,
 };
 use crate::post::{settle, Stop};
-use crate::recovery::delete_blob;
 use crate::types::{
     ArticleRow, ArticleState, ExtentRow, FailClass, GenerationState, Job, JobExtent, JobOutcome,
     OutboxStage, ProviderConfig, SafetyState, UnixMs, VerificationRow, VerifyResult, JOB_VERSION,
@@ -97,7 +98,7 @@ where
     }
 
     /// Runs the release stage for a claimed extent: re-verify every
-    /// backbone now, then delete the safety copy.
+    /// backbone now, then mark the safety copy evictable.
     pub async fn release_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
         match self.release_extent(lease, job).await {
             Ok(()) => JobOutcome::Ack,
@@ -301,7 +302,7 @@ where
         let required = self.cfg.required_backbones;
         match extent.safety_state {
             SafetyState::Held => {}
-            // A job died between the release decision and the delete.
+            // A job died between the release decision and its last step.
             SafetyState::Releasing => return self.finish_release(lease, extent).await,
             SafetyState::Released | SafetyState::Deleted => {
                 return self.advance(lease, OutboxStage::Done, now).await;
@@ -379,13 +380,9 @@ where
         }
     }
 
-    /// Deletes the safety copy of an extent already marked `releasing`.
-    /// Both steps are idempotent, so a re-driven job finishes the release.
-    async fn finish_release(&self, lease: &Lease, extent: &ExtentRow) -> Staged<()> {
-        if !self.catalog.renew(lease, self.clock.now()).await? {
-            return Err(Stop::Fenced);
-        }
-        delete_blob(&self.safety, &extent.id.safety_key()).await?;
+    /// Completes the release of an extent already marked `releasing`: the
+    /// safety copy becomes evictable. Nothing is deleted here.
+    async fn finish_release(&self, lease: &Lease, _extent: &ExtentRow) -> Staged<()> {
         match self.catalog.finish_release(lease, self.clock.now()).await? {
             true => Ok(()),
             false => Err(Stop::Fenced),

@@ -1,24 +1,24 @@
-//! Migration 0004 on a catalogue that already holds data.
+//! Migration 0005 on a catalogue that already holds data.
 //!
 //! The catalogue is filled through the service, then taken back to the
-//! schema of migration 0003 (the reference table, its indexes and its
+//! schema of migration 0004 (the reference table, its indexes and its
 //! triggers removed), which leaves exactly the rows a Worker from before
-//! the migration writes. Applying 0004 to that must give every object the
+//! the migration writes. Applying 0005 to that must give every object the
 //! reads it had.
 
 mod service_support;
 
 use service_support::*;
 use velmora_bridge::testkit::{
-    RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004,
+    RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
 };
 use velmora_bridge::*;
 
 const BUCKET: &str = "bkt-migrate";
 const KEYS: [&str; 3] = ["one", "big", "over"];
 
-/// Takes a catalogue back to the schema of migration 0003, data kept.
-const UNDO_0004: &str = "DROP TRIGGER generation_extents_on_insert; \
+/// Takes a catalogue back to the schema of migration 0004, data kept.
+const UNDO_0005: &str = "DROP TRIGGER generation_extents_on_insert; \
      DROP TRIGGER generation_extents_on_adopt; \
      DROP TRIGGER gc_keep_shared_extents; \
      DROP TRIGGER outbox_keep_shared_extents; \
@@ -166,16 +166,21 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
     assert_eq!(written.len(), 6);
     assert_eq!(rig.count("extents"), 7);
 
-    // Back to the schema of migration 0003, data kept.
+    // Back to the schema of migration 0004, data kept.
     let db: &RusqliteSql = &rig.bridge.catalog.sql;
-    db.apply(UNDO_0004).unwrap();
+    db.apply(UNDO_0005).unwrap();
     let old = RusqliteSql::open_in_memory().unwrap();
-    for migration in [MIGRATION_0001, MIGRATION_0002, MIGRATION_0003] {
+    for migration in [
+        MIGRATION_0001,
+        MIGRATION_0002,
+        MIGRATION_0003,
+        MIGRATION_0004,
+    ] {
         old.apply(migration).unwrap();
     }
     assert_eq!(schema(db), schema(&old));
 
-    db.apply(MIGRATION_0004).unwrap();
+    db.apply(MIGRATION_0005).unwrap();
     assert_eq!(schema(db), schema(&RusqliteSql::with_schema().unwrap()));
     assert_eq!(references(&rig), written);
     assert_eq!(reads(&rig, &bucket, &signer).await, before);
@@ -371,7 +376,7 @@ async fn migration_stops_when_a_live_object_would_come_out_short() {
     .await;
     let (big, _) = rig.live(&bucket, "big").await.unwrap();
     let db: &RusqliteSql = &rig.bridge.catalog.sql;
-    db.apply(UNDO_0004).unwrap();
+    db.apply(UNDO_0005).unwrap();
     let old = schema(db);
 
     // The second extent of "big" has lost its place.
@@ -385,7 +390,7 @@ async fn migration_stops_when_a_live_object_would_come_out_short() {
         })
     };
     assert_eq!(damage("NULL"), 1);
-    assert!(db.apply(MIGRATION_0004).is_err());
+    assert!(db.apply(MIGRATION_0005).is_err());
     assert_eq!(schema(db), old);
 
     // A retired generation in that state holds nothing a reader needs.
@@ -399,6 +404,6 @@ async fn migration_stops_when_a_live_object_would_come_out_short() {
             )
         })
         .unwrap();
-    db.apply(MIGRATION_0004).unwrap();
+    db.apply(MIGRATION_0005).unwrap();
     assert_eq!(rig.count("generation_extents"), 2);
 }

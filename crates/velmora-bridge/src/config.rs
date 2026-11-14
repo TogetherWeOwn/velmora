@@ -87,6 +87,9 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// `HOT_CAP_BYTES` when the variable is absent: 100 GiB.
+pub const DEFAULT_HOT_CAP_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+
 /// Validated settings for one isolate.
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -103,6 +106,9 @@ pub struct BridgeConfig {
     pub kek_active: u32,
     pub inflight_budget_bytes: u64,
     pub gc_mode: GcMode,
+    /// Cap on evictable bytes in R2 (released safety copies and cache
+    /// fills). Pinned bytes are outside it: uploads are never throttled.
+    pub hot_cap_bytes: u64,
     pub maintenance: Maintenance,
     /// Serve CopyObject. Off until the version that is rolled back to
     /// also reads extent references: an older Worker cannot read a copy
@@ -237,6 +243,19 @@ impl BridgeConfig {
             _ => return Err(ConfigError::Invalid("GC_MODE".into())),
         };
 
+        // Optional: absent or empty is the default. 0 keeps nothing hot.
+        let hot_cap_bytes = match get("HOT_CAP_BYTES") {
+            Some(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| ConfigError::Invalid("HOT_CAP_BYTES".into()))?,
+            _ => DEFAULT_HOT_CAP_BYTES,
+        };
+        // SQLite sums are signed 64-bit.
+        if i64::try_from(hot_cap_bytes).is_err() {
+            return Err(ConfigError::Invalid("HOT_CAP_BYTES".into()));
+        }
+
         let maintenance = match required(&get, "MAINTENANCE")?.as_str() {
             "off" => Maintenance::Off,
             "restore" => Maintenance::Restore,
@@ -285,6 +304,7 @@ impl BridgeConfig {
             kek_active,
             inflight_budget_bytes,
             gc_mode,
+            hot_cap_bytes,
             maintenance,
             server_side_copy,
             dev_trust_http,
