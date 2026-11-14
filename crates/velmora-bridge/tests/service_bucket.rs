@@ -215,3 +215,32 @@ async fn signed_create_bucket_only_confirms_an_owned_bucket() {
         (403, "SignatureDoesNotMatch")
     );
 }
+
+/// rclone's CreateBucket carries `x-amz-bucket-object-lock-enabled: false`.
+#[tokio::test(flavor = "current_thread")]
+async fn signed_create_bucket_accepts_object_lock_disabled_only() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    for (value, status, want) in [
+        ("false", 409, "BucketAlreadyOwnedByYou"),
+        ("False", 409, "BucketAlreadyOwnedByYou"),
+        ("true", 501, "NotImplemented"),
+        ("yes", 501, "NotImplemented"),
+    ] {
+        let resp = rig
+            .call(
+                &signer,
+                Method::Put,
+                &format!("/{BUCKET}"),
+                &[],
+                &[("x-amz-bucket-object-lock-enabled", value)],
+                b"",
+            )
+            .await;
+        assert_eq!(
+            (resp.status, code(&resp).as_str()),
+            (status, want),
+            "{value}"
+        );
+    }
+}
