@@ -123,6 +123,7 @@ impl Fx {
             post: true,
             read: true,
             max_conns: 2,
+            max_ips: None,
             priority: 0,
             retention_days: None,
             pool: None,
@@ -1037,8 +1038,20 @@ async fn object_status_evict_and_drill_after_release() {
 
     // Drill: read back from Usenet, decrypted and compared.
     let connects = fx.bridge.nntp.connects();
+    let slots = "SELECT group_concat(slot || ':' || token || ':' || background) \
+                 FROM (SELECT * FROM provider_permits ORDER BY slot)";
+    let before = fx.scalar(slots, &[]).await;
     let r = fx.post(&format!("/drill/{path}")).await;
     assert_eq!(r.status, 200);
+    // It ran inside a request, so the slot it took was a read's: the
+    // short permit, and the short calls.
+    let after = fx.scalar(slots, &[]).await;
+    let taken: Vec<&str> = after
+        .split(',')
+        .filter(|slot| !before.split(',').any(|b| b == *slot))
+        .collect();
+    assert_eq!(taken.len(), 1, "{before} -> {after}");
+    assert!(taken[0].ends_with(":0"), "{before} -> {after}");
     assert_eq!(
         r.json(),
         json!({
@@ -1217,6 +1230,10 @@ async fn status_reports_provider_health_without_credentials() {
         (Some(0), Some(0))
     );
     assert_eq!(one["cooling"], false);
+    // The limits, as configured: no address limit is `null`.
+    assert_eq!(one["max_conns"], p.max_conns);
+    assert!(one["max_ips"].is_null());
+    assert_eq!(one["holders"], 0);
 
     // A held slot and three failed sessions show up.
     let permit = fx
@@ -1231,7 +1248,7 @@ async fn status_reports_provider_health_without_credentials() {
     }
     let r = fx.get("/status").await;
     let one = r.json()["providers"][0].clone();
-    assert_eq!(one["held"], 1);
+    assert_eq!((&one["held"], &one["holders"]), (&json!(1), &json!(1)));
     assert_eq!(one["cooling"], true);
     assert_eq!(one["cooldown_until"], now.0 + 60_000);
     let body = r.text();
@@ -1239,4 +1256,29 @@ async fn status_reports_provider_health_without_credentials() {
         assert!(!body.contains(secret), "status leaks provider details");
     }
     fx.bridge.catalog.release_permit(&permit).await.unwrap();
+}
+
+/// The address limit of a provider and the number of jobs and requests
+/// that hold slots there are in the status.
+#[tokio::test]
+async fn status_reports_the_address_limit_and_its_holders() {
+    let mut fx = Fx::new().await;
+    Rc::get_mut(&mut fx.bridge)
+        .expect("one owner")
+        .cfg
+        .providers[0]
+        .max_ips = Some(2);
+    let now = fx.bridge.clock.now();
+    let p = fx.bridge.cfg.providers[0].clone();
+    for holder in ["a", "a", "b"] {
+        let permit = fx
+            .bridge
+            .catalog
+            .acquire_permit(&p, PermitClass::Read, holder, now);
+        // Two slots in the fixture: the third is refused.
+        assert_eq!(permit.await.unwrap().is_some(), holder == "a");
+    }
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(one["max_ips"], 2);
+    assert_eq!((&one["held"], &one["holders"]), (&json!(2), &json!(1)));
 }

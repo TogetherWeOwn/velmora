@@ -382,7 +382,10 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
             }
             _ => false,
         };
-        if !pool_ok || p.retention_days == Some(0) {
+        // Stated, the address limit is a real one: `0` would shut the
+        // provider out without saying so (`enabled` does that).
+        let ips_ok = p.max_ips.is_none_or(|n| (1..=MAX_CONNS_LIMIT).contains(&n));
+        if !pool_ok || !ips_ok || p.retention_days == Some(0) {
             return Err(bad());
         }
         if p.id.is_empty()

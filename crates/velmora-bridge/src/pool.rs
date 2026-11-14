@@ -5,13 +5,13 @@
 //! - a disabled provider and one in a cooldown are left out;
 //! - the rest are tried by `priority` (`0` first);
 //! - inside a priority tier the provider with the most free slots goes
-//!   first, and a tie goes to the one that was handed the fewest slots so
+//!   first (one whose `max_ips` addresses are all in use has none), and a tie goes to the one that was handed the fewest slots so
 //!   far, which rotates idle providers of a tier.
 //!
 //! The order is a preference only. The permit gate still decides whether
 //! a connection may be opened.
 
-use crate::ports::Catalog;
+use crate::ports::{Catalog, PermitClass};
 use crate::types::{ProviderConfig, ProviderLoad, Result, UnixMs};
 
 /// A snapshot of the pool at `now`.
@@ -56,9 +56,21 @@ impl<'a> Pool<'a> {
             .is_some_and(|l| l.cooldown_until > self.now)
     }
 
-    /// Slots the provider could still hand out: under its own limit and,
-    /// in a pool, under what the pool's accounts hold together.
-    fn free(&self, p: &ProviderConfig) -> u32 {
+    /// Slots the provider could still hand out to a caller of `class`
+    /// that holds none there: under its own limit and, in a pool, under
+    /// what the pool's accounts hold together; none while the account is
+    /// in use from as many addresses as it allows, or as it allows to
+    /// background jobs.
+    fn free(&self, p: &ProviderConfig, class: PermitClass) -> u32 {
+        let (holders, jobs) = self
+            .state(&p.id)
+            .map_or((0, 0), |l| (l.holders, l.background_holders));
+        let no_address = p.max_ips.is_some_and(|max| holders >= max)
+            || (class == PermitClass::Background
+                && p.background_ips().is_some_and(|max| jobs >= max));
+        if no_address {
+            return 0;
+        }
         let own = p.max_conns.saturating_sub(self.held(&p.id));
         match (&p.pool, p.pool_max_conns) {
             (Some(pool), Some(max)) => {
@@ -75,8 +87,12 @@ impl<'a> Pool<'a> {
     }
 
     /// The enabled providers among `candidates` that are not cooling, in
-    /// the order they should be tried.
-    pub(crate) fn order<'c>(&self, candidates: Vec<&'c ProviderConfig>) -> Vec<&'c ProviderConfig> {
+    /// the order a caller of `class` should try them.
+    pub(crate) fn order<'c>(
+        &self,
+        candidates: Vec<&'c ProviderConfig>,
+        class: PermitClass,
+    ) -> Vec<&'c ProviderConfig> {
         let mut usable: Vec<&ProviderConfig> = candidates
             .into_iter()
             .filter(|p| p.enabled && !self.cooling(p))
@@ -84,7 +100,7 @@ impl<'a> Pool<'a> {
         // Stable: equal providers keep their configuration order.
         usable.sort_by_key(|p| {
             let uses = self.state(&p.id).map_or(0, |l| l.uses);
-            (p.priority, core::cmp::Reverse(self.free(p)), uses)
+            (p.priority, core::cmp::Reverse(self.free(p, class)), uses)
         });
         usable
     }

@@ -116,6 +116,9 @@ struct Spool {
     /// While true, a login over the connection cap is answered `482`
     /// instead of `502`.
     limit_482: bool,
+    /// The whole reply line of a login over the connection cap, when a
+    /// test sets one; it overrides `limit_482`.
+    limit_reply: Option<String>,
 }
 
 struct Shared {
@@ -144,6 +147,7 @@ impl Shared {
             drop_bodies: 0,
             stat_lag: false,
             limit_482: false,
+            limit_reply: None,
         };
         Self {
             config,
@@ -327,6 +331,13 @@ impl TestNntpServer {
     pub async fn set_limit_reply_482(&self, on: bool) {
         self.shared.spool.lock().await.limit_482 = on;
     }
+
+    /// Sets the whole reply line (code and text, no line ending) of a
+    /// login over the per-user connection cap, for a provider's own
+    /// wording of a limit. `None` = the default reply again.
+    pub async fn set_limit_reply(&self, line: Option<&str>) {
+        self.shared.spool.lock().await.limit_reply = line.map(str::to_string);
+    }
 }
 
 impl Drop for TestNntpServer {
@@ -462,11 +473,15 @@ async fn handle_connection(
                     let count = active.get(&user).copied().unwrap_or(0);
                     if count >= max {
                         drop(active);
-                        let reply: &[u8] = match shared.spool.lock().await.limit_482 {
-                            true => b"482 Too many connections for user\r\n",
-                            false => b"502 Too many connections for user\r\n",
+                        let reply = {
+                            let spool = shared.spool.lock().await;
+                            match (&spool.limit_reply, spool.limit_482) {
+                                (Some(line), _) => format!("{line}\r\n"),
+                                (None, true) => "482 Too many connections for user\r\n".into(),
+                                (None, false) => "502 Too many connections for user\r\n".into(),
+                            }
                         };
-                        let _ = writer.write_all(reply).await;
+                        let _ = writer.write_all(reply.as_bytes()).await;
                         break;
                     }
                     active.insert(user.clone(), count + 1);
