@@ -28,3 +28,13 @@ region = "aws:us-east-1"
 
 [env.us.vars]
 NEWSGROUPS = "alt.binaries.test"
+
+# The same near the US west coast: `wrangler deploy --env usw`.
+[env.usw]
+name = "velmora-nntp-probe-usw"
+
+[env.usw.placement]
+region = "aws:us-west-1"
+
+[env.usw.vars]
+NEWSGROUPS = "alt.binaries.test"
