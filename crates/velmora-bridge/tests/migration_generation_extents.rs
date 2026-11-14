@@ -20,10 +20,10 @@ const KEYS: [&str; 3] = ["one", "big", "over"];
 /// Takes a catalogue back to the schema of migration 0003, data kept.
 const UNDO_0004: &str = "DROP TRIGGER generation_extents_on_insert; \
      DROP TRIGGER generation_extents_on_adopt; \
-     DROP TRIGGER generations_keep_shared_extents; \
+     DROP TRIGGER gc_keep_shared_extents; \
+     DROP TRIGGER outbox_keep_shared_extents; \
      DROP TRIGGER extents_keep_key_in_service; \
      DROP TRIGGER articles_keep_in_service; \
-     DROP INDEX gc_open_by_extent; \
      DROP INDEX upload_parts_by_extent; \
      DROP TABLE generation_extents;";
 
@@ -303,6 +303,19 @@ async fn old_workers_cannot_take_a_shared_extent_out_of_service() {
     assert_eq!(rig.count("gc"), 0);
     assert_eq!(rig.count("outbox WHERE stage = 'cancelled'"), 0);
     assert!(rig.live(&bucket, "src").await.is_some());
+    // Each of the two statements is refused on its own, too.
+    for sql in &OLD_RETIRE[..2] {
+        let args = vec![
+            SqlValue::Text(bucket.id.as_str().to_owned()),
+            SqlValue::Text("src".to_owned()),
+            SqlValue::Int(rig.now().0),
+        ];
+        let refused = db.batch(vec![(*sql, args)]).await.unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("referenced by another live generation"),
+            "{refused:?}"
+        );
+    }
 
     // The collector's writes, for an extent in service: refused.
     const SHRED: &str = "UPDATE extents SET wrapped_file_key = NULL WHERE id = ?1";

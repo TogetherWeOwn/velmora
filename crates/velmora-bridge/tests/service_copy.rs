@@ -468,9 +468,11 @@ async fn collector_refuses_an_extent_a_copy_references() {
     rig.put(&signer, BUCKET, "src", &body).await.expect(200);
     let (_, extents) = rig.live(&bucket, "src").await.unwrap();
     let extent = extents[0].id.clone();
-    copy(&rig, &signer, &source("src"), "kept", &[])
-        .await
-        .expect(200);
+    for key in ["kept", "other"] {
+        copy(&rig, &signer, &source("src"), key, &[])
+            .await
+            .expect(200);
+    }
     assert_eq!(delete(&rig, &signer, "src").await.status, 204);
 
     rig.bridge.catalog.sql.with_conn(|c| {
@@ -486,6 +488,11 @@ async fn collector_refuses_an_extent_a_copy_references() {
 
     assert!(rig.bridge.safety.contains(&extent.safety_key()));
     assert_eq!(rig.count("gc WHERE done_at IS NULL"), 3);
+    // The refused rows stay queued. They do not stand in the way of
+    // retiring one of the copies.
+    assert_eq!(delete(&rig, &signer, "other").await.status, 204);
+    collect_garbage(&rig).await;
+    assert!(rig.bridge.safety.contains(&extent.safety_key()));
     let read = get(&rig, &signer, "kept").await;
     read.expect(200);
     assert_eq!(read.body, body);

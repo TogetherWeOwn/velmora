@@ -65,24 +65,33 @@ END;
 -- answers an error and nothing is lost. Current code never reaches them:
 -- it asks the same question before it writes.
 
--- Retiring a generation after queueing collection, or cancelling the
--- posting, of an extent another live generation references.
-CREATE TRIGGER generations_keep_shared_extents BEFORE UPDATE OF state ON generations
-WHEN OLD.state = 'live' AND NEW.state <> 'live' AND EXISTS (
-  SELECT 1 FROM generation_extents mine
-   WHERE mine.generation_id = OLD.id
-     AND EXISTS (SELECT 1 FROM generation_extents other
-                   JOIN generations og ON og.id = other.generation_id
-                  WHERE other.extent_id = mine.extent_id
-                    AND og.state = 'live' AND og.id <> OLD.id)
-     AND (EXISTS (SELECT 1 FROM gc q
-                   WHERE q.extent_id = mine.extent_id AND q.done_at IS NULL)
-          OR EXISTS (SELECT 1 FROM outbox o
-                      WHERE o.extent_id = mine.extent_id AND o.stage = 'cancelled')))
+-- Queueing collection of an extent whose own generation is live and
+-- which a second live generation references. Current code queues an
+-- extent only when at most the generation being retired references it.
+CREATE TRIGGER gc_keep_shared_extents BEFORE INSERT ON gc
+WHEN EXISTS (
+  SELECT 1 FROM extents e JOIN generations og ON og.id = e.generation_id
+   WHERE e.id = NEW.extent_id AND og.state = 'live'
+     AND EXISTS (SELECT 1 FROM generation_extents r
+                   JOIN generations g ON g.id = r.generation_id
+                  WHERE r.extent_id = e.id AND g.state = 'live'
+                    AND g.id <> e.generation_id))
 BEGIN
   SELECT RAISE(ABORT, 'extent is referenced by another live generation');
 END;
-CREATE INDEX gc_open_by_extent ON gc(extent_id) WHERE done_at IS NULL;
+
+-- Cancelling the posting of such an extent.
+CREATE TRIGGER outbox_keep_shared_extents BEFORE UPDATE OF stage ON outbox
+WHEN NEW.stage = 'cancelled' AND OLD.stage <> 'cancelled' AND EXISTS (
+  SELECT 1 FROM generations og
+   WHERE og.id = OLD.generation_id AND og.state = 'live'
+     AND EXISTS (SELECT 1 FROM generation_extents r
+                   JOIN generations g ON g.id = r.generation_id
+                  WHERE r.extent_id = OLD.extent_id AND g.state = 'live'
+                    AND g.id <> OLD.generation_id))
+BEGIN
+  SELECT RAISE(ABORT, 'extent is referenced by another live generation');
+END;
 
 -- Shredding the key of an extent that is in service.
 CREATE TRIGGER extents_keep_key_in_service BEFORE UPDATE OF wrapped_file_key ON extents
