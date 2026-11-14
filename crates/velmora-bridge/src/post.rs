@@ -307,6 +307,17 @@ where
             self.load_planned(lease, extent, stored),
         )
         .await;
+        // Nothing renews the permits while the extent loads. After a load
+        // so slow that they could lapse before the round renews them, no
+        // connection is kept on them: the round connects again.
+        let lapse_ms = i64::from(PERMIT_SECS) * 1000 - POST_RESERVE_MS;
+        let kept_at = match kept_at {
+            Some(at) if self.clock.now().0 - at.0 >= lapse_ms => {
+                held.iter_mut().for_each(ProviderSession::discard);
+                None
+            }
+            kept => kept,
+        };
         let (cipher, mut plan) = match loaded {
             Ok(loaded) => loaded,
             Err(stop) => {
@@ -359,6 +370,14 @@ where
             Ok((true, held)) if held.len() == permits.len() && held.iter().all(|h| *h) => {}
             _ => return (None, Vec::new()),
         }
+        // As in `Round::kept`: a renewal that itself took too long does
+        // not leave the reserve a connect needs.
+        if !(0..KEEP_EVERY_MS).contains(&(self.clock.now().0 - now.0)) {
+            return (None, Vec::new());
+        }
+        // A connect ends within `NNTP_CALL_SECS` like any call, and the
+        // round could not end before it either: it would wait for the
+        // article that socket had taken.
         let refused =
             join_all(sessions.iter_mut().map(|session| async move {
                 matches!(session.session().await, Err(Stop::NoPermit))
@@ -787,11 +806,12 @@ struct Opened<'a, C: Catalog, N: NntpConnector, T: Clock> {
     refused: Vec<&'a str>,
 }
 
-/// Ends every session and frees its slot.
+/// Ends every session and frees its slot, with one health report per
+/// provider however many sessions it had, as at the end of a round.
 async fn close_all<C: Catalog, N: NntpConnector, T: Clock>(
     sessions: Vec<ProviderSession<'_, C, N, T>>,
 ) {
-    join_all(sessions.into_iter().map(ProviderSession::close)).await;
+    ProviderSession::close_all(sessions).await;
 }
 
 /// The lease and every permit of a posting job are renewed together, in

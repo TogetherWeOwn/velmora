@@ -21,7 +21,7 @@ use std::task::{Poll, Waker};
 
 use velmora_bridge::ingress;
 use velmora_bridge::service::classify;
-use velmora_bridge::{BridgeError, Job, JobOutcome, OutboxStage, S3Response, UnixMs};
+use velmora_bridge::{BridgeError, Job, JobOutcome, OutboxStage, S3Response};
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt,
     QueueRetryOptionsBuilder, Request, Response, Result, ScheduleContext, ScheduledEvent,
@@ -162,8 +162,7 @@ fn log_post_trace(job: &Job, outcome: &JobOutcome) {
     else {
         return;
     };
-    let now = UnixMs(worker::Date::now().as_millis() as i64);
-    if let Some(trace) = velmora_bridge::trace::take(extent, now) {
+    if let Some(trace) = velmora_bridge::trace::take(extent) {
         let outcome = match outcome {
             JobOutcome::Ack => "ack".to_string(),
             JobOutcome::Retry { delay_secs } => format!("retry {delay_secs}s"),

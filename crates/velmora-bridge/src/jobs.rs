@@ -18,7 +18,7 @@
 //!   `x/<extent>` and `c/<extent>`.
 
 use crate::config::{GcMode, Maintenance};
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector};
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::types::{
@@ -133,16 +133,30 @@ where
             Ok(None) => return JobOutcome::Ack,
             Err(_) => return RETRY,
         };
-        if stage == OutboxStage::Post {
-            crate::trace::begin(extent, started);
+        if stage != OutboxStage::Post {
+            return self.run_leased(&lease, extent, generation, stage).await;
         }
+        crate::trace::begin(extent, started);
+        let outcome = self.run_leased(&lease, extent, generation, stage).await;
+        crate::trace::finish(extent, self.clock.now());
+        outcome
+    }
+
+    /// The part of [`Self::run_extent`] after a successful claim.
+    async fn run_leased(
+        &self,
+        lease: &Lease,
+        extent: &ExtentId,
+        generation: &GenerationId,
+        stage: OutboxStage,
+    ) -> JobOutcome {
         let row = match self.catalog.job_extent(extent, generation).await {
             Ok(Some(row)) => row,
             Ok(None) => {
                 let stop = Stop::fail(FailClass::Internal);
-                return settle(&self.catalog, &self.clock, &lease, stop).await;
+                return settle(&self.catalog, &self.clock, lease, stop).await;
             }
-            Err(e) => return settle(&self.catalog, &self.clock, &lease, e.into()).await,
+            Err(e) => return settle(&self.catalog, &self.clock, lease, e.into()).await,
         };
         let bytes = job_bytes(stage, row.extent.cipher_size, self.cfg.post_sockets);
         // A job larger than the whole budget still has to run: alone.
@@ -154,12 +168,12 @@ where
         let Ok(_charge) = charged else {
             // No memory right now is not a failure of the extent: give the
             // lease back without spending an attempt.
-            return settle(&self.catalog, &self.clock, &lease, Stop::NoPermit).await;
+            return settle(&self.catalog, &self.clock, lease, Stop::NoPermit).await;
         };
         match stage {
-            OutboxStage::Post => self.post_stage(&lease, &row).await,
-            OutboxStage::Verify => self.verify_stage(&lease, &row).await,
-            _ => self.release_stage(&lease, &row).await,
+            OutboxStage::Post => self.post_stage(lease, &row).await,
+            OutboxStage::Verify => self.verify_stage(lease, &row).await,
+            _ => self.release_stage(lease, &row).await,
         }
     }
 

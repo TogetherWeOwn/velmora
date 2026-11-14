@@ -304,6 +304,10 @@ pub struct MemCatalog {
     acquire_in_flight: Cell<u32>,
     /// Most slot requests ever in flight at once.
     pub acquire_peak: Cell<u32>,
+    /// The next `renew_all` takes this long on this clock.
+    pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
+    /// `provider_failed` calls so far (strikes reported).
+    pub failures_reported: Cell<u32>,
 }
 
 impl MemCatalog {
@@ -808,6 +812,9 @@ impl Catalog for MemCatalog {
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
         self.renewals.set(self.renewals.get() + 1);
+        if let Some((clock, ms)) = self.slow_next_renewal.borrow_mut().take() {
+            clock.advance_ms(ms);
+        }
         self.renewed_at.borrow_mut().push(now);
         let lease = self.renew(l, now).await?;
         let mut held = Vec::new();
@@ -994,6 +1001,7 @@ impl Catalog for MemCatalog {
     }
 
     async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+        self.failures_reported.set(self.failures_reported.get() + 1);
         let mut health = self.health.borrow_mut();
         let h = health.entry(provider.to_string()).or_default();
         if h.until > now.0 {

@@ -975,12 +975,60 @@ async fn a_post_job_leaves_its_timings() {
 
     assert_eq!(rig.bridge.run_job(&job).await, JobOutcome::Ack);
 
-    let now = rig.bridge.clock.now();
-    let trace = trace::take(&s.extent, now).expect("a record");
+    let trace = trace::take(&s.extent).expect("a record");
     assert_eq!((trace.sockets, trace.articles), (4, 10));
     let line = trace.to_string();
     assert!(!line.contains(s.extent.as_str()), "{line}");
     assert!(line.contains("sockets=4 articles=10"), "{line}");
     // Taken once.
-    assert_eq!(trace::take(&s.extent, now), None);
+    assert_eq!(trace::take(&s.extent), None);
+}
+
+/// A renewal that takes too long leaves no time for a connect: the job
+/// connects nothing while the extent loads, and the round connects and
+/// posts after renewing again.
+#[tokio::test]
+async fn a_slow_renewal_leaves_the_connects_to_the_round() {
+    let rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    *rig.bridge.catalog.slow_next_renewal.borrow_mut() = Some((rig.bridge.clock.clone(), 25_000));
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let events = events();
+    let plan = events.iter().position(|e| *e == "plan").expect("planned");
+    let connects: Vec<usize> = (0..events.len())
+        .filter(|i| events[*i] == "connect")
+        .collect();
+    assert_eq!(connects.len(), 4);
+    assert!(connects.iter().all(|at| *at > plan), "{events:?}");
+    // The slow one, then the round's own.
+    assert_eq!(rig.bridge.catalog.renewals.get(), 2);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+}
+
+/// Sockets that could not connect while the extent loaded, of a job that
+/// then stops (the extent is corrupt), are one strike for their
+/// provider, not one each.
+#[tokio::test]
+async fn sockets_that_failed_together_are_one_strike() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    // Nothing listens on the provider's port any more.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    rig.bridge.cfg.providers[0].port = closed.local_addr().unwrap().port();
+    drop(closed);
+    rig.bridge
+        .safety
+        .corrupt(&s.extent.safety_key(), |b| b[100] ^= 1);
+
+    let outcome = rig.run_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+
+    assert_eq!(events().iter().filter(|e| **e == "connect").count(), 4);
+    assert_eq!(rig.bridge.catalog.failures_reported.get(), 1);
+    assert_eq!(
+        rig.bridge.catalog.outbox(&s.extent).last_error,
+        Some(FailClass::Corrupt)
+    );
 }

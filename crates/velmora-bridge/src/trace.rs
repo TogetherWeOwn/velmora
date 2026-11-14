@@ -44,6 +44,8 @@ pub struct PostTrace {
     /// Articles the job set out to post.
     pub articles: u32,
     started: i64,
+    /// The job that began the record has returned.
+    finished: bool,
 }
 
 impl fmt::Display for PostTrace {
@@ -93,14 +95,25 @@ pub(crate) fn note(extent: &ExtentId, f: impl FnOnce(&mut PostTrace)) {
     });
 }
 
-/// Takes the record of the post job for `extent`, with its total up to
-/// `now`. `None` = no post job ran for it.
-pub fn take(extent: &ExtentId, now: UnixMs) -> Option<PostTrace> {
+/// The job that began the record of `extent` has returned at `now`.
+pub(crate) fn finish(extent: &ExtentId, now: UnixMs) {
+    note(extent, |t| {
+        t.total_ms = now.0 - t.started;
+        t.finished = true;
+    });
+}
+
+/// Takes the record of the post job for `extent` once that job has
+/// returned. `None` = no post job for it has finished: none ran, or the
+/// one that began the record is still running (a second delivery of the
+/// same job, which claimed nothing, must not take its record).
+pub fn take(extent: &ExtentId) -> Option<PostTrace> {
     RECORDS.with(|r| {
-        r.borrow_mut().remove(extent.as_str()).map(|mut t| {
-            t.total_ms = now.0 - t.started;
-            t
-        })
+        let mut r = r.borrow_mut();
+        match r.get(extent.as_str()) {
+            Some(t) if t.finished => r.remove(extent.as_str()),
+            _ => None,
+        }
     })
 }
 
@@ -109,20 +122,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_record_is_taken_once_with_its_total() {
+    fn a_record_is_taken_once_after_its_job_returned() {
         let extent = ExtentId::new("x_trace_once");
         begin(&extent, UnixMs(1_000));
         note(&extent, |t| t.post_ms = 40);
-        let t = take(&extent, UnixMs(1_250)).expect("record");
+        // The job is still running: a duplicate delivery takes nothing.
+        assert_eq!(take(&extent), None);
+        finish(&extent, UnixMs(1_250));
+        let t = take(&extent).expect("record");
         assert_eq!((t.post_ms, t.total_ms), (40, 250));
-        assert_eq!(take(&extent, UnixMs(2_000)), None);
+        assert_eq!(take(&extent), None);
     }
 
     #[test]
     fn the_line_names_no_extent() {
         let extent = ExtentId::new("x_secretive");
         begin(&extent, UnixMs(0));
-        let line = take(&extent, UnixMs(5)).expect("record").to_string();
+        finish(&extent, UnixMs(5));
+        let line = take(&extent).expect("record").to_string();
         assert!(!line.contains("secretive"), "{line}");
         assert!(line.starts_with("wait_ms=0 ") && line.contains(" total_ms=5 "));
     }

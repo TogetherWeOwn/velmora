@@ -6,7 +6,7 @@
 //! decoded, and compared with the SHA-256 stored in its plan row before
 //! anything uses its bytes.
 
-use futures_util::future::{select, Either};
+use futures_util::future::{join_all, select, Either};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora::transport::is_article_limit_error;
 use velmora::yenc::decode_part_to;
@@ -263,6 +263,36 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// frees the slot and returns how the session went. Several sessions
     /// of one job on one provider are one strike or one recovery, which
     /// the caller reports once with [`report_health`].
+    /// Ends every session and frees its slot, then reports each
+    /// provider's health once: one session that went well clears its
+    /// strikes, otherwise the first failure is one strike. Several
+    /// sockets that failed together are one strike, not one each.
+    pub(crate) async fn close_all(sessions: Vec<Self>) {
+        let Some(first) = sessions.first() else {
+            return;
+        };
+        let (catalog, clock) = (first.catalog, first.clock);
+        let ended = join_all(sessions.into_iter().map(|session| {
+            let id = session.provider.id.as_str();
+            async move { (id, session.finish().await) }
+        }))
+        .await;
+        let mut ids: Vec<&str> = Vec::new();
+        for (id, _) in &ended {
+            if !ids.contains(id) {
+                ids.push(id);
+            }
+        }
+        for id in ids {
+            let mine = || ended.iter().filter(|e| e.0 == id);
+            let healthy = match mine().any(|e| e.1 == Some(true)) {
+                true => Some(true),
+                false => mine().find_map(|e| e.1),
+            };
+            report_health(catalog, clock, id, healthy).await;
+        }
+    }
+
     pub(crate) async fn finish(mut self) -> Option<bool> {
         if let Some(session) = self.session.take() {
             session.quit().await;
