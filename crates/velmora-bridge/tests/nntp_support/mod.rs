@@ -634,6 +634,13 @@ impl Catalog for MemCatalog {
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
+    async fn copy_generation(
+        &self,
+        _: &velmora_bridge::CopyGeneration,
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
+        unused()
+    }
     async fn delete_object_before(
         &self,
         _: &BucketId,
@@ -678,9 +685,6 @@ impl Catalog for MemCatalog {
         _: &[velmora_bridge::ExtentPlacement],
         _: UnixMs,
     ) -> Result<Guard<()>> {
-        unused()
-    }
-    async fn replay_rebind(&self, _: &GenerationRow, _: &GenerationId) -> Result<Guard<()>> {
         unused()
     }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {
@@ -879,6 +883,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
+        server_side_copy: true,
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),

@@ -400,7 +400,7 @@ pub(super) async fn complete_upload<S: Sql>(
     let gen_id = || text(g.id.as_str());
     let key = || vec![text(t.bucket.as_str()), text(t.key)];
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(11 + commit.placements.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(13 + commit.placements.len());
     let mut guard = target(t);
     guard.push(int(revision)?);
     stmts.push((
@@ -443,9 +443,17 @@ pub(super) async fn complete_upload<S: Sql>(
             ],
         ));
     }
+    // The references reads go through. `OR IGNORE`: the migration's
+    // trigger records the same rows for the adoptions above.
+    stmts.push((
+        "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+         SELECT generation_id, seq, id, plain_offset FROM extents WHERE generation_id = ?1",
+        vec![gen_id()],
+    ));
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-           (SELECT COUNT(*) FROM extents WHERE generation_id = ?1) <> ?2 \
+           (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
+           OR (SELECT COUNT(*) FROM extents WHERE generation_id = ?1) <> ?2 \
            OR (SELECT COALESCE(SUM(plain_size), 0) FROM extents WHERE generation_id = ?1) <> ?3 \
            OR EXISTS (SELECT 1 FROM (SELECT plain_offset, SUM(plain_size) OVER (ORDER BY seq \
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
@@ -465,30 +473,11 @@ pub(super) async fn complete_upload<S: Sql>(
     // After adoption: whatever is still staged was not listed.
     stmts.push(gc_staged_parts(t.id, None, now));
     // Retire the generation the live pointer names, before moving it.
-    let mut retire_gc = key();
-    retire_gc.extend([ms(now), ms(now.plus_ms(SHRED_GRACE_MS))]);
-    stmts.push((
-        "INSERT INTO gc(extent_id, action, due_at) \
-         SELECT e.id, a.action, a.due_at FROM objects o \
-         JOIN extents e ON e.generation_id = o.generation_id \
-         JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
-               UNION ALL SELECT 'delete_safety', ?3 \
-               UNION ALL SELECT 'shred_key', ?4) a \
-         WHERE o.bucket_id = ?1 AND o.key = ?2",
-        retire_gc,
-    ));
-    let mut retire = key();
-    retire.push(ms(now));
-    stmts.push((
-        "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
-         WHERE stage NOT IN ('done', 'cancelled') AND generation_id = \
-           (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
-        retire.clone(),
-    ));
-    stmts.push((
-        "UPDATE generations SET state = 'superseded', retired_at = ?3 WHERE id = \
-           (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
-        retire,
+    stmts.extend(super::objects::retire_live(
+        t.bucket,
+        t.key,
+        GenerationState::Superseded,
+        now,
     ));
     let mut pointer = key();
     pointer.push(gen_id());

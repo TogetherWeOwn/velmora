@@ -39,6 +39,7 @@ fn vars(dev_trust_http: bool) -> BTreeMap<String, String> {
         ("INFLIGHT_BUDGET_BYTES", "50331648"),
         ("GC_MODE", "disposable"),
         ("MAINTENANCE", "off"),
+        ("SERVER_SIDE_COPY", "off"),
         ("ADMIN_TOKEN", ADMIN),
         (
             "NNTP_PROVIDERS",
@@ -407,6 +408,41 @@ fn aws_chunked_uploads_are_capped_by_the_decoded_length() {
             Body::Empty,
         );
         assert_eq!(check(&req, &cfg, true), Err(err), "{pairs:?}");
+    }
+}
+
+/// A copy names its source in a header and sends no body, so it passes
+/// without a declared length. One that declares a body is the handler's
+/// to refuse; a declared body over the cap is still refused here.
+#[test]
+fn a_copy_needs_no_declared_length() {
+    let cfg = cfg(false);
+    for target in ["/bucket/key", "/bucket/key?partNumber=1&uploadId=u"] {
+        let plain = request(
+            Method::Put,
+            target,
+            &[("authorization", SIGV4)],
+            Body::Empty,
+        );
+        assert_eq!(
+            check(&plain, &cfg, true),
+            Err(IngressError::MissingContentLength)
+        );
+        let copy = [
+            ("authorization", SIGV4),
+            ("x-amz-copy-source", "/bucket/src"),
+        ];
+        let req = request(Method::Put, target, &copy, Body::Empty);
+        assert_eq!(check(&req, &cfg, true), Ok(()), "{target}");
+        let mut over = copy.to_vec();
+        let len = (cfg.max_extent_bytes + 1).to_string();
+        over.push(("content-length", &len));
+        let req = request(Method::Put, target, &over, Body::Empty);
+        assert_eq!(
+            check(&req, &cfg, true),
+            Err(IngressError::EntityTooLarge),
+            "{target}"
+        );
     }
 }
 

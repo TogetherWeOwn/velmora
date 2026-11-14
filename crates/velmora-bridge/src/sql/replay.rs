@@ -7,7 +7,11 @@
 //!    like the parts of an open upload), their article plans exist, and
 //!    an extent whose pinned copy is gone says so.
 //! 2. [`replay_publish`], once: one guarded batch that publishes the
-//!    generation exactly like a multipart Complete adopts its parts.
+//!    generation. An extent no generation holds yet is adopted, exactly
+//!    like a multipart Complete adopts its parts. An extent another
+//!    generation already holds (the two share it through a copy) gets a
+//!    second reference in `generation_extents` and is otherwise left as
+//!    it is. Which of the two manifests comes first does not matter.
 //!
 //! A generation row therefore exists only when the whole generation was
 //! published, which is what makes "already present" a safe reason to
@@ -183,8 +187,9 @@ pub(super) async fn replay_damaged<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
 ) -> Result<(u64, Vec<GenerationId>)> {
-    const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM extents e \
-         WHERE e.generation_id = o.generation_id AND e.safety_state = 'deleted' \
+    const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM generation_extents ge \
+         JOIN extents e ON e.id = ge.extent_id \
+         WHERE ge.generation_id = o.generation_id AND e.safety_state = 'deleted' \
            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))";
     let count = c
         .sql
@@ -294,7 +299,8 @@ pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
 
 /// Step 2. `Lost` = the generation is already there, a newer generation
 /// of the key is live, or the extents do not tile it (one of them is
-/// held by another generation).
+/// missing, in another bucket, still a part of an upload under another
+/// generation's name, or its key was shredded).
 pub(super) async fn replay_publish<S: Sql>(
     c: &SqlCatalog<S>,
     g: &GenerationRow,
@@ -311,7 +317,7 @@ pub(super) async fn replay_publish<S: Sql>(
     }
     let gen_id = || text(g.id.as_str());
     let bucket = || text(g.bucket_id.as_str());
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(9 + placements.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(10 + 2 * placements.len());
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
          OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
@@ -333,16 +339,37 @@ pub(super) async fn replay_publish<S: Sql>(
                 bucket(),
             ],
         ));
+        // An extent another generation holds is shared with it: this
+        // generation is a copy of that one, or that one of this. The
+        // adoption above already wrote the reference for an extent it
+        // took (trigger `generation_extents_on_adopt`), and such an
+        // extent no longer matches here.
+        stmts.push((
+            "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT ?1, ?2, e.id, ?3 FROM extents e \
+              WHERE e.id = ?4 AND e.bucket_id = ?5 AND e.state = 'committed' \
+                AND e.generation_id <> ?1",
+            vec![
+                gen_id(),
+                SqlValue::Int(i64::from(p.seq)),
+                uint(p.plain_offset)?,
+                text(p.extent_id.as_str()),
+                bucket(),
+            ],
+        ));
     }
-    // The adopted extents tile the object exactly, each with its key.
+    // The referenced extents tile the object exactly, each with its key.
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-           (SELECT COUNT(*) FROM extents WHERE generation_id = ?1 \
-              AND wrapped_file_key IS NOT NULL) <> ?2 \
-           OR (SELECT COALESCE(SUM(plain_size), 0) FROM extents WHERE generation_id = ?1) <> ?3 \
-           OR EXISTS (SELECT 1 FROM (SELECT plain_offset, SUM(plain_size) OVER (ORDER BY seq \
+           (SELECT COUNT(*) FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             WHERE ge.generation_id = ?1 AND e.wrapped_file_key IS NOT NULL) <> ?2 \
+           OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM generation_extents ge \
+                 JOIN extents e ON e.id = ge.extent_id WHERE ge.generation_id = ?1) <> ?3 \
+           OR EXISTS (SELECT 1 FROM (SELECT ge.plain_offset AS plain_offset, \
+                SUM(e.plain_size) OVER (ORDER BY ge.seq \
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
-                FROM extents WHERE generation_id = ?1) \
+                FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+               WHERE ge.generation_id = ?1) \
               WHERE plain_offset <> COALESCE(expected, 0))",
         vec![
             gen_id(),
@@ -352,11 +379,30 @@ pub(super) async fn replay_publish<S: Sql>(
     ));
     // An extent whose pinned copy is held goes through post and verify
     // again: posting a planned article twice is harmless, and the read
-    // back is the evidence a release needs.
+    // back is the evidence a release needs. The obligation stays under
+    // the generation the extent was first written for.
     stmts.push((
         "INSERT OR IGNORE INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-         SELECT id, generation_id, CASE safety_state WHEN 'held' THEN 'post' ELSE 'done' END, \
-                ?2, ?2 FROM extents WHERE generation_id = ?1",
+         SELECT e.id, e.generation_id, \
+                CASE e.safety_state WHEN 'held' THEN 'post' ELSE 'done' END, ?2, ?2 \
+           FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1",
+        vec![gen_id(), ms(now)],
+    ));
+    // A shared extent can have left service earlier in this replay: the
+    // generation it was written for was retired by a manifest that sorts
+    // before this one. It is back in service now, so its obligation runs
+    // again. Its open GC rows stay; the collector refuses them for as
+    // long as a live generation references the extent. Nothing collects
+    // while a restore runs, so no delete is under way.
+    stmts.push((
+        "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
+                                          WHERE e.id = outbox.extent_id) \
+                                   WHEN 'held' THEN 'post' ELSE 'done' END, \
+                attempts = 0, next_at = ?2, lease_owner = NULL, lease_until = NULL, \
+                updated_at = ?2 \
+          WHERE stage = 'cancelled' AND extent_id IN \
+                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
         vec![gen_id(), ms(now)],
     ));
     stmts.extend(retire_live(
@@ -396,53 +442,4 @@ fn insert_live(g: &GenerationRow) -> Result<Stmt> {
             ms(g.created_at),
         ],
     ))
-}
-
-/// Two records of one object (see [`Catalog::replay_rebind`]). The id
-/// of a generation is what a tombstone is compared with, so the object
-/// has to stand under the id of its last record: a delete between the
-/// two must not remove it.
-pub(super) async fn replay_rebind<S: Sql>(
-    c: &SqlCatalog<S>,
-    g: &GenerationRow,
-    from: &GenerationId,
-) -> Result<Guard<()>> {
-    if g.state != GenerationState::Live || g.retired_at.is_some() {
-        return Err(BridgeError::Invalid(
-            "replay does not describe one live generation",
-        ));
-    }
-    let to = || text(g.id.as_str());
-    let old = || text(from.as_str());
-    let stmts: Vec<Stmt> = vec![
-        (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
-             OR NOT EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
-                            AND generation_id = ?4 AND generation_id < ?1)",
-            vec![to(), text(g.bucket_id.as_str()), text(&g.key), old()],
-        ),
-        clear_tombstone(&g.bucket_id, &g.key, &g.id),
-        insert_live(g)?,
-        (
-            "UPDATE extents SET generation_id = ?1 WHERE generation_id = ?2",
-            vec![to(), old()],
-        ),
-        (
-            "UPDATE outbox SET generation_id = ?1 WHERE generation_id = ?2",
-            vec![to(), old()],
-        ),
-        (
-            "UPDATE objects SET generation_id = ?1 WHERE bucket_id = ?2 AND key = ?3",
-            vec![to(), text(g.bucket_id.as_str()), text(&g.key)],
-        ),
-        (
-            "DELETE FROM generations WHERE id = ?1",
-            vec![old()],
-        ),
-    ];
-    match c.sql.batch(stmts).await {
-        Ok(_) => Ok(Guard::Applied(())),
-        Err(BridgeError::GuardFailed) => Ok(Guard::Lost),
-        Err(e) => Err(e),
-    }
 }

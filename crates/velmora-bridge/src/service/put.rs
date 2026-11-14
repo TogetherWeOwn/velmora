@@ -64,10 +64,10 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let (bucket, key) = authed.object()?;
     mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
     restore_gate(bridge).await?;
-    // A copy has no body: storing it as a plain PUT would publish an
-    // empty object under the destination key.
+    // CopyObject is this request shape with a source header and no body.
     if authed.headers.get("x-amz-copy-source").is_some() {
-        return Err(S3Response::not_implemented());
+        let declared = crate::ingress::declared_length(&req.headers).map_err(|e| e.response())?;
+        return super::copy::copy_object(bridge, &authed, declared, req.body).await;
     }
     let metadata = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
     // For aws-chunked bodies every length below is the decoded one.

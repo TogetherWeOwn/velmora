@@ -271,6 +271,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
+        server_side_copy: true,
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
