@@ -101,6 +101,16 @@ impl Fx {
     }
 
     async fn with(environment: Environment, maintenance: Maintenance) -> Fx {
+        Fx::with_providers(environment, maintenance, |_| {}).await
+    }
+
+    /// The fixture, with `edit` applied to its provider list (one
+    /// provider, `p0`, on the fixture server).
+    async fn with_providers(
+        environment: Environment,
+        maintenance: Maintenance,
+        edit: impl FnOnce(&mut Vec<ProviderConfig>),
+    ) -> Fx {
         let mut config = ServerConfig::for_test();
         config.articles = Vec::new();
         config.missing_ids.clear();
@@ -112,9 +122,11 @@ impl Fx {
             },
         );
         let server = TestNntpServer::spawn(config).await;
-        let providers = vec![ProviderConfig {
+        let mut providers = vec![ProviderConfig {
             id: "p0".to_string(),
             host: server.addr().ip().to_string(),
+            hosts: Vec::new(),
+            host_select: Default::default(),
             port: server.addr().port(),
             tls: false,
             user: USER.to_string(),
@@ -130,6 +142,7 @@ impl Fx {
             pool_max_conns: None,
             enabled: true,
         }];
+        edit(&mut providers);
         let cfg = BridgeConfig {
             environment,
             s3_host: "s3.test".to_string(),
@@ -984,6 +997,31 @@ async fn evict_gives_up_a_verified_pinned_copy_on_a_disposable_bucket() {
     // The object is still whole on Usenet.
     let drill = fx.post("/drill/scratch/k").await.json();
     assert_eq!(drill["match"], true);
+}
+
+/// The drill reads like a cold read: never from a provider that does not
+/// read (`read: false`), even one listed first that holds the articles.
+#[tokio::test]
+async fn drill_skips_a_provider_that_does_not_read() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut post_only = providers[0].clone();
+        post_only.id = "p6".to_string();
+        post_only.read = false;
+        post_only.post = false;
+        providers.insert(0, post_only);
+    })
+    .await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    assert_eq!(fx.bridge.nntp.connects_to("p6"), 0);
+
+    let drill = fx.post("/drill/scratch/k").await.json();
+    assert_eq!(
+        (&drill["provider"], &drill["match"]),
+        (&json!("p0"), &json!(true))
+    );
+    assert_eq!(fx.bridge.nntp.connects_to("p6"), 0);
 }
 
 #[tokio::test]

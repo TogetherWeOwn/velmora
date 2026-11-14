@@ -23,8 +23,10 @@
 //!   object and hide the rollback for good.
 //!
 //! Who raises: the cron tick, once per run, and a write that must be
-//! covered at once ([`Bridge::raise_stamp`]: after its commit is
-//! confirmed, before it answers `200`).
+//! covered at once ([`Bridge::raise_stamp`]). A raise is safe at any
+//! point; its place decides which rollbacks are found: one to any point
+//! before it. After a confirmed commit and before the `200` it covers
+//! that commit.
 //!
 //! What the stamp does not see: a commit that no raise followed before
 //! the rollback (the handler was killed before its raise, or the raise
@@ -198,19 +200,25 @@ where
         last
     }
 
-    /// Raises the stamp for a write that was just committed. Call it
-    /// after the commit is confirmed and before the `200`: a rollback to
-    /// any point before that commit is then found.
+    /// Raises the stamp: checks, moves the counter by compare-and-set,
+    /// then puts the object of the new value.
     ///
-    /// Never call it for a commit whose outcome is unknown, and never
-    /// before the commit.
+    /// A raise is safe at any point of a request, before or after a
+    /// commit and whatever the outcome of that commit: it depends on
+    /// nothing but the counter, and the bucket is never ahead of the
+    /// catalogue. Where it is placed decides only which rollbacks are
+    /// found: one to any point before the raise. So a raise after a
+    /// confirmed commit and before the `200` covers that commit, and a
+    /// raise before a commit covers what was written up to there, not
+    /// the commit.
     ///
-    /// `Err` does not undo the write, which is committed: the caller
-    /// still answers `200`. [`ERR_ROLLED_BACK`] = the catalogue is
+    /// `Err` undoes nothing. [`ERR_ROLLED_BACK`] = the catalogue is
     /// behind its stamp (now recorded; writes are refused from here on).
-    /// Any other error = the stamp was not raised after
-    /// several tries; the next raise (at the latest the next cron tick)
-    /// covers this write too.
+    /// Any other error = the stamp was not raised after several tries:
+    /// what the raise was to cover is covered by the next raise (at the
+    /// latest the next cron tick). A caller that needs the cover before
+    /// it goes on fails its request; a caller whose write is committed
+    /// still answers `200`.
     pub async fn raise_stamp(&self) -> Result<()> {
         match self.stamp_advance().await? {
             Some(counter) => self.stamp_store(counter).await,

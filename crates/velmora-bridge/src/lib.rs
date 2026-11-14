@@ -11,6 +11,7 @@ pub mod articles;
 pub mod config;
 pub mod crypto;
 pub mod fetch;
+pub mod hosts;
 pub mod ingress;
 pub mod jobs;
 mod pool;

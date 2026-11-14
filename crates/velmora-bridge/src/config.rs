@@ -27,6 +27,9 @@ pub const MAX_CONNS_LIMIT: u32 = 64;
 /// Most entries `NNTP_PROVIDERS` may hold.
 pub const MAX_PROVIDERS: usize = 32;
 
+/// Most entries a provider's `hosts` may hold (next to `host`).
+pub const MAX_HOSTS: usize = 8;
+
 /// Longest accepted provider `pool` name (bytes).
 pub const MAX_POOL_NAME_LEN: usize = 64;
 
@@ -202,6 +205,43 @@ fn valid_catalogue_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// A DNS name: at most 253 bytes of two or more dot-separated labels,
+/// each 1 to 63 of `[A-Za-z0-9-]` and not starting or ending with `-`,
+/// the last one not all digits (so no IPv4 address and no single-label
+/// name). An entry of a provider's `hosts`.
+fn valid_host_name(h: &str) -> bool {
+    let labels: Vec<&str> = h.split('.').collect();
+    h.len() <= 253
+        && labels.len() >= 2
+        && labels
+            .last()
+            .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()))
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// A provider's `hosts`: at most [`MAX_HOSTS`] valid names, none twice
+/// and none the same as `host` (case does not make two hosts), and only
+/// on TLS: a plaintext provider is the local fake server, one host.
+fn hosts_ok(p: &ProviderConfig) -> bool {
+    if p.hosts.is_empty() {
+        return true;
+    }
+    if !p.tls || p.hosts.len() > MAX_HOSTS || !p.hosts.iter().all(|h| valid_host_name(h)) {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    p.endpoints()
+        .into_iter()
+        .all(|h| seen.insert(h.to_ascii_lowercase()))
 }
 
 fn valid_newsgroup(g: &str) -> bool {
@@ -411,7 +451,7 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
         // Stated, the address limit is a real one: `0` would shut the
         // provider out without saying so (`enabled` does that).
         let ips_ok = p.max_ips.is_none_or(|n| (1..=MAX_CONNS_LIMIT).contains(&n));
-        if !pool_ok || !ips_ok || p.retention_days == Some(0) {
+        if !pool_ok || !ips_ok || !hosts_ok(p) || p.retention_days == Some(0) {
             return Err(bad());
         }
         if p.id.is_empty()
