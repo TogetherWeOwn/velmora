@@ -31,7 +31,7 @@ All hashes below are SHA-256 of file bytes, not Git object hashes.
 | `velmora/src/transports/peer_tls.rs` | `93846315476f0132cbf90db3b109fbdcc6be833809925050c55b8f3b411f5ebb` | Only `nntune_ssrf_guard` → `velmora_ssrf_guard` |
 | `velmora/src/transports/tokio_tls.rs` | `a85904f74b7741df9f0f5aa254483301895466301460da9269c26c3ba95080b0` | Byte-identical |
 | `velmora/src/transports/worker_pinned_tls.rs` | `397aac7929c5a862ac0b0a794bf95f5486a2a7d8eb8a8583fe62b353e54bcacc` | Byte-identical |
-| `velmora/src/transports/worker_socket.rs` | `0720b9455ce9e5abc3ebc84957fe451596e3b98a897293821005767d3c8d8608` | Byte-identical |
+| `velmora/src/transports/worker_socket.rs` | `71bd895e2772f526929af7b0dad48a37c3fe892ada23edfe847894614762bf92` | Source (SHA-256 `0720b9455ce9e5abc3ebc84957fe451596e3b98a897293821005767d3c8d8608` on 2026-11-07) plus an `impl Drop` that asks the runtime to close the socket (velmora #83, 2026-11-14) |
 | `velmora/tests/fixtures/peer_tls/README.md` | `cbd539dbcba7183d27b1966bab630c4f7fec90fe0693596a41f5a84aebd9e926` | Byte-identical |
 | `velmora/tests/fixtures/peer_tls/ca.der` | `bbfb04f3867caca38b21d157fe6fe8a084068909e94b2b21b38f540dd6451eeb` | Byte-identical |
 | `velmora/tests/fixtures/peer_tls/server-key.der` | `080982fbd94977236b37188850c5d04d95bd443fc816d544942e8d80cf0e0673` | Byte-identical public test key |

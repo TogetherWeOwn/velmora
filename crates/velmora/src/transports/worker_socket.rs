@@ -99,10 +99,14 @@ impl WorkerTransport {
 }
 
 /// A transport that is dropped (a call that ran out of time, a session
-/// given up without a goodbye) closes its connection: the runtime would
-/// otherwise keep the socket, and the provider would keep counting it,
-/// until the invocation ends. `close()` is called and not awaited: the
-/// first poll makes the runtime's call, and its promise is let go.
+/// given up without a goodbye) asks the runtime to close its connection;
+/// otherwise the runtime would keep the socket, and the provider would keep
+/// counting it, until the invocation ends. `close()` is called and not
+/// awaited: the first poll makes the runtime's call, and its promise is let
+/// go. The runtime flushes pending writes before it tears down, so a socket
+/// dropped with a stalled write (a POST cut off against a peer that stopped
+/// reading) may still stay open until the invocation ends: provider
+/// connection counts on the posting path must not rely on this.
 impl Drop for WorkerTransport {
     fn drop(&mut self) {
         let mut close = pin!(self.socket.close());

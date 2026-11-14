@@ -285,7 +285,12 @@ async fn a_read_gives_up_a_renewal_that_hangs() {
     rig.bridge.nntp.slow(&clock, 0);
 
     rig.bridge.catalog.renew_hangs.set(true);
-    assert_eq!(rig.fetch(&s).await, ColdFetch::Busy);
+    // Bounded: without the timer race the fetch would wait for ever, and
+    // the test must fail by name rather than hang until the job times out.
+    let fetched = tokio::time::timeout(std::time::Duration::from_secs(5), rig.fetch(&s))
+        .await
+        .expect("the renewal is bounded by the timer");
+    assert_eq!(fetched, ColdFetch::Busy);
     assert_eq!(*asked.borrow(), [READ_RENEW_SECS * 1000]);
     assert!(rig.bridge.nntp.calls().is_empty());
     let load = rig.bridge.catalog.provider_load(clock.now()).await.unwrap();
