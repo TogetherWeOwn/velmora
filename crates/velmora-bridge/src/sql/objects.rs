@@ -1,15 +1,16 @@
 //! Objects, generations, listing and admin status (catalogue lane A).
 //!
-//! Publication and deletion are each one atomic [`Sql::batch`]. The
+//! PublishOutcome and deletion are each one atomic [`Sql::batch`]. The
 //! generation being replaced or deleted is resolved *inside* the batch
 //! (sub-selects on the live `objects` pointer), never read beforehand, so
 //! two racing writers cannot both retire the same generation or leave one
 //! live without a pointer. Statements are fixed-shape, one row each, and
 //! stay far below the 100-bound-parameter limit.
 
-use super::uploads::guarded;
+use super::uploads::published;
 use super::SqlCatalog;
-use crate::ports::{Guard, Row, Sql, SqlValue};
+use crate::ports::{PublishOutcome, Row, Sql, SqlValue};
+use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, ExtentId, ExtentRow, ExtentState,
     ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry, ListPage,
@@ -206,7 +207,7 @@ pub(super) async fn live_object<S: Sql>(
 }
 
 // ---------------------------------------------------------------------------
-// Publication and deletion
+// PublishOutcome and deletion
 // ---------------------------------------------------------------------------
 
 type Stmt = (&'static str, Vec<SqlValue>);
@@ -337,7 +338,8 @@ pub(super) async fn newest_id<S: Sql>(
 pub(super) async fn commit_generation<S: Sql>(
     c: &SqlCatalog<S>,
     commit: &CommitGeneration,
-) -> Result<Guard<()>> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &commit.generation;
     // The extents must tile the object exactly, in order: a gap or an
     // overlap here would be served as wrong bytes later. Each must still
@@ -403,7 +405,7 @@ pub(super) async fn commit_generation<S: Sql>(
             text(g.id.as_str()),
         ],
     ));
-    guarded(c, stmts).await
+    published(c, stmts, &g.id, record).await
 }
 
 /// Idempotent: deleting a key with no live object changes nothing.

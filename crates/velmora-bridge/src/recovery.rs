@@ -19,13 +19,18 @@
 //! Records are key-bearing copies: they hold wrapped keys, never plain
 //! ones, and they open only under the KEK version that sealed them.
 //!
-//! No delete that the catalogue asks for removes a record: release,
-//! garbage collection and evict delete blobs through [`delete_blob`],
-//! which refuses `m/*`. The one other delete is by the writer itself: a
-//! request whose batch was refused (a definite failure, answered as one)
-//! removes the record it has just written, because nothing was published
-//! under that id. A record of a request that failed with an unknown
-//! outcome stays, and a replay may publish it.
+//! Two rules are held by types, not by care at the call sites:
+//!
+//! - **Record before commit.** The catalogue publishes a generation
+//!   only against a [`Recorded`], and only [`write_generation`] makes
+//!   one, after the record is stored.
+//! - **No delete removes a record.** [`BlobStore::delete`] refuses every
+//!   key under `m/`, in the store adapter itself. The one way to remove
+//!   a record is [`discard_generation`], and it takes the [`Recorded`]
+//!   that the catalogue hands back when it refused the publication (a
+//!   definite failure: nothing was published under that id). When the
+//!   outcome is unknown the proof is gone with the call, so the record
+//!   stays, and a replay may publish it.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -77,14 +82,49 @@ pub fn is_record_key(key: &str) -> bool {
     key.starts_with(RECORD_PREFIX)
 }
 
-/// Deletes a ciphertext blob. Release, garbage collection and evict
-/// delete through this function only: it refuses every recovery record,
-/// whatever the catalogue row that asked for the delete says.
+/// What a store answers to a delete of a recovery record.
+pub const ERR_RECORD_DELETE: BridgeError =
+    BridgeError::Invalid("recovery records are never deleted");
+
+/// Deletes a ciphertext blob for release, garbage collection and evict.
+/// It refuses every recovery record before the store is asked, whatever
+/// the catalogue row that asked for the delete says; the store refuses
+/// them too ([`BlobStore::delete`]).
 pub async fn delete_blob<B: BlobStore>(store: &B, key: &str) -> Result<()> {
     if is_record_key(key) {
-        return Err(BridgeError::Invalid("recovery records are never deleted"));
+        return Err(ERR_RECORD_DELETE);
     }
     store.delete(key).await
+}
+
+/// Proof that the recovery record of one generation is stored in
+/// `SAFETY`. [`write_generation`] is the only place that makes one; the
+/// catalogue publishes a generation only against it, and gives it back
+/// when it refused, which is what [`discard_generation`] takes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Recorded {
+    generation: GenerationId,
+}
+
+impl Recorded {
+    /// The generation whose record is stored.
+    pub fn generation(&self) -> &GenerationId {
+        &self.generation
+    }
+
+    /// Blob key of the record.
+    pub fn key(&self) -> String {
+        generation_key(&self.generation)
+    }
+
+    /// A proof without a record, for catalogue tests that publish rows
+    /// directly. Never compiled into the Worker.
+    #[cfg(feature = "testkit")]
+    pub fn for_test(generation: &GenerationId) -> Recorded {
+        Recorded {
+            generation: generation.clone(),
+        }
+    }
 }
 
 /// Mint time of a generation or tombstone id (`g_` + 13 hex digits of
@@ -113,8 +153,8 @@ pub fn tombstone_id(now: UnixMs, live: &GenerationId, rand: [u8; 8]) -> Generati
 /// Removes the record of a generation whose publication batch was
 /// refused: nothing was published under the id, so nothing may replay
 /// it. The one delete of a record there is (see the module doc).
-pub async fn discard_generation<B: BlobStore>(safety: &B, id: &GenerationId) -> Result<()> {
-    safety.delete(&generation_key(id)).await
+pub async fn discard_generation<B: BlobStore>(safety: &B, refused: Recorded) -> Result<()> {
+    safety.delete_record(refused).await
 }
 
 // ---------------------------------------------------------------------------
@@ -447,15 +487,15 @@ async fn read<B: BlobStore, K: Kek, R: for<'de> Deserialize<'de>>(
         .map_err(|_| ERR_RECORD)
 }
 
-/// Writes `m/<generation_id>`. The caller publishes the generation only
-/// after this returned `Ok`.
+/// Writes `m/<generation_id>` and returns the proof of it, without
+/// which the catalogue publishes nothing.
 pub async fn write_generation<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
     bucket: &Bucket,
     generation: &GenerationRow,
     extents: &[ExtentRow],
-) -> Result<()> {
+) -> Result<Recorded> {
     let record = GenerationManifest::new(bucket, generation, extents)?;
     let name = generation_key(&generation.id);
     write(
@@ -466,7 +506,10 @@ pub async fn write_generation<B: BlobStore, K: Kek>(
         generation.id.as_str(),
         &record,
     )
-    .await
+    .await?;
+    Ok(Recorded {
+        generation: generation.id.clone(),
+    })
 }
 
 /// Writes `m/del/<id>`. The caller deletes only after this returned `Ok`.

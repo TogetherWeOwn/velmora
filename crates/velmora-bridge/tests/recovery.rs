@@ -368,17 +368,92 @@ async fn recovery_records_survive_gc_and_eviction() {
     rig.send(evict).await.expect(200);
     assert_eq!(records(&rig), kept, "eviction deleted no record");
 
-    // The one function every blob delete goes through refuses a record,
-    // whatever asks.
+    // A delete of a record is refused whatever asks: by the function
+    // that release, collection and evict delete through, and by the
+    // store itself for a caller that goes around it.
     for key in kept.iter().map(String::as_str).chain(["m/", "m/art/x"]) {
         for store in [&rig.bridge.safety, &rig.bridge.cache] {
             assert!(matches!(
                 delete_blob(store, key).await,
                 Err(BridgeError::Invalid(_))
             ));
+            assert!(matches!(
+                store.delete(key).await,
+                Err(BridgeError::Invalid(_))
+            ));
         }
     }
     assert_eq!(records(&rig), kept);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_refused_publication_gives_its_record_up() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
+    let (live, extents) = rig
+        .bridge
+        .catalog
+        .live_object(&bucket.id, "k")
+        .await
+        .unwrap()
+        .unwrap();
+    let kept = records(&rig);
+
+    // A generation that sorts before the live one, recorded and offered.
+    let mut older = live.clone();
+    older.id = GenerationId::mint(UnixMs(rig.now().0 - 1000), [1; 8]);
+    let mut rows = extents.clone();
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.id = ExtentId::mint([i as u8; 13]);
+        row.generation_id = Some(older.id.clone());
+    }
+    let commit = CommitGeneration {
+        generation: older,
+        extents: rows,
+        now: rig.now(),
+    };
+    let write = || {
+        velmora_bridge::recovery::write_generation(
+            &rig.bridge.safety,
+            &rig.bridge.kek,
+            &bucket,
+            &commit.generation,
+            &commit.extents,
+        )
+    };
+
+    // The proof of one generation publishes no other.
+    let mut other = commit.clone();
+    other.generation.id = GenerationId::mint(UnixMs(rig.now().0 + 1000), [2; 8]);
+    for row in &mut other.extents {
+        row.generation_id = Some(other.generation.id.clone());
+    }
+    let proof = write().await.unwrap();
+    assert!(matches!(
+        rig.bridge.catalog.commit_generation(&other, proof).await,
+        Err(BridgeError::Invalid(_))
+    ));
+    assert_eq!(rig.count("generations"), 1);
+
+    // Refused: the proof comes back, and it is what removes the record.
+    let proof = write().await.unwrap();
+    assert_eq!(records(&rig).len(), kept.len() + 1);
+    let PublishOutcome::Refused(refused) = rig
+        .bridge
+        .catalog
+        .commit_generation(&commit, proof)
+        .await
+        .unwrap()
+    else {
+        panic!("an id older than the live one was published");
+    };
+    assert_eq!(refused.generation(), &commit.generation.id);
+    velmora_bridge::recovery::discard_generation(&rig.bridge.safety, refused)
+        .await
+        .unwrap();
+    assert_eq!(records(&rig), kept);
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"v1");
 }
 
 // ---------------------------------------------------------------------------

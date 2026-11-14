@@ -18,10 +18,14 @@ use rusqlite::{params_from_iter, Connection};
 use sha2::{Digest, Sha256};
 
 use crate::ports::{
-    BlobMeta, BlobStore, Clock, JobSink, Kek, Row, Sql, SqlValue, MAX_QUEUE_DELAY_SECS,
-    MAX_SQL_PARAMS,
+    BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
+    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
 };
-use crate::types::{BridgeError, BucketId, ByteSpan, ExtentId, Job, KekBytes, Result, UnixMs};
+use crate::recovery::{is_record_key, Recorded, ERR_RECORD_DELETE};
+use crate::types::{
+    BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, ExtentId, Job, KekBytes,
+    Result, UnixMs,
+};
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
 pub const MIGRATION_0001: &str =
@@ -273,7 +277,15 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
+        if is_record_key(key) {
+            return Err(ERR_RECORD_DELETE);
+        }
         self.blobs.borrow_mut().remove(key);
+        Ok(())
+    }
+
+    async fn delete_record(&self, refused: Recorded) -> Result<()> {
+        self.blobs.borrow_mut().remove(&refused.key());
         Ok(())
     }
 
@@ -447,3 +459,39 @@ impl Kek for TestKek {
         self.keys.get(&v)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Publishing without a record
+// ---------------------------------------------------------------------------
+
+/// Catalogue tests publish rows that no request recorded. These two
+/// make the proof the catalogue asks for ([`Recorded::for_test`]) and
+/// answer as a guarded batch does.
+#[allow(async_fn_in_trait)]
+pub trait PublishUnrecorded: Catalog {
+    async fn publish(&self, c: &CommitGeneration) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(match self.commit_generation(c, record).await? {
+            PublishOutcome::Applied => Guard::Applied(()),
+            PublishOutcome::Refused(_) => Guard::Lost,
+        })
+    }
+
+    async fn publish_upload(
+        &self,
+        t: &UploadTarget<'_>,
+        revision: u64,
+        digest: &[u8; 32],
+        c: &CompleteUpload,
+    ) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(
+            match self.complete_upload(t, revision, digest, c, record).await? {
+                PublishOutcome::Applied => Guard::Applied(()),
+                PublishOutcome::Refused(_) => Guard::Lost,
+            },
+        )
+    }
+}
+
+impl<C: Catalog> PublishUnrecorded for C {}

@@ -9,7 +9,8 @@
 
 use super::objects::{clear_tombstone, guard_newest};
 use super::SqlCatalog;
-use crate::ports::{Guard, Row, Sql, SqlValue, UploadTarget};
+use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
+use crate::recovery::Recorded;
 use crate::types::{
     BridgeError, BucketId, CompleteUpload, ExtentId, ExtentRow, ExtentState, GenerationId,
     GenerationState, Result, UnixMs, UploadId, UploadPartRow, UploadRow, UploadState,
@@ -113,6 +114,27 @@ pub(super) async fn guarded<S: Sql>(c: &SqlCatalog<S>, stmts: Vec<Stmt>) -> Resu
     match c.sql.batch(stmts).await {
         Ok(_) => Ok(Guard::Applied(())),
         Err(BridgeError::GuardFailed) => Ok(Guard::Lost),
+        Err(e) => Err(e),
+    }
+}
+
+/// Runs the batch that publishes the generation `id`. It runs only
+/// against the proof of that generation's recovery record, and hands the
+/// proof back only when the guard failed and nothing was written.
+pub(super) async fn published<S: Sql>(
+    c: &SqlCatalog<S>,
+    stmts: Vec<Stmt>,
+    id: &GenerationId,
+    record: Recorded,
+) -> Result<PublishOutcome> {
+    if record.generation() != id {
+        return Err(BridgeError::Invalid(
+            "the recovery record is of another generation",
+        ));
+    }
+    match c.sql.batch(stmts).await {
+        Ok(_) => Ok(PublishOutcome::Applied),
+        Err(BridgeError::GuardFailed) => Ok(PublishOutcome::Refused(record)),
         Err(e) => Err(e),
     }
 }
@@ -353,7 +375,8 @@ pub(super) async fn complete_upload<S: Sql>(
     revision: u64,
     digest: &[u8; 32],
     commit: &CompleteUpload,
-) -> Result<Guard<()>> {
+    record: Recorded,
+) -> Result<PublishOutcome> {
     let g = &commit.generation;
     let now = commit.now;
     let in_order = commit
@@ -486,5 +509,5 @@ pub(super) async fn complete_upload<S: Sql>(
          WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
         receipt,
     ));
-    guarded(c, stmts).await
+    published(c, stmts, &g.id, record).await
 }

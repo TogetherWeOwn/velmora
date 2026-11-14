@@ -46,9 +46,10 @@ use crate::config::{BridgeConfig, Maintenance};
 use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
 use crate::ingress::{read_upload, upload_lengths, IngressError, UploadReadError};
 use crate::ports::{
-    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, UploadTarget,
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
+    PublishOutcome, UploadTarget,
 };
-use crate::recovery::{generation_key, id_after, write_generation};
+use crate::recovery::{discard_generation, id_after, write_generation};
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
     GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
@@ -931,7 +932,7 @@ where
             lost_at = Some(upload.revision);
             continue;
         }
-        write_generation(
+        let record = write_generation(
             &bridge.safety,
             &bridge.kek,
             &a.bucket,
@@ -942,10 +943,10 @@ where
         drop(extents);
         match bridge
             .catalog
-            .complete_upload(&target, upload.revision, &digest, &commit)
+            .complete_upload(&target, upload.revision, &digest, &commit, record)
             .await?
         {
-            Guard::Applied(()) => {
+            PublishOutcome::Applied => {
                 // The outbox rows are the durable obligation; a lost
                 // notification is picked up by the dispatcher.
                 for p in &commit.placements {
@@ -959,14 +960,11 @@ where
                 }
                 return complete_response(&a, publication.etag, now.0);
             }
-            Guard::Lost => {
+            PublishOutcome::Refused(record) => {
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
                 // record left behind replays as a PUT that failed.
-                let _ = bridge
-                    .safety
-                    .delete(&generation_key(&commit.generation.id))
-                    .await;
+                let _ = discard_generation(&bridge.safety, record).await;
                 // Refused for the id (the key took a newer one since it
                 // was read) or for the upload. Only the second is judged
                 // by the revision on the next turn.

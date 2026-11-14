@@ -17,6 +17,7 @@ use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, MAX_EXTENT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::recovery::Recorded;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, MIGRATION_0001,
@@ -897,7 +898,9 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.access_key(akid).await;
     let _ = c.grant(akid, b).await;
     let _ = c.live_object(b, "a/k").await;
-    let _ = c.commit_generation(&commit).await;
+    let _ = c
+        .commit_generation(&commit, Recorded::for_test(&commit.generation.id))
+        .await;
     let _ = c.delete_object(b, "a/k", T0).await;
     let _ = c.list(b, &query).await;
     let _ = c.object_status(b, "a/k").await;
@@ -907,7 +910,15 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.create_upload(&upload).await;
     let _ = c.upload(&target).await;
     let _ = c.put_upload_part(&target, &part, &extent, T0).await;
-    let _ = c.complete_upload(&target, 1, &[0; 32], &complete).await;
+    let _ = c
+        .complete_upload(
+            &target,
+            1,
+            &[0; 32],
+            &complete,
+            Recorded::for_test(&complete.generation.id),
+        )
+        .await;
     let _ = c.abort_upload(&target, T0).await;
     let _ = c
         .claim(&extent.id, &gen.id, OutboxStage::Post, "owner-1", T0)
