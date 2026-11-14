@@ -1028,7 +1028,10 @@ impl ChunkReader<'_> {
     /// callback receives an immutable view of every sealed byte, including the
     /// tag. If it fails, its error is returned without any AEAD call or
     /// plaintext output. The caller is responsible for choosing and trusting
-    /// whatever expected digest or other policy the callback checks.
+    /// whatever expected digest or other policy the callback checks. When
+    /// fetching article 0, the caller must also check its wire header against
+    /// the record using [`ChunkReader::check_wire_header`]; this operation
+    /// accepts only the sealed chunk and does not check the wire header.
     ///
     /// After a successful callback, the existing STREAM AEAD opens **that same
     /// owned buffer in place**, immediately: there is no reread, replacement,
