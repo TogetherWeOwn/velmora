@@ -21,7 +21,7 @@ use std::task::{Poll, Waker};
 
 use velmora_bridge::ingress;
 use velmora_bridge::service::classify;
-use velmora_bridge::{BridgeError, Job, JobOutcome, S3Response};
+use velmora_bridge::{BridgeError, Job, JobOutcome, OutboxStage, S3Response, UnixMs};
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt,
     QueueRetryOptionsBuilder, Request, Response, Result, ScheduleContext, ScheduledEvent,
@@ -137,7 +137,9 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             msg.ack();
             continue;
         };
-        match bridge.run_job(&job).await {
+        let outcome = bridge.run_job(&job).await;
+        log_post_trace(&job, &outcome);
+        match outcome {
             JobOutcome::Ack => msg.ack(),
             JobOutcome::Retry { delay_secs } => msg.retry_with_options(
                 &QueueRetryOptionsBuilder::new()
@@ -147,6 +149,27 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         }
     }
     Ok(())
+}
+
+/// One line per post job: its outcome and phase timings, milliseconds
+/// and counts only (see `velmora_bridge::trace`).
+fn log_post_trace(job: &Job, outcome: &JobOutcome) {
+    let Job::Extent {
+        extent,
+        stage: OutboxStage::Post,
+        ..
+    } = job
+    else {
+        return;
+    };
+    let now = UnixMs(worker::Date::now().as_millis() as i64);
+    if let Some(trace) = velmora_bridge::trace::take(extent, now) {
+        let outcome = match outcome {
+            JobOutcome::Ack => "ack".to_string(),
+            JobOutcome::Retry { delay_secs } => format!("retry {delay_secs}s"),
+        };
+        console_log!("post job: outcome={outcome} {trace}");
+    }
 }
 
 #[event(scheduled)]
