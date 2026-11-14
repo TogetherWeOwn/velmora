@@ -701,6 +701,7 @@ async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
     // The first POST to be answered stays in flight.
     let release = rig.bridge.nntp.park_next_post();
     let calls_then = Cell::new(0);
+    let renewed_in_flight = Cell::new(false);
 
     let revoke = async || {
         let renewals = rig.bridge.catalog.renewals.get();
@@ -708,7 +709,12 @@ async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
         // Old enough for the other socket to renew before its next call.
         rig.bridge.clock.advance_secs(30);
         calls_then.set(rig.bridge.nntp.calls().len());
-        while rig.bridge.catalog.renewals.get() == renewals {
+        // Bounded: a job that never renews fails the test, not hangs it.
+        for _ in 0..1_000_000 {
+            if rig.bridge.catalog.renewals.get() != renewals {
+                renewed_in_flight.set(true);
+                break;
+            }
             tokio::task::yield_now().await;
         }
         release.set(true);
@@ -720,6 +726,10 @@ async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
     let outbox = rig.bridge.catalog.outbox(&s.extent);
     assert_eq!((outbox.stage, outbox.attempts), (OutboxStage::Post, 0));
     assert!(release.get(), "the permits were never taken over");
+    assert!(
+        renewed_in_flight.get(),
+        "no renewal while the POST was in flight"
+    );
     // No call began after the takeover, on either socket.
     let calls = rig.bridge.nntp.calls();
     assert_eq!(calls.len(), calls_then.get(), "{calls:?}");
