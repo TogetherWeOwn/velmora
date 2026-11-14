@@ -26,7 +26,8 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     let raw_target = ingress::origin_form(&url)?.to_string();
     let https = ingress::is_https(&url);
     let method = Method::parse(&req.inner().method());
-    let headers: Vec<(String, String)> = req.headers().entries().collect();
+    let mut headers: Vec<(String, String)> = req.headers().entries().collect();
+    ingress::restore_accept_encoding(&mut headers, client_accept_encoding(&req).as_deref());
     let declared_len = ingress::declared_length(&headers).unwrap_or(None);
     let body = if req.inner().body().is_some() {
         let stream = req
@@ -49,6 +50,21 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
         },
         https,
     })
+}
+
+/// `request.cf.clientAcceptEncoding`, the client's own `Accept-Encoding`
+/// before the edge rewrote it (see `ingress::restore_accept_encoding`).
+/// `None` when the runtime gives no `cf` object or no string there.
+fn client_accept_encoding(req: &Request) -> Option<String> {
+    use worker::js_sys::Reflect;
+    use worker::wasm_bindgen::JsValue;
+    let cf = Reflect::get(req.inner(), &JsValue::from_str("cf")).ok()?;
+    if !cf.is_object() {
+        return None;
+    }
+    Reflect::get(&cf, &JsValue::from_str("clientAcceptEncoding"))
+        .ok()?
+        .as_string()
 }
 
 fn content_length(headers: &[(String, String)]) -> Option<u64> {
