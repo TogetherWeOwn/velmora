@@ -512,3 +512,27 @@ async fn list_objects_v1_needs_a_grant() {
     .await
     .expect(400);
 }
+
+/// restic (minio-go) lists with exactly this query.
+#[tokio::test(flavor = "current_thread")]
+async fn restic_listing_query_is_served() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "repo/keys/k1", b"x")
+        .await
+        .expect(200);
+    let resp = list(
+        &rig,
+        &signer,
+        BUCKET,
+        &[
+            ("delimiter", "/"),
+            ("encoding-type", "url"),
+            ("fetch-owner", "true"),
+            ("prefix", "repo/keys/"),
+        ],
+    )
+    .await;
+    resp.expect(200);
+    assert_eq!(resp.values("Key"), ["repo%2Fkeys%2Fk1"]);
+}

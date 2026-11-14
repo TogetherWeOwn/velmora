@@ -6,7 +6,7 @@
 // CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted;
 // the SDK's `x-id` operation hint is accepted as a query parameter;
 // `x-amz-bucket-object-lock-enabled: false` is accepted (Object Lock is not offered);
-// the ListObjects V1 `marker` query key is accepted.
+// the ListObjects V1 `marker` and the V2 `fetch-owner` query keys are accepted.
 
 use super::{ErrorCode, Policy, Result};
 
@@ -143,6 +143,7 @@ impl Target {
                     | "continuation-token"
                     | "start-after"
                     | "marker"
+                    | "fetch-owner"
                     | "max-keys"
                     | "encoding-type"
                     | "key-marker"

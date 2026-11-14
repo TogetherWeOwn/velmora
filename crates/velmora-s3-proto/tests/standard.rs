@@ -550,6 +550,11 @@ fn list_objects_xml_fields() {
         ("&max-keys=x", ErrorCode::InvalidRequest),
         ("&encoding-type=xml", ErrorCode::InvalidArgument),
         ("&prefix=a&prefix=b", ErrorCode::InvalidRequest),
+        ("&fetch-owner=maybe", ErrorCode::InvalidArgument),
+        (
+            "&fetch-owner=true&fetch-owner=true",
+            ErrorCode::InvalidRequest,
+        ),
     ] {
         let t = Target::parse(&format!("/bucket?list-type=2{query}"), &policy()).unwrap();
         assert_eq!(
@@ -962,5 +967,26 @@ fn v1_listing_xml_fields() {
     ] {
         let t = Target::parse(&format!("/bucket?{query}"), &policy()).unwrap();
         assert_eq!(ListObjectsV2::parse_v1(&t).unwrap_err(), err, "{query}");
+    }
+}
+
+/// restic (minio-go) lists with `fetch-owner=true&encoding-type=url`.
+#[test]
+fn fetch_owner_is_accepted_and_changes_nothing() {
+    let rows = ["repo/keys/a", "repo/keys/b"];
+    for flag in ["true", "false"] {
+        let with = page(
+            &rows,
+            &format!("&delimiter=%2F&encoding-type=url&fetch-owner={flag}&prefix=repo%2Fkeys%2F"),
+            1000,
+            1,
+        );
+        let without = page(
+            &rows,
+            "&delimiter=%2F&encoding-type=url&prefix=repo%2Fkeys%2F",
+            1000,
+            1,
+        );
+        assert_eq!(with, without);
     }
 }

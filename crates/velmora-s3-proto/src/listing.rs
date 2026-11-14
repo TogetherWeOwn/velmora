@@ -199,6 +199,12 @@ impl ListObjectsV2 {
         if !matches!(encoding, None | Some("url")) {
             return Err(ErrorCode::InvalidArgument);
         }
+        // minio-go (restic) always asks for owners. Objects carry no
+        // owner of their own here, so the field is accepted and the page
+        // renders without `Owner`, which S3 clients treat as absent.
+        if !matches!(target.one("fetch-owner")?, None | Some("true" | "false")) {
+            return Err(ErrorCode::InvalidArgument);
+        }
         let scope = TokenScope {
             bucket: target.bucket.clone(),
             prefix: target.one("prefix")?.unwrap_or("").into(),
