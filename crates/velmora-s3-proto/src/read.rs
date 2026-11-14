@@ -156,6 +156,27 @@ impl Conditions {
         }
     }
 
+    /// The `x-amz-copy-source-if-*` conditions of a copy request.
+    pub fn from_copy_source(headers: &Headers) -> Self {
+        let get = |name| headers.get(name).map(str::to_owned);
+        Self {
+            if_match: get("x-amz-copy-source-if-match"),
+            if_none_match: get("x-amz-copy-source-if-none-match"),
+            if_modified_since: get("x-amz-copy-source-if-modified-since"),
+            if_unmodified_since: get("x-amz-copy-source-if-unmodified-since"),
+        }
+    }
+
+    /// Whether a copy may read `metadata` as its source. A copy has no
+    /// `304`: every condition that does not hold is `PreconditionFailed`.
+    pub fn check_copy_source(&self, metadata: &ObjectMetadata) -> Result<()> {
+        if self.evaluate(metadata)? {
+            Ok(())
+        } else {
+            Err(ErrorCode::PreconditionFailed)
+        }
+    }
+
     pub(super) fn evaluate(&self, metadata: &ObjectMetadata) -> Result<bool> {
         if let Some(tags) = &self.if_match {
             if !matches_tag(tags, &metadata.etag, false)? {

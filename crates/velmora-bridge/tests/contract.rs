@@ -614,6 +614,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "buckets",
             "extents",
             "gc",
+            "generation_extents",
             "generations",
             "grants",
             "meta",
@@ -664,7 +665,18 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
-    assert!(changed.iter().all(|n| *n == 1), "{changed:?}");
+    // The committed extent (statement 5) also gets its reference row
+    // in `generation_extents`, written by the migration's trigger.
+    let want: Vec<u64> = (0..changed.len()).map(|n| 1 + u64::from(n == 5)).collect();
+    assert_eq!(changed, want);
+    let refs = db
+        .query(
+            "SELECT generation_id, seq, extent_id, plain_offset FROM generation_extents",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(refs, vec![vec![text("g_1"), i(0), text("x_1"), i(0)]]);
 
     let back = db
         .query(

@@ -583,14 +583,26 @@ if [[ $MODE == remote ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 5c move within the bucket (CopyObject, then DeleteObject of the source)
+# ---------------------------------------------------------------------------
+
+STEP=5c-move
+log "step $STEP"
+run_aws "MOVE a/small.bin to a/moved.bin" "${S3[@]}" mv "s3://$SB/a/small.bin" "s3://$SB/a/moved.bin" >/dev/null
+run_aws "GET a/moved.bin" "${S3[@]}" cp "s3://$SB/a/moved.bin" "$T/got-moved.bin" >/dev/null
+same_bytes "GET a/moved.bin equals the upload" "$T/small.bin" "$T/got-moved.bin"
+expect_err "HEAD a/small.bin after the move" '\(404\)' \
+  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
+
+# ---------------------------------------------------------------------------
 # 6 delete
 # ---------------------------------------------------------------------------
 
 STEP=6-delete
 log "step $STEP"
-run_aws "DELETE a/small.bin" "${S3[@]}" rm "s3://$SB/a/small.bin" >/dev/null
-expect_err "HEAD a/small.bin after delete" '\(404\)' \
-  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin
+run_aws "DELETE a/moved.bin" "${S3[@]}" rm "s3://$SB/a/moved.bin" >/dev/null
+expect_err "HEAD a/moved.bin after delete" '\(404\)' \
+  "${S3API[@]}" head-object --bucket "$SB" --key a/moved.bin
 
 # ---------------------------------------------------------------------------
 # 7 dispatcher recovery

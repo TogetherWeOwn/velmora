@@ -1,9 +1,12 @@
 //! Garbage-collection rows (catalogue lane B).
 //!
 //! GC rows are only ever queued for extents that left service: a replaced,
-//! unlisted or aborted upload part, or an extent of a retired generation.
-//! `gc_begin` still re-checks that at execution time and refuses to act on
-//! an extent a live generation or an open upload references.
+//! unlisted or aborted upload part, or an extent of a retired generation
+//! that no other live generation references. `gc_begin` still re-checks
+//! that at execution time and refuses to act on an extent any live
+//! generation or an open upload references. An extent that left service
+//! cannot come back: a copy is only published from a generation that is
+//! live in the same batch.
 
 use super::uploads::{guarded, ms, text, Cols, Stmt};
 use super::SqlCatalog;
@@ -14,13 +17,18 @@ use crate::types::{BlobStoreKind, ExtentId, GcAction, GcRow, GcStep, Result, Uni
 /// newer work out of the bounded `gc_due` window.
 const SKIP_RETRY_MS: i64 = 60 * 60 * 1000;
 
-/// True while the extent `?1` must not be touched.
+/// True while the extent `?1` must not be touched: a live generation
+/// references it (its own, or a copy), or an open upload does.
 macro_rules! in_use {
     () => {
-        "(EXISTS (SELECT 1 FROM extents e JOIN generations g ON g.id = e.generation_id \
-                  WHERE e.id = ?1 AND g.state = 'live') \
-          OR EXISTS (SELECT 1 FROM upload_parts p JOIN uploads u ON u.id = p.upload_id \
-                     WHERE p.extent_id = ?1 AND u.state = 'open'))"
+        concat!(
+            "(EXISTS (SELECT 1 FROM extents e JOIN generations g ON g.id = e.generation_id \
+                      WHERE e.id = ?1 AND g.state = 'live') OR ",
+            live_ref!("?1"),
+            " OR ",
+            part_ref!("?1"),
+            ")"
+        )
     };
 }
 

@@ -588,6 +588,9 @@ impl Catalog for MemCatalog {
     async fn commit_generation(&self, _: &CommitGeneration) -> Result<()> {
         unused()
     }
+    async fn copy_generation(&self, _: &velmora_bridge::CopyGeneration) -> Result<Guard<()>> {
+        unused()
+    }
     async fn delete_object(&self, _: &BucketId, _: &str, _: UnixMs) -> Result<()> {
         unused()
     }

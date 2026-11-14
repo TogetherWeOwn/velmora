@@ -13,10 +13,10 @@ use crate::ingress::ByteBudget;
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
-    CompleteUpload, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep, GenerationId,
-    GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage,
-    OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow,
-    UploadRow, VerificationRow,
+    CompleteUpload, CopyGeneration, DueRow, ExtentId, ExtentRow, FailClass, GcRow, GcStep,
+    GenerationId, GenerationRow, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
+    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, SafetyState, UnixMs, UploadId,
+    UploadPartRow, UploadRow, VerificationRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -225,6 +225,10 @@ pub trait Catalog {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>>;
     /// Single PUT; one batch (DESIGN §A.3 step 6).
     async fn commit_generation(&self, c: &CommitGeneration) -> Result<()>;
+    /// Publishes a generation that references the extents of the source
+    /// generation; no extent is written. `Lost` = the source is no longer
+    /// the live object of its key, and nothing was published.
+    async fn copy_generation(&self, c: &CopyGeneration) -> Result<Guard<()>>;
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()>;
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage>;
     /// Admin view.
@@ -283,7 +287,9 @@ pub trait Catalog {
     async fn set_cursor(&self, l: &Lease, cursor: u32, now: UnixMs) -> Result<bool>;
     /// No permit: frees the lease without consuming an attempt.
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool>;
-    /// Extent + bucket + generation state.
+    /// Extent + bucket + generation state: `live` while any live
+    /// generation references the extent, else the state of the generation
+    /// it was written for.
     async fn job_extent(
         &self,
         extent: &ExtentId,
@@ -320,8 +326,8 @@ pub trait Catalog {
 
     // gc
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>>;
-    /// Re-checks that no live generation uses the extent; applies
-    /// catalogue-only actions.
+    /// Re-checks that no live generation and no open upload references
+    /// the extent; applies catalogue-only actions.
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep>;
     /// After the blob delete that `GcStep::DeleteBlob` asked for.
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()>;
@@ -348,7 +354,7 @@ pub trait Catalog {
     /// One good session: clears failures and the cooldown history, unless
     /// the provider is cooling now.
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;
-    /// Sends live `done` extents back to verify: safety copy still
+    /// Sends `done` extents of live generations back to verify: safety copy still
     /// `held`, fewer than `required` of `backbones` counting. One call
     /// looks at the next `limit` held extents, in a rotation over all of
     /// them. Returns how many moved.

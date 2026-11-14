@@ -739,6 +739,18 @@ pub struct CommitGeneration {
     pub now: UnixMs,
 }
 
+/// Input of a copy publication batch: the new generation, and the
+/// generation whose extents it references. The source must still be the
+/// live object of `(generation.bucket_id, source_key)` when the batch
+/// runs; `generation` repeats its size, ETag and extent count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyGeneration {
+    pub generation: GenerationRow,
+    pub source: GenerationId,
+    pub source_key: String,
+    pub now: UnixMs,
+}
+
 /// Where one staged part extent lands in the completed object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtentPlacement {

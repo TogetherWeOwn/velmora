@@ -8,11 +8,11 @@
 //! stay far below the 100-bound-parameter limit.
 
 use super::SqlCatalog;
-use crate::ports::{Row, Sql, SqlValue};
+use crate::ports::{Guard, Row, Sql, SqlValue};
 use crate::types::{
-    BackboneStatus, BridgeError, BucketId, CommitGeneration, ExtentId, ExtentRow, ExtentState,
-    ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry, ListPage,
-    ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyResult,
+    BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
+    ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
+    ListPage, ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyResult,
 };
 
 /// A retired generation's key is shredded this long after retirement;
@@ -142,13 +142,7 @@ fn generation_row(row: Row) -> Result<GenerationRow> {
     })
 }
 
-/// Column list of [`extent_row`], for any `SELECT … FROM extents`.
-pub(super) const EXTENT_COLS: &str =
-    "id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, \
-     media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, \
-     safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, \
-     created_at";
-
+/// One extent row: the `extents` columns in schema order.
 pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
     let mut c = Cols::new(row);
     Ok(ExtentRow {
@@ -198,8 +192,21 @@ pub(super) async fn live_object<S: Sql>(
         return Ok(None);
     };
     let generation = generation_row(row)?;
-    let sql = format!("SELECT {EXTENT_COLS} FROM extents WHERE generation_id = ?1 ORDER BY seq");
-    let rows = c.sql.query(&sql, &[text(generation.id.as_str())]).await?;
+    // The extents this generation references, placed where it has them:
+    // `seq` and `plain_offset` come from the reference, not from the
+    // generation the extent was first written for.
+    let rows = c
+        .sql
+        .query(
+            "SELECT e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
+               e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
+               e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
+               e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at \
+             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             WHERE ge.generation_id = ?1 ORDER BY ge.seq",
+            &[text(generation.id.as_str())],
+        )
+        .await?;
     let extents = rows.into_iter().map(extent_row).collect::<Result<_>>()?;
     Ok(Some((generation, extents)))
 }
@@ -210,28 +217,55 @@ pub(super) async fn live_object<S: Sql>(
 
 type Stmt = (&'static str, Vec<SqlValue>);
 
+/// The extents that leave service when the generation `objects` points
+/// at for `(?1, ?2)` is retired: those it references that no other live
+/// generation and no open upload references.
+macro_rules! retiring {
+    () => {
+        concat!(
+            "SELECT DISTINCT ge.extent_id FROM objects o \
+               JOIN generation_extents ge ON ge.generation_id = o.generation_id \
+              WHERE o.bucket_id = ?1 AND o.key = ?2 AND NOT ",
+            live_ref!("ge.extent_id", except "o.generation_id"),
+            " AND NOT ",
+            part_ref!("ge.extent_id")
+        )
+    };
+}
+
 /// Statements that retire whatever generation `objects` points at for
-/// `(bucket, key)`: GC rows for its extents, its posting obligations
-/// cancelled, and its state flipped. They must run before the pointer is
-/// moved or removed, and all are no-ops when the key has no live object.
-fn retire_live(bucket: &BucketId, key: &str, to: GenerationState, now: UnixMs) -> Vec<Stmt> {
+/// `(bucket, key)`: its state flipped and, for each extent that leaves
+/// service with it (see `retiring!`), GC rows queued and the posting
+/// obligation cancelled. An extent another live generation still
+/// references (a copy) is left alone. They must run before the pointer is
+/// moved or removed and after the replacing generation, if any, has its
+/// extent references; all are no-ops when the key has no live object.
+pub(super) fn retire_live(
+    bucket: &BucketId,
+    key: &str,
+    to: GenerationState,
+    now: UnixMs,
+) -> Vec<Stmt> {
     let b = || text(bucket.as_str());
     vec![
         (
-            "INSERT INTO gc(extent_id, action, due_at) \
-             SELECT e.id, a.action, a.due_at FROM objects o \
-             JOIN extents e ON e.generation_id = o.generation_id \
-             JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
-                   UNION ALL SELECT 'delete_safety', ?3 \
-                   UNION ALL SELECT 'shred_key', ?4) a \
-             WHERE o.bucket_id = ?1 AND o.key = ?2",
+            concat!(
+                "INSERT INTO gc(extent_id, action, due_at) \
+                 SELECT x.extent_id, a.action, a.due_at FROM (",
+                retiring!(),
+                ") x JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
+                       UNION ALL SELECT 'delete_safety', ?3 \
+                       UNION ALL SELECT 'shred_key', ?4) a"
+            ),
             vec![b(), text(key), ms(now), ms(now.plus_ms(SHRED_GRACE_MS))],
         ),
         (
-            "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
-             WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN \
-               (SELECT e.id FROM objects o JOIN extents e ON e.generation_id = o.generation_id \
-                WHERE o.bucket_id = ?1 AND o.key = ?2)",
+            concat!(
+                "UPDATE outbox SET stage = 'cancelled', updated_at = ?3 \
+                 WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN (",
+                retiring!(),
+                ")"
+            ),
             vec![b(), text(key), ms(now)],
         ),
         (
@@ -240,6 +274,41 @@ fn retire_live(bucket: &BucketId, key: &str, to: GenerationState, now: UnixMs) -
             vec![b(), text(key), text(to.as_str()), ms(now)],
         ),
     ]
+}
+
+/// The row of a new live generation.
+fn generation_insert(g: &GenerationRow) -> Result<Stmt> {
+    Ok((
+        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+           content_json, user_meta_json, extent_count, created_at, retired_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL)",
+        vec![
+            text(g.id.as_str()),
+            text(g.bucket_id.as_str()),
+            text(&g.key),
+            text(g.state.as_str()),
+            uint(g.size)?,
+            text(&g.etag),
+            opt(g.checksum_json.as_deref(), text),
+            text(&g.content_json),
+            text(&g.user_meta_json),
+            SqlValue::Int(i64::from(g.extent_count)),
+            ms(g.created_at),
+        ],
+    ))
+}
+
+/// Points `(bucket, key)` of `g` at it.
+fn pointer_upsert(g: &GenerationRow) -> Stmt {
+    (
+        "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id",
+        vec![
+            text(g.bucket_id.as_str()),
+            text(&g.key),
+            text(g.id.as_str()),
+        ],
+    )
 }
 
 /// Inserts a freshly sealed extent as `committed` in `generation`.
@@ -305,27 +374,17 @@ pub(super) async fn commit_generation<S: Sql>(
         ));
     }
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(5 + 2 * commit.extents.len());
-    stmts.push((
-        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-           content_json, user_meta_json, extent_count, created_at, retired_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL)",
-        vec![
-            text(g.id.as_str()),
-            text(g.bucket_id.as_str()),
-            text(&g.key),
-            text(g.state.as_str()),
-            uint(g.size)?,
-            text(&g.etag),
-            opt(g.checksum_json.as_deref(), text),
-            text(&g.content_json),
-            text(&g.user_meta_json),
-            SqlValue::Int(i64::from(g.extent_count)),
-            ms(g.created_at),
-        ],
-    ));
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(5 + 3 * commit.extents.len());
+    stmts.push(generation_insert(g)?);
     for e in &commit.extents {
         stmts.push(extent_insert(e, &g.id)?);
+        // The reference reads go through. `OR IGNORE`: the migration's
+        // trigger records the same row for the insert above.
+        stmts.push((
+            "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT generation_id, seq, id, plain_offset FROM extents WHERE id = ?1",
+            vec![text(e.id.as_str())],
+        ));
         stmts.push((
             "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
              VALUES (?1, ?2, 'post', ?3, ?3)",
@@ -338,16 +397,64 @@ pub(super) async fn commit_generation<S: Sql>(
         GenerationState::Superseded,
         commit.now,
     ));
-    stmts.push((
-        "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id",
-        vec![
-            text(g.bucket_id.as_str()),
-            text(&g.key),
-            text(g.id.as_str()),
-        ],
-    ));
+    stmts.push(pointer_upsert(g));
     c.sql.batch(stmts).await.map(|_| ())
+}
+
+/// Publishes a copy: a new generation that references the extents of the
+/// source generation, in the same order and at the same offsets. One
+/// batch:
+/// - guard: the source is still the live object of its key, so its
+///   extents are in service and the row the caller read is the one copied;
+/// - the new generation and its references. No extent, key or posting
+///   obligation is written: the extents keep the ones they have;
+/// - the destination's previous generation retired. When the destination
+///   is the source key, that is the source itself, and its extents stay in
+///   service through the new references;
+/// - the live pointer moved.
+pub(super) async fn copy_generation<S: Sql>(
+    c: &SqlCatalog<S>,
+    copy: &CopyGeneration,
+) -> Result<Guard<()>> {
+    let g = &copy.generation;
+    if g.state != GenerationState::Live || g.retired_at.is_some() || g.id == copy.source {
+        return Err(BridgeError::Invalid(
+            "copy does not describe one new live generation",
+        ));
+    }
+    let source = || text(copy.source.as_str());
+    let mut stmts: Vec<Stmt> = vec![
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS ( \
+               SELECT 1 FROM objects o JOIN generations s ON s.id = o.generation_id \
+                WHERE o.bucket_id = ?1 AND o.key = ?2 AND o.generation_id = ?3 \
+                  AND s.bucket_id = ?1 AND s.state = 'live' \
+                  AND s.size = ?4 AND s.etag = ?5 AND s.extent_count = ?6)",
+            vec![
+                text(g.bucket_id.as_str()),
+                text(&copy.source_key),
+                source(),
+                uint(g.size)?,
+                text(&g.etag),
+                SqlValue::Int(i64::from(g.extent_count)),
+            ],
+        ),
+        generation_insert(g)?,
+        (
+            "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT ?1, seq, extent_id, plain_offset FROM generation_extents \
+              WHERE generation_id = ?2",
+            vec![text(g.id.as_str()), source()],
+        ),
+    ];
+    stmts.extend(retire_live(
+        &g.bucket_id,
+        &g.key,
+        GenerationState::Superseded,
+        copy.now,
+    ));
+    stmts.push(pointer_upsert(g));
+    super::uploads::guarded(c, stmts).await
 }
 
 /// Idempotent: deleting a key with no live object changes nothing.
@@ -533,9 +640,10 @@ pub(super) async fn object_status<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT e.id, e.seq, e.safety_state, o.stage, o.attempts, o.last_error \
-             FROM extents e LEFT JOIN outbox o ON o.extent_id = e.id \
-             WHERE e.generation_id = ?1 ORDER BY e.seq",
+            "SELECT e.id, ge.seq, e.safety_state, o.stage, o.attempts, o.last_error \
+             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             LEFT JOIN outbox o ON o.extent_id = e.id \
+             WHERE ge.generation_id = ?1 ORDER BY ge.seq",
             &gid,
         )
         .await?;
@@ -563,7 +671,8 @@ pub(super) async fn object_status<S: Sql>(
             "SELECT v.extent_id, v.backbone, v.provider_id, v.verified_at, v.plan_rev, \
                v.articles_ok, v.articles_total, v.result, e.article_count \
              FROM verifications v JOIN extents e ON e.id = v.extent_id \
-             WHERE e.generation_id = ?1 AND v.plan_rev = e.plan_rev AND v.verified_at = \
+             WHERE e.id IN (SELECT extent_id FROM generation_extents WHERE generation_id = ?1) \
+               AND v.plan_rev = e.plan_rev AND v.verified_at = \
                (SELECT MAX(n.verified_at) FROM verifications n WHERE n.extent_id = v.extent_id \
                   AND n.backbone = v.backbone AND n.plan_rev = v.plan_rev) \
              ORDER BY v.extent_id, v.backbone",

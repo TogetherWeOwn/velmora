@@ -35,6 +35,10 @@ pub const MIGRATION_0002: &str =
 pub const MIGRATION_0003: &str =
     include_str!("../../../workers/s3-bridge/migrations/0003_extents_held.sql");
 
+/// Extent references per generation (copies share extents).
+pub const MIGRATION_0004: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0004_generation_extents.sql");
+
 // ---------------------------------------------------------------------------
 // RusqliteSql
 // ---------------------------------------------------------------------------
@@ -119,6 +123,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0001)?;
         db.apply(MIGRATION_0002)?;
         db.apply(MIGRATION_0003)?;
+        db.apply(MIGRATION_0004)?;
         Ok(db)
     }
 
