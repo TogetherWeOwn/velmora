@@ -128,8 +128,8 @@ pub struct ReplayReport {
     pub tombstones: u32,
     /// Tombstones that removed a live object.
     pub deleted: u32,
-    /// Not published: the catalogue refused the generation (its extents
-    /// belong to another generation, or it lost a race).
+    /// Not published: the catalogue refused the generation (an extent
+    /// is missing or its key was shredded, or it lost a race).
     pub unpublishable: Vec<String>,
     /// Set by the last call: live generations with an extent that has no
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.

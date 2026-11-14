@@ -486,13 +486,17 @@ async fn outbox_cancel_does_not_scan_the_outbox() {
         let plan = explain(cancel[0]);
         assert!(plan.contains("SEARCH outbox USING"), "{plan}");
         assert!(plan.contains("SEARCH o USING PRIMARY KEY"), "{plan}");
-        assert!(plan.contains("SEARCH e USING"), "{plan}");
+        assert!(plan.contains("SEARCH ge USING"), "{plan}");
         // No statement of a retirement reads a whole table.
         for sql in batch.iter() {
             let plan = explain(sql);
             let scans: Vec<_> = plan
                 .lines()
-                .filter(|l| l.starts_with("SCAN") && *l != "SCAN CONSTANT ROW" && *l != "SCAN a")
+                // `a` is the constant action list and `x` the retiring
+                // extents, themselves found through the live pointer.
+                .filter(|l| {
+                    l.starts_with("SCAN") && !["SCAN CONSTANT ROW", "SCAN a", "SCAN x"].contains(l)
+                })
                 .collect();
             assert!(scans.is_empty(), "{sql}\n{plan}");
         }
@@ -733,6 +737,182 @@ async fn delete_retires_generation_cancels_outbox_and_adds_gc_rows() {
         3,
         "nothing live was replaced"
     );
+}
+
+/// A copy of `source` under `key`, as the service builds it.
+fn copy_of(fx: &Fx, source: &GenerationRow, key: &str, now: UnixMs) -> CopyGeneration {
+    CopyGeneration {
+        generation: GenerationRow {
+            id: GenerationId::mint(now, [fx.seed(); 8]),
+            key: key.into(),
+            created_at: now,
+            ..source.clone()
+        },
+        source: source.id.clone(),
+        source_key: source.key.clone(),
+        now,
+    }
+}
+
+/// The copy is refused and writes nothing.
+async fn refused(fx: &Fx, c: CopyGeneration) {
+    let before = fx.footprint();
+    let references = fx.int("SELECT COUNT(*) FROM generation_extents");
+    assert_eq!(fx.cat.publish_copy(&c).await.unwrap(), Guard::Lost);
+    assert_eq!(fx.footprint(), before);
+    assert_eq!(
+        fx.int("SELECT COUNT(*) FROM generation_extents"),
+        references
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn copy_references_the_extents_of_a_live_source_only() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let other = fx.bucket("beta").await;
+    let src = fx.commit(&b.id, "src", 3, T0);
+    fx.cat.publish(&src).await.unwrap();
+    let t1 = T0.plus_ms(1_000);
+
+    let copy = copy_of(&fx, &src.generation, "dst", t1);
+    let before = fx.footprint();
+    assert_eq!(
+        fx.cat.publish_copy(&copy).await.unwrap(),
+        Guard::Applied(())
+    );
+    let after = fx.footprint();
+    // One generation and one pointer; no extent, outbox or gc row.
+    assert_eq!(
+        after,
+        [
+            before[0] + 1,
+            before[1],
+            before[2],
+            before[3] + 1,
+            before[4]
+        ]
+    );
+    let (generation, extents) = fx.cat.live_object(&b.id, "dst").await.unwrap().unwrap();
+    assert_eq!(generation, copy.generation);
+    assert_eq!(extents, src.extents);
+
+    // Every way the source can differ from what the copy was planned on.
+    let mut wrong_key = copy_of(&fx, &src.generation, "x", t1);
+    wrong_key.source_key = "dst".into();
+    refused(&fx, wrong_key).await;
+    let mut wrong_size = copy_of(&fx, &src.generation, "x", t1);
+    wrong_size.generation.size += 1;
+    refused(&fx, wrong_size).await;
+    let mut wrong_etag = copy_of(&fx, &src.generation, "x", t1);
+    wrong_etag.generation.etag = "\"other\"".into();
+    refused(&fx, wrong_etag).await;
+    let mut wrong_count = copy_of(&fx, &src.generation, "x", t1);
+    wrong_count.generation.extent_count = 2;
+    refused(&fx, wrong_count).await;
+    let mut wrong_bucket = copy_of(&fx, &src.generation, "x", t1);
+    wrong_bucket.generation.bucket_id = other.id.clone();
+    refused(&fx, wrong_bucket).await;
+
+    // A source that was overwritten or deleted since it was read.
+    let stale = copy_of(&fx, &src.generation, "late", t1);
+    fx.cat.delete_object(&b.id, "src", t1).await.unwrap();
+    refused(&fx, stale).await;
+    assert_eq!(
+        fx.int("SELECT COUNT(*) FROM gc"),
+        0,
+        "dst holds the extents"
+    );
+
+    // The copy itself can be copied; a generation cannot copy itself.
+    let mut own = copy_of(&fx, &copy.generation, "x", t1);
+    own.generation.id = copy.generation.id.clone();
+    assert!(fx.cat.publish_copy(&own).await.is_err());
+    let second = copy_of(&fx, &copy.generation, "second", t1);
+    assert_eq!(
+        fx.cat.publish_copy(&second).await.unwrap(),
+        Guard::Applied(())
+    );
+
+    // A copy onto a key whose live generation it does not sort after: a
+    // replay would put that generation back over the copy.
+    let newer = fx.commit(&b.id, "newer", 1, t1.plus_ms(60_000));
+    fx.cat.publish(&newer).await.unwrap();
+    refused(&fx, copy_of(&fx, &copy.generation, "newer", t1)).await;
+    let mut same_id = copy_of(&fx, &copy.generation, "newer", t1);
+    same_id.generation.id = newer.generation.id.clone();
+    refused(&fx, same_id).await;
+    assert_eq!(
+        fx.cat
+            .publish_copy(&copy_of(&fx, &copy.generation, "newer", t1.plus_ms(60_001)))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shared_extents_leave_service_with_their_last_reference() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let src = fx.commit(&b.id, "src", 2, T0);
+    fx.cat.publish(&src).await.unwrap();
+    let copy = copy_of(&fx, &src.generation, "dst", T0);
+    fx.cat.publish_copy(&copy).await.unwrap();
+    let ids: Vec<String> = src.extents.iter().map(|x| x.id.to_string()).collect();
+
+    // Overwrite the source: its extents stay, the job still sees them live.
+    let t1 = T0.plus_ms(5_000);
+    fx.put(&b.id, "src", t1).await;
+    assert_eq!(fx.int("SELECT COUNT(*) FROM gc"), 0);
+    assert_eq!(
+        fx.int("SELECT COUNT(*) FROM outbox WHERE stage = 'cancelled'"),
+        0
+    );
+    let job = fx
+        .cat
+        .job_extent(&src.extents[0].id, &src.generation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.generation_state, GenerationState::Live);
+    // A collection row for a referenced extent is refused when it runs.
+    fx.run(&format!(
+        "INSERT INTO gc(extent_id, action, due_at) VALUES ('{}', 'delete_safety', 0)",
+        ids[0]
+    ));
+    let forged = fx.cat.gc_due(t1, 10, false).await.unwrap();
+    assert_eq!(forged.len(), 1);
+    assert_eq!(
+        fx.cat.gc_begin(&forged[0], t1).await.unwrap(),
+        GcStep::Skipped
+    );
+    fx.run("DELETE FROM gc");
+
+    // Overwrite the copy: nothing references the extents any more.
+    let t2 = t1.plus_ms(5_000);
+    fx.put(&b.id, "dst", t2).await;
+    assert_eq!(
+        fx.strings("SELECT DISTINCT extent_id FROM gc ORDER BY 1"),
+        ids
+    );
+    assert_eq!(fx.int("SELECT COUNT(*) FROM gc"), 6);
+    assert_eq!(
+        fx.int("SELECT COUNT(*) FROM outbox WHERE stage = 'cancelled'"),
+        2
+    );
+    let job = fx
+        .cat
+        .job_extent(&src.extents[0].id, &src.generation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.generation_state, GenerationState::Superseded);
+    let due = fx.cat.gc_due(t2, 10, false).await.unwrap();
+    assert!(matches!(
+        fx.cat.gc_begin(&due[0], t2).await.unwrap(),
+        GcStep::DeleteBlob { .. }
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1510,7 +1690,7 @@ async fn the_migration_fences_keys_deleted_before_it() {
     // Back to the schema before the migration, then the migration.
     let db = &fx.cat.sql.db;
     db.apply("DROP TABLE key_tombstones;").unwrap();
-    db.apply(velmora_bridge::testkit::MIGRATION_0005).unwrap();
+    db.apply(velmora_bridge::testkit::MIGRATION_0006).unwrap();
 
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_tombstones"), 1);
     assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());

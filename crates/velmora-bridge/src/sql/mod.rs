@@ -7,7 +7,7 @@
 //! | module | methods |
 //! |---|---|
 //! | `auth` | buckets, access keys, grants |
-//! | `objects` | live object, commit, delete, list, admin status, safety CAS |
+//! | `objects` | live object, commit, copy, delete, list, admin status, safety CAS |
 //! | `uploads` | multipart (guarded batches, receipt) |
 //! | `outbox` | leases, article plan, verification, release, dispatcher reads |
 //! | `gc` | due rows, begin, done |
@@ -15,6 +15,51 @@
 //! | `health` | provider load, failures and cooldown |
 //! | `recovery` | tombstone-ordered delete, upload extent rows |
 //! | `replay` | recovery replay: extents, article plans, publication |
+//!
+//! An extent is in service while a live generation references it through
+//! `generation_extents`, or a part of an open upload names it. A copy adds
+//! such a reference, so every statement that retires a generation, queues
+//! or runs garbage collection, or decides a release asks that question
+//! (`live_ref!`, `part_ref!`) instead of looking at the one generation the
+//! extent was first written for.
+
+/// True while a live generation references the extent `$x` (an SQL
+/// expression). With `except`, references from that generation do not
+/// count: it is the one being retired.
+macro_rules! live_ref {
+    ($x:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM generation_extents lr \
+               JOIN generations lg ON lg.id = lr.generation_id \
+              WHERE lr.extent_id = ",
+            $x,
+            " AND lg.state = 'live')"
+        )
+    };
+    ($x:literal, except $g:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM generation_extents lr \
+               JOIN generations lg ON lg.id = lr.generation_id \
+              WHERE lr.extent_id = ",
+            $x,
+            " AND lg.state = 'live' AND lg.id <> ",
+            $g,
+            ")"
+        )
+    };
+}
+
+/// True while a part of an open upload references the extent `$x`.
+macro_rules! part_ref {
+    ($x:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM upload_parts pr JOIN uploads pu ON pu.id = pr.upload_id \
+              WHERE pr.extent_id = ",
+            $x,
+            " AND pu.state = 'open')"
+        )
+    };
+}
 
 mod auth;
 mod gc;
@@ -36,10 +81,10 @@ use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayProbe};
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
-    CompleteUpload, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow,
-    GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage, ListQuery, ObjectStatus,
-    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result, SafetyState, UnixMs,
-    UploadPartRow, UploadRow, VerificationRow,
+    CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
+    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage,
+    ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result,
+    SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -97,6 +142,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
+    }
+    async fn copy_generation(
+        &self,
+        c: &CopyGeneration,
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        objects::copy_generation(self, c, record).await
     }
     async fn delete_object(&self, bucket: &BucketId, key: &str, now: UnixMs) -> Result<()> {
         objects::delete_object(self, bucket, key, now).await

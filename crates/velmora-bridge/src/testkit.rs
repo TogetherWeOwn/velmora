@@ -23,8 +23,8 @@ use crate::ports::{
 };
 use crate::recovery::{is_record_key, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
-    BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, ExtentId, Job, KekBytes,
-    Result, UnixMs,
+    BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
+    Job, KekBytes, Result, UnixMs,
 };
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
@@ -42,10 +42,13 @@ pub const MIGRATION_0003: &str =
 /// Hot-tier accounting: evictable bytes, last read, eviction fence.
 pub const MIGRATION_0004: &str =
     include_str!("../../../workers/s3-bridge/migrations/0004_hot_tier.sql");
+/// Extent references per generation (copies share extents).
+pub const MIGRATION_0005: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0005_generation_extents.sql");
 
 /// The newest tombstone of each deleted key.
-pub const MIGRATION_0005: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0005_key_tombstones.sql");
+pub const MIGRATION_0006: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0006_key_tombstones.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -133,6 +136,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0003)?;
         db.apply(MIGRATION_0004)?;
         db.apply(MIGRATION_0005)?;
+        db.apply(MIGRATION_0006)?;
         Ok(db)
     }
 
@@ -225,6 +229,12 @@ impl MemBlobStore {
 
     pub fn stored(&self, key: &str) -> Option<StoredBlob> {
         self.blobs.borrow().get(key).cloned()
+    }
+
+    /// Loses a blob behind the store's back, a recovery record as well:
+    /// the store itself never deletes one. `false` = it was not there.
+    pub fn lose(&self, key: &str) -> bool {
+        self.blobs.borrow_mut().remove(key).is_some()
     }
 
     /// Overwrites stored bytes (tamper tests).
@@ -469,7 +479,7 @@ impl Kek for TestKek {
 // Publishing without a record
 // ---------------------------------------------------------------------------
 
-/// Catalogue tests publish rows that no request recorded. These two
+/// Catalogue tests publish rows that no request recorded. These
 /// make the proof the catalogue asks for ([`Recorded::for_test`]) and
 /// answer as a guarded batch does.
 #[allow(async_fn_in_trait)]
@@ -477,6 +487,14 @@ pub trait PublishUnrecorded: Catalog {
     async fn publish(&self, c: &CommitGeneration) -> Result<Guard<()>> {
         let record = Recorded::for_test(&c.generation.id);
         Ok(match self.commit_generation(c, record).await? {
+            PublishOutcome::Applied => Guard::Applied(()),
+            PublishOutcome::Refused(_) => Guard::Lost,
+        })
+    }
+
+    async fn publish_copy(&self, c: &CopyGeneration) -> Result<Guard<()>> {
+        let record = Recorded::for_test(&c.generation.id);
+        Ok(match self.copy_generation(c, record).await? {
             PublishOutcome::Applied => Guard::Applied(()),
             PublishOutcome::Refused(_) => Guard::Lost,
         })

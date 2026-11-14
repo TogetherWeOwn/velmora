@@ -143,6 +143,7 @@ impl Fx {
             gc_mode: GcMode::Disposable,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
+            server_side_copy: false,
             dev_trust_http: false,
             providers,
             admin_token: Secret::new(TOKEN.to_string()),
