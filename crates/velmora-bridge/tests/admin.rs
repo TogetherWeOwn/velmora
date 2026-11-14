@@ -140,6 +140,7 @@ impl Fx {
             kek_active: 1,
             inflight_budget_bytes: BUDGET,
             gc_mode: GcMode::Disposable,
+            hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             dev_trust_http: false,
             providers,
