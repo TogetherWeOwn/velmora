@@ -377,15 +377,19 @@ where
         for tier in order.chunk_by(|a, b| a.priority == b.priority) {
             // Providers of the tier that have not posted for this job yet.
             let mut untried: Vec<&ProviderConfig> = tier.to_vec();
-            // A provider of the tier had no slot, in the catalogue or at
-            // its own login.
+            // A provider of the tier refused a login because its account
+            // is at its limit (or a permit was gone): it is not asked
+            // again in this job, but it may do the work later.
             let mut busy = false;
+            // A provider still untried had no slot in the catalogue when
+            // the tier was last asked.
+            let mut no_slot;
             loop {
                 let todo: Vec<usize> = (0..plan.len())
                     .filter(|at| plan[*at].state == ArticleState::Planned)
                     .collect();
-                let (sessions, no_slot) = self.open_sessions(&untried, &holder, todo.len()).await?;
-                busy |= no_slot;
+                let (sessions, without) = self.open_sessions(&untried, &holder, todo.len()).await?;
+                no_slot = without;
                 if sessions.is_empty() {
                     break;
                 }
@@ -410,10 +414,13 @@ where
                         // The first failure is the one reported.
                         failed.get_or_insert(stop);
                     }
+                    // Every socket of the round found no slot: the rest
+                    // of the tier is asked first.
+                    Some(Stop::NoPermit) => {}
                     Some(stop) => return Err(stop),
                 }
             }
-            if busy {
+            if busy || no_slot {
                 // A healthy provider of the tier had no slot: wait for it
                 // rather than spend an attempt or fall to a backup.
                 return Err(Stop::NoPermit);

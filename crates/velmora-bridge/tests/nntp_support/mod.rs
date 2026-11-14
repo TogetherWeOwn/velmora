@@ -243,6 +243,8 @@ pub struct MemCatalog {
     /// Most permits ever held at once, per provider.
     pub permit_peak: RefCell<BTreeMap<String, u32>>,
     pub permit_refusals: Cell<u32>,
+    /// Permits another holder gives back right after the next refusal.
+    pub free_after_refusal: RefCell<Vec<Permit>>,
 }
 
 impl MemCatalog {
@@ -620,6 +622,12 @@ impl Catalog for MemCatalog {
         let free = (0..limit(p.max_conns) as usize).find(|&i| slots[i].until < now.0);
         let Some(i) = free.filter(|_| !pool_full) else {
             self.permit_refusals.set(self.permit_refusals.get() + 1);
+            for freed in self.free_after_refusal.borrow_mut().drain(..) {
+                let slot = &mut all.get_mut(&freed.provider).expect("seeded")[freed.slot as usize];
+                if slot.token == freed.token {
+                    slot.until = 0;
+                }
+            }
             return Ok(None);
         };
         slots[i].token += 1;
@@ -1191,13 +1199,24 @@ impl Rig {
     ) -> JobOutcome {
         let lease = self.claim(s, OutboxStage::Post).await;
         let job = self.job(s).await;
+        // A job that ends before `stored` articles are there is returned
+        // as it is: `then` does not run and nothing waits for ever.
+        let done = Cell::new(false);
+        let post = async {
+            let outcome = self.bridge.post_stage(&lease, &job).await;
+            done.set(true);
+            outcome
+        };
         let mid = async {
             while self.servers[server].posted_count().await < stored {
+                if done.get() {
+                    return;
+                }
                 tokio::task::yield_now().await;
             }
             then().await;
         };
-        tokio::join!(self.bridge.post_stage(&lease, &job), mid).0
+        tokio::join!(post, mid).0
     }
 
     /// Claims `stage` and runs it once.

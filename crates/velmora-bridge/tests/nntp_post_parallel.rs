@@ -514,3 +514,67 @@ async fn slow_calls_never_start_on_an_old_renewal() {
     assert!(all_posted_by(&plan, "p0"));
     assert_eq!(stored(&rig, 0).await, id_set(&plan));
 }
+
+/// One socket, and the provider it goes to refuses the login because its
+/// account is full: the other provider of the tier does the work in the
+/// same run, whichever of the two is full.
+#[tokio::test]
+async fn a_full_account_leaves_the_work_to_the_rest_of_the_tier() {
+    for full in [0, 1] {
+        let mut rig = spread_rig().await;
+        rig.bridge.cfg.post_sockets = 1;
+        let s = rig.seed(1, &marked_plaintext(1_400_000)).await;
+        let addr = rig.servers[full].addr();
+        let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(dial(&cfg).await.unwrap());
+        }
+
+        assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+        let plan = rig.plan(&s).await;
+        assert!(all_posted_by(&plan, &format!("p{}", 1 - full)));
+        assert_eq!(rig.servers[full].posted_count().await, 0);
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        for client in held {
+            client.quit().await;
+        }
+    }
+}
+
+/// A provider that had no slot when the job began gets one while the
+/// other is refusing, is asked, and refuses too. Now every provider of
+/// the tier was asked and failed, none is busy any more: the backup tier
+/// posts the lot instead of the job waiting.
+#[tokio::test]
+async fn a_provider_that_was_busy_and_then_failed_does_not_hold_the_job() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5), spec("bb2", 5)]).await;
+    rig.bridge.cfg.providers[2].priority = 1;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.servers[1].set_posting_allowed(false).await;
+    // Another job holds every slot of the first provider.
+    let p0 = &rig.bridge.cfg.providers[0];
+    let now = rig.bridge.clock.now();
+    let mut held = Vec::new();
+    while let Some(permit) = rig
+        .bridge
+        .catalog
+        .acquire_permit(p0, PermitClass::Background, "other", now)
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+    }
+    // It gives them back just after this job was turned away.
+    rig.bridge
+        .catalog
+        .free_after_refusal
+        .borrow_mut()
+        .extend(held);
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let plan = rig.plan(&s).await;
+    assert!(all_posted_by(&plan, "p2"));
+    assert_eq!(rig.servers[2].posted_count().await, 10);
+}

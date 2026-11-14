@@ -869,15 +869,19 @@ async fn resolve(host: &str) -> Value {
     let mut out = serde_json::Map::new();
     for kind in ["A", "AAAA"] {
         let url = format!("https://cloudflare-dns.com/dns-query?name={host}&type={kind}");
-        let answer = async {
-            let headers = worker::Headers::new();
-            headers.set("accept", "application/dns-json")?;
-            let mut init = worker::RequestInit::new();
-            init.with_headers(headers);
-            let req = Request::new_with_init(&url, &init)?;
-            let mut resp = worker::Fetch::Request(req).send().await?;
-            resp.json::<Value>().await
-        }
+        // One limit over the request and the reading of its answer.
+        let answer = with_timeout(async {
+            let lookup = async {
+                let headers = worker::Headers::new();
+                headers.set("accept", "application/dns-json")?;
+                let mut init = worker::RequestInit::new();
+                init.with_headers(headers);
+                let req = Request::new_with_init(&url, &init)?;
+                let mut resp = worker::Fetch::Request(req).send().await?;
+                resp.json::<Value>().await
+            };
+            lookup.await.map_err(|_| std::io::Error::other("lookup"))
+        })
         .await;
         let records: Vec<Value> = match answer {
             Ok(v) => v["Answer"]
@@ -902,6 +906,8 @@ async fn probe_caps(req: &Request, env: &Env) -> Result<Response> {
         Err(e) => return config_error(e),
     };
     let values = all_configured_values(env);
+    // Before the session opens: a slow lookup must not idle the socket.
+    let resolved = resolve(&cfg.host).await;
     let t0 = now_ms();
     let (mut mini, greeting) = match Mini::open(&cfg).await {
         Ok(v) => v,
@@ -917,7 +923,7 @@ async fn probe_caps(req: &Request, env: &Env) -> Result<Response> {
         "greeting_text": text(&greeting, &values),
         "connect_tls_greeting_ms": t_greet - t0,
         "peer": mini.peer.as_deref().map(|p| text(p.as_bytes(), &values)),
-        "resolved": resolve(&cfg.host).await,
+        "resolved": resolved,
     });
     let result: std::result::Result<(), Value> = async {
         let caps_pre = capabilities(&mut mini, &values).await?;
@@ -1194,6 +1200,10 @@ const MAX_RUN_SOCKETS: u32 = 30;
 const MAX_RUN_SECS: u64 = 60;
 /// Most payload one run may post, whatever the caller asks for.
 const MAX_RUN_MB: u64 = 400;
+/// Most article payload the sockets of one run hold at the same moment
+/// (each holds one article while it posts it): well inside the memory
+/// of an isolate.
+const MAX_RUN_INFLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What the sockets of one run share.
 struct RunShared {
@@ -1238,7 +1248,7 @@ async fn run_socket(cfg: &NntpConfig, idx: u32, shared: Rc<RunShared>) -> Value 
     let mut duplicates = 0u32;
     let mut error = None;
     let mut first_post = None;
-    let mut last_reply = now_ms();
+    let mut last_reply = None;
     let mut lingered = false;
     loop {
         if shared.arts > 0 && post_ms.len() as u32 >= shared.arts {
@@ -1266,8 +1276,9 @@ async fn run_socket(cfg: &NntpConfig, idx: u32, shared: Rc<RunShared>) -> Value 
         first_post.get_or_insert(t);
         match session.client.post_article(&mid, &article).await {
             Ok(outcome) => {
-                last_reply = now_ms();
-                post_ms.push(last_reply - t);
+                let replied = now_ms();
+                last_reply = Some(replied);
+                post_ms.push(replied - t);
                 wire_bytes += article.len() as u64;
                 if outcome == PostOutcome::Duplicate {
                     duplicates += 1;
@@ -1338,6 +1349,9 @@ async fn probe_postrun(req: &Request, env: &Env) -> Result<Response> {
         Some(a) if a <= 1000 => a as u32,
         _ => return bad_request("arts must be 0-1000"),
     };
+    if u64::from(n) * size > MAX_RUN_INFLIGHT_BYTES {
+        return bad_request("n * size must be at most 64 MiB");
+    }
     let groups: Vec<String> = env
         .var("NEWSGROUPS")
         .map(|v| v.to_string())
