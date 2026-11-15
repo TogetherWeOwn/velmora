@@ -14,7 +14,7 @@ use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
 use velmora_bridge::copy::{
     pass_due, Copier, CopyCounts, StepError, FRESH_MS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
-    RETRY_WINDOW_MS, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, WALK_KEY,
+    RETRY_WINDOW_MS, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, WALK_KEY,
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
@@ -3060,7 +3060,8 @@ async fn the_plans_of_a_record_stop_at_the_bounds_of_a_job() {
     assert_eq!(put_at(w.e2, "m/art/x_0006"), None);
 
     // The store is found down by the records before any plan is looked
-    // at: no plan is asked for, and the cursor stays before the record.
+    // at: no plan is asked for, and the record is held back. The cursor
+    // of the step goes past it: a job that is retried does not use it.
     let w = World::new();
     w.generation(&key, &["x_1"]).await;
     w.record("m/art/x_1", b"plan").await;
@@ -3070,9 +3071,10 @@ async fn the_plans_of_a_record_stop_at_the_bounds_of_a_job() {
     }
     let step = w.copier().step(UnixMs(NOW), &sweep(&start)).await.unwrap();
     assert!(step.outage);
-    assert_eq!(step.next, Some(sweep(&start)));
+    assert_eq!(step.next, Some(sweep("m/zz2")));
     assert!(w.e2.log.borrow().iter().all(|l| !l.contains("m/art/")));
-    assert_eq!(step.counts.records, 0);
+    assert_eq!((step.counts.failed, step.counts.pending), (3, 1));
+    assert_eq!(put_at(w.e2, &key), None);
 }
 
 /// A record that asked nothing of the store says nothing about it: three
@@ -3125,4 +3127,203 @@ async fn a_record_fresh_for_the_last_time_is_sent_as_it_is() {
     let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
     assert!(step.outage);
     assert_eq!(put_at(w.e2, &goes), None);
+
+    // A plan the store did not take, and one that does not open: the
+    // record goes all the same, after the plan that is there.
+    let w = World::new();
+    w.generation(&goes, &["x_1", "x_2", "x_3"]).await;
+    w.record("m/art/x_1", b"plan").await;
+    w.record("m/art/x_2", b"plan").await;
+    w.raw("m/art/x_3", b"not sealed".to_vec()).await;
+    w.e2.put_500_keys.borrow_mut().push("m/art/x_2".into());
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert!(!step.outage);
+    assert!(put_at(w.e2, "m/art/x_1") < put_at(w.e2, &goes));
+    assert!(w.e2.get(&goes).is_some() && w.e2.get("m/art/x_2").is_none());
+    // The same record, fresh in the next pass too, waits for it.
+    let w = World::new();
+    w.generation(&stays, &["x_1", "x_2"]).await;
+    w.record("m/art/x_1", b"plan").await;
+    w.record("m/art/x_2", b"plan").await;
+    w.e2.put_500_keys.borrow_mut().push("m/art/x_2".into());
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert_eq!((step.outage, step.counts.pending), (false, 1));
+    assert_eq!(put_at(w.e2, &stays), None);
+}
+
+/// A pass through the queue, a job that is retried coming again after
+/// its delay: why its jobs fell short, and how often one was retried.
+async fn retried_pass(w: &World, start: UnixMs) -> (Vec<StepError>, usize) {
+    assert!(w.copier().start_pass(&w.jobs, start).await.unwrap());
+    let (mut whys, mut retries) = (Vec::new(), 0);
+    let mut sent = w.jobs.take();
+    while let Some(job) = sent.pop() {
+        assert!(sent.is_empty());
+        let Job::RecoveryCopy { pass, cursor, .. } = &job.job else {
+            panic!("another job");
+        };
+        loop {
+            let (outcome, _, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+            whys.extend(why);
+            let JobOutcome::Retry { delay_secs } = outcome else {
+                break;
+            };
+            assert!(w.jobs.take().is_empty());
+            retries += 1;
+            w.clock
+                .set(UnixMs(w.clock.now().0 + i64::from(delay_secs) * 1000));
+        }
+        sent = w.jobs.take();
+    }
+    (whys, retries)
+}
+
+/// Records of the sweep that the store never takes do not keep the
+/// sweep from those behind them: its job is retried for less long than
+/// the sweep has, and then goes on. Three tombstones without an answer,
+/// and the generation record behind them is over there in that pass.
+#[tokio::test(flavor = "current_thread")]
+async fn records_without_an_answer_do_not_keep_the_sweep_from_those_behind() {
+    let w = World::new();
+    for i in 0..3 {
+        let key = format!("m/del/g_{:013x}_t{i}", NOW - 600_000);
+        w.record(&key, b"gone").await;
+        w.e2.put_500_keys.borrow_mut().push(key);
+    }
+    let key = generation(600_000, "_a");
+    w.generation(&key, &["x_1"]).await;
+    w.record("m/art/x_1", b"plan").await;
+
+    let (whys, retries) = retried_pass(&w, UnixMs(NOW)).await;
+    assert!(retries > 0);
+    let down = StepError::Store(RemoteError::Unavailable);
+    assert!(whys.iter().all(|why| *why == down), "{whys:?}");
+    assert!(put_at(w.e2, "m/art/x_1") < put_at(w.e2, &key));
+    assert!(w.e2.get(&key).is_some());
+
+    // The job was retried first, and the tombstones wait for the sweep
+    // of the next pass: the walk does not go where records are fresh.
+    let log = w.e2.log.borrow();
+    let sent = log.iter().position(|l| *l == format!("PUT {key}")).unwrap();
+    let tries = |upto: &[String]| upto.iter().filter(|l| l.ends_with("_t0")).count();
+    let before = tries(&log[..sent]);
+    assert!(before >= 8 && tries(&log) == before, "{before}");
+    assert!(w.clock.now().0 - NOW < SWEEP_MS);
+    const { assert!(SWEEP_RETRY_MS < SWEEP_MS && SWEEP_RETRY_MS < RETRY_WINDOW_MS) };
+}
+
+/// To the last millisecond a job of the sweep that found the store down
+/// is retried with its cursor; after it the job is done and the next
+/// one goes on behind the records that got no answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_job_of_the_sweep_is_retried_for_half_the_time_of_the_sweep() {
+    let w = World::new();
+    for i in 0..3 {
+        let key = format!("m/del/g_{:013x}_t{i}", NOW - 600_000);
+        w.record(&key, b"gone").await;
+        w.e2.put_500_keys.borrow_mut().push(key);
+    }
+    let down = Some(StepError::Store(RemoteError::Unavailable));
+
+    w.clock.set(UnixMs(NOW + SWEEP_RETRY_MS - 1));
+    let (outcome, _, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((outcome, why), (JobOutcome::Retry { delay_secs: 60 }, down));
+    assert!(w.jobs.take().is_empty());
+
+    w.clock.set(UnixMs(NOW + SWEEP_RETRY_MS));
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().failed, 3);
+    let sent = w.jobs.take();
+    let Job::RecoveryCopy { cursor, .. } = &sent[0].job else {
+        panic!("another job");
+    };
+    assert!(
+        cursor.starts_with("{\"p\":\"d\",\"k\":\"m/del/g_"),
+        "{cursor}"
+    );
+    assert!(cursor.contains("_t2"), "{cursor}");
+}
+
+/// A group of plans that asked nothing of the store says nothing about
+/// it: two plans without an answer, a record whose plan is not written
+/// yet, and a third plan without an answer are an outage.
+#[tokio::test(flavor = "current_thread")]
+async fn plans_that_asked_nothing_do_not_hide_an_outage() {
+    let w = World::new();
+    w.generation(&generation(600_000, "_a"), &["x_1", "x_2"])
+        .await;
+    w.generation(&generation(500_000, "_b"), &["x_never"]).await;
+    w.generation(&generation(400_000, "_c"), &["x_3"]).await;
+    for id in ["x_1", "x_2", "x_3"] {
+        w.record(&format!("m/art/{id}"), b"plan").await;
+        w.e2.put_500_keys.borrow_mut().push(format!("m/art/{id}"));
+    }
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert!(step.outage);
+    // Found in the sweep: the walk was not begun.
+    assert!(step.next.unwrap().starts_with("{\"p\":\"g\""));
+    assert_eq!((step.counts.failed, step.counts.pending), (3, 3));
+    for id in ["x_1", "x_2", "x_3"] {
+        assert_eq!(asked_for(w.e2, "PUT", &format!("m/art/{id}")), 4);
+    }
+}
+
+struct NoRead<'a>(&'a MemBlobStore, &'static str);
+
+impl BlobStore for NoRead<'_> {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.0.put(key, bytes, meta).await
+    }
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if key == self.1 {
+            return Err(BridgeError::Blob("down".into()));
+        }
+        self.0.get(key, span).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.0.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0.delete(key).await
+    }
+    async fn delete_record(&self, refused: &recovery::Unpublished) -> Result<()> {
+        self.0.delete_record(refused).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.0.list(prefix, start_after, limit).await
+    }
+}
+
+/// What is saved of the sweep and could not be read is not written
+/// over: the job knows less than is saved. The pass goes on without it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sweep_that_cannot_be_read_is_not_written_over() {
+    let w = World::new();
+    let other = generation(700_000, "_other");
+    let before = format!("{{\"{other}\":5}}");
+    w.raw(SWEEP_KEY, before.clone().into_bytes()).await;
+    let key = generation(600_000, "_a");
+    w.generation(&key, &["x_1", "x_2"]).await;
+    w.record("m/art/x_1", b"plan").await;
+    w.record("m/art/x_2", b"plan").await;
+    w.e2.put_500_keys.borrow_mut().push("m/art/x_2".into());
+
+    let store = NoRead(&w.safety, SWEEP_KEY);
+    let copier = Copier {
+        safety: &store,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let step = copier.step(UnixMs(NOW), "").await.unwrap();
+    assert_eq!((step.counts.copied, step.counts.pending), (1, 1));
+    assert!(!step.unsaved);
+    assert_eq!(known(&w).await, before);
+
+    // Read, the same job saves what it found beside what was there.
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert_eq!(step.counts.pending, 1);
+    assert_eq!(known(&w).await, format!("{{\"{other}\":5,\"{key}\":1}}"));
 }

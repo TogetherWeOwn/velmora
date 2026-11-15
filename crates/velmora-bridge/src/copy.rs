@@ -37,7 +37,10 @@
 //! - **A generation record is copied once its id is two minutes old.**
 //!   The record of a refused publication is removed in the request that
 //!   wrote it ([`crate::recovery::discard_generation`]); the wait keeps
-//!   it from being copied first.
+//!   it from being copied first, unless that request took longer than
+//!   the wait. The copy then stays, like a record that could not be
+//!   removed here: it replays as an object nobody was told exists, below
+//!   whatever was published on the key after it.
 //! - **Tenant keys (`m/tk/`) never leave**, and neither do their names.
 //! - **What something else wrote over there is counted (`foreign`) and
 //!   passed.** It is never a copy, and it does not stop the pass. (One
@@ -112,6 +115,10 @@ pub const PAGE: u32 = 1000;
 /// started.
 pub const RETRY_WINDOW_MS: i64 = 10 * 60 * 1000;
 pub const RETRY_SECS: u32 = 60;
+/// A job of the fresh sweep that found the store down is retried while
+/// its pass is younger than this. After it the sweep goes on past the
+/// records that got no answer, while it still has time ([`SWEEP_MS`]).
+pub const SWEEP_RETRY_MS: i64 = 5 * 60 * 1000;
 /// List requests to the store for one page of the source, and for
 /// counting the copies past the last source key.
 pub const LIST_PAGES: u32 = 10;
@@ -326,6 +333,9 @@ struct Budget {
 struct Known {
     loaded: bool,
     changed: bool,
+    /// It could not be read: what this job knows is not all, and is
+    /// not saved over it.
+    unread: bool,
     plans: BTreeMap<String, u32>,
 }
 
@@ -534,8 +544,15 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         };
         // The store is down: the cursor does not move while the job may
         // be retried. After that the pass goes on past the records that
-        // failed, so that no record can hold back those behind it.
-        if step.outage && age < RETRY_WINDOW_MS {
+        // failed, so that no record can hold back those behind it. A
+        // job of the sweep goes on sooner: the sweep ends at SWEEP_MS.
+        let sweeping = !Place::parse(cursor).is_some_and(|p| p.walking());
+        let hold = if sweeping {
+            SWEEP_RETRY_MS
+        } else {
+            RETRY_WINDOW_MS
+        };
+        if step.outage && age < hold {
             let down = StepError::Store(RemoteError::Unavailable);
             return (again, Some(step.counts), Some(down));
         }
@@ -622,12 +639,21 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             return;
         }
         known.loaded = true;
-        let Ok(Some(bytes)) = self.safety.get(SWEEP_KEY, None).await else {
-            return;
+        // Its size first: something else may have written it.
+        let bytes = match self.safety.head(SWEEP_KEY).await {
+            Ok(None) => return,
+            Ok(Some(size)) if size > SWEEP_BYTES as u64 => return,
+            Ok(Some(_)) => self.safety.get(SWEEP_KEY, None).await,
+            Err(e) => Err(e),
         };
-        if bytes.len() > SWEEP_BYTES {
-            return;
-        }
+        let bytes = match bytes {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(_) => {
+                known.unread = true;
+                return;
+            }
+        };
         let saved: BTreeMap<String, u32> = serde_json::from_slice(&bytes).unwrap_or_default();
         let before = saved.len();
         known.plans = saved
@@ -641,7 +667,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// Writes [`SWEEP_KEY`] when the job changed it. False when it
     /// could not be written.
     async fn save_known(&self, known: Known) -> bool {
-        if !known.changed {
+        if !known.changed || known.unread {
             return true;
         }
         // Serializing strings and integers cannot fail.
@@ -860,9 +886,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         for (i, (_, keys)) in &generations {
             let key = &chunk[*i].entry.key;
             if outage {
-                // Not looked at: the job comes again, or the next one.
-                finished = *i;
-                break;
+                // Not looked at: the job comes again, or the next pass.
+                result[*i] = Some(Copied::Held);
+                continue;
             }
             // How many of its plans are over there: what an earlier job
             // of this pass counted, or an earlier pass. A count for
@@ -915,11 +941,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 n += lead;
                 stopped = lead < take;
-                silent = if asked > 0 && down == asked {
-                    silent + down
-                } else {
-                    0
-                };
+                // A group that asked nothing says nothing.
+                if asked > 0 {
+                    silent = if down == asked { silent + down } else { 0 };
+                }
                 outage = silent >= OUTAGE_MIN;
             }
             known.keep(key, n, keys.len());
