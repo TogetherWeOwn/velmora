@@ -112,6 +112,10 @@ where
                 }
             }
             Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
+            // Run by the adapter that holds the recovery store
+            // (`crate::copy`), never here: one that arrives all the same
+            // is dropped, and the next pass does its work.
+            Job::RecoveryCopy { .. } => JobOutcome::Ack,
             // A message from another version: its outbox row is re-sent in
             // the current format.
             _ => JobOutcome::Ack,

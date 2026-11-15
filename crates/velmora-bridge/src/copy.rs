@@ -16,7 +16,9 @@
 //!   The record of a refused publication is removed in the request that
 //!   wrote it ([`crate::recovery::discard_generation`]); the wait keeps
 //!   it from being copied first.
-//! - **Tenant keys (`m/tk/`) never leave.**
+//! - **Tenant keys (`m/tk/`) never leave**, and neither do their names.
+//! - **What something else wrote over there is counted (`foreign`) and
+//!   passed.** It is never a copy, and it does not stop the pass.
 //! - **No catalogue.** The pass reads the two stores and the clock, so
 //!   it runs while the catalogue is closed (rolled back, or a replay
 //!   unfinished) and trusts no cursor: a lost or repeated job only makes
@@ -82,6 +84,9 @@ pub struct CopyCounts {
     pub young: u64,
     /// Copies without a source (at least this many). Never deleted.
     pub extra: u64,
+    /// Keys over there that this service would not write: something
+    /// else did. Never a copy, never deleted.
+    pub foreign: u64,
 }
 
 impl CopyCounts {
@@ -111,6 +116,29 @@ pub enum StepError {
     Store(RemoteError),
     /// The job for the next step could not be sent.
     Queue,
+    /// The pass was not at its end when the next one started: what was
+    /// left of it was not looked at.
+    Expired,
+}
+
+/// What the store holds in a range.
+#[derive(Default)]
+struct Range {
+    copies: Vec<Listed>,
+    foreign: Vec<String>,
+    /// The last key listed, when the requests ran out before the end of
+    /// the range.
+    cut: Option<String>,
+}
+
+/// Where a source page ends for the store. Tenant keys are passed as a
+/// whole, by a key that sorts after all of them and names none.
+fn page_end(last: &str) -> String {
+    if last.starts_with(TENANT_KEY_PREFIX) {
+        format!("{}0", TENANT_KEY_PREFIX.trim_end_matches('/'))
+    } else {
+        last.to_string()
+    }
 }
 
 enum Copied {
@@ -184,7 +212,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // quickly over what is done, so two never run for long.
         let age = self.clock.now().0 - pass.0;
         if age >= PASS_INTERVAL_MS {
-            return (JobOutcome::Ack, None, None);
+            return (JobOutcome::Ack, None, Some(StepError::Expired));
         }
         // Every step is idempotent, so a failed job simply runs again,
         // but not for ever: a later pass takes over.
@@ -203,7 +231,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // be retried. After that the pass goes on past the records that
         // failed, so that no record can hold back those behind it.
         if step.outage && age < RETRY_WINDOW_MS {
-            return (again, Some(step.counts), None);
+            let down = StepError::Store(RemoteError::Unavailable);
+            return (again, Some(step.counts), Some(down));
         }
         if let Some(cursor) = step.next {
             let next = Job::RecoveryCopy {
@@ -239,9 +268,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 .list_entries(RECORD_PREFIX, &cursor, PAGE)
                 .await
                 .map_err(|_| StepError::Source)?;
-            let Some(last) = source.last().map(|e| e.key.clone()) else {
+            let Some(last) = source.last().map(|e| page_end(&e.key)) else {
                 // The source has ended; what the store still lists is extra.
-                counts.extra += self.listed(&cursor, None).await?.0.len() as u64;
+                let rest = self.listed(&cursor, None).await?;
+                counts.extra += rest.copies.len() as u64;
+                counts.foreign += rest.foreign.len() as u64;
                 return Ok(CopyStep {
                     counts,
                     next: None,
@@ -251,8 +282,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             // The store may hold far more keys in this range than the
             // source: its listing is cut after LIST_PAGES requests, and
             // the page then ends at the last key listed.
-            let (there, cut) = self.listed(&cursor, Some(&last)).await?;
-            let end = match cut {
+            let range = self.listed(&cursor, Some(&last)).await?;
+            let end = match range.cut {
                 Some(cut) => {
                     source.retain(|e| e.key <= cut);
                     cut
@@ -260,7 +291,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 None => last,
             };
             let there: BTreeMap<&str, &Listed> =
-                there.iter().map(|o| (o.key.as_str(), o)).collect();
+                range.copies.iter().map(|o| (o.key.as_str(), o)).collect();
             let names: BTreeSet<&str> = source.iter().map(|e| e.key.as_str()).collect();
 
             // In key order, CONCURRENCY copies at a time; the bounds are
@@ -305,6 +336,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 .keys()
                 .filter(|k| **k <= upto.as_str() && !names.contains(*k))
                 .count() as u64;
+            counts.foreign += range.foreign.iter().filter(|k| **k <= upto).count() as u64;
             cursor = upto;
         }
         Ok(CopyStep {
@@ -322,13 +354,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         counts: &mut CopyCounts,
     ) -> bool {
         let size = group.len();
-        let results: Vec<Copied> = stream::iter(group.drain(..))
-            .map(|(entry, copy)| self.copy_one(&entry.key, copy))
+        let results: Vec<(u64, Copied)> = stream::iter(group.drain(..))
+            .map(|(entry, copy)| async move { (entry.size, self.copy_one(&entry.key, copy).await) })
             .buffer_unordered(CONCURRENCY)
             .collect()
             .await;
         let mut down = 0;
-        for result in results {
+        for (size, result) in results {
             match result {
                 Copied::Done => counts.copied += 1,
                 Copied::Same => counts.same += 1,
@@ -340,22 +372,23 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 Copied::Refused => counts.refused += 1,
                 // Removed since it was listed: not a record any more.
-                Copied::Gone => counts.records -= 1,
+                Copied::Gone => {
+                    counts.records -= 1;
+                    counts.bytes -= size;
+                }
             }
         }
         size >= OUTAGE_MIN && down == size
     }
 
-    /// Copies of the store after `after`, up to and including `upto`
-    /// (`None` = to the end), from at most [`LIST_PAGES`] requests. The
-    /// second value is the last key listed when the requests ran out
-    /// before `upto` was reached.
+    /// What the store holds after `after`, up to and including `upto`
+    /// (`None` = to the end), from at most [`LIST_PAGES`] requests.
     async fn listed(
         &self,
         after: &str,
         upto: Option<&String>,
-    ) -> std::result::Result<(Vec<Listed>, Option<String>), StepError> {
-        let mut out: Vec<Listed> = Vec::new();
+    ) -> std::result::Result<Range, StepError> {
+        let mut range = Range::default();
         let mut after = after.to_string();
         for pages in 1..=LIST_PAGES {
             let page = self
@@ -363,22 +396,25 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 .list(self.clock, RECORD_PREFIX, &after)
                 .await
                 .map_err(StepError::Store)?;
-            let Some(last) = page.objects.last().map(|o| o.key.clone()) else {
+            let Some(last) = page.last else {
                 break;
             };
-            out.extend(page.objects);
+            range.copies.extend(page.objects);
+            range.foreign.extend(page.foreign);
             if !page.truncated || upto.is_some_and(|u| last.as_str() >= u.as_str()) {
                 break;
             }
             if pages == LIST_PAGES {
-                return Ok((out, upto.map(|_| last)));
+                range.cut = upto.map(|_| last);
+                return Ok(range);
             }
             after = last;
         }
         if let Some(upto) = upto {
-            out.retain(|o| o.key.as_str() <= upto.as_str());
+            range.copies.retain(|o| o.key.as_str() <= upto.as_str());
+            range.foreign.retain(|k| k.as_str() <= upto.as_str());
         }
-        Ok((out, None))
+        Ok(range)
     }
 
     async fn copy_one(&self, key: &str, copy: Option<&Listed>) -> Copied {

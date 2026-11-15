@@ -12,7 +12,10 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
-use velmora_bridge::copy::{pass_due, Copier, CopyCounts, StepError, JOB_COPIES, MIN_AGE_MS};
+use velmora_bridge::copy::{
+    pass_due, Copier, CopyCounts, StepError, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
+    RETRY_WINDOW_MS,
+};
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
     md5_hex, HttpRequest, HttpResponse, HttpSend, NoAnswer, RemoteConfig, RemoteError, S3Remote,
@@ -63,6 +66,8 @@ struct FakeE2 {
     list_inner: RefCell<Option<String>>,
     /// The next n answers have a body one byte longer than was asked for.
     long_next: Cell<u32>,
+    /// `start-after` of every list request, without the store's prefix.
+    asked: RefCell<Vec<String>>,
 }
 
 fn unescape(s: &str) -> String {
@@ -192,6 +197,7 @@ impl FakeE2 {
             Some(a) => a.strip_prefix(own).expect("own prefix").to_string(),
             None => String::new(),
         };
+        self.asked.borrow_mut().push(after.clone());
         let mut limit: usize = q["max-keys"].parse().unwrap();
         if self.page.get() > 0 {
             limit = limit.min(self.page.get());
@@ -425,6 +431,7 @@ impl World {
             total.source_unreadable += c.source_unreadable;
             total.young += c.young;
             total.extra += c.extra;
+            total.foreign += c.foreign;
             cursor = step.next;
         }
         total
@@ -762,17 +769,18 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
         ),
         ("the start itself", "m/b", k("m/b"), RemoteError::Mismatch),
         ("before the start", "m/b", k("m/a"), RemoteError::Mismatch),
-        ("a .. segment", "", k("m/../a"), RemoteError::Foreign),
-        ("a . segment", "", k("m/./a"), RemoteError::Foreign),
-        ("an empty segment", "", k("m//a"), RemoteError::Foreign),
-        ("a key that ends in /", "", k("m/a/"), RemoteError::Foreign),
-        // Characters this module would not sign: written by something
-        // else.
-        ("a space", "", k("m/a b"), RemoteError::Foreign),
-        ("an escape", "", k("m/%2e%2e/x"), RemoteError::Foreign),
-        ("a query", "", k("m/a?x#y"), RemoteError::Foreign),
-        ("a backslash", "", k("m/a\\..\\b"), RemoteError::Foreign),
-        ("not ASCII", "", k("m/\u{e9}\u{202e}"), RemoteError::Foreign),
+        (
+            "a foreign key out of order",
+            "",
+            k("m/b b") + &k("m/a"),
+            RemoteError::Mismatch,
+        ),
+        (
+            "a foreign key outside the prefix",
+            "",
+            k("rs/a b"),
+            RemoteError::Mismatch,
+        ),
         (
             "more to come and no key",
             "",
@@ -797,6 +805,34 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
         assert_eq!(e.err(), Some(kind), "{what}");
     }
 
+    // A key this module would not sign was written by something else:
+    // it is given apart, never as a copy, and the listing goes on.
+    for key in [
+        "m/../a",
+        "m/./a",
+        "m//a",
+        "m/a/",
+        "m/a b",
+        "m/%2e%2e/x",
+        "m/a?x#y",
+        "m/a\\..\\b",
+        "m/\u{e9}\u{202e}",
+    ] {
+        set(format!("<IsTruncated>true</IsTruncated>{}", k(key)));
+        let page = w.remote.list(&w.clock, "m/", "").await.unwrap();
+        assert!(page.objects.is_empty(), "{key}");
+        assert_eq!(page.foreign, [key]);
+        // The caller goes on from it.
+        assert_eq!(page.last.as_deref(), Some(key));
+        assert!(page.truncated);
+    }
+    set(k("m/a") + &k("m/a b") + &k("m/b"));
+    let page = w.remote.list(&w.clock, "m/", "").await.unwrap();
+    let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["m/a", "m/b"]);
+    assert_eq!(page.foreign, ["m/a b"]);
+    assert_eq!(page.last.as_deref(), Some("m/b"));
+
     // An object that is the store prefix itself (a folder made in a
     // console) is no copy: it is left out and the listing goes on.
     set(contents(own) + &k("m/a"));
@@ -806,6 +842,7 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
     set(contents(own));
     let page = w.remote.list(&w.clock, "", "").await.unwrap();
     assert!(page.objects.is_empty() && !page.truncated);
+    assert_eq!((page.foreign.len(), page.last), (0, None));
 
     // No bucket.
     w.e2.status.set(Some(404));
@@ -1016,16 +1053,37 @@ async fn pass_copies_every_record_kind_byte_equal() {
     assert_eq!(w.e2.objects.borrow().len(), 3);
 }
 
+/// Neither a tenant key nor its name leaves: where the source page ends
+/// in tenant keys, the store is asked for what follows all of them.
 #[tokio::test(flavor = "current_thread")]
 async fn pass_never_copies_tenant_keys() {
     let w = World::new();
-    w.record("m/tk/t_1", b"tenant key").await;
     w.record("m/art/x_1", b"plan").await;
+    w.record("m/tk/t_1", b"tenant key").await;
+    w.record("m/tk/t_2", b"tenant key").await;
     let counts = w.pass().await;
     assert_eq!((counts.records, counts.copied), (1, 1));
     let there: Vec<String> = w.e2.objects.borrow().keys().cloned().collect();
     assert_eq!(there, ["m/art/x_1"]);
     assert_eq!(w.e2.count("PUT m/tk/"), 0);
+    assert_eq!(*w.e2.asked.borrow(), ["", "m/tk0"]);
+
+    // A record behind the tenant keys is still reached, and a job that
+    // stops among them goes on without naming one.
+    w.record("m/x_9", b"plan").await;
+    let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "m/tk0").await;
+    assert_eq!((counts.unwrap().copied, why), (1, None));
+    assert!(w.e2.get("m/x_9").is_some());
+    for line in w.e2.log.borrow().iter().chain(w.e2.asked.borrow().iter()) {
+        assert!(!line.contains("m/tk/"), "{line}");
+    }
+    for sent in w.jobs.take() {
+        assert!(
+            matches!(&sent.job, Job::RecoveryCopy { cursor, .. } if !cursor.contains("m/tk/")),
+            "{:?}",
+            sent.job
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1283,8 +1341,9 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
         w.record(&format!("m/art/x_{i}"), b"plan").await;
     }
     w.e2.put_status.set(Some(500));
+    let down = Some(StepError::Store(RemoteError::Unavailable));
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
-    assert_eq!(why, None);
+    assert_eq!(why, down);
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts.unwrap().failed, 4);
     assert!(w.jobs.take().is_empty());
@@ -1299,8 +1358,17 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
     assert_eq!(w.e2.puts(), 16);
     w.e2.put_status.set(Some(500));
 
+    // To the last millisecond of the retry window. (The pauses between
+    // tries have moved the clock.)
+    w.clock.set(UnixMs(NOW + RETRY_WINDOW_MS - 1));
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, down);
+    assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
+    assert_eq!(counts.unwrap().failed, 4);
+    assert!(w.jobs.take().is_empty());
+
     // Past the retry window the job is not retried; the pass goes on.
-    w.clock.advance_ms(10 * 60 * 1000);
+    w.clock.set(UnixMs(NOW + RETRY_WINDOW_MS));
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
@@ -1312,11 +1380,25 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
         sent[0].job
     );
 
-    // The next pass has started: a job of this one does nothing more.
-    w.clock.advance_ms(5 * 60 * 1000);
+    // A step that fails is not retried any more either, and says why.
+    w.e2.drop_next.set(4);
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((outcome, counts, why), (JobOutcome::Ack, None, down));
+    assert!(w.jobs.take().is_empty());
+
+    // To the last millisecond of its interval the pass still works.
+    w.clock.set(UnixMs(NOW + PASS_INTERVAL_MS - 1));
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().failed, 4);
+    assert_eq!(w.jobs.take().len(), 1);
+
+    // The next pass has started: a job of this one does nothing more,
+    // and says that it left work undone.
+    w.clock.set(UnixMs(NOW + PASS_INTERVAL_MS));
     let before = w.e2.log.borrow().len();
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
-    assert_eq!(why, None);
+    assert_eq!(why, Some(StepError::Expired));
     assert_eq!((outcome, counts), (JobOutcome::Ack, None));
     assert!(w.jobs.take().is_empty());
     assert_eq!(w.e2.log.borrow().len(), before);
@@ -1325,38 +1407,45 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
     assert_eq!(w.pass().await.copied, 4);
 }
 
-/// Records that fail every time (here two, among others that copy) are
-/// counted and passed: every record behind them is still copied, in the
-/// same job, with no retry of the job.
+/// What something else wrote under the prefix (a note, a folder made
+/// in a console) is counted and passed: the records before and behind
+/// it are copied, and it is left as it is.
 #[tokio::test(flavor = "current_thread")]
-async fn a_key_written_by_something_else_stops_the_step_and_says_so() {
+async fn a_key_written_by_something_else_is_counted_and_passed() {
     let w = World::new();
     w.record("m/art/x_1", b"plan").await;
-    // Not a key of this service: the listing that names it is not
-    // trusted, so nothing is compared with it and nothing is sent.
-    w.e2.set("m/art/note 1.txt", b"note");
-    let foreign = StepError::Store(RemoteError::Foreign);
-    assert_eq!(w.copier().step("").await.unwrap_err(), foreign);
-    assert_eq!(w.e2.puts(), 0);
+    w.record("m/art/x_3", b"plan").await;
+    let foreign = ["m/art/", "m/art/note 1.txt", "m/art/x_2/", "m/zz zz"];
+    for key in foreign {
+        w.e2.set(key, b"note");
+    }
+    // One key per answer: the listing goes on from each of them.
+    w.e2.page.set(1);
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
-    assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
-    assert_eq!((counts, why), (None, Some(foreign)));
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    let counts = counts.unwrap();
+    assert_eq!(
+        (counts.records, counts.copied, counts.foreign, counts.extra),
+        (2, 2, 4, 0)
+    );
+    assert!(counts.clean());
     assert!(w.jobs.take().is_empty());
-    // Past the retry window the job is acknowledged, and still says why
-    // it did nothing.
-    w.clock.advance_ms(10 * 60 * 1000);
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
-    assert_eq!(outcome, JobOutcome::Ack);
-    assert_eq!((counts, why), (None, Some(foreign)));
-    assert!(w.jobs.take().is_empty());
-    // The object is left where it is.
-    assert_eq!(w.e2.get("m/art/note 1.txt").unwrap(), b"note");
-    assert_eq!(w.e2.objects.borrow().len(), 1);
-
-    // Once it is gone, the next step copies.
-    w.e2.objects.borrow_mut().clear();
-    let step = w.copier().step("").await.unwrap();
-    assert_eq!(step.counts.copied, 1);
+    let total = w.pass().await;
+    assert_eq!(
+        (total.same, total.copied, total.foreign, total.extra),
+        (2, 0, 4, 0)
+    );
+    for key in foreign {
+        assert_eq!(w.e2.get(key).unwrap(), b"note", "{key}");
+        // No request ever named it.
+        let log = w.e2.log.borrow();
+        assert!(
+            !log.iter().any(|l| l.ends_with(&format!(" {key}"))),
+            "{key}"
+        );
+    }
+    assert_eq!(w.e2.objects.borrow().len(), 6);
+    assert_eq!(w.e2.puts(), 2);
 }
 
 /// A queue that takes no job.
@@ -1394,6 +1483,9 @@ async fn a_next_job_that_cannot_be_sent_is_retried_and_reported() {
     assert!(matches!(start, Err(BridgeError::Queue(_))));
 }
 
+/// Records that fail every time (here two, among others that copy) are
+/// counted and passed: every record behind them is still copied, in the
+/// same job, with no retry of the job.
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_that_always_fails_does_not_hold_back_the_others() {
     let w = World::new();
@@ -1515,6 +1607,197 @@ async fn a_store_far_larger_than_the_source_is_listed_in_bounded_parts() {
     let total = w2.pass().await;
     assert_eq!((total.records, total.copied, total.extra), (1, 1, 5_000));
     assert_eq!(w2.e2.objects.borrow().len(), 5_001);
+}
+
+/// The store holds more keys inside one source page than a job lists
+/// for it, at seven keys an answer: the page ends at the last key
+/// listed, which here is a source record whose copy is damaged. Every
+/// record is looked at exactly once, on either side of each cut.
+#[tokio::test(flavor = "current_thread")]
+async fn a_source_page_cut_by_the_store_listing_loses_no_record() {
+    let w = World::new();
+    let n = 100;
+    // In key order: one key before all, then for each record its copy
+    // (damaged for the even ones) and a key the source lacks.
+    w.e2.set("m/art/a", b"left over");
+    for i in 0..n {
+        let key = format!("m/art/s_{i:03}");
+        let sealed = w.record(&key, b"plan").await;
+        if i % 2 == 0 {
+            w.e2.set(&key, b"damaged");
+        } else {
+            w.e2.set(&key, &sealed);
+        }
+        w.e2.set(&format!("{key}x"), b"left over");
+    }
+    w.e2.page.set(7);
+
+    // Ten answers of seven keys: the first round ends at the 70th key.
+    let cut = w.e2.objects.borrow().keys().nth(69).cloned().unwrap();
+    assert_eq!(cut, "m/art/s_034");
+    let first = w.copier().step("").await.unwrap();
+    assert!(w.e2.asked.borrow().contains(&cut));
+    assert_eq!(w.e2.get(&cut), w.safety.get(&cut, None).await.unwrap());
+    let mut total = first.counts;
+    let mut cursor = first.next;
+    while let Some(at) = cursor {
+        let step = w.copier().step(&at).await.unwrap();
+        total.records += step.counts.records;
+        total.same += step.counts.same;
+        total.copied += step.counts.copied;
+        total.extra += step.counts.extra;
+        cursor = step.next;
+    }
+    assert_eq!(
+        (total.records, total.same, total.copied, total.extra),
+        (n, n / 2, n / 2, n + 1)
+    );
+    for key in w.safety.keys() {
+        assert_eq!(w.e2.get(&key), w.safety.get(&key, None).await.unwrap());
+    }
+    let second = w.pass().await;
+    assert_eq!(
+        (second.records, second.same, second.copied, second.extra),
+        (n, n, 0, n + 1)
+    );
+}
+
+/// The store goes down in the middle of a page: the step stops after
+/// the group that got no answer, with the cursor at its last record,
+/// and counts only what lies before it. The rest is counted once, by
+/// the steps that follow.
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_that_finds_the_store_down_stops_inside_the_page() {
+    let w = World::new();
+    for i in 0..20 {
+        w.record(&format!("m/art/x_{i:02}"), b"plan").await;
+    }
+    for key in ["m/art/x_03a", "m/art/x_10a", "m/zz"] {
+        w.e2.set(key, b"left over");
+    }
+    for key in ["m/art/x_02 b", "m/art/x_10 b"] {
+        w.e2.set(key, b"note");
+    }
+    w.e2.put_status.set(Some(500));
+    let first = w.copier().step("").await.unwrap();
+    assert!(first.outage);
+    assert_eq!(first.next.as_deref(), Some("m/art/x_05"));
+    let c = &first.counts;
+    assert_eq!((c.records, c.failed, c.extra, c.foreign), (6, 6, 1, 1));
+    // Six records, four tries each, and no more.
+    assert_eq!(w.e2.puts(), 24);
+
+    w.e2.put_status.set(None);
+    let mut extra = first.counts.extra;
+    let mut foreign = first.counts.foreign;
+    let mut records = first.counts.records;
+    let mut cursor = first.next;
+    while let Some(at) = cursor {
+        let step = w.copier().step(&at).await.unwrap();
+        assert!(!step.outage);
+        extra += step.counts.extra;
+        foreign += step.counts.foreign;
+        records += step.counts.records;
+        cursor = step.next;
+    }
+    assert_eq!((records, extra, foreign), (20, 3, 2));
+}
+
+/// A source whose listing is not to be believed: it still names keys
+/// that are gone, and its digests are not the MD5 of the bytes.
+struct Stale<'a> {
+    inner: &'a MemBlobStore,
+    gone: Vec<&'static str>,
+    md5: Option<&'static str>,
+}
+
+impl BlobStore for Stale<'_> {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.inner.put(key, bytes, meta).await
+    }
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if self.gone.contains(&key) {
+            return Ok(None);
+        }
+        self.inner.get(key, span).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn delete_record(&self, refused: &recovery::Unpublished) -> Result<()> {
+        self.inner.delete_record(refused).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.inner.list(prefix, start_after, limit).await
+    }
+    async fn list_entries(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<BlobEntry>> {
+        let mut entries = self.inner.list_entries(prefix, after, limit).await?;
+        if let Some(md5) = self.md5 {
+            for entry in &mut entries {
+                entry.md5 = md5.into();
+            }
+        }
+        Ok(entries)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_removed_after_it_was_listed_is_not_counted() {
+    let w = World::new();
+    w.record("m/art/x_1", b"a plan that is gone").await;
+    let kept = w.record("m/art/x_2", b"plan").await;
+    let safety = Stale {
+        inner: &w.safety,
+        gone: vec!["m/art/x_1"],
+        md5: None,
+    };
+    let copier = Copier {
+        safety: &safety,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let step = copier.step("").await.unwrap();
+    let c = step.counts;
+    assert_eq!((c.records, c.bytes, c.copied), (1, kept.len() as u64, 1));
+    assert!(c.clean());
+    assert!(w.e2.get("m/art/x_1").is_none());
+}
+
+/// The source's listing names a digest that is not the MD5 of the bytes
+/// (a record stored in parts): the bytes are read and compared, and an
+/// equal copy is not sent again.
+#[tokio::test(flavor = "current_thread")]
+async fn an_equal_copy_is_not_sent_again_when_the_listing_names_another_digest() {
+    let w = World::new();
+    for i in 0..3 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    let safety = Stale {
+        inner: &w.safety,
+        gone: vec![],
+        md5: Some("0123456789abcdef0123456789abcdef-2"),
+    };
+    let copier = Copier {
+        safety: &safety,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let first = copier.step("").await.unwrap().counts;
+    assert_eq!((first.copied, first.same), (3, 0));
+    let second = copier.step("").await.unwrap().counts;
+    assert_eq!((second.copied, second.same), (0, 3));
+    assert_eq!(w.e2.puts(), 3);
+    // A copy that differs is still mended.
+    w.e2.set("m/art/x_1", b"damaged");
+    let third = copier.step("").await.unwrap().counts;
+    assert_eq!((third.copied, third.same), (1, 2));
 }
 
 #[tokio::test(flavor = "current_thread")]
