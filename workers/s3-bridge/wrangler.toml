@@ -53,6 +53,21 @@ MAX_PUT_BYTES = "103809024"
 # off; /_admin/status counts what it would take (write_intents:
 # waiting_writes, oldest_waiting_at).
 INTENT_SWEEP = "off"
+# off | on. On: every 15 minutes a pass copies each recovery record of
+# SAFETY (m/) to a bucket at another S3-compatible provider, so that the
+# records survive the loss of this account. It puts only what is missing
+# or different there (key, size, MD5), proves each put with a HEAD, and
+# never deletes there. Tenant keys (m/tk/) are not copied, a generation
+# record is copied once it is two minutes old, and no pass runs while
+# MAINTENANCE is "restore". A key there that this service did not write
+# is counted (`foreign`) and left alone. With `on`
+# these are required, each as a var or a secret:
+#   E2_ENDPOINT (https://host), E2_REGION, E2_BUCKET,
+#   RECOVERY_PREFIX (put before every key; ends with "/"),
+#   E2_ACCESS_KEY and E2_SECRET_KEY (secrets; a key that cannot delete).
+# A missing or refused value stops the copy only, with an error line on
+# every cron run; it never stops the S3 service.
+RECOVERY_COPY = "off"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
@@ -121,7 +136,16 @@ crons = ["*/5 * * * *"]
 
 # secrets (wrangler secret put, value on stdin): VELMORA_KEK_1, NNTP_PROVIDERS, ADMIN_TOKEN
 # NNTP_PROVIDERS refuses unknown fields: deploy a Worker before the secret uses a new provider field
-# (`hosts`, `host_select`, `proxies`), and take such fields out of the secret before rolling the Worker back.
+# (`hosts`, `host_select`, `release`, `proxies`), and take such fields out of the secret before rolling the Worker back.
+# `release` (true when absent) says whether a provider's backbone counts toward releasing the pinned
+# copy. A backbone with `"release": false` on any of its providers is posted to and read from, but is
+# neither verified nor counted: use it for short-retention or post-only accounts. A release needs
+# every article read in full (BODY) on one backbone that counts and present (STAT) on
+# REQUIRED_BACKBONES of them in all; BODY goes to the first one in the list, so list the account to
+# read in full first. `release` is true when absent, so a short-retention provider MUST say
+# `"release": false`. With fewer readable backbones that count than REQUIRED_BACKBONES the Worker keeps
+# serving reads and writes and releases nothing: every pinned copy stays held, /_admin/status lists a
+# "release paused" line under `config_warnings`, and the cron logs it on every tick.
 #
 # A provider's `proxies` (in NNTP_PROVIDERS) is a list of SOCKS5 proxies,
 # each {"host", "port", "user", "pass"}, tried in order. Every connection

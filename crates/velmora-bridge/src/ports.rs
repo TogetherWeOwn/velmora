@@ -80,6 +80,16 @@ pub struct BlobMeta<'a> {
     pub cipher_sha256: &'a [u8; 32],
 }
 
+/// One key of a listing with what identifies its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobEntry {
+    pub key: String,
+    pub size: u64,
+    /// MD5 of the bytes in lowercase hex, as the store reports it for an
+    /// object written by one put.
+    pub md5: String,
+}
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
     /// H2 adds `put_stream(len)`.
@@ -101,6 +111,42 @@ pub trait BlobStore {
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
+    /// Keys as [`BlobStore::list`] gives them, with the size and MD5 of
+    /// each. The end rule is not that of `list`: only an **empty** answer
+    /// means no more keys. A short answer is not the end (a key removed
+    /// since it was listed is left out); the caller goes on from the
+    /// last key returned. A `limit` of 0 is read as 1.
+    ///
+    /// This default reads every blob; an adapter whose listing carries
+    /// size and MD5 overrides it.
+    async fn list_entries(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> Result<Vec<BlobEntry>> {
+        let mut entries = Vec::new();
+        let mut after = start_after.to_string();
+        // A key removed since it was listed is left out; an answer is
+        // empty only when the listing itself has ended.
+        while entries.is_empty() {
+            let keys = self.list(prefix, &after, limit.max(1)).await?;
+            let Some(last) = keys.last().cloned() else {
+                break;
+            };
+            for key in keys {
+                if let Some(bytes) = self.get(&key, None).await? {
+                    entries.push(BlobEntry {
+                        size: bytes.len() as u64,
+                        md5: crate::remote::md5_hex(&bytes),
+                        key,
+                    });
+                }
+            }
+            after = last;
+        }
+        Ok(entries)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,10 +601,15 @@ pub trait Catalog {
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
+    /// `counting` = the labels of the backbones that count toward a
+    /// release. The guard is the release rule over rows recorded under
+    /// this claim: `required` of those backbones with a complete pass,
+    /// at least one of them a `body` pass.
     async fn begin_release(
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>>;

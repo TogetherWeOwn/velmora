@@ -396,7 +396,8 @@ pub(crate) const MAX_READ_RECONNECTS: u32 = 2;
 /// What one pass over a set of articles found. Indexes are `ArticleRow::idx`.
 #[derive(Debug, Default)]
 pub(crate) struct ReadTally {
-    /// Articles whose decoded payload matched the stored SHA-256.
+    /// Articles whose decoded payload matched the stored SHA-256; in a
+    /// `STAT` pass ([`stat_articles`]), articles the provider said it has.
     pub(crate) ok: u32,
     /// Still `430` after the in-pass retry.
     pub(crate) missing: Vec<u32>,
@@ -406,8 +407,20 @@ pub(crate) struct ReadTally {
 
 enum Checked {
     Good(Vec<u8>),
+    /// A `STAT` found the article. Nothing was read, so nothing is known
+    /// about its bytes.
+    Present,
     Missing,
     Corrupt,
+}
+
+/// How one article is asked of a provider.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// `BODY`, decoded and compared with the planned SHA-256.
+    Body,
+    /// `STAT`: whether the provider says it has the article.
+    Stat,
 }
 
 /// Decodes a `BODY` reply and accepts it only if it is exactly the planned
@@ -425,7 +438,7 @@ fn check_payload(row: &ArticleRow, wire: &[u8]) -> Checked {
     }
 }
 
-/// One `BODY`, checked. A `430` leaves the session in use. Any session
+/// One `BODY`, checked, or one `STAT` (`ask`). A `430` leaves the session in use. Any session
 /// error drops the session and resumes at the same message-id on a new
 /// one, while `reconnects` lasts. A connect the provider refused is not
 /// tried again: the pass ends with [`Stop::NoPermit`] or
@@ -439,6 +452,7 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
     lease: Option<&Lease>,
     row: &ArticleRow,
+    ask: Ask,
     wire: &mut Vec<u8>,
     reconnects: &mut u32,
 ) -> core::result::Result<Checked, Stop> {
@@ -455,7 +469,14 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
         }
         let result = match connected {
             Ok(()) => match session.session().await {
-                Ok(s) => s.body(&row.message_id, wire).await,
+                Ok(s) => match ask {
+                    Ask::Body => s.body(&row.message_id, wire).await.map(Some),
+                    Ask::Stat => match s.stat(&row.message_id).await {
+                        Ok(true) => Ok(None),
+                        Ok(false) => Ok(Some(BodyOutcome::Missing)),
+                        Err(e) => Err(e),
+                    },
+                },
                 Err(Stop::Session(e)) => Err(e),
                 Err(stop) => return Err(stop),
             },
@@ -465,8 +486,9 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
             Ok(found) => {
                 session.note_ok();
                 return Ok(match found {
-                    BodyOutcome::Found => check_payload(row, wire),
-                    BodyOutcome::Missing => Checked::Missing,
+                    Some(BodyOutcome::Found) => check_payload(row, wire),
+                    Some(BodyOutcome::Missing) => Checked::Missing,
+                    None => Checked::Present,
                 });
             }
             Err(e) => e,
@@ -498,6 +520,32 @@ pub(crate) async fn read_articles<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
     lease: Option<&Lease>,
     rows: &[&ArticleRow],
+    sink: impl FnMut(&ArticleRow, Vec<u8>),
+) -> core::result::Result<ReadTally, Stop> {
+    ask_articles(session, lease, rows, Ask::Body, sink).await
+}
+
+/// Asks the provider with `STAT` whether it has each of `rows`: no article
+/// is read, so `ReadTally::ok` counts what the provider claims to hold and
+/// `corrupt` stays empty. The retry of a `430` and the lease are as in
+/// [`read_articles`].
+///
+/// This is not a check of the bytes. A provider can answer `STAT` for an
+/// article whose `BODY` it does not serve; only [`read_articles`] proves
+/// an article can be read back.
+pub(crate) async fn stat_articles<C: Catalog, N: NntpConnector, T: Clock>(
+    session: &mut ProviderSession<'_, C, N, T>,
+    lease: Option<&Lease>,
+    rows: &[&ArticleRow],
+) -> core::result::Result<ReadTally, Stop> {
+    ask_articles(session, lease, rows, Ask::Stat, |_, _| {}).await
+}
+
+async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
+    session: &mut ProviderSession<'_, C, N, T>,
+    lease: Option<&Lease>,
+    rows: &[&ArticleRow],
+    ask: Ask,
     mut sink: impl FnMut(&ArticleRow, Vec<u8>),
 ) -> core::result::Result<ReadTally, Stop> {
     let mut tally = ReadTally::default();
@@ -512,11 +560,12 @@ pub(crate) async fn read_articles<C: Catalog, N: NntpConnector, T: Clock>(
         };
         for row in todo {
             session.keep(lease).await?;
-            match read_one(session, lease, row, &mut wire, &mut reconnects).await? {
+            match read_one(session, lease, row, ask, &mut wire, &mut reconnects).await? {
                 Checked::Good(payload) => {
                     tally.ok += 1;
                     sink(row, payload);
                 }
+                Checked::Present => tally.ok += 1,
                 Checked::Corrupt => tally.corrupt.push(row.idx),
                 Checked::Missing if pass == 0 => retry.push(row),
                 Checked::Missing => tally.missing.push(row.idx),

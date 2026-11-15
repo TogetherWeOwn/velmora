@@ -389,10 +389,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(self, l, required, evidence_json, now).await
+        outbox::begin_release(self, l, required, counting, evidence_json, now).await
     }
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await

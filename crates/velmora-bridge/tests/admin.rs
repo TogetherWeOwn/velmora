@@ -142,6 +142,7 @@ impl Fx {
             pool_max_conns: None,
             proxies: Vec::new(),
             enabled: true,
+            release: true,
         }];
         edit(&mut providers);
         let cfg = BridgeConfig {
@@ -1280,6 +1281,7 @@ async fn status_reports_provider_health_without_credentials() {
     // The limits, as configured: no address limit is `null`.
     assert_eq!(one["max_conns"], p.max_conns);
     assert!(one["max_ips"].is_null());
+    assert_eq!(one["release"], true);
     assert_eq!(one["holders"], 0);
 
     // A held slot and three failed sessions show up.
@@ -1392,4 +1394,149 @@ async fn status_reports_the_address_limit_and_its_holders() {
     let one = fx.get("/status").await.json()["providers"][0].clone();
     assert_eq!(one["max_ips"], 2);
     assert_eq!((&one["held"], &one["holders"]), (&json!(2), &json!(1)));
+}
+
+/// A `STAT` pass says the backbone lists the articles, not that it serves
+/// them: it is no reason to give up the pinned copy.
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("body"), &json!(true))
+    );
+
+    let sql = &fx.bridge.catalog.sql;
+    // As a `STAT` pass is stored: its tally in `articles_present`.
+    sql.exec(
+        "UPDATE verifications SET kind = 'stat', articles_present = articles_ok, articles_ok = 0",
+        &[],
+    )
+    .await
+    .unwrap();
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("stat"), &json!(true))
+    );
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // Read in full again: the copy can go.
+    sql.exec(
+        "UPDATE verifications SET kind = 'body', articles_ok = articles_present, articles_present = 0",
+        &[],
+    )
+    .await
+    .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
+}
+
+/// Fewer backbones count toward a release than `REQUIRED_BACKBONES`: the
+/// Worker serves as before, the status says that the release is paused,
+/// and no pinned copy is given up, read back in full or not.
+#[tokio::test]
+async fn too_few_release_backbones_are_a_warning_and_keep_the_pinned_copy() {
+    let mut fx = Fx::new().await;
+    let status = fx.get("/status").await.json();
+    assert_eq!(status["config_warnings"], json!([]));
+
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.required_backbones = 2;
+    let status = fx.get("/status").await.json();
+    assert_eq!(
+        status["config_warnings"],
+        json!(["release paused: 1 backbone(s) count toward release, \
+                REQUIRED_BACKBONES is 2; pinned copies stay held"])
+    );
+
+    // Writes and reads go on, and the upload is read back in full.
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    assert_eq!(fx.safety_state(&o).await, "held");
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("body"), &json!(true))
+    );
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // With the count put right, the same read-back is enough here.
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.required_backbones = 1;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+}
+
+/// A read-back from a backbone that does not count toward a release is no
+/// reason to give up the pinned copy either.
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_the_read_back_is_on_a_backbone_that_does_not_count() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut side = providers[0].clone();
+        side.id = "p9".to_string();
+        side.backbone = "side".to_string();
+        side.post = false;
+        side.release = false;
+        providers.push(side);
+    })
+    .await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    let sql = &fx.bridge.catalog.sql;
+    let home = fx.bridge.cfg.providers[0].backbone.clone();
+
+    // The full read-back is on the backbone that does not count.
+    sql.exec("UPDATE verifications SET backbone = 'side'", &[])
+        .await
+        .unwrap();
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (
+            &backbone["backbone"],
+            &backbone["kind"],
+            &backbone["counts"]
+        ),
+        (&json!("side"), &json!("body"), &json!(true))
+    );
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+
+    // On the backbone that counts: the copy can go.
+    sql.exec(
+        "UPDATE verifications SET backbone = ?1",
+        &[SqlValue::Text(home)],
+    )
+    .await
+    .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
 }

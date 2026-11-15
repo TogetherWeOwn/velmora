@@ -24,12 +24,6 @@ async fn pool_rig(n: usize) -> Rig {
     rig(&specs).await
 }
 
-/// A local port nothing listens on.
-fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 impl Rig {
     fn set_priorities(&mut self, priorities: &[u8]) {
         for (p, priority) in self.bridge.cfg.providers.iter_mut().zip(priorities) {
@@ -99,11 +93,28 @@ impl Rig {
         self.load(i).await.cooldown_until > self.bridge.clock.now()
     }
 
-    /// Points provider `i` at a port nothing listens on; returns the port
-    /// it had.
+    /// Points provider `i` at a port nothing listens on, which the rig
+    /// keeps reserved; returns the port it had.
     fn unplug(&mut self, i: usize) -> u16 {
-        core::mem::replace(&mut self.bridge.cfg.providers[i].port, dead_port())
+        let dead = DeadPort::reserve();
+        let port = core::mem::replace(&mut self.bridge.cfg.providers[i].port, dead.port());
+        self.dead_ports.push(dead);
+        port
     }
+}
+
+/// The port of an unplugged provider refuses a connect at once, and
+/// nothing else can bind it while the rig is alive.
+#[tokio::test]
+async fn an_unplugged_port_refuses_and_stays_taken() {
+    let mut rig = pool_rig(1).await;
+    rig.unplug(0);
+    let dead = ("127.0.0.1", rig.bridge.cfg.providers[0].port);
+
+    let refused = tokio::net::TcpStream::connect(dead).await.unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+    let taken = std::net::TcpListener::bind(dead).unwrap_err();
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
 }
 
 // ---------------------------------------------------------------------------
