@@ -450,6 +450,13 @@ async fn head_and_list_report_what_the_store_holds() {
     assert!(!page.truncated);
     let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
     assert_eq!(keys, ["m/art/x_3", "m/art/x_4"]);
+
+    // Every character a key may have can be put and read back.
+    let wide = "m/art/A-b_c.d~0";
+    w.remote.put(&w.clock, wide, b"wide").await.unwrap();
+    let head = w.remote.head(&w.clock, wide).await.unwrap().unwrap();
+    assert_eq!((head.size, head.etag), (4, md5_hex(b"wide")));
+    assert_eq!(w.e2.get(wide).unwrap(), b"wide");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -646,11 +653,12 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
     set(format!(
         "<IsTruncated>true</IsTruncated>{}{}",
         k("m/b"),
-        k("m/c")
+        k("m/c.D-e~f_0")
     ));
     let page = w.remote.list(&w.clock, "m/", "m/a").await.unwrap();
     let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
-    assert_eq!(keys, ["m/b", "m/c"]);
+    // Every character a key may have is accepted.
+    assert_eq!(keys, ["m/b", "m/c.D-e~f_0"]);
     assert!(page.truncated);
 
     for (what, after, inner) in [
