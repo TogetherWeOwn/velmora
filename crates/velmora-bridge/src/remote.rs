@@ -65,12 +65,20 @@ impl fmt::Debug for HttpRequest {
     }
 }
 
-/// An answer. Header names are lowercase.
-#[derive(Clone, Debug, Default)]
+/// An answer. Header names are lowercase. `Debug` shows the status and
+/// the length of the body only: the error text of a store can name the
+/// access key.
+#[derive(Clone, Default)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({} bytes)", self.status, self.body.len())
+    }
 }
 
 impl HttpResponse {
@@ -158,11 +166,19 @@ fn host_name(value: &str) -> bool {
 }
 
 /// A key of this module (without bucket and store prefix) that stays
-/// under the store prefix whatever reads the path: not empty, no empty,
-/// `.` or `..` segment. The signer checks the characters.
+/// under the store prefix whatever reads the path: segments of
+/// unreserved characters (letters, digits, `-`, `_`, `.`, `~`), none
+/// empty, `.` or `..`. The signer has the same rule for a path; this
+/// one also holds for a key that a listing names, which is not signed.
 fn key_ok(key: &str) -> bool {
-    key.split('/')
-        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+    key.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.~".contains(&c))
+    })
 }
 
 impl RemoteConfig {
@@ -386,7 +402,9 @@ impl<H: HttpSend> S3Remote<H> {
     /// (without the store's own prefix). An answer that is out of order,
     /// or names a key outside the range or one this module would not
     /// sign, is an error. An object that is the store's prefix itself (a
-    /// "folder" made in a console) is no copy and is left out.
+    /// "folder" made in a console) is no copy and is left out. Any other
+    /// key that ends in `/` is an error like every key this module would
+    /// not sign: nothing but this module writes under the prefix.
     pub async fn list<T: Clock>(
         &self,
         clock: &T,

@@ -32,7 +32,7 @@ type Sent = std::result::Result<HttpResponse, NoAnswer>;
 #[derive(Default)]
 struct FakeE2 {
     /// The store's own time: a pause moves it, and a request signed for
-    /// another second than this one is refused.
+    /// a time more than one second from it is refused.
     clock: Option<FixedClock>,
     /// By key, without bucket and prefix.
     objects: RefCell<BTreeMap<String, Vec<u8>>>,
@@ -473,6 +473,13 @@ async fn e2_authorization_never_logged() {
     let mut shown = format!("{shown} {e:?} {:?}", spy.0.borrow());
     shown.make_ascii_lowercase();
     assert!(shown.contains("put https://e2.test/records/drill-1/m/art/x_1"));
+    // An answer: the error text of a store can name the access key.
+    let answer = HttpResponse {
+        status: 403,
+        headers: vec![("x-key".into(), ACCESS_KEY.into())],
+        body: format!("<AWSAccessKeyId>{ACCESS_KEY}</AWSAccessKeyId>").into_bytes(),
+    };
+    assert_eq!(format!("{answer:?}"), "403 (53 bytes)");
     let access_key = ACCESS_KEY.to_ascii_lowercase();
     for secret in [SECRET_KEY, &access_key, "signature", "aws4", "credential"] {
         assert!(!shown.contains(secret), "{secret} in {shown}");
@@ -658,6 +665,12 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
         ("a . segment", "", k("m/./a")),
         ("an empty segment", "", k("m//a")),
         ("a key that ends in /", "", k("m/a/")),
+        // Characters this module would not sign.
+        ("a space", "", k("m/a b")),
+        ("an escape", "", k("m/%2e%2e/x")),
+        ("a query", "", k("m/a?x#y")),
+        ("a backslash", "", k("m/a\\..\\b")),
+        ("not ASCII", "", k("m/\u{e9}\u{202e}")),
         (
             "more to come and no key",
             "",
