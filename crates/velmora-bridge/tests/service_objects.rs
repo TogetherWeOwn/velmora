@@ -727,12 +727,12 @@ async fn restore_mode_refuses_mutations() {
         b"payload".to_vec(),
     );
     let (resp, polled) = frozen.send_watched(req).await;
-    assert_eq!(resp.status, 503);
+    resp.expect_writes_refused();
     assert!(!polled);
     let resp = frozen
         .call(&signer, Method::Delete, &path(BUCKET, "k"), &[], &[], b"")
         .await;
-    assert_eq!(resp.status, 503);
+    resp.expect_writes_refused();
     assert_nothing_stored(&frozen);
     frozen.head(&signer, BUCKET, "k").await.expect(404);
 }
