@@ -457,7 +457,7 @@ impl BridgeConfig {
         for pool in providers.iter_mut().filter_map(|p| p.pool.as_mut()) {
             *pool = pool.trim().to_lowercase();
         }
-        validate_providers(&providers, dev)?;
+        validate_providers(&providers, dev, required_backbones)?;
 
         let admin_token = required(&get, "ADMIN_TOKEN")?;
         if admin_token.len() < MIN_ADMIN_TOKEN_LEN {
@@ -496,7 +496,11 @@ impl BridgeConfig {
     }
 }
 
-fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), ConfigError> {
+fn validate_providers(
+    providers: &[ProviderConfig],
+    dev: bool,
+    required_backbones: u32,
+) -> Result<(), ConfigError> {
     let bad = || ConfigError::Invalid("NNTP_PROVIDERS".into());
     if providers.is_empty() {
         return Err(bad());
@@ -547,6 +551,15 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
     let usable = |role: fn(&ProviderConfig) -> bool| providers.iter().any(|p| p.enabled && role(p));
     if !usable(|p| p.post) || !usable(|p| p.read) {
         return Err(bad());
+    }
+    // A release needs `REQUIRED_BACKBONES` backbones that count toward
+    // it, each with a provider to check it through. With fewer, nothing
+    // uploaded could ever be verified for release: refused here, not
+    // found out later from safety copies that never leave.
+    if crate::verify::release_labels(providers).len() < required_backbones as usize {
+        return Err(ConfigError::Refused(
+            "fewer backbones that count toward release than REQUIRED_BACKBONES",
+        ));
     }
     Ok(())
 }

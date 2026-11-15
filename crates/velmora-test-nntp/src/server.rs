@@ -113,6 +113,9 @@ struct Spool {
     drop_bodies: usize,
     /// While true, `STAT` answers `430` for articles in the `POST` spool.
     stat_lag: bool,
+    /// While true, `BODY` answers `430` for articles in the `POST` spool
+    /// although `STAT` finds them.
+    body_gone: bool,
     /// While true, a login over the connection cap is answered `482`
     /// instead of `502`.
     limit_482: bool,
@@ -146,6 +149,7 @@ impl Shared {
             discard_posts: 0,
             drop_bodies: 0,
             stat_lag: false,
+            body_gone: false,
             limit_482: false,
             limit_reply: None,
         };
@@ -324,6 +328,13 @@ impl TestNntpServer {
     /// serves them (a provider whose `STAT` lags right after a `POST`).
     pub async fn set_stat_lag(&self, lag: bool) {
         self.shared.spool.lock().await.stat_lag = lag;
+    }
+
+    /// While set, `BODY` answers `430` for posted articles although `STAT`
+    /// answers `223` for them (a provider that still lists an article it
+    /// no longer serves).
+    pub async fn set_body_gone(&self, gone: bool) {
+        self.shared.spool.lock().await.body_gone = gone;
     }
 
     /// While set, a login over the per-user connection cap is answered
@@ -679,6 +690,17 @@ async fn handle_connection(
                     let mut spool = shared.spool.lock().await;
                     if cmd.as_str() == "STAT"
                         && spool.stat_lag
+                        && spool
+                            .posted
+                            .iter()
+                            .any(|a| a.message_id == article.message_id)
+                    {
+                        drop(spool);
+                        let _ = writer.write_all(b"430 No such article\r\n").await;
+                        continue;
+                    }
+                    if cmd.as_str() == "BODY"
+                        && spool.body_gone
                         && spool
                             .posted
                             .iter()

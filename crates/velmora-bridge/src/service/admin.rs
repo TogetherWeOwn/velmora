@@ -721,6 +721,7 @@ async fn object_status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
                     "backbone": b.backbone,
                     "provider": b.provider_id,
                     "counts": b.counts,
+                    "kind": b.kind,
                     "ok": b.articles_ok,
                     "total": b.articles_total,
                     "at": b.verified_at,
@@ -781,8 +782,8 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .ok_or_else(no_key)?;
 
     // Only a read-back from a backbone that is still configured is
-    // evidence, as in the verify stage. Labels compare trimmed and in
-    // lower case.
+    // evidence, as in the verify stage: a `STAT` pass is not one. Labels
+    // compare trimmed and in lower case.
     let label = |b: &str| b.trim().to_lowercase();
     let configured: Vec<String> = bridge
         .cfg
@@ -792,9 +793,11 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .map(|p| label(&p.backbone))
         .collect();
     let on_usenet = |x: &crate::types::ExtentStatus| {
-        x.backbones
-            .iter()
-            .any(|b| b.counts && configured.contains(&label(&b.backbone)))
+        x.backbones.iter().any(|b| {
+            b.counts
+                && b.kind == crate::types::VerifyKind::Body
+                && configured.contains(&label(&b.backbone))
+        })
     };
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
@@ -1048,6 +1051,9 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
                 "backbone": p.backbone,
                 "priority": p.priority,
                 "enabled": p.enabled,
+                // Whether the provider lets its backbone count toward a
+                // release (one `false` speaks for the whole backbone).
+                "release": p.release,
                 "max_conns": p.max_conns,
                 // `null` = no address limit: `max_conns` alone.
                 "max_ips": p.max_ips,

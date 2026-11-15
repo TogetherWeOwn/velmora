@@ -223,6 +223,7 @@ impl Fx {
             pool: None,
             pool_max_conns: None,
             enabled: true,
+            release: true,
         }];
         let cfg = BridgeConfig {
             environment: Environment::Dev,
@@ -1305,6 +1306,14 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     p1.post = false;
     fx.bridge.cfg.providers.push(p1);
 
+    // Not while the new backbone does not count toward a release: there
+    // is still only one that does.
+    fx.bridge.cfg.providers[1].release = false;
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.redriven, report.enqueued), (0, 0));
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    fx.bridge.cfg.providers[1].release = true;
+
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (1, 1));
     assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Verify));
@@ -1315,6 +1324,17 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     assert!(fx.has_safety(&o));
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.iter().filter(|s| s.counts).count(), 2);
+    // Read in full on the first backbone, asked for on the second.
+    let kinds: Vec<_> = status
+        .iter()
+        .map(|s| (s.backbone.as_str(), s.kind))
+        .collect();
+    assert!(kinds.contains(&("bb1", VerifyKind::Stat)), "{kinds:?}");
+    assert_eq!(
+        kinds.iter().filter(|k| k.1 == VerifyKind::Body).count(),
+        1,
+        "{kinds:?}"
+    );
     // Nothing was posted twice.
     assert_eq!(fx.server.posted_count().await, 3);
 

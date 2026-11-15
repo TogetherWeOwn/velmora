@@ -305,6 +305,14 @@ db_enum!(
     VerifyResult { Ok => "ok", Missing => "missing", Corrupt => "corrupt", Error => "error" }
 );
 db_enum!(
+    /// `verifications.kind`: how the articles were checked. `Body` = every
+    /// article was read and its payload hash compared; `Stat` = the
+    /// provider only said that it has them. A `Stat` pass is never the
+    /// full check: a provider can answer `STAT` for an article whose
+    /// `BODY` it no longer serves.
+    VerifyKind { Body => "body", Stat => "stat" }
+);
+db_enum!(
     /// `uploads.state`.
     UploadState { Open => "open", Completed => "completed", Aborted => "aborted" }
 );
@@ -428,6 +436,18 @@ pub struct ProviderConfig {
     /// `false` = configured but never used.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// Whether this provider's backbone counts toward the release of a
+    /// safety copy. `false` for a backbone that does not keep articles
+    /// long enough to be a durable copy: it is still posted to and read
+    /// from, but it is never verified and never evidence. One provider
+    /// that says `false` takes its whole backbone out, whatever the
+    /// backbone's other providers say.
+    ///
+    /// Rollout: deploy a Worker that knows this field before the secret
+    /// carries it; an older Worker refuses the whole secret. Rollback:
+    /// take `release` out of the secret first.
+    #[serde(default = "enabled_by_default")]
+    pub release: bool,
 }
 
 /// How a provider with several endpoints (`host` and `hosts`) picks the
@@ -778,6 +798,7 @@ pub struct VerificationRow {
     pub articles_ok: u32,
     pub articles_total: u32,
     pub result: VerifyResult,
+    pub kind: VerifyKind,
 }
 
 /// Latest verification per backbone for the extent's current `plan_rev`.
@@ -790,7 +811,11 @@ pub struct BackboneStatus {
     pub articles_ok: u32,
     pub articles_total: u32,
     pub result: VerifyResult,
-    /// `result = ok` and `articles_ok = articles_total = article_count`.
+    /// How the articles were checked. Only a `Body` pass is a full check.
+    pub kind: VerifyKind,
+    /// `result = ok` and `articles_ok = articles_total = article_count`:
+    /// a complete pass of its `kind`. Whether that is enough for a
+    /// release is `verify::releasable`'s decision, never this flag's.
     pub counts: bool,
 }
 

@@ -89,6 +89,7 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         pool: None,
         pool_max_conns: None,
         enabled: true,
+        release: true,
     }]);
     // The shipped ratio: the budget is three extents.
     cfg.max_extent_bytes = CAP as u64;

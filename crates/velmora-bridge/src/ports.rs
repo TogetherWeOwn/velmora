@@ -555,10 +555,15 @@ pub trait Catalog {
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
+    /// `counting` = the labels of the backbones that count toward a
+    /// release. The guard is the release rule over rows recorded under
+    /// this claim: `required` of those backbones with a complete pass,
+    /// at least one of them a `body` pass.
     async fn begin_release(
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>>;

@@ -141,6 +141,7 @@ impl Fx {
             pool: None,
             pool_max_conns: None,
             enabled: true,
+            release: true,
         }];
         edit(&mut providers);
         let cfg = BridgeConfig {
@@ -1279,6 +1280,7 @@ async fn status_reports_provider_health_without_credentials() {
     // The limits, as configured: no address limit is `null`.
     assert_eq!(one["max_conns"], p.max_conns);
     assert!(one["max_ips"].is_null());
+    assert_eq!(one["release"], true);
     assert_eq!(one["holders"], 0);
 
     // A held slot and three failed sessions show up.
@@ -1343,4 +1345,47 @@ async fn status_reports_the_address_limit_and_its_holders() {
     let one = fx.get("/status").await.json()["providers"][0].clone();
     assert_eq!(one["max_ips"], 2);
     assert_eq!((&one["held"], &one["holders"]), (&json!(2), &json!(1)));
+}
+
+/// A `STAT` pass says the backbone lists the articles, not that it serves
+/// them: it is no reason to give up the pinned copy.
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("body"), &json!(true))
+    );
+
+    let sql = &fx.bridge.catalog.sql;
+    sql.exec("UPDATE verifications SET kind = 'stat'", &[])
+        .await
+        .unwrap();
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("stat"), &json!(true))
+    );
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // Read in full again: the copy can go.
+    sql.exec("UPDATE verifications SET kind = 'body'", &[])
+        .await
+        .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
 }

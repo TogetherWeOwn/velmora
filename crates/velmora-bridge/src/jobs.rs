@@ -26,7 +26,7 @@ use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
     GenerationId, Job, JobOutcome, OutboxStage, Result, JOB_VERSION,
 };
-use crate::verify::backbones;
+use crate::verify::release_labels;
 
 /// Outbox rows one dispatcher run re-sends (one queue batch).
 pub const DISPATCH_LIMIT: u32 = 100;
@@ -422,10 +422,8 @@ where
         // A `done` extent whose safety copy is held was short of backbones
         // when it was verified. Once enough are configured it is verified
         // again; the rows moved here are due at once and sent below.
-        let labels: Vec<String> = backbones(&self.cfg.providers)
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect();
+        // Only the backbones that count toward a release are asked for.
+        let labels = release_labels(&self.cfg.providers);
         let required = self.cfg.required_backbones;
         if labels.len() >= required as usize {
             // The re-drive is an extra: its failure must not keep the
