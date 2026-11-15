@@ -48,11 +48,16 @@ pub const MAX_HOSTS: usize = 8;
 
 /// Most entries a provider's `proxies` may hold. Each one that cannot
 /// be used costs a connect its time limit
-/// ([`crate::hosts::PROXY_CONNECT_SECS`]), and all of them together
-/// must leave room inside one call of a read.
+/// ([`crate::hosts::PROXY_CONNECT_SECS`]) and, before that, at most one
+/// probe its own ([`crate::hosts::PROBE_TIMEOUT_MS`]: a proxy that a
+/// probe found unusable is not probed through again). All of that
+/// together must leave room inside one call of a read.
 pub const MAX_PROXIES: usize = 3;
-const _: () =
-    assert!(MAX_PROXIES as u32 * crate::hosts::PROXY_CONNECT_SECS < crate::ports::READ_CALL_SECS);
+const _: () = assert!(
+    MAX_PROXIES as u32
+        * (crate::hosts::PROXY_CONNECT_SECS * 1_000 + crate::hosts::PROBE_TIMEOUT_MS)
+        < crate::ports::READ_CALL_SECS * 1_000
+);
 
 /// Longest name, user name or password SOCKS5 carries, in bytes.
 const SOCKS_FIELD_MAX: usize = 255;
@@ -296,7 +301,8 @@ fn hosts_ok(p: &ProviderConfig) -> bool {
         .all(|h| seen.insert(h.to_ascii_lowercase()))
 }
 
-/// An address a proxy may have: not loopback, private, link-local,
+/// An address a proxy may have: not loopback, private, shared
+/// (100.64.0.0/10, as overlay networks hand out), link-local,
 /// unspecified, multicast or broadcast. The runtime does not connect to
 /// those either; here they are a configuration mistake.
 fn public_ip(ip: IpAddr) -> bool {
@@ -304,6 +310,7 @@ fn public_ip(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => {
             !(v4.is_loopback()
                 || v4.is_private()
+                || (v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()

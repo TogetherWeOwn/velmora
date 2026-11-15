@@ -15,8 +15,23 @@ use velmora::socks5::{self, is_proxy_failure, is_target_failure};
 use velmora::transport::Transport;
 use velmora_test_nntp::{ProxyMode, TestNntpServer, TestSocks5Proxy};
 
-const PROXY_USER: &str = "proxy-login";
-const PROXY_PASS: &str = "proxy-secret";
+/// The proxy login of a test run, made at run time: no login is written
+/// in the source.
+fn login() -> &'static (String, String) {
+    static LOGIN: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    LOGIN.get_or_init(|| {
+        let id = std::process::id();
+        (format!("user-{id}"), format!("word-{id}"))
+    })
+}
+
+fn proxy_user() -> &'static str {
+    &login().0
+}
+
+fn proxy_pass() -> &'static str {
+    &login().1
+}
 
 /// A plain TCP stream as the engine's transport.
 struct Tcp(TcpStream);
@@ -69,8 +84,8 @@ async fn handshake(
 #[tokio::test]
 async fn an_nntp_session_runs_through_the_proxy() {
     let server = TestNntpServer::spawn_for_test().await;
-    let proxy = TestSocks5Proxy::spawn(PROXY_USER, PROXY_PASS, ProxyMode::Relay).await;
-    let (out, tcp) = handshake(&proxy, &server, PROXY_USER, PROXY_PASS).await;
+    let proxy = TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), ProxyMode::Relay).await;
+    let (out, tcp) = handshake(&proxy, &server, proxy_user(), proxy_pass()).await;
     out.unwrap();
 
     let cfg = nntp_config(&server);
@@ -91,8 +106,12 @@ async fn an_nntp_session_runs_through_the_proxy() {
 #[tokio::test]
 async fn a_wrong_login_is_a_proxy_failure() {
     let server = TestNntpServer::spawn_for_test().await;
-    let proxy = TestSocks5Proxy::spawn(PROXY_USER, PROXY_PASS, ProxyMode::Relay).await;
-    for (user, pass) in [(PROXY_USER, "wrong"), ("wrong", PROXY_PASS)] {
+    let proxy = TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), ProxyMode::Relay).await;
+    let other = format!("other-{}", std::process::id());
+    for (user, pass) in [
+        (proxy_user(), other.as_str()),
+        (other.as_str(), proxy_pass()),
+    ] {
         let (out, _tcp) = handshake(&proxy, &server, user, pass).await;
         let e = out.unwrap_err();
         assert_eq!(e.to_string(), socks5::ERR_AUTH);
@@ -105,14 +124,14 @@ async fn a_wrong_login_is_a_proxy_failure() {
 /// target's failure, not the proxy's.
 #[tokio::test]
 async fn a_dead_target_is_a_target_failure() {
-    let proxy = TestSocks5Proxy::spawn(PROXY_USER, PROXY_PASS, ProxyMode::Relay).await;
+    let proxy = TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), ProxyMode::Relay).await;
     // A port that was free a moment ago.
     let dead = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap().port()
     };
     let mut tcp = to_proxy(&proxy).await;
-    let e = socks5::connect(&mut tcp, PROXY_USER, PROXY_PASS, "127.0.0.1", dead)
+    let e = socks5::connect(&mut tcp, proxy_user(), proxy_pass(), "127.0.0.1", dead)
         .await
         .unwrap_err();
     assert_eq!(e.to_string(), socks5::ERR_CONNECT);
@@ -124,29 +143,38 @@ async fn a_dead_target_is_a_target_failure() {
 #[tokio::test]
 async fn a_misbehaving_proxy_is_refused() {
     let server = TestNntpServer::spawn_for_test().await;
+    // The last column: the failure is the proxy's own. A connection that
+    // ends after the login was accepted, while the proxy was connecting,
+    // counts against the target: a proxy that reaches no host often just
+    // closes.
     let cases = [
-        (ProxyMode::SelectsNoAuth, socks5::ERR_METHOD),
-        (ProxyMode::NoAcceptableMethod, socks5::ERR_METHOD),
-        (ProxyMode::RefuseLogin, socks5::ERR_AUTH),
-        (ProxyMode::RefuseConnect(2), socks5::ERR_REQUEST),
-        (ProxyMode::MalformedReply, socks5::ERR_MALFORMED),
-        (ProxyMode::TruncatedReply, socks5::ERR_CLOSED),
-        (ProxyMode::CloseEarly, socks5::ERR_CLOSED),
+        (ProxyMode::SelectsNoAuth, socks5::ERR_METHOD, true),
+        (ProxyMode::NoAcceptableMethod, socks5::ERR_METHOD, true),
+        (ProxyMode::RefuseLogin, socks5::ERR_AUTH, true),
+        (ProxyMode::RefuseConnect(2), socks5::ERR_REQUEST, true),
+        (ProxyMode::MalformedReply, socks5::ERR_MALFORMED, true),
+        (ProxyMode::TruncatedReply, socks5::ERR_CLOSED, false),
+        (ProxyMode::CloseEarly, socks5::ERR_CLOSED, true),
     ];
-    for (mode, message) in cases {
-        let proxy = TestSocks5Proxy::spawn(PROXY_USER, PROXY_PASS, mode).await;
-        let (out, _tcp) = handshake(&proxy, &server, PROXY_USER, PROXY_PASS).await;
+    for (mode, message, own) in cases {
+        let proxy = TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), mode).await;
+        let (out, _tcp) = handshake(&proxy, &server, proxy_user(), proxy_pass()).await;
         let e = out.expect_err("handshake must fail");
         assert_eq!(e.to_string(), message, "{mode:?}");
-        assert!(is_proxy_failure(&e), "{mode:?}");
+        assert_eq!(
+            (is_proxy_failure(&e), is_target_failure(&e)),
+            (own, !own),
+            "{mode:?}"
+        );
         let text = format!("{e} {e:?}");
-        for secret in [PROXY_USER, PROXY_PASS, "127.0.0.1"] {
+        for secret in [proxy_user(), proxy_pass(), "127.0.0.1"] {
             assert!(!text.contains(secret), "{mode:?}: {text}");
         }
     }
     // The proxy that connects nowhere by its own reply code 5.
-    let proxy = TestSocks5Proxy::spawn(PROXY_USER, PROXY_PASS, ProxyMode::RefuseConnect(5)).await;
-    let (out, _tcp) = handshake(&proxy, &server, PROXY_USER, PROXY_PASS).await;
+    let proxy =
+        TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), ProxyMode::RefuseConnect(5)).await;
+    let (out, _tcp) = handshake(&proxy, &server, proxy_user(), proxy_pass()).await;
     assert!(is_target_failure(&out.unwrap_err()));
 }
 
@@ -157,8 +185,8 @@ async fn a_misbehaving_proxy_is_refused() {
 async fn bytes_after_the_reply_are_refused() {
     let server = TestNntpServer::spawn_for_test().await;
     let mode = ProxyMode::TrailingBytes(b"200 injected greeting\r\n");
-    let proxy = TestSocks5Proxy::spawn(PROXY_USER, PROXY_PASS, mode).await;
-    let (out, _tcp) = handshake(&proxy, &server, PROXY_USER, PROXY_PASS).await;
+    let proxy = TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), mode).await;
+    let (out, _tcp) = handshake(&proxy, &server, proxy_user(), proxy_pass()).await;
     let e = out.unwrap_err();
     assert_eq!(e.to_string(), socks5::ERR_TRAILING);
     assert!(is_proxy_failure(&e));

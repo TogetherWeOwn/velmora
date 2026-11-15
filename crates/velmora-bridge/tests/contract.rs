@@ -1603,8 +1603,9 @@ fn provider_proxies_fail_closed() {
         providers_of(&[provider_json("a", &extra)])
     };
     assert!(with(std::slice::from_ref(&ok)).is_ok());
-    // An empty list is "no proxy", as if the field were absent.
-    assert!(with(&[]).unwrap()[0].proxies.is_empty());
+    // A list that is there and empty is refused: only a provider
+    // without the field is connected directly.
+    assert_eq!(with(&[]), invalid);
 
     let long = "x".repeat(256);
     let bad = [
@@ -1622,6 +1623,8 @@ fn provider_proxies_fail_closed() {
         // Addresses no proxy of the bridge can have.
         proxy_json("127.0.0.1", 1080, "u", "p"),
         proxy_json("10.1.2.3", 1080, "u", "p"),
+        proxy_json("100.64.0.1", 1080, "u", "p"),
+        proxy_json("100.127.255.254", 1080, "u", "p"),
         proxy_json("192.168.1.1", 1080, "u", "p"),
         proxy_json("169.254.1.1", 1080, "u", "p"),
         proxy_json("0.0.0.0", 1080, "u", "p"),
@@ -1633,6 +1636,10 @@ fn provider_proxies_fail_closed() {
         assert_eq!(with(std::slice::from_ref(&entry)), invalid, "{entry}");
         // Not next to a good one either.
         assert_eq!(with(&[ok.clone(), entry.clone()]), invalid, "{entry}");
+    }
+    // Next to the shared range, on both sides: public.
+    for host in ["100.63.255.255", "100.128.0.1"] {
+        assert!(with(&[proxy_json(host, 1080, "u", "p")]).is_ok(), "{host}");
     }
     // A login of the longest length SOCKS5 carries is in order.
     let longest = "x".repeat(255);

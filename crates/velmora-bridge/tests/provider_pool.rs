@@ -1166,10 +1166,12 @@ fn behind_a_dead_proxy(rig: &mut Rig, i: usize) {
 /// The only poster is behind a proxy that is down for days. The job
 /// waits as it does for a cooling provider: it never spends an attempt,
 /// so it never ends up dead, and the provider is marked with the reason
-/// `proxy_failed`. No connection reaches the provider's server in all
-/// that time. When the proxy is back, the job posts.
+/// `proxy_failed`. When the proxy is back, the job posts. (That nothing
+/// connects directly when the proxies are down is proved on the Worker's
+/// connector, in `workers/s3-bridge/src/nntp.rs`; the connector of this
+/// rig has no proxy to go through and refuses by construction.)
 #[tokio::test]
-async fn a_dead_proxy_never_spends_an_attempt_and_nothing_connects_directly() {
+async fn a_dead_proxy_never_spends_an_attempt() {
     let mut rig = pool_rig(1).await;
     let s = rig.seed(43, &marked_plaintext(PLAIN_LEN)).await;
     behind_a_dead_proxy(&mut rig, 0);

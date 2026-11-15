@@ -43,7 +43,7 @@ use worker::{worker_sys, Socket};
 
 use super::worker_socket::{with_timeout, WorkerTransport};
 use crate::nntp::NntpConfig;
-use crate::socks5::{self, Socks5Proxy};
+use crate::socks5::{self, Progress, Socks5Proxy};
 use crate::transport::Transport;
 
 #[wasm_bindgen(wasm_bindgen = worker::wasm_bindgen)]
@@ -141,9 +141,12 @@ impl WorkerTransport {
     ///
     /// Each read and write is bounded by `config.timeout`. The caller
     /// bounds the whole call; dropping this future closes the connection.
+    /// `progress` then tells the caller whether the proxy had accepted
+    /// the login, that is, whether the wait was for the provider's host.
     pub async fn connect_pinned_via_socks5(
         config: &NntpConfig,
         proxy: &Socks5Proxy,
+        progress: &Progress,
     ) -> io::Result<Self> {
         if !config.tls {
             return Err(refused(
@@ -160,18 +163,27 @@ impl WorkerTransport {
         let options = Object::new();
         set(&options, "allowHalfOpen", JsValue::FALSE)?;
         set(&options, "secureTransport", JsValue::from_str("starttls"))?;
+        // Built before the socket opens: nothing after the handshake
+        // can fail without the connection being closed.
+        let tls_options = Object::new();
+        set(
+            &tls_options,
+            "expectedServerHostname",
+            JsValue::from_str(&config.host),
+        )?;
         let raw = worker_sys::connect(address.into(), options.into()).map_err(|_| open_failed())?;
 
         let mut stage = ProxyStage {
             socket: Some(Socket::from(raw.clone())),
             timeout: config.timeout,
         };
-        socks5::connect(
+        socks5::connect_tracked(
             &mut stage,
             &proxy.username,
             &proxy.password,
             &config.host,
             config.port,
+            progress,
         )
         .await?;
 
@@ -180,12 +192,6 @@ impl WorkerTransport {
         // over. From here the plain socket is not closed on drop; the
         // upgrade takes the connection.
         drop(stage.socket.take());
-        let tls_options = Object::new();
-        set(
-            &tls_options,
-            "expectedServerHostname",
-            JsValue::from_str(&config.host),
-        )?;
         match raw
             .unchecked_ref::<UpgradableSocket>()
             .start_tls_with(&tls_options.into())

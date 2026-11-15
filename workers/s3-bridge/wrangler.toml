@@ -134,7 +134,9 @@ crons = ["*/5 * * * *"]
 # is never connected directly: with every proxy down it is unhealthy
 # (`proxy_failed` in /status, `route` = "proxy") and its jobs wait, as
 # for a cooling provider, without spending attempts. `proxies` needs
-# `tls: true`.
+# `tls: true`, and a list that is there must not be empty. Leave
+# `max_ips` out for a provider with `proxies`: it counts invocations,
+# and the provider now counts one address per proxy.
 
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }

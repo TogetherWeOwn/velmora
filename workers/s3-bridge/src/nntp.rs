@@ -24,19 +24,20 @@
 //! session errors are the engine's own: their `Debug` redacts auth reply
 //! text, but `Display` may carry a runtime I/O message or a server reply.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
-use velmora::socks5::{self, Socks5Proxy};
+use velmora::socks5::{self, Progress, Socks5Proxy};
 use velmora_bridge::hosts::{
     self, DialError, Dialer, HostPicker, Picked, HOST_CONNECT_SECS, PROBE_GOODBYE_MS,
-    PROXY_CONNECT_SECS,
+    PROXY_CONNECT_SECS, PROXY_DOWN_MS,
 };
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
@@ -224,17 +225,24 @@ impl Dialer for Dial<'_> {
         let start = now();
         // The socket is dropped, which closes it, at the end of this
         // block: also after a probe that was cut off.
+        let memory = proxy_memory();
+        // No proxy could be used a moment ago: a probe would measure
+        // the proxies, not the host, and cost its whole limit.
+        if memory.all_down(&self.provider.proxies, start.0) {
+            return None;
+        }
         let (code, ms) = {
-            // The proxy stage of a provider with proxies counts into the
-            // time, and has the probe's limit too.
-            let opening = open_routed(&WorkerNet, &self.provider.proxies, &cfg);
-            let mut socket = within(after_ms(limit_ms), opening).await.ok()?;
+            // One limit for opening and greeting. The proxy stage of a
+            // provider with proxies counts into the time.
+            let mut opened = None;
             let code = within(after_ms(limit_ms), async {
-                Ok(hosts::greeting(&mut socket).await)
+                let socket = open_routed(&WorkerNet, &memory, &self.provider.proxies, &cfg).await?;
+                Ok(hosts::greeting(opened.insert(socket)).await)
             })
             .await
             .ok()
             .flatten();
+            let mut socket = opened?;
             // Timed to the greeting; the goodbye is not measured.
             let ms = now().0.saturating_sub(start.0);
             let _ = within(after_ms(PROBE_GOODBYE_MS), async {
@@ -259,7 +267,7 @@ impl Dialer for Dial<'_> {
         let cfg = nntp_config(self.provider, host).map_err(DialError::Account)?;
         // A failure of the proxy stage is the proxies' or the host's,
         // never the account's: no login was sent.
-        let socket = open_routed(&WorkerNet, &self.provider.proxies, &cfg)
+        let socket = open_routed(&WorkerNet, &proxy_memory(), &self.provider.proxies, &cfg)
             .await
             .map_err(|e| DialError::classify(e, false))?;
         let class = self.class;
@@ -375,25 +383,97 @@ trait Net {
     fn direct(&self, cfg: &NntpConfig) -> Result<Self::Socket>;
 
     /// A socket to the host of `cfg` through `proxy`, with TLS to the
-    /// host started on it.
-    async fn via_proxy(&self, cfg: &NntpConfig, proxy: &Socks5Proxy) -> io::Result<Self::Socket>;
+    /// host started on it. `progress` is set once the proxy accepted
+    /// the login.
+    async fn via_proxy(
+        &self,
+        cfg: &NntpConfig,
+        proxy: &Socks5Proxy,
+        progress: &Progress,
+    ) -> io::Result<Self::Socket>;
 
     /// Ends after `secs`.
     async fn limit(&self, secs: u32);
+
+    /// The time, in Unix milliseconds.
+    fn now_ms(&self) -> i64;
+}
+
+/// The proxies that could not be used a moment ago, by host and port,
+/// with the time until which each is tried after the others. Kept per
+/// isolate, so that one proxy that does not answer costs its time limit
+/// once and not on every connect. It only changes the order: a proxy in
+/// here is still tried, and a provider with proxies has no other way.
+#[derive(Default)]
+struct ProxyMemory(RefCell<Vec<(String, u16, i64)>>);
+
+impl ProxyMemory {
+    fn is_down(&self, proxy: &ProxyConfig, now_ms: i64) -> bool {
+        self.0.borrow().iter().any(|(host, port, until)| {
+            *host == proxy.host && *port == proxy.port && now_ms < *until
+        })
+    }
+
+    /// Whether there are proxies and every one is down.
+    fn all_down(&self, proxies: &[ProxyConfig], now_ms: i64) -> bool {
+        !proxies.is_empty() && proxies.iter().all(|p| self.is_down(p, now_ms))
+    }
+
+    /// Records whether `proxy` could be used at `now_ms`. Entries whose
+    /// time is over are dropped on the way.
+    fn set(&self, proxy: &ProxyConfig, usable: bool, now_ms: i64) {
+        let mut down = self.0.borrow_mut();
+        down.retain(|(host, port, until)| {
+            now_ms < *until && !(*host == proxy.host && *port == proxy.port)
+        });
+        if !usable {
+            down.push((proxy.host.clone(), proxy.port, now_ms + PROXY_DOWN_MS));
+        }
+    }
+}
+
+thread_local! {
+    static PROXY_MEMORY: Rc<ProxyMemory> = Rc::default();
+}
+
+/// This isolate's [`ProxyMemory`].
+fn proxy_memory() -> Rc<ProxyMemory> {
+    PROXY_MEMORY.with(Rc::clone)
+}
+
+/// One try of one proxy. When it ends, also by being dropped half way
+/// (the caller's own time limit), the memory learns whether the proxy
+/// could be used: it connected, or at least accepted the login.
+struct Try<'a, N: Net> {
+    net: &'a N,
+    memory: &'a ProxyMemory,
+    proxy: &'a ProxyConfig,
+    progress: Progress,
+    connected: bool,
+}
+
+impl<N: Net> Drop for Try<'_, N> {
+    fn drop(&mut self) {
+        let usable = self.connected || self.progress.logged_in();
+        self.memory.set(self.proxy, usable, self.net.now_ms());
+    }
 }
 
 /// Opens the socket of one connect. A provider without proxies is
 /// connected directly. One with proxies is connected through them and
 /// in no other way: each in order, each within [`PROXY_CONNECT_SECS`],
-/// the first that connects wins.
+/// the first that connects wins. The proxies that `memory` holds as
+/// unusable come after the others, in order too.
 ///
-/// When none does, the failure says whose it was. If a proxy worked and
-/// reported that it did not connect to the host, it is the host's: the
-/// next host is worth a try. Otherwise it is the proxies'
+/// When none connects, the failure says whose it was. If a proxy worked
+/// and did not connect to the host, it is the host's, and the next host
+/// is worth a try: the proxy reported so, or it accepted the login and
+/// the host did not answer in time. Otherwise it is the proxies'
 /// (`hosts::proxy_failure`). The direct route is not taken in either
 /// case.
 async fn open_routed<N: Net>(
     net: &N,
+    memory: &ProxyMemory,
     proxies: &[ProxyConfig],
     cfg: &NntpConfig,
 ) -> Result<N::Socket> {
@@ -405,14 +485,30 @@ async fn open_routed<N: Net>(
             "transport_tls_required: no plaintext through a proxy".into(),
         ));
     }
+    let start = net.now_ms();
+    let (usable, down): (Vec<_>, Vec<_>) = proxies.iter().partition(|p| !memory.is_down(p, start));
     let mut host_refused = false;
-    for proxy in proxies {
-        let proxy = socks5_proxy(proxy);
-        let stage = async { Ok(net.via_proxy(cfg, &proxy).await) };
-        match within(net.limit(PROXY_CONNECT_SECS), stage).await {
-            Ok(Ok(socket)) => return Ok(socket),
+    for proxy in usable.into_iter().chain(down) {
+        let mut attempt = Try {
+            net,
+            memory,
+            proxy,
+            progress: Progress::new(),
+            connected: false,
+        };
+        let login = socks5_proxy(proxy);
+        let stage = async { Ok(net.via_proxy(cfg, &login, &attempt.progress).await) };
+        let out = within(net.limit(PROXY_CONNECT_SECS), stage).await;
+        match out {
+            Ok(Ok(socket)) => {
+                attempt.connected = true;
+                return Ok(socket);
+            }
             Ok(Err(e)) if socks5::is_target_failure(&e) => host_refused = true,
-            // The proxy failed, or did not finish in time.
+            // Out of time while the proxy was connecting to the host.
+            Err(_) if attempt.progress.logged_in() => host_refused = true,
+            // The proxy failed, or did not get as far as the login in
+            // time.
             Ok(Err(_)) | Err(_) => {}
         }
     }
@@ -439,12 +535,21 @@ impl Net for WorkerNet {
         socket.map_err(|_| open_failed())
     }
 
-    async fn via_proxy(&self, cfg: &NntpConfig, proxy: &Socks5Proxy) -> io::Result<Socket> {
-        Socket::connect_pinned_via_socks5(cfg, proxy).await
+    async fn via_proxy(
+        &self,
+        cfg: &NntpConfig,
+        proxy: &Socks5Proxy,
+        progress: &Progress,
+    ) -> io::Result<Socket> {
+        Socket::connect_pinned_via_socks5(cfg, proxy, progress).await
     }
 
     async fn limit(&self, secs: u32) {
         after(secs).await
+    }
+
+    fn now_ms(&self) -> i64 {
+        now().0
     }
 }
 
@@ -458,7 +563,12 @@ impl Net for WorkerNet {
         ))
     }
 
-    async fn via_proxy(&self, _cfg: &NntpConfig, _proxy: &Socks5Proxy) -> io::Result<Socket> {
+    async fn via_proxy(
+        &self,
+        _cfg: &NntpConfig,
+        _proxy: &Socks5Proxy,
+        _progress: &Progress,
+    ) -> io::Result<Socket> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "nntp: sockets exist only on wasm32",
@@ -467,6 +577,10 @@ impl Net for WorkerNet {
 
     async fn limit(&self, secs: u32) {
         after(secs).await
+    }
+
+    fn now_ms(&self) -> i64 {
+        now().0
     }
 }
 
@@ -575,6 +689,9 @@ mod tests {
         Down,
         /// The proxy works and did not connect to the host.
         HostRefused,
+        /// The proxy accepts the login, and then waits for a host that
+        /// does not answer.
+        HostSilent,
         /// The proxy never answers.
         Hangs,
     }
@@ -587,6 +704,8 @@ mod tests {
         proxied: std::cell::RefCell<Vec<String>>,
         /// Whether the bound on a proxy stage ends at once.
         cut: bool,
+        now_ms: Cell<i64>,
+        memory: ProxyMemory,
     }
 
     impl FakeNet {
@@ -596,6 +715,8 @@ mod tests {
                 direct: Cell::new(0),
                 proxied: Default::default(),
                 cut: false,
+                now_ms: Cell::new(1_000),
+                memory: ProxyMemory::default(),
             }
         }
     }
@@ -608,8 +729,20 @@ mod tests {
             Ok("direct".into())
         }
 
-        async fn via_proxy(&self, cfg: &NntpConfig, proxy: &Socks5Proxy) -> io::Result<String> {
+        async fn via_proxy(
+            &self,
+            cfg: &NntpConfig,
+            proxy: &Socks5Proxy,
+            progress: &Progress,
+        ) -> io::Result<String> {
             self.proxied.borrow_mut().push(proxy.host.clone());
+            // The handshake itself, against a scripted proxy.
+            let handshake = |replies: &'static [u8], hangs: bool| async move {
+                let mut script = Script(replies, hangs);
+                let (user, pass) = (proxy.username.as_str(), proxy.password.as_str());
+                socks5::connect_tracked(&mut script, user, pass, &cfg.host, cfg.port, progress)
+                    .await
+            };
             let (_, via) = self.via.iter().find(|(h, _)| *h == proxy.host).unwrap();
             match via {
                 Via::Connects => Ok(format!("{} via {}", cfg.host, proxy.host)),
@@ -619,14 +752,15 @@ mod tests {
                 )),
                 Via::HostRefused => {
                     // What the handshake returns for a refused CONNECT.
-                    const REPLIES: &[u8] = &[5, 2, 1, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0];
-                    let mut script = Script(REPLIES);
-                    let e = socks5::connect(&mut script, "u", "p", &cfg.host, cfg.port)
-                        .now_or_never()
-                        .unwrap()
+                    let e = handshake(&[5, 2, 1, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0], false)
+                        .await
                         .unwrap_err();
                     assert!(socks5::is_target_failure(&e));
                     Err(e)
+                }
+                Via::HostSilent => {
+                    handshake(&[5, 2, 1, 0], true).await?;
+                    unreachable!("the proxy never answers the request")
                 }
                 Via::Hangs => std::future::pending().await,
             }
@@ -637,15 +771,27 @@ mod tests {
                 std::future::pending().await
             }
         }
+
+        fn now_ms(&self) -> i64 {
+            self.now_ms.get()
+        }
     }
 
-    /// A proxy's whole answer, served in one read.
-    struct Script(&'static [u8]);
+    /// A proxy's answers, and whether it then goes silent instead of
+    /// closing.
+    struct Script(&'static [u8], bool);
 
     impl velmora::transport::Transport for Script {
         async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() && self.1 {
+                std::future::pending::<()>().await;
+            }
             // One reply per read: method (2 bytes), login (2), connect (10).
-            let n = if self.0.len() > 10 { 2 } else { self.0.len() };
+            let n = if self.0.len() != 10 {
+                self.0.len().min(2)
+            } else {
+                10
+            };
             buf[..n].copy_from_slice(&self.0[..n]);
             self.0 = &self.0[n..];
             Ok(n)
@@ -676,7 +822,14 @@ mod tests {
     }
 
     fn route(net: &FakeNet, p: &ProviderConfig, cfg: &NntpConfig) -> Result<String> {
-        open_routed(net, &p.proxies, cfg).now_or_never().unwrap()
+        open_routed(net, &net.memory, &p.proxies, cfg)
+            .now_or_never()
+            .unwrap()
+    }
+
+    /// What was opened through proxies since the last look.
+    fn tried(net: &FakeNet) -> Vec<String> {
+        std::mem::take(&mut *net.proxied.borrow_mut())
     }
 
     /// A provider without proxies is connected directly, and one with
@@ -705,14 +858,14 @@ mod tests {
     /// that is down, hangs or did not connect to the host.
     #[test]
     fn the_next_proxy_takes_over() {
-        for first in [Via::Down, Via::Hangs, Via::HostRefused] {
+        for first in [Via::Down, Via::Hangs, Via::HostRefused, Via::HostSilent] {
             let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
             let mut net = FakeNet::new(&[
                 ("a.proxy.example", first),
                 ("b.proxy.example", Via::Connects),
             ]);
-            // Only a proxy that hangs runs into the bound.
-            net.cut = matches!(first, Via::Hangs);
+            // Only a proxy that waits runs into the bound.
+            net.cut = matches!(first, Via::Hangs | Via::HostSilent);
             assert_eq!(
                 route(&net, &p, &cfg).unwrap(),
                 "news.example via b.proxy.example"
@@ -745,7 +898,11 @@ mod tests {
                 DialError::classify(err, false),
                 DialError::Proxy(_)
             ));
+            // Again, with both proxies known as down: both are tried,
+            // and still nothing goes direct.
             let err = route(&net, &p, &cfg).unwrap_err();
+            assert_eq!(net.direct.get(), 0, "a direct socket was opened");
+            assert_eq!(net.proxied.borrow().len(), 4);
             let text = format!("{err} {err:?}");
             for secret in ["proxy.example", "proxy-user", "proxy-pass", "news.example"] {
                 assert!(!text.contains(secret), "{text}");
@@ -755,21 +912,95 @@ mod tests {
 
     /// A proxy that works and did not connect to the host: the failure is
     /// the host's (the next host is tried), not the proxies', and still
-    /// nothing was opened directly.
+    /// nothing was opened directly. The proxy said so, or it accepted
+    /// the login and the host did not answer before the bound.
     #[test]
     fn a_host_the_proxy_cannot_reach_is_a_host_failure() {
-        let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
-        let net = FakeNet::new(&[
-            ("a.proxy.example", Via::Down),
-            ("b.proxy.example", Via::HostRefused),
-        ]);
-        let err = route(&net, &p, &cfg).unwrap_err();
-        assert_eq!(net.direct.get(), 0);
-        assert!(!hosts::proxy_failure(&err) && hosts::host_failure(&err));
-        assert!(matches!(
-            DialError::classify(err, false),
-            DialError::Unreachable(_)
-        ));
+        for unreached in [Via::HostRefused, Via::HostSilent] {
+            let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
+            let mut net = FakeNet::new(&[
+                ("a.proxy.example", Via::Down),
+                ("b.proxy.example", unreached),
+            ]);
+            net.cut = matches!(unreached, Via::HostSilent);
+            let err = route(&net, &p, &cfg).unwrap_err();
+            assert_eq!(net.direct.get(), 0);
+            assert!(!hosts::proxy_failure(&err) && hosts::host_failure(&err));
+            assert!(matches!(
+                DialError::classify(err, false),
+                DialError::Unreachable(_)
+            ));
+            // The proxy that got as far as the login is not held as
+            // down; the one that failed is.
+            assert!(net.memory.is_down(&p.proxies[0], net.now_ms()));
+            assert!(!net.memory.is_down(&p.proxies[1], net.now_ms()));
+        }
+    }
+
+    /// A proxy that could not be used is tried after the others for a
+    /// while, so that it costs its time limit once. It is still tried
+    /// when the others fail, and comes first again when the time is
+    /// over or when it connected.
+    #[test]
+    fn a_proxy_that_failed_is_tried_last_for_a_while() {
+        let (a, b) = ("a.proxy.example", "b.proxy.example");
+        for failed in [Via::Down, Via::Hangs] {
+            let (p, cfg) = proxied(&[a, b]);
+            let mut net = FakeNet::new(&[(a, failed), (b, Via::Connects)]);
+            net.cut = matches!(failed, Via::Hangs);
+            route(&net, &p, &cfg).unwrap();
+            assert_eq!(tried(&net), [a, b]);
+            assert!(!net.memory.all_down(&p.proxies, net.now_ms()));
+            // The next connects go to the one that works, at once.
+            for _ in 0..3 {
+                route(&net, &p, &cfg).unwrap();
+                assert_eq!(tried(&net), [b]);
+            }
+            // That one fails too: the first is tried again, not skipped.
+            net.via[1].1 = Via::Down;
+            assert!(route(&net, &p, &cfg).is_err());
+            assert_eq!(tried(&net), [b, a]);
+            assert!(net.memory.all_down(&p.proxies, net.now_ms()));
+            // Both down: the configured order.
+            assert!(route(&net, &p, &cfg).is_err());
+            assert_eq!(tried(&net), [a, b]);
+            // The time is over: forgotten.
+            net.now_ms.set(net.now_ms() + PROXY_DOWN_MS);
+            assert!(!net.memory.is_down(&p.proxies[0], net.now_ms()));
+            // A proxy that connects is not held as down any longer.
+            net.via = vec![(a, Via::Down), (b, Via::Connects)];
+            route(&net, &p, &cfg).unwrap();
+            net.via[0].1 = Via::Connects;
+            net.via[1].1 = Via::Down;
+            route(&net, &p, &cfg).unwrap();
+            assert_eq!(tried(&net), [a, b, b, a]);
+            assert!(!net.memory.is_down(&p.proxies[0], net.now_ms()));
+            assert!(net.memory.is_down(&p.proxies[1], net.now_ms()));
+        }
+        // No proxies: nothing is "all down".
+        assert!(!ProxyMemory::default().all_down(&[], 0));
+    }
+
+    /// A caller that gives up on the connect half way (a probe at its
+    /// limit) leaves the proxy it was waiting for marked: the next
+    /// connect starts with another one.
+    #[test]
+    fn a_connect_cut_off_from_outside_marks_the_proxy() {
+        let (a, b) = ("a.proxy.example", "b.proxy.example");
+        for (waits, marked) in [(Via::Hangs, true), (Via::HostSilent, false)] {
+            let (p, cfg) = proxied(&[a, b]);
+            let mut net = FakeNet::new(&[(a, waits), (b, Via::Connects)]);
+            // The proxy's own bound never ends; the caller drops it.
+            let pending = open_routed(&net, &net.memory, &p.proxies, &cfg).now_or_never();
+            assert!(pending.is_none());
+            assert_eq!(tried(&net), [a]);
+            assert_eq!(net.memory.is_down(&p.proxies[0], net.now_ms()), marked);
+            // The next connect: past the marked proxy at once; a proxy
+            // that had accepted the login keeps its place.
+            net.cut = true;
+            route(&net, &p, &cfg).unwrap();
+            assert_eq!(tried(&net), if marked { vec![b] } else { vec![a, b] });
+        }
     }
 
     /// Plaintext never goes through a proxy: refused before any socket.
@@ -794,7 +1025,7 @@ mod tests {
         let (p, cfg) = proxied(&["a.proxy.example"]);
         let net = WorkerNet;
         // Natively the timer never ends, and no proxy answers: at once.
-        let err = open_routed(&net, &p.proxies, &cfg)
+        let err = open_routed(&net, &ProxyMemory::default(), &p.proxies, &cfg)
             .now_or_never()
             .unwrap()
             .err()

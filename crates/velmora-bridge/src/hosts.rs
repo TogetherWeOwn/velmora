@@ -93,6 +93,11 @@ pub const HOST_CONNECT_SECS: u32 = 10;
 /// not finish in this time cannot be used; the next one is tried.
 pub const PROXY_CONNECT_SECS: u32 = 4;
 
+/// How long a proxy that could not be used is tried after the others,
+/// in milliseconds. It is still tried: when no other proxy connects,
+/// and again first once this time is over.
+pub const PROXY_DOWN_MS: i64 = 60_000;
+
 /// Longest greeting line a probe reads, in bytes.
 const MAX_GREETING_BYTES: usize = 512;
 

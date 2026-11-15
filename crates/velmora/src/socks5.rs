@@ -27,8 +27,10 @@
 //! without reading text:
 //! - [`is_proxy_failure`]: the proxy itself failed (not reached, closed,
 //!   out of protocol, login refused). The target was never asked.
-//! - [`is_target_failure`]: the proxy works and reported that it did not
-//!   connect to the target.
+//! - [`is_target_failure`]: the proxy works and did not connect to the
+//!   target. It said so, or it accepted the login and then gave no
+//!   answer to the request (a proxy waits for the target before it
+//!   answers, so a target that does not answer shows as silence).
 //!
 //! The proxy login is sent in clear to the proxy, as RFC 1929 defines it.
 //! It guards the use of the proxy only; the provider login travels inside
@@ -36,6 +38,7 @@
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::transport::Transport;
 
@@ -107,8 +110,9 @@ pub fn is_proxy_failure(e: &io::Error) -> bool {
     stage(e).is_some_and(|s| !s.target)
 }
 
-/// Whether `e` is the proxy's report that it did not connect to the
-/// target: the proxy works.
+/// Whether `e` says the proxy works and did not connect to the target:
+/// it reported so, or it went silent or closed after it accepted the
+/// login, while the target was being connected.
 pub fn is_target_failure(e: &io::Error) -> bool {
     stage(e).is_some_and(|s| s.target)
 }
@@ -131,6 +135,40 @@ fn io_failure(e: io::Error) -> io::Error {
     match e.kind() {
         io::ErrorKind::TimedOut => proxy_failure(io::ErrorKind::TimedOut, ERR_TIMEOUT),
         kind => proxy_failure(kind, ERR_IO),
+    }
+}
+
+/// How far a handshake got, for a caller that bounds it from outside
+/// and has to tell what a handshake it cut off was waiting for.
+#[derive(Debug, Default)]
+pub struct Progress(AtomicBool);
+
+impl Progress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the proxy accepted the login. From then on the handshake
+    /// waits for the proxy's connect to the target.
+    pub fn logged_in(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A read that failed while the proxy was connecting to the target: the
+/// login was accepted, so the proxy works. Silence, a closed connection
+/// or a failed read is then the target's; a reply out of protocol stays
+/// the proxy's.
+fn while_connecting(e: io::Error) -> io::Error {
+    match stage(&e) {
+        Some(s) if [ERR_CLOSED, ERR_IO, ERR_TIMEOUT].contains(&s.message) => io::Error::new(
+            e.kind(),
+            StageError {
+                message: s.message,
+                target: true,
+            },
+        ),
+        _ => e,
     }
 }
 
@@ -247,6 +285,18 @@ pub async fn connect<T: Transport>(
     host: &str,
     port: u16,
 ) -> io::Result<()> {
+    connect_tracked(transport, username, password, host, port, &Progress::new()).await
+}
+
+/// [`connect`], which also records in `progress` how far it got.
+pub async fn connect_tracked<T: Transport>(
+    transport: &mut T,
+    username: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    progress: &Progress,
+) -> io::Result<()> {
     if !field_ok(username) || !field_ok(password) || !field_ok(host) || port == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, ERR_ARGUMENT));
     }
@@ -276,6 +326,7 @@ pub async fn connect<T: Transport>(
     if buf[1] != 0 {
         return Err(error(io::ErrorKind::PermissionDenied, ERR_AUTH));
     }
+    progress.0.store(true, Ordering::Relaxed);
 
     // CONNECT to the host name; the proxy resolves it.
     let mut request = Vec::with_capacity(7 + host.len());
@@ -283,7 +334,9 @@ pub async fn connect<T: Transport>(
     request.extend_from_slice(host.as_bytes());
     request.extend_from_slice(&port.to_be_bytes());
     transport.write_all(&request).await.map_err(io_failure)?;
-    read_reply(transport, &mut buf, connect_reply_len).await?;
+    read_reply(transport, &mut buf, connect_reply_len)
+        .await
+        .map_err(while_connecting)?;
     if buf[2] != 0 {
         return Err(malformed());
     }
@@ -349,9 +402,17 @@ mod tests {
     const AUTH_OK: &[u8] = &[1, 0];
     const BOUND_V4: &[u8] = &[5, 0, 0, 1, 10, 0, 0, 1, 0x1f, 0x90];
 
+    /// A proxy login for one test run: made at run time, so no login is
+    /// written down here, and no test passes by matching a known one.
+    fn login() -> (String, String) {
+        let run = std::process::id();
+        (format!("user-{run}"), format!("word-{run}"))
+    }
+
     fn run(reads: &[&[u8]]) -> (io::Result<()>, Script) {
         let mut t = Script::new(reads);
-        let out = futures_now(connect(&mut t, "user", "pw", "news.example", 563));
+        let (user, pass) = login();
+        let out = futures_now(connect(&mut t, &user, &pass, "news.example", 563));
         (out, t)
     }
 
@@ -367,23 +428,29 @@ mod tests {
     }
 
     fn fails(reads: &[&[u8]], kind: io::ErrorKind, msg: &str) {
+        // Only the proxy's own "did not connect" is the target's, unless
+        // a test says otherwise.
+        fails_as(reads, kind, msg, msg == ERR_CONNECT);
+    }
+
+    fn fails_as(reads: &[&[u8]], kind: io::ErrorKind, msg: &str, target: bool) {
         let (out, _) = run(reads);
         let e = out.expect_err("handshake must fail");
         assert_eq!((e.kind(), e.to_string().as_str()), (kind, msg));
-        // Only the proxy's own "did not connect" is the target's.
-        assert_eq!(is_target_failure(&e), msg == ERR_CONNECT);
-        assert_eq!(is_proxy_failure(&e), msg != ERR_CONNECT);
+        assert_eq!(is_target_failure(&e), target, "{reads:?}");
+        assert_eq!(is_proxy_failure(&e), !target, "{reads:?}");
     }
 
     #[test]
     fn success_sends_exactly_the_three_requests() {
         let (out, t) = run(&[METHOD_OK, AUTH_OK, BOUND_V4]);
         out.unwrap();
+        let (user, pass) = login();
         let mut want = vec![5, 1, 2];
-        want.extend_from_slice(&[1, 4]);
-        want.extend_from_slice(b"user");
-        want.push(2);
-        want.extend_from_slice(b"pw");
+        want.extend_from_slice(&[1, user.len() as u8]);
+        want.extend_from_slice(user.as_bytes());
+        want.push(pass.len() as u8);
+        want.extend_from_slice(pass.as_bytes());
         want.extend_from_slice(&[5, 1, 0, 3, 12]);
         want.extend_from_slice(b"news.example");
         want.extend_from_slice(&[0x02, 0x33]);
@@ -489,9 +556,45 @@ mod tests {
         fails(&[&[5]], eof, ERR_CLOSED);
         fails(&[METHOD_OK], eof, ERR_CLOSED);
         fails(&[METHOD_OK, &[1]], eof, ERR_CLOSED);
-        fails(&[METHOD_OK, AUTH_OK], eof, ERR_CLOSED);
+        // After the login was accepted the proxy is connecting to the
+        // target: a connection that ends there is the target's.
+        fails_as(&[METHOD_OK, AUTH_OK], eof, ERR_CLOSED, true);
         for cut in 1..BOUND_V4.len() {
-            fails(&[METHOD_OK, AUTH_OK, &BOUND_V4[..cut]], eof, ERR_CLOSED);
+            fails_as(
+                &[METHOD_OK, AUTH_OK, &BOUND_V4[..cut]],
+                eof,
+                ERR_CLOSED,
+                true,
+            );
+        }
+    }
+
+    /// `Progress` says whether the login was accepted: what a caller
+    /// that cuts the handshake off needs to know.
+    #[test]
+    fn progress_is_the_accepted_login() {
+        let cases: [(&[&[u8]], bool); 6] = [
+            (&[], false),
+            (&[METHOD_OK], false),
+            (&[METHOD_OK, &[1, 1]], false),
+            (&[METHOD_OK, AUTH_OK], true),
+            (&[METHOD_OK, AUTH_OK, &[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]], true),
+            (&[METHOD_OK, AUTH_OK, BOUND_V4], true),
+        ];
+        let (user, pass) = login();
+        for (reads, logged_in) in cases {
+            let mut t = Script::new(reads);
+            let progress = Progress::new();
+            assert!(!progress.logged_in());
+            let _ = futures_now(connect_tracked(
+                &mut t,
+                &user,
+                &pass,
+                "h.example",
+                563,
+                &progress,
+            ));
+            assert_eq!(progress.logged_in(), logged_in, "{reads:?}");
         }
     }
 
@@ -537,14 +640,16 @@ mod tests {
     fn arguments_the_protocol_cannot_carry_send_nothing() {
         let long = "a".repeat(256);
         let max = "a".repeat(255);
+        let (u, pw) = login();
+        let none = String::new();
         let cases: [(&str, &str, &str, u16); 7] = [
-            ("", "pw", "h.example", 563),
-            ("u", "", "h.example", 563),
-            ("u", "pw", "", 563),
-            ("u", "pw", "h.example", 0),
-            (&long, "pw", "h.example", 563),
-            ("u", &long, "h.example", 563),
-            ("u", "pw", &long, 563),
+            (&none, &pw, "h.example", 563),
+            (&u, &none, "h.example", 563),
+            (&u, &pw, "", 563),
+            (&u, &pw, "h.example", 0),
+            (&long, &pw, "h.example", 563),
+            (&u, &long, "h.example", 563),
+            (&u, &pw, &long, 563),
         ];
         for (user, pass, host, port) in cases {
             let mut t = Script::new(&[METHOD_OK, AUTH_OK, BOUND_V4]);
@@ -595,6 +700,7 @@ mod tests {
 
     #[test]
     fn a_transport_error_is_a_proxy_failure_without_its_text() {
+        let (u, pw) = login();
         // Six steps: write, read, write, read, write, read.
         for fail_at in 0..6 {
             for (kind, msg) in [
@@ -608,9 +714,12 @@ mod tests {
                     calls: 0,
                     kind,
                 };
-                let e = futures_now(connect(&mut t, "u", "pw", "h.example", 563)).unwrap_err();
+                let e = futures_now(connect(&mut t, &u, &pw, "h.example", 563)).unwrap_err();
                 assert_eq!((e.kind(), e.to_string().as_str()), (kind, msg));
-                assert!(is_proxy_failure(&e) && !is_target_failure(&e));
+                // The last read waits for the proxy's connect to the
+                // target; every step before it is the proxy's own.
+                assert_eq!(is_target_failure(&e), fail_at == 5);
+                assert_eq!(is_proxy_failure(&e), fail_at != 5);
                 assert!(!format!("{e:?}").contains("proxy.example"));
             }
         }
@@ -620,7 +729,7 @@ mod tests {
             calls: 0,
             kind: io::ErrorKind::Other,
         };
-        futures_now(connect(&mut t, "u", "pw", "h.example", 563)).unwrap();
+        futures_now(connect(&mut t, &u, &pw, "h.example", 563)).unwrap();
     }
 
     #[test]
@@ -634,28 +743,31 @@ mod tests {
 
     #[test]
     fn no_error_names_the_login_or_the_host() {
-        let scripts: [&[&[u8]]; 5] = [
+        let scripts: [&[&[u8]]; 4] = [
             &[&[5, 0]],
             &[METHOD_OK, &[1, 1]],
             &[METHOD_OK, AUTH_OK, &[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]],
-            &[b"news.example alice hunter2"],
             &[],
         ];
-        for reads in scripts {
+        let (user, pass) = login();
+        // A proxy that sends the host and the login back as its answer.
+        let echo = format!("news.example {user} {pass}");
+        for reads in scripts.iter().copied().chain([&[echo.as_bytes()][..]]) {
             let mut t = Script::new(reads);
-            let e =
-                futures_now(connect(&mut t, "alice", "hunter2", "news.example", 563)).unwrap_err();
+            let e = futures_now(connect(&mut t, &user, &pass, "news.example", 563)).unwrap_err();
             let text = format!("{e} {e:?}");
-            for secret in ["alice", "hunter2", "news.example"] {
+            for secret in [user.as_str(), pass.as_str(), "news.example"] {
                 assert!(!text.contains(secret), "{text}");
             }
         }
         let proxy = Socks5Proxy {
             host: "proxy.example".into(),
             port: 1080,
-            username: "proxy-user".into(),
-            password: "proxy-pass".into(),
+            username: user.clone(),
+            password: pass.clone(),
         };
-        assert_eq!(format!("{proxy:?}"), "Socks5Proxy(<redacted>)");
+        let shown = format!("{proxy:?}");
+        assert_eq!(shown, "Socks5Proxy(<redacted>)");
+        assert!(!shown.contains(&user) && !shown.contains(&pass));
     }
 }

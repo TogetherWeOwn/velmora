@@ -433,15 +433,32 @@ pub struct ProviderConfig {
     ///
     /// With this set the provider is never connected directly: when no
     /// proxy can be used the connect fails
-    /// ([`ProviderFault::ProxyFailed`]). Empty = direct connections.
+    /// ([`ProviderFault::ProxyFailed`]). Absent = direct connections; a
+    /// list that is there and empty is refused, so that a list emptied
+    /// by mistake does not turn into direct connections.
+    ///
+    /// The provider sees one address per proxy, whatever the number of
+    /// invocations. `max_ips` still counts invocations, so behind
+    /// proxies it is left out.
     ///
     /// Rollout and rollback as for `hosts`: an older Worker refuses a
     /// secret that carries this field.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "some_proxies")]
     pub proxies: Vec<ProxyConfig>,
     /// `false` = configured but never used.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+}
+
+/// A `proxies` list as written: one entry at least.
+fn some_proxies<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> core::result::Result<Vec<ProxyConfig>, D::Error> {
+    let list = Vec::<ProxyConfig>::deserialize(d)?;
+    if list.is_empty() {
+        return Err(serde::de::Error::custom("proxies: empty list"));
+    }
+    Ok(list)
 }
 
 /// One SOCKS5 proxy of a provider (`proxies`), with its
