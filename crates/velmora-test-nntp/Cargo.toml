@@ -16,3 +16,7 @@ tokio = { version = "1", features = ["full"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 velmora = { version = "0.1.0", path = "../velmora", default-features = false, features = ["native-tls"] }
+# The TLS server of the proxied-TLS tests, and their client's private CA
+# and fixed clock. Same versions and features as the engine's.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

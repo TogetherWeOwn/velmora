@@ -1054,6 +1054,9 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
                 "max_conns": p.max_conns,
                 // `null` = no address limit: `max_conns` alone.
                 "max_ips": p.max_ips,
+                // How connections leave: through one of the provider's
+                // proxies (never around them), or directly.
+                "route": if p.proxies.is_empty() { "direct" } else { "proxy" },
                 "held": l.map_or(0, |l| l.held),
                 "holders": l.map_or(0, |l| l.holders),
                 "failures": l.map_or(0, |l| l.failures),

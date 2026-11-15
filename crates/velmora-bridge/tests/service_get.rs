@@ -575,6 +575,7 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
         retention_days: None,
         pool: None,
         pool_max_conns: None,
+        proxies: Vec::new(),
         enabled: true,
         release: true,
     }

@@ -136,7 +136,7 @@ crons = ["*/5 * * * *"]
 
 # secrets (wrangler secret put, value on stdin): VELMORA_KEK_1, NNTP_PROVIDERS, ADMIN_TOKEN
 # NNTP_PROVIDERS refuses unknown fields: deploy a Worker before the secret uses a new provider field
-# (`hosts`, `host_select`, `release`), and take such fields out of the secret before rolling the Worker back.
+# (`hosts`, `host_select`, `release`, `proxies`), and take such fields out of the secret before rolling the Worker back.
 # `release` (true when absent) says whether a provider's backbone counts toward releasing the pinned
 # copy. A backbone with `"release": false` on any of its providers is posted to and read from, but is
 # neither verified nor counted: use it for short-retention or post-only accounts. A release needs
@@ -146,6 +146,26 @@ crons = ["*/5 * * * *"]
 # `"release": false`. With fewer readable backbones that count than REQUIRED_BACKBONES the Worker keeps
 # serving reads and writes and releases nothing: every pinned copy stays held, /_admin/status lists a
 # "release paused" line under `config_warnings`, and the cron logs it on every tick.
+#
+# A provider's `proxies` (in NNTP_PROVIDERS) is a list of SOCKS5 proxies,
+# each {"host", "port", "user", "pass"}, tried in order. Every connection
+# to that provider then goes through one of them, so the provider sees
+# the proxy's address and not the changing address of each invocation.
+# TLS runs from the Worker to the provider inside the proxied connection:
+# the proxy relays ciphertext and never sees the provider login. On this
+# route the Worker makes TLS itself and checks the certificate against
+# the provider's host name and the public roots, so that host must be a
+# DNS name (a direct connection keeps the runtime's TLS). The
+# proxy login itself is sent to the proxy in clear (RFC 1929), so it
+# guards the use of the proxy and nothing else. A provider with `proxies`
+# is never connected directly: with every proxy down it is unhealthy
+# (`proxy_failed` in /status, `route` = "proxy") and its jobs wait, as
+# for a cooling provider, without spending attempts. `proxies` needs
+# `tls: true`, and a list that is there must not be empty. All the
+# proxies of a provider may be in use at the same time, so `proxies`
+# needs `max_ips` too, the number of addresses the provider allows, and
+# a `proxies` list longer than it is refused. `max_ips` goes on counting
+# invocations, which is never the looser count.
 
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }

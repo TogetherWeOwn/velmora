@@ -38,6 +38,9 @@ velmora = { git = "https://github.com/TogetherWeOwn/velmora", rev = "<full 40-ch
 
 - `default = ["native-tls"]`: tokio + rustls transport (non-wasm).
 - `worker-transport`: Workers `connect()` socket transport (wasm32).
+- `worker-socks5-tls`: a Workers socket through a SOCKS5 proxy, with TLS
+  to the provider made in the Worker (rustls, public roots). The S3 bridge
+  Worker builds with it and uses it for a provider with `proxies` only.
 - `worker-pinned-tls`: opt-in, qualification-only peer-pinned Worker TLS;
   no runtime activation or physical-close qualification is implied. See
   [preservation and qualification boundaries](transport-preservation.md).

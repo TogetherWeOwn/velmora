@@ -44,9 +44,9 @@ pub(crate) fn cooldown_cap(fault: ProviderFault) -> (i64, i64) {
             LOGIN_REFUSED_COOLDOWN_MAX_MS,
             LOGIN_REFUSED_COOLDOWN_MAX_STEPS,
         ),
-        ProviderFault::ConnectRefused | ProviderFault::SessionFailed => {
-            (COOLDOWN_MAX_MS, COOLDOWN_MAX_STEPS)
-        }
+        ProviderFault::ConnectRefused
+        | ProviderFault::SessionFailed
+        | ProviderFault::ProxyFailed => (COOLDOWN_MAX_MS, COOLDOWN_MAX_STEPS),
     }
 }
 

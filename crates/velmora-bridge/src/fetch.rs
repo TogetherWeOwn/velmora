@@ -86,6 +86,11 @@ enum Refusal {
 ///   ([`velmora::nntp::is_limit_reply`]) is [`Refusal::Limit`], whatever
 ///   its code and whether it came at the greeting or in the login.
 /// - Any other `502`, `480`, `481` or `482` is [`Refusal::Account`].
+/// - A connect that none of the provider's proxies let through
+///   ([`crate::hosts::proxy_failure`]) is [`Refusal::Account`] with
+///   [`ProviderFault::ProxyFailed`]: the provider was not asked, and the
+///   next connect would end the same way. The caller defers as it does
+///   for a refused account, and no attempt is spent.
 /// - `None` = not such a refusal (no connection, another reply code).
 ///
 /// The login gives `NoPermission`, `AuthFailed` and, for every other
@@ -96,6 +101,9 @@ enum Refusal {
 fn refusal(e: &BridgeError) -> Option<Refusal> {
     use velmora::nntp::{is_limit_reply, REDACTED_REPLY};
     use velmora::Error as E;
+    if crate::hosts::proxy_failure(e) {
+        return Some(Refusal::Account(ProviderFault::ProxyFailed));
+    }
     let (code, text, login) = match e {
         BridgeError::Nntp(E::NoPermission(text)) => (502, text, true),
         BridgeError::Nntp(E::AuthFailed(text)) => (481, text, true),

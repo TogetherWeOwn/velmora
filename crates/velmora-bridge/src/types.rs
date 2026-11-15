@@ -433,6 +433,29 @@ pub struct ProviderConfig {
     /// every member of a pool, with one value; refused without `pool`.
     #[serde(default)]
     pub pool_max_conns: Option<u32>,
+    /// SOCKS5 proxies every connection to this provider goes through,
+    /// tried in order: the next one when one cannot be used. The
+    /// provider then counts the proxy's address, not the changing
+    /// address of each invocation. TLS runs from the bridge to the
+    /// provider through the proxy, which relays ciphertext.
+    ///
+    /// With this set the provider is never connected directly: when no
+    /// proxy can be used the connect fails
+    /// ([`ProviderFault::ProxyFailed`]). Absent = direct connections; a
+    /// list that is there and empty is refused, so that a list emptied
+    /// by mistake does not turn into direct connections.
+    ///
+    /// The provider sees one address per proxy in use, whatever the
+    /// number of invocations, and all the proxies may be in use at the
+    /// same time. So `max_ips`, the number of addresses the provider
+    /// allows, must be stated with this field, and a list longer than
+    /// it is refused. `max_ips` goes on counting invocations, which is
+    /// never the looser count.
+    ///
+    /// Rollout and rollback as for `hosts`: an older Worker refuses a
+    /// secret that carries this field.
+    #[serde(default, deserialize_with = "some_proxies")]
+    pub proxies: Vec<ProxyConfig>,
     /// `false` = configured but never used.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
@@ -456,6 +479,36 @@ pub struct ProviderConfig {
     /// take `release` out of the secret first.
     #[serde(default = "enabled_by_default")]
     pub release: bool,
+}
+
+/// A `proxies` list as written: one entry at least.
+fn some_proxies<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> core::result::Result<Vec<ProxyConfig>, D::Error> {
+    let list = Vec::<ProxyConfig>::deserialize(d)?;
+    if list.is_empty() {
+        return Err(serde::de::Error::custom("proxies: empty list"));
+    }
+    Ok(list)
+}
+
+/// One SOCKS5 proxy of a provider (`proxies`), with its
+/// username/password login (RFC 1929). Deserialize only. `Debug` shows
+/// no field: the address of a proxy is as private as its login.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// A DNS name or a public IP address.
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub pass: String,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProxyConfig(<redacted>)")
+    }
 }
 
 /// How a provider with several endpoints (`host` and `hosts`) picks the
@@ -534,13 +587,18 @@ pub enum ProviderFault {
     /// Any other failure of a session: no connection, a broken one, a
     /// reply out of protocol.
     SessionFailed,
+    /// None of the provider's proxies (`proxies`) could be used: not
+    /// reached, or it refused the bridge or answered out of protocol.
+    /// The provider itself was not asked, and is not connected directly.
+    ProxyFailed,
 }
 
 impl ProviderFault {
-    const ALL: [ProviderFault; 3] = [
+    const ALL: [ProviderFault; 4] = [
         ProviderFault::ConnectRefused,
         ProviderFault::LoginRefused,
         ProviderFault::SessionFailed,
+        ProviderFault::ProxyFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -548,6 +606,7 @@ impl ProviderFault {
             ProviderFault::ConnectRefused => "connect_refused",
             ProviderFault::LoginRefused => "login_refused",
             ProviderFault::SessionFailed => "session_failed",
+            ProviderFault::ProxyFailed => "proxy_failed",
         }
     }
 
@@ -556,11 +615,14 @@ impl ProviderFault {
         Self::ALL.into_iter().find(|f| f.as_str() == code)
     }
 
-    /// The provider answered and turned the caller away, at the greeting
-    /// or at the login. Asking again at once gets the same answer.
+    /// The caller was turned away before any work: by the provider, at
+    /// the greeting or at the login, or by having no proxy to reach it
+    /// through. Asking again at once gets the same answer.
     pub fn is_refusal(self) -> bool {
         match self {
-            ProviderFault::ConnectRefused | ProviderFault::LoginRefused => true,
+            ProviderFault::ConnectRefused
+            | ProviderFault::LoginRefused
+            | ProviderFault::ProxyFailed => true,
             ProviderFault::SessionFailed => false,
         }
     }
@@ -618,6 +680,7 @@ impl fmt::Debug for ProviderConfig {
             .field("retention_days", &self.retention_days)
             .field("pool", &self.pool)
             .field("pool_max_conns", &self.pool_max_conns)
+            .field("proxies", &self.proxies.len())
             .field("enabled", &self.enabled)
             .finish()
     }

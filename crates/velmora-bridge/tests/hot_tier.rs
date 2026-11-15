@@ -95,6 +95,7 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
         retention_days: None,
         pool: None,
         pool_max_conns: None,
+        proxies: Vec::new(),
         enabled: true,
         release: true,
     }]);

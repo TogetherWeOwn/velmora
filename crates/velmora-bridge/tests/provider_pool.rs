@@ -1164,6 +1164,84 @@ async fn a_lasting_refusal_never_spends_an_attempt() {
     assert_eq!((load.healthy(), load.fault), (true, None));
 }
 
+/// Gives provider `i` a proxy. The test connector has none to go
+/// through, so every connect to the provider fails as the Worker's does
+/// when all its proxies are down, and never goes to the server directly.
+fn behind_a_dead_proxy(rig: &mut Rig, i: usize) {
+    rig.bridge.cfg.providers[i].proxies = vec![serde_json::from_value(serde_json::json!({
+        "host": "proxy.example", "port": 1080, "user": "proxy-login", "pass": "proxy-secret"
+    }))
+    .unwrap()];
+}
+
+/// The only poster is behind a proxy that is down for days. The job
+/// waits as it does for a cooling provider: it never spends an attempt,
+/// so it never ends up dead, and the provider is marked with the reason
+/// `proxy_failed`. When the proxy is back, the job posts. (That nothing
+/// connects directly when the proxies are down is proved on the Worker's
+/// connector, in `workers/s3-bridge/src/nntp.rs`; the connector of this
+/// rig has no proxy to go through and refuses by construction.)
+#[tokio::test]
+async fn a_dead_proxy_never_spends_an_attempt() {
+    let mut rig = pool_rig(1).await;
+    let s = rig.seed(43, &marked_plaintext(PLAIN_LEN)).await;
+    behind_a_dead_proxy(&mut rig, 0);
+    let nntp = &rig.bridge.nntp;
+    let sessions = nntp.connects();
+
+    for _ in 0..3 {
+        assert!(!rig.cooling(0).await);
+        let outcome = rig.rerun_post(&s).await;
+        assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    }
+    assert!(rig.cooling(0).await);
+    let load = rig.load(0).await;
+    assert_eq!(
+        (load.healthy(), load.fault),
+        (false, Some(ProviderFault::ProxyFailed))
+    );
+
+    // Far more runs than a job has attempts.
+    let before = nntp.dials_to("p0");
+    let mut probes = 0;
+    for _ in 0..200 {
+        probes += usize::from(!rig.cooling(0).await);
+        let outcome = rig.rerun_post(&s).await;
+        assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+        rig.bridge.clock.advance_secs(3600);
+    }
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!((outbox.attempts, &outbox.last_error), (0, &None));
+    assert_ne!(outbox.stage, OutboxStage::Dead);
+    // One try per ended cooldown, with one socket.
+    assert_eq!(nntp.dials_to("p0") - before, probes);
+    assert!(probes > 0);
+    // Not one session was opened, and the server saw no post.
+    assert_eq!(nntp.connects(), sessions);
+    assert_eq!(rig.servers[0].posted_count().await, 0);
+
+    // The proxy is back (here: the provider is reached without one).
+    rig.bridge.cfg.providers[0].proxies.clear();
+    rig.bridge.clock.advance_secs(3600);
+    assert_eq!(rig.rerun_post(&s).await, JobOutcome::Ack);
+    let load = rig.load(0).await;
+    assert_eq!((load.healthy(), load.fault), (true, None));
+}
+
+/// A read from a provider behind a dead proxy goes on to the next
+/// provider that has the article, and the first takes a strike for its
+/// proxy, not for its account or its host.
+#[tokio::test]
+async fn a_read_goes_past_a_provider_behind_a_dead_proxy() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let (s, _) = rig.posted_on(44, &[1]).await;
+    behind_a_dead_proxy(&mut rig, 0);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert_eq!(rig.load(0).await.fault, Some(ProviderFault::ProxyFailed));
+    assert_eq!(rig.load(1).await.fault, None);
+}
+
 /// Every tier refuses the login for its account: the job waits without
 /// spending an attempt. A real failure next to a refusal is still a
 /// failed run and costs one.

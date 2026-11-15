@@ -87,6 +87,17 @@ pub const PROBE_POLL_MS: u32 = 50;
 /// to, in seconds. The last endpoint runs under the caller's bound only.
 pub const HOST_CONNECT_SECS: u32 = 10;
 
+/// Bound on the proxy stage of one connect (opening the socket to a
+/// proxy and the SOCKS5 handshake, which includes the proxy's own
+/// connect to the provider), in seconds, per proxy. A proxy that does
+/// not finish in this time cannot be used; the next one is tried.
+pub const PROXY_CONNECT_SECS: u32 = 4;
+
+/// How long a proxy that could not be used is tried after the others,
+/// in milliseconds. It is still tried: when no other proxy connects,
+/// and again first once this time is over.
+pub const PROXY_DOWN_MS: i64 = 60_000;
+
 /// Longest greeting line a probe reads, in bytes.
 const MAX_GREETING_BYTES: usize = 512;
 
@@ -103,12 +114,19 @@ pub enum DialError {
     /// account), or the configuration's: another endpoint would not do
     /// better.
     Account(BridgeError),
+    /// None of the provider's proxies could be used
+    /// ([`proxy_failure`]): no endpoint was reached, and another one
+    /// would go through the same proxies.
+    Proxy(BridgeError),
 }
 
 impl DialError {
     /// Sorts a failed handshake. `greeted` = the server's greeting was
     /// accepted (the handshake got as far as the login).
     pub fn classify(e: BridgeError, greeted: bool) -> DialError {
+        if proxy_failure(&e) {
+            return DialError::Proxy(e);
+        }
         if host_failure(&e) {
             return DialError::Unreachable(e);
         }
@@ -131,7 +149,10 @@ impl DialError {
 
     pub fn into_inner(self) -> BridgeError {
         match self {
-            DialError::Unreachable(e) | DialError::Refused(e) | DialError::Account(e) => e,
+            DialError::Unreachable(e)
+            | DialError::Refused(e)
+            | DialError::Account(e)
+            | DialError::Proxy(e) => e,
         }
     }
 }
@@ -207,6 +228,16 @@ pub fn host_failure(e: &BridgeError) -> bool {
     }
 }
 
+/// Whether a failed connect says that the provider's proxies failed,
+/// and not the provider: the proxy was not reached, refused the bridge
+/// or answered out of protocol ([`velmora::socks5::is_proxy_failure`]).
+/// A proxy that works and reports that it did not connect to the host
+/// is not this: that is a host that cannot be reached
+/// ([`host_failure`]).
+pub fn proxy_failure(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Nntp(velmora::Error::Io(io)) if velmora::socks5::is_proxy_failure(io))
+}
+
 impl HostPicker {
     pub fn new() -> Self {
         HostPicker::default()
@@ -264,7 +295,7 @@ impl HostPicker {
                         self.demote(&provider.id, host, &e, d.now());
                     }
                     match e {
-                        DialError::Account(e) => return Err(e),
+                        DialError::Account(e) | DialError::Proxy(e) => return Err(e),
                         other => failure = Some(other.into_inner()),
                     }
                 }
@@ -494,6 +525,8 @@ mod tests {
         /// Hosts whose greeting is a `502` (to a dial; a probe of such a
         /// host is set with `probe_ms`).
         greets_502: RefCell<Vec<&'static str>>,
+        /// No proxy of the provider can be used (to a dial).
+        proxies_down: Cell<bool>,
     }
 
     trait ConnectHost {
@@ -544,6 +577,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("dial {host} {bounded}"));
+            if self.proxies_down.get() {
+                return Err(DialError::classify(proxies_down(), false));
+            }
             if self.down.borrow().contains(&host) {
                 return Err(DialError::classify(timed_out(), false));
             }
@@ -854,6 +890,57 @@ mod tests {
             DialError::Account(_)
         ));
         assert!(!ready(Some(502)) && !ready(Some(400)));
+    }
+
+    fn proxies_down() -> BridgeError {
+        BridgeError::Nntp(velmora::Error::Io(velmora::socks5::proxy_failure(
+            std::io::ErrorKind::ConnectionRefused,
+            velmora::socks5::ERR_IO,
+        )))
+    }
+
+    /// A failure of the proxies is neither the host's nor the account's,
+    /// whatever its I/O kind and wherever the handshake stood. An I/O
+    /// error of the same kind from elsewhere is the host's.
+    #[test]
+    fn a_proxy_failure_is_its_own_class() {
+        for greeted in [false, true] {
+            assert!(matches!(
+                DialError::classify(proxies_down(), greeted),
+                DialError::Proxy(_)
+            ));
+        }
+        assert!(proxy_failure(&proxies_down()));
+        let plain = BridgeError::Nntp(velmora::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            velmora::socks5::ERR_IO,
+        )));
+        assert!(!proxy_failure(&plain) && host_failure(&plain));
+        assert!(matches!(
+            DialError::classify(plain, false),
+            DialError::Unreachable(_)
+        ));
+        assert!(!proxy_failure(&timed_out()));
+    }
+
+    /// The proxies are down: the first endpoint's failure ends the
+    /// connect. The others would go through the same proxies, so none is
+    /// dialled, and the pick made by the probe is not thrown away.
+    #[test]
+    fn a_proxy_failure_tries_no_other_endpoint() {
+        let n = net(&[("a", Some(30)), ("b", Some(10)), ("c", Some(20))]);
+        let picker = HostPicker::new();
+        let p = provider("a", &["b", "c"]);
+        n.proxies_down.set(true);
+        let err = run(picker.connect_host(&p, &n)).unwrap_err();
+        assert!(proxy_failure(&err));
+        let dials = |n: &Net| n.calls().iter().filter(|c| c.starts_with("dial")).count();
+        assert_eq!(dials(&n), 1);
+        // The proxies are back: the same endpoint, without a new probe.
+        n.proxies_down.set(false);
+        let probes = n.probes();
+        assert_eq!(run(picker.connect_host(&p, &n)).unwrap(), "b");
+        assert_eq!((n.probes(), dials(&n)), (probes, 2));
     }
 
     #[test]
