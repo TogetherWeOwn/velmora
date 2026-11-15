@@ -122,6 +122,10 @@ pub enum RemoteError {
     /// The request cannot be signed: a key outside the safe alphabet, or
     /// with an empty, `.` or `..` segment. Nothing was sent.
     Unsignable,
+    /// A listing names a key under the prefix that this module would
+    /// not sign, so something else wrote there (a console, another
+    /// tool). The listing is not used; the object has to be looked at.
+    Foreign,
 }
 
 /// `RECOVERY_COPY` and the `E2_*` values, validated. `Debug` shows
@@ -401,9 +405,10 @@ impl<H: HttpSend> S3Remote<H> {
 
     /// Up to [`LIST_LIMIT`] copies whose key starts with `prefix` and
     /// sorts after `start_after`, in key order, named by their key here
-    /// (without the store's own prefix). An answer that is out of order,
-    /// or names a key outside the range or one this module would not
-    /// sign, is an error. An object that is the store's prefix itself (a
+    /// (without the store's own prefix). An answer that is out of order
+    /// or names a key outside the range is [`RemoteError::Mismatch`];
+    /// one that names a key this module would not sign is
+    /// [`RemoteError::Foreign`]. An object that is the store's prefix itself (a
     /// "folder" made in a console) is no copy and is left out. Any other
     /// key that ends in `/` is an error like every key this module would
     /// not sign: nothing but this module writes under the prefix.
@@ -444,9 +449,12 @@ impl<H: HttpSend> S3Remote<H> {
             let key = object
                 .key
                 .strip_prefix(own.as_str())
-                .filter(|k| key_ok(k) && k.starts_with(prefix) && *k > last.as_str())
+                .filter(|k| k.starts_with(prefix) && *k > last.as_str())
                 .ok_or(RemoteError::Mismatch)?
                 .to_string();
+            if !key_ok(&key) {
+                return Err(RemoteError::Foreign);
+            }
             last.clone_from(&key);
             object.key = key;
         }

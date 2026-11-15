@@ -729,39 +729,72 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
     assert_eq!(keys, ["m/b", "m/c.D-e~f_0"]);
     assert!(page.truncated);
 
-    for (what, after, inner) in [
-        ("outside the store prefix", "", contents("other/m/a")),
-        ("the bucket root", "", contents("m/a")),
-        ("outside the prefix asked for", "", k("rs/a")),
-        ("out of order", "", k("m/b") + &k("m/a")),
-        ("a key twice", "", k("m/a") + &k("m/a")),
-        ("the start itself", "m/b", k("m/b")),
-        ("before the start", "m/b", k("m/a")),
-        ("a .. segment", "", k("m/../a")),
-        ("a . segment", "", k("m/./a")),
-        ("an empty segment", "", k("m//a")),
-        ("a key that ends in /", "", k("m/a/")),
-        // Characters this module would not sign.
-        ("a space", "", k("m/a b")),
-        ("an escape", "", k("m/%2e%2e/x")),
-        ("a query", "", k("m/a?x#y")),
-        ("a backslash", "", k("m/a\\..\\b")),
-        ("not ASCII", "", k("m/\u{e9}\u{202e}")),
+    for (what, after, inner, kind) in [
+        (
+            "outside the store prefix",
+            "",
+            contents("other/m/a"),
+            RemoteError::Mismatch,
+        ),
+        (
+            "the bucket root",
+            "",
+            contents("m/a"),
+            RemoteError::Mismatch,
+        ),
+        (
+            "outside the prefix asked for",
+            "",
+            k("rs/a"),
+            RemoteError::Mismatch,
+        ),
+        (
+            "out of order",
+            "",
+            k("m/b") + &k("m/a"),
+            RemoteError::Mismatch,
+        ),
+        (
+            "a key twice",
+            "",
+            k("m/a") + &k("m/a"),
+            RemoteError::Mismatch,
+        ),
+        ("the start itself", "m/b", k("m/b"), RemoteError::Mismatch),
+        ("before the start", "m/b", k("m/a"), RemoteError::Mismatch),
+        ("a .. segment", "", k("m/../a"), RemoteError::Foreign),
+        ("a . segment", "", k("m/./a"), RemoteError::Foreign),
+        ("an empty segment", "", k("m//a"), RemoteError::Foreign),
+        ("a key that ends in /", "", k("m/a/"), RemoteError::Foreign),
+        // Characters this module would not sign: written by something
+        // else.
+        ("a space", "", k("m/a b"), RemoteError::Foreign),
+        ("an escape", "", k("m/%2e%2e/x"), RemoteError::Foreign),
+        ("a query", "", k("m/a?x#y"), RemoteError::Foreign),
+        ("a backslash", "", k("m/a\\..\\b"), RemoteError::Foreign),
+        ("not ASCII", "", k("m/\u{e9}\u{202e}"), RemoteError::Foreign),
         (
             "more to come and no key",
             "",
             format!("<IsTruncated>true</IsTruncated>{token}"),
+            RemoteError::Mismatch,
         ),
         (
             "more to come and the folder object only",
             "",
             format!("<IsTruncated>true</IsTruncated>{token}{}", contents(own)),
+            RemoteError::Mismatch,
         ),
-        ("no listing", "", "<Contents>".to_string()),
+        (
+            "no listing",
+            "",
+            "<Contents>".to_string(),
+            RemoteError::Mismatch,
+        ),
     ] {
         set(inner);
         let e = w.remote.list(&w.clock, "m/", after).await;
-        assert_eq!(e.err(), Some(RemoteError::Mismatch), "{what}");
+        assert_eq!(e.err(), Some(kind), "{what}");
     }
 
     // An object that is the store prefix itself (a folder made in a
@@ -1287,6 +1320,33 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
 /// Records that fail every time (here two, among others that copy) are
 /// counted and passed: every record behind them is still copied, in the
 /// same job, with no retry of the job.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_written_by_something_else_stops_the_step_and_says_so() {
+    let w = World::new();
+    w.record("m/art/x_1", b"plan").await;
+    // Not a key of this service: the listing that names it is not
+    // trusted, so nothing is compared with it and nothing is sent.
+    w.e2.set("m/art/note 1.txt", b"note");
+    let e = w.copier().step("").await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "blob: recovery store holds a key this service did not write"
+    );
+    assert_eq!(w.e2.puts(), 0);
+    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
+    assert_eq!(counts, None);
+    assert!(w.jobs.take().is_empty());
+    // The object is left where it is.
+    assert_eq!(w.e2.get("m/art/note 1.txt").unwrap(), b"note");
+    assert_eq!(w.e2.objects.borrow().len(), 1);
+
+    // Once it is gone, the next step copies.
+    w.e2.objects.borrow_mut().clear();
+    let step = w.copier().step("").await.unwrap();
+    assert_eq!(step.counts.copied, 1);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_that_always_fails_does_not_hold_back_the_others() {
     let w = World::new();

@@ -396,6 +396,7 @@ fn remote_err(e: RemoteError) -> crate::types::BridgeError {
             RemoteError::Unavailable => "recovery store did not answer",
             RemoteError::Mismatch => "recovery store answered out of contract",
             RemoteError::Unsignable => "recovery store request cannot be signed",
+            RemoteError::Foreign => "recovery store holds a key this service did not write",
         }
         .to_string(),
     )
