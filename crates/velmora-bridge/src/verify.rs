@@ -485,10 +485,20 @@ where
             return self.advance(lease, OutboxStage::Done, now).await;
         }
         // Too few backbones count toward a release: nothing is released
-        // and nothing is read for it. The safety copy stays held, and the
-        // dispatcher sends the extent back to verify once enough count.
+        // and nothing is read for it. The safety copy stays held and the
+        // row stays in this stage, looked at again later without an
+        // attempt spent. Parked as `done` it would stay there for good:
+        // its earlier passes still count, so the re-drive of the
+        // dispatcher would never pick it up once the list is put right.
         if self.cfg.release_paused().is_some() {
-            return self.advance(lease, OutboxStage::Done, now).await;
+            if !self
+                .catalog
+                .defer(lease, now.plus_secs(REVERIFY_SECS), now)
+                .await?
+            {
+                return Err(Stop::Fenced);
+            }
+            return Ok(());
         }
         let ready = extent.created_at.plus_secs(self.cfg.safety_min_age_secs);
         if now < ready {

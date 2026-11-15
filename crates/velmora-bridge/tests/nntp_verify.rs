@@ -483,7 +483,9 @@ async fn newer_failure_cancels_pass() {
 
 /// A provider list with fewer backbones that count than a release needs:
 /// the release job releases nothing and reads nothing, and the safety
-/// copy stays held. The rows that would have passed stay as they are.
+/// copy stays held. The rows that would have passed stay as they are,
+/// and the row waits in its stage without an attempt spent, so the
+/// release goes through once the list is put right.
 #[tokio::test]
 async fn too_few_counting_backbones_release_nothing() {
     let mut rig = two_backbone_rig().await;
@@ -492,13 +494,33 @@ async fn too_few_counting_backbones_release_nothing() {
     assert!(rig.bridge.cfg.release_paused().is_some());
     let before = checks(&rig, &s);
     let connects = rig.bridge.nntp.connects();
+    let attempts = rig.outbox(&s).attempts;
 
+    for _ in 0..3 {
+        let now = rig.bridge.clock.now();
+        assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+        assert!(rig.safety_held(&s));
+        assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+        let outbox = rig.outbox(&s);
+        assert_eq!(
+            (outbox.stage, outbox.attempts, outbox.next_at),
+            (OutboxStage::Release, attempts, now.plus_secs(REVERIFY_SECS))
+        );
+        assert_eq!(checks(&rig, &s), before);
+        assert_eq!(rig.bridge.nntp.connects(), connects);
+        rig.bridge.clock.advance_secs(REVERIFY_SECS);
+    }
+
+    // The list is put right: the same row is released on its next run.
+    rig.bridge.cfg.providers[1].release = true;
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert!(rig.safety_held(&s));
-    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
-    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
-    assert_eq!(checks(&rig, &s), before);
-    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert!(!rig.safety_held(&s));
+    assert!(rig
+        .bridge
+        .catalog
+        .extent(&s.extent)
+        .release_evidence
+        .is_some());
 }
 
 /// No backbone counts at all: the upload is not checked, nothing fails
@@ -838,7 +860,11 @@ async fn one_counting_backbone_is_not_two() {
         rig.bridge.catalog.edit(&s.extent, to_release);
         rig.bridge.clock.advance_secs(1);
         assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-        assert_eq!(rig.outbox(&s).stage, OutboxStage::Done, "marked = {marked}");
+        assert_eq!(
+            rig.outbox(&s).stage,
+            OutboxStage::Release,
+            "marked = {marked}"
+        );
         assert_eq!(checks(&rig, &s), [ok(&counted, VerifyKind::Body)]);
         assert!(rig.safety_held(&s));
         assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
@@ -897,7 +923,7 @@ async fn same_backbone_counts_once() {
     rig.bridge.catalog.edit(&s.extent, to_release);
     rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     assert_eq!(rig.rows(&s).len(), 1);
     assert!(rig.safety_held(&s));
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
