@@ -40,7 +40,8 @@ use crate::recovery::delete_blob;
 use crate::replay::ReplayCursor;
 use crate::types::{
     AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
-    KeyStatus, Method, OutboxStage, Perm, RespBody, S3Request, S3Response, SafetyState,
+    KeyStatus, Method, OutboxStage, Perm, ProviderLoad, RespBody, S3Request, S3Response,
+    SafetyState,
 };
 
 /// Largest admin request body.
@@ -923,7 +924,13 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         match read {
             Ok(tally) if tally.ok > 0 => last_provider.clone_from(&provider.id),
             Ok(_) => {}
-            Err(Stop::NoPermit | Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+            Err(
+                Stop::NoPermit
+                | Stop::Refused
+                | Stop::Cooling(_)
+                | Stop::Fail(..)
+                | Stop::Session(_),
+            ) => {
                 busy = true;
             }
             Err(Stop::Fenced | Stop::Catalog) => {
@@ -1049,6 +1056,11 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
                 "failures": l.map_or(0, |l| l.failures),
                 "cooling": l.is_some_and(|l| l.cooldown_until > now),
                 "cooldown_until": l.map_or(0, |l| l.cooldown_until.0),
+                // `false` from the first strike until a good session;
+                // `reason` says why the last strike was one (a code,
+                // never the provider's words).
+                "healthy": l.is_none_or(ProviderLoad::healthy),
+                "reason": l.and_then(|l| l.fault),
             })
         })
         .collect();

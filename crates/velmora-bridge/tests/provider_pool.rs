@@ -86,6 +86,7 @@ impl Rig {
             failures: 0,
             cooldowns: 0,
             cooldown_until: UnixMs(0),
+            fault: None,
         })
     }
 
@@ -293,6 +294,15 @@ async fn login_refused_for_the_address_limit_is_no_slot_not_a_fault() {
         "482 Already connected from different IP",
         "481 Exceeded maximum number of connections per user",
         "481 exceeded MAXIMUM number of connections (20)",
+        "482 Too many connected hosts",
+        "502 Too many sessions for user",
+        "502 Session limit reached",
+        "502 Too many connects",
+        "502 Too many connections for your login",
+        "481 Too many simultaneous logins",
+        "502 Too many connections, temporarily blocked",
+        // The limit is what counts, not the reply code.
+        "400 Too many connections",
     ] {
         let mut rig = pool_rig(2).await;
         rig.set_priorities(&[0, 1]);
@@ -328,6 +338,209 @@ async fn login_refused_for_the_address_limit_is_no_slot_not_a_fault() {
         }
         assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
         assert_eq!(rig.run_post(&to_post).await, JobOutcome::Ack);
+    }
+}
+
+/// The provider refuses the login for the account itself: access denied,
+/// a used-up quota, a suspended account, a login it no longer takes.
+/// Waiting for a slot would never end, so this is a fault, not "no
+/// slot": the read goes to the next provider, the post goes to the next
+/// tier **in the same job**, and the provider takes a strike with the
+/// reason `login_refused` and then cools down.
+#[tokio::test]
+async fn login_refused_for_the_account_is_a_strike_and_the_work_moves_on() {
+    for reply in [
+        "502 Access denied: quota exceeded, see your account page",
+        "502 Access denied: block quota exceeded",
+        "502 Account suspended",
+        "502",
+        "482 Authentication rejected",
+        "481 Authentication failed",
+        // A limit, but not one of connections: no slot will come free.
+        "502 Download limit exceeded",
+        // They mention a connection; what they refuse is the account.
+        "502 Quota exceeded, closing connection",
+        "481 Invalid login; max attempts exceeded, connection closed",
+        "502 Block exhausted (unlimited connections plan)",
+    ] {
+        let mut rig = pool_rig(2).await;
+        rig.set_priorities(&[0, 1]);
+        let (s, _) = rig.posted_on(22, &[1]).await;
+        let to_post = rig.seed(23, &marked_plaintext(PLAIN_LEN)).await;
+        let had = rig.servers[1].posted_count().await;
+
+        // p0 answers every login with `reply`.
+        rig.servers[0].set_limit_reply(Some(reply)).await;
+        let addr = rig.servers[0].addr();
+        let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+        let held = [dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()];
+
+        // The post: p0 is the whole first tier and refuses, so the job
+        // posts on the backup tier at once and is done.
+        assert_eq!(rig.run_post(&to_post).await, JobOutcome::Ack, "{reply}");
+        let plan = rig.bridge.catalog.articles(&to_post.extent).await.unwrap();
+        assert!(!plan.is_empty(), "{reply}");
+        for row in &plan {
+            assert_eq!(row.state, ArticleState::Posted, "{reply}");
+            assert_eq!(row.provider_id.as_deref(), Some("p1"), "{reply}");
+        }
+        assert_eq!(
+            rig.servers[1].posted_count().await,
+            had + plan.len(),
+            "{reply}"
+        );
+        let load = rig.load(0).await;
+        assert_eq!(
+            (load.failures, load.fault, load.healthy()),
+            (1, Some(ProviderFault::LoginRefused), false),
+            "{reply}"
+        );
+
+        // The read: p0 is asked first and refuses, p1 has the articles.
+        // The refusal is final for this read: one login, not a second
+        // try on a new connection.
+        let asked = rig.bridge.nntp.dials_to("p0");
+        assert_eq!(
+            rig.fetch(&s).await,
+            ColdFetch::Filled(s.cipher.clone()),
+            "{reply}"
+        );
+        assert_eq!(rig.bridge.nntp.dials_to("p0"), asked + 1, "{reply}");
+        assert_eq!(rig.load(0).await.failures, 2, "{reply}");
+
+        // The third strike starts the cooldown: p0 is left out.
+        assert_eq!(
+            rig.fetch(&s).await,
+            ColdFetch::Filled(s.cipher.clone()),
+            "{reply}"
+        );
+        let now = rig.bridge.clock.now();
+        let load = rig.load(0).await;
+        assert!(load.cooldown_until > now, "{reply}");
+        assert_eq!(load.fault, Some(ProviderFault::LoginRefused), "{reply}");
+        let asked = rig.bridge.nntp.dials_to("p0");
+        assert_eq!(
+            rig.fetch(&s).await,
+            ColdFetch::Filled(s.cipher.clone()),
+            "{reply}"
+        );
+        assert_eq!(rig.bridge.nntp.dials_to("p0"), asked, "{reply}");
+        assert_eq!(rig.bridge.nntp.live(), 0, "{reply}");
+
+        // The account is in order again: one good session after the
+        // cooldown clears the strikes and the reason.
+        rig.servers[0].set_limit_reply(None).await;
+        for client in held {
+            client.quit().await;
+        }
+        rig.bridge.clock.advance_secs(61);
+        assert_eq!(
+            rig.fetch(&s).await,
+            ColdFetch::Filled(s.cipher.clone()),
+            "{reply}"
+        );
+        let load = rig.load(0).await;
+        assert_eq!((load.healthy(), load.fault), (true, None), "{reply}");
+    }
+}
+
+/// A tier with a provider that refuses the login for its account and a
+/// healthy one that is only out of slots still waits for the healthy
+/// one: a lower tier is a backup for failure, not overflow.
+#[tokio::test]
+async fn a_refused_account_next_to_a_busy_provider_still_waits_for_the_tier() {
+    let mut rig = pool_rig(3).await;
+    rig.set_priorities(&[0, 0, 1]);
+    let to_post = rig.seed(23, &marked_plaintext(PLAIN_LEN)).await;
+
+    rig.servers[0]
+        .set_limit_reply(Some("502 Account suspended"))
+        .await;
+    let held: Vec<_> = {
+        let mut held = Vec::new();
+        // p0 refuses for the account, p1 for its connection limit.
+        for server in &rig.servers[..2] {
+            let addr = server.addr();
+            let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+            held.push(dial(&cfg).await.unwrap());
+            held.push(dial(&cfg).await.unwrap());
+        }
+        held
+    };
+
+    let outcome = rig.run_post(&to_post).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    assert_eq!(rig.bridge.catalog.outbox(&to_post.extent).attempts, 0);
+    assert_eq!(rig.servers[2].posted_count().await, 0);
+    let (refused, busy) = (rig.load(0).await, rig.load(1).await);
+    assert_eq!(
+        (refused.failures, refused.fault),
+        (1, Some(ProviderFault::LoginRefused))
+    );
+    assert_eq!((busy.failures, busy.fault), (0, None));
+    for client in held {
+        client.quit().await;
+    }
+}
+
+/// The only provider that has the articles refuses the login for its
+/// account. Each read costs it one login until it cools down, and then
+/// none: a read does not try a provider that cools for a refused login,
+/// as it does one that cools for a failure that may be over.
+#[tokio::test]
+async fn reads_leave_a_provider_that_cools_for_a_refused_login_alone() {
+    let rig = {
+        let mut rig = pool_rig(1).await;
+        let (s, _) = rig.posted_on(31, &[]).await;
+        (rig, s)
+    };
+    let (rig, s) = rig;
+    rig.servers[0]
+        .set_limit_reply(Some("502 Account suspended"))
+        .await;
+    let addr = rig.servers[0].addr();
+    let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+    let held = [dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()];
+
+    for strike in 1..=3 {
+        assert!(!rig.cooling(0).await);
+        let asked = rig.bridge.nntp.dials_to("p0");
+        assert_eq!(rig.fetch(&s).await, ColdFetch::Interrupted);
+        assert_eq!(rig.bridge.nntp.dials_to("p0"), asked + 1, "strike {strike}");
+    }
+    assert!(rig.cooling(0).await);
+    let asked = rig.bridge.nntp.dials_to("p0");
+    for _ in 0..10 {
+        assert_eq!(rig.fetch(&s).await, ColdFetch::Interrupted);
+    }
+    assert_eq!(rig.bridge.nntp.dials_to("p0"), asked);
+    for client in held {
+        client.quit().await;
+    }
+
+    // The same with the account in order and only the record differing:
+    // the reason decides, not the server.
+    for (fault, probed) in [
+        (ProviderFault::LoginRefused, false),
+        (ProviderFault::ConnectRefused, true),
+        (ProviderFault::SessionFailed, true),
+    ] {
+        let mut rig = pool_rig(1).await;
+        let (s, _) = rig.posted_on(32, &[]).await;
+        let now = rig.bridge.clock.now();
+        for _ in 0..3 {
+            let failed = rig.bridge.catalog.provider_failed("p0", fault, now);
+            failed.await.unwrap();
+        }
+        assert!(rig.cooling(0).await);
+        let asked = rig.bridge.nntp.dials_to("p0");
+        let got = rig.fetch(&s).await;
+        let dials = rig.bridge.nntp.dials_to("p0") - asked;
+        if probed {
+            assert_eq!((got, dials), (ColdFetch::Filled(s.cipher.clone()), 1));
+        } else {
+            assert_eq!((got, dials), (ColdFetch::Interrupted, 0), "{fault:?}");
+        }
     }
 }
 
@@ -544,12 +757,13 @@ async fn read_tries_the_soonest_cooling_provider_when_all_cool() {
     // p1 trips twice (60 s, then 120 s from +60 s); p0 once at +100 s.
     let catalog = &rig.bridge.catalog;
     for at in [0, 0, 0, 60] {
-        let failed = catalog.provider_failed("p1", now.plus_secs(at));
+        let failed = catalog.provider_failed("p1", ProviderFault::SessionFailed, now.plus_secs(at));
         failed.await.unwrap();
     }
     rig.bridge.clock.set(now.plus_secs(100));
     for _ in 0..3 {
-        let failed = catalog.provider_failed("p0", now.plus_secs(100));
+        let failed =
+            catalog.provider_failed("p0", ProviderFault::SessionFailed, now.plus_secs(100));
         failed.await.unwrap();
     }
     assert!(rig.cooling(0).await && rig.cooling(1).await);
@@ -575,7 +789,10 @@ async fn cooling_provider_past_its_retention_is_not_waited_for() {
     rig.bridge.clock.advance_secs(11 * DAY_SECS);
     let now = rig.bridge.clock.now();
     for _ in 0..3 {
-        let failed = rig.bridge.catalog.provider_failed("p0", now);
+        let failed = rig
+            .bridge
+            .catalog
+            .provider_failed("p0", ProviderFault::SessionFailed, now);
         failed.await.unwrap();
     }
     assert!(rig.cooling(0).await);
@@ -855,6 +1072,204 @@ async fn failover_stays_in_a_tier_that_is_only_busy() {
     assert_eq!(rig.uses(2).await, 0);
 }
 
+/// Holds both of provider `i`'s connections and makes it answer every
+/// further login with `reply`.
+async fn refuse_logins(
+    rig: &Rig,
+    i: usize,
+    reply: &'static str,
+) -> [velmora::nntp::NntpClient<velmora::transports::NativeTlsTransport>; 2] {
+    rig.servers[i].set_limit_reply(Some(reply)).await;
+    let addr = rig.servers[i].addr();
+    let cfg = nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+    [dial(&cfg).await.unwrap(), dial(&cfg).await.unwrap()]
+}
+
+impl Rig {
+    /// Runs the post job again, whenever it was due.
+    async fn rerun_post(&self, s: &Seeded) -> JobOutcome {
+        self.bridge.catalog.edit(&s.extent, |e| {
+            e.outbox.next_at = UnixMs(0);
+            e.outbox.lease_until = None;
+        });
+        self.run_post(s).await
+    }
+}
+
+/// The only poster refuses the login for its account for days. The job
+/// waits, never spends an attempt and so never ends up dead; the
+/// provider sees one login per try once it is known to refuse, and none
+/// while it cools down. When the account is in order again the job
+/// posts.
+#[tokio::test]
+async fn a_lasting_refusal_never_spends_an_attempt() {
+    let mut rig = pool_rig(1).await;
+    let s = rig.seed(41, &marked_plaintext(PLAIN_LEN)).await;
+    // Room for three sockets of a job (one slot stays with the reads).
+    rig.bridge.cfg.providers[0].max_conns = 4;
+    let held = refuse_logins(&rig, 0, "502 Account suspended").await;
+
+    // The first run opens every socket of the job; the provider refuses
+    // them all. From then on a run tries with one.
+    let nntp = &rig.bridge.nntp;
+    let mut dials = Vec::new();
+    for _ in 0..3 {
+        assert!(!rig.cooling(0).await);
+        let before = nntp.dials_to("p0");
+        let outcome = rig.rerun_post(&s).await;
+        assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+        dials.push(nntp.dials_to("p0") - before);
+    }
+    assert_eq!(dials, [3, 1, 1]);
+    assert!(rig.cooling(0).await);
+    assert_eq!(nntp.live(), 0);
+
+    // Far more runs than a job has attempts, over more than a week.
+    let before = nntp.dials_to("p0");
+    let mut probes = 0;
+    for _ in 0..200 {
+        probes += usize::from(!rig.cooling(0).await);
+        let outcome = rig.rerun_post(&s).await;
+        assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+        rig.bridge.clock.advance_secs(3600);
+    }
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!((outbox.attempts, &outbox.last_error), (0, &None));
+    // One login per ended cooldown, and the cooldowns grow to six hours.
+    assert_eq!(nntp.dials_to("p0") - before, probes);
+    assert!((30..45).contains(&probes), "{probes}");
+    assert_eq!(rig.load(0).await.fault, Some(ProviderFault::LoginRefused));
+
+    // The account is in order again.
+    rig.servers[0].set_limit_reply(None).await;
+    for client in held {
+        client.quit().await;
+    }
+    rig.bridge.clock.advance_secs(6 * 3600);
+    assert_eq!(rig.rerun_post(&s).await, JobOutcome::Ack);
+    let plan = rig.bridge.catalog.articles(&s.extent).await.unwrap();
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    let load = rig.load(0).await;
+    assert_eq!((load.healthy(), load.fault), (true, None));
+}
+
+/// Every tier refuses the login for its account: the job waits without
+/// spending an attempt. A real failure next to a refusal is still a
+/// failed run and costs one.
+#[tokio::test]
+async fn only_a_real_failure_next_to_a_refusal_spends_an_attempt() {
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let s = rig.seed(42, &marked_plaintext(PLAIN_LEN)).await;
+    let mut held = Vec::new();
+    for i in [0, 1] {
+        held.extend(refuse_logins(&rig, i, "502 Account suspended").await);
+    }
+    let outcome = rig.rerun_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!((outbox.attempts, &outbox.last_error), (0, &None));
+    for i in [0, 1] {
+        let load = rig.load(i).await;
+        assert_eq!(
+            (load.failures, load.fault),
+            (1, Some(ProviderFault::LoginRefused))
+        );
+    }
+
+    // p1 cannot be reached at all: that run failed.
+    rig.unplug(1);
+    let outcome = rig.rerun_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    let outbox = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!(outbox.attempts, 1);
+    assert!(outbox.last_error.is_some());
+    assert_eq!(rig.load(1).await.fault, Some(ProviderFault::SessionFailed));
+    for client in held {
+        client.quit().await;
+    }
+}
+
+/// The job is logged in on a provider and a further login there is
+/// refused, in words that name no limit. A provider that just let the
+/// job in is not refusing the account: the job has reached the number
+/// of connections it gets. It posts on the sockets it has, the provider
+/// takes no strike and nothing goes to the backup tier.
+#[tokio::test]
+async fn a_refusal_next_to_a_logged_in_socket_is_the_connection_limit() {
+    for reply in ["502 Please try again later", "481 Not now", "502"] {
+        let mut rig = pool_rig(2).await;
+        rig.set_priorities(&[0, 1]);
+        let s = rig.seed(43, &marked_plaintext(PLAIN_LEN)).await;
+        // The catalogue has three slots for a job; the server gives two.
+        rig.bridge.cfg.providers[0].max_conns = 4;
+        rig.servers[0].set_limit_reply(Some(reply)).await;
+
+        assert_eq!(rig.run_post(&s).await, JobOutcome::Ack, "{reply}");
+        assert_eq!(rig.bridge.nntp.dials_to("p0"), 3, "{reply}");
+        let plan = rig.bridge.catalog.articles(&s.extent).await.unwrap();
+        assert!(plan.len() >= 3, "{reply}");
+        for row in &plan {
+            assert_eq!(row.state, ArticleState::Posted, "{reply}");
+            assert_eq!(row.provider_id.as_deref(), Some("p0"), "{reply}");
+        }
+        assert_eq!(rig.servers[1].posted_count().await, 0, "{reply}");
+        let load = rig.load(0).await;
+        assert_eq!((load.failures, load.fault), (0, None), "{reply}");
+        assert_eq!(rig.bridge.nntp.live(), 0, "{reply}");
+    }
+
+    // Not a strike even for a moment: a provider one strike away from a
+    // cooldown does not start one.
+    let mut rig = pool_rig(2).await;
+    rig.set_priorities(&[0, 1]);
+    let s = rig.seed(44, &marked_plaintext(PLAIN_LEN)).await;
+    rig.bridge.cfg.providers[0].max_conns = 4;
+    rig.servers[0].set_limit_reply(Some("502")).await;
+    let now = rig.bridge.clock.now();
+    for _ in 0..2 {
+        let failed = rig
+            .bridge
+            .catalog
+            .provider_failed("p0", ProviderFault::SessionFailed, now);
+        failed.await.unwrap();
+    }
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    let load = rig.load(0).await;
+    assert_eq!((load.healthy(), load.cooldowns), (true, 0));
+}
+
+/// The same on the tier a job falls to, whose sockets connect inside the
+/// posting round: the first tier cannot be reached, the backup lets two
+/// of the job's three sockets in and refuses the third. The two post
+/// everything, the third's article included, and the backup takes no
+/// strike.
+#[tokio::test]
+async fn a_refusal_inside_the_round_next_to_a_logged_in_socket_is_the_limit() {
+    let mut rig = pool_rig(3).await;
+    rig.set_priorities(&[0, 1, 2]);
+    let s = rig.seed(45, &marked_plaintext(PLAIN_LEN)).await;
+    rig.unplug(0);
+    rig.bridge.cfg.providers[1].max_conns = 4;
+    rig.servers[1]
+        .set_limit_reply(Some("502 Please try again later"))
+        .await;
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(rig.bridge.nntp.dials_to("p1"), 3);
+    let plan = rig.bridge.catalog.articles(&s.extent).await.unwrap();
+    assert!(plan.len() >= 3);
+    for row in &plan {
+        assert_eq!(row.state, ArticleState::Posted);
+        assert_eq!(row.provider_id.as_deref(), Some("p1"));
+    }
+    assert_eq!(rig.servers[2].posted_count().await, 0);
+    let load = rig.load(1).await;
+    assert_eq!((load.failures, load.fault), (0, None));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
 /// Every provider that could post is cooling: the job waits for the
 /// cooldown without spending an attempt and without a connection.
 #[tokio::test]
@@ -894,4 +1309,29 @@ async fn post_waits_while_every_poster_cools() {
     let plan = rig.post(&s).await;
     assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
     assert!(!rig.cooling(0).await);
+}
+
+/// The backup tier connects inside the round. It lets two of the job's
+/// three sockets in and refuses the third in words that name no limit;
+/// the two that are in then get every POST refused (`440`), so no socket
+/// of the provider ends with a good session. The refused login is still
+/// the provider's limit: it is no strike.
+#[tokio::test]
+async fn a_refusal_inside_the_round_is_no_strike_when_no_socket_ends_well() {
+    let mut rig = pool_rig(3).await;
+    rig.set_priorities(&[0, 1, 2]);
+    let s = rig.seed(46, &marked_plaintext(PLAIN_LEN)).await;
+    rig.unplug(0);
+    rig.bridge.cfg.providers[1].max_conns = 4;
+    rig.servers[1]
+        .set_limit_reply(Some("502 Please try again later"))
+        .await;
+    rig.servers[1].set_posting_allowed(false).await;
+
+    let outcome = rig.run_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    assert_eq!(rig.bridge.nntp.dials_to("p1"), 3);
+    let load = rig.load(1).await;
+    assert_eq!((load.failures, load.fault, load.held), (0, None, 0));
+    assert_eq!(rig.bridge.nntp.live(), 0);
 }

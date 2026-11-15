@@ -363,27 +363,37 @@ async fn cooldown_starts_after_repeated_failures_and_doubles() {
     let c = catalog();
     assert_eq!(load_of(&c, "p1", T0).await, None);
 
-    c.provider_failed("p1", T0).await.unwrap();
-    c.provider_failed("p1", T0.plus_ms(1)).await.unwrap();
+    c.provider_failed("p1", ProviderFault::SessionFailed, T0)
+        .await
+        .unwrap();
+    c.provider_failed("p1", ProviderFault::SessionFailed, T0.plus_ms(1))
+        .await
+        .unwrap();
     let before = load_of(&c, "p1", T0.plus_ms(1)).await.unwrap();
     assert_eq!((before.failures, before.cooldown_until), (2, UnixMs(0)));
 
     let mut now = T0.plus_ms(2);
-    c.provider_failed("p1", now).await.unwrap();
+    c.provider_failed("p1", ProviderFault::SessionFailed, now)
+        .await
+        .unwrap();
     let tripped = load_of(&c, "p1", now).await.unwrap();
     assert_eq!(tripped.cooldown_until, now.plus_ms(MINUTE_MS));
     assert_eq!((tripped.failures, tripped.cooldowns), (0, 1));
 
     // Reports that arrive while it cools change nothing: jobs that fail
     // together do not stack cooldowns.
-    c.provider_failed("p1", now.plus_ms(10)).await.unwrap();
+    c.provider_failed("p1", ProviderFault::SessionFailed, now.plus_ms(10))
+        .await
+        .unwrap();
     c.provider_recovered("p1", now.plus_ms(10)).await.unwrap();
     assert_eq!(load_of(&c, "p1", now).await.unwrap(), tripped);
 
     // After a cooldown one more failure is enough, and the wait doubles.
     for minutes in [2, 4, 8, 15, 15] {
         now = load_of(&c, "p1", now).await.unwrap().cooldown_until;
-        c.provider_failed("p1", now).await.unwrap();
+        c.provider_failed("p1", ProviderFault::SessionFailed, now)
+            .await
+            .unwrap();
         let l = load_of(&c, "p1", now).await.unwrap();
         assert_eq!(l.cooldown_until, now.plus_ms(minutes * MINUTE_MS));
     }
@@ -396,11 +406,141 @@ async fn cooldown_starts_after_repeated_failures_and_doubles() {
         (clean.failures, clean.cooldowns, clean.cooldown_until),
         (0, 0, UnixMs(0))
     );
-    c.provider_failed("p1", now).await.unwrap();
-    c.provider_failed("p1", now).await.unwrap();
+    c.provider_failed("p1", ProviderFault::SessionFailed, now)
+        .await
+        .unwrap();
+    c.provider_failed("p1", ProviderFault::SessionFailed, now)
+        .await
+        .unwrap();
     assert_eq!(load_of(&c, "p1", now).await.unwrap().cooldown_until.0, 0);
     // Other providers are untouched.
     assert_eq!(load_of(&c, "p2", now).await, None);
+}
+
+/// A strike is stored with its reason code, the newest one wins, a
+/// report during a cooldown leaves it alone and a good session clears
+/// it. From the first strike to that good session the provider does not
+/// count as healthy, between cooldowns too.
+#[tokio::test]
+async fn a_strike_keeps_its_reason_until_a_good_session() {
+    let c = catalog();
+    let mut now = T0;
+    c.provider_failed("p1", ProviderFault::SessionFailed, now)
+        .await
+        .unwrap();
+    let one = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!(one.fault, Some(ProviderFault::SessionFailed));
+    assert!(!one.healthy());
+
+    c.provider_failed("p1", ProviderFault::LoginRefused, now)
+        .await
+        .unwrap();
+    c.provider_failed("p1", ProviderFault::LoginRefused, now)
+        .await
+        .unwrap();
+    let tripped = load_of(&c, "p1", now).await.unwrap();
+    assert!(tripped.cooldown_until > now);
+    assert_eq!(tripped.fault, Some(ProviderFault::LoginRefused));
+
+    // Cooling: a report changes nothing, its reason included.
+    c.provider_failed("p1", ProviderFault::SessionFailed, now.plus_ms(1))
+        .await
+        .unwrap();
+    assert_eq!(load_of(&c, "p1", now).await.unwrap(), tripped);
+
+    // The cooldown is over and nothing ran yet: still not healthy.
+    now = tripped.cooldown_until;
+    let waiting = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!((waiting.failures, waiting.cooldown_until > now), (0, false));
+    assert!(!waiting.healthy());
+    assert_eq!(waiting.fault, Some(ProviderFault::LoginRefused));
+
+    c.provider_recovered("p1", now).await.unwrap();
+    let clean = load_of(&c, "p1", now).await.unwrap();
+    assert!(clean.healthy());
+    assert_eq!(clean.fault, None);
+
+    // A code written by a later version reads as "no reason".
+    c.provider_failed("p1", ProviderFault::LoginRefused, now)
+        .await
+        .unwrap();
+    c.sql
+        .apply("UPDATE provider_health SET last_failure_reason = 'not_known_here'")
+        .unwrap();
+    let later = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!((later.failures, later.fault), (1, None));
+
+    // A version from before the reason clears the strikes and leaves
+    // the reason: a provider with no strike has none.
+    c.sql
+        .apply(
+            "UPDATE provider_health SET failures = 0, cooldowns = 0, cooldown_until = 0, \
+               last_failure_reason = 'login_refused'",
+        )
+        .unwrap();
+    let stale = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!((stale.healthy(), stale.fault), (true, None));
+}
+
+/// A refused login waits longer between tries than any other fault, up
+/// to six hours: an account that is closed for days is asked a handful
+/// of times a day. The other faults stop at fifteen minutes.
+#[tokio::test]
+async fn a_refused_login_cools_down_for_up_to_six_hours() {
+    for (fault, minutes) in [
+        (
+            ProviderFault::LoginRefused,
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 360, 360],
+        ),
+        (ProviderFault::ConnectRefused, vec![1, 2, 4, 8, 15, 15]),
+        (ProviderFault::SessionFailed, vec![1, 2, 4, 8, 15, 15]),
+    ] {
+        let c = catalog();
+        let mut now = T0;
+        for _ in 0..2 {
+            c.provider_failed("p1", fault, now).await.unwrap();
+        }
+        for wait in minutes {
+            c.provider_failed("p1", fault, now).await.unwrap();
+            let l = load_of(&c, "p1", now).await.unwrap();
+            assert_eq!(l.cooldown_until, now.plus_ms(wait * MINUTE_MS), "{fault:?}");
+            now = l.cooldown_until;
+        }
+    }
+
+    // The cap follows the newest fault: a login refused for hours that
+    // then fails another way is back to fifteen minutes.
+    let c = catalog();
+    let mut now = T0;
+    for _ in 0..2 {
+        let failed = c.provider_failed("p1", ProviderFault::LoginRefused, now);
+        failed.await.unwrap();
+    }
+    for _ in 0..8 {
+        let failed = c.provider_failed("p1", ProviderFault::LoginRefused, now);
+        failed.await.unwrap();
+        now = load_of(&c, "p1", now).await.unwrap().cooldown_until;
+    }
+    let failed = c.provider_failed("p1", ProviderFault::SessionFailed, now);
+    failed.await.unwrap();
+    let l = load_of(&c, "p1", now).await.unwrap();
+    assert_eq!(l.cooldown_until, now.plus_ms(15 * MINUTE_MS));
+}
+
+/// The codes are stable: they are stored and shown.
+#[test]
+fn fault_codes_are_stable() {
+    for (fault, code) in [
+        (ProviderFault::ConnectRefused, "connect_refused"),
+        (ProviderFault::LoginRefused, "login_refused"),
+        (ProviderFault::SessionFailed, "session_failed"),
+    ] {
+        assert_eq!(fault.as_str(), code);
+        assert_eq!(ProviderFault::parse(code), Some(fault));
+        assert_eq!(serde_json::to_value(fault).unwrap(), code);
+    }
+    assert_eq!(ProviderFault::parse("Login_Refused"), None);
+    assert_eq!(ProviderFault::parse(""), None);
 }
 
 /// The load snapshot joins held slots, hand-outs so far and health.
@@ -413,7 +553,9 @@ async fn provider_load_reports_slots_and_health_per_provider() {
     acquire(&c, &p1, PermitClass::Read, T0).await.unwrap();
     acquire(&c, &p2, PermitClass::Read, T0).await.unwrap();
     c.release_permit(&first).await.unwrap();
-    c.provider_failed("p2", T0).await.unwrap();
+    c.provider_failed("p2", ProviderFault::SessionFailed, T0)
+        .await
+        .unwrap();
 
     let l1 = load_of(&c, "p1", T0).await.unwrap();
     assert_eq!((l1.held, l1.failures), (1, 0));

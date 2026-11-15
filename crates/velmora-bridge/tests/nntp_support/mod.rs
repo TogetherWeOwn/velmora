@@ -63,6 +63,8 @@ pub struct TcpConnector {
     connects: Cell<u32>,
     /// The provider of every session opened, in order.
     opened: RefCell<Vec<String>>,
+    /// The provider of every connect tried, in order.
+    dialed: RefCell<Vec<String>>,
     slow: Rc<RefCell<Option<Slow>>>,
     park: Rc<RefCell<Option<Rc<Cell<bool>>>>>,
 }
@@ -122,6 +124,11 @@ impl TcpConnector {
     /// Sessions opened so far on provider `id`.
     pub fn connects_to(&self, id: &str) -> usize {
         self.opened.borrow().iter().filter(|p| *p == id).count()
+    }
+    /// Connects tried so far on provider `id`, counted before the dial:
+    /// those the provider refused too.
+    pub fn dials_to(&self, id: &str) -> usize {
+        self.dialed.borrow().iter().filter(|p| *p == id).count()
     }
 }
 
@@ -203,6 +210,7 @@ impl NntpConnector for TcpConnector {
 
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
         note_event("connect");
+        self.dialed.borrow_mut().push(p.id.clone());
         begin(&self.slow, "connect");
         let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
         end(&self.slow);
@@ -261,6 +269,7 @@ struct Health {
     failures: u32,
     cooldowns: u32,
     until: i64,
+    fault: Option<ProviderFault>,
 }
 
 /// A takeover injected at the catalogue write that marks one article
@@ -1074,21 +1083,32 @@ impl Catalog for MemCatalog {
                     failures: h.failures,
                     cooldowns: h.cooldowns,
                     cooldown_until: UnixMs(h.until),
+                    fault: h.fault,
                 }
             })
             .collect())
     }
 
-    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+    async fn provider_failed(
+        &self,
+        provider: &str,
+        fault: ProviderFault,
+        now: UnixMs,
+    ) -> Result<()> {
         self.failures_reported.set(self.failures_reported.get() + 1);
         let mut health = self.health.borrow_mut();
         let h = health.entry(provider.to_string()).or_default();
         if h.until > now.0 {
             return Ok(());
         }
+        h.fault = Some(fault);
+        let (max_ms, max_steps) = match fault {
+            ProviderFault::LoginRefused => (6 * 3_600_000, 9),
+            _ => (900_000, 4),
+        };
         if h.failures + 1 >= 3 || h.cooldowns > 0 {
-            h.until = now.0 + (60_000i64 << h.cooldowns).min(900_000);
-            h.cooldowns = (h.cooldowns + 1).min(4);
+            h.until = now.0 + (60_000i64 << h.cooldowns).min(max_ms);
+            h.cooldowns = (h.cooldowns + 1).min(max_steps);
             h.failures = 0;
         } else {
             h.failures += 1;
