@@ -640,8 +640,13 @@ mod tests {
     fn arguments_the_protocol_cannot_carry_send_nothing() {
         let (u, pw) = login();
         // Fields of 256 and 255 bytes, made of the run's own login.
-        let mut long = u.repeat(256);
-        long.truncate(256);
+        let mut long = String::new();
+        for c in u.chars().cycle() {
+            if long.len() == 256 {
+                break;
+            }
+            long.push(c);
+        }
         let max = &long[..255];
         let none = String::new();
         let cases: [(&str, &str, &str, u16); 7] = [
