@@ -10,7 +10,7 @@ mod nntp_support;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use nntp_support::{TcpConnector, PASS, USER};
+use nntp_support::{DeadPort, TcpConnector, PASS, USER};
 use sha2::Digest as _;
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
@@ -656,9 +656,12 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     let mut fx = Fx::new().await;
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "a/cool.bin", &plaintext()).await;
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = dead.local_addr().unwrap().port();
-    let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead);
+    // A port nothing listens on, reserved until the end of the test: each
+    // connect is refused at once. A listener would take the connect and
+    // never greet, and each job would wait out the read timeout of the
+    // client.
+    let dead = DeadPort::reserve();
+    let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead.port());
 
     for run in 0..3 {
         fx.make_due(&o).await;
@@ -697,6 +700,7 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     assert_eq!(fx.health("failures").await, "0");
     assert_eq!(fx.health("cooldowns").await, "0");
     assert_eq!(fx.health("cooldown_until").await, "0");
+    drop(dead);
 }
 
 /// Two accounts of one pool share `pool_max_conns` in `provider_permits`:
