@@ -308,6 +308,46 @@ fn config_loads_from_documented_vars() {
     assert!(!cfg.providers[0].tls);
 }
 
+/// The recovery copy is no part of the service's configuration: off
+/// when unset or blank, and a copy that is refused does not stop the
+/// service.
+#[test]
+fn recovery_copy_is_off_by_default_and_cannot_stop_the_service() {
+    use velmora_bridge::remote::RemoteConfig;
+    let (prod, _) = wrangler_vars();
+    let mut vars = with_secrets(prod, PROVIDER_TLS);
+    for name in [
+        "RECOVERY_COPY",
+        "E2_ENDPOINT",
+        "E2_REGION",
+        "E2_BUCKET",
+        "E2_ACCESS_KEY",
+        "E2_SECRET_KEY",
+        "RECOVERY_PREFIX",
+    ] {
+        vars.remove(name);
+    }
+    let copy = |vars: &BTreeMap<String, String>| RemoteConfig::from_vars(|n| vars.get(n).cloned());
+    for (value, off) in [
+        (None, true),
+        (Some(""), true),
+        (Some("  "), true),
+        (Some("off"), true),
+        (Some("on"), false),
+        (Some("true"), false),
+    ] {
+        match value {
+            Some(v) => vars.insert("RECOVERY_COPY".into(), v.into()),
+            None => vars.remove("RECOVERY_COPY"),
+        };
+        load(&vars).unwrap();
+        match copy(&vars) {
+            Ok(none) => assert!(off && none.is_none(), "{value:?}"),
+            Err(_) => assert!(!off, "{value:?}"),
+        }
+    }
+}
+
 #[test]
 fn missing_secret_fails_closed() {
     let (prod, _) = wrangler_vars();
@@ -340,6 +380,18 @@ fn missing_secret_fails_closed() {
                     assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
                     assert!(!cfg.intent_sweep);
                 }
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
+        // The recovery copy: absent or blank is off. It is no part of
+        // this configuration and cannot stop the service.
+        if name == "RECOVERY_COPY" {
+            for _ in 0..2 {
+                load(&vars).unwrap();
+                let copy =
+                    velmora_bridge::remote::RemoteConfig::from_vars(|n| vars.get(n).cloned());
+                assert!(copy.unwrap().is_none());
                 vars.insert(name.clone(), "  ".into());
             }
             continue;
