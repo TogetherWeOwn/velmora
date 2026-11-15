@@ -111,9 +111,14 @@ pub trait BlobStore {
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
-    /// [`BlobStore::list`] with the size and MD5 of each key. An empty
-    /// answer = no more keys. This default reads every blob; an adapter
-    /// whose listing carries both overrides it.
+    /// Keys as [`BlobStore::list`] gives them, with the size and MD5 of
+    /// each. The end rule is not that of `list`: only an **empty** answer
+    /// means no more keys. A short answer is not the end (a key removed
+    /// since it was listed is left out); the caller goes on from the
+    /// last key returned. A `limit` of 0 is read as 1.
+    ///
+    /// This default reads every blob; an adapter whose listing carries
+    /// size and MD5 overrides it.
     async fn list_entries(
         &self,
         prefix: &str,
@@ -125,7 +130,7 @@ pub trait BlobStore {
         // A key removed since it was listed is left out; an answer is
         // empty only when the listing itself has ended.
         while entries.is_empty() {
-            let keys = self.list(prefix, &after, limit).await?;
+            let keys = self.list(prefix, &after, limit.max(1)).await?;
             let Some(last) = keys.last().cloned() else {
                 break;
             };
