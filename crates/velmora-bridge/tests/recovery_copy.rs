@@ -553,8 +553,11 @@ async fn e2_authorization_never_logged() {
     };
     assert_eq!(format!("{answer:?}"), "403 (53 bytes)");
     let access_key = ACCESS_KEY.to_ascii_lowercase();
-    for secret in [SECRET_KEY, &access_key, "signature", "aws4", "credential"] {
-        assert!(!shown.contains(secret), "{secret} in {shown}");
+    // A failure names the place in this list only: the message of a
+    // failed test is a log too.
+    let hidden = [SECRET_KEY, &access_key, "signature", "aws4", "credential"];
+    for (at, text) in hidden.iter().enumerate() {
+        assert!(!shown.contains(text), "text {at} of the list is shown");
     }
 }
 
