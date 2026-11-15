@@ -23,7 +23,9 @@ pub const MAX_EXTENT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Largest PutObject body `MAX_PUT_BYTES` may allow. The edge refuses a
 /// request of 100 MiB before the Worker runs; the last MiB is left for
-/// the framing of a chunked body.
+/// the framing of a chunked body. It is enough for signed chunks of
+/// 16 KiB or more; with signed chunks of 8 KiB, the smallest S3 allows,
+/// the edge refuses a body above about 98.9 MiB.
 pub const MAX_PUT_BYTES_LIMIT: u64 = 99 * 1024 * 1024;
 
 /// `SLICE_BYTES` when the variable is absent: 8 MiB, or one extent when

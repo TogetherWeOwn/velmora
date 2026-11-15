@@ -319,7 +319,11 @@ record, like any other, and its ETag is the MD5 of the body. A part of
 a multipart upload stays at `MAX_EXTENT_BYTES`.
 
 - A request body above 100 MiB is refused before the Worker runs, so
-  99 MiB is the most `MAX_PUT_BYTES` takes. A client has to send larger
+  99 MiB is the most `MAX_PUT_BYTES` takes. That limit counts the bytes
+  on the wire: a body sent in signed chunks carries 89 bytes of framing
+  per chunk. With chunks of 8 KiB, the smallest S3 allows, a body above
+  about 98.9 MiB is over it and is refused there; chunks of 16 KiB or
+  more fit up to 99 MiB. A client has to send larger
   files as multipart uploads. aws-cli does so from 8 MiB. rclone does so
   from 200 MiB by default: run it with `--s3-upload-cutoff 95M` and
   `--s3-chunk-size 16M` (or `upload_cutoff = 95M` and `chunk_size = 16M`
@@ -359,8 +363,14 @@ deployed Worker has passed.
 | `kept_writes`, `kept_slices` | writes with a recovery record and without an object in the catalogue: the request died between the two, or its publication was refused and the record could not be removed | run the restore steps above; the replay reads the records, and its first step empties the table |
 | `anomalies` | how often a write was marked `kept`, ever; it does not go down | see `kept_writes` |
 
-No client was told `200` for a write that is `open`, `waiting` or
-`kept`.
+These figures describe the catalogue as it is now. In a catalogue that
+was never restored, no client was told `200` for a write that is
+`open`, `waiting` or `kept`. After a restore of the database that no
+longer holds: the rows are those of the restored point, and a write
+that is `open` or `waiting` there may have been answered `200` later.
+Its recovery record is in `SAFETY`, the sweep deletes nothing of it
+(the rules above), and the replay publishes it. A row is never proof
+that an upload failed.
 
 **With a restore.** The first step of a replay empties `write_intents`:
 a row of an earlier point may name slices that the replay publishes.
