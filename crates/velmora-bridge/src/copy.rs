@@ -101,6 +101,18 @@ pub struct CopyStep {
     pub outage: bool,
 }
 
+/// Why a job did not do its step: a class, and a status at most. Never
+/// text from a store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepError {
+    /// The safety bucket could not be listed.
+    Source,
+    /// The recovery store could not be listed.
+    Store(RemoteError),
+    /// The job for the next step could not be sent.
+    Queue,
+}
+
 enum Copied {
     Done,
     Same,
@@ -155,22 +167,24 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     }
 
     /// One queue job of a pass: a step from `cursor`, then the message
-    /// for the next step. `None` = nothing was done (maintenance, or a
-    /// newer pass has started).
+    /// for the next step. No counts = no step was done (maintenance, a
+    /// newer pass has started, or the step failed). The third value is
+    /// why the job did not do all of its work, when it did not; the
+    /// job may be acknowledged all the same, so it has to be reported.
     pub async fn run_job<J: JobSink>(
         &self,
         jobs: &J,
         pass: UnixMs,
         cursor: &str,
-    ) -> (JobOutcome, Option<CopyCounts>) {
+    ) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
         if self.maintenance == Maintenance::Restore {
-            return (JobOutcome::Ack, None);
+            return (JobOutcome::Ack, None, None);
         }
         // A pass ends when the next one starts: the newer pass passes
         // quickly over what is done, so two never run for long.
         let age = self.clock.now().0 - pass.0;
         if age >= PASS_INTERVAL_MS {
-            return (JobOutcome::Ack, None);
+            return (JobOutcome::Ack, None, None);
         }
         // Every step is idempotent, so a failed job simply runs again,
         // but not for ever: a later pass takes over.
@@ -181,14 +195,15 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         } else {
             JobOutcome::Ack
         };
-        let Ok(step) = self.step(cursor).await else {
-            return (again, None);
+        let step = match self.step(cursor).await {
+            Ok(step) => step,
+            Err(e) => return (again, None, Some(e)),
         };
         // The store is down: the cursor does not move while the job may
         // be retried. After that the pass goes on past the records that
         // failed, so that no record can hold back those behind it.
         if step.outage && age < RETRY_WINDOW_MS {
-            return (again, Some(step.counts));
+            return (again, Some(step.counts), None);
         }
         if let Some(cursor) = step.next {
             let next = Job::RecoveryCopy {
@@ -197,10 +212,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 cursor,
             };
             if jobs.send(&next, 0).await.is_err() {
-                return (again, Some(step.counts));
+                return (again, Some(step.counts), Some(StepError::Queue));
             }
         }
-        (JobOutcome::Ack, Some(step.counts))
+        (JobOutcome::Ack, Some(step.counts), None)
     }
 
     fn spent(&self, started: UnixMs) -> bool {
@@ -209,7 +224,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
 
     /// Walks the source from `cursor` until a bound of the job is
     /// reached, the store is found down, or the source ends.
-    pub async fn step(&self, cursor: &str) -> Result<CopyStep> {
+    pub async fn step(&self, cursor: &str) -> std::result::Result<CopyStep, StepError> {
         let started = self.clock.now();
         let mut counts = CopyCounts::default();
         let mut cursor = cursor.to_string();
@@ -222,7 +237,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             let mut source = self
                 .safety
                 .list_entries(RECORD_PREFIX, &cursor, PAGE)
-                .await?;
+                .await
+                .map_err(|_| StepError::Source)?;
             let Some(last) = source.last().map(|e| e.key.clone()) else {
                 // The source has ended; what the store still lists is extra.
                 counts.extra += self.listed(&cursor, None).await?.0.len() as u64;
@@ -338,7 +354,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         &self,
         after: &str,
         upto: Option<&String>,
-    ) -> Result<(Vec<Listed>, Option<String>)> {
+    ) -> std::result::Result<(Vec<Listed>, Option<String>), StepError> {
         let mut out: Vec<Listed> = Vec::new();
         let mut after = after.to_string();
         for pages in 1..=LIST_PAGES {
@@ -346,7 +362,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 .remote
                 .list(self.clock, RECORD_PREFIX, &after)
                 .await
-                .map_err(remote_err)?;
+                .map_err(StepError::Store)?;
             let Some(last) = page.objects.last().map(|o| o.key.clone()) else {
                 break;
             };
@@ -387,17 +403,4 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             Err(_) => Copied::Failed,
         }
     }
-}
-
-fn remote_err(e: RemoteError) -> crate::types::BridgeError {
-    crate::types::BridgeError::Blob(
-        match e {
-            RemoteError::Refused(_) => "recovery store refused the request",
-            RemoteError::Unavailable => "recovery store did not answer",
-            RemoteError::Mismatch => "recovery store answered out of contract",
-            RemoteError::Unsignable => "recovery store request cannot be signed",
-            RemoteError::Foreign => "recovery store holds a key this service did not write",
-        }
-        .to_string(),
-    )
 }

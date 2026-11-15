@@ -12,7 +12,7 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
-use velmora_bridge::copy::{pass_due, Copier, CopyCounts, JOB_COPIES, MIN_AGE_MS};
+use velmora_bridge::copy::{pass_due, Copier, CopyCounts, StepError, JOB_COPIES, MIN_AGE_MS};
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
     md5_hex, HttpRequest, HttpResponse, HttpSend, NoAnswer, RemoteConfig, RemoteError, S3Remote,
@@ -1191,7 +1191,8 @@ async fn pass_resumes_from_cursor_after_job_death() {
         w.record(&format!("m/art/x_{i:04}"), b"plan").await;
     }
     w.e2.page.set(100);
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
     assert_eq!(w.e2.objects.borrow().len(), JOB_COPIES);
@@ -1209,7 +1210,8 @@ async fn pass_resumes_from_cursor_after_job_death() {
     // finds everything done. The last job of a pass sends none.
     let died = w.copier().step(cursor).await.unwrap();
     assert_eq!((died.counts.copied, died.next), (30, None));
-    let (outcome, counts) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     let counts = counts.unwrap();
     assert_eq!((counts.copied, counts.same), (0, 30));
@@ -1240,7 +1242,8 @@ async fn pass_needs_no_catalogue_and_starts_once_per_interval() {
         panic!("{:?}", sent[0].job);
     };
     assert_eq!(*pass, UnixMs(slot));
-    let (outcome, counts) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().copied, 1);
     assert!(w.e2.get("m/art/x_1").is_some());
@@ -1263,7 +1266,8 @@ async fn pass_does_not_run_in_maintenance_restore() {
     let mut copier = w.copier();
     copier.maintenance = Maintenance::Restore;
     assert!(!copier.start_pass(&w.jobs, slot).await.unwrap());
-    let (outcome, counts) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     assert_eq!((outcome, counts), (JobOutcome::Ack, None));
     assert!(w.jobs.take().is_empty());
     assert!(w.e2.log.borrow().is_empty());
@@ -1279,7 +1283,8 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
         w.record(&format!("m/art/x_{i}"), b"plan").await;
     }
     w.e2.put_status.set(Some(500));
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts.unwrap().failed, 4);
     assert!(w.jobs.take().is_empty());
@@ -1287,7 +1292,8 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
     // A list request that gets no answer: the same, with no counts.
     w.e2.put_status.set(None);
     w.e2.drop_next.set(4);
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, Some(StepError::Store(RemoteError::Unavailable)));
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts, None);
     assert_eq!(w.e2.puts(), 16);
@@ -1295,7 +1301,8 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
 
     // Past the retry window the job is not retried; the pass goes on.
     w.clock.advance_ms(10 * 60 * 1000);
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().failed, 4);
     let sent = w.jobs.take();
@@ -1308,7 +1315,8 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
     // The next pass has started: a job of this one does nothing more.
     w.clock.advance_ms(5 * 60 * 1000);
     let before = w.e2.log.borrow().len();
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     assert_eq!((outcome, counts), (JobOutcome::Ack, None));
     assert!(w.jobs.take().is_empty());
     assert_eq!(w.e2.log.borrow().len(), before);
@@ -1327,15 +1335,19 @@ async fn a_key_written_by_something_else_stops_the_step_and_says_so() {
     // Not a key of this service: the listing that names it is not
     // trusted, so nothing is compared with it and nothing is sent.
     w.e2.set("m/art/note 1.txt", b"note");
-    let e = w.copier().step("").await.unwrap_err();
-    assert_eq!(
-        e.to_string(),
-        "blob: recovery store holds a key this service did not write"
-    );
+    let foreign = StepError::Store(RemoteError::Foreign);
+    assert_eq!(w.copier().step("").await.unwrap_err(), foreign);
     assert_eq!(w.e2.puts(), 0);
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
-    assert_eq!(counts, None);
+    assert_eq!((counts, why), (None, Some(foreign)));
+    assert!(w.jobs.take().is_empty());
+    // Past the retry window the job is acknowledged, and still says why
+    // it did nothing.
+    w.clock.advance_ms(10 * 60 * 1000);
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    assert_eq!((counts, why), (None, Some(foreign)));
     assert!(w.jobs.take().is_empty());
     // The object is left where it is.
     assert_eq!(w.e2.get("m/art/note 1.txt").unwrap(), b"note");
@@ -1347,6 +1359,41 @@ async fn a_key_written_by_something_else_stops_the_step_and_says_so() {
     assert_eq!(step.counts.copied, 1);
 }
 
+/// A queue that takes no job.
+struct NoQueue;
+impl JobSink for NoQueue {
+    async fn send(&self, _: &Job, _: u32) -> Result<()> {
+        Err(BridgeError::Queue("down".into()))
+    }
+    async fn send_many(&self, _: &[Job]) -> Result<()> {
+        Err(BridgeError::Queue("down".into()))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_next_job_that_cannot_be_sent_is_retried_and_reported() {
+    let w = World::new();
+    for i in 0..=JOB_COPIES {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    // The step is done and the pass has more to do, but the job for the
+    // next step is not taken: this job comes again, and says why.
+    let (outcome, counts, why) = w.copier().run_job(&NoQueue, UnixMs(NOW), "").await;
+    assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
+    assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
+    assert_eq!(why, Some(StepError::Queue));
+    // Past the retry window it is acknowledged; the reason stays.
+    w.clock.advance_ms(10 * 60 * 1000);
+    w.e2.objects.borrow_mut().clear();
+    let (outcome, counts, why) = w.copier().run_job(&NoQueue, UnixMs(NOW), "").await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
+    assert_eq!(why, Some(StepError::Queue));
+    // The start of a pass that cannot be sent is an error of the cron.
+    let start = w.copier().start_pass(&NoQueue, UnixMs(0)).await;
+    assert!(matches!(start, Err(BridgeError::Queue(_))));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_that_always_fails_does_not_hold_back_the_others() {
     let w = World::new();
@@ -1354,7 +1401,8 @@ async fn a_record_that_always_fails_does_not_hold_back_the_others() {
         w.record(&format!("m/art/x_{i:02}"), b"plan").await;
     }
     *w.e2.put_500_keys.borrow_mut() = vec!["m/art/x_00".into(), "m/art/x_07".into()];
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     let counts = counts.unwrap();
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!((counts.copied, counts.failed), (18, 2));
@@ -1363,7 +1411,8 @@ async fn a_record_that_always_fails_does_not_hold_back_the_others() {
 
     // Alone in its job (the steady state: everything else is copied),
     // one failing record is not taken for an outage either.
-    let (outcome, counts) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, None);
     let counts = counts.unwrap();
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!((counts.same, counts.failed), (18, 2));
