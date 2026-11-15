@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
 use velmora_bridge::copy::{
-    pass_due, Copier, CopyCounts, StepError, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
-    RETRY_WINDOW_MS,
+    pass_due, Copier, CopyCounts, StepError, FRESH_MS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
+    RETRY_WINDOW_MS, WALK_KEY,
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
@@ -410,6 +410,16 @@ impl World {
         sealed
     }
 
+    /// Stores a generation record that names the extents `ids`.
+    async fn generation(&self, key: &str, ids: &[&str]) -> Vec<u8> {
+        let extents: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{{\"id\":\"{id}\"}}"))
+            .collect();
+        let plain = format!("{{\"v\":1,\"extents\":[{}]}}", extents.join(","));
+        self.record(key, plain.as_bytes()).await
+    }
+
     async fn raw(&self, key: &str, bytes: Vec<u8>) {
         let sha: [u8; 32] = Sha256::digest(&bytes).into();
         let meta = BlobMeta {
@@ -423,9 +433,10 @@ impl World {
     /// A whole pass, job after job. Returns the counts summed.
     async fn pass(&self) -> CopyCounts {
         let mut total = CopyCounts::default();
+        let pass = self.clock.now();
         let mut cursor = Some(String::new());
         while let Some(at) = cursor {
-            let step = self.copier().step(&at).await.unwrap();
+            let step = self.copier().step(pass, &at).await.unwrap();
             let c = step.counts;
             total.records += c.records;
             total.bytes += c.bytes;
@@ -435,6 +446,7 @@ impl World {
             total.refused += c.refused;
             total.source_unreadable += c.source_unreadable;
             total.young += c.young;
+            total.pending += c.pending;
             total.extra += c.extra;
             total.foreign += c.foreign;
             cursor = step.next;
@@ -448,7 +460,18 @@ fn generation(age_ms: i64, tail: &str) -> String {
     format!("m/g_{:013x}{tail}", NOW - age_ms)
 }
 
-const OLD: i64 = 3_600_000;
+/// The cursor of a job of the walk that goes on after `key`.
+fn walk(key: &str) -> String {
+    format!("{{\"p\":\"a\",\"k\":\"{key}\"}}")
+}
+
+/// The cursor of a job of the fresh sweep that goes on after `key`.
+fn sweep(key: &str) -> String {
+    format!("{{\"p\":\"g\",\"k\":\"{key}\"}}")
+}
+
+/// Older than the fresh sweep reaches: a record of the walk.
+const OLD: i64 = 2 * 3_600_000;
 
 // ---------------------------------------------------------------------------
 // The adapter
@@ -1082,12 +1105,17 @@ async fn pass_never_copies_tenant_keys() {
     let there: Vec<String> = w.e2.objects.borrow().keys().cloned().collect();
     assert_eq!(there, ["m/art/x_1"]);
     assert_eq!(w.e2.count("PUT m/tk/"), 0);
-    assert_eq!(*w.e2.asked.borrow(), ["", "m/tk0"]);
+    // The fresh sweep goes to the end of the keys, so it is the part
+    // of a pass that meets them.
+    assert!(w.e2.asked.borrow().iter().any(|a| a == "m/tk0"));
 
     // A record behind the tenant keys is still reached, and a job that
     // stops among them goes on without naming one.
     w.record("m/x_9", b"plan").await;
-    let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "m/tk0").await;
+    let (_, counts, why) = w
+        .copier()
+        .run_job(&w.jobs, UnixMs(NOW), &sweep("m/tk0"))
+        .await;
     assert_eq!((counts.unwrap().copied, why), (1, None));
     assert!(w.e2.get("m/x_9").is_some());
     for line in w.e2.log.borrow().iter().chain(w.e2.asked.borrow().iter()) {
@@ -1102,7 +1130,7 @@ async fn pass_skips_generation_records_younger_than_two_minutes() {
     let ahead = generation(-5_000, "bbbb");
     let old = generation(MIN_AGE_MS, "cccc");
     for key in [&young, &ahead, &old] {
-        w.record(key, b"g").await;
+        w.generation(key, &[]).await;
     }
     // The rule is for generation records only: only they are ever removed.
     w.record(&format!("m/del/g_{:013x}dddd", NOW), b"t").await;
@@ -1132,12 +1160,14 @@ async fn pass_is_idempotent_second_pass_copies_nothing() {
     let counts = w.pass().await;
     assert_eq!((counts.copied, counts.same, counts.records), (0, 7, 7));
     assert_eq!(w.e2.puts(), puts);
-    // Two list requests: the range of the source page, and what
-    // follows it. An answer that is not cut is the last one.
-    assert_eq!(w.e2.count("GET "), lists + 2);
+    // Five list requests: the range of the source page and what
+    // follows it, and one for each of the three parts of a pass that
+    // find no record. An answer that is not cut is the last one.
+    assert_eq!(w.e2.count("GET "), lists + 5);
     assert_eq!(w.e2.count("HEAD "), 7);
-    // MemBlobStore lists by reading (the port's default); nothing more.
-    assert_eq!(w.safety.gets(), gets + 7);
+    // MemBlobStore lists by reading (the port's default); the place of
+    // the walk is read once; nothing more.
+    assert_eq!(w.safety.gets(), gets + 8);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1208,8 +1238,9 @@ async fn pass_never_deletes_extra_at_e2_and_counts_it() {
     }
     assert_eq!(w.e2.objects.borrow().len(), 6);
     // No list request more than is needed: one for the range of the
-    // source page, and one for what follows it, which is not cut.
-    assert_eq!(w.e2.count("GET "), 2);
+    // source page, one for what follows it, which is not cut, and one
+    // for each of the three parts of a pass that find no record.
+    assert_eq!(w.e2.count("GET "), 5);
 
     // The same when an answer is cut exactly at the end of the page.
     let w = World::new();
@@ -1221,7 +1252,7 @@ async fn pass_never_deletes_extra_at_e2_and_counts_it() {
     let lists = w.e2.count("GET ");
     let counts = w.pass().await;
     assert_eq!((counts.same, counts.extra), (2, 1));
-    assert_eq!(w.e2.count("GET "), lists + 2);
+    assert_eq!(w.e2.count("GET "), lists + 5);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1291,11 +1322,11 @@ async fn pass_resumes_from_cursor_after_job_death() {
         panic!("{:?}", sent[0].job);
     };
     let last = format!("m/art/x_{:04}", JOB_COPIES - 1);
-    assert_eq!((*pass, cursor), (UnixMs(NOW), &last));
+    assert_eq!((*pass, cursor), (UnixMs(NOW), &walk(&last)));
 
     // The second job dies after its work: its message comes again and
     // finds everything done. The last job of a pass sends none.
-    let died = w.copier().step(cursor).await.unwrap();
+    let died = w.copier().step(UnixMs(NOW), cursor).await.unwrap();
     assert_eq!((died.counts.copied, died.next), (30, None));
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
     assert_eq!(why, None);
@@ -1371,16 +1402,18 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
     }
     w.e2.put_status.set(Some(500));
     let down = Some(StepError::Store(RemoteError::Unavailable));
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &walk("")).await;
     assert_eq!(why, down);
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts.unwrap().failed, 4);
     assert!(w.jobs.take().is_empty());
+    // The place of the walk does not move while the job may come again.
+    assert_eq!(saved(&w).await, None);
 
     // A list request that gets no answer: the same, with no counts.
     w.e2.put_status.set(None);
     w.e2.drop_next.set(4);
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &walk("")).await;
     assert_eq!(why, Some(StepError::Store(RemoteError::Unavailable)));
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts, None);
@@ -1390,7 +1423,7 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
     // To the last millisecond of the retry window. (The pauses between
     // tries have moved the clock.)
     w.clock.set(UnixMs(NOW + RETRY_WINDOW_MS - 1));
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &walk("")).await;
     assert_eq!(why, down);
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts.unwrap().failed, 4);
@@ -1398,39 +1431,53 @@ async fn an_outage_retries_the_job_then_leaves_it_to_the_next_pass() {
 
     // Past the retry window the job is not retried; the pass goes on.
     w.clock.set(UnixMs(NOW + RETRY_WINDOW_MS));
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &walk("")).await;
     assert_eq!(why, None);
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().failed, 4);
     let sent = w.jobs.take();
     assert!(
-        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if cursor == "m/art/x_3"),
+        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == walk("m/art/x_3")),
         "{:?}",
         sent[0].job
     );
 
     // A step that fails is not retried any more either, and says why.
     w.e2.drop_next.set(4);
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &walk("")).await;
     assert_eq!((outcome, counts, why), (JobOutcome::Ack, None, down));
     assert!(w.jobs.take().is_empty());
 
     // To the last millisecond of its interval the pass still works.
     w.clock.set(UnixMs(NOW + PASS_INTERVAL_MS - 1));
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &walk("")).await;
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
     assert_eq!(counts.unwrap().failed, 4);
     assert_eq!(w.jobs.take().len(), 1);
 
-    // The next pass has started: a job of this one does nothing more,
-    // and says that it left work undone.
+    // The next pass has started: a job of this one does nothing more.
+    // A job of the fresh sweep says that it left work undone. One of
+    // the walk does not: the next pass goes on from the saved place.
     w.clock.set(UnixMs(NOW + PASS_INTERVAL_MS));
     let before = w.e2.log.borrow().len();
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
-    assert_eq!(why, Some(StepError::Expired));
-    assert_eq!((outcome, counts), (JobOutcome::Ack, None));
+    for (cursor, late) in [
+        (String::new(), Some(StepError::Expired)),
+        (sweep("m/g_1"), Some(StepError::Expired)),
+        (
+            "{\"p\":\"d\",\"k\":\"m/del/g_1\"}".to_string(),
+            Some(StepError::Expired),
+        ),
+        ("not a cursor".to_string(), Some(StepError::Expired)),
+        (walk("m/art/x_1"), None),
+        ("{\"p\":\"b\",\"k\":\"m/del0\"}".to_string(), None),
+    ] {
+        let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), &cursor).await;
+        assert_eq!(why, late, "{cursor}");
+        assert_eq!((outcome, counts), (JobOutcome::Ack, None));
+    }
     assert!(w.jobs.take().is_empty());
     assert_eq!(w.e2.log.borrow().len(), before);
+    w.safety.lose(WALK_KEY);
 
     w.e2.put_status.set(None);
     assert_eq!(w.pass().await.copied, 4);
@@ -1496,14 +1543,14 @@ async fn a_next_job_that_cannot_be_sent_is_retried_and_reported() {
     }
     // The step is done and the pass has more to do, but the job for the
     // next step is not taken: this job comes again, and says why.
-    let (outcome, counts, why) = w.copier().run_job(&NoQueue, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&NoQueue, UnixMs(NOW), &walk("")).await;
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
     assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
     assert_eq!(why, Some(StepError::Queue));
     // Past the retry window it is acknowledged; the reason stays.
     w.clock.advance_ms(10 * 60 * 1000);
     w.e2.objects.borrow_mut().clear();
-    let (outcome, counts, why) = w.copier().run_job(&NoQueue, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = w.copier().run_job(&NoQueue, UnixMs(NOW), &walk("")).await;
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
     assert_eq!(why, Some(StepError::Queue));
@@ -1567,18 +1614,21 @@ async fn a_job_stops_at_its_time_bound_and_the_next_goes_on() {
     // Every request reads the clock, so a few groups of copies take
     // the job past its 20 seconds: it stops after a whole group, with
     // the cursor at the last record of that group.
-    let first = copier.step("").await.unwrap();
+    let first = copier.step(UnixMs(NOW), &walk("")).await.unwrap();
     let copied = first.counts.copied as usize;
     assert!(
         copied > 0 && copied < 40 && copied.is_multiple_of(6),
         "{copied}"
     );
-    assert_eq!(first.next, Some(format!("m/art/x_{:02}", copied - 1)));
+    assert_eq!(
+        first.next,
+        Some(walk(&format!("m/art/x_{:02}", copied - 1)))
+    );
     assert_eq!(w.e2.objects.borrow().len(), copied);
     let mut jobs = 1;
     let mut cursor = first.next;
     while let Some(at) = cursor {
-        cursor = copier.step(&at).await.unwrap().next;
+        cursor = copier.step(UnixMs(NOW), &at).await.unwrap().next;
         jobs += 1;
     }
     assert!(jobs >= 3, "{jobs}");
@@ -1616,22 +1666,22 @@ async fn a_store_far_larger_than_the_source_is_listed_in_bounded_parts() {
     for i in 0..5_000 {
         w.e2.set(&format!("m/art/x_{i:05}"), b"old");
     }
-    let key = generation(OLD, "aaaa");
-    w.record(&key, b"g").await;
+    let key = "m/art/y_1";
+    w.record(key, b"plan").await;
     w.e2.page.set(10);
 
     // 40 rounds of at most 10 list requests, 10 keys each: the job ends
     // 4,000 keys in, and the next one goes on from there.
-    let first = w.copier().step("").await.unwrap();
+    let first = w.copier().step(UnixMs(NOW), &walk("")).await.unwrap();
     assert_eq!(w.e2.count("GET "), 400);
-    assert_eq!(first.next.as_deref(), Some("m/art/x_03999"));
+    assert_eq!(first.next, Some(walk("m/art/x_03999")));
     assert_eq!((first.counts.copied, first.counts.extra), (0, 4_000));
 
     let w2 = World::new();
     for i in 0..5_000 {
         w2.e2.set(&format!("m/art/x_{i:05}"), b"old");
     }
-    w2.record(&key, b"g").await;
+    w2.record(key, b"plan").await;
     w2.e2.page.set(100);
     let total = w2.pass().await;
     assert_eq!((total.records, total.copied, total.extra), (1, 1, 5_000));
@@ -1666,7 +1716,7 @@ async fn a_source_page_cut_by_the_store_listing_loses_no_record() {
     // Ten answers of seven keys: the first round ends at the 70th key.
     let cut = w.e2.objects.borrow().keys().nth(69).cloned().unwrap();
     assert_eq!(cut, "m/art/s_034");
-    let first = w.copier().step("").await.unwrap();
+    let first = w.copier().step(UnixMs(NOW), &walk("")).await.unwrap();
     assert!(w.e2.asked.borrow().contains(&cut));
     assert_eq!(w.e2.get(&cut), w.safety.get(&cut, None).await.unwrap());
     assert!(w.e2.asked.borrow().iter().any(|a| a == "m/art/s_068x"));
@@ -1721,15 +1771,15 @@ async fn a_pass_goes_on_from_a_key_that_something_else_wrote() {
     };
     // Ten list requests take the job to its cut and past half of its
     // time; the second cut ends it.
-    let first = copier.step("").await.unwrap();
-    assert_eq!(first.next.as_deref(), Some("m/art/a 19"));
+    let first = copier.step(UnixMs(NOW), &walk("")).await.unwrap();
+    assert_eq!(first.next, Some(walk("m/art/a 19")));
     assert_eq!((first.counts.foreign, first.counts.records), (20, 0));
     assert!(w.e2.asked.borrow().iter().any(|a| a == "m/art/a 09"));
     let mut foreign = first.counts.foreign;
     let mut copied = 0;
     let mut cursor = first.next;
     while let Some(at) = cursor {
-        let step = copier.step(&at).await.unwrap();
+        let step = copier.step(UnixMs(NOW), &at).await.unwrap();
         foreign += step.counts.foreign;
         copied += step.counts.copied;
         cursor = step.next;
@@ -1746,7 +1796,8 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     // Five copies and ten list requests take the job past its time
     // before the next page.
     for i in 0..5 {
-        w.record(&format!("m/art/x_{i}"), b"plan").await;
+        w.generation(&generation(600_000, &format!("_{i}")), &[])
+            .await;
     }
     // More tenant keys than fill the first source page.
     for i in 0..1_000 {
@@ -1755,7 +1806,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     }
     w.record("m/x_9", b"plan").await;
     for i in 0..9 {
-        w.e2.set(&format!("m/art/y_{i}"), b"left over");
+        w.e2.set(&format!("m/g_zz{i}"), b"left over");
     }
     w.e2.page.set(1);
     let clock = TickClock(w.clock.clone());
@@ -1774,7 +1825,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     let sent = w.jobs.take();
     assert_eq!(sent.len(), 1);
     assert!(
-        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if cursor == "m/tk0"),
+        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == sweep("m/tk0")),
         "{:?}",
         sent[0].job
     );
@@ -1794,7 +1845,7 @@ async fn a_copy_of_another_size_is_not_equal() {
     ));
     // The forced answer is wrong for the listing that follows the
     // page, so the step ends in an error; the copy was made before.
-    let _ = w.copier().step("").await;
+    let _ = w.copier().step(UnixMs(NOW), &walk("")).await;
     assert_eq!(w.e2.puts(), 1);
     assert_eq!(w.e2.get("m/art/x_1"), Some(sealed));
 }
@@ -1811,9 +1862,9 @@ async fn a_step_that_finds_the_store_down_does_not_read_the_next_page() {
     }
     w.e2.put_status.set(Some(500));
     w.e2.still.set(true);
-    let step = w.copier().step("").await.unwrap();
+    let step = w.copier().step(UnixMs(NOW), &walk("")).await.unwrap();
     assert!(step.outage);
-    assert_eq!(step.next.as_deref(), Some("m/art/x_3"));
+    assert_eq!(step.next, Some(walk("m/art/x_3")));
     assert_eq!(step.counts.failed, 4);
     assert_eq!(w.e2.count("GET "), 1);
 }
@@ -1828,16 +1879,16 @@ async fn a_step_that_finds_the_store_down_stops_inside_the_page() {
     for i in 0..20 {
         w.record(&format!("m/art/x_{i:02}"), b"plan").await;
     }
-    for key in ["m/art/x_03a", "m/art/x_10a", "m/zz"] {
+    for key in ["m/art/x_03a", "m/art/x_10a", "m/art/zz"] {
         w.e2.set(key, b"left over");
     }
     for key in ["m/art/x_02 b", "m/art/x_10 b"] {
         w.e2.set(key, b"note");
     }
     w.e2.put_status.set(Some(500));
-    let first = w.copier().step("").await.unwrap();
+    let first = w.copier().step(UnixMs(NOW), &walk("")).await.unwrap();
     assert!(first.outage);
-    assert_eq!(first.next.as_deref(), Some("m/art/x_05"));
+    assert_eq!(first.next, Some(walk("m/art/x_05")));
     let c = &first.counts;
     assert_eq!((c.records, c.failed, c.extra, c.foreign), (6, 6, 1, 1));
     // Six records, four tries each, and no more.
@@ -1849,7 +1900,7 @@ async fn a_step_that_finds_the_store_down_stops_inside_the_page() {
     let mut records = first.counts.records;
     let mut cursor = first.next;
     while let Some(at) = cursor {
-        let step = w.copier().step(&at).await.unwrap();
+        let step = w.copier().step(UnixMs(NOW), &at).await.unwrap();
         assert!(!step.outage);
         extra += step.counts.extra;
         foreign += step.counts.foreign;
@@ -1917,7 +1968,7 @@ async fn a_record_removed_after_it_was_listed_is_not_counted() {
         remote: &w.remote,
         maintenance: Maintenance::Off,
     };
-    let step = copier.step("").await.unwrap();
+    let step = copier.step(UnixMs(NOW), &walk("")).await.unwrap();
     let c = step.counts;
     assert_eq!((c.records, c.bytes, c.copied), (1, kept.len() as u64, 1));
     assert!(c.clean());
@@ -1933,6 +1984,8 @@ async fn an_equal_copy_is_not_sent_again_when_the_listing_names_another_digest()
     for i in 0..3 {
         w.record(&format!("m/art/x_{i}"), b"plan").await;
     }
+    let fresh = generation(600_000, "_a");
+    w.generation(&fresh, &["x_0"]).await;
     let safety = Stale {
         inner: &w.safety,
         gone: vec![],
@@ -1945,15 +1998,21 @@ async fn an_equal_copy_is_not_sent_again_when_the_listing_names_another_digest()
         remote: &w.remote,
         maintenance: Maintenance::Off,
     };
-    let first = copier.step("").await.unwrap().counts;
+    let first = copier.step(UnixMs(NOW), &walk("")).await.unwrap().counts;
     assert_eq!((first.copied, first.same), (3, 0));
-    let second = copier.step("").await.unwrap().counts;
+    let second = copier.step(UnixMs(NOW), &walk("")).await.unwrap().counts;
     assert_eq!((second.copied, second.same), (0, 3));
     assert_eq!(w.e2.puts(), 3);
     // A copy that differs is still mended.
     w.e2.set("m/art/x_1", b"damaged");
-    let third = copier.step("").await.unwrap().counts;
+    let third = copier.step(UnixMs(NOW), &walk("")).await.unwrap().counts;
     assert_eq!((third.copied, third.same), (1, 2));
+    // The same for a record of the fresh sweep.
+    let sweep = copier.step(UnixMs(NOW), "").await.unwrap().counts;
+    assert_eq!((sweep.copied, sweep.same), (1, 3));
+    let sweep = copier.step(UnixMs(NOW), "").await.unwrap().counts;
+    assert_eq!((sweep.copied, sweep.same), (0, 4));
+    assert_eq!(w.e2.puts(), 5);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1974,4 +2033,556 @@ async fn no_delete_request_is_ever_sent_to_e2() {
         .iter()
         .all(|l| l.starts_with("GET ") || l.starts_with("HEAD ") || l.starts_with("PUT ")));
     assert_eq!(w.e2.objects.borrow().len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// The fresh sweep and the walk that goes on from where it stopped
+// ---------------------------------------------------------------------------
+
+/// Where `key` was put, among the requests the store got.
+fn put_at(e2: &FakeE2, key: &str) -> Option<usize> {
+    let log = e2.log.borrow();
+    log.iter()
+        .position(|l| l.starts_with("PUT ") && l.ends_with(key))
+}
+
+/// The place the walk is saved at.
+async fn saved(w: &World) -> Option<String> {
+    let bytes = w.safety.get(WALK_KEY, None).await.unwrap()?;
+    Some(String::from_utf8(bytes).unwrap())
+}
+
+/// More records than a pass can even list: the store answers one key at
+/// a time and every request takes a second, so a pass of 15 minutes
+/// gets through a few hundred of them. Every record is over there
+/// within a bounded number of passes, because each pass goes on where
+/// the last one stopped. And what is written or deleted while that goes
+/// on is over there by the end of the next pass, article plan included,
+/// however far the walk is from it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_backfill_longer_than_a_pass_reaches_every_key_and_new_ones_first() {
+    const OLD_RECORDS: usize = 1_300;
+    const PASSES: i64 = 10;
+    let w = World::new();
+    for i in 0..1_000 {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    for i in 0..150 {
+        let id = format!("{:013x}_{i:03}", NOW - OLD - i64::from(i));
+        w.record(&format!("m/del/g_{id}"), b"gone").await;
+        w.record(&format!("m/g_{id}"), b"old").await;
+    }
+    w.e2.page.set(1);
+    let clock = TickClock(w.clock.clone());
+    let copier = Copier {
+        safety: &w.safety,
+        kek: &w.kek,
+        clock: &clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let old: Vec<String> = w.safety.keys();
+    assert_eq!(old.len(), OLD_RECORDS);
+    let behind = |e2: &FakeE2| old.iter().filter(|k| e2.get(k).is_none()).count();
+
+    let mut left = Vec::new();
+    let mut places = Vec::new();
+    for n in 0..PASSES {
+        let start = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        if w.clock.now().0 < start.0 {
+            w.clock.set(start);
+        }
+        // A write and a delete, three minutes before the pass. The plan
+        // sorts after every key the walk has to go through.
+        let minted = start.0 - 180_000;
+        let plan = format!("m/art/x_zz{n:02}");
+        let written = format!("m/g_{minted:013x}_new");
+        let deleted = format!("m/del/g_{minted:013x}_new");
+        w.record(&plan, b"plan").await;
+        w.generation(&written, &[&plan["m/art/".len()..]]).await;
+        w.record(&deleted, b"gone").await;
+
+        assert!(copier.start_pass(&w.jobs, start).await.unwrap());
+        let mut jobs = 0;
+        loop {
+            let sent = w.jobs.take();
+            if sent.is_empty() {
+                break;
+            }
+            assert_eq!(sent.len(), 1);
+            let Job::RecoveryCopy { pass, cursor, .. } = &sent[0].job else {
+                panic!("another job");
+            };
+            let (outcome, _, why) = copier.run_job(&w.jobs, *pass, cursor).await;
+            assert_eq!((outcome, why), (JobOutcome::Ack, None), "pass {n}");
+            jobs += 1;
+        }
+        assert!(jobs > 1);
+        // The pass ended, or the next one is due: never much later.
+        let now = w.clock.now().0;
+        assert!(now < start.0 + PASS_INTERVAL_MS + 60_000, "pass {n}");
+        // What was new is over there, whole, within the bound.
+        for key in [&plan, &written, &deleted] {
+            assert_eq!(
+                w.e2.get(key),
+                w.safety.stored(key).map(|b| b.bytes),
+                "{key}"
+            );
+        }
+        assert!(put_at(w.e2, &plan) < put_at(w.e2, &written));
+        assert!(now - minted <= 180_000 + PASS_INTERVAL_MS + 60_000);
+        left.push(behind(w.e2));
+        places.push(saved(&w).await.unwrap());
+    }
+    // One pass was not enough, by far, and no pass was idle.
+    let done = left.iter().position(|n| *n == 0).expect("every key");
+    assert!((3..=5).contains(&done), "{left:?}");
+    assert!(left[..done].windows(2).all(|w| w[1] < w[0]), "{left:?}");
+    // The walk went on from pass to pass: the place moved forward, and
+    // went back to the start only at the end of the keys.
+    assert!(places[..done].windows(2).all(|w| w[0] < w[1]), "{places:?}");
+    assert!(places[done..].iter().any(String::is_empty), "{places:?}");
+    // Nothing but what the source holds, each byte equal.
+    for key in w.safety.keys().iter().filter(|k| k.starts_with("m/")) {
+        assert_eq!(
+            w.e2.get(key),
+            w.safety.stored(key).map(|b| b.bytes),
+            "{key}"
+        );
+    }
+    assert_eq!(w.e2.puts(), OLD_RECORDS + 3 * PASSES as usize);
+}
+
+/// A fresh generation record goes after the article plans it names.
+/// While one of them is not written, the record is held back and
+/// counted; the pass after the plan appears sends both, plan first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fresh_generation_record_is_sent_after_its_article_plans() {
+    let w = World::new();
+    let key = generation(600_000, "_a");
+    let sealed = w.generation(&key, &["x_1", "x_2"]).await;
+    w.record("m/art/x_1", b"plan").await;
+    let counts = w.pass().await;
+    assert_eq!((counts.pending, counts.copied), (1, 1));
+    assert_eq!((counts.failed, counts.refused), (0, 0));
+    // The record itself and the plan that is there; the plan was sent
+    // by the sweep, so the walk found it equal.
+    assert_eq!((counts.records, counts.same), (2, 1));
+    assert!(w.e2.get(&key).is_none() && w.e2.get("m/art/x_1").is_some());
+
+    w.record("m/art/x_2", b"plan").await;
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    let counts = w.pass().await;
+    assert_eq!((counts.pending, counts.copied), (0, 2));
+    assert_eq!(w.e2.get(&key), Some(sealed));
+    assert!(put_at(w.e2, "m/art/x_2") < put_at(w.e2, &key));
+    // Each plan was sent once.
+    assert_eq!(w.e2.puts(), 3);
+
+    // A record that names no extent has nothing to wait for.
+    let empty = generation(500_000, "_b");
+    w.generation(&empty, &[]).await;
+    let counts = w.pass().await;
+    assert_eq!((counts.pending, counts.copied), (0, 1));
+    assert!(w.e2.get(&empty).is_some());
+}
+
+/// A record that was held back for an hour is no longer fresh: the walk
+/// copies it as it is. The same for one whose extents cannot be read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_generation_record_held_back_is_copied_by_the_walk_once_old() {
+    let w = World::new();
+    let held = generation(600_000, "_a");
+    let odd = generation(600_000, "_b");
+    let bad = generation(600_000, "_c");
+    w.generation(&held, &["x_never"]).await;
+    w.record(&odd, b"not a manifest").await;
+    w.record(&bad, br#"{"extents":[{"id":"../x_1"}]}"#).await;
+    let counts = w.pass().await;
+    assert_eq!((counts.pending, counts.source_unreadable), (1, 2));
+    assert_eq!((counts.copied, w.e2.puts()), (0, 0));
+    // No request named a key that the record made up.
+    assert!(w.e2.log.borrow().iter().all(|l| !l.contains("..")));
+
+    w.clock.advance_ms(FRESH_MS);
+    let counts = w.pass().await;
+    assert_eq!((counts.pending, counts.source_unreadable), (0, 0));
+    assert_eq!(counts.copied, 3);
+    for key in [&held, &odd, &bad] {
+        assert!(w.e2.get(key).is_some());
+    }
+}
+
+/// A generation record with more article plans than a job has room for
+/// is done over several jobs: the cursor keeps how many plans are over
+/// there, no plan is sent twice, and the record goes last.
+#[tokio::test(flavor = "current_thread")]
+async fn a_generation_record_with_more_plans_than_a_job_takes_several() {
+    let w = World::new();
+    let ids: Vec<String> = (0..600).map(|i| format!("x_{i:04}")).collect();
+    for id in &ids {
+        w.record(&format!("m/art/{id}"), b"plan").await;
+    }
+    let key = generation(600_000, "_big");
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    w.generation(&key, &ids).await;
+    let after = generation(500_000, "_next");
+    w.generation(&after, &[]).await;
+    let start = format!("m/g_{:013x}", NOW - FRESH_MS);
+    let at = |n: u32| format!("{{\"p\":\"g\",\"k\":\"{start}\",\"g\":\"{key}\",\"n\":{n}}}");
+
+    // The two records take two of the 250.
+    let first = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert_eq!(first.next, Some(at(248)));
+    assert_eq!((first.counts.copied, first.counts.records), (248, 0));
+    assert_eq!(first.walk, None);
+    let second = w.copier().step(UnixMs(NOW), &at(248)).await.unwrap();
+    assert_eq!(second.next, Some(at(496)));
+    assert_eq!(w.e2.puts(), 496);
+    // Neither it nor the record after it is over there yet.
+    assert!(w.e2.get(&key).is_none() && w.e2.get(&after).is_none());
+
+    let mut total = second.counts.copied + first.counts.copied;
+    let mut same = 0;
+    let mut cursor = second.next;
+    while let Some(at) = cursor {
+        let step = w.copier().step(UnixMs(NOW), &at).await.unwrap();
+        total += step.counts.copied;
+        same += step.counts.same;
+        cursor = step.next;
+    }
+    // 600 plans and two records, once each; the walk found the plans.
+    assert_eq!((total, same, w.e2.puts()), (602, 600, 602));
+    assert!(put_at(w.e2, "m/art/x_0599") < put_at(w.e2, &key));
+    assert!(w.e2.get(&after).is_some());
+
+    // A count in the cursor for another record, or a larger one than
+    // the record has plans, is not believed.
+    let small = generation(600_000, "_s");
+    for (named, n) in [(format!("{small}x"), 1), (small.clone(), 2)] {
+        let w = World::new();
+        w.generation(&small, &["x_1"]).await;
+        w.record("m/art/x_1", b"plan").await;
+        let lie = format!("{{\"p\":\"g\",\"k\":\"{start}\",\"g\":\"{named}\",\"n\":{n}}}");
+        w.copier().step(UnixMs(NOW), &lie).await.unwrap();
+        assert!(put_at(w.e2, "m/art/x_1").is_some());
+        assert!(put_at(w.e2, "m/art/x_1") < put_at(w.e2, &small));
+    }
+}
+
+/// A plan that is absent while an earlier job's count says it is over
+/// there cannot happen through the queue; a plan that fails, though,
+/// holds its record back and is counted.
+#[tokio::test(flavor = "current_thread")]
+async fn an_article_plan_that_cannot_be_sent_holds_the_record_back() {
+    let w = World::new();
+    let key = generation(600_000, "_a");
+    w.generation(&key, &["x_1", "x_2", "x_3"]).await;
+    for id in ["x_1", "x_2", "x_3"] {
+        w.record(&format!("m/art/{id}"), b"plan").await;
+    }
+    w.e2.put_500_keys.borrow_mut().push("m/art/x_2".into());
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert!(!step.outage);
+    let c = &step.counts;
+    // The plan fails for the sweep, and again for the walk.
+    assert_eq!((c.pending, c.failed, c.copied), (1, 2, 2));
+    assert!(w.e2.get(&key).is_none());
+
+    // A plan that does not open is never sent, and neither is the
+    // record while it is fresh.
+    let w = World::new();
+    w.generation(&key, &["x_1"]).await;
+    w.raw("m/art/x_1", b"not sealed".to_vec()).await;
+    let counts = w.pass().await;
+    // Counted by the sweep and again by the walk.
+    assert_eq!((counts.pending, counts.source_unreadable), (1, 2));
+    assert_eq!(w.e2.puts(), 0);
+
+    // The store is down while the plans are sent: the step says so,
+    // and the job comes again from the same cursor.
+    let w = World::new();
+    w.generation(&key, &["x_1", "x_2", "x_3"]).await;
+    for id in ["x_1", "x_2", "x_3"] {
+        w.record(&format!("m/art/{id}"), b"plan").await;
+    }
+    w.e2.put_status.set(Some(500));
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert!(step.outage);
+    assert_eq!((step.counts.pending, step.counts.failed), (1, 3));
+    let (outcome, _, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(outcome, JobOutcome::Retry { delay_secs: 60 });
+    assert_eq!(why, Some(StepError::Store(RemoteError::Unavailable)));
+    assert!(w.jobs.take().is_empty());
+    assert!(w.e2.get(&key).is_none());
+    w.e2.put_status.set(None);
+    let counts = w.pass().await;
+    assert_eq!((counts.pending, counts.copied), (0, 4));
+}
+
+/// The saved place only says where the walk starts. Whatever it holds,
+/// every record is reached: at once when the place is not one of the
+/// walk, and by the pass after the next when it lies in the middle.
+#[tokio::test(flavor = "current_thread")]
+async fn any_saved_place_of_the_walk_is_safe() {
+    let fresh_tombstone = format!("m/del/g_{:013x}_x", NOW - 600_000);
+    let fresh_generation = generation(600_000, "_x");
+    // Too long to be asked of the store; it sorts before every record.
+    let long = format!("m/a{}", "a".repeat(2_000));
+    let places: [&[u8]; 7] = [
+        b"",
+        b"\xff\xfe",
+        long.as_bytes(),
+        b"m/zzzz",
+        b"zzzz",
+        fresh_tombstone.as_bytes(),
+        fresh_generation.as_bytes(),
+    ];
+    for place in places {
+        let w = World::new();
+        let old = generation(OLD, "_o");
+        for key in ["m/art/x_1", "m/art/x_5", "m/del/g_0000000000001_t", &old] {
+            w.record(key, b"record").await;
+        }
+        w.raw(WALK_KEY, place.to_vec()).await;
+        let counts = w.pass().await;
+        assert_eq!(counts.copied, 4, "{place:?}");
+        // The saved place is not a record: never sent, never counted.
+        assert_eq!((counts.records, w.e2.objects.borrow().len()), (4, 4));
+    }
+
+    // In the middle: the walk goes on from there to the end, then the
+    // next pass starts over and reaches what lies before.
+    for (place, first) in [
+        ("m/art/x_3", 3),
+        ("m/del0", 1),
+        ("m/del/g_0000000000001_t", 1),
+    ] {
+        let w = World::new();
+        let old = generation(OLD, "_o");
+        for key in ["m/art/x_1", "m/art/x_5", "m/del/g_0000000000001_t", &old] {
+            w.record(key, b"record").await;
+        }
+        w.raw(WALK_KEY, place.as_bytes().to_vec()).await;
+        let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+        assert_eq!(why, None);
+        assert_eq!(counts.unwrap().copied, first, "{place}");
+        assert!(w.jobs.take().is_empty());
+        assert_eq!(saved(&w).await.as_deref(), Some(""));
+        let (_, counts, _) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+        assert_eq!(counts.unwrap().copied, 4 - first, "{place}");
+        assert_eq!(w.e2.objects.borrow().len(), 4);
+    }
+}
+
+/// A job of the walk saves its place when it is done, and only then; a
+/// pass that starts later goes on from it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_is_saved_job_by_job_and_a_later_pass_goes_on_from_it() {
+    let w = World::new();
+    for i in 0..=JOB_COPIES {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((counts.unwrap().copied as usize, why), (JOB_COPIES, None));
+    let last = format!("m/art/x_{:04}", JOB_COPIES - 1);
+    assert_eq!(saved(&w).await.as_deref(), Some(last.as_str()));
+    let sent = w.jobs.take();
+    assert!(matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == walk(&last)));
+
+    // That job is lost. The next pass copies the one record left, and
+    // lists nothing of what lies before the place.
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    w.e2.asked.borrow_mut().clear();
+    let pass = w.clock.now();
+    let (_, counts, why) = w.copier().run_job(&w.jobs, pass, "").await;
+    let counts = counts.unwrap();
+    assert_eq!((counts.copied, counts.same, why), (1, 0, None));
+    assert!(
+        w.e2.asked.borrow().iter().all(|a| *a >= last),
+        "{:?}",
+        w.e2.asked
+    );
+    assert_eq!(saved(&w).await.as_deref(), Some(""));
+
+    // A job of the fresh sweep saves nothing.
+    let w = World::new();
+    for i in 0..=JOB_COPIES {
+        w.generation(&generation(600_000, &format!("_{i:04}")), &[])
+            .await;
+    }
+    let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((counts.unwrap().copied as usize, why), (JOB_COPIES, None));
+    assert_eq!(saved(&w).await, None);
+}
+
+/// A safety bucket that takes no write of the saved place.
+struct NoMark<'a>(&'a MemBlobStore);
+
+impl BlobStore for NoMark<'_> {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        if key == WALK_KEY {
+            return Err(BridgeError::Blob("down".into()));
+        }
+        self.0.put(key, bytes, meta).await
+    }
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        self.0.get(key, span).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.0.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0.delete(key).await
+    }
+    async fn delete_record(&self, refused: &recovery::Unpublished) -> Result<()> {
+        self.0.delete_record(refused).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.0.list(prefix, start_after, limit).await
+    }
+}
+
+/// A place that cannot be saved is reported, and the pass goes on.
+#[tokio::test(flavor = "current_thread")]
+async fn a_place_that_cannot_be_saved_is_reported_and_the_pass_goes_on() {
+    let w = World::new();
+    for i in 0..=JOB_COPIES {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    let source = NoMark(&w.safety);
+    let copier = Copier {
+        safety: &source,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(outcome, JobOutcome::Ack);
+    assert_eq!(counts.unwrap().copied as usize, JOB_COPIES);
+    assert_eq!(why, Some(StepError::Mark));
+    let sent = w.jobs.take();
+    let Job::RecoveryCopy { cursor, .. } = &sent[0].job else {
+        panic!("another job");
+    };
+    let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), cursor).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, Some(StepError::Mark)));
+    assert_eq!(counts.unwrap().copied, 1);
+    assert_eq!(w.e2.objects.borrow().len(), JOB_COPIES + 1);
+}
+
+/// The parts of a pass meet without a gap and without an overlap: a
+/// record whose key is the very bound between two of them is looked at
+/// once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_at_a_bound_between_two_parts_is_copied_once() {
+    let w = World::new();
+    let bounds = [
+        "m/del0".to_string(),
+        format!("m/del/g_{:013x}", NOW - FRESH_MS),
+        format!("m/g_{:013x}", NOW - FRESH_MS),
+    ];
+    for key in &bounds {
+        w.record(key, b"record").await;
+    }
+    let counts = w.pass().await;
+    assert_eq!((counts.records, counts.copied, counts.same), (3, 3, 0));
+    assert_eq!(w.e2.puts(), 3);
+    // A copy without a source at a bound is counted once, too.
+    let w = World::new();
+    for key in &bounds {
+        w.e2.set(key, b"left over");
+    }
+    assert_eq!(w.pass().await.extra, 3);
+}
+
+/// Checks of article plans count against the bound of a job like
+/// copies do.
+#[tokio::test(flavor = "current_thread")]
+async fn article_plans_count_against_the_bound_of_a_job() {
+    let w = World::new();
+    for g in 0..100 {
+        let ids: Vec<String> = (0..5).map(|i| format!("x_{g:03}{i}")).collect();
+        for id in &ids {
+            w.record(&format!("m/art/{id}"), b"plan").await;
+        }
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        w.generation(&generation(600_000, &format!("_{g:03}")), &ids)
+            .await;
+    }
+    let first = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert!(first.next.is_some());
+    // The last group of six records may take the job a little past it.
+    let did = first.counts.copied as usize;
+    assert!((JOB_COPIES - 36..JOB_COPIES + 36).contains(&did), "{did}");
+    assert_eq!(w.e2.puts(), did);
+    let counts = w.pass().await;
+    assert_eq!(counts.copied as usize + did, 600);
+    assert_eq!(counts.pending, 0);
+}
+
+/// A plan that fails, or is refused, holds its record back: no put of
+/// the record is tried.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_is_not_tried_while_a_plan_failed_or_was_refused() {
+    let key = generation(600_000, "_a");
+    for refused in [false, true] {
+        let w = World::new();
+        w.generation(&key, &["x_1"]).await;
+        w.record("m/art/x_1", b"plan").await;
+        if refused {
+            w.e2.put_status.set(Some(403));
+        } else {
+            w.e2.damage_puts.set(true);
+        }
+        let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+        assert_eq!(step.counts.pending, 1, "{refused}");
+        assert!(put_at(w.e2, "m/art/x_1").is_some());
+        assert_eq!(put_at(w.e2, &key), None, "{refused}");
+    }
+
+    // The store goes down when the records themselves are sent.
+    let w = World::new();
+    for i in 0..3 {
+        w.generation(&generation(600_000, &format!("_{i}")), &[])
+            .await;
+    }
+    w.e2.put_status.set(Some(500));
+    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+    assert!(step.outage);
+    assert_eq!(step.counts.failed, 3);
+}
+
+/// A record with more plans than a job takes, one of which is not
+/// written: it is held back once, the pass goes on past it, and the
+/// record is not sent however many of its plans are over there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_large_record_with_a_plan_missing_is_passed_and_not_sent() {
+    let w = World::new();
+    let ids: Vec<String> = (0..300).map(|i| format!("x_{i:04}")).collect();
+    for id in &ids[1..] {
+        w.record(&format!("m/art/{id}"), b"plan").await;
+    }
+    let key = generation(600_000, "_big");
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    w.generation(&key, &ids).await;
+    let after = generation(500_000, "_next");
+    w.generation(&after, &[]).await;
+
+    let mut pending = 0;
+    let mut cursor = Some(String::new());
+    let mut jobs = 0;
+    while let Some(at) = cursor {
+        let step = w.copier().step(UnixMs(NOW), &at).await.unwrap();
+        pending += step.counts.pending;
+        cursor = step.next;
+        jobs += 1;
+        assert!(jobs < 10, "the pass does not get past the record");
+    }
+    assert_eq!(pending, 1);
+    assert_eq!(put_at(w.e2, &key), None);
+    assert!(w.e2.get(&after).is_some());
+    // Every plan that is there was sent once: by the sweep or the walk.
+    assert_eq!(w.e2.puts(), 300);
 }
