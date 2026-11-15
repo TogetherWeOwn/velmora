@@ -61,9 +61,15 @@ fn valid_path(path: &str) -> bool {
 }
 
 /// A lower-case host name without a port: a URL parser leaves it as it
-/// is. Labels of letters, digits and `-`, none empty.
+/// is. Labels of letters, digits and `-`, none empty, and the last one
+/// starts with a letter: a parser reads a last label that is a number
+/// (`127.1`, `0x7f.1`, `2130706433`) as an address and rewrites the host.
 fn valid_host(host: &str) -> bool {
     host.split('.').all(valid_name)
+        && host
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()))
 }
 
 /// Headers a caller may have signed, besides `x-amz-meta-*`. The signer
@@ -152,6 +158,11 @@ pub fn sign_request(
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
         || headers.iter().any(|(name, _)| !allowed_header(name))
+        // This crate's verifier reads a comma in such a value as two
+        // values that were merged, and refuses the request.
+        || headers
+            .iter()
+            .any(|(name, value)| name.starts_with("x-amz-meta-") && value.contains(','))
     {
         return Err(ErrorCode::InvalidArgument);
     }
@@ -329,7 +340,11 @@ fn once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
 /// - one root, and nothing but white space around it; the fields are
 ///   read under a root `ListBucketResult` only, so another root gives
 ///   no `IsTruncated` and is an error;
-/// - no DTD, CDATA or processing instruction;
+/// - no DTD, CDATA or processing instruction; a declaration only
+///   before the root; no comment inside a field;
+/// - no control character in a field, written as it is or as a
+///   reference (tab and line feed included). A key with one makes the
+///   whole page an error; the keys this is used for have none;
 /// - a field that is read is given once, is not empty and holds text
 ///   only (no element inside it);
 /// - an entry that lacks one of its three fields is an error;
@@ -378,10 +393,17 @@ pub fn parse_list(body: &[u8]) -> Result<ListedPage> {
                     return Err(bad);
                 }
             }
-            Event::Decl(_) | Event::Comment(_) => {}
+            // A declaration comes before the root, and a comment is
+            // never inside a field: `fal<!-- -->se` is not `false`.
+            Event::Decl(_) if !rooted => {}
+            Event::Comment(_) if !leaf => {}
             Event::Text(e) => {
                 let part = e.xml10_content();
-                if path.is_empty() && !part.trim().is_empty() {
+                // Around the root, white space only. In a field, no
+                // control character, as for a reference.
+                if (path.is_empty() && !part.trim().is_empty())
+                    || (leaf && part.chars().any(|c| c < ' '))
+                {
                     return Err(bad);
                 }
                 text.push_str(&part);

@@ -492,10 +492,22 @@ fn what_cannot_be_signed_unambiguously_is_refused() {
     // The host: a lower-case name, no port, nothing a URL parser changes.
     let secret = secret();
     let host_signs = |host: &str| sign_request(&test_key(&secret), host, NOW, &BASE).is_ok();
-    for host in ["store.example", "a-1.b2.example", "localhost"] {
+    for host in ["store.example", "a-1.b2.example", "localhost", "1.a2"] {
         assert!(host_signs(host), "{host}");
     }
     for host in [
+        // A last label that a URL parser reads as a number.
+        "127.0.0.1",
+        "127.1",
+        "0x7f.1",
+        "1.2.3",
+        "2130706433",
+        "010",
+        "09",
+        "a.1",
+        "a.0x",
+        "a.1b",
+        "a.-b",
         "",
         "Store.Example",
         "store.example:443",
@@ -740,4 +752,118 @@ fn e2_list_refuses_what_it_cannot_read_exactly() {
     }
     // White space and a declaration around the root are fine.
     assert!(parse_list(format!("<?xml version=\"1.0\"?>\n{whole}\n").as_bytes()).is_ok());
+}
+
+/// The set of characters that are neither refused in a path nor escaped
+/// in a query is exactly the unreserved set of SigV4.
+#[test]
+fn the_unreserved_set_is_exact() {
+    for c in 0u8..=0x7f {
+        let ch = c as char;
+        let plain = ch.is_ascii_alphanumeric() || "-_.~".contains(ch);
+        let path = format!("/bucket/a{ch}b");
+        // `/` only starts another segment.
+        assert_eq!(
+            signs(&Unsigned {
+                path: &path,
+                ..BASE
+            }),
+            plain || ch == '/',
+            "path {c:#04x}"
+        );
+        let value = format!("a{ch}b");
+        let query = [("prefix", value.as_str())];
+        let signed = sign(&Unsigned {
+            method: "GET",
+            query: &query,
+            ..BASE
+        });
+        let want = if plain {
+            format!("/bucket/a?prefix=a{ch}b")
+        } else {
+            format!("/bucket/a?prefix=a%{c:02X}b")
+        };
+        assert_eq!(signed.target, want, "query {c:#04x}");
+    }
+    // Without a query the target is the path alone.
+    assert_eq!(sign(&BASE).target, "/bucket/a");
+}
+
+/// A value this crate's own verifier would read as two merged values.
+#[test]
+fn a_comma_in_metadata_is_refused() {
+    for (name, value, ok) in [
+        ("x-amz-meta-a", "a,b", false),
+        ("x-amz-meta-a", ",", false),
+        ("x-amz-meta-a", "a;b", true),
+        ("content-type", "a,b", true),
+    ] {
+        let headers = [(name, value)];
+        let request = Unsigned {
+            headers: &headers,
+            ..BASE
+        };
+        assert_eq!(signs(&request), ok, "{name}: {value}");
+        if ok {
+            assert_eq!(check("PUT", &sign(&request)), Ok(()), "{name}: {value}");
+        }
+    }
+}
+
+/// A field is read at its own place only, whatever else an answer holds.
+#[test]
+fn e2_list_reads_a_field_only_at_its_place() {
+    use velmora_s3_proto::sign::parse_list;
+    // The same names elsewhere are not the fields.
+    let page = parse_list(&list_of(&format!(
+        "<Other><NextContinuationToken>t</NextContinuationToken>\
+         <EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>\
+         <Key>x</Key><Size>9</Size><ETag>z</ETag></Other>\
+         <Contents><Owner><Key>x</Key><Size>9</Size><ETag>z</ETag>\
+         <Contents><Key>y</Key></Contents></Owner>\
+         <Key>k</Key><ETag>e</ETag><Size>1</Size></Contents>{END}"
+    )))
+    .unwrap();
+    assert_eq!(page.objects.len(), 1);
+    let o = &page.objects[0];
+    assert_eq!((o.key.as_str(), o.size, o.etag.as_str()), ("k", 1, "e"));
+    assert!(!page.truncated && page.next_token.is_none());
+
+    // Names with a prefix, a comment and a declaration where XML has them.
+    let body = "<?xml version=\"1.0\"?><!-- a --><s:ListBucketResult xmlns:s=\"u\">\
+         <!-- b --><s:Contents><s:Key>k&#32;1</s:Key><!-- c --><s:ETag>e</s:ETag>\
+         <s:Size>1</s:Size></s:Contents><s:IsTruncated>false</s:IsTruncated>\
+         </s:ListBucketResult><!-- d -->";
+    let page = parse_list(body.as_bytes()).unwrap();
+    assert_eq!(page.objects[0].key, "k 1");
+
+    let entry = |key: &str| {
+        list_of(&format!(
+            "<Contents><Key>{key}</Key><ETag>e</ETag><Size>1</Size></Contents>{END}"
+        ))
+    };
+    assert!(parse_list(&entry("a b")).is_ok());
+    for key in [
+        // A comment or a declaration inside a field.
+        "a<!-- x -->b",
+        "a<?xml version=\"1.0\"?>b",
+        // A control character written as it is.
+        "a\u{1}b",
+        "a\tb",
+        "a\nb",
+        "a\r\nb",
+        "a\u{0}b",
+    ] {
+        assert!(parse_list(&entry(key)).is_err(), "{key:?}");
+    }
+    for body in [
+        // A declaration after the root has opened, or after it.
+        format!("<ListBucketResult><?xml version=\"1.0\"?>{ENTRY}{END}</ListBucketResult>"),
+        format!("<ListBucketResult>{ENTRY}{END}</ListBucketResult><?xml version=\"1.0\"?>"),
+        format!(
+            "<ListBucketResult>{ENTRY}<IsTruncated>fal<!-- -->se</IsTruncated></ListBucketResult>"
+        ),
+    ] {
+        assert!(parse_list(body.as_bytes()).is_err(), "{body}");
+    }
 }
