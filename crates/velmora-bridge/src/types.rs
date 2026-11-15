@@ -1064,6 +1064,15 @@ pub enum Job {
         v: u8,
         write: WriteId,
     },
+    /// One step of a pass of the recovery copy (`crate::copy`), from
+    /// `cursor`. `pass` is the time the pass started. Run by the adapter
+    /// that holds the recovery store, not by `run_job`: it needs no
+    /// catalogue and runs while the catalogue is closed.
+    RecoveryCopy {
+        v: u8,
+        pass: UnixMs,
+        cursor: String,
+    },
 }
 
 impl Job {
