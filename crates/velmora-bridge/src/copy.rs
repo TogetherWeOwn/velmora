@@ -18,7 +18,9 @@
 //!   it from being copied first.
 //! - **Tenant keys (`m/tk/`) never leave**, and neither do their names.
 //! - **What something else wrote over there is counted (`foreign`) and
-//!   passed.** It is never a copy, and it does not stop the pass.
+//!   passed.** It is never a copy, and it does not stop the pass. (One
+//!   exception: a key with a control character is refused by the
+//!   parser of the listing, so the step fails and says so.)
 //! - **No catalogue.** The pass reads the two stores and the clock, so
 //!   it runs while the catalogue is closed (rolled back, or a replay
 //!   unfinished) and trusts no cursor: a lost or repeated job only makes
@@ -381,8 +383,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         size >= OUTAGE_MIN && down == size
     }
 
-    /// What the store holds after `after`, up to and including `upto`
-    /// (`None` = to the end), from at most [`LIST_PAGES`] requests.
+    /// What the store holds after `after`, at least up to and including
+    /// `upto` (`None` = to the end), from at most [`LIST_PAGES`]
+    /// requests. The last answer may reach past `upto`; the caller
+    /// counts only what lies before its cursor.
     async fn listed(
         &self,
         after: &str,
@@ -409,10 +413,6 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 return Ok(range);
             }
             after = last;
-        }
-        if let Some(upto) = upto {
-            range.copies.retain(|o| o.key.as_str() <= upto.as_str());
-            range.foreign.retain(|k| k.as_str() <= upto.as_str());
         }
         Ok(range)
     }

@@ -48,6 +48,9 @@ pub const TRIES: u32 = 4;
 pub const FIRST_PAUSE_MS: u64 = 200;
 /// Keys asked for in one list request.
 pub const LIST_LIMIT: u32 = 1000;
+/// The longest key a store may name. A listed key becomes the place a
+/// caller goes on from, so its length is bounded here.
+pub const MAX_KEY_BYTES: usize = 1024;
 /// The longest answer body that is read to a `HEAD` or a `PUT`: none is
 /// used, an error text is small.
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
@@ -418,7 +421,8 @@ impl<H: HttpSend> S3Remote<H> {
     /// Up to [`LIST_LIMIT`] keys that start with `prefix` and sort after
     /// `start_after`, in key order, named by their key here (without
     /// the store's own prefix). An answer that is out of order or names
-    /// a key outside the range is an error. A key this module would not
+    /// a key outside the range or longer than [`MAX_KEY_BYTES`] is an
+    /// error. A key this module would not
     /// sign is no copy: it is given apart ([`CopyPage::foreign`]) and
     /// the listing goes on. An object that is the store's prefix itself
     /// (a "folder" made in a console) is left out altogether.
@@ -457,9 +461,9 @@ impl<H: HttpSend> S3Remote<H> {
             if object.key == *own {
                 continue;
             }
-            let key = object
-                .key
-                .strip_prefix(own.as_str())
+            let key = Some(object.key.as_str())
+                .filter(|k| k.len() <= MAX_KEY_BYTES)
+                .and_then(|k| k.strip_prefix(own.as_str()))
                 .filter(|k| k.starts_with(prefix) && *k > last.as_str())
                 .ok_or(RemoteError::Mismatch)?
                 .to_string();

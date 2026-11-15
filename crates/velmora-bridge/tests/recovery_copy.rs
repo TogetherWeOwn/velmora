@@ -66,6 +66,8 @@ struct FakeE2 {
     list_inner: RefCell<Option<String>>,
     /// The next n answers have a body one byte longer than was asked for.
     long_next: Cell<u32>,
+    /// A pause takes no time.
+    still: Cell<bool>,
     /// `start-after` of every list request, without the store's prefix.
     asked: RefCell<Vec<String>>,
 }
@@ -337,6 +339,9 @@ impl HttpSend for &FakeE2 {
 
     async fn pause(&self, ms: u64) {
         self.pauses.borrow_mut().push(ms);
+        if self.still.get() {
+            return;
+        }
         self.clock.as_ref().expect("a clock").advance_ms(ms as i64);
     }
 }
@@ -768,6 +773,12 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
             RemoteError::Mismatch,
         ),
         ("the start itself", "m/b", k("m/b"), RemoteError::Mismatch),
+        (
+            "a key longer than a store may have",
+            "",
+            k(&format!("m/{}", "a".repeat(1024 - own.len() - 1))),
+            RemoteError::Mismatch,
+        ),
         ("before the start", "m/b", k("m/a"), RemoteError::Mismatch),
         (
             "a foreign key out of order",
@@ -826,6 +837,11 @@ async fn a_list_answer_is_checked_against_what_was_asked() {
         assert_eq!(page.last.as_deref(), Some(key));
         assert!(page.truncated);
     }
+    // The longest key a store may have is accepted.
+    let longest = format!("m/{}", "a".repeat(1024 - own.len() - 2));
+    set(k(&longest));
+    let page = w.remote.list(&w.clock, "m/", "").await.unwrap();
+    assert_eq!(page.last, Some(longest));
     set(k("m/a") + &k("m/a b") + &k("m/b"));
     let page = w.remote.list(&w.clock, "m/", "").await.unwrap();
     let keys: Vec<_> = page.objects.iter().map(|o| o.key.as_str()).collect();
@@ -1077,13 +1093,6 @@ async fn pass_never_copies_tenant_keys() {
     for line in w.e2.log.borrow().iter().chain(w.e2.asked.borrow().iter()) {
         assert!(!line.contains("m/tk/"), "{line}");
     }
-    for sent in w.jobs.take() {
-        assert!(
-            matches!(&sent.job, Job::RecoveryCopy { cursor, .. } if !cursor.contains("m/tk/")),
-            "{:?}",
-            sent.job
-        );
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1119,9 +1128,14 @@ async fn pass_is_idempotent_second_pass_copies_nothing() {
     }
     assert_eq!(w.pass().await.copied, 7);
     let (puts, gets) = (w.e2.puts(), w.safety.gets());
+    let lists = w.e2.count("GET ");
     let counts = w.pass().await;
     assert_eq!((counts.copied, counts.same, counts.records), (0, 7, 7));
     assert_eq!(w.e2.puts(), puts);
+    // Two list requests: the range of the source page, and what
+    // follows it. An answer that is not cut is the last one.
+    assert_eq!(w.e2.count("GET "), lists + 2);
+    assert_eq!(w.e2.count("HEAD "), 7);
     // MemBlobStore lists by reading (the port's default); nothing more.
     assert_eq!(w.safety.gets(), gets + 7);
 }
@@ -1193,6 +1207,21 @@ async fn pass_never_deletes_extra_at_e2_and_counts_it() {
         assert!(w.e2.get(key).is_some());
     }
     assert_eq!(w.e2.objects.borrow().len(), 6);
+    // No list request more than is needed: one for the range of the
+    // source page, and one for what follows it, which is not cut.
+    assert_eq!(w.e2.count("GET "), 2);
+
+    // The same when an answer is cut exactly at the end of the page.
+    let w = World::new();
+    w.record("m/art/x_1", b"plan").await;
+    w.record("m/art/x_2", b"plan").await;
+    w.pass().await;
+    w.e2.set("m/zz", b"left over");
+    w.e2.page.set(2);
+    let lists = w.e2.count("GET ");
+    let counts = w.pass().await;
+    assert_eq!((counts.same, counts.extra), (2, 1));
+    assert_eq!(w.e2.count("GET "), lists + 2);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1630,6 +1659,8 @@ async fn a_source_page_cut_by_the_store_listing_loses_no_record() {
         }
         w.e2.set(&format!("{key}x"), b"left over");
     }
+    // One more, so that the second cut falls on a key the source lacks.
+    w.e2.set("m/art/s_034y", b"left over");
     w.e2.page.set(7);
 
     // Ten answers of seven keys: the first round ends at the 70th key.
@@ -1638,19 +1669,13 @@ async fn a_source_page_cut_by_the_store_listing_loses_no_record() {
     let first = w.copier().step("").await.unwrap();
     assert!(w.e2.asked.borrow().contains(&cut));
     assert_eq!(w.e2.get(&cut), w.safety.get(&cut, None).await.unwrap());
-    let mut total = first.counts;
-    let mut cursor = first.next;
-    while let Some(at) = cursor {
-        let step = w.copier().step(&at).await.unwrap();
-        total.records += step.counts.records;
-        total.same += step.counts.same;
-        total.copied += step.counts.copied;
-        total.extra += step.counts.extra;
-        cursor = step.next;
-    }
+    assert!(w.e2.asked.borrow().iter().any(|a| a == "m/art/s_068x"));
+    // One job walked all of it, cut after cut.
+    assert_eq!(first.next, None);
+    let total = first.counts;
     assert_eq!(
         (total.records, total.same, total.copied, total.extra),
-        (n, n / 2, n / 2, n + 1)
+        (n, n / 2, n / 2, n + 2)
     );
     for key in w.safety.keys() {
         assert_eq!(w.e2.get(&key), w.safety.get(&key, None).await.unwrap());
@@ -1658,8 +1683,139 @@ async fn a_source_page_cut_by_the_store_listing_loses_no_record() {
     let second = w.pass().await;
     assert_eq!(
         (second.records, second.same, second.copied, second.extra),
-        (n, n, 0, n + 1)
+        (n, n, 0, n + 2)
     );
+}
+
+/// The numbers the description of the copy gives.
+#[test]
+fn the_bounds_are_the_ones_described() {
+    use velmora_bridge::copy::*;
+    assert_eq!(PASS_INTERVAL_MS, 15 * 60 * 1000);
+    assert_eq!(START_WINDOW_MS, 5 * 60 * 1000);
+    assert_eq!(MIN_AGE_MS, 2 * 60 * 1000);
+    assert_eq!(RETRY_WINDOW_MS, 10 * 60 * 1000);
+    assert_eq!((JOB_COPIES, JOB_PAGES, JOB_MS), (250, 40, 20_000));
+    assert_eq!((CONCURRENCY, PAGE, LIST_PAGES), (6, 1000, 10));
+    assert_eq!((RETRY_SECS, OUTAGE_MIN), (60, 3));
+}
+
+/// The store's listing is cut at keys that something else wrote, and a
+/// job ends at one: the next job, the source listing and the store
+/// listing all go on from it, and each such key is counted once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_goes_on_from_a_key_that_something_else_wrote() {
+    let w = World::new();
+    for i in 0..25 {
+        w.e2.set(&format!("m/art/a {i:02}"), b"note");
+    }
+    w.record("m/art/x_1", b"plan").await;
+    w.e2.page.set(1);
+    let clock = TickClock(w.clock.clone());
+    let copier = Copier {
+        safety: &w.safety,
+        kek: &w.kek,
+        clock: &clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    // Ten list requests take the job to its cut and past half of its
+    // time; the second cut ends it.
+    let first = copier.step("").await.unwrap();
+    assert_eq!(first.next.as_deref(), Some("m/art/a 19"));
+    assert_eq!((first.counts.foreign, first.counts.records), (20, 0));
+    assert!(w.e2.asked.borrow().iter().any(|a| a == "m/art/a 09"));
+    let mut foreign = first.counts.foreign;
+    let mut copied = 0;
+    let mut cursor = first.next;
+    while let Some(at) = cursor {
+        let step = copier.step(&at).await.unwrap();
+        foreign += step.counts.foreign;
+        copied += step.counts.copied;
+        cursor = step.next;
+    }
+    assert_eq!((foreign, copied), (25, 1));
+    assert_eq!(w.e2.objects.borrow().len(), 26);
+}
+
+/// A job that ends where a source page ends in tenant keys sends a
+/// cursor that names none of them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
+    let w = World::new();
+    // Five copies and ten list requests take the job past its time
+    // before the next page.
+    for i in 0..5 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    // More tenant keys than fill the first source page.
+    for i in 0..1_000 {
+        w.raw(&format!("m/tk/t_{i:04}"), b"tenant key".to_vec())
+            .await;
+    }
+    w.record("m/x_9", b"plan").await;
+    for i in 0..9 {
+        w.e2.set(&format!("m/art/y_{i}"), b"left over");
+    }
+    w.e2.page.set(1);
+    let clock = TickClock(w.clock.clone());
+    let copier = Copier {
+        safety: &w.safety,
+        kek: &w.kek,
+        clock: &clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    let counts = counts.unwrap();
+    assert_eq!((counts.records, counts.copied), (5, 5));
+    assert!(w.e2.get("m/x_9").is_none());
+    let sent = w.jobs.take();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if cursor == "m/tk0"),
+        "{:?}",
+        sent[0].job
+    );
+}
+
+/// A copy with the MD5 of the record and another size is not equal: the
+/// record is sent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_of_another_size_is_not_equal() {
+    let w = World::new();
+    let sealed = w.record("m/art/x_1", b"plan").await;
+    assert_ne!(sealed.len(), 1);
+    *w.e2.list_inner.borrow_mut() = Some(format!(
+        "<IsTruncated>false</IsTruncated><Contents><Key>drill-1/m/art/x_1</Key>\
+         <ETag>&quot;{}&quot;</ETag><Size>1</Size></Contents>",
+        md5_hex(&sealed)
+    ));
+    // The forced answer is wrong for the listing that follows the
+    // page, so the step ends in an error; the copy was made before.
+    let _ = w.copier().step("").await;
+    assert_eq!(w.e2.puts(), 1);
+    assert_eq!(w.e2.get("m/art/x_1"), Some(sealed));
+}
+
+/// The store is found down by the last copies of a page: the step ends
+/// there for that reason, not because the tries took its time, and does
+/// not go on to the next page (where the source ends, and the outage
+/// would be forgotten).
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_that_finds_the_store_down_does_not_read_the_next_page() {
+    let w = World::new();
+    for i in 0..4 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    w.e2.put_status.set(Some(500));
+    w.e2.still.set(true);
+    let step = w.copier().step("").await.unwrap();
+    assert!(step.outage);
+    assert_eq!(step.next.as_deref(), Some("m/art/x_3"));
+    assert_eq!(step.counts.failed, 4);
+    assert_eq!(w.e2.count("GET "), 1);
 }
 
 /// The store goes down in the middle of a page: the step stops after
