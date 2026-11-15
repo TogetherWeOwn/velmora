@@ -59,6 +59,26 @@ fn guard_unpublished(write: &WriteId) -> Stmt {
     )
 }
 
+/// Fails the batch when the stamp counter is below `seen`, the value
+/// the caller found level with the stamp objects in `SAFETY`: the
+/// catalogue was restored to an earlier point since that check. `None`
+/// = the check found no stamp object at all, and there is nothing to
+/// be behind.
+fn guard_stamp(seen: Option<u64>) -> Result<Stmt> {
+    let seen = match seen {
+        None => SqlValue::Null,
+        Some(n) => SqlValue::Int(
+            i64::try_from(n)
+                .map_err(|_| BridgeError::Invalid("stamp counter exceeds the catalogue range"))?,
+        ),
+    };
+    Ok((
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE ?1 IS NOT NULL AND NOT EXISTS \
+           (SELECT 1 FROM rollback_stamp WHERE id = 1 AND counter >= ?1)",
+        vec![seen],
+    ))
+}
+
 pub(super) async fn open_intents<S: Sql>(
     c: &SqlCatalog<S>,
     write: &WriteId,
@@ -68,8 +88,9 @@ pub(super) async fn open_intents<S: Sql>(
     if extents.is_empty() {
         return Err(BridgeError::Invalid("a write has at least one slice"));
     }
-    // No intent is created under a replay: the replay emptied the table
-    // when it started and must find it empty when it ends.
+    // No intent is created under a replay: the replay removed the rows
+    // when it started (all but `kept` rows of records it does not read)
+    // and must find no other row when it ends.
     let mut stmts: Vec<Stmt> = Vec::with_capacity(1 + extents.len());
     stmts.push(guard_no_replay());
     for e in extents {
@@ -193,9 +214,11 @@ pub(super) async fn fence_intents<S: Sql>(
     c: &SqlCatalog<S>,
     write: &WriteId,
     open_before: UnixMs,
+    stamp: Option<u64>,
 ) -> Result<IntentFence> {
     let stmts = vec![
         guard_no_replay(),
+        guard_stamp(stamp)?,
         guard_unpublished(write),
         (
             "UPDATE write_intents SET state = 'sweeping' WHERE write_id = ?1 \
@@ -253,9 +276,11 @@ pub(super) async fn hold_intent_fence<S: Sql>(
     c: &SqlCatalog<S>,
     write: &WriteId,
     slices: usize,
+    stamp: Option<u64>,
 ) -> Result<bool> {
     let stmts = vec![
         guard_no_replay(),
+        guard_stamp(stamp)?,
         guard_unpublished(write),
         (
             "UPDATE write_intents SET state = 'sweeping' \
@@ -308,6 +333,7 @@ pub(super) async fn intent_stats<S: Sql>(
             "SELECT \
                COUNT(DISTINCT CASE WHEN state = 'kept' THEN write_id END), \
                COUNT(CASE WHEN state = 'kept' THEN 1 END), \
+               MIN(CASE WHEN state = 'kept' THEN created_at END), \
                COUNT(DISTINCT CASE WHEN state IN ('abandoned', 'sweeping') \
                  OR (state = 'open' AND created_at < ?1) THEN write_id END), \
                MIN(CASE WHEN state IN ('abandoned', 'sweeping') \
@@ -326,6 +352,7 @@ pub(super) async fn intent_stats<S: Sql>(
     Ok(IntentStats {
         kept_writes: r.num()?,
         kept_slices: r.num()?,
+        oldest_kept_at: r.opt_ms()?,
         waiting_writes: r.num()?,
         oldest_waiting_at: r.opt_ms()?,
         open_writes: r.num()?,

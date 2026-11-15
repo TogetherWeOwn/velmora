@@ -449,8 +449,13 @@ fn maintenance(rig: &mut Rig, mode: Maintenance) {
 /// The runbook's restore: maintenance on, the replay of every recovery
 /// record to its end, maintenance off.
 pub async fn restore(rig: &mut Rig) {
+    restore_from(rig, 0).await;
+}
+
+/// The same, of the records minted at or after `since_ms` only.
+pub async fn restore_from(rig: &mut Rig, since_ms: i64) {
     maintenance(rig, Maintenance::Restore);
-    let mut body = json!({ "since_ms": 0 });
+    let mut body = json!({ "since_ms": since_ms, "margin_ms": 0 });
     loop {
         let r = admin(rig, Method::Post, "/restore", body.to_string().as_bytes()).await;
         r.expect(200);

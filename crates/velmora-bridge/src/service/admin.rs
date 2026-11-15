@@ -1087,6 +1087,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
             "oldest_waiting_at": intents.oldest_waiting_at.map(|t| t.0),
             "kept_writes": intents.kept_writes,
             "kept_slices": intents.kept_slices,
+            "oldest_kept_at": intents.oldest_kept_at.map(|t| t.0),
             "anomalies": intents.anomalies,
         },
         // R2 as a hot tier. Pinned bytes are safety copies not yet

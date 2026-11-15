@@ -663,6 +663,577 @@ async fn the_publish_first_then_the_sweep_deletes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// A slice put that fails
+// ---------------------------------------------------------------------------
+
+/// Every put of a slice that was sent: its key and the SHA-256 of its
+/// bytes.
+fn slice_puts(rig: &Rig) -> Vec<(String, [u8; 32])> {
+    let puts = rig.bridge.safety.puts.borrow();
+    puts.iter()
+        .filter(|(key, _)| key.starts_with("x/"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_slice_put_that_fails_is_sent_again_with_the_same_bytes() {
+    // The put fails, or it is carried out and its answer is lost.
+    for trip in [Trip::Fail, Trip::Lost] {
+        for k in [1, 2, SLICES - 1] {
+            let s = setup().await;
+            let before = slice_puts(&s.rig).len();
+            // Stopped at the put of slice k - 1: the call after it trips.
+            let fut = s
+                .put_stopped(|p| p.rows == SLICES && p.blobs == k - 1)
+                .await;
+            let what = format!("{trip:?} at slice {k}");
+            let answer = resume_until(&s.rig, fut, 0, trip).await.done();
+            answer.expect(&what).expect(200);
+
+            let puts = slice_puts(&s.rig).split_off(before);
+            assert_eq!(puts.len(), SLICES + 1, "{what}");
+            assert_eq!(puts[k], puts[k + 1], "{what}: the same key and bytes");
+            let keys: BTreeSet<&String> = puts.iter().map(|(key, _)| key).collect();
+            assert_eq!(keys.len(), SLICES, "{what}");
+            assert!(s.body().await == s.new, "{what}");
+            assert!(broken(&s.rig).is_empty() && orphans(&s.rig).is_empty());
+            assert!(intents(&s.rig).is_empty(), "{what}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_slice_put_that_keeps_failing_ends_the_write_after_three_attempts() {
+    let s = setup().await;
+    let before = slice_puts(&s.rig).len();
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = Some("x/".into());
+    s.put().await.expect_error(500, "InternalError");
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+
+    let puts = slice_puts(&s.rig).split_off(before);
+    assert_eq!(puts.len(), 3);
+    assert!(puts.iter().all(|put| put == &puts[0]));
+    // No record can exist: the request gave its rows up.
+    assert_eq!(states(&s.rig), [("abandoned".to_string(), SLICES)]);
+    assert!(stamps(&s.rig).is_empty() && unpublished(&s.rig).is_empty());
+    assert_eq!(sweep_tick(&s.rig).await, 1);
+    assert!(orphans(&s.rig).is_empty() && intents(&s.rig).is_empty());
+    assert!(s.body().await == s.old);
+}
+
+// ---------------------------------------------------------------------------
+// The guards of the write path, one at a time
+// ---------------------------------------------------------------------------
+
+/// The publish batch inserts the extents of its commit and removes the
+/// intent rows of its write. It commits only when the two are the same
+/// slices.
+#[tokio::test(flavor = "current_thread")]
+async fn a_publish_whose_intents_name_other_extents_is_refused() {
+    let s = setup().await;
+    let fut = s.put_stopped(|p| p.record).await;
+    // The rows are open, under the id of the record and as many as the
+    // slices: they name other extents than the commit holds.
+    sql(
+        &s.rig,
+        "UPDATE write_intents SET extent_id = extent_id || 'z'",
+    );
+    let r = resume(&s.rig, fut).await;
+    assert!(r.status >= 500, "{}", r.text());
+    assert_eq!(s.rig.count("generations"), 1);
+    assert_eq!(s.rig.count("extents"), 1);
+    assert!(unpublished(&s.rig).is_empty(), "the record was removed");
+    assert_eq!(s.rig.count("write_intents"), SLICES as i64);
+    assert!(s.body().await == s.old);
+}
+
+/// A writer that no longer has all its rows `open` stops before it
+/// raises the stamp or writes a record, and leaves the rows as the
+/// sweep made them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_writer_whose_rows_are_not_open_writes_no_record() {
+    for tamper in [
+        "UPDATE write_intents SET state = 'sweeping'",
+        "UPDATE write_intents SET state = 'kept'",
+        "UPDATE write_intents SET state = 'sweeping' \
+          WHERE extent_id = (SELECT MIN(extent_id) FROM write_intents)",
+        "DELETE FROM write_intents WHERE extent_id = (SELECT MIN(extent_id) FROM write_intents)",
+        "DELETE FROM write_intents",
+    ] {
+        let s = setup().await;
+        let fut = s.put_stopped(|p| p.blobs == SLICES).await;
+        sql(&s.rig, tamper);
+        let rows = intents(&s.rig);
+        let r = resume(&s.rig, fut).await;
+        assert!(r.status >= 500, "{tamper}: {}", r.text());
+        // Neither the stamp nor a record: it stopped at its rows.
+        let at = point(&s.rig);
+        assert_eq!((at.counter, at.stamps), (0, 0), "{tamper}");
+        assert!(!at.named && !at.record && !at.published, "{tamper}");
+        // Giving up takes `open` rows only.
+        let after = intents(&s.rig);
+        assert_eq!(after.len(), rows.len(), "{tamper}");
+        for (was, is) in rows.iter().zip(&after) {
+            let expected = match was.state.as_str() {
+                "open" => "abandoned",
+                other => other,
+            };
+            assert_eq!(is.state, expected, "{tamper}");
+        }
+        assert!(s.body().await == s.old, "{tamper}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn giving_up_changes_open_rows_only() {
+    let s = setup().await;
+    drop(s.put_stopped(|p| p.blobs == SLICES).await);
+    s.rig.trip().disarm();
+    let write = WriteId::new(s.write());
+    let catalog = &s.rig.bridge.catalog;
+    for state in ["sweeping", "kept", "abandoned"] {
+        sql(
+            &s.rig,
+            &format!("UPDATE write_intents SET state = '{state}'"),
+        );
+        catalog.abandon_intents(&write).await.unwrap();
+        assert_eq!(states(&s.rig), [(state.to_string(), SLICES)]);
+    }
+    sql(&s.rig, "UPDATE write_intents SET state = 'open'");
+    catalog.abandon_intents(&write).await.unwrap();
+    assert_eq!(states(&s.rig), [("abandoned".to_string(), SLICES)]);
+}
+
+/// The put of the recovery record fails, or is carried out without an
+/// answer. The request cannot tell the two apart: its rows stay `open`,
+/// and the sweep decides after the grace period by what `SAFETY` holds.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_write_without_an_answer_leaves_the_rows_open() {
+    // Which call of the request puts the record.
+    let s = setup().await;
+    let calls = s.rig.trip().calls();
+    drop(s.put_stopped(|p| p.record).await);
+    // The last call counted is the one the request stopped at; the put
+    // of the record is the one before it.
+    let skip = s.rig.trip().calls() - calls - 2;
+
+    for trip in [Trip::Fail, Trip::Lost] {
+        let mut s = setup().await;
+        let ran = run_until(&s.rig, s.put(), skip, trip).await;
+        assert!(s.rig.trip().tripped());
+        ran.done()
+            .expect("an answer")
+            .expect_error(500, "InternalError");
+        let at = point(&s.rig);
+        assert_eq!(at.stamps, 1, "{trip:?}: the call was the put of the record");
+        assert_eq!(at.record, trip == Trip::Lost, "{trip:?}");
+        assert!(at.named && !at.published, "{trip:?}");
+        assert_eq!(states(&s.rig), [("open".to_string(), SLICES)], "{trip:?}");
+        assert_eq!(sweep_tick(&s.rig).await, 0, "{trip:?}");
+
+        s.rig.bridge.clock.advance_ms(DAY_MS);
+        assert_eq!(sweep_tick(&s.rig).await, 1, "{trip:?}");
+        if trip == Trip::Lost {
+            // The record exists: everything stays, and a replay
+            // publishes the write.
+            assert!(kept(&s.rig));
+            assert_eq!(orphans(&s.rig).len(), SLICES);
+            restore(&mut s.rig).await;
+            assert!(s.body().await == s.new);
+        } else {
+            assert!(orphans(&s.rig).is_empty() && intents(&s.rig).is_empty());
+            assert!(s.body().await == s.old);
+        }
+        assert!(broken(&s.rig).is_empty(), "{trip:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The guards of the sweep batches, one at a time
+// ---------------------------------------------------------------------------
+
+/// Intent rows of the write `w_guard` put next to the object of a
+/// [`Setup`], which is published.
+fn guard_rows(s: &Setup, state: &str, names: &str) -> WriteId {
+    let rows = match names {
+        // They name the extent of the object.
+        "extent" => format!(
+            "INSERT INTO write_intents(extent_id, write_id, state, created_at) \
+             SELECT id, 'w_guard', '{state}', 0 FROM extents"
+        ),
+        // They hold the id of its generation.
+        "generation" => format!(
+            "INSERT INTO write_intents(extent_id, write_id, state, created_at, generation_id) \
+             SELECT 'x_none', 'w_guard', '{state}', 0, id FROM generations"
+        ),
+        // Neither: the write was not published.
+        _ => format!(
+            "INSERT INTO write_intents(extent_id, write_id, state, created_at) \
+             VALUES ('x_none', 'w_guard', '{state}', 0)"
+        ),
+    };
+    sql(&s.rig, "DELETE FROM write_intents");
+    sql(&s.rig, &rows);
+    WriteId::new("w_guard")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_write_with_a_catalogue_row_is_neither_fenced_nor_held() {
+    let s = setup().await;
+    let catalog = &s.rig.bridge.catalog;
+    let all = blobs(&s.rig);
+    let now = s.rig.now();
+    for names in ["extent", "generation"] {
+        // The fence finds the write published: its rows go, counted.
+        let before = intent_status(&s.rig).await["anomalies"].as_u64().unwrap();
+        let write = guard_rows(&s, "abandoned", names);
+        assert_eq!(
+            catalog.fence_intents(&write, now, None).await.unwrap(),
+            IntentFence::Published,
+            "{names}"
+        );
+        assert_eq!(s.rig.count("write_intents"), 0, "{names}");
+        assert_eq!(
+            intent_status(&s.rig).await["anomalies"],
+            before + 1,
+            "{names}"
+        );
+
+        // Rows that are fenced already are not held either.
+        let write = guard_rows(&s, "sweeping", names);
+        assert!(
+            !catalog.hold_intent_fence(&write, 1, None).await.unwrap(),
+            "{names}"
+        );
+        // The same rows of a write that was not published are.
+        let write = guard_rows(&s, "sweeping", "nothing");
+        assert!(catalog.hold_intent_fence(&write, 1, None).await.unwrap());
+        // And the job deletes nothing of the published one.
+        let write = guard_rows(&s, "sweeping", names);
+        assert_eq!(s.sweep(write.as_str()).await, JobOutcome::Ack, "{names}");
+        assert_eq!(blobs(&s.rig), all, "{names}");
+        assert!(s.body().await == s.old, "{names}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn under_a_replay_no_intent_batch_goes_through() {
+    let s = setup().await;
+    let catalog = &s.rig.bridge.catalog;
+    let now = s.rig.now();
+    catalog
+        .restore_begin(UnixMs(0), now)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Fenced rows are not held.
+    let write = guard_rows(&s, "sweeping", "nothing");
+    assert!(!catalog.hold_intent_fence(&write, 1, None).await.unwrap());
+    // The rows of a published write stay, uncounted: under a replay
+    // the catalogue rows are no proof of anything.
+    for names in ["extent", "generation"] {
+        let write = guard_rows(&s, "abandoned", names);
+        assert_eq!(
+            catalog.fence_intents(&write, now, None).await.unwrap(),
+            IntentFence::Refused,
+            "{names}"
+        );
+        assert_eq!(states(&s.rig), [("abandoned".to_string(), 1)], "{names}");
+    }
+    assert_eq!(
+        number(
+            &s.rig,
+            "SELECT COUNT(*) FROM meta WHERE k = 'intent_anomalies'"
+        ),
+        0
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_fenced_rows_are_dropped_and_they_count_as_waiting() {
+    let s = setup().await;
+    let catalog = &s.rig.bridge.catalog;
+    for state in ["open", "abandoned", "kept"] {
+        let write = guard_rows(&s, state, "nothing");
+        catalog.drop_intents(&write).await.unwrap();
+        assert_eq!(states(&s.rig), [(state.to_string(), 1)]);
+    }
+    // A write a job left fenced is still to be swept, and is shown so.
+    let write = guard_rows(&s, "sweeping", "nothing");
+    let stats = intent_status(&s.rig).await;
+    assert_eq!(stats["waiting_writes"], 1);
+    assert_eq!(stats["oldest_waiting_at"], 0);
+    assert_eq!(stats["open_writes"], 0);
+    catalog.drop_intents(&write).await.unwrap();
+    assert_eq!(s.rig.count("write_intents"), 0);
+    assert_eq!(intent_status(&s.rig).await["waiting_writes"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// The stamp counter inside the fence and the hold
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_fence_and_the_hold_fail_below_the_counter_that_was_compared() {
+    let s = setup().await;
+    // A sliced write raised the stamp twice.
+    s.put_to("other", &s.new).await.expect(200);
+    let counter = u64::try_from(point(&s.rig).counter).unwrap();
+    assert_eq!(counter, 2);
+    let catalog = &s.rig.bridge.catalog;
+    let now = s.rig.now();
+
+    // The check saw a stamp object this catalogue does not know.
+    let write = guard_rows(&s, "abandoned", "nothing");
+    let ahead = Some(counter + 1);
+    assert_eq!(
+        catalog.fence_intents(&write, now, ahead).await.unwrap(),
+        IntentFence::Refused
+    );
+    assert_eq!(states(&s.rig), [("abandoned".to_string(), 1)]);
+    // Level with it, or above it, the fence goes through.
+    for seen in [Some(counter), Some(counter - 1), None] {
+        let write = guard_rows(&s, "abandoned", "nothing");
+        let fence = catalog.fence_intents(&write, now, seen).await.unwrap();
+        assert!(matches!(fence, IntentFence::Fenced { .. }), "{seen:?}");
+        assert!(!catalog.hold_intent_fence(&write, 1, ahead).await.unwrap());
+        assert_eq!(states(&s.rig), [("sweeping".to_string(), 1)]);
+        assert!(catalog.hold_intent_fence(&write, 1, seen).await.unwrap());
+    }
+    // A catalogue without a stamp row is behind every counter.
+    sql(&s.rig, "DELETE FROM rollback_stamp");
+    let write = guard_rows(&s, "abandoned", "nothing");
+    assert_eq!(
+        catalog.fence_intents(&write, now, Some(1)).await.unwrap(),
+        IntentFence::Refused
+    );
+    let write = guard_rows(&s, "sweeping", "nothing");
+    assert!(!catalog.hold_intent_fence(&write, 1, Some(1)).await.unwrap());
+}
+
+/// The database is restored between the rollback check of a sweep job
+/// and the batch that acts on it. The check was made on the catalogue
+/// as it was; the batch runs on the restored one and refuses.
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_between_the_rollback_check_and_its_batch_stops_the_job() {
+    let recorded = |s: &Setup| {
+        number(
+            &s.rig,
+            "SELECT COUNT(*) FROM rollback_stamp WHERE rolled_back_at IS NOT NULL",
+        )
+    };
+
+    // Before the fence.
+    let s = setup().await;
+    drop(s.put_stopped(|p| p.blobs == SLICES).await);
+    s.rig.trip().disarm();
+    let write = s.write();
+    s.rig.bridge.clock.advance_ms(DAY_MS);
+    snapshot(&s.rig);
+    s.put_to("other", &s.new).await.expect(200);
+    // The check is two calls; the job stops at the fence.
+    let job = run_until(&s.rig, start_job(&s.rig, sweep_job(&write)), 2, Trip::Stall)
+        .await
+        .stalled();
+    rollback(&s.rig);
+    assert_eq!(resume(&s.rig, job).await, JobOutcome::Ack);
+    assert_eq!(states(&s.rig), [("open".to_string(), SLICES)]);
+    assert_eq!(orphans(&s.rig).len(), 2 * SLICES, "nothing was deleted");
+    assert_eq!(recorded(&s), 0, "the batch refused, not a second check");
+
+    // Before the hold: the rows of the restored catalogue are fenced,
+    // as the job left them.
+    let s = setup().await;
+    drop(s.put_stopped(|p| p.blobs == SLICES).await);
+    s.rig.trip().disarm();
+    let write = s.write();
+    s.rig.bridge.clock.advance_ms(DAY_MS);
+    let job = step_to(&s.rig, start_job(&s.rig, sweep_job(&write)), |rig| {
+        states(rig) == [("sweeping".to_string(), SLICES)]
+    })
+    .await
+    .stalled();
+    snapshot(&s.rig);
+    resume(&s.rig, s.put_to("other", &s.new)).await.expect(200);
+    // The read of the fenced rows, the two calls of the second check,
+    // and the job stops at the hold.
+    let calls = s.rig.trip().calls();
+    let job = resume_until(&s.rig, job, 2, Trip::Stall).await.stalled();
+    assert_eq!(s.rig.trip().calls(), calls + 3);
+    rollback(&s.rig);
+    assert_eq!(resume(&s.rig, job).await, JobOutcome::Ack);
+    assert_eq!(states(&s.rig), [("sweeping".to_string(), SLICES)]);
+    assert_eq!(orphans(&s.rig).len(), 2 * SLICES, "nothing was deleted");
+    assert_eq!(recorded(&s), 0, "the batch refused, not a second check");
+}
+
+// ---------------------------------------------------------------------------
+// The start of a replay
+// ---------------------------------------------------------------------------
+
+/// A write that died between its record and its publish, marked `kept`
+/// by the sweep. Returns the id of its record and the time in it.
+async fn kept_write(s: &Setup) -> (String, i64) {
+    drop(s.put_stopped(|p| p.record).await);
+    s.rig.trip().disarm();
+    s.rig.bridge.clock.advance_ms(DAY_MS);
+    assert_eq!(sweep_tick(&s.rig).await, 1);
+    assert!(kept(&s.rig));
+    let record = unpublished(&s.rig);
+    assert_eq!(record.len(), 1);
+    let minted = i64::from_str_radix(&record[0][2..15], 16).unwrap();
+    (record[0].clone(), minted)
+}
+
+/// A kept row is the only sign of a record without an object. A replay
+/// that does not read the record must leave the row.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_that_starts_after_a_kept_record_leaves_its_rows() {
+    let mut s = setup().await;
+    let (record, minted) = kept_write(&s).await;
+    let oldest = intents(&s.rig)[0].created_at;
+    assert!(oldest <= minted);
+    let first = intent_status(&s.rig).await;
+    assert_eq!(first["kept_writes"], 1);
+    assert_eq!(first["oldest_kept_at"], oldest);
+
+    // A second write died at the same place a day later: its rows are
+    // open and hold the id of its record.
+    let fut = step_to(&s.rig, s.put_to("other", &s.new), |rig| {
+        records(rig).len() == 3
+    })
+    .await
+    .stalled();
+    drop(fut);
+    s.rig.trip().disarm();
+    assert_eq!(
+        states(&s.rig),
+        [("kept".to_string(), SLICES), ("open".to_string(), SLICES)]
+    );
+
+    // From after both records, and from one millisecond after the kept
+    // one: neither replay reads the kept record. The open rows go
+    // whether or not their record is read; only the kept rows stay.
+    for (since, unread) in [(s.rig.now().0 + 1, 2), (minted + 1, 1)] {
+        restore_from(&mut s.rig, since).await;
+        assert!(kept(&s.rig), "since {since}: only the kept rows stay");
+        assert_eq!(intent_status(&s.rig).await["kept_writes"], 1);
+        assert_eq!(intent_status(&s.rig).await["oldest_kept_at"], oldest);
+        let left = unpublished(&s.rig);
+        assert_eq!(left.len(), unread, "since {since}");
+        assert!(left.contains(&record), "since {since}");
+        assert_eq!(orphans(&s.rig).len(), unread * SLICES, "since {since}");
+        assert!(s.body().await == s.old, "since {since}");
+    }
+
+    // From the time of the record, or from `oldest_kept_at`: the replay
+    // publishes it, and its rows go with the first step.
+    restore_from(&mut s.rig, minted).await;
+    assert!(s.body().await == s.new);
+    assert!(intents(&s.rig).is_empty());
+    let last = intent_status(&s.rig).await;
+    assert_eq!(last["kept_writes"], 0);
+    assert!(last["oldest_kept_at"].is_null());
+    assert!(unpublished(&s.rig).is_empty() && orphans(&s.rig).is_empty());
+    assert!(broken(&s.rig).is_empty());
+
+    let mut s = setup().await;
+    kept_write(&s).await;
+    let oldest = intents(&s.rig)[0].created_at;
+    restore_from(&mut s.rig, oldest).await;
+    assert!(s.body().await == s.new);
+    assert!(intents(&s.rig).is_empty() && broken(&s.rig).is_empty());
+}
+
+/// Two begins read the mark of the replay before them and then write
+/// their own. The second one to write must not get the mark of the
+/// first: a cursor belongs to one replay.
+#[tokio::test(flavor = "current_thread")]
+async fn two_begins_at_once_get_two_marks() {
+    let s = setup().await;
+    let catalog = &s.rig.bridge.catalog;
+    let now = s.rig.now();
+    let mark = || number(&s.rig, "SELECT started_at FROM restore_state");
+    for round in 0..2 {
+        // The first begin has read the mark and stops at its batch.
+        let first = run_until(
+            &s.rig,
+            catalog.restore_begin(UnixMs(500), now),
+            1,
+            Trip::Stall,
+        )
+        .await
+        .stalled();
+        let second = catalog.restore_begin(UnixMs(500), now).await.unwrap();
+        let second = second.unwrap();
+        assert_eq!(mark(), second.0, "round {round}");
+        let first = resume(&s.rig, first).await.unwrap().unwrap();
+        assert!(first > second, "round {round}: {first:?} after {second:?}");
+        assert_eq!(mark(), first.0, "round {round}");
+    }
+}
+
+/// A begin read that the last replay had ended. Before its batch runs,
+/// the database is restored to a point at which that replay had not
+/// ended. The batch must hold the rule itself: a later restore point
+/// than the one of an unfinished replay is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn a_begin_does_not_move_an_unfinished_replay_to_a_later_point() {
+    let s = setup().await;
+    let catalog = &s.rig.bridge.catalog;
+    let now = s.rig.now();
+    let run = catalog.restore_begin(UnixMs(100), now).await.unwrap();
+    let run = run.unwrap();
+    snapshot(&s.rig);
+    sql(
+        &s.rig,
+        &format!(
+            "UPDATE restore_state SET state = 'complete', finished_at = {}",
+            now.0
+        ),
+    );
+
+    let later = run_until(
+        &s.rig,
+        catalog.restore_begin(UnixMs(500), now),
+        1,
+        Trip::Stall,
+    )
+    .await
+    .stalled();
+    rollback(&s.rig);
+    assert_eq!(resume(&s.rig, later).await.unwrap(), Err(UnixMs(100)));
+    assert_eq!(
+        column(
+            &s.rig,
+            "SELECT state || ' ' || since_ms || ' ' || started_at FROM restore_state"
+        ),
+        [format!("replaying 100 {}", run.0)]
+    );
+
+    // Another begin from a later point started and has not ended.
+    let s = setup().await;
+    let catalog = &s.rig.bridge.catalog;
+    let later = run_until(
+        &s.rig,
+        catalog.restore_begin(UnixMs(500), now),
+        1,
+        Trip::Stall,
+    )
+    .await
+    .stalled();
+    catalog
+        .restore_begin(UnixMs(100), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resume(&s.rig, later).await.unwrap(), Err(UnixMs(100)));
+    assert_eq!(number(&s.rig, "SELECT since_ms FROM restore_state"), 100);
+}
+
+// ---------------------------------------------------------------------------
 // A sweep job that dies
 // ---------------------------------------------------------------------------
 
@@ -983,10 +1554,16 @@ async fn a_started_replay_empties_the_intents_and_refuses_every_step() {
     sql(&s.rig, again);
     let open_before = s.rig.now();
     assert_eq!(
-        catalog.fence_intents(&write, open_before).await.unwrap(),
+        catalog
+            .fence_intents(&write, open_before, None)
+            .await
+            .unwrap(),
         IntentFence::Refused
     );
-    assert!(!catalog.hold_intent_fence(&write, SLICES).await.unwrap());
+    assert!(!catalog
+        .hold_intent_fence(&write, SLICES, None)
+        .await
+        .unwrap());
     assert_eq!(states(&s.rig), [("abandoned".to_string(), SLICES)]);
     sql(&s.rig, "UPDATE write_intents SET state = 'open'");
     let id = GenerationId::new("g_0000000000001aaaaaaaaaaaaaaaa");

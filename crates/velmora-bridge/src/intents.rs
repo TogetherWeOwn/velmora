@@ -9,7 +9,8 @@
 //! 1. the rollback check: no delete from a catalogue that is behind its
 //!    stamp;
 //! 2. the fence: one batch moves the rows to `sweeping`, and fails under
-//!    a replay or when the write has a catalogue row. The publish batch
+//!    a replay, when the write has a catalogue row, or when the stamp
+//!    counter is below the one step 1 compared. The publish batch
 //!    commits only over `open` rows, so a fenced write is never
 //!    published afterwards;
 //! 3. a recovery record of the write exists: the rows become `kept`,
@@ -53,16 +54,18 @@ where
     K: Kek,
     T: Clock,
 {
-    /// Whether a delete may go ahead: `Some(outcome)` ends the job.
-    async fn sweep_refused(&self) -> Option<JobOutcome> {
-        match self.catalogue_rolled_back().await {
-            Ok(false) => None,
+    /// Whether a delete may go ahead: `Err(outcome)` ends the job.
+    /// `Ok` holds the stamp counter the check found level with the
+    /// stamp objects; the batch that follows fails below it.
+    async fn sweep_allowed(&self) -> std::result::Result<Option<u64>, JobOutcome> {
+        match self.stamp_checked().await {
+            Ok(Some(counter)) => Ok(counter),
             // Behind its stamp: the rows may be those of acknowledged
             // objects. Nothing is deleted until the replay has run.
-            Ok(true) => Some(JobOutcome::Ack),
+            Ok(None) => Err(JobOutcome::Ack),
             // The check could not be made: the same as a rollback for
             // this run.
-            Err(_) => Some(crate::jobs::RETRY),
+            Err(_) => Err(crate::jobs::RETRY),
         }
     }
 
@@ -78,12 +81,13 @@ where
     }
 
     async fn sweep(&self, write: &WriteId) -> Result<JobOutcome> {
-        if let Some(outcome) = self.sweep_refused().await {
-            return Ok(outcome);
-        }
+        let stamp = match self.sweep_allowed().await {
+            Ok(stamp) => stamp,
+            Err(outcome) => return Ok(outcome),
+        };
         let fence = self
             .catalog
-            .fence_intents(write, open_before(self.clock.now()))
+            .fence_intents(write, open_before(self.clock.now()), stamp)
             .await?;
         let IntentFence::Fenced {
             generation,
@@ -107,10 +111,15 @@ where
         }
         // The checks once more, as late as possible: a restore of the
         // catalogue or a replay may have started since the fence.
-        if let Some(outcome) = self.sweep_refused().await {
-            return Ok(outcome);
-        }
-        if !self.catalog.hold_intent_fence(write, extents.len()).await? {
+        let stamp = match self.sweep_allowed().await {
+            Ok(stamp) => stamp,
+            Err(outcome) => return Ok(outcome),
+        };
+        if !self
+            .catalog
+            .hold_intent_fence(write, extents.len(), stamp)
+            .await?
+        {
             return Ok(JobOutcome::Ack);
         }
         for extent in &extents {

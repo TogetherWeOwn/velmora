@@ -207,6 +207,9 @@ pub struct Blobs {
     pub fail_put: Cell<bool>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
+    /// Every put that was sent, also one that failed: its key and the
+    /// SHA-256 of its bytes.
+    pub puts: RefCell<Vec<(String, [u8; 32])>>,
     /// The next list call waits until `list_held` is cleared again.
     pub hold_list: Cell<bool>,
     /// A list call is waiting.
@@ -254,6 +257,9 @@ impl std::ops::Deref for Blobs {
 
 impl BlobStore for Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.puts
+            .borrow_mut()
+            .push((key.to_string(), Sha256::digest(&bytes).into()));
         fire(&self.before_put, key);
         let holds = |key: &str| {
             let prefix = self.hold_put_prefix.borrow();

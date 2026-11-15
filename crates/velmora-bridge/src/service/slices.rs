@@ -10,6 +10,7 @@
 use futures_util::StreamExt;
 use velmora::rng::FillRandom;
 use velmora_s3_proto::{ErrorCode, UploadValidator};
+use zeroize::Zeroize;
 
 use crate::crypto::{seal_extent, DataKey, SealedExtent};
 use crate::ingress::{Charge, IngressError, UploadLengths};
@@ -64,6 +65,44 @@ pub(super) struct SliceSink<'a, B: BlobStore, R: FillRandom> {
     pub(super) rng: &'a mut R,
 }
 
+/// Puts of one slice before the write fails. A put is safe to send
+/// again: the key is the slice's own, and every attempt carries the same
+/// bytes.
+const PUT_ATTEMPTS: usize = 3;
+
+/// Randomness that can be drawn a second time. `put` takes the
+/// ciphertext, so a put that is sent again needs the slice sealed
+/// again, and it must come out byte for byte the same: an earlier
+/// attempt whose answer was lost may still land, before or after the
+/// later one, and the extent row must describe whichever is stored.
+struct Replay<'a, R: FillRandom> {
+    rng: &'a mut R,
+    /// What the first seal drew: a file key among it.
+    drawn: Vec<u8>,
+    at: usize,
+}
+
+impl<R: FillRandom> FillRandom for Replay<'_, R> {
+    fn fill_bytes(&mut self, dest: &mut [u8]) -> velmora::Result<()> {
+        let have = self.drawn.get(self.at..).unwrap_or_default();
+        let n = have.len().min(dest.len());
+        let (old, new) = dest.split_at_mut(n);
+        old.copy_from_slice(&have[..n]);
+        if !new.is_empty() {
+            self.rng.fill_bytes(new)?;
+            self.drawn.extend_from_slice(new);
+        }
+        self.at += n + new.len();
+        Ok(())
+    }
+}
+
+impl<R: FillRandom> Drop for Replay<'_, R> {
+    fn drop(&mut self) {
+        self.drawn.zeroize();
+    }
+}
+
 impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
     /// Seals `plain` as slice `stored.len()` and stores it.
     async fn store(
@@ -72,28 +111,39 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
         stored: &mut Vec<StoredSlice>,
     ) -> Result<(), SliceError> {
         let id = self.ids.get(stored.len()).ok_or(SliceError::Store)?;
-        let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, self.rng)
-            .map_err(|_| SliceError::Store)?;
-        let ciphertext = std::mem::take(&mut sealed.ciphertext);
-        let cipher_size = ciphertext.len() as u64;
-        self.safety
-            .put(
-                &id.safety_key(),
-                ciphertext,
-                &BlobMeta {
-                    bucket: self.bucket,
-                    extent: id,
-                    cipher_sha256: &sealed.cipher_sha256,
-                },
-            )
-            .await
-            .map_err(|_| SliceError::Store)?;
-        stored.push(StoredSlice {
-            plain_size: plain.len() as u64,
-            cipher_size,
-            sealed,
-        });
-        Ok(())
+        let mut rng = Replay {
+            rng: &mut *self.rng,
+            drawn: Vec::new(),
+            at: 0,
+        };
+        for _ in 0..PUT_ATTEMPTS {
+            rng.at = 0;
+            let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, &mut rng)
+                .map_err(|_| SliceError::Store)?;
+            let ciphertext = std::mem::take(&mut sealed.ciphertext);
+            let cipher_size = ciphertext.len() as u64;
+            let put = self
+                .safety
+                .put(
+                    &id.safety_key(),
+                    ciphertext,
+                    &BlobMeta {
+                        bucket: self.bucket,
+                        extent: id,
+                        cipher_sha256: &sealed.cipher_sha256,
+                    },
+                )
+                .await;
+            if put.is_ok() {
+                stored.push(StoredSlice {
+                    plain_size: plain.len() as u64,
+                    cipher_size,
+                    sealed,
+                });
+                return Ok(());
+            }
+        }
+        Err(SliceError::Store)
     }
 }
 

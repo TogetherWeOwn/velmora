@@ -117,6 +117,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         "{}",
         ingress::log_line(&method, &target, resp.status, &request_id)
     );
+    if let Some(line) = env::memory_line(&bridge) {
+        console_log!("{line}");
+    }
     Ok(http::to_response(resp))
 }
 

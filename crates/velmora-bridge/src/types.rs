@@ -1140,6 +1140,10 @@ pub struct IntentStats {
     pub kept_writes: u64,
     /// Safety blobs of those writes, at most one slice each.
     pub kept_slices: u64,
+    /// `created_at` of the oldest of them: its request began then, and
+    /// its recovery record is not older. A replay that starts no later
+    /// reads the record of every kept write.
+    pub oldest_kept_at: Option<UnixMs>,
     /// Writes the sweep has still to look at: given up by their request,
     /// or older than the grace period.
     pub waiting_writes: u64,

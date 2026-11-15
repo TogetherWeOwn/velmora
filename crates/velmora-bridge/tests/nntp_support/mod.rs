@@ -930,10 +930,10 @@ impl Catalog for MemCatalog {
     async fn due_intents(&self, _: UnixMs, _: u32) -> Result<Vec<WriteId>> {
         unused()
     }
-    async fn fence_intents(&self, _: &WriteId, _: UnixMs) -> Result<IntentFence> {
+    async fn fence_intents(&self, _: &WriteId, _: UnixMs, _: Option<u64>) -> Result<IntentFence> {
         unused()
     }
-    async fn hold_intent_fence(&self, _: &WriteId, _: usize) -> Result<bool> {
+    async fn hold_intent_fence(&self, _: &WriteId, _: usize, _: Option<u64>) -> Result<bool> {
         unused()
     }
     async fn keep_intents(&self, _: &WriteId) -> Result<()> {

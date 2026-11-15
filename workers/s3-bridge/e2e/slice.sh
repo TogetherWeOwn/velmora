@@ -480,7 +480,7 @@ if [[ ${E2E_SLICED:-1} == 1 ]]; then
     '.write_intents | (.sweep == "on" or .sweep == "off") and ([.open_writes, .waiting_writes, .kept_writes, .kept_slices, .anomalies] | all(type == "number"))' "$json"
   if [[ $MODE == local ]]; then
     jcheck "no write is open, waiting or kept after the uploads" \
-      '.write_intents == {sweep: "on", open_writes: 0, waiting_writes: 0, oldest_waiting_at: null, kept_writes: 0, kept_slices: 0, anomalies: 0}' "$json"
+      '.write_intents == {sweep: "on", open_writes: 0, waiting_writes: 0, oldest_waiting_at: null, kept_writes: 0, kept_slices: 0, oldest_kept_at: null, anomalies: 0}' "$json"
   fi
   log "write_intents: $(jq -c .write_intents <<<"$json")"
   # Deleted here, so that the later steps post and verify what they did before.

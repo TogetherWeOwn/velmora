@@ -10,7 +10,8 @@
 --   kept       the sweep found a recovery record and left the blobs
 -- `generation_id` is stored before the recovery record of that id is
 -- written, so a record of the write can always be found from its rows.
--- A replay of the recovery records empties the table when it starts.
+-- A replay of the recovery records removes the rows when it starts, all
+-- but the `kept` rows whose record it does not read.
 -- Additive only.
 
 CREATE TABLE write_intents (

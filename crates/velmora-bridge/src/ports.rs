@@ -387,12 +387,26 @@ pub trait Catalog {
     /// `open_before`.
     async fn due_intents(&self, open_before: UnixMs, limit: u32) -> Result<Vec<WriteId>>;
     /// Takes `write` for the sweep in one batch that fails while a
-    /// replay is under way or the write has a generation or extent row.
-    async fn fence_intents(&self, write: &WriteId, open_before: UnixMs) -> Result<IntentFence>;
+    /// replay is under way, the write has a generation or extent row,
+    /// or the stamp counter is below `stamp`: the counter the caller's
+    /// rollback check found level with the stamp objects (`None` = it
+    /// found no stamp object).
+    async fn fence_intents(
+        &self,
+        write: &WriteId,
+        open_before: UnixMs,
+        stamp: Option<u64>,
+    ) -> Result<IntentFence>;
     /// The checks of the fence once more, just before blobs are
     /// deleted. `true` = all `slices` rows are still `sweeping`, no
-    /// replay runs, and the write has no catalogue row.
-    async fn hold_intent_fence(&self, write: &WriteId, slices: usize) -> Result<bool>;
+    /// replay runs, the write has no catalogue row, and the stamp
+    /// counter is not below `stamp` (as for the fence).
+    async fn hold_intent_fence(
+        &self,
+        write: &WriteId,
+        slices: usize,
+        stamp: Option<u64>,
+    ) -> Result<bool>;
     /// A recovery record of the fenced write exists: its rows become
     /// `kept` and one anomaly is counted. Nothing is deleted.
     async fn keep_intents(&self, write: &WriteId) -> Result<()>;
@@ -586,6 +600,9 @@ pub trait Catalog {
     /// `Ok` = the mark of this replay: later than that of every replay
     /// before it. `Err` = refused: a replay from the restore point in
     /// the `Err` has not ended, and `since` is later than that point.
+    /// The start removes the write intents in its own batch, all but
+    /// the `kept` rows whose record the replay does not read (a record
+    /// from before `since`).
     async fn restore_begin(
         &self,
         since: UnixMs,

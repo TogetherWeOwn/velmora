@@ -157,16 +157,25 @@ where
     /// `Err` = the check could not be made. A caller that would delete
     /// something treats that like `true`.
     pub async fn catalogue_rolled_back(&self) -> Result<bool> {
+        Ok(self.stamp_checked().await?.is_none())
+    }
+
+    /// [`Self::catalogue_rolled_back`], with what it compared: `Some` =
+    /// not rolled back, and no stamp object exists after the one of the
+    /// counter in it (`Some(None)` = no stamp row and no stamp object).
+    /// A batch that acts on this answer holds the catalogue to that
+    /// counter: a database restored after the check is below it.
+    pub(crate) async fn stamp_checked(&self) -> Result<Option<Option<u64>>> {
         for _ in 0..ADVANCE_ATTEMPTS {
             let row = self.stamp_row().await?;
             if row.rolled_back {
-                return Ok(true);
+                return Ok(None);
             }
             if !self.stamp_ahead(row.counter).await? {
-                return Ok(false);
+                return Ok(Some(row.counter));
             }
             if self.stamp_behind(row.counter).await? {
-                return Ok(true);
+                return Ok(None);
             }
         }
         Err(BridgeError::Invalid(MOVING))

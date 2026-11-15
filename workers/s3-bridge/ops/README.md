@@ -336,6 +336,12 @@ a multipart upload stays at `MAX_EXTENT_BYTES`.
 - The request raises the rollback stamp before it writes its recovery
   record, and once more after the commit. If the first raise fails, it
   answers 503 `SlowDown` and publishes nothing.
+- Such a request counts two slices (16 MiB) against
+  `INFLIGHT_BUDGET_BYTES`, so with the shipped 48 MiB one isolate reads
+  three at once. A fourth waits a bounded time for room and then
+  answers 503 `SlowDown`. Measured on a test deployment: with three
+  95 MiB bodies at once in one isolate, its wasm memory stayed at
+  41.9 MiB or less (1.4 MiB before any large body).
 
 **The sweep** (`INTENT_SWEEP = "on"`, independent of `GC_MODE`) removes
 what such a request left. Each cron run sends a job for up to 20
@@ -360,20 +366,30 @@ deployed Worker has passed.
 |---|---|---|
 | `open_writes` | requests under way, and dead ones younger than a day | nothing to do |
 | `waiting_writes`, `oldest_waiting_at` | writes that are due for the sweep: bytes in `SAFETY` that no object uses | the sweep is off, a replay is unfinished, the catalogue is rolled back, or the cron could not send the jobs (it logs `dispatch: the sweep of unpublished writes was not sent`) |
-| `kept_writes`, `kept_slices` | writes with a recovery record and without an object in the catalogue: the request died between the two, or its publication was refused and the record could not be removed | run the restore steps above; the replay reads the records, and its first step empties the table |
+| `kept_writes`, `kept_slices`, `oldest_kept_at` | writes with a recovery record and without an object in the catalogue: the request died between the two, its publication was refused and the record could not be removed, or the database was restored to a point before the commit and the restore was not noticed | run the restore steps above with a `since_ms` no later than `oldest_kept_at`. The replay reads only the records from `since_ms` (less the margin) on: it publishes those, and its first step removes their rows. A `kept` row whose record is older than that stays, and so does the figure |
 | `anomalies` | how often a write was marked `kept`, ever; it does not go down | see `kept_writes` |
 
 These figures describe the catalogue as it is now. In a catalogue that
 was never restored, no client was told `200` for a write that is
 `open`, `waiting` or `kept`. After a restore of the database that no
 longer holds: the rows are those of the restored point, and a write
-that is `open` or `waiting` there may have been answered `200` later.
-Its recovery record is in `SAFETY`, the sweep deletes nothing of it
-(the rules above), and the replay publishes it. A row is never proof
-that an upload failed.
+that is `open`, `waiting` or `kept` there may have been answered `200`
+later. Its recovery record is in `SAFETY`, the sweep deletes nothing of
+it (the rules above), and a replay that starts before its record
+publishes it. A row is never proof that an upload failed.
 
-**With a restore.** The first step of a replay empties `write_intents`:
-a row of an earlier point may name slices that the replay publishes.
+One such restore is not found by the rollback check: to a point after
+the request raised the stamp and before its commit, when the request's
+raise after the commit failed and no cron run has raised the stamp
+since. The object was answered `200` and is missing from the catalogue.
+A day later the sweep finds its record and marks the write `kept`:
+treat `kept_writes` above 0 as an object that may be missing until a
+replay from `oldest_kept_at` or earlier has run.
+
+**With a restore.** The first step of a replay removes from
+`write_intents` every row but the `kept` rows whose record the replay
+does not read (a record from before its `since_ms`, less the margin): a
+row of an earlier point may name slices that the replay publishes.
 Slices of requests that were under way at that moment and never
 published stay in `SAFETY` without a row, and no figure counts them.
 

@@ -441,6 +441,19 @@ fn config_rejects_invalid_and_unsafe_values() {
     small.remove("MAX_PUT_BYTES");
     let cfg = load(&small).unwrap();
     assert_eq!((cfg.max_put_bytes, cfg.slice_bytes), (4_194_304, 4_194_304));
+    // More than 16 slices (99 MiB in slices of 4 MiB are 25): the error
+    // names the variable that was set, not the slice that followed from
+    // the extent.
+    small.remove("SLICE_BYTES");
+    assert_eq!(
+        set(&small, "MAX_PUT_BYTES", "103809024"),
+        invalid("MAX_PUT_BYTES")
+    );
+    small.insert("MAX_PUT_BYTES".into(), "103809024".into());
+    assert_eq!(
+        set(&small, "SLICE_BYTES", "4194304"),
+        invalid("SLICE_BYTES")
+    );
 
     // Shape and range.
     assert_eq!(set(&prod, "ENVIRONMENT", "staging"), invalid("ENVIRONMENT"));

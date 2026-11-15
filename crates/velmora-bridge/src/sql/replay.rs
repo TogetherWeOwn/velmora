@@ -21,6 +21,7 @@ use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::uploads::int;
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
+use crate::recovery::{start_after, GENERATION_PREFIX, RECORD_PREFIX};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::stamp::StampRow;
 use crate::types::{
@@ -282,6 +283,11 @@ pub(super) async fn restore_begin<S: Sql>(
             Some(_) => return Err(BridgeError::Sql("row decode: restore mark".into())),
         };
         let run = before.map_or(now.0, |mark| now.0.max(mark.saturating_add(1)));
+        // Every generation id the replay reads sorts after this one.
+        let first_key = start_after(GENERATION_PREFIX, since);
+        let first_read = first_key
+            .strip_prefix(RECORD_PREFIX)
+            .ok_or(BridgeError::Invalid("a record key without its prefix"))?;
         let stmts: Vec<Stmt> = vec![
             (
                 "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
@@ -301,7 +307,16 @@ pub(super) async fn restore_begin<S: Sql>(
             // these intents: they go in the batch that starts the
             // replay. Losing them leaves at most the blobs of writes
             // that were under way.
-            ("DELETE FROM write_intents", Vec::new()),
+            //
+            // A `kept` row stays when this replay does not read its
+            // record (one minted before `since`): the row is then still
+            // the only sign of a record without an object, and no sweep
+            // deletes anything of a `kept` write.
+            (
+                "DELETE FROM write_intents WHERE NOT \
+                   (state = 'kept' AND generation_id IS NOT NULL AND generation_id <= ?1)",
+                vec![text(first_read)],
+            ),
             (
                 "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
                  VALUES (1, 'replaying', ?1, ?2, NULL) \

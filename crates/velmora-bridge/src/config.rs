@@ -332,15 +332,22 @@ impl BridgeConfig {
         if max_put_bytes < max_extent_bytes || max_put_bytes > MAX_PUT_BYTES_LIMIT {
             return Err(ConfigError::Invalid("MAX_PUT_BYTES".into()));
         }
-        let slice_bytes =
-            optional_u64(&get, "SLICE_BYTES")?.unwrap_or(DEFAULT_SLICE_BYTES.min(max_extent_bytes));
+        let set_slice_bytes = optional_u64(&get, "SLICE_BYTES")?;
+        let slice_bytes = set_slice_bytes.unwrap_or(DEFAULT_SLICE_BYTES.min(max_extent_bytes));
         // A slice is an extent, and a maximal body stays within the
         // slice count one write may have.
-        if slice_bytes == 0
-            || slice_bytes > max_extent_bytes
-            || max_put_bytes.div_ceil(slice_bytes) > MAX_WRITE_SLICES
-        {
+        if slice_bytes == 0 || slice_bytes > max_extent_bytes {
             return Err(ConfigError::Invalid("SLICE_BYTES".into()));
+        }
+        if max_put_bytes.div_ceil(slice_bytes) > MAX_WRITE_SLICES {
+            // With `SLICE_BYTES` unset the slice follows from
+            // `MAX_EXTENT_BYTES`, and the limit that asks too much of it
+            // is the one that was set.
+            let cause = match set_slice_bytes {
+                Some(_) => "SLICE_BYTES",
+                None => "MAX_PUT_BYTES",
+            };
+            return Err(ConfigError::Invalid(cause.into()));
         }
         let intent_sweep = match get("INTENT_SWEEP").as_deref().map(str::trim) {
             None | Some("") | Some("off") => false,

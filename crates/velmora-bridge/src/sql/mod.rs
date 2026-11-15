@@ -180,11 +180,21 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn due_intents(&self, open_before: UnixMs, limit: u32) -> Result<Vec<WriteId>> {
         intents::due_intents(self, open_before, limit).await
     }
-    async fn fence_intents(&self, write: &WriteId, open_before: UnixMs) -> Result<IntentFence> {
-        intents::fence_intents(self, write, open_before).await
+    async fn fence_intents(
+        &self,
+        write: &WriteId,
+        open_before: UnixMs,
+        stamp: Option<u64>,
+    ) -> Result<IntentFence> {
+        intents::fence_intents(self, write, open_before, stamp).await
     }
-    async fn hold_intent_fence(&self, write: &WriteId, slices: usize) -> Result<bool> {
-        intents::hold_intent_fence(self, write, slices).await
+    async fn hold_intent_fence(
+        &self,
+        write: &WriteId,
+        slices: usize,
+        stamp: Option<u64>,
+    ) -> Result<bool> {
+        intents::hold_intent_fence(self, write, slices, stamp).await
     }
     async fn keep_intents(&self, write: &WriteId) -> Result<()> {
         intents::keep_intents(self, write).await
