@@ -55,6 +55,13 @@ jobs:
       # only main saves, so per-PR copies do not evict main's entries.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # `v1`: a new cache, begun when `cargo test` started to build the
+          # dependencies optimized (`[profile.test.package."*"]` in the root
+          # manifest). The cache key covers Cargo.lock and the manifests of
+          # the members, not the root manifest, so the old cache matched in
+          # full, was never saved again and kept the dependencies as they
+          # were built before. Change the prefix again with that profile.
+          prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -260,6 +267,13 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # `v1`: a new cache, begun when `cargo test` started to build the
+          # dependencies optimized (`[profile.test.package."*"]` in the root
+          # manifest). The cache key covers Cargo.lock and the manifests of
+          # the members, not the root manifest, so the old cache matched in
+          # full, was never saved again and kept the dependencies as they
+          # were built before. Change the prefix again with that profile.
+          prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
