@@ -151,6 +151,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                 if *v == JOB_VERSION {
                     recovery_copy(&env, &bridge, *pass, cursor).await
                 } else {
+                    console_error!("recovery copy: a job of another version was dropped");
                     JobOutcome::Ack
                 }
             }

@@ -1,5 +1,6 @@
 //! `impl JobSink` over Queues. A `Job` is sent as a JSON message. Post jobs
-//! go to `POST_Q`; verify, release and gc jobs go to `VERIFY_Q`.
+//! go to `POST_Q`; verify, release, gc and recovery-copy jobs go to
+//! `VERIFY_Q`.
 //!
 //! Dev only: `DEV_DROP_NOTIFY_N` makes the first `n` `send` calls of the
 //! isolate vanish while reporting success (a lost queue notification), so

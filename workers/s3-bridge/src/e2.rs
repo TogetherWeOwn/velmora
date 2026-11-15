@@ -44,7 +44,9 @@ async fn exchange(
     init.with_method(match request.method {
         "PUT" => Method::Put,
         "HEAD" => Method::Head,
-        _ => Method::Get,
+        "GET" => Method::Get,
+        // Nothing else is ever signed: not sent as something it is not.
+        _ => return Err(worker::Error::RustError("method".into())),
     })
     .with_headers(headers)
     .with_redirect(RequestRedirect::Manual);
