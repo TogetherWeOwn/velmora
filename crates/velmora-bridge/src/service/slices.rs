@@ -70,6 +70,10 @@ pub(super) struct SliceSink<'a, B: BlobStore, R: FillRandom> {
 /// bytes.
 const PUT_ATTEMPTS: usize = 3;
 
+/// Most bytes one seal may draw. A seal draws a file key, a stream
+/// nonce and a wrap nonce, 72 bytes in all.
+const REPLAY_CAP: usize = 128;
+
 /// Randomness that can be drawn a second time. `put` takes the
 /// ciphertext, so a put that is sent again needs the slice sealed
 /// again, and it must come out byte for byte the same: an earlier
@@ -77,9 +81,22 @@ const PUT_ATTEMPTS: usize = 3;
 /// later one, and the extent row must describe whichever is stored.
 struct Replay<'a, R: FillRandom> {
     rng: &'a mut R,
-    /// What the first seal drew: a file key among it.
+    /// What the first seal drew: a file key among it. It is allocated
+    /// once with room for `REPLAY_CAP` bytes and never grows: a buffer
+    /// that grows is copied to a new place, and the old place is freed
+    /// with the key still in it.
     drawn: Vec<u8>,
     at: usize,
+}
+
+impl<'a, R: FillRandom> Replay<'a, R> {
+    fn new(rng: &'a mut R) -> Self {
+        Self {
+            rng,
+            drawn: Vec::with_capacity(REPLAY_CAP),
+            at: 0,
+        }
+    }
 }
 
 impl<R: FillRandom> FillRandom for Replay<'_, R> {
@@ -89,8 +106,18 @@ impl<R: FillRandom> FillRandom for Replay<'_, R> {
         let (old, new) = dest.split_at_mut(n);
         old.copy_from_slice(&have[..n]);
         if !new.is_empty() {
+            // Refused before a byte is drawn: the buffer stays where
+            // it is.
+            if self.drawn.len() + new.len() > REPLAY_CAP {
+                return Err(velmora::Error::Bounds {
+                    bound: "randomness of one seal",
+                    limit: REPLAY_CAP as i64,
+                });
+            }
+            let room = self.drawn.capacity();
             self.rng.fill_bytes(new)?;
             self.drawn.extend_from_slice(new);
+            debug_assert_eq!(self.drawn.capacity(), room);
         }
         self.at += n + new.len();
         Ok(())
@@ -111,11 +138,7 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
         stored: &mut Vec<StoredSlice>,
     ) -> Result<(), SliceError> {
         let id = self.ids.get(stored.len()).ok_or(SliceError::Store)?;
-        let mut rng = Replay {
-            rng: &mut *self.rng,
-            drawn: Vec::new(),
-            at: 0,
-        };
+        let mut rng = Replay::new(&mut *self.rng);
         for _ in 0..PUT_ATTEMPTS {
             rng.at = 0;
             let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, &mut rng)
@@ -197,4 +220,81 @@ pub(super) async fn store_slices<B: BlobStore, R: FillRandom>(
         sink.store(&plain, &mut stored).await?;
     }
     Ok(stored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Counts up from zero: the next byte is the number of bytes drawn.
+    struct Count(u8);
+
+    impl FillRandom for Count {
+        fn fill_bytes(&mut self, dest: &mut [u8]) -> velmora::Result<()> {
+            for b in dest {
+                *b = self.0;
+                self.0 += 1;
+            }
+            Ok(())
+        }
+    }
+
+    /// Where the buffer is and how much it holds.
+    fn place<R: FillRandom>(rng: &Replay<'_, R>) -> (*const u8, usize) {
+        (rng.drawn.as_ptr(), rng.drawn.capacity())
+    }
+
+    /// The buffer holds a file key. It must stay in the one place it
+    /// was allocated at, so that the wipe on drop reaches every copy.
+    #[test]
+    fn replayed_randomness_stays_in_one_buffer() {
+        let bdk = DataKey::from_bytes([7; 32]);
+        let (bucket, id) = (BucketId::new("b_1"), ExtentId::new("x_1"));
+        let mut inner = Count(0);
+        let mut rng = Replay::new(&mut inner);
+        let at_first = place(&rng);
+        assert!(at_first.1 >= REPLAY_CAP);
+
+        let first = seal_extent(&bdk, &bucket, &id, b"slice", &mut rng).unwrap();
+        // A file key, a stream nonce and a wrap nonce.
+        assert_eq!(rng.drawn.len(), 32 + 16 + 24);
+        assert_eq!(place(&rng), at_first);
+
+        // The second seal draws the same bytes and nothing new.
+        rng.at = 0;
+        let second = seal_extent(&bdk, &bucket, &id, b"slice", &mut rng).unwrap();
+        assert!(first.ciphertext == second.ciphertext);
+        assert!(first.wrapped_file_key == second.wrapped_file_key);
+        assert_eq!(rng.drawn.len(), 32 + 16 + 24);
+        assert_eq!(place(&rng), at_first);
+        drop(rng);
+        assert_eq!(inner.0, 32 + 16 + 24);
+    }
+
+    #[test]
+    fn a_draw_past_the_buffer_is_refused_before_anything_is_drawn() {
+        let mut inner = Count(0);
+        let mut rng = Replay::new(&mut inner);
+        let at_first = place(&rng);
+
+        // The buffer takes exactly what it was allocated for.
+        let mut all = [0u8; REPLAY_CAP];
+        rng.fill_bytes(&mut all).unwrap();
+        assert_eq!(rng.drawn.len(), REPLAY_CAP);
+        let mut one = [0xaa];
+        assert!(rng.fill_bytes(&mut one).is_err());
+        assert_eq!(one, [0xaa]);
+
+        // A draw that is partly a replay is refused as a whole.
+        rng.at = REPLAY_CAP - 8;
+        let mut both = [0xaa; 16];
+        assert!(rng.fill_bytes(&mut both).is_err());
+        assert_eq!(both[8..], [0xaa; 8]);
+        assert_eq!(rng.at, REPLAY_CAP - 8);
+
+        assert_eq!(rng.drawn.len(), REPLAY_CAP);
+        assert_eq!(place(&rng), at_first);
+        drop(rng);
+        assert_eq!(usize::from(inner.0), REPLAY_CAP);
+    }
 }

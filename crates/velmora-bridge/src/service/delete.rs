@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use velmora::rng::{FillRandom, SystemRng};
 
-use super::common::{authenticate, internal, mutation_gate, restore_gate, unavailable};
+use super::common::{authenticate, internal, mutation_gate, restore_gate, writes_refused};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone};
 use crate::types::{RespBody, S3Request, S3Response};
@@ -110,7 +110,7 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         .await
         .map_err(|_| internal())?;
     match live {
-        Some((live, _)) if live.id < tombstone => Err(unavailable()),
+        Some((live, _)) if live.id < tombstone => Err(writes_refused()),
         _ => Ok(no_content()),
     }
 }

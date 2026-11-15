@@ -1,3 +1,20 @@
 [workspace]
 members = ["crates/velmora", "crates/velmora-test-nntp", "crates/velmora-ssrf-guard", "crates/velmora-s3-proto", "crates/velmora-bridge", "workers/s3-bridge"]
 resolver = "2"
+
+# `cargo test` only. The tests seal, encode, hash and read back hundreds of
+# megabytes, and at opt-level 0 that work alone took most of the native CI
+# job. The dependencies and the two library crates that do it are optimized
+# here; the bridge, its tests and every other member are not, so they build
+# as fast as before. Debug assertions and overflow checks stay on: they are
+# set by the `dev` profile, which `test` inherits, and not by the opt-level.
+# `cargo build`, `cargo check`, clippy and the release build of the Worker
+# do not use this profile.
+[profile.test.package."*"]
+opt-level = 3
+
+[profile.test.package.velmora]
+opt-level = 3
+
+[profile.test.package.velmora-s3-proto]
+opt-level = 3
