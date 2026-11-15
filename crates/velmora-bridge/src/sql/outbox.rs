@@ -14,7 +14,7 @@ use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, LEASE_SECS};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, BridgeError, Bucket, BucketId, DueRow, ExtentId,
     ExtentRow, ExtentState, FailClass, GenerationId, GenerationState, JobExtent, OutboxStage,
-    OutboxStats, Result, SafetyState, UnixMs, VerificationRow, VerifyResult,
+    OutboxStats, Result, SafetyState, UnixMs, VerificationRow, VerifyKind, VerifyResult,
 };
 
 /// Lease length. Jobs renew on a timer and before each read article.
@@ -60,11 +60,40 @@ macro_rules! latest {
     };
 }
 
-/// Whether that row is a full pass of the current plan.
+/// The articles a row found: read back and matching for a `body` row,
+/// present for a `stat` row. A `stat` row keeps `articles_ok` at 0, so a
+/// reader from before `kind` never takes it for a read-back.
+macro_rules! tally {
+    () => {
+        "(CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END)"
+    };
+}
+
+/// Whether that row is a complete pass of its kind for the current plan.
 macro_rules! counts {
     () => {
-        "(v.result = 'ok' AND v.articles_ok = v.articles_total \
-           AND v.articles_total = COALESCE(e.article_count, -1))"
+        concat!(
+            "(v.result = 'ok' AND ",
+            tally!(),
+            " = v.articles_total \
+               AND v.articles_total = COALESCE(e.article_count, -1))"
+        )
+    };
+}
+
+/// A row that is evidence for the release of extent `?1` at `?6`: the one
+/// that speaks for a backbone in the list `?7`, a complete pass, recorded
+/// under the current claim of the outbox row.
+macro_rules! fresh_pass {
+    () => {
+        concat!(
+            "v.extent_id = ?1 AND v.verified_at <= ?6 \
+               AND v.verified_at >= (SELECT updated_at FROM outbox WHERE extent_id = ?1) \
+               AND v.backbone IN (SELECT value FROM json_each(?7)) AND ",
+            counts!(),
+            " AND ",
+            latest!()
+        )
     };
 }
 
@@ -452,8 +481,9 @@ async fn renew_check<S: Sql>(c: &SqlCatalog<S>, l: &Lease) -> Result<bool> {
 // Verification and release
 // ---------------------------------------------------------------------------
 
-/// Appends one verification result under the lease; a full pass of the
-/// current plan also moves `extents.last_verified_at` forward.
+/// Appends one verification result under the lease; a full `body` pass of
+/// the current plan also moves `extents.last_verified_at` forward. A
+/// `stat` pass does not: nothing was read.
 pub(super) async fn record_verification<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -473,25 +503,32 @@ pub(super) async fn record_verification<S: Sql>(
         SqlValue::Int(i64::from(v.articles_ok)),
         SqlValue::Int(i64::from(v.articles_total)),
         text(v.result.as_str()),
+        text(v.kind.as_str()),
     ];
     let stmts = vec![
         (held_guard!(), lease_params(l, [])?),
         (
             // Two results for one backbone in the same millisecond: a
-            // failure is never replaced, so the pair cannot count as a pass.
+            // failure is never replaced, so the pair cannot count as a
+            // pass, and the kind is that of the result that stays. The
+            // tally of a `STAT` goes to `articles_present` (see `tally!`).
             "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
-               plan_rev, articles_ok, articles_total, result) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+               plan_rev, articles_ok, articles_present, articles_total, result, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
+               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9) \
              ON CONFLICT(extent_id, backbone, verified_at) DO UPDATE SET \
                provider_id = excluded.provider_id, plan_rev = excluded.plan_rev, \
-               articles_ok = excluded.articles_ok, articles_total = excluded.articles_total, \
-               result = excluded.result \
+               articles_ok = excluded.articles_ok, \
+               articles_present = excluded.articles_present, \
+               articles_total = excluded.articles_total, \
+               result = excluded.result, kind = excluded.kind \
              WHERE verifications.result = 'ok'",
             row,
         ),
         (
             "UPDATE extents SET last_verified_at = ?2 \
              WHERE id = ?1 AND ?3 = 'ok' AND ?4 = ?5 AND ?5 = article_count AND ?6 = plan_rev \
+               AND ?7 = 'body' \
                AND (last_verified_at IS NULL OR last_verified_at < ?2)",
             vec![
                 text(v.extent_id.as_str()),
@@ -500,6 +537,7 @@ pub(super) async fn record_verification<S: Sql>(
                 SqlValue::Int(i64::from(v.articles_ok)),
                 SqlValue::Int(i64::from(v.articles_total)),
                 SqlValue::Int(i64::from(v.plan_rev)),
+                text(v.kind.as_str()),
             ],
         ),
     ];
@@ -507,16 +545,18 @@ pub(super) async fn record_verification<S: Sql>(
 }
 
 /// Latest row per backbone for the extent's current plan. `counts` is true
-/// only for a full pass (`ok`, `articles_ok = articles_total =
-/// article_count`): a newer failure hides an older pass, and two providers
-/// on one backbone are one row.
+/// only for a complete pass of the row's `kind` (`ok`, `articles_ok =
+/// articles_total = article_count`): a newer failure hides an older pass,
+/// a newer `stat` pass hides an older `body` pass, and two providers on
+/// one backbone are one row.
 pub(super) async fn backbone_status<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<Vec<BackboneStatus>> {
     let sql = concat!(
-        "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, v.articles_ok, \
-           v.articles_total, v.result, ",
+        "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, ",
+        tally!(),
+        ", v.articles_total, v.result, v.kind, ",
         counts!(),
         " FROM verifications v JOIN extents e ON e.id = v.extent_id \
          WHERE v.extent_id = ?1 AND ",
@@ -535,6 +575,7 @@ pub(super) async fn backbone_status<S: Sql>(
             articles_ok: r.num()?,
             articles_total: r.num()?,
             result: r.parsed(VerifyResult::parse)?,
+            kind: r.parsed(VerifyKind::parse)?,
             counts: r.num::<i64>()? != 0,
         });
     }
@@ -543,14 +584,18 @@ pub(super) async fn backbone_status<S: Sql>(
 
 /// Authorizes unpinning the safety copy (it becomes evictable). One batch whose guard requires:
 /// the release lease still holds, a live generation references the extent, the copy is
-/// `held` (or `releasing`, when re-driven), and at least `required`
-/// backbones count with a row recorded under this claim (between the claim
-/// time and `now`). The lease must also be unexpired: an expired lease may
+/// `held` (or `releasing`, when re-driven), and the release rule holds over
+/// the rows recorded under this claim (between the claim time and `now`):
+/// at least `required` of the `counting` backbones have a complete pass,
+/// and at least one of those passes is a `body` pass. `stat` passes alone
+/// release nothing, and a pass on a backbone outside `counting` is not
+/// looked at. The lease must also be unexpired: an expired lease may
 /// be taken over at any moment. Anything else is `Lost`.
 pub(super) async fn begin_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
     required: u32,
+    counting: &[String],
     evidence_json: &str,
     now: UnixMs,
 ) -> Result<Guard<()>> {
@@ -559,6 +604,8 @@ pub(super) async fn begin_release<S: Sql>(
             "release needs a release lease and at least one required backbone",
         ));
     }
+    let labels =
+        serde_json::to_string(counting).map_err(|_| BridgeError::Invalid("backbone labels"))?;
     let guard = concat!(
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
         held!(),
@@ -568,17 +615,21 @@ pub(super) async fn begin_release<S: Sql>(
         " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
               AND safety_state IN ('held', 'releasing')) \
          OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
-              WHERE v.extent_id = ?1 AND v.verified_at <= ?6 \
-                AND v.verified_at >= (SELECT updated_at FROM outbox WHERE extent_id = ?1) AND ",
-        counts!(),
-        " AND ",
-        latest!(),
-        ") < ?5"
+              WHERE ",
+        fresh_pass!(),
+        ") < ?5 \
+         OR NOT EXISTS (SELECT 1 FROM verifications v JOIN extents e ON e.id = v.extent_id \
+              WHERE v.kind = 'body' AND ",
+        fresh_pass!(),
+        ")"
     );
     let stmts = vec![
         (
             guard,
-            lease_params(l, [SqlValue::Int(i64::from(required)), ms(now)])?,
+            lease_params(
+                l,
+                [SqlValue::Int(i64::from(required)), ms(now), text(&labels)],
+            )?,
         ),
         (
             "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \

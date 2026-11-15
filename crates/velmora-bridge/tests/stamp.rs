@@ -305,8 +305,10 @@ async fn a_rollback_closes_writes_and_stops_jobs_until_a_replay_ends() {
 
     // Writes are refused, reads are served, jobs do nothing.
     assert!(rig.bridge.catalogue_rolled_back().await.unwrap());
-    rig.put(&signer, BUCKET, "c", b"c").await.expect(503);
-    delete(&rig, &signer, "a").await.expect(503);
+    rig.put(&signer, BUCKET, "c", b"c")
+        .await
+        .expect_writes_refused();
+    delete(&rig, &signer, "a").await.expect_writes_refused();
     get(&rig, &signer, "a").await.expect(200);
     assert_eq!(
         rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,

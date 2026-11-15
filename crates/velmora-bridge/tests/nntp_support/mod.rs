@@ -242,6 +242,8 @@ pub struct OutboxRow {
     pub lease_until: Option<UnixMs>,
     pub cursor: u32,
     pub last_error: Option<FailClass>,
+    /// When the row was last claimed (`outbox.updated_at` at a claim).
+    pub claimed_at: UnixMs,
 }
 
 pub struct Entry {
@@ -338,6 +340,7 @@ impl MemCatalog {
             lease_until: None,
             cursor: 0,
             last_error: None,
+            claimed_at: T0,
         };
         self.entries.borrow_mut().insert(
             job.extent.id.clone(),
@@ -407,6 +410,7 @@ impl MemCatalog {
                 articles_ok: v.articles_ok,
                 articles_total: v.articles_total,
                 result: v.result,
+                kind: v.kind,
                 counts: v.result == VerifyResult::Ok
                     && v.articles_ok == v.articles_total
                     && Some(v.articles_total) == extent.article_count,
@@ -440,6 +444,7 @@ impl Catalog for MemCatalog {
         o.token += 1;
         o.attempts += 1;
         o.lease_until = Some(now.plus_secs(LEASE_SECS));
+        o.claimed_at = now;
         Ok(Some(Lease {
             extent: extent.clone(),
             generation: generation.clone(),
@@ -573,7 +578,7 @@ impl Catalog for MemCatalog {
                 return false;
             }
             e.verifications.push(v.clone());
-            if v.result == VerifyResult::Ok {
+            if v.result == VerifyResult::Ok && v.kind == VerifyKind::Body {
                 e.job.extent.last_verified_at = Some(v.verified_at);
             }
             true
@@ -593,12 +598,19 @@ impl Catalog for MemCatalog {
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
         let applied = self.fenced(l, |e| {
-            let counting = Self::statuses(e).iter().filter(|s| s.counts).count();
-            if counting < required as usize {
+            // As the SQL guard: only rows recorded under this claim.
+            let claimed = e.outbox.claimed_at;
+            let statuses = Self::statuses(e);
+            let passes = statuses
+                .iter()
+                .filter(|s| s.counts && s.verified_at >= claimed)
+                .map(|s| (s.backbone.as_str(), s.kind));
+            if !velmora_bridge::verify::releasable(passes, counting, required) {
                 return false;
             }
             e.job.extent.safety_state = SafetyState::Releasing;
@@ -1214,6 +1226,31 @@ pub struct Rig {
     /// One server per provider, in provider order (`p0`, `p1`, …).
     pub servers: Vec<TestNntpServer>,
     pub bridge: TestBridge,
+    /// The ports of the providers a test has unplugged, kept for as long
+    /// as the rig.
+    pub dead_ports: Vec<DeadPort>,
+}
+
+/// A local port nothing listens on, for as long as this value lives.
+///
+/// The socket is bound and never listens: a connect to the port is refused
+/// at once, and the port stays taken, so no server or client of a test
+/// running at the same time can be given it. A listener that is bound and
+/// dropped frees the port, and the next bind may get it.
+pub struct DeadPort {
+    socket: tokio::net::TcpSocket,
+}
+
+impl DeadPort {
+    pub fn reserve() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        Self { socket }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.socket.local_addr().unwrap().port()
+    }
 }
 
 /// A recognisable plaintext: any leak into an article is easy to find.
@@ -1264,6 +1301,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             pool: None,
             pool_max_conns: None,
             enabled: true,
+            release: true,
         });
         servers.push(server);
     }
@@ -1303,7 +1341,11 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         budget: ByteBudget::new(48 * 1024 * 1024),
         cfg,
     };
-    Rig { servers, bridge }
+    Rig {
+        servers,
+        bridge,
+        dead_ports: Vec::new(),
+    }
 }
 
 /// A single provider that posts and reads, two connections.

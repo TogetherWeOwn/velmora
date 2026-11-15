@@ -85,6 +85,18 @@ pub(super) fn unavailable() -> S3Response {
     resp
 }
 
+/// `503 ServiceUnavailable` with `Retry-After` for a write: nothing is
+/// published while the catalogue is being restored.
+pub(super) fn writes_refused() -> S3Response {
+    let mut resp = S3Response::error(
+        503,
+        "ServiceUnavailable",
+        "Writes are refused until the catalogue has been restored. Please try again later.",
+    );
+    resp.headers.push(("retry-after".into(), "30".into()));
+    resp
+}
+
 /// A protocol-crate response as a bridge response.
 pub(super) fn from_proto(r: velmora_s3_proto::Response) -> S3Response {
     S3Response {
@@ -307,7 +319,7 @@ pub(super) fn mutation_gate(
         return Err(S3Response::not_implemented());
     }
     if cfg.maintenance == Maintenance::Restore {
-        return Err(unavailable());
+        return Err(writes_refused());
     }
     if !REAL_DATA_READY && !bucket.disposable {
         return Err(s3_error(ErrorCode::AccessDenied));
@@ -415,7 +427,7 @@ pub(super) async fn restore_gate<
 ) -> Result<(), S3Response> {
     match bridge.catalog.restore_pending().await {
         Ok(false) => Ok(()),
-        Ok(true) => Err(unavailable()),
+        Ok(true) => Err(writes_refused()),
         Err(_) => Err(internal()),
     }
 }

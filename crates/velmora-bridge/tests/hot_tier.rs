@@ -96,6 +96,7 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
         pool: None,
         pool_max_conns: None,
         enabled: true,
+        release: true,
     }]);
     cfg.gc_mode = GcMode::Off;
     cfg.hot_cap_bytes = 0;

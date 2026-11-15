@@ -182,7 +182,9 @@ fn copier<'a>(
     }
 }
 
-/// One job of a pass of the recovery copy. Logs counts only.
+/// One job of a pass of the recovery copy. Logs counts only. A job
+/// that is retried does its work again and logs it again with
+/// `retry=true`: a sum over a pass takes the other lines only.
 async fn recovery_copy(
     env: &Env,
     bridge: &env::WorkerBridge,
@@ -213,24 +215,26 @@ async fn recovery_copy(
     }
     match counts {
         Some(c) if c.clean() && c.source_unreadable == 0 && !retry => console_log!(
-            "recovery copy: pass={} records={} bytes={} same={} copied={} young={} extra={} foreign={}",
+            "recovery copy: pass={} records={} bytes={} same={} copied={} young={} pending={} extra={} foreign={}",
             pass.0,
             c.records,
             c.bytes,
             c.same,
             c.copied,
             c.young,
+            c.pending,
             c.extra,
             c.foreign
         ),
         Some(c) => console_error!(
-            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} extra={} foreign={}",
+            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} pending={} extra={} foreign={}",
             pass.0,
             c.records,
             c.copied,
             c.failed,
             c.refused,
             c.source_unreadable,
+            c.pending,
             c.extra,
             c.foreign
         ),
@@ -299,6 +303,11 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
             if report.evict_failed {
                 console_error!("dispatch: hot-tier check failed");
+            }
+            if report.release_paused {
+                if let Some(warning) = bridge.cfg.release_paused() {
+                    console_error!("dispatch: {warning}");
+                }
             }
             if report.sweep_failed {
                 console_error!("dispatch: the sweep of unpublished writes was not sent");

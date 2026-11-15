@@ -2118,13 +2118,19 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     };
 
     arm();
-    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    rig.put(&signer, BUCKET, "a", b"two")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
-    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    rig.put(&signer, BUCKET, "new", b"new")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
-    copy(&rig, &signer, "a", "copy").await.expect(503);
+    copy(&rig, &signer, "a", "copy")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
     complete(&rig, &signer, "big", &id, &etags)
@@ -2138,7 +2144,7 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     // A delete answers 503 as well, and the object stays. Its tombstone
     // is on record, as that of any delete that failed.
     arm();
-    delete(&rig, &signer, "a").await.expect(503);
+    delete(&rig, &signer, "a").await.expect_writes_refused();
     disarm();
     assert_eq!(live_ids(&rig), live);
     assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
@@ -3196,4 +3202,44 @@ async fn a_plan_record_with_a_bad_yenc_name_is_unreadable() {
 /// The stamp counter as the last step of a replay would read it.
 async fn stamp_seen(rig: &Rig) -> Option<u64> {
     rig.bridge.catalog.stamp("main").await.unwrap().counter
+}
+
+/// The recovery copy sends a new generation record after the article
+/// plans it names, which it finds by the extents of the record as the
+/// service writes it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_generation_record_names_the_article_plans_of_its_extents() {
+    use velmora_bridge::crypto::open_manifest;
+    use velmora_bridge::recovery::{article_key, generation_key, plan_keys};
+
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"some bytes")
+        .await
+        .expect(200);
+    let (generation, extents) = rig.live(&bucket, "k").await.unwrap();
+    assert!(!extents.is_empty());
+    let name = generation_key(&generation.id);
+    let sealed = rig.bridge.safety.stored(&name).unwrap().bytes;
+    let plain = open_manifest(&rig.bridge.kek, &name, &sealed).unwrap();
+    let plans: Vec<String> = extents.iter().map(|x| article_key(&x.id)).collect();
+    assert_eq!(plan_keys(&plain), Some(plans));
+
+    assert_eq!(plan_keys(br#"{"extents":[]}"#), Some(Vec::new()));
+    let long = format!(r#"{{"extents":[{{"id":"x_{}"}}]}}"#, "a".repeat(65));
+    for bad in [
+        r#"{}"#,
+        r#"not json"#,
+        r#"{"extents":[{"id":"x_"}]}"#,
+        r#"{"extents":[{"id":"y_1"}]}"#,
+        r#"{"extents":[{"id":"x_1/../../x"}]}"#,
+        r#"{"extents":[{"id":"x_1"},{"id":"x_ 2"}]}"#,
+        r#"{"extents":[{"id":"x_é"}]}"#,
+        r#"{"extents":[{"seq":0}]}"#,
+        long.as_str(),
+    ] {
+        assert_eq!(plan_keys(bad.as_bytes()), None, "{bad}");
+    }
+    let most = format!(r#"{{"extents":[{{"id":"x_{}"}}]}}"#, "a".repeat(64));
+    assert_eq!(plan_keys(most.as_bytes()).map(|k| k.len()), Some(1));
 }

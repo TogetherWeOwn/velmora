@@ -89,6 +89,33 @@ pub fn start_after(prefix: &str, since: UnixMs) -> String {
     format!("{prefix}{ms:013x}")
 }
 
+/// The blob keys of the article plans that a generation record names,
+/// in the order of its extents, from the plaintext of the record.
+/// `None` = the plaintext does not name its extents, or names one that
+/// is not an extent id.
+pub fn plan_keys(plain: &[u8]) -> Option<Vec<String>> {
+    #[derive(Deserialize)]
+    struct Extent {
+        id: String,
+    }
+    #[derive(Deserialize)]
+    struct Named {
+        extents: Vec<Extent>,
+    }
+    let named: Named = serde_json::from_slice(plain).ok()?;
+    let id = |id: &str| {
+        id.strip_prefix("x_").is_some_and(|rest| {
+            (1..=64).contains(&rest.len())
+                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    };
+    named
+        .extents
+        .iter()
+        .map(|e| id(&e.id).then(|| format!("{ARTICLE_DIR}{}", e.id)))
+        .collect()
+}
+
 /// Reserved for tenant keys. It lies under [`RECORD_PREFIX`], so no
 /// delete removes such a key, and none of the record kinds above match
 /// it, so a replay does not read one as a record.

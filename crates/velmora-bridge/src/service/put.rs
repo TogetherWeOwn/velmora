@@ -22,7 +22,7 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, checksum_json, discard_refused, from_proto, internal, metadata_json,
-    mutation_gate, restore_gate, s3_error, unavailable,
+    mutation_gate, restore_gate, s3_error, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
@@ -352,7 +352,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         // A replay started after this request passed the gate.
         Ok(Guard::Lost) => {
             restore_gate(bridge).await?;
-            return Err(unavailable());
+            return Err(writes_refused());
         }
         Err(_) => return Err(internal()),
     }

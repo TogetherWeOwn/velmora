@@ -457,7 +457,7 @@ impl BridgeConfig {
         for pool in providers.iter_mut().filter_map(|p| p.pool.as_mut()) {
             *pool = pool.trim().to_lowercase();
         }
-        validate_providers(&providers, dev)?;
+        validate_providers(&providers, dev, required_backbones)?;
 
         let admin_token = required(&get, "ADMIN_TOKEN")?;
         if admin_token.len() < MIN_ADMIN_TOKEN_LEN {
@@ -494,9 +494,29 @@ impl BridgeConfig {
     pub fn is_dev(&self) -> bool {
         self.environment == Environment::Dev
     }
+
+    /// `Some(warning)` while the provider list has fewer backbones that
+    /// count toward a release than `REQUIRED_BACKBONES`. Reads and writes
+    /// go on; no pinned copy is released or given up, so everything
+    /// uploaded stays held until the list is put right. The text names
+    /// counts only, never a provider.
+    pub fn release_paused(&self) -> Option<String> {
+        let counting = crate::verify::release_labels(&self.providers).len();
+        (counting < self.required_backbones as usize).then(|| {
+            format!(
+                "release paused: {counting} backbone(s) count toward release, \
+                 REQUIRED_BACKBONES is {}; pinned copies stay held",
+                self.required_backbones
+            )
+        })
+    }
 }
 
-fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), ConfigError> {
+fn validate_providers(
+    providers: &[ProviderConfig],
+    dev: bool,
+    required_backbones: u32,
+) -> Result<(), ConfigError> {
     let bad = || ConfigError::Invalid("NNTP_PROVIDERS".into());
     if providers.is_empty() {
         return Err(bad());
@@ -548,6 +568,10 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
     if !usable(|p| p.post) || !usable(|p| p.read) {
         return Err(bad());
     }
+    // Fewer backbones that count toward a release than
+    // `REQUIRED_BACKBONES` is not refused here: the Worker has to keep
+    // serving. See [`Config::release_paused`].
+    let _ = required_backbones;
     Ok(())
 }
 

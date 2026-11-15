@@ -16,8 +16,8 @@ use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
     ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyResult,
-    WriteId,
+    ListPage, ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyKind,
+    VerifyResult, WriteId,
 };
 
 /// A retired generation's key is shredded this long after retirement;
@@ -828,7 +828,8 @@ pub(super) async fn object_status<S: Sql>(
         .sql
         .query(
             "SELECT v.extent_id, v.backbone, v.provider_id, v.verified_at, v.plan_rev, \
-               v.articles_ok, v.articles_total, v.result, e.article_count \
+               CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END, \
+               v.articles_total, v.result, v.kind, e.article_count \
              FROM verifications v JOIN extents e ON e.id = v.extent_id \
              WHERE e.id IN (SELECT extent_id FROM generation_extents WHERE generation_id = ?1) \
                AND v.plan_rev = e.plan_rev AND v.verified_at = \
@@ -849,6 +850,7 @@ pub(super) async fn object_status<S: Sql>(
             articles_ok: r.num()?,
             articles_total: r.num()?,
             result: r.parsed(VerifyResult::parse)?,
+            kind: r.parsed(VerifyKind::parse)?,
             counts: false,
         };
         let article_count: Option<u32> = r.opt_num()?;
