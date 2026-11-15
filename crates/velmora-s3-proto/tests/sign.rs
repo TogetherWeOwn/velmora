@@ -201,70 +201,364 @@ fn sigv4_signed_request_passes_own_verifier() {
     assert_eq!(check("GET", &list), Ok(()));
 }
 
+/// The published "GET Bucket Lifecycle" example: a query key without a
+/// value is signed as `lifecycle=`.
 #[test]
-fn a_changed_request_fails_the_verifier() {
-    let mut put = sign(&Unsigned {
-        method: "PUT",
-        path: "/bucket/a",
-        query: &[],
+fn sigv4_empty_query_value_matches_aws_test_vector() {
+    let signed = sign_request(
+        &doc_key(),
+        DOC_HOST,
+        NOW,
+        &Unsigned {
+            method: "GET",
+            path: "/",
+            query: &[("lifecycle", "")],
+            headers: &[],
+            payload_sha256: EMPTY_SHA256,
+        },
+    )
+    .unwrap();
+    assert_eq!(signed.target, "/?lifecycle=");
+    assert_eq!(
+        signature(&signed),
+        "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"
+    );
+}
+
+/// Unreserved characters are sent as they are, everything else escaped
+/// in upper-case hex.
+#[test]
+fn sigv4_query_escapes_all_but_unreserved() {
+    let signed = sign(&Unsigned {
+        method: "GET",
+        path: "/bucket",
+        query: &[("start-after", "a-b_c.d~e/f g+h=i&j")],
         headers: &[],
         payload_sha256: EMPTY_SHA256,
     });
-    put.target = "/bucket/b".into();
-    assert_eq!(check("PUT", &put), Err(ErrorCode::SignatureDoesNotMatch));
+    assert_eq!(
+        signed.target,
+        "/bucket?start-after=a-b_c.d~e%2Ff%20g%2Bh%3Di%26j"
+    );
+    assert_eq!(check("GET", &signed), Ok(()));
+}
+
+/// Every signed part is covered by the signature: a request changed
+/// after signing fails the verifier.
+#[test]
+fn a_changed_request_fails_the_verifier() {
+    let mismatch = Err(ErrorCode::SignatureDoesNotMatch);
+    let sha = "ab".repeat(32);
+    let put = Unsigned {
+        method: "PUT",
+        path: "/bucket/a",
+        query: &[],
+        headers: &[("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==")],
+        payload_sha256: &sha,
+    };
+    assert_eq!(check("PUT", &sign(&put)), Ok(()));
+    assert_eq!(check("GET", &sign(&put)), mismatch, "method");
+
+    let mut changed = sign(&put);
+    changed.target = "/bucket/b".into();
+    assert_eq!(check("PUT", &changed), mismatch, "path");
+
+    for (name, value) in [
+        ("content-md5", "XrY7u+Ae7tCTyyK7j1rNww==".to_owned()),
+        ("x-amz-content-sha256", "cd".repeat(32)),
+        ("x-amz-date", "20130524T000001Z".to_owned()),
+    ] {
+        let mut changed = sign(&put);
+        let slot = changed.headers.iter_mut().find(|(k, _)| k == name);
+        slot.unwrap().1 = value;
+        assert_eq!(check("PUT", &changed), mismatch, "{name}");
+    }
+
+    let list = Unsigned {
+        method: "GET",
+        path: "/bucket",
+        query: &[("list-type", "2"), ("prefix", "a/")],
+        headers: &[],
+        payload_sha256: EMPTY_SHA256,
+    };
+    assert_eq!(check("GET", &sign(&list)), Ok(()));
+    for target in [
+        "/bucket?list-type=2&prefix=b%2F",
+        "/bucket?list-type=2",
+        "/bucket?list-type=2&prefix=a%2F&start-after=a%2Fz",
+    ] {
+        let mut changed = sign(&list);
+        changed.target = target.into();
+        assert_eq!(check("GET", &changed), mismatch, "{target}");
+    }
+}
+
+fn test_key(secret: &[u8]) -> SigningKey<'_> {
+    SigningKey {
+        access_key: "AKIDEXAMPLE",
+        secret,
+        region: "us-east-1",
+    }
+}
+
+const BASE: Unsigned<'static> = Unsigned {
+    method: "PUT",
+    path: "/bucket/a",
+    query: &[],
+    headers: &[],
+    payload_sha256: EMPTY_SHA256,
+};
+
+fn signs(request: &Unsigned<'_>) -> bool {
+    sign_request(&test_key(&secret()), HOST, NOW, request).is_ok()
+}
+
+/// The signed path is the sent path: a path a URL parser would rewrite,
+/// or that needs an escape, is refused.
+#[test]
+fn a_path_that_a_client_would_rewrite_is_refused() {
+    for path in [
+        "/",
+        "/bucket",
+        "/bucket/a",
+        "/bucket/a.b/c-d_e~f",
+        "/b/..a",
+        "/b/a..",
+        "/b/...",
+    ] {
+        assert!(signs(&Unsigned { path, ..BASE }), "{path}");
+    }
+    for path in [
+        "",
+        "bucket/a",
+        "/bucket/../other/a",
+        "/bucket/a/..",
+        "/..",
+        "/bucket/./a",
+        "/bucket/a/.",
+        "/.",
+        "//other.example/a",
+        "/bucket//a",
+        "/bucket/a/",
+        "/bucket/",
+        "/bucket/a b",
+        "/bucket/a%2Fb",
+        "/bucket/a%2e%2e",
+        "/bucket/a?x",
+        "/bucket/a#x",
+        "/bucket/a\\b",
+        "/bucket/a\r\nb",
+        "/bucket/a\u{e9}",
+        "/bucket/a:b",
+        "/bucket/a@b",
+        "/bucket/a;b",
+    ] {
+        assert!(!signs(&Unsigned { path, ..BASE }), "{path:?}");
+    }
+}
+
+/// Only headers of the allow-list are signed, with values that are
+/// their own canonical form.
+#[test]
+fn only_allowed_headers_are_signed() {
+    for name in [
+        "content-md5",
+        "content-type",
+        "range",
+        "x-amz-meta-sha256",
+        "x-amz-meta-a-1",
+    ] {
+        let headers = [(name, "v")];
+        assert!(
+            signs(&Unsigned {
+                headers: &headers,
+                ..BASE
+            }),
+            "{name}"
+        );
+    }
+    for name in [
+        "authorization",
+        "host",
+        "x-amz-date",
+        "x-amz-content-sha256",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "accept-encoding",
+        "expect",
+        "x-amz-security-token",
+        "x-amz-acl",
+        "x-amz-meta-",
+        "x-amz-meta-a_b",
+        "x-amz-meta-A",
+        "Content-MD5",
+        "content-md5 ",
+        "",
+        "x-other",
+    ] {
+        let headers = [(name, "v")];
+        assert!(
+            !signs(&Unsigned {
+                headers: &headers,
+                ..BASE
+            }),
+            "{name:?}"
+        );
+    }
+    // The same header twice.
+    let twice = [("content-md5", "a"), ("content-md5", "b")];
+    assert!(!signs(&Unsigned {
+        headers: &twice,
+        ..BASE
+    }));
+
+    for value in ["a b", "bytes=0-9", "~!@#$%^&*()"] {
+        let headers = [("x-amz-meta-a", value)];
+        assert!(
+            signs(&Unsigned {
+                headers: &headers,
+                ..BASE
+            }),
+            "{value}"
+        );
+    }
+    for value in [
+        "",
+        " a",
+        "a ",
+        "two  spaces",
+        "a\r\nx-evil: 1",
+        "a\nb",
+        "a\tb",
+        "a\u{7f}",
+        "caf\u{e9}",
+    ] {
+        let headers = [("x-amz-meta-a", value)];
+        assert!(
+            !signs(&Unsigned {
+                headers: &headers,
+                ..BASE
+            }),
+            "{value:?}"
+        );
+    }
 }
 
 #[test]
 fn what_cannot_be_signed_unambiguously_is_refused() {
-    let refuse = |request: Unsigned<'_>| {
-        let secret = secret();
+    assert!(signs(&BASE));
+    for method in ["GET", "HEAD", "PUT"] {
+        assert!(signs(&Unsigned { method, ..BASE }));
+    }
+    for method in ["DELETE", "POST", "get", "", "PUT "] {
+        assert!(!signs(&Unsigned { method, ..BASE }), "{method:?}");
+    }
+
+    // The payload hash: 64 lower-case hex digits, nothing else.
+    let upper = EMPTY_SHA256.to_uppercase();
+    let not_hex = "g".repeat(64);
+    let short = &EMPTY_SHA256[..63];
+    for payload_sha256 in [
+        "UNSIGNED-PAYLOAD",
+        "",
+        upper.as_str(),
+        not_hex.as_str(),
+        short,
+    ] {
+        assert!(
+            !signs(&Unsigned {
+                payload_sha256,
+                ..BASE
+            }),
+            "{payload_sha256:?}"
+        );
+    }
+
+    // A query key once, not empty, and no signing parameter.
+    for query in [
+        &[("prefix", "a/"), ("prefix", "b/")][..],
+        &[("", "v")],
+        &[("X-Amz-Algorithm", "AWS4-HMAC-SHA256")],
+        &[("x-amz-signature", "00")],
+    ] {
+        assert!(!signs(&Unsigned { query, ..BASE }), "{query:?}");
+    }
+    assert!(signs(&Unsigned {
+        query: &[("prefix", "a/"), ("start-after", "a/")],
+        ..BASE
+    }));
+
+    // The host: a lower-case name, no port, nothing a URL parser changes.
+    let secret = secret();
+    let host_signs = |host: &str| sign_request(&test_key(&secret), host, NOW, &BASE).is_ok();
+    for host in ["store.example", "a-1.b2.example", "localhost"] {
+        assert!(host_signs(host), "{host}");
+    }
+    for host in [
+        "",
+        "Store.Example",
+        "store.example:443",
+        "store.example.",
+        ".store.example",
+        "store..example",
+        "store.example/x",
+        "user@store.example",
+        "a b",
+        "store.example\r\nx: y",
+        "[::1]",
+        "st\u{f6}re.example",
+    ] {
+        assert!(!host_signs(host), "{host:?}");
+    }
+
+    // The key and the region.
+    let with = |access_key: &str, region: &str| {
         let key = SigningKey {
-            access_key: "AKIDEXAMPLE",
+            access_key,
             secret: &secret,
-            region: "us-east-1",
+            region,
         };
-        assert!(sign_request(&key, HOST, NOW, &request).is_err());
+        sign_request(&key, HOST, NOW, &BASE).is_ok()
     };
-    let base = Unsigned {
-        method: "PUT",
-        path: "/bucket/a",
-        query: &[],
-        headers: &[],
-        payload_sha256: EMPTY_SHA256,
-    };
-    refuse(Unsigned {
-        method: "DELETE",
-        ..base
-    });
-    refuse(Unsigned {
-        path: "/bucket/a b",
-        ..base
-    });
-    refuse(Unsigned {
-        path: "/bucket/a%2Fb",
-        ..base
-    });
-    refuse(Unsigned {
-        path: "bucket/a",
-        ..base
-    });
-    refuse(Unsigned {
-        payload_sha256: "UNSIGNED-PAYLOAD",
-        ..base
-    });
-    refuse(Unsigned {
-        headers: &[("Content-MD5", "x")],
-        ..base
-    });
-    refuse(Unsigned {
-        headers: &[("x-amz-meta-a", "two  spaces")],
-        ..base
-    });
-    refuse(Unsigned {
-        headers: &[("host", "other.example")],
-        ..base
-    });
+    assert!(with("AKIDEXAMPLE", "us-east-1"));
+    for access_key in [
+        "",
+        "AKID/EXAMPLE",
+        "AKID EXAMPLE",
+        "AKID,EXAMPLE",
+        "AKID=EXAMPLE",
+        "AKID\nEXAMPLE",
+    ] {
+        assert!(!with(access_key, "us-east-1"), "{access_key:?}");
+    }
+    for region in [
+        "",
+        "us/east",
+        "US-EAST-1",
+        "us east",
+        "us-east-1\n",
+        "us.east",
+    ] {
+        assert!(!with("AKIDEXAMPLE", region), "{region:?}");
+    }
+
+    // The time: seconds, of a year of four digits.
+    let at = |unix_secs: i64| sign_request(&test_key(&secret), HOST, unix_secs, &BASE).is_ok();
+    for ok in [0, NOW, 253_402_300_799] {
+        assert!(at(ok), "{ok}");
+    }
+    for bad in [-1, 253_402_300_800, NOW * 1000, i64::MIN, i64::MAX] {
+        assert!(!at(bad), "{bad}");
+    }
 }
+
+fn list_of(inner: &str) -> Vec<u8> {
+    format!("<ListBucketResult>{inner}</ListBucketResult>").into_bytes()
+}
+
+const ENTRY: &str = "<Contents><Key>k</Key><ETag>e</ETag><Size>1</Size></Contents>";
+const END: &str = "<IsTruncated>false</IsTruncated>";
 
 #[test]
 fn e2_list_parses_keys_sizes_etags_and_truncation() {
@@ -298,17 +592,152 @@ fn e2_list_parses_keys_sizes_etags_and_truncation() {
     assert_eq!(parse_list(empty).unwrap().objects.len(), 0);
     assert!(!parse_list(empty).unwrap().truncated);
 
-    // Never a shorter list: an entry without a size, an answer without
-    // IsTruncated, another root, a cut body and a DTD are all errors.
-    for bad in [
-        &br#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>k</Key><ETag>e</ETag></Contents></ListBucketResult>"#[..],
-        br#"<ListBucketResult><Contents><Key>k</Key><ETag>e</ETag><Size>1</Size></Contents></ListBucketResult>"#,
-        br#"<Error><Code>AccessDenied</Code></Error>"#,
-        br#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>k</Key>"#,
-        br#"<!DOCTYPE x><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"#,
-        br#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>k</Key><ETag>e</ETag><Size>-1</Size></Contents></ListBucketResult>"#,
-        b"",
+    assert_eq!(page.next_token, None);
+    assert_eq!(
+        parse_list(&list_of(&format!("{ENTRY}{END}")))
+            .unwrap()
+            .objects
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn e2_list_reads_references_and_the_continuation_token() {
+    use velmora_s3_proto::sign::parse_list;
+    // Character references, decimal and hex, and the five named ones.
+    let page = parse_list(&list_of(&format!(
+        "<Contents><Key>&#65;&#x42;&#x63;&amp;&lt;&gt;&quot;&apos;&#233;</Key><ETag>e</ETag><Size>1</Size></Contents>{END}"
+    )))
+    .unwrap();
+    assert_eq!(page.objects[0].key, "ABc&<>\"'\u{e9}");
+
+    // A truncated page says where to go on: an object or the token.
+    let token =
+        "<IsTruncated>true</IsTruncated><NextContinuationToken>t&amp;1</NextContinuationToken>";
+    let page = parse_list(&list_of(&format!(
+        "<CommonPrefixes><Prefix>p/</Prefix></CommonPrefixes>{token}"
+    )))
+    .unwrap();
+    assert!(page.truncated && page.objects.is_empty());
+    assert_eq!(page.next_token.as_deref(), Some("t&1"));
+    let page = parse_list(&list_of(&format!("{ENTRY}<IsTruncated>true</IsTruncated>"))).unwrap();
+    assert!(page.truncated && page.next_token.is_none());
+    assert!(parse_list(&list_of("<IsTruncated>true</IsTruncated>")).is_err());
+
+    // Only an entry right under the root is an entry.
+    let nested = format!("<Other>{ENTRY}<IsTruncated>true</IsTruncated></Other>{END}");
+    let page = parse_list(&list_of(&nested)).unwrap();
+    assert!(page.objects.is_empty() && !page.truncated);
+
+    // Eight levels are read, nine are not.
+    let deep = |levels: usize| {
+        list_of(&format!(
+            "{}{}{END}",
+            "<a>".repeat(levels - 1),
+            "</a>".repeat(levels - 1)
+        ))
+    };
+    assert!(parse_list(&deep(8)).is_ok());
+    assert!(parse_list(&deep(9)).is_err());
+
+    // The size bound: a body of the limit is read, one byte more is not.
+    let mut body = list_of(&format!("{ENTRY}{END}"));
+    let pad = velmora_s3_proto::sign::MAX_LIST_BYTES - body.len();
+    body.extend(std::iter::repeat_n(b' ', pad));
+    assert_eq!(parse_list(&body).unwrap().objects.len(), 1);
+    body.push(b' ');
+    assert_eq!(parse_list(&body), Err(ErrorCode::InvalidRequest));
+}
+
+/// Never a shorter or another list: what a lenient parser would skip or
+/// guess is an error.
+#[test]
+fn e2_list_refuses_what_it_cannot_read_exactly() {
+    use velmora_s3_proto::sign::parse_list;
+    let good = format!("{ENTRY}{END}");
+    assert!(parse_list(&list_of(&good)).is_ok());
+    let entry = |fields: &str| format!("<Contents>{fields}</Contents>{END}");
+    for inner in [
+        // An entry without one of its fields.
+        entry("<ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>k</Key><Size>1</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag>"),
+        "<Contents/>".to_owned() + END,
+        // An empty field, as text or as an empty element.
+        entry("<Key></Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key/><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>k</Key><ETag></ETag><Size>1</Size>"),
+        entry("<Key>k</Key><ETag>\"\"</ETag><Size>1</Size>"),
+        entry("<Key>k</Key><ETag/><Size>1</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size></Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size/>"),
+        // A field given twice.
+        entry("<Key>k</Key><Key>l</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><ETag>f</ETag><Size>1</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size>1</Size><Size>2</Size>"),
+        format!("{ENTRY}{END}<IsTruncated>true</IsTruncated>"),
+        format!("{ENTRY}<IsTruncated>true</IsTruncated>{END}"),
+        format!("{ENTRY}{END}<NextContinuationToken>a</NextContinuationToken><NextContinuationToken>b</NextContinuationToken>"),
+        // Keys that the store says it encoded: none was asked for.
+        format!("{ENTRY}{END}<EncodingType>url</EncodingType>"),
+        format!("<EncodingType>url</EncodingType>{ENTRY}{END}"),
+        format!("{ENTRY}{END}<EncodingType/>"),
+        // An element inside a field.
+        entry("<Key>a<x>b</x>c</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a<x/>c</Key><ETag>e</ETag><Size>1</Size>"),
+        format!("{ENTRY}<IsTruncated>false<x/></IsTruncated>"),
+        // A size that is not digits only.
+        entry("<Key>k</Key><ETag>e</ETag><Size>-1</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size>+5</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size> 5</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size>1e3</Size>"),
+        entry("<Key>k</Key><ETag>e</ETag><Size>99999999999999999999</Size>"),
+        // References: a sign, a control character, an unknown name, a surrogate.
+        entry("<Key>&#+65;</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>&#x+41;</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a&#0;</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a&#10;b</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a&#x1f;b</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a&nbsp;b</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a&#xD800;b</Key><ETag>e</ETag><Size>1</Size>"),
+        entry("<Key>a&#;b</Key><ETag>e</ETag><Size>1</Size>"),
+        // No IsTruncated, or one that is not true or false.
+        ENTRY.to_owned(),
+        format!("{ENTRY}<IsTruncated>TRUE</IsTruncated>"),
+        format!("{ENTRY}<IsTruncated></IsTruncated>"),
+        format!("{ENTRY}<IsTruncated/>"),
+        format!("{ENTRY}{END}<NextContinuationToken></NextContinuationToken>"),
+        format!("{ENTRY}{END}<NextContinuationToken/>"),
+        // CDATA and a processing instruction.
+        entry("<Key><![CDATA[k]]></Key><ETag>e</ETag><Size>1</Size>"),
+        format!("<?pi x?>{good}"),
     ] {
-        assert!(parse_list(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        assert!(parse_list(&list_of(&inner)).is_err(), "{inner}");
     }
+    // Around the root: another root, a second root, text, a cut body, a DTD.
+    let whole = String::from_utf8(list_of(&good)).unwrap();
+    for body in [
+        "<Error><Code>AccessDenied</Code></Error>".to_owned(),
+        format!("<Other>{good}</Other>"),
+        format!("{whole}{whole}"),
+        format!("{whole}<x/>"),
+        format!("<x/>{whole}"),
+        format!("{whole}<x></x>"),
+        format!("{whole}<ListBucketResult></ListBucketResult>"),
+        format!("<x></x>{whole}"),
+        format!("text{whole}"),
+        format!("{whole}text"),
+        format!("&amp;{whole}"),
+        "<ListBucketResult/>".to_owned(),
+        whole[..whole.len() - 5].to_owned(),
+        format!("<ListBucketResult>{END}<Contents><Key>k</Key>"),
+        format!("<!DOCTYPE x>{whole}"),
+        String::new(),
+        " ".to_owned(),
+    ] {
+        assert!(parse_list(body.as_bytes()).is_err(), "{body}");
+    }
+    // White space and a declaration around the root are fine.
+    assert!(parse_list(format!("<?xml version=\"1.0\"?>\n{whole}\n").as_bytes()).is_ok());
 }
