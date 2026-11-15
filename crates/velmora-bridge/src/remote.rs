@@ -14,7 +14,8 @@
 //!   read ([`HttpRequest::max_answer`]).
 //! - A key is checked before it is signed: segments of letters, digits
 //!   and `-_.~`, none empty, `.` or `..`, so a request never leaves the
-//!   store's prefix. A listed key must pass the same check.
+//!   store's prefix. A listed key that does not pass the same check
+//!   is never taken for a copy.
 //! - A `PUT` carries `Content-MD5`, so the store refuses a body damaged
 //!   on the way, and is followed by a `HEAD` whose size and ETag must be
 //!   those of the bytes sent.
@@ -34,7 +35,7 @@ use sha2::{Digest, Sha256};
 /// The longest list answer that is read.
 pub use velmora_s3_proto::sign::MAX_LIST_BYTES;
 use velmora_s3_proto::sign::{
-    parse_list, sign_request, Listed, ListedPage, SigningKey, Unsigned, EMPTY_SHA256,
+    parse_list, sign_request, Listed, SigningKey, Unsigned, EMPTY_SHA256,
 };
 
 use crate::config::ConfigError;
@@ -47,6 +48,9 @@ pub const TRIES: u32 = 4;
 pub const FIRST_PAUSE_MS: u64 = 200;
 /// Keys asked for in one list request.
 pub const LIST_LIMIT: u32 = 1000;
+/// The longest key a store may name. A listed key becomes the place a
+/// caller goes on from, so its length is bounded here.
+pub const MAX_KEY_BYTES: usize = 1024;
 /// The longest answer body that is read to a `HEAD` or a `PUT`: none is
 /// used, an error text is small.
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024;
@@ -122,6 +126,21 @@ pub enum RemoteError {
     /// The request cannot be signed: a key outside the safe alphabet, or
     /// with an empty, `.` or `..` segment. Nothing was sent.
     Unsignable,
+}
+
+/// One page of what the store holds under the prefix, in key order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopyPage {
+    /// The copies, named by their key here.
+    pub objects: Vec<Listed>,
+    /// Keys that this module would not sign, so something else wrote
+    /// them (a console, another tool). None of them is a copy.
+    pub foreign: Vec<String>,
+    /// There is more after this page.
+    pub truncated: bool,
+    /// The last key of the page, of either kind: the next page starts
+    /// after it.
+    pub last: Option<String>,
 }
 
 /// `RECOVERY_COPY` and the `E2_*` values, validated. `Debug` shows
@@ -399,20 +418,20 @@ impl<H: HttpSend> S3Remote<H> {
         }
     }
 
-    /// Up to [`LIST_LIMIT`] copies whose key starts with `prefix` and
-    /// sorts after `start_after`, in key order, named by their key here
-    /// (without the store's own prefix). An answer that is out of order,
-    /// or names a key outside the range or one this module would not
-    /// sign, is an error. An object that is the store's prefix itself (a
-    /// "folder" made in a console) is no copy and is left out. Any other
-    /// key that ends in `/` is an error like every key this module would
-    /// not sign: nothing but this module writes under the prefix.
+    /// Up to [`LIST_LIMIT`] keys that start with `prefix` and sort after
+    /// `start_after`, in key order, named by their key here (without
+    /// the store's own prefix). An answer that is out of order or names
+    /// a key outside the range or longer than [`MAX_KEY_BYTES`] is an
+    /// error. A key this module would not
+    /// sign is no copy: it is given apart ([`CopyPage::foreign`]) and
+    /// the listing goes on. An object that is the store's prefix itself
+    /// (a "folder" made in a console) is left out altogether.
     pub async fn list<T: Clock>(
         &self,
         clock: &T,
         prefix: &str,
         start_after: &str,
-    ) -> Result<ListedPage, RemoteError> {
+    ) -> Result<CopyPage, RemoteError> {
         let own = &self.cfg.prefix;
         let full_prefix = format!("{own}{prefix}");
         let full_after = format!("{own}{start_after}");
@@ -432,23 +451,34 @@ impl<H: HttpSend> S3Remote<H> {
         if r.status == 404 {
             return Err(RemoteError::Refused(404));
         }
-        let mut page = parse_list(&r.body).map_err(|_| RemoteError::Mismatch)?;
-        page.objects.retain(|object| object.key != *own);
-        // The caller goes on from the last key, so a page that says
-        // "more" must name one.
-        if page.truncated && page.objects.is_empty() {
-            return Err(RemoteError::Mismatch);
-        }
+        let listed = parse_list(&r.body).map_err(|_| RemoteError::Mismatch)?;
+        let mut page = CopyPage {
+            truncated: listed.truncated,
+            ..CopyPage::default()
+        };
         let mut last = start_after.to_string();
-        for object in &mut page.objects {
-            let key = object
-                .key
-                .strip_prefix(own.as_str())
-                .filter(|k| key_ok(k) && k.starts_with(prefix) && *k > last.as_str())
+        for object in listed.objects {
+            if object.key == *own {
+                continue;
+            }
+            let key = Some(object.key.as_str())
+                .filter(|k| k.len() <= MAX_KEY_BYTES)
+                .and_then(|k| k.strip_prefix(own.as_str()))
+                .filter(|k| k.starts_with(prefix) && *k > last.as_str())
                 .ok_or(RemoteError::Mismatch)?
                 .to_string();
             last.clone_from(&key);
-            object.key = key;
+            if key_ok(&key) {
+                page.objects.push(Listed { key, ..object });
+            } else {
+                page.foreign.push(key);
+            }
+            page.last = Some(last.clone());
+        }
+        // The caller goes on from the last key, so a page that says
+        // "more" must name one.
+        if page.truncated && page.last.is_none() {
+            return Err(RemoteError::Mismatch);
         }
         Ok(page)
     }

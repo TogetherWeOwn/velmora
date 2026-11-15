@@ -9,6 +9,7 @@
 
 pub mod articles;
 pub mod config;
+pub mod copy;
 pub mod crypto;
 pub mod fetch;
 pub mod hosts;
