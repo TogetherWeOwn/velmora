@@ -20,9 +20,11 @@ use velmora_bridge::{Bridge, Clock, UnixMs};
 use worker::Env;
 
 use crate::d1::D1Sql;
+use crate::e2::FetchHttp;
 use crate::nntp::WorkerConnector;
 use crate::queues::{DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
 use crate::r2::R2Blobs;
+use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
 /// Wall clock of the Workers runtime (advances on I/O only).
 pub struct WorkerClock;
@@ -136,6 +138,14 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         budget: ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(sleeper()),
         cfg,
     })
+}
+
+/// The recovery store, when `RECOVERY_COPY` is on. A refused
+/// configuration is a class-only reason; it never stops the S3 service,
+/// only the copy.
+pub fn recovery_store(env: &Env) -> Result<Option<S3Remote<FetchHttp>>, String> {
+    let cfg = RemoteConfig::from_vars(|name| lookup(env, name)).map_err(|e| e.to_string())?;
+    Ok(cfg.map(|cfg| S3Remote::new(cfg, FetchHttp)))
 }
 
 #[cfg(test)]
