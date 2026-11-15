@@ -1015,9 +1015,8 @@ async fn sockets_that_failed_together_are_one_strike() {
     let mut rig = rig(&[spec("bb0", 5)]).await;
     let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
     // Nothing listens on the provider's port any more.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    rig.bridge.cfg.providers[0].port = closed.local_addr().unwrap().port();
-    drop(closed);
+    let dead = DeadPort::reserve();
+    rig.bridge.cfg.providers[0].port = dead.port();
     rig.bridge
         .safety
         .corrupt(&s.extent.safety_key(), |b| b[100] ^= 1);

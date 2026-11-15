@@ -1214,6 +1214,31 @@ pub struct Rig {
     /// One server per provider, in provider order (`p0`, `p1`, …).
     pub servers: Vec<TestNntpServer>,
     pub bridge: TestBridge,
+    /// The ports of the providers a test has unplugged, kept for as long
+    /// as the rig.
+    pub dead_ports: Vec<DeadPort>,
+}
+
+/// A local port nothing listens on, for as long as this value lives.
+///
+/// The socket is bound and never listens: a connect to the port is refused
+/// at once, and the port stays taken, so no server or client of a test
+/// running at the same time can be given it. A listener that is bound and
+/// dropped frees the port, and the next bind may get it.
+pub struct DeadPort {
+    socket: tokio::net::TcpSocket,
+}
+
+impl DeadPort {
+    pub fn reserve() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        Self { socket }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.socket.local_addr().unwrap().port()
+    }
 }
 
 /// A recognisable plaintext: any leak into an article is easy to find.
@@ -1303,7 +1328,11 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         budget: ByteBudget::new(48 * 1024 * 1024),
         cfg,
     };
-    Rig { servers, bridge }
+    Rig {
+        servers,
+        bridge,
+        dead_ports: Vec::new(),
+    }
 }
 
 /// A single provider that posts and reads, two connections.
