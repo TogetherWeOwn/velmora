@@ -3,7 +3,7 @@
 //!
 //! The servers here speak plaintext on loopback, so these tests cover
 //! the proxy stage and the hand-over to the target's stream. The TLS
-//! that production starts on the proxied connection is the runtime's.
+//! that production runs on the proxied connection is in `socks5_tls.rs`.
 
 use std::io;
 use std::time::Duration;

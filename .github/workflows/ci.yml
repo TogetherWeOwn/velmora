@@ -144,6 +144,9 @@ jobs:
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls
       - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls -- -D warnings
+      # The proxied connector (SOCKS5, then TLS made in the Worker), alone.
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-socks5-tls
+      - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-socks5-tls -- -D warnings
       # Retain compatibility when consumers leave native-tls enabled on wasm.
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --all-features
 
@@ -175,6 +178,7 @@ jobs:
           rustup toolchain install 1.91 --profile minimal --no-self-update
           rustup default 1.91
       - run: cargo check --locked -p velmora --features worker-pinned-tls
+      - run: cargo check --locked -p velmora --features worker-socks5-tls
       # The S3 Worker crate declares rust-version 1.91 (workers-rs 0.8.7).
       - run: cargo check --locked -p velmora-s3-bridge
 

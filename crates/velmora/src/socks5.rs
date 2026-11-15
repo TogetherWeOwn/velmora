@@ -82,6 +82,9 @@ pub const ERR_IO: &str = "socks5: connection to the proxy failed";
 /// A read or write on the connection to the proxy ran out of time, or
 /// the whole handshake did.
 pub const ERR_TIMEOUT: &str = "socks5: proxy did not answer in time";
+/// TLS with the target, on the connection the proxy opened, failed: the
+/// handshake, the certificate chain, or the name in the certificate.
+pub const ERR_TLS: &str = "socks5: TLS with the target failed";
 
 /// What every failure of the proxy stage carries inside its
 /// [`io::Error`]: the fixed message, and whether the proxy named the
@@ -170,6 +173,19 @@ fn while_connecting(e: io::Error) -> io::Error {
         ),
         _ => e,
     }
+}
+
+/// A failure behind a proxy that works, for a connector's own steps
+/// after the handshake (TLS with the target). `message` is one of this
+/// module's constants.
+pub fn target_failure(kind: io::ErrorKind, message: &'static str) -> io::Error {
+    io::Error::new(
+        kind,
+        StageError {
+            message,
+            target: true,
+        },
+    )
 }
 
 /// A SOCKS5 proxy and the login for it. `Debug` shows no field.

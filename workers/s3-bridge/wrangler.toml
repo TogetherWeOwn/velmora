@@ -152,7 +152,10 @@ crons = ["*/5 * * * *"]
 # to that provider then goes through one of them, so the provider sees
 # the proxy's address and not the changing address of each invocation.
 # TLS runs from the Worker to the provider inside the proxied connection:
-# the proxy relays ciphertext and never sees the provider login. The
+# the proxy relays ciphertext and never sees the provider login. On this
+# route the Worker makes TLS itself and checks the certificate against
+# the provider's host name and the public roots, so that host must be a
+# DNS name (a direct connection keeps the runtime's TLS). The
 # proxy login itself is sent to the proxy in clear (RFC 1929), so it
 # guards the use of the proxy and nothing else. A provider with `proxies`
 # is never connected directly: with every proxy down it is unhealthy

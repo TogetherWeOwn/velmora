@@ -52,7 +52,7 @@ pub const MAX_ARTICLE_BYTES: usize = 1024 * 1024;
 const OP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(target_arch = "wasm32")]
-type Socket = velmora::transports::WorkerTransport;
+type Socket = routed::Socket;
 #[cfg(not(target_arch = "wasm32"))]
 type Socket = native::NoSocket;
 
@@ -382,8 +382,8 @@ trait Net {
     /// A socket straight to the host of `cfg`.
     fn direct(&self, cfg: &NntpConfig) -> Result<Self::Socket>;
 
-    /// A socket to the host of `cfg` through `proxy`, with TLS to the
-    /// host started on it. `progress` is set once the proxy accepted
+    /// A socket to the host of `cfg` through `proxy`, under TLS with
+    /// the host. `progress` is set once the proxy accepted
     /// the login.
     async fn via_proxy(
         &self,
@@ -523,16 +523,19 @@ async fn open_routed<N: Net>(
 struct WorkerNet;
 
 #[cfg(target_arch = "wasm32")]
+use velmora::transports::{WorkerProxiedTransport, WorkerTransport};
+
+#[cfg(target_arch = "wasm32")]
 impl Net for WorkerNet {
     type Socket = Socket;
 
     fn direct(&self, cfg: &NntpConfig) -> Result<Socket> {
         let socket = if cfg.tls {
-            Socket::connect_pinned(cfg)
+            WorkerTransport::connect_pinned(cfg)
         } else {
-            Socket::connect(cfg)
+            WorkerTransport::connect(cfg)
         };
-        socket.map_err(|_| open_failed())
+        socket.map(Socket::Direct).map_err(|_| open_failed())
     }
 
     async fn via_proxy(
@@ -541,7 +544,9 @@ impl Net for WorkerNet {
         proxy: &Socks5Proxy,
         progress: &Progress,
     ) -> io::Result<Socket> {
-        Socket::connect_pinned_via_socks5(cfg, proxy, progress).await
+        WorkerProxiedTransport::connect_pinned(cfg, proxy, progress)
+            .await
+            .map(|t| Socket::Proxied(Box::new(t)))
     }
 
     async fn limit(&self, secs: u32) {
@@ -581,6 +586,44 @@ impl Net for WorkerNet {
 
     fn now_ms(&self) -> i64 {
         now().0
+    }
+}
+
+/// The socket of a session: the runtime's own for a direct connection
+/// (TLS by the runtime), or the one through a proxy (TLS made in the
+/// Worker, see `velmora::transports::worker_socks5`).
+#[cfg(target_arch = "wasm32")]
+mod routed {
+    use std::io;
+    use velmora::transport::Transport;
+    use velmora::transports::{WorkerProxiedTransport, WorkerTransport};
+
+    pub enum Socket {
+        Direct(WorkerTransport),
+        // Boxed: the TLS state is some hundred bytes, the direct socket
+        // a few.
+        Proxied(Box<WorkerProxiedTransport>),
+    }
+
+    impl Transport for Socket {
+        async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self {
+                Socket::Direct(t) => t.read(buf).await,
+                Socket::Proxied(t) => t.read(buf).await,
+            }
+        }
+        async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            match self {
+                Socket::Direct(t) => t.write_all(buf).await,
+                Socket::Proxied(t) => t.write_all(buf).await,
+            }
+        }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            match self {
+                Socket::Direct(t) => t.shutdown().await,
+                Socket::Proxied(t) => t.shutdown().await,
+            }
+        }
     }
 }
 

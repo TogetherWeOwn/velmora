@@ -47,6 +47,8 @@ struct Shared {
     pass: String,
     mode: Mutex<ProxyMode>,
     seen: Mutex<Seen>,
+    /// Names the proxy resolves itself, like a hosts table.
+    names: Mutex<Vec<(String, SocketAddr)>>,
 }
 
 /// A proxy on an ephemeral loopback port. It stops when dropped, and
@@ -73,6 +75,7 @@ impl TestSocks5Proxy {
             pass: pass.to_string(),
             mode: Mutex::new(mode),
             seen: Mutex::new(Seen::default()),
+            names: Mutex::new(Vec::new()),
         });
         let accept = Arc::clone(&shared);
         let task = tokio::spawn(async move {
@@ -98,6 +101,12 @@ impl TestSocks5Proxy {
 
     pub fn set_mode(&self, mode: ProxyMode) {
         *self.shared.mode.lock().unwrap() = mode;
+    }
+
+    /// From now on a CONNECT to `name`, on any port, goes to `addr`. A
+    /// test gives a loopback server a host name this way.
+    pub fn resolve(&self, name: &str, addr: SocketAddr) {
+        self.shared.names.lock().unwrap().push((name.into(), addr));
     }
 
     /// Connections accepted so far.
@@ -179,7 +188,18 @@ async fn serve(mut client: TcpStream, shared: &Shared) -> std::io::Result<()> {
         ProxyMode::TruncatedReply => return client.write_all(&OK[..6]).await,
         _ => {}
     }
-    let Ok(mut target) = TcpStream::connect((host.as_str(), port)).await else {
+    let named = shared
+        .names
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| *name == host)
+        .map(|(_, addr)| *addr);
+    let connect = match named {
+        Some(addr) => TcpStream::connect(addr).await,
+        None => TcpStream::connect((host.as_str(), port)).await,
+    };
+    let Ok(mut target) = connect else {
         return client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
     };
     let mut reply = OK.to_vec();
