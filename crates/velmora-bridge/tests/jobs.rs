@@ -656,13 +656,14 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     let mut fx = Fx::new().await;
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "a/cool.bin", &plaintext()).await;
-    // A port nothing listens on: the listener is closed before the first
-    // dial, so each connect is refused at once. Left open, it would take
-    // the connect and never greet, and each job would wait out the read
-    // timeout of the client.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = closed.local_addr().unwrap().port();
-    drop(closed);
+    // A port nothing listens on. The socket is bound and never listens, so
+    // each connect is refused at once, and the port stays taken until the
+    // end of the test: no other test can be given it in the meantime. A
+    // listener would take the connect and never greet, and each job would
+    // wait out the read timeout of the client.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let dead = reserved.local_addr().unwrap().port();
     let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead);
 
     for run in 0..3 {
@@ -702,6 +703,7 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     assert_eq!(fx.health("failures").await, "0");
     assert_eq!(fx.health("cooldowns").await, "0");
     assert_eq!(fx.health("cooldown_until").await, "0");
+    drop(reserved);
 }
 
 /// Two accounts of one pool share `pool_max_conns` in `provider_permits`:
