@@ -298,6 +298,9 @@ async fn login_refused_for_the_address_limit_is_no_slot_not_a_fault() {
         "502 Too many sessions for user",
         "502 Session limit reached",
         "502 Too many connects",
+        "502 Too many connections for your login",
+        "481 Too many simultaneous logins",
+        "502 Too many connections, temporarily blocked",
         // The limit is what counts, not the reply code.
         "400 Too many connections",
     ] {
@@ -348,6 +351,7 @@ async fn login_refused_for_the_address_limit_is_no_slot_not_a_fault() {
 async fn login_refused_for_the_account_is_a_strike_and_the_work_moves_on() {
     for reply in [
         "502 Access denied: quota exceeded, see your account page",
+        "502 Access denied: block quota exceeded",
         "502 Account suspended",
         "502",
         "482 Authentication rejected",
@@ -1305,4 +1309,29 @@ async fn post_waits_while_every_poster_cools() {
     let plan = rig.post(&s).await;
     assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
     assert!(!rig.cooling(0).await);
+}
+
+/// The backup tier connects inside the round. It lets two of the job's
+/// three sockets in and refuses the third in words that name no limit;
+/// the two that are in then get every POST refused (`440`), so no socket
+/// of the provider ends with a good session. The refused login is still
+/// the provider's limit: it is no strike.
+#[tokio::test]
+async fn a_refusal_inside_the_round_is_no_strike_when_no_socket_ends_well() {
+    let mut rig = pool_rig(3).await;
+    rig.set_priorities(&[0, 1, 2]);
+    let s = rig.seed(46, &marked_plaintext(PLAIN_LEN)).await;
+    rig.unplug(0);
+    rig.bridge.cfg.providers[1].max_conns = 4;
+    rig.servers[1]
+        .set_limit_reply(Some("502 Please try again later"))
+        .await;
+    rig.servers[1].set_posting_allowed(false).await;
+
+    let outcome = rig.run_post(&s).await;
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    assert_eq!(rig.bridge.nntp.dials_to("p1"), 3);
+    let load = rig.load(1).await;
+    assert_eq!((load.failures, load.fault, load.held), (0, None, 0));
+    assert_eq!(rig.bridge.nntp.live(), 0);
 }

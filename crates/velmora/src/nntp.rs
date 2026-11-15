@@ -788,10 +788,12 @@ const LIMIT_PHRASES: [&str; 18] = [
 ];
 
 /// Words of a refusal that is about the account whatever else it says
-/// ("quota exceeded, closing connection", "block exhausted (unlimited
-/// connections plan)", "max login attempts exceeded, connection
-/// closed"): with one of them a reply is never a limit reply.
-const ACCOUNT_WORDS: [&str; 4] = ["quota", "block", "login", "attempt"];
+/// ("quota exceeded: too many connections this month", "max login
+/// attempts exceeded, connection limit reached"): with one of them a
+/// reply is never a limit reply. "login" and "block" are not among
+/// them: limit replies use both ("too many connections for your login",
+/// "too many connections, temporarily blocked").
+const ACCOUNT_WORDS: [&str; 2] = ["quota", "attempt"];
 
 /// True when a refused connection or login says the account (or the
 /// address) is at its limit of connections: "too many connections",
@@ -877,6 +879,11 @@ mod tests {
             "Too many connects",
             "Maximum number of sessions reached",
             "No more than 2 simultaneous sessions",
+            // "login" and "blocked" do not make a limit an account matter.
+            "Too many connections for your login",
+            "Too many simultaneous logins",
+            "Too many connections from your address, temporarily blocked",
+            "Connection limit reached: temporarily blocked",
             REDACTED_LIMIT,
         ] {
             assert!(is_limit_reply(text), "{text:?}");
@@ -905,9 +912,11 @@ mod tests {
             "Invalid login; max attempts exceeded, connection closed",
             "Block exhausted (unlimited connections plan)",
             "Quota exceeded: too many connections this month",
-            "Block account empty, connection limit 50",
-            "Too many connections: login disabled",
+            "Access denied: block quota exceeded",
+            "Block quota exceeded, connection limit 50",
             "Too many connection attempts",
+            // No limit phrase: a block alone is not a connection limit.
+            "Temporarily blocked",
             REDACTED_REPLY,
         ] {
             assert!(!is_limit_reply(text), "{text:?}");
