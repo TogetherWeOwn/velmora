@@ -5,6 +5,7 @@
 //! is an error naming the variable, never echoing its value.
 
 use core::fmt;
+use core::net::IpAddr;
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
@@ -44,6 +45,17 @@ pub const MAX_PROVIDERS: usize = 32;
 
 /// Most entries a provider's `hosts` may hold (next to `host`).
 pub const MAX_HOSTS: usize = 8;
+
+/// Most entries a provider's `proxies` may hold. Each one that cannot
+/// be used costs a connect its time limit
+/// ([`crate::hosts::PROXY_CONNECT_SECS`]), and all of them together
+/// must leave room inside one call of a read.
+pub const MAX_PROXIES: usize = 3;
+const _: () =
+    assert!(MAX_PROXIES as u32 * crate::hosts::PROXY_CONNECT_SECS < crate::ports::READ_CALL_SECS);
+
+/// Longest name, user name or password SOCKS5 carries, in bytes.
+const SOCKS_FIELD_MAX: usize = 255;
 
 /// Longest accepted provider `pool` name (bytes).
 pub const MAX_POOL_NAME_LEN: usize = 64;
@@ -284,6 +296,54 @@ fn hosts_ok(p: &ProviderConfig) -> bool {
         .all(|h| seen.insert(h.to_ascii_lowercase()))
 }
 
+/// An address a proxy may have: not loopback, private, link-local,
+/// unspecified, multicast or broadcast. The runtime does not connect to
+/// those either; here they are a configuration mistake.
+fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.to_ipv4_mapped().is_some()
+                // Unique local fc00::/7, link-local fe80::/10.
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80)
+        }
+    }
+}
+
+/// A provider's `proxies`: at most [`MAX_PROXIES`], each a DNS name or a
+/// public IP address with a port and a login SOCKS5 can carry, none
+/// twice. Only on a TLS provider, whose every host name fits a SOCKS5
+/// request: through a proxy there is no plaintext.
+fn proxies_ok(p: &ProviderConfig) -> bool {
+    if p.proxies.is_empty() {
+        return true;
+    }
+    let field = |s: &str| (1..=SOCKS_FIELD_MAX).contains(&s.len());
+    let mut seen = BTreeSet::new();
+    p.tls
+        && p.proxies.len() <= MAX_PROXIES
+        && p.endpoints().into_iter().all(valid_host_name)
+        && p.proxies.iter().all(|x| {
+            (valid_host_name(&x.host) || x.host.parse::<IpAddr>().is_ok_and(public_ip))
+                && x.port != 0
+                && field(&x.user)
+                && field(&x.pass)
+                && seen.insert((x.host.to_ascii_lowercase(), x.port))
+        })
+}
+
 fn valid_newsgroup(g: &str) -> bool {
     !g.is_empty()
         && g.len() <= 128
@@ -522,7 +582,7 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
         // Stated, the address limit is a real one: `0` would shut the
         // provider out without saying so (`enabled` does that).
         let ips_ok = p.max_ips.is_none_or(|n| (1..=MAX_CONNS_LIMIT).contains(&n));
-        if !pool_ok || !ips_ok || !hosts_ok(p) || p.retention_days == Some(0) {
+        if !pool_ok || !ips_ok || !hosts_ok(p) || !proxies_ok(p) || p.retention_days == Some(0) {
             return Err(bad());
         }
         if p.id.is_empty()

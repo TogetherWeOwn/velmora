@@ -14,6 +14,11 @@
 //! greeting probe, kept per isolate, with fallback to the others. The TLS
 //! policy is checked for every endpoint before any socket opens.
 //!
+//! A provider with `proxies` is reached through them only ([`open_routed`]):
+//! each in order, TLS to the provider inside the proxied connection. When
+//! none can be used the connect fails as a proxy failure. No direct
+//! socket is ever opened for such a provider.
+//!
 //! Sessions read at most 1 MiB per article body. Policy refusals and
 //! socket-open failures are class-only (no host or credential). Later
 //! session errors are the engine's own: their `Debug` redacts auth reply
@@ -28,12 +33,14 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use velmora::nntp::{NntpClient, NntpConfig, PostOutcome};
 use velmora::pinned_transport::pinned_rejection_message;
+use velmora::socks5::{self, Socks5Proxy};
 use velmora_bridge::hosts::{
     self, DialError, Dialer, HostPicker, Picked, HOST_CONNECT_SECS, PROBE_GOODBYE_MS,
+    PROXY_CONNECT_SECS,
 };
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
-    Result, UnixMs, QUIT_SECS,
+    ProxyConfig, Result, UnixMs, QUIT_SECS,
 };
 
 /// Largest article the bridge reads or posts (velmora articles are about
@@ -218,7 +225,10 @@ impl Dialer for Dial<'_> {
         // The socket is dropped, which closes it, at the end of this
         // block: also after a probe that was cut off.
         let (code, ms) = {
-            let mut socket = open(&cfg).ok()?;
+            // The proxy stage of a provider with proxies counts into the
+            // time, and has the probe's limit too.
+            let opening = open_routed(&WorkerNet, &self.provider.proxies, &cfg);
+            let mut socket = within(after_ms(limit_ms), opening).await.ok()?;
             let code = within(after_ms(limit_ms), async {
                 Ok(hosts::greeting(&mut socket).await)
             })
@@ -247,7 +257,11 @@ impl Dialer for Dial<'_> {
         bounded: bool,
     ) -> core::result::Result<WorkerSession, DialError> {
         let cfg = nntp_config(self.provider, host).map_err(DialError::Account)?;
-        let socket = open(&cfg).map_err(DialError::Unreachable)?;
+        // A failure of the proxy stage is the proxies' or the host's,
+        // never the account's: no login was sent.
+        let socket = open_routed(&WorkerNet, &self.provider.proxies, &cfg)
+            .await
+            .map_err(|e| DialError::classify(e, false))?;
         let class = self.class;
         // Set when the engine is about to log in: the greeting was
         // accepted. A refusal before that is the host's, as a probe
@@ -307,6 +321,11 @@ fn nntp_config(p: &ProviderConfig, host: &str) -> Result<NntpConfig> {
         ..NntpConfig::default()
     };
     if !p.tls {
+        if !p.proxies.is_empty() {
+            return Err(refused(
+                "transport_tls_required: no plaintext through a proxy".into(),
+            ));
+        }
         if !is_loopback(host) {
             return Err(refused(
                 "transport_tls_required: plaintext only on loopback".into(),
@@ -318,27 +337,137 @@ fn nntp_config(p: &ProviderConfig, host: &str) -> Result<NntpConfig> {
     Ok(cfg)
 }
 
-#[cfg(target_arch = "wasm32")]
-fn open(cfg: &NntpConfig) -> Result<Socket> {
-    let socket = if cfg.tls {
-        Socket::connect_pinned(cfg)
+/// A socket could not be opened, or a proxy reported that it did not
+/// connect to the host. The runtime's message may name the host: the
+/// class only.
+fn open_failed() -> BridgeError {
+    BridgeError::Nntp(velmora::Error::Io(io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        "workers socket open failed",
+    )))
+}
+
+/// None of the provider's proxies could be used
+/// (`velmora_bridge::hosts::proxy_failure`).
+fn proxies_failed() -> BridgeError {
+    BridgeError::Nntp(velmora::Error::Io(socks5::proxy_failure(
+        io::ErrorKind::ConnectionRefused,
+        socks5::ERR_IO,
+    )))
+}
+
+fn socks5_proxy(p: &ProxyConfig) -> Socks5Proxy {
+    Socks5Proxy {
+        host: p.host.clone(),
+        port: p.port,
+        username: p.user.clone(),
+        password: p.pass.clone(),
+    }
+}
+
+/// The two ways a socket to a provider is opened, and the timer that
+/// bounds the proxy stage. A trait so that the routing rule
+/// ([`open_routed`]) is tested without a socket.
+trait Net {
+    type Socket;
+
+    /// A socket straight to the host of `cfg`.
+    fn direct(&self, cfg: &NntpConfig) -> Result<Self::Socket>;
+
+    /// A socket to the host of `cfg` through `proxy`, with TLS to the
+    /// host started on it.
+    async fn via_proxy(&self, cfg: &NntpConfig, proxy: &Socks5Proxy) -> io::Result<Self::Socket>;
+
+    /// Ends after `secs`.
+    async fn limit(&self, secs: u32);
+}
+
+/// Opens the socket of one connect. A provider without proxies is
+/// connected directly. One with proxies is connected through them and
+/// in no other way: each in order, each within [`PROXY_CONNECT_SECS`],
+/// the first that connects wins.
+///
+/// When none does, the failure says whose it was. If a proxy worked and
+/// reported that it did not connect to the host, it is the host's: the
+/// next host is worth a try. Otherwise it is the proxies'
+/// (`hosts::proxy_failure`). The direct route is not taken in either
+/// case.
+async fn open_routed<N: Net>(
+    net: &N,
+    proxies: &[ProxyConfig],
+    cfg: &NntpConfig,
+) -> Result<N::Socket> {
+    if proxies.is_empty() {
+        return net.direct(cfg);
+    }
+    if !cfg.tls {
+        return Err(refused(
+            "transport_tls_required: no plaintext through a proxy".into(),
+        ));
+    }
+    let mut host_refused = false;
+    for proxy in proxies {
+        let proxy = socks5_proxy(proxy);
+        let stage = async { Ok(net.via_proxy(cfg, &proxy).await) };
+        match within(net.limit(PROXY_CONNECT_SECS), stage).await {
+            Ok(Ok(socket)) => return Ok(socket),
+            Ok(Err(e)) if socks5::is_target_failure(&e) => host_refused = true,
+            // The proxy failed, or did not finish in time.
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    Err(if host_refused {
+        open_failed()
     } else {
-        Socket::connect(cfg)
-    };
-    // The runtime's message may name the host: keep the class only.
-    socket.map_err(|_| {
-        BridgeError::Nntp(velmora::Error::Io(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "workers socket open failed",
-        )))
+        proxies_failed()
     })
 }
 
+/// The Workers runtime's sockets.
+struct WorkerNet;
+
+#[cfg(target_arch = "wasm32")]
+impl Net for WorkerNet {
+    type Socket = Socket;
+
+    fn direct(&self, cfg: &NntpConfig) -> Result<Socket> {
+        let socket = if cfg.tls {
+            Socket::connect_pinned(cfg)
+        } else {
+            Socket::connect(cfg)
+        };
+        socket.map_err(|_| open_failed())
+    }
+
+    async fn via_proxy(&self, cfg: &NntpConfig, proxy: &Socks5Proxy) -> io::Result<Socket> {
+        Socket::connect_pinned_via_socks5(cfg, proxy).await
+    }
+
+    async fn limit(&self, secs: u32) {
+        after(secs).await
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-fn open(_cfg: &NntpConfig) -> Result<Socket> {
-    Err(BridgeError::NotImplemented(
-        "nntp: sockets exist only on wasm32",
-    ))
+impl Net for WorkerNet {
+    type Socket = Socket;
+
+    fn direct(&self, _cfg: &NntpConfig) -> Result<Socket> {
+        Err(BridgeError::NotImplemented(
+            "nntp: sockets exist only on wasm32",
+        ))
+    }
+
+    async fn via_proxy(&self, _cfg: &NntpConfig, _proxy: &Socks5Proxy) -> io::Result<Socket> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "nntp: sockets exist only on wasm32",
+        ))
+    }
+
+    async fn limit(&self, secs: u32) {
+        after(secs).await
+    }
 }
 
 /// Native builds (`cargo check`, unit tests) have no Workers socket.
@@ -436,5 +565,240 @@ mod tests {
             let text = format!("{err} {err:?}");
             assert!(!text.contains(host) && !text.contains("pw"), "{text}");
         }
+    }
+
+    /// What a fake proxy does with a connect.
+    #[derive(Clone, Copy)]
+    enum Via {
+        Connects,
+        /// The proxy cannot be reached, or refuses the bridge.
+        Down,
+        /// The proxy works and did not connect to the host.
+        HostRefused,
+        /// The proxy never answers.
+        Hangs,
+    }
+
+    /// A network that counts what was opened. `via` holds one entry per
+    /// proxy host.
+    struct FakeNet {
+        via: Vec<(&'static str, Via)>,
+        direct: Cell<u32>,
+        proxied: std::cell::RefCell<Vec<String>>,
+        /// Whether the bound on a proxy stage ends at once.
+        cut: bool,
+    }
+
+    impl FakeNet {
+        fn new(via: &[(&'static str, Via)]) -> Self {
+            FakeNet {
+                via: via.to_vec(),
+                direct: Cell::new(0),
+                proxied: Default::default(),
+                cut: false,
+            }
+        }
+    }
+
+    impl Net for FakeNet {
+        type Socket = String;
+
+        fn direct(&self, _cfg: &NntpConfig) -> Result<String> {
+            self.direct.set(self.direct.get() + 1);
+            Ok("direct".into())
+        }
+
+        async fn via_proxy(&self, cfg: &NntpConfig, proxy: &Socks5Proxy) -> io::Result<String> {
+            self.proxied.borrow_mut().push(proxy.host.clone());
+            let (_, via) = self.via.iter().find(|(h, _)| *h == proxy.host).unwrap();
+            match via {
+                Via::Connects => Ok(format!("{} via {}", cfg.host, proxy.host)),
+                Via::Down => Err(socks5::proxy_failure(
+                    io::ErrorKind::ConnectionRefused,
+                    socks5::ERR_IO,
+                )),
+                Via::HostRefused => {
+                    // What the handshake returns for a refused CONNECT.
+                    const REPLIES: &[u8] = &[5, 2, 1, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0];
+                    let mut script = Script(REPLIES);
+                    let e = socks5::connect(&mut script, "u", "p", &cfg.host, cfg.port)
+                        .now_or_never()
+                        .unwrap()
+                        .unwrap_err();
+                    assert!(socks5::is_target_failure(&e));
+                    Err(e)
+                }
+                Via::Hangs => std::future::pending().await,
+            }
+        }
+
+        async fn limit(&self, _secs: u32) {
+            if !self.cut {
+                std::future::pending().await
+            }
+        }
+    }
+
+    /// A proxy's whole answer, served in one read.
+    struct Script(&'static [u8]);
+
+    impl velmora::transport::Transport for Script {
+        async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // One reply per read: method (2 bytes), login (2), connect (10).
+            let n = if self.0.len() > 10 { 2 } else { self.0.len() };
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+        async fn write_all(&mut self, _buf: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    use futures_util::FutureExt;
+
+    fn proxied(proxy_hosts: &[&str]) -> (ProviderConfig, NntpConfig) {
+        let mut p = provider("news.example", 563, true);
+        p.proxies = proxy_hosts
+            .iter()
+            .map(|host| {
+                serde_json::from_value(serde_json::json!({
+                    "host": host, "port": 1080, "user": "proxy-user", "pass": "proxy-pass"
+                }))
+                .unwrap()
+            })
+            .collect();
+        let cfg = nntp_config(&p, "news.example").unwrap();
+        (p, cfg)
+    }
+
+    fn route(net: &FakeNet, p: &ProviderConfig, cfg: &NntpConfig) -> Result<String> {
+        open_routed(net, &p.proxies, cfg).now_or_never().unwrap()
+    }
+
+    /// A provider without proxies is connected directly, and one with
+    /// proxies through the first that connects.
+    #[test]
+    fn a_provider_goes_the_way_it_is_configured() {
+        let (p, cfg) = proxied(&[]);
+        let net = FakeNet::new(&[]);
+        assert_eq!(route(&net, &p, &cfg).unwrap(), "direct");
+        assert_eq!((net.direct.get(), net.proxied.borrow().len()), (1, 0));
+
+        let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
+        let net = FakeNet::new(&[
+            ("a.proxy.example", Via::Connects),
+            ("b.proxy.example", Via::Connects),
+        ]);
+        assert_eq!(
+            route(&net, &p, &cfg).unwrap(),
+            "news.example via a.proxy.example"
+        );
+        assert_eq!(*net.proxied.borrow(), ["a.proxy.example"]);
+        assert_eq!(net.direct.get(), 0);
+    }
+
+    /// The proxies are tried in order; the next one takes over from one
+    /// that is down, hangs or did not connect to the host.
+    #[test]
+    fn the_next_proxy_takes_over() {
+        for first in [Via::Down, Via::Hangs, Via::HostRefused] {
+            let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
+            let mut net = FakeNet::new(&[
+                ("a.proxy.example", first),
+                ("b.proxy.example", Via::Connects),
+            ]);
+            // Only a proxy that hangs runs into the bound.
+            net.cut = matches!(first, Via::Hangs);
+            assert_eq!(
+                route(&net, &p, &cfg).unwrap(),
+                "news.example via b.proxy.example"
+            );
+            assert_eq!(
+                *net.proxied.borrow(),
+                ["a.proxy.example", "b.proxy.example"]
+            );
+            assert_eq!(net.direct.get(), 0);
+        }
+    }
+
+    /// Every proxy of the provider is down, or hangs: the connect fails
+    /// as a proxy failure, and no direct socket was opened. The failure
+    /// names no proxy and no login.
+    #[test]
+    fn no_direct_connect_when_every_proxy_is_down() {
+        for down in [Via::Down, Via::Hangs] {
+            let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
+            let mut net = FakeNet::new(&[("a.proxy.example", down), ("b.proxy.example", down)]);
+            net.cut = true;
+            let err = route(&net, &p, &cfg).unwrap_err();
+            assert_eq!(net.direct.get(), 0, "a direct socket was opened");
+            assert_eq!(
+                *net.proxied.borrow(),
+                ["a.proxy.example", "b.proxy.example"]
+            );
+            assert!(hosts::proxy_failure(&err));
+            assert!(matches!(
+                DialError::classify(err, false),
+                DialError::Proxy(_)
+            ));
+            let err = route(&net, &p, &cfg).unwrap_err();
+            let text = format!("{err} {err:?}");
+            for secret in ["proxy.example", "proxy-user", "proxy-pass", "news.example"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+    }
+
+    /// A proxy that works and did not connect to the host: the failure is
+    /// the host's (the next host is tried), not the proxies', and still
+    /// nothing was opened directly.
+    #[test]
+    fn a_host_the_proxy_cannot_reach_is_a_host_failure() {
+        let (p, cfg) = proxied(&["a.proxy.example", "b.proxy.example"]);
+        let net = FakeNet::new(&[
+            ("a.proxy.example", Via::Down),
+            ("b.proxy.example", Via::HostRefused),
+        ]);
+        let err = route(&net, &p, &cfg).unwrap_err();
+        assert_eq!(net.direct.get(), 0);
+        assert!(!hosts::proxy_failure(&err) && hosts::host_failure(&err));
+        assert!(matches!(
+            DialError::classify(err, false),
+            DialError::Unreachable(_)
+        ));
+    }
+
+    /// Plaintext never goes through a proxy: refused before any socket.
+    #[test]
+    fn no_plaintext_through_a_proxy() {
+        let (mut p, _) = proxied(&["a.proxy.example"]);
+        (p.tls, p.host, p.port) = (false, "127.0.0.1".into(), 11119);
+        assert!(nntp_config(&p, "127.0.0.1").is_err());
+        // The routing refuses it too, whatever built the config.
+        let mut cfg = nntp_config(&provider("127.0.0.1", 11119, false), "127.0.0.1").unwrap();
+        cfg.tls = false;
+        let net = FakeNet::new(&[("a.proxy.example", Via::Connects)]);
+        assert!(route(&net, &p, &cfg).is_err());
+        assert_eq!((net.direct.get(), net.proxied.borrow().len()), (0, 0));
+    }
+
+    /// The real network, natively: a provider with proxies fails as a
+    /// proxy failure there as well (no socket exists), and not as the
+    /// direct route's error.
+    #[test]
+    fn the_worker_network_routes_through_the_proxies() {
+        let (p, cfg) = proxied(&["a.proxy.example"]);
+        let net = WorkerNet;
+        // Natively the timer never ends, and no proxy answers: at once.
+        let err = open_routed(&net, &p.proxies, &cfg)
+            .now_or_never()
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(hosts::proxy_failure(&err), "{err:?}");
     }
 }

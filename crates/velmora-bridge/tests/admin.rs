@@ -140,6 +140,7 @@ impl Fx {
             retention_days: None,
             pool: None,
             pool_max_conns: None,
+            proxies: Vec::new(),
             enabled: true,
         }];
         edit(&mut providers);
@@ -1318,6 +1319,54 @@ async fn status_reports_provider_health_without_credentials() {
         assert!(!body.contains(secret), "status leaks provider details");
     }
     fx.bridge.catalog.release_permit(&permit).await.unwrap();
+}
+
+/// The status says how each provider is reached: directly or through
+/// its proxies. When the proxies cannot be used the provider is not
+/// healthy, for the reason `proxy_failed`. Nothing of a proxy (host,
+/// port, login) is in the status.
+#[tokio::test]
+async fn status_reports_the_route_and_a_proxy_failure() {
+    let fx = Fx::new().await;
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(one["route"], "direct");
+
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        providers[0].proxies = vec![serde_json::from_value(json!({
+            "host": "status-proxy.example", "port": 41234,
+            "user": "status-proxy-login", "pass": "status-proxy-secret"
+        }))
+        .unwrap()];
+    })
+    .await;
+    let now = fx.bridge.clock.now();
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(
+        (&one["route"], &one["healthy"], &one["reason"]),
+        (&json!("proxy"), &json!(true), &json!(null))
+    );
+
+    let p = fx.bridge.cfg.providers[0].clone();
+    let failed = fx
+        .bridge
+        .catalog
+        .provider_failed(&p.id, ProviderFault::ProxyFailed, now);
+    failed.await.unwrap();
+    let r = fx.get("/status").await;
+    let one = r.json()["providers"][0].clone();
+    assert_eq!(
+        (&one["route"], &one["healthy"], &one["reason"]),
+        (&json!("proxy"), &json!(false), &json!("proxy_failed"))
+    );
+    let body = r.text();
+    for secret in [
+        "status-proxy.example",
+        "41234",
+        "status-proxy-login",
+        "status-proxy-secret",
+    ] {
+        assert!(!body.contains(secret), "status leaks proxy details");
+    }
 }
 
 /// The address limit of a provider and the number of jobs and requests

@@ -211,6 +211,17 @@ impl NntpConnector for TcpConnector {
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
         note_event("connect");
         self.dialed.borrow_mut().push(p.id.clone());
+        if !p.proxies.is_empty() {
+            // This connector has no proxy to go through, and a provider
+            // with proxies is reached in no other way: what the Worker's
+            // connector answers when every proxy is down.
+            return Err(BridgeError::Nntp(velmora::Error::Io(
+                velmora::socks5::proxy_failure(
+                    std::io::ErrorKind::ConnectionRefused,
+                    velmora::socks5::ERR_IO,
+                ),
+            )));
+        }
         begin(&self.slow, "connect");
         let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
         end(&self.slow);
@@ -1263,6 +1274,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             retention_days: None,
             pool: None,
             pool_max_conns: None,
+            proxies: Vec::new(),
             enabled: true,
         });
         servers.push(server);

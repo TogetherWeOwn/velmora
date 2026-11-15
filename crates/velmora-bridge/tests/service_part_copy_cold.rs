@@ -88,6 +88,7 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         retention_days: None,
         pool: None,
         pool_max_conns: None,
+        proxies: Vec::new(),
         enabled: true,
     }]);
     // The shipped ratio: the budget is three extents.

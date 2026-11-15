@@ -1548,6 +1548,165 @@ fn old_provider_config_parses_with_pool_defaults() {
     assert!(p.retains(None, now));
 }
 
+fn proxy_json(host: &str, port: u32, user: &str, pass: &str) -> String {
+    format!(r#"{{"host":"{host}","port":{port},"user":"{user}","pass":"{pass}"}}"#)
+}
+
+/// `proxies` is optional: without it a provider is connected directly.
+/// With it, every entry is a SOCKS5 proxy with a login, kept in order.
+/// Neither the provider's nor a proxy's `Debug` shows a proxy's host or
+/// login.
+#[test]
+fn provider_proxies_parse_in_order_and_are_redacted() {
+    let direct = providers_of(&[provider_json("a", "")]).unwrap();
+    assert!(direct[0].proxies.is_empty());
+
+    let proxies = format!(
+        r#""proxies":[{},{}]"#,
+        proxy_json("first.proxy.example", 1080, "proxy-login", "proxy-secret"),
+        proxy_json("203.0.113.9", 40000, "other-login", "other-secret"),
+    );
+    let providers = providers_of(&[provider_json("a", &proxies)]).unwrap();
+    let got = &providers[0].proxies;
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        (got[0].host.as_str(), got[0].port, got[0].user.as_str()),
+        ("first.proxy.example", 1080, "proxy-login")
+    );
+    assert_eq!(got[0].pass, "proxy-secret");
+    assert_eq!((got[1].host.as_str(), got[1].port), ("203.0.113.9", 40000));
+
+    let shown = format!("{:?} {:?} {:?}", providers[0], got, got[0]);
+    for secret in [
+        "first.proxy.example",
+        "203.0.113.9",
+        "40000",
+        "proxy-login",
+        "proxy-secret",
+        "other-login",
+        "other-secret",
+    ] {
+        assert!(!shown.contains(secret), "{shown}");
+    }
+    assert!(shown.contains("proxies: 2"), "{shown}");
+}
+
+/// A `proxies` list that cannot be used as written is refused as a
+/// whole: nothing in it is dropped or guessed, and a provider is never
+/// left to connect directly because its proxy entry was wrong.
+#[test]
+fn provider_proxies_fail_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let ok = proxy_json("proxy.example", 1080, "u", "p");
+    let with = |list: &[String]| {
+        let extra = format!(r#""proxies":[{}]"#, list.join(","));
+        providers_of(&[provider_json("a", &extra)])
+    };
+    assert!(with(std::slice::from_ref(&ok)).is_ok());
+    // An empty list is "no proxy", as if the field were absent.
+    assert!(with(&[]).unwrap()[0].proxies.is_empty());
+
+    let long = "x".repeat(256);
+    let bad = [
+        // Port, login and host that SOCKS5 or the network cannot carry.
+        proxy_json("proxy.example", 0, "u", "p"),
+        proxy_json("proxy.example", 65536, "u", "p"),
+        proxy_json("proxy.example", 1080, "", "p"),
+        proxy_json("proxy.example", 1080, "u", ""),
+        proxy_json("proxy.example", 1080, &long, "p"),
+        proxy_json("proxy.example", 1080, "u", &long),
+        proxy_json("", 1080, "u", "p"),
+        proxy_json("proxy example", 1080, "u", "p"),
+        proxy_json("proxy.example:1080", 1080, "u", "p"),
+        proxy_json("socks5://proxy.example", 1080, "u", "p"),
+        // Addresses no proxy of the bridge can have.
+        proxy_json("127.0.0.1", 1080, "u", "p"),
+        proxy_json("10.1.2.3", 1080, "u", "p"),
+        proxy_json("192.168.1.1", 1080, "u", "p"),
+        proxy_json("169.254.1.1", 1080, "u", "p"),
+        proxy_json("0.0.0.0", 1080, "u", "p"),
+        proxy_json("::1", 1080, "u", "p"),
+        proxy_json("fd00::1", 1080, "u", "p"),
+        proxy_json("::ffff:10.0.0.1", 1080, "u", "p"),
+    ];
+    for entry in bad {
+        assert_eq!(with(std::slice::from_ref(&entry)), invalid, "{entry}");
+        // Not next to a good one either.
+        assert_eq!(with(&[ok.clone(), entry.clone()]), invalid, "{entry}");
+    }
+    // A login of the longest length SOCKS5 carries is in order.
+    let longest = "x".repeat(255);
+    assert!(with(&[proxy_json("proxy.example", 1080, &longest, &longest)]).is_ok());
+
+    // The same proxy twice, also in another case; more than the most.
+    assert_eq!(with(&[ok.clone(), ok.clone()]), invalid);
+    let upper = proxy_json("PROXY.example", 1080, "u2", "p2");
+    assert_eq!(with(&[ok.clone(), upper]), invalid);
+    let many: Vec<String> = (0..=velmora_bridge::config::MAX_PROXIES)
+        .map(|i| proxy_json(&format!("p{i}.proxy.example"), 1080, "u", "p"))
+        .collect();
+    assert_eq!(with(&many), invalid);
+    assert!(with(&many[1..]).is_ok());
+
+    // The proxy is given the provider's host as a name, and the
+    // certificate is checked against that name: a provider known by an
+    // address, or by a name the request cannot carry, takes no proxy.
+    for host in ["203.0.113.5", "nntp", "nntp_1.invalid"] {
+        let entry = |extra: &str| {
+            let json = provider_json("a", extra).replace("nntp.invalid", host);
+            assert!(json.contains(host));
+            providers_of(&[json])
+        };
+        assert!(entry("").is_ok(), "{host}");
+        assert_eq!(entry(&format!(r#""proxies":[{ok}]"#)), invalid, "{host}");
+    }
+
+    // Unknown or missing members, and the wrong shape.
+    for extra in [
+        r#""proxies":[{"host":"proxy.example","port":1080,"user":"u","pass":"p","fallback":"direct"}]"#,
+        r#""proxies":[{"host":"proxy.example","port":1080,"user":"u"}]"#,
+        r#""proxies":[{"host":"proxy.example","port":1080}]"#,
+        r#""proxies":{"host":"proxy.example","port":1080,"user":"u","pass":"p"}"#,
+        r#""proxies":["proxy.example:1080"]"#,
+        r#""proxies":null"#,
+        r#""proxy":{"host":"proxy.example","port":1080,"user":"u","pass":"p"}"#,
+        r#""proxy_fallback":"direct""#,
+    ] {
+        assert_eq!(
+            providers_of(&[provider_json("a", extra)]),
+            invalid,
+            "{extra}"
+        );
+    }
+}
+
+/// Through a proxy there is no plaintext: `proxies` on a provider
+/// without TLS is refused, in every environment.
+#[test]
+fn provider_proxies_need_tls() {
+    let (prod, dev) = wrangler_vars();
+    let entry = |tls: bool, extra: &str| {
+        format!(
+            r#"[{{"id":"a","host":"nntp.invalid","port":563,"tls":{tls},"user":"u","pass":"p","backbone":"bb","post":true,"read":true,"max_conns":2{extra}}}]"#
+        )
+    };
+    let proxies = format!(
+        r#","proxies":[{}]"#,
+        proxy_json("proxy.example", 1080, "u", "p")
+    );
+    let loads = |vars: &_, json: &str| load(&with_secrets(Clone::clone(vars), json)).map(|_| ());
+    for vars in [&prod, &dev] {
+        assert_eq!(loads(vars, &entry(true, &proxies)), Ok(()));
+        assert_eq!(
+            loads(vars, &entry(false, &proxies)),
+            Err(ConfigError::Invalid("NNTP_PROVIDERS".into()))
+        );
+    }
+    // The same plaintext provider without a proxy is in order in dev:
+    // it is the proxy that is refused.
+    assert_eq!(loads(&dev, &entry(false, "")), Ok(()));
+}
+
 /// `max_ips` is the number of source addresses an account may be
 /// connected from at once. It is optional, at least one, and no more
 /// than the largest connection limit; it may be larger than the

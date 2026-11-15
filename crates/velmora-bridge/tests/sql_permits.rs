@@ -534,6 +534,7 @@ fn fault_codes_are_stable() {
         (ProviderFault::ConnectRefused, "connect_refused"),
         (ProviderFault::LoginRefused, "login_refused"),
         (ProviderFault::SessionFailed, "session_failed"),
+        (ProviderFault::ProxyFailed, "proxy_failed"),
     ] {
         assert_eq!(fault.as_str(), code);
         assert_eq!(ProviderFault::parse(code), Some(fault));

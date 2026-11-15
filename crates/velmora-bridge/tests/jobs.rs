@@ -222,6 +222,7 @@ impl Fx {
             retention_days: None,
             pool: None,
             pool_max_conns: None,
+            proxies: Vec::new(),
             enabled: true,
         }];
         let cfg = BridgeConfig {

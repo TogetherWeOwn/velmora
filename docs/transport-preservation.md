@@ -27,7 +27,7 @@ All hashes below are SHA-256 of file bytes, not Git object hashes.
 | Destination (relative to `crates/`) | SHA-256 | Comparison |
 | --- | --- | --- |
 | `velmora-ssrf-guard/src/lib.rs` | `a027eb3f1ddafe6aec55e01dbf6736688e68f869bc5e0344f78f2e40bde40997` | Byte-identical predicate, vectors and tests |
-| `velmora/src/transports/mod.rs` | `17896cd32b9bc23b88889004f67fc97e38976bb584486387f4ca23a91c58a30d` | Byte-identical |
+| `velmora/src/transports/mod.rs` | `3c8f3ec69e3de941ecab9775ef3abb5f23848444cd451e590abf4e3d76e74c3b` | Source (SHA-256 `17896cd32b9bc23b88889004f67fc97e38976bb584486387f4ca23a91c58a30d`) plus the declaration and one doc line for the `worker_socks5` module (2026-11-15) |
 | `velmora/src/transports/peer_tls.rs` | `93846315476f0132cbf90db3b109fbdcc6be833809925050c55b8f3b411f5ebb` | Only `nntune_ssrf_guard` → `velmora_ssrf_guard` |
 | `velmora/src/transports/tokio_tls.rs` | `a85904f74b7741df9f0f5aa254483301895466301460da9269c26c3ba95080b0` | Byte-identical |
 | `velmora/src/transports/worker_pinned_tls.rs` | `397aac7929c5a862ac0b0a794bf95f5486a2a7d8eb8a8583fe62b353e54bcacc` | Byte-identical |
@@ -45,6 +45,12 @@ SSRF manifest hash is
 `8cf0944c65f87a04229fd8c34a90d0a8debe4042957a7f596a37cd5163209a86`.
 The manifest's historical description and predicate's historical call-site
 comments are deliberately unchanged, not new product dependencies.
+
+`velmora/src/transports/worker_socks5.rs` and `velmora/src/socks5.rs` are
+not part of the relocation: they are new in this repository (a Workers
+socket through a SOCKS5 proxy, with TLS to the provider started on the
+proxied connection). They add a connector next to the preserved ones and
+change none of them; `worker_socket.rs` keeps the hash above.
 
 ## Boundaries
 
