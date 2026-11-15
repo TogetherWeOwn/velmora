@@ -60,11 +60,24 @@ macro_rules! latest {
     };
 }
 
-/// Whether that row is a full pass of the current plan.
+/// The articles a row found: read back and matching for a `body` row,
+/// present for a `stat` row. A `stat` row keeps `articles_ok` at 0, so a
+/// reader from before `kind` never takes it for a read-back.
+macro_rules! tally {
+    () => {
+        "(CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END)"
+    };
+}
+
+/// Whether that row is a complete pass of its kind for the current plan.
 macro_rules! counts {
     () => {
-        "(v.result = 'ok' AND v.articles_ok = v.articles_total \
-           AND v.articles_total = COALESCE(e.article_count, -1))"
+        concat!(
+            "(v.result = 'ok' AND ",
+            tally!(),
+            " = v.articles_total \
+               AND v.articles_total = COALESCE(e.article_count, -1))"
+        )
     };
 }
 
@@ -497,13 +510,17 @@ pub(super) async fn record_verification<S: Sql>(
         (
             // Two results for one backbone in the same millisecond: a
             // failure is never replaced, so the pair cannot count as a
-            // pass, and the kind is that of the result that stays.
+            // pass, and the kind is that of the result that stays. The
+            // tally of a `STAT` goes to `articles_present` (see `tally!`).
             "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
-               plan_rev, articles_ok, articles_total, result, kind) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+               plan_rev, articles_ok, articles_present, articles_total, result, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
+               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9) \
              ON CONFLICT(extent_id, backbone, verified_at) DO UPDATE SET \
                provider_id = excluded.provider_id, plan_rev = excluded.plan_rev, \
-               articles_ok = excluded.articles_ok, articles_total = excluded.articles_total, \
+               articles_ok = excluded.articles_ok, \
+               articles_present = excluded.articles_present, \
+               articles_total = excluded.articles_total, \
                result = excluded.result, kind = excluded.kind \
              WHERE verifications.result = 'ok'",
             row,
@@ -537,8 +554,9 @@ pub(super) async fn backbone_status<S: Sql>(
     extent: &ExtentId,
 ) -> Result<Vec<BackboneStatus>> {
     let sql = concat!(
-        "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, v.articles_ok, \
-           v.articles_total, v.result, v.kind, ",
+        "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, ",
+        tally!(),
+        ", v.articles_total, v.result, v.kind, ",
         counts!(),
         " FROM verifications v JOIN extents e ON e.id = v.extent_id \
          WHERE v.extent_id = ?1 AND ",

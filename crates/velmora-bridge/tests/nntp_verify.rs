@@ -212,6 +212,36 @@ async fn transport_failure_records_nothing() {
     assert_eq!(rig.rows(&s)[0].result, VerifyResult::Ok);
 }
 
+/// The same for a `STAT`: a connection that breaks before the answer says
+/// nothing about the article. No pass is recorded for that backbone and
+/// nothing is released on it.
+#[tokio::test]
+async fn stat_transport_failure_records_nothing() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.posted(31).await;
+    rig.propagate(&s, 0, 1).await;
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+
+    rig.servers[1].drop_next_stats(3).await;
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(delay, backoff(rig.outbox(&s).attempts));
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+    let outbox = rig.outbox(&s);
+    assert_eq!(outbox.stage, OutboxStage::Verify);
+    assert_eq!(outbox.last_error, Some(FailClass::NntpError));
+    assert!(rig.safety_held(&s));
+
+    // One more break is replaced inside the job, and the answer counts.
+    rig.servers[1].drop_next_stats(1).await;
+    rig.bridge.clock.advance_secs(delay);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+}
+
 /// One backbone per job; the cursor carries the position between jobs and
 /// moving on spends no attempt.
 #[tokio::test]
@@ -437,6 +467,18 @@ async fn newer_failure_cancels_pass() {
         (bb1.result, bb1.kind, bb1.counts),
         (VerifyResult::Ok, VerifyKind::Body, true)
     );
+
+    // The next round finds the first backbone still corrupt. The second
+    // one's own full pass of the round before does not spare it the full
+    // check: only a pass on a backbone before it would.
+    rig.servers[1].set_body_gone(true).await;
+    rig.bridge.clock.advance_secs(REVERIFY_SECS);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let _ = rig.run(&s, OutboxStage::Verify).await;
+    let status = rig.bridge.catalog.backbone_status(&s.extent).await.unwrap();
+    let bb1 = status.iter().find(|b| b.backbone == "bb1").unwrap();
+    assert_eq!(bb1.kind, VerifyKind::Body);
+    assert!(rig.safety_held(&s));
 }
 
 /// The backbones, results and kinds of an extent's verification rows.

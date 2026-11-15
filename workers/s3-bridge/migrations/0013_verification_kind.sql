@@ -10,3 +10,10 @@
 
 ALTER TABLE verifications ADD COLUMN kind TEXT NOT NULL DEFAULT 'body'
   CHECK (kind IN ('body','stat'));
+
+-- The articles a `stat` row found present. A `stat` row keeps
+-- `articles_ok` at 0 and counts here instead, so a reader from before
+-- this migration, which takes `articles_ok = articles_total` for a full
+-- read-back, never takes a `stat` pass for one (after a rollback of the
+-- Worker, for example). A `body` row keeps this at 0.
+ALTER TABLE verifications ADD COLUMN articles_present INTEGER NOT NULL DEFAULT 0;

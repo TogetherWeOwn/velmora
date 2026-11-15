@@ -1222,6 +1222,65 @@ async fn verification_kind_defaults_to_body_and_stat_is_not_a_read() {
     assert_eq!((b.kind, b.verified_at), (VerifyKind::Body, T0.plus_ms(3)));
 }
 
+/// How many rows of a backbone a reader from before `kind` takes for a
+/// complete read-back: its test names no kind.
+async fn read_backs_before_kind(fx: &Fx, o: &Obj, backbone: &str) -> String {
+    let rows = fx
+        .cat
+        .sql
+        .0
+        .query(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM verifications v \
+               JOIN extents e ON e.id = v.extent_id \
+              WHERE v.extent_id = ?1 AND v.backbone = ?2 AND v.result = 'ok' \
+                AND v.articles_ok = v.articles_total \
+                AND v.articles_total = COALESCE(e.article_count, -1)",
+            &[text(o.extent.as_str()), text(backbone)],
+        )
+        .await
+        .unwrap();
+    match &rows[0][0] {
+        SqlValue::Text(s) => s.clone(),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A Worker from before `kind` (after a rollback, say) takes a row with
+/// `articles_ok = articles_total` for a full read-back. A `STAT` pass is
+/// stored so that it never is one to that reader, and still reads as a
+/// complete pass of its kind to this one.
+#[tokio::test]
+async fn a_stat_pass_is_no_read_back_to_a_reader_from_before_kind() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "1");
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-b").await, "0");
+
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    let seen: Vec<_> = status
+        .iter()
+        .map(|b| (b.backbone.as_str(), b.kind, b.articles_ok, b.counts))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("bb-a", VerifyKind::Body, 2, true),
+            ("bb-b", VerifyKind::Stat, 2, true)
+        ]
+    );
+
+    // A second result in the same millisecond moves the tally with the kind.
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-b").await, "1");
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "0");
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    assert!(status.iter().all(|b| b.counts && b.articles_ok == 2));
+}
+
 #[tokio::test]
 async fn release_refuses_a_retired_generation_and_a_missing_safety_copy() {
     let fx = Fx::new().await;

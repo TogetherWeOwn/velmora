@@ -781,17 +781,11 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .or_internal()?
         .ok_or_else(no_key)?;
 
-    // Only a read-back from a backbone that is still configured is
+    // Only a read-back from a backbone that counts toward a release is
     // evidence, as in the verify stage: a `STAT` pass is not one. Labels
     // compare trimmed and in lower case.
     let label = |b: &str| b.trim().to_lowercase();
-    let configured: Vec<String> = bridge
-        .cfg
-        .providers
-        .iter()
-        .filter(|p| p.read && p.enabled)
-        .map(|p| label(&p.backbone))
-        .collect();
+    let configured = crate::verify::release_labels(&bridge.cfg.providers);
     let on_usenet = |x: &crate::types::ExtentStatus| {
         x.backbones.iter().any(|b| {
             b.counts

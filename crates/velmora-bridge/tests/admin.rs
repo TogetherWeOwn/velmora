@@ -1363,9 +1363,13 @@ async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
     );
 
     let sql = &fx.bridge.catalog.sql;
-    sql.exec("UPDATE verifications SET kind = 'stat'", &[])
-        .await
-        .unwrap();
+    // As a `STAT` pass is stored: its tally in `articles_present`.
+    sql.exec(
+        "UPDATE verifications SET kind = 'stat', articles_present = articles_ok, articles_ok = 0",
+        &[],
+    )
+    .await
+    .unwrap();
     let status = fx.get("/objects/scratch/k").await.json();
     let backbone = &status["extents"][0]["backbones"][0];
     assert_eq!(
@@ -1382,9 +1386,64 @@ async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
     assert_eq!(fx.safety_state(&o).await, "held");
 
     // Read in full again: the copy can go.
-    sql.exec("UPDATE verifications SET kind = 'body'", &[])
+    sql.exec(
+        "UPDATE verifications SET kind = 'body', articles_ok = articles_present, articles_present = 0",
+        &[],
+    )
+    .await
+    .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
+}
+
+/// A read-back from a backbone that does not count toward a release is no
+/// reason to give up the pinned copy either.
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_the_read_back_is_on_a_backbone_that_does_not_count() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut side = providers[0].clone();
+        side.id = "p9".to_string();
+        side.backbone = "side".to_string();
+        side.post = false;
+        side.release = false;
+        providers.push(side);
+    })
+    .await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    let sql = &fx.bridge.catalog.sql;
+    let home = fx.bridge.cfg.providers[0].backbone.clone();
+
+    // The full read-back is on the backbone that does not count.
+    sql.exec("UPDATE verifications SET backbone = 'side'", &[])
         .await
         .unwrap();
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (
+            &backbone["backbone"],
+            &backbone["kind"],
+            &backbone["counts"]
+        ),
+        (&json!("side"), &json!("body"), &json!(true))
+    );
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+
+    // On the backbone that counts: the copy can go.
+    sql.exec(
+        "UPDATE verifications SET backbone = ?1",
+        &[SqlValue::Text(home)],
+    )
+    .await
+    .unwrap();
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(r.json()["safety_deleted"], 1);
     assert!(!fx.has_safety(&o));

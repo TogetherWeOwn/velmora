@@ -111,6 +111,8 @@ struct Spool {
     discard_posts: usize,
     /// Remaining `BODY` replies to cut mid-body.
     drop_bodies: usize,
+    /// Remaining `STAT`s to close the connection on without a reply.
+    drop_stats: usize,
     /// While true, `STAT` answers `430` for articles in the `POST` spool.
     stat_lag: bool,
     /// While true, `BODY` answers `430` for articles in the `POST` spool
@@ -148,6 +150,7 @@ impl Shared {
             drop_posts: 0,
             discard_posts: 0,
             drop_bodies: 0,
+            drop_stats: 0,
             stat_lag: false,
             body_gone: false,
             limit_482: false,
@@ -322,6 +325,11 @@ impl TestNntpServer {
     /// The next `n` `BODY` replies stop mid-body and close the connection.
     pub async fn drop_next_bodies(&self, n: usize) {
         self.shared.spool.lock().await.drop_bodies = n;
+    }
+
+    /// The next `n` `STAT`s get no reply: the connection closes instead.
+    pub async fn drop_next_stats(&self, n: usize) {
+        self.shared.spool.lock().await.drop_stats = n;
     }
 
     /// While set, `STAT` answers `430` for posted articles although `BODY`
@@ -688,6 +696,10 @@ async fn handle_connection(
                 // Runtime hooks: a lagging STAT and a one-shot mid-body drop.
                 {
                     let mut spool = shared.spool.lock().await;
+                    if cmd.as_str() == "STAT" && spool.drop_stats > 0 {
+                        spool.drop_stats -= 1;
+                        break;
+                    }
                     if cmd.as_str() == "STAT"
                         && spool.stat_lag
                         && spool
