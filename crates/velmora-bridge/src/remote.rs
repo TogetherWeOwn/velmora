@@ -12,15 +12,17 @@
 //!   [`RemoteError::Refused`] at once: a retry cannot help.
 //! - An answer is bounded: the request names the longest body that is
 //!   read ([`HttpRequest::max_answer`]).
-//! - A key is checked before it is signed: no empty, `.` or `..`
-//!   segment, so a request never leaves the store's prefix.
+//! - A key is checked before it is signed: segments of letters, digits
+//!   and `-_.~`, none empty, `.` or `..`, so a request never leaves the
+//!   store's prefix. A listed key must pass the same check.
 //! - A `PUT` carries `Content-MD5`, so the store refuses a body damaged
 //!   on the way, and is followed by a `HEAD` whose size and ETag must be
 //!   those of the bytes sent.
 //! - Neither key of the store nor an `Authorization` header is ever
 //!   formatted: [`RemoteConfig`]'s `Debug` shows `<redacted>` for the
 //!   access key and for the secret, and [`HttpRequest`]'s `Debug` shows
-//!   the method and the target only.
+//!   the method and the target only. [`HttpResponse`]'s `Debug` shows
+//!   the status and the length of the body, never the body or a header.
 
 // No `Send` bound is intended (see `ports`).
 #![allow(async_fn_in_trait)]
