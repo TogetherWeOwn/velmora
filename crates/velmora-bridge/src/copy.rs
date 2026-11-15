@@ -4,10 +4,12 @@
 //! A **pass** starts every [`PASS_INTERVAL_MS`] and does two things, in
 //! this order:
 //!
-//! 1. **The fresh sweep.** The generation records and the tombstones
+//! 1. **The fresh sweep.** The tombstones, then the generation records,
 //!    minted in the last [`FRESH_MS`]. Their keys start with the time,
 //!    so this is a short range of the listing however many records the
 //!    bucket holds. A new write or delete is over there one pass later.
+//!    The sweep has the first [`SWEEP_MS`] of a pass; what it did not
+//!    reach by then is left to the next pass, and reported.
 //! 2. **The walk.** Everything else under `m/`, in key order, from
 //!    where the last pass stopped ([`WALK_KEY`]). A pass ends when the
 //!    next one starts; the walk goes on from the saved place and starts
@@ -21,9 +23,10 @@
 //!   a listing without reading all of it. The sweep reads which extents
 //!   a generation names and copies their plans first. A record with a
 //!   plan that is not written yet (the extent is not posted) is held
-//!   back (`pending`) and looked at again by the next pass. Once it is
-//!   older than [`FRESH_MS`] the walk copies it as it is, and its plans
-//!   when it comes to them.
+//!   back (`pending`) and looked at again by the next pass, which goes
+//!   on after the plans that are over there ([`SWEEP_KEY`]). The last
+//!   pass in which the record is fresh sends it as it is; its other
+//!   plans are copied by the walk when it comes to them.
 //! - **Nothing is ever deleted over there.** "Absent in the safety
 //!   bucket" cannot be told from "the safety bucket was lost", which is
 //!   the event the copy exists for. A copy without a source is counted
@@ -44,9 +47,10 @@
 //!   it runs while the catalogue is closed (rolled back, or a replay
 //!   unfinished). The saved place of the walk is a hint: any value,
 //!   or none, only changes where the walk starts, never what it
-//!   reaches. A lost or repeated job only makes a later pass do the
-//!   work. It does not run in `MAINTENANCE=restore`, when the safety
-//!   bucket may be half filled.
+//!   reaches. What is saved of the sweep is a hint too: it can only
+//!   change which record is sent before which. A lost or repeated job
+//!   only makes a later pass do the work. It does not run in
+//!   `MAINTENANCE=restore`, when the safety bucket may be half filled.
 //! - **A record of the walk that could not be copied waits for the walk
 //!   to come round.** One of the fresh sweep is tried again by the next
 //!   pass.
@@ -78,12 +82,24 @@ pub const MIN_AGE_MS: i64 = 2 * 60 * 1000;
 /// tombstones minted in this long before the pass started. Older ones
 /// belong to the walk.
 pub const FRESH_MS: i64 = 60 * 60 * 1000;
+/// The fresh sweep has this much of a pass. After it the pass goes on
+/// with the walk, so that neither can keep the other from its turn.
+pub const SWEEP_MS: i64 = 10 * 60 * 1000;
 /// Where the walk stopped: a key of the safety bucket, outside the
 /// records. Its body is the key the walk goes on after.
 pub const WALK_KEY: &str = "rc/walk";
+/// How far the fresh generation records came that are not sent yet: a
+/// JSON object, key of the record to the number of its article plans,
+/// from the first, that are over there. A plan is never changed or
+/// removed over there, so a number that was true stays true.
+pub const SWEEP_KEY: &str = "rc/sweep";
+/// Records at most in [`SWEEP_KEY`], and the bytes read of it.
+pub const SWEEP_RECORDS: usize = 1000;
+const SWEEP_BYTES: usize = 1024 * 1024;
 /// Bounds of one job; the next job goes on from the cursor. A copy and
-/// a check of an article plan count alike, so a job makes about 1,100
-/// requests at most.
+/// a check of an article plan count alike: a job starts 250 of them at
+/// most, [`CONCURRENCY`] at a time, and looks at the clock and at the
+/// answers of the store after each group.
 pub const JOB_COPIES: usize = 250;
 pub const JOB_PAGES: u32 = 40;
 pub const JOB_MS: i64 = 20_000;
@@ -126,7 +142,8 @@ pub struct CopyCounts {
     /// Generation records too young to copy.
     pub young: u64,
     /// Fresh generation records held back: an article plan they name is
-    /// not over there yet.
+    /// not over there yet. (One sent in its last fresh pass with a plan
+    /// missing is `copied`.)
     pub pending: u64,
     /// Copies without a source (at least this many). Never deleted.
     pub extra: u64,
@@ -153,6 +170,10 @@ pub struct CopyStep {
     /// The key the walk goes on after, when the step came to the walk
     /// (empty = from the start: the walk has ended).
     pub walk: Option<String>,
+    /// The fresh sweep was left unfinished: its time was up.
+    pub late: bool,
+    /// What the sweep learned could not be saved ([`SWEEP_KEY`]).
+    pub unsaved: bool,
 }
 
 /// Why a job did not do its step: a class, and a status at most. Never
@@ -165,23 +186,25 @@ pub enum StepError {
     Store(RemoteError),
     /// The job for the next step could not be sent.
     Queue,
-    /// The fresh sweep was not at its end when the next pass started:
-    /// what was left of it was not looked at.
+    /// The fresh sweep was not at its end when its time was up
+    /// ([`SWEEP_MS`]), or when the next pass started: what was left of
+    /// it was not looked at. The next pass starts it again; what is
+    /// over there by then costs it nothing.
     Expired,
-    /// The place of the walk could not be saved. The pass goes on; a
-    /// pass that starts before a later save walks this part again.
+    /// The place of the walk, or what the sweep learned, could not be
+    /// saved. The pass goes on; a later pass does that part again.
     Mark,
 }
 
 /// The parts of a pass, in the order they are done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Phase {
-    /// Fresh generation records, and whatever sorts after them.
-    #[serde(rename = "g")]
-    Generations,
     /// Fresh tombstones.
     #[serde(rename = "d")]
     Tombstones,
+    /// Fresh generation records, and whatever sorts after them.
+    #[serde(rename = "g")]
+    Generations,
     /// The walk below the fresh tombstones.
     #[serde(rename = "a")]
     Low,
@@ -235,6 +258,11 @@ impl Place {
     fn walking(&self) -> bool {
         matches!(self.phase, Phase::Low | Phase::High)
     }
+
+    /// Where a pass starts.
+    fn start(pass: UnixMs) -> Place {
+        Place::at(Phase::Tombstones, fresh(TOMBSTONE_PREFIX, pass))
+    }
 }
 
 /// The keys of one phase: after the place of the pass, up to and
@@ -243,6 +271,11 @@ struct Span {
     until: Option<String>,
     /// Generation records are sent after their article plans.
     plans: bool,
+    /// Every fresh generation record sorts after this key.
+    first: String,
+    /// A generation record up to this key is not fresh any more when
+    /// the next pass starts: it is not held back.
+    last: String,
 }
 
 /// The first key of the fresh generation records (or tombstones) of the
@@ -261,6 +294,11 @@ fn span(phase: Phase, pass: UnixMs) -> Span {
     Span {
         until,
         plans: phase == Phase::Generations,
+        first: fresh(GENERATION_PREFIX, pass),
+        last: start_after(
+            GENERATION_PREFIX,
+            UnixMs(pass.0 - FRESH_MS + PASS_INTERVAL_MS),
+        ),
     }
 }
 
@@ -281,6 +319,31 @@ struct Budget {
     started: UnixMs,
     copies: usize,
     pages: u32,
+}
+
+/// What [`SWEEP_KEY`] holds, read when a job first needs it.
+#[derive(Default)]
+struct Known {
+    loaded: bool,
+    changed: bool,
+    plans: BTreeMap<String, u32>,
+}
+
+impl Known {
+    /// Keeps that `n` of the `of` plans of the record at `key` are over
+    /// there. Only a part is kept: a record with all of them is sent.
+    fn keep(&mut self, key: &str, n: usize, of: usize) {
+        let room = self.plans.len() < SWEEP_RECORDS || self.plans.contains_key(key);
+        if n == 0 || n >= of || !room || self.plans.get(key) == Some(&(n as u32)) {
+            return;
+        }
+        self.plans.insert(key.to_string(), n as u32);
+        self.changed = true;
+    }
+
+    fn forget(&mut self, key: &str) {
+        self.changed |= self.plans.remove(key).is_some();
+    }
 }
 
 /// How a phase stopped.
@@ -380,6 +443,11 @@ fn all_down(asked: usize, down: usize) -> bool {
     asked >= OUTAGE_MIN && down == asked
 }
 
+/// The store was asked for this record.
+fn asked_store(copied: Copied) -> bool {
+    !matches!(copied, Copied::Gone | Copied::Unreadable | Copied::Same)
+}
+
 /// True on the cron run that starts a pass.
 pub fn pass_due(now: UnixMs) -> bool {
     now.0.rem_euclid(PASS_INTERVAL_MS) < START_WINDOW_MS
@@ -430,6 +498,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// newer pass has started, or the step failed). The third value is
     /// why the job did not do all of its work, when it did not; the
     /// job may be acknowledged all the same, so it has to be reported.
+    ///
+    /// A job that is to be retried does its step again, and counts it
+    /// again: a sum over a pass takes the acknowledged jobs only.
     pub async fn run_job<J: JobSink>(
         &self,
         jobs: &J,
@@ -468,10 +539,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             let down = StepError::Store(RemoteError::Unavailable);
             return (again, Some(step.counts), Some(down));
         }
-        let mut why = None;
+        let mut why = step.late.then_some(StepError::Expired);
+        if step.unsaved {
+            why = why.or(Some(StepError::Mark));
+        }
         if let Some(at) = &step.walk {
             if self.save_walk(at).await.is_err() {
-                why = Some(StepError::Mark);
+                why = why.or(Some(StepError::Mark));
             }
         }
         if let Some(cursor) = step.next {
@@ -505,38 +579,74 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             pages: 0,
         };
         let mut counts = CopyCounts::default();
-        let mut place = Place::parse(cursor)
-            .unwrap_or_else(|| Place::at(Phase::Generations, fresh(GENERATION_PREFIX, pass)));
-        loop {
+        let mut known = Known::default();
+        let mut place = Place::parse(cursor).unwrap_or_else(|| Place::start(pass));
+        // The time of the sweep is up: the walk has the rest of the pass.
+        let late = !place.walking() && budget.started.0 - pass.0 >= SWEEP_MS;
+        if late {
+            place = walk_from(self.saved_walk().await?, pass);
+        }
+        let (next, outage) = loop {
             let phase = span(place.phase, pass);
             let walked = self
-                .walk(&phase, &mut place, &mut budget, &mut counts)
+                .walk(&phase, &mut place, &mut budget, &mut counts, &mut known)
                 .await?;
-            if walked == Walked::End {
-                place = match place.phase {
-                    Phase::Generations => {
-                        Place::at(Phase::Tombstones, fresh(TOMBSTONE_PREFIX, pass))
-                    }
-                    Phase::Tombstones => walk_from(self.saved_walk().await?, pass),
-                    Phase::Low => Place::at(Phase::High, TOMBSTONES_END.to_string()),
-                    Phase::High => {
-                        return Ok(CopyStep {
-                            counts,
-                            next: None,
-                            outage: false,
-                            walk: Some(String::new()),
-                        })
-                    }
-                };
-                continue;
+            if walked != Walked::End {
+                break (Some(place.cursor()), walked == Walked::Outage);
             }
-            return Ok(CopyStep {
-                counts,
-                walk: place.walking().then(|| place.key.clone()),
-                next: Some(place.cursor()),
-                outage: walked == Walked::Outage,
-            });
+            place = match place.phase {
+                Phase::Tombstones => Place::at(Phase::Generations, fresh(GENERATION_PREFIX, pass)),
+                Phase::Generations => walk_from(self.saved_walk().await?, pass),
+                Phase::Low => Place::at(Phase::High, TOMBSTONES_END.to_string()),
+                Phase::High => {
+                    place.key = String::new();
+                    break (None, false);
+                }
+            };
+        };
+        Ok(CopyStep {
+            counts,
+            walk: place.walking().then(|| place.key.clone()),
+            next,
+            outage,
+            late,
+            unsaved: !self.save_known(known).await,
+        })
+    }
+
+    /// Reads [`SWEEP_KEY`], once in a job. Anything that is not what a
+    /// job would have written is read as nothing, and a record that is
+    /// not fresh any more is dropped.
+    async fn load_known(&self, known: &mut Known, span: &Span) {
+        if known.loaded {
+            return;
         }
+        known.loaded = true;
+        let Ok(Some(bytes)) = self.safety.get(SWEEP_KEY, None).await else {
+            return;
+        };
+        if bytes.len() > SWEEP_BYTES {
+            return;
+        }
+        let saved: BTreeMap<String, u32> = serde_json::from_slice(&bytes).unwrap_or_default();
+        let before = saved.len();
+        known.plans = saved
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(GENERATION_PREFIX) && *key > span.first)
+            .take(SWEEP_RECORDS)
+            .collect();
+        known.changed = known.plans.len() < before;
+    }
+
+    /// Writes [`SWEEP_KEY`] when the job changed it. False when it
+    /// could not be written.
+    async fn save_known(&self, known: Known) -> bool {
+        if !known.changed {
+            return true;
+        }
+        // Serializing strings and integers cannot fail.
+        let body = serde_json::to_vec(&known.plans).unwrap_or_default();
+        self.put_mark(SWEEP_KEY, body).await.is_ok()
     }
 
     /// The place the walk was saved at; empty when none is, or when it
@@ -554,14 +664,17 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     }
 
     async fn save_walk(&self, at: &str) -> Result<()> {
-        let body = at.as_bytes().to_vec();
+        self.put_mark(WALK_KEY, at.as_bytes().to_vec()).await
+    }
+
+    async fn put_mark(&self, key: &str, body: Vec<u8>) -> Result<()> {
         let sha: [u8; 32] = Sha256::digest(&body).into();
         let meta = BlobMeta {
             bucket: &BucketId::new("-"),
             extent: &ExtentId::new("recovery-copy"),
             cipher_sha256: &sha,
         };
-        self.safety.put(WALK_KEY, body, &meta).await
+        self.safety.put(key, body, &meta).await
     }
 
     /// Walks the keys of `span` after `place.key`, and moves the place,
@@ -573,6 +686,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         place: &mut Place,
         budget: &mut Budget,
         counts: &mut CopyCounts,
+        known: &mut Known,
     ) -> std::result::Result<Walked, StepError> {
         let inside = |key: &str| span.until.iter().all(|until| key <= until.as_str());
         loop {
@@ -648,7 +762,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 budget.copies += copies;
                 let chunk = self
-                    .copy_chunk(&items[done..to], span.plans, place, budget, counts)
+                    .copy_chunk(&items[done..to], span, place, budget, counts, known)
                     .await;
                 done += chunk.finished;
                 outage = chunk.outage;
@@ -681,22 +795,26 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
 
     /// Does the records of `chunk` and counts those that are finished.
     ///
-    /// With `plans`, a generation record is sent after the article plans
-    /// it names: all the records are read, then the plans are looked at,
-    /// in key order as far as the bounds of the job allow, then the
-    /// records whose plans are all over there are sent. A record whose
-    /// plans did not fit is not finished: `place` keeps how far it came,
-    /// and the next job goes on there. Nothing after it is counted. (A
+    /// In the fresh sweep a generation record is sent after the article
+    /// plans it names: all the records are read, then the plans are
+    /// looked at, record after record in key order and a group of
+    /// [`CONCURRENCY`] at a time, then the records whose plans are all
+    /// over there are sent. The bounds of the job and the answers of
+    /// the store are looked at after each group. A record whose plans
+    /// did not fit is not finished: `place` keeps how far it came, and
+    /// the next job goes on there. Nothing after it is counted. (A
     /// record after it that is not a generation record was sent all the
     /// same; the next job finds it equal.)
     async fn copy_chunk(
         &self,
         chunk: &[Item<'_>],
-        plans: bool,
+        span: &Span,
         place: &mut Place,
         budget: &mut Budget,
         counts: &mut CopyCounts,
+        known: &mut Known,
     ) -> Chunk {
+        let plans = span.plans;
         let work = chunk
             .iter()
             .enumerate()
@@ -721,7 +839,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         for (i, read) in read {
             match read {
                 Read::Is(copied) => {
-                    asked += 1;
+                    asked += usize::from(asked_store(copied));
                     down += usize::from(copied == Copied::Down);
                     result[i] = Some(copied);
                 }
@@ -731,83 +849,109 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             }
         }
         let mut outage = all_down(asked, down);
+        if !generations.is_empty() {
+            self.load_known(known, span).await;
+        }
 
-        // The plans to look at: those of each record, in key order,
-        // while the job has room.
         let mut finished = chunk.len();
-        let mut part: Option<(usize, usize)> = None;
-        let mut tasks: Vec<(usize, &str)> = Vec::new();
-        let mut room = JOB_COPIES.saturating_sub(budget.copies);
+        let mut ready: Vec<usize> = Vec::new();
+        // Requests in a row, group after group, that got no answer.
+        let mut silent = 0;
         for (i, (_, keys)) in &generations {
-            // A count for another record, or one larger than this record
-            // has plans, is not believed.
-            let begun = place.generation == chunk[*i].entry.key;
-            let from = match place.plans as usize {
-                n if begun && n <= keys.len() => n,
-                _ => 0,
-            };
-            let take = (keys.len() - from).min(room);
-            tasks.extend(keys[from..from + take].iter().map(|k| (*i, k.as_str())));
-            room -= take;
-            if from + take < keys.len() {
-                part = Some((*i, from + take));
+            let key = &chunk[*i].entry.key;
+            if outage {
+                // Not looked at: the job comes again, or the next one.
+                finished = *i;
+                break;
+            }
+            // How many of its plans are over there: what an earlier job
+            // of this pass counted, or an earlier pass. A count for
+            // another record, or one that leaves no plan to look at, is
+            // not believed.
+            let believed = |n: u32| Some(n as usize).filter(|n| *n < keys.len());
+            let counted = believed(place.plans).filter(|_| place.generation == *key);
+            let saved = known.plans.get(key).copied().and_then(believed);
+            let mut n = counted.max(saved).unwrap_or(0);
+            // A plan of the record is not over there.
+            let mut stopped = false;
+            while n < keys.len() && !stopped {
+                let room = JOB_COPIES.saturating_sub(budget.copies);
+                if room == 0 || self.spent(budget.started) {
+                    break;
+                }
+                let take = CONCURRENCY.min(room).min(keys.len() - n);
+                budget.copies += take;
+                let looked: Vec<Plan> = stream::iter(&keys[n..n + take])
+                    .map(|key| self.plan(key))
+                    .buffered(CONCURRENCY)
+                    .collect()
+                    .await;
+                let (mut asked, mut down, mut lead) = (0, 0, 0);
+                for (at, plan) in looked.into_iter().enumerate() {
+                    asked += usize::from(!matches!(plan, Plan::Absent | Plan::Unreadable));
+                    match plan {
+                        Plan::There => {}
+                        Plan::Sent => counts.copied += 1,
+                        Plan::Absent => continue,
+                        Plan::Unreadable => {
+                            counts.source_unreadable += 1;
+                            continue;
+                        }
+                        Plan::Failed => {
+                            counts.failed += 1;
+                            continue;
+                        }
+                        Plan::Down => {
+                            counts.failed += 1;
+                            down += 1;
+                            continue;
+                        }
+                        Plan::Refused => {
+                            counts.refused += 1;
+                            continue;
+                        }
+                    }
+                    lead += usize::from(lead == at);
+                }
+                n += lead;
+                stopped = lead < take;
+                silent = if asked > 0 && down == asked {
+                    silent + down
+                } else {
+                    0
+                };
+                outage = silent >= OUTAGE_MIN;
+            }
+            known.keep(key, n, keys.len());
+            if n == keys.len() || (stopped && !outage && *key <= span.last) {
+                // All its plans are over there, or it is fresh for the
+                // last time: the walk would send it as it is.
+                ready.push(*i);
+            } else if stopped {
+                // Held back: finished for this pass.
+                result[*i] = Some(Copied::Held);
+            } else {
+                place.generation = key.clone();
+                place.plans = n as u32;
                 finished = *i;
                 break;
             }
         }
-        budget.copies += tasks.len();
-        let looked: Vec<(usize, Plan)> = stream::iter(tasks)
-            .map(|(i, key)| async move { (i, self.plan(key).await) })
-            .buffer_unordered(CONCURRENCY)
-            .collect()
-            .await;
-        let mut held: BTreeSet<usize> = BTreeSet::new();
-        let (asked, mut down) = (looked.len(), 0);
-        for (i, plan) in looked {
-            match plan {
-                Plan::There => continue,
-                Plan::Sent => {
-                    counts.copied += 1;
-                    continue;
-                }
-                Plan::Absent => {}
-                Plan::Unreadable => counts.source_unreadable += 1,
-                Plan::Failed => counts.failed += 1,
-                Plan::Down => {
-                    counts.failed += 1;
-                    down += 1;
-                }
-                Plan::Refused => counts.refused += 1,
-            }
-            held.insert(i);
-        }
-        outage |= all_down(asked, down);
-        if let Some((i, plans)) = part {
-            if held.contains(&i) {
-                // Held back already: finished for this pass.
-                finished = i + 1;
-            } else {
-                place.generation = chunk[i].entry.key.clone();
-                place.plans = plans as u32;
-            }
-        }
 
-        // The records whose plans are all over there.
-        for i in &held {
-            result[*i] = Some(Copied::Held);
-        }
-        let ready = generations
-            .iter()
-            .filter(|(i, _)| **i < finished && !held.contains(*i))
-            .map(|(i, (bytes, _))| (*i, bytes));
         let sent: Vec<(usize, Copied)> = stream::iter(ready)
-            .map(|(i, bytes)| async move { (i, self.send(&chunk[i].entry.key, bytes).await) })
+            .map(|i| {
+                let bytes = &generations[&i].0;
+                async move { (i, self.send(&chunk[i].entry.key, bytes).await) }
+            })
             .buffer_unordered(CONCURRENCY)
             .collect()
             .await;
         let (asked, mut down) = (sent.len(), 0);
         for (i, copied) in sent {
             down += usize::from(copied == Copied::Down);
+            if copied == Copied::Done {
+                known.forget(&chunk[i].entry.key);
+            }
             result[i] = Some(copied);
         }
         outage |= all_down(asked, down);
