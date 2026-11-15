@@ -72,6 +72,9 @@ pub const MIGRATION_0011: &str =
 /// Why a provider's last failed session failed.
 pub const MIGRATION_0012: &str =
     include_str!("../../../workers/s3-bridge/migrations/0012_provider_health_reason.sql");
+/// How a verification row checked the articles (`body` or `stat`).
+pub const MIGRATION_0013: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0013_verification_kind.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -166,6 +169,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0010)?;
         db.apply(MIGRATION_0011)?;
         db.apply(MIGRATION_0012)?;
+        db.apply(MIGRATION_0013)?;
         Ok(db)
     }
 

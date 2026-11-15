@@ -576,6 +576,7 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
         pool: None,
         pool_max_conns: None,
         enabled: true,
+        release: true,
     }
 }
 
