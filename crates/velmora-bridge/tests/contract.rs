@@ -1841,6 +1841,22 @@ fn provider_proxies_fail_closed() {
     assert_eq!(with(&many), invalid);
     assert!(with(&many[1..]).is_ok());
 
+    // Every proxy may be in use at the same time, each with its own
+    // address: more proxies than the stated address limit are refused.
+    let capped = |ips: u32, list: &[String]| {
+        let extra = format!(r#""max_ips":{ips},"proxies":[{}]"#, list.join(","));
+        providers_of(&[provider_json("a", &extra)])
+    };
+    let three = &many[1..];
+    assert_eq!(three.len(), 3);
+    assert_eq!(capped(1, three), invalid);
+    assert_eq!(capped(2, three), invalid);
+    assert!(capped(3, three).is_ok());
+    assert!(capped(4, three).is_ok());
+    assert_eq!(capped(1, &three[..2]), invalid);
+    assert!(capped(2, &three[..2]).is_ok());
+    assert!(capped(1, &three[..1]).is_ok());
+
     // The proxy is given the provider's host as a name, and the
     // certificate is checked against that name: a provider known by an
     // address, or by a name the request cannot carry, takes no proxy.

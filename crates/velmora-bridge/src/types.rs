@@ -445,9 +445,12 @@ pub struct ProviderConfig {
     /// list that is there and empty is refused, so that a list emptied
     /// by mistake does not turn into direct connections.
     ///
-    /// The provider sees one address per proxy, whatever the number of
-    /// invocations. `max_ips` still counts invocations, so behind
-    /// proxies it is left out.
+    /// The provider sees one address per proxy in use, whatever the
+    /// number of invocations, and all the proxies may be in use at the
+    /// same time. So list no more proxies than the addresses the
+    /// provider allows. `max_ips` still counts invocations and is best
+    /// left out behind proxies; where it is stated, a list longer than
+    /// it is refused.
     ///
     /// Rollout and rollback as for `hosts`: an older Worker refuses a
     /// secret that carries this field.

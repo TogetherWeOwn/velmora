@@ -272,6 +272,40 @@ async fn an_untrusted_chain_fails_closed() {
     assert_eq!((seen.handshakes, seen.bytes), (0, 0));
 }
 
+/// The connector the Worker uses, with the public roots and the real
+/// clock, does not accept the fixture CA: the same server that passes
+/// with a connector that trusts it fails closed, and nothing was sent
+/// under TLS. A connector that checked less would pass here.
+#[tokio::test]
+async fn the_public_connector_trusts_only_the_public_roots() {
+    let server = TestNntpServer::spawn_for_test().await;
+    let (front, seen) = tls_front(&server).await;
+    let (proxy, login) = proxy().await;
+    proxy.resolve(NAME, front);
+    let cfg = nntp_config(NAME);
+    let progress = Progress::new();
+
+    // The server is one a client can talk to.
+    drop(
+        connect(&proxy, &login, &connector(true), &cfg, &Progress::new())
+            .await
+            .unwrap(),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(seen.lock().unwrap().handshakes, 1);
+
+    let public = proxy_tls::public_connector().unwrap();
+    let e = connect(&proxy, &login, &public, &cfg, &progress)
+        .await
+        .expect_err("the fixture CA is not a public root");
+    assert_eq!(e.to_string(), socks5::ERR_TLS);
+    assert!(is_target_failure(&e) && !is_proxy_failure(&e));
+    assert!(progress.logged_in());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seen = seen.lock().unwrap();
+    assert_eq!((seen.handshakes, seen.bytes), (1, 0));
+}
+
 /// A server that does not speak TLS (the plaintext NNTP port) is not
 /// talked to in plaintext: the connect fails, and no login was sent.
 #[tokio::test]

@@ -47,10 +47,11 @@ pub const MAX_PROVIDERS: usize = 32;
 pub const MAX_HOSTS: usize = 8;
 
 /// Most entries a provider's `proxies` may hold. Each one that cannot
-/// be used costs a connect its time limit
-/// ([`crate::hosts::PROXY_CONNECT_SECS`]) and, before that, at most one
-/// probe its own ([`crate::hosts::PROBE_TIMEOUT_MS`]: a proxy that a
-/// probe found unusable is not probed through again). All of that
+/// be used costs the callers its time limit
+/// ([`crate::hosts::PROXY_CONNECT_SECS`]) once, over all the connects
+/// and probes that wait for it: the time a probe gave up after counts
+/// into it. A probe may run into the end of that time, at most its own
+/// limit late ([`crate::hosts::PROBE_TIMEOUT_MS`]). All of that
 /// together must leave room inside one call of a read.
 pub const MAX_PROXIES: usize = 3;
 const _: () = assert!(
@@ -333,6 +334,11 @@ fn public_ip(ip: IpAddr) -> bool {
 /// public IP address with a port and a login SOCKS5 can carry, none
 /// twice. Only on a TLS provider, whose every host name fits a SOCKS5
 /// request: through a proxy there is no plaintext.
+///
+/// The provider sees one address per proxy in use, and all of them may
+/// be in use together (each isolate keeps its own order). So the list
+/// is no longer than the provider's address limit, `max_ips`, where one
+/// is stated.
 fn proxies_ok(p: &ProviderConfig) -> bool {
     if p.proxies.is_empty() {
         return true;
@@ -341,6 +347,8 @@ fn proxies_ok(p: &ProviderConfig) -> bool {
     let mut seen = BTreeSet::new();
     p.tls
         && p.proxies.len() <= MAX_PROXIES
+        && p.max_ips
+            .is_none_or(|ips| p.proxies.len() as u64 <= u64::from(ips))
         && p.endpoints().into_iter().all(valid_host_name)
         && p.proxies.iter().all(|x| {
             (valid_host_name(&x.host) || x.host.parse::<IpAddr>().is_ok_and(public_ip))

@@ -41,6 +41,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::transport::Transport;
+use zeroize::Zeroizing;
 
 /// Longest name, user name or password the protocol carries, in bytes.
 pub const MAX_FIELD_BYTES: usize = 255;
@@ -93,6 +94,9 @@ pub const ERR_TLS: &str = "socks5: TLS with the target failed";
 pub struct StageError {
     message: &'static str,
     target: bool,
+    /// The proxy answered the request with a reply that names the
+    /// target or the way to it (RFC 1928, codes 3 to 6).
+    named: bool,
 }
 
 impl fmt::Display for StageError {
@@ -120,6 +124,14 @@ pub fn is_target_failure(e: &io::Error) -> bool {
     stage(e).is_some_and(|s| s.target)
 }
 
+/// Whether `e` is the proxy's own answer that the target was not
+/// reached (RFC 1928, reply codes 3 to 6): the proxy tried, and another
+/// proxy would be told the same. Silence, a closed connection and the
+/// general failure (code 1) are target failures too, and are not this.
+pub fn is_target_reply(e: &io::Error) -> bool {
+    stage(e).is_some_and(|s| s.target && s.named)
+}
+
 /// A failure of the proxy itself, for a connector's own steps of the
 /// stage (opening the socket, the bound on the whole handshake).
 /// `message` is one of this module's constants.
@@ -129,6 +141,7 @@ pub fn proxy_failure(kind: io::ErrorKind, message: &'static str) -> io::Error {
         StageError {
             message,
             target: false,
+            named: false,
         },
     )
 }
@@ -169,6 +182,7 @@ fn while_connecting(e: io::Error) -> io::Error {
             StageError {
                 message: s.message,
                 target: true,
+                named: false,
             },
         ),
         _ => e,
@@ -184,6 +198,7 @@ pub fn target_failure(kind: io::ErrorKind, message: &'static str) -> io::Error {
         StageError {
             message,
             target: true,
+            named: false,
         },
     )
 }
@@ -289,6 +304,13 @@ fn target_reply(rep: u8) -> bool {
     matches!(rep, 1 | 3..=6)
 }
 
+/// The reply codes that name the target or the way to it (3 = network
+/// unreachable, 4 = host unreachable, 5 = connection refused, 6 = TTL
+/// expired). The general failure (1) names nothing.
+fn named_reply(rep: u8) -> bool {
+    matches!(rep, 3..=6)
+}
+
 /// Runs the handshake on a freshly opened connection to the proxy:
 /// greeting, login, `CONNECT host:port`. On `Ok` the next byte either
 /// side sends belongs to the target's stream.
@@ -329,14 +351,16 @@ pub async fn connect_tracked<T: Transport>(
     }
 
     // Login (RFC 1929). The lengths fit a byte: checked above.
-    let mut login = Vec::with_capacity(3 + username.len() + password.len());
+    // Wiped when it goes out of scope, on every path. The capacity is
+    // exact, so the bytes are never moved to a second buffer.
+    let mut login = Zeroizing::new(Vec::with_capacity(3 + username.len() + password.len()));
     login.push(AUTH_VERSION);
     login.push(username.len() as u8);
     login.extend_from_slice(username.as_bytes());
     login.push(password.len() as u8);
     login.extend_from_slice(password.as_bytes());
     let sent = transport.write_all(&login).await;
-    login.fill(0);
+    drop(login);
     sent.map_err(io_failure)?;
     read_reply(transport, &mut buf, two_bytes(AUTH_VERSION)).await?;
     if buf[1] != 0 {
@@ -363,6 +387,7 @@ pub async fn connect_tracked<T: Transport>(
             StageError {
                 message: ERR_CONNECT,
                 target: true,
+                named: named_reply(rep),
             },
         )),
         _ => Err(error(io::ErrorKind::ConnectionRefused, ERR_REQUEST)),
@@ -532,6 +557,32 @@ mod tests {
                 msg,
             );
         }
+    }
+
+    /// Only the replies that name the target or the way to it (3 to 6)
+    /// are a target reply. The general failure, a failure the client
+    /// infers and a failure of the proxy are not.
+    #[test]
+    fn only_replies_three_to_six_name_the_target() {
+        for rep in 1..=255u8 {
+            let reply = [5, rep, 0, 1, 0, 0, 0, 0, 0, 0];
+            let (out, _) = run(&[METHOD_OK, AUTH_OK, &reply]);
+            let e = out.expect_err("handshake must fail");
+            assert_eq!(is_target_reply(&e), (3..=6).contains(&rep), "{rep}");
+            assert!(!is_target_reply(&e) || is_target_failure(&e), "{rep}");
+        }
+        assert!(!is_target_reply(&target_failure(
+            io::ErrorKind::TimedOut,
+            ERR_TLS
+        )));
+        assert!(!is_target_reply(&proxy_failure(
+            io::ErrorKind::ConnectionRefused,
+            ERR_IO
+        )));
+        assert!(!is_target_reply(&io::Error::other("elsewhere")));
+        // The proxy closed after the login: inferred, not named.
+        let (out, _) = run(&[METHOD_OK, AUTH_OK]);
+        assert!(!is_target_reply(&out.expect_err("closed")));
     }
 
     #[test]
