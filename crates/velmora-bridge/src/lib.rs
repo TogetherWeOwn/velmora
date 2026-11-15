@@ -19,6 +19,7 @@ mod pool;
 pub mod ports;
 pub mod post;
 pub mod recovery;
+pub mod remote;
 pub mod replay;
 pub mod service;
 pub mod sql;

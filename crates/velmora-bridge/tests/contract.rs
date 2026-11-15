@@ -344,6 +344,18 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // The recovery copy: absent or blank is off. It is no part of
+        // this configuration and cannot stop the service.
+        if name == "RECOVERY_COPY" {
+            for _ in 0..2 {
+                load(&vars).unwrap();
+                let copy =
+                    velmora_bridge::remote::RemoteConfig::from_vars(|n| vars.get(n).cloned());
+                assert!(copy.unwrap().is_none());
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         assert_eq!(
             load(&vars).unwrap_err(),
             ConfigError::Missing(name.clone()),

@@ -80,6 +80,16 @@ pub struct BlobMeta<'a> {
     pub cipher_sha256: &'a [u8; 32],
 }
 
+/// One key of a listing with what identifies its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobEntry {
+    pub key: String,
+    pub size: u64,
+    /// MD5 of the bytes in lowercase hex, as the store reports it for an
+    /// object written by one put.
+    pub md5: String,
+}
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
     /// H2 adds `put_stream(len)`.
@@ -101,6 +111,37 @@ pub trait BlobStore {
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
+    /// [`BlobStore::list`] with the size and MD5 of each key. An empty
+    /// answer = no more keys. This default reads every blob; an adapter
+    /// whose listing carries both overrides it.
+    async fn list_entries(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> Result<Vec<BlobEntry>> {
+        let mut entries = Vec::new();
+        let mut after = start_after.to_string();
+        // A key removed since it was listed is left out; an answer is
+        // empty only when the listing itself has ended.
+        while entries.is_empty() {
+            let keys = self.list(prefix, &after, limit).await?;
+            let Some(last) = keys.last().cloned() else {
+                break;
+            };
+            for key in keys {
+                if let Some(bytes) = self.get(&key, None).await? {
+                    entries.push(BlobEntry {
+                        size: bytes.len() as u64,
+                        md5: crate::remote::md5_hex(&bytes),
+                        key,
+                    });
+                }
+            }
+            after = last;
+        }
+        Ok(entries)
+    }
 }
 
 // ---------------------------------------------------------------------------
