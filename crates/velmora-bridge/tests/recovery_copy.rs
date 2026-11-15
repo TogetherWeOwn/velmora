@@ -2619,7 +2619,7 @@ async fn queued_pass<B: BlobStore, T: Clock>(
         if sent.is_empty() {
             return whys;
         }
-        assert_eq!(sent.len(), 1);
+        assert_eq!((sent.len(), sent[0].delay_secs), (1, 0));
         let Job::RecoveryCopy { pass, cursor, .. } = &sent[0].job else {
             panic!("another job");
         };
@@ -3174,6 +3174,10 @@ async fn retried_pass(w: &World, start: UnixMs) -> (Vec<StepError>, usize) {
                 .set(UnixMs(w.clock.now().0 + i64::from(delay_secs) * 1000));
         }
         sent = w.jobs.take();
+        if let Some(next) = sent.first() {
+            w.clock
+                .set(UnixMs(w.clock.now().0 + i64::from(next.delay_secs) * 1000));
+        }
     }
     (whys, retries)
 }
@@ -3235,6 +3239,8 @@ async fn a_job_of_the_sweep_is_retried_for_half_the_time_of_the_sweep() {
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
     assert_eq!(counts.unwrap().failed, 3);
     let sent = w.jobs.take();
+    // The next job waits: the store may be back by then.
+    assert_eq!(sent[0].delay_secs, 60);
     let Job::RecoveryCopy { cursor, .. } = &sent[0].job else {
         panic!("another job");
     };
@@ -3243,6 +3249,19 @@ async fn a_job_of_the_sweep_is_retried_for_half_the_time_of_the_sweep() {
         "{cursor}"
     );
     assert!(cursor.contains("_t2"), "{cursor}");
+
+    // A job that begins in the sweep and finds the store down in the
+    // walk is retried as long as a job of the walk is.
+    let w = World::new();
+    for i in 0..3 {
+        w.record(&format!("m/art/x_{i}"), b"old").await;
+        w.e2.put_500_keys.borrow_mut().push(format!("m/art/x_{i}"));
+    }
+    w.clock.set(UnixMs(NOW + SWEEP_RETRY_MS));
+    let (outcome, _, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((outcome, why), (JobOutcome::Retry { delay_secs: 60 }, down));
+    assert!(w.jobs.take().is_empty());
+    assert_eq!(saved(&w).await, None);
 }
 
 /// A group of plans that asked nothing of the store says nothing about
@@ -3259,29 +3278,40 @@ async fn plans_that_asked_nothing_do_not_hide_an_outage() {
         w.record(&format!("m/art/{id}"), b"plan").await;
         w.e2.put_500_keys.borrow_mut().push(format!("m/art/{id}"));
     }
+    // The record behind the one that found it is not looked at, and is
+    // held back, although the store would take it and its plan.
+    let behind = generation(300_000, "_d");
+    w.generation(&behind, &["x_4"]).await;
+    w.record("m/art/x_4", b"plan").await;
     let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
     assert!(step.outage);
     // Found in the sweep: the walk was not begun.
     assert!(step.next.unwrap().starts_with("{\"p\":\"g\""));
-    assert_eq!((step.counts.failed, step.counts.pending), (3, 3));
+    assert_eq!((step.counts.failed, step.counts.pending), (3, 4));
+    assert_eq!(asked_for(w.e2, "HEAD", "m/art/x_4"), 0);
+    assert_eq!(put_at(w.e2, &behind), None);
     for id in ["x_1", "x_2", "x_3"] {
         assert_eq!(asked_for(w.e2, "PUT", &format!("m/art/{id}")), 4);
     }
 }
 
-struct NoRead<'a>(&'a MemBlobStore, &'static str);
+/// Refuses to read the named key: its size (`true`), or its bytes.
+struct NoRead<'a>(&'a MemBlobStore, &'static str, bool);
 
 impl BlobStore for NoRead<'_> {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
         self.0.put(key, bytes, meta).await
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
-        if key == self.1 {
+        if key == self.1 && !self.2 {
             return Err(BridgeError::Blob("down".into()));
         }
         self.0.get(key, span).await
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
+        if key == self.1 && self.2 {
+            return Err(BridgeError::Blob("down".into()));
+        }
         self.0.head(key).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
@@ -3296,34 +3326,40 @@ impl BlobStore for NoRead<'_> {
 }
 
 /// What is saved of the sweep and could not be read is not written
-/// over: the job knows less than is saved. The pass goes on without it.
+/// over: the job knows less than is saved. The pass goes on without it,
+/// and says that what it found is not saved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_sweep_that_cannot_be_read_is_not_written_over() {
-    let w = World::new();
     let other = generation(700_000, "_other");
     let before = format!("{{\"{other}\":5}}");
-    w.raw(SWEEP_KEY, before.clone().into_bytes()).await;
     let key = generation(600_000, "_a");
-    w.generation(&key, &["x_1", "x_2"]).await;
-    w.record("m/art/x_1", b"plan").await;
-    w.record("m/art/x_2", b"plan").await;
-    w.e2.put_500_keys.borrow_mut().push("m/art/x_2".into());
+    for head in [false, true] {
+        let w = World::new();
+        w.raw(SWEEP_KEY, before.clone().into_bytes()).await;
+        w.generation(&key, &["x_1", "x_2"]).await;
+        w.record("m/art/x_1", b"plan").await;
+        w.record("m/art/x_2", b"plan").await;
+        w.e2.put_500_keys.borrow_mut().push("m/art/x_2".into());
 
-    let store = NoRead(&w.safety, SWEEP_KEY);
-    let copier = Copier {
-        safety: &store,
-        kek: &w.kek,
-        clock: &w.clock,
-        remote: &w.remote,
-        maintenance: Maintenance::Off,
-    };
-    let step = copier.step(UnixMs(NOW), "").await.unwrap();
-    assert_eq!((step.counts.copied, step.counts.pending), (1, 1));
-    assert!(!step.unsaved);
-    assert_eq!(known(&w).await, before);
+        let store = NoRead(&w.safety, SWEEP_KEY, head);
+        let copier = Copier {
+            safety: &store,
+            kek: &w.kek,
+            clock: &w.clock,
+            remote: &w.remote,
+            maintenance: Maintenance::Off,
+        };
+        let step = copier.step(UnixMs(NOW), "").await.unwrap();
+        assert_eq!((step.counts.copied, step.counts.pending), (1, 1));
+        assert!(step.unsaved, "{head}");
+        assert_eq!(known(&w).await, before);
+        // A job that found nothing to save has nothing to report.
+        let step = copier.step(UnixMs(NOW), &walk("")).await.unwrap();
+        assert!(!step.unsaved);
 
-    // Read, the same job saves what it found beside what was there.
-    let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
-    assert_eq!(step.counts.pending, 1);
-    assert_eq!(known(&w).await, format!("{{\"{other}\":5,\"{key}\":1}}"));
+        // Read, the same job saves what it found beside what was there.
+        let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
+        assert_eq!((step.counts.pending, step.unsaved), (1, false));
+        assert_eq!(known(&w).await, format!("{{\"{other}\":5,\"{key}\":1}}"));
+    }
 }

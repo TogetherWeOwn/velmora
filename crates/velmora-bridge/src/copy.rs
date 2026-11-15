@@ -545,12 +545,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // The store is down: the cursor does not move while the job may
         // be retried. After that the pass goes on past the records that
         // failed, so that no record can hold back those behind it. A
-        // job of the sweep goes on sooner: the sweep ends at SWEEP_MS.
-        let sweeping = !Place::parse(cursor).is_some_and(|p| p.walking());
-        let hold = if sweeping {
-            SWEEP_RETRY_MS
-        } else {
+        // job that stopped in the sweep goes on sooner: the sweep ends
+        // at SWEEP_MS. One that began in the sweep and stopped in the
+        // walk is held as long as any job of the walk.
+        let hold = if step.walk.is_some() {
             RETRY_WINDOW_MS
+        } else {
+            SWEEP_RETRY_MS
         };
         if step.outage && age < hold {
             let down = StepError::Store(RemoteError::Unavailable);
@@ -571,7 +572,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 pass,
                 cursor,
             };
-            if jobs.send(&next, 0).await.is_err() {
+            // Past records that got no answer the pass goes on slowly:
+            // a store that comes back finds most of them still ahead.
+            let delay = if step.outage { RETRY_SECS } else { 0 };
+            if jobs.send(&next, delay).await.is_err() {
                 return (again, Some(step.counts), Some(StepError::Queue));
             }
         }
@@ -647,6 +651,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             Err(e) => Err(e),
         };
         let bytes = match bytes {
+            Ok(Some(bytes)) if bytes.len() > SWEEP_BYTES => return,
             Ok(Some(bytes)) => bytes,
             Ok(None) => return,
             Err(_) => {
@@ -667,8 +672,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// Writes [`SWEEP_KEY`] when the job changed it. False when it
     /// could not be written.
     async fn save_known(&self, known: Known) -> bool {
-        if !known.changed || known.unread {
+        if !known.changed {
             return true;
+        }
+        if known.unread {
+            return false;
         }
         // Serializing strings and integers cannot fail.
         let body = serde_json::to_vec(&known.plans).unwrap_or_default();
