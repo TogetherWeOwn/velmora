@@ -78,17 +78,51 @@ async fn handshake(
     (out, tcp)
 }
 
+/// A door in front of `server` that says nothing until the client has
+/// sent one byte, as a TLS server waits for the client's first message.
+/// (The plaintext server greets at once, and a greeting that arrives
+/// with the proxy's reply is refused by the handshake: see
+/// `bytes_after_the_reply_are_refused`.)
+async fn client_speaks_first(server: &TestNntpServer) -> std::net::SocketAddr {
+    let door = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = door.local_addr().unwrap();
+    let target = server.addr();
+    tokio::spawn(async move {
+        let Ok((mut client, _)) = door.accept().await else {
+            return;
+        };
+        let mut first = [0u8; 1];
+        if client.read_exact(&mut first).await.is_err() {
+            return;
+        }
+        let Ok(mut server) = TcpStream::connect(target).await else {
+            return;
+        };
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+    });
+    addr
+}
+
 /// Through a correct proxy the engine logs in to the server and reads an
 /// article: the proxy was asked for exactly the server, by name, and
 /// nothing of the server's stream was lost to the handshake.
 #[tokio::test]
 async fn an_nntp_session_runs_through_the_proxy() {
     let server = TestNntpServer::spawn_for_test().await;
+    let door = client_speaks_first(&server).await;
     let proxy = TestSocks5Proxy::spawn(proxy_user(), proxy_pass(), ProxyMode::Relay).await;
-    let (out, tcp) = handshake(&proxy, &server, proxy_user(), proxy_pass()).await;
-    out.unwrap();
+    let cfg = NntpConfig {
+        host: door.ip().to_string(),
+        port: door.port(),
+        ..nntp_config(&server)
+    };
+    let mut tcp = to_proxy(&proxy).await;
+    socks5::connect(&mut tcp, proxy_user(), proxy_pass(), &cfg.host, cfg.port)
+        .await
+        .unwrap();
+    // The client's first byte opens the door; the server greets after it.
+    tcp.write_all(&[0]).await.unwrap();
 
-    let cfg = nntp_config(&server);
     let mut client = NntpClient::connect(tcp, &cfg).await.unwrap();
     let id = velmora_test_nntp::default_corpus()[0].message_id.clone();
     let id = id.trim_matches(['<', '>']);

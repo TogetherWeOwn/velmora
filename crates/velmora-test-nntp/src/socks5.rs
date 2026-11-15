@@ -49,7 +49,8 @@ struct Shared {
     seen: Mutex<Seen>,
 }
 
-/// A proxy on an ephemeral loopback port. It stops when dropped.
+/// A proxy on an ephemeral loopback port. It stops when dropped, and
+/// so does every connection it relays.
 pub struct TestSocks5Proxy {
     addr: SocketAddr,
     shared: Arc<Shared>,
@@ -75,13 +76,15 @@ impl TestSocks5Proxy {
         });
         let accept = Arc::clone(&shared);
         let task = tokio::spawn(async move {
+            // Owned here, so that the sessions end with this task.
+            let mut sessions = tokio::task::JoinSet::new();
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 accept.seen.lock().unwrap().connections += 1;
                 let shared = Arc::clone(&accept);
-                tokio::spawn(async move {
+                sessions.spawn(async move {
                     let _ = serve(stream, &shared).await;
                 });
             }
