@@ -540,12 +540,20 @@ jobs:
       # repository build code. Values must be a valid hostname and a UUID,
       # so nothing else can be injected into the TOML. Values are never
       # printed. Pure Python, no repository code.
+      # The recovery copy is switched by two more variables of the
+      # environment: VELMORA_RECOVERY_COPY (unset or "off": the shipped
+      # "off" stays; "on") and VELMORA_RECOVERY_PREFIX. "on" needs a valid
+      # prefix (lowercase segments, each ending with "/"); with a missing
+      # or invalid one this step fails and nothing is deployed. A prefix
+      # that is set must be valid also while the copy is off.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
+          VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
+          VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
@@ -559,6 +567,16 @@ jobs:
               sys.exit("VELMORA_S3_HOST is missing or not a plain lowercase hostname")
           if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", dbid):
               sys.exit("VELMORA_D1_DATABASE_ID is missing or not a lowercase UUID")
+          copy = os.environ.get("VELMORA_RECOVERY_COPY", "") or "off"
+          prefix = os.environ.get("VELMORA_RECOVERY_PREFIX", "")
+          if copy not in ("off", "on"):
+              sys.exit("VELMORA_RECOVERY_COPY must be unset, off or on")
+          segment = r"[a-z0-9]([a-z0-9_-]{0,30}[a-z0-9])?"
+          prefix_ok = len(prefix) <= 64 and re.fullmatch(rf"({segment}/)+", prefix) is not None
+          if prefix and not prefix_ok:
+              sys.exit("VELMORA_RECOVERY_PREFIX is not lowercase segments that each end with a slash")
+          if copy == "on" and not prefix_ok:
+              sys.exit("VELMORA_RECOVERY_COPY is on and VELMORA_RECOVERY_PREFIX is missing")
 
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
@@ -570,6 +588,10 @@ jobs:
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
           ]
+          if copy == "on":
+              # One line in, two lines out: the switch and its prefix.
+              subs.append(('RECOVERY_COPY = "off"',
+                           f'RECOVERY_COPY = "on"\nRECOVERY_PREFIX = "{prefix}"'))
           for placeholder, value in subs:
               hits = [i for i in range(end) if lines[i].strip() == placeholder]
               if len(hits) != 1:
@@ -584,7 +606,7 @@ jobs:
           del lines[start:stop]
           with open(dst, "w", encoding="utf-8") as f:
               f.write("\n".join(lines))
-          print("wrangler.deploy.toml: 2 prod placeholders substituted, prod [build] removed")
+          print(f"wrangler.deploy.toml: 2 prod placeholders substituted, prod [build] removed, recovery copy {copy}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other
