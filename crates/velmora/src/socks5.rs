@@ -638,9 +638,11 @@ mod tests {
 
     #[test]
     fn arguments_the_protocol_cannot_carry_send_nothing() {
-        let long = "a".repeat(256);
-        let max = "a".repeat(255);
         let (u, pw) = login();
+        // Fields of 256 and 255 bytes, made of the run's own login.
+        let mut long = u.repeat(256);
+        long.truncate(256);
+        let max = &long[..255];
         let none = String::new();
         let cases: [(&str, &str, &str, u16); 7] = [
             (&none, &pw, "h.example", 563),
@@ -660,7 +662,7 @@ mod tests {
             assert!(t.written.is_empty());
         }
         let mut t = Script::new(&[METHOD_OK, AUTH_OK, BOUND_V4]);
-        futures_now(connect(&mut t, &max, &max, &max, 1)).unwrap();
+        futures_now(connect(&mut t, max, max, max, 1)).unwrap();
         assert_eq!(t.written.len(), 3 + (3 + 255 + 255) + (7 + 255));
     }
 
