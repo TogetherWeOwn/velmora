@@ -95,7 +95,7 @@ pub struct StageError {
     message: &'static str,
     target: bool,
     /// The proxy answered the request with a reply that names the
-    /// target or the way to it (RFC 1928, codes 3 to 6).
+    /// target itself (RFC 1928, codes 4 and 5).
     named: bool,
 }
 
@@ -124,10 +124,12 @@ pub fn is_target_failure(e: &io::Error) -> bool {
     stage(e).is_some_and(|s| s.target)
 }
 
-/// Whether `e` is the proxy's own answer that the target was not
-/// reached (RFC 1928, reply codes 3 to 6): the proxy tried, and another
-/// proxy would be told the same. Silence, a closed connection and the
-/// general failure (code 1) are target failures too, and are not this.
+/// Whether `e` is the proxy's own answer that the target itself could
+/// not be reached (RFC 1928, reply codes 4 and 5): the proxy tried, and
+/// another proxy would be told the same. Silence, a closed connection,
+/// the general failure (code 1) and the replies about the proxy's own
+/// way to the target (codes 3 and 6) are target failures too, and are
+/// not this: another proxy may have a way.
 pub fn is_target_reply(e: &io::Error) -> bool {
     stage(e).is_some_and(|s| s.target && s.named)
 }
@@ -304,11 +306,13 @@ fn target_reply(rep: u8) -> bool {
     matches!(rep, 1 | 3..=6)
 }
 
-/// The reply codes that name the target or the way to it (3 = network
-/// unreachable, 4 = host unreachable, 5 = connection refused, 6 = TTL
-/// expired). The general failure (1) names nothing.
+/// The reply codes that name the target itself (4 = host unreachable,
+/// 5 = connection refused). The others say nothing of the target that
+/// holds for another proxy: the general failure (1) names nothing, and
+/// 3 (network unreachable) and 6 (TTL expired) are about the way from
+/// this proxy.
 fn named_reply(rep: u8) -> bool {
-    matches!(rep, 3..=6)
+    matches!(rep, 4 | 5)
 }
 
 /// Runs the handshake on a freshly opened connection to the proxy:
@@ -559,16 +563,17 @@ mod tests {
         }
     }
 
-    /// Only the replies that name the target or the way to it (3 to 6)
-    /// are a target reply. The general failure, a failure the client
-    /// infers and a failure of the proxy are not.
+    /// Only the replies that name the target itself (4 and 5) are a
+    /// target reply. The general failure, the replies about the proxy's
+    /// way to the target (3 and 6), a failure the client infers and a
+    /// failure of the proxy are not.
     #[test]
-    fn only_replies_three_to_six_name_the_target() {
+    fn only_replies_four_and_five_name_the_target() {
         for rep in 1..=255u8 {
             let reply = [5, rep, 0, 1, 0, 0, 0, 0, 0, 0];
             let (out, _) = run(&[METHOD_OK, AUTH_OK, &reply]);
             let e = out.expect_err("handshake must fail");
-            assert_eq!(is_target_reply(&e), (3..=6).contains(&rep), "{rep}");
+            assert_eq!(is_target_reply(&e), (4..=5).contains(&rep), "{rep}");
             assert!(!is_target_reply(&e) || is_target_failure(&e), "{rep}");
         }
         assert!(!is_target_reply(&target_failure(

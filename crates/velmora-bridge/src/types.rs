@@ -447,10 +447,10 @@ pub struct ProviderConfig {
     ///
     /// The provider sees one address per proxy in use, whatever the
     /// number of invocations, and all the proxies may be in use at the
-    /// same time. So list no more proxies than the addresses the
-    /// provider allows. `max_ips` still counts invocations and is best
-    /// left out behind proxies; where it is stated, a list longer than
-    /// it is refused.
+    /// same time. So `max_ips`, the number of addresses the provider
+    /// allows, must be stated with this field, and a list longer than
+    /// it is refused. `max_ips` goes on counting invocations, which is
+    /// never the looser count.
     ///
     /// Rollout and rollback as for `hosts`: an older Worker refuses a
     /// secret that carries this field.

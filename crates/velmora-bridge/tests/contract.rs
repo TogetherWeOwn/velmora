@@ -1748,7 +1748,7 @@ fn provider_proxies_parse_in_order_and_are_redacted() {
     assert!(direct[0].proxies.is_empty());
 
     let proxies = format!(
-        r#""proxies":[{},{}]"#,
+        r#""max_ips":2,"proxies":[{},{}]"#,
         proxy_json("first.proxy.example", 1080, "proxy-login", "proxy-secret"),
         proxy_json("203.0.113.9", 40000, "other-login", "other-secret"),
     );
@@ -1785,7 +1785,7 @@ fn provider_proxies_fail_closed() {
     let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
     let ok = proxy_json("proxy.example", 1080, "u", "p");
     let with = |list: &[String]| {
-        let extra = format!(r#""proxies":[{}]"#, list.join(","));
+        let extra = format!(r#""max_ips":4,"proxies":[{}]"#, list.join(","));
         providers_of(&[provider_json("a", &extra)])
     };
     assert!(with(std::slice::from_ref(&ok)).is_ok());
@@ -1842,7 +1842,13 @@ fn provider_proxies_fail_closed() {
     assert!(with(&many[1..]).is_ok());
 
     // Every proxy may be in use at the same time, each with its own
-    // address: more proxies than the stated address limit are refused.
+    // address: more proxies than the address limit are refused, and so
+    // is a list without the limit, which nothing could be checked
+    // against.
+    for list in [&many[1..], &many[1..2]] {
+        let extra = format!(r#""proxies":[{}]"#, list.join(","));
+        assert_eq!(providers_of(&[provider_json("a", &extra)]), invalid);
+    }
     let capped = |ips: u32, list: &[String]| {
         let extra = format!(r#""max_ips":{ips},"proxies":[{}]"#, list.join(","));
         providers_of(&[provider_json("a", &extra)])
@@ -1867,7 +1873,10 @@ fn provider_proxies_fail_closed() {
             providers_of(&[json])
         };
         assert!(entry("").is_ok(), "{host}");
-        assert_eq!(entry(&format!(r#""proxies":[{ok}]"#)), invalid, "{host}");
+        let extra = format!(r#""max_ips":4,"proxies":[{ok}]"#);
+        assert_eq!(entry(&extra), invalid, "{host}");
+        // The same entry on a provider known by a name is accepted.
+        assert!(providers_of(&[provider_json("a", &extra)]).is_ok());
     }
 
     // Unknown or missing members, and the wrong shape.
@@ -1881,8 +1890,10 @@ fn provider_proxies_fail_closed() {
         r#""proxy":{"host":"proxy.example","port":1080,"user":"u","pass":"p"}"#,
         r#""proxy_fallback":"direct""#,
     ] {
+        // With the address limit, so that the entry is the only fault.
+        let extra = format!(r#""max_ips":4,{extra}"#);
         assert_eq!(
-            providers_of(&[provider_json("a", extra)]),
+            providers_of(&[provider_json("a", &extra)]),
             invalid,
             "{extra}"
         );
@@ -1900,7 +1911,7 @@ fn provider_proxies_need_tls() {
         )
     };
     let proxies = format!(
-        r#","proxies":[{}]"#,
+        r#","max_ips":4,"proxies":[{}]"#,
         proxy_json("proxy.example", 1080, "u", "p")
     );
     let loads = |vars: &_, json: &str| load(&with_secrets(Clone::clone(vars), json)).map(|_| ());

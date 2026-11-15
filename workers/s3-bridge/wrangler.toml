@@ -162,11 +162,10 @@ crons = ["*/5 * * * *"]
 # (`proxy_failed` in /status, `route` = "proxy") and its jobs wait, as
 # for a cooling provider, without spending attempts. `proxies` needs
 # `tls: true`, and a list that is there must not be empty. All the
-# proxies of a provider may be in use at the same time, so list no more
-# of them than the addresses the provider allows. Leave `max_ips` out
-# for a provider with `proxies` (it counts invocations, and the provider
-# now counts one address per proxy); where it is stated, a `proxies`
-# list longer than it is refused.
+# proxies of a provider may be in use at the same time, so `proxies`
+# needs `max_ips` too, the number of addresses the provider allows, and
+# a `proxies` list longer than it is refused. `max_ips` goes on counting
+# invocations, which is never the looser count.
 
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }

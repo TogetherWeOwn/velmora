@@ -50,9 +50,10 @@ pub const MAX_HOSTS: usize = 8;
 /// be used costs the callers its time limit
 /// ([`crate::hosts::PROXY_CONNECT_SECS`]) once, over all the connects
 /// and probes that wait for it: the time a probe gave up after counts
-/// into it. A probe may run into the end of that time, at most its own
-/// limit late ([`crate::hosts::PROBE_TIMEOUT_MS`]). All of that
-/// together must leave room inside one call of a read.
+/// into it. No try is shorter than a probe's limit
+/// ([`crate::hosts::PROBE_TIMEOUT_MS`]), so the last one may end that
+/// much late at most. All of that together must leave room inside one
+/// call of a read.
 pub const MAX_PROXIES: usize = 3;
 const _: () = assert!(
     MAX_PROXIES as u32
@@ -336,9 +337,10 @@ fn public_ip(ip: IpAddr) -> bool {
 /// request: through a proxy there is no plaintext.
 ///
 /// The provider sees one address per proxy in use, and all of them may
-/// be in use together (each isolate keeps its own order). So the list
-/// is no longer than the provider's address limit, `max_ips`, where one
-/// is stated.
+/// be in use together (each isolate keeps its own order). So the
+/// provider's address limit, `max_ips`, must be stated with `proxies`,
+/// and the list is no longer than it: without the limit nothing here
+/// could tell a list that is too long.
 fn proxies_ok(p: &ProviderConfig) -> bool {
     if p.proxies.is_empty() {
         return true;
@@ -348,7 +350,7 @@ fn proxies_ok(p: &ProviderConfig) -> bool {
     p.tls
         && p.proxies.len() <= MAX_PROXIES
         && p.max_ips
-            .is_none_or(|ips| p.proxies.len() as u64 <= u64::from(ips))
+            .is_some_and(|ips| p.proxies.len() as u64 <= u64::from(ips))
         && p.endpoints().into_iter().all(valid_host_name)
         && p.proxies.iter().all(|x| {
             (valid_host_name(&x.host) || x.host.parse::<IpAddr>().is_ok_and(public_ip))
