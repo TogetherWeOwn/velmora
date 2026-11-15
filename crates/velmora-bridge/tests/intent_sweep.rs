@@ -971,6 +971,43 @@ async fn only_fenced_rows_are_dropped_and_they_count_as_waiting() {
     assert_eq!(intent_status(&s.rig).await["waiting_writes"], 0);
 }
 
+/// `oldest_kept_at` is where a restore must start from to read the
+/// record of every kept write: the earliest kept row, and no row in
+/// another state.
+#[tokio::test(flavor = "current_thread")]
+async fn the_oldest_kept_write_is_the_earliest_kept_row_only() {
+    let s = setup().await;
+    sql(&s.rig, "DELETE FROM write_intents");
+    // The later kept write sorts first, and a write that is still to
+    // be swept is older than both.
+    sql(
+        &s.rig,
+        "INSERT INTO write_intents(extent_id, write_id, state, created_at) VALUES \
+           ('x_a', 'w_a_late', 'kept', 500), \
+           ('x_b', 'w_b_early', 'kept', 300), \
+           ('x_c', 'w_b_early', 'kept', 300), \
+           ('x_d', 'w_c_older', 'abandoned', 100)",
+    );
+    let stats = intent_status(&s.rig).await;
+    assert_eq!(stats["kept_writes"], 2);
+    assert_eq!(stats["kept_slices"], 3);
+    assert_eq!(stats["oldest_kept_at"], 300);
+    assert_eq!(stats["waiting_writes"], 1);
+    assert_eq!(stats["oldest_waiting_at"], 100);
+
+    // Without the older of the two, the later one is the oldest.
+    sql(
+        &s.rig,
+        "DELETE FROM write_intents WHERE write_id = 'w_b_early'",
+    );
+    assert_eq!(intent_status(&s.rig).await["oldest_kept_at"], 500);
+    // Without any, there is none, whatever else waits.
+    sql(&s.rig, "DELETE FROM write_intents WHERE state = 'kept'");
+    let stats = intent_status(&s.rig).await;
+    assert!(stats["oldest_kept_at"].is_null());
+    assert_eq!(stats["oldest_waiting_at"], 100);
+}
+
 // ---------------------------------------------------------------------------
 // The stamp counter inside the fence and the hold
 // ---------------------------------------------------------------------------
@@ -1403,8 +1440,8 @@ async fn restored_into_an_upload(last_raise_fails: bool) {
     s.rig
         .put(&s.signer, BUCKET, "other", b"x")
         .await
-        .expect_error(503, "ServiceUnavailable");
-    s.put().await.expect_error(503, "ServiceUnavailable");
+        .expect_writes_refused();
+    s.put().await.expect_writes_refused();
     assert_eq!(s.sweep(&write).await, JobOutcome::Ack);
     assert_eq!((blobs(&s.rig), records(&s.rig)), all);
 
@@ -1611,9 +1648,7 @@ async fn a_replay_that_starts_under_a_writer_publishes_nothing_of_it() {
             .await
             .unwrap()
             .unwrap();
-        resume(&s.rig, fut)
-            .await
-            .expect_error(503, "ServiceUnavailable");
+        resume(&s.rig, fut).await.expect_writes_refused();
         assert_eq!(s.rig.count("generations"), 1);
         assert_eq!(s.rig.count("write_intents"), 0);
         assert!(unpublished(&s.rig).is_empty());

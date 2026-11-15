@@ -2118,13 +2118,19 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     };
 
     arm();
-    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    rig.put(&signer, BUCKET, "a", b"two")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
-    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    rig.put(&signer, BUCKET, "new", b"new")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
-    copy(&rig, &signer, "a", "copy").await.expect(503);
+    copy(&rig, &signer, "a", "copy")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
     complete(&rig, &signer, "big", &id, &etags)
@@ -2138,7 +2144,7 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     // A delete answers 503 as well, and the object stays. Its tombstone
     // is on record, as that of any delete that failed.
     arm();
-    delete(&rig, &signer, "a").await.expect(503);
+    delete(&rig, &signer, "a").await.expect_writes_refused();
     disarm();
     assert_eq!(live_ids(&rig), live);
     assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");

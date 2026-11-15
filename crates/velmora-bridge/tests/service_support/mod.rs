@@ -1035,6 +1035,14 @@ impl Resp {
         self.values("Code").into_iter().next().unwrap_or_default()
     }
 
+    /// The `<Message>` of an S3 error body.
+    pub fn message(&self) -> String {
+        self.values("Message")
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
     /// The text of every `<tag>…</tag>` in the body, in order.
     pub fn values(&self, tag: &str) -> Vec<String> {
         let text = self.text();
@@ -1064,6 +1072,19 @@ impl Resp {
             "body: {}",
             self.text()
         );
+        self
+    }
+
+    /// The answer to a write while the catalogue is being restored. It
+    /// does not say that an object cannot be read: no object was read.
+    #[track_caller]
+    pub fn expect_writes_refused(&self) -> &Self {
+        self.expect_error(503, "ServiceUnavailable");
+        assert_eq!(
+            self.message(),
+            "Writes are refused until the catalogue has been restored. Please try again later."
+        );
+        assert_eq!(self.header("retry-after"), Some("30"));
         self
     }
 }

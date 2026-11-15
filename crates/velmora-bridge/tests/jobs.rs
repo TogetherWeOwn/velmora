@@ -656,8 +656,13 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     let mut fx = Fx::new().await;
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "a/cool.bin", &plaintext()).await;
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = dead.local_addr().unwrap().port();
+    // A port nothing listens on: the listener is closed before the first
+    // dial, so each connect is refused at once. Left open, it would take
+    // the connect and never greet, and each job would wait out the read
+    // timeout of the client.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = closed.local_addr().unwrap().port();
+    drop(closed);
     let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead);
 
     for run in 0..3 {
