@@ -15,7 +15,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
-    DEFAULT_POST_SOCKETS, MAX_EXTENT_BYTES_LIMIT,
+    DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT, MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::recovery::Recorded;
@@ -270,6 +270,12 @@ fn config_loads_from_documented_vars() {
     // one isolate (see below); the grace keeps its default.
     assert_eq!(cfg.post_sockets, 6);
     assert_eq!(cfg.propagation_grace_secs, 21_600);
+    // A PutObject body may be 99 MiB, stored in slices of 8 MiB. The
+    // sweep of writes that were never published ships off in production.
+    assert_eq!(cfg.max_put_bytes, 99 * 1024 * 1024);
+    assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
+    assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
+    assert!(!cfg.intent_sweep);
 
     // The dev environment is complete on its own (envs do not inherit vars).
     let cfg = load(&with_secrets(dev.clone(), PROVIDER_PLAIN)).unwrap();
@@ -280,6 +286,10 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.verify_delay_secs, 1);
     assert_eq!(cfg.gc_mode, GcMode::Disposable);
     assert!(cfg.server_side_copy);
+    assert_eq!(
+        (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
+        (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
+    );
     // Absent or empty is the default; any other size is taken as given.
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     let mut sized = with_secrets(dev, PROVIDER_PLAIN);
@@ -316,6 +326,22 @@ fn missing_secret_fails_closed() {
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
             vars.insert(name.clone(), "  ".into());
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
+            continue;
+        }
+        // Sliced PutObject: absent or blank, a PUT is one extent as
+        // before, and nothing is swept.
+        if name == "MAX_PUT_BYTES" || name == "INTENT_SWEEP" {
+            for _ in 0..2 {
+                let cfg = load(&vars).unwrap();
+                if name == "MAX_PUT_BYTES" {
+                    assert_eq!(cfg.max_put_bytes, cfg.max_extent_bytes);
+                    assert!(!cfg.intent_sweep);
+                } else {
+                    assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
+                    assert!(!cfg.intent_sweep);
+                }
+                vars.insert(name.clone(), "  ".into());
+            }
             continue;
         }
         assert_eq!(
@@ -373,6 +399,19 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("POST_SOCKETS", "four"),
         ("PROPAGATION_GRACE_SECS", "-1"),
         ("PROPAGATION_GRACE_SECS", "6h"),
+        // Below one extent, above what the edge lets through, not a number.
+        ("MAX_PUT_BYTES", "16777215"),
+        ("MAX_PUT_BYTES", "103809025"),
+        ("MAX_PUT_BYTES", "99MiB"),
+        // No slice, a slice above one extent, more than 16 slices in
+        // the largest body (99 MiB in slices of 6 MiB are 17).
+        ("SLICE_BYTES", "0"),
+        ("SLICE_BYTES", "16777217"),
+        ("SLICE_BYTES", "6291456"),
+        ("SLICE_BYTES", "8m"),
+        ("INTENT_SWEEP", "1"),
+        ("INTENT_SWEEP", "ON"),
+        ("INTENT_SWEEP", "disposable"),
     ] {
         assert_eq!(set(&prod, name, bad), invalid(name), "{name}={bad}");
     }
@@ -381,6 +420,40 @@ fn config_rejects_invalid_and_unsafe_values() {
     tuned.insert("PROPAGATION_GRACE_SECS".into(), "0".into());
     let cfg = load(&tuned).unwrap();
     assert_eq!((cfg.post_sockets, cfg.propagation_grace_secs), (8, 0));
+    // The limits of the slice settings themselves are accepted, and the
+    // default slice is never above one extent.
+    for (put, slice, sweep) in [
+        ("16777216", "16777216", "off"),
+        ("103809024", "6488064", " on "),
+        ("103809024", "16777216", ""),
+    ] {
+        let mut tuned = prod.clone();
+        tuned.insert("MAX_PUT_BYTES".into(), put.into());
+        tuned.insert("SLICE_BYTES".into(), slice.into());
+        tuned.insert("INTENT_SWEEP".into(), sweep.into());
+        let cfg = load(&tuned).unwrap();
+        assert_eq!(cfg.max_put_bytes.to_string(), put);
+        assert_eq!(cfg.slice_bytes.to_string(), slice);
+        assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
+    }
+    let mut small = prod.clone();
+    small.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    small.remove("MAX_PUT_BYTES");
+    let cfg = load(&small).unwrap();
+    assert_eq!((cfg.max_put_bytes, cfg.slice_bytes), (4_194_304, 4_194_304));
+    // More than 16 slices (99 MiB in slices of 4 MiB are 25): the error
+    // names the variable that was set, not the slice that followed from
+    // the extent.
+    small.remove("SLICE_BYTES");
+    assert_eq!(
+        set(&small, "MAX_PUT_BYTES", "103809024"),
+        invalid("MAX_PUT_BYTES")
+    );
+    small.insert("MAX_PUT_BYTES".into(), "103809024".into());
+    assert_eq!(
+        set(&small, "SLICE_BYTES", "4194304"),
+        invalid("SLICE_BYTES")
+    );
 
     // Shape and range.
     assert_eq!(set(&prod, "ENVIRONMENT", "staging"), invalid("ENVIRONMENT"));
@@ -705,6 +778,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "upload_parts",
             "uploads",
             "verifications",
+            "write_intents",
         ]
     );
 
@@ -741,6 +815,8 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         ("INSERT INTO provider_permits(provider_id,slot,token,holder,lease_until) VALUES (?1,?2,?3,?4,?5)",
          vec![text("p1"), i(0), i(0), SqlValue::Null, i(0)]),
         ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
+        ("INSERT INTO write_intents(extent_id,write_id,generation_id,state,created_at) VALUES (?1,?2,?3,?4,?5)",
+         vec![text("x_3"), text("w_1"), SqlValue::Null, text("open"), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
     // The committed extent (statement 5) also gets its reference row

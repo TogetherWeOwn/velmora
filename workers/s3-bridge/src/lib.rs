@@ -117,6 +117,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         "{}",
         ingress::log_line(&method, &target, resp.status, &request_id)
     );
+    if let Some(line) = env::memory_line(&bridge) {
+        console_log!("{line}");
+    }
     Ok(http::to_response(resp))
 }
 
@@ -195,6 +198,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
             if report.evict_failed {
                 console_error!("dispatch: hot-tier check failed");
+            }
+            if report.sweep_failed {
+                console_error!("dispatch: the sweep of unpublished writes was not sent");
             }
         }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),

@@ -98,7 +98,8 @@ pub(super) fn from_proto(r: velmora_s3_proto::Response) -> S3Response {
     }
 }
 
-/// The protocol policy for this deployment. Uploads are capped at one
+/// The protocol policy for this deployment. An upload is capped at the
+/// largest PutObject body; UploadPart has its own policy, capped at one
 /// extent.
 pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
     Policy::new(
@@ -110,7 +111,7 @@ pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
             header_bytes: HEADER_BYTES,
             header_count: HEADER_COUNT,
             query_pairs: QUERY_PAIRS,
-            upload_bytes: cfg.max_extent_bytes,
+            upload_bytes: cfg.max_put_bytes,
             clock_skew_seconds: CLOCK_SKEW_SECS,
             presign_seconds: PRESIGN_SECS,
         },

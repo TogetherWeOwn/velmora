@@ -128,6 +128,7 @@ pub struct UploadValidator {
 pub struct DecodedUpload {
     length: u64,
     sha256: [u8; 32],
+    md5: [u8; 16],
     checksum: Option<(ChecksumAlgorithm, String)>,
 }
 
@@ -137,6 +138,10 @@ impl DecodedUpload {
     }
     pub fn sha256(&self) -> &[u8; 32] {
         &self.sha256
+    }
+    /// MD5 of the decoded body: the ETag of an object stored from it.
+    pub fn md5(&self) -> &[u8; 16] {
+        &self.md5
     }
     pub fn checksum(&self) -> Option<&(ChecksumAlgorithm, String)> {
         self.checksum.as_ref()
@@ -349,6 +354,7 @@ impl UploadValidator {
         Ok(DecodedUpload {
             length: digests.length,
             sha256,
+            md5,
             checksum,
         })
     }

@@ -21,6 +21,7 @@ use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::uploads::int;
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
+use crate::recovery::{start_after, GENERATION_PREFIX, RECORD_PREFIX};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::stamp::StampRow;
 use crate::types::{
@@ -244,46 +245,96 @@ pub(super) async fn held_extents<S: Sql>(
     Ok(ids)
 }
 
+/// How often [`restore_begin`] reads the mark again when another begin
+/// moved it in between.
+const BEGIN_ATTEMPTS: u32 = 4;
+
 pub(super) async fn restore_begin<S: Sql>(
     c: &SqlCatalog<S>,
     since: UnixMs,
     now: UnixMs,
 ) -> Result<std::result::Result<UnixMs, UnixMs>> {
-    // The mark is the start time, moved past the mark of the replay
-    // before it when the two fall into one millisecond.
-    // A replay that has not ended is replaced only by one that starts
-    // no later than it: the catalogue holds no more than the records up
-    // to that point, whatever was restored since. A row that the
-    // runbook's arming statement wrote over no unfinished replay has no
-    // such point (`since_ms` -1).
-    let rows = c
-        .sql
-        .query(
-            "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
-             VALUES (1, 'replaying', ?1, ?2, NULL) \
-             ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
-               started_at = max(excluded.started_at, restore_state.started_at + 1), \
-               finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
-               reached_extent = NULL \
-             WHERE restore_state.state = 'complete' OR restore_state.since_ms < 0 \
-               OR excluded.since_ms <= restore_state.since_ms \
-             RETURNING started_at",
-            &[ms(since), ms(now)],
-        )
-        .await?;
-    match rows.first().map(Vec::as_slice) {
-        Some([SqlValue::Int(run)]) => return Ok(Ok(UnixMs(*run))),
-        Some(_) => return Err(BridgeError::Sql("row decode: restore mark".into())),
-        None => {}
+    for _ in 0..BEGIN_ATTEMPTS {
+        // The mark is the start time, moved past the mark of the replay
+        // before it when the two fall into one millisecond. It is read
+        // first and the batch commits only if it is still the same, so
+        // that the batch needs no result row: the mark it wrote is known.
+        let rows = c
+            .sql
+            .query(
+                "SELECT started_at, state = 'complete', since_ms FROM restore_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        let before = match rows.first().map(Vec::as_slice) {
+            None => None,
+            Some([SqlValue::Int(mark), SqlValue::Int(ended), SqlValue::Int(point)]) => {
+                // A replay that has not ended is replaced only by one
+                // that starts no later than it: the catalogue holds no
+                // more than the records up to that point, whatever was
+                // restored since. A row that the runbook's arming
+                // statement wrote over no unfinished replay has no such
+                // point (`since_ms` -1).
+                if *ended == 0 && *point >= 0 && since.0 > *point {
+                    return Ok(Err(UnixMs(*point)));
+                }
+                Some(*mark)
+            }
+            Some(_) => return Err(BridgeError::Sql("row decode: restore mark".into())),
+        };
+        let run = before.map_or(now.0, |mark| now.0.max(mark.saturating_add(1)));
+        // Every generation id the replay reads sorts after this one.
+        let first_key = start_after(GENERATION_PREFIX, since);
+        let first_read = first_key
+            .strip_prefix(RECORD_PREFIX)
+            .ok_or(BridgeError::Invalid("a record key without its prefix"))?;
+        let stmts: Vec<Stmt> = vec![
+            (
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+                   (SELECT started_at FROM restore_state WHERE id = 1) IS NOT ?1",
+                vec![opt(before, SqlValue::Int)],
+            ),
+            // The rule above, held by the batch itself: it does not
+            // rest on the row that was read.
+            (
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM restore_state \
+                   WHERE id = 1 AND state <> 'complete' AND since_ms >= 0 AND ?1 > since_ms)",
+                vec![ms(since)],
+            ),
+            // The intents of a restored catalogue can name the blobs of
+            // objects that were acknowledged after its backup; their
+            // rows only come back with the replay. No sweep may read
+            // these intents: they go in the batch that starts the
+            // replay. Losing them leaves at most the blobs of writes
+            // that were under way.
+            //
+            // A `kept` row stays when this replay does not read its
+            // record (one minted before `since`): the row is then still
+            // the only sign of a record without an object, and no sweep
+            // deletes anything of a `kept` write.
+            (
+                "DELETE FROM write_intents WHERE NOT \
+                   (state = 'kept' AND generation_id IS NOT NULL AND generation_id <= ?1)",
+                vec![text(first_read)],
+            ),
+            (
+                "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
+                 VALUES (1, 'replaying', ?1, ?2, NULL) \
+                 ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
+                   started_at = excluded.started_at, \
+                   finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
+                   reached_extent = NULL",
+                vec![ms(since), SqlValue::Int(run)],
+            ),
+        ];
+        match c.sql.batch(stmts).await {
+            Ok(_) => return Ok(Ok(UnixMs(run))),
+            // Another begin moved the mark: read again.
+            Err(BridgeError::GuardFailed) => continue,
+            Err(e) => return Err(e),
+        }
     }
-    let rows = c
-        .sql
-        .query("SELECT since_ms FROM restore_state WHERE id = 1", &[])
-        .await?;
-    match rows.first().map(Vec::as_slice) {
-        Some([SqlValue::Int(unfinished)]) => Ok(Err(UnixMs(*unfinished))),
-        _ => Err(BridgeError::Sql("row decode: restore point".into())),
-    }
+    Err(BridgeError::Sql("restore mark kept moving".into()))
 }
 
 pub(super) async fn restore_finish<S: Sql>(

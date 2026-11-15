@@ -309,6 +309,99 @@ PutObject, CompleteMultipartUpload, CopyObject and DeleteObject are in
 `SAFETY`, where a database restore cannot reach them, and the replay
 brings them back.
 
+## A PutObject above one extent
+
+With `MAX_PUT_BYTES` above `MAX_EXTENT_BYTES` (shipped: 99 MiB over
+16 MiB), the body of one PutObject may be larger than one extent. It is
+stored as slices of `SLICE_BYTES` (8 MiB), each an extent of its own,
+one in memory at a time. The object is one generation with one recovery
+record, like any other, and its ETag is the MD5 of the body. A part of
+a multipart upload stays at `MAX_EXTENT_BYTES`.
+
+- A request body above 100 MiB is refused before the Worker runs, so
+  99 MiB is the most `MAX_PUT_BYTES` takes. That limit counts the bytes
+  on the wire: a body sent in signed chunks carries 89 bytes of framing
+  per chunk. With chunks of 8 KiB, the smallest S3 allows, a body above
+  about 98.9 MiB is over it and is refused there; chunks of 16 KiB or
+  more fit up to 99 MiB. A client has to send larger
+  files as multipart uploads. aws-cli does so from 8 MiB. rclone does so
+  from 200 MiB by default: run it with `--s3-upload-cutoff 95M` and
+  `--s3-chunk-size 16M` (or `upload_cutoff = 95M` and `chunk_size = 16M`
+  in the remote's section of `rclone.conf`). A part of 16 MiB is one
+  full extent; rclone's default part of 5 MiB makes about three times as
+  many extents.
+- Before its first slice is stored, the request writes one row per
+  slice into `write_intents`. The commit removes the rows. A request
+  that died leaves its rows, and its slices in `SAFETY`.
+- The request raises the rollback stamp before it writes its recovery
+  record, and once more after the commit. If the first raise fails, it
+  answers 503 `SlowDown` and publishes nothing.
+- Such a request counts two slices (16 MiB) against
+  `INFLIGHT_BUDGET_BYTES`, so with the shipped 48 MiB one isolate reads
+  three at once. A fourth waits a bounded time for room and then
+  answers 503 `SlowDown`. Measured on a test deployment: with three
+  95 MiB bodies at once in one isolate, its wasm memory stayed at
+  41.9 MiB or less (1.4 MiB before any large body).
+
+**The sweep** (`INTENT_SWEEP = "on"`, independent of `GC_MODE`) removes
+what such a request left. Each cron run sends a job for up to 20
+writes, the oldest first, whose rows are a day old or were given up by
+their request. The job deletes the slices and then the rows. It deletes
+nothing:
+
+- of a write that has a recovery record in `SAFETY`. Its rows are
+  marked `kept` and stay;
+- while a replay is under way;
+- while the catalogue is behind its rollback stamp.
+
+With the switch off nothing is deleted and the rows stay; a later run
+with the switch on removes them. Production ships with the switch off:
+`waiting_writes` and `oldest_waiting_at` below count what the sweep
+would take. Turn it on in `wrangler.toml` after a restore drill on a
+deployed Worker has passed.
+
+`GET /_admin/status` shows the table under `write_intents`:
+
+| Field | Meaning | If it stays above 0 |
+|---|---|---|
+| `open_writes` | requests under way, and dead ones younger than a day | nothing to do |
+| `waiting_writes`, `oldest_waiting_at` | writes that are due for the sweep: bytes in `SAFETY` that no object uses | the sweep is off, a replay is unfinished, the catalogue is rolled back, or the cron could not send the jobs (it logs `dispatch: the sweep of unpublished writes was not sent`) |
+| `kept_writes`, `kept_slices`, `oldest_kept_at` | writes with a recovery record and without an object in the catalogue: the request died between the two, its publication was refused and the record could not be removed, or the database was restored to a point before the commit and the restore was not noticed | run the restore steps above with a `since_ms` no later than `oldest_kept_at`. The replay reads only the records from `since_ms` (less the margin) on: it publishes those, and its first step removes their rows. A `kept` row whose record is older than that stays, and so does the figure |
+| `anomalies` | how often a write was marked `kept`, ever; it does not go down | see `kept_writes` |
+
+These figures describe the catalogue as it is now. In a catalogue that
+was never restored, no client was told `200` for a write that is
+`open`, `waiting` or `kept`. After a restore of the database that no
+longer holds: the rows are those of the restored point, and a write
+that is `open`, `waiting` or `kept` there may have been answered `200`
+later. Its recovery record is in `SAFETY`, the sweep deletes nothing of
+it (the rules above), and a replay that starts before its record
+publishes it. A row is never proof that an upload failed.
+
+One such restore is not found by the rollback check: to a point after
+the request raised the stamp and before its commit, when the request's
+raise after the commit failed and no cron run has raised the stamp
+since. The object was answered `200` and is missing from the catalogue.
+A day later the sweep finds its record and marks the write `kept`:
+treat `kept_writes` above 0 as an object that may be missing until a
+replay from `oldest_kept_at` or earlier has run.
+
+**With a restore.** The first step of a replay removes from
+`write_intents` every row but the `kept` rows whose record the replay
+does not read (a record from before its `since_ms`, less the margin): a
+row of an earlier point may name slices that the replay publishes.
+Slices of requests that were under way at that moment and never
+published stay in `SAFETY` without a row, and no figure counts them.
+
+A Worker version from before this table does not empty it. If such a
+version ran a restore, run `DELETE FROM write_intents` on the database
+before a version with the sweep is deployed again.
+
+Going back to a Worker version from before this table needs nothing
+else: the objects are ordinary generations, which it reads, posts,
+verifies and replays. It answers `EntityTooLarge` to a new PutObject
+above one extent.
+
 ## The route
 
 `POST /_admin/restore` (admin bearer; 409 unless `MAINTENANCE=restore`)
