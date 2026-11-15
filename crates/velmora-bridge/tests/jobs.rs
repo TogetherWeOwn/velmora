@@ -1071,6 +1071,7 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             stamp_failed: false,
             sweeps_enqueued: 0,
             sweep_failed: false,
+            release_paused: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -1274,6 +1275,9 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     fx.clock.advance_secs(300);
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (0, 0));
+    // And says so on every run, for the cron to log.
+    assert!(report.release_paused);
+    assert!(fx.bridge.cfg.release_paused().is_some());
     assert_eq!(fx.outbox(&o, "stage").await, "done");
 
     // A second backbone that has the articles by peering.
@@ -1318,11 +1322,13 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     fx.bridge.cfg.providers[1].release = false;
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (0, 0));
+    assert!(report.release_paused);
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     fx.bridge.cfg.providers[1].release = true;
 
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (1, 1));
+    assert!(!report.release_paused);
     assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Verify));
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
     fx.pump().await;

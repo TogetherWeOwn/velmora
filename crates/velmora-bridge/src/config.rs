@@ -494,6 +494,22 @@ impl BridgeConfig {
     pub fn is_dev(&self) -> bool {
         self.environment == Environment::Dev
     }
+
+    /// `Some(warning)` while the provider list has fewer backbones that
+    /// count toward a release than `REQUIRED_BACKBONES`. Reads and writes
+    /// go on; no pinned copy is released or given up, so everything
+    /// uploaded stays held until the list is put right. The text names
+    /// counts only, never a provider.
+    pub fn release_paused(&self) -> Option<String> {
+        let counting = crate::verify::release_labels(&self.providers).len();
+        (counting < self.required_backbones as usize).then(|| {
+            format!(
+                "release paused: {counting} backbone(s) count toward release, \
+                 REQUIRED_BACKBONES is {}; pinned copies stay held",
+                self.required_backbones
+            )
+        })
+    }
 }
 
 fn validate_providers(
@@ -552,15 +568,10 @@ fn validate_providers(
     if !usable(|p| p.post) || !usable(|p| p.read) {
         return Err(bad());
     }
-    // A release needs `REQUIRED_BACKBONES` backbones that count toward
-    // it, each with a provider to check it through. With fewer, nothing
-    // uploaded could ever be verified for release: refused here, not
-    // found out later from safety copies that never leave.
-    if crate::verify::release_labels(providers).len() < required_backbones as usize {
-        return Err(ConfigError::Refused(
-            "fewer backbones that count toward release than REQUIRED_BACKBONES",
-        ));
-    }
+    // Fewer backbones that count toward a release than
+    // `REQUIRED_BACKBONES` is not refused here: the Worker has to keep
+    // serving. See [`Config::release_paused`].
+    let _ = required_backbones;
     Ok(())
 }
 

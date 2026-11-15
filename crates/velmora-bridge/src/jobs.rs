@@ -425,7 +425,8 @@ where
         // Only the backbones that count toward a release are asked for.
         let labels = release_labels(&self.cfg.providers);
         let required = self.cfg.required_backbones;
-        if labels.len() >= required as usize {
+        report.release_paused = self.cfg.release_paused().is_some();
+        if !report.release_paused {
             // The re-drive is an extra: its failure must not keep the
             // due rows below from being sent.
             let redriven =

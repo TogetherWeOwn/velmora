@@ -1397,6 +1397,49 @@ async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
     assert!(!fx.has_safety(&o));
 }
 
+/// Fewer backbones count toward a release than `REQUIRED_BACKBONES`: the
+/// Worker serves as before, the status says that the release is paused,
+/// and no pinned copy is given up, read back in full or not.
+#[tokio::test]
+async fn too_few_release_backbones_are_a_warning_and_keep_the_pinned_copy() {
+    let mut fx = Fx::new().await;
+    let status = fx.get("/status").await.json();
+    assert_eq!(status["config_warnings"], json!([]));
+
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.required_backbones = 2;
+    let status = fx.get("/status").await.json();
+    assert_eq!(
+        status["config_warnings"],
+        json!(["release paused: 1 backbone(s) count toward release, \
+                REQUIRED_BACKBONES is 2; pinned copies stay held"])
+    );
+
+    // Writes and reads go on, and the upload is read back in full.
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    assert_eq!(fx.safety_state(&o).await, "held");
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("body"), &json!(true))
+    );
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // With the count put right, the same read-back is enough here.
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.required_backbones = 1;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+}
+
 /// A read-back from a backbone that does not count toward a release is no
 /// reason to give up the pinned copy either.
 #[tokio::test]

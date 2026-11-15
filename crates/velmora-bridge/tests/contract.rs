@@ -1551,14 +1551,11 @@ fn providers_of(entries: &[String]) -> std::result::Result<Vec<ProviderConfig>, 
 /// `release` says whether a provider's backbone counts toward releasing
 /// the safety copy. It is optional and true when absent; one provider
 /// saying false speaks for its whole backbone. A list with fewer
-/// counting, readable backbones than `REQUIRED_BACKBONES` could never
-/// release anything, and is refused.
+/// counting, readable backbones than `REQUIRED_BACKBONES` still loads,
+/// so the Worker keeps serving, and says that the release is paused.
 #[test]
-fn release_backbones_are_counted_and_too_few_are_refused() {
+fn release_backbones_are_counted_and_too_few_pause_the_release() {
     let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
-    let too_few = Err(ConfigError::Refused(
-        "fewer backbones that count toward release than REQUIRED_BACKBONES",
-    ));
     // `on` puts the provider on a named backbone.
     let on = |id: &str, backbone: &str, extra: &str| {
         provider_json(id, extra).replace(&format!("bb-{id}"), backbone)
@@ -1569,6 +1566,18 @@ fn release_backbones_are_counted_and_too_few_are_refused() {
         let json = format!("[{}]", entries.join(","));
         let cfg = load(&with_secrets(prod, &json))?;
         Ok(cfg.providers.iter().map(|p| p.release).collect())
+    };
+    // Whether the list loads with the release paused.
+    let paused = |entries: &[String]| -> std::result::Result<bool, ConfigError> {
+        let (prod, _) = wrangler_vars();
+        let json = format!("[{}]", entries.join(","));
+        let cfg = load(&with_secrets(prod, &json))?;
+        let warning = cfg.release_paused();
+        if let Some(text) = &warning {
+            assert!(text.starts_with("release paused: "), "{text}");
+            assert!(text.contains("REQUIRED_BACKBONES is 2"), "{text}");
+        }
+        Ok(warning.is_some())
     };
 
     // Absent means it counts; so does an explicit true.
@@ -1594,12 +1603,15 @@ fn release_backbones_are_counted_and_too_few_are_refused() {
     }
 
     // One backbone, however many accounts.
-    assert_eq!(flags(&[provider_json("a", "")]), too_few);
-    assert_eq!(flags(&[on("a", "one", ""), on("b", " ONE ", "")]), too_few);
+    assert_eq!(paused(&[provider_json("a", "")]), Ok(true));
+    assert_eq!(
+        paused(&[on("a", "one", ""), on("b", " ONE ", "")]),
+        Ok(true)
+    );
     // Two backbones, one of them marked.
     assert_eq!(
-        flags(&[provider_json("a", ""), provider_json("b", off)]),
-        too_few
+        paused(&[provider_json("a", ""), provider_json("b", off)]),
+        Ok(true)
     );
     // One account's mark is its backbone's: the other account on it does
     // not bring the backbone back, whichever comes first, and whether the
@@ -1613,12 +1625,12 @@ fn release_backbones_are_counted_and_too_few_are_refused() {
         let pair = [marked.clone(), on("c", "Two", "")];
         let mut list = vec![provider_json("a", "")];
         list.extend(pair.clone());
-        assert_eq!(flags(&list), too_few, "{marked}");
+        assert_eq!(paused(&list), Ok(true), "{marked}");
         list = vec![pair[1].clone(), pair[0].clone(), provider_json("a", "")];
-        assert_eq!(flags(&list), too_few, "{marked}");
+        assert_eq!(paused(&list), Ok(true), "{marked}");
         // A third backbone that counts makes the two.
         list.push(provider_json("d", ""));
-        assert!(flags(&list).is_ok(), "{marked}");
+        assert_eq!(paused(&list), Ok(false), "{marked}");
     }
     // A backbone nothing can be read from, or whose reader is disabled,
     // proves nothing and does not count.
@@ -1627,17 +1639,22 @@ fn release_backbones_are_counted_and_too_few_are_refused() {
         provider_json("b", r#""enabled":false"#),
     ] {
         let list = [provider_json("a", ""), other];
-        assert_eq!(flags(&list), too_few, "{}", list[1]);
+        assert_eq!(paused(&list), Ok(true), "{}", list[1]);
     }
 
     // Dev asks for one backbone: one that counts, and not one that does not.
     let (_, dev) = wrangler_vars();
     let dev_load = |extra: &str| {
         let json = PROVIDER_PLAIN.replace(r#""max_conns":2"#, &format!(r#""max_conns":2{extra}"#));
-        load(&with_secrets(dev.clone(), &json)).map(|cfg| vec![cfg.providers[0].release])
+        load(&with_secrets(dev.clone(), &json)).map(|cfg| cfg.release_paused())
     };
-    assert_eq!(dev_load(""), Ok(vec![true]));
-    assert_eq!(dev_load(r#","release":false"#), too_few);
+    assert_eq!(dev_load(""), Ok(None));
+    let warning = dev_load(r#","release":false"#).unwrap().unwrap();
+    assert_eq!(
+        warning,
+        "release paused: 0 backbone(s) count toward release, REQUIRED_BACKBONES is 1; \
+         pinned copies stay held"
+    );
 }
 
 /// A provider list written before the pool settings existed still loads,

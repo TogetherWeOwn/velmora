@@ -199,6 +199,11 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             if report.evict_failed {
                 console_error!("dispatch: hot-tier check failed");
             }
+            if report.release_paused {
+                if let Some(warning) = bridge.cfg.release_paused() {
+                    console_error!("dispatch: {warning}");
+                }
+            }
             if report.sweep_failed {
                 console_error!("dispatch: the sweep of unpublished writes was not sent");
             }

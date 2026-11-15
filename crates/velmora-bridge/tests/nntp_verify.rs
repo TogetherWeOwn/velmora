@@ -481,6 +481,45 @@ async fn newer_failure_cancels_pass() {
     assert!(rig.safety_held(&s));
 }
 
+/// A provider list with fewer backbones that count than a release needs:
+/// the release job releases nothing and reads nothing, and the safety
+/// copy stays held. The rows that would have passed stay as they are.
+#[tokio::test]
+async fn too_few_counting_backbones_release_nothing() {
+    let mut rig = two_backbone_rig().await;
+    let (s, _) = rig.verified_on_two(34).await;
+    rig.bridge.cfg.providers[1].release = false;
+    assert!(rig.bridge.cfg.release_paused().is_some());
+    let before = checks(&rig, &s);
+    let connects = rig.bridge.nntp.connects();
+
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert_eq!(checks(&rig, &s), before);
+    assert_eq!(rig.bridge.nntp.connects(), connects);
+}
+
+/// No backbone counts at all: the upload is not checked, nothing fails
+/// over and over, and the safety copy stays held.
+#[tokio::test]
+async fn no_counting_backbone_holds_the_copy_without_retries() {
+    let mut rig = two_backbone_rig().await;
+    let (s, _) = rig.posted(35).await;
+    rig.propagate(&s, 0, 1).await;
+    for p in &mut rig.bridge.cfg.providers {
+        p.release = false;
+    }
+    let connects = rig.bridge.nntp.connects();
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert!(rig.rows(&s).is_empty());
+    assert!(rig.safety_held(&s));
+}
+
 /// The backbones, results and kinds of an extent's verification rows.
 fn checks(rig: &Rig, s: &Seeded) -> Vec<(String, VerifyKind, VerifyResult)> {
     let rows = rig.rows(s);
@@ -798,10 +837,9 @@ async fn one_counting_backbone_is_not_two() {
         let to_release = |e: &mut Entry| e.outbox.stage = OutboxStage::Release;
         rig.bridge.catalog.edit(&s.extent, to_release);
         rig.bridge.clock.advance_secs(1);
-        let outcome = rig.run(&s, OutboxStage::Release).await;
-        assert_eq!(retry_delay(&outcome), REVERIFY_SECS);
-        assert_eq!(checks(&rig, &s).len(), 2, "marked = {marked}");
-        assert_eq!(checks(&rig, &s)[1], ok(&counted, VerifyKind::Body));
+        assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+        assert_eq!(rig.outbox(&s).stage, OutboxStage::Done, "marked = {marked}");
+        assert_eq!(checks(&rig, &s), [ok(&counted, VerifyKind::Body)]);
         assert!(rig.safety_held(&s));
         assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
     }
@@ -853,12 +891,14 @@ async fn same_backbone_counts_once() {
     assert!(rig.sent_stages().is_empty());
     assert!(rig.safety_held(&s));
 
-    // Even a release job that runs anyway deletes nothing.
+    // Even a release job that runs anyway deletes nothing: the release
+    // is paused, and the job ends without reading.
     let to_release = |e: &mut Entry| e.outbox.stage = OutboxStage::Release;
     rig.bridge.catalog.edit(&s.extent, to_release);
     rig.bridge.clock.advance_secs(1);
-    let outcome = rig.run(&s, OutboxStage::Release).await;
-    assert_eq!(retry_delay(&outcome), REVERIFY_SECS);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
+    assert_eq!(rig.rows(&s).len(), 1);
     assert!(rig.safety_held(&s));
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
 }

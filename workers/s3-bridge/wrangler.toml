@@ -127,7 +127,10 @@ crons = ["*/5 * * * *"]
 # neither verified nor counted: use it for short-retention or post-only accounts. A release needs
 # every article read in full (BODY) on one backbone that counts and present (STAT) on
 # REQUIRED_BACKBONES of them in all; BODY goes to the first one in the list, so list the account to
-# read in full first. Fewer readable backbones that count than REQUIRED_BACKBONES is a config error.
+# read in full first. `release` is true when absent, so a short-retention provider MUST say
+# `"release": false`. With fewer readable backbones that count than REQUIRED_BACKBONES the Worker keeps
+# serving reads and writes and releases nothing: every pinned copy stays held, /_admin/status lists a
+# "release paused" line under `config_warnings`, and the cron logs it on every tick.
 
 [env.dev]
 vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }

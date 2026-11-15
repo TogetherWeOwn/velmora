@@ -443,6 +443,11 @@ where
             .await;
             return Ok(());
         }
+        if groups.is_empty() {
+            // No backbone counts toward a release: nothing was checked
+            // and nothing can be. The safety copy stays held.
+            return self.advance(lease, OutboxStage::Done, now).await;
+        }
         let failed = |r| status.iter().any(|s| s.result == r);
         if failed(VerifyResult::Corrupt) {
             return Err(Stop::Fail(FailClass::Corrupt, Some(REVERIFY_SECS)));
@@ -477,6 +482,12 @@ where
         }
         // One backbone is never enough outside development.
         if required == 0 || !(required >= 2 || self.cfg.is_dev()) {
+            return self.advance(lease, OutboxStage::Done, now).await;
+        }
+        // Too few backbones count toward a release: nothing is released
+        // and nothing is read for it. The safety copy stays held, and the
+        // dispatcher sends the extent back to verify once enough count.
+        if self.cfg.release_paused().is_some() {
             return self.advance(lease, OutboxStage::Done, now).await;
         }
         let ready = extent.created_at.plus_secs(self.cfg.safety_min_age_secs);

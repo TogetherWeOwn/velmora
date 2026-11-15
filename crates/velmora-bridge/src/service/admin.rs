@@ -786,12 +786,15 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     // compare trimmed and in lower case.
     let label = |b: &str| b.trim().to_lowercase();
     let configured = crate::verify::release_labels(&bridge.cfg.providers);
+    // With too few backbones that count, no pinned copy is given up.
+    let paused = bridge.cfg.release_paused().is_some();
     let on_usenet = |x: &crate::types::ExtentStatus| {
-        x.backbones.iter().any(|b| {
-            b.counts
-                && b.kind == crate::types::VerifyKind::Body
-                && configured.contains(&label(&b.backbone))
-        })
+        !paused
+            && x.backbones.iter().any(|b| {
+                b.counts
+                    && b.kind == crate::types::VerifyKind::Body
+                    && configured.contains(&label(&b.backbone))
+            })
     };
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
@@ -1119,6 +1122,9 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         },
         "real_data_ready": REAL_DATA_READY,
         "required_backbones": cfg.required_backbones,
+        // Empty unless the configuration needs attention. While a
+        // "release paused" line is here, nothing is released.
+        "config_warnings": cfg.release_paused().into_iter().collect::<Vec<_>>(),
         // Figures of the isolate that answers; another isolate has its own.
         "inflight_peak_bytes": bridge.budget.peak(),
         "inflight_bytes": bridge.budget.in_use(),

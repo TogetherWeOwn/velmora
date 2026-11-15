@@ -443,6 +443,14 @@ pub struct ProviderConfig {
     /// that says `false` takes its whole backbone out, whatever the
     /// backbone's other providers say.
     ///
+    /// The default is `true`: every provider added without the field
+    /// counts. A provider on a short-retention backbone must say
+    /// `"release": false`, or its copy is taken for a durable one.
+    ///
+    /// With fewer backbones that count than `REQUIRED_BACKBONES` the
+    /// Worker keeps serving and releases nothing
+    /// ([`crate::config::Config::release_paused`]).
+    ///
     /// Rollout: deploy a Worker that knows this field before the secret
     /// carries it; an older Worker refuses the whole secret. Rollback:
     /// take `release` out of the secret first.
@@ -1133,6 +1141,9 @@ pub struct DispatchReport {
     pub sweeps_enqueued: u32,
     /// Listing those writes failed; the rest of the run went on without it.
     pub sweep_failed: bool,
+    /// Fewer backbones count toward a release than `REQUIRED_BACKBONES`:
+    /// nothing is released until the provider list is put right.
+    pub release_paused: bool,
 }
 
 // ---------------------------------------------------------------------------
