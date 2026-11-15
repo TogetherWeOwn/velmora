@@ -1,6 +1,8 @@
 //! Worker entry: `fetch` -> headers-only precheck -> `Bridge::handle` (S3
 //! and `/_admin`), `queue` -> `Bridge::run_job`, `scheduled` ->
-//! `Bridge::dispatch` only (the bounded dispatcher).
+//! the start of a pass of the recovery copy when one is due, then
+//! `Bridge::dispatch` (the bounded dispatcher). A recovery-copy job is run
+//! here, with the recovery store, not by `Bridge::run_job`.
 //!
 //! The `Bridge` is built once per isolate from validated configuration.
 //! A refused configuration is a `500` with a class-only log line (fail
@@ -8,6 +10,7 @@
 //! never credentials, presigned queries, bodies or provider text.
 
 mod d1;
+mod e2;
 mod env;
 mod http;
 mod nntp;
@@ -19,9 +22,10 @@ use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
+use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
 use velmora_bridge::service::classify;
-use velmora_bridge::{BridgeError, Job, JobOutcome, OutboxStage, S3Response};
+use velmora_bridge::{BridgeError, Job, JobOutcome, OutboxStage, S3Response, UnixMs, JOB_VERSION};
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt,
     QueueRetryOptionsBuilder, Request, Response, Result, ScheduleContext, ScheduledEvent,
@@ -140,7 +144,18 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             msg.ack();
             continue;
         };
-        let outcome = bridge.run_job(&job).await;
+        let outcome = match &job {
+            // Never through `run_job`, which reads the catalogue. A job
+            // of another version is dropped: the next pass does the work.
+            Job::RecoveryCopy { v, pass, cursor } => {
+                if *v == JOB_VERSION {
+                    recovery_copy(&env, &bridge, *pass, cursor).await
+                } else {
+                    JobOutcome::Ack
+                }
+            }
+            _ => bridge.run_job(&job).await,
+        };
         log_post_trace(&job, &outcome);
         match outcome {
             JobOutcome::Ack => msg.ack(),
@@ -152,6 +167,76 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         }
     }
     Ok(())
+}
+
+fn copier<'a>(
+    bridge: &'a env::WorkerBridge,
+    remote: &'a velmora_bridge::remote::S3Remote<e2::FetchHttp>,
+) -> Copier<'a, r2::R2Blobs, velmora_bridge::KekRing, env::WorkerClock, e2::FetchHttp> {
+    Copier {
+        safety: &bridge.safety,
+        kek: &bridge.kek,
+        clock: &bridge.clock,
+        remote,
+        maintenance: bridge.cfg.maintenance,
+    }
+}
+
+/// One job of a pass of the recovery copy. Logs counts only.
+async fn recovery_copy(
+    env: &Env,
+    bridge: &env::WorkerBridge,
+    pass: UnixMs,
+    cursor: &str,
+) -> JobOutcome {
+    let remote = match env::recovery_store(env) {
+        Ok(Some(remote)) => remote,
+        // Switched off since the job was sent.
+        Ok(None) => return JobOutcome::Ack,
+        Err(class) => {
+            console_error!("recovery copy: config refused: {class}");
+            return JobOutcome::Ack;
+        }
+    };
+    let (outcome, counts, why) = copier(bridge, &remote)
+        .run_job(&bridge.jobs, pass, cursor)
+        .await;
+    let retry = matches!(outcome, JobOutcome::Retry { .. });
+    // The reason is a class and a status at most. It is logged whether
+    // the job is retried or not: past the retry window a job that did
+    // nothing is acknowledged, and must not end without a line.
+    if let Some(why) = why {
+        console_error!(
+            "recovery copy: pass={} retry={retry} stopped: {why:?}",
+            pass.0
+        );
+    }
+    match counts {
+        Some(c) if c.clean() && c.source_unreadable == 0 && !retry => console_log!(
+            "recovery copy: pass={} records={} bytes={} same={} copied={} young={} extra={} foreign={}",
+            pass.0,
+            c.records,
+            c.bytes,
+            c.same,
+            c.copied,
+            c.young,
+            c.extra,
+            c.foreign
+        ),
+        Some(c) => console_error!(
+            "recovery copy: pass={} retry={retry} records={} copied={} failed={} refused={} source_unreadable={} extra={} foreign={}",
+            pass.0,
+            c.records,
+            c.copied,
+            c.failed,
+            c.refused,
+            c.source_unreadable,
+            c.extra,
+            c.foreign
+        ),
+        None => {}
+    }
+    outcome
 }
 
 /// One line per post job: its outcome and phase timings, milliseconds
@@ -175,7 +260,7 @@ fn log_post_trace(job: &Job, outcome: &JobOutcome) {
 }
 
 #[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
@@ -183,6 +268,22 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             return;
         }
     };
+    // Before the dispatcher and apart from it: the copy reads no
+    // catalogue, so a dispatcher that fails or does not return cannot
+    // keep a pass from starting.
+    match env::recovery_store(&env) {
+        Ok(None) => {}
+        Ok(Some(remote)) => {
+            if copier(&bridge, &remote)
+                .start_pass(&bridge.jobs, UnixMs(event.schedule() as i64))
+                .await
+                .is_err()
+            {
+                console_error!("recovery copy: the pass was not started");
+            }
+        }
+        Err(class) => console_error!("recovery copy: config refused: {class}"),
+    }
     match bridge.dispatch().await {
         Ok(report) => {
             if report.rolled_back {

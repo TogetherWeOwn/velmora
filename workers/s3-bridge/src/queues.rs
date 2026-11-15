@@ -177,6 +177,13 @@ mod tests {
             write: WriteId::new("w_0000000000000000"),
         };
         assert_eq!(lane(&sweep), Lane::Verify);
+        // The recovery copy shares the verify lane; a job is bounded.
+        let copy = Job::RecoveryCopy {
+            v: JOB_VERSION,
+            pass: velmora_bridge::UnixMs(1),
+            cursor: String::new(),
+        };
+        assert_eq!(lane(&copy), Lane::Verify);
         for remaining in [0, 4096] {
             let evict = Job::Evict {
                 v: JOB_VERSION,
