@@ -309,6 +309,73 @@ PutObject, CompleteMultipartUpload, CopyObject and DeleteObject are in
 `SAFETY`, where a database restore cannot reach them, and the replay
 brings them back.
 
+## A PutObject above one extent
+
+With `MAX_PUT_BYTES` above `MAX_EXTENT_BYTES` (shipped: 99 MiB over
+16 MiB), the body of one PutObject may be larger than one extent. It is
+stored as slices of `SLICE_BYTES` (8 MiB), each an extent of its own,
+one in memory at a time. The object is one generation with one recovery
+record, like any other, and its ETag is the MD5 of the body. A part of
+a multipart upload stays at `MAX_EXTENT_BYTES`.
+
+- A request body above 100 MiB is refused before the Worker runs, so
+  99 MiB is the most `MAX_PUT_BYTES` takes. A client has to send larger
+  files as multipart uploads. aws-cli does so from 8 MiB. rclone does so
+  from 200 MiB by default: run it with `--s3-upload-cutoff 95M` and
+  `--s3-chunk-size 16M` (or `upload_cutoff = 95M` and `chunk_size = 16M`
+  in the remote's section of `rclone.conf`). A part of 16 MiB is one
+  full extent; rclone's default part of 5 MiB makes about three times as
+  many extents.
+- Before its first slice is stored, the request writes one row per
+  slice into `write_intents`. The commit removes the rows. A request
+  that died leaves its rows, and its slices in `SAFETY`.
+- The request raises the rollback stamp before it writes its recovery
+  record, and once more after the commit. If the first raise fails, it
+  answers 503 `SlowDown` and publishes nothing.
+
+**The sweep** (`INTENT_SWEEP = "on"`, independent of `GC_MODE`) removes
+what such a request left. Each cron run sends a job for up to 20
+writes, the oldest first, whose rows are a day old or were given up by
+their request. The job deletes the slices and then the rows. It deletes
+nothing:
+
+- of a write that has a recovery record in `SAFETY`. Its rows are
+  marked `kept` and stay;
+- while a replay is under way;
+- while the catalogue is behind its rollback stamp.
+
+With the switch off nothing is deleted and the rows stay; a later run
+with the switch on removes them. Production ships with the switch off:
+`waiting_writes` and `oldest_waiting_at` below count what the sweep
+would take. Turn it on in `wrangler.toml` after a restore drill on a
+deployed Worker has passed.
+
+`GET /_admin/status` shows the table under `write_intents`:
+
+| Field | Meaning | If it stays above 0 |
+|---|---|---|
+| `open_writes` | requests under way, and dead ones younger than a day | nothing to do |
+| `waiting_writes`, `oldest_waiting_at` | writes that are due for the sweep: bytes in `SAFETY` that no object uses | the sweep is off, a replay is unfinished, the catalogue is rolled back, or the cron could not send the jobs (it logs `dispatch: the sweep of unpublished writes was not sent`) |
+| `kept_writes`, `kept_slices` | writes with a recovery record and without an object in the catalogue: the request died between the two, or its publication was refused and the record could not be removed | run the restore steps above; the replay reads the records, and its first step empties the table |
+| `anomalies` | how often a write was marked `kept`, ever; it does not go down | see `kept_writes` |
+
+No client was told `200` for a write that is `open`, `waiting` or
+`kept`.
+
+**With a restore.** The first step of a replay empties `write_intents`:
+a row of an earlier point may name slices that the replay publishes.
+Slices of requests that were under way at that moment and never
+published stay in `SAFETY` without a row, and no figure counts them.
+
+A Worker version from before this table does not empty it. If such a
+version ran a restore, run `DELETE FROM write_intents` on the database
+before a version with the sweep is deployed again.
+
+Going back to a Worker version from before this table needs nothing
+else: the objects are ordinary generations, which it reads, posts,
+verifies and replays. It answers `EntityTooLarge` to a new PutObject
+above one extent.
+
 ## The route
 
 `POST /_admin/restore` (admin bearer; 409 unless `MAINTENANCE=restore`)

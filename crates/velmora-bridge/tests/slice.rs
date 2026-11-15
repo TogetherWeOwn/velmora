@@ -524,6 +524,11 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Rig {
+        Rig::with_vars(&[]).await
+    }
+
+    /// The dev configuration with `extra` variables set on top of it.
+    async fn with_vars(extra: &[(&'static str, &str)]) -> Rig {
         let mut cfg = ServerConfig::for_test();
         cfg.group = GROUP.to_string();
         cfg.users.clear();
@@ -578,6 +583,9 @@ impl Rig {
         .map(|(k, v)| (k, v.to_string()))
         .collect();
         vars.insert("NNTP_PROVIDERS", providers);
+        for (k, v) in extra {
+            vars.insert(k, v.to_string());
+        }
         // TestKek's version 1; the config only checks its presence and shape.
         vars.insert(
             "VELMORA_KEK_1",
@@ -2003,6 +2011,185 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
     }
     rig.pump(s).await;
     expect_eq(s, "dead outbox rows", 0, rig.outbox_dead());
+}
+
+/// A PutObject above one extent is stored in slices. Each slice is an
+/// extent like any other: it is posted and verified, and the object is
+/// rebuilt from its recovery record and read from Usenet.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
+    use velmora_bridge::replay::ReplayCursor;
+
+    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024")]).await;
+    let s = "sliced setup";
+    rig.setup_buckets_and_key(s).await;
+    // Three slices of the default 8 MiB: two full ones and 4 MiB + 1 B.
+    let body = test_bytes(21, 20 * MIB + 1);
+    let r = rig.put("/slice/a/sliced.bin", &body).await;
+    expect_status(s, "PUT a/sliced.bin", 200, &r);
+    expect_eq(
+        s,
+        "ETag is the MD5 of the body",
+        Some(format!("\"{:x}\"", md5::compute(&body))),
+        r.header("etag").map(str::to_string),
+    );
+    let sizes: Vec<i64> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT plain_size FROM extents ORDER BY seq")
+            .expect("extents");
+        let sizes = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .expect("extents")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("extents");
+        sizes
+    });
+    expect_eq(
+        s,
+        "slice sizes",
+        vec![8 * MIB as i64, 8 * MIB as i64, 4 * MIB as i64 + 1],
+        sizes,
+    );
+    expect_eq(
+        s,
+        "intent rows after the publish",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM write_intents"),
+    );
+
+    let s = "sliced post-and-verify";
+    rig.pump(s).await;
+    expect_eq(s, "dead outbox rows", 0, rig.outbox_dead());
+    let extents: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c.prepare("SELECT id FROM extents").expect("extents");
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("extents")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("extents");
+        ids
+    });
+    for id in &extents {
+        expect(
+            s,
+            &format!("slice {id} has an article plan record"),
+            rig.bridge.safety.contains(&format!("m/art/{id}")),
+            "absent",
+        );
+    }
+    expect_eq(
+        s,
+        "slices verified",
+        3,
+        rig.sql_count("SELECT COUNT(DISTINCT extent_id) FROM verifications"),
+    );
+    let st = rig.status(s, "slice", "a/sliced.bin").await;
+    expect_eq(s, "slices of the live object", 3, st.extents.len());
+    for x in &st.extents {
+        let id = x.extent_id.as_str();
+        expect(
+            s,
+            &format!("slice {id} stage is release or done"),
+            matches!(x.stage, Some(OutboxStage::Release | OutboxStage::Done)),
+            format!("{:?}", x.stage),
+        );
+        expect(
+            s,
+            &format!("slice {id} has a counting backbone"),
+            x.backbones.iter().any(|b| b.counts),
+            format!("{:?}", x.backbones),
+        );
+    }
+
+    // Lose the catalogue, the cache and everything in SAFETY besides
+    // the records and the rollback stamps.
+    for key in rig.bridge.cache.keys() {
+        rig.bridge.cache.delete(&key).await.expect("cache delete");
+    }
+    for key in rig.bridge.safety.keys() {
+        if !velmora_bridge::recovery::is_protected_key(&key) {
+            rig.bridge.safety.delete(&key).await.expect("safety delete");
+        }
+    }
+    let wipe = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM key_floors; DELETE FROM verifications; DELETE FROM articles; \
+                DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
+                DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
+                DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.execute_batch(wipe).expect("wipe"));
+
+    let s = "sliced replay";
+    let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+    let (mut published, mut plans) = (0, 0);
+    let mut damaged = u64::MAX;
+    while let Some(at) = cursor {
+        let mut report = rig
+            .bridge
+            .replay_step(at)
+            .await
+            .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+        published += report.published;
+        plans += report.article_plans;
+        damaged = report.damaged_total;
+        expect(
+            s,
+            "every record opens and publishes",
+            report.unreadable.is_empty() && report.unpublishable.is_empty(),
+            format!("{report:?}"),
+        );
+        cursor = report.next.take();
+    }
+    expect_eq(s, "generations published", 1, published);
+    expect_eq(s, "slices with an article plan record", 3, plans);
+    expect_eq(s, "damaged generations", 0, damaged);
+
+    let s = "sliced read-back";
+    let key = rig
+        .admin_json(
+            s,
+            Method::Post,
+            "/keys",
+            Some(serde_json::json!({"buckets": ["slice"], "perm": "rw"})),
+        )
+        .await;
+    *rig.signer.borrow_mut() = Some(Signer {
+        akid: key["access_key_id"].as_str().expect("akid").to_string(),
+        secret: key["secret"].as_str().expect("secret").to_string(),
+        host: S3_HOST.to_string(),
+        region: REGION.to_string(),
+    });
+    let bodies_before = rig.n.bodies.get();
+    // A range over the border of the first two slices.
+    let (from, to) = (8 * MIB - 3, 8 * MIB + 2);
+    let r = rig
+        .s3(
+            Method::Get,
+            "/slice/a/sliced.bin",
+            &[],
+            &[("range", &format!("bytes={from}-{to}"))],
+            Vec::new(),
+        )
+        .await;
+    expect_status(s, "ranged GET a/sliced.bin", 206, &r);
+    expect_bytes(s, "ranged GET body", &body[from..=to], &r.body);
+    let r = rig.get("/slice/a/sliced.bin").await;
+    expect_status(s, "GET a/sliced.bin", 200, &r);
+    expect_bytes(s, "GET a/sliced.bin body", &body, &r.body);
+    expect(
+        s,
+        "the reads came from NNTP",
+        rig.n.bodies.get() > bodies_before,
+        format!("{} BODY commands", rig.n.bodies.get() - bodies_before),
+    );
+    let r = rig.head("/slice/a/sliced.bin").await;
+    expect_eq(
+        s,
+        "HEAD ETag after the replay",
+        Some(format!("\"{:x}\"", md5::compute(&body))),
+        r.header("etag").map(str::to_string),
+    );
 }
 
 #[test]

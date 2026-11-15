@@ -47,6 +47,8 @@
 #   VELMORA_ADMIN_TOKEN_FILE  admin bearer file, mode 0600 (remote only)
 #   STEP4_TIMEOUT_SECS        step 4 poll limit (default 180 local, 900 remote)
 #   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
+#   E2E_SLICED                0 skips step 0c (a 99 MiB PutObject) against a
+#                             remote that runs without MAX_PUT_BYTES
 #
 # Every failure prints `SLICE FAILED at step <n>: <what>` with the expected
 # and the actual value, and the script exits non-zero.
@@ -432,6 +434,62 @@ same_bytes "GET w/small.bin equals the upload" "$T/small.bin" "$T/got-w-small.bi
 run_aws "GET w/mid.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "s3://$SB/w/mid.bin" "$T/got-w-mid.bin" >/dev/null
 same_bytes "GET w/mid.bin equals the upload" "$T/mid.bin" "$T/got-w-mid.bin"
 rm -f "$T/mid.bin" "$T/got-w-mid.bin" "$T/got-w-small.bin"
+
+# ---------------------------------------------------------------------------
+# 0c one PutObject above one extent (stored as slices of 8 MiB)
+# ---------------------------------------------------------------------------
+
+STEP=0c-sliced-put
+# The shipped vars set MAX_PUT_BYTES to 99 MiB. E2E_SLICED=0 skips the step
+# against a remote that runs without it.
+if [[ ${E2E_SLICED:-1} == 1 ]]; then
+  log "step $STEP"
+  head -c 103809024 /dev/urandom >"$T/sliced.bin" # 99 MiB, the limit: 13 slices
+  WANT_MD5=$(md5sum <"$T/sliced.bin" | cut -c1-32)
+  t0=$(now_ms)
+  json=$(run_aws "PutObject s/sliced.bin (99 MiB in one request)" "${S3API[@]}" put-object \
+    --bucket "$SB" --key s/sliced.bin --body "$T/sliced.bin")
+  log "PutObject s/sliced.bin: $(($(now_ms) - t0)) ms for 103809024 bytes"
+  # The ETag of a single PUT is the MD5 of the whole body, with no part count.
+  jcheck "PutObject s/sliced.bin returns the MD5 of the body as its ETag" \
+    ".ETag == \"\\\"$WANT_MD5\\\"\"" "$json"
+  json=$(run_aws "HEAD s/sliced.bin" "${S3API[@]}" head-object --bucket "$SB" --key s/sliced.bin)
+  jcheck "HEAD s/sliced.bin: 99 MiB and the same ETag" \
+    ".ContentLength == 103809024 and .ETag == \"\\\"$WANT_MD5\\\"\"" "$json"
+  json=$(adm "GET /_admin/objects/$SB/s/sliced.bin" "$BASE/_admin/objects/$SB/s/sliced.bin")
+  jcheck "s/sliced.bin is 13 extents" '.extents | length == 13' "$json"
+  run_aws "GET s/sliced.bin" "${S3[@]}" cp "s3://$SB/s/sliced.bin" "$T/got-sliced.bin" >/dev/null
+  same_bytes "GET s/sliced.bin equals the upload" "$T/sliced.bin" "$T/got-sliced.bin"
+  # A range that starts in the first slice and ends in the second.
+  run_aws "GET s/sliced.bin bytes=8388000-8389000" "${S3API[@]}" get-object --bucket "$SB" --key s/sliced.bin \
+    --range bytes=8388000-8389000 "$T/got-sliced.bin" >/dev/null
+  dd if="$T/sliced.bin" of="$T/sliced-want.bin" bs=1 skip=8388000 count=1001 status=none
+  same_bytes "range body equals bytes 8388000-8389000" "$T/sliced-want.bin" "$T/got-sliced.bin"
+  # The same without a checksum from the client: one extent and one byte.
+  head -c 16777217 "$T/sliced.bin" >"$T/sliced-want.bin"
+  WANT_MD5=$(md5sum <"$T/sliced-want.bin" | cut -c1-32)
+  json=$(run_aws "PutObject s/over.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3API[@]}" put-object \
+    --bucket "$SB" --key s/over.bin --body "$T/sliced-want.bin")
+  jcheck "PutObject s/over.bin returns the MD5 of the body as its ETag" \
+    ".ETag == \"\\\"$WANT_MD5\\\"\"" "$json"
+  run_aws "GET s/over.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "s3://$SB/s/over.bin" "$T/got-sliced.bin" >/dev/null
+  same_bytes "GET s/over.bin equals the upload" "$T/sliced-want.bin" "$T/got-sliced.bin"
+  # A published write leaves no row behind; nothing waits for the sweep.
+  json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+  jcheck "write_intents in /_admin/status" \
+    '.write_intents | (.sweep == "on" or .sweep == "off") and ([.open_writes, .waiting_writes, .kept_writes, .kept_slices, .anomalies] | all(type == "number"))' "$json"
+  if [[ $MODE == local ]]; then
+    jcheck "no write is open, waiting or kept after the uploads" \
+      '.write_intents == {sweep: "on", open_writes: 0, waiting_writes: 0, oldest_waiting_at: null, kept_writes: 0, kept_slices: 0, anomalies: 0}' "$json"
+  fi
+  log "write_intents: $(jq -c .write_intents <<<"$json")"
+  # Deleted here, so that the later steps post and verify what they did before.
+  run_aws "DELETE s/sliced.bin" "${S3API[@]}" delete-object --bucket "$SB" --key s/sliced.bin >/dev/null
+  run_aws "DELETE s/over.bin" "${S3API[@]}" delete-object --bucket "$SB" --key s/over.bin >/dev/null
+  rm -f "$T/sliced.bin" "$T/got-sliced.bin" "$T/sliced-want.bin"
+else
+  log "step $STEP skipped (E2E_SLICED is not 1)"
+fi
 
 # ---------------------------------------------------------------------------
 # 1 read-after-write (served from SAFETY)

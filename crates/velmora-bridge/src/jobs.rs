@@ -68,7 +68,7 @@ pub fn low_watermark(cap: u64) -> u64 {
     cap - cap / 10
 }
 
-const RETRY: JobOutcome = JobOutcome::Retry {
+pub(crate) const RETRY: JobOutcome = JobOutcome::Retry {
     delay_secs: INFRA_RETRY_SECS,
 };
 
@@ -111,6 +111,7 @@ where
                     Err(_) => RETRY,
                 }
             }
+            Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
             // A message from another version: its outbox row is re-sent in
             // the current format.
             _ => JobOutcome::Ack,
@@ -468,6 +469,9 @@ where
             Ok(sent) => report.evict_enqueued = sent,
             Err(_) => report.evict_failed = true,
         }
+
+        // Unpublished sliced writes whose slices are due for deletion.
+        self.sweep_check(now, &mut report).await;
 
         self.catalog.record_dispatch(now).await?;
         Ok(report)

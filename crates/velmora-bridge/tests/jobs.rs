@@ -229,6 +229,9 @@ impl Fx {
             s3_host: "s3.test".to_string(),
             region: "auto".to_string(),
             max_extent_bytes: 16 * 1024 * 1024,
+            max_put_bytes: 16 * 1024 * 1024,
+            slice_bytes: 8 * 1024 * 1024,
+            intent_sweep: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: VERIFY_DELAY_SECS,
@@ -1058,6 +1061,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             evict_failed: false,
             rolled_back: false,
             stamp_failed: false,
+            sweeps_enqueued: 0,
+            sweep_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

@@ -93,10 +93,117 @@ impl JobSink for Jobs {
     }
 }
 
+/// What happens at one call of a store or of the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trip {
+    /// The call never answers: the request stops here. Dropping its
+    /// future is a handler that was killed at this point;
+    /// [`Tripwire::release`] lets it go on.
+    Stall,
+    /// The call fails and did nothing.
+    Fail,
+    /// The call is carried out and then fails: no answer.
+    Lost,
+}
+
+/// Counts the calls of the safety store and of the database of a rig,
+/// and trips one of them.
+#[derive(Clone, Default)]
+pub struct Tripwire(Rc<TripState>);
+
+#[derive(Default)]
+struct TripState {
+    armed: Cell<Option<(u64, Trip)>>,
+    held: Cell<bool>,
+    calls: Cell<u64>,
+}
+
+impl Tripwire {
+    /// Trips the call that comes after `skip` more calls.
+    pub fn arm(&self, skip: u64, trip: Trip) {
+        self.0.armed.set(Some((skip, trip)));
+    }
+
+    pub fn disarm(&self) {
+        self.0.armed.set(None);
+        self.0.held.set(false);
+    }
+
+    /// Whether the wire tripped (it disarms itself when it does).
+    pub fn tripped(&self) -> bool {
+        self.0.armed.get().is_none()
+    }
+
+    /// Lets a stalled call go on.
+    pub fn release(&self) {
+        self.0.held.set(false);
+    }
+
+    /// Calls seen so far.
+    pub fn calls(&self) -> u64 {
+        self.0.calls.get()
+    }
+
+    /// `Some` = the caller fails, before (`Fail`) or after (`Lost`)
+    /// doing its work.
+    async fn cross(&self) -> Option<Trip> {
+        self.0.calls.set(self.0.calls.get() + 1);
+        match self.0.armed.get() {
+            None => None,
+            Some((0, trip)) => {
+                self.0.armed.set(None);
+                if trip != Trip::Stall {
+                    return Some(trip);
+                }
+                self.0.held.set(true);
+                std::future::poll_fn(|_| {
+                    if self.0.held.get() {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(())
+                    }
+                })
+                .await;
+                None
+            }
+            Some((n, trip)) => {
+                self.0.armed.set(Some((n - 1, trip)));
+                None
+            }
+        }
+    }
+
+    /// Runs one call of a store under the wire.
+    async fn guard<V>(
+        &self,
+        down: fn() -> BridgeError,
+        call: impl std::future::Future<Output = Result<V>>,
+    ) -> Result<V> {
+        match self.cross().await {
+            None => call.await,
+            Some(Trip::Lost) => {
+                call.await?;
+                Err(down())
+            }
+            Some(_) => Err(down()),
+        }
+    }
+}
+
+fn blob_down() -> BridgeError {
+    BridgeError::Blob("store down".into())
+}
+
+fn sql_down() -> BridgeError {
+    BridgeError::Sql("no answer".into())
+}
+
 /// A blob store whose writes can be made to fail.
 #[derive(Default)]
 pub struct Blobs {
     pub inner: MemBlobStore,
+    /// Every call crosses it first.
+    pub trip: Tripwire,
     pub fail_put: Cell<bool>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
@@ -164,13 +271,15 @@ impl BlobStore for Blobs {
         if self.fail_put.get() || refused {
             return Err(BridgeError::Blob("store down".into()));
         }
-        self.inner.put(key, bytes, meta).await
+        self.trip
+            .guard(blob_down, self.inner.put(key, bytes, meta))
+            .await
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key, span).await
+        self.trip.guard(blob_down, self.inner.get(key, span)).await
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
-        self.inner.head(key).await
+        self.trip.guard(blob_down, self.inner.head(key)).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
         fire(&self.before_delete, key);
@@ -181,7 +290,7 @@ impl BlobStore for Blobs {
             self.fail_deletes.set(self.fail_deletes.get() - 1);
             return Err(BridgeError::Blob("store down".into()));
         }
-        self.inner.delete(key).await
+        self.trip.guard(blob_down, self.inner.delete(key)).await
     }
     async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
         // The faults of `delete` hold for the delete of a record too.
@@ -197,14 +306,19 @@ impl BlobStore for Blobs {
             self.fail_record_deletes.set(left - 1);
             return Err(BridgeError::Blob("store down".into()));
         }
-        self.inner.delete_record(refused).await
+        self.trip
+            .guard(blob_down, self.inner.delete_record(refused))
+            .await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
         if self.fail_list.get() {
             return Err(BridgeError::Blob("list failed".into()));
         }
         if !self.hold_list.take() {
-            return self.inner.list(prefix, start_after, limit).await;
+            return self
+                .trip
+                .guard(blob_down, self.inner.list(prefix, start_after, limit))
+                .await;
         }
         let early = match self.list_first.take() {
             true => Some(self.inner.list(prefix, start_after, limit).await),
@@ -238,6 +352,8 @@ pub struct FailSql {
     /// Fails this many batches, the next ones: a commit that does not
     /// go through while single statements still do.
     pub fail_batches: Cell<u32>,
+    /// Every call crosses it first.
+    pub trip: Tripwire,
 }
 
 /// How a publication batch fails: D1 may answer with an error before it
@@ -276,13 +392,17 @@ impl Sql for FailSql {
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
-        self.inner.query(sql, params).await
+        self.trip
+            .guard(sql_down, self.inner.query(sql, params))
+            .await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
-        self.inner.exec(sql, params).await
+        self.trip
+            .guard(sql_down, self.inner.exec(sql, params))
+            .await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if self.fail_writes.get() {
@@ -314,7 +434,7 @@ impl Sql for FailSql {
                 None => {}
             }
         }
-        self.inner.batch(stmts).await
+        self.trip.guard(sql_down, self.inner.batch(stmts)).await
     }
 }
 
@@ -328,6 +448,9 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         s3_host: HOST.to_string(),
         region: REGION.to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
+        max_put_bytes: 16 * 1024 * 1024,
+        slice_bytes: 8 * 1024 * 1024,
+        intent_sweep: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
@@ -366,9 +489,13 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
     cfg: BridgeConfig,
     budget: ByteBudget,
 ) -> Rig<N> {
+    // One wire over the safety store and the database: a request is a
+    // single sequence of calls to the two.
+    let trip = Tripwire::default();
     Rig {
         bridge: Rc::new(Bridge {
             catalog: SqlCatalog::new(FailSql {
+                trip: trip.clone(),
                 inner: RusqliteSql::with_schema().unwrap(),
                 fail_writes: Cell::new(false),
                 fail_publish: Cell::new(None),
@@ -376,7 +503,10 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),
             }),
-            safety: Blobs::default(),
+            safety: Blobs {
+                trip,
+                ..Blobs::default()
+            },
             cache: Blobs::default(),
             nntp,
             jobs: Jobs::default(),
@@ -449,6 +579,11 @@ impl<N: NntpConnector + 'static> Rig<N> {
 
     pub fn now(&self) -> UnixMs {
         self.bridge.clock.now()
+    }
+
+    /// The wire over the safety store and the database.
+    pub fn trip(&self) -> &Tripwire {
+        &self.bridge.safety.trip
     }
 
     pub async fn send(&self, req: Req) -> Resp {
@@ -658,6 +793,44 @@ impl Signer {
         extra: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Req {
+        self.sign_as(now, method, raw_path, query, extra, body, None)
+            .0
+    }
+
+    /// The timestamp, the credential scope and the signing key at `now`:
+    /// what a chunk-signature chain is built from.
+    pub fn scope(&self, now: UnixMs) -> (String, String, Vec<u8>) {
+        let secs = now.0.div_euclid(1000);
+        let (y, mo, d) = civil(secs.div_euclid(86_400));
+        let t = secs.rem_euclid(86_400);
+        let date = format!("{y:04}{mo:02}{d:02}");
+        let stamp = format!("{date}T{:02}{:02}{:02}Z", t / 3600, t % 3600 / 60, t % 60);
+        let mut key = hmac(format!("AWS4{}", self.secret).as_bytes(), date.as_bytes());
+        for part in [self.region.as_str(), "s3", "aws4_request"] {
+            key = hmac(&key, part.as_bytes());
+        }
+        (
+            stamp,
+            format!("{date}/{}/s3/aws4_request", self.region),
+            key,
+        )
+    }
+
+    /// [`Self::sign`] with an explicit `x-amz-content-sha256`
+    /// (`UNSIGNED-PAYLOAD` or a `STREAMING-*` value): the body is not
+    /// hashed and no `Content-Length` is added. Returns the request and
+    /// its signature, the seed of a chunk-signature chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_as(
+        &self,
+        now: UnixMs,
+        method: Method,
+        raw_path: &str,
+        query: &[(&str, &str)],
+        extra: &[(&str, &str)],
+        body: Vec<u8>,
+        payload: Option<&str>,
+    ) -> (Req, String) {
         let mut q: Vec<(String, String)> = query
             .iter()
             .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
@@ -674,13 +847,9 @@ impl Signer {
             format!("{raw_path}?{canonical_query}")
         };
 
-        let secs = now.0.div_euclid(1000);
-        let (y, mo, d) = civil(secs.div_euclid(86_400));
-        let t = secs.rem_euclid(86_400);
-        let date = format!("{y:04}{mo:02}{d:02}");
-        let stamp = format!("{date}T{:02}{:02}{:02}Z", t / 3600, t % 3600 / 60, t % 60);
-
-        let payload = hex(&sha256(&body));
+        let (stamp, scope, key) = self.scope(now);
+        let explicit = payload.is_some();
+        let payload = payload.map_or_else(|| hex(&sha256(&body)), str::to_string);
         let mut signed: BTreeMap<String, String> = BTreeMap::new();
         signed.insert("host".into(), HOST.into());
         signed.insert("x-amz-content-sha256".into(), payload.clone());
@@ -694,15 +863,10 @@ impl Signer {
             "{}\n{raw_path}\n{canonical_query}\n{canonical_headers}\n{names}\n{payload}",
             method.as_str()
         );
-        let scope = format!("{date}/{}/s3/aws4_request", self.region);
         let to_sign = format!(
             "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
             hex(&sha256(canonical.as_bytes()))
         );
-        let mut key = hmac(format!("AWS4{}", self.secret).as_bytes(), date.as_bytes());
-        for part in [self.region.as_str(), "s3", "aws4_request"] {
-            key = hmac(&key, part.as_bytes());
-        }
         let signature = hex(&hmac(&key, to_sign.as_bytes()));
 
         let mut headers: Vec<(String, String)> = signed.into_iter().collect();
@@ -713,16 +877,100 @@ impl Signer {
                 self.akid
             ),
         ));
-        if method == Method::Put || !body.is_empty() {
+        if !explicit && (method == Method::Put || !body.is_empty()) {
             headers.push(("content-length".into(), body.len().to_string()));
         }
-        Req {
-            method,
-            target,
-            headers,
-            body,
-        }
+        (
+            Req {
+                method,
+                target,
+                headers,
+                body,
+            },
+            signature,
+        )
     }
+
+    /// A signed aws-chunked body chained from `seed` (the signature of
+    /// its request), with an optional signed trailer.
+    pub fn signed_chunks(
+        &self,
+        now: UnixMs,
+        seed: &str,
+        data: &[u8],
+        chunk: usize,
+        trailer: Option<(&str, String)>,
+    ) -> Vec<u8> {
+        let (stamp, scope, key) = self.scope(now);
+        let empty = hex(&sha256(b""));
+        let mut previous = seed.to_owned();
+        let mut out = Vec::with_capacity(data.len() + data.len() / chunk * 96 + 512);
+        for c in data.chunks(chunk).chain([&b""[..]]) {
+            let sts = format!(
+                "AWS4-HMAC-SHA256-PAYLOAD\n{stamp}\n{scope}\n{previous}\n{empty}\n{}",
+                hex(&sha256(c))
+            );
+            previous = hex(&hmac(&key, sts.as_bytes()));
+            out.extend_from_slice(
+                format!("{:x};chunk-signature={previous}\r\n", c.len()).as_bytes(),
+            );
+            if !c.is_empty() {
+                out.extend_from_slice(c);
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        if let Some((name, value)) = trailer {
+            let sts = format!(
+                "AWS4-HMAC-SHA256-TRAILER\n{stamp}\n{scope}\n{previous}\n{}",
+                hex(&sha256(format!("{name}:{value}\n").as_bytes()))
+            );
+            let sig = hex(&hmac(&key, sts.as_bytes()));
+            out.extend_from_slice(
+                format!("{name}:{value}\r\nx-amz-trailer-signature:{sig}\r\n").as_bytes(),
+            );
+        }
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+}
+
+/// An unsigned aws-chunked body, the way aws-cli sends it. `trailer` is
+/// one `name:value` line, or empty.
+pub fn unsigned_chunks(data: &[u8], chunk: usize, trailer: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + data.len() / chunk * 16 + 256);
+    for c in data.chunks(chunk) {
+        out.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
+        out.extend_from_slice(c);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n");
+    if !trailer.is_empty() {
+        out.extend_from_slice(format!("{trailer}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// CRC-32C of `data`, base64: the value of `x-amz-checksum-crc32c`.
+pub fn crc32c_b64(data: &[u8]) -> String {
+    use base64::Engine as _;
+    let mut table = [0u32; 256];
+    for (i, t) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 == 1 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            };
+        }
+        *t = c;
+    }
+    let mut c = !0u32;
+    for b in data {
+        c = table[((c ^ u32::from(*b)) & 0xff) as usize] ^ (c >> 8);
+    }
+    base64::engine::general_purpose::STANDARD.encode((!c).to_be_bytes())
 }
 
 // ---------------------------------------------------------------------------

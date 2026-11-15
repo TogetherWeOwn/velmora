@@ -15,6 +15,7 @@ pub use get::READ_STAMP_MS;
 mod list;
 mod multipart;
 mod put;
+mod slices;
 
 use std::rc::Rc;
 

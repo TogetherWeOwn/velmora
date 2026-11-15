@@ -16,10 +16,10 @@ pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
-    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, Job, JobExtent, KekBytes,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig,
-    ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow, UploadRow,
-    VerificationRow,
+    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats, Job,
+    JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm,
+    ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow,
+    UploadRow, VerificationRow, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -346,6 +346,60 @@ pub trait Catalog {
         c: &CommitGeneration,
         record: Recorded,
     ) -> Result<PublishOutcome>;
+    /// [`Self::commit_generation`] for a body stored as the slices of
+    /// `write`. The batch also commits only while every intent of the
+    /// write is `open` under this generation id, and deletes them. So a
+    /// write the sweep has taken is refused like one with an older id.
+    async fn commit_sliced(
+        &self,
+        c: &CommitGeneration,
+        write: &WriteId,
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
+
+    // write intents (the slices of a multi-extent write)
+    /// Records the slices of `write` before the first of them is
+    /// stored: one `open` row per extent id, in one batch. `Lost` = a
+    /// replay is under way; nothing was written.
+    async fn open_intents(
+        &self,
+        write: &WriteId,
+        extents: &[ExtentId],
+        now: UnixMs,
+    ) -> Result<Guard<()>>;
+    /// Stores the id of the recovery record that is written next. A
+    /// record of the write is then always found from its rows. `Lost` =
+    /// the write no longer has `slices` open rows (the sweep took it, or
+    /// a replay emptied the table) or a replay is under way: the request
+    /// must stop before it writes a record.
+    async fn intents_generation(
+        &self,
+        write: &WriteId,
+        generation: &GenerationId,
+        slices: usize,
+    ) -> Result<Guard<()>>;
+    /// The request gave up and no recovery record of the write exists:
+    /// its `open` rows become `abandoned`, and the sweep takes them
+    /// without waiting for the grace period.
+    async fn abandon_intents(&self, write: &WriteId) -> Result<()>;
+    /// Writes the sweep has to look at, oldest first: `abandoned`, left
+    /// `sweeping` by a job that died, or `open` and created before
+    /// `open_before`.
+    async fn due_intents(&self, open_before: UnixMs, limit: u32) -> Result<Vec<WriteId>>;
+    /// Takes `write` for the sweep in one batch that fails while a
+    /// replay is under way or the write has a generation or extent row.
+    async fn fence_intents(&self, write: &WriteId, open_before: UnixMs) -> Result<IntentFence>;
+    /// The checks of the fence once more, just before blobs are
+    /// deleted. `true` = all `slices` rows are still `sweeping`, no
+    /// replay runs, and the write has no catalogue row.
+    async fn hold_intent_fence(&self, write: &WriteId, slices: usize) -> Result<bool>;
+    /// A recovery record of the fenced write exists: its rows become
+    /// `kept` and one anomaly is counted. Nothing is deleted.
+    async fn keep_intents(&self, write: &WriteId) -> Result<()>;
+    /// The blobs of the fenced write are gone: its rows go.
+    async fn drop_intents(&self, write: &WriteId) -> Result<()>;
+    /// Counts for `GET /_admin/status`.
+    async fn intent_stats(&self, open_before: UnixMs) -> Result<IntentStats>;
     /// The newest id on `(bucket, key)`: its live generation or its
     /// floor. A publication or a tombstone must sort after it.
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;

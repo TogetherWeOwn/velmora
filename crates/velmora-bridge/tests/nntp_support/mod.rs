@@ -905,6 +905,46 @@ impl Catalog for MemCatalog {
     async fn commit_generation(&self, _: &CommitGeneration, _: Recorded) -> Result<PublishOutcome> {
         unused()
     }
+    async fn commit_sliced(
+        &self,
+        _: &CommitGeneration,
+        _: &WriteId,
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
+        unused()
+    }
+    async fn open_intents(&self, _: &WriteId, _: &[ExtentId], _: UnixMs) -> Result<Guard<()>> {
+        unused()
+    }
+    async fn intents_generation(
+        &self,
+        _: &WriteId,
+        _: &GenerationId,
+        _: usize,
+    ) -> Result<Guard<()>> {
+        unused()
+    }
+    async fn abandon_intents(&self, _: &WriteId) -> Result<()> {
+        unused()
+    }
+    async fn due_intents(&self, _: UnixMs, _: u32) -> Result<Vec<WriteId>> {
+        unused()
+    }
+    async fn fence_intents(&self, _: &WriteId, _: UnixMs) -> Result<IntentFence> {
+        unused()
+    }
+    async fn hold_intent_fence(&self, _: &WriteId, _: usize) -> Result<bool> {
+        unused()
+    }
+    async fn keep_intents(&self, _: &WriteId) -> Result<()> {
+        unused()
+    }
+    async fn drop_intents(&self, _: &WriteId) -> Result<()> {
+        unused()
+    }
+    async fn intent_stats(&self, _: UnixMs) -> Result<IntentStats> {
+        unused()
+    }
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
@@ -1232,6 +1272,9 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         s3_host: "s3.test".to_string(),
         region: "auto".to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
+        max_put_bytes: 16 * 1024 * 1024,
+        slice_bytes: 8 * 1024 * 1024,
+        intent_sweep: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,

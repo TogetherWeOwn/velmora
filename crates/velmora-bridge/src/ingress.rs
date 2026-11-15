@@ -375,7 +375,11 @@ pub fn precheck(
     // declare a length. The handler refuses one that declares a body.
     let copy = header(req, "x-amz-copy-source").is_some();
     match route {
-        Route::PutObject { .. } | Route::UploadPart { .. } if !copy => {
+        // A PutObject body above one extent is stored as slices.
+        Route::PutObject { .. } if !copy => {
+            upload_lengths(&req.headers, cfg.max_put_bytes)?;
+        }
+        Route::UploadPart { .. } if !copy => {
             upload_lengths(&req.headers, cfg.max_extent_bytes)?;
         }
         _ => {

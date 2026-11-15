@@ -153,7 +153,7 @@ impl JobSink for QueueSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velmora_bridge::{ExtentId, GenerationId, JOB_VERSION};
+    use velmora_bridge::{ExtentId, GenerationId, WriteId, JOB_VERSION};
 
     fn extent_job(stage: OutboxStage) -> Job {
         Job::Extent {
@@ -171,6 +171,12 @@ mod tests {
             assert_eq!(lane(&extent_job(stage)), Lane::Verify);
         }
         assert_eq!(lane(&Job::Gc { v: JOB_VERSION }), Lane::Verify);
+        // The sweep of a write deletes blobs and posts nothing.
+        let sweep = Job::Sweep {
+            v: JOB_VERSION,
+            write: WriteId::new("w_0000000000000000"),
+        };
+        assert_eq!(lane(&sweep), Lane::Verify);
         for remaining in [0, 4096] {
             let evict = Job::Evict {
                 v: JOB_VERSION,

@@ -1069,8 +1069,26 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         outbox.insert(stage.as_str().to_string(), json!(n));
     }
     let hot = bridge.catalog.hot_stats().await.or_internal()?;
+    let intents = bridge
+        .catalog
+        .intent_stats(crate::intents::open_before(now))
+        .await
+        .or_internal()?;
     let cfg = &bridge.cfg;
     Ok(ok(&json!({
+        // Slices of large PUTs that never became an object. `kept` rows
+        // sit beside a generation record and are never deleted by the
+        // sweep; `waiting` writes are past the grace period and are
+        // leaked safety bytes until the sweep (`sweep`) removes them.
+        "write_intents": {
+            "sweep": if cfg.intent_sweep { "on" } else { "off" },
+            "open_writes": intents.open_writes,
+            "waiting_writes": intents.waiting_writes,
+            "oldest_waiting_at": intents.oldest_waiting_at.map(|t| t.0),
+            "kept_writes": intents.kept_writes,
+            "kept_slices": intents.kept_slices,
+            "anomalies": intents.anomalies,
+        },
         // R2 as a hot tier. Pinned bytes are safety copies not yet
         // released; they are never evicted and are outside the cap.
         "hot": {

@@ -37,7 +37,25 @@ MAINTENANCE = "off"                  # off | restore
 # and the others wait for it (measured on a test deployment: 3.6 MiB/s
 # at 8, 5.2 MiB/s at 6).
 POST_SOCKETS = "6"
+# The largest PutObject body: 99 MiB, the most this build takes. A request
+# body above 100 MiB is refused before it reaches the Worker, and the
+# margin is for chunked framing. A body above MAX_EXTENT_BYTES is stored
+# as slices of SLICE_BYTES, one in memory at a time. Without the variable
+# the limit is MAX_EXTENT_BYTES. A part of a multipart upload stays at
+# MAX_EXTENT_BYTES.
+MAX_PUT_BYTES = "103809024"
+# off | on. On: the cron tick removes the slices of a sliced PutObject
+# that was never published, a day after it began. It deletes nothing of
+# a write that has a recovery record, nothing while a replay is under
+# way, and nothing while the catalogue is behind its rollback stamp.
+# Independent of GC_MODE. Off: the slices and their rows stay, and a
+# later run with the switch on removes them. Production ships with it
+# off; /_admin/status counts what it would take (write_intents:
+# waiting_writes, oldest_waiting_at).
+INTENT_SWEEP = "off"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
+#   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
+#   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
@@ -106,7 +124,7 @@ crons = ["*/5 * * * *"]
 # (`hosts`, `host_select`), and take such fields out of the secret before rolling the Worker back.
 
 [env.dev]
-vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on" }
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.

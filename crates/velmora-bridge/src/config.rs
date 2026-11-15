@@ -17,9 +17,22 @@ use crate::types::{KekBytes, ProviderConfig, Secret};
 /// lands the catalogue recovery protocol and its drill may flip it.
 pub const REAL_DATA_READY: bool = false;
 
-/// Largest request body (one extent) the slice accepts. Raised when
-/// streaming bodies land.
+/// Largest extent, and largest UploadPart body. Raised when streaming
+/// bodies land.
 pub const MAX_EXTENT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Largest PutObject body `MAX_PUT_BYTES` may allow. The edge refuses a
+/// request of 100 MiB before the Worker runs; the last MiB is left for
+/// the framing of a chunked body.
+pub const MAX_PUT_BYTES_LIMIT: u64 = 99 * 1024 * 1024;
+
+/// `SLICE_BYTES` when the variable is absent: 8 MiB, or one extent when
+/// that is smaller.
+pub const DEFAULT_SLICE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Most slices one PutObject is cut into. Their ids travel in single
+/// catalogue batches, and one generation holds them.
+pub const MAX_WRITE_SLICES: u64 = 16;
 
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
@@ -110,6 +123,16 @@ pub struct BridgeConfig {
     pub s3_host: String,
     pub region: String,
     pub max_extent_bytes: u64,
+    /// Largest PutObject body. A body above `max_extent_bytes` is cut
+    /// into slices of `slice_bytes`, each its own extent. Equal to
+    /// `max_extent_bytes` = no body is sliced.
+    pub max_put_bytes: u64,
+    /// Plaintext bytes of one slice of a sliced body.
+    pub slice_bytes: u64,
+    /// Delete the safety blobs of sliced writes that were never
+    /// published. Off: their `write_intents` rows stay and can be swept
+    /// later.
+    pub intent_sweep: bool,
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
     pub verify_delay_secs: u32,
@@ -163,6 +186,21 @@ fn number_or(
             _ => Err(ConfigError::Invalid(name.to_string())),
         },
         _ => Ok(default),
+    }
+}
+
+/// An optional `u64`; unset or empty = `None`.
+fn optional_u64(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<Option<u64>, ConfigError> {
+    match get(name) {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ConfigError::Invalid(name.to_string())),
+        _ => Ok(None),
     }
 }
 
@@ -287,6 +325,27 @@ impl BridgeConfig {
             return Err(ConfigError::Invalid("MAX_EXTENT_BYTES".into()));
         }
 
+        // Optional: absent or empty keeps every PUT at one extent.
+        let max_put_bytes = optional_u64(&get, "MAX_PUT_BYTES")?.unwrap_or(max_extent_bytes);
+        if max_put_bytes < max_extent_bytes || max_put_bytes > MAX_PUT_BYTES_LIMIT {
+            return Err(ConfigError::Invalid("MAX_PUT_BYTES".into()));
+        }
+        let slice_bytes =
+            optional_u64(&get, "SLICE_BYTES")?.unwrap_or(DEFAULT_SLICE_BYTES.min(max_extent_bytes));
+        // A slice is an extent, and a maximal body stays within the
+        // slice count one write may have.
+        if slice_bytes == 0
+            || slice_bytes > max_extent_bytes
+            || max_put_bytes.div_ceil(slice_bytes) > MAX_WRITE_SLICES
+        {
+            return Err(ConfigError::Invalid("SLICE_BYTES".into()));
+        }
+        let intent_sweep = match get("INTENT_SWEEP").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("INTENT_SWEEP".into())),
+        };
+
         let required_backbones: u32 = number(&get, "REQUIRED_BACKBONES")?;
         if required_backbones == 0 {
             return Err(ConfigError::Invalid("REQUIRED_BACKBONES".into()));
@@ -401,6 +460,9 @@ impl BridgeConfig {
             s3_host,
             region,
             max_extent_bytes,
+            max_put_bytes,
+            slice_bytes,
+            intent_sweep,
             required_backbones,
             safety_min_age_secs,
             verify_delay_secs,

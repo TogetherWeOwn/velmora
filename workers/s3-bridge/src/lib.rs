@@ -196,6 +196,9 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             if report.evict_failed {
                 console_error!("dispatch: hot-tier check failed");
             }
+            if report.sweep_failed {
+                console_error!("dispatch: the sweep of unpublished writes was not sent");
+            }
         }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
     }

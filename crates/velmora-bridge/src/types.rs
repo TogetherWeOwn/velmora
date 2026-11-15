@@ -176,6 +176,11 @@ id_type!(
     /// 32 hex, random. Never an authorization boundary (§A.4).
     UploadId
 );
+id_type!(
+    /// `w_<32 hex>`, random: one request that stores its body as several
+    /// slices.
+    WriteId
+);
 
 impl BucketId {
     pub fn mint(rand: [u8; 8]) -> Self {
@@ -212,6 +217,15 @@ impl ExtentId {
     /// Key of the evictable ciphertext in `CACHE`.
     pub fn cache_key(&self) -> String {
         format!("c/{}", self.0)
+    }
+}
+
+impl WriteId {
+    pub fn mint(rand: [u8; 16]) -> Self {
+        let mut s = String::with_capacity(34);
+        s.push_str("w_");
+        push_hex(&mut s, &rand);
+        WriteId(s)
     }
 }
 
@@ -1044,6 +1058,12 @@ pub enum Job {
         v: u8,
         remaining: u64,
     },
+    /// Sweep of one sliced write that was never published: its
+    /// `write_intents` rows name the safety blobs to delete.
+    Sweep {
+        v: u8,
+        write: WriteId,
+    },
 }
 
 impl Job {
@@ -1084,6 +1104,52 @@ pub struct DispatchReport {
     pub rolled_back: bool,
     /// The rollback stamp was not raised; the rest of the run went on.
     pub stamp_failed: bool,
+    /// Sliced writes that were never published and were sent to the sweep.
+    pub sweeps_enqueued: u32,
+    /// Listing those writes failed; the rest of the run went on without it.
+    pub sweep_failed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Write intents
+// ---------------------------------------------------------------------------
+
+/// What the fence of a sweep found (`Catalog::fence_intents`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentFence {
+    /// The rows are `sweeping`: no publication of this write can commit
+    /// any more. `generation` is the id its recovery record would have.
+    Fenced {
+        generation: Option<GenerationId>,
+        extents: Vec<ExtentId>,
+    },
+    /// No row of the write is due: published, swept, kept or too young.
+    Gone,
+    /// A replay is under way; nothing was changed.
+    Refused,
+    /// The write has a generation or an extent row: it was published
+    /// after all. Its intent rows were deleted; no blob may be touched.
+    Published,
+}
+
+/// `write_intents` as `GET /_admin/status` reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct IntentStats {
+    /// Writes whose blobs the sweep left in place because a recovery
+    /// record of the write exists. Nothing reclaims them yet.
+    pub kept_writes: u64,
+    /// Safety blobs of those writes, at most one slice each.
+    pub kept_slices: u64,
+    /// Writes the sweep has still to look at: given up by their request,
+    /// or older than the grace period.
+    pub waiting_writes: u64,
+    /// `created_at` of the oldest of them.
+    pub oldest_waiting_at: Option<UnixMs>,
+    /// Writes of requests that can still be running.
+    pub open_writes: u64,
+    /// Times the sweep met a write it could not explain: one it kept, or
+    /// one that had catalogue rows next to its intents.
+    pub anomalies: u64,
 }
 
 // ---------------------------------------------------------------------------

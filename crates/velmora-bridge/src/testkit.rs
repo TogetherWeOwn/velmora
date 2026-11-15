@@ -65,6 +65,9 @@ pub const MIGRATION_0009: &str =
 /// The rollback stamp counter.
 pub const MIGRATION_0010: &str =
     include_str!("../../../workers/s3-bridge/migrations/0010_rollback_stamp.sql");
+/// The slices of a multi-extent write, recorded before they are stored.
+pub const MIGRATION_0011: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0011_write_intents.sql");
 
 /// Why a provider's last failed session failed.
 pub const MIGRATION_0012: &str =
@@ -161,6 +164,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0008)?;
         db.apply(MIGRATION_0009)?;
         db.apply(MIGRATION_0010)?;
+        db.apply(MIGRATION_0011)?;
         db.apply(MIGRATION_0012)?;
         Ok(db)
     }
