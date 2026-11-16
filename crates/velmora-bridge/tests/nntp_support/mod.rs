@@ -416,12 +416,28 @@ impl MemCatalog {
     }
 
     fn statuses(e: &Entry) -> Vec<BackboneStatus> {
+        Self::latest_rows(e, |_| true)
+    }
+
+    /// As the SQL catalogue: per backbone, the latest row that is a
+    /// `BODY` row or a failure, if it is a complete `BODY` pass. A later
+    /// `STAT` pass does not hide it.
+    fn body_on_record(e: &Entry) -> Vec<BackboneStatus> {
+        let deciding =
+            |v: &VerificationRow| v.kind == VerifyKind::Body || v.result != VerifyResult::Ok;
+        let mut rows = Self::latest_rows(e, deciding);
+        rows.retain(|s| s.counts && s.kind == VerifyKind::Body);
+        rows
+    }
+
+    /// The latest row per backbone for the current plan among `rows`.
+    fn latest_rows(e: &Entry, rows: impl Fn(&VerificationRow) -> bool) -> Vec<BackboneStatus> {
         let extent = &e.job.extent;
         let mut latest: BTreeMap<&str, &VerificationRow> = BTreeMap::new();
         for v in e
             .verifications
             .iter()
-            .filter(|v| v.plan_rev == extent.plan_rev)
+            .filter(|v| v.plan_rev == extent.plan_rev && rows(v))
         {
             match latest.get(v.backbone.as_str()) {
                 Some(old) if old.verified_at > v.verified_at => {}
@@ -625,6 +641,12 @@ impl Catalog for MemCatalog {
         Ok(entries.get(extent).map(Self::statuses).unwrap_or_default())
     }
 
+    async fn body_passes(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
+        let entries = self.entries.borrow();
+        let found = entries.get(extent).map(Self::body_on_record);
+        Ok(found.unwrap_or_default())
+    }
+
     async fn begin_release(
         &self,
         l: &Lease,
@@ -637,10 +659,16 @@ impl Catalog for MemCatalog {
             // As the SQL guard: only rows recorded under this claim.
             let claimed = e.outbox.claimed_at;
             let statuses = Self::statuses(e);
+            // A fresh pass is the full check only where a `BODY` pass
+            // is on record.
+            let full = Self::body_on_record(e);
             let passes = statuses
                 .iter()
                 .filter(|s| s.counts && s.verified_at >= claimed)
-                .map(|s| (s.backbone.as_str(), s.kind));
+                .map(|s| match full.iter().any(|b| b.backbone == s.backbone) {
+                    true => (s.backbone.as_str(), VerifyKind::Body),
+                    false => (s.backbone.as_str(), VerifyKind::Stat),
+                });
             if !velmora_bridge::verify::releasable(passes, counting, required) {
                 return false;
             }

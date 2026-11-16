@@ -247,7 +247,12 @@ crons = ["*/5 * * * *"]
 # neither verified nor counted: use it for short-retention or post-only accounts. A release needs
 # every article read in full (BODY) on one backbone that counts and present (STAT) on
 # REQUIRED_BACKBONES of them in all; BODY goes to the first one in the list, so list the account to
-# read in full first. `release` is true when absent, so a short-retention provider MUST say
+# read in full first. The BODY read happens once, at verify. The release, after SAFETY_MIN_AGE_SECS,
+# reads no BODY: it asks every backbone that counts for every article with STAT, and needs the BODY
+# pass of the current article plan on record for one of the backbones that answer (an operator
+# decision: it halves the read volume; a body a backbone stopped serving in between, while it still
+# answers STAT, is not seen by the release).
+# `release` is true when absent, so a short-retention provider MUST say
 # `"release": false`. With fewer readable backbones that count than REQUIRED_BACKBONES the Worker keeps
 # serving reads and writes and releases nothing: every pinned copy stays held, /_admin/status lists a
 # "release paused" line under `config_warnings`, and the cron logs it on every tick.

@@ -2,8 +2,8 @@
 //!
 //! Verify checks an extent's articles on every backbone that counts
 //! toward a release. Release unpins the safety copy, and only on evidence
-//! read in the same job. The copy stays in R2 and keeps serving reads;
-//! from then on the hot-tier eviction may drop it.
+//! of presence asked for in the same job. The copy stays in R2 and keeps
+//! serving reads; from then on the hot-tier eviction may drop it.
 //!
 //! The release rule ([`releasable`]), the same for the verify decision,
 //! the release job and the catalogue's guard:
@@ -18,8 +18,22 @@
 //!   for an article whose `BODY` it no longer serves. So `STAT` passes
 //!   alone, on however many backbones, release nothing.
 //!
-//! Backbones are checked in configuration order: `BODY` until one has
-//! passed it, `STAT` on the ones after.
+//! Where the two kinds of check happen (an operator decision, taken to
+//! halve the read volume asked of the providers):
+//! - The full `BODY` read happens once, at verify. Verify checks the
+//!   backbones in configuration order: `BODY` until one has passed it,
+//!   `STAT` on the ones after.
+//! - Release reads no `BODY`. Once the minimum age is over it asks every
+//!   backbone that counts for every article with `STAT`, and only what
+//!   that job finds counts as presence. The full check it takes from the
+//!   record: a complete `BODY` pass of the extent's current `plan_rev`
+//!   that no later check has cancelled, on a backbone whose `STAT` pass
+//!   it has just seen. A backbone counts as the full check only so.
+//! - A plan that changed (a new `plan_rev`) has no full check on record:
+//!   it goes back to verify and is read in full before any release.
+//! - What this gives up: a body that a backbone stopped serving between
+//!   verify and release, while it still answers `STAT`, is not seen by
+//!   the release. Only a later read of the bodies would find it.
 //!
 //! Rules of a check:
 //! - Only a complete pass over all articles is recorded. A transport
@@ -173,9 +187,9 @@ where
         }
     }
 
-    /// Runs the release stage for a claimed extent: check every backbone
-    /// that counts again now, by the same rule as at verify, then mark
-    /// the safety copy evictable.
+    /// Runs the release stage for a claimed extent: ask every backbone
+    /// that counts for every article now (`STAT`), require the full check
+    /// on record from verify, then mark the safety copy evictable.
     pub async fn release_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
         match self.release_extent(lease, job).await {
             Ok(()) => JobOutcome::Ack,
@@ -525,54 +539,75 @@ where
             return Ok(());
         }
 
-        // Only what this job finds now counts as evidence. Every backbone
-        // that counts is checked: one that lacks the extent does not hold
-        // the release up while enough others pass. `BODY` until one
-        // backbone has passed it, `STAT` on the ones after.
         let groups = release_backbones(&self.cfg.providers);
         let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
-        let mut read = Vec::new();
-        let mut full = false;
-        for (_, providers) in &groups {
-            let kind = match full {
-                true => VerifyKind::Stat,
-                false => VerifyKind::Body,
-            };
-            let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
-            full |= kind == VerifyKind::Body && result_of(&tally) == VerifyResult::Ok;
-            read.push((provider, tally, kind));
+        // The full check is not repeated here: it is taken from the
+        // record, a complete `BODY` pass of the current plan on a
+        // backbone that counts. A plan without one was never read in
+        // full (or its pass was cancelled since): back to verify, which
+        // reads it, and nothing is asked of a provider here.
+        let mut full = self.catalog.body_passes(&extent.id).await?;
+        full.retain(|b| b.plan_rev == extent.plan_rev && labels.contains(&label(&b.backbone)));
+        if full.is_empty() {
+            return self.back_to_verify(lease, now).await;
         }
-        let result = |r| read.iter().filter(|(_, t, _)| result_of(t) == r).count();
-        let (passed, missing) = (result(VerifyResult::Ok), result(VerifyResult::Missing));
+        // Presence: only what this job finds now counts. Every backbone
+        // that counts is asked with `STAT`, and no `BODY` is read: one
+        // that lacks the extent does not hold the release up while enough
+        // others pass.
+        let mut read = Vec::new();
+        for (_, providers) in &groups {
+            read.push(
+                self.read_backbone(lease, &plan, providers, VerifyKind::Stat)
+                    .await?,
+            );
+        }
+        // A backbone is the full check only if it was read in full on
+        // record and still answers for every article now.
+        let read_in_full = |backbone: &str| {
+            let name = label(backbone);
+            full.iter().any(|b| label(&b.backbone) == name)
+        };
         let passes = read
             .iter()
-            .filter(|(_, t, _)| result_of(t) == VerifyResult::Ok)
-            .map(|(p, _, kind)| (p.backbone.as_str(), *kind));
-        let enough = releasable(passes, &labels, required);
-        if !enough && passed + missing == read.len() && missing > 0 {
-            // Not releasable after all, and nothing worse than missing:
-            // back to verify, which owns the retry waits and the record.
-            self.cursor(lease, 0).await?;
-            self.advance(lease, OutboxStage::Verify, now).await?;
-            self.notify(lease, OutboxStage::Verify, 0).await;
-            return Ok(());
+            .filter(|(_, t)| result_of(t) == VerifyResult::Ok)
+            .map(|(p, _)| match read_in_full(&p.backbone) {
+                true => (p.backbone.as_str(), VerifyKind::Body),
+                false => (p.backbone.as_str(), VerifyKind::Stat),
+            });
+        if !releasable(passes, &labels, required) {
+            if read.iter().all(|(_, t)| result_of(t) == VerifyResult::Ok) {
+                return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
+            }
+            // An article is missing where it has to be. Nothing is
+            // recorded: back to verify, which owns the retry waits, the
+            // repost, the record, and the next full read.
+            return self.back_to_verify(lease, now).await;
         }
         let mut rows = Vec::new();
-        for (provider, tally, kind) in &read {
-            let row = self.record(lease, extent, provider, tally, *kind).await?;
+        for (provider, tally) in &read {
+            let row = self
+                .record(lease, extent, provider, tally, VerifyKind::Stat)
+                .await?;
             if row.result == VerifyResult::Ok {
                 rows.push(row);
             }
         }
-        if !enough && rows.len() < read.len() {
-            // A backbone serves damaged articles: verify again later.
-            self.cursor(lease, 0).await?;
-            let again = self.clock.now().plus_secs(REVERIFY_SECS);
-            return self.advance(lease, OutboxStage::Verify, again).await;
-        }
-        if !enough {
-            return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
-        }
+        // The evidence: this job's `STAT` passes, then the full checks on
+        // record of the backbones among them.
+        let on_record = full.iter().filter(|b| {
+            let name = label(&b.backbone);
+            rows.iter().any(|r| r.backbone == name)
+        });
+        let on_record = on_record.map(|b| Evidence {
+            backbone: &b.backbone,
+            provider: &b.provider_id,
+            verified_at: b.verified_at,
+            kind: b.kind,
+            ok: b.articles_ok,
+            total: b.articles_total,
+            plan_rev: b.plan_rev,
+        });
         let evidence: Vec<Evidence<'_>> = rows
             .iter()
             .map(|r| Evidence {
@@ -584,6 +619,7 @@ where
                 total: r.articles_total,
                 plan_rev: r.plan_rev,
             })
+            .chain(on_record)
             .collect();
         let evidence =
             serde_json::to_string(&evidence).map_err(|_| Stop::fail(FailClass::Internal))?;
@@ -597,6 +633,15 @@ where
             // lease still holds, the job comes back and reads again.
             Guard::Lost => Err(Stop::fail(FailClass::Internal)),
         }
+    }
+
+    /// Sends a release that cannot go through back to the start of verify,
+    /// at once and without an attempt spent.
+    async fn back_to_verify(&self, lease: &Lease, now: UnixMs) -> Staged<()> {
+        self.cursor(lease, 0).await?;
+        self.advance(lease, OutboxStage::Verify, now).await?;
+        self.notify(lease, OutboxStage::Verify, 0).await;
+        Ok(())
     }
 
     /// Completes the release of an extent already marked `releasing`: the

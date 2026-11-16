@@ -1127,8 +1127,9 @@ async fn release_refuses_both_checks_on_one_backbone() {
             .unwrap(),
         Guard::Lost
     );
-    // The latest row speaks for its backbone, and it is the `STAT` one:
-    // even where one backbone is enough, this is no full check.
+    // The latest row speaks for its backbone, and it is the `STAT` one.
+    // The `BODY` pass before it stays the full check on record, so where
+    // one backbone is enough the rule holds.
     let status = fx.cat.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status[0].kind, VerifyKind::Stat);
     assert_eq!(
@@ -1136,19 +1137,32 @@ async fn release_refuses_both_checks_on_one_backbone() {
             .begin_release(&r, 1, &counting, "[]", T0.plus_ms(3))
             .await
             .unwrap(),
-        Guard::Lost
+        Guard::Applied(())
     );
 }
 
-/// `BODY` on one backbone that counts and `STAT` on another: released.
-/// The evidence has to be from this claim, whatever its kind.
+/// The backbones with the full check on record, with the time of it.
+async fn on_record(fx: &Fx, o: &Obj) -> Vec<(String, UnixMs)> {
+    let rows = fx.cat.body_passes(&o.extent).await.unwrap();
+    for b in &rows {
+        assert!(b.counts && b.kind == VerifyKind::Body && b.result == VerifyResult::Ok);
+        assert_eq!((b.articles_ok, b.articles_total), (2, 2));
+    }
+    rows.into_iter()
+        .map(|b| (b.backbone, b.verified_at))
+        .collect()
+}
+
+/// The release rule: the full `BODY` check from verify, on record, and a
+/// `STAT` pass under the release claim from every backbone that is to
+/// count, the one read in full among them.
 #[tokio::test]
-async fn release_takes_a_body_pass_and_a_stat_pass_on_two_backbones() {
+async fn release_takes_fresh_stat_passes_with_the_body_pass_on_record() {
     let fx = Fx::new().await;
     let o = fx.publish(&fx.bucket, "k").await;
     let l = fx.posted(&o, 2, T0).await;
     let counting = labels(&["bb-a", "bb-b"]);
-    // The verify stage: the same two passes, before the release claim.
+    // The verify stage, before the release claim.
     assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
     assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
     let later = T0.plus_ms(HOUR_MS);
@@ -1163,18 +1177,172 @@ async fn release_takes_a_body_pass_and_a_stat_pass_on_two_backbones() {
         async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
     };
     assert!(lost(later).await, "passes from before the claim");
-    // Only the `STAT` half again: the old `BODY` pass does not complete it.
     assert!(
         fx.pass(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat)
             .await
     );
-    assert!(lost(later.plus_ms(2)).await, "no fresh full check");
+    assert!(lost(later.plus_ms(2)).await, "one backbone asked");
     assert!(
-        fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Body)
+        fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Stat)
             .await
     );
+    // The `STAT` pass did not hide the full check of an hour before.
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
     assert!(!lost(later.plus_ms(4)).await);
     assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+}
+
+/// The full check counts only on a backbone that answered under this
+/// claim: with it on a backbone that was not asked, or that now lacks an
+/// article, fresh `STAT` passes on two others release nothing.
+#[tokio::test]
+async fn release_refuses_stat_passes_without_the_backbone_read_in_full() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b", "bb-c"]);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let begin = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() }
+    };
+    for backbone in ["bb-b", "bb-c"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    assert_eq!(begin(later.plus_ms(2)).await, Guard::Lost, "not asked");
+    // It lacks an article now: the full check on record is cancelled.
+    let missing = VerifyResult::Missing;
+    assert!(
+        fx.verify(&r, "bb-a", "p-bb-a", later.plus_ms(3), 1, 2, missing)
+            .await
+    );
+    assert_eq!(on_record(&fx, &o).await, []);
+    assert_eq!(begin(later.plus_ms(4)).await, Guard::Lost, "missing");
+    // A `STAT` pass after the failure does not bring the full check back.
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(5), VerifyKind::Stat)
+            .await
+    );
+    assert_eq!(on_record(&fx, &o).await, []);
+    assert_eq!(begin(later.plus_ms(6)).await, Guard::Lost, "cancelled");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // Read in full again: released.
+    let again = later.plus_ms(7);
+    assert!(fx.pass(&r, "bb-a", again, VerifyKind::Body).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), again)]);
+    assert_eq!(begin(later.plus_ms(8)).await, Guard::Applied(()));
+}
+
+/// No release on `STAT` alone for a plan that was never read in full: the
+/// full check of an earlier plan revision is not on record for this one.
+#[tokio::test]
+async fn release_refuses_a_plan_that_was_never_read_in_full() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    // The plan changes: the same number of articles, a new revision.
+    fx.run(
+        "UPDATE extents SET plan_rev = 2 WHERE id = ?1",
+        &[text(o.extent.as_str())],
+    )
+    .await;
+    assert_eq!(on_record(&fx, &o).await, []);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let new_plan = |backbone: &str, at: UnixMs, kind| VerificationRow {
+        extent_id: o.extent.clone(),
+        backbone: backbone.into(),
+        provider_id: format!("p-{backbone}"),
+        verified_at: at,
+        plan_rev: 2,
+        articles_ok: 2,
+        articles_total: 2,
+        result: VerifyResult::Ok,
+        kind,
+    };
+    for backbone in ["bb-a", "bb-b"] {
+        let row = new_plan(backbone, later.plus_ms(1), VerifyKind::Stat);
+        assert!(fx.cat.record_verification(&r, &row).await.unwrap());
+    }
+    assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
+    let before = fx.dump().await;
+    for required in [1, 2] {
+        assert_eq!(
+            fx.cat
+                .begin_release(&r, required, &counting, "[]", later.plus_ms(2))
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "required = {required}"
+        );
+    }
+    assert_eq!(fx.dump().await, before);
+
+    // The new plan read in full: on record, and the release goes through.
+    let row = new_plan("bb-b", later.plus_ms(3), VerifyKind::Body);
+    assert!(fx.cat.record_verification(&r, &row).await.unwrap());
+    assert_eq!(
+        on_record(&fx, &o).await,
+        [("bb-b".to_string(), later.plus_ms(3))]
+    );
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 2, &counting, "[]", later.plus_ms(4))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+}
+
+/// A `BODY` pass that a later `BODY` check contradicts is not on record,
+/// and an incomplete one never was.
+#[tokio::test]
+async fn the_full_check_on_record_is_the_latest_body_check() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    assert_eq!(on_record(&fx, &o).await, []);
+    let corrupt = VerifyResult::Corrupt;
+    // One of two articles, recorded as `ok`: not a complete pass.
+    assert!(fx.verify(&l, "bb-a", "p", T0, 1, 2, VerifyResult::Ok).await);
+    assert_eq!(on_record(&fx, &o).await, []);
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(2), VerifyKind::Body).await);
+    assert_eq!(
+        on_record(&fx, &o).await,
+        [
+            ("bb-a".to_string(), T0.plus_ms(2)),
+            ("bb-b".to_string(), T0.plus_ms(1))
+        ]
+    );
+    assert!(
+        fx.verify(&l, "bb-b", "p", T0.plus_ms(3), 1, 2, corrupt)
+            .await
+    );
+    assert_eq!(
+        on_record(&fx, &o).await,
+        [("bb-a".to_string(), T0.plus_ms(2))]
+    );
 }
 
 /// What the column means for rows and Workers from before it, and what
@@ -1276,10 +1444,23 @@ async fn a_stat_pass_is_no_read_back_to_a_reader_from_before_kind() {
     // A second result in the same millisecond moves the tally with the kind.
     assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
     assert_eq!(read_backs_before_kind(&fx, &o, "bb-b").await, "1");
+    // A `STAT` pass in the millisecond of a `BODY` pass leaves it as it
+    // is: the full check stays on record.
     assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
-    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "0");
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "1");
     let status = fx.cat.backbone_status(&o.extent).await.unwrap();
     assert!(status.iter().all(|b| b.counts && b.articles_ok == 2));
+    assert!(status.iter().all(|b| b.kind == VerifyKind::Body));
+    let on_record = fx.cat.body_passes(&o.extent).await.unwrap();
+    assert_eq!(on_record.len(), 2);
+    // A failure in that millisecond still replaces it.
+    let missing = VerifyResult::Missing;
+    assert!(
+        fx.verify(&l, "bb-a", "p", T0.plus_ms(1), 1, 2, missing)
+            .await
+    );
+    let on_record = fx.cat.body_passes(&o.extent).await.unwrap();
+    assert_eq!(on_record.len(), 1);
 }
 
 #[tokio::test]
