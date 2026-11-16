@@ -227,7 +227,9 @@ impl Fx {
         let body = match resp.body {
             RespBody::Empty => Vec::new(),
             RespBody::Bytes(b) => b,
-            RespBody::Stream(_) => panic!("admin responses are never streamed"),
+            RespBody::Stream(_) | RespBody::Deferred(_) => {
+                panic!("admin responses are never streamed")
+            }
         };
         Resp {
             status: resp.status,

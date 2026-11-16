@@ -16,6 +16,7 @@ pub mod hosts;
 pub mod ingress;
 pub mod intents;
 pub mod jobs;
+pub mod keepalive;
 mod pool;
 pub mod ports;
 pub mod post;

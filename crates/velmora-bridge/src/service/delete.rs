@@ -27,10 +27,11 @@ use velmora_s3_proto::mutation::{delete_result, parse_delete, DeleteOutcome};
 use velmora_s3_proto::{storable_key, ChecksumAlgorithm, ErrorCode, UploadValidator};
 
 use super::common::{
-    authenticate, check_precondition, conditional_gate, from_proto, internal, mutation_gate,
-    policy_with, restore_gate, s3_error, writes_refused,
+    authenticate, check_precondition, conditional_gate, internal, mutation_gate, policy_with,
+    restore_gate, s3_error, writes_refused,
 };
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
+use crate::keepalive::Deferred;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone, write_tombstones, NewTombstone};
 use crate::types::{Bucket, GenerationId, Precondition, RespBody, S3Request, S3Response, UnixMs};
@@ -570,12 +571,12 @@ async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 // ---------------------------------------------------------------------------
 
 pub(super) async fn delete_objects<
-    C: Catalog,
-    B: BlobStore,
-    N: NntpConnector,
-    J: JobSink,
-    K: Kek,
-    T: Clock,
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
 >(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
@@ -597,8 +598,18 @@ fn names_integrity_check(headers: &velmora_s3_proto::Headers) -> bool {
             .any(|a| headers.get(a.header()).is_some())
 }
 
-async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
-    bridge: &Bridge<C, B, N, J, K, T>,
+/// Everything that can fail the request with a status code comes before
+/// the answer: authentication, the gates, the body and its document.
+/// The deletes are the work of the [`Deferred`] body that answers.
+async fn delete_many<
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
 ) -> Result<S3Response, S3Response> {
     // POST: `authenticate` requires a read-write grant on the bucket.
@@ -647,6 +658,38 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
     // tree read from it are gone.
     drop(charge);
 
+    // Nothing from here on fails the request: every failure is the
+    // answer for a key. So the answer is a `200` whose document may be
+    // sent after its headers (see `crate::keepalive`).
+    let keys = Rc::new(request.keys);
+    let quiet = request.quiet;
+    let work = {
+        let (bridge, bucket, keys) = (Rc::clone(bridge), bucket.clone(), Rc::clone(&keys));
+        async move {
+            let outcomes = delete_keys(&bridge, &bucket, &keys).await;
+            delete_document(&keys, &outcomes, quiet)
+        }
+    };
+    // Work that ends without its document (it was dropped) is answered
+    // as if every key had failed: a delete is idempotent, and a client
+    // tries the keys again.
+    let fallback = move || {
+        let outcomes = vec![DeleteError::Internal.outcome(); keys.len()];
+        delete_document(&keys, &outcomes, quiet)
+    };
+    Ok(S3Response {
+        status: 200,
+        headers: vec![("content-type".to_string(), "application/xml".to_string())],
+        body: RespBody::Deferred(Deferred::new(work, fallback)),
+    })
+}
+
+/// The answer for every key of `keys`, in their order.
+async fn delete_keys<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    keys: &[String],
+) -> Vec<DeleteOutcome> {
     // Every key is deleted as a DeleteObject deletes it, once: a key
     // that is named again gets the answer of its first mention, so the
     // request leaves the records of one delete per key, and no two
@@ -654,8 +697,7 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
     // back in request order.
     let mut first: HashMap<&str, usize> = HashMap::new();
     let mut distinct: Vec<&str> = Vec::new();
-    let slots: Vec<usize> = request
-        .keys
+    let slots: Vec<usize> = keys
         .iter()
         .map(|key| {
             *first.entry(key.as_str()).or_insert_with(|| {
@@ -689,8 +731,19 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
             Err(e) => e.outcome(),
         };
     }
-    let outcomes: Vec<DeleteOutcome> = slots.into_iter().map(|i| done[i].clone()).collect();
-    delete_result(&request.keys, &outcomes, request.quiet)
-        .map(from_proto)
-        .map_err(s3_error)
+    slots.into_iter().map(|i| done[i].clone()).collect()
+}
+
+/// The `DeleteResult` document. It cannot fail any more: when the
+/// answers do not match the keys, every key is answered `InternalError`.
+fn delete_document(keys: &[String], outcomes: &[DeleteOutcome], quiet: bool) -> Vec<u8> {
+    match delete_result(keys, outcomes, quiet) {
+        Ok(resp) => resp.body,
+        Err(_) => {
+            let failed = vec![DeleteError::Internal.outcome(); keys.len()];
+            delete_result(keys, &failed, quiet)
+                .map(|resp| resp.body)
+                .unwrap_or_default()
+        }
+    }
 }

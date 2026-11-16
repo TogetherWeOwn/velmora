@@ -11,8 +11,9 @@
 # bodies are aws-chunked with a trailing checksum, over HTTP the checksum is
 # a header). Step 0b repeats uploads with `when_required` (no checksum, no
 # aws-chunked), so both client settings are covered in every run. Step 7 restarts it with DEV_DROP_NOTIFY_N=1 so the next
-# queue send is lost, then calls the scheduled handler. Everything it started
-# or wrote is removed on exit.
+# queue send is lost, then calls the scheduled handler. Step 7b restarts it
+# with DEV_TOMBSTONE_PUT_DELAY_MS so a DeleteObjects outlasts aws-cli's read
+# timeout. Everything it started or wrote is removed on exit.
 #
 # Remote (any other base URL): runs against a deployed Worker. Nothing is
 # started or migrated. The admin bearer comes from the 0600 file named by
@@ -204,8 +205,9 @@ if [[ $MODE == local ]]; then
   poll 30 0.2 port_open "$FAKESRV_PORT" ||
     { redacted_tail "$T/fakesrv.log"; fail "fakesrv listening" "port $FAKESRV_PORT open within 30 s" "closed"; }
 
-  # write_dev_vars <drop-notify-n>: the throwaway .dev.vars (0600). printf
-  # is a builtin, so the values never reach argv.
+  # write_dev_vars <drop-notify-n> [<tombstone-put-delay-ms>]: the
+  # throwaway .dev.vars (0600). printf is a builtin, so the values never
+  # reach argv.
   write_dev_vars() {
     DEV_VARS_WRITTEN=1
     {
@@ -217,6 +219,8 @@ if [[ $MODE == local ]]; then
       printf 'S3_HOST=%s:%s\n' "$HOST" "$PORT"
       # Dev only: the first n queue sends of the isolate are lost (step 7).
       printf 'DEV_DROP_NOTIFY_N=%s\n' "$1"
+      # Dev only: every tombstone put waits this long first (step 7b).
+      printf 'DEV_TOMBSTONE_PUT_DELAY_MS=%s\n' "${2:-0}"
     } >"$WORKER_DIR/.dev.vars"
     chmod 600 "$WORKER_DIR/.dev.vars"
   }
@@ -1019,6 +1023,76 @@ else
     log "dispatcher run $run of $CRON_RUNS: last_dispatch_at=$SEEN ($(date -u -d "@$((SEEN / 1000))" +%H:%M:%SZ))"
   done
   log "status: $(jq -c '{environment, gc_mode, required_backbones, real_data_ready, outbox, dead, last_dispatch_at}' <<<"$json")"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b a DeleteObjects that outlasts the client's read timeout
+# ---------------------------------------------------------------------------
+
+# Local only: the delay of the tombstone puts is a dev variable. Each put
+# of a tombstone record waits 2.5 s, so a DeleteObjects of 120 keys takes
+# about 20 s; aws-cli reads with a 10 s timeout and no retry. The answer is
+# a 200 whose document follows after keepalive whitespace, so it succeeds
+# with every key deleted. Then rclone, when it is on PATH, purges a folder
+# of as many keys under the same slow tombstones with a 10 s timeout.
+# rclone (1.75) deletes an S3 folder key by key, with DeleteObject, not
+# DeleteObjects: its purge is a check of the slow store, not of the
+# keepalive.
+STEP=7b-slow-delete-objects
+log "step $STEP"
+if [[ $MODE == local ]]; then
+  log "restarting wrangler dev with DEV_TOMBSTONE_PUT_DELAY_MS=2500"
+  stop_wrangler
+  write_dev_vars 0 2500
+  start_wrangler
+  SLOW_KEYS=120
+  for dir in slow rcl; do
+    mkdir "$T/$dir"
+    for i in $(seq "$SLOW_KEYS"); do printf '%s %d\n' "$dir" "$i" >"$T/$dir/$(printf 'o%03d' "$i")"; done
+    run_aws "PUT $SLOW_KEYS objects under $dir/" "${S3[@]}" cp --recursive "$T/$dir" "s3://$OB/$dir/" >/dev/null
+    rm -rf "$T/$dir"
+  done
+  jq -n --argjson n "$SLOW_KEYS" '{Objects: [range(1; $n + 1) | {Key: ("slow/o" + ("00\(.)" | .[-3:]))}]}' >"$T/delete.json"
+  t0=$(now_ms)
+  json=$(AWS_MAX_ATTEMPTS=1 run_aws "DeleteObjects of $SLOW_KEYS keys with a 10 s read timeout" \
+    "${S3API[@]}" --cli-read-timeout 10 --output json delete-objects --bucket "$OB" --delete "file://$T/delete.json")
+  took=$(($(now_ms) - t0))
+  log "DeleteObjects of $SLOW_KEYS keys with slow tombstones: $took ms"
+  ((took > 10000)) || fail "the slow DeleteObjects outlasts the 10 s read timeout" "> 10000 ms" "$took ms"
+  jcheck "all $SLOW_KEYS keys are reported deleted, none with an error" \
+    "((.Errors // []) | length == 0) and (.Deleted | length == $SLOW_KEYS) and (.Deleted | map(.Key) | unique | length == $SLOW_KEYS)" "$json"
+  json=$(run_aws "ListObjectsV2 of slow/ after the delete" \
+    "${S3API[@]}" --output json list-objects-v2 --bucket "$OB" --prefix slow/)
+  jcheck "none of the slow keys is still listed" '(.Contents // []) | length == 0' "${json:-{\}}"
+
+  if command -v rclone >/dev/null; then
+    # The remote comes from the environment of a subshell. The key goes
+    # from the 0600 credentials file into exported variables (export is a
+    # builtin), so it never reaches argv.
+    rclone_env() (
+      export RCLONE_CONFIG_E2E_TYPE=s3 RCLONE_CONFIG_E2E_PROVIDER=Other
+      export RCLONE_CONFIG_E2E_ENDPOINT="$BASE" RCLONE_CONFIG_E2E_REGION=auto
+      export RCLONE_CONFIG_E2E_FORCE_PATH_STYLE=true RCLONE_CONFIG=/dev/null
+      RCLONE_CONFIG_E2E_ACCESS_KEY_ID=$(sed -n 's/^aws_access_key_id=//p' "$T/aws-credentials")
+      RCLONE_CONFIG_E2E_SECRET_ACCESS_KEY=$(sed -n 's/^aws_secret_access_key=//p' "$T/aws-credentials")
+      export RCLONE_CONFIG_E2E_ACCESS_KEY_ID RCLONE_CONFIG_E2E_SECRET_ACCESS_KEY
+      if [[ -n ${AWS_CA_BUNDLE:-} ]]; then export RCLONE_CA_CERT=$AWS_CA_BUNDLE; fi
+      "$@"
+    )
+    t0=$(now_ms)
+    if ! rclone_env rclone purge "e2e:$OB/rcl" --timeout 10s --contimeout 10s \
+      --retries 1 --low-level-retries 1 -v >"$T/rclone.log" 2>&1; then
+      redacted_tail "$T/rclone.log"
+      fail "rclone purge of rcl/ with a 10 s timeout" "exit 0" "non-zero exit (log above)"
+    fi
+    took=$(($(now_ms) - t0))
+    log "rclone purge of $SLOW_KEYS keys with slow tombstones: $took ms"
+    json=$(run_aws "ListObjectsV2 of rcl/ after the purge" \
+      "${S3API[@]}" --output json list-objects-v2 --bucket "$OB" --prefix rcl/)
+    jcheck "none of the rclone keys is still listed" '(.Contents // []) | length == 0' "${json:-{\}}"
+  else
+    log "rclone not on PATH: its purge is skipped"
+  fi
 fi
 
 STEP=finished

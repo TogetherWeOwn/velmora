@@ -1474,6 +1474,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "md5",
+ "quick-xml",
  "rusqlite",
  "serde",
  "serde_json",

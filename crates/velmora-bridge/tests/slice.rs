@@ -501,6 +501,10 @@ async fn collect(body: RespBody) -> std::result::Result<Vec<u8>, String> {
     match body {
         RespBody::Empty => Ok(Vec::new()),
         RespBody::Bytes(b) => Ok(b),
+        RespBody::Deferred(d) => d
+            .settle(Box::pin(std::future::pending()))
+            .await
+            .map_err(|_| "the window never elapses".to_string()),
         RespBody::Stream(mut s) => {
             let mut out = Vec::new();
             while let Some(chunk) = s.next().await {

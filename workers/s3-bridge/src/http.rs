@@ -93,6 +93,15 @@ fn try_response(resp: S3Response) -> worker::Result<Response> {
     let out = match resp.body {
         RespBody::Empty => Response::empty()?,
         RespBody::Bytes(bytes) => Response::from_bytes(bytes)?,
+        // `fetch` settles a deferred body first; one that is left is
+        // streamed with its keepalive.
+        RespBody::Deferred(d) => Response::from_stream(
+            d.into_stream(
+                crate::env::sleeper(),
+                velmora_bridge::keepalive::KEEPALIVE_INTERVAL_MS,
+            )
+            .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into()))),
+        )?,
         RespBody::Stream(stream) => {
             let stream = stream
                 .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into())));

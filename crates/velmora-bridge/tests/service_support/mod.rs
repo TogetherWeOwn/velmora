@@ -1022,6 +1022,11 @@ impl Resp {
         match resp.body {
             RespBody::Empty => {}
             RespBody::Bytes(b) => body = b,
+            // The buffered form: the document once it is done.
+            RespBody::Deferred(d) => match d.settle(Box::pin(std::future::pending())).await {
+                Ok(doc) => body = doc,
+                Err(_) => unreachable!("the window never elapses"),
+            },
             RespBody::Stream(mut s) => {
                 while let Some(item) = s.next().await {
                     match item {

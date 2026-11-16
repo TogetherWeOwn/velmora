@@ -42,3 +42,6 @@ velmora-bridge = { version = "0.1.0", path = ".", features = ["testkit"] }
 velmora = { version = "0.1.0", path = "../velmora", default-features = false, features = ["native-tls"] }
 velmora-test-nntp = { version = "0.1.0", path = "../velmora-test-nntp" }
 tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util", "sync"] }
+# A strict XML reader for the streamed DeleteResult (already in the lock
+# through velmora-s3-proto).
+quick-xml = "=0.42.0"
