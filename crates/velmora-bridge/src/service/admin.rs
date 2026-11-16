@@ -584,6 +584,68 @@ pub(super) async fn create_bucket_s3<
     }
 }
 
+/// S3 `DELETE /<bucket>`: admin only, like [`create_bucket_s3`], so it
+/// needs the admin bearer token. The bucket and its grants go only while
+/// nothing of the bucket is on record ([`Catalog::delete_bucket`]); any
+/// other bucket is `409 BucketNotEmpty`. Errors are S3 XML.
+///
+/// Unlike the other admin mutations it is accepted under
+/// `MAINTENANCE=restore`, once no replay is unfinished: an operator who
+/// has to remove a stale bucket between two replays does it while no
+/// client can write into that bucket. It is refused while a replay is
+/// under way, or due because the restore was armed or the rollback stamp
+/// found the catalogue set back, here and again in the catalogue batch:
+/// the records not yet read may name the bucket. A restored catalogue
+/// that is neither armed nor found out yet is not known to be one: there
+/// a bucket that looks empty goes with its grants, and the replay makes
+/// it again from its records, without the grants.
+pub(super) async fn delete_bucket_s3<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    req: S3Request,
+    bucket: &str,
+) -> S3Response {
+    if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
+        return IngressError::AccessDenied.response();
+    }
+    let failed = || S3Response::error(500, "InternalError", "The request failed.");
+    match bridge.catalog.restore_pending().await {
+        Ok(false) => {}
+        Ok(true) => {
+            return S3Response::error(
+                503,
+                "ServiceUnavailable",
+                "A replay of the recovery records is not finished.",
+            )
+        }
+        Err(_) => return failed(),
+    }
+    let found = match bridge.catalog.bucket_by_name(bucket).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return S3Response::error(404, "NoSuchBucket", "The specified bucket does not exist.")
+        }
+        Err(_) => return failed(),
+    };
+    match bridge.catalog.delete_bucket(&found).await {
+        Ok(Guard::Applied(())) => S3Response {
+            status: 204,
+            headers: Vec::new(),
+            body: RespBody::Empty,
+        },
+        // In use, or deleted by another request in between; a retry of
+        // the latter is `NoSuchBucket`.
+        Ok(Guard::Lost) => super::bucket::bucket_not_empty(),
+        Err(_) => failed(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Access keys
 // ---------------------------------------------------------------------------

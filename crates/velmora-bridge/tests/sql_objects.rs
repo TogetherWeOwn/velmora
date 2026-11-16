@@ -1702,13 +1702,15 @@ async fn a_tombstone_settles_only_the_records_below_it() {
 async fn a_commit_must_not_sort_below_the_floor_of_the_key() {
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
-    // A bucket the catalogue does not have gets no floor, and no error.
+    // A bucket the catalogue does not have gets no floor, and the caller
+    // is told: it must not store a record for a bucket that is gone.
     let nowhere = BucketId::new("b_nowhere".to_owned());
     let stray = GenerationId::mint(T0, [1; 8]);
-    fx.cat
+    assert!(fx
+        .cat
         .raise_floor(&nowhere, "k", &stray, false)
         .await
-        .unwrap();
+        .is_err());
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 0);
 
     // The record of a write that was never published.

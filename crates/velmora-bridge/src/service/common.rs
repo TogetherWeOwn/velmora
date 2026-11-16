@@ -59,6 +59,11 @@ pub(super) fn s3_error(code: ErrorCode) -> S3Response {
         ErrorCode::IncompleteBody => {
             "You did not provide the number of bytes specified by the Content-Length HTTP header."
         }
+        ErrorCode::MalformedXML => "The XML you provided was not well-formed.",
+        ErrorCode::NoSuchUpload => {
+            "The specified upload does not exist. The upload ID may be invalid, or the upload \
+             may have been aborted or completed."
+        }
         ErrorCode::NotImplemented => return S3Response::not_implemented(),
         ErrorCode::SlowDown => return IngressError::SlowDown.response(),
         ErrorCode::InternalError => "We encountered an internal error. Please try again.",
@@ -114,16 +119,27 @@ pub(super) fn from_proto(r: velmora_s3_proto::Response) -> S3Response {
 /// largest PutObject body; UploadPart has its own policy, capped at one
 /// extent.
 pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
+    policy_with(cfg, CONTROL_XML_BYTES, cfg.max_put_bytes)
+}
+
+/// [`policy`] with other caps on a control document and on a validated
+/// body (DeleteObjects takes 1000 keys of up to 1024 bytes each, whatever
+/// the limits on an object body are).
+pub(super) fn policy_with(
+    cfg: &BridgeConfig,
+    control_xml_bytes: usize,
+    upload_bytes: u64,
+) -> Result<Policy, S3Response> {
     Policy::new(
         cfg.s3_host.clone(),
         cfg.region.clone(),
         Limits {
             target_bytes: TARGET_BYTES,
-            control_xml_bytes: CONTROL_XML_BYTES,
+            control_xml_bytes,
             header_bytes: HEADER_BYTES,
             header_count: HEADER_COUNT,
             query_pairs: QUERY_PAIRS,
-            upload_bytes: cfg.max_put_bytes,
+            upload_bytes,
             clock_skew_seconds: CLOCK_SKEW_SECS,
             presign_seconds: PRESIGN_SECS,
         },

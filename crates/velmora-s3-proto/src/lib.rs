@@ -18,6 +18,7 @@ mod auth;
 mod checksum;
 pub mod chunked;
 pub mod listing;
+pub mod multipart_listing;
 pub mod mutation;
 mod read;
 pub mod sign;
@@ -27,7 +28,7 @@ mod wire;
 pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest, SINGLE_VALUE_HEADERS};
 pub use read::{plan_read, ByteRange, Conditions, ObjectMetadata, ReadPlan, StoredChecksum};
 pub use upload::{is_aws_chunked, ChecksumAlgorithm, DecodedUpload, UploadValidator};
-pub use wire::{canonical_request, Headers, Target, MAX_KEY_BYTES};
+pub use wire::{canonical_request, storable_key, Headers, Target, MAX_KEY_BYTES};
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;
 

@@ -4,6 +4,8 @@
 //! one that does not exist. It has no row, no grant and no buckets.
 
 use super::objects::{ms, text, Cols};
+use super::replay::guard_no_replay;
+use super::uploads::guarded;
 use super::SqlCatalog;
 use crate::ports::{Guard, Row, Sql, SqlValue};
 use crate::types::{AccessKeyRow, Bucket, BucketId, KeyStatus, Perm, Result};
@@ -94,6 +96,60 @@ pub(super) async fn bucket_by_name<S: Sql>(
         )
         .await?;
     rows.into_iter().next().map(bucket_row).transpose()
+}
+
+/// `true` while a row of any table names the bucket, other than a grant.
+/// `extents` and `uploads` have no index on the bucket: this reads them
+/// through, which a rare call can afford.
+pub(super) async fn bucket_in_use<S: Sql>(c: &SqlCatalog<S>, bucket: &BucketId) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT EXISTS (SELECT 1 FROM generations WHERE bucket_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM key_floors WHERE bucket_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM uploads WHERE bucket_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM extents WHERE bucket_id = ?1)",
+            &[text(bucket.as_str())],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(n)]) => Ok(*n != 0),
+        _ => Err(crate::types::BridgeError::Sql(
+            "bucket_in_use: unexpected row".into(),
+        )),
+    }
+}
+
+/// See [`crate::ports::Catalog::delete_bucket`]. The guards and the two
+/// deletes are one batch: a write that raises a floor, opens an upload
+/// or stages an extent commits before it (and the guard then fails) or
+/// after it (and then finds no bucket).
+pub(super) async fn delete_bucket<S: Sql>(c: &SqlCatalog<S>, b: &Bucket) -> Result<Guard<()>> {
+    let id = || vec![text(b.id.as_str())];
+    guarded(
+        c,
+        vec![
+            (
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS \
+                   (SELECT 1 FROM buckets WHERE id = ?1 AND name = ?2)",
+                vec![text(b.id.as_str()), text(&b.name)],
+            ),
+            guard_no_replay(),
+            (
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+                   EXISTS (SELECT 1 FROM generations WHERE bucket_id = ?1) \
+                   OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?1) \
+                   OR EXISTS (SELECT 1 FROM key_floors WHERE bucket_id = ?1) \
+                   OR EXISTS (SELECT 1 FROM uploads WHERE bucket_id = ?1) \
+                   OR EXISTS (SELECT 1 FROM extents WHERE bucket_id = ?1)",
+                id(),
+            ),
+            ("DELETE FROM grants WHERE bucket_id = ?1", id()),
+            ("DELETE FROM buckets WHERE id = ?1", id()),
+        ],
+    )
+    .await
 }
 
 /// Buckets the key holds a grant on, by name. Empty for a disabled key.

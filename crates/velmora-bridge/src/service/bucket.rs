@@ -1,14 +1,17 @@
-//! Bucket-level probes clients make before they touch objects:
-//! HeadBucket, GetBucketLocation and a SigV4-signed CreateBucket.
+//! Bucket-level calls clients make with an access key: HeadBucket,
+//! GetBucketLocation, and a SigV4-signed CreateBucket or DeleteBucket.
 //!
-//! All three authenticate exactly like an object request. A bucket that
+//! All four authenticate exactly like an object request. A bucket that
 //! does not exist and one the key holds no grant on are indistinguishable
 //! (`AccessDenied`), so none of them tells a caller which names exist.
-//! None of them changes state.
+//! None of them changes state: buckets are created and deleted with the
+//! admin bearer token.
 
 use std::rc::Rc;
 
-use super::common::authenticate;
+use velmora_s3_proto::ErrorCode;
+
+use super::common::{authenticate, internal, s3_error};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{RespBody, S3Request, S3Response};
 
@@ -94,6 +97,53 @@ pub(super) async fn create_bucket_signed<
         ),
         Err(resp) => resp,
     }
+}
+
+/// `DELETE /<bucket>` signed with an access key. Deleting a bucket is an
+/// admin action (the admin bearer token), so this never changes state.
+/// A key that may write the bucket learns `BucketNotEmpty` while the
+/// bucket could not be deleted anyway, as S3 clients expect of a bucket
+/// that still holds objects; otherwise the answer is `AccessDenied`.
+pub(super) async fn delete_bucket_signed<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    req: S3Request,
+) -> S3Response {
+    // `authenticate` verifies the signature and, for DELETE, requires a
+    // read-write grant on an existing bucket.
+    let authed = match authenticate(bridge, &req).await {
+        Ok(authed) => authed,
+        Err(resp) => return resp,
+    };
+    let Some(bucket) = &authed.bucket else {
+        return s3_error(ErrorCode::InvalidRequest);
+    };
+    match bridge.catalog.bucket_in_use(&bucket.id).await {
+        Ok(true) => bucket_not_empty(),
+        Ok(false) => S3Response::error(
+            403,
+            "AccessDenied",
+            "Only the administrator can delete a bucket.",
+        ),
+        Err(_) => internal(),
+    }
+}
+
+/// `409 BucketNotEmpty`. A bucket goes only while nothing of it is on
+/// record, see [`Catalog::delete_bucket`].
+pub(super) fn bucket_not_empty() -> S3Response {
+    S3Response::error(
+        409,
+        "BucketNotEmpty",
+        "The bucket you tried to delete is not empty, or has held data: a bucket that ever \
+         stored an object or opened a multipart upload is kept.",
+    )
 }
 
 /// `true` when the request carries SigV4 credentials (header or presigned

@@ -1,7 +1,9 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/mutation/control.rs. License: MIT.
 // Copied verbatim except: line 4 `use crate::s3::{...}` -> `use crate::{...}`; this header;
-// `parse_complete` names the part checksum element from `ChecksumAlgorithm::name`.
+// `parse_complete` names the part checksum element from `ChecksumAlgorithm::name`;
+// `parse_delete` answers `MalformedXML` (as S3 does) for a list that is empty or
+// longer than the maximum; `DeleteOutcome` and `delete_result` are added.
 
 use quick_xml::{events::Event, Reader};
 
@@ -46,10 +48,15 @@ pub(super) fn xml_char(c: char) -> bool {
 /// Bounded control XML, not a general XML object mapper. No DTD, external
 /// entities, CDATA, PI, comments, unknown namespaces or mixed-content fields.
 /// Preserve key whitespace; decode only XML predefined/numeric references.
-fn tree(bytes: &[u8], policy: &Policy) -> Result<Node> {
+///
+/// `max_nodes` caps the elements the document may open: a document of
+/// tiny elements would otherwise build a tree many times its own size
+/// before any count of its entries is taken.
+fn tree(bytes: &[u8], policy: &Policy, max_nodes: usize) -> Result<Node> {
     if bytes.len() > policy.limits.control_xml_bytes {
         return Err(ErrorCode::InvalidRequest);
     }
+    let mut nodes = 0usize;
     let mut reader = Reader::from_reader(bytes);
     let mut stack: Vec<Node> = Vec::new();
     let mut root = None;
@@ -58,6 +65,10 @@ fn tree(bytes: &[u8], policy: &Policy) -> Result<Node> {
         match reader.read_event().map_err(|_| ErrorCode::MalformedXML)? {
             Event::Start(e) => {
                 if stack.len() >= 3 || (stack.is_empty() && root.is_some()) {
+                    return Err(ErrorCode::MalformedXML);
+                }
+                nodes += 1;
+                if nodes > max_nodes {
                     return Err(ErrorCode::MalformedXML);
                 }
                 for attr in e.attributes() {
@@ -173,7 +184,8 @@ fn tree(bytes: &[u8], policy: &Policy) -> Result<Node> {
 }
 
 pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<DeleteRequest> {
-    let root = tree(bytes, policy)?;
+    // The root, one `Quiet`, and an `Object` with its `Key` per entry.
+    let root = tree(bytes, policy, 2 * maximum.min(1000) + 2)?;
     if root.name != "Delete" {
         return Err(ErrorCode::MalformedXML);
     }
@@ -195,8 +207,11 @@ pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<Del
                     return Err(ErrorCode::InvalidRequest);
                 }
                 let key = node.children[0].leaf()?;
-                if key.is_empty() || keys.len() >= maximum.min(1000) {
+                if key.is_empty() {
                     return Err(ErrorCode::InvalidRequest);
+                }
+                if keys.len() >= maximum.min(1000) {
+                    return Err(ErrorCode::MalformedXML);
                 }
                 keys.push(key.to_owned());
             }
@@ -204,12 +219,56 @@ pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<Del
         }
     }
     if keys.is_empty() {
-        return Err(ErrorCode::InvalidRequest);
+        return Err(ErrorCode::MalformedXML);
     }
     Ok(DeleteRequest {
         keys,
         quiet: quiet.unwrap_or(false),
     })
+}
+
+/// What became of one key of a DeleteObjects request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// An S3 error code and its message, for this key only.
+    Failed {
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+/// The `DeleteResult` document, one entry per key in request order. Quiet
+/// mode lists only the keys that failed. Every key came out of the
+/// request XML, so XML can carry it back.
+pub fn delete_result(
+    keys: &[String],
+    outcomes: &[DeleteOutcome],
+    quiet: bool,
+) -> Result<crate::Response> {
+    if keys.len() != outcomes.len() {
+        return Err(ErrorCode::InternalError);
+    }
+    let mut out = format!("<DeleteResult xmlns=\"{}\">", crate::listing::NS);
+    for (key, outcome) in keys.iter().zip(outcomes) {
+        match outcome {
+            DeleteOutcome::Deleted if quiet => {}
+            DeleteOutcome::Deleted => {
+                out.push_str(&format!(
+                    "<Deleted><Key>{}</Key></Deleted>",
+                    crate::xml(key)
+                ));
+            }
+            DeleteOutcome::Failed { code, message } => out.push_str(&format!(
+                "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+                crate::xml(key),
+                crate::xml(code),
+                crate::xml(message)
+            )),
+        }
+    }
+    out.push_str("</DeleteResult>");
+    Ok(crate::xml_response(out))
 }
 
 /// Version IDs, unknown integrity algorithms and duplicate/missing part fields
@@ -220,7 +279,7 @@ pub fn parse_complete(
     maximum: u16,
     checksum: MultipartChecksum,
 ) -> Result<Vec<PartEvidence>> {
-    let root = tree(bytes, policy)?;
+    let root = tree(bytes, policy, usize::MAX)?;
     if root.name != "CompleteMultipartUpload" {
         return Err(ErrorCode::MalformedXML);
     }
@@ -281,7 +340,7 @@ pub fn parse_complete(
 /// Client-side classification: an HTTP 200 with an embedded Error is failure,
 /// not a completed upload. This reference server never emits an early 200.
 pub fn completion_result(status: u16, bytes: &[u8], policy: &Policy) -> Result<String> {
-    let root = tree(bytes, policy)?;
+    let root = tree(bytes, policy, usize::MAX)?;
     root.container()?;
     if root.name == "Error" {
         let code = root

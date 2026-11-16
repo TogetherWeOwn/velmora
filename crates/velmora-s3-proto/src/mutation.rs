@@ -18,7 +18,9 @@
 // provenance notes (`UploadMetadata`, `CommitResult`).
 
 mod control;
-pub use control::{completion_result, parse_complete, parse_delete, DeleteRequest};
+pub use control::{
+    completion_result, delete_result, parse_complete, parse_delete, DeleteOutcome, DeleteRequest,
+};
 
 use std::collections::BTreeMap;
 

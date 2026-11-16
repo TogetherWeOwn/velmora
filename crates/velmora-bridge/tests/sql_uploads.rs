@@ -998,3 +998,271 @@ async fn abort_touches_only_its_own_parts() {
     );
     fx.assert_no_live_extent_is_gc_bound().await;
 }
+
+// ---------------------------------------------------------------------------
+// Listing open uploads, and deleting a bucket
+// ---------------------------------------------------------------------------
+
+fn listing(prefix: &str, limit: u32) -> UploadListQuery {
+    UploadListQuery {
+        prefix: prefix.into(),
+        after: None,
+        skip_prefix: None,
+        limit,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open_uploads_list_by_key_then_id_within_one_bucket() {
+    let fx = Fx::new().await;
+    // Created out of key order; ids ascend with creation.
+    let mut made = Vec::new();
+    for key in ["dir/b", "a", "dir/a", "a", "dir0", "di", "100%_x", "100%"] {
+        made.push((key.to_string(), fx.create(&fx.bucket, key).await));
+    }
+    let elsewhere = fx.create(&fx.other_bucket, "a").await;
+    made.sort();
+    let keys = |rows: &[OpenUpload]| rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>();
+    let pairs = |rows: Vec<OpenUpload>| rows.into_iter().map(|r| (r.key, r.id)).collect::<Vec<_>>();
+
+    let all = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("", 100))
+        .await
+        .unwrap();
+    assert!(all
+        .iter()
+        .all(|r| r.initiated_at == T0 && r.id != elsewhere));
+    assert_eq!(pairs(all), made);
+    let other = fx
+        .cat
+        .list_uploads(&fx.other_bucket, &listing("", 100))
+        .await
+        .unwrap();
+    assert_eq!(pairs(other), [("a".to_string(), elsewhere)]);
+
+    // The limit, and the prefix as a key range: `%` and `_` are bytes
+    // like any other.
+    let rows = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("", 3))
+        .await
+        .unwrap();
+    assert_eq!(pairs(rows), made[..3]);
+    assert!(fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("", 0))
+        .await
+        .unwrap()
+        .is_empty());
+    let rows = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("dir/", 100))
+        .await
+        .unwrap();
+    assert_eq!(keys(&rows), ["dir/a", "dir/b"]);
+    let rows = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("di", 100))
+        .await
+        .unwrap();
+    assert_eq!(keys(&rows), ["di", "dir/a", "dir/b", "dir0"]);
+    let rows = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("100%_", 100))
+        .await
+        .unwrap();
+    assert_eq!(keys(&rows), ["100%_x"]);
+    let rows = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("1__", 100))
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+
+    // After a key and an id: the later uploads of that key, then the
+    // keys after it. After a key alone: only the keys after it.
+    let first_a = made.iter().find(|(k, _)| k == "a").unwrap().1.clone();
+    let mut q = listing("", 100);
+    q.after = Some(("a".into(), Some(first_a.as_str().to_owned())));
+    let rows = fx.cat.list_uploads(&fx.bucket, &q).await.unwrap();
+    assert_eq!(keys(&rows), ["a", "di", "dir/a", "dir/b", "dir0"]);
+    assert_ne!(rows[0].id, first_a);
+    q.after = Some(("a".into(), None));
+    let rows = fx.cat.list_uploads(&fx.bucket, &q).await.unwrap();
+    assert_eq!(keys(&rows), ["di", "dir/a", "dir/b", "dir0"]);
+    // Past a common prefix: none of its members, whatever the position.
+    q.after = Some(("dir/a".into(), None));
+    q.skip_prefix = Some("dir/".into());
+    let rows = fx.cat.list_uploads(&fx.bucket, &q).await.unwrap();
+    assert_eq!(keys(&rows), ["dir0"]);
+    q.prefix = "dir/".into();
+    assert!(fx
+        .cat
+        .list_uploads(&fx.bucket, &q)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Only open uploads are listed.
+    let (key, id) = made.last().unwrap().clone();
+    assert_eq!(
+        fx.cat
+            .abort_upload(&target(&fx.bucket, &key, &id), T0)
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    let rows = fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("", 100))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), made.len() - 1);
+    assert!(rows.iter().all(|r| r.id != id));
+}
+
+fn bucket_row(id: &BucketId, name: &str) -> Bucket {
+    Bucket {
+        id: id.clone(),
+        name: name.into(),
+        owner: "owner".into(),
+        bdk_wrapped: vec![7],
+        kek_version: 1,
+        disposable: true,
+        created_at: UnixMs(0),
+    }
+}
+
+/// A bucket goes only while no row names it but its grants, and it
+/// takes exactly its grants with it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bucket_is_deleted_only_while_nothing_names_it() {
+    // Every way a bucket can be named by a row that is not a grant.
+    let traces: [(&str, &str); 5] = [
+        (
+            "generations",
+            "INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
+             user_meta_json, extent_count, created_at) \
+             VALUES ('g_1', ?1, 'k', 'deleted', 0, '\"e\"', '{}', '{}', 0, 0)",
+        ),
+        (
+            "key_floors",
+            "INSERT INTO key_floors(bucket_id, key, floor_id) VALUES (?1, 'k', 'g_1')",
+        ),
+        (
+            "uploads",
+            "INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
+             initiated_at) VALUES ('u1', ?1, 'k', '{}', '{}', 'aborted', 0)",
+        ),
+        ("objects", ""),
+        ("extents", ""),
+    ];
+    for (table, insert) in traces {
+        let fx = Fx::new().await;
+        let one = bucket_row(&fx.bucket, "one");
+        match table {
+            "objects" => {
+                // The live pointer has no foreign key on the bucket.
+                fx.run(
+                    "INSERT INTO generations(id, bucket_id, key, state, size, etag, \
+                     content_json, user_meta_json, extent_count, created_at) \
+                     VALUES ('g_1', ?1, 'k', 'live', 0, '\"e\"', '{}', '{}', 0, 0)",
+                    &[text(fx.other_bucket.as_str())],
+                )
+                .await;
+                fx.run(
+                    "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, 'k', 'g_1')",
+                    &[text(fx.bucket.as_str())],
+                )
+                .await;
+            }
+            "extents" => {
+                let id = fx.create(&fx.other_bucket, "k").await;
+                let (_, staged) = fx.part(&target(&fx.other_bucket, "k", &id), 1, 10).await;
+                assert_eq!(staged, Guard::Applied(()));
+                fx.run(
+                    "UPDATE extents SET bucket_id = ?1",
+                    &[text(fx.bucket.as_str())],
+                )
+                .await;
+            }
+            _ => {
+                fx.run(insert, &[text(fx.bucket.as_str())]).await;
+            }
+        }
+        assert!(fx.cat.bucket_in_use(&fx.bucket).await.unwrap(), "{table}");
+        assert_eq!(
+            fx.cat.delete_bucket(&one).await.unwrap(),
+            Guard::Lost,
+            "{table}"
+        );
+        assert_eq!(fx.count("SELECT COUNT(*) FROM buckets").await, 2, "{table}");
+    }
+
+    let fx = Fx::new().await;
+    let one = bucket_row(&fx.bucket, "one");
+    fx.run(
+        "INSERT INTO access_keys(access_key_id, principal, secret_wrapped, kek_version, status, \
+         created_at) VALUES ('AK', 'p', x'00', 1, 'active', 0)",
+        &[],
+    )
+    .await;
+    for bucket in [&fx.bucket, &fx.other_bucket] {
+        fx.cat.put_grant("AK", bucket, Perm::Rw).await.unwrap();
+    }
+    // What the other bucket holds does not keep this one.
+    fx.create(&fx.other_bucket, "k").await;
+    assert!(!fx.cat.bucket_in_use(&fx.bucket).await.unwrap());
+    assert!(fx.cat.bucket_in_use(&fx.other_bucket).await.unwrap());
+
+    // The row must be the bucket the caller read: same id, same name.
+    assert_eq!(
+        fx.cat
+            .delete_bucket(&bucket_row(&fx.bucket, "renamed"))
+            .await
+            .unwrap(),
+        Guard::Lost
+    );
+    assert_eq!(
+        fx.cat.delete_bucket(&one).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(
+        fx.texts("SELECT name FROM buckets", &[]).await,
+        ["two".to_string()]
+    );
+    assert_eq!(
+        fx.texts("SELECT bucket_id FROM grants", &[]).await,
+        [fx.other_bucket.as_str().to_string()]
+    );
+    // Gone: a second delete changes nothing, and nothing can be opened
+    // or recorded under the id any more.
+    assert_eq!(fx.cat.delete_bucket(&one).await.unwrap(), Guard::Lost);
+    let id = UploadId::mint([0xee; 16]);
+    assert!(fx
+        .cat
+        .create_upload(&UploadRow {
+            id,
+            bucket_id: fx.bucket.clone(),
+            key: "k".into(),
+            content_json: "{}".into(),
+            user_meta_json: "{}".into(),
+            state: UploadState::Open,
+            revision: 0,
+            completed_generation_id: None,
+            complete_digest: None,
+            result_etag: None,
+            initiated_at: T0,
+        })
+        .await
+        .is_err());
+    let floor = GenerationId::mint(T0, [1; 8]);
+    assert!(fx
+        .cat
+        .raise_floor(&fx.bucket, "k", &floor, false)
+        .await
+        .is_err());
+    assert_eq!(fx.count("SELECT COUNT(*) FROM uploads").await, 1);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM key_floors").await, 0);
+}

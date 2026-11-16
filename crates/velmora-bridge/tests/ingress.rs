@@ -946,3 +946,39 @@ fn tls_provider_port_must_be_119_or_563() {
     // Plaintext (dev only) is not bound by the TLS policy.
     assert!(load(provider(11119, false)).is_ok());
 }
+
+/// DeleteObjects carries a control document with a limit of its own: the
+/// extent limit does not apply to it, in either direction.
+#[test]
+fn a_delete_objects_body_has_its_own_limit() {
+    let mut cfg = cfg(false);
+    let post = |len: Option<u64>| {
+        let len = len.map(|n| n.to_string());
+        let mut headers = vec![("authorization", SIGV4)];
+        if let Some(len) = &len {
+            headers.push(("content-length", len));
+        }
+        request(Method::Post, "/bucket?delete", &headers, Body::Empty)
+    };
+    for extent in [64 * 1024, 16 * 1024 * 1024] {
+        cfg.max_extent_bytes = extent;
+        cfg.max_put_bytes = extent;
+        for len in [1, 65 * 1024, ingress::MAX_DELETE_BODY_BYTES] {
+            assert_eq!(
+                check(&post(Some(len)), &cfg, true),
+                Ok(()),
+                "{extent} {len}"
+            );
+        }
+        assert_eq!(
+            check(&post(Some(ingress::MAX_DELETE_BODY_BYTES + 1)), &cfg, true),
+            Err(IngressError::EntityTooLarge),
+            "{extent}"
+        );
+        assert_eq!(
+            check(&post(None), &cfg, true),
+            Err(IngressError::MissingContentLength),
+            "{extent}"
+        );
+    }
+}
