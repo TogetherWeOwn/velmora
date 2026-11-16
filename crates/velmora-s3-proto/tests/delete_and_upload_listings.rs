@@ -134,6 +134,44 @@ fn a_delete_document_that_is_not_one_is_refused() {
     assert!(parse_delete(delete_xml(10).as_bytes(), &policy_with(64), 1000).is_err());
 }
 
+/// The count of elements is capped while the document is read, not after
+/// a tree of it is built: 1000 entries and `Quiet` fit, and one element
+/// more is refused whatever it is.
+#[test]
+fn a_delete_document_may_open_only_as_many_elements_as_1000_entries_need() {
+    let entries = "<Object><Key>k</Key></Object>".repeat(1000);
+    let full = format!("<Delete><Quiet>true</Quiet>{entries}</Delete>");
+    let request = parse_delete(full.as_bytes(), &policy(), 1000).unwrap();
+    assert_eq!((request.keys.len(), request.quiet), (1000, true));
+    let malformed = |xml: &str| parse_delete(xml.as_bytes(), &policy(), 1000).unwrap_err();
+
+    // A few unknown elements are an invalid request ...
+    let few = format!("<Delete>{}</Delete>", "<a></a>".repeat(5));
+    assert_eq!(malformed(&few), ErrorCode::InvalidRequest);
+    // ... and past the cap the document is refused as malformed, before
+    // the unknown element is looked at.
+    let unknown = format!("<Delete>{}</Delete>", "<a></a>".repeat(2002));
+    assert_eq!(malformed(&unknown), ErrorCode::MalformedXML);
+    let nested = format!("<Delete>{}</Delete>", "<a><b></b></a>".repeat(1001));
+    assert_eq!(malformed(&nested), ErrorCode::MalformedXML);
+    // The cap follows the caller's maximum.
+    let three = format!(
+        "<Delete>{}</Delete>",
+        "<Object><Key>k</Key></Object>".repeat(3)
+    );
+    assert_eq!(
+        parse_delete(three.as_bytes(), &policy(), 2).unwrap_err(),
+        ErrorCode::MalformedXML
+    );
+    assert_eq!(
+        parse_delete(three.as_bytes(), &policy(), 3)
+            .unwrap()
+            .keys
+            .len(),
+        3
+    );
+}
+
 #[test]
 fn a_delete_result_has_one_entry_per_key_in_request_order() {
     let keys = ["a".to_string(), "b & <c>".to_string(), "a".to_string()];

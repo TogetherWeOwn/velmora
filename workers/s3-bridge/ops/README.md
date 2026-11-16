@@ -125,6 +125,17 @@ Limits to know:
   touch the new bucket: it skips the records of the old one and lists
   them under `other_bucket`. Which of the two keeps the name is for the
   operator to decide; the records of the old one stay in the store.
+- A bucket that never held anything can be deleted (`DELETE /<bucket>`
+  with the admin token), and its name given to a new bucket. A catalogue
+  from before that deletion names the deleted bucket again, so this is
+  the case above the other way round: the replay skips the records of
+  the new bucket, the one with the data, and lists them under
+  `other_bucket`. To set it right, end the replay, turn `MAINTENANCE`
+  off, delete the stale bucket with `DELETE /<bucket>` (it is empty, so
+  the answer is `204`; a `409` means it holds data and is not the stale
+  one), run the replay again from the same `since_ms`, and grant the
+  access keys the bucket again: the replay makes the bucket of the
+  records, and grants are not in the records.
 - A pinned copy is deleted once its extent was read back from Usenet
   and `SAFETY_MIN_AGE_SECS` have passed. A catalogue from before that
   moment still says `held` for the extent, and a replay from the restore

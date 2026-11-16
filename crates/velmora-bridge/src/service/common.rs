@@ -119,14 +119,16 @@ pub(super) fn from_proto(r: velmora_s3_proto::Response) -> S3Response {
 /// largest PutObject body; UploadPart has its own policy, capped at one
 /// extent.
 pub(super) fn policy(cfg: &BridgeConfig) -> Result<Policy, S3Response> {
-    policy_with(cfg, CONTROL_XML_BYTES)
+    policy_with(cfg, CONTROL_XML_BYTES, cfg.max_put_bytes)
 }
 
-/// [`policy`] with another cap on a control document (DeleteObjects takes
-/// 1000 keys of up to 1024 bytes each).
+/// [`policy`] with other caps on a control document and on a validated
+/// body (DeleteObjects takes 1000 keys of up to 1024 bytes each, whatever
+/// the limits on an object body are).
 pub(super) fn policy_with(
     cfg: &BridgeConfig,
     control_xml_bytes: usize,
+    upload_bytes: u64,
 ) -> Result<Policy, S3Response> {
     Policy::new(
         cfg.s3_host.clone(),
@@ -137,7 +139,7 @@ pub(super) fn policy_with(
             header_bytes: HEADER_BYTES,
             header_count: HEADER_COUNT,
             query_pairs: QUERY_PAIRS,
-            upload_bytes: cfg.max_put_bytes,
+            upload_bytes,
             clock_skew_seconds: CLOCK_SKEW_SECS,
             presign_seconds: PRESIGN_SECS,
         },

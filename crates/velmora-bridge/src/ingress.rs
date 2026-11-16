@@ -47,6 +47,10 @@ pub const CHARGE_POLL_MS: u32 = 100;
 
 /// Longest accepted `Content-Length` value (digits). `u64::MAX` has 20.
 const MAX_LENGTH_DIGITS: usize = 20;
+/// Largest accepted DeleteObjects body: 1000 keys of 1024 bytes, each
+/// byte possibly a character reference, stay below it in practice; a
+/// larger document is refused before it is read.
+pub const MAX_DELETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
 /// An ingress refusal. Each maps to one fixed S3 error; no request data is
 /// ever echoed.
@@ -381,6 +385,10 @@ pub fn precheck(
         }
         Route::UploadPart { .. } if !copy => {
             upload_lengths(&req.headers, cfg.max_extent_bytes)?;
+        }
+        // A control document with its own limit, whatever an extent is.
+        Route::DeleteObjects { .. } => {
+            upload_lengths(&req.headers, MAX_DELETE_BODY_BYTES)?;
         }
         _ => {
             let declared = declared_length(&req.headers)?;

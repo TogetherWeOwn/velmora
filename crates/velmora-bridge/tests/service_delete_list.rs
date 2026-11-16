@@ -7,7 +7,7 @@ mod service_support;
 use std::rc::Rc;
 
 use base64::Engine as _;
-use intent_support::{column, number, restore, rollback, snapshot};
+use intent_support::{admin, column, number, restore, rollback, snapshot};
 use service_support::*;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::crypto::open_manifest;
@@ -240,6 +240,43 @@ async fn delete_objects_needs_an_integrity_check_that_holds() {
     let resp = rig.send(chunked(&sum)).await;
     assert_eq!(resp.expect(200).values("Key"), ["k"]);
     assert!(live_keys(&rig).is_empty());
+}
+
+/// The document has a limit of its own. A deployment whose extents and
+/// objects are capped below it still takes a full-size delete.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_objects_takes_a_document_larger_than_an_extent() {
+    let mut cfg = config(Vec::new());
+    cfg.max_extent_bytes = 64 * 1024;
+    cfg.max_put_bytes = 64 * 1024;
+    cfg.slice_bytes = 64 * 1024;
+    let rig = rig_with(NoNntp, cfg);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k0", b"payload").await.expect(200);
+
+    // 200 keys of 1000 bytes: about 200 KiB of XML.
+    let mut keys: Vec<String> = (0..199).map(|i| format!("{i:0>1000}")).collect();
+    keys.push("k0".to_string());
+    let xml = delete_xml(&keys.iter().map(String::as_str).collect::<Vec<_>>(), false);
+    assert!(xml.len() > 3 * 64 * 1024);
+    let resp = delete_objects(&rig, &signer, BUCKET, &xml).await;
+    assert_eq!(resp.expect(200).values("Key").len(), 200);
+    assert!(live_keys(&rig).is_empty());
+
+    // The same document with a trailing checksum instead of a header digest
+    // is validated against the same limit.
+    let crc = crc32c_b64(xml.as_bytes());
+    let resp = rig
+        .call(
+            &signer,
+            Method::Post,
+            &format!("/{BUCKET}"),
+            &[("delete", "")],
+            &[("x-amz-checksum-crc32c", &crc)],
+            xml.as_bytes(),
+        )
+        .await;
+    assert_eq!(resp.expect(200).values("Key").len(), 200);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1130,4 +1167,82 @@ async fn a_write_that_lost_its_bucket_stores_no_record() {
         403
     );
     assert_eq!(rig.bridge.safety.keys(), stored);
+}
+
+/// One replay of every record, as the runbook runs it. Returns how many
+/// records it left out because another bucket holds their bucket's name.
+async fn replay_all(rig: &mut Rig) -> u64 {
+    set_maintenance(rig, Maintenance::Restore);
+    let mut body = serde_json::json!({ "since_ms": 0, "margin_ms": 0 });
+    let mut other_bucket = 0;
+    loop {
+        let r = admin(rig, Method::Post, "/restore", body.to_string().as_bytes()).await;
+        r.expect(200);
+        let report: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        other_bucket += report["other_bucket_total"].as_u64().unwrap();
+        if report["next"].is_null() {
+            break;
+        }
+        body = serde_json::json!({ "cursor": report["next"] });
+    }
+    set_maintenance(rig, Maintenance::Off);
+    other_bucket
+}
+
+/// A bucket is deleted, its name is given to a new bucket that takes
+/// data, and the catalogue is then set back to before the deletion. The
+/// catalogue names the deleted bucket again, and a replay leaves the
+/// records of the new one out and says so. Deleting the stale bucket,
+/// which is still empty, and replaying again brings the objects back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rollback_to_before_a_bucket_deletion_is_repaired_by_deleting_it_again() {
+    let mut rig = rig();
+    let (stale, signer) = rig.standard(BUCKET).await;
+    snapshot(&rig);
+
+    delete_bucket(&rig, BUCKET).await.expect(204);
+    let body = format!(r#"{{"name":"{BUCKET}","disposable":true}}"#);
+    admin(&rig, Method::Post, "/buckets", body.as_bytes())
+        .await
+        .expect(200);
+    let fresh = rig
+        .bridge
+        .catalog
+        .bucket_by_name(BUCKET)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(fresh.id, stale.id);
+    rig.grant(AKID, &fresh, Perm::Rw).await;
+    rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
+
+    let bucket_ids = |rig: &Rig| column(rig, "SELECT id FROM buckets");
+    rollback(&rig);
+    assert_eq!(bucket_ids(&rig), [stale.id.as_str()]);
+
+    // The replay ends, and reports the record it could not place.
+    assert_eq!(replay_all(&mut rig).await, 1);
+    assert_eq!(bucket_ids(&rig), [stale.id.as_str()]);
+    assert!(live_keys(&rig).is_empty());
+
+    // The stale bucket never held anything, so it can go; the next replay
+    // makes the bucket of the records and publishes them.
+    delete_bucket(&rig, BUCKET).await.expect(204);
+    assert_eq!(replay_all(&mut rig).await, 0);
+    assert_eq!(bucket_ids(&rig), [fresh.id.as_str()]);
+    assert_eq!(live_keys(&rig), ["k"]);
+
+    // Grants are not in the records: the key is granted the bucket again.
+    assert_eq!(rig.count("grants"), 0);
+    assert_eq!(get(&rig, &signer, "k").await.status, 403);
+    let restored = rig
+        .bridge
+        .catalog
+        .bucket_by_name(BUCKET)
+        .await
+        .unwrap()
+        .unwrap();
+    rig.grant(AKID, &restored, Perm::Rw).await;
+    let resp = get(&rig, &signer, "k").await;
+    assert_eq!((resp.status, resp.body.as_slice()), (200, &b"payload"[..]));
 }

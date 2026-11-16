@@ -27,10 +27,7 @@ use crate::types::{Bucket, RespBody, S3Request, S3Response};
 
 /// Most keys one DeleteObjects request may name (the S3 limit).
 pub const MAX_DELETE_KEYS: usize = 1000;
-/// Largest accepted DeleteObjects body: 1000 keys of 1024 bytes, each
-/// byte possibly a character reference, stay below it in practice; a
-/// larger document is refused before it is read.
-pub const MAX_DELETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
+pub use crate::ingress::MAX_DELETE_BODY_BYTES;
 /// Keys of one DeleteObjects request that are deleted at the same time.
 /// Each delete is a handful of catalogue and store calls in sequence, so
 /// this is also the number of connections the request holds open.
@@ -248,9 +245,15 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
         ));
     }
 
+    // The limits of this document, not those of an object body.
+    let xml_policy = policy_with(
+        &bridge.cfg,
+        MAX_DELETE_BODY_BYTES as usize,
+        MAX_DELETE_BODY_BYTES,
+    )?;
     let lengths = upload_lengths(&req.headers, MAX_DELETE_BODY_BYTES).map_err(|e| e.response())?;
-    let mut validator = UploadValidator::new(&authed.headers, &authed.verified, &authed.policy)
-        .map_err(s3_error)?;
+    let mut validator =
+        UploadValidator::new(&authed.headers, &authed.verified, &xml_policy).map_err(s3_error)?;
     let charge = bridge
         .budget
         .charge_body(lengths.decoded)
@@ -269,7 +272,6 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
         return Err(s3_error(ErrorCode::InvalidRequest));
     }
 
-    let xml_policy = policy_with(&bridge.cfg, MAX_DELETE_BODY_BYTES as usize)?;
     let request = parse_delete(&body, &xml_policy, MAX_DELETE_KEYS).map_err(s3_error)?;
     drop(body);
 
