@@ -949,6 +949,41 @@ async fn a_part_without_its_stamp_is_not_acknowledged_and_is_replaced_by_the_ret
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn complete_publishes_a_sliced_part_only_with_a_raised_stamp() {
+    let s = setup().await;
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = Some("rs/".into());
+    let bytes = four();
+    send_part(&s.rig, &s.signer, &s.id, 1, &bytes)
+        .await
+        .expect_error(503, "SlowDown");
+    // The client does not send the part again: it is in ListParts.
+    let etag = md5_etag(&bytes);
+    s.complete(std::slice::from_ref(&etag))
+        .await
+        .expect_error(503, "SlowDown");
+    assert!(records(&s.rig).is_empty() && stamps(&s.rig).is_empty());
+    assert_eq!(s.rig.count("generations"), 0);
+    assert_eq!(staged(&s.rig).len(), SLICES);
+
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+    s.complete(&[etag]).await.expect(200);
+    assert_eq!(stamps(&s.rig).len(), 1);
+    assert!(s.read().await == bytes);
+    assert!(broken(&s.rig).is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn complete_of_parts_of_one_extent_raises_no_stamp() {
+    let s = setup().await;
+    let bytes = body(3, 100);
+    let etag = s.part(1, &bytes).await;
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = Some("rs/".into());
+    s.complete(&[etag]).await.expect(200);
+    assert!(stamps(&s.rig).is_empty());
+    assert!(s.read().await == bytes);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_part_older_than_twelve_hours_is_not_committed() {
     let s = setup().await;
     let fut = step_to(&s.rig, s.start(&four()), |rig| blobs(rig).len() == 2)

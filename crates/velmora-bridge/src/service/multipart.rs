@@ -1305,12 +1305,23 @@ where
         if u32::try_from(staged.len()).map_or(true, |n| n > limit) {
             return Err(too_many_extents(limit).into());
         }
+        let sliced = staged.iter().any(|p| p.piece > 0);
         let Some(extents) = place(&publication.parts, staged) else {
             // An UploadPart replaced a listed part after the upload was
             // read. The batch would lose its guard: take the same path.
             lost_at = Some(upload.revision);
             continue;
         };
+        // A part stored in slices may be here without its stamp: its
+        // request answered `503` and the client took the part from
+        // ListParts. Its write intents are in any catalogue saved while
+        // it was stored, and in one restored from there the sweep would
+        // take the slices of this object. So the stamp is raised before
+        // the record exists, and without it nothing is published.
+        if sliced && bridge.raise_stamp().await.is_err() {
+            restore_gate(bridge).await?;
+            return Err(ErrorCode::SlowDown.into());
+        }
         let mut placements = Vec::with_capacity(extents.len());
         for e in &extents {
             placements.push(ExtentPlacement {
