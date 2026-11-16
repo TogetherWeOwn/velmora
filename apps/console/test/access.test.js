@@ -164,3 +164,20 @@ test("a hung certs fetch is not waited on forever", async () => {
   await denied(v(await issuer.token()), "certs-timeout");
   assert.ok(Date.now() - started < 8000);
 });
+
+test("an abandoned (hung) certs fetch does not lock everyone out for a minute", async () => {
+  let t = NOW;
+  let calls = 0;
+  const v = createAccessVerifier({
+    teamDomain: TEAM,
+    aud: AUD,
+    allowedEmails: [EMAIL],
+    now: () => t,
+    fetchCerts: (url) => (++calls === 1 ? new Promise(() => {}) : issuer.fetchCerts(url)),
+  });
+  await denied(v(await issuer.token()), "certs-timeout");
+  t += 7000; // past the in-flight bound, well inside a minute
+  const claims = await v(await issuer.token());
+  assert.equal(claims.email, EMAIL);
+  assert.equal(calls, 2);
+});

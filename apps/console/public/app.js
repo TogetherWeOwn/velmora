@@ -713,12 +713,10 @@ async function replaceOk(key) {
 
 // Batches run one after another, so two drops never race each other.
 let uploadChain = Promise.resolve();
-function uploadAll(items) {
+function uploadAll(items, bucket = state.bucket, base = state.prefix) {
   // The destination is where the files were dropped, not where the user
   // is by the time an earlier batch has finished.
-  if (!state.bucket) return toast("Pick a bucket first");
-  const bucket = state.bucket;
-  const base = state.prefix;
+  if (!bucket) return toast("Pick a bucket first");
   const run = uploadChain.then(() => uploadBatch(items, bucket, base));
   uploadChain = run.catch(() => {});
   return run;
@@ -765,11 +763,14 @@ drop.addEventListener("dragleave", () => drop.classList.remove("over"));
 drop.addEventListener("drop", async (e) => {
   e.preventDefault();
   drop.classList.remove("over");
+  // Pinned before the (possibly long) walk of a dropped folder tree.
+  const { bucket, prefix } = state;
+  if (!bucket) return toast("Pick a bucket first");
   const entries = [...e.dataTransfer.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
   const out = [];
   if (entries.length) for (const en of entries) await walk(en, "", out);
   else for (const f of e.dataTransfer.files) out.push({ file: f, path: f.name });
-  uploadAll(out);
+  uploadAll(out, bucket, prefix);
 });
 
 // ---------------------------------------------------------------------------

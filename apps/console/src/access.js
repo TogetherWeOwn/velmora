@@ -86,6 +86,8 @@ export function createAccessVerifier({ teamDomain, aud, allowedEmails, fetchCert
   let keys = new Map(); // kid -> CryptoKey
   let fetchedAt = -Infinity;
   let lastRefresh = -Infinity;
+  // When a refresh last actually failed (not merely was abandoned).
+  let lastFailure = -Infinity;
 
   async function refresh() {
     lastRefresh = clock();
@@ -132,9 +134,14 @@ export function createAccessVerifier({ teamDomain, aud, allowedEmails, fetchCert
     if (inflight && clock() - inflightAt > INFLIGHT_MAX_MS) inflight = null;
     if (!inflight) {
       inflightAt = clock();
-      const p = refresh().finally(() => {
-        if (inflight === p) inflight = null;
-      });
+      const p = refresh()
+        .catch((e) => {
+          lastFailure = clock();
+          throw e;
+        })
+        .finally(() => {
+          if (inflight === p) inflight = null;
+        });
       inflight = p;
     }
     return inflight;
@@ -153,7 +160,7 @@ export function createAccessVerifier({ teamDomain, aud, allowedEmails, fetchCert
     if (clock() - fetchedAt > CERTS_TTL_MS) {
       if (inflight && clock() - inflightAt <= INFLIGHT_MAX_MS) await waitFor(inflight);
       // The last attempt failed, and recently: refuse without fetching again.
-      else if (fetchedAt < lastRefresh && clock() - lastRefresh < REFRESH_MIN_INTERVAL_MS) deny("certs-unavailable");
+      else if (lastFailure > fetchedAt && clock() - lastFailure < REFRESH_MIN_INTERVAL_MS) deny("certs-unavailable");
       else await waitFor(refreshOnce());
     }
     let key = keys.get(kid);
