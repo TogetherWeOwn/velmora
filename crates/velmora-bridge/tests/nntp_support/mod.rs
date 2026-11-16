@@ -318,6 +318,8 @@ pub struct MemCatalog {
     pub renew_takes: RefCell<Option<(FixedClock, i64)>>,
     /// The time of each permit renewal that held.
     pub permit_renewed_at: RefCell<Vec<UnixMs>>,
+    /// The time of each lease renewal on its own (not in `renew_all`).
+    pub lease_renewed_at: RefCell<Vec<UnixMs>>,
     /// `mark_posted_many` calls so far.
     pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
@@ -388,6 +390,21 @@ impl MemCatalog {
 
     pub fn edit(&self, extent: &ExtentId, f: impl FnOnce(&mut Entry)) {
         f(self.entries.borrow_mut().get_mut(extent).expect("extent"));
+    }
+
+    /// Every slot is taken away from its holder, as when it ran out and
+    /// was given to another job.
+    pub fn drop_permits(&self) {
+        for slot in self.slots.borrow_mut().values_mut().flatten() {
+            slot.token += 1;
+        }
+    }
+
+    /// Another job takes the row over: every lease handed out before is
+    /// stale from here on.
+    pub fn take_over(&self, extent: &ExtentId) {
+        let mut entries = self.entries.borrow_mut();
+        entries.get_mut(extent).expect("seeded").outbox.token += 1;
     }
 
     /// Runs `f` on the entry only while the lease still holds.
@@ -469,6 +486,7 @@ impl Catalog for MemCatalog {
     }
 
     async fn renew(&self, l: &Lease, now: UnixMs) -> Result<bool> {
+        self.lease_renewed_at.borrow_mut().push(now);
         Ok(self
             .fenced(l, |e| {
                 e.outbox.lease_until = Some(now.plus_secs(LEASE_SECS))
@@ -1403,6 +1421,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
+        job_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,

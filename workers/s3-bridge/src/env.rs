@@ -22,7 +22,7 @@ use worker::Env;
 use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
 use crate::nntp::WorkerConnector;
-use crate::queues::{DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
+use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
@@ -133,13 +133,16 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
         nntp: WorkerConnector::new(),
         jobs: QueueSink::new(
-            env.queue("POST_Q").map_err(binding("POST_Q"))?,
-            env.queue("VERIFY_Q").map_err(binding("VERIFY_Q"))?,
+            queues(env, "POST_Q")?,
+            queues(env, "VERIFY_Q")?,
             drop_notify,
-        ),
+        )
+        .map_err(|name| format!("missing binding {name}"))?,
         kek,
         clock: WorkerClock,
-        budget: ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(sleeper()),
+        budget: ByteBudget::new(cfg.inflight_budget_bytes)
+            .with_job_capacity(cfg.job_budget_bytes)
+            .with_sleeper(sleeper()),
         cfg,
     })
 }
@@ -150,6 +153,20 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
 pub fn recovery_store(env: &Env) -> Result<Option<S3Remote<FetchHttp>>, String> {
     let cfg = RemoteConfig::from_vars(|name| lookup(env, name)).map_err(|e| e.to_string())?;
     Ok(cfg.map(|cfg| S3Remote::new(cfg, FetchHttp)))
+}
+
+/// The queues of one kind that are bound: `first` (`POST_Q`), then
+/// `POST_Q2`, `POST_Q3`, ... A missing first binding or a gap in the
+/// numbers is refused ([`bound_queues`]).
+fn queues(env: &Env, first: &str) -> Result<Vec<worker::Queue>, String> {
+    let count = bound_queues(first, |name| env.queue(name).is_ok())?;
+    (0..count)
+        .map(|index| {
+            let name = binding_name(first, index);
+            env.queue(&name)
+                .map_err(|_| format!("missing binding {name}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]

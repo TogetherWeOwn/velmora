@@ -1167,6 +1167,163 @@ async fn stale_lease_records_nothing() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+/// A verify job renews its lease and its slot once for calls that all
+/// start within 20 s of that renewal, not once per article: each renewal
+/// is two catalogue round trips, and a slot renewed less than 20 s ago
+/// outlasts any one call with time to spare.
+#[tokio::test]
+async fn verify_renews_once_for_a_quick_pass() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(40).await;
+    assert!(plan.len() > 1);
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 1_000);
+    rig.bridge.catalog.permit_renewed_at.borrow_mut().clear();
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+    let start = clock.now();
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
+    assert_eq!(*rig.bridge.catalog.permit_renewed_at.borrow(), [start]);
+    assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), [start]);
+    assert_eq!(rig.rows(&s)[0].result, VerifyResult::Ok);
+}
+
+/// A slow pass renews again before the first call that would start 20 s
+/// or more after the last renewal: no call starts on an older one, and
+/// the lease is renewed whenever the slot is.
+#[tokio::test]
+async fn verify_renews_again_when_the_last_renewal_is_old() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(41).await;
+    assert_eq!(plan.len(), 3);
+    let clock = rig.bridge.clock.clone();
+    let call_ms = 8_000;
+    rig.bridge.nntp.slow(&clock, call_ms);
+    rig.bridge.catalog.permit_renewed_at.borrow_mut().clear();
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+    let start = clock.now();
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+
+    // connect at 0, BODY at 8 s and 16 s, renewal, BODY at 24 s.
+    let renewed = rig.bridge.catalog.permit_renewed_at.borrow().clone();
+    assert_eq!(renewed, [start, start.plus_ms(3 * call_ms)]);
+    assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), renewed);
+    let calls = rig.bridge.nntp.calls();
+    assert_eq!(calls.len(), 1 + plan.len());
+    for (what, at) in &calls {
+        let age = renewed.iter().filter(|r| r.0 <= at.0).map(|r| at.0 - r.0);
+        let age = age.min().expect("renewed before the call");
+        assert!(age < 20_000, "{what} on a renewal {age} ms old");
+    }
+}
+
+impl Rig {
+    /// Runs the verify stage on a fresh claim and calls `then` once the
+    /// job has made `after` calls to the provider. A stage that ends
+    /// before that fails the test instead of leaving it waiting.
+    async fn verify_interrupted(
+        &self,
+        s: &Seeded,
+        after: usize,
+        then: impl FnOnce(),
+    ) -> JobOutcome {
+        let job = self.job(s).await;
+        let lease = self.claim(s, OutboxStage::Verify).await;
+        let done = std::cell::Cell::new(false);
+        let stage = async {
+            let outcome = self.bridge.verify_stage(&lease, &job).await;
+            done.set(true);
+            outcome
+        };
+        let interrupt = async {
+            while self.bridge.nntp.calls().len() < after {
+                assert!(!done.get(), "the stage ended before call {after}");
+                tokio::task::yield_now().await;
+            }
+            then();
+        };
+        tokio::join!(stage, interrupt).0
+    }
+
+    /// Runs the verify stage and takes the row over once the job has
+    /// made `after` calls to the provider.
+    async fn verify_taken_over(&self, s: &Seeded, after: usize) -> JobOutcome {
+        self.verify_interrupted(s, after, || self.bridge.catalog.take_over(&s.extent))
+            .await
+    }
+}
+
+/// The row is taken over while the job reads on a renewal it does not
+/// repeat yet. The renewal that comes due finds the lease gone: the job
+/// stops there, reads no further and records nothing.
+#[tokio::test]
+async fn verify_stops_at_the_renewal_that_finds_its_lease_gone() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(42).await;
+    assert_eq!(plan.len(), 3);
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 8_000);
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+    let start = clock.now();
+
+    // Taken over once the first BODY is out: connect, BODY.
+    rig.verify_taken_over(&s, 2).await;
+
+    // connect at 0, BODY at 8 s and 16 s; the renewal due at 24 s stops it.
+    let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["connect", "body", "body"]);
+    assert_eq!(
+        *rig.bridge.catalog.lease_renewed_at.borrow(),
+        [start, start.plus_ms(24_000)]
+    );
+    assert!(rig.rows(&s).is_empty());
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// A pass that ends before another renewal is due may read every article
+/// on a lease that was taken over meanwhile. What it read is not
+/// recorded: every write carries the lease and is refused.
+#[tokio::test]
+async fn a_pass_read_on_a_lease_lost_meanwhile_records_nothing() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(43).await;
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 1_000);
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+
+    rig.verify_taken_over(&s, 2).await;
+
+    assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
+    assert_eq!(rig.bridge.catalog.lease_renewed_at.borrow().len(), 1);
+    assert!(rig.rows(&s).is_empty());
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// A slot lost while the job reads is found at the renewal that comes
+/// due: the job stops there and is deferred, and nothing is recorded.
+#[tokio::test]
+async fn verify_stops_at_the_renewal_that_finds_its_slot_gone() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(44).await;
+    assert_eq!(plan.len(), 3);
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 8_000);
+    let lose_slot = || rig.bridge.catalog.drop_permits();
+
+    let outcome = rig.verify_interrupted(&s, 2, lose_slot).await;
+
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["connect", "body", "body"]);
+    assert!(rig.rows(&s).is_empty());
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
 /// No free slot: the job is deferred, no attempt is spent, nothing is read.
 #[tokio::test]
 async fn verify_without_a_slot_is_deferred() {

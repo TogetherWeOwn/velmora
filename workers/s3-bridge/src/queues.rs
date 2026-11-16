@@ -1,6 +1,8 @@
 //! `impl JobSink` over Queues. A `Job` is sent as a JSON message. Post jobs
-//! go to `POST_Q`; verify, release, gc and recovery-copy jobs go to
-//! `VERIFY_Q`.
+//! go to a post queue (`POST_Q`, and `POST_Q2`, `POST_Q3`, ... where they
+//! are bound); verify, release, gc and recovery-copy jobs go to a verify
+//! queue (`VERIFY_Q`, `VERIFY_Q2`, ...). An extent's job always goes to
+//! the same queue of its kind ([`shard`]).
 //!
 //! Dev only: `DEV_DROP_NOTIFY_N` makes the first `n` `send` calls of the
 //! isolate vanish while reporting success (a lost queue notification), so
@@ -66,42 +68,146 @@ impl DropNotify {
     }
 }
 
+/// Most queues of one kind a deployment may bind (`POST_Q`, `POST_Q2`,
+/// ... and `VERIFY_Q`, `VERIFY_Q2`, ...).
+pub const MAX_QUEUES: usize = 8;
+
+/// The binding name of queue `index` (from 0) of the kind `first` names:
+/// `POST_Q`, then `POST_Q2`, `POST_Q3`, ...
+pub fn binding_name(first: &str, index: usize) -> String {
+    match index {
+        0 => first.into(),
+        n => format!("{first}{}", n + 1),
+    }
+}
+
+/// How many queues of the kind `first` names are bound, given which
+/// binding names exist: `first`, `first2`, ... counted up to the first
+/// name that is not bound. A name bound after a gap is refused with that
+/// name: the queues after a gap would silently get no jobs.
+pub fn bound_queues(
+    first: &str,
+    is_bound: impl Fn(&str) -> bool,
+) -> std::result::Result<usize, String> {
+    let bound: Vec<bool> = (0..MAX_QUEUES)
+        .map(|index| is_bound(&binding_name(first, index)))
+        .collect();
+    let count = bound.iter().take_while(|b| **b).count();
+    match bound.iter().skip(count).position(|b| *b) {
+        Some(after) => {
+            let (stray, gap) = (
+                binding_name(first, count + after),
+                binding_name(first, count),
+            );
+            Err(format!("binding {stray} without {gap}"))
+        }
+        None if count == 0 => Err(format!("missing binding {first}")),
+        None => Ok(count),
+    }
+}
+
 pub struct QueueSink {
-    post: Queue,
-    verify: Queue,
+    /// Never empty.
+    post: Vec<Queue>,
+    /// Never empty.
+    verify: Vec<Queue>,
     drop_notify: DropNotify,
 }
 
 impl QueueSink {
-    pub fn new(post: Queue, verify: Queue, drop_notify: DropNotify) -> Self {
-        QueueSink {
+    /// `post` and `verify` hold the queues of each kind in binding order,
+    /// at least one each: an empty list is refused, with the name of the
+    /// first binding of the kind.
+    pub fn new(
+        post: Vec<Queue>,
+        verify: Vec<Queue>,
+        drop_notify: DropNotify,
+    ) -> std::result::Result<Self, &'static str> {
+        if post.is_empty() {
+            return Err("POST_Q");
+        }
+        if verify.is_empty() {
+            return Err("VERIFY_Q");
+        }
+        Ok(QueueSink {
             post,
             verify,
             drop_notify,
+        })
+    }
+
+    fn shards(&self) -> Shards {
+        Shards {
+            post: self.post.len(),
+            verify: self.verify.len(),
         }
     }
 
     fn queue(&self, lane: Lane) -> &Queue {
         match lane {
-            Lane::Post => &self.post,
-            Lane::Verify => &self.verify,
+            Lane::Post(shard) => &self.post[shard],
+            Lane::Verify(shard) => &self.verify[shard],
         }
     }
 }
 
+/// The queue a job is sent to: the kind and the queue's index in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lane {
-    Post,
-    Verify,
+    Post(usize),
+    Verify(usize),
 }
 
-fn lane(job: &Job) -> Lane {
+/// How many queues of each kind are bound, at least one each.
+#[derive(Clone, Copy, Debug)]
+struct Shards {
+    post: usize,
+    verify: usize,
+}
+
+impl Shards {
+    /// Every lane, post queues first.
+    fn lanes(self) -> impl Iterator<Item = Lane> {
+        (0..self.post)
+            .map(Lane::Post)
+            .chain((0..self.verify).map(Lane::Verify))
+    }
+}
+
+/// The queue of an extent among `queues` of one kind: the same one every
+/// time, and the extents spread evenly (FNV-1a over the id, then mixed).
+///
+/// Each queue has its own consumer, whose invocations share an isolate:
+/// one byte budget and one thread. More queues are more isolates at
+/// work. Which queue a job is in changes nothing else: a job only names
+/// an outbox row, and the lease on that row decides who works on it.
+fn shard(extent: &str, queues: usize) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in extent.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Mixed once more (the finalizer of MurmurHash3): a change in the
+    // last byte of the id alone reaches only some bits of FNV-1a.
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    (h % queues.max(1) as u64) as usize
+}
+
+/// Post jobs go to a post queue. Every other job goes to a verify queue:
+/// an extent's by its id, the rest (gc, sweep, eviction, recovery copy)
+/// to the first.
+fn lane(job: &Job, shards: Shards) -> Lane {
     match job {
         Job::Extent {
             stage: OutboxStage::Post,
+            extent,
             ..
-        } => Lane::Post,
-        _ => Lane::Verify,
+        } => Lane::Post(shard(extent.as_str(), shards.post)),
+        Job::Extent { extent, .. } => Lane::Verify(shard(extent.as_str(), shards.verify)),
+        _ => Lane::Verify(0),
     }
 }
 
@@ -112,6 +218,27 @@ fn check_delay(delay_secs: u32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The jobs of each lane that has any, in lane order.
+fn batches(jobs: &[Job], shards: Shards) -> Vec<(Lane, Vec<&Job>)> {
+    shards
+        .lanes()
+        .map(|target| {
+            let batch: Vec<&Job> = jobs.iter().filter(|j| lane(j, shards) == target).collect();
+            (target, batch)
+        })
+        .filter(|(_, batch)| !batch.is_empty())
+        .collect()
+}
+
+/// The outcome of sends that were all made: a queue that refused its
+/// batch did not keep the others from getting theirs.
+fn first_error<E>(sends: Vec<std::result::Result<(), E>>) -> Result<()> {
+    match sends.into_iter().find_map(|sent| sent.err()) {
+        Some(_) => Err(BridgeError::Queue("send failed".into())),
+        None => Ok(()),
+    }
 }
 
 fn send_err(_: worker::Error) -> BridgeError {
@@ -128,26 +255,26 @@ impl JobSink for QueueSink {
             .content_type(QueueContentType::Json)
             .delay_seconds(delay_secs)
             .build();
-        self.queue(lane(job)).send(msg).await.map_err(send_err)
+        self.queue(lane(job, self.shards()))
+            .send(msg)
+            .await
+            .map_err(send_err)
     }
 
-    /// One batch per queue. An `Err` may follow a sent `POST_Q` batch; the
+    /// One batch per queue, every queue tried. An `Err` may come with
+    /// sent batches; the
     /// dispatcher re-drives from the outbox and a duplicate job only finds
     /// its lease taken.
     async fn send_many(&self, jobs: &[Job]) -> Result<()> {
         if jobs.len() > MAX_BATCH {
             return Err(BridgeError::Queue(format!("batch above {MAX_BATCH} jobs")));
         }
-        for target in [Lane::Post, Lane::Verify] {
-            let batch: Vec<&Job> = jobs.iter().filter(|j| lane(j) == target).collect();
-            if !batch.is_empty() {
-                self.queue(target)
-                    .send_batch(batch)
-                    .await
-                    .map_err(send_err)?;
-            }
+        let shards = self.shards();
+        let mut sends = Vec::new();
+        for (target, batch) in batches(jobs, shards) {
+            sends.push(self.queue(target).send_batch(batch).await);
         }
-        Ok(())
+        first_error(sends)
     }
 }
 
@@ -165,33 +292,186 @@ mod tests {
         }
     }
 
+    const ONE: Shards = Shards { post: 1, verify: 1 };
+
     #[test]
     fn only_post_jobs_use_the_post_queue() {
-        assert_eq!(lane(&extent_job(OutboxStage::Post)), Lane::Post);
+        assert_eq!(lane(&extent_job(OutboxStage::Post), ONE), Lane::Post(0));
         for stage in [OutboxStage::Verify, OutboxStage::Release] {
-            assert_eq!(lane(&extent_job(stage)), Lane::Verify);
+            assert_eq!(lane(&extent_job(stage), ONE), Lane::Verify(0));
         }
-        assert_eq!(lane(&Job::Gc { v: JOB_VERSION }), Lane::Verify);
-        // The sweep of a write deletes blobs and posts nothing.
-        let sweep = Job::Sweep {
-            v: JOB_VERSION,
-            write: WriteId::new("w_0000000000000000"),
-        };
-        assert_eq!(lane(&sweep), Lane::Verify);
-        // The recovery copy shares the verify lane; a job is bounded.
-        let copy = Job::RecoveryCopy {
-            v: JOB_VERSION,
-            pass: velmora_bridge::UnixMs(1),
-            cursor: String::new(),
-        };
-        assert_eq!(lane(&copy), Lane::Verify);
+        for job in other_jobs() {
+            assert_eq!(lane(&job, ONE), Lane::Verify(0));
+        }
+    }
+
+    /// The jobs that name no extent.
+    fn other_jobs() -> Vec<Job> {
+        let mut jobs = vec![
+            Job::Gc { v: JOB_VERSION },
+            // The sweep of a write deletes blobs and posts nothing.
+            Job::Sweep {
+                v: JOB_VERSION,
+                write: WriteId::new("w_0000000000000000"),
+            },
+            // The recovery copy shares the verify lane; a job is bounded.
+            Job::RecoveryCopy {
+                v: JOB_VERSION,
+                pass: velmora_bridge::UnixMs(1),
+                cursor: String::new(),
+            },
+        ];
         for remaining in [0, 4096] {
-            let evict = Job::Evict {
+            jobs.push(Job::Evict {
                 v: JOB_VERSION,
                 remaining,
-            };
-            assert_eq!(lane(&evict), Lane::Verify);
+            });
         }
+        jobs
+    }
+
+    fn job_of(extent: &str, stage: OutboxStage) -> Job {
+        Job::Extent {
+            v: JOB_VERSION,
+            extent: ExtentId::new(extent),
+            generation: GenerationId::new("g_1"),
+            stage,
+        }
+    }
+
+    #[test]
+    fn an_extent_keeps_its_queue_and_extents_spread_over_all() {
+        let shards = Shards { post: 4, verify: 2 };
+        let mut post = [0u32; 4];
+        let mut verify = [0u32; 2];
+        for n in 0..4000u32 {
+            // The shape of a real id: a prefix and hex digits.
+            let id = format!("x_{:026x}", u128::from(n) * 0x9e37_79b9_7f4a_7c15_f39c);
+            let Lane::Post(p) = lane(&job_of(&id, OutboxStage::Post), shards) else {
+                panic!("a post job left the post queues");
+            };
+            assert_eq!(lane(&job_of(&id, OutboxStage::Post), shards), Lane::Post(p));
+            post[p] += 1;
+            for stage in [OutboxStage::Verify, OutboxStage::Release] {
+                let Lane::Verify(v) = lane(&job_of(&id, stage), shards) else {
+                    panic!("a verify job left the verify queues");
+                };
+                assert_eq!(v, shard(&id, 2));
+                if stage == OutboxStage::Verify {
+                    verify[v] += 1;
+                }
+            }
+        }
+        // Even within a fifth of the mean.
+        assert!(post.iter().all(|n| (800..=1200).contains(n)), "{post:?}");
+        assert!(
+            verify.iter().all(|n| (1600..=2400).contains(n)),
+            "{verify:?}"
+        );
+        // Ids that differ in the last character only still spread.
+        let mut tail = [0u32; 4];
+        for c in "0123456789abcdef".chars() {
+            tail[shard(&format!("x_00000000000000000000000{c}"), 4)] += 1;
+        }
+        assert!(tail.iter().filter(|n| **n > 0).count() >= 3, "{tail:?}");
+    }
+
+    #[test]
+    fn jobs_without_an_extent_use_the_first_verify_queue() {
+        let shards = Shards { post: 4, verify: 3 };
+        for job in other_jobs() {
+            assert_eq!(lane(&job, shards), Lane::Verify(0));
+        }
+    }
+
+    #[test]
+    fn every_lane_is_listed_once_and_one_queue_takes_everything() {
+        let shards = Shards { post: 3, verify: 2 };
+        let lanes: Vec<Lane> = shards.lanes().collect();
+        assert_eq!(
+            lanes,
+            [
+                Lane::Post(0),
+                Lane::Post(1),
+                Lane::Post(2),
+                Lane::Verify(0),
+                Lane::Verify(1)
+            ]
+        );
+        for n in 0..64 {
+            assert_eq!(shard(&format!("x_{n:x}"), 1), 0);
+            // Never out of range, and no division by zero.
+            assert_eq!(shard(&format!("x_{n:x}"), 0), 0);
+            assert!(shard(&format!("x_{n:x}"), MAX_QUEUES) < MAX_QUEUES);
+        }
+    }
+
+    #[test]
+    fn bound_queues_are_counted_and_a_gap_is_refused() {
+        let with = |names: &'static [&'static str]| {
+            bound_queues("POST_Q", move |name| names.contains(&name))
+        };
+        assert_eq!(with(&["POST_Q"]), Ok(1));
+        assert_eq!(with(&["POST_Q", "POST_Q2", "POST_Q3", "VERIFY_Q"]), Ok(3));
+        assert_eq!(with(&["VERIFY_Q"]), Err("missing binding POST_Q".into()));
+        assert_eq!(
+            with(&["POST_Q", "POST_Q3", "POST_Q4"]),
+            Err("binding POST_Q3 without POST_Q2".into())
+        );
+        assert_eq!(
+            with(&["POST_Q2"]),
+            Err("binding POST_Q2 without POST_Q".into())
+        );
+        // Names above the most this build reads are not looked at.
+        assert_eq!(with(&["POST_Q", "POST_Q10"]), Ok(1));
+    }
+
+    #[test]
+    fn a_batch_is_split_by_queue_and_no_job_is_left_out() {
+        let shards = Shards { post: 3, verify: 2 };
+        let mut jobs: Vec<Job> = (0..40u8)
+            .map(|n| Job::Extent {
+                v: JOB_VERSION,
+                extent: ExtentId::new(format!("e_{n}")),
+                generation: GenerationId::new("g_1"),
+                stage: if n % 2 == 0 {
+                    OutboxStage::Post
+                } else {
+                    OutboxStage::Verify
+                },
+            })
+            .collect();
+        jobs.push(Job::Gc { v: JOB_VERSION });
+        let split = batches(&jobs, shards);
+        assert_eq!(
+            split.iter().map(|(_, b)| b.len()).sum::<usize>(),
+            jobs.len()
+        );
+        for (target, batch) in &split {
+            assert!(!batch.is_empty());
+            assert!(batch.iter().all(|j| lane(j, shards) == *target));
+        }
+        let lanes: Vec<Lane> = split.iter().map(|(l, _)| *l).collect();
+        let mut sorted = lanes.clone();
+        sorted.dedup();
+        assert_eq!(lanes, sorted, "one batch per queue");
+        assert!(batches(&[], shards).is_empty());
+    }
+
+    #[test]
+    fn sends_report_the_first_failure_after_all_were_made() {
+        assert!(first_error::<&str>(vec![]).is_ok());
+        assert!(first_error::<&str>(vec![Ok(()), Ok(())]).is_ok());
+        let failed = first_error(vec![Ok(()), Err("second queue"), Ok(())]);
+        assert!(matches!(failed, Err(BridgeError::Queue(_))));
+    }
+
+    #[test]
+    fn binding_names_count_from_two() {
+        assert_eq!(binding_name("POST_Q", 0), "POST_Q");
+        assert_eq!(binding_name("POST_Q", 1), "POST_Q2");
+        assert_eq!(binding_name("VERIFY_Q", 0), "VERIFY_Q");
+        assert_eq!(binding_name("VERIFY_Q", 7), "VERIFY_Q8");
     }
 
     #[test]

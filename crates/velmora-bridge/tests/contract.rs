@@ -266,6 +266,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.required_backbones, 2);
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
+    assert_eq!(cfg.job_budget_bytes, 72 * 1024 * 1024);
     assert_eq!(cfg.safety_min_age_secs, 86_400);
     assert_eq!(cfg.verify_delay_secs, 120);
     assert_eq!(
@@ -285,7 +286,7 @@ fn config_loads_from_documented_vars() {
     assert!(cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 2);
-    // Production posts on six sockets per job, so that two post jobs fit
+    // Production posts on six sockets per job, so that three post jobs fit
     // one isolate (see below); the grace keeps its default.
     assert_eq!(cfg.post_sockets, 6);
     assert_eq!(cfg.propagation_grace_secs, 21_600);
@@ -309,6 +310,8 @@ fn config_loads_from_documented_vars() {
         (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
         (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
     );
+    // Dev sets no job budget: jobs and requests share the one limit.
+    assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
     // Absent or empty is the default; any other size is taken as given.
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     let mut sized = with_secrets(dev, PROVIDER_PLAIN);
@@ -413,6 +416,16 @@ fn missing_secret_fails_closed() {
                 assert!(copy.unwrap().is_none());
                 vars.insert(name.clone(), "  ".into());
             }
+            continue;
+        }
+        // The job budget: absent or blank is the request budget, which
+        // is the smaller of the two bounds, so nothing fails open.
+        if name == "JOB_BUDGET_BYTES" {
+            let cfg = load(&vars).unwrap();
+            assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
+            vars.insert(name.clone(), "  ".into());
+            let cfg = load(&vars).unwrap();
+            assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
             continue;
         }
         assert_eq!(
@@ -560,6 +573,23 @@ fn config_rejects_invalid_and_unsafe_values() {
         set(&prod, "INFLIGHT_BUDGET_BYTES", "33554431"),
         invalid("INFLIGHT_BUDGET_BYTES")
     );
+    // The job budget: from the request budget to 1.5 times it.
+    for bad in ["50331647", "75497473", "72MiB", "-1"] {
+        assert_eq!(
+            set(&prod, "JOB_BUDGET_BYTES", bad),
+            invalid("JOB_BUDGET_BYTES"),
+            "{bad}"
+        );
+    }
+    for (good, want) in [
+        ("50331648", 50_331_648),
+        ("75497472", 75_497_472),
+        ("", 50_331_648),
+    ] {
+        let mut vars = with_secrets(prod.clone(), PROVIDER_TLS);
+        vars.insert("JOB_BUDGET_BYTES".into(), good.into());
+        assert_eq!(load(&vars).unwrap().job_budget_bytes, want, "{good:?}");
+    }
     assert_eq!(
         set(&prod, "SAFETY_MIN_AGE_SECS", "-1"),
         invalid("SAFETY_MIN_AGE_SECS")
@@ -2178,17 +2208,18 @@ fn provider_pool_settings_fail_closed() {
     assert!(providers_of(&many[..32]).is_ok());
 }
 
-/// The shipped `POST_SOCKETS` lets two post jobs of full-size extents and
-/// a verify job share one isolate's byte budget. The queue's invocations
-/// share isolates, so with a larger setting every post job but one waits.
+/// The shipped `POST_SOCKETS` and `JOB_BUDGET_BYTES` let three post jobs
+/// of full-size extents and a verify job share one isolate's byte budget.
+/// The queue's invocations share isolates, so with a larger socket count
+/// or a smaller job budget a post job waits for another.
 #[test]
-fn two_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
+fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     use velmora::media::{FileKey, Profile, Sealer};
     use velmora::rng::SystemRng;
     use velmora_bridge::jobs::job_bytes;
 
     let (prod, _) = wrangler_vars();
-    let budget: u64 = prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap();
+    let budget: u64 = prod["JOB_BUDGET_BYTES"].parse().unwrap();
     let sockets: u32 = prod["POST_SOCKETS"].parse().unwrap();
     let max_extent: usize = prod["MAX_EXTENT_BYTES"].parse().unwrap();
     let key = FileKey::generate(&mut SystemRng).unwrap();
@@ -2198,7 +2229,96 @@ fn two_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     let post = job_bytes(OutboxStage::Post, cipher_size, sockets);
     let verify = job_bytes(OutboxStage::Verify, cipher_size, sockets);
     assert!(
-        2 * post + verify <= budget,
-        "two post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
+        3 * post + verify <= budget,
+        "three post jobs ({post} B each) and a verify job ({verify} B) exceed {budget} B"
     );
+    let jobs =
+        ByteBudget::new(prod["INFLIGHT_BUDGET_BYTES"].parse().unwrap()).with_job_capacity(budget);
+    let held: Vec<_> = [post, post, post, verify]
+        .into_iter()
+        .map(|bytes| jobs.try_charge_job(bytes).expect("fits"))
+        .collect();
+    assert!(jobs.try_charge_job(post).is_none());
+    drop(held);
+}
+
+/// The queue tables of the shipped `wrangler.toml`: producers as
+/// (binding, queue) and the queues with a consumer, for production
+/// (`env` empty) or `env.dev.`.
+fn wrangler_queues(env: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let toml = std::fs::read_to_string(path).unwrap();
+    let value = |line: &str, key: &str| -> Option<String> {
+        let rest = line.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+        Some(rest.trim().trim_matches('"').to_string())
+    };
+    let (mut producers, mut consumers) = (Vec::new(), Vec::new());
+    let (mut section, mut binding) = (String::new(), None);
+    for line in toml.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line.to_string();
+            binding = None;
+        } else if section == format!("[[{env}queues.producers]]") {
+            if let Some(name) = value(line, "binding") {
+                binding = Some(name);
+            } else if let Some(queue) = value(line, "queue") {
+                producers.push((binding.take().expect("binding before queue"), queue));
+            }
+        } else if section == format!("[[{env}queues.consumers]]") {
+            consumers.extend(value(line, "queue"));
+        }
+    }
+    (producers, consumers)
+}
+
+/// Every queue the shipped configuration sends jobs to has exactly one
+/// consumer (a queue that is only read is being emptied), and the bindings of a kind are numbered without a gap: an
+/// extent's jobs always go to the same queue, so a queue nobody reads
+/// would hold the same extents back for good.
+#[test]
+fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
+    for env in ["", "env.dev."] {
+        let (producers, consumers) = wrangler_queues(env);
+        for kind in ["POST_Q", "VERIFY_Q"] {
+            let mut numbers: Vec<u32> = producers
+                .iter()
+                .filter_map(|(binding, _)| binding.strip_prefix(kind))
+                .map(|n| if n.is_empty() { 1 } else { n.parse().unwrap() })
+                .collect();
+            numbers.sort_unstable();
+            let expected: Vec<u32> = (1..=numbers.len() as u32).collect();
+            assert!(!numbers.is_empty(), "{env}{kind} is not bound");
+            assert!(
+                numbers.len() <= 8,
+                "{env}{kind}: more than the Worker reads"
+            );
+            assert_eq!(numbers, expected, "{env}{kind} bindings");
+            assert!(!numbers.contains(&0));
+        }
+        assert_eq!(
+            producers.len(),
+            producers
+                .iter()
+                .filter(|(b, _)| b.starts_with("POST_Q") || b.starts_with("VERIFY_Q"))
+                .count(),
+            "{env}: a producer of another kind"
+        );
+        // A consumer without a producer is a queue being emptied before
+        // it is taken away; a producer without a consumer is never right.
+        let mut sent: Vec<&String> = producers.iter().map(|(_, queue)| queue).collect();
+        for queue in &sent {
+            let readers = consumers.iter().filter(|c| c == queue).count();
+            assert_eq!(readers, 1, "{env}: consumers of {queue}");
+        }
+        let mut read: Vec<&String> = consumers.iter().collect();
+        read.sort();
+        read.dedup();
+        assert_eq!(read.len(), consumers.len(), "{env}: a queue read twice");
+        sent.sort();
+        sent.dedup();
+        assert_eq!(sent.len(), producers.len(), "{env}: a queue bound twice");
+    }
 }

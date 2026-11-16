@@ -161,6 +161,7 @@ impl Fx {
             newsgroups: vec!["alt.binaries.test".to_string()],
             kek_active: 1,
             inflight_budget_bytes: BUDGET,
+            job_budget_bytes: BUDGET,
             gc_mode: GcMode::Disposable,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
@@ -909,6 +910,7 @@ async fn status_reports_outbox_dispatch_and_memory() {
     );
     assert_eq!(r["inflight_bytes"], 0);
     assert_eq!(r["inflight_budget_bytes"], BUDGET);
+    assert_eq!(r["job_budget_bytes"], BUDGET);
 }
 
 // ---------------------------------------------------------------------------
