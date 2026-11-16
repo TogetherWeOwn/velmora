@@ -1,0 +1,37 @@
+# Example deploy config for the velmora console. Copy it outside the repo,
+# fill in the placeholders, and deploy with `npx wrangler deploy -c <copy>`.
+# Keep the real copy private: it names your hostnames and Access app.
+
+name = "velmora-console"
+main = "src/worker.js"
+compatibility_date = "2026-11-01"
+
+# The custom domain behind Cloudflare Access is the only way in.
+workers_dev = false
+preview_urls = false
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+# Every request, the page included, passes the Access JWT check first.
+run_worker_first = true
+
+# velmora's S3 Worker, called directly: no CORS, no public round trip.
+[[services]]
+binding = "S3"
+service = "<velmora-s3-worker-name>"
+
+[observability]
+enabled = false
+
+[vars]
+S3_HOST = "<the S3 host velmora-s3 answers to>"
+S3_REGION = "auto"
+ACCESS_TEAM_DOMAIN = "<team>.cloudflareaccess.com"
+ACCESS_AUD = "<Access application AUD tag>"
+ALLOWED_EMAILS = "<comma-separated emails, the same as the Access policy>"
+
+# Secrets (`npx wrangler secret put <NAME> -c <copy>`, value on stdin):
+#   S3_ACCESS_KEY_ID      the console's velmora access key id
+#   S3_SECRET_ACCESS_KEY  its secret
+#   ADMIN_TOKEN           velmora's admin bearer token
