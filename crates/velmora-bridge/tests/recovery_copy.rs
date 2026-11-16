@@ -4287,3 +4287,87 @@ async fn a_start_saved_over_an_old_place_does_not_go_on_from_it() {
     assert_eq!(saved(&w).await.as_deref(), Some(""));
     assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
 }
+
+/// The end of the walk cannot be saved. The place does not stay near
+/// the end, where every later pass would walk the last keys only: it
+/// goes back to the first key, and the next pass goes through every
+/// key again. It is reported each time.
+#[tokio::test(flavor = "current_thread")]
+async fn an_end_that_cannot_be_saved_does_not_leave_the_walk_at_its_end() {
+    let w = World::new();
+    for i in 0..(2 * JOB_COPIES + 1) {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    let stuck = NoMark(&w.safety, WALKED_KEY);
+    let copier = Copier {
+        safety: &stuck,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    for n in 0..3 {
+        let pass = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        w.clock.set(pass);
+        // The copy of the first key is damaged at the store: only a
+        // walk from the first key finds it.
+        w.e2.set("m/art/x_0000", b"other");
+        let whys = queued_pass(&w, &copier, pass).await;
+        assert!(whys.contains(&StepError::Mark), "pass {n}: {whys:?}");
+        assert_ne!(w.e2.get("m/art/x_0000").as_deref(), Some(&b"other"[..]));
+        assert_eq!(saved(&w).await.as_deref(), Some(""), "pass {n}");
+        assert_eq!(time_at(&w, WALKED_KEY).await, None);
+        assert_eq!(time_at(&w, BEGAN_KEY).await, ms(pass.0), "pass {n}");
+    }
+}
+
+/// A place that lies under a walk at rest is cleared, so that a start
+/// that turns up later does not go on from it and rest for a day with
+/// the keys before it not walked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_place_under_a_walk_at_rest_is_cleared() {
+    let w = World::new();
+    for i in 0..4 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    w.raw(WALK_KEY, b"m/art/x_2".to_vec()).await;
+    let pass = |n: i64| UnixMs(NOW + n * PASS_INTERVAL_MS);
+    w.clock.set(pass(1));
+    assert!(queued_pass(&w, &w.copier(), pass(1)).await.is_empty());
+    assert_eq!(saved(&w).await.as_deref(), Some(""));
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    // The start turns up: the walk goes through every key.
+    w.raw(BEGAN_KEY, (pass(1).0 + 1).to_string().into_bytes())
+        .await;
+    w.e2.set("m/art/x_0", b"other");
+    w.clock.set(pass(2));
+    assert!(queued_pass(&w, &w.copier(), pass(2)).await.is_empty());
+    assert_ne!(w.e2.get("m/art/x_0").as_deref(), Some(&b"other"[..]));
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(pass(2).0));
+}
+
+/// The first job of a pass after a gap does not write its time over a
+/// later one: a job that asked for the walk after the pass started is
+/// not forgotten.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gap_does_not_write_over_a_later_time_that_asks_for_the_walk() {
+    let w = World::new();
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    let pass = UnixMs(NOW + 8 * PASS_INTERVAL_MS);
+    w.clock.set(pass);
+    let asked = (pass.0 + 5).to_string();
+    w.raw(WANT_KEY, asked.clone().into_bytes()).await;
+    assert!(queued_pass(&w, &w.copier(), pass).await.is_empty());
+    assert_eq!(time_at(&w, WANT_KEY).await, Some(asked));
+    // An older one, or one that has not come yet, is written over.
+    for old in [pass.0 - 2, pass.0 + PASS_INTERVAL_MS] {
+        let later = UnixMs(pass.0 + 8 * PASS_INTERVAL_MS);
+        w.clock.set(later);
+        w.raw(WANT_KEY, old.to_string().into_bytes()).await;
+        w.raw(SWEPT_KEY, b"0".to_vec()).await;
+        assert!(queued_pass(&w, &w.copier(), later).await.is_empty());
+        assert_eq!(time_at(&w, WANT_KEY).await, ms(later.0 - 1));
+    }
+}

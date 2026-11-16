@@ -84,6 +84,13 @@
 //!   put a walk off. The saved place counts only while a walk is under
 //!   way, that is when one began after the last one ended; otherwise
 //!   the walk starts from the first key.
+//! - **A time or a place that cannot be saved is reported in every
+//!   pass** ([`StepError::Mark`]), and makes the walk come more often,
+//!   not less: without the end, every pass walks from the first key;
+//!   without the start or the place, every pass begins again. In the
+//!   last case a walk that takes more than one pass does not reach its
+//!   end until the safety bucket takes the write again (the sweep and
+//!   the hints go on meanwhile).
 //! - **A record of the walk that could not be copied waits for the walk
 //!   to come round**, which it then does [`WALK_SOON_MS`] after the
 //!   last one at the latest. One of the fresh sweep is tried again by
@@ -694,7 +701,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if place.is_none() {
             let last = self.read_time(SWEPT_KEY).await;
             if !matches!(last, Ok(Some(at)) if pass.0 - at <= PASS_INTERVAL_MS) {
-                let _ = self.save_time(WANT_KEY, UnixMs(pass.0 - 1)).await;
+                // Not over a later time that has come: a job that
+                // asked after this pass started would be forgotten.
+                let asked = self.read_time(WANT_KEY).await;
+                let later = pass.0..pass.0 + PASS_INTERVAL_MS;
+                if !matches!(asked, Ok(Some(at)) if later.contains(&at)) {
+                    let _ = self.save_time(WANT_KEY, UnixMs(pass.0 - 1)).await;
+                }
             }
         }
         let step = match self.step(pass, cursor).await {
@@ -720,10 +733,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if step.unsaved {
             why = why.or(Some(StepError::Mark));
         }
-        // The times of the walk, each before the place it belongs to:
-        // a start that is not saved only brings the next walk forward,
-        // and an end that is not saved leaves the place where it was,
-        // so that the next pass comes to the end again.
+        // The times of the walk, each before the place it belongs to.
+        // A start that is not saved saves no place: the next pass
+        // begins again. An end that is not saved still puts the place
+        // back at the first key, so that the next pass, which finds a
+        // walk under way, goes through every key again: with the place
+        // left near the end, every pass would walk that end only.
         // Best effort: without it the next pass asks for the walk.
         if step.swept {
             let _ = self.save_time(SWEPT_KEY, pass).await;
@@ -735,11 +750,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             saved &= self.save_walk("").await.is_ok();
             saved = saved && self.save_time(BEGAN_KEY, pass).await.is_ok();
         }
+        let started = saved;
         if step.ended {
             saved &= self.save_time(WALKED_KEY, pass).await.is_ok();
         }
-        if let Some(at) = step.walk.as_ref().filter(|_| saved) {
-            saved = self.save_walk(at).await.is_ok();
+        if let Some(at) = step.walk.as_ref().filter(|_| started) {
+            saved &= self.save_walk(at).await.is_ok();
         }
         if !saved {
             why = why.or(Some(StepError::Mark));
@@ -844,7 +860,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         began: &mut bool,
     ) -> std::result::Result<Option<Place>, StepError> {
-        let place = walk_from(self.saved_walk().await?, pass);
+        let left = self.saved_walk().await?;
+        let stale = !left.is_empty();
+        let place = walk_from(left, pass);
         let ended = self.read_time(WALKED_KEY).await;
         // A time that has not come yet is none: an end in the future
         // would otherwise make every pass begin the walk again.
@@ -863,6 +881,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // Under way without a place (the job that began it died before
         // the place was saved): it begins again.
         if !under_way && !self.walk_due(pass, ended, start).await {
+            // A place left under a walk that rests is cleared: a start
+            // that turns up later (one saved with a time that had not
+            // come yet) would go on from it. Best effort: a walk that
+            // begins clears it too.
+            if stale {
+                let _ = self.save_walk("").await;
+            }
             return Ok(None);
         }
         *began = true;
