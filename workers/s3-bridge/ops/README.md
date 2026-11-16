@@ -77,10 +77,14 @@ Limits to know:
   extent is counted in `safety_missing`, not in `damaged`; a read of it
   fails loudly.
 - An article plan record that does not open is listed under
-  `unreadable` and its extent is restored without a plan. So is the
-  record of an extent whose packed plan in the catalogue cannot be read
-  when the record has no plan to put in its place: that extent cannot
-  be read from Usenet.
+  `unreadable` and its extent is restored without a plan.
+- A packed plan in the catalogue that cannot be read is replaced by the
+  plan of the extent's record. When the record has no plan to give (it
+  is absent, it does not open, or its plan does not fit the row), the
+  stored value stays as it is, and the name of the extent's plan record
+  (`m/art/<extent id>`) is listed under `unreadable`, whether or not
+  such a record exists. That extent cannot be read from Usenet, and
+  this entry is the only report of it: it is not counted in `damaged`.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
   lists it under `damaged`. The exception: when the key has an older

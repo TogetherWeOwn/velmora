@@ -246,9 +246,11 @@ pub struct ReplayReport {
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
     pub damaged: Vec<String>,
-    /// Records that did not open or parse (blob keys). Also the plan
-    /// record of an extent whose packed plan in the catalogue cannot be
-    /// read and whose record has none to put in its place.
+    /// Records that did not open or parse (blob keys). Also the name
+    /// of the plan record of an extent whose packed plan in the
+    /// catalogue cannot be read and stays so, because the record has no
+    /// plan to put in its place (whether or not the record exists):
+    /// the only report of such an extent.
     pub unreadable: Vec<String>,
     /// `None` = the replay is complete.
     pub next: Option<ReplayCursor>,

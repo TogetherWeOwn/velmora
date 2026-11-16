@@ -1308,6 +1308,35 @@ async fn an_unreadable_article_plan_does_not_stop_the_replay() {
     assert_eq!(get(&rig, &signer, "two").await.expect(200).body, b"two");
 }
 
+/// A packed plan in the catalogue that cannot be read, on an extent
+/// whose record has no plan to put in its place, stays as it is and is
+/// named by every replay: nothing else says that the extent cannot be
+/// read from Usenet.
+#[tokio::test(flavor = "current_thread")]
+async fn a_packed_plan_that_nothing_replaces_is_named() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"one").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "one").await.unwrap();
+    tick(&rig);
+    rig.put(&signer, BUCKET, "two", b"two").await.expect(200);
+    // Nothing was posted: no extent has a plan record.
+    let id = extents[0].id.as_str();
+    let record = format!("m/art/{id}");
+    assert!(!rig.bridge.safety.inner.contains(&record));
+    sql(
+        &rig,
+        &format!("UPDATE extents SET plan = x'ff', article_count = 1 WHERE id = '{id}';"),
+    );
+    let stored = format!("extents WHERE id = '{id}' AND hex(plan) = 'FF'");
+    assert_eq!(rig.count(&stored), 1);
+    for _ in 0..2 {
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert_eq!(report.unreadable, [record.as_str()], "{report:?}");
+        assert_eq!(rig.count(&stored), 1, "the value stays as it is");
+    }
+}
+
 /// A record sealed under another key or stored under another name does
 /// not open.
 #[tokio::test(flavor = "current_thread")]
