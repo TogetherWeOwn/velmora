@@ -550,6 +550,32 @@ got=$("${SIGV4_GET[@]}" gzip identity "$T/got-ae.bin" 2>&1) ||
 rm -f "$T/got-ae.bin"
 
 # ---------------------------------------------------------------------------
+# 1b2 a stored Content-Encoding is served as stored
+# ---------------------------------------------------------------------------
+
+STEP=1b2-stored-content-encoding
+log "step $STEP"
+# An object uploaded already gzipped, with Content-Encoding: gzip, comes
+# back as the stored bytes: the runtime must not compress it again.
+for i in $(seq 1 200); do printf '<p>stored gzip line %d</p>\n' "$i"; done | gzip -n -c >"$T/enc.html.gz"
+run_aws "PUT a/enc.html (Content-Encoding: gzip)" "${S3API[@]}" put-object --bucket "$SB" --key a/enc.html \
+  --body "$T/enc.html.gz" --content-type text/html --content-encoding gzip >/dev/null
+got=$(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/enc.html" gzip gzip "$T/got-enc.bin" 2>&1) ||
+  fail "GET a/enc.html with Accept-Encoding: gzip" "the helper exits 0" "$got"
+[[ $got == "200 -" ]] || fail "GET a/enc.html with Accept-Encoding: gzip" "200" "$got"
+same_bytes "GET a/enc.html equals the stored gzip bytes" "$T/enc.html.gz" "$T/got-enc.bin"
+json=$(run_aws "HEAD a/enc.html" "${S3API[@]}" head-object --bucket "$SB" --key a/enc.html)
+enc_len=$(stat -c %s "$T/enc.html.gz")
+enc_md5=$(md5sum "$T/enc.html.gz" | cut -d' ' -f1)
+# Content-Encoding itself is not asserted on HEAD: for a compressible
+# Content-Type and a client that does not accept gzip (aws-cli sends
+# identity), `wrangler dev` leaves it out (see docs/object-responses.md).
+jcheck "HEAD a/enc.html keeps its length and strong ETag" \
+  ".ContentLength == $enc_len and .ETag == \"\\\"$enc_md5\\\"\"" "$json"
+run_aws "DELETE a/enc.html" "${S3API[@]}" delete-object --bucket "$SB" --key a/enc.html >/dev/null
+rm -f "$T/enc.html.gz" "$T/got-enc.bin"
+
+# ---------------------------------------------------------------------------
 # 1c an access key: minted, used, revoked, refused
 # ---------------------------------------------------------------------------
 

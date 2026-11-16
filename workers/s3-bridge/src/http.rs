@@ -14,7 +14,7 @@
 use futures_util::StreamExt;
 use velmora_bridge::ingress::{self, IngressError};
 use velmora_bridge::{Body, BridgeError, Method, RespBody, S3Request, S3Response};
-use worker::{FixedLengthStream, Headers, Request, Response, ResponseBody};
+use worker::{EncodeBody, FixedLengthStream, Headers, Request, Response, ResponseBody};
 
 /// One request as the bridge sees it, plus what the edge knows about it.
 pub struct Incoming {
@@ -115,7 +115,14 @@ fn try_response(resp: S3Response) -> worker::Result<Response> {
             }
         }
     };
-    Ok(out.with_status(resp.status).with_headers(headers))
+    // `manual`: the body is sent as it is. Every body is final; a
+    // `content-encoding` header can only be an object's stored metadata,
+    // which describes the stored bytes. The default (`automatic`) would
+    // compress such an object again and drop its length.
+    Ok(out
+        .with_status(resp.status)
+        .with_headers(headers)
+        .with_encode_body(EncodeBody::Manual))
 }
 
 /// A class-only `500` (fail closed). Never names a variable or value.
