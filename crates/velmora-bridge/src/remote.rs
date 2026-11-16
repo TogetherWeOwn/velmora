@@ -281,6 +281,15 @@ impl<H: HttpSend> S3Remote<H> {
         S3Remote { cfg, http }
     }
 
+    /// Names the place the copy goes to (host, bucket and prefix), so
+    /// that what is saved about one place is not read as being about
+    /// another. No secret is in it.
+    pub fn place(&self) -> String {
+        let cfg = &self.cfg;
+        let named = format!("{}\n{}\n{}", cfg.host, cfg.bucket, cfg.prefix);
+        hex(&Sha256::digest(named.as_bytes())[..8])
+    }
+
     /// Signs and sends, with the retries of the module doc. A 2xx or a
     /// 404 is returned; every other status is an error.
     #[allow(clippy::too_many_arguments)]

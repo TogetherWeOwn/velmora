@@ -15,8 +15,8 @@ use velmora_bridge::config::{ConfigError, Maintenance};
 use velmora_bridge::copy::{
     pass_due, plan_hint, Copier, CopyCounts, StepError, BEGAN_KEY, DOWN_KEY, FRESH_MS,
     HINT_PAUSE_MS, HINT_RETRY_MS, HINT_RETRY_SECS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
-    RETRY_WINDOW_MS, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, SWEPT_KEY, WALKED_KEY,
-    WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
+    RETRY_WINDOW_MS, STORE_KEY, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, SWEPT_KEY,
+    WALKED_KEY, WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
@@ -1168,8 +1168,8 @@ async fn pass_is_idempotent_second_pass_copies_nothing() {
     assert_eq!(w.e2.count("GET "), lists + 5);
     assert_eq!(w.e2.count("HEAD "), 7);
     // MemBlobStore lists by reading (the port's default); the place of
-    // the walk is read once; nothing more.
-    assert_eq!(w.safety.gets(), gets + 8);
+    // the walk and the name of its store are read once; nothing more.
+    assert_eq!(w.safety.gets(), gets + 9);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2393,6 +2393,7 @@ async fn any_saved_place_of_the_walk_is_safe() {
             for key in ["m/art/x_1", "m/art/x_5", "m/del/g_0000000000001_t", &old] {
                 w.record(key, b"record").await;
             }
+            known_store(&w).await;
             w.raw(WALK_KEY, place.as_bytes().to_vec()).await;
             for (key, body) in times.iter() {
                 w.raw(key, body.to_vec()).await;
@@ -2417,6 +2418,7 @@ async fn any_saved_place_of_the_walk_is_safe() {
             w.raw(BEGAN_KEY, times[0].clone()).await;
             w.raw(WALKED_KEY, times[1].clone()).await;
             no_gap(&w, UnixMs(NOW)).await;
+            known_store(&w).await;
             let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
             assert_eq!((counts.unwrap().records, why), (0, None), "{place}");
             let day = UnixMs(NOW + WALK_INTERVAL_MS - PASS_INTERVAL_MS);
@@ -3051,6 +3053,7 @@ async fn a_sweep_whose_time_is_up_leaves_the_pass_to_the_walk() {
     w.raw(WALK_KEY, b"m/art/x_1".to_vec()).await;
     w.raw(BEGAN_KEY, (NOW - PASS_INTERVAL_MS).to_string().into_bytes())
         .await;
+    known_store(&w).await;
     w.clock.advance_ms(SWEEP_MS);
     let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
     assert!(step.late);
@@ -3452,6 +3455,11 @@ impl BlobStore for Counted<'_> {
 async fn time_at(w: &World, key: &str) -> Option<String> {
     let bytes = w.safety.get(key, None).await.unwrap()?;
     Some(String::from_utf8(bytes).unwrap())
+}
+
+/// The times of the walk that are saved are about the store of `w`.
+async fn known_store(w: &World) {
+    w.raw(STORE_KEY, w.remote.place().into_bytes()).await;
 }
 
 /// The pass before the one at `pass` came to the end of its sweep.
@@ -4022,6 +4030,7 @@ async fn any_saved_time_of_the_walk_is_safe() {
         for (key, body) in times {
             w.raw(key, body.to_vec()).await;
         }
+        known_store(&w).await;
         w
     }
     async fn walks(w: &World, at: i64) -> bool {
@@ -4213,7 +4222,7 @@ async fn a_gap_in_the_passes_asks_for_the_walk() {
     for (body, asks) in [
         (&b"soon"[..], true),
         (b"0", true),
-        (b"9999999999999999", false),
+        (b"9999999999999999", true),
     ] {
         let w = World::new();
         w.raw(SWEPT_KEY, body.to_vec()).await;
@@ -4369,5 +4378,36 @@ async fn a_gap_does_not_write_over_a_later_time_that_asks_for_the_walk() {
         w.raw(SWEPT_KEY, b"0".to_vec()).await;
         assert!(queued_pass(&w, &w.copier(), later).await.is_empty());
         assert_eq!(time_at(&w, WANT_KEY).await, ms(later.0 - 1));
+    }
+}
+
+/// The copy is pointed at another bucket or prefix, which holds
+/// nothing. The times of the walk are about the store before: they
+/// count for nothing, and the next pass walks every key.
+#[tokio::test(flavor = "current_thread")]
+async fn the_times_of_the_walk_are_about_one_store_only() {
+    for other in [Some(&b"0123456789abcdef"[..]), Some(b""), None] {
+        let w = World::new();
+        for i in 0..4 {
+            w.record(&format!("m/art/x_{i}"), b"plan").await;
+        }
+        assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+        assert_eq!(time_at(&w, STORE_KEY).await, Some(w.remote.place()));
+        // The walk rests, and does not see a copy that is not right.
+        w.e2.set("m/art/x_0", b"other");
+        let pass = |n: i64| UnixMs(NOW + n * PASS_INTERVAL_MS);
+        w.clock.set(pass(1));
+        assert!(queued_pass(&w, &w.copier(), pass(1)).await.is_empty());
+        assert_eq!(w.e2.get("m/art/x_0").as_deref(), Some(&b"other"[..]));
+        // What is saved names another store, or none.
+        match other {
+            Some(name) => w.raw(STORE_KEY, name.to_vec()).await,
+            None => w.safety.delete(STORE_KEY).await.unwrap(),
+        }
+        w.clock.set(pass(2));
+        assert!(queued_pass(&w, &w.copier(), pass(2)).await.is_empty());
+        assert_ne!(w.e2.get("m/art/x_0").as_deref(), Some(&b"other"[..]));
+        assert_eq!(time_at(&w, STORE_KEY).await, Some(w.remote.place()));
+        assert_eq!(time_at(&w, WALKED_KEY).await, ms(pass(2).0));
     }
 }

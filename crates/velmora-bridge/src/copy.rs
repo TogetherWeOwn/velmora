@@ -81,7 +81,10 @@
 //!   come yet, starts it at once. [`BEGAN_KEY`], [`WANT_KEY`] and
 //!   [`SWEPT_KEY`] can only bring a walk forward, and [`DOWN_KEY`] can
 //!   only hold the hints back for [`HINT_PAUSE_MS`]; none of them can
-//!   put a walk off. The saved place counts only while a walk is under
+//!   put a walk off. They count only for the store they were saved
+//!   about ([`STORE_KEY`]): a copy that is pointed at another bucket
+//!   or prefix is walked at once. The saved place counts only while a
+//!   walk is under
 //!   way, that is when one began after the last one ended; otherwise
 //!   the walk starts from the first key.
 //! - **A time or a place that cannot be saved is reported in every
@@ -164,6 +167,11 @@ pub const HINT_RETRY_SECS: u32 = 120;
 /// this long.
 pub const HINT_PAUSE_MS: i64 = 5 * 60 * 1000;
 /// The bytes read of a saved time.
+/// Where [`S3Remote::place`] of the store that the times of the walk
+/// are about is saved. When it does not name the store of this pass
+/// (the copy was pointed at another bucket or prefix), those times
+/// count for nothing and the walk begins at once.
+pub const STORE_KEY: &str = "rc/store";
 const TIME_BYTES: usize = 20;
 /// How far the fresh generation records came that are not sent yet: a
 /// JSON object, key of the record to the number of its article plans,
@@ -700,7 +708,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // begins in it answers.
         if place.is_none() {
             let last = self.read_time(SWEPT_KEY).await;
-            if !matches!(last, Ok(Some(at)) if pass.0 - at <= PASS_INTERVAL_MS) {
+            if !matches!(last, Ok(Some(at)) if (0..=PASS_INTERVAL_MS).contains(&(pass.0 - at))) {
                 // Not over a later time that has come: a job that
                 // asked after this pass started would be forgotten.
                 let asked = self.read_time(WANT_KEY).await;
@@ -749,6 +757,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             // such a place under it would go on from there.
             saved &= self.save_walk("").await.is_ok();
             saved = saved && self.save_time(BEGAN_KEY, pass).await.is_ok();
+            // Last: until it is there, the next pass begins again.
+            let store = self.remote.place().into_bytes();
+            saved = saved && self.put_mark(STORE_KEY, store).await.is_ok();
         }
         let started = saved;
         if step.ended {
@@ -866,7 +877,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let ended = self.read_time(WALKED_KEY).await;
         // A time that has not come yet is none: an end in the future
         // would otherwise make every pass begin the walk again.
-        let come = |at: &i64| *at < pass.0 + PASS_INTERVAL_MS;
+        // And so is a time that is about another store: that one may
+        // hold nothing yet.
+        let here = self.remote.place().into_bytes();
+        let store = self.safety.get(STORE_KEY, None).await;
+        let same = store.map_err(|_| StepError::Source)? == Some(here);
+        let come = |at: &i64| same && *at < pass.0 + PASS_INTERVAL_MS;
         let ended = ended.map_err(|_| StepError::Source)?.filter(come);
         let start = self.read_time(BEGAN_KEY).await;
         let start = start.map_err(|_| StepError::Source)?.filter(come);
@@ -985,7 +1001,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             return (JobOutcome::Ack, None, None);
         }
         let now = self.clock.now().0;
-        let young = (0..HINT_RETRY_MS).contains(&(now - hint.made));
+        let young = (0..HINT_RETRY_MS).contains(&now.saturating_sub(hint.made));
         let down = StepError::Store(RemoteError::Unavailable);
         let paused = matches!(
             self.read_time(DOWN_KEY).await,
