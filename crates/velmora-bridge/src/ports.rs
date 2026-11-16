@@ -367,6 +367,19 @@ pub enum PublishOutcome {
 // Fenced methods return Ok(false) (or None) when the lease token no longer
 // matches: the caller stops and acks.
 
+/// The ids the catalogue holds on one key ([`Catalog::key_heads`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyHead {
+    /// The id of the live generation.
+    pub live: Option<GenerationId>,
+    /// The floor of the key.
+    pub floor: Option<GenerationId>,
+    /// The floor stands for a generation record that may exist, was
+    /// never published and is covered by no tombstone
+    /// ([`Catalog::unpublished_floor`]).
+    pub unpublished: bool,
+}
+
 /// The catalogue, implemented once: `sql::SqlCatalog<S: Sql>`.
 pub trait Catalog {
     // admin + auth
@@ -561,6 +574,26 @@ pub trait Catalog {
         key: &str,
         before: &GenerationId,
         condition: &Precondition,
+        now: UnixMs,
+    ) -> Result<bool>;
+    /// What [`Self::live_object`] and the floor of each key say, for
+    /// every key of `keys` in its order, read in one statement: all keys
+    /// as of one moment.
+    async fn key_heads(&self, bucket: &BucketId, keys: &[&str]) -> Result<Vec<KeyHead>>;
+    /// [`Self::raise_floor`] for the tombstone of every `(key, id)`, in
+    /// one batch: all floors are raised or, on an error, none.
+    async fn raise_floors(&self, bucket: &BucketId, ids: &[(&str, &GenerationId)]) -> Result<()>;
+    /// [`Self::settle_floor`] for every `(key, id)`, in one batch.
+    async fn settle_floors(&self, bucket: &BucketId, ids: &[(&str, &GenerationId)]) -> Result<()>;
+    /// [`Self::delete_object_before`] for every `(key, id)` (each key
+    /// once), in one batch: every key is deleted as that call deletes
+    /// it, in the order given, or nothing is changed. `false` = nothing
+    /// was changed, because for at least one key that call would have
+    /// answered `false`; the caller then asks key by key.
+    async fn delete_objects_before(
+        &self,
+        bucket: &BucketId,
+        deletes: &[(&str, &GenerationId)],
         now: UnixMs,
     ) -> Result<bool>;
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage>;

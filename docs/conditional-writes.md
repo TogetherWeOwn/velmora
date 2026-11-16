@@ -82,6 +82,33 @@ delete changes nothing and starts again after that write:
 A delete that meets a newer write several times in a row is answered
 `503 SlowDown` (in DeleteObjects: for that key) and can be sent again.
 
+## DeleteObjects
+
+A DeleteObjects request deletes each key it names the way a DeleteObject
+does, and leaves what one DeleteObject per key leaves: the same
+tombstone record for each key, stored before the catalogue changes, and
+the same catalogue rows. What differs is the number of calls. The keys
+are taken in chunks of up to 50 (less for long keys: 32 KiB of key text
+a chunk), four chunks at a time, and each step of a chunk is one
+catalogue call for all its keys: one read of their ids, one batch that
+raises their floors, one that settles them, one that deletes. The
+tombstones are stored one record a key, six at a time within a chunk.
+
+- A key named more than once is deleted once; every mention gets the
+  answer of the first.
+- A key whose step in the chunk fails is reported with its own error;
+  the other keys of the request are not affected.
+- When the deleting batch of a chunk is refused (a write or another
+  delete moved one of its keys meanwhile), nothing of it is applied and
+  each of its keys goes on alone, on the path of a DeleteObject, with
+  the tombstone it already has on record.
+
+A request of 1,000 live keys with nothing else at work on them makes
+about 100 catalogue calls and 1,000 store calls (before: about 7,000 and
+1,000). When every chunk is refused once it is about 6 calls a key; a
+key that keeps meeting newer writes ends as `SlowDown` after four
+tries, as before.
+
 ## Limits
 
 - The answer `412`/`404` is given only when the recovery record of the

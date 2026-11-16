@@ -77,7 +77,8 @@ mod uploads;
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
 use crate::ports::{
-    Catalog, Guard, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue, UploadTarget,
+    Catalog, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
+    UploadTarget,
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
@@ -276,6 +277,27 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<bool> {
         recovery::delete_object_before(self, bucket, key, before, Some(condition), now, true).await
+    }
+    async fn key_heads(&self, bucket: &BucketId, keys: &[&str]) -> Result<Vec<KeyHead>> {
+        objects::key_heads(self, bucket, keys).await
+    }
+    async fn raise_floors(&self, bucket: &BucketId, ids: &[(&str, &GenerationId)]) -> Result<()> {
+        // As `raise_floor`: without the bucket no record may be stored.
+        match objects::raise_floors(self, bucket, ids).await? {
+            true => Ok(()),
+            false => Err(BridgeError::Invalid("the bucket of the key does not exist")),
+        }
+    }
+    async fn settle_floors(&self, bucket: &BucketId, ids: &[(&str, &GenerationId)]) -> Result<()> {
+        objects::settle_floors(self, bucket, ids).await
+    }
+    async fn delete_objects_before(
+        &self,
+        bucket: &BucketId,
+        deletes: &[(&str, &GenerationId)],
+        now: UnixMs,
+    ) -> Result<bool> {
+        recovery::delete_objects_before(self, bucket, deletes, now).await
     }
     async fn replay_tombstone(
         &self,

@@ -11,7 +11,7 @@ use super::intents::publish_intents;
 use super::replay::guard_no_replay;
 use super::uploads::published;
 use super::SqlCatalog;
-use crate::ports::{PublishOutcome, Row, Sql, SqlValue};
+use crate::ports::{KeyHead, PublishOutcome, Row, Sql, SqlValue};
 use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
@@ -228,7 +228,7 @@ pub(super) async fn live_object<S: Sql>(
 // Publication and deletion
 // ---------------------------------------------------------------------------
 
-type Stmt = (&'static str, Vec<SqlValue>);
+pub(super) type Stmt = (&'static str, Vec<SqlValue>);
 
 /// The extents that leave service when the generation `objects` points
 /// at for `(?1, ?2)` is retired: those it references that no other live
@@ -376,23 +376,43 @@ pub(super) async fn raise_floor<S: Sql>(
     id: &GenerationId,
     generation: bool,
 ) -> Result<u64> {
-    c.sql
-        .exec(
-            // Nothing for a bucket the catalogue does not have (a replay
-            // can read a tombstone of one): nothing is published there.
-            "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
-             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
-             ON CONFLICT(bucket_id, key) DO UPDATE SET \
-               floor_id = max(floor_id, excluded.floor_id), \
-               unpublished = max(unpublished, excluded.unpublished)",
-            &[
-                text(bucket.as_str()),
-                text(key),
-                text(id.as_str()),
-                SqlValue::Int(i64::from(generation)),
-            ],
-        )
-        .await
+    let (sql, params) = raise_floor_stmt(bucket, key, id, generation);
+    c.sql.exec(sql, &params).await
+}
+
+fn raise_floor_stmt(bucket: &BucketId, key: &str, id: &GenerationId, generation: bool) -> Stmt {
+    (
+        // Nothing for a bucket the catalogue does not have (a replay
+        // can read a tombstone of one): nothing is published there.
+        "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET \
+           floor_id = max(floor_id, excluded.floor_id), \
+           unpublished = max(unpublished, excluded.unpublished)",
+        vec![
+            text(bucket.as_str()),
+            text(key),
+            text(id.as_str()),
+            SqlValue::Int(i64::from(generation)),
+        ],
+    )
+}
+
+/// [`raise_floor`] for the tombstone of every `(key, id)`, as one batch.
+/// `false` = the catalogue has no such bucket, and no floor was raised.
+pub(super) async fn raise_floors<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    ids: &[(&str, &GenerationId)],
+) -> Result<bool> {
+    let stmts: Vec<Stmt> = ids
+        .iter()
+        .map(|(key, id)| raise_floor_stmt(bucket, key, id, false))
+        .collect();
+    // One transaction: the bucket is there for every statement or for
+    // none, so either every key has its floor or no row was changed.
+    let changed = c.sql.batch(stmts).await?;
+    Ok(changed.iter().all(|n| *n == 1))
 }
 
 /// The tombstone `id` of `(bucket, key)` is stored: it covers every
@@ -404,14 +424,80 @@ pub(super) async fn settle_floor<S: Sql>(
     key: &str,
     id: &GenerationId,
 ) -> Result<()> {
-    c.sql
-        .exec(
-            "UPDATE key_floors SET unpublished = 0 \
-             WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3 AND unpublished <> 0",
-            &[text(bucket.as_str()), text(key), text(id.as_str())],
+    let (sql, params) = settle_floor_stmt(bucket, key, id);
+    c.sql.exec(sql, &params).await.map(|_| ())
+}
+
+fn settle_floor_stmt(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
+    (
+        "UPDATE key_floors SET unpublished = 0 \
+         WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3 AND unpublished <> 0",
+        vec![text(bucket.as_str()), text(key), text(id.as_str())],
+    )
+}
+
+/// [`settle_floor`] for every `(key, id)`, as one batch.
+pub(super) async fn settle_floors<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    ids: &[(&str, &GenerationId)],
+) -> Result<()> {
+    let stmts = ids
+        .iter()
+        .map(|(key, id)| settle_floor_stmt(bucket, key, id))
+        .collect();
+    c.sql.batch(stmts).await.map(|_| ())
+}
+
+/// The live id and the floor of every key of `keys`, in its order. One
+/// statement, so the answer is the catalogue of one moment. The keys go
+/// as one JSON array; each row names the place and the text of its key,
+/// and an answer that is not exactly the keys asked for is an error.
+pub(super) async fn key_heads<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    keys: &[&str],
+) -> Result<Vec<KeyHead>> {
+    let bad = || BridgeError::Sql("key_heads: unexpected row".into());
+    let list = serde_json::to_string(keys).map_err(|_| bad())?;
+    let rows = c
+        .sql
+        .query(
+            "SELECT k.key, k.value, o.generation_id, f.floor_id, f.unpublished \
+             FROM json_each(?2) k \
+             LEFT JOIN objects o ON o.bucket_id = ?1 AND o.key = k.value \
+             LEFT JOIN key_floors f ON f.bucket_id = ?1 AND f.key = k.value \
+             ORDER BY k.key",
+            &[text(bucket.as_str()), text(&list)],
         )
-        .await
-        .map(|_| ())
+        .await?;
+    if rows.len() != keys.len() {
+        return Err(bad());
+    }
+    let id = |v: SqlValue| match v {
+        SqlValue::Text(id) => Ok(Some(GenerationId::new(id))),
+        SqlValue::Null => Ok(None),
+        _ => Err(bad()),
+    };
+    rows.into_iter()
+        .zip(keys.iter().enumerate())
+        .map(|(row, (i, key))| {
+            let [at, value, live, floor, unpublished] =
+                <[SqlValue; 5]>::try_from(row).map_err(|_| bad())?;
+            if at != SqlValue::Int(i as i64) || value != SqlValue::Text((*key).to_owned()) {
+                return Err(bad());
+            }
+            Ok(KeyHead {
+                live: id(live)?,
+                floor: id(floor)?,
+                unpublished: match unpublished {
+                    SqlValue::Int(n) => n != 0,
+                    SqlValue::Null => false,
+                    _ => return Err(bad()),
+                },
+            })
+        })
+        .collect()
 }
 
 /// The floor of `(bucket, key)` if a generation record may exist under

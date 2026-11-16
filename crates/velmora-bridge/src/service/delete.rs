@@ -2,11 +2,16 @@
 //! Idempotent, so a key that does not exist is deleted too (`204`, or a
 //! `Deleted` entry).
 //!
-//! There is one delete path, [`delete_key`]. DeleteObject runs it for the
-//! key in the path, DeleteObjects for every key in its body: the same
-//! gate against a replay, the same tombstone record before the catalogue
-//! batch, the same guarded batch. A DeleteObjects request of N keys
-//! leaves what N DeleteObject requests leave.
+//! There is one delete of a key: the gate against a replay, the ids of
+//! the key, the tombstone record, then the guarded catalogue batch.
+//! DeleteObject runs it for the key in the path ([`delete_key`]).
+//! DeleteObjects runs the same steps for the keys of its body, a chunk
+//! of keys at a time ([`delete_chunk`]): each step is one catalogue call
+//! for the whole chunk instead of one per key, and the tombstone of
+//! every key is on record before the batch that deletes it. A key whose
+//! turn in the chunk did not settle it (another request is at work on
+//! it) goes on alone, on the path of a DeleteObject. A DeleteObjects
+//! request of N keys leaves what N DeleteObject requests leave.
 //!
 //! A DeleteObject with `If-Match` takes [`delete_key_if`]: it deletes
 //! only the object the condition names, which the batch that deletes
@@ -27,18 +32,31 @@ use super::common::{
 };
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
-use crate::recovery::{tombstone_id, write_tombstone};
-use crate::types::{Bucket, Precondition, RespBody, S3Request, S3Response};
+use crate::recovery::{tombstone_id, write_tombstone, write_tombstones, NewTombstone};
+use crate::types::{Bucket, GenerationId, Precondition, RespBody, S3Request, S3Response, UnixMs};
 
 /// Most keys one DeleteObjects request may name (the S3 limit).
 pub const MAX_DELETE_KEYS: usize = 1000;
 pub use crate::ingress::MAX_DELETE_BODY_BYTES;
-/// Keys of one DeleteObjects request that are deleted at the same time.
-/// Each delete is a handful of catalogue and store calls in sequence, so
-/// this is also the number of connections the request holds open.
+/// Most keys of one DeleteObjects request that share their catalogue
+/// calls: about seven statements a key in the batch that deletes.
+const DELETE_CHUNK_KEYS: usize = 50;
+/// Most bytes of key text in such a chunk, whatever the number of keys.
+/// A key is bound several times in a batch; this keeps one batch of the
+/// longest keys in the low hundreds of kilobytes.
+const DELETE_CHUNK_KEY_BYTES: usize = 32 * 1024;
+/// Chunks of one DeleteObjects request that are at work at the same
+/// time. Their keys are different ones, so they do not wait for each
+/// other; while one waits for the catalogue, the tombstones of the
+/// others are on their way to the store.
+const DELETE_CHUNKS: usize = 4;
+/// Keys of one chunk that go on alone at the same time, when the batch
+/// of the chunk deleted nothing. Each is a handful of catalogue and
+/// store calls in sequence.
 const DELETE_CONCURRENCY: usize = 6;
 
 /// Why one key was not deleted.
+#[derive(Clone, Copy)]
 enum DeleteError {
     /// Catalogue, store or RNG failure.
     Internal,
@@ -133,7 +151,17 @@ async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     bucket: &Bucket,
     key: &str,
 ) -> Result<(), DeleteError> {
-    for _ in 0..DELETE_ATTEMPTS {
+    delete_key_in(bridge, bucket, key, DELETE_ATTEMPTS).await
+}
+
+/// [`delete_key`] with `attempts` attempts left.
+async fn delete_key_in<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    key: &str,
+    attempts: usize,
+) -> Result<(), DeleteError> {
+    for _ in 0..attempts {
         if delete_key_once(bridge, bucket, key).await? {
             return Ok(());
         }
@@ -215,9 +243,23 @@ async fn delete_key_once<
     )
     .await
     .map_err(failed)?;
+    commit_delete(bridge, bucket, key, &tombstone, now).await
+}
+
+/// The end of one attempt: the batch that deletes `key` under its
+/// `tombstone`, which is on record, and what it means when the batch
+/// changed nothing. `false` as [`delete_key_once`].
+async fn commit_delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    key: &str,
+    tombstone: &GenerationId,
+    now: UnixMs,
+) -> Result<bool, DeleteError> {
+    let failed = |_| DeleteError::Internal;
     let deleted = bridge
         .catalog
-        .delete_object_before(&bucket.id, key, &tombstone, now)
+        .delete_object_before(&bucket.id, key, tombstone, now)
         .await
         .map_err(failed)?;
     if deleted {
@@ -235,7 +277,7 @@ async fn delete_key_once<
         .newest_id(&bucket.id, key)
         .await
         .map_err(failed)?;
-    if newest.is_some_and(|n| n > tombstone) {
+    if newest.is_some_and(|n| n > *tombstone) {
         return Ok(false);
     }
     // Or nothing older than the tombstone was live any more (another
@@ -246,9 +288,162 @@ async fn delete_key_once<
         .await
         .map_err(failed)?;
     match live {
-        Some((live, _)) if live.id < tombstone => Err(DeleteError::Refused),
+        Some((live, _)) if live.id < *tombstone => Err(DeleteError::Refused),
         _ => Ok(true),
     }
+}
+
+/// The first attempt of [`delete_key`] for every key of `keys` (each
+/// key once), with one catalogue call a step for all of them, and the
+/// later attempts of the keys that need one. The answers are in the
+/// order of `keys`.
+///
+/// Every key goes through the steps of [`delete_key_once`] in their
+/// order: the gate, its ids, its floor, its tombstone record, the mark
+/// on the floor, the batch. A step that is one call here fails for all
+/// keys that take it, as it fails for the key of a DeleteObject: they
+/// answer `InternalError` and nothing further is done for them. The
+/// batch deletes all keys that have a live object, or none. When it
+/// deletes none, one of them is held up (a newer id, another delete, a
+/// replay), and each key takes the rest of its attempt alone, under the
+/// tombstone it has.
+async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    keys: &[&str],
+) -> Vec<Result<(), DeleteError>> {
+    let all = |e: DeleteError| keys.iter().map(|_| Err(e)).collect::<Vec<_>>();
+    match bridge.catalog.restore_pending().await {
+        Ok(false) => {}
+        Ok(true) => return all(DeleteError::Refused),
+        Err(_) => return all(DeleteError::Internal),
+    }
+    let Ok(heads) = bridge.catalog.key_heads(&bucket.id, keys).await else {
+        return all(DeleteError::Internal);
+    };
+    if heads.len() != keys.len() {
+        return all(DeleteError::Internal);
+    }
+    // `Ok` until a step says otherwise.
+    let mut done: Vec<Result<(), DeleteError>> = vec![Ok(()); keys.len()];
+    // The keys that need a tombstone: the place of each in `keys`,
+    // whether it has a live object, and its tombstone.
+    let mut places = Vec::new();
+    let mut tombstones = Vec::new();
+    for (place, (key, head)) in keys.iter().zip(heads).enumerate() {
+        // Nothing live and no record a replay would publish: nothing to
+        // delete and nothing to record (see `delete_key_once`).
+        if head.live.is_none() && !head.unpublished {
+            continue;
+        }
+        let live = head.live.is_some();
+        // The live generation, or a floor above it.
+        let Some(newest) = head.live.max(head.floor) else {
+            done[place] = Err(DeleteError::Internal);
+            continue;
+        };
+        let now = bridge.clock.now();
+        let mut rand = [0u8; 8];
+        if SystemRng.fill_bytes(&mut rand).is_err() {
+            done[place] = Err(DeleteError::Internal);
+            continue;
+        }
+        places.push((place, live));
+        tombstones.push(NewTombstone {
+            key,
+            id: tombstone_id(now, &newest, rand),
+            now,
+        });
+    }
+    // Every tombstone is durable before the batch below.
+    let stored = match write_tombstones(
+        &bridge.catalog,
+        &bridge.safety,
+        &bridge.kek,
+        &bucket.id,
+        &tombstones,
+    )
+    .await
+    {
+        Ok(stored) if stored.len() == tombstones.len() => stored,
+        _ => {
+            for (place, _) in places {
+                done[place] = Err(DeleteError::Internal);
+            }
+            return done;
+        }
+    };
+    // The keys whose tombstone is on record. Those with a live object
+    // share the batch that deletes. A key without one has a tombstone
+    // for the record of a write that was not published: its own batch
+    // finds nothing to delete, which would undo the batch of all, so it
+    // takes the end of its attempt alone.
+    let mut batch = Vec::new();
+    let mut alone = Vec::new();
+    for (((place, live), tombstone), stored) in places.into_iter().zip(&tombstones).zip(stored) {
+        match stored {
+            Ok(()) if live => batch.push((place, tombstone)),
+            Ok(()) => alone.push((place, tombstone)),
+            Err(_) => done[place] = Err(DeleteError::Internal),
+        }
+    }
+    if !batch.is_empty() {
+        let deletes: Vec<(&str, &GenerationId)> =
+            batch.iter().map(|(_, t)| (t.key, &t.id)).collect();
+        // One clock reading for the batch, not older than any tombstone.
+        match bridge
+            .catalog
+            .delete_objects_before(&bucket.id, &deletes, bridge.clock.now())
+            .await
+        {
+            Ok(true) => {}
+            // Nothing was deleted: one key is held up (a newer id,
+            // another delete, a replay). Each on its own from here.
+            Ok(false) => alone.append(&mut batch),
+            Err(_) => {
+                for (place, _) in batch {
+                    done[place] = Err(DeleteError::Internal);
+                }
+            }
+        }
+    }
+    let alone: Vec<(usize, Result<(), DeleteError>)> = stream::iter(alone)
+        .map(|(place, tombstone)| async move {
+            let key = tombstone.key;
+            let result =
+                match commit_delete(bridge, bucket, key, &tombstone.id, tombstone.now).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => delete_key_in(bridge, bucket, key, DELETE_ATTEMPTS - 1).await,
+                    Err(e) => Err(e),
+                };
+            (place, result)
+        })
+        .buffered(DELETE_CONCURRENCY)
+        .collect()
+        .await;
+    for (place, result) in alone {
+        done[place] = result;
+    }
+    done
+}
+
+/// Cuts `keys` into the chunks [`delete_chunk`] takes, in order.
+fn delete_chunks<'k, 'a>(keys: &'k [&'a str]) -> Vec<&'k [&'a str]> {
+    let mut chunks = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, key) in keys.iter().enumerate() {
+        if i > start
+            && (i - start == DELETE_CHUNK_KEYS || bytes + key.len() > DELETE_CHUNK_KEY_BYTES)
+        {
+            chunks.push(&keys[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += key.len();
+    }
+    if start < keys.len() {
+        chunks.push(&keys[start..]);
+    }
+    chunks
 }
 
 /// How often a delete is tried before it answers `SlowDown`.
@@ -411,10 +606,11 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
     // tree read from it are gone.
     drop(charge);
 
-    // Every key takes the path of a DeleteObject on it, once: a key that
-    // is named again gets the answer of its first mention, so the request
-    // leaves the records of one delete per key. The answers come back in
-    // request order.
+    // Every key is deleted as a DeleteObject deletes it, once: a key
+    // that is named again gets the answer of its first mention, so the
+    // request leaves the records of one delete per key, and no two
+    // deletes of this request are at work on one key. The answers come
+    // back in request order.
     let mut first: HashMap<&str, usize> = HashMap::new();
     let mut distinct: Vec<&str> = Vec::new();
     let slots: Vec<usize> = request
@@ -427,23 +623,31 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
             })
         })
         .collect();
-    let done: Vec<DeleteOutcome> = stream::iter(distinct)
-        .map(|key| async move {
-            if !storable_key(key) {
-                // No request can have stored such a key.
-                return DeleteOutcome::Failed {
-                    code: "InvalidArgument",
-                    message: "The key is not valid.",
-                };
-            }
-            match delete_key(bridge, bucket, key).await {
-                Ok(()) => DeleteOutcome::Deleted,
-                Err(e) => e.outcome(),
-            }
-        })
-        .buffered(DELETE_CONCURRENCY)
+    // No request can have stored a key that is not storable.
+    let mut done: Vec<DeleteOutcome> = vec![
+        DeleteOutcome::Failed {
+            code: "InvalidArgument",
+            message: "The key is not valid.",
+        };
+        distinct.len()
+    ];
+    let (places, storable): (Vec<usize>, Vec<&str>) = distinct
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| storable_key(key))
+        .map(|(place, key)| (place, *key))
+        .unzip();
+    let deleted: Vec<Vec<Result<(), DeleteError>>> = stream::iter(delete_chunks(&storable))
+        .map(|chunk| delete_chunk(bridge, bucket, chunk))
+        .buffered(DELETE_CHUNKS)
         .collect()
         .await;
+    for (place, result) in places.into_iter().zip(deleted.into_iter().flatten()) {
+        done[place] = match result {
+            Ok(()) => DeleteOutcome::Deleted,
+            Err(e) => e.outcome(),
+        };
+    }
     let outcomes: Vec<DeleteOutcome> = slots.into_iter().map(|i| done[i].clone()).collect();
     delete_result(&request.keys, &outcomes, request.quiet)
         .map(from_proto)
