@@ -7,7 +7,7 @@ const RETRIES = 4;
 
 const $ = (id) => document.getElementById(id);
 // What the server says about this session (see /api/session).
-const session = { email: "", adopt: false };
+const session = { email: "", adopt: null }; // null: not known yet
 const state = { bucket: "", prefix: "", folders: [], files: [], next: null, selected: new Set(), filter: "", listing: "ok" };
 
 function el(tag, props = {}, ...children) {
@@ -132,7 +132,8 @@ $("new-bucket").addEventListener("submit", async (ev) => {
       if (e.code !== "BucketAlreadyExists") throw e;
       const operatorMust = `${name} already exists; an operator must list it in ADOPT_BUCKETS to use it here.`;
       // Offered only where the deploy allows adopting at all.
-      if (!session.adopt) return toast(operatorMust);
+      // Unknown (session not loaded) still offers it: the server decides.
+      if (session.adopt === false) return toast(operatorMust);
       const answer = await dialog("Bucket exists", el("p", {}, `${name} already exists. Give this console read-write access to it? This cannot be undone from the console.`), [
         ["Cancel", "cancel", "ghost"],
         ["Give access", "ok"],
