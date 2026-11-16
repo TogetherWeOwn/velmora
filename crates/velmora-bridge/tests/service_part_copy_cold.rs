@@ -73,6 +73,8 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
     let mut cfg = config(vec![ProviderConfig {
         id: "p0".to_string(),
         host: server.addr().ip().to_string(),
+        hosts: Vec::new(),
+        host_select: Default::default(),
         port: server.addr().port(),
         tls: false,
         user: USER.to_string(),
@@ -86,7 +88,9 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         retention_days: None,
         pool: None,
         pool_max_conns: None,
+        proxies: Vec::new(),
         enabled: true,
+        release: true,
     }]);
     // The shipped ratio: the budget is three extents.
     cfg.max_extent_bytes = CAP as u64;

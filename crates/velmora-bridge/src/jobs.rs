@@ -21,11 +21,12 @@ use crate::config::{GcMode, Maintenance};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector};
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
+use crate::stamp::Advance;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
     GenerationId, Job, JobOutcome, OutboxStage, Result, JOB_VERSION,
 };
-use crate::verify::backbones;
+use crate::verify::release_labels;
 
 /// Outbox rows one dispatcher run re-sends (one queue batch).
 pub const DISPATCH_LIMIT: u32 = 100;
@@ -67,7 +68,7 @@ pub fn low_watermark(cap: u64) -> u64 {
     cap - cap / 10
 }
 
-const RETRY: JobOutcome = JobOutcome::Retry {
+pub(crate) const RETRY: JobOutcome = JobOutcome::Retry {
     delay_secs: INFRA_RETRY_SECS,
 };
 
@@ -110,6 +111,11 @@ where
                     Err(_) => RETRY,
                 }
             }
+            Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
+            // Run by the adapter that holds the recovery store
+            // (`crate::copy`), never here: one that arrives all the same
+            // is dropped, and the next pass does its work.
+            Job::RecoveryCopy { .. } => JobOutcome::Ack,
             // A message from another version: its outbox row is re-sent in
             // the current format.
             _ => JobOutcome::Ack,
@@ -199,6 +205,12 @@ where
     }
 
     async fn gc_batch(&self, disposable_only: bool) -> Result<()> {
+        // Nothing is deleted on a catalogue that is behind its stamp:
+        // its rows may name as garbage what a later commit used. A check
+        // that could not be made retries the job.
+        if self.catalogue_rolled_back().await? {
+            return Ok(());
+        }
         let now = self.clock.now();
         let rows = self.catalog.gc_due(now, GC_BATCH, disposable_only).await?;
         // One row that fails must not hold up the rows behind it. The row
@@ -252,6 +264,11 @@ where
     /// cap. Only a first step that is retried after an error totals the
     /// tier again and goes on from there.
     pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+        // As in garbage collection: no delete on a catalogue that is
+        // behind its stamp.
+        if self.catalogue_rolled_back().await? {
+            return Ok(0);
+        }
         let mut excess = remaining;
         if excess == 0 {
             let cap = self.cfg.hot_cap_bytes;
@@ -355,12 +372,38 @@ where
         Ok(over)
     }
 
-    /// The whole cron handler: bounded catalogue reads and queue sends
-    /// only.
+    /// The whole cron handler: bounded catalogue reads and queue sends,
+    /// plus the rollback stamp (one list call of one key and one small
+    /// put in the safety bucket).
     pub async fn dispatch(&self) -> Result<DispatchReport> {
         let mut report = DispatchReport::default();
-        if self.cfg.maintenance == Maintenance::Restore || self.catalog.restore_pending().await? {
+        if self.cfg.maintenance == Maintenance::Restore {
             return Ok(report);
+        }
+        if self.catalog.restore_pending().await? {
+            // Said on every run until the replay has ended. Checked
+            // against the bucket here too: a catalogue that was restored
+            // to a point where a replay ran is found now, not only by
+            // the last step of that replay.
+            report.rolled_back = self.catalogue_rolled_back().await?;
+            return Ok(report);
+        }
+        // The rollback stamp, before anything else: on a catalogue that
+        // was restored to an earlier point this run must send no job. A
+        // check that could not be made ends the run as well.
+        match self.stamp_advance(false).await? {
+            Advance::RolledBack => {
+                report.rolled_back = true;
+                return Ok(report);
+            }
+            // The check passed. A stamp object that could not be put is
+            // made up for by the next run.
+            Advance::Raised(counter) => {
+                report.stamp_failed = self.stamp_store(counter).await.is_err();
+            }
+            // The check passed and a write raised the stamp meanwhile:
+            // the run goes on without a raise of its own.
+            Advance::Checked => {}
         }
         let now = self.clock.now();
 
@@ -383,12 +426,11 @@ where
         // A `done` extent whose safety copy is held was short of backbones
         // when it was verified. Once enough are configured it is verified
         // again; the rows moved here are due at once and sent below.
-        let labels: Vec<String> = backbones(&self.cfg.providers)
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect();
+        // Only the backbones that count toward a release are asked for.
+        let labels = release_labels(&self.cfg.providers);
         let required = self.cfg.required_backbones;
-        if labels.len() >= required as usize {
+        report.release_paused = self.cfg.release_paused().is_some();
+        if !report.release_paused {
             // The re-drive is an extra: its failure must not keep the
             // due rows below from being sent.
             let redriven =
@@ -430,6 +472,9 @@ where
             Ok(sent) => report.evict_enqueued = sent,
             Err(_) => report.evict_failed = true,
         }
+
+        // Unpublished sliced writes whose slices are due for deletion.
+        self.sweep_check(now, &mut report).await;
 
         self.catalog.record_dispatch(now).await?;
         Ok(report)

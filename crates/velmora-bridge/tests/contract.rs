@@ -15,7 +15,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
     BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
-    DEFAULT_POST_SOCKETS, MAX_EXTENT_BYTES_LIMIT,
+    DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT, MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::recovery::Recorded;
@@ -31,6 +31,13 @@ use velmora_bridge::*;
 
 /// 2025-11-13T00:00:00.123Z.
 const T0: UnixMs = UnixMs(1_762_992_000_123);
+
+/// The backbones that count toward a release in these tests.
+fn bbs() -> Vec<String> {
+    ["bb", "bb-a", "bb-b", "bb1", "bb2"]
+        .map(String::from)
+        .to_vec()
+}
 
 fn text(s: &str) -> SqlValue {
     SqlValue::Text(s.to_string())
@@ -205,6 +212,9 @@ fn wrangler_vars() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
 }
 
 const PROVIDER_TLS: &str = r#"[{"id":"p1","host":"nntp.invalid","port":563,"tls":true,"user":"u-fixture","pass":"p-fixture","backbone":"bb1","post":true,"read":true,"max_conns":2}]"#;
+/// A second backbone, read only: outside dev a release needs two backbones
+/// that count toward it, and a configuration with fewer is refused.
+const SECOND_BACKBONE: &str = r#"{"id":"p2","host":"nntp2.invalid","port":563,"tls":true,"user":"u-fixture","pass":"p-fixture","backbone":"bb2","post":false,"read":true,"max_conns":2}"#;
 const PROVIDER_PLAIN: &str = r#"[{"id":"p1","host":"127.0.0.1","port":11119,"tls":false,"user":"testuser","pass":"testpass","backbone":"fake","post":true,"read":true,"max_conns":2}]"#;
 const ADMIN_TOKEN_FIXTURE: &str = "admin-token-fixture-admin-token-fixture";
 
@@ -215,6 +225,14 @@ fn kek_b64(byte: u8, len: usize) -> String {
 /// The shipped prod `S3_HOST` is a placeholder that config refuses (see
 /// `config_loads_from_documented_vars`); fixtures use a concrete host.
 const PROD_HOST_FIXTURE: &str = "velmora-s3.example.workers.dev";
+
+/// `PROVIDER_TLS` and the second backbone: the smallest list prod accepts.
+fn prod_providers() -> String {
+    format!(
+        "{},{SECOND_BACKBONE}]",
+        &PROVIDER_TLS[..PROVIDER_TLS.len() - 1]
+    )
+}
 
 fn with_secrets(mut vars: BTreeMap<String, String>, providers: &str) -> BTreeMap<String, String> {
     if vars.get("S3_HOST").is_some_and(|h| h.contains('<')) {
@@ -235,14 +253,14 @@ fn config_loads_from_documented_vars() {
     let (prod, dev) = wrangler_vars();
 
     // Until deploy fills in the account subdomain, prod refuses to start.
-    let mut shipped = with_secrets(prod.clone(), PROVIDER_TLS);
+    let mut shipped = with_secrets(prod.clone(), &prod_providers());
     shipped.insert("S3_HOST".into(), prod["S3_HOST"].clone());
     assert_eq!(
         load(&shipped).unwrap_err(),
         ConfigError::Invalid("S3_HOST".into())
     );
 
-    let cfg = load(&with_secrets(prod, PROVIDER_TLS)).unwrap();
+    let cfg = load(&with_secrets(prod, &prod_providers())).unwrap();
     assert_eq!(cfg.environment, Environment::Prod);
     assert_eq!(cfg.s3_host, PROD_HOST_FIXTURE);
     assert_eq!(cfg.required_backbones, 2);
@@ -250,7 +268,15 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
     assert_eq!(cfg.safety_min_age_secs, 604_800);
     assert_eq!(cfg.verify_delay_secs, 120);
-    assert_eq!(cfg.newsgroups, vec!["alt.binaries.test".to_string()]);
+    assert_eq!(
+        cfg.newsgroups,
+        [
+            "alt.binaries.boneless",
+            "alt.binaries.misc",
+            "alt.binaries.multimedia",
+            "alt.binaries.test"
+        ]
+    );
     assert_eq!(cfg.kek_active, 1);
     assert_eq!(cfg.gc_mode, GcMode::Off);
     assert_eq!(cfg.hot_cap_bytes, 100 * 1024 * 1024 * 1024);
@@ -258,11 +284,17 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.maintenance, Maintenance::Off);
     assert!(!cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
-    assert_eq!(cfg.providers.len(), 1);
+    assert_eq!(cfg.providers.len(), 2);
     // Production posts on six sockets per job, so that two post jobs fit
     // one isolate (see below); the grace keeps its default.
     assert_eq!(cfg.post_sockets, 6);
     assert_eq!(cfg.propagation_grace_secs, 21_600);
+    // A PutObject body may be 99 MiB, stored in slices of 8 MiB. The
+    // sweep of writes that were never published ships off in production.
+    assert_eq!(cfg.max_put_bytes, 99 * 1024 * 1024);
+    assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
+    assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
+    assert!(!cfg.intent_sweep);
 
     // The dev environment is complete on its own (envs do not inherit vars).
     let cfg = load(&with_secrets(dev.clone(), PROVIDER_PLAIN)).unwrap();
@@ -273,6 +305,10 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.verify_delay_secs, 1);
     assert_eq!(cfg.gc_mode, GcMode::Disposable);
     assert!(cfg.server_side_copy);
+    assert_eq!(
+        (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
+        (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
+    );
     // Absent or empty is the default; any other size is taken as given.
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     let mut sized = with_secrets(dev, PROVIDER_PLAIN);
@@ -280,14 +316,61 @@ fn config_loads_from_documented_vars() {
         sized.insert("HOT_CAP_BYTES".to_string(), value.to_string());
         assert_eq!(load(&sized).unwrap().hot_cap_bytes, want, "{value:?}");
     }
+    // The catalogue id is one path segment of the stamp keys.
+    assert_eq!(cfg.catalogue_id, "main");
+    for (value, want) in [("", Some("main")), (" eu-1 ", Some("eu-1")), ("a/b", None)] {
+        sized.insert("CATALOGUE_ID".to_string(), value.to_string());
+        let got = load(&sized).ok().map(|c| c.catalogue_id);
+        assert_eq!(got.as_deref(), want, "{value:?}");
+    }
     assert!(cfg.dev_trust_http);
     assert!(!cfg.providers[0].tls);
+}
+
+/// The recovery copy is no part of the service's configuration: off
+/// when unset or blank, and a copy that is refused does not stop the
+/// service.
+#[test]
+fn recovery_copy_is_off_by_default_and_cannot_stop_the_service() {
+    use velmora_bridge::remote::RemoteConfig;
+    let (prod, _) = wrangler_vars();
+    let mut vars = with_secrets(prod, PROVIDER_TLS);
+    for name in [
+        "RECOVERY_COPY",
+        "E2_ENDPOINT",
+        "E2_REGION",
+        "E2_BUCKET",
+        "E2_ACCESS_KEY",
+        "E2_SECRET_KEY",
+        "RECOVERY_PREFIX",
+    ] {
+        vars.remove(name);
+    }
+    let copy = |vars: &BTreeMap<String, String>| RemoteConfig::from_vars(|n| vars.get(n).cloned());
+    for (value, off) in [
+        (None, true),
+        (Some(""), true),
+        (Some("  "), true),
+        (Some("off"), true),
+        (Some("on"), false),
+        (Some("true"), false),
+    ] {
+        match value {
+            Some(v) => vars.insert("RECOVERY_COPY".into(), v.into()),
+            None => vars.remove("RECOVERY_COPY"),
+        };
+        load(&vars).unwrap();
+        match copy(&vars) {
+            Ok(none) => assert!(off && none.is_none(), "{value:?}"),
+            Err(_) => assert!(!off, "{value:?}"),
+        }
+    }
 }
 
 #[test]
 fn missing_secret_fails_closed() {
     let (prod, _) = wrangler_vars();
-    let full = with_secrets(prod, PROVIDER_TLS);
+    let full = with_secrets(prod, &prod_providers());
     for name in full.keys() {
         let mut vars = full.clone();
         vars.remove(name);
@@ -302,6 +385,34 @@ fn missing_secret_fails_closed() {
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
             vars.insert(name.clone(), "  ".into());
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
+            continue;
+        }
+        // Sliced PutObject: absent or blank, a PUT is one extent as
+        // before, and nothing is swept.
+        if name == "MAX_PUT_BYTES" || name == "INTENT_SWEEP" {
+            for _ in 0..2 {
+                let cfg = load(&vars).unwrap();
+                if name == "MAX_PUT_BYTES" {
+                    assert_eq!(cfg.max_put_bytes, cfg.max_extent_bytes);
+                    assert!(!cfg.intent_sweep);
+                } else {
+                    assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
+                    assert!(!cfg.intent_sweep);
+                }
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
+        // The recovery copy: absent or blank is off. It is no part of
+        // this configuration and cannot stop the service.
+        if name == "RECOVERY_COPY" {
+            for _ in 0..2 {
+                load(&vars).unwrap();
+                let copy =
+                    velmora_bridge::remote::RemoteConfig::from_vars(|n| vars.get(n).cloned());
+                assert!(copy.unwrap().is_none());
+                vars.insert(name.clone(), "  ".into());
+            }
             continue;
         }
         assert_eq!(
@@ -321,7 +432,7 @@ fn missing_secret_fails_closed() {
 #[test]
 fn config_rejects_invalid_and_unsafe_values() {
     let (prod, dev) = wrangler_vars();
-    let prod = with_secrets(prod, PROVIDER_TLS);
+    let prod = with_secrets(prod, &prod_providers());
     let dev = with_secrets(dev, PROVIDER_PLAIN);
     let set = |base: &BTreeMap<String, String>, k: &str, v: &str| {
         let mut m = base.clone();
@@ -354,6 +465,19 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("POST_SOCKETS", "four"),
         ("PROPAGATION_GRACE_SECS", "-1"),
         ("PROPAGATION_GRACE_SECS", "6h"),
+        // Below one extent, above what the edge lets through, not a number.
+        ("MAX_PUT_BYTES", "16777215"),
+        ("MAX_PUT_BYTES", "103809025"),
+        ("MAX_PUT_BYTES", "99MiB"),
+        // No slice, a slice above one extent, more than 16 slices in
+        // the largest body (99 MiB in slices of 6 MiB are 17).
+        ("SLICE_BYTES", "0"),
+        ("SLICE_BYTES", "16777217"),
+        ("SLICE_BYTES", "6291456"),
+        ("SLICE_BYTES", "8m"),
+        ("INTENT_SWEEP", "1"),
+        ("INTENT_SWEEP", "ON"),
+        ("INTENT_SWEEP", "disposable"),
     ] {
         assert_eq!(set(&prod, name, bad), invalid(name), "{name}={bad}");
     }
@@ -362,6 +486,40 @@ fn config_rejects_invalid_and_unsafe_values() {
     tuned.insert("PROPAGATION_GRACE_SECS".into(), "0".into());
     let cfg = load(&tuned).unwrap();
     assert_eq!((cfg.post_sockets, cfg.propagation_grace_secs), (8, 0));
+    // The limits of the slice settings themselves are accepted, and the
+    // default slice is never above one extent.
+    for (put, slice, sweep) in [
+        ("16777216", "16777216", "off"),
+        ("103809024", "6488064", " on "),
+        ("103809024", "16777216", ""),
+    ] {
+        let mut tuned = prod.clone();
+        tuned.insert("MAX_PUT_BYTES".into(), put.into());
+        tuned.insert("SLICE_BYTES".into(), slice.into());
+        tuned.insert("INTENT_SWEEP".into(), sweep.into());
+        let cfg = load(&tuned).unwrap();
+        assert_eq!(cfg.max_put_bytes.to_string(), put);
+        assert_eq!(cfg.slice_bytes.to_string(), slice);
+        assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
+    }
+    let mut small = prod.clone();
+    small.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
+    small.remove("MAX_PUT_BYTES");
+    let cfg = load(&small).unwrap();
+    assert_eq!((cfg.max_put_bytes, cfg.slice_bytes), (4_194_304, 4_194_304));
+    // More than 16 slices (99 MiB in slices of 4 MiB are 25): the error
+    // names the variable that was set, not the slice that followed from
+    // the extent.
+    small.remove("SLICE_BYTES");
+    assert_eq!(
+        set(&small, "MAX_PUT_BYTES", "103809024"),
+        invalid("MAX_PUT_BYTES")
+    );
+    small.insert("MAX_PUT_BYTES".into(), "103809024".into());
+    assert_eq!(
+        set(&small, "SLICE_BYTES", "4194304"),
+        invalid("SLICE_BYTES")
+    );
 
     // Shape and range.
     assert_eq!(set(&prod, "ENVIRONMENT", "staging"), invalid("ENVIRONMENT"));
@@ -461,7 +619,7 @@ fn config_rejects_invalid_and_unsafe_values() {
 #[test]
 fn config_errors_and_debug_never_show_secret_values() {
     let (prod, _) = wrangler_vars();
-    let vars = with_secrets(prod, PROVIDER_TLS);
+    let vars = with_secrets(prod, &prod_providers());
     let cfg = load(&vars).unwrap();
     let dbg = format!("{cfg:?}");
     for secret in [
@@ -680,11 +838,13 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "provider_health",
             "provider_permits",
             "restore_state",
+            "rollback_stamp",
             "scan_cursors",
             "tx_guard",
             "upload_parts",
             "uploads",
             "verifications",
+            "write_intents",
         ]
     );
 
@@ -721,6 +881,8 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         ("INSERT INTO provider_permits(provider_id,slot,token,holder,lease_until) VALUES (?1,?2,?3,?4,?5)",
          vec![text("p1"), i(0), i(0), SqlValue::Null, i(0)]),
         ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
+        ("INSERT INTO write_intents(extent_id,write_id,generation_id,state,created_at) VALUES (?1,?2,?3,?4,?5)",
+         vec![text("x_3"), text("w_1"), SqlValue::Null, text("open"), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
     // The committed extent (statement 5) also gets its reference row
@@ -913,6 +1075,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         cipher_offset: 0,
         cipher_len: 69,
         payload_sha256: [0; 32],
+        yenc_name: Some("k3v9q0zx7m2a".into()),
         state: ArticleState::Planned,
         provider_id: None,
         posted_at: None,
@@ -926,6 +1089,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         articles_ok: 1,
         articles_total: 1,
         result: VerifyResult::Ok,
+        kind: VerifyKind::Body,
     };
     let gc_row = GcRow {
         id: 1,
@@ -1004,7 +1168,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.mark_posted(&lease, 0, "p1", T0).await;
     let _ = c.record_verification(&lease, &verification).await;
     let _ = c.backbone_status(&extent.id).await;
-    let _ = c.begin_release(&lease, 1, "[]", T0).await;
+    let _ = c.begin_release(&lease, 1, &bbs(), "[]", T0).await;
     let _ = c.finish_release(&lease, T0).await;
     let _ = c.due(T0, 100).await;
     let _ = c.bury_exhausted(50, T0).await;
@@ -1422,8 +1586,123 @@ fn provider_json(id: &str, extra: &str) -> String {
 
 fn providers_of(entries: &[String]) -> std::result::Result<Vec<ProviderConfig>, ConfigError> {
     let (prod, _) = wrangler_vars();
-    let json = format!("[{}]", entries.join(","));
+    // A list of one gets the second backbone prod asks for; the entries
+    // under test stay first.
+    let second = match entries.len() {
+        1 => format!(",{SECOND_BACKBONE}"),
+        _ => String::new(),
+    };
+    let json = format!("[{}{second}]", entries.join(","));
     load(&with_secrets(prod, &json)).map(|cfg| cfg.providers)
+}
+
+/// `release` says whether a provider's backbone counts toward releasing
+/// the safety copy. It is optional and true when absent; one provider
+/// saying false speaks for its whole backbone. A list with fewer
+/// counting, readable backbones than `REQUIRED_BACKBONES` still loads,
+/// so the Worker keeps serving, and says that the release is paused.
+#[test]
+fn release_backbones_are_counted_and_too_few_pause_the_release() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    // `on` puts the provider on a named backbone.
+    let on = |id: &str, backbone: &str, extra: &str| {
+        provider_json(id, extra).replace(&format!("bb-{id}"), backbone)
+    };
+    let off = r#""release":false"#;
+    let flags = |entries: &[String]| -> std::result::Result<Vec<bool>, ConfigError> {
+        let (prod, _) = wrangler_vars();
+        let json = format!("[{}]", entries.join(","));
+        let cfg = load(&with_secrets(prod, &json))?;
+        Ok(cfg.providers.iter().map(|p| p.release).collect())
+    };
+    // Whether the list loads with the release paused.
+    let paused = |entries: &[String]| -> std::result::Result<bool, ConfigError> {
+        let (prod, _) = wrangler_vars();
+        let json = format!("[{}]", entries.join(","));
+        let cfg = load(&with_secrets(prod, &json))?;
+        let warning = cfg.release_paused();
+        if let Some(text) = &warning {
+            assert!(text.starts_with("release paused: "), "{text}");
+            assert!(text.contains("REQUIRED_BACKBONES is 2"), "{text}");
+        }
+        Ok(warning.is_some())
+    };
+
+    // Absent means it counts; so does an explicit true.
+    assert_eq!(
+        flags(&[
+            provider_json("a", ""),
+            provider_json("b", r#""release":true"#)
+        ]),
+        Ok(vec![true, true])
+    );
+    // Two that count and one that does not.
+    assert_eq!(
+        flags(&[
+            provider_json("a", off),
+            provider_json("b", ""),
+            provider_json("c", "")
+        ]),
+        Ok(vec![false, true, true])
+    );
+    for bad in [r#""no""#, "0", "1", "null", r#""false""#] {
+        let entry = provider_json("a", &format!(r#""release":{bad}"#));
+        assert_eq!(flags(&[entry, provider_json("b", "")]), invalid, "{bad}");
+    }
+
+    // One backbone, however many accounts.
+    assert_eq!(paused(&[provider_json("a", "")]), Ok(true));
+    assert_eq!(
+        paused(&[on("a", "one", ""), on("b", " ONE ", "")]),
+        Ok(true)
+    );
+    // Two backbones, one of them marked.
+    assert_eq!(
+        paused(&[provider_json("a", ""), provider_json("b", off)]),
+        Ok(true)
+    );
+    // One account's mark is its backbone's: the other account on it does
+    // not bring the backbone back, whichever comes first, and whether the
+    // marked one reads, only posts, or is disabled.
+    let unread = |json: String| json.replace(r#""read":true"#, r#""read":false"#);
+    for marked in [
+        on("b", "two", off),
+        unread(on("b", "two", off)),
+        on("b", "two", &format!(r#"{off},"enabled":false"#)),
+    ] {
+        let pair = [marked.clone(), on("c", "Two", "")];
+        let mut list = vec![provider_json("a", "")];
+        list.extend(pair.clone());
+        assert_eq!(paused(&list), Ok(true), "{marked}");
+        list = vec![pair[1].clone(), pair[0].clone(), provider_json("a", "")];
+        assert_eq!(paused(&list), Ok(true), "{marked}");
+        // A third backbone that counts makes the two.
+        list.push(provider_json("d", ""));
+        assert_eq!(paused(&list), Ok(false), "{marked}");
+    }
+    // A backbone nothing can be read from, or whose reader is disabled,
+    // proves nothing and does not count.
+    for other in [
+        unread(provider_json("b", "")),
+        provider_json("b", r#""enabled":false"#),
+    ] {
+        let list = [provider_json("a", ""), other];
+        assert_eq!(paused(&list), Ok(true), "{}", list[1]);
+    }
+
+    // Dev asks for one backbone: one that counts, and not one that does not.
+    let (_, dev) = wrangler_vars();
+    let dev_load = |extra: &str| {
+        let json = PROVIDER_PLAIN.replace(r#""max_conns":2"#, &format!(r#""max_conns":2{extra}"#));
+        load(&with_secrets(dev.clone(), &json)).map(|cfg| cfg.release_paused())
+    };
+    assert_eq!(dev_load(""), Ok(None));
+    let warning = dev_load(r#","release":false"#).unwrap().unwrap();
+    assert_eq!(
+        warning,
+        "release paused: 0 backbone(s) count toward release, REQUIRED_BACKBONES is 1; \
+         pinned copies stay held"
+    );
 }
 
 /// A provider list written before the pool settings existed still loads,
@@ -1432,8 +1711,8 @@ fn providers_of(entries: &[String]) -> std::result::Result<Vec<ProviderConfig>, 
 #[test]
 fn old_provider_config_parses_with_pool_defaults() {
     let (prod, _) = wrangler_vars();
-    let cfg = load(&with_secrets(prod, PROVIDER_TLS)).unwrap();
-    assert_eq!(cfg.providers.len(), 1);
+    let cfg = load(&with_secrets(prod, &prod_providers())).unwrap();
+    assert_eq!(cfg.providers.len(), 2);
     let p = &cfg.providers[0];
     assert_eq!(
         (p.id.as_str(), p.max_conns, p.post, p.read),
@@ -1449,6 +1728,199 @@ fn old_provider_config_parses_with_pool_defaults() {
     let now = UnixMs(1_800_000_000_000);
     assert!(p.retains(Some(UnixMs(0)), now));
     assert!(p.retains(None, now));
+}
+
+fn proxy_json(host: &str, port: u32, user: &str, pass: &str) -> String {
+    format!(r#"{{"host":"{host}","port":{port},"user":"{user}","pass":"{pass}"}}"#)
+}
+
+/// `proxies` is optional: without it a provider is connected directly.
+/// With it, every entry is a SOCKS5 proxy with a login, kept in order.
+/// Neither the provider's nor a proxy's `Debug` shows a proxy's host or
+/// login.
+#[test]
+fn provider_proxies_parse_in_order_and_are_redacted() {
+    let direct = providers_of(&[provider_json("a", "")]).unwrap();
+    assert!(direct[0].proxies.is_empty());
+
+    let proxies = format!(
+        r#""max_ips":2,"proxies":[{},{}]"#,
+        proxy_json("first.proxy.example", 1080, "proxy-login", "proxy-secret"),
+        proxy_json("203.0.113.9", 40000, "other-login", "other-secret"),
+    );
+    let providers = providers_of(&[provider_json("a", &proxies)]).unwrap();
+    let got = &providers[0].proxies;
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        (got[0].host.as_str(), got[0].port, got[0].user.as_str()),
+        ("first.proxy.example", 1080, "proxy-login")
+    );
+    assert_eq!(got[0].pass, "proxy-secret");
+    assert_eq!((got[1].host.as_str(), got[1].port), ("203.0.113.9", 40000));
+
+    let shown = format!("{:?} {:?} {:?}", providers[0], got, got[0]);
+    for secret in [
+        "first.proxy.example",
+        "203.0.113.9",
+        "40000",
+        "proxy-login",
+        "proxy-secret",
+        "other-login",
+        "other-secret",
+    ] {
+        assert!(!shown.contains(secret), "{shown}");
+    }
+    assert!(shown.contains("proxies: 2"), "{shown}");
+}
+
+/// A `proxies` list that cannot be used as written is refused as a
+/// whole: nothing in it is dropped or guessed, and a provider is never
+/// left to connect directly because its proxy entry was wrong.
+#[test]
+fn provider_proxies_fail_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let ok = proxy_json("proxy.example", 1080, "u", "p");
+    let with = |list: &[String]| {
+        let extra = format!(r#""max_ips":4,"proxies":[{}]"#, list.join(","));
+        providers_of(&[provider_json("a", &extra)])
+    };
+    assert!(with(std::slice::from_ref(&ok)).is_ok());
+    // A list that is there and empty is refused: only a provider
+    // without the field is connected directly.
+    assert_eq!(with(&[]), invalid);
+
+    let long = "x".repeat(256);
+    let bad = [
+        // Port, login and host that SOCKS5 or the network cannot carry.
+        proxy_json("proxy.example", 0, "u", "p"),
+        proxy_json("proxy.example", 65536, "u", "p"),
+        proxy_json("proxy.example", 1080, "", "p"),
+        proxy_json("proxy.example", 1080, "u", ""),
+        proxy_json("proxy.example", 1080, &long, "p"),
+        proxy_json("proxy.example", 1080, "u", &long),
+        proxy_json("", 1080, "u", "p"),
+        proxy_json("proxy example", 1080, "u", "p"),
+        proxy_json("proxy.example:1080", 1080, "u", "p"),
+        proxy_json("socks5://proxy.example", 1080, "u", "p"),
+        // Addresses no proxy of the bridge can have.
+        proxy_json("127.0.0.1", 1080, "u", "p"),
+        proxy_json("10.1.2.3", 1080, "u", "p"),
+        proxy_json("100.64.0.1", 1080, "u", "p"),
+        proxy_json("100.127.255.254", 1080, "u", "p"),
+        proxy_json("192.168.1.1", 1080, "u", "p"),
+        proxy_json("169.254.1.1", 1080, "u", "p"),
+        proxy_json("0.0.0.0", 1080, "u", "p"),
+        proxy_json("::1", 1080, "u", "p"),
+        proxy_json("fd00::1", 1080, "u", "p"),
+        proxy_json("::ffff:10.0.0.1", 1080, "u", "p"),
+    ];
+    for entry in bad {
+        assert_eq!(with(std::slice::from_ref(&entry)), invalid, "{entry}");
+        // Not next to a good one either.
+        assert_eq!(with(&[ok.clone(), entry.clone()]), invalid, "{entry}");
+    }
+    // Next to the shared range, on both sides: public.
+    for host in ["100.63.255.255", "100.128.0.1"] {
+        assert!(with(&[proxy_json(host, 1080, "u", "p")]).is_ok(), "{host}");
+    }
+    // A login of the longest length SOCKS5 carries is in order.
+    let longest = "x".repeat(255);
+    assert!(with(&[proxy_json("proxy.example", 1080, &longest, &longest)]).is_ok());
+
+    // The same proxy twice, also in another case; more than the most.
+    assert_eq!(with(&[ok.clone(), ok.clone()]), invalid);
+    let upper = proxy_json("PROXY.example", 1080, "u2", "p2");
+    assert_eq!(with(&[ok.clone(), upper]), invalid);
+    let many: Vec<String> = (0..=velmora_bridge::config::MAX_PROXIES)
+        .map(|i| proxy_json(&format!("p{i}.proxy.example"), 1080, "u", "p"))
+        .collect();
+    assert_eq!(with(&many), invalid);
+    assert!(with(&many[1..]).is_ok());
+
+    // Every proxy may be in use at the same time, each with its own
+    // address: more proxies than the address limit are refused, and so
+    // is a list without the limit, which nothing could be checked
+    // against.
+    for list in [&many[1..], &many[1..2]] {
+        let extra = format!(r#""proxies":[{}]"#, list.join(","));
+        assert_eq!(providers_of(&[provider_json("a", &extra)]), invalid);
+    }
+    let capped = |ips: u32, list: &[String]| {
+        let extra = format!(r#""max_ips":{ips},"proxies":[{}]"#, list.join(","));
+        providers_of(&[provider_json("a", &extra)])
+    };
+    let three = &many[1..];
+    assert_eq!(three.len(), 3);
+    assert_eq!(capped(1, three), invalid);
+    assert_eq!(capped(2, three), invalid);
+    assert!(capped(3, three).is_ok());
+    assert!(capped(4, three).is_ok());
+    assert_eq!(capped(1, &three[..2]), invalid);
+    assert!(capped(2, &three[..2]).is_ok());
+    assert!(capped(1, &three[..1]).is_ok());
+
+    // The proxy is given the provider's host as a name, and the
+    // certificate is checked against that name: a provider known by an
+    // address, or by a name the request cannot carry, takes no proxy.
+    for host in ["203.0.113.5", "nntp", "nntp_1.invalid"] {
+        let entry = |extra: &str| {
+            let json = provider_json("a", extra).replace("nntp.invalid", host);
+            assert!(json.contains(host));
+            providers_of(&[json])
+        };
+        assert!(entry("").is_ok(), "{host}");
+        let extra = format!(r#""max_ips":4,"proxies":[{ok}]"#);
+        assert_eq!(entry(&extra), invalid, "{host}");
+        // The same entry on a provider known by a name is accepted.
+        assert!(providers_of(&[provider_json("a", &extra)]).is_ok());
+    }
+
+    // Unknown or missing members, and the wrong shape.
+    for extra in [
+        r#""proxies":[{"host":"proxy.example","port":1080,"user":"u","pass":"p","fallback":"direct"}]"#,
+        r#""proxies":[{"host":"proxy.example","port":1080,"user":"u"}]"#,
+        r#""proxies":[{"host":"proxy.example","port":1080}]"#,
+        r#""proxies":{"host":"proxy.example","port":1080,"user":"u","pass":"p"}"#,
+        r#""proxies":["proxy.example:1080"]"#,
+        r#""proxies":null"#,
+        r#""proxy":{"host":"proxy.example","port":1080,"user":"u","pass":"p"}"#,
+        r#""proxy_fallback":"direct""#,
+    ] {
+        // With the address limit, so that the entry is the only fault.
+        let extra = format!(r#""max_ips":4,{extra}"#);
+        assert_eq!(
+            providers_of(&[provider_json("a", &extra)]),
+            invalid,
+            "{extra}"
+        );
+    }
+}
+
+/// Through a proxy there is no plaintext: `proxies` on a provider
+/// without TLS is refused, in every environment.
+#[test]
+fn provider_proxies_need_tls() {
+    let (prod, dev) = wrangler_vars();
+    let entry = |tls: bool, extra: &str| {
+        format!(
+            r#"[{{"id":"a","host":"nntp.invalid","port":563,"tls":{tls},"user":"u","pass":"p","backbone":"bb","post":true,"read":true,"max_conns":2{extra}}}]"#
+        )
+    };
+    let proxies = format!(
+        r#","max_ips":4,"proxies":[{}]"#,
+        proxy_json("proxy.example", 1080, "u", "p")
+    );
+    let loads = |vars: &_, json: &str| load(&with_secrets(Clone::clone(vars), json)).map(|_| ());
+    for vars in [&prod, &dev] {
+        assert_eq!(loads(vars, &entry(true, &proxies)), Ok(()));
+        assert_eq!(
+            loads(vars, &entry(false, &proxies)),
+            Err(ConfigError::Invalid("NNTP_PROVIDERS".into()))
+        );
+    }
+    // The same plaintext provider without a proxy is in order in dev:
+    // it is the proxy that is refused.
+    assert_eq!(loads(&dev, &entry(false, "")), Ok(()));
 }
 
 /// `max_ips` is the number of source addresses an account may be
@@ -1475,6 +1947,123 @@ fn provider_address_limit_parses_and_fails_closed() {
     }
     // The setting is not a secret, and shows when a provider is printed.
     assert!(format!("{:?}", providers[0]).contains("max_ips: Some(1)"));
+}
+
+/// `hosts` lists more host names of one account next to `host`. It is
+/// optional: an entry without it has `host` alone, as before.
+#[test]
+fn provider_hosts_parse_and_extend_host() {
+    let providers = providers_of(&[
+        provider_json("a", r#""hosts":["us.nntp.invalid","eu.nntp.invalid"]"#),
+        provider_json("b", r#""hosts":[]"#),
+        provider_json("c", ""),
+    ])
+    .unwrap();
+    assert_eq!(
+        providers[0].endpoints(),
+        ["nntp.invalid", "us.nntp.invalid", "eu.nntp.invalid"]
+    );
+    assert_eq!(providers[1].endpoints(), ["nntp.invalid"]);
+    assert_eq!(providers[2].endpoints(), ["nntp.invalid"]);
+    // Host names stay out of `Debug`, like `host`: only their number shows.
+    let shown = format!("{:?}", providers[0]);
+    assert!(
+        !shown.contains("us.nntp.invalid") && shown.contains("hosts: 2"),
+        "{shown}"
+    );
+}
+
+/// `host_select` is `fastest` (the default) or `ordered`.
+#[test]
+fn provider_host_select_parses_and_fails_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let hosts = r#""hosts":["us.nntp.invalid"]"#;
+    let providers = providers_of(&[
+        provider_json("a", hosts),
+        provider_json("b", &format!(r#"{hosts},"host_select":"fastest""#)),
+        provider_json("c", &format!(r#"{hosts},"host_select":"ordered""#)),
+    ])
+    .unwrap();
+    let modes: Vec<HostSelect> = providers.iter().map(|p| p.host_select).collect();
+    assert_eq!(
+        modes,
+        [
+            HostSelect::Fastest,
+            HostSelect::Fastest,
+            HostSelect::Ordered
+        ]
+    );
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+    for bad in [r#""Ordered""#, r#""nearest""#, "1", "null", "true"] {
+        assert_eq!(one(&format!(r#""host_select":{bad}"#)), invalid, "{bad}");
+    }
+}
+
+#[test]
+fn provider_hosts_fail_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+
+    // Not a list of names.
+    for bad in [
+        r#""hosts":"us.nntp.invalid""#,
+        r#""hosts":[1]"#,
+        r#""hosts":null"#,
+        r#""hosts":[""]"#,
+        r#""hosts":["us.nntp.invalid:5563"]"#,
+        r#""hosts":["us nntp"]"#,
+        r#""hosts":["-us.nntp.invalid"]"#,
+        r#""hosts":["user@us.nntp.invalid"]"#,
+        r#""hosts":["us-.nntp.invalid"]"#,
+        r#""hosts":["us..nntp.invalid"]"#,
+        r#""hosts":[".us.nntp.invalid"]"#,
+        r#""hosts":["us.nntp.invalid."]"#,
+        r#""hosts":["localhost"]"#,
+        r#""hosts":["192.0.2.1"]"#,
+        r#""hosts":["news.123"]"#,
+    ] {
+        assert_eq!(one(bad), invalid, "{bad}");
+    }
+    // A label is at most 63 bytes, the name at most 253.
+    let label = |n: usize| format!(r#""hosts":["{}.nntp.invalid"]"#, "a".repeat(n));
+    assert!(one(&label(63)).is_ok());
+    assert!(one(r#""hosts":["news.example","n1.example.co"]"#).is_ok());
+    assert_eq!(one(&label(64)), invalid);
+    assert!(one(&format!(r#""hosts":["{}"]"#, labels_of(4))).is_ok()); // 251 bytes
+    let long = format!(r#""hosts":["{}.a.b"]"#, labels_of(4));
+    assert_eq!(one(&long), invalid); // 255 bytes
+                                     // No host twice, whatever its case, and not `host` again.
+    assert_eq!(
+        one(r#""hosts":["us.nntp.invalid","US.nntp.invalid"]"#),
+        invalid
+    );
+    assert_eq!(one(r#""hosts":["NNTP.invalid"]"#), invalid);
+    // At most `MAX_HOSTS`.
+    let names = |n: usize| -> String {
+        let list: Vec<String> = (0..n).map(|i| format!(r#""h{i}.nntp.invalid""#)).collect();
+        format!(r#""hosts":[{}]"#, list.join(","))
+    };
+    assert!(one(&names(velmora_bridge::config::MAX_HOSTS)).is_ok());
+    assert_eq!(one(&names(velmora_bridge::config::MAX_HOSTS + 1)), invalid);
+}
+
+/// `n` labels of 62 bytes, joined with dots.
+fn labels_of(n: usize) -> String {
+    (0..n).map(|_| "a".repeat(62)).collect::<Vec<_>>().join(".")
+}
+
+/// The local fake server is one plaintext loopback host: `hosts` is for
+/// TLS providers only.
+#[test]
+fn provider_hosts_only_on_tls() {
+    let (_, dev) = wrangler_vars();
+    let plain = r#"[{"id":"p1","host":"127.0.0.1","hosts":["localhost"],"port":11119,"tls":false,"user":"","pass":"","backbone":"bb","post":true,"read":true,"max_conns":2}]"#;
+    assert_eq!(
+        load(&with_secrets(dev.clone(), plain)).map(|_| ()),
+        Err(ConfigError::Invalid("NNTP_PROVIDERS".into()))
+    );
+    let one_host = plain.replace(r#""hosts":["localhost"],"#, "");
+    assert!(load(&with_secrets(dev, &one_host)).is_ok());
 }
 
 #[test]

@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use velmora_bridge::recovery::{is_record_key, Unpublished, ERR_RECORD_DELETE};
-use velmora_bridge::{BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
+use velmora_bridge::recovery::{is_protected_key, Unpublished, ERR_RECORD_DELETE};
+use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
 use worker::{Bucket, Range};
 
 /// R2 range offsets travel as JS numbers (workers-rs panics above this).
@@ -109,7 +109,7 @@ impl BlobStore for R2Blobs {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        if is_record_key(key) {
+        if is_protected_key(key) {
             return Err(ERR_RECORD_DELETE);
         }
         self.bucket.delete(key).await.map_err(blob_err("delete"))
@@ -141,6 +141,44 @@ impl BlobStore for R2Blobs {
             };
         }
         Ok(keys)
+    }
+
+    /// Sizes and MD5s from the listing itself, with no read per key:
+    /// R2's etag of an object written by one put is the MD5 of its
+    /// bytes. As in the default, only an empty answer is the end: a
+    /// limit of 0 is read as 1, and a page that says "more" and gives
+    /// no cursor is an error.
+    async fn list_entries(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> Result<Vec<BlobEntry>> {
+        let limit = limit.max(1);
+        let mut entries = Vec::new();
+        let mut cursor: Option<String> = None;
+        while (entries.len() as u64) < u64::from(limit) {
+            let want = limit - entries.len() as u32;
+            let mut req = self.bucket.list().prefix(prefix).limit(want);
+            req = match &cursor {
+                Some(c) => req.cursor(c.clone()),
+                None => req.start_after(start_after),
+            };
+            let page = req.execute().await.map_err(blob_err("list"))?;
+            entries.extend(page.objects().iter().map(|o| BlobEntry {
+                key: o.key(),
+                size: o.size(),
+                md5: o.etag(),
+            }));
+            cursor = match (page.truncated(), page.cursor()) {
+                (true, Some(c)) => Some(c),
+                (true, None) => {
+                    return Err(BridgeError::Blob("list: more to come and no cursor".into()))
+                }
+                (false, _) => break,
+            };
+        }
+        Ok(entries)
     }
 }
 

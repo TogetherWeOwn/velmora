@@ -12,7 +12,7 @@ use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{
     delete_blob, tombstone_id, write_tombstone, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
-use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::replay::{RecordRef, ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
@@ -1112,9 +1112,14 @@ async fn a_record_without_its_extents_does_not_replace_a_good_object() {
     wipe(&rig);
     for _ in 0..2 {
         let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        // Listed with its bucket and key.
         assert_eq!(
             report.damaged_unpublished,
-            [lingering.as_str()],
+            [RecordRef {
+                id: lingering.clone(),
+                bucket: BUCKET.to_owned(),
+                key: "big".to_owned(),
+            }],
             "{report:?}"
         );
         assert!(report.unpublishable.is_empty(), "{report:?}");
@@ -1155,7 +1160,11 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
             let plan = velmora_bridge::recovery::article_key(&x.id);
             rig.bridge.safety.lose(&plan);
         }
-        lost.push(generation.id.as_str().to_owned());
+        lost.push(RecordRef {
+            id: generation.id.as_str().to_owned(),
+            bucket: BUCKET.to_owned(),
+            key: key.to_owned(),
+        });
     }
     lost.sort();
 
@@ -1171,13 +1180,43 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     get(&rig, &signer, "k").await.expect(404);
     assert_eq!(get(&rig, &signer, "j").await.expect(200).body, b"good");
 
+    // The runbook's way out. A PUT on the key that is acknowledged ends
+    // the report in a replay over a catalogue where the object of that
+    // PUT is live. A rebuild from the records alone lists the record
+    // again, and the key ends with the object of that PUT all the same.
+    // So does a replay after a delete of the key.
+    tick(&rig);
+    rig.put(&signer, BUCKET, "k", b"again").await.expect(200);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    // The two failed writes can share a millisecond, so the order of
+    // their ids says nothing about which key each one is on.
+    let on = |key: &str| lost.iter().find(|r| r.key == key).cloned().unwrap();
+    assert_eq!(report.damaged_unpublished, [on("j")], "only `j` is left");
+    wipe(&rig);
+    let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    report.damaged_unpublished.sort();
+    assert_eq!(report.damaged_unpublished, lost, "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"again");
+    let (again, _) = rig.live(&bucket, "k").await.unwrap();
+    assert!(again.id.as_str() > on("k").id.as_str());
+    tick(&rig);
+    delete(&rig, &signer, "k").await.expect(204);
+    let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    report.damaged_unpublished.sort();
+    assert_eq!(report.damaged_unpublished, lost, "`k` is listed again");
+    get(&rig, &signer, "k").await.expect(404);
+
     // The floor of a key is its refused record: a write and a delete
     // from a clock that runs behind sort after it.
     rig.bridge.clock.advance_ms(-1500);
     for key in ["j", "k"] {
         rig.put(&signer, BUCKET, key, b"new").await.expect(200);
         let (new, _) = rig.live(&bucket, key).await.unwrap();
-        assert!(new.id.as_str() > lost[1].as_str(), "{new:?} after {lost:?}");
+        assert!(
+            new.id.as_str() > lost[1].id.as_str(),
+            "{new:?} after {lost:?}"
+        );
         delete(&rig, &signer, key).await.expect(204);
         let newest = tombstones(&rig).into_iter().max().unwrap();
         assert!(&newest["m/del/".len()..] > new.id.as_str(), "{newest}");
@@ -1891,6 +1930,7 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         .catalog
         .restore_begin(UnixMs(0), rig.now())
         .await
+        .unwrap()
         .unwrap();
     rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
     rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
@@ -1953,14 +1993,20 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
     assert!(!rig
         .bridge
         .catalog
-        .restore_finish(UnixMs(run.0 - 1), rig.now())
+        .restore_finish(
+            UnixMs(run.0 - 1),
+            rig.now(),
+            0,
+            stamp_seen(&rig).await,
+            "main"
+        )
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["replaying"]);
     assert!(rig
         .bridge
         .catalog
-        .restore_finish(run, rig.now())
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
         .await
         .unwrap());
     assert_eq!(restore_state(&rig), ["complete"]);
@@ -1977,6 +2023,7 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         .catalog
         .restore_begin(UnixMs(5), rig.now())
         .await
+        .unwrap()
         .unwrap();
     assert!(second > run);
     assert_eq!(restore_state(&rig), ["replaying"]);
@@ -2011,9 +2058,16 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
     rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
 
     // A replay that runs to its end opens it.
-    let run = catalog.restore_begin(UnixMs(0), rig.now()).await.unwrap();
+    let run = catalog
+        .restore_begin(UnixMs(0), rig.now())
+        .await
+        .unwrap()
+        .unwrap();
     replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert!(catalog.restore_finish(run, rig.now()).await.unwrap());
+    assert!(catalog
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
+        .await
+        .unwrap());
     rig.put(&signer, BUCKET, "a", b"two").await.expect(200);
 
     // Brought back once more (the row of the finished replay came with
@@ -2023,7 +2077,10 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
     assert_eq!(restore_state(&rig), ["replaying"]);
     rig.put(&signer, BUCKET, "a", b"three").await.expect(503);
     assert_eq!(catalog.restore_progress(run).await.unwrap(), None);
-    assert!(!catalog.restore_finish(run, rig.now()).await.unwrap());
+    assert!(!catalog
+        .restore_finish(run, rig.now(), 0, stamp_seen(&rig).await, "main")
+        .await
+        .unwrap());
     assert_eq!(restore_state(&rig), ["replaying"]);
 }
 
@@ -2061,13 +2118,19 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     };
 
     arm();
-    rig.put(&signer, BUCKET, "a", b"two").await.expect(503);
+    rig.put(&signer, BUCKET, "a", b"two")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
-    rig.put(&signer, BUCKET, "new", b"new").await.expect(503);
+    rig.put(&signer, BUCKET, "new", b"new")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
-    copy(&rig, &signer, "a", "copy").await.expect(503);
+    copy(&rig, &signer, "a", "copy")
+        .await
+        .expect_writes_refused();
     disarm();
     arm();
     complete(&rig, &signer, "big", &id, &etags)
@@ -2081,7 +2144,7 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     // A delete answers 503 as well, and the object stays. Its tombstone
     // is on record, as that of any delete that failed.
     arm();
-    delete(&rig, &signer, "a").await.expect(503);
+    delete(&rig, &signer, "a").await.expect_writes_refused();
     disarm();
     assert_eq!(live_ids(&rig), live);
     assert_eq!(get(&rig, &signer, "a").await.expect(200).body, b"one");
@@ -2873,6 +2936,68 @@ async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
     replay_answers_the_same(&rig, &signer, &["src", "k"]).await;
 }
 
+/// A delete has raised the floor of the key to its tombstone and has
+/// not stored it yet. A PUT fails now, with its record stored: the
+/// record sorts above the tombstone, so the tombstone does not cover it,
+/// and the delete must not take the mark of the record off the floor
+/// when it finishes. The next delete then leaves a tombstone above the
+/// record, and a replay does not publish the failed write.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"good").await.expect(200);
+    tick(&rig);
+
+    let safety = &rig.bridge.safety;
+    safety
+        .hold_put_prefix
+        .replace(Some(TOMBSTONE_PREFIX.to_owned()));
+    let first = delete(&rig, &signer, "k");
+    let failed_put = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        assert!(tombstones(&rig).is_empty(), "the tombstone is not stored");
+        // A PUT takes its first id from the clock alone. One in the
+        // millisecond of the tombstone would sort above or below it as
+        // its random part falls; this one is later.
+        tick(&rig);
+        rig.bridge.catalog.sql.fail_batches.set(1);
+        rig.put(&signer, BUCKET, "k", b"failed")
+            .await
+            .expect_error(500, "InternalError");
+        safety.hold_put_prefix.replace(None);
+        newest_record(&rig).0
+    };
+    let (first, failed) = tokio::join!(first, failed_put);
+    first.expect(204);
+    let stored = tombstones(&rig);
+    assert_eq!(stored.len(), 1);
+    assert!(
+        failed.as_str() > &stored[0][TOMBSTONE_PREFIX.len()..],
+        "the record of the failed write sorts above the tombstone"
+    );
+    assert!(live_ids(&rig).is_empty());
+
+    // The key is empty, and the delete still has something to record.
+    delete(&rig, &signer, "k").await.expect(204);
+    let stored = tombstones(&rig);
+    assert_eq!(stored.len(), 2, "a tombstone above the failed write");
+    assert!(stored
+        .iter()
+        .any(|t| &t[TOMBSTONE_PREFIX.len()..] > failed.as_str()));
+    delete(&rig, &signer, "k").await.expect(204);
+    assert_eq!(tombstones(&rig).len(), 2, "and only one");
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(report.damaged_unpublished.is_empty(), "{report:?}");
+    assert!(live_ids(&rig).is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    get(&rig, &signer, "k").await.expect(404);
+}
+
 /// The delete of a key with nothing live runs the catalogue batch as
 /// well: a PUT that is published under an id below the tombstone, after
 /// the delete looked and before its batch, is deleted here as it is in
@@ -2975,4 +3100,146 @@ async fn a_complete_refused_for_its_parts_is_not_taken_for_an_id_race() {
         .await
         .expect_error(400, "InvalidPart");
     assert!(records(&rig).is_empty(), "the refused record is removed");
+}
+
+// ---------------------------------------------------------------------------
+// Article plans: each row's yEnc form
+// ---------------------------------------------------------------------------
+
+/// Stores a plan record for the only extent of `key`, one row per
+/// article, row `i` under `names[i]`. Returns the extent and the plan.
+async fn plan_record(
+    rig: &Rig,
+    bucket: &Bucket,
+    key: &str,
+    names: &[Option<&str>],
+) -> (ExtentRow, Vec<ArticleRow>) {
+    let (_, extents) = rig.live(bucket, key).await.unwrap();
+    let extent = extents[0].clone();
+    let spans = velmora_bridge::articles::article_spans(extent.cipher_size);
+    assert_eq!(spans.len(), names.len());
+    let plan: Vec<ArticleRow> = (0u32..)
+        .zip(spans.iter().zip(names))
+        .map(|(idx, (span, name))| ArticleRow {
+            extent_id: extent.id.clone(),
+            idx,
+            message_id: format!("{idx}k7q2m9x4v1z8c3b6n5j0h2g4f6d8s1a3@example.invalid"),
+            newsgroup: "alt.binaries.test".into(),
+            headers: format!("Subject: s{idx}\r\n").into_bytes(),
+            cipher_offset: span.start,
+            cipher_len: span.len,
+            payload_sha256: [idx as u8; 32],
+            yenc_name: name.map(str::to_owned),
+            state: ArticleState::Planned,
+            provider_id: None,
+            posted_at: None,
+        })
+        .collect();
+    velmora_bridge::recovery::write_article_plan(
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &extent,
+        &plan,
+    )
+    .await
+    .unwrap();
+    (extent, plan)
+}
+
+/// A replay through the SQL catalogue restores each row's yEnc name: a
+/// standalone row keeps its own, an older multi-part row stays NULL, so
+/// each reposts in the form it was posted in.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replayed_plan_keeps_each_rows_yenc_form() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![7u8; 1_000_000];
+    rig.put(&signer, BUCKET, "two-articles", &body)
+        .await
+        .expect(200);
+    let (extent, plan) =
+        plan_record(&rig, &bucket, "two-articles", &[Some("k3v9q0zx7m2a"), None]).await;
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.article_plans, 1, "{report:?}");
+    assert!(report.unreadable.is_empty(), "{report:?}");
+
+    let rows = rig.bridge.catalog.articles(&extent.id).await.unwrap();
+    let names: Vec<_> = rows.iter().map(|a| a.yenc_name.clone()).collect();
+    assert_eq!(names, [Some("k3v9q0zx7m2a".to_string()), None]);
+    let ids: Vec<_> = rows.iter().map(|a| a.message_id.clone()).collect();
+    let want: Vec<_> = plan.iter().map(|a| a.message_id.clone()).collect();
+    assert_eq!(ids, want);
+}
+
+/// A plan record whose yEnc name the catalogue would refuse is reported
+/// unreadable, not skipped without a word by the replay's insert.
+#[tokio::test(flavor = "current_thread")]
+async fn a_plan_record_with_a_bad_yenc_name_is_unreadable() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![7u8; 1_000_000];
+    rig.put(&signer, BUCKET, "two-articles", &body)
+        .await
+        .expect(200);
+    let (extent, _) = plan_record(&rig, &bucket, "two-articles", &[None, Some("Not Valid")]).await;
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(report.article_plans, 0, "{report:?}");
+    assert_eq!(report.unreadable, [format!("m/art/{}", extent.id.as_str())]);
+    assert!(rig
+        .bridge
+        .catalog
+        .articles(&extent.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// The stamp counter as the last step of a replay would read it.
+async fn stamp_seen(rig: &Rig) -> Option<u64> {
+    rig.bridge.catalog.stamp("main").await.unwrap().counter
+}
+
+/// The recovery copy sends a new generation record after the article
+/// plans it names, which it finds by the extents of the record as the
+/// service writes it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_generation_record_names_the_article_plans_of_its_extents() {
+    use velmora_bridge::crypto::open_manifest;
+    use velmora_bridge::recovery::{article_key, generation_key, plan_keys};
+
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "k", b"some bytes")
+        .await
+        .expect(200);
+    let (generation, extents) = rig.live(&bucket, "k").await.unwrap();
+    assert!(!extents.is_empty());
+    let name = generation_key(&generation.id);
+    let sealed = rig.bridge.safety.stored(&name).unwrap().bytes;
+    let plain = open_manifest(&rig.bridge.kek, &name, &sealed).unwrap();
+    let plans: Vec<String> = extents.iter().map(|x| article_key(&x.id)).collect();
+    assert_eq!(plan_keys(&plain), Some(plans));
+
+    assert_eq!(plan_keys(br#"{"extents":[]}"#), Some(Vec::new()));
+    let long = format!(r#"{{"extents":[{{"id":"x_{}"}}]}}"#, "a".repeat(65));
+    for bad in [
+        r#"{}"#,
+        r#"not json"#,
+        r#"{"extents":[{"id":"x_"}]}"#,
+        r#"{"extents":[{"id":"y_1"}]}"#,
+        r#"{"extents":[{"id":"x_1/../../x"}]}"#,
+        r#"{"extents":[{"id":"x_1"},{"id":"x_ 2"}]}"#,
+        r#"{"extents":[{"id":"x_é"}]}"#,
+        r#"{"extents":[{"seq":0}]}"#,
+        long.as_str(),
+    ] {
+        assert_eq!(plan_keys(bad.as_bytes()), None, "{bad}");
+    }
+    let most = format!(r#"{{"extents":[{{"id":"x_{}"}}]}}"#, "a".repeat(64));
+    assert_eq!(plan_keys(most.as_bytes()).map(|k| k.len()), Some(1));
 }

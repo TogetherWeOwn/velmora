@@ -51,8 +51,8 @@ use velmora::rng::SystemRng;
 use crate::crypto::{open_manifest, seal_manifest};
 use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow, ExtentState,
-    GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow,
+    ExtentState, GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
 };
 
 /// Every recovery record lives under this prefix.
@@ -89,12 +89,51 @@ pub fn start_after(prefix: &str, since: UnixMs) -> String {
     format!("{prefix}{ms:013x}")
 }
 
+/// The blob keys of the article plans that a generation record names,
+/// in the order of its extents, from the plaintext of the record.
+/// `None` = the plaintext does not name its extents, or names one that
+/// is not an extent id.
+pub fn plan_keys(plain: &[u8]) -> Option<Vec<String>> {
+    #[derive(Deserialize)]
+    struct Extent {
+        id: String,
+    }
+    #[derive(Deserialize)]
+    struct Named {
+        extents: Vec<Extent>,
+    }
+    let named: Named = serde_json::from_slice(plain).ok()?;
+    let id = |id: &str| {
+        id.strip_prefix("x_").is_some_and(|rest| {
+            (1..=64).contains(&rest.len())
+                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    };
+    named
+        .extents
+        .iter()
+        .map(|e| id(&e.id).then(|| format!("{ARTICLE_DIR}{}", e.id)))
+        .collect()
+}
+
+/// Reserved for tenant keys. It lies under [`RECORD_PREFIX`], so no
+/// delete removes such a key, and none of the record kinds above match
+/// it, so a replay does not read one as a record.
+pub const TENANT_KEY_PREFIX: &str = "m/tk/";
+
 /// Whether `key` names a recovery record.
 pub fn is_record_key(key: &str) -> bool {
     key.starts_with(RECORD_PREFIX)
 }
 
-/// What a store answers to a delete of a recovery record.
+/// Whether `key` is one that no delete may remove: a recovery record
+/// (which includes [`TENANT_KEY_PREFIX`]) or a rollback stamp.
+pub fn is_protected_key(key: &str) -> bool {
+    is_record_key(key) || crate::stamp::is_stamp_key(key)
+}
+
+/// What a store answers to a delete of a recovery record or of a
+/// rollback stamp.
 pub const ERR_RECORD_DELETE: BridgeError =
     BridgeError::Invalid("recovery records are never deleted");
 
@@ -103,7 +142,7 @@ pub const ERR_RECORD_DELETE: BridgeError =
 /// the catalogue row that asked for the delete says; the store refuses
 /// them too ([`BlobStore::delete`]).
 pub async fn delete_blob<B: BlobStore>(store: &B, key: &str) -> Result<()> {
-    if is_record_key(key) {
+    if is_protected_key(key) {
         return Err(ERR_RECORD_DELETE);
     }
     store.delete(key).await
@@ -303,6 +342,13 @@ pub struct ArticleRecord {
     pub cipher_len: u64,
     #[serde(with = "b64")]
     pub payload_sha256: Vec<u8>,
+    /// The article's own yEnc name (a standalone single-part article).
+    /// Absent in a record of a row planned before standalone articles,
+    /// and left out when the row has none, so such a record is the same
+    /// bytes as before and a replayed row reposts in the form it was
+    /// posted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yenc_name: Option<String>,
 }
 
 /// `m/art/<extent_id>`: where the extent's ciphertext is on Usenet.
@@ -453,6 +499,7 @@ impl ArticleManifest {
                     cipher_offset: a.cipher_offset,
                     cipher_len: a.cipher_len,
                     payload_sha256: a.payload_sha256.to_vec(),
+                    yenc_name: a.yenc_name.clone(),
                 })
                 .collect(),
         }
@@ -472,6 +519,13 @@ impl ArticleManifest {
                     cipher_offset: a.cipher_offset,
                     cipher_len: a.cipher_len,
                     payload_sha256: digest(&a.payload_sha256)?,
+                    // The catalogue would refuse any other name, and a
+                    // replay's insert skips a refused row without a word:
+                    // such a record is unreadable instead.
+                    yenc_name: match &a.yenc_name {
+                        Some(name) if !valid_yenc_name(name) => return Err(ERR_RECORD),
+                        name => name.clone(),
+                    },
                     state,
                     provider_id: None,
                     posted_at: None,

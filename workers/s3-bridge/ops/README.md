@@ -48,6 +48,15 @@ Limits to know:
   the order: every write and delete that was acknowledged on the key
   after it sorts after it and stays on top. It is visible after a replay
   only when nothing was acknowledged on the key after it.
+  - A DeleteObject of such a key, also when nothing is live on it,
+    leaves a tombstone above the record, so the delete holds in a
+    replay. The exception is a record of a write that failed before the
+    migration `0007_key_floors.sql` was applied: the catalogue has no
+    mark for it, a DeleteObject that finds nothing live records
+    nothing, and a replay publishes the record. A PutObject followed by
+    a DeleteObject of the key, made now, covers it, provided the clock
+    has not moved back since the failed write: without a mark, the
+    order of the new ids against the record's rests on the clock alone.
 - Replay order is id order. Before a record is stored, the catalogue
   raises the floor of the key to the record's id, in a statement of its
   own, and it accepts a publication or a tombstone only if its id sorts
@@ -72,12 +81,30 @@ Limits to know:
   lists it under `damaged`. The exception: when the key has an older
   generation, live or deleted, the key stays as the older records leave
   it and the record is listed under `damaged_unpublished`, in every
-  replay. Such a record is far more often what a failed write left
-  behind (a CompleteMultipartUpload whose parts were then collected)
-  than an acknowledged object that lost its data, and the replay cannot
-  tell the two apart. If it was acknowledged, the key answers with the
+  replay, with its id, the name of its bucket and its key. Such a
+  record is far more often what a failed write left behind (a
+  CompleteMultipartUpload whose parts were then collected) than an
+  acknowledged object that lost its data, and the replay cannot tell
+  the two apart. If it was acknowledged, the key answers with the
   object before it, or with 404 after a delete before it, instead of an
   error.
+  - What to do about one: find out whether the write was acknowledged
+    (the client's log, the application that owns the key).
+    - Not acknowledged (a failed upload): nothing. The key holds what it
+      should.
+    - Acknowledged: the object is lost. Put it again from its source,
+      or tell its owner.
+  - The record stays in `SAFETY` either way, and no command removes it.
+    A replay leaves it out only while the key has a live object that
+    is newer than the record, so a PutObject on the key ends the report
+    for replays over a catalogue where that object is live. The record
+    is listed again after a DeleteObject of the key, and by a replay
+    into an empty database, which reads the record before the newer
+    ones; the key ends as the newer records say all the same.
+  - Every replay that lists such a record exits with status 2, and for
+    a record that stays listed that does not end. Exit status 2 from
+    this list alone is then no new damage: compare the list with the
+    list of the replay before.
 - A CompleteMultipartUpload that got no answer from the catalogue and
   was sent again can leave two records of one object. The replay
   publishes one and counts the other in `duplicate`; nothing is missing.
@@ -170,8 +197,11 @@ jobs and the cron. If a replay was stopped, run it again to its end.
 Starting a replay again makes the earlier one void: a step sent with a
 cursor of the earlier one answers 409 and does nothing, and the
 catalogue stays closed until the replay that was started last has
-ended. A database that was brought back without the last command
-of step 2 is not closed: nothing in it says that a replay is due.
+ended. A replay that is started while another one has not ended must
+start from the same restore point or an earlier one; a later one
+answers 409. A database that was brought back without the last command
+of step 2 is not closed at once: nothing in it says that a replay is
+due. The rollback stamp (below) closes it at the next cron run.
 
 The catalogue refuses the commit as well, not only the request: a write
 that was already under way when a replay started answers 503 and
@@ -190,6 +220,187 @@ into a catalogue that holds a part of the records.
 
 The replay is idempotent. It can be stopped, repeated, or run over a
 catalogue that already holds some of the records.
+
+## The rollback stamp
+
+It finds a catalogue that was brought back to an earlier point without
+the steps above (a Time Travel restore or an import with the Worker
+serving).
+
+- The catalogue holds a counter (`rollback_stamp`). `SAFETY` holds one
+  small object per value the counter has reached:
+  `rs/<catalogue id>/<counter, 20 digits>`. The objects are only put; no
+  delete removes one. The body is the time of the raise in milliseconds.
+- The counter is raised by every cron run, and by a write that must be
+  covered at once, after its commit and before its `200`. A cron run
+  whose raise loses to such a write goes on without a raise of its own.
+- A restore takes the counter back and leaves the objects. **A counter
+  behind the newest object, or no counter while an object exists, means
+  the catalogue was rolled back.** The cron run checks this before it
+  does anything else, and before it moves the counter. It checks it
+  while a replay is on record as unfinished too. Garbage collection and
+  eviction check it themselves before they delete anything.
+- When it is found: `GET /_admin/status` shows
+  `"catalogue_rolled_back": true` (and `replay_unfinished: true`), the
+  cron logs it on every run, every write answers 503, and the jobs and
+  the cron do nothing. Reads are served.
+- **Way out: the restore above, from step 1.** In step 2 the database
+  is already "brought back"; run the two commands. The restore point is
+  the time the database was restored to, with one exception: if the
+  database came back with a replay on record as unfinished (after the
+  arming statement of step 2, `SELECT since_ms FROM restore_state` is
+  not `-1`), the restore point is that replay's, not a later one. The catalogue holds
+  the records up to that point at most. The route enforces it: a first
+  call with a later `since_ms` answers 409 and names the value to send
+  (`unfinished_since_ms`, with `margin_ms` 0). A second exception, which
+  the route cannot see: if the row is already `replaying` with
+  `since_ms` `-1` before you run the arming statement (check with
+  `SELECT state, since_ms FROM restore_state` first), the database was
+  restored a second time, to a point after an earlier arming and before
+  that replay's first call. The time of this restore is then too late:
+  take the restore point from the stamp object as described next, not
+  from the bookmark time. If the time is not known,
+  take the body of the stamp object of the counter the catalogue holds
+  (`SELECT counter FROM rollback_stamp`) minus one cron interval, or
+  `0`. The last step of the replay sets the counter level with the
+  newest object and opens the catalogue.
+- Only a replay that is started after the rollback does that. The last
+  step of a replay that was started before it answers 409
+  (`The catalogue was rolled back after this replay started`) and leaves
+  the catalogue closed, whether that replay had ended or was still
+  running at the point the database went back to: start a new replay
+  with `since_ms`. The route tells the two apart by the time in the
+  newest stamp object, so it also refuses in one harmless case: a raise
+  that was under way at the moment the replay was started. Start the
+  replay again then.
+- `CATALOGUE_ID` (default `main`) is the `<catalogue id>` of the keys.
+  Two catalogues over one `SAFETY` bucket need two ids. Do not change it
+  for a catalogue in use: its objects would no longer be found, and a
+  rollback would go unseen. The row keeps the id it was created with,
+  so a Worker with another id refuses to use the stamp: the cron run
+  fails before it sends a job, garbage collection and eviction retry,
+  no stamp is raised, and `GET /_admin/status` shows
+  `"catalogue_id_mismatch": true` with `"catalogue_rolled_back": null`.
+  Put the id back.
+- A new, empty database over a `SAFETY` bucket that already has stamp
+  objects of its id counts as rolled back. That is the restore case
+  "Nothing"; run the replay.
+- A database restored from an export made before this table existed has
+  no counter. The same holds: the replay sets it.
+
+What the stamp does not see. In both cases the catalogue is rolled back
+to a point after the last raise and before a commit, so counter and
+newest object are level and nothing closes:
+
+- **A.** A handler is killed between its commit and its raise. The
+  write was not acknowledged. The window ends with the next raise, at
+  the latest the next cron run (5 minutes).
+- **B.** The raise fails after the commit (the counter cannot be moved,
+  or three puts of the object fail). The write is answered `200`,
+  because it is committed. The window ends with the next raise that
+  succeeds. The cron logs `the rollback stamp was not raised` while its
+  own raise fails.
+- Writes that do not raise on their own are covered by the cron run
+  only: a rollback to a point after the last cron run is not seen.
+
+For all of these the rule stays: after any restore of the database,
+run the restore steps above. The recovery records of every acknowledged
+PutObject, CompleteMultipartUpload, CopyObject and DeleteObject are in
+`SAFETY`, where a database restore cannot reach them, and the replay
+brings them back.
+
+## A PutObject above one extent
+
+With `MAX_PUT_BYTES` above `MAX_EXTENT_BYTES` (shipped: 99 MiB over
+16 MiB), the body of one PutObject may be larger than one extent. It is
+stored as slices of `SLICE_BYTES` (8 MiB), each an extent of its own,
+one in memory at a time. The object is one generation with one recovery
+record, like any other, and its ETag is the MD5 of the body. A part of
+a multipart upload stays at `MAX_EXTENT_BYTES`.
+
+- A request body above 100 MiB is refused before the Worker runs, so
+  99 MiB is the most `MAX_PUT_BYTES` takes. That limit counts the bytes
+  on the wire: a body sent in signed chunks carries 89 bytes of framing
+  per chunk. With chunks of 8 KiB, the smallest S3 allows, a body above
+  about 98.9 MiB is over it and is refused there; chunks of 16 KiB or
+  more fit up to 99 MiB. A client has to send larger
+  files as multipart uploads. aws-cli does so from 8 MiB. rclone does so
+  from 200 MiB by default: run it with `--s3-upload-cutoff 95M` and
+  `--s3-chunk-size 16M` (or `upload_cutoff = 95M` and `chunk_size = 16M`
+  in the remote's section of `rclone.conf`). A part of 16 MiB is one
+  full extent; rclone's default part of 5 MiB makes about three times as
+  many extents.
+- Before its first slice is stored, the request writes one row per
+  slice into `write_intents`. The commit removes the rows. A request
+  that died leaves its rows, and its slices in `SAFETY`.
+- The request raises the rollback stamp before it writes its recovery
+  record, and once more after the commit. If the first raise fails, it
+  answers 503 `SlowDown` and publishes nothing.
+- Such a request counts two slices (16 MiB) against
+  `INFLIGHT_BUDGET_BYTES`, so with the shipped 48 MiB one isolate reads
+  three at once. A fourth waits a bounded time for room and then
+  answers 503 `SlowDown`. Measured on a test deployment: with three
+  95 MiB bodies at once in one isolate, its wasm memory stayed at
+  41.9 MiB or less (1.4 MiB before any large body).
+
+**The sweep** (`INTENT_SWEEP = "on"`, independent of `GC_MODE`) removes
+what such a request left. Each cron run sends a job for up to 20
+writes, the oldest first, whose rows are a day old or were given up by
+their request. The job deletes the slices and then the rows. It deletes
+nothing:
+
+- of a write that has a recovery record in `SAFETY`. Its rows are
+  marked `kept` and stay;
+- while a replay is under way;
+- while the catalogue is behind its rollback stamp.
+
+With the switch off nothing is deleted and the rows stay; a later run
+with the switch on removes them. Production ships with the switch off:
+`waiting_writes` and `oldest_waiting_at` below count what the sweep
+would take. Turn it on in `wrangler.toml` after a restore drill on a
+deployed Worker has passed.
+
+`GET /_admin/status` shows the table under `write_intents`:
+
+| Field | Meaning | If it stays above 0 |
+|---|---|---|
+| `open_writes` | requests under way, and dead ones younger than a day | nothing to do |
+| `waiting_writes`, `oldest_waiting_at` | writes that are due for the sweep: bytes in `SAFETY` that no object uses | the sweep is off, a replay is unfinished, the catalogue is rolled back, or the cron could not send the jobs (it logs `dispatch: the sweep of unpublished writes was not sent`) |
+| `kept_writes`, `kept_slices`, `oldest_kept_at` | writes with a recovery record and without an object in the catalogue: the request died between the two, its publication was refused and the record could not be removed, or the database was restored to a point before the commit and the restore was not noticed | run the restore steps above with a `since_ms` no later than `oldest_kept_at`. The replay reads only the records from `since_ms` (less the margin) on: it publishes those, and its first step removes their rows. A `kept` row whose record is older than that stays, and so does the figure |
+| `anomalies` | how often a write was marked `kept`, ever; it does not go down | see `kept_writes` |
+
+These figures describe the catalogue as it is now. In a catalogue that
+was never restored, no client was told `200` for a write that is
+`open`, `waiting` or `kept`. After a restore of the database that no
+longer holds: the rows are those of the restored point, and a write
+that is `open`, `waiting` or `kept` there may have been answered `200`
+later. Its recovery record is in `SAFETY`, the sweep deletes nothing of
+it (the rules above), and a replay that starts before its record
+publishes it. A row is never proof that an upload failed.
+
+One such restore is not found by the rollback check: to a point after
+the request raised the stamp and before its commit, when the request's
+raise after the commit failed and no cron run has raised the stamp
+since. The object was answered `200` and is missing from the catalogue.
+A day later the sweep finds its record and marks the write `kept`:
+treat `kept_writes` above 0 as an object that may be missing until a
+replay from `oldest_kept_at` or earlier has run.
+
+**With a restore.** The first step of a replay removes from
+`write_intents` every row but the `kept` rows whose record the replay
+does not read (a record from before its `since_ms`, less the margin): a
+row of an earlier point may name slices that the replay publishes.
+Slices of requests that were under way at that moment and never
+published stay in `SAFETY` without a row, and no figure counts them.
+
+A Worker version from before this table does not empty it. If such a
+version ran a restore, run `DELETE FROM write_intents` on the database
+before a version with the sweep is deployed again.
+
+Going back to a Worker version from before this table needs nothing
+else: the objects are ordinary generations, which it reads, posts,
+verifies and replays. It answers `EntityTooLarge` to a new PutObject
+above one extent.
 
 ## The route
 

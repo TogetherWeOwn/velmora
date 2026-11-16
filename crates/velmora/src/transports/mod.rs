@@ -7,8 +7,14 @@
 //!   Workers [`connect()`](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 //!   TCP socket, with per-operation timeouts via
 //!   [`worker::Delay`](https://docs.rs/worker).
+//! - [`worker_socks5`] (feature `worker-socks5-tls`, wasm32 only): that socket through a
+//!   SOCKS5 proxy, with TLS end to end from the Worker to the provider.
 
-#[cfg(any(feature = "native-tls", feature = "worker-pinned-tls"))]
+#[cfg(any(
+    feature = "native-tls",
+    feature = "worker-pinned-tls",
+    feature = "worker-socks5-tls"
+))]
 pub mod peer_tls;
 
 #[cfg(all(feature = "worker-pinned-tls", target_arch = "wasm32"))]
@@ -27,3 +33,12 @@ pub mod worker_socket;
 
 #[cfg(all(feature = "worker-transport", target_arch = "wasm32"))]
 pub use worker_socket::WorkerTransport;
+
+#[cfg(any(feature = "native-tls", feature = "worker-socks5-tls"))]
+pub mod proxy_tls;
+
+#[cfg(all(feature = "worker-socks5-tls", target_arch = "wasm32"))]
+pub mod worker_socks5;
+
+#[cfg(all(feature = "worker-socks5-tls", target_arch = "wasm32"))]
+pub use worker_socks5::WorkerProxiedTransport;

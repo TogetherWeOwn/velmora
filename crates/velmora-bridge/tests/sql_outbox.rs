@@ -15,6 +15,13 @@ const T0: UnixMs = UnixMs(1_762_992_000_123);
 const LEASE_MS: i64 = 600_000;
 const HOUR_MS: i64 = 3_600_000;
 
+/// The backbones that count toward a release in these tests.
+fn bbs() -> Vec<String> {
+    ["bb", "bb-a", "bb-b", "bb1", "bb2"]
+        .map(String::from)
+        .to_vec()
+}
+
 struct Probe(RusqliteSql);
 
 fn check_params(params: &[SqlValue]) {
@@ -107,6 +114,23 @@ impl Fx {
     /// One outbox column of an object's row, as text.
     async fn outbox(&self, o: &Obj, column: &str) -> String {
         let sql = format!("SELECT CAST({column} AS TEXT) FROM outbox WHERE extent_id = ?1");
+        let rows = self
+            .cat
+            .sql
+            .0
+            .query(&sql, &[text(o.extent.as_str())])
+            .await
+            .unwrap();
+        match &rows[0][0] {
+            SqlValue::Text(s) => s.clone(),
+            SqlValue::Null => "NULL".into(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// One column of an object's extent row, as text.
+    async fn extent(&self, o: &Obj, column: &str) -> String {
+        let sql = format!("SELECT CAST({column} AS TEXT) FROM extents WHERE id = ?1");
         let rows = self
             .cat
             .sql
@@ -236,6 +260,9 @@ impl Fx {
                 cipher_offset: u64::from(idx) * 100,
                 cipher_len: 100,
                 payload_sha256: [idx as u8; 32],
+                // Both forms: a standalone article and an older
+                // multi-part one, which has no name of its own.
+                yenc_name: (idx % 2 == 0).then(|| format!("{idx}name")),
                 state: ArticleState::Planned,
                 provider_id: None,
                 posted_at: None,
@@ -280,8 +307,38 @@ impl Fx {
             articles_ok: ok,
             articles_total: total,
             result,
+            kind: VerifyKind::Body,
         };
         self.cat.record_verification(l, &v).await.unwrap()
+    }
+
+    /// A complete pass of `kind` over the extent's two articles.
+    async fn pass(&self, l: &Lease, backbone: &str, at: UnixMs, kind: VerifyKind) -> bool {
+        let v = VerificationRow {
+            extent_id: l.extent.clone(),
+            backbone: backbone.into(),
+            provider_id: format!("p-{backbone}"),
+            verified_at: at,
+            plan_rev: 1,
+            articles_ok: 2,
+            articles_total: 2,
+            result: VerifyResult::Ok,
+            kind,
+        };
+        self.cat.record_verification(l, &v).await.unwrap()
+    }
+
+    /// A two-article extent claimed for release at `T0`.
+    async fn at_release(&self, key: &str) -> (Obj, Lease) {
+        let o = self.publish(&self.bucket, key).await;
+        let l = self.posted(&o, 2, T0).await;
+        assert!(self
+            .cat
+            .advance(&l, OutboxStage::Release, T0, T0)
+            .await
+            .unwrap());
+        let r = self.claim(&o, OutboxStage::Release, T0).await.unwrap();
+        (o, r)
     }
 
     /// Backbones that count, in order.
@@ -499,7 +556,9 @@ async fn stale_lease_is_fenced() {
     assert!(fx.verify(&r, "bb", "p1", t3, 3, 3, VerifyResult::Ok).await);
     let before = fx.dump().await;
     assert_eq!(
-        c.begin_release(&stale_r, 1, "[]", t3).await.unwrap(),
+        c.begin_release(&stale_r, 1, &bbs(), "[]", t3)
+            .await
+            .unwrap(),
         Guard::Lost
     );
     assert!(!c.finish_release(&stale_r, t3).await.unwrap());
@@ -509,7 +568,7 @@ async fn stale_lease_is_fenced() {
         "a stale release lease wrote something"
     );
     assert_eq!(
-        c.begin_release(&r, 1, "[]", t3).await.unwrap(),
+        c.begin_release(&r, 1, &bbs(), "[]", t3).await.unwrap(),
         Guard::Applied(())
     );
     // The owner began; the stale lease still cannot finish for it.
@@ -635,6 +694,19 @@ async fn plan_articles_is_all_or_nothing_and_chunk_free() {
         fx.cat.plan_articles(&lease, &dup).await,
         Err(BridgeError::Sql(_))
     ));
+    // So does a yEnc name the schema refuses (empty, too long, or not
+    // lowercase alphanumeric).
+    for name in ["", "Upper", "has space", &"x".repeat(65)] {
+        let mut named = fx.plan(&o, "n", 3);
+        named[2].yenc_name = Some(name.to_string());
+        assert!(
+            matches!(
+                fx.cat.plan_articles(&lease, &named).await,
+                Err(BridgeError::Sql(_))
+            ),
+            "{name:?}"
+        );
+    }
     assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
     assert_eq!(
         fx.count("SELECT COUNT(*) FROM extents WHERE article_count IS NOT NULL")
@@ -734,6 +806,7 @@ async fn partial_ok_does_not_count() {
         articles_ok: 3,
         articles_total: 3,
         result: VerifyResult::Ok,
+        kind: VerifyKind::Body,
     };
     assert!(fx.cat.record_verification(&l, &v).await.unwrap());
     assert!(fx
@@ -795,7 +868,7 @@ async fn same_backbone_counts_once() {
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, "[]", T0.plus_ms(4))
+            .begin_release(&r, 2, &bbs(), "[]", T0.plus_ms(4))
             .await
             .unwrap(),
         Guard::Lost
@@ -808,7 +881,7 @@ async fn same_backbone_counts_once() {
     assert!(fx.counting(&o).await.is_empty());
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, "[]", T0.plus_ms(6))
+            .begin_release(&r, 1, &bbs(), "[]", T0.plus_ms(6))
             .await
             .unwrap(),
         Guard::Lost
@@ -826,7 +899,7 @@ async fn same_backbone_counts_once() {
     assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, "[]", T0.plus_ms(8))
+            .begin_release(&r, 2, &bbs(), "[]", T0.plus_ms(8))
             .await
             .unwrap(),
         Guard::Applied(())
@@ -848,7 +921,7 @@ async fn release_needs_fresh_evidence() {
     );
     // Only a release lease may release.
     assert!(matches!(
-        fx.cat.begin_release(&l, 1, "[]", T0).await,
+        fx.cat.begin_release(&l, 1, &bbs(), "[]", T0).await,
         Err(BridgeError::Invalid(_))
     ));
     let week = T0.plus_ms(7 * 24 * HOUR_MS);
@@ -869,7 +942,7 @@ async fn release_needs_fresh_evidence() {
     let before = fx.dump().await;
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, "[\"old\"]", week)
+            .begin_release(&r, 1, &bbs(), "[\"old\"]", week)
             .await
             .unwrap(),
         Guard::Lost
@@ -881,7 +954,7 @@ async fn release_needs_fresh_evidence() {
     assert_eq!(fx.dump().await, before);
     // Zero required backbones is never a valid release.
     assert!(matches!(
-        fx.cat.begin_release(&r, 0, "[]", week).await,
+        fx.cat.begin_release(&r, 0, &bbs(), "[]", week).await,
         Err(BridgeError::Invalid(_))
     ));
 
@@ -892,13 +965,16 @@ async fn release_needs_fresh_evidence() {
             .await
     );
     assert_eq!(
-        fx.cat.begin_release(&r, 2, "[]", now).await.unwrap(),
+        fx.cat
+            .begin_release(&r, 2, &bbs(), "[]", now)
+            .await
+            .unwrap(),
         Guard::Lost,
         "one backbone is not two"
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, "[{\"backbone\":\"bb-a\"}]", now)
+            .begin_release(&r, 1, &bbs(), "[{\"backbone\":\"bb-a\"}]", now)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -920,7 +996,7 @@ async fn release_needs_fresh_evidence() {
     // A crash after the blob delete is re-driven: begin again, then finish.
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, "[{\"backbone\":\"bb-a\"}]", now)
+            .begin_release(&r, 1, &bbs(), "[{\"backbone\":\"bb-a\"}]", now)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -940,7 +1016,10 @@ async fn release_needs_fresh_evidence() {
     // Done is final.
     assert!(!fx.cat.finish_release(&r, done_at).await.unwrap());
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", done_at).await.unwrap(),
+        fx.cat
+            .begin_release(&r, 1, &bbs(), "[]", done_at)
+            .await
+            .unwrap(),
         Guard::Lost
     );
     assert!(fx
@@ -949,6 +1028,257 @@ async fn release_needs_fresh_evidence() {
         .await
         .unwrap()
         .is_empty());
+}
+
+fn labels(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+/// `STAT` passes are never the full check: on however many backbones,
+/// they release nothing until one backbone has a `BODY` pass.
+#[tokio::test]
+async fn release_refuses_stat_passes_alone() {
+    let fx = Fx::new().await;
+    let (o, r) = fx.at_release("k").await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Stat).await);
+    // Both rows are complete passes of their kind.
+    assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
+    let before = fx.dump().await;
+    for required in [1, 2] {
+        assert_eq!(
+            fx.cat
+                .begin_release(&r, required, &counting, "[]", T0.plus_ms(2))
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "required = {required}"
+        );
+    }
+    assert_eq!(fx.dump().await, before);
+
+    // One of the two read in full: the rule holds.
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(3), VerifyKind::Body).await);
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 2, &counting, "[]", T0.plus_ms(4))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+}
+
+/// A pass on a backbone that does not count toward a release is nothing:
+/// neither the full check nor one of the copies.
+#[tokio::test]
+async fn release_refuses_a_backbone_that_does_not_count() {
+    let fx = Fx::new().await;
+    let (_, r) = fx.at_release("k").await;
+    // The full check sits on the backbone that does not count.
+    assert!(fx.pass(&r, "short", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    let before = fx.dump().await;
+    for (required, counting) in [(2, labels(&["bb-a", "bb-b"])), (1, labels(&["bb-a"]))] {
+        assert_eq!(
+            fx.cat
+                .begin_release(&r, required, &counting, "[]", T0.plus_ms(2))
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "required = {required}"
+        );
+    }
+    assert_eq!(fx.dump().await, before);
+    // A `BODY` pass on one that counts, and the other is still not a
+    // second copy.
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(3), VerifyKind::Body).await);
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 2, &labels(&["bb-a", "bb-b"]), "[]", T0.plus_ms(4))
+            .await
+            .unwrap(),
+        Guard::Lost
+    );
+    // No list of backbones that count: nothing counts.
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 1, &[], "[]", T0.plus_ms(4))
+            .await
+            .unwrap(),
+        Guard::Lost
+    );
+}
+
+/// Both checks on one backbone are one copy.
+#[tokio::test]
+async fn release_refuses_both_checks_on_one_backbone() {
+    let fx = Fx::new().await;
+    let (o, r) = fx.at_release("k").await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(2), VerifyKind::Stat).await);
+    assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 2, &counting, "[]", T0.plus_ms(3))
+            .await
+            .unwrap(),
+        Guard::Lost
+    );
+    // The latest row speaks for its backbone, and it is the `STAT` one:
+    // even where one backbone is enough, this is no full check.
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    assert_eq!(status[0].kind, VerifyKind::Stat);
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 1, &counting, "[]", T0.plus_ms(3))
+            .await
+            .unwrap(),
+        Guard::Lost
+    );
+}
+
+/// `BODY` on one backbone that counts and `STAT` on another: released.
+/// The evidence has to be from this claim, whatever its kind.
+#[tokio::test]
+async fn release_takes_a_body_pass_and_a_stat_pass_on_two_backbones() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    // The verify stage: the same two passes, before the release claim.
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let lost = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
+    };
+    assert!(lost(later).await, "passes from before the claim");
+    // Only the `STAT` half again: the old `BODY` pass does not complete it.
+    assert!(
+        fx.pass(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat)
+            .await
+    );
+    assert!(lost(later.plus_ms(2)).await, "no fresh full check");
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Body)
+            .await
+    );
+    assert!(!lost(later.plus_ms(4)).await);
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+}
+
+/// What the column means for rows and Workers from before it, and what
+/// a `STAT` pass leaves alone.
+#[tokio::test]
+async fn verification_kind_defaults_to_body_and_stat_is_not_a_read() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    // A Worker from before the column names no kind.
+    fx.run(
+        "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, plan_rev, \
+           articles_ok, articles_total, result) VALUES (?1, 'bb-a', 'p1', ?2, 1, 2, 2, 'ok')",
+        &[text(o.extent.as_str()), SqlValue::Int(T0.0)],
+    )
+    .await;
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    assert_eq!((status[0].kind, status[0].counts), (VerifyKind::Body, true));
+    // Only the two kinds exist.
+    let bad = fx
+        .cat
+        .sql
+        .exec("UPDATE verifications SET kind = 'head'", &[])
+        .await;
+    assert!(bad.is_err());
+
+    // A `STAT` pass read nothing: the extent's last read stays where it was.
+    assert_eq!(fx.extent(&o, "last_verified_at").await, "NULL");
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert_eq!(fx.extent(&o, "last_verified_at").await, "NULL");
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(2), VerifyKind::Body).await);
+    assert_eq!(
+        fx.extent(&o, "last_verified_at").await,
+        T0.plus_ms(2).0.to_string()
+    );
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(3), VerifyKind::Stat).await);
+    assert_eq!(
+        fx.extent(&o, "last_verified_at").await,
+        T0.plus_ms(2).0.to_string()
+    );
+
+    // Two results in one millisecond: the kind is that of the row kept.
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(3), VerifyKind::Body).await);
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    let b = status.iter().find(|b| b.backbone == "bb-b").unwrap();
+    assert_eq!((b.kind, b.verified_at), (VerifyKind::Body, T0.plus_ms(3)));
+}
+
+/// How many rows of a backbone a reader from before `kind` takes for a
+/// complete read-back: its test names no kind.
+async fn read_backs_before_kind(fx: &Fx, o: &Obj, backbone: &str) -> String {
+    let rows = fx
+        .cat
+        .sql
+        .0
+        .query(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM verifications v \
+               JOIN extents e ON e.id = v.extent_id \
+              WHERE v.extent_id = ?1 AND v.backbone = ?2 AND v.result = 'ok' \
+                AND v.articles_ok = v.articles_total \
+                AND v.articles_total = COALESCE(e.article_count, -1)",
+            &[text(o.extent.as_str()), text(backbone)],
+        )
+        .await
+        .unwrap();
+    match &rows[0][0] {
+        SqlValue::Text(s) => s.clone(),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A Worker from before `kind` (after a rollback, say) takes a row with
+/// `articles_ok = articles_total` for a full read-back. A `STAT` pass is
+/// stored so that it never is one to that reader, and still reads as a
+/// complete pass of its kind to this one.
+#[tokio::test]
+async fn a_stat_pass_is_no_read_back_to_a_reader_from_before_kind() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "1");
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-b").await, "0");
+
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    let seen: Vec<_> = status
+        .iter()
+        .map(|b| (b.backbone.as_str(), b.kind, b.articles_ok, b.counts))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("bb-a", VerifyKind::Body, 2, true),
+            ("bb-b", VerifyKind::Stat, 2, true)
+        ]
+    );
+
+    // A second result in the same millisecond moves the tally with the kind.
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-b").await, "1");
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "0");
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    assert!(status.iter().all(|b| b.counts && b.articles_ok == 2));
 }
 
 #[tokio::test]
@@ -970,7 +1300,7 @@ async fn release_refuses_a_retired_generation_and_a_missing_safety_copy() {
     fx.run("UPDATE extents SET safety_state = 'deleted'", &[])
         .await;
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", T0).await.unwrap(),
+        fx.cat.begin_release(&r, 1, &bbs(), "[]", T0).await.unwrap(),
         Guard::Lost
     );
 
@@ -994,7 +1324,7 @@ async fn release_refuses_a_retired_generation_and_a_missing_safety_copy() {
     )
     .await;
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", T0).await.unwrap(),
+        fx.cat.begin_release(&r, 1, &bbs(), "[]", T0).await.unwrap(),
         Guard::Lost
     );
     let je = fx
@@ -1354,12 +1684,12 @@ async fn release_evidence_must_come_from_this_claim() {
     let r = fx.claim(&o, OutboxStage::Release, t1).await.unwrap();
     assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", t1).await.unwrap(),
+        fx.cat.begin_release(&r, 1, &bbs(), "[]", t1).await.unwrap(),
         Guard::Lost
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, "[]", t1.plus_ms(9 * 60_000))
+            .begin_release(&r, 1, &bbs(), "[]", t1.plus_ms(9 * 60_000))
             .await
             .unwrap(),
         Guard::Lost
@@ -1372,7 +1702,7 @@ async fn release_evidence_must_come_from_this_claim() {
             .await
     );
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", t2).await.unwrap(),
+        fx.cat.begin_release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
         Guard::Lost
     );
 
@@ -1393,7 +1723,7 @@ async fn release_evidence_must_come_from_this_claim() {
     assert!(fx.cat.set_cursor(&r, 1, t2).await.unwrap());
     assert!(fx.cat.renew(&r, t2).await.unwrap());
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", t2).await.unwrap(),
+        fx.cat.begin_release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
         Guard::Applied(())
     );
 }
@@ -1418,14 +1748,20 @@ async fn expired_release_lease_cannot_release() {
     let expired = T0.plus_ms(LEASE_MS + 1);
     let before = fx.dump().await;
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", expired).await.unwrap(),
+        fx.cat
+            .begin_release(&r, 1, &bbs(), "[]", expired)
+            .await
+            .unwrap(),
         Guard::Lost
     );
     assert_eq!(fx.dump().await, before);
     // Begun in time, but the delete outlived the lease: not finished.
     let last = T0.plus_ms(LEASE_MS);
     assert_eq!(
-        fx.cat.begin_release(&r, 1, "[]", last).await.unwrap(),
+        fx.cat
+            .begin_release(&r, 1, &bbs(), "[]", last)
+            .await
+            .unwrap(),
         Guard::Applied(())
     );
     let before = fx.dump().await;

@@ -295,6 +295,58 @@ fn unauthenticated_body_never_read() {
 }
 
 #[test]
+fn a_raised_put_limit_leaves_every_other_body_at_one_extent() {
+    const PUT: u64 = 99 * 1024 * 1024;
+    let mut v = vars(true);
+    v.insert("MAX_PUT_BYTES".into(), PUT.to_string());
+    let cfg = BridgeConfig::from_vars(|k| v.get(k).cloned()).expect("fixture config");
+    assert_eq!((cfg.max_put_bytes, cfg.max_extent_bytes), (PUT, MAX));
+    let decide = |method: Method, target: &str, len: u64, extra: &[(&str, &str)]| {
+        let len = len.to_string();
+        let mut headers = vec![("authorization", SIGV4), ("content-length", len.as_str())];
+        headers.extend(extra.iter().copied());
+        check(&request(method, target, &headers, Body::Empty), &cfg, true)
+    };
+    let too_large = Err(IngressError::EntityTooLarge);
+
+    // PutObject, and nothing else, takes up to the raised limit.
+    assert_eq!(decide(Method::Put, "/bucket/key", PUT, &[]), Ok(()));
+    assert_eq!(decide(Method::Put, "/bucket/key", PUT + 1, &[]), too_large);
+    let chunked = |decoded: u64| {
+        let decoded = decoded.to_string();
+        let headers = [
+            ("authorization", SIGV4),
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", decoded.as_str()),
+        ];
+        let req = request(Method::Put, "/bucket/key", &headers, Body::Empty);
+        check(&req, &cfg, true)
+    };
+    assert_eq!(chunked(PUT), Ok(()));
+    assert_eq!(chunked(PUT + 1), too_large);
+
+    // A part, a copy that declares a length, and a body of any other
+    // operation stay at one extent.
+    let part = "/bucket/key?partNumber=1&uploadId=u";
+    let copy = [("x-amz-copy-source", "/bucket/src")];
+    assert_eq!(decide(Method::Put, part, MAX, &[]), Ok(()));
+    assert_eq!(decide(Method::Put, part, MAX + 1, &[]), too_large);
+    assert_eq!(
+        decide(Method::Put, "/bucket/key", MAX + 1, &copy),
+        too_large
+    );
+    assert_eq!(decide(Method::Put, part, MAX + 1, &copy), too_large);
+    assert_eq!(
+        decide(Method::Post, "/bucket/key?uploadId=u", MAX + 1, &[]),
+        too_large
+    );
+    assert_eq!(
+        decide(Method::Post, "/bucket?delete", MAX + 1, &[]),
+        too_large
+    );
+}
+
+#[test]
 fn oversized_declared_length_rejected_unread() {
     let cfg = cfg(true);
     let over = (MAX + 1).to_string();

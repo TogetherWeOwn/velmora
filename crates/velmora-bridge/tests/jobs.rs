@@ -10,7 +10,7 @@ mod nntp_support;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use nntp_support::{TcpConnector, PASS, USER};
+use nntp_support::{DeadPort, TcpConnector, PASS, USER};
 use sha2::Digest as _;
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
@@ -70,11 +70,18 @@ impl GuardedBlob {
     fn check(&self) {
         assert!(!self.forbid.get(), "blob store touched");
     }
+    /// The rollback stamp is the one thing the dispatcher may put and
+    /// list.
+    fn check_unless_stamp(&self, key: &str) {
+        if !velmora_bridge::stamp::is_stamp_key(key) {
+            self.check();
+        }
+    }
 }
 
 impl BlobStore for GuardedBlob {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
-        self.check();
+        self.check_unless_stamp(key);
         if self
             .no_put
             .borrow()
@@ -105,7 +112,7 @@ impl BlobStore for GuardedBlob {
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
-        self.check();
+        self.check_unless_stamp(prefix);
         self.inner.list(prefix, start_after, limit).await
     }
 }
@@ -200,6 +207,8 @@ impl Fx {
         let providers = vec![ProviderConfig {
             id: "p0".to_string(),
             host: server.addr().ip().to_string(),
+            hosts: Vec::new(),
+            host_select: Default::default(),
             port: server.addr().port(),
             tls: false,
             user: USER.to_string(),
@@ -213,13 +222,18 @@ impl Fx {
             retention_days: None,
             pool: None,
             pool_max_conns: None,
+            proxies: Vec::new(),
             enabled: true,
+            release: true,
         }];
         let cfg = BridgeConfig {
             environment: Environment::Dev,
             s3_host: "s3.test".to_string(),
             region: "auto".to_string(),
             max_extent_bytes: 16 * 1024 * 1024,
+            max_put_bytes: 16 * 1024 * 1024,
+            slice_bytes: 8 * 1024 * 1024,
+            intent_sweep: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: VERIFY_DELAY_SECS,
@@ -232,6 +246,7 @@ impl Fx {
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             server_side_copy: false,
+            catalogue_id: "main".to_string(),
             dev_trust_http: false,
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
@@ -643,9 +658,12 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     let mut fx = Fx::new().await;
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "a/cool.bin", &plaintext()).await;
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead = dead.local_addr().unwrap().port();
-    let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead);
+    // A port nothing listens on, reserved until the end of the test: each
+    // connect is refused at once. A listener would take the connect and
+    // never greet, and each job would wait out the read timeout of the
+    // client.
+    let dead = DeadPort::reserve();
+    let port = core::mem::replace(&mut fx.bridge.cfg.providers[0].port, dead.port());
 
     for run in 0..3 {
         fx.make_due(&o).await;
@@ -684,6 +702,7 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     assert_eq!(fx.health("failures").await, "0");
     assert_eq!(fx.health("cooldowns").await, "0");
     assert_eq!(fx.health("cooldown_until").await, "0");
+    drop(dead);
 }
 
 /// Two accounts of one pool share `pool_max_conns` in `provider_permits`:
@@ -1046,6 +1065,11 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             redriven: 0,
             redrive_failed: false,
             evict_failed: false,
+            rolled_back: false,
+            stamp_failed: false,
+            sweeps_enqueued: 0,
+            sweep_failed: false,
+            release_paused: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -1249,6 +1273,9 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     fx.clock.advance_secs(300);
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (0, 0));
+    // And says so on every run, for the cron to log.
+    assert!(report.release_paused);
+    assert!(fx.bridge.cfg.release_paused().is_some());
     assert_eq!(fx.outbox(&o, "stage").await, "done");
 
     // A second backbone that has the articles by peering.
@@ -1288,8 +1315,18 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     p1.post = false;
     fx.bridge.cfg.providers.push(p1);
 
+    // Not while the new backbone does not count toward a release: there
+    // is still only one that does.
+    fx.bridge.cfg.providers[1].release = false;
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.redriven, report.enqueued), (0, 0));
+    assert!(report.release_paused);
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    fx.bridge.cfg.providers[1].release = true;
+
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (1, 1));
+    assert!(!report.release_paused);
     assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Verify));
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
     fx.pump().await;
@@ -1298,6 +1335,17 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     assert!(fx.has_safety(&o));
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status.iter().filter(|s| s.counts).count(), 2);
+    // Read in full on the first backbone, asked for on the second.
+    let kinds: Vec<_> = status
+        .iter()
+        .map(|s| (s.backbone.as_str(), s.kind))
+        .collect();
+    assert!(kinds.contains(&("bb1", VerifyKind::Stat)), "{kinds:?}");
+    assert_eq!(
+        kinds.iter().filter(|k| k.1 == VerifyKind::Body).count(),
+        1,
+        "{kinds:?}"
+    );
     // Nothing was posted twice.
     assert_eq!(fx.server.posted_count().await, 3);
 

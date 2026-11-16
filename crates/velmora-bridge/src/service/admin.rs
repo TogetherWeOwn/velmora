@@ -40,7 +40,8 @@ use crate::recovery::delete_blob;
 use crate::replay::ReplayCursor;
 use crate::types::{
     AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
-    KeyStatus, Method, OutboxStage, Perm, RespBody, S3Request, S3Response, SafetyState,
+    KeyStatus, Method, OutboxStage, Perm, ProviderLoad, RespBody, S3Request, S3Response,
+    SafetyState,
 };
 
 /// Largest admin request body.
@@ -411,7 +412,19 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                 .catalog
                 .restore_begin(from, bridge.clock.now())
                 .await
-                .or_internal()?;
+                .or_internal()?
+                .map_err(|unfinished| {
+                    // The catalogue holds the records up to that point
+                    // at most, whatever was restored since.
+                    json_response(
+                        409,
+                        &json!({
+                            "error": "OperationAborted",
+                            "message": "A replay from an earlier restore point is not finished. Start no later than it: send the since_ms of unfinished_since_ms with margin_ms 0, or an earlier since_ms.",
+                            "unfinished_since_ms": unfinished.0,
+                        }),
+                    )
+                })?;
             ReplayCursor {
                 run_ms: run.0,
                 ..ReplayCursor::start(from)
@@ -433,13 +446,42 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
         // last step of an older cursor must not open the catalogue for
         // writes while a replay that was started after it still runs.
         None => {
+            let rolled_back = || {
+                fail(
+                    409,
+                    "OperationAborted",
+                    "The catalogue was rolled back after this replay started. Start a new replay with since_ms.",
+                )
+            };
+            // Not if the catalogue is behind a stamp that was raised
+            // after this replay started: it was rolled back since, and
+            // this replay does not hold what was written before that.
+            let (stamp, seen) = bridge
+                .stamp_level(run)
+                .await
+                .or_internal()?
+                .ok_or_else(rolled_back)?;
+            // The catalogue holds every record again: its stamp counter
+            // is brought level with the newest stamp object.
             if !bridge
                 .catalog
-                .restore_finish(run, bridge.clock.now())
+                .restore_finish(
+                    run,
+                    bridge.clock.now(),
+                    stamp,
+                    seen,
+                    &bridge.cfg.catalogue_id,
+                )
                 .await
                 .or_internal()?
             {
                 return Err(earlier());
+            }
+            // The last step of a replay that had ended before, sent
+            // again: it changed nothing. If the catalogue was rolled
+            // back since, that replay does not cover it.
+            if bridge.stamp_row().await.or_internal()?.rolled_back {
+                return Err(rolled_back());
             }
         }
     }
@@ -678,6 +720,7 @@ async fn object_status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
                     "backbone": b.backbone,
                     "provider": b.provider_id,
                     "counts": b.counts,
+                    "kind": b.kind,
                     "ok": b.articles_ok,
                     "total": b.articles_total,
                     "at": b.verified_at,
@@ -737,21 +780,20 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .or_internal()?
         .ok_or_else(no_key)?;
 
-    // Only a read-back from a backbone that is still configured is
-    // evidence, as in the verify stage. Labels compare trimmed and in
-    // lower case.
+    // Only a read-back from a backbone that counts toward a release is
+    // evidence, as in the verify stage: a `STAT` pass is not one. Labels
+    // compare trimmed and in lower case.
     let label = |b: &str| b.trim().to_lowercase();
-    let configured: Vec<String> = bridge
-        .cfg
-        .providers
-        .iter()
-        .filter(|p| p.read && p.enabled)
-        .map(|p| label(&p.backbone))
-        .collect();
+    let configured = crate::verify::release_labels(&bridge.cfg.providers);
+    // With too few backbones that count, no pinned copy is given up.
+    let paused = bridge.cfg.release_paused().is_some();
     let on_usenet = |x: &crate::types::ExtentStatus| {
-        x.backbones
-            .iter()
-            .any(|b| b.counts && configured.contains(&label(&b.backbone)))
+        !paused
+            && x.backbones.iter().any(|b| {
+                b.counts
+                    && b.kind == crate::types::VerifyKind::Body
+                    && configured.contains(&label(&b.backbone))
+            })
     };
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
@@ -881,7 +923,13 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         match read {
             Ok(tally) if tally.ok > 0 => last_provider.clone_from(&provider.id),
             Ok(_) => {}
-            Err(Stop::NoPermit | Stop::Cooling(_) | Stop::Fail(..) | Stop::Session(_)) => {
+            Err(
+                Stop::NoPermit
+                | Stop::Refused
+                | Stop::Cooling(_)
+                | Stop::Fail(..)
+                | Stop::Session(_),
+            ) => {
                 busy = true;
             }
             Err(Stop::Fenced | Stop::Catalog) => {
@@ -978,6 +1026,13 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
     let replaying = bridge.catalog.restore_pending().await.or_internal()?;
+    // A stamp row of another catalogue id is said, not failed on: this
+    // is where the operator looks for it.
+    let (rolled_back, id_mismatch) = match bridge.stamp_row().await {
+        Ok(row) => (Some(row.rolled_back), false),
+        Err(e) if crate::stamp::is_catalogue_id_error(&e) => (None, true),
+        Err(e) => return Err(internal(&e)),
+    };
     let now = bridge.clock.now();
     let load = bridge.catalog.provider_load(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
@@ -992,14 +1047,25 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
                 "backbone": p.backbone,
                 "priority": p.priority,
                 "enabled": p.enabled,
+                // Whether the provider lets its backbone count toward a
+                // release (one `false` speaks for the whole backbone).
+                "release": p.release,
                 "max_conns": p.max_conns,
                 // `null` = no address limit: `max_conns` alone.
                 "max_ips": p.max_ips,
+                // How connections leave: through one of the provider's
+                // proxies (never around them), or directly.
+                "route": if p.proxies.is_empty() { "direct" } else { "proxy" },
                 "held": l.map_or(0, |l| l.held),
                 "holders": l.map_or(0, |l| l.holders),
                 "failures": l.map_or(0, |l| l.failures),
                 "cooling": l.is_some_and(|l| l.cooldown_until > now),
                 "cooldown_until": l.map_or(0, |l| l.cooldown_until.0),
+                // `false` from the first strike until a good session;
+                // `reason` says why the last strike was one (a code,
+                // never the provider's words).
+                "healthy": l.is_none_or(ProviderLoad::healthy),
+                "reason": l.and_then(|l| l.fault),
             })
         })
         .collect();
@@ -1008,8 +1074,27 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         outbox.insert(stage.as_str().to_string(), json!(n));
     }
     let hot = bridge.catalog.hot_stats().await.or_internal()?;
+    let intents = bridge
+        .catalog
+        .intent_stats(crate::intents::open_before(now))
+        .await
+        .or_internal()?;
     let cfg = &bridge.cfg;
     Ok(ok(&json!({
+        // Slices of large PUTs that never became an object. `kept` rows
+        // sit beside a generation record and are never deleted by the
+        // sweep; `waiting` writes are past the grace period and are
+        // leaked safety bytes until the sweep (`sweep`) removes them.
+        "write_intents": {
+            "sweep": if cfg.intent_sweep { "on" } else { "off" },
+            "open_writes": intents.open_writes,
+            "waiting_writes": intents.waiting_writes,
+            "oldest_waiting_at": intents.oldest_waiting_at.map(|t| t.0),
+            "kept_writes": intents.kept_writes,
+            "kept_slices": intents.kept_slices,
+            "oldest_kept_at": intents.oldest_kept_at.map(|t| t.0),
+            "anomalies": intents.anomalies,
+        },
         // R2 as a hot tier. Pinned bytes are safety copies not yet
         // released; they are never evicted and are outside the cap.
         "hot": {
@@ -1025,14 +1110,23 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
             Maintenance::Off => "off",
             Maintenance::Restore => "restore",
         },
-        // A replay was started and did not end: writes are refused.
+        // A replay was started and did not end, or the catalogue was
+        // found behind its rollback stamp: writes are refused.
         "replay_unfinished": replaying,
+        // `null` = not known: see `catalogue_id_mismatch`.
+        "catalogue_rolled_back": rolled_back,
+        // `CATALOGUE_ID` is not the id this catalogue's stamp was raised
+        // under: no stamp is raised and no job runs until it is put right.
+        "catalogue_id_mismatch": id_mismatch,
         "gc_mode": match cfg.gc_mode {
             crate::config::GcMode::Off => "off",
             crate::config::GcMode::Disposable => "disposable",
         },
         "real_data_ready": REAL_DATA_READY,
         "required_backbones": cfg.required_backbones,
+        // Empty unless the configuration needs attention. While a
+        // "release paused" line is here, nothing is released.
+        "config_warnings": cfg.release_paused().into_iter().collect::<Vec<_>>(),
         // Figures of the isolate that answers; another isolate has its own.
         "inflight_peak_bytes": bridge.budget.peak(),
         "inflight_bytes": bridge.budget.in_use(),

@@ -7,6 +7,7 @@
 //! live without a pointer. Statements are fixed-shape, one row each, and
 //! stay far below the 100-bound-parameter limit.
 
+use super::intents::publish_intents;
 use super::replay::guard_no_replay;
 use super::uploads::published;
 use super::SqlCatalog;
@@ -15,7 +16,8 @@ use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
     ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyResult,
+    ListPage, ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyKind,
+    VerifyResult, WriteId,
 };
 
 /// A retired generation's key is shredded this long after retirement;
@@ -492,9 +494,14 @@ pub(super) async fn newest_id<S: Sql>(
 /// generation retired with GC rows, and the live pointer moved. Any
 /// failing statement leaves the catalogue exactly as it was. `Lost` =
 /// the key already has a newer id ([`guard_newest`]).
+///
+/// With `write`, the body was stored as slices under that write: the
+/// batch also commits only while every intent of the write is still
+/// `open` under this generation id, and deletes the intents.
 pub(super) async fn commit_generation<S: Sql>(
     c: &SqlCatalog<S>,
     commit: &CommitGeneration,
+    write: Option<&WriteId>,
     record: Recorded,
 ) -> Result<PublishOutcome> {
     let g = &commit.generation;
@@ -518,7 +525,7 @@ pub(super) async fn commit_generation<S: Sql>(
         ));
     }
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(7 + 3 * commit.extents.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(10 + 3 * commit.extents.len());
     stmts.push(guard_no_replay());
     stmts.push(guard_newest(&g.bucket_id, &g.key, &g.id));
     stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
@@ -537,6 +544,9 @@ pub(super) async fn commit_generation<S: Sql>(
              VALUES (?1, ?2, 'post', ?3, ?3)",
             vec![text(e.id.as_str()), text(g.id.as_str()), ms(commit.now)],
         ));
+    }
+    if let Some(write) = write {
+        stmts.extend(publish_intents(write, &g.id, commit.extents.len())?);
     }
     stmts.extend(retire_live(
         &g.bucket_id,
@@ -818,7 +828,8 @@ pub(super) async fn object_status<S: Sql>(
         .sql
         .query(
             "SELECT v.extent_id, v.backbone, v.provider_id, v.verified_at, v.plan_rev, \
-               v.articles_ok, v.articles_total, v.result, e.article_count \
+               CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END, \
+               v.articles_total, v.result, v.kind, e.article_count \
              FROM verifications v JOIN extents e ON e.id = v.extent_id \
              WHERE e.id IN (SELECT extent_id FROM generation_extents WHERE generation_id = ?1) \
                AND v.plan_rev = e.plan_rev AND v.verified_at = \
@@ -839,6 +850,7 @@ pub(super) async fn object_status<S: Sql>(
             articles_ok: r.num()?,
             articles_total: r.num()?,
             result: r.parsed(VerifyResult::parse)?,
+            kind: r.parsed(VerifyKind::parse)?,
             counts: false,
         };
         let article_count: Option<u32> = r.opt_num()?;

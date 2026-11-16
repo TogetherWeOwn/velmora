@@ -22,7 +22,9 @@ MAX_EXTENT_BYTES = "16777216"
 REQUIRED_BACKBONES = "2"
 SAFETY_MIN_AGE_SECS = "604800"
 VERIFY_DELAY_SECS = "120"
-NEWSGROUPS = "alt.binaries.test"   # posting here is proven by the provider probe
+# One group per article, drawn at random. Each was posted to from every
+# posting account and read back by message-id on every account.
+NEWSGROUPS = "alt.binaries.boneless,alt.binaries.misc,alt.binaries.multimedia,alt.binaries.test"
 VELMORA_KEK_ACTIVE = "1"
 INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
 GC_MODE = "off"                      # off | disposable
@@ -35,7 +37,41 @@ MAINTENANCE = "off"                  # off | restore
 # and the others wait for it (measured on a test deployment: 3.6 MiB/s
 # at 8, 5.2 MiB/s at 6).
 POST_SOCKETS = "6"
+# The largest PutObject body: 99 MiB, the most this build takes. A request
+# body above 100 MiB is refused before it reaches the Worker, and the
+# margin is for chunked framing. A body above MAX_EXTENT_BYTES is stored
+# as slices of SLICE_BYTES, one in memory at a time. Without the variable
+# the limit is MAX_EXTENT_BYTES. A part of a multipart upload stays at
+# MAX_EXTENT_BYTES.
+MAX_PUT_BYTES = "103809024"
+# off | on. On: the cron tick removes the slices of a sliced PutObject
+# that was never published, a day after it began. It deletes nothing of
+# a write that has a recovery record, nothing while a replay is under
+# way, and nothing while the catalogue is behind its rollback stamp.
+# Independent of GC_MODE. Off: the slices and their rows stay, and a
+# later run with the switch on removes them. Production ships with it
+# off; /_admin/status counts what it would take (write_intents:
+# waiting_writes, oldest_waiting_at).
+INTENT_SWEEP = "off"
+# off | on. On: every 15 minutes a pass copies each recovery record of
+# SAFETY (m/) to a bucket at another S3-compatible provider, so that the
+# records survive the loss of this account. It puts only what is missing
+# or different there (key, size, MD5), proves each put with a HEAD, and
+# never deletes there. Tenant keys (m/tk/) are not copied, a generation
+# record is copied once it is two minutes old, and no pass runs while
+# MAINTENANCE is "restore". A key there that this service did not write
+# is counted (`foreign`) and left alone. With `on`
+# these are required, each as a var or a secret:
+#   E2_ENDPOINT (https://host), E2_REGION, E2_BUCKET,
+#   RECOVERY_PREFIX (put before every key; ends with "/"),
+#   E2_ACCESS_KEY and E2_SECRET_KEY (secrets; a key that cannot delete).
+# A missing or refused value stops the copy only, with an error line on
+# every cron run; it never stops the S3 service.
+RECOVERY_COPY = "off"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
+#   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
+#   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
+#   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
@@ -99,9 +135,40 @@ dead_letter_queue = "velmora-dlq"
 crons = ["*/5 * * * *"]
 
 # secrets (wrangler secret put, value on stdin): VELMORA_KEK_1, NNTP_PROVIDERS, ADMIN_TOKEN
+# NNTP_PROVIDERS refuses unknown fields: deploy a Worker before the secret uses a new provider field
+# (`hosts`, `host_select`, `release`, `proxies`), and take such fields out of the secret before rolling the Worker back.
+# `release` (true when absent) says whether a provider's backbone counts toward releasing the pinned
+# copy. A backbone with `"release": false` on any of its providers is posted to and read from, but is
+# neither verified nor counted: use it for short-retention or post-only accounts. A release needs
+# every article read in full (BODY) on one backbone that counts and present (STAT) on
+# REQUIRED_BACKBONES of them in all; BODY goes to the first one in the list, so list the account to
+# read in full first. `release` is true when absent, so a short-retention provider MUST say
+# `"release": false`. With fewer readable backbones that count than REQUIRED_BACKBONES the Worker keeps
+# serving reads and writes and releases nothing: every pinned copy stays held, /_admin/status lists a
+# "release paused" line under `config_warnings`, and the cron logs it on every tick.
+#
+# A provider's `proxies` (in NNTP_PROVIDERS) is a list of SOCKS5 proxies,
+# each {"host", "port", "user", "pass"}, tried in order. Every connection
+# to that provider then goes through one of them, so the provider sees
+# the proxy's address and not the changing address of each invocation.
+# TLS runs from the Worker to the provider inside the proxied connection:
+# the proxy relays ciphertext and never sees the provider login. On this
+# route the Worker makes TLS itself and checks the certificate against
+# the provider's host name and the public roots, so that host must be a
+# DNS name (a direct connection keeps the runtime's TLS). The
+# proxy login itself is sent to the proxy in clear (RFC 1929), so it
+# guards the use of the proxy and nothing else. A provider with `proxies`
+# is never connected directly: with every proxy down it is unhealthy
+# (`proxy_failed` in /status, `route` = "proxy") and its jobs wait, as
+# for a cooling provider, without spending attempts. `proxies` needs
+# `tls: true`, and a list that is there must not be empty. All the
+# proxies of a provider may be in use at the same time, so `proxies`
+# needs `max_ips` too, the number of addresses the provider allows, and
+# a `proxies` list longer than it is refused. `max_ips` goes on counting
+# invocations, which is never the looser count.
 
 [env.dev]
-vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on" }
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.

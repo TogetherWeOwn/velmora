@@ -1,9 +1,18 @@
-//! PutObject: one request body sealed as one extent.
+//! PutObject: one request body sealed as one extent, or, above
+//! `max_extent_bytes`, as slices that are each an extent.
 //!
 //! Order: authenticate from headers, refuse what the slice cannot honour,
 //! check the declared length, charge the byte budget, then read. The body
 //! is acknowledged only after the safety copy is stored and the catalogue
 //! batch that publishes the generation has committed.
+//!
+//! A sliced body is stored while it arrives, so its slices exist before
+//! the body is known to be valid. Each has a `write_intents` row from
+//! before its blob is stored, nothing is published before the validator
+//! accepted the whole body, and the batch that publishes deletes the
+//! rows. A request that fails or dies leaves rows that name every blob
+//! it wrote, for the sweep ([`crate::intents`]). This handler never
+//! deletes a slice.
 
 use std::rc::Rc;
 
@@ -13,17 +22,19 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, checksum_json, discard_refused, from_proto, internal, metadata_json,
-    mutation_gate, restore_gate, s3_error,
+    mutation_gate, restore_gate, s3_error, writes_refused,
 };
+use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
-use crate::ingress::{read_upload, upload_lengths, UploadReadError};
+use crate::ingress::{read_upload, upload_lengths, UploadLengths, UploadReadError};
+use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
-    BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PublishOutcome,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
-    CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
-    GenerationState, Job, OutboxStage, S3Request, S3Response, SafetyState, JOB_VERSION,
+    Body, Bucket, CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
+    GenerationState, Job, OutboxStage, S3Request, S3Response, SafetyState, WriteId, JOB_VERSION,
 };
 
 /// How often a PUT is published before it answers `SlowDown`: once
@@ -72,10 +83,20 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     let metadata = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
     // For aws-chunked bodies every length below is the decoded one.
     let lengths =
-        upload_lengths(&req.headers, bridge.cfg.max_extent_bytes).map_err(|e| e.response())?;
+        upload_lengths(&req.headers, bridge.cfg.max_put_bytes).map_err(|e| e.response())?;
     let len = lengths.decoded;
     let mut validator = UploadValidator::new(&authed.headers, &authed.verified, &authed.policy)
         .map_err(s3_error)?;
+    if len > bridge.cfg.max_extent_bytes {
+        let upload = SlicedUpload {
+            bucket,
+            key,
+            metadata,
+            lengths,
+            validator,
+        };
+        return put_sliced(bridge, req.body, upload).await;
+    }
 
     // Nothing of the body is buffered before this charge is held.
     let charge = bridge
@@ -243,6 +264,312 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             0,
         )
         .await;
+
+    let checksum = match checksum {
+        Some((algorithm, value)) => {
+            Some(StoredChecksum::full(algorithm, value).map_err(|_| internal())?)
+        }
+        None => None,
+    };
+    Ok(from_proto(
+        CommitResult {
+            bucket: bucket.name.clone(),
+            key: key.to_owned(),
+            etag,
+            checksum,
+            modified_ms: now.0,
+        }
+        .put_response(),
+    ))
+}
+
+/// A body above one extent, after authentication and the length check.
+struct SlicedUpload<'a> {
+    bucket: &'a Bucket,
+    key: &'a str,
+    metadata: UploadMetadata,
+    lengths: UploadLengths,
+    validator: UploadValidator,
+}
+
+/// The request gave up at a point where no recovery record of the write
+/// exists: its rows are marked so that the sweep need not wait for them.
+/// Best effort; rows left `open` are swept after the grace period.
+async fn give_up<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    write: &WriteId,
+) {
+    let _ = bridge.catalog.abandon_intents(write).await;
+}
+
+async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    body: Body,
+    upload: SlicedUpload<'_>,
+) -> Result<S3Response, S3Response> {
+    let SlicedUpload {
+        bucket,
+        key,
+        metadata,
+        lengths,
+        mut validator,
+    } = upload;
+    let len = lengths.decoded;
+    let slice_bytes = bridge.cfg.slice_bytes;
+    let count = usize::try_from(len.div_ceil(slice_bytes)).map_err(|_| internal())?;
+
+    // One slice of plaintext and one of ciphertext are held at a time,
+    // whatever the length of the body. Nothing is read before this.
+    let charge = bridge
+        .budget
+        .charge_body(slice_bytes)
+        .await
+        .map_err(|e| e.response())?;
+
+    let started = bridge.clock.now();
+    let mut rng = SystemRng;
+    let mut write_rand = [0u8; 16];
+    rng.fill_bytes(&mut write_rand).map_err(|_| internal())?;
+    let write = WriteId::mint(write_rand);
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut extent_rand = [0u8; 13];
+        rng.fill_bytes(&mut extent_rand).map_err(|_| internal())?;
+        ids.push(ExtentId::mint(extent_rand));
+    }
+    let bdk = unwrap_bdk(
+        &bridge.kek,
+        bucket.kek_version,
+        &bucket.id,
+        &bucket.bdk_wrapped,
+    )
+    .map_err(|_| internal())?;
+
+    // Every slice has its row before its blob exists: whatever happens
+    // to this request from here on, the catalogue names what it stored.
+    match bridge.catalog.open_intents(&write, &ids, started).await {
+        Ok(Guard::Applied(())) => {}
+        // A replay started after this request passed the gate.
+        Ok(Guard::Lost) => {
+            restore_gate(bridge).await?;
+            return Err(writes_refused());
+        }
+        Err(_) => return Err(internal()),
+    }
+
+    let sink = SliceSink {
+        safety: &bridge.safety,
+        bdk: &bdk,
+        bucket: &bucket.id,
+        ids: &ids,
+        slice_bytes,
+        rng: &mut rng,
+    };
+    let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            give_up(bridge, &write).await;
+            return Err(match e {
+                SliceError::Ingress(e) => e.response(),
+                SliceError::Proto(e) => s3_error(e),
+                SliceError::Store => internal(),
+            });
+        }
+    };
+    // The signature of the last chunk, the trailer, the digests and the
+    // length are only known here: until this passes the slices are those
+    // of a body nobody vouched for.
+    let decoded = match validator.finish() {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            give_up(bridge, &write).await;
+            return Err(s3_error(e));
+        }
+    };
+    if stored.len() != count {
+        give_up(bridge, &write).await;
+        return Err(internal());
+    }
+
+    let now = bridge.clock.now();
+    let mut generation_rand = [0u8; 8];
+    if rng.fill_bytes(&mut generation_rand).is_err() {
+        give_up(bridge, &write).await;
+        return Err(internal());
+    }
+    let generation_id = GenerationId::mint(now, generation_rand);
+    // The ETag of a PutObject is the MD5 of its whole body, whatever the
+    // number of extents it is stored in.
+    let etag = format!("\"{}\"", hex(decoded.md5()));
+    let checksum = decoded.checksum().cloned();
+    let (content_json, user_meta_json) = metadata_json(&metadata);
+
+    let mut extents = Vec::with_capacity(count);
+    let mut offset = 0u64;
+    for (seq, (id, slice)) in ids.iter().zip(stored).enumerate() {
+        extents.push(ExtentRow {
+            id: id.clone(),
+            bucket_id: bucket.id.clone(),
+            generation_id: Some(generation_id.clone()),
+            state: ExtentState::Committed,
+            seq: u32::try_from(seq).ok(),
+            plain_offset: Some(offset),
+            plain_size: slice.plain_size,
+            cipher_size: slice.cipher_size,
+            media_header: slice.sealed.media_header.to_vec(),
+            key_mode: KEY_MODE_RANDOM,
+            wrapped_file_key: Some(slice.sealed.wrapped_file_key.to_vec()),
+            plain_md5: slice.sealed.plain_md5,
+            plain_sha256: slice.sealed.plain_sha256,
+            cipher_sha256: slice.sealed.cipher_sha256,
+            safety_state: SafetyState::Held,
+            article_count: None,
+            plan_rev: 0,
+            last_verified_at: None,
+            release_evidence: None,
+            released_at: None,
+            created_at: now,
+        });
+        offset = offset.saturating_add(slice.plain_size);
+    }
+    let generation = GenerationRow {
+        id: generation_id,
+        bucket_id: bucket.id.clone(),
+        key: key.to_owned(),
+        state: GenerationState::Live,
+        size: len,
+        etag: etag.clone(),
+        checksum_json: checksum.as_ref().map(|(a, v)| checksum_json(*a, v)),
+        content_json,
+        user_meta_json,
+        extent_count: u32::try_from(count).map_err(|_| internal())?,
+        created_at: now,
+        retired_at: None,
+    };
+
+    let mut commit = CommitGeneration {
+        generation,
+        extents,
+        now,
+    };
+    let mut attempts = 0;
+    loop {
+        // A write this old stops before it writes a record. The sweep
+        // takes `open` rows only long after this age, so a writer that
+        // passed here still has its rows when it publishes.
+        if bridge.clock.now().0.saturating_sub(started.0) > WRITER_MAX_AGE_MS {
+            give_up(bridge, &write).await;
+            return Err(s3_error(ErrorCode::SlowDown));
+        }
+        // The id of the record goes on the rows before the record is
+        // written: a record of this write is always found from them.
+        match bridge
+            .catalog
+            .intents_generation(&write, &commit.generation.id, count)
+            .await
+        {
+            Ok(Guard::Applied(())) => {}
+            // The rows are no longer this request's to publish: the
+            // sweep took them, or a replay began. No record was written
+            // under this id, and none is left of an earlier one.
+            Ok(Guard::Lost) => {
+                give_up(bridge, &write).await;
+                restore_gate(bridge).await?;
+                return Err(internal());
+            }
+            Err(_) => {
+                give_up(bridge, &write).await;
+                return Err(internal());
+            }
+        }
+        // The stamp is raised with the id on the rows and before the
+        // record exists. A catalogue restored to any point before this
+        // raise is then behind its stamp, and the sweep refuses; one
+        // restored to a later point names the record on its rows, and
+        // the sweep keeps the slices. A raise after the commit alone
+        // would leave the restore into the upload of a write whose raise
+        // failed: rows without an id, and no stamp that says so.
+        if bridge.raise_stamp().await.is_err() {
+            give_up(bridge, &write).await;
+            restore_gate(bridge).await?;
+            return Err(s3_error(ErrorCode::SlowDown));
+        }
+        // From the record on, a failure without an answer leaves the
+        // rows `open`: the record may exist, and only the sweep's look
+        // at `SAFETY` after the grace period decides what the slices
+        // are. They are marked abandoned only where the record is known
+        // to be gone.
+        let record = write_generation(
+            &bridge.catalog,
+            &bridge.safety,
+            &bridge.kek,
+            bucket,
+            &commit.generation,
+            &commit.extents,
+        )
+        .await
+        .map_err(|_| internal())?;
+        let refused = match bridge
+            .catalog
+            .commit_sliced(&commit, &write, record)
+            .await
+            .map_err(|_| internal())?
+        {
+            PublishOutcome::Applied => break,
+            PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
+        };
+        // A newer id on the key, a replay, or rows the sweep took.
+        // Nothing was published, so the record goes.
+        discard_refused(bridge, &commit.generation, refused)
+            .await
+            .map_err(|_| internal())?;
+        if let Err(resp) = restore_gate(bridge).await {
+            give_up(bridge, &write).await;
+            return Err(resp);
+        }
+        attempts += 1;
+        if attempts == COMMIT_ATTEMPTS {
+            give_up(bridge, &write).await;
+            return Err(s3_error(ErrorCode::SlowDown));
+        }
+        // No record exists here, so a failure below gives the slices up.
+        let next = async {
+            let newest = bridge.catalog.newest_id(&bucket.id, key).await.ok()?;
+            rng.fill_bytes(&mut generation_rand).ok()?;
+            Some(id_after(
+                bridge.clock.now(),
+                newest.as_ref(),
+                generation_rand,
+            ))
+        };
+        let Some(id) = next.await else {
+            give_up(bridge, &write).await;
+            return Err(internal());
+        };
+        for e in &mut commit.extents {
+            e.generation_id = Some(id.clone());
+        }
+        commit.generation.id = id;
+    }
+    // Once more with the commit confirmed, before the answer: a restore
+    // to a point before this commit is then found as such, and closes
+    // the write gate. A raise that fails does not undo the commit.
+    let _ = bridge.raise_stamp().await;
+    drop(charge);
+
+    // The commit wrote the posting obligations; the queue messages are
+    // only a wake-up. If they are lost the dispatcher finds the rows.
+    let jobs: Vec<Job> = commit
+        .extents
+        .iter()
+        .map(|e| Job::Extent {
+            v: JOB_VERSION,
+            extent: e.id.clone(),
+            generation: commit.generation.id.clone(),
+            stage: OutboxStage::Post,
+        })
+        .collect();
+    let _ = bridge.jobs.send_many(&jobs).await;
 
     let checksum = match checksum {
         Some((algorithm, value)) => {

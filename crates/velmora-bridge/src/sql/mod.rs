@@ -13,6 +13,7 @@
 //! | `gc` | due rows, begin, done |
 //! | `permits` | provider connection slots, pool-shared limits |
 //! | `health` | provider load, failures and cooldown |
+//! | `intents` | slices of a multi-extent write: record, publish guard, fence, sweep |
 //! | `recovery` | tombstone-ordered delete, upload extent rows |
 //! | `replay` | recovery replay: extents, article plans, publication |
 //!
@@ -65,6 +66,7 @@ mod auth;
 mod gc;
 mod health;
 mod hot;
+mod intents;
 mod objects;
 mod outbox;
 mod permits;
@@ -82,9 +84,10 @@ use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, Restor
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
-    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, JobExtent, ListPage,
-    ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderLoad, Result,
-    SafetyState, UnixMs, UploadPartRow, UploadRow, VerificationRow,
+    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats,
+    JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig,
+    ProviderFault, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow, UploadRow,
+    VerificationRow, WriteId,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -145,7 +148,62 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         c: &CommitGeneration,
         record: Recorded,
     ) -> Result<PublishOutcome> {
-        objects::commit_generation(self, c, record).await
+        objects::commit_generation(self, c, None, record).await
+    }
+    async fn commit_sliced(
+        &self,
+        c: &CommitGeneration,
+        write: &WriteId,
+        record: Recorded,
+    ) -> Result<PublishOutcome> {
+        objects::commit_generation(self, c, Some(write), record).await
+    }
+    async fn open_intents(
+        &self,
+        write: &WriteId,
+        extents: &[ExtentId],
+        now: UnixMs,
+    ) -> Result<Guard<()>> {
+        intents::open_intents(self, write, extents, now).await
+    }
+    async fn intents_generation(
+        &self,
+        write: &WriteId,
+        generation: &GenerationId,
+        slices: usize,
+    ) -> Result<Guard<()>> {
+        intents::intents_generation(self, write, generation, slices).await
+    }
+    async fn abandon_intents(&self, write: &WriteId) -> Result<()> {
+        intents::abandon_intents(self, write).await
+    }
+    async fn due_intents(&self, open_before: UnixMs, limit: u32) -> Result<Vec<WriteId>> {
+        intents::due_intents(self, open_before, limit).await
+    }
+    async fn fence_intents(
+        &self,
+        write: &WriteId,
+        open_before: UnixMs,
+        stamp: Option<u64>,
+    ) -> Result<IntentFence> {
+        intents::fence_intents(self, write, open_before, stamp).await
+    }
+    async fn hold_intent_fence(
+        &self,
+        write: &WriteId,
+        slices: usize,
+        stamp: Option<u64>,
+    ) -> Result<bool> {
+        intents::hold_intent_fence(self, write, slices, stamp).await
+    }
+    async fn keep_intents(&self, write: &WriteId) -> Result<()> {
+        intents::keep_intents(self, write).await
+    }
+    async fn drop_intents(&self, write: &WriteId) -> Result<()> {
+        intents::drop_intents(self, write).await
+    }
+    async fn intent_stats(&self, open_before: UnixMs) -> Result<IntentStats> {
+        intents::intent_stats(self, open_before).await
     }
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>> {
         objects::newest_id(self, bucket, key).await
@@ -331,10 +389,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(self, l, required, evidence_json, now).await
+        outbox::begin_release(self, l, required, counting, evidence_json, now).await
     }
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await
@@ -407,11 +466,36 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
         replay::held_extents(self, after, limit).await
     }
-    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs> {
+    async fn restore_begin(
+        &self,
+        since: UnixMs,
+        now: UnixMs,
+    ) -> Result<std::result::Result<UnixMs, UnixMs>> {
         replay::restore_begin(self, since, now).await
     }
-    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool> {
-        replay::restore_finish(self, run, now).await
+    async fn restore_finish(
+        &self,
+        run: UnixMs,
+        now: UnixMs,
+        stamp: u64,
+        seen: Option<u64>,
+        catalogue: &str,
+    ) -> Result<bool> {
+        replay::restore_finish(self, run, now, stamp, seen, catalogue).await
+    }
+    async fn stamp(&self, catalogue: &str) -> Result<crate::stamp::StampRow> {
+        replay::stamp(self, catalogue).await
+    }
+    async fn stamp_advance(&self, from: Option<u64>, catalogue: &str) -> Result<bool> {
+        replay::stamp_advance(self, from, catalogue).await
+    }
+    async fn stamp_rolled_back(
+        &self,
+        seen: Option<u64>,
+        now: UnixMs,
+        catalogue: &str,
+    ) -> Result<bool> {
+        replay::stamp_rolled_back(self, seen, now, catalogue).await
     }
     async fn restore_pending(&self) -> Result<bool> {
         replay::restore_pending(self).await
@@ -458,8 +542,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
         health::provider_load(self, now).await
     }
-    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
-        health::provider_failed(self, provider, now).await
+    async fn provider_failed(
+        &self,
+        provider: &str,
+        fault: ProviderFault,
+        now: UnixMs,
+    ) -> Result<()> {
+        health::provider_failed(self, provider, fault, now).await
     }
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()> {
         health::provider_recovered(self, provider, now).await

@@ -24,7 +24,8 @@
 //! live or deleted. It is the record of a write that was never
 //! acknowledged far more often than the loss of an acknowledged one, so
 //! the key stays as the older records leave it and the record is
-//! reported as `damaged_unpublished`.
+//! reported as `damaged_unpublished`. Those entries carry the name of
+//! the bucket and the object key beside the id; no other list does.
 
 use serde::{Deserialize, Serialize};
 
@@ -179,8 +180,18 @@ impl ReplayCursor {
     }
 }
 
+/// A record that was not published, with where it belongs: the id alone
+/// does not tell the operator which object to look at.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct RecordRef {
+    pub id: String,
+    /// The name of the record's bucket.
+    pub bucket: String,
+    pub key: String,
+}
+
 /// What one call did. Lists hold generation ids or blob keys, never
-/// object keys.
+/// object keys; `damaged_unpublished` is the exception.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ReplayReport {
     /// Generation manifests finished.
@@ -212,8 +223,9 @@ pub struct ReplayReport {
     pub unpublishable: Vec<String>,
     /// Not published: an extent of the generation has no copy anywhere,
     /// and the key has an older generation. The key stays as the older
-    /// records leave it.
-    pub damaged_unpublished: Vec<String>,
+    /// records leave it. Listed with bucket and key: the operator has
+    /// to decide about that one object.
+    pub damaged_unpublished: Vec<RecordRef>,
     /// Not replayed: the catalogue has another bucket under the name of
     /// the record's bucket. The first ids of `other_bucket_total`.
     pub other_bucket_total: u32,
@@ -434,7 +446,11 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                                 true,
                             )
                             .await?;
-                        report.damaged_unpublished.push(id);
+                        report.damaged_unpublished.push(RecordRef {
+                            id,
+                            bucket: bucket.name.clone(),
+                            key: generation.key.clone(),
+                        });
                     }
                     // The extents of an object can be shared, so a second
                     // record of one object is published like any other

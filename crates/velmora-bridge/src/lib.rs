@@ -9,17 +9,22 @@
 
 pub mod articles;
 pub mod config;
+pub mod copy;
 pub mod crypto;
 pub mod fetch;
+pub mod hosts;
 pub mod ingress;
+pub mod intents;
 pub mod jobs;
 mod pool;
 pub mod ports;
 pub mod post;
 pub mod recovery;
+pub mod remote;
 pub mod replay;
 pub mod service;
 pub mod sql;
+pub mod stamp;
 pub mod trace;
 pub mod types;
 pub mod verify;

@@ -1,5 +1,6 @@
 //! `impl JobSink` over Queues. A `Job` is sent as a JSON message. Post jobs
-//! go to `POST_Q`; verify, release and gc jobs go to `VERIFY_Q`.
+//! go to `POST_Q`; verify, release, gc and recovery-copy jobs go to
+//! `VERIFY_Q`.
 //!
 //! Dev only: `DEV_DROP_NOTIFY_N` makes the first `n` `send` calls of the
 //! isolate vanish while reporting success (a lost queue notification), so
@@ -153,7 +154,7 @@ impl JobSink for QueueSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velmora_bridge::{ExtentId, GenerationId, JOB_VERSION};
+    use velmora_bridge::{ExtentId, GenerationId, WriteId, JOB_VERSION};
 
     fn extent_job(stage: OutboxStage) -> Job {
         Job::Extent {
@@ -171,6 +172,19 @@ mod tests {
             assert_eq!(lane(&extent_job(stage)), Lane::Verify);
         }
         assert_eq!(lane(&Job::Gc { v: JOB_VERSION }), Lane::Verify);
+        // The sweep of a write deletes blobs and posts nothing.
+        let sweep = Job::Sweep {
+            v: JOB_VERSION,
+            write: WriteId::new("w_0000000000000000"),
+        };
+        assert_eq!(lane(&sweep), Lane::Verify);
+        // The recovery copy shares the verify lane; a job is bounded.
+        let copy = Job::RecoveryCopy {
+            v: JOB_VERSION,
+            pass: velmora_bridge::UnixMs(1),
+            cursor: String::new(),
+        };
+        assert_eq!(lane(&copy), Lane::Verify);
         for remaining in [0, 4096] {
             let evict = Job::Evict {
                 v: JOB_VERSION,

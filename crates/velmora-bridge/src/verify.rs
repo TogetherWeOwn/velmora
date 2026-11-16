@@ -1,12 +1,27 @@
 //! Verify and release stages.
 //!
-//! Verify proves, per backbone, that every article of an extent can be
-//! read back intact with `BODY` (a `STAT` only proves headers). Release
-//! unpins the safety copy, and only on evidence read in the same job. The
-//! copy stays in R2 and keeps serving reads; from then on the hot-tier
-//! eviction may drop it.
+//! Verify checks an extent's articles on every backbone that counts
+//! toward a release. Release unpins the safety copy, and only on evidence
+//! read in the same job. The copy stays in R2 and keeps serving reads;
+//! from then on the hot-tier eviction may drop it.
 //!
-//! Rules:
+//! The release rule ([`releasable`]), the same for the verify decision,
+//! the release job and the catalogue's guard:
+//! - Only a backbone that counts is evidence ([`release_backbones`]): it
+//!   has an enabled `read` provider, and none of its providers says
+//!   `release: false`. The others are neither read nor counted here.
+//! - On at least one of them every article was read back with `BODY` and
+//!   its payload hash matched (the full check).
+//! - `REQUIRED_BACKBONES` distinct ones in all hold every article, the
+//!   others by `BODY` or by `STAT`.
+//! - A `STAT` pass is never the full check: a provider can answer `STAT`
+//!   for an article whose `BODY` it no longer serves. So `STAT` passes
+//!   alone, on however many backbones, release nothing.
+//!
+//! Backbones are checked in configuration order: `BODY` until one has
+//! passed it, `STAT` on the ones after.
+//!
+//! Rules of a check:
 //! - Only a complete pass over all articles is recorded. A transport
 //!   failure records nothing and the job retries.
 //! - A `430` is not loss by itself: an article is posted to one provider
@@ -21,7 +36,7 @@
 
 use serde::Serialize;
 
-use crate::fetch::{job_holder, read_articles, ProviderSession, ReadTally};
+use crate::fetch::{job_holder, read_articles, stat_articles, ProviderSession, ReadTally};
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
@@ -29,8 +44,9 @@ use crate::ports::{
 };
 use crate::post::{settle, Stop};
 use crate::types::{
-    ArticleRow, ArticleState, ExtentRow, FailClass, GenerationState, Job, JobExtent, JobOutcome,
-    OutboxStage, ProviderConfig, SafetyState, UnixMs, VerificationRow, VerifyResult, JOB_VERSION,
+    ArticleRow, ArticleState, BackboneStatus, ExtentRow, FailClass, GenerationState, Job,
+    JobExtent, JobOutcome, OutboxStage, ProviderConfig, SafetyState, UnixMs, VerificationRow,
+    VerifyKind, VerifyResult, JOB_VERSION,
 };
 
 /// Waits before a backbone with missing articles is read again. After the
@@ -52,6 +68,7 @@ struct Evidence<'a> {
     backbone: &'a str,
     provider: &'a str,
     verified_at: UnixMs,
+    kind: VerifyKind,
     ok: u32,
     total: u32,
     plan_rev: u32,
@@ -63,18 +80,69 @@ pub(crate) fn label(backbone: &str) -> String {
     backbone.trim().to_lowercase()
 }
 
-/// Enabled `read` providers grouped by backbone, in configuration order. Two
-/// providers on one backbone are one copy, so they share an entry.
-pub(crate) fn backbones(providers: &[ProviderConfig]) -> Vec<(String, Vec<&ProviderConfig>)> {
+/// The backbones that count toward a release, each with its enabled
+/// `read` providers, in configuration order. Two providers on one
+/// backbone are one copy, so they share an entry.
+///
+/// A backbone counts only if none of its providers says `release: false`,
+/// whether that provider reads, posts or is disabled: one statement that
+/// the backbone is not a durable copy is enough.
+pub(crate) fn release_backbones(
+    providers: &[ProviderConfig],
+) -> Vec<(String, Vec<&ProviderConfig>)> {
+    let excluded: Vec<String> = providers
+        .iter()
+        .filter(|p| !p.release)
+        .map(|p| label(&p.backbone))
+        .collect();
     let mut groups: Vec<(String, Vec<&ProviderConfig>)> = Vec::new();
     for p in providers.iter().filter(|p| p.read && p.enabled) {
         let name = label(&p.backbone);
+        if excluded.contains(&name) {
+            continue;
+        }
         match groups.iter_mut().find(|(b, _)| *b == name) {
             Some((_, members)) => members.push(p),
             None => groups.push((name, vec![p])),
         }
     }
     groups
+}
+
+/// The labels of [`release_backbones`].
+pub(crate) fn release_labels(providers: &[ProviderConfig]) -> Vec<String> {
+    release_backbones(providers)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The release rule. `passes` are complete passes (every article of the
+/// current plan), one per backbone and kind of check; `counting` are the
+/// labels of the backbones that count ([`release_backbones`]).
+///
+/// True only if, among the backbones that count, at least one has a
+/// `BODY` pass and `required` distinct ones have a pass of either kind.
+/// Two passes on one backbone are one copy, and a pass on a backbone that
+/// does not count is nothing.
+pub fn releasable<'a>(
+    passes: impl IntoIterator<Item = (&'a str, VerifyKind)>,
+    counting: &[String],
+    required: u32,
+) -> bool {
+    let mut holding: Vec<String> = Vec::new();
+    let mut full = false;
+    for (backbone, kind) in passes {
+        let name = label(backbone);
+        if !counting.contains(&name) {
+            continue;
+        }
+        full |= kind == VerifyKind::Body;
+        if !holding.contains(&name) {
+            holding.push(name);
+        }
+    }
+    required > 0 && full && holding.len() >= required as usize
 }
 
 fn result_of(tally: &ReadTally) -> VerifyResult {
@@ -105,8 +173,9 @@ where
         }
     }
 
-    /// Runs the release stage for a claimed extent: re-verify every
-    /// backbone now, then mark the safety copy evictable.
+    /// Runs the release stage for a claimed extent: check every backbone
+    /// that counts again now, by the same rule as at verify, then mark
+    /// the safety copy evictable.
     pub async fn release_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
         match self.release_extent(lease, job).await {
             Ok(()) => JobOutcome::Ack,
@@ -126,8 +195,9 @@ where
         Ok(plan)
     }
 
-    /// Reads every article from one backbone, through its first provider
-    /// in pool order with a free slot. Providers that still retain the
+    /// Checks every article on one backbone, with `BODY` and the payload
+    /// hash or with `STAT` (`kind`), through its first provider in pool
+    /// order with a free slot. Providers that still retain the
     /// oldest article are preferred; when none does, the others answer,
     /// because a result needs a read.
     async fn read_backbone<'p>(
@@ -135,6 +205,7 @@ where
         lease: &Lease,
         plan: &[ArticleRow],
         providers: &[&'p ProviderConfig],
+        kind: VerifyKind,
     ) -> Staged<(&'p ProviderConfig, ReadTally)> {
         let holder = job_holder(lease);
         let rows: Vec<&ArticleRow> = plan.iter().collect();
@@ -154,6 +225,7 @@ where
                 return Err(Stop::Cooling(until));
             }
         }
+        let mut refused = false;
         for provider in usable {
             let Some(mut session) = ProviderSession::open(
                 &self.catalog,
@@ -167,11 +239,24 @@ where
             else {
                 continue;
             };
-            let tally = read_articles(&mut session, Some(lease), &rows, |_, _| {}).await;
+            let tally = match kind {
+                VerifyKind::Body => {
+                    read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
+                }
+                VerifyKind::Stat => stat_articles(&mut session, Some(lease), &rows).await,
+            };
             session.close().await;
-            return Ok((provider, tally?));
+            match tally {
+                // The provider refused the account: the next one of the
+                // backbone is asked.
+                Err(Stop::Refused) => refused = true,
+                tally => return Ok((provider, tally?)),
+            }
         }
-        Err(Stop::NoPermit)
+        Err(match refused {
+            true => Stop::Refused,
+            false => Stop::NoPermit,
+        })
     }
 
     async fn record(
@@ -180,6 +265,7 @@ where
         extent: &ExtentRow,
         provider: &ProviderConfig,
         tally: &ReadTally,
+        kind: VerifyKind,
     ) -> Staged<VerificationRow> {
         let total = extent.article_count.unwrap_or(0);
         let row = VerificationRow {
@@ -191,6 +277,7 @@ where
             articles_ok: tally.ok,
             articles_total: total,
             result: result_of(tally),
+            kind,
         };
         if !self.catalog.record_verification(lease, &row).await? {
             return Err(Stop::Fenced);
@@ -286,11 +373,25 @@ where
 
     async fn verify_extent(&self, lease: &Lease, extent: &ExtentRow) -> Staged<()> {
         let plan = self.posted_plan(extent).await?;
-        let groups = backbones(&self.cfg.providers);
+        let groups = release_backbones(&self.cfg.providers);
+        let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
         let index = (lease.cursor / CURSOR_STEPS) as usize;
 
         if let Some((name, providers)) = groups.get(index) {
-            let (provider, tally) = self.read_backbone(lease, &plan, providers).await?;
+            // `BODY` until a backbone before this one has passed it.
+            let mut kind = VerifyKind::Body;
+            if index > 0 {
+                let status = self.catalog.backbone_status(&extent.id).await?;
+                let full = |s: &BackboneStatus| {
+                    s.counts
+                        && s.kind == VerifyKind::Body
+                        && labels[..index].contains(&label(&s.backbone))
+                };
+                if status.iter().any(full) {
+                    kind = VerifyKind::Stat;
+                }
+            }
+            let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
             if result_of(&tally) == VerifyResult::Missing {
                 let wait = self
                     .missing_wait(lease, extent, &plan, name, &tally.missing)
@@ -300,7 +401,7 @@ where
                     return Err(Stop::Fail(FailClass::MissingPending, Some(wait)));
                 }
             }
-            self.record(lease, extent, provider, &tally).await?;
+            self.record(lease, extent, provider, &tally, kind).await?;
             let next = index as u32 + 1;
             self.cursor(lease, next * CURSOR_STEPS).await?;
             if (next as usize) < groups.len() {
@@ -317,12 +418,16 @@ where
 
         // Every backbone has a recorded result for this round.
         self.cursor(lease, 0).await?;
-        // Results for backbones that are no longer configured do not count.
+        // Results for backbones that are no longer configured, or that do
+        // not count toward a release, are not looked at.
         let mut status = self.catalog.backbone_status(&extent.id).await?;
-        status.retain(|s| groups.iter().any(|(b, _)| *b == label(&s.backbone)));
-        let counting = status.iter().filter(|s| s.counts).count();
+        status.retain(|s| labels.contains(&label(&s.backbone)));
+        let passes = status
+            .iter()
+            .filter(|s| s.counts)
+            .map(|s| (s.backbone.as_str(), s.kind));
         let now = self.clock.now();
-        if counting >= self.cfg.required_backbones as usize && counting > 0 {
+        if releasable(passes, &labels, self.cfg.required_backbones) {
             let ready = extent
                 .created_at
                 .plus_secs(self.cfg.safety_min_age_secs)
@@ -338,6 +443,11 @@ where
             .await;
             return Ok(());
         }
+        if groups.is_empty() {
+            // No backbone counts toward a release: nothing was checked
+            // and nothing can be. The safety copy stays held.
+            return self.advance(lease, OutboxStage::Done, now).await;
+        }
         let failed = |r| status.iter().any(|s| s.result == r);
         if failed(VerifyResult::Corrupt) {
             return Err(Stop::Fail(FailClass::Corrupt, Some(REVERIFY_SECS)));
@@ -345,8 +455,12 @@ where
         if status.iter().any(|s| !s.counts) || status.len() < groups.len() || status.is_empty() {
             return Err(Stop::Fail(FailClass::MissingPending, Some(REVERIFY_SECS)));
         }
-        // Every configured backbone holds the extent, but there are fewer
-        // backbones than a release needs: the safety copy stays held.
+        if !status.iter().any(|s| s.kind == VerifyKind::Body) {
+            // Passes, but none of them the full check: read again.
+            return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
+        }
+        // Every backbone that counts holds the extent, but there are fewer
+        // of them than a release needs: the safety copy stays held.
         self.advance(lease, OutboxStage::Done, now).await
     }
 
@@ -370,6 +484,22 @@ where
         if required == 0 || !(required >= 2 || self.cfg.is_dev()) {
             return self.advance(lease, OutboxStage::Done, now).await;
         }
+        // Too few backbones count toward a release: nothing is released
+        // and nothing is read for it. The safety copy stays held and the
+        // row stays in this stage, looked at again later without an
+        // attempt spent. Parked as `done` it would stay there for good:
+        // its earlier passes still count, so the re-drive of the
+        // dispatcher would never pick it up once the list is put right.
+        if self.cfg.release_paused().is_some() {
+            if !self
+                .catalog
+                .defer(lease, now.plus_secs(REVERIFY_SECS), now)
+                .await?
+            {
+                return Err(Stop::Fenced);
+            }
+            return Ok(());
+        }
         let ready = extent.created_at.plus_secs(self.cfg.safety_min_age_secs);
         if now < ready {
             if !self.catalog.defer(lease, ready, now).await? {
@@ -378,17 +508,31 @@ where
             return Ok(());
         }
 
-        // Only what this job reads now counts as evidence. Every
-        // backbone is read: one that lacks the extent does not hold the
-        // release up while `required` others pass.
+        // Only what this job finds now counts as evidence. Every backbone
+        // that counts is checked: one that lacks the extent does not hold
+        // the release up while enough others pass. `BODY` until one
+        // backbone has passed it, `STAT` on the ones after.
         let plan = self.posted_plan(extent).await?;
+        let groups = release_backbones(&self.cfg.providers);
+        let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
         let mut read = Vec::new();
-        for (_, providers) in backbones(&self.cfg.providers) {
-            read.push(self.read_backbone(lease, &plan, &providers).await?);
+        let mut full = false;
+        for (_, providers) in &groups {
+            let kind = match full {
+                true => VerifyKind::Stat,
+                false => VerifyKind::Body,
+            };
+            let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
+            full |= kind == VerifyKind::Body && result_of(&tally) == VerifyResult::Ok;
+            read.push((provider, tally, kind));
         }
-        let result = |r| read.iter().filter(|(_, t)| result_of(t) == r).count();
+        let result = |r| read.iter().filter(|(_, t, _)| result_of(t) == r).count();
         let (passed, missing) = (result(VerifyResult::Ok), result(VerifyResult::Missing));
-        let enough = passed >= required as usize;
+        let passes = read
+            .iter()
+            .filter(|(_, t, _)| result_of(t) == VerifyResult::Ok)
+            .map(|(p, _, kind)| (p.backbone.as_str(), *kind));
+        let enough = releasable(passes, &labels, required);
         if !enough && passed + missing == read.len() && missing > 0 {
             // Not releasable after all, and nothing worse than missing:
             // back to verify, which owns the retry waits and the record.
@@ -398,8 +542,8 @@ where
             return Ok(());
         }
         let mut rows = Vec::new();
-        for (provider, tally) in &read {
-            let row = self.record(lease, extent, provider, tally).await?;
+        for (provider, tally, kind) in &read {
+            let row = self.record(lease, extent, provider, tally, *kind).await?;
             if row.result == VerifyResult::Ok {
                 rows.push(row);
             }
@@ -419,6 +563,7 @@ where
                 backbone: &r.backbone,
                 provider: &r.provider_id,
                 verified_at: r.verified_at,
+                kind: r.kind,
                 ok: r.articles_ok,
                 total: r.articles_total,
                 plan_rev: r.plan_rev,
@@ -428,7 +573,7 @@ where
             serde_json::to_string(&evidence).map_err(|_| Stop::fail(FailClass::Internal))?;
         match self
             .catalog
-            .begin_release(lease, required, &evidence, self.clock.now())
+            .begin_release(lease, required, &labels, &evidence, self.clock.now())
             .await?
         {
             Guard::Applied(()) => self.finish_release(lease, extent).await,

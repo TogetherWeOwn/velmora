@@ -44,7 +44,7 @@ use velmora::transport::Transport;
 use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
-use crate::fetch::{job_holder, report_health, ProviderSession};
+use crate::fetch::{forgiven, job_holder, report_health, Health, ProviderSession};
 use crate::jobs::JOB_OVERHEAD_BYTES;
 use crate::pool::Pool;
 use crate::ports::{
@@ -54,8 +54,8 @@ use crate::ports::{
 };
 use crate::recovery::write_article_plan;
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent, JobOutcome,
-    OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
+    valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
+    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
 };
 
 impl<T: Transport> NntpSession for NntpClient<T> {
@@ -102,6 +102,13 @@ pub(crate) enum Stop {
     Fenced,
     /// No provider slot: free the lease without spending an attempt.
     NoPermit,
+    /// A provider refused the connection or the login, and not for a
+    /// connection limit ([`ProviderSession::session`]). The session has
+    /// the strike. It is not connected again in this run; a run that
+    /// failed in no other way frees the lease without spending an
+    /// attempt, so a refusal that lasts never uses the attempts up: the
+    /// strikes cool the provider down and the job waits for that.
+    Refused,
     /// Every provider that could do the work is in a cooldown until then:
     /// free the lease until that time without spending an attempt.
     Cooling(UnixMs),
@@ -123,8 +130,8 @@ impl From<BridgeError> for Stop {
     fn from(e: BridgeError) -> Stop {
         match e {
             // `440`, or a `502` in answer to a command: the provider
-            // refuses this account. Only a `502` to the connection itself
-            // means "no slot" (see `ProviderSession::session`).
+            // refuses this account. A refused connect never comes here
+            // (see `ProviderSession::session`).
             BridgeError::Nntp(
                 velmora::Error::PostProhibited(_) | velmora::Error::NoPermission(_),
             ) => Stop::fail(FailClass::PostRefused),
@@ -161,7 +168,7 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
         Stop::Catalog => JobOutcome::Retry {
             delay_secs: CATALOG_RETRY_SECS,
         },
-        Stop::NoPermit => {
+        Stop::NoPermit | Stop::Refused => {
             let jitter = uniform_below(&mut SystemRng, u64::from(NO_PERMIT_SPREAD_SECS))
                 .ok()
                 .and_then(|j| u32::try_from(j).ok())
@@ -210,22 +217,37 @@ fn payload_of<'a>(cipher: &'a [u8], row: &ArticleRow) -> Option<&'a [u8]> {
 }
 
 /// Renders the complete article for a stored row. Everything on the wire
-/// is a function of the stored row and the ciphertext (the yEnc name is
-/// the head of the message-id), so a repost is byte-identical.
+/// is a function of the stored row and the ciphertext, so a repost is
+/// byte-identical.
+///
+/// A row with its own yEnc name is a standalone single-part yEnc file:
+/// `=ybegin line=128 size=<payload> name=<name>`, the payload, then
+/// `=yend size=<payload> crc32=<payload crc>`. No part number, no range
+/// and no extent size: nothing on the wire ties the articles of one
+/// extent together. A row without one was planned before standalone
+/// articles and keeps the multi-part form it was posted in: part
+/// `idx + 1` of `total`, the extent's ciphertext range, `size=` of the
+/// whole extent, and the name taken from the head of the message-id.
+///
+/// Reads never depend on the form: they decode either one and accept only
+/// the stored length and SHA-256 (`fetch::check_payload`).
 fn render_article(row: &ArticleRow, total: u32, file_size: u64, payload: &[u8]) -> Result<Vec<u8>> {
-    let name: String = row
-        .message_id
-        .chars()
-        .take_while(char::is_ascii_alphanumeric)
-        .take(OBFUSCATED_YENC_NAME_LEN)
-        .collect();
-    let params = SegmentParams {
-        name,
-        part: row.idx + 1,
-        total,
-        begin: row.cipher_offset + 1,
-        end: row.cipher_offset + row.cipher_len,
-        file_size,
+    let params = match &row.yenc_name {
+        Some(name) if valid_yenc_name(name) => SegmentParams::single(name.clone()),
+        Some(_) => return Err(BridgeError::Invalid("stored yEnc name is malformed")),
+        None => SegmentParams {
+            name: row
+                .message_id
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .take(OBFUSCATED_YENC_NAME_LEN)
+                .collect(),
+            part: row.idx + 1,
+            total,
+            begin: row.cipher_offset + 1,
+            end: row.cipher_offset + row.cipher_len,
+            file_size,
+        },
     };
     let mut body = Vec::with_capacity(payload.len() + payload.len() / 16 + 512);
     encode_segment(&mut body, &params, payload)?;
@@ -267,6 +289,7 @@ where
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
         let cooling = pool.cooling_until(&posters);
+        let probing = pool.refusing(&posters);
         let order = pool.order(posters, PermitClass::Background);
         // The slots first. Loading and hashing the extent is the expensive
         // part of the job: one that would only find every slot of its
@@ -287,7 +310,9 @@ where
                 .count(),
         };
         let asked = self.clock.now();
-        let (mut held, _) = self.open_sessions(first_tier, &holder, todo).await?;
+        let (mut held, _) = self
+            .open_sessions(first_tier, &holder, todo, &probing)
+            .await?;
         let permits_ms = self.clock.now().0 - asked.0;
         crate::trace::note(&lease.extent, |t| {
             t.permits_ms = permits_ms;
@@ -312,7 +337,7 @@ where
         // record is durable: posting starts only once both are done. The
         // round renews before its first call once `kept_at` is older than
         // the renewal interval, as after any renewal.
-        let (refused, loaded) = join(
+        let (turned_away, loaded) = join(
             self.connect_all(lease, &mut held, kept_at),
             self.load_planned(lease, extent, stored),
         )
@@ -329,7 +354,8 @@ where
             let opened = Opened {
                 sessions: held,
                 kept_at,
-                refused,
+                turned_away,
+                probing,
             };
             let posted = self
                 .post_with_failover(lease, extent, &mut plan, &cipher, &order, cooling, opened)
@@ -372,48 +398,73 @@ where
 
     /// Connects every held session at once when `kept_at` says a renewal
     /// confirmed the lease and their permits ([`Self::renew_held`]).
-    /// Returns the providers that refused a login for their limit.
+    /// Returns the providers that turned a connect away.
     ///
-    /// A session whose login the provider refused for its limit ("no
-    /// slot") is ended at once and its slot given back, as the round
-    /// would do. Any other failed connect is left to the round: the
-    /// session stays unconnected, and the round connects it again and
-    /// decides what the failure means, as it does for any session.
+    /// A session whose connect the provider refused is ended at once and
+    /// its slot given back, as the round would do:
+    /// - for its limit ("no slot"): that session alone;
+    /// - for the account, while another session of the job is logged in
+    ///   to the same provider: that session alone, without a strike. An
+    ///   account that takes one login is not refused, whatever the words
+    ///   of the reply: it is at a limit;
+    /// - for the account, with no session logged in: every session of
+    ///   the provider, with one strike. None of them connects again.
+    ///
+    /// Any other failed connect is left to the round: the session stays
+    /// unconnected, and the round connects it again and decides what the
+    /// failure means, as it does for any session.
     async fn connect_all<'a>(
         &self,
         lease: &Lease,
         sessions: &mut Vec<ProviderSession<'a, C, N, T>>,
         kept_at: Option<UnixMs>,
-    ) -> Vec<&'a str> {
+    ) -> TurnedAway<'a> {
+        let mut away = TurnedAway::default();
         let Some(now) = kept_at else {
-            return Vec::new();
+            return away;
         };
         // A connect ends within `NNTP_CALL_SECS` like any call, and the
         // round could not end before it either: it would wait for the
         // article that socket had taken.
-        let refused =
-            join_all(sessions.iter_mut().map(|session| async move {
-                matches!(session.session().await, Err(Stop::NoPermit))
-            }))
-            .await;
+        let stops = join_all(
+            sessions
+                .iter_mut()
+                .map(|session| async move { session.session().await.err() }),
+        )
+        .await;
         let connect_ms = self.clock.now().0 - now.0;
         crate::trace::note(&lease.extent, |t| t.connect_ms = connect_ms);
-        let mut by: Vec<&'a str> = Vec::new();
-        if refused.iter().any(|r| *r) {
-            let (out, kept): (Vec<_>, Vec<_>) = sessions
-                .drain(..)
-                .zip(refused)
-                .partition(|(_, refused)| *refused);
-            sessions.extend(kept.into_iter().map(|(s, _)| s));
-            for (session, _) in &out {
-                let id = session.provider.id.as_str();
-                if !by.contains(&id) {
-                    by.push(id);
+        let logged_in: Vec<&'a str> = sessions
+            .iter()
+            .filter(|s| s.connected())
+            .map(|s| s.provider.id.as_str())
+            .collect();
+        for (session, stop) in sessions.iter_mut().zip(&stops) {
+            let id = session.provider.id.as_str();
+            let list = match stop {
+                Some(Stop::NoPermit) => &mut away.busy,
+                Some(Stop::Refused) if logged_in.contains(&id) => {
+                    session.forgive_refusal();
+                    &mut away.busy
                 }
+                Some(Stop::Refused) => &mut away.refused,
+                _ => continue,
+            };
+            if !list.contains(&id) {
+                list.push(id);
             }
-            close_all(out.into_iter().map(|(s, _)| s).collect()).await;
         }
-        by
+        if away.busy.is_empty() && away.refused.is_empty() {
+            return away;
+        }
+        let (out, kept): (Vec<_>, Vec<_>) =
+            sessions.drain(..).zip(stops).partition(|(session, stop)| {
+                matches!(stop, Some(Stop::NoPermit | Stop::Refused))
+                    || away.refused.contains(&session.provider.id.as_str())
+            });
+        sessions.extend(kept.into_iter().map(|(s, _)| s));
+        close_all(out.into_iter().map(|(s, _)| s).collect()).await;
+        away
     }
 
     /// Every article is recorded as posted: the extent goes on to verify.
@@ -504,6 +555,7 @@ where
                     cipher_offset: span.start,
                     cipher_len: span.len,
                     payload_sha256: [0; 32],
+                    yenc_name: Some(meta.yenc_name),
                     state: ArticleState::Planned,
                     provider_id: None,
                     posted_at: None,
@@ -541,8 +593,13 @@ where
     /// is confirmed and recorded once, like any other accepted post.
     ///
     /// A lower tier is a backup for failure, not overflow: it is reached
-    /// only when every provider of the tiers above was tried and failed.
-    /// While one of them is merely busy the job waits for a slot.
+    /// only when every provider of the tiers above was tried and failed
+    /// or refused the connection. While one of them is merely busy the
+    /// job waits for a slot.
+    ///
+    /// When no tier is left, the first failure is the job's and costs an
+    /// attempt. A run in which providers only refused the connection or
+    /// the login ends as [`Stop::Refused`], without one.
     ///
     /// `order` is the posting providers in pool order and `first` the
     /// sessions the job already holds on its first tier: they are the
@@ -559,8 +616,12 @@ where
         first: Opened<'a, C, N, T>,
     ) -> core::result::Result<(), Stop> {
         let holder = job_holder(lease);
+        let probing = first.probing.clone();
         let mut first = Some(first);
         let mut failed = None;
+        // A provider refused the connection or the login. That alone
+        // spends no attempt: see `Stop::Refused`.
+        let mut refused = false;
         // Per article: a POST of it may have landed on a provider that
         // then failed, so the next provider is asked before it is sent.
         let mut unknown = vec![false; plan.len()];
@@ -583,19 +644,25 @@ where
                 // connected under is the round's first.
                 let (sessions, kept_at) = match first.take() {
                     Some(opened) => {
-                        // A provider that refused a login is not asked
-                        // again in this job, as after a round.
+                        // A provider that turned a connect away is not
+                        // asked again in this job, as after a round.
                         no_slot = false;
-                        busy |= !opened.refused.is_empty();
-                        untried.retain(|p| !opened.refused.contains(&p.id.as_str()));
+                        let away = opened.turned_away;
+                        busy |= !away.busy.is_empty();
+                        refused |= !away.refused.is_empty();
+                        untried.retain(|p| {
+                            let id = p.id.as_str();
+                            !away.busy.contains(&id) && !away.refused.contains(&id)
+                        });
                         if opened.sessions.is_empty() {
                             continue;
                         }
                         (opened.sessions, opened.kept_at)
                     }
                     None => {
-                        let (sessions, without) =
-                            self.open_sessions(&untried, &holder, todo.len()).await?;
+                        let (sessions, without) = self
+                            .open_sessions(&untried, &holder, todo.len(), &probing)
+                            .await?;
                         no_slot = without;
                         (sessions, None)
                     }
@@ -635,6 +702,9 @@ where
                     // Every socket of the round found no slot: the rest
                     // of the tier is asked first.
                     Some(Stop::NoPermit) => {}
+                    // No socket got further than a refused connect: the
+                    // rest of the tier, then the next one.
+                    Some(Stop::Refused) => refused = true,
                     Some(stop) => return Err(stop),
                 }
             }
@@ -644,10 +714,11 @@ where
                 return Err(Stop::NoPermit);
             }
         }
-        Err(match (failed, cooling) {
-            (Some(stop), _) => stop,
-            (None, Some(until)) => Stop::Cooling(until),
-            (None, None) => Stop::fail(FailClass::Internal),
+        Err(match (failed, refused, cooling) {
+            (Some(stop), ..) => stop,
+            (None, true, _) => Stop::Refused,
+            (None, false, Some(until)) => Stop::Cooling(until),
+            (None, false, None) => Stop::fail(FailClass::Internal),
         })
     }
 
@@ -667,11 +738,16 @@ where
     /// longer has costs a refused call. A provider that refuses is not
     /// asked again, and what it did not give goes to the others in the
     /// next pass.
+    ///
+    /// A provider in `probing` ([`Pool::refusing`]) gets one socket: its
+    /// last word was a refusal, and one login shows whether it still
+    /// refuses.
     pub(crate) async fn open_sessions<'a>(
         &'a self,
         providers: &[&'a ProviderConfig],
         holder: &str,
         articles: usize,
+        probing: &[&str],
     ) -> Result<(Vec<ProviderSession<'a, C, N, T>>, bool)> {
         let wanted = usize::try_from(self.cfg.post_sockets)
             .unwrap_or(1)
@@ -725,6 +801,10 @@ where
                 busy |= !sessions.iter().any(|s| s.provider.id == id);
                 open.retain(|p| p.id != id);
             }
+            open.retain(|p| {
+                let id = p.id.as_str();
+                !(probing.contains(&id) && sessions.iter().any(|s| s.provider.id == id))
+            });
             turn = next
                 .and_then(|id| open.iter().position(|p| p.id == id))
                 .map_or(0, |at| at + 1);
@@ -782,7 +862,10 @@ where
             .filter(|at| missing.contains(&plan[*at].idx))
             .collect();
         let holder = job_holder(lease);
-        let (sessions, _) = self.open_sessions(&order, &holder, todo.len()).await?;
+        let probing = pool.refusing(&order);
+        let (sessions, _) = self
+            .open_sessions(&order, &holder, todo.len(), &probing)
+            .await?;
         if sessions.is_empty() {
             return Err(Stop::NoPermit);
         }
@@ -803,12 +886,22 @@ where
 pub(crate) const POST_SOCKET_BYTES: u64 = 1024 * 1024;
 
 /// The sessions a job opened before it loaded its extent, the time of the
-/// renewal they were connected under (`None` = not connected yet), and
-/// the providers that refused a login for their limit meanwhile (their
-/// sessions are ended).
+/// renewal they were connected under (`None` = not connected yet), the
+/// providers that turned a connect away meanwhile (those sessions are
+/// ended), and the providers the job probes with one socket.
 struct Opened<'a, C: Catalog, N: NntpConnector, T: Clock> {
     sessions: Vec<ProviderSession<'a, C, N, T>>,
     kept_at: Option<UnixMs>,
+    turned_away: TurnedAway<'a>,
+    probing: Vec<&'a str>,
+}
+
+/// The providers that turned a connect of the job away.
+#[derive(Default)]
+struct TurnedAway<'a> {
+    /// For a limit: the account takes no more connections now.
+    busy: Vec<&'a str>,
+    /// For the account, with no session of the job logged in.
     refused: Vec<&'a str>,
 }
 
@@ -852,6 +945,8 @@ impl Fatal {
 struct Socket {
     /// `None` = the permit is lost or given back.
     permit: Option<Permit>,
+    /// The socket was logged in at some time since the job opened it.
+    logged_in: bool,
 }
 
 struct RoundState<'a> {
@@ -887,7 +982,7 @@ pub(crate) struct Ended {
     /// Per plan position: a POST may have landed (see [`post_one`]).
     pub(crate) unknown: Vec<bool>,
     /// A socket found no slot: its permit was gone, or the provider
-    /// refused the login because the account is at its limit.
+    /// refused the connect because the account is at its limit.
     pub(crate) busy: bool,
 }
 
@@ -974,6 +1069,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 }
                 state.sockets.push(Socket {
                     permit: Some(session.permit().clone()),
+                    logged_in: session.connected(),
                 });
             }
         }
@@ -981,7 +1077,23 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             .into_iter()
             .enumerate()
             .map(|(slot, session)| self.work(slot, session));
-        let ended = join_all(work).await;
+        let mut ended = join_all(work).await;
+        // A provider that took one login of the round does not refuse
+        // the account, whatever the words of its reply: a refused
+        // connect of another of its sockets is its limit. "No slot", and
+        // no strike.
+        let logged_in: Vec<&'a str> = ended
+            .iter()
+            .zip(&self.state.borrow().sockets)
+            .filter(|(_, socket)| socket.logged_in)
+            .map(|(end, _)| end.0)
+            .collect();
+        for end in ended.iter_mut().filter(|e| logged_in.contains(&e.0)) {
+            if matches!(end.1, Some(Stop::Refused)) {
+                end.1 = Some(Stop::NoPermit);
+            }
+            end.2 = forgiven(end.2);
+        }
         // Also after the catalogue failed once: what the providers
         // accepted is recorded if the catalogue answers now. The write is
         // fenced like every other, so a stale lease still writes nothing.
@@ -991,11 +1103,11 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         // a provider that answered one socket in order is in order.
         for provider in providers {
             let mine = || ended.iter().filter(|e| e.0 == provider);
-            let healthy = match mine().any(|e| e.2 == Some(true)) {
-                true => Some(true),
+            let health = match mine().any(|e| e.2 == Some(Ok(()))) {
+                true => Some(Ok(())),
                 false => mine().find_map(|e| e.2),
             };
-            report_health(self.catalog, self.clock, provider, healthy).await;
+            report_health(self.catalog, self.clock, provider, health).await;
         }
         let busy = ended.iter().any(|e| matches!(e.1, Some(Stop::NoPermit)));
         let state = self.state.into_inner();
@@ -1005,13 +1117,19 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             (None, 0) => None,
             // Articles are left: the first provider in order says why. A
             // socket that only found no slot does not outweigh one that
-            // failed.
+            // was refused, and neither outweighs one that failed.
             (None, _) => {
-                let mut stops = ended.into_iter().filter_map(|e| e.1);
-                let mut stop = stops.next().unwrap_or(Stop::fail(FailClass::Internal));
-                if matches!(stop, Stop::NoPermit) {
-                    stop = stops.find(|s| !matches!(s, Stop::NoPermit)).unwrap_or(stop);
-                }
+                let weight = |stop: &Stop| match stop {
+                    Stop::NoPermit => 2,
+                    Stop::Refused => 1,
+                    _ => 0,
+                };
+                // The first of the lightest.
+                let stop = ended
+                    .into_iter()
+                    .filter_map(|e| e.1)
+                    .min_by_key(weight)
+                    .unwrap_or(Stop::fail(FailClass::Internal));
                 Some(stop)
             }
         };
@@ -1031,7 +1149,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         &self,
         slot: usize,
         mut session: ProviderSession<'a, C, N, T>,
-    ) -> (&'a str, Option<Stop>, Option<bool>) {
+    ) -> (&'a str, Option<Stop>, Health) {
         let provider = session.provider.id.as_str();
         let stop = loop {
             let Some(at) = self.take(provider).await else {
@@ -1067,10 +1185,13 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                     let landed = matches!(stop, Stop::Fail(FailClass::NntpError, _));
                     state.unknown[at] |= landed;
                     state.queue.push_front(at);
-                    // Only "no slot" and a broken connection are this
-                    // socket's own trouble; any other verdict would be
-                    // repeated to every socket of the provider.
-                    if !(landed || matches!(stop, Stop::NoPermit)) {
+                    // Only "no slot", a refused connect and a broken
+                    // connection are this socket's own trouble; any
+                    // other verdict would be repeated to every socket of
+                    // the provider. (A refused connect may be the
+                    // provider's limit: that is known when the round is
+                    // over, see `run`.)
+                    if !(landed || matches!(stop, Stop::NoPermit | Stop::Refused)) {
                         state.closed.push(provider);
                     }
                     break Some(stop);
@@ -1078,8 +1199,8 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             }
         };
         self.state.borrow_mut().sockets[slot].permit = None;
-        let healthy = session.finish().await;
-        (provider, stop, healthy)
+        let health = session.finish().await;
+        (provider, stop, health)
     }
 
     /// The next article for a socket of `provider`. With an empty queue
@@ -1245,6 +1366,7 @@ async fn exchange<'a, C: Catalog, N: NntpConnector, T: Clock>(
     unknown: bool,
 ) -> core::result::Result<Result<()>, Stop> {
     session.session().await?;
+    round.state.borrow_mut().sockets[slot].logged_in = true;
     round.keep(slot, session).await?;
     if unknown {
         match session.session().await?.stat(&row.message_id).await {

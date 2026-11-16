@@ -426,6 +426,10 @@ async fn tampered_copy_is_never_served() {
         .corrupt(&extent.id.safety_key(), |b| b[1000] ^= 1));
     let resp = get(&rig, &signer, "k", &[]).await;
     resp.expect_error(503, "ServiceUnavailable");
+    assert_eq!(
+        resp.message(),
+        "The object cannot be read right now. Please try again."
+    );
     assert!(resp.header("retry-after").is_some());
     // A range that avoids the damaged chunk still authenticates.
     let resp = get_range(&rig, &signer, "k", "bytes=199000-199999").await;
@@ -556,6 +560,8 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
     ProviderConfig {
         id: "p0".to_string(),
         host: server.addr().ip().to_string(),
+        hosts: Vec::new(),
+        host_select: Default::default(),
         port: server.addr().port(),
         tls: false,
         user: USER.to_string(),
@@ -569,7 +575,9 @@ fn provider(server: &TestNntpServer) -> ProviderConfig {
         retention_days: None,
         pool: None,
         pool_max_conns: None,
+        proxies: Vec::new(),
         enabled: true,
+        release: true,
     }
 }
 

@@ -80,6 +80,8 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
     let mut cfg = config(vec![ProviderConfig {
         id: "p0".to_string(),
         host: server.addr().ip().to_string(),
+        hosts: Vec::new(),
+        host_select: Default::default(),
         port: server.addr().port(),
         tls: false,
         user: USER.to_string(),
@@ -93,7 +95,9 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
         retention_days: None,
         pool: None,
         pool_max_conns: None,
+        proxies: Vec::new(),
         enabled: true,
+        release: true,
     }]);
     cfg.gc_mode = GcMode::Off;
     cfg.hot_cap_bytes = 0;

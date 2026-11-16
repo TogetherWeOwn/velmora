@@ -5,6 +5,7 @@
 //! is an error naming the variable, never echoing its value.
 
 use core::fmt;
+use core::net::IpAddr;
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
@@ -18,15 +19,51 @@ use crate::types::{KekBytes, ProviderConfig, Secret};
 /// `workers/s3-bridge/ops/README.md`).
 pub const REAL_DATA_READY: bool = true;
 
-/// Largest request body (one extent) the slice accepts. Raised when
-/// streaming bodies land.
+/// Largest extent, and largest UploadPart body. Raised when streaming
+/// bodies land.
 pub const MAX_EXTENT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Largest PutObject body `MAX_PUT_BYTES` may allow. The edge refuses a
+/// request of 100 MiB before the Worker runs; the last MiB is left for
+/// the framing of a chunked body. It is enough for signed chunks of
+/// 16 KiB or more; with signed chunks of 8 KiB, the smallest S3 allows,
+/// the edge refuses a body above about 98.9 MiB.
+pub const MAX_PUT_BYTES_LIMIT: u64 = 99 * 1024 * 1024;
+
+/// `SLICE_BYTES` when the variable is absent: 8 MiB, or one extent when
+/// that is smaller.
+pub const DEFAULT_SLICE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Most slices one PutObject is cut into. Their ids travel in single
+/// catalogue batches, and one generation holds them.
+pub const MAX_WRITE_SLICES: u64 = 16;
 
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
 
 /// Most entries `NNTP_PROVIDERS` may hold.
 pub const MAX_PROVIDERS: usize = 32;
+
+/// Most entries a provider's `hosts` may hold (next to `host`).
+pub const MAX_HOSTS: usize = 8;
+
+/// Most entries a provider's `proxies` may hold. Each one that cannot
+/// be used costs the callers its time limit
+/// ([`crate::hosts::PROXY_CONNECT_SECS`]) once, over all the connects
+/// and probes that wait for it: the time a probe gave up after counts
+/// into it. No try is shorter than a probe's limit
+/// ([`crate::hosts::PROBE_TIMEOUT_MS`]), so the last one may end that
+/// much late at most. All of that together must leave room inside one
+/// call of a read.
+pub const MAX_PROXIES: usize = 3;
+const _: () = assert!(
+    MAX_PROXIES as u32
+        * (crate::hosts::PROXY_CONNECT_SECS * 1_000 + crate::hosts::PROBE_TIMEOUT_MS)
+        < crate::ports::READ_CALL_SECS * 1_000
+);
+
+/// Longest name, user name or password SOCKS5 carries, in bytes.
+const SOCKS_FIELD_MAX: usize = 255;
 
 /// Longest accepted provider `pool` name (bytes).
 pub const MAX_POOL_NAME_LEN: usize = 64;
@@ -108,6 +145,16 @@ pub struct BridgeConfig {
     pub s3_host: String,
     pub region: String,
     pub max_extent_bytes: u64,
+    /// Largest PutObject body. A body above `max_extent_bytes` is cut
+    /// into slices of `slice_bytes`, each its own extent. Equal to
+    /// `max_extent_bytes` = no body is sliced.
+    pub max_put_bytes: u64,
+    /// Plaintext bytes of one slice of a sliced body.
+    pub slice_bytes: u64,
+    /// Delete the safety blobs of sliced writes that were never
+    /// published. Off: their `write_intents` rows stay and can be swept
+    /// later.
+    pub intent_sweep: bool,
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
     pub verify_delay_secs: u32,
@@ -126,6 +173,11 @@ pub struct BridgeConfig {
     /// fills). Pinned bytes are outside it: uploads are never throttled.
     pub hot_cap_bytes: u64,
     pub maintenance: Maintenance,
+    /// Names this catalogue in the keys of its rollback stamp
+    /// (`rs/<catalogue id>/<counter>`). Two catalogues over one safety
+    /// bucket need two ids. Never change it for a catalogue in use: its
+    /// stamp objects would no longer be found.
+    pub catalogue_id: String,
     /// Serve CopyObject. Off until the version that is rolled back to
     /// also reads extent references: an older Worker cannot read a copy
     /// and does not know that the source's extents are shared.
@@ -159,6 +211,21 @@ fn number_or(
     }
 }
 
+/// An optional `u64`; unset or empty = `None`.
+fn optional_u64(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<Option<u64>, ConfigError> {
+    match get(name) {
+        Some(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ConfigError::Invalid(name.to_string())),
+        _ => Ok(None),
+    }
+}
+
 fn number<N: core::str::FromStr>(
     get: &impl Fn(&str) -> Option<String>,
     name: &str,
@@ -187,6 +254,112 @@ fn valid_s3_host(h: &str) -> bool {
             && p.parse::<u32>().is_ok_and(|n| (1..=65_535).contains(&n))
     });
     name_ok && port_ok
+}
+
+/// The catalogue id when `CATALOGUE_ID` is not set.
+pub const DEFAULT_CATALOGUE_ID: &str = "main";
+
+/// `[a-z0-9_-]{1,32}`: one path segment of a blob key.
+fn valid_catalogue_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// A DNS name: at most 253 bytes of two or more dot-separated labels,
+/// each 1 to 63 of `[A-Za-z0-9-]` and not starting or ending with `-`,
+/// the last one not all digits (so no IPv4 address and no single-label
+/// name). An entry of a provider's `hosts`.
+fn valid_host_name(h: &str) -> bool {
+    let labels: Vec<&str> = h.split('.').collect();
+    h.len() <= 253
+        && labels.len() >= 2
+        && labels
+            .last()
+            .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()))
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// A provider's `hosts`: at most [`MAX_HOSTS`] valid names, none twice
+/// and none the same as `host` (case does not make two hosts), and only
+/// on TLS: a plaintext provider is the local fake server, one host.
+fn hosts_ok(p: &ProviderConfig) -> bool {
+    if p.hosts.is_empty() {
+        return true;
+    }
+    if !p.tls || p.hosts.len() > MAX_HOSTS || !p.hosts.iter().all(|h| valid_host_name(h)) {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    p.endpoints()
+        .into_iter()
+        .all(|h| seen.insert(h.to_ascii_lowercase()))
+}
+
+/// An address a proxy may have: not loopback, private, shared
+/// (100.64.0.0/10, as overlay networks hand out), link-local,
+/// unspecified, multicast or broadcast. The runtime does not connect to
+/// those either; here they are a configuration mistake.
+fn public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || (v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast())
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.to_ipv4_mapped().is_some()
+                // Unique local fc00::/7, link-local fe80::/10.
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80)
+        }
+    }
+}
+
+/// A provider's `proxies`: at most [`MAX_PROXIES`], each a DNS name or a
+/// public IP address with a port and a login SOCKS5 can carry, none
+/// twice. Only on a TLS provider, whose every host name fits a SOCKS5
+/// request: through a proxy there is no plaintext.
+///
+/// The provider sees one address per proxy in use, and all of them may
+/// be in use together (each isolate keeps its own order). So the
+/// provider's address limit, `max_ips`, must be stated with `proxies`,
+/// and the list is no longer than it: without the limit nothing here
+/// could tell a list that is too long.
+fn proxies_ok(p: &ProviderConfig) -> bool {
+    if p.proxies.is_empty() {
+        return true;
+    }
+    let field = |s: &str| (1..=SOCKS_FIELD_MAX).contains(&s.len());
+    let mut seen = BTreeSet::new();
+    p.tls
+        && p.proxies.len() <= MAX_PROXIES
+        && p.max_ips
+            .is_some_and(|ips| p.proxies.len() as u64 <= u64::from(ips))
+        && p.endpoints().into_iter().all(valid_host_name)
+        && p.proxies.iter().all(|x| {
+            (valid_host_name(&x.host) || x.host.parse::<IpAddr>().is_ok_and(public_ip))
+                && x.port != 0
+                && field(&x.user)
+                && field(&x.pass)
+                && seen.insert((x.host.to_ascii_lowercase(), x.port))
+        })
 }
 
 fn valid_newsgroup(g: &str) -> bool {
@@ -231,6 +404,34 @@ impl BridgeConfig {
         if max_extent_bytes == 0 || max_extent_bytes > MAX_EXTENT_BYTES_LIMIT {
             return Err(ConfigError::Invalid("MAX_EXTENT_BYTES".into()));
         }
+
+        // Optional: absent or empty keeps every PUT at one extent.
+        let max_put_bytes = optional_u64(&get, "MAX_PUT_BYTES")?.unwrap_or(max_extent_bytes);
+        if max_put_bytes < max_extent_bytes || max_put_bytes > MAX_PUT_BYTES_LIMIT {
+            return Err(ConfigError::Invalid("MAX_PUT_BYTES".into()));
+        }
+        let set_slice_bytes = optional_u64(&get, "SLICE_BYTES")?;
+        let slice_bytes = set_slice_bytes.unwrap_or(DEFAULT_SLICE_BYTES.min(max_extent_bytes));
+        // A slice is an extent, and a maximal body stays within the
+        // slice count one write may have.
+        if slice_bytes == 0 || slice_bytes > max_extent_bytes {
+            return Err(ConfigError::Invalid("SLICE_BYTES".into()));
+        }
+        if max_put_bytes.div_ceil(slice_bytes) > MAX_WRITE_SLICES {
+            // With `SLICE_BYTES` unset the slice follows from
+            // `MAX_EXTENT_BYTES`, and the limit that asks too much of it
+            // is the one that was set.
+            let cause = match set_slice_bytes {
+                Some(_) => "SLICE_BYTES",
+                None => "MAX_PUT_BYTES",
+            };
+            return Err(ConfigError::Invalid(cause.into()));
+        }
+        let intent_sweep = match get("INTENT_SWEEP").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("INTENT_SWEEP".into())),
+        };
 
         let required_backbones: u32 = number(&get, "REQUIRED_BACKBONES")?;
         if required_backbones == 0 {
@@ -302,6 +503,15 @@ impl BridgeConfig {
             _ => return Err(ConfigError::Invalid("MAINTENANCE".into())),
         };
 
+        // Optional: absent or empty is the default.
+        let catalogue_id = match get("CATALOGUE_ID") {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => DEFAULT_CATALOGUE_ID.to_string(),
+        };
+        if !valid_catalogue_id(&catalogue_id) {
+            return Err(ConfigError::Invalid("CATALOGUE_ID".into()));
+        }
+
         let server_side_copy = match required(&get, "SERVER_SIDE_COPY")?.as_str() {
             "off" => false,
             "on" => true,
@@ -325,7 +535,7 @@ impl BridgeConfig {
         for pool in providers.iter_mut().filter_map(|p| p.pool.as_mut()) {
             *pool = pool.trim().to_lowercase();
         }
-        validate_providers(&providers, dev)?;
+        validate_providers(&providers, dev, required_backbones)?;
 
         let admin_token = required(&get, "ADMIN_TOKEN")?;
         if admin_token.len() < MIN_ADMIN_TOKEN_LEN {
@@ -337,6 +547,9 @@ impl BridgeConfig {
             s3_host,
             region,
             max_extent_bytes,
+            max_put_bytes,
+            slice_bytes,
+            intent_sweep,
             required_backbones,
             safety_min_age_secs,
             verify_delay_secs,
@@ -348,6 +561,7 @@ impl BridgeConfig {
             gc_mode,
             hot_cap_bytes,
             maintenance,
+            catalogue_id,
             server_side_copy,
             dev_trust_http,
             providers,
@@ -358,9 +572,29 @@ impl BridgeConfig {
     pub fn is_dev(&self) -> bool {
         self.environment == Environment::Dev
     }
+
+    /// `Some(warning)` while the provider list has fewer backbones that
+    /// count toward a release than `REQUIRED_BACKBONES`. Reads and writes
+    /// go on; no pinned copy is released or given up, so everything
+    /// uploaded stays held until the list is put right. The text names
+    /// counts only, never a provider.
+    pub fn release_paused(&self) -> Option<String> {
+        let counting = crate::verify::release_labels(&self.providers).len();
+        (counting < self.required_backbones as usize).then(|| {
+            format!(
+                "release paused: {counting} backbone(s) count toward release, \
+                 REQUIRED_BACKBONES is {}; pinned copies stay held",
+                self.required_backbones
+            )
+        })
+    }
 }
 
-fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), ConfigError> {
+fn validate_providers(
+    providers: &[ProviderConfig],
+    dev: bool,
+    required_backbones: u32,
+) -> Result<(), ConfigError> {
     let bad = || ConfigError::Invalid("NNTP_PROVIDERS".into());
     if providers.is_empty() {
         return Err(bad());
@@ -386,7 +620,7 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
         // Stated, the address limit is a real one: `0` would shut the
         // provider out without saying so (`enabled` does that).
         let ips_ok = p.max_ips.is_none_or(|n| (1..=MAX_CONNS_LIMIT).contains(&n));
-        if !pool_ok || !ips_ok || p.retention_days == Some(0) {
+        if !pool_ok || !ips_ok || !hosts_ok(p) || !proxies_ok(p) || p.retention_days == Some(0) {
             return Err(bad());
         }
         if p.id.is_empty()
@@ -412,6 +646,10 @@ fn validate_providers(providers: &[ProviderConfig], dev: bool) -> Result<(), Con
     if !usable(|p| p.post) || !usable(|p| p.read) {
         return Err(bad());
     }
+    // Fewer backbones that count toward a release than
+    // `REQUIRED_BACKBONES` is not refused here: the Worker has to keep
+    // serving. See [`Config::release_paused`].
+    let _ = required_backbones;
     Ok(())
 }
 

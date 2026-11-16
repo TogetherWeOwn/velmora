@@ -39,7 +39,6 @@ tiers:
   # file are sensitive; a fixture change that feeds parser/crypto inputs is
   # sensitive.
   low:
-    - "README.md"
     - "crates/velmora/README.md"
     - "crates/velmora-test-nntp/README.md"
     - "crates/velmora/testdata/README.md"

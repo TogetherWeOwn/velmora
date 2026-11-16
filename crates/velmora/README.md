@@ -11,6 +11,7 @@ native targets (services, Container batch jobs).
 | `pinned_transport` | Pinned, cancellable fetch policy for NZB fetch: TLS-on only, port allowlist, cooperative cancellation, names-only diagnostics (see below) |
 | `transports::tokio_tls` | Native transport: tokio TCP with optional rustls (Mozilla roots), feature `native-tls` |
 | `transports::worker_socket` | Workers transport over `connect()`, timeouts via `worker::Delay`, feature `worker-transport` (wasm32) |
+| `transports::worker_socks5` | Workers transport through a SOCKS5 proxy: `socks5` handshake, then TLS made in the Worker (`transports::proxy_tls`, rustls, Mozilla roots), feature `worker-socks5-tls` (wasm32) |
 | `yenc` | yEnc encode/decode, byte-identical to v1; explicit SIMD fast path (x86_64 SSE2, wasm simd128 with `RUSTFLAGS="-C target-feature=+simd128"`), scalar fallback |
 | `nzb` | Streaming NZB parser (quick-xml) with hard bounds on files, segments, bytes, nesting; SHA-256 segment digest identical to v1 |
 | `media` | `velmora.media.v1`, the only format velmora products write: age v1 STREAM payload with a 48-byte committing header, three key modes, commitment-gated ranged reads and full verification (see below) |
@@ -151,6 +152,8 @@ wiring consumes (separate intake card, untouched here):
 - `default = ["native-tls"]` — what services and tests build.
 - `native-tls` — tokio + rustls transport (non-wasm).
 - `worker-transport` — Workers `connect()` socket transport (wasm32 only).
+- `worker-socks5-tls` — that socket through a SOCKS5 proxy, with TLS to the
+  provider made in the Worker (wasm32 only).
 
 (Sources: `crates/velmora/Cargo.toml:11-13`; gating `src/transports/mod.rs:11-21`;
 wasm32 tokio `io-util`-only `Cargo.toml:43-44`.)

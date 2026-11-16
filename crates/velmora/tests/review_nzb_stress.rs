@@ -8,9 +8,14 @@
 //! declared gigabytes.
 //!
 //! Two gates, neither vacuous:
-//! - [`STRESS_TIME_BOUND`]: an absolute bound for the full-cap corpus
-//!   (measured ~0.43 s in a debug build, so 5 s is ~10x headroom while a
-//!   quadratic regression at 65,536 IDs takes minutes).
+//! - [`STRESS_TIME_BOUND`]: an absolute bound for the full-cap corpus.
+//!   `cargo test` builds this crate at opt-level 3 (the `test` profile in
+//!   the workspace manifest). Built that way the parse takes about 0.05 s
+//!   on a CI runner and 0.07 s on a loaded 4-core host, so 600 ms is ~10x
+//!   headroom, and a quadratic regression at 65,536 IDs is far outside it.
+//!   At opt-level 0 the same parse takes 0.45 to 0.8 s on a CI runner,
+//!   which leaves no headroom: if that profile changes, measure again and
+//!   change the bound with it.
 //! - a scaling assertion: parsing 4x the IDs must cost less than 8x the time
 //!   (best-of-3, machine-normalised). Linear parsing costs ~4x; a quadratic
 //!   regression costs ~16x and fails regardless of host speed.
@@ -24,8 +29,9 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use velmora::nzb::Parser;
 
-/// Stated CI time bound for parsing the full-cap stress corpus (debug build).
-const STRESS_TIME_BOUND: Duration = Duration::from_secs(5);
+/// Stated CI time bound for parsing the full-cap stress corpus, with this
+/// crate built at opt-level 3 as `cargo test` builds it.
+const STRESS_TIME_BOUND: Duration = Duration::from_millis(600);
 
 /// Declared wire bytes per synthetic segment (1 MiB of encoded payload).
 const BYTES_PER_SEGMENT: i64 = 1 << 20;

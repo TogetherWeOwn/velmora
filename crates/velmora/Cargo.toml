@@ -12,6 +12,9 @@ default = ["native-tls"]
 archive-provider = []
 native-tls = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:rustls-pki-types", "dep:velmora-ssrf-guard"]
 worker-transport = ["dep:worker", "dep:futures-util", "dep:tokio"]
+# A Workers socket through a SOCKS5 proxy, with TLS to the provider made
+# in the Worker (rustls) on the proxied connection.
+worker-socks5-tls = ["worker-transport", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:rustls-pki-types", "dep:velmora-ssrf-guard"]
 # Qualification-only; no runtime call site is enabled by this feature.
 worker-pinned-tls = ["worker-transport", "dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:rustls-pki-types", "dep:velmora-ssrf-guard"]
 

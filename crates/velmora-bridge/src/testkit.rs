@@ -22,7 +22,7 @@ use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
     UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
 };
-use crate::recovery::{is_record_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
+use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
     Job, KekBytes, Result, UnixMs,
@@ -58,6 +58,23 @@ pub const MIGRATION_0007: &str =
 /// The mark of an unfinished catalogue replay.
 pub const MIGRATION_0008: &str =
     include_str!("../../../workers/s3-bridge/migrations/0008_restore_state.sql");
+/// Each article's own yEnc name (standalone single-part articles).
+pub const MIGRATION_0009: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0009_article_yenc_name.sql");
+
+/// The rollback stamp counter.
+pub const MIGRATION_0010: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0010_rollback_stamp.sql");
+/// The slices of a multi-extent write, recorded before they are stored.
+pub const MIGRATION_0011: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0011_write_intents.sql");
+
+/// Why a provider's last failed session failed.
+pub const MIGRATION_0012: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0012_provider_health_reason.sql");
+/// How a verification row checked the articles (`body` or `stat`).
+pub const MIGRATION_0013: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0013_verification_kind.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -148,6 +165,11 @@ impl RusqliteSql {
         db.apply(MIGRATION_0006)?;
         db.apply(MIGRATION_0007)?;
         db.apply(MIGRATION_0008)?;
+        db.apply(MIGRATION_0009)?;
+        db.apply(MIGRATION_0010)?;
+        db.apply(MIGRATION_0011)?;
+        db.apply(MIGRATION_0012)?;
+        db.apply(MIGRATION_0013)?;
         Ok(db)
     }
 
@@ -310,7 +332,7 @@ impl BlobStore for MemBlobStore {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        if is_record_key(key) {
+        if is_protected_key(key) {
             return Err(ERR_RECORD_DELETE);
         }
         self.blobs.borrow_mut().remove(key);

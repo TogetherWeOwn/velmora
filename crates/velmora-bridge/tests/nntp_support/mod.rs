@@ -61,6 +61,10 @@ pub struct TcpConnector {
     live: Rc<Cell<u32>>,
     peak: Rc<Cell<u32>>,
     connects: Cell<u32>,
+    /// The provider of every session opened, in order.
+    opened: RefCell<Vec<String>>,
+    /// The provider of every connect tried, in order.
+    dialed: RefCell<Vec<String>>,
     slow: Rc<RefCell<Option<Slow>>>,
     park: Rc<RefCell<Option<Rc<Cell<bool>>>>>,
 }
@@ -116,6 +120,15 @@ impl TcpConnector {
     /// Sessions opened so far.
     pub fn connects(&self) -> u32 {
         self.connects.get()
+    }
+    /// Sessions opened so far on provider `id`.
+    pub fn connects_to(&self, id: &str) -> usize {
+        self.opened.borrow().iter().filter(|p| *p == id).count()
+    }
+    /// Connects tried so far on provider `id`, counted before the dial:
+    /// those the provider refused too.
+    pub fn dials_to(&self, id: &str) -> usize {
+        self.dialed.borrow().iter().filter(|p| *p == id).count()
     }
 }
 
@@ -197,11 +210,24 @@ impl NntpConnector for TcpConnector {
 
     async fn connect(&self, p: &ProviderConfig, _permit: &Permit) -> Result<CountedSession> {
         note_event("connect");
+        self.dialed.borrow_mut().push(p.id.clone());
+        if !p.proxies.is_empty() {
+            // This connector has no proxy to go through, and a provider
+            // with proxies is reached in no other way: what the Worker's
+            // connector answers when every proxy is down.
+            return Err(BridgeError::Nntp(velmora::Error::Io(
+                velmora::socks5::proxy_failure(
+                    std::io::ErrorKind::ConnectionRefused,
+                    velmora::socks5::ERR_IO,
+                ),
+            )));
+        }
         begin(&self.slow, "connect");
         let client = dial(&nntp_config(&p.host, p.port, &p.user, &p.pass)).await;
         end(&self.slow);
         let client = client?;
         self.connects.set(self.connects.get() + 1);
+        self.opened.borrow_mut().push(p.id.clone());
         self.live.set(self.live.get() + 1);
         self.peak.set(self.peak.get().max(self.live.get()));
         Ok(CountedSession {
@@ -227,6 +253,8 @@ pub struct OutboxRow {
     pub lease_until: Option<UnixMs>,
     pub cursor: u32,
     pub last_error: Option<FailClass>,
+    /// When the row was last claimed (`outbox.updated_at` at a claim).
+    pub claimed_at: UnixMs,
 }
 
 pub struct Entry {
@@ -254,6 +282,7 @@ struct Health {
     failures: u32,
     cooldowns: u32,
     until: i64,
+    fault: Option<ProviderFault>,
 }
 
 /// A takeover injected at the catalogue write that marks one article
@@ -322,6 +351,7 @@ impl MemCatalog {
             lease_until: None,
             cursor: 0,
             last_error: None,
+            claimed_at: T0,
         };
         self.entries.borrow_mut().insert(
             job.extent.id.clone(),
@@ -391,6 +421,7 @@ impl MemCatalog {
                 articles_ok: v.articles_ok,
                 articles_total: v.articles_total,
                 result: v.result,
+                kind: v.kind,
                 counts: v.result == VerifyResult::Ok
                     && v.articles_ok == v.articles_total
                     && Some(v.articles_total) == extent.article_count,
@@ -424,6 +455,7 @@ impl Catalog for MemCatalog {
         o.token += 1;
         o.attempts += 1;
         o.lease_until = Some(now.plus_secs(LEASE_SECS));
+        o.claimed_at = now;
         Ok(Some(Lease {
             extent: extent.clone(),
             generation: generation.clone(),
@@ -557,7 +589,7 @@ impl Catalog for MemCatalog {
                 return false;
             }
             e.verifications.push(v.clone());
-            if v.result == VerifyResult::Ok {
+            if v.result == VerifyResult::Ok && v.kind == VerifyKind::Body {
                 e.job.extent.last_verified_at = Some(v.verified_at);
             }
             true
@@ -577,12 +609,19 @@ impl Catalog for MemCatalog {
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
         let applied = self.fenced(l, |e| {
-            let counting = Self::statuses(e).iter().filter(|s| s.counts).count();
-            if counting < required as usize {
+            // As the SQL guard: only rows recorded under this claim.
+            let claimed = e.outbox.claimed_at;
+            let statuses = Self::statuses(e);
+            let passes = statuses
+                .iter()
+                .filter(|s| s.counts && s.verified_at >= claimed)
+                .map(|s| (s.backbone.as_str(), s.kind));
+            if !velmora_bridge::verify::releasable(passes, counting, required) {
                 return false;
             }
             e.job.extent.safety_state = SafetyState::Releasing;
@@ -889,6 +928,46 @@ impl Catalog for MemCatalog {
     async fn commit_generation(&self, _: &CommitGeneration, _: Recorded) -> Result<PublishOutcome> {
         unused()
     }
+    async fn commit_sliced(
+        &self,
+        _: &CommitGeneration,
+        _: &WriteId,
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
+        unused()
+    }
+    async fn open_intents(&self, _: &WriteId, _: &[ExtentId], _: UnixMs) -> Result<Guard<()>> {
+        unused()
+    }
+    async fn intents_generation(
+        &self,
+        _: &WriteId,
+        _: &GenerationId,
+        _: usize,
+    ) -> Result<Guard<()>> {
+        unused()
+    }
+    async fn abandon_intents(&self, _: &WriteId) -> Result<()> {
+        unused()
+    }
+    async fn due_intents(&self, _: UnixMs, _: u32) -> Result<Vec<WriteId>> {
+        unused()
+    }
+    async fn fence_intents(&self, _: &WriteId, _: UnixMs, _: Option<u64>) -> Result<IntentFence> {
+        unused()
+    }
+    async fn hold_intent_fence(&self, _: &WriteId, _: usize, _: Option<u64>) -> Result<bool> {
+        unused()
+    }
+    async fn keep_intents(&self, _: &WriteId) -> Result<()> {
+        unused()
+    }
+    async fn drop_intents(&self, _: &WriteId) -> Result<()> {
+        unused()
+    }
+    async fn intent_stats(&self, _: UnixMs) -> Result<IntentStats> {
+        unused()
+    }
     async fn newest_id(&self, _: &BucketId, _: &str) -> Result<Option<GenerationId>> {
         unused()
     }
@@ -934,10 +1013,33 @@ impl Catalog for MemCatalog {
     async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {
         unused()
     }
-    async fn restore_begin(&self, _: UnixMs, _: UnixMs) -> Result<UnixMs> {
+    async fn restore_begin(
+        &self,
+        _: UnixMs,
+        _: UnixMs,
+    ) -> Result<std::result::Result<UnixMs, UnixMs>> {
         unused()
     }
-    async fn restore_finish(&self, _: UnixMs, _: UnixMs) -> Result<bool> {
+    async fn restore_finish(
+        &self,
+        _: UnixMs,
+        _: UnixMs,
+        _: u64,
+        _: Option<u64>,
+        _: &str,
+    ) -> Result<bool> {
+        unused()
+    }
+    async fn stamp(&self, _: &str) -> Result<velmora_bridge::stamp::StampRow> {
+        Ok(velmora_bridge::stamp::StampRow {
+            counter: None,
+            rolled_back: false,
+        })
+    }
+    async fn stamp_advance(&self, _: Option<u64>, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    async fn stamp_rolled_back(&self, _: Option<u64>, _: UnixMs, _: &str) -> Result<bool> {
         unused()
     }
     async fn restore_pending(&self) -> Result<bool> {
@@ -1044,21 +1146,32 @@ impl Catalog for MemCatalog {
                     failures: h.failures,
                     cooldowns: h.cooldowns,
                     cooldown_until: UnixMs(h.until),
+                    fault: h.fault,
                 }
             })
             .collect())
     }
 
-    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()> {
+    async fn provider_failed(
+        &self,
+        provider: &str,
+        fault: ProviderFault,
+        now: UnixMs,
+    ) -> Result<()> {
         self.failures_reported.set(self.failures_reported.get() + 1);
         let mut health = self.health.borrow_mut();
         let h = health.entry(provider.to_string()).or_default();
         if h.until > now.0 {
             return Ok(());
         }
+        h.fault = Some(fault);
+        let (max_ms, max_steps) = match fault {
+            ProviderFault::LoginRefused => (6 * 3_600_000, 9),
+            _ => (900_000, 4),
+        };
         if h.failures + 1 >= 3 || h.cooldowns > 0 {
-            h.until = now.0 + (60_000i64 << h.cooldowns).min(900_000);
-            h.cooldowns = (h.cooldowns + 1).min(4);
+            h.until = now.0 + (60_000i64 << h.cooldowns).min(max_ms);
+            h.cooldowns = (h.cooldowns + 1).min(max_steps);
             h.failures = 0;
         } else {
             h.failures += 1;
@@ -1124,6 +1237,31 @@ pub struct Rig {
     /// One server per provider, in provider order (`p0`, `p1`, …).
     pub servers: Vec<TestNntpServer>,
     pub bridge: TestBridge,
+    /// The ports of the providers a test has unplugged, kept for as long
+    /// as the rig.
+    pub dead_ports: Vec<DeadPort>,
+}
+
+/// A local port nothing listens on, for as long as this value lives.
+///
+/// The socket is bound and never listens: a connect to the port is refused
+/// at once, and the port stays taken, so no server or client of a test
+/// running at the same time can be given it. A listener that is bound and
+/// dropped frees the port, and the next bind may get it.
+pub struct DeadPort {
+    socket: tokio::net::TcpSocket,
+}
+
+impl DeadPort {
+    pub fn reserve() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        Self { socket }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.socket.local_addr().unwrap().port()
+    }
 }
 
 /// A recognisable plaintext: any leak into an article is easy to find.
@@ -1158,6 +1296,8 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         providers.push(ProviderConfig {
             id: format!("p{i}"),
             host: server.addr().ip().to_string(),
+            hosts: Vec::new(),
+            host_select: Default::default(),
             port: server.addr().port(),
             tls: false,
             user: USER.to_string(),
@@ -1171,7 +1311,9 @@ pub async fn rig(specs: &[Spec]) -> Rig {
             retention_days: None,
             pool: None,
             pool_max_conns: None,
+            proxies: Vec::new(),
             enabled: true,
+            release: true,
         });
         servers.push(server);
     }
@@ -1180,6 +1322,9 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         s3_host: "s3.test".to_string(),
         region: "auto".to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
+        max_put_bytes: 16 * 1024 * 1024,
+        slice_bytes: 8 * 1024 * 1024,
+        intent_sweep: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
@@ -1192,6 +1337,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
         server_side_copy: true,
+        catalogue_id: "main".to_string(),
         dev_trust_http: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
@@ -1207,7 +1353,11 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         budget: ByteBudget::new(48 * 1024 * 1024),
         cfg,
     };
-    Rig { servers, bridge }
+    Rig {
+        servers,
+        bridge,
+        dead_ports: Vec::new(),
+    }
 }
 
 /// A single provider that posts and reads, two connections.

@@ -41,6 +41,7 @@ pub mod par2;
 pub mod pinned_transport;
 pub mod rng;
 pub mod segment_identity;
+pub mod socks5;
 pub mod transport;
 pub mod transports;
 pub mod yenc;

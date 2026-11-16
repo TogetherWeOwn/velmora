@@ -20,6 +20,7 @@ pub mod chunked;
 pub mod listing;
 pub mod mutation;
 mod read;
+pub mod sign;
 mod upload;
 mod wire;
 

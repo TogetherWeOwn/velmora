@@ -16,9 +16,10 @@ pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
-    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, Job, JobExtent, KekBytes,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig,
-    ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow, UploadRow, VerificationRow,
+    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats, Job,
+    JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm,
+    ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow,
+    UploadRow, VerificationRow, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,16 @@ pub struct BlobMeta<'a> {
     pub cipher_sha256: &'a [u8; 32],
 }
 
+/// One key of a listing with what identifies its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobEntry {
+    pub key: String,
+    pub size: u64,
+    /// MD5 of the bytes in lowercase hex, as the store reports it for an
+    /// object written by one put.
+    pub md5: String,
+}
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
     /// H2 adds `put_stream(len)`.
@@ -87,9 +98,11 @@ pub trait BlobStore {
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
-    /// Idempotent. Refuses a recovery record (any key under `m/`) with
-    /// [`crate::recovery::ERR_RECORD_DELETE`] before the store is asked:
-    /// no caller can remove one through this method.
+    /// Idempotent. Refuses a recovery record (any key under `m/`, which
+    /// includes the tenant keys under `m/tk/`) and a rollback stamp (any
+    /// key under `rs/`) with [`crate::recovery::ERR_RECORD_DELETE`]
+    /// before the store is asked: no caller can remove one through this
+    /// method.
     async fn delete(&self, key: &str) -> Result<()>;
     /// Removes the record of a generation that the catalogue refused to
     /// publish. The only delete of a key under `m/`; the argument exists
@@ -98,6 +111,42 @@ pub trait BlobStore {
     /// Up to `limit` keys that start with `prefix` and sort after
     /// `start_after`, in key order. Fewer than `limit` = no more keys.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
+    /// Keys as [`BlobStore::list`] gives them, with the size and MD5 of
+    /// each. The end rule is not that of `list`: only an **empty** answer
+    /// means no more keys. A short answer is not the end (a key removed
+    /// since it was listed is left out); the caller goes on from the
+    /// last key returned. A `limit` of 0 is read as 1.
+    ///
+    /// This default reads every blob; an adapter whose listing carries
+    /// size and MD5 overrides it.
+    async fn list_entries(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> Result<Vec<BlobEntry>> {
+        let mut entries = Vec::new();
+        let mut after = start_after.to_string();
+        // A key removed since it was listed is left out; an answer is
+        // empty only when the listing itself has ended.
+        while entries.is_empty() {
+            let keys = self.list(prefix, &after, limit.max(1)).await?;
+            let Some(last) = keys.last().cloned() else {
+                break;
+            };
+            for key in keys {
+                if let Some(bytes) = self.get(&key, None).await? {
+                    entries.push(BlobEntry {
+                        size: bytes.len() as u64,
+                        md5: crate::remote::md5_hex(&bytes),
+                        key,
+                    });
+                }
+            }
+            after = last;
+        }
+        Ok(entries)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +392,74 @@ pub trait Catalog {
         c: &CommitGeneration,
         record: Recorded,
     ) -> Result<PublishOutcome>;
+    /// [`Self::commit_generation`] for a body stored as the slices of
+    /// `write`. The batch also commits only while every intent of the
+    /// write is `open` under this generation id, and deletes them. So a
+    /// write the sweep has taken is refused like one with an older id.
+    async fn commit_sliced(
+        &self,
+        c: &CommitGeneration,
+        write: &WriteId,
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
+
+    // write intents (the slices of a multi-extent write)
+    /// Records the slices of `write` before the first of them is
+    /// stored: one `open` row per extent id, in one batch. `Lost` = a
+    /// replay is under way; nothing was written.
+    async fn open_intents(
+        &self,
+        write: &WriteId,
+        extents: &[ExtentId],
+        now: UnixMs,
+    ) -> Result<Guard<()>>;
+    /// Stores the id of the recovery record that is written next. A
+    /// record of the write is then always found from its rows. `Lost` =
+    /// the write no longer has `slices` open rows (the sweep took it, or
+    /// a replay emptied the table) or a replay is under way: the request
+    /// must stop before it writes a record.
+    async fn intents_generation(
+        &self,
+        write: &WriteId,
+        generation: &GenerationId,
+        slices: usize,
+    ) -> Result<Guard<()>>;
+    /// The request gave up and no recovery record of the write exists:
+    /// its `open` rows become `abandoned`, and the sweep takes them
+    /// without waiting for the grace period.
+    async fn abandon_intents(&self, write: &WriteId) -> Result<()>;
+    /// Writes the sweep has to look at, oldest first: `abandoned`, left
+    /// `sweeping` by a job that died, or `open` and created before
+    /// `open_before`.
+    async fn due_intents(&self, open_before: UnixMs, limit: u32) -> Result<Vec<WriteId>>;
+    /// Takes `write` for the sweep in one batch that fails while a
+    /// replay is under way, the write has a generation or extent row,
+    /// or the stamp counter is below `stamp`: the counter the caller's
+    /// rollback check found level with the stamp objects (`None` = it
+    /// found no stamp object).
+    async fn fence_intents(
+        &self,
+        write: &WriteId,
+        open_before: UnixMs,
+        stamp: Option<u64>,
+    ) -> Result<IntentFence>;
+    /// The checks of the fence once more, just before blobs are
+    /// deleted. `true` = all `slices` rows are still `sweeping`, no
+    /// replay runs, the write has no catalogue row, and the stamp
+    /// counter is not below `stamp` (as for the fence).
+    async fn hold_intent_fence(
+        &self,
+        write: &WriteId,
+        slices: usize,
+        stamp: Option<u64>,
+    ) -> Result<bool>;
+    /// A recovery record of the fenced write exists: its rows become
+    /// `kept` and one anomaly is counted. Nothing is deleted.
+    async fn keep_intents(&self, write: &WriteId) -> Result<()>;
+    /// The blobs of the fenced write are gone: its rows go.
+    async fn drop_intents(&self, write: &WriteId) -> Result<()>;
+    /// Counts for `GET /_admin/status`.
+    async fn intent_stats(&self, open_before: UnixMs) -> Result<IntentStats>;
     /// The newest id on `(bucket, key)`: its live generation or its
     /// floor. A publication or a tombstone must sort after it.
     async fn newest_id(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationId>>;
@@ -484,10 +601,15 @@ pub trait Catalog {
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
+    /// `counting` = the labels of the backbones that count toward a
+    /// release. The guard is the release rule over rows recorded under
+    /// this claim: `required` of those backbones with a complete pass,
+    /// at least one of them a `body` pass.
     async fn begin_release(
         &self,
         l: &Lease,
         required: u32,
+        counting: &[String],
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>>;
@@ -526,14 +648,59 @@ pub trait Catalog {
     /// `after`.
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>>;
     /// A replay starts: writes are refused until [`Self::restore_finish`].
-    /// Returns the mark of this replay: later than that of every replay
-    /// before it.
-    async fn restore_begin(&self, since: UnixMs, now: UnixMs) -> Result<UnixMs>;
+    /// `Ok` = the mark of this replay: later than that of every replay
+    /// before it. `Err` = refused: a replay from the restore point in
+    /// the `Err` has not ended, and `since` is later than that point.
+    /// The start removes the write intents in its own batch, all but
+    /// the `kept` rows whose record the replay does not read (a record
+    /// from before `since`).
+    async fn restore_begin(
+        &self,
+        since: UnixMs,
+        now: UnixMs,
+    ) -> Result<std::result::Result<UnixMs, UnixMs>>;
     /// The replay with the mark `run` ran to its end. `false` = another
     /// replay was started since; that one is not ended by this.
-    async fn restore_finish(&self, run: UnixMs, now: UnixMs) -> Result<bool>;
-    /// Whether a replay was started and has not ended.
+    /// In the same batch the rollback stamp is made level: the counter
+    /// becomes at least `stamp` (the newest stamp object) and a recorded
+    /// rollback is cleared. Only the call that ends the replay does
+    /// that; a repeated call for a replay that has ended does not.
+    /// `seen` is the counter the caller read when it chose `stamp`: if
+    /// the catalogue holds another one by now (it was brought back to
+    /// an earlier point in between), nothing is changed and the answer
+    /// is `false`.
+    async fn restore_finish(
+        &self,
+        run: UnixMs,
+        now: UnixMs,
+        stamp: u64,
+        seen: Option<u64>,
+        catalogue: &str,
+    ) -> Result<bool>;
+    /// Whether writes and jobs must be refused: a replay was started and
+    /// has not ended, or a rollback of the catalogue was found and no
+    /// replay has ended since.
     async fn restore_pending(&self) -> Result<bool>;
+    /// The rollback stamp row ([`crate::stamp`]). `catalogue` is the id
+    /// this Worker keys the stamp objects by; the row keeps the id it
+    /// was created with. [`crate::stamp::ERR_CATALOGUE_ID`] = the two
+    /// differ.
+    async fn stamp(&self, catalogue: &str) -> Result<crate::stamp::StampRow>;
+    /// Moves the stamp counter from `from` to the next value (`None` =
+    /// creates the row at 1). `false` = the counter is not at `from`, or
+    /// a rollback is recorded: nothing changed.
+    async fn stamp_advance(&self, from: Option<u64>, catalogue: &str) -> Result<bool>;
+    /// Records that the catalogue was found behind its stamp, if its
+    /// counter is still `seen` (`None` = there is no row) and no
+    /// rollback is on record. `false` = nothing was recorded: the
+    /// counter moved since the caller read it, or another caller
+    /// recorded the rollback. The caller reads again.
+    async fn stamp_rolled_back(
+        &self,
+        seen: Option<u64>,
+        now: UnixMs,
+        catalogue: &str,
+    ) -> Result<bool>;
     /// The replay with the mark `run`: its restore point and how far it
     /// has come. `None` = `run` is not the replay that was started last.
     async fn restore_progress(&self, run: UnixMs) -> Result<Option<RestoreProgress>>;
@@ -579,9 +746,14 @@ pub trait Catalog {
     /// Held slots, slots ever handed out and health, per provider that
     /// has a permit or a health row.
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>>;
-    /// One failed session. Repeated failures start a cooldown; a failure
-    /// reported while the provider is cooling changes nothing.
-    async fn provider_failed(&self, provider: &str, now: UnixMs) -> Result<()>;
+    /// One failed session, and why. Repeated failures start a cooldown; a
+    /// failure reported while the provider is cooling changes nothing.
+    async fn provider_failed(
+        &self,
+        provider: &str,
+        fault: ProviderFault,
+        now: UnixMs,
+    ) -> Result<()>;
     /// One good session: clears failures and the cooldown history, unless
     /// the provider is cooling now.
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;

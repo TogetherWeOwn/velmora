@@ -176,6 +176,11 @@ id_type!(
     /// 32 hex, random. Never an authorization boundary (§A.4).
     UploadId
 );
+id_type!(
+    /// `w_<32 hex>`, random: one request that stores its body as several
+    /// slices.
+    WriteId
+);
 
 impl BucketId {
     pub fn mint(rand: [u8; 8]) -> Self {
@@ -212,6 +217,15 @@ impl ExtentId {
     /// Key of the evictable ciphertext in `CACHE`.
     pub fn cache_key(&self) -> String {
         format!("c/{}", self.0)
+    }
+}
+
+impl WriteId {
+    pub fn mint(rand: [u8; 16]) -> Self {
+        let mut s = String::with_capacity(34);
+        s.push_str("w_");
+        push_hex(&mut s, &rand);
+        WriteId(s)
     }
 }
 
@@ -291,6 +305,14 @@ db_enum!(
     VerifyResult { Ok => "ok", Missing => "missing", Corrupt => "corrupt", Error => "error" }
 );
 db_enum!(
+    /// `verifications.kind`: how the articles were checked. `Body` = every
+    /// article was read and its payload hash compared; `Stat` = the
+    /// provider only said that it has them. A `Stat` pass is never the
+    /// full check: a provider can answer `STAT` for an article whose
+    /// `BODY` it no longer serves.
+    VerifyKind { Body => "body", Stat => "stat" }
+);
+db_enum!(
     /// `uploads.state`.
     UploadState { Open => "open", Completed => "completed", Aborted => "aborted" }
 );
@@ -366,6 +388,19 @@ impl fmt::Debug for Secret {
 pub struct ProviderConfig {
     pub id: String,
     pub host: String,
+    /// More host names of the same account, on the same `port`. With them
+    /// the bridge picks one endpoint of `host` and these per isolate (see
+    /// `host_select` and `hosts::HostPicker`) and falls back to the others
+    /// when it cannot be reached. Empty = `host` only.
+    ///
+    /// Rollout: deploy a Worker that knows this field before the secret
+    /// carries it; an older Worker refuses the whole secret. Rollback:
+    /// take `hosts` (and `host_select`) out of the secret first.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// How the endpoint is picked when `hosts` is set.
+    #[serde(default)]
+    pub host_select: HostSelect,
     pub port: u16,
     pub tls: bool,
     pub user: String,
@@ -398,9 +433,97 @@ pub struct ProviderConfig {
     /// every member of a pool, with one value; refused without `pool`.
     #[serde(default)]
     pub pool_max_conns: Option<u32>,
+    /// SOCKS5 proxies every connection to this provider goes through,
+    /// tried in order: the next one when one cannot be used. The
+    /// provider then counts the proxy's address, not the changing
+    /// address of each invocation. TLS runs from the bridge to the
+    /// provider through the proxy, which relays ciphertext.
+    ///
+    /// With this set the provider is never connected directly: when no
+    /// proxy can be used the connect fails
+    /// ([`ProviderFault::ProxyFailed`]). Absent = direct connections; a
+    /// list that is there and empty is refused, so that a list emptied
+    /// by mistake does not turn into direct connections.
+    ///
+    /// The provider sees one address per proxy in use, whatever the
+    /// number of invocations, and all the proxies may be in use at the
+    /// same time. So `max_ips`, the number of addresses the provider
+    /// allows, must be stated with this field, and a list longer than
+    /// it is refused. `max_ips` goes on counting invocations, which is
+    /// never the looser count.
+    ///
+    /// Rollout and rollback as for `hosts`: an older Worker refuses a
+    /// secret that carries this field.
+    #[serde(default, deserialize_with = "some_proxies")]
+    pub proxies: Vec<ProxyConfig>,
     /// `false` = configured but never used.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// Whether this provider's backbone counts toward the release of a
+    /// safety copy. `false` for a backbone that does not keep articles
+    /// long enough to be a durable copy: it is still posted to and read
+    /// from, but it is never verified and never evidence. One provider
+    /// that says `false` takes its whole backbone out, whatever the
+    /// backbone's other providers say.
+    ///
+    /// The default is `true`: every provider added without the field
+    /// counts. A provider on a short-retention backbone must say
+    /// `"release": false`, or its copy is taken for a durable one.
+    ///
+    /// With fewer backbones that count than `REQUIRED_BACKBONES` the
+    /// Worker keeps serving and releases nothing
+    /// ([`crate::config::Config::release_paused`]).
+    ///
+    /// Rollout: deploy a Worker that knows this field before the secret
+    /// carries it; an older Worker refuses the whole secret. Rollback:
+    /// take `release` out of the secret first.
+    #[serde(default = "enabled_by_default")]
+    pub release: bool,
+}
+
+/// A `proxies` list as written: one entry at least.
+fn some_proxies<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> core::result::Result<Vec<ProxyConfig>, D::Error> {
+    let list = Vec::<ProxyConfig>::deserialize(d)?;
+    if list.is_empty() {
+        return Err(serde::de::Error::custom("proxies: empty list"));
+    }
+    Ok(list)
+}
+
+/// One SOCKS5 proxy of a provider (`proxies`), with its
+/// username/password login (RFC 1929). Deserialize only. `Debug` shows
+/// no field: the address of a proxy is as private as its login.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// A DNS name or a public IP address.
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub pass: String,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProxyConfig(<redacted>)")
+    }
+}
+
+/// How a provider with several endpoints (`host` and `hosts`) picks the
+/// one it connects to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostSelect {
+    /// The endpoint with the quickest TLS handshake and greeting, measured
+    /// once per isolate.
+    #[default]
+    Fastest,
+    /// The configuration order, with no measuring: `host` first, then
+    /// `hosts`, the next one when one cannot be reached. For a provider
+    /// whose nearest server is not its fastest one.
+    Ordered,
 }
 
 fn enabled_by_default() -> bool {
@@ -424,6 +547,13 @@ impl ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Every host name of the account: `host`, then `hosts`, in order.
+    pub fn endpoints(&self) -> Vec<&str> {
+        core::iter::once(self.host.as_str())
+            .chain(self.hosts.iter().map(String::as_str))
+            .collect()
+    }
+
     /// Connections background jobs may hold together: one is left for a
     /// cold read when the provider allows two or more. Not on an account
     /// with one address, where a read cannot connect next to a job
@@ -438,6 +568,63 @@ impl ProviderConfig {
     /// provider has no address limit.
     pub fn background_ips(&self) -> Option<u32> {
         self.max_ips.map(|max| max - u32::from(max >= 2))
+    }
+}
+
+/// Why a session with a provider counts as a strike. The code is all
+/// that is stored and shown: never the provider's own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFault {
+    /// The provider refused the connection at its greeting, before any
+    /// login, and not for a connection limit: the service or the address
+    /// is turned away.
+    ConnectRefused,
+    /// The provider refused the login, and not because the account was
+    /// at a connection limit: the account is denied, suspended, out of
+    /// quota, or its credentials are no longer taken.
+    LoginRefused,
+    /// Any other failure of a session: no connection, a broken one, a
+    /// reply out of protocol.
+    SessionFailed,
+    /// None of the provider's proxies (`proxies`) could be used: not
+    /// reached, or it refused the bridge or answered out of protocol.
+    /// The provider itself was not asked, and is not connected directly.
+    ProxyFailed,
+}
+
+impl ProviderFault {
+    const ALL: [ProviderFault; 4] = [
+        ProviderFault::ConnectRefused,
+        ProviderFault::LoginRefused,
+        ProviderFault::SessionFailed,
+        ProviderFault::ProxyFailed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderFault::ConnectRefused => "connect_refused",
+            ProviderFault::LoginRefused => "login_refused",
+            ProviderFault::SessionFailed => "session_failed",
+            ProviderFault::ProxyFailed => "proxy_failed",
+        }
+    }
+
+    /// The fault a stored code names; `None` for an unknown code.
+    pub fn parse(code: &str) -> Option<ProviderFault> {
+        Self::ALL.into_iter().find(|f| f.as_str() == code)
+    }
+
+    /// The caller was turned away before any work: by the provider, at
+    /// the greeting or at the login, or by having no proxy to reach it
+    /// through. Asking again at once gets the same answer.
+    pub fn is_refusal(self) -> bool {
+        match self {
+            ProviderFault::ConnectRefused
+            | ProviderFault::LoginRefused
+            | ProviderFault::ProxyFailed => true,
+            ProviderFault::SessionFailed => false,
+        }
     }
 }
 
@@ -459,6 +646,16 @@ pub struct ProviderLoad {
     pub cooldowns: u32,
     /// The provider is skipped until this time (`0` = not cooling).
     pub cooldown_until: UnixMs,
+    /// Why the last strike was one; `None` once a good session cleared
+    /// the strikes.
+    pub fault: Option<ProviderFault>,
+}
+
+impl ProviderLoad {
+    /// No strike and no cooldown on record since the last good session.
+    pub fn healthy(&self) -> bool {
+        self.failures == 0 && self.cooldowns == 0
+    }
 }
 
 /// Redacts host and credentials: provider identity in logs is `id` and
@@ -468,6 +665,8 @@ impl fmt::Debug for ProviderConfig {
         f.debug_struct("ProviderConfig")
             .field("id", &self.id)
             .field("host", &"<redacted>")
+            .field("hosts", &self.hosts.len())
+            .field("host_select", &self.host_select)
             .field("port", &self.port)
             .field("tls", &self.tls)
             .field("user", &"<redacted>")
@@ -481,6 +680,7 @@ impl fmt::Debug for ProviderConfig {
             .field("retention_days", &self.retention_days)
             .field("pool", &self.pool)
             .field("pool_max_conns", &self.pool_max_conns)
+            .field("proxies", &self.proxies.len())
             .field("enabled", &self.enabled)
             .finish()
     }
@@ -633,9 +833,29 @@ pub struct ArticleRow {
     pub cipher_len: u64,
     /// SHA-256 of the decoded article payload.
     pub payload_sha256: [u8; 32],
+    /// The article's own random yEnc name: it is posted as one standalone
+    /// single-part yEnc file. `None` is a row planned before standalone
+    /// articles, posted (and reposted) in the multi-part form under a name
+    /// taken from the message-id. See `post::render_article`.
+    pub yenc_name: Option<String>,
     pub state: ArticleState,
     pub provider_id: Option<String>,
     pub posted_at: Option<UnixMs>,
+}
+
+/// Longest yEnc name an article row may carry (the catalogue's CHECK).
+pub const MAX_YENC_NAME_LEN: usize = 64;
+
+/// A stored yEnc name is 1 to [`MAX_YENC_NAME_LEN`] lowercase ASCII
+/// letters and digits, as the `articles.yenc_name` CHECK requires. The
+/// post stage renders only such a name, and a plan record with any other
+/// is not read.
+pub fn valid_yenc_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_YENC_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
 }
 
 /// `verifications` row.
@@ -649,6 +869,7 @@ pub struct VerificationRow {
     pub articles_ok: u32,
     pub articles_total: u32,
     pub result: VerifyResult,
+    pub kind: VerifyKind,
 }
 
 /// Latest verification per backbone for the extent's current `plan_rev`.
@@ -661,7 +882,11 @@ pub struct BackboneStatus {
     pub articles_ok: u32,
     pub articles_total: u32,
     pub result: VerifyResult,
-    /// `result = ok` and `articles_ok = articles_total = article_count`.
+    /// How the articles were checked. Only a `Body` pass is a full check.
+    pub kind: VerifyKind,
+    /// `result = ok` and `articles_ok = articles_total = article_count`:
+    /// a complete pass of its `kind`. Whether that is enough for a
+    /// release is `verify::releasable`'s decision, never this flag's.
     pub counts: bool,
 }
 
@@ -929,6 +1154,21 @@ pub enum Job {
         v: u8,
         remaining: u64,
     },
+    /// Sweep of one sliced write that was never published: its
+    /// `write_intents` rows name the safety blobs to delete.
+    Sweep {
+        v: u8,
+        write: WriteId,
+    },
+    /// One step of a pass of the recovery copy (`crate::copy`), from
+    /// `cursor`. `pass` is the time the pass started. Run by the adapter
+    /// that holds the recovery store, not by `run_job`: it needs no
+    /// catalogue and runs while the catalogue is closed.
+    RecoveryCopy {
+        v: u8,
+        pass: UnixMs,
+        cursor: String,
+    },
 }
 
 impl Job {
@@ -965,6 +1205,63 @@ pub struct DispatchReport {
     pub redrive_failed: bool,
     /// The hot-tier check failed; the rest of the run went on without it.
     pub evict_failed: bool,
+    /// The catalogue is behind its rollback stamp: nothing else was done.
+    pub rolled_back: bool,
+    /// The rollback stamp was not raised; the rest of the run went on.
+    pub stamp_failed: bool,
+    /// Sliced writes that were never published and were sent to the sweep.
+    pub sweeps_enqueued: u32,
+    /// Listing those writes failed; the rest of the run went on without it.
+    pub sweep_failed: bool,
+    /// Fewer backbones count toward a release than `REQUIRED_BACKBONES`:
+    /// nothing is released until the provider list is put right.
+    pub release_paused: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Write intents
+// ---------------------------------------------------------------------------
+
+/// What the fence of a sweep found (`Catalog::fence_intents`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntentFence {
+    /// The rows are `sweeping`: no publication of this write can commit
+    /// any more. `generation` is the id its recovery record would have.
+    Fenced {
+        generation: Option<GenerationId>,
+        extents: Vec<ExtentId>,
+    },
+    /// No row of the write is due: published, swept, kept or too young.
+    Gone,
+    /// A replay is under way; nothing was changed.
+    Refused,
+    /// The write has a generation or an extent row: it was published
+    /// after all. Its intent rows were deleted; no blob may be touched.
+    Published,
+}
+
+/// `write_intents` as `GET /_admin/status` reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct IntentStats {
+    /// Writes whose blobs the sweep left in place because a recovery
+    /// record of the write exists. Nothing reclaims them yet.
+    pub kept_writes: u64,
+    /// Safety blobs of those writes, at most one slice each.
+    pub kept_slices: u64,
+    /// `created_at` of the oldest of them: its request began then, and
+    /// its recovery record is not older. A replay that starts no later
+    /// reads the record of every kept write.
+    pub oldest_kept_at: Option<UnixMs>,
+    /// Writes the sweep has still to look at: given up by their request,
+    /// or older than the grace period.
+    pub waiting_writes: u64,
+    /// `created_at` of the oldest of them.
+    pub oldest_waiting_at: Option<UnixMs>,
+    /// Writes of requests that can still be running.
+    pub open_writes: u64,
+    /// Times the sweep met a write it could not explain: one it kept, or
+    /// one that had catalogue rows next to its intents.
+    pub anomalies: u64,
 }
 
 // ---------------------------------------------------------------------------

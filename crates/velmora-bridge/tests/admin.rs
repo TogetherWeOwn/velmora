@@ -101,6 +101,16 @@ impl Fx {
     }
 
     async fn with(environment: Environment, maintenance: Maintenance) -> Fx {
+        Fx::with_providers(environment, maintenance, |_| {}).await
+    }
+
+    /// The fixture, with `edit` applied to its provider list (one
+    /// provider, `p0`, on the fixture server).
+    async fn with_providers(
+        environment: Environment,
+        maintenance: Maintenance,
+        edit: impl FnOnce(&mut Vec<ProviderConfig>),
+    ) -> Fx {
         let mut config = ServerConfig::for_test();
         config.articles = Vec::new();
         config.missing_ids.clear();
@@ -112,9 +122,11 @@ impl Fx {
             },
         );
         let server = TestNntpServer::spawn(config).await;
-        let providers = vec![ProviderConfig {
+        let mut providers = vec![ProviderConfig {
             id: "p0".to_string(),
             host: server.addr().ip().to_string(),
+            hosts: Vec::new(),
+            host_select: Default::default(),
             port: server.addr().port(),
             tls: false,
             user: USER.to_string(),
@@ -128,13 +140,19 @@ impl Fx {
             retention_days: None,
             pool: None,
             pool_max_conns: None,
+            proxies: Vec::new(),
             enabled: true,
+            release: true,
         }];
+        edit(&mut providers);
         let cfg = BridgeConfig {
             environment,
             s3_host: "s3.test".to_string(),
             region: "auto".to_string(),
             max_extent_bytes: 16 * 1024 * 1024,
+            max_put_bytes: 16 * 1024 * 1024,
+            slice_bytes: 8 * 1024 * 1024,
+            intent_sweep: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: 1,
@@ -147,6 +165,7 @@ impl Fx {
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             server_side_copy: false,
+            catalogue_id: "main".to_string(),
             dev_trust_http: false,
             providers,
             admin_token: Secret::new(TOKEN.to_string()),
@@ -986,6 +1005,31 @@ async fn evict_gives_up_a_verified_pinned_copy_on_a_disposable_bucket() {
     assert_eq!(drill["match"], true);
 }
 
+/// The drill reads like a cold read: never from a provider that does not
+/// read (`read: false`), even one listed first that holds the articles.
+#[tokio::test]
+async fn drill_skips_a_provider_that_does_not_read() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut post_only = providers[0].clone();
+        post_only.id = "p6".to_string();
+        post_only.read = false;
+        post_only.post = false;
+        providers.insert(0, post_only);
+    })
+    .await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    assert_eq!(fx.bridge.nntp.connects_to("p6"), 0);
+
+    let drill = fx.post("/drill/scratch/k").await.json();
+    assert_eq!(
+        (&drill["provider"], &drill["match"]),
+        (&json!("p0"), &json!(true))
+    );
+    assert_eq!(fx.bridge.nntp.connects_to("p6"), 0);
+}
+
 #[tokio::test]
 async fn object_status_evict_and_drill_after_release() {
     let fx = Fx::new().await;
@@ -1231,9 +1275,14 @@ async fn status_reports_provider_health_without_credentials() {
         (Some(0), Some(0))
     );
     assert_eq!(one["cooling"], false);
+    assert_eq!(
+        (&one["healthy"], &one["reason"]),
+        (&json!(true), &json!(null))
+    );
     // The limits, as configured: no address limit is `null`.
     assert_eq!(one["max_conns"], p.max_conns);
     assert!(one["max_ips"].is_null());
+    assert_eq!(one["release"], true);
     assert_eq!(one["holders"], 0);
 
     // A held slot and three failed sessions show up.
@@ -1244,19 +1293,83 @@ async fn status_reports_provider_health_without_credentials() {
         .await
         .unwrap()
         .unwrap();
-    for _ in 0..3 {
-        fx.bridge.catalog.provider_failed(&p.id, now).await.unwrap();
+    // The first strike already shows, with its reason as a code.
+    let failed = |fault| fx.bridge.catalog.provider_failed(&p.id, fault, now);
+    failed(ProviderFault::SessionFailed).await.unwrap();
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(
+        (&one["failures"], &one["cooling"]),
+        (&json!(1), &json!(false))
+    );
+    assert_eq!(
+        (&one["healthy"], &one["reason"]),
+        (&json!(false), &json!("session_failed"))
+    );
+    for _ in 0..2 {
+        failed(ProviderFault::LoginRefused).await.unwrap();
     }
     let r = fx.get("/status").await;
     let one = r.json()["providers"][0].clone();
     assert_eq!((&one["held"], &one["holders"]), (&json!(1), &json!(1)));
     assert_eq!(one["cooling"], true);
     assert_eq!(one["cooldown_until"], now.0 + 60_000);
+    assert_eq!(
+        (&one["healthy"], &one["reason"]),
+        (&json!(false), &json!("login_refused"))
+    );
     let body = r.text();
     for secret in [p.user.as_str(), p.pass.as_str(), p.host.as_str()] {
         assert!(!body.contains(secret), "status leaks provider details");
     }
     fx.bridge.catalog.release_permit(&permit).await.unwrap();
+}
+
+/// The status says how each provider is reached: directly or through
+/// its proxies. When the proxies cannot be used the provider is not
+/// healthy, for the reason `proxy_failed`. Nothing of a proxy (host,
+/// port, login) is in the status.
+#[tokio::test]
+async fn status_reports_the_route_and_a_proxy_failure() {
+    let fx = Fx::new().await;
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(one["route"], "direct");
+
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        providers[0].proxies = vec![serde_json::from_value(json!({
+            "host": "status-proxy.example", "port": 41234,
+            "user": "status-proxy-login", "pass": "status-proxy-secret"
+        }))
+        .unwrap()];
+    })
+    .await;
+    let now = fx.bridge.clock.now();
+    let one = fx.get("/status").await.json()["providers"][0].clone();
+    assert_eq!(
+        (&one["route"], &one["healthy"], &one["reason"]),
+        (&json!("proxy"), &json!(true), &json!(null))
+    );
+
+    let p = fx.bridge.cfg.providers[0].clone();
+    let failed = fx
+        .bridge
+        .catalog
+        .provider_failed(&p.id, ProviderFault::ProxyFailed, now);
+    failed.await.unwrap();
+    let r = fx.get("/status").await;
+    let one = r.json()["providers"][0].clone();
+    assert_eq!(
+        (&one["route"], &one["healthy"], &one["reason"]),
+        (&json!("proxy"), &json!(false), &json!("proxy_failed"))
+    );
+    let body = r.text();
+    for secret in [
+        "status-proxy.example",
+        "41234",
+        "status-proxy-login",
+        "status-proxy-secret",
+    ] {
+        assert!(!body.contains(secret), "status leaks proxy details");
+    }
 }
 
 /// The address limit of a provider and the number of jobs and requests
@@ -1282,4 +1395,149 @@ async fn status_reports_the_address_limit_and_its_holders() {
     let one = fx.get("/status").await.json()["providers"][0].clone();
     assert_eq!(one["max_ips"], 2);
     assert_eq!((&one["held"], &one["holders"]), (&json!(2), &json!(1)));
+}
+
+/// A `STAT` pass says the backbone lists the articles, not that it serves
+/// them: it is no reason to give up the pinned copy.
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("body"), &json!(true))
+    );
+
+    let sql = &fx.bridge.catalog.sql;
+    // As a `STAT` pass is stored: its tally in `articles_present`.
+    sql.exec(
+        "UPDATE verifications SET kind = 'stat', articles_present = articles_ok, articles_ok = 0",
+        &[],
+    )
+    .await
+    .unwrap();
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("stat"), &json!(true))
+    );
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // Read in full again: the copy can go.
+    sql.exec(
+        "UPDATE verifications SET kind = 'body', articles_ok = articles_present, articles_present = 0",
+        &[],
+    )
+    .await
+    .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
+}
+
+/// Fewer backbones count toward a release than `REQUIRED_BACKBONES`: the
+/// Worker serves as before, the status says that the release is paused,
+/// and no pinned copy is given up, read back in full or not.
+#[tokio::test]
+async fn too_few_release_backbones_are_a_warning_and_keep_the_pinned_copy() {
+    let mut fx = Fx::new().await;
+    let status = fx.get("/status").await.json();
+    assert_eq!(status["config_warnings"], json!([]));
+
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.required_backbones = 2;
+    let status = fx.get("/status").await.json();
+    assert_eq!(
+        status["config_warnings"],
+        json!(["release paused: 1 backbone(s) count toward release, \
+                REQUIRED_BACKBONES is 2; pinned copies stay held"])
+    );
+
+    // Writes and reads go on, and the upload is read back in full.
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    assert_eq!(fx.safety_state(&o).await, "held");
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (&backbone["kind"], &backbone["counts"]),
+        (&json!("body"), &json!(true))
+    );
+
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+    assert_eq!(fx.safety_state(&o).await, "held");
+
+    // With the count put right, the same read-back is enough here.
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.required_backbones = 1;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+}
+
+/// A read-back from a backbone that does not count toward a release is no
+/// reason to give up the pinned copy either.
+#[tokio::test]
+async fn evict_keeps_the_pinned_copy_when_the_read_back_is_on_a_backbone_that_does_not_count() {
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut side = providers[0].clone();
+        side.id = "p9".to_string();
+        side.backbone = "side".to_string();
+        side.post = false;
+        side.release = false;
+        providers.push(side);
+    })
+    .await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Release).await;
+    let sql = &fx.bridge.catalog.sql;
+    let home = fx.bridge.cfg.providers[0].backbone.clone();
+
+    // The full read-back is on the backbone that does not count.
+    sql.exec("UPDATE verifications SET backbone = 'side'", &[])
+        .await
+        .unwrap();
+    let status = fx.get("/objects/scratch/k").await.json();
+    let backbone = &status["extents"][0]["backbones"][0];
+    assert_eq!(
+        (
+            &backbone["backbone"],
+            &backbone["kind"],
+            &backbone["counts"]
+        ),
+        (&json!("side"), &json!("body"), &json!(true))
+    );
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(
+        r.json(),
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+    );
+    assert!(fx.has_safety(&o));
+
+    // On the backbone that counts: the copy can go.
+    sql.exec(
+        "UPDATE verifications SET backbone = ?1",
+        &[SqlValue::Text(home)],
+    )
+    .await
+    .unwrap();
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.json()["safety_deleted"], 1);
+    assert!(!fx.has_safety(&o));
 }

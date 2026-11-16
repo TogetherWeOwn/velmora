@@ -55,6 +55,13 @@ jobs:
       # only main saves, so per-PR copies do not evict main's entries.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # `v1`: a new cache, begun when `cargo test` started to build the
+          # dependencies optimized (`[profile.test.package."*"]` in the root
+          # manifest). The cache key covers Cargo.lock and the manifests of
+          # the members, not the root manifest, so the old cache matched in
+          # full, was never saved again and kept the dependencies as they
+          # were built before. Change the prefix again with that profile.
+          prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -137,6 +144,9 @@ jobs:
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls
       - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-pinned-tls -- -D warnings
+      # The proxied connector (SOCKS5, then TLS made in the Worker), alone.
+      - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-socks5-tls
+      - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-socks5-tls -- -D warnings
       # Retain compatibility when consumers leave native-tls enabled on wasm.
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --all-features
 
@@ -168,6 +178,7 @@ jobs:
           rustup toolchain install 1.91 --profile minimal --no-self-update
           rustup default 1.91
       - run: cargo check --locked -p velmora --features worker-pinned-tls
+      - run: cargo check --locked -p velmora --features worker-socks5-tls
       # The S3 Worker crate declares rust-version 1.91 (workers-rs 0.8.7).
       - run: cargo check --locked -p velmora-s3-bridge
 
@@ -260,6 +271,13 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # `v1`: a new cache, begun when `cargo test` started to build the
+          # dependencies optimized (`[profile.test.package."*"]` in the root
+          # manifest). The cache key covers Cargo.lock and the manifests of
+          # the members, not the root manifest, so the old cache matched in
+          # full, was never saved again and kept the dependencies as they
+          # were built before. Change the prefix again with that profile.
+          prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
@@ -526,12 +544,24 @@ jobs:
       # repository build code. Values must be a valid hostname and a UUID,
       # so nothing else can be injected into the TOML. Values are never
       # printed. Pure Python, no repository code.
+      # The recovery copy is switched by two more variables of the
+      # environment: VELMORA_RECOVERY_COPY (unset or "off": the shipped
+      # "off" stays; "on") and VELMORA_RECOVERY_PREFIX. "on" needs a valid
+      # prefix (lowercase segments, each ending with "/"); with a missing
+      # or invalid one this step fails and nothing is deployed. A prefix
+      # that is set must be valid also while the copy is off. The shipped
+      # file must say "off" exactly once, in the prod [vars] table, and
+      # name no prefix, whatever the switch says. The store's endpoint,
+      # region, bucket and keys are Worker secrets: this job writes none
+      # of them, and a plain var set outside it is gone after a deploy.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
         env:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
+          VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
+          VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
@@ -545,6 +575,16 @@ jobs:
               sys.exit("VELMORA_S3_HOST is missing or not a plain lowercase hostname")
           if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", dbid):
               sys.exit("VELMORA_D1_DATABASE_ID is missing or not a lowercase UUID")
+          copy = os.environ.get("VELMORA_RECOVERY_COPY", "") or "off"
+          prefix = os.environ.get("VELMORA_RECOVERY_PREFIX", "")
+          if copy not in ("off", "on"):
+              sys.exit("VELMORA_RECOVERY_COPY must be unset, off or on")
+          segment = r"[a-z0-9]([a-z0-9_-]{0,30}[a-z0-9])?"
+          prefix_ok = len(prefix) <= 64 and re.fullmatch(rf"({segment}/)+", prefix) is not None
+          if prefix and not prefix_ok:
+              sys.exit("VELMORA_RECOVERY_PREFIX is not lowercase segments that each end with a slash")
+          if copy == "on" and not prefix_ok:
+              sys.exit("VELMORA_RECOVERY_COPY is on and VELMORA_RECOVERY_PREFIX is missing")
 
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
@@ -556,6 +596,19 @@ jobs:
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
           ]
+          # One line in, two lines out with "on": the switch and its
+          # prefix. Checked also when the switch is off.
+          shipped = 'RECOVERY_COPY = "off"'
+          subs.append((shipped, f'RECOVERY_COPY = "on"\nRECOVERY_PREFIX = "{prefix}"'
+                       if copy == "on" else shipped))
+          switch = [i for i in range(end) if lines[i].strip() == shipped]
+          tables = [lines[i].strip() for i in range(switch[0] if switch else 0)
+                    if header.match(lines[i])]
+          if tables[-1:] != ["[vars]"]:
+              sys.exit("the prod RECOVERY_COPY line is not in the [vars] table")
+          if any(re.match(r"\s*RECOVERY_(COPY|PREFIX)\b", lines[i])
+                 for i in range(end) if i not in switch):
+              sys.exit("the prod section sets RECOVERY_COPY or RECOVERY_PREFIX a second time")
           for placeholder, value in subs:
               hits = [i for i in range(end) if lines[i].strip() == placeholder]
               if len(hits) != 1:
@@ -570,7 +623,7 @@ jobs:
           del lines[start:stop]
           with open(dst, "w", encoding="utf-8") as f:
               f.write("\n".join(lines))
-          print("wrangler.deploy.toml: 2 prod placeholders substituted, prod [build] removed")
+          print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other

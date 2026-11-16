@@ -1,3 +1,132 @@
 [workspace]
 members = ["crates/velmora", "crates/velmora-test-nntp", "crates/velmora-ssrf-guard", "crates/velmora-s3-proto", "crates/velmora-bridge", "workers/s3-bridge"]
 resolver = "2"
+
+# `cargo test` only. The tests seal, encode, hash and read back hundreds of
+# megabytes, and at opt-level 0 that work alone took most of the native CI
+# job. The dependencies and the two library crates that do it are optimized
+# here; the bridge, its tests and every other member are not, so they build
+# as fast as before. Debug assertions and overflow checks stay on: they are
+# set by the `dev` profile, which `test` inherits, and not by the opt-level.
+# `cargo build`, `cargo check`, clippy and the release build of the Worker
+# do not use this profile.
+[profile.test.package."*"]
+opt-level = 3
+
+[profile.test.package.velmora]
+opt-level = 3
+
+[profile.test.package.velmora-s3-proto]
+opt-level = 3
+
+# Release build of the Worker. The wasm has a size budget (CI: under
+# 3,000,000 bytes) and carries a TLS stack for the proxied NNTP route, so
+# it is built for size with whole-program LTO. The code that touches every
+# byte of an object is kept at opt-level 3: the engine, bridge and S3
+# library crates, the cipher, MAC, hash and checksum crates, and the
+# crates that move bytes between the runtime and the Worker. Measured on
+# a deployed Worker, CPU per MiB for PUT, GET and a read from Usenet is
+# the same as with opt-level 3 everywhere, within the noise of the
+# measurement.
+#
+# Built for size all the same: the Worker crate itself (where the
+# bridge's generic code is instantiated; at 3 the wasm is over the
+# budget) and the TLS crates of the proxied route (`ring`, `rustls`; at
+# 3 they fit, and the CPU of a proxied read was not clearly lower).
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+
+[profile.release.package.velmora]
+opt-level = 3
+
+[profile.release.package.velmora-bridge]
+opt-level = 3
+
+[profile.release.package.velmora-s3-proto]
+opt-level = 3
+
+[profile.release.package.chacha20]
+opt-level = 3
+
+[profile.release.package.chacha20poly1305]
+opt-level = 3
+
+[profile.release.package.poly1305]
+opt-level = 3
+
+[profile.release.package.universal-hash]
+opt-level = 3
+
+[profile.release.package.aead]
+opt-level = 3
+
+[profile.release.package.cipher]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.sha1]
+opt-level = 3
+
+[profile.release.package.md5]
+opt-level = 3
+
+[profile.release.package.crc32fast]
+opt-level = 3
+
+[profile.release.package.hmac]
+opt-level = 3
+
+[profile.release.package.digest]
+opt-level = 3
+
+[profile.release.package.block-buffer]
+opt-level = 3
+
+[profile.release.package.memchr]
+opt-level = 3
+
+[profile.release.package.worker]
+opt-level = 3
+
+[profile.release.package.worker-sys]
+opt-level = 3
+
+[profile.release.package.tokio]
+opt-level = 3
+
+[profile.release.package.futures-util]
+opt-level = 3
+
+[profile.release.package.futures-core]
+opt-level = 3
+
+[profile.release.package.futures-channel]
+opt-level = 3
+
+[profile.release.package.futures-io]
+opt-level = 3
+
+[profile.release.package.bytes]
+opt-level = 3
+
+[profile.release.package.js-sys]
+opt-level = 3
+
+[profile.release.package.wasm-bindgen]
+opt-level = 3
+
+[profile.release.package.wasm-bindgen-futures]
+opt-level = 3
+
+[profile.release.package.wasm-streams]
+opt-level = 3
+
+[profile.release.package.web-sys]
+opt-level = 3
+
+[profile.release.package.pin-project-lite]
+opt-level = 3
