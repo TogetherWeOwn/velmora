@@ -84,7 +84,9 @@ Limits to know:
   stored value stays as it is, and the name of the extent's plan record
   (`m/art/<extent id>`) is listed under `unreadable`, whether or not
   such a record exists. That extent cannot be read from Usenet, and
-  this entry is the only report of it: it is not counted in `damaged`.
+  it is not counted in `damaged`. When it has no pinned copy either and
+  its key has an older generation, its record is not published over
+  that generation and is listed under `damaged_unpublished`, as below.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
   lists it under `damaged`. The exception: when the key has an older

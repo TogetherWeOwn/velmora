@@ -264,6 +264,10 @@ impl Sql for RusqliteSql {
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         let conn = self.conn.borrow();
         let mut meter = self.meter.borrow_mut();
+        // What a failed query left behind was rolled back.
+        if let Some(m) = meter.as_mut() {
+            m.discard();
+        }
         let changed = match run_to_completion(&conn, sql, params) {
             Ok(n) => n,
             Err(e) => {
@@ -285,6 +289,10 @@ impl Sql for RusqliteSql {
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         let mut conn = self.conn.borrow_mut();
         let mut meter = self.meter.borrow_mut();
+        // What a failed query left behind was rolled back.
+        if let Some(m) = meter.as_mut() {
+            m.discard();
+        }
         let tx = conn.transaction().map_err(map_err)?;
         let mut changed = Vec::with_capacity(stmts.len());
         let mut priced = Vec::new();

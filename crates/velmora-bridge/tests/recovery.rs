@@ -1269,6 +1269,78 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
     }
 }
 
+/// A packed plan that cannot be read is no plan. A generation with such
+/// an extent, and no pinned copy of it, cannot be read in full: like
+/// one whose extent has no plan at all, it does not take the place of
+/// an older generation of the key.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreadable_packed_plan_does_not_replace_a_good_object() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "big", b"good").await.expect(200);
+    let (good, _) = rig.live(&bucket, "big").await.unwrap();
+    tick(&rig);
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+
+    // The Complete is refused and the store keeps its record.
+    rig.bridge.safety.fail_record_deletes.set(3);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    let lingering = records(&rig).into_iter().max().unwrap()["m/".len()..].to_owned();
+    assert!(lingering.as_str() > good.id.as_str());
+    let parts: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT id FROM extents WHERE generation_id IS NULL ORDER BY id")
+            .unwrap();
+        let ids = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        ids.map(|id| id.unwrap()).collect()
+    });
+    assert_eq!(parts.len(), 2);
+    for part in &parts {
+        let id = velmora_bridge::ExtentId::new(part.clone());
+        assert!(rig.bridge.safety.lose(&id.safety_key()));
+    }
+
+    // The replay brings the parts back without a pinned copy. Each
+    // then holds a value that is not a plan, and no record has a plan
+    // for it.
+    wipe(&rig);
+    replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    sql(
+        &rig,
+        "UPDATE extents SET plan = x'ff', article_count = 1 WHERE generation_id IS NULL;",
+    );
+    let stored = "extents WHERE hex(plan) = 'FF' AND safety_state = 'deleted'";
+    assert_eq!(rig.count(stored), 2);
+    let names: Vec<String> = parts.iter().map(|id| format!("m/art/{id}")).collect();
+
+    for _ in 0..2 {
+        let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert_eq!(
+            report.damaged_unpublished,
+            [RecordRef {
+                id: lingering.clone(),
+                bucket: BUCKET.to_owned(),
+                key: "big".to_owned(),
+            }],
+            "{report:?}"
+        );
+        report.unreadable.sort();
+        assert_eq!(report.unreadable, names, "{report:?}");
+        assert_eq!(live_ids(&rig), [good.id.as_str()]);
+        assert_eq!(rig.count(stored), 2, "the values stay as they are");
+    }
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, b"good");
+}
+
 /// An article plan record that does not open is reported and does not
 /// stop the replay: the extent comes back without a plan, from its
 /// pinned copy.
@@ -1355,6 +1427,41 @@ async fn a_packed_plan_that_nothing_replaces_is_named() {
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
     assert_eq!(report.unreadable, [record.as_str()], "{report:?}");
     assert_eq!(rig.count(&stored), 1, "the value stays as it is");
+}
+
+/// A generation that is in the catalogue stays what it is when the
+/// packed plan of its extent cannot be read and the extent has no
+/// pinned copy: the extent is named, and the generation is not listed
+/// as a record that was kept from its key, though the key has an older
+/// generation.
+#[tokio::test(flavor = "current_thread")]
+async fn a_live_generation_with_an_unreadable_packed_plan_is_not_listed_as_kept_back() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"old").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "one", b"new").await.expect(200);
+    let (live, extents) = rig.live(&bucket, "one").await.unwrap();
+    let id = extents[0].id.as_str();
+    let record = format!("m/art/{id}");
+    sql(
+        &rig,
+        &format!(
+            "UPDATE extents SET plan = x'ff', article_count = 1, safety_state = 'deleted' \
+             WHERE id = '{id}';"
+        ),
+    );
+    let stored =
+        format!("extents WHERE id = '{id}' AND hex(plan) = 'FF' AND safety_state = 'deleted'");
+    assert_eq!(rig.count("generations WHERE key = 'one'"), 2);
+    for _ in 0..2 {
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert_eq!(report.unreadable, [record.as_str()], "{report:?}");
+        assert!(report.damaged_unpublished.is_empty(), "{report:?}");
+        assert!(report.unpublishable.is_empty(), "{report:?}");
+        assert_eq!(rig.count(&stored), 1, "the extent is as it was");
+        assert_eq!(rig.live(&bucket, "one").await.unwrap().0.id, live.id);
+    }
 }
 
 /// A record sealed under another key or stored under another name does

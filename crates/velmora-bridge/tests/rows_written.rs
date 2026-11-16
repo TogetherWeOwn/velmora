@@ -244,3 +244,23 @@ fn a_rolled_back_batch_is_not_metered() {
     assert_eq!(report.table("meta"), 2);
     assert_eq!(report.writing_statements, 2);
 }
+
+/// A statement with RETURNING that fails after it wrote a row is undone
+/// as a whole: it is not metered, and what it left behind is not put on
+/// the next statement.
+#[test]
+fn a_failed_query_is_not_metered() {
+    let db = RusqliteSql::with_schema().expect("schema");
+    db.meter_writes().expect("meter");
+    let failed = block_on(db.query(
+        "INSERT INTO meta(k, v) VALUES ('a', 1), ('a', 2) RETURNING k",
+        &[],
+    ));
+    assert!(failed.is_err(), "the second row has the key of the first");
+    assert_eq!(db.writes().billed(), 0, "nothing was written");
+    block_on(db.exec("INSERT INTO meta(k, v) VALUES ('b', 1)", &[])).expect("exec");
+    block_on(db.batch(vec![("INSERT INTO meta(k, v) VALUES ('c', 1)", vec![])])).expect("batch");
+    let report = db.writes();
+    assert_eq!(report.billed(), 2, "one row each");
+    assert_eq!(report.table("meta"), 2);
+}

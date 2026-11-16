@@ -710,6 +710,60 @@ async fn has_lost_extent<S: Sql>(
     Ok(false)
 }
 
+/// Whether one of the extents has no pinned copy and a packed plan that
+/// cannot be read. Such a value is no plan ([`unreadable_plans`]), so
+/// the extent has no copy anywhere, though its row holds a value and
+/// [`NO_COPY`] does not see it.
+async fn has_unread_extent<S: Sql>(
+    c: &SqlCatalog<S>,
+    placements: &[ExtentPlacement],
+) -> Result<bool> {
+    for chunk in placements.chunks(LOST_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let rows = c
+            .sql
+            .query(
+                &format!(
+                    "SELECT id, cipher_size, plan FROM extents \
+                     WHERE id IN ({marks}) AND safety_state = 'deleted' AND plan IS NOT NULL"
+                ),
+                &chunk
+                    .iter()
+                    .map(|p| text(p.extent_id.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        for row in rows {
+            let mut r = super::uploads::Cols::new(row);
+            let id = ExtentId::new(r.text()?);
+            let cipher_size: u64 = r.num()?;
+            let stored = r.blob()?;
+            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_err() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the catalogue knows an older generation of the key of `g`,
+/// live or not.
+async fn has_older<S: Sql>(c: &SqlCatalog<S>, g: &GenerationRow) -> Result<bool> {
+    let older = c
+        .sql
+        .query(
+            "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
+               AND id < ?3 LIMIT 1",
+            &[
+                text(g.bucket_id.as_str()),
+                text(&g.key),
+                text(g.id.as_str()),
+            ],
+        )
+        .await?;
+    Ok(!older.is_empty())
+}
+
 /// Step 2. `Refused` = the generation is already there, a newer
 /// generation of the key is live, or the extents do not tile it (one of
 /// them is missing, in another bucket, still a part of an upload under
@@ -734,6 +788,14 @@ pub(super) async fn replay_publish<S: Sql>(
         return Err(BridgeError::Invalid(
             "replay does not describe one live generation",
         ));
+    }
+    // A packed plan that cannot be read is no plan, and the guard of
+    // the batch below cannot tell: it sees a value. So it is asked
+    // here, of the rows the batch will find (nothing else writes during
+    // a replay), and only for a key that has an older generation: the
+    // one case in which it decides.
+    if has_older(c, g).await? && has_unread_extent(c, placements).await? {
+        return Ok(ReplayPublish::Damaged);
     }
     let gen_id = || text(g.id.as_str());
     let bucket = || text(g.bucket_id.as_str());
@@ -860,15 +922,7 @@ pub(super) async fn replay_publish<S: Sql>(
         Err(BridgeError::GuardFailed) => {
             // Which guard refused it. Nothing else writes during a
             // replay, so the catalogue is as the batch found it.
-            let older = c
-                .sql
-                .query(
-                    "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
-                       AND id < ?3 LIMIT 1",
-                    &[bucket(), text(&g.key), gen_id()],
-                )
-                .await?;
-            if !older.is_empty() && has_lost_extent(c, placements).await? {
+            if has_older(c, g).await? && has_lost_extent(c, placements).await? {
                 Ok(ReplayPublish::Damaged)
             } else {
                 Ok(ReplayPublish::Refused)

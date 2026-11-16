@@ -2,9 +2,16 @@
 -- an extent in service.
 --
 -- The article rows of an extent in service may go once its plan is
--- packed: they are a copy of what the extent's row holds.
-DROP TRIGGER articles_keep_in_service;
-CREATE TRIGGER articles_keep_in_service BEFORE DELETE ON articles
+-- packed: they are a copy of what the extent's row holds. For an extent
+-- whose plan is not packed the rule is the one of migration 0005, word
+-- for word, so a Worker from before this migration (it packs nothing)
+-- finds what it found.
+--
+-- A trigger cannot be altered, and no second trigger can let through
+-- what the first one aborts, so the old one is dropped. It is dropped
+-- after its replacement exists, under another name: the rows are
+-- covered after every statement of this file, however it is applied.
+CREATE TRIGGER articles_keep_unpacked_in_service BEFORE DELETE ON articles
 WHEN (SELECT plan FROM extents WHERE id = OLD.extent_id) IS NULL
  AND (EXISTS (SELECT 1 FROM generation_extents r JOIN generations g ON g.id = r.generation_id
                WHERE r.extent_id = OLD.extent_id AND g.state = 'live')
@@ -13,6 +20,7 @@ WHEN (SELECT plan FROM extents WHERE id = OLD.extent_id) IS NULL
 BEGIN
   SELECT RAISE(ABORT, 'extent is in service');
 END;
+DROP TRIGGER articles_keep_in_service;
 
 -- The packed plan of an extent in service stays, as its key does and as
 -- its article rows did: without it the articles cannot be found.

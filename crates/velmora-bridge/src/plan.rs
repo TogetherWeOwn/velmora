@@ -188,9 +188,11 @@ fn derive(
 }
 
 /// Digest of the plan `rows` of extent `extent`: the extent's id and
-/// everything its articles are posted and read back with. It is stored
-/// with the packed plan, so that a derivation that ever changed, a
-/// changed byte or a plan that is on another extent's row is noticed.
+/// everything its articles are posted and read back with, the bytes of
+/// the extent each one holds included. It is stored with the packed
+/// plan, so that a derivation that ever changed, a changed byte, a plan
+/// that is on another extent's row or one read with another size than
+/// it was made for is noticed.
 fn check_of(extent: &ExtentId, rows: &[ArticleRow]) -> [u8; CHECK_LEN] {
     let mut h = Sha256::new();
     h.update(b"velmora article plan v1 check");
@@ -205,6 +207,8 @@ fn check_of(extent: &ExtentId, rows: &[ArticleRow]) -> [u8; CHECK_LEN] {
         field(&a.headers);
         field(a.yenc_name.as_deref().unwrap_or("").as_bytes());
         field(&a.payload_sha256);
+        field(&a.cipher_offset.to_be_bytes());
+        field(&a.cipher_len.to_be_bytes());
     }
     let full: [u8; 32] = h.finalize().into();
     let mut out = [0u8; CHECK_LEN];
@@ -766,9 +770,9 @@ mod tests {
          Message-ID: <q9yy2r3oct0dqhkvsazqmeefn0ulktk5@nzij7j50.gq2>\r\n",
     );
     /// SHA-256 of the seeded and of the explicit form of the pinned plan.
-    const PINNED_SEEDED: &str = "4c0f239031457b405a03c20d83cdd14970477c67674550345c2d26bd3ca45b07";
+    const PINNED_SEEDED: &str = "1f2911a80cc0136d9d8b66795ec87b909890cee233a2df04cb026e92efe9ac01";
     const PINNED_EXPLICIT: &str =
-        "3510e3893ec99c6234835d2b5fcb96fc6ae6e1dbe29544d1c987e1193b73be8f";
+        "1a05f4835dc89253750c7a38326f00ea01d68b242056d0535e46099f4a2d8e80";
     const PINNED_LAST: &str = "nsuzl0xtch3x8o6m8ajfxm15moyfa8du@idmg8en1.48q";
 
     #[test]
@@ -828,6 +832,24 @@ mod tests {
         assert!(expand(&other, cipher, &blob, None, None).is_err());
         assert!(expand(&extent(), cipher, &seeded, None, None).is_ok());
         assert!(expand(&other, cipher, &seeded, None, None).is_err());
+    }
+
+    /// The cuts are a part of the plan: the same number of articles on
+    /// an extent of another size is another plan.
+    #[test]
+    fn a_plan_of_another_size_with_as_many_articles_is_refused() {
+        let cipher = cipher_size(2 * MIB);
+        let articles = article_spans(cipher).len();
+        let (seeded, _) =
+            plan_seeded(&mut SystemRng, NOW, &["a.b"], &extent(), cipher, hash_of).unwrap();
+        let explicit = pack_explicit(&extent(), cipher, &random_plan(cipher, &["a.b"])).unwrap();
+        for other in [cipher - 1, cipher + 1] {
+            assert_eq!(article_spans(other).len(), articles, "as many articles");
+            for blob in [&seeded, &explicit] {
+                assert!(expand(&extent(), cipher, blob, None, None).is_ok());
+                assert!(expand(&extent(), other, blob, None, None).is_err());
+            }
+        }
     }
 
     #[test]
