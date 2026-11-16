@@ -6,6 +6,8 @@ const PART_CONCURRENCY = 2;
 const RETRIES = 4;
 
 const $ = (id) => document.getElementById(id);
+// What the server says about this session (see /api/session).
+const session = { email: "", adopt: false };
 const state = { bucket: "", prefix: "", folders: [], files: [], next: null, selected: new Set(), filter: "", listing: "ok" };
 
 function el(tag, props = {}, ...children) {
@@ -128,12 +130,20 @@ $("new-bucket").addEventListener("submit", async (ev) => {
       // Exists already (made elsewhere, or a create whose grant failed):
       // the console gets access to it only if the user says so.
       if (e.code !== "BucketAlreadyExists") throw e;
+      const operatorMust = `${name} already exists; an operator must list it in ADOPT_BUCKETS to use it here.`;
+      // Offered only where the deploy allows adopting at all.
+      if (!session.adopt) return toast(operatorMust);
       const answer = await dialog("Bucket exists", el("p", {}, `${name} already exists. Give this console read-write access to it? This cannot be undone from the console.`), [
         ["Cancel", "cancel", "ghost"],
         ["Give access", "ok"],
       ]);
       if (answer !== "ok") return;
-      await api("/buckets", { method: "POST", body: { name, adopt: true } });
+      try {
+        await api("/buckets", { method: "POST", body: { name, adopt: true } });
+      } catch (e2) {
+        if (e2.code === "AdoptDisabled") return toast(operatorMust);
+        throw e2;
+      }
       toast(`Console has access to ${name}`);
     }
     $("new-bucket-name").value = "";
@@ -198,6 +208,8 @@ async function loadPage(more) {
   if (failure) {
     toast(`Listing failed: ${failure.message}`);
     if (!more) state.listing = `Could not list this folder: ${failure.message}`;
+    // A failed "Load more" keeps the rows; it must not leave "Loading…" behind.
+    else if (state.listing === "loading") state.listing = "ok";
   } else {
     state.listing = "ok";
     state.folders.push(...out.folders);
@@ -916,7 +928,8 @@ $("status-btn").addEventListener("click", async () => {
 
 (async () => {
   try {
-    const { email } = await api("/session");
+    Object.assign(session, await api("/session"));
+    const { email } = session;
     $("who").textContent = email;
   } catch {
     /* shown by the failing calls below */
