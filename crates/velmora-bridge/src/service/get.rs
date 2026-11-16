@@ -207,8 +207,8 @@ fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
         .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
     {
         Some((_, value)) => {
-            let present = value
-                .split(',')
+            let present = directives(value)
+                .iter()
                 .any(|d| d.trim().eq_ignore_ascii_case(DIRECTIVE));
             if !present {
                 // Trailing commas are dropped rather than doubled.
@@ -224,6 +224,31 @@ fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
         }
         None => headers.push(("cache-control".to_string(), DIRECTIVE.to_string())),
     }
+}
+
+/// The directives of a `Cache-Control` value: split at the commas outside
+/// quoted strings (`private="a, b"` is one directive), a backslash escaping
+/// the next character inside one.
+fn directives(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
 }
 
 async fn read<
@@ -598,6 +623,22 @@ mod tests {
         // A directive that only contains the word does not count.
         let h = served(&[("cache-control", "x-no-transform-ish")]);
         assert_eq!(cache_control(&h), ["x-no-transform-ish, no-transform"]);
+    }
+
+    #[test]
+    fn a_quoted_argument_is_not_a_directive() {
+        // RFC 9111 field-name lists: the quoted `no-transform` is a name.
+        let stored = r#"private="x-a,no-transform,x-b""#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [format!("{stored}, no-transform")]);
+        // An escaped quote does not end the quoted string.
+        let stored = r#"private="a\",no-transform", max-age=5"#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [format!("{stored}, no-transform")]);
+        // A real directive after a quoted argument counts.
+        let stored = r#"no-cache="set-cookie, x", no-transform"#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [stored]);
     }
 
     #[test]
