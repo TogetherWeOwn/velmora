@@ -1171,6 +1171,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         .await;
     let _ = c.articles(&extent.id).await;
     let _ = c.mark_posted(&lease, 0, "p1", T0).await;
+    let _ = c.mark_reposted_many(&lease, &[0], T0).await;
     let _ = c.record_verification(&lease, &verification).await;
     let _ = c.backbone_status(&extent.id).await;
     let _ = c.begin_release(&lease, 1, &bbs(), "[]", T0).await;

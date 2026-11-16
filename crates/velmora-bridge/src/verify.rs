@@ -442,6 +442,10 @@ where
             .map(|s| (s.backbone.as_str(), s.kind));
         let now = self.clock.now();
         if releasable(passes, &labels, self.cfg.required_backbones) {
+            // Read again: a repost by this job stamped its articles after
+            // the plan was loaded. The release job reads the plan itself
+            // and is the gate; this only keeps the due time right.
+            let plan = self.posted_plan(extent).await?;
             let ready = self.min_age_over(extent, &plan).max(now);
             self.advance(lease, OutboxStage::Release, ready).await?;
             // Rounded up: a job that arrives early cannot claim the row.

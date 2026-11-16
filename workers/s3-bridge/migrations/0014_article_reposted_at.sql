@@ -3,8 +3,11 @@
 -- `posted_at` stays the time of the first post: the retention of the
 -- provider that took it counts from there.
 -- The minimum age of a safety copy counts from the newest of the two
--- over all the articles of its extent, so a release never follows a
--- post, or a repost, by less than the minimum age.
+-- over all the articles of its extent, so a release follows a post, or
+-- a repost, by the minimum age. The stamp is written before the repost
+-- is sent and again when the provider has taken the article; if the job
+-- dies in between, the stamp is older than that POST by at most the
+-- length of one lease.
 -- A Worker from before this column neither reads nor writes it: it can
 -- run on this schema.
 -- Additive only.
