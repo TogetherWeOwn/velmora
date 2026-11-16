@@ -64,7 +64,8 @@ pub const GENERATION_PREFIX: &str = "m/g_";
 /// Tombstones: `m/del/` + a tombstone id (`g_…`).
 pub const TOMBSTONE_PREFIX: &str = "m/del/g_";
 const TOMBSTONE_DIR: &str = "m/del/";
-const ARTICLE_DIR: &str = "m/art/";
+/// Article plans: `m/art/` + an extent id.
+pub(crate) const ARTICLE_DIR: &str = "m/art/";
 
 /// Format version of every record.
 const RECORD_VERSION: u32 = 1;

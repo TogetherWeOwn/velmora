@@ -629,3 +629,24 @@ The escrow file holds one `VELMORA_KEK_<version>=<base64 of 32 bytes>` line
 per version, mode 0600, outside any repository. `ops/kek-restore.sh` sets
 each one as a Worker secret through stdin. Nothing else can replace a lost
 KEK.
+
+## Naming a wasm frame
+
+The deployed wasm has no `name` section (bundle.sh drops it to stay
+under the size budget), so a panic's message is logged as before but
+its trace frames read `wasm-function[N]:0xOFF` instead of Rust function
+names. To name a frame:
+
+1. Find the deployed version's message, `ci <run id>.<attempt> <sha>`
+   (`wrangler deployments list`, or the dashboard).
+2. Download the `s3-bridge-symbols` artifact of that CI run (kept 90
+   days): `gh run download <run id> -n s3-bridge-symbols`. It holds
+   `index_bg.unstripped.wasm`, the same wasm with the names kept.
+3. Function `N` is entry `N` of its `name` section. Any wasm tool reads
+   it; `wasm-tools print index_bg.unstripped.wasm` prints it as the line
+   `(func $<name> (;N;) ...`. Function indices and code offsets are the
+   same in both files.
+
+After 90 days, rebuild at `<sha>` with the same toolchain
+(`bash bundle.sh`) and use `symbols/index_bg.unstripped.wasm`; a
+different rustc may number the functions differently.
