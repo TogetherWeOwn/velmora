@@ -23,10 +23,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
-# `wasm-opt` level of the release bundle, in place of worker-build's
-# default `-O`. `-O3` optimizes for speed first and inlines more; with
-# the function names kept (worker-build always passes `--debuginfo`) the
-# bundle comes out smaller, because a function that is inlined away
-# takes its name with it. Measured on this tree: about 38,000 bytes less.
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O3"]
+# The function names in the release bundle stay in Rust's mangled form
+# (wasm-bindgen would otherwise spell each one out, generic arguments and
+# crate hashes included). The names are all still there, so a wasm frame
+# in a stack trace reads through `rustfilt`; the code is the same.
+# Measured on this tree: about 99,000 bytes less of the 3,000,000 budget.
+[package.metadata.wasm-pack.profile.release.wasm-bindgen]
+demangle-name-section = false
