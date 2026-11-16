@@ -12,7 +12,7 @@ use crate::types::{
     AccessKeyRow, AccessKeySummary, BridgeError, Bucket, BucketId, KeyStatus, Perm, Result,
 };
 
-fn bucket_row(row: Row) -> Result<Bucket> {
+pub(super) fn bucket_row(row: Row) -> Result<Bucket> {
     let mut c = Cols::new(row);
     Ok(Bucket {
         id: BucketId::new(c.text()?),

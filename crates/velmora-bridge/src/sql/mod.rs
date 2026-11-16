@@ -168,6 +168,24 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         objects::live_object(self, bucket, key).await
     }
+    async fn live_generation(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationRow>> {
+        objects::live_generation(self, bucket, key).await
+    }
+    async fn generation_by_id(
+        &self,
+        bucket: &BucketId,
+        generation: &GenerationId,
+    ) -> Result<Option<(Bucket, GenerationRow)>> {
+        objects::generation_by_id(self, bucket, generation).await
+    }
+    async fn extents_in(
+        &self,
+        generation: &GenerationId,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ExtentRow>> {
+        objects::extents_in(self, generation, start, end).await
+    }
     async fn commit_generation(
         &self,
         c: &CommitGeneration,

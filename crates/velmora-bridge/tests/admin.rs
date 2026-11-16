@@ -166,6 +166,7 @@ impl Fx {
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             server_side_copy: false,
+            get_fanout_bytes: None,
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
             providers,
@@ -228,7 +229,7 @@ impl Fx {
         let body = match resp.body {
             RespBody::Empty => Vec::new(),
             RespBody::Bytes(b) => b,
-            RespBody::Stream(_) | RespBody::Deferred(_) => {
+            RespBody::Stream(_) | RespBody::Deferred(_) | RespBody::Fanout(_) => {
                 panic!("admin responses are never streamed")
             }
         };

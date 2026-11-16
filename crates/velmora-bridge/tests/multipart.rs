@@ -457,7 +457,7 @@ impl Rig {
         let body = match resp.body {
             RespBody::Empty => Vec::new(),
             RespBody::Bytes(b) => b,
-            RespBody::Stream(_) | RespBody::Deferred(_) => {
+            RespBody::Stream(_) | RespBody::Deferred(_) | RespBody::Fanout(_) => {
                 panic!("multipart responses are never streamed")
             }
         };

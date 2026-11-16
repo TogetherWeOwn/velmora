@@ -202,6 +202,12 @@ pub struct BridgeConfig {
     /// extents are shared. Cloudflare still offers such versions, so the
     /// rule is "Rollback floor" in `workers/s3-bridge/ops/README.md`.
     pub server_side_copy: bool,
+    /// A GET body above this many plaintext bytes is served in
+    /// sub-ranges of this size, each by an invocation of its own
+    /// (`GET_FANOUT_BYTES`, see [`crate::fanout`]). `None` (unset, empty
+    /// or `0`) = every GET is served by the invocation that received it.
+    /// Needs the Worker's service binding to itself.
+    pub get_fanout_bytes: Option<u64>,
     /// Accept `http://` as if it were HTTPS (`wrangler dev` only).
     pub dev_trust_http: bool,
     pub providers: Vec<ProviderConfig>,
@@ -545,6 +551,16 @@ impl BridgeConfig {
             return Err(ConfigError::Invalid("CATALOGUE_ID".into()));
         }
 
+        let get_fanout_bytes = match optional_u64(&get, "GET_FANOUT_BYTES")? {
+            None | Some(0) => None,
+            Some(n)
+                if (crate::fanout::MIN_FANOUT_BYTES..=crate::fanout::MAX_FANOUT_BYTES)
+                    .contains(&n) =>
+            {
+                Some(n)
+            }
+            Some(_) => return Err(ConfigError::Invalid("GET_FANOUT_BYTES".into())),
+        };
         let server_side_copy = match required(&get, "SERVER_SIDE_COPY")?.as_str() {
             "off" => false,
             "on" => true,
@@ -597,6 +613,7 @@ impl BridgeConfig {
             maintenance,
             catalogue_id,
             server_side_copy,
+            get_fanout_bytes,
             dev_trust_http,
             providers,
             admin_token: Secret::new(admin_token),

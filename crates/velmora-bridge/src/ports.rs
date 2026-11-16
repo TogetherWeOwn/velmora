@@ -451,6 +451,28 @@ pub trait Catalog {
         bucket: &BucketId,
         key: &str,
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>>;
+    /// The live generation of the key without its extents: all a HEAD
+    /// needs, and what a GET plans from before it reads
+    /// [`Self::extents_in`] for the bytes it serves.
+    async fn live_generation(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationRow>>;
+    /// The generation with this id in this bucket, whatever its state,
+    /// with the bucket row. A read that was planned against a generation
+    /// is finished against the same one.
+    async fn generation_by_id(
+        &self,
+        bucket: &BucketId,
+        generation: &GenerationId,
+    ) -> Result<Option<(Bucket, GenerationRow)>>;
+    /// The extents of the generation that hold plaintext
+    /// `[start, end)`, in order and placed as the generation has them:
+    /// from the one that contains `start` to the last that begins before
+    /// `end`. The caller checks that they tile the range.
+    async fn extents_in(
+        &self,
+        generation: &GenerationId,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ExtentRow>>;
     /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
     /// live generation carries a newer id or its floor a higher one; nothing
     /// was written. The caller takes a newer id and tries again.

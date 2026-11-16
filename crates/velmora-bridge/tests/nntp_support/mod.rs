@@ -1015,6 +1015,19 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         unused()
     }
+    async fn live_generation(&self, _: &BucketId, _: &str) -> Result<Option<GenerationRow>> {
+        unused()
+    }
+    async fn generation_by_id(
+        &self,
+        _: &BucketId,
+        _: &GenerationId,
+    ) -> Result<Option<(Bucket, GenerationRow)>> {
+        unused()
+    }
+    async fn extents_in(&self, _: &GenerationId, _: u64, _: u64) -> Result<Vec<ExtentRow>> {
+        unused()
+    }
     async fn commit_generation(
         &self,
         _: &CommitGeneration,
@@ -1474,6 +1487,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
         server_side_copy: true,
+        get_fanout_bytes: None,
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         providers,

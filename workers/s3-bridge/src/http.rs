@@ -102,6 +102,9 @@ fn try_response(resp: S3Response) -> worker::Result<Response> {
             )
             .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into()))),
         )?,
+        // `fetch` serves a body in sub-ranges itself (`crate::fanout`);
+        // one that reaches this point has no stream to go to.
+        RespBody::Fanout(_) => return Err(worker::Error::RustError("fanout body".into())),
         RespBody::Stream(stream) => {
             let stream = stream
                 .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into())));

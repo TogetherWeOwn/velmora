@@ -285,6 +285,8 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     assert_eq!(cfg.maintenance, Maintenance::Off);
     assert!(cfg.server_side_copy);
+    // A GET above 1 GiB is served in sub-ranges of 1 GiB.
+    assert_eq!(cfg.get_fanout_bytes, Some(1 << 30));
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 2);
     // Production posts on six sockets per job, so that three post jobs fit
@@ -320,6 +322,32 @@ fn config_loads_from_documented_vars() {
         sized.insert("HOT_CAP_BYTES".to_string(), value.to_string());
         assert_eq!(load(&sized).unwrap().hot_cap_bytes, want, "{value:?}");
     }
+    // Dev serves a GET above 8 MiB in sub-ranges. Absent, empty or 0:
+    // never in sub-ranges; a size outside 1 MiB..=4 GiB is refused.
+    assert_eq!(cfg.get_fanout_bytes, Some(8 << 20));
+    for (value, want) in [
+        ("", Some(None)),
+        ("0", Some(None)),
+        ("1048575", None),
+        ("1048576", Some(Some(1 << 20))),
+        ("4294967296", Some(Some(1 << 32))),
+        ("4294967297", None),
+        ("1g", None),
+        ("-1", None),
+    ] {
+        sized.insert("GET_FANOUT_BYTES".to_string(), value.to_string());
+        let got = load(&sized).map(|c| c.get_fanout_bytes);
+        match want {
+            Some(want) => assert_eq!(got.unwrap(), want, "{value:?}"),
+            None => assert_eq!(
+                got.unwrap_err(),
+                ConfigError::Invalid("GET_FANOUT_BYTES".into()),
+                "{value:?}"
+            ),
+        }
+    }
+    sized.remove("GET_FANOUT_BYTES");
+    assert_eq!(load(&sized).unwrap().get_fanout_bytes, None);
     // The catalogue id is one path segment of the stamp keys.
     assert_eq!(cfg.catalogue_id, "main");
     for (value, want) in [("", Some("main")), (" eu-1 ", Some("eu-1")), ("a/b", None)] {
@@ -415,6 +443,15 @@ fn missing_secret_fails_closed() {
                 let copy =
                     velmora_bridge::remote::RemoteConfig::from_vars(|n| vars.get(n).cloned());
                 assert!(copy.unwrap().is_none());
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
+        // Absent or blank: every GET is served by one invocation, as
+        // before the variable existed.
+        if name == "GET_FANOUT_BYTES" {
+            for _ in 0..2 {
+                assert_eq!(load(&vars).unwrap().get_fanout_bytes, None);
                 vars.insert(name.clone(), "  ".into());
             }
             continue;
