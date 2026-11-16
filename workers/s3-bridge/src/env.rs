@@ -22,7 +22,7 @@ use worker::Env;
 use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
 use crate::nntp::WorkerConnector;
-use crate::queues::{binding_name, DropNotify, QueueSink, DEV_DROP_NOTIFY_N, MAX_QUEUES};
+use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
@@ -132,8 +132,12 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
             .with_tombstone_delay(tombstone_delay),
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
         nntp: WorkerConnector::new(),
-        jobs: QueueSink::new(queues(env, "POST_Q"), queues(env, "VERIFY_Q"), drop_notify)
-            .map_err(|name| format!("missing binding {name}"))?,
+        jobs: QueueSink::new(
+            queues(env, "POST_Q")?,
+            queues(env, "VERIFY_Q")?,
+            drop_notify,
+        )
+        .map_err(|name| format!("missing binding {name}"))?,
         kek,
         clock: WorkerClock,
         budget: ByteBudget::new(cfg.inflight_budget_bytes)
@@ -152,11 +156,16 @@ pub fn recovery_store(env: &Env) -> Result<Option<S3Remote<FetchHttp>>, String> 
 }
 
 /// The queues of one kind that are bound: `first` (`POST_Q`), then
-/// `POST_Q2`, `POST_Q3`, ... up to the first name that is not bound. Empty
-/// when `first` itself is not bound.
-fn queues(env: &Env, first: &str) -> Vec<worker::Queue> {
-    (0..MAX_QUEUES)
-        .map_while(|index| env.queue(&binding_name(first, index)).ok())
+/// `POST_Q2`, `POST_Q3`, ... A missing first binding or a gap in the
+/// numbers is refused ([`bound_queues`]).
+fn queues(env: &Env, first: &str) -> Result<Vec<worker::Queue>, String> {
+    let count = bound_queues(first, |name| env.queue(name).is_ok())?;
+    (0..count)
+        .map(|index| {
+            let name = binding_name(first, index);
+            env.queue(&name)
+                .map_err(|_| format!("missing binding {name}"))
+        })
         .collect()
 }
 

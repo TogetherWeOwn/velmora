@@ -426,6 +426,10 @@ impl BudgetState {
     /// equal limits that is `requests + jobs <= capacity`.
     fn fits(&self, requests: u64, jobs: u64) -> bool {
         let (cap, job_cap) = (u128::from(self.capacity), u128::from(self.job_capacity));
+        // A budget of nothing holds nothing (the products below are 0).
+        if cap == 0 || job_cap == 0 {
+            return requests == 0 && jobs == 0;
+        }
         u128::from(requests) * job_cap + u128::from(jobs) * cap <= cap * job_cap
     }
 }

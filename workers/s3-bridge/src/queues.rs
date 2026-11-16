@@ -81,6 +81,31 @@ pub fn binding_name(first: &str, index: usize) -> String {
     }
 }
 
+/// How many queues of the kind `first` names are bound, given which
+/// binding names exist: `first`, `first2`, ... counted up to the first
+/// name that is not bound. A name bound after a gap is refused with that
+/// name: the queues after a gap would silently get no jobs.
+pub fn bound_queues(
+    first: &str,
+    is_bound: impl Fn(&str) -> bool,
+) -> std::result::Result<usize, String> {
+    let bound: Vec<bool> = (0..MAX_QUEUES)
+        .map(|index| is_bound(&binding_name(first, index)))
+        .collect();
+    let count = bound.iter().take_while(|b| **b).count();
+    match bound.iter().skip(count).position(|b| *b) {
+        Some(after) => {
+            let (stray, gap) = (
+                binding_name(first, count + after),
+                binding_name(first, count),
+            );
+            Err(format!("binding {stray} without {gap}"))
+        }
+        None if count == 0 => Err(format!("missing binding {first}")),
+        None => Ok(count),
+    }
+}
+
 pub struct QueueSink {
     /// Never empty.
     post: Vec<Queue>,
@@ -215,7 +240,8 @@ impl JobSink for QueueSink {
             .map_err(send_err)
     }
 
-    /// One batch per queue. An `Err` may follow a sent batch; the
+    /// One batch per queue, every queue tried. An `Err` may come with
+    /// sent batches; the
     /// dispatcher re-drives from the outbox and a duplicate job only finds
     /// its lease taken.
     async fn send_many(&self, jobs: &[Job]) -> Result<()> {
@@ -223,16 +249,17 @@ impl JobSink for QueueSink {
             return Err(BridgeError::Queue(format!("batch above {MAX_BATCH} jobs")));
         }
         let shards = self.shards();
+        // A queue that refuses its batch does not keep the others from
+        // getting theirs.
+        let mut result = Ok(());
         for target in shards.lanes() {
             let batch: Vec<&Job> = jobs.iter().filter(|j| lane(j, shards) == target).collect();
             if !batch.is_empty() {
-                self.queue(target)
-                    .send_batch(batch)
-                    .await
-                    .map_err(send_err)?;
+                let sent = self.queue(target).send_batch(batch).await;
+                result = result.and(sent.map_err(send_err));
             }
         }
-        Ok(())
+        result
     }
 }
 
@@ -362,6 +389,26 @@ mod tests {
             assert_eq!(shard(&format!("x_{n:x}"), 0), 0);
             assert!(shard(&format!("x_{n:x}"), MAX_QUEUES) < MAX_QUEUES);
         }
+    }
+
+    #[test]
+    fn bound_queues_are_counted_and_a_gap_is_refused() {
+        let with = |names: &'static [&'static str]| {
+            bound_queues("POST_Q", move |name| names.contains(&name))
+        };
+        assert_eq!(with(&["POST_Q"]), Ok(1));
+        assert_eq!(with(&["POST_Q", "POST_Q2", "POST_Q3", "VERIFY_Q"]), Ok(3));
+        assert_eq!(with(&["VERIFY_Q"]), Err("missing binding POST_Q".into()));
+        assert_eq!(
+            with(&["POST_Q", "POST_Q3", "POST_Q4"]),
+            Err("binding POST_Q3 without POST_Q2".into())
+        );
+        assert_eq!(
+            with(&["POST_Q2"]),
+            Err("binding POST_Q2 without POST_Q".into())
+        );
+        // Names above the most this build reads are not looked at.
+        assert_eq!(with(&["POST_Q", "POST_Q10"]), Ok(1));
     }
 
     #[test]

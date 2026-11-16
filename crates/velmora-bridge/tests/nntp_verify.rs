@@ -1220,25 +1220,94 @@ async fn verify_renews_again_when_the_last_renewal_is_old() {
     }
 }
 
-/// The renewal that comes due finds the lease taken over: the job stops
-/// there, reads no further and records nothing.
+impl Rig {
+    /// Runs the verify stage and takes the row over once the job has
+    /// made `after` calls to the provider.
+    async fn verify_taken_over(&self, s: &Seeded, after: usize) -> JobOutcome {
+        let job = self.job(s).await;
+        let lease = self.claim(s, OutboxStage::Verify).await;
+        let take_over = async {
+            while self.bridge.nntp.calls().len() < after {
+                tokio::task::yield_now().await;
+            }
+            self.bridge.catalog.take_over(&s.extent);
+        };
+        tokio::join!(self.bridge.verify_stage(&lease, &job), take_over).0
+    }
+}
+
+/// The row is taken over while the job reads on a renewal it does not
+/// repeat yet. The renewal that comes due finds the lease gone: the job
+/// stops there, reads no further and records nothing.
 #[tokio::test]
 async fn verify_stops_at_the_renewal_that_finds_its_lease_gone() {
     let rig = simple_rig().await;
     let (s, plan) = rig.posted(42).await;
     assert_eq!(plan.len(), 3);
     let clock = rig.bridge.clock.clone();
-    let job = rig.job(&s).await;
-    let stale = rig.claim(&s, OutboxStage::Verify).await;
-    clock.advance_secs(LEASE_SECS + 1);
-    let _current = rig.claim(&s, OutboxStage::Verify).await;
-    rig.bridge.nntp.slow(&clock, 1_000);
+    rig.bridge.nntp.slow(&clock, 8_000);
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+    let start = clock.now();
 
-    rig.bridge.verify_stage(&stale, &job).await;
+    // Taken over once the first BODY is out: connect, BODY.
+    rig.verify_taken_over(&s, 2).await;
 
-    assert!(rig.bridge.nntp.calls().is_empty());
+    // connect at 0, BODY at 8 s and 16 s; the renewal due at 24 s stops it.
+    let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["connect", "body", "body"]);
+    assert_eq!(
+        *rig.bridge.catalog.lease_renewed_at.borrow(),
+        [start, start.plus_ms(24_000)]
+    );
     assert!(rig.rows(&s).is_empty());
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// A pass that ends before another renewal is due may read every article
+/// on a lease that was taken over meanwhile. What it read is not
+/// recorded: every write carries the lease and is refused.
+#[tokio::test]
+async fn a_pass_read_on_a_lease_lost_meanwhile_records_nothing() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(43).await;
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 1_000);
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+
+    rig.verify_taken_over(&s, 2).await;
+
+    assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
+    assert_eq!(rig.bridge.catalog.lease_renewed_at.borrow().len(), 1);
+    assert!(rig.rows(&s).is_empty());
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// A slot lost while the job reads is found at the renewal that comes
+/// due: the job stops there and is deferred, and nothing is recorded.
+#[tokio::test]
+async fn verify_stops_at_the_renewal_that_finds_its_slot_gone() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(44).await;
+    assert_eq!(plan.len(), 3);
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 8_000);
+    let job = rig.job(&s).await;
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    let lose_slot = async {
+        while rig.bridge.nntp.calls().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        rig.bridge.catalog.drop_permits();
+    };
+
+    let (outcome, ()) = tokio::join!(rig.bridge.verify_stage(&lease, &job), lose_slot);
+
+    assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
+    let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
+    assert_eq!(calls, ["connect", "body", "body"]);
+    assert!(rig.rows(&s).is_empty());
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 

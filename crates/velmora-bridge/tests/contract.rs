@@ -2241,3 +2241,77 @@ fn three_post_jobs_and_a_verify_job_fit_the_shipped_budget() {
     assert!(jobs.try_charge_job(post).is_none());
     drop(held);
 }
+
+/// The queue tables of the shipped `wrangler.toml`: producers as
+/// (binding, queue) and the queues with a consumer, for production
+/// (`env` empty) or `env.dev.`.
+fn wrangler_queues(env: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let toml = std::fs::read_to_string(path).unwrap();
+    let value = |line: &str, key: &str| -> Option<String> {
+        let rest = line.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+        Some(rest.trim().trim_matches('"').to_string())
+    };
+    let (mut producers, mut consumers) = (Vec::new(), Vec::new());
+    let (mut section, mut binding) = (String::new(), None);
+    for line in toml.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line.to_string();
+            binding = None;
+        } else if section == format!("[[{env}queues.producers]]") {
+            if let Some(name) = value(line, "binding") {
+                binding = Some(name);
+            } else if let Some(queue) = value(line, "queue") {
+                producers.push((binding.take().expect("binding before queue"), queue));
+            }
+        } else if section == format!("[[{env}queues.consumers]]") {
+            consumers.extend(value(line, "queue"));
+        }
+    }
+    (producers, consumers)
+}
+
+/// Every queue the shipped configuration sends jobs to has exactly one
+/// consumer, and the bindings of a kind are numbered without a gap: an
+/// extent's jobs always go to the same queue, so a queue nobody reads
+/// would hold the same extents back for good.
+#[test]
+fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
+    for env in ["", "env.dev."] {
+        let (producers, consumers) = wrangler_queues(env);
+        for kind in ["POST_Q", "VERIFY_Q"] {
+            let mut numbers: Vec<u32> = producers
+                .iter()
+                .filter_map(|(binding, _)| binding.strip_prefix(kind))
+                .map(|n| if n.is_empty() { 1 } else { n.parse().unwrap() })
+                .collect();
+            numbers.sort_unstable();
+            let expected: Vec<u32> = (1..=numbers.len() as u32).collect();
+            assert!(!numbers.is_empty(), "{env}{kind} is not bound");
+            assert!(
+                numbers.len() <= 8,
+                "{env}{kind}: more than the Worker reads"
+            );
+            assert_eq!(numbers, expected, "{env}{kind} bindings");
+            assert!(!numbers.contains(&0));
+        }
+        assert_eq!(
+            producers.len(),
+            producers
+                .iter()
+                .filter(|(b, _)| b.starts_with("POST_Q") || b.starts_with("VERIFY_Q"))
+                .count(),
+            "{env}: a producer of another kind"
+        );
+        let mut sent: Vec<&String> = producers.iter().map(|(_, queue)| queue).collect();
+        let mut read: Vec<&String> = consumers.iter().collect();
+        sent.sort();
+        read.sort();
+        assert_eq!(sent, read, "{env}: producers and consumers differ");
+        sent.dedup();
+        assert_eq!(sent.len(), producers.len(), "{env}: a queue bound twice");
+    }
+}

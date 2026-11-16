@@ -116,13 +116,16 @@ bucket_name = "velmora-cache-enam"
 # adding a queue, not by raising max_concurrency.
 #
 # The bindings of one kind are POST_Q, POST_Q2, POST_Q3, ... (VERIFY_Q,
-# VERIFY_Q2, ...), read up to the first name that is not bound, 8 at most.
-# An extent's jobs always go to the same queue of a kind (by a hash of its
-# id); jobs without an extent (gc, sweeps) go to VERIFY_Q. To add a queue:
-# create it, then add its producer and its consumer here. To take one
-# away: remove its producer first, and its consumer only when the queue is
-# empty (the cron run sends a due extent's job again, to a queue that is
-# still bound, so a job left behind delays its extent and loses nothing).
+# VERIFY_Q2, ...), 8 at most, numbered without a gap: the Worker refuses
+# to start with POST_Q3 bound and POST_Q2 not. An extent's jobs always go
+# to the same queue of a kind (by a hash of its id); jobs without an
+# extent (gc, sweeps) go to VERIFY_Q. Every queue needs its consumer: the
+# extents of a queue nobody reads are never posted.
+# To add a queue: create it, then add its producer and its consumer here.
+# To take one away: remove the producer with the highest number, and its
+# consumer only when the queue is empty (the cron run sends a due
+# extent's job again, to a queue that is still bound, so a job left
+# behind delays its extent and loses nothing).
 [[queues.producers]]
 binding = "POST_Q"
 queue = "velmora-post"
@@ -146,6 +149,14 @@ queue = "velmora-verify"
 [[queues.producers]]
 binding = "VERIFY_Q2"
 queue = "velmora-verify2"
+
+[[queues.producers]]
+binding = "VERIFY_Q3"
+queue = "velmora-verify3"
+
+[[queues.producers]]
+binding = "VERIFY_Q4"
+queue = "velmora-verify4"
 
 # The post queues. max_concurrency is a secondary bound; provider_permits
 # is the real gate. The measured providers limit the source addresses an
@@ -188,12 +199,15 @@ max_retries = 20
 retry_delay = 60
 dead_letter_queue = "velmora-dlq"
 
-# The verify queues. A verify job reads every article of an extent on one
-# backbone (about a second of CPU for 16 MiB) and holds one connection.
+# The verify queues. A verify job holds one connection. The full read of
+# an extent (16 MiB) takes about 14 s and more than a second of CPU, so
+# the read rate is about 1 MiB/s for every job that runs: measured about
+# 9 MiB/s with two queues of eight, about 14 MiB/s with four queues of
+# six, where the reading provider's slots became the limit.
 [[queues.consumers]]
 queue = "velmora-verify"
 max_batch_size = 1
-max_concurrency = 4
+max_concurrency = 6
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"
@@ -201,7 +215,23 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify2"
 max_batch_size = 1
-max_concurrency = 4
+max_concurrency = 6
+max_retries = 20
+retry_delay = 120
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-verify3"
+max_batch_size = 1
+max_concurrency = 6
+max_retries = 20
+retry_delay = 120
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-verify4"
+max_batch_size = 1
+max_concurrency = 6
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"

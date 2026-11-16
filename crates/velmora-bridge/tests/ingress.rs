@@ -1068,3 +1068,14 @@ fn a_delete_objects_body_has_its_own_limit() {
         );
     }
 }
+
+/// A budget of nothing admits nothing, for requests and for jobs.
+#[test]
+fn an_empty_budget_takes_no_charge() {
+    let budget = ByteBudget::new(0);
+    assert!(budget.try_charge(1).is_none());
+    assert!(budget.try_charge_job(1).is_none());
+    let jobs_only = ByteBudget::new(0).with_job_capacity(1024);
+    assert!(jobs_only.try_charge(1).is_none());
+    assert!(jobs_only.try_charge_job(1).is_none());
+}
