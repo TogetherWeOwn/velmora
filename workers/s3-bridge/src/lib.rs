@@ -219,7 +219,9 @@ fn copier<'a>(
 /// plan waits for the walk (`velmora_bridge::copy`).
 async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &JobOutcome) {
     use velmora_bridge::copy::{posted, send_hint};
-    // Off, or refused: the cron run says so.
+    // Nothing to hint at, or no copy. A configuration that is refused
+    // is found by the job of the hint, which says nothing: the cron
+    // run says it.
     if posted(job, outcome).is_none()
         || bridge.cfg.maintenance == velmora_bridge::config::Maintenance::Restore
         || !env::recovery_copy_on(env)

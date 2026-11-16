@@ -327,7 +327,8 @@ const PHASES: [(Phase, &str); 5] = [
 ///
 /// The members: `p` the phase and `k` the key, both required; `g`, `n`
 /// and `t`, each left out when empty or zero. A member of another name
-/// is passed over; one of another type is no cursor.
+/// is passed over; one of another type is no cursor, and neither is
+/// an object that is not plain JSON of small depth.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Place {
     phase: Phase,

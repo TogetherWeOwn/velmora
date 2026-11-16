@@ -4462,3 +4462,48 @@ async fn a_walk_under_way_begins_again_at_another_store() {
         assert_ne!(w.e2.get("m/art/x_0").as_deref(), Some(&b"other"[..]));
     }
 }
+
+/// A mark of the walk that cannot be read is not a mark that is not
+/// there: the job stops and comes again, and no mark is written. Taken
+/// as absent, a start that cannot be read would end a walk under way.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mark_of_the_walk_that_cannot_be_read_stops_the_job() {
+    for key in [WALK_KEY, WALKED_KEY, BEGAN_KEY, STORE_KEY] {
+        for head in [false, true] {
+            let w = World::new();
+            for i in 0..4 {
+                w.record(&format!("m/art/x_{i}"), b"plan").await;
+            }
+            // A walk under way, at this store.
+            known_store(&w).await;
+            w.raw(WALK_KEY, b"m/art/x_1".to_vec()).await;
+            w.raw(
+                WALKED_KEY,
+                (NOW - 3 * PASS_INTERVAL_MS).to_string().into_bytes(),
+            )
+            .await;
+            w.raw(BEGAN_KEY, (NOW - PASS_INTERVAL_MS).to_string().into_bytes())
+                .await;
+            let down = NoRead(&w.safety, key, head);
+            let copier = Copier {
+                safety: &down,
+                kek: &w.kek,
+                clock: &w.clock,
+                remote: &w.remote,
+                maintenance: Maintenance::Off,
+            };
+            let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+            assert!(
+                matches!(outcome, JobOutcome::Retry { .. }),
+                "{key} head={head}: {outcome:?}"
+            );
+            assert_eq!((counts, why), (None, Some(StepError::Source)), "{key}");
+            assert_eq!(time_at(&w, WALK_KEY).await.as_deref(), Some("m/art/x_1"));
+            assert_eq!(
+                time_at(&w, BEGAN_KEY).await,
+                Some((NOW - PASS_INTERVAL_MS).to_string())
+            );
+            assert_eq!(w.e2.get("m/art/x_2"), None, "{key} head={head}");
+        }
+    }
+}
