@@ -203,6 +203,15 @@ pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<Del
             }
             "Object" => {
                 node.container()?;
+                // A condition on the key (delete it only if it is this
+                // object) is not evaluated: it is refused, never dropped.
+                if node
+                    .children
+                    .iter()
+                    .any(|c| matches!(c.name.as_str(), "ETag" | "LastModifiedTime" | "Size"))
+                {
+                    return Err(ErrorCode::NotImplemented);
+                }
                 if node.children.len() != 1 || node.children[0].name != "Key" {
                     return Err(ErrorCode::InvalidRequest);
                 }

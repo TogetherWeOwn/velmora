@@ -1266,3 +1266,80 @@ async fn a_bucket_is_deleted_only_while_nothing_names_it() {
     assert_eq!(fx.count("SELECT COUNT(*) FROM uploads").await, 1);
     assert_eq!(fx.count("SELECT COUNT(*) FROM key_floors").await, 0);
 }
+
+#[tokio::test]
+async fn a_conditional_complete_is_judged_by_its_own_batch_and_leaves_the_upload_open() {
+    let fx = Fx::new().await;
+    // An object under the key, published by an earlier upload.
+    let old_id = fx.create(&fx.bucket, KEY).await;
+    let old_t = target(&fx.bucket, KEY, &old_id);
+    let (old_x, _) = fx.part(&old_t, 1, 100).await;
+    let mut old_c = fx.commit(&fx.bucket, KEY, &[(&old_x, 100)]);
+    old_c.generation.etag = "\"old-1\"".into();
+
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    let (x1, _) = fx.part(&t, 1, 500).await;
+    let (upload, _) = fx.read(&t).await;
+
+    // No object yet: nothing to match.
+    for condition in [Precondition::Exists, Precondition::Etag("\"old-1\"".into())] {
+        let c = fx.commit(&fx.bucket, KEY, &[(&x1, 500)]);
+        assert_eq!(
+            fx.cat
+                .publish_upload_if(&t, upload.revision, &DIGEST, &c, Some(&condition))
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "{condition:?}"
+        );
+    }
+    assert_eq!(
+        fx.cat
+            .publish_upload_if(&old_t, 1, &DIGEST, &old_c, Some(&Precondition::Absent))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+
+    // An object under the key: not absent, and another ETag.
+    for condition in [Precondition::Absent, Precondition::Etag("\"abc-2\"".into())] {
+        let c = fx.commit(&fx.bucket, KEY, &[(&x1, 500)]);
+        assert_eq!(
+            fx.cat
+                .publish_upload_if(&t, upload.revision, &DIGEST, &c, Some(&condition))
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "{condition:?}"
+        );
+    }
+    // Refused, the upload is what it was: open, at the same revision,
+    // with its part, and the object under the key is the old one.
+    let (after, parts) = fx.read(&t).await;
+    assert_eq!(
+        (after.state, after.revision),
+        (UploadState::Open, upload.revision)
+    );
+    assert_eq!(parts.len(), 1);
+    assert_eq!(
+        fx.live_generation(&fx.bucket, KEY).await,
+        Some(old_c.generation.id.to_string())
+    );
+
+    // So it can still be completed, here against the ETag that is live.
+    let c = fx.commit(&fx.bucket, KEY, &[(&x1, 500)]);
+    let matching = Precondition::Etag("\"old-1\"".into());
+    assert_eq!(
+        fx.cat
+            .publish_upload_if(&t, upload.revision, &DIGEST, &c, Some(&matching))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(
+        fx.live_generation(&fx.bucket, KEY).await,
+        Some(c.generation.id.to_string())
+    );
+    assert_eq!(fx.read(&t).await.0.state, UploadState::Completed);
+}

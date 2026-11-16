@@ -16,8 +16,8 @@ use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
     ExtentState, ExtentStatus, GenerationId, GenerationRow, GenerationState, ListCursor, ListEntry,
-    ListPage, ListQuery, ObjectStatus, OutboxStage, Result, SafetyState, UnixMs, VerifyKind,
-    VerifyResult, WriteId,
+    ListPage, ListQuery, ObjectStatus, OutboxStage, Precondition, Result, SafetyState, UnixMs,
+    VerifyKind, VerifyResult, WriteId,
 };
 
 /// A retired generation's key is shredded this long after retirement;
@@ -458,6 +458,39 @@ pub(super) fn guard_newest(bucket: &BucketId, key: &str, id: &GenerationId) -> S
     )
 }
 
+/// Guard of a conditional write: the live object of `(bucket, key)`
+/// meets `condition` ([`Precondition::check`] decides the same way). It
+/// is a statement of the batch that publishes or deletes, placed before
+/// the statements that retire the live generation and move the pointer:
+/// it reads the object that batch replaces. Of two conditional writes
+/// that race for one key, the batch that runs second sees what the
+/// first published and writes nothing.
+pub(super) fn guard_precondition(bucket: &BucketId, key: &str, condition: &Precondition) -> Stmt {
+    let at = || vec![text(bucket.as_str()), text(key)];
+    match condition {
+        Precondition::Absent => (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2)",
+            at(),
+        ),
+        Precondition::Exists => (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2)",
+            at(),
+        ),
+        Precondition::Etag(etag) => {
+            let mut params = at();
+            params.push(text(etag));
+            (
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects o \
+                   JOIN generations g ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                  WHERE o.bucket_id = ?1 AND o.key = ?2 AND g.etag = ?3)",
+                params,
+            )
+        }
+    }
+}
+
 /// The key lives under `id`: a floor at or below it has nothing left to
 /// hold back, the live pointer does it from here.
 pub(super) fn clear_floor(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
@@ -504,6 +537,7 @@ pub(super) async fn commit_generation<S: Sql>(
     c: &SqlCatalog<S>,
     commit: &CommitGeneration,
     write: Option<&WriteId>,
+    condition: Option<&Precondition>,
     record: Recorded,
 ) -> Result<PublishOutcome> {
     let g = &commit.generation;
@@ -529,6 +563,7 @@ pub(super) async fn commit_generation<S: Sql>(
 
     let mut stmts: Vec<Stmt> = Vec::with_capacity(10 + 3 * commit.extents.len());
     stmts.push(guard_no_replay());
+    stmts.extend(condition.map(|c| guard_precondition(&g.bucket_id, &g.key, c)));
     stmts.push(guard_newest(&g.bucket_id, &g.key, &g.id));
     stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(generation_insert(g)?);
@@ -575,6 +610,7 @@ pub(super) async fn commit_generation<S: Sql>(
 pub(super) async fn copy_generation<S: Sql>(
     c: &SqlCatalog<S>,
     copy: &CopyGeneration,
+    condition: Option<&Precondition>,
     record: Recorded,
 ) -> Result<PublishOutcome> {
     let g = &copy.generation;
@@ -601,6 +637,10 @@ pub(super) async fn copy_generation<S: Sql>(
             ],
         ),
         guard_no_replay(),
+    ];
+    // On the destination key. The source has its own guard above.
+    stmts.extend(condition.map(|c| guard_precondition(&g.bucket_id, &g.key, c)));
+    stmts.extend([
         // The copy is the newest id of its key as well, as for a PUT.
         guard_newest(&g.bucket_id, &g.key, &g.id),
         clear_floor(&g.bucket_id, &g.key, &g.id),
@@ -622,7 +662,7 @@ pub(super) async fn copy_generation<S: Sql>(
                 SqlValue::Int(i64::from(g.extent_count)),
             ],
         ),
-    ];
+    ]);
     stmts.extend(retire_live(
         &g.bucket_id,
         &g.key,

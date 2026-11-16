@@ -7,6 +7,11 @@
 //! gate against a replay, the same tombstone record before the catalogue
 //! batch, the same guarded batch. A DeleteObjects request of N keys
 //! leaves what N DeleteObject requests leave.
+//!
+//! A DeleteObject with `If-Match` takes [`delete_key_if`]: it deletes
+//! only the object the condition names, which the batch that deletes
+//! checks itself, and answers `412` or `404` otherwise. DeleteObjects
+//! takes no condition, in a header or per key: `501`.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -17,13 +22,13 @@ use velmora_s3_proto::mutation::{delete_result, parse_delete, DeleteOutcome};
 use velmora_s3_proto::{storable_key, ChecksumAlgorithm, ErrorCode, UploadValidator};
 
 use super::common::{
-    authenticate, from_proto, internal, mutation_gate, policy_with, restore_gate, s3_error,
-    writes_refused,
+    authenticate, check_precondition, conditional_gate, from_proto, internal, mutation_gate,
+    policy_with, restore_gate, s3_error, writes_refused,
 };
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone};
-use crate::types::{Bucket, RespBody, S3Request, S3Response};
+use crate::types::{Bucket, Precondition, RespBody, S3Request, S3Response};
 
 /// Most keys one DeleteObjects request may name (the S3 limit).
 pub const MAX_DELETE_KEYS: usize = 1000;
@@ -90,10 +95,14 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 ) -> Result<S3Response, S3Response> {
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
-    mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
-    delete_key(bridge, bucket, key)
-        .await
-        .map_err(|e| e.response())?;
+    match conditional_gate(&bridge.cfg, &authed.headers, bucket)? {
+        None => delete_key(bridge, bucket, key)
+            .await
+            .map_err(|e| e.response())?,
+        // A delete is conditional on the object it deletes only.
+        Some(Precondition::Absent) => return Err(S3Response::not_implemented()),
+        Some(condition) => delete_key_if(bridge, bucket, key, &condition).await?,
+    }
     Ok(S3Response {
         status: 204,
         headers: Vec::new(),
@@ -192,6 +201,81 @@ async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         Some((live, _)) if live.id < tombstone => Err(DeleteError::Refused),
         _ => Ok(()),
     }
+}
+
+/// How often a conditional delete is tried before it answers
+/// `SlowDown`: again whenever the key changed between the look at its
+/// live object and the batch, each time judged against what is live then.
+const CONDITIONAL_ATTEMPTS: u32 = 4;
+
+/// Deletes `key` if its live object meets `condition` (`If-Match`), for
+/// a request that is authorized to write the bucket and passed the gate.
+/// `Ok` = this request deleted the object the condition names.
+///
+/// Unlike [`delete_key`] it is not idempotent: without a live object
+/// the answer is `404 NoSuchKey`, with another one `412`.
+///
+/// The tombstone is a record a replay applies whatever became of the
+/// request, and it is never removed. So it is stored only once the floor
+/// of the key stands at its id and the condition held after that: from
+/// then on nothing is published on the key under an id the tombstone
+/// covers, and all it can delete in a replay is the object the condition
+/// named, or one that was gone before it. A request that answers `412`
+/// or `404` stored no tombstone under the id it judged with; one from an
+/// earlier turn covers only what a later write or delete had already
+/// taken the place of.
+async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    key: &str,
+    condition: &Precondition,
+) -> Result<(), S3Response> {
+    for _ in 0..CONDITIONAL_ATTEMPTS {
+        restore_gate(bridge).await?;
+        // Without any id on the key there is no object, and no floor to
+        // raise: the condition fails on that alone.
+        check_precondition(bridge, &bucket.id, key, condition).await?;
+        let Some(newest) = bridge
+            .catalog
+            .newest_id(&bucket.id, key)
+            .await
+            .map_err(|_| internal())?
+        else {
+            continue;
+        };
+        let now = bridge.clock.now();
+        let mut rand = [0u8; 8];
+        SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
+        let tombstone = tombstone_id(now, &newest, rand);
+        bridge
+            .catalog
+            .raise_floor(&bucket.id, key, &tombstone, false)
+            .await
+            .map_err(|_| internal())?;
+        check_precondition(bridge, &bucket.id, key, condition).await?;
+        write_tombstone(
+            &bridge.catalog,
+            &bridge.safety,
+            &bridge.kek,
+            &bucket.id,
+            key,
+            &tombstone,
+            now,
+        )
+        .await
+        .map_err(|_| internal())?;
+        if bridge
+            .catalog
+            .delete_object_if(&bucket.id, key, &tombstone, condition, now)
+            .await
+            .map_err(|_| internal())?
+        {
+            return Ok(());
+        }
+        // Nothing was deleted: the key changed after the look above, or
+        // a replay began. The next turn says which.
+    }
+    Err(s3_error(ErrorCode::SlowDown))
 }
 
 // ---------------------------------------------------------------------------

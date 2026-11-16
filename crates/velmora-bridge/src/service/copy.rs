@@ -7,6 +7,10 @@
 //!
 //! Served only when `SERVER_SIDE_COPY` is on (see `BridgeConfig`).
 //!
+//! `If-None-Match: *` and `If-Match` are conditions on the destination
+//! key, as for a PutObject, and judged by the same batch. The
+//! `x-amz-copy-source-if-*` headers are conditions on the source.
+//!
 //! Not served, each `501 NotImplemented`:
 //! - a source in another bucket. Its file keys are wrapped under that
 //!   bucket's data key, so the copy would need a second wrapped key per
@@ -21,15 +25,16 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    discard_refused, internal, metadata_json, restore_gate, s3_error, stored_checksum,
-    stored_headers, unavailable, Authed,
+    discard_refused, hold_precondition, internal, metadata_json, restore_gate, s3_error,
+    stored_checksum, stored_headers, unavailable, Authed,
 };
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
-    Body, Bucket, CopyGeneration, ExtentRow, GenerationRow, GenerationState, S3Response,
+    Body, Bucket, CopyGeneration, ExtentRow, GenerationRow, GenerationState, Precondition,
+    S3Response,
 };
 
 /// Times the copy is re-planned when the source changes under it.
@@ -123,6 +128,7 @@ pub(super) async fn copy_object<C, B, N, J, K, T>(
     authed: &Authed,
     declared: Option<u64>,
     body: Body,
+    condition: Option<Precondition>,
 ) -> Result<S3Response, S3Response>
 where
     C: Catalog,
@@ -233,6 +239,9 @@ where
             checksum: stored_checksum(&generation),
             modified_ms: now.0,
         };
+        // A condition on the destination that does not hold ends the
+        // copy here, before a record exists under this id.
+        hold_precondition(bridge, &bucket.id, key, &generation.id, condition.as_ref()).await?;
         // The recovery record is durable before the catalogue batch, as
         // for a PUT. It describes every extent in full, so a replay can
         // rebuild the copy when the source it shares them with is gone.
@@ -256,7 +265,7 @@ where
         };
         let refused = match bridge
             .catalog
-            .copy_generation(&copy, record)
+            .copy_generation(&copy, condition.as_ref(), record)
             .await
             .map_err(|_| internal())?
         {
@@ -268,8 +277,9 @@ where
             }
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
-        // The source was overwritten or deleted since it was read, or
-        // the destination got a generation this id does not sort after.
+        // The source was overwritten or deleted since it was read, the
+        // destination got a generation this id does not sort after, or
+        // the condition on the destination no longer holds.
         // Nothing was published under this id, so its record must not
         // publish it in a replay either. A record that cannot be removed
         // ends the request: no copy was made, and the caller is told so.

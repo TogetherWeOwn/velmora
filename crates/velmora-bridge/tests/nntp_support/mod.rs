@@ -943,13 +943,19 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         unused()
     }
-    async fn commit_generation(&self, _: &CommitGeneration, _: Recorded) -> Result<PublishOutcome> {
+    async fn commit_generation(
+        &self,
+        _: &CommitGeneration,
+        _: Option<&velmora_bridge::Precondition>,
+        _: Recorded,
+    ) -> Result<PublishOutcome> {
         unused()
     }
     async fn commit_sliced(
         &self,
         _: &CommitGeneration,
         _: &WriteId,
+        _: Option<&velmora_bridge::Precondition>,
         _: Recorded,
     ) -> Result<PublishOutcome> {
         unused()
@@ -1001,6 +1007,7 @@ impl Catalog for MemCatalog {
     async fn copy_generation(
         &self,
         _: &velmora_bridge::CopyGeneration,
+        _: Option<&velmora_bridge::Precondition>,
         _: Recorded,
     ) -> Result<PublishOutcome> {
         unused()
@@ -1010,6 +1017,16 @@ impl Catalog for MemCatalog {
         _: &BucketId,
         _: &str,
         _: &GenerationId,
+        _: UnixMs,
+    ) -> Result<bool> {
+        unused()
+    }
+    async fn delete_object_if(
+        &self,
+        _: &BucketId,
+        _: &str,
+        _: &GenerationId,
+        _: &velmora_bridge::Precondition,
         _: UnixMs,
     ) -> Result<bool> {
         unused()
@@ -1138,6 +1155,7 @@ impl Catalog for MemCatalog {
         _: u64,
         _: &[u8; 32],
         _: &CompleteUpload,
+        _: Option<&velmora_bridge::Precondition>,
         _: Recorded,
     ) -> Result<PublishOutcome> {
         unused()

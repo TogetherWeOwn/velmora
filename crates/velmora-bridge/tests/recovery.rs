@@ -457,7 +457,10 @@ async fn only_a_refused_publication_gives_its_record_up() {
     }
     let proof = write().await.unwrap();
     assert!(matches!(
-        rig.bridge.catalog.commit_generation(&other, proof).await,
+        rig.bridge
+            .catalog
+            .commit_generation(&other, None, proof)
+            .await,
         Err(BridgeError::Invalid(_))
     ));
     assert_eq!(rig.count("generations"), 1);
@@ -468,7 +471,7 @@ async fn only_a_refused_publication_gives_its_record_up() {
     let PublishOutcome::Refused(refused) = rig
         .bridge
         .catalog
-        .commit_generation(&commit, proof)
+        .commit_generation(&commit, None, proof)
         .await
         .unwrap()
     else {

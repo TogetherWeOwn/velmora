@@ -116,6 +116,8 @@ struct TripState {
     armed: Cell<Option<(u64, Trip)>>,
     held: Cell<bool>,
     calls: Cell<u64>,
+    /// State of the generator behind [`Tripwire::jitter`].
+    jitter: Cell<Option<u64>>,
 }
 
 impl Tripwire {
@@ -139,6 +141,17 @@ impl Tripwire {
         self.0.held.set(false);
     }
 
+    /// From now on every call first lets the other requests of the test
+    /// run, zero to three times, as `seed` decides: requests that are
+    /// polled together then take their store and database calls in an
+    /// order that differs from seed to seed and repeats for one seed.
+    pub fn jitter(&self, seed: u64) {
+        // Never zero: the generator would stay there.
+        self.0
+            .jitter
+            .set(Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1));
+    }
+
     /// Calls seen so far.
     pub fn calls(&self) -> u64 {
         self.0.calls.get()
@@ -148,6 +161,16 @@ impl Tripwire {
     /// doing its work.
     async fn cross(&self) -> Option<Trip> {
         self.0.calls.set(self.0.calls.get() + 1);
+        if let Some(mut x) = self.0.jitter.get() {
+            // xorshift64
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0.jitter.set(Some(x));
+            for _ in 0..(x >> 32) % 4 {
+                tokio::task::yield_now().await;
+            }
+        }
         match self.0.armed.get() {
             None => None,
             Some((0, trip)) => {

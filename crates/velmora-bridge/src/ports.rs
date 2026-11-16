@@ -18,7 +18,7 @@ use crate::types::{
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
     FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats, Job,
     JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OpenUpload, OutboxStage, OutboxStats,
-    Perm, ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId,
+    Perm, Precondition, ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId,
     UploadListQuery, UploadPartRow, UploadRow, VerificationRow, WriteId,
 };
 
@@ -407,9 +407,17 @@ pub trait Catalog {
     /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
     /// live generation carries a newer id or its floor a higher one; nothing
     /// was written. The caller takes a newer id and tries again.
+    ///
+    /// `condition`, here and on the other publications: the batch also
+    /// publishes only while the live object of the key meets it. It is a
+    /// guard statement of the batch, judged against the very object the
+    /// batch retires. A batch refused for it wrote nothing and is
+    /// `Refused` like one refused for its id; the caller tells the two
+    /// apart by looking at the key again.
     async fn commit_generation(
         &self,
         c: &CommitGeneration,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome>;
     /// [`Self::commit_generation`] for a body stored as the slices of
@@ -420,6 +428,7 @@ pub trait Catalog {
         &self,
         c: &CommitGeneration,
         write: &WriteId,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome>;
 
@@ -512,8 +521,12 @@ pub trait Catalog {
     /// longer the live object of its key, or the destination key's live
     /// generation carries a newer id or its floor a higher one; nothing was
     /// published.
-    async fn copy_generation(&self, c: &CopyGeneration, record: Recorded)
-        -> Result<PublishOutcome>;
+    async fn copy_generation(
+        &self,
+        c: &CopyGeneration,
+        condition: Option<&Precondition>,
+        record: Recorded,
+    ) -> Result<PublishOutcome>;
     /// DeleteObject as the service runs it: retires the live generation
     /// of the key only if its id sorts before `before`, the id of the
     /// tombstone written for this delete. `false` = nothing was changed:
@@ -525,6 +538,17 @@ pub trait Catalog {
         bucket: &BucketId,
         key: &str,
         before: &GenerationId,
+        now: UnixMs,
+    ) -> Result<bool>;
+    /// [`Self::delete_object_before`] for a conditional DeleteObject:
+    /// the batch also retires the live generation only while it meets
+    /// `condition`.
+    async fn delete_object_if(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        before: &GenerationId,
+        condition: &Precondition,
         now: UnixMs,
     ) -> Result<bool>;
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage>;
@@ -561,6 +585,7 @@ pub trait Catalog {
         revision: u64,
         digest: &[u8; 32],
         c: &CompleteUpload,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome>;
     /// The extent rows of the upload's current parts, in no order.

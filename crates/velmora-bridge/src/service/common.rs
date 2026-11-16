@@ -17,7 +17,10 @@ use crate::ingress::IngressError;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{discard_generation, Unpublished};
 use crate::replay::ReplayProbe;
-use crate::types::{Bucket, GenerationRow, KeyStatus, Perm, RespBody, S3Request, S3Response};
+use crate::types::{
+    Bucket, BucketId, GenerationId, GenerationRow, KeyStatus, Perm, Precondition,
+    PreconditionError, RespBody, S3Request, S3Response,
+};
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
 /// percent-encoded, plus bucket and query.
@@ -29,8 +32,9 @@ const CONTROL_XML_BYTES: usize = 1024 * 1024;
 const CLOCK_SKEW_SECS: u32 = 900;
 const PRESIGN_SECS: u32 = 604_800;
 
-/// Headers that make a mutation conditional. The slice cannot evaluate
-/// them atomically with the commit, so it refuses them outright.
+/// Headers that make a mutation conditional. A request that carries one
+/// is either held to it by the batch that commits ([`conditional_gate`])
+/// or refused ([`mutation_gate`]): none is ever ignored.
 const CONDITIONAL_HEADERS: [&str; 4] = [
     "if-match",
     "if-none-match",
@@ -320,9 +324,136 @@ where
     })
 }
 
+/// The condition a write request names, if any. Understood are
+/// `If-None-Match: *` and `If-Match` with `*` or one strong ETag, quoted
+/// or bare. Everything else is `501 NotImplemented`: a date condition,
+/// both headers at once, `If-None-Match` with an ETag, a list of ETags, a
+/// weak one. A header that is not understood is refused, never ignored.
+pub(super) fn precondition(headers: &Headers) -> Result<Option<Precondition>, S3Response> {
+    let refused = || S3Response::not_implemented();
+    if headers.get("if-modified-since").is_some() || headers.get("if-unmodified-since").is_some() {
+        return Err(refused());
+    }
+    match (headers.get("if-none-match"), headers.get("if-match")) {
+        (None, None) => Ok(None),
+        (Some(none), None) if none.trim() == "*" => Ok(Some(Precondition::Absent)),
+        (None, Some(tag)) => {
+            let tag = tag.trim();
+            if tag == "*" {
+                return Ok(Some(Precondition::Exists));
+            }
+            let bare = tag
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(tag);
+            // What is left is one opaque tag: no quote (an unbalanced
+            // one, or the `W/"…"` of a weak tag), no list.
+            let opaque = !bare.is_empty()
+                && bare
+                    .bytes()
+                    .all(|b| b.is_ascii_graphic() && b != b'"' && b != b',');
+            if !opaque {
+                return Err(refused());
+            }
+            Ok(Some(Precondition::Etag(format!("\"{bare}\""))))
+        }
+        _ => Err(refused()),
+    }
+}
+
+/// The answer to a write whose condition does not hold.
+pub(super) fn precondition_error(e: PreconditionError) -> S3Response {
+    s3_error(match e {
+        PreconditionError::Failed => ErrorCode::PreconditionFailed,
+        PreconditionError::NoSuchKey => ErrorCode::NoSuchKey,
+    })
+}
+
+/// Judges `condition` against the live object of the key as the
+/// catalogue has it now. A write is refused on this answer; it is never
+/// accepted on it, only by the guard of its batch.
+pub(super) async fn check_precondition<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &BucketId,
+    key: &str,
+    condition: &Precondition,
+) -> Result<(), S3Response> {
+    let live = bridge
+        .catalog
+        .live_object(bucket, key)
+        .await
+        .map_err(|_| internal())?;
+    condition
+        .check(live.as_ref().map(|(g, _)| g.etag.as_str()))
+        .map_err(precondition_error)
+}
+
+/// The step of a conditional write between choosing the id `id` and
+/// storing the recovery record under it: raises the floor of the key to
+/// `id`, then judges the condition. Nothing for an unconditional write.
+///
+/// From the raise on, whatever is published or deleted on the key takes
+/// an id above `id`. So:
+/// - a condition that fails here is answered before any record exists:
+///   a refused conditional write leaves nothing for a replay to publish;
+/// - a record is stored only for a condition that held at this point. If
+///   its batch is refused all the same, the key changed after the raise:
+///   the record of that change sorts above this one, and a replay puts it
+///   on top, should this record outlive its removal.
+///
+/// The batch judges the condition again, in its own guard
+/// (`Catalog::commit_generation`): that one decides what is published.
+pub(super) async fn hold_precondition<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &BucketId,
+    key: &str,
+    id: &GenerationId,
+    condition: Option<&Precondition>,
+) -> Result<(), S3Response> {
+    let Some(condition) = condition else {
+        return Ok(());
+    };
+    // Not marked as a generation record: none is stored yet, and
+    // `write_generation` raises the floor again when one is.
+    bridge
+        .catalog
+        .raise_floor(bucket, key, id, false)
+        .await
+        .map_err(|_| internal())?;
+    check_precondition(bridge, bucket, key, condition).await
+}
+
+/// [`mutation_gate`] for the requests that can be conditional
+/// (PutObject, CopyObject, DeleteObject): the same gates, and the
+/// condition the request names instead of a refusal of it.
+pub(super) fn conditional_gate(
+    cfg: &BridgeConfig,
+    headers: &Headers,
+    bucket: &Bucket,
+) -> Result<Option<Precondition>, S3Response> {
+    let condition = precondition(headers)?;
+    open_gate(cfg, bucket)?;
+    Ok(condition)
+}
+
 /// The gates every mutation passes after authentication and before its
 /// body is read or anything is stored:
-/// - a conditional header is `501 NotImplemented`, never ignored;
+/// - a conditional header is `501 NotImplemented`, never ignored (the
+///   requests that honour one pass [`conditional_gate`] instead);
 /// - a catalogue restore in progress is `503`;
 /// - PutObject, CopyObject (the same request shape) and DeleteObject on a
 ///   non-disposable bucket are refused while `REAL_DATA_READY` is false
@@ -337,6 +468,10 @@ pub(super) fn mutation_gate(
     if CONDITIONAL_HEADERS.iter().any(|h| headers.get(h).is_some()) {
         return Err(S3Response::not_implemented());
     }
+    open_gate(cfg, bucket)
+}
+
+fn open_gate(cfg: &BridgeConfig, bucket: &Bucket) -> Result<(), S3Response> {
     if cfg.maintenance == Maintenance::Restore {
         return Err(writes_refused());
     }

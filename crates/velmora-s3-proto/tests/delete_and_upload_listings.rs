@@ -130,6 +130,26 @@ fn a_delete_document_that_is_not_one_is_refused() {
         malformed("<Delete><Quiet>maybe</Quiet><Object><Key>k</Key></Object></Delete>"),
         ErrorCode::InvalidArgument
     );
+    // A condition on one of the keys (delete it only if it is this
+    // object) is not evaluated, and says so.
+    for condition in [
+        "<ETag>&quot;0123456789abcdef0123456789abcdef&quot;</ETag>",
+        "<LastModifiedTime>Fri, 15 Jan 2027 08:00:00 GMT</LastModifiedTime>",
+        "<Size>7</Size>",
+    ] {
+        for object in [
+            format!("<Key>k</Key>{condition}"),
+            format!("{condition}<Key>k</Key>"),
+        ] {
+            assert_eq!(
+                malformed(&format!(
+                    "<Delete><Object><Key>a</Key></Object><Object>{object}</Object></Delete>"
+                )),
+                ErrorCode::NotImplemented,
+                "{object}"
+            );
+        }
+    }
     // A document over the size limit of the policy.
     assert!(parse_delete(delete_xml(10).as_bytes(), &policy_with(64), 1000).is_err());
 }

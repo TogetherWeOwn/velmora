@@ -54,7 +54,9 @@ use crate::ports::{
     PublishOutcome, UploadTarget,
 };
 use crate::recovery::{id_after, write_generation};
-use crate::service::common::discard_refused;
+use crate::service::common::{
+    check_precondition, discard_refused, hold_precondition, precondition,
+};
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
     GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
@@ -170,6 +172,10 @@ fn message(code: ErrorCode) -> &'static str {
         }
         ErrorCode::SlowDown => "Please reduce your request rate.",
         ErrorCode::InternalError => "We encountered an internal error. Please try again.",
+        ErrorCode::PreconditionFailed => {
+            "At least one of the pre-conditions you specified did not hold."
+        }
+        ErrorCode::NoSuchKey => "The specified key does not exist.",
         _ => "The request is not valid.",
     }
 }
@@ -915,8 +921,10 @@ where
     T: Clock,
 {
     let a = authenticate(bridge, &req).await?;
-    // Before the body is read or anything is published.
-    refuse_conditional(&a.headers)?;
+    // Before the body is read or anything is published: `If-None-Match:
+    // *` or `If-Match` is a condition on the key, held to by the batch
+    // that publishes. Any other conditional header is refused.
+    let condition = precondition(&a.headers)?;
     // A whole-object checksum cannot be checked: none is computed.
     if ChecksumAlgorithm::ALL
         .iter()
@@ -1025,6 +1033,18 @@ where
             lost_at = Some(upload.revision);
             continue;
         }
+        // A condition that does not hold ends the request with `412`
+        // or `404`, before a record exists under this id. The upload is
+        // not touched: it stays open with its parts, to be completed
+        // again or aborted.
+        hold_precondition(
+            bridge,
+            &a.bucket.id,
+            &a.key,
+            &commit.generation.id,
+            condition.as_ref(),
+        )
+        .await?;
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
@@ -1037,7 +1057,14 @@ where
         drop(extents);
         match bridge
             .catalog
-            .complete_upload(&target, upload.revision, &digest, &commit, record)
+            .complete_upload(
+                &target,
+                upload.revision,
+                &digest,
+                &commit,
+                condition.as_ref(),
+                record,
+            )
             .await?
         {
             PublishOutcome::Applied => {
@@ -1060,11 +1087,23 @@ where
                 // record left behind replays as a PUT that failed, and
                 // under everything that follows it on the key, which
                 // the floor raised for it holds to a later id.
-                let _ = discard_refused(bridge, &commit.generation, record).await;
+                let discarded = discard_refused(bridge, &commit.generation, record).await;
                 // Refused as well when a replay started after this
                 // request passed the gate.
                 if bridge.catalog.restore_pending().await? {
                     return Err(ErrorCode::SlowDown.into());
+                }
+                if let Some(condition) = &condition {
+                    // A conditional Complete says `412` or `404` only
+                    // when no record of it is left: with one, a replay
+                    // could publish what the answer says was refused.
+                    discarded?;
+                    // The batch does not say which guard refused it. If
+                    // the condition fails now, that is the answer. The
+                    // key can change without a newer id on it (a delete
+                    // whose tombstone was chosen before this id), so the
+                    // upload is not blamed below for what the key did.
+                    check_precondition(bridge, &a.bucket.id, &a.key, condition).await?;
                 }
                 // Otherwise refused for the id (the key took a newer one
                 // since it was read) or for the upload. Only the second

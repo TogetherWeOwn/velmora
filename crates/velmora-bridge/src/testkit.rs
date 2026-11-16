@@ -25,7 +25,7 @@ use crate::ports::{
 use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
     BridgeError, BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, ExtentId,
-    Job, KekBytes, Result, UnixMs,
+    Job, KekBytes, Precondition, Result, UnixMs,
 };
 
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
@@ -530,16 +530,33 @@ impl Kek for TestKek {
 #[allow(async_fn_in_trait)]
 pub trait PublishUnrecorded: Catalog {
     async fn publish(&self, c: &CommitGeneration) -> Result<Guard<()>> {
+        self.publish_if(c, None).await
+    }
+
+    /// [`Self::publish`] under the condition of a conditional write.
+    async fn publish_if(
+        &self,
+        c: &CommitGeneration,
+        condition: Option<&Precondition>,
+    ) -> Result<Guard<()>> {
         let record = Recorded::for_test(&c.generation.id);
-        Ok(match self.commit_generation(c, record).await? {
+        Ok(match self.commit_generation(c, condition, record).await? {
             PublishOutcome::Applied => Guard::Applied(()),
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
         })
     }
 
     async fn publish_copy(&self, c: &CopyGeneration) -> Result<Guard<()>> {
+        self.publish_copy_if(c, None).await
+    }
+
+    async fn publish_copy_if(
+        &self,
+        c: &CopyGeneration,
+        condition: Option<&Precondition>,
+    ) -> Result<Guard<()>> {
         let record = Recorded::for_test(&c.generation.id);
-        Ok(match self.copy_generation(c, record).await? {
+        Ok(match self.copy_generation(c, condition, record).await? {
             PublishOutcome::Applied => Guard::Applied(()),
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
         })
@@ -552,9 +569,23 @@ pub trait PublishUnrecorded: Catalog {
         digest: &[u8; 32],
         c: &CompleteUpload,
     ) -> Result<Guard<()>> {
+        self.publish_upload_if(t, revision, digest, c, None).await
+    }
+
+    async fn publish_upload_if(
+        &self,
+        t: &UploadTarget<'_>,
+        revision: u64,
+        digest: &[u8; 32],
+        c: &CompleteUpload,
+        condition: Option<&Precondition>,
+    ) -> Result<Guard<()>> {
         let record = Recorded::for_test(&c.generation.id);
         Ok(
-            match self.complete_upload(t, revision, digest, c, record).await? {
+            match self
+                .complete_upload(t, revision, digest, c, condition, record)
+                .await?
+            {
                 PublishOutcome::Applied => Guard::Applied(()),
                 PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
             },
