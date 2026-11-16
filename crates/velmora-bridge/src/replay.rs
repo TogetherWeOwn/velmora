@@ -249,8 +249,9 @@ pub struct ReplayReport {
     /// Records that did not open or parse (blob keys). Also the name
     /// of the plan record of an extent whose packed plan in the
     /// catalogue cannot be read and stays so, because the record has no
-    /// plan to put in its place (whether or not the record exists):
-    /// the only report of such an extent.
+    /// plan to put in its place (whether or not the record exists).
+    /// Such an extent is not counted in `damaged`; a generation it
+    /// keeps from its key is listed in `damaged_unpublished`.
     pub unreadable: Vec<String>,
     /// `None` = the replay is complete.
     pub next: Option<ReplayCursor>,

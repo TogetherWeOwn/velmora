@@ -1341,6 +1341,93 @@ async fn an_unreadable_packed_plan_does_not_replace_a_good_object() {
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, b"good");
 }
 
+/// An unreadable packed plan keeps a generation from its key only when
+/// the extent has no pinned copy and the key has an older generation.
+/// With the pinned copy the object reads, so it takes its key; with no
+/// older generation there is nothing to keep in its place.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreadable_packed_plan_alone_keeps_no_object_from_its_key() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    // "big": a good object, then a Complete that is refused and leaves
+    // its record. The pinned copies of its parts stay.
+    rig.put(&signer, BUCKET, "big", b"good").await.expect(200);
+    let (good, _) = rig.live(&bucket, "big").await.unwrap();
+    tick(&rig);
+    let (id, etags, body) = two_parts(&rig, &signer, "big").await;
+    tick(&rig);
+    rig.bridge.safety.fail_record_deletes.set(3);
+    rig.bridge
+        .catalog
+        .sql
+        .fail_publish
+        .set(Some(PublishFault::NotApplied));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    let lingering = records(&rig).into_iter().max().unwrap()["m/".len()..].to_owned();
+    assert!(lingering.as_str() > good.id.as_str());
+    let mut damaged: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT id FROM extents WHERE generation_id IS NULL ORDER BY id")
+            .unwrap();
+        let ids = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        ids.map(|id| id.unwrap()).collect()
+    });
+    assert_eq!(damaged.len(), 2);
+    // "solo": written once, and its pinned copy is lost.
+    tick(&rig);
+    rig.put(&signer, BUCKET, "solo", b"solo").await.expect(200);
+    let (solo, lost) = rig.live(&bucket, "solo").await.unwrap();
+    assert!(rig.bridge.safety.lose(&lost[0].id.safety_key()));
+    let lost = lost[0].id.as_str().to_owned();
+    damaged.push(lost.clone());
+
+    // Each of the three extents comes back holding a value that is not
+    // a plan, before its generation is published.
+    wipe(&rig);
+    let ids = damaged
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql(
+        &rig,
+        &format!(
+            "CREATE TRIGGER damage AFTER INSERT ON extents WHEN NEW.id IN ({ids}) BEGIN \
+               UPDATE extents SET plan = x'ff', article_count = 1 WHERE id = NEW.id; \
+             END;"
+        ),
+    );
+    let mut names: Vec<String> = damaged.iter().map(|id| format!("m/art/{id}")).collect();
+    names.sort();
+
+    for pass in 0..2 {
+        let (mut report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(report.damaged_unpublished.is_empty(), "{report:?}");
+        // The first pass wrote the rows, and the values went in behind
+        // its back; the second one finds them.
+        if pass == 1 {
+            report.unreadable.sort();
+            assert_eq!(report.unreadable, names, "{report:?}");
+        }
+        assert_eq!(live_ids(&rig), [lingering.as_str(), solo.id.as_str()]);
+        assert_eq!(rig.count("extents WHERE hex(plan) = 'FF'"), 3);
+        assert_eq!(
+            rig.count("extents WHERE hex(plan) = 'FF' AND safety_state = 'deleted'"),
+            1
+        );
+        assert_eq!(
+            rig.count(&format!(
+                "extents WHERE id = '{lost}' AND safety_state = 'deleted'"
+            )),
+            1
+        );
+    }
+    let signer = reissue_key(&rig).await;
+    assert!(get(&rig, &signer, "big").await.expect(200).body == body);
+}
+
 /// An article plan record that does not open is reported and does not
 /// stop the replay: the extent comes back without a plan, from its
 /// pinned copy.

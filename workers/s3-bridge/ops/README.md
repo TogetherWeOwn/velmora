@@ -103,8 +103,10 @@ Limits to know:
     (the client's log, the application that owns the key).
     - Not acknowledged (a failed upload): nothing. The key holds what it
       should.
-    - Acknowledged: the object is lost. Put it again from its source,
-      or tell its owner.
+    - Acknowledged: the object cannot be read. Put it again from its
+      source, or tell its owner. (When the cause is a packed plan that
+      cannot be read, listed under `unreadable`, the articles may still
+      be on Usenet; without a plan nothing finds them.)
   - The record stays in `SAFETY` either way, and no command removes it.
     A replay leaves it out only while the key has a live object that
     is newer than the record, so a PutObject on the key ends the report

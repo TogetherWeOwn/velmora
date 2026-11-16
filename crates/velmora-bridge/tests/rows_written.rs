@@ -259,6 +259,13 @@ fn a_failed_query_is_not_metered() {
     assert!(failed.is_err(), "the second row has the key of the first");
     assert_eq!(db.writes().billed(), 0, "nothing was written");
     block_on(db.exec("INSERT INTO meta(k, v) VALUES ('b', 1)", &[])).expect("exec");
+    assert_eq!(db.writes().billed(), 1, "one row");
+    // The same before a batch.
+    let failed = block_on(db.query(
+        "INSERT INTO meta(k, v) VALUES ('c', 1), ('c', 2) RETURNING k",
+        &[],
+    ));
+    assert!(failed.is_err());
     block_on(db.batch(vec![("INSERT INTO meta(k, v) VALUES ('c', 1)", vec![])])).expect("batch");
     let report = db.writes();
     assert_eq!(report.billed(), 2, "one row each");
