@@ -613,8 +613,9 @@ async fn a_chunk_whose_batch_is_refused_finishes_key_by_key() {
     assert!(live_keys(&rig).is_empty());
 }
 
-/// A step of a chunk that fails, fails for the keys that take it and for
-/// no other; nothing is deleted without its tombstone, and the request
+/// A step of a chunk that fails before the batch, fails for the keys
+/// that take it and for no other; a batch that fails leaves each key its
+/// own try; nothing is deleted without its tombstone, and the request
 /// can be sent again.
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_step_of_a_chunk_fails_its_keys_only() {
@@ -667,23 +668,26 @@ async fn a_failed_step_of_a_chunk_fails_its_keys_only() {
         0
     );
 
-    // The batch that deletes fails after every tombstone was stored:
-    // nothing is deleted, every live key fails.
-    let before = tombstones(&rig).await.len();
+    // The batch that deletes fails after every tombstone was stored, or
+    // is carried out and not answered: each key goes on alone under the
+    // tombstone it has, and is deleted. No second tombstone is stored.
     // Calls of a request of one chunk: the gate, the ids, the floors,
     // the tombstones, the marks, then the batch.
-    let chunk: Vec<String> = live.iter().take(10).cloned().collect();
     let signed_calls = {
         let (_, none) = counted(&rig, delete_objects(&rig, &signer, &["no/such".into()])).await;
         none.database - 2
     };
-    rig.trip().arm(signed_calls + 3 + 10 + 1, Trip::Fail);
-    let resp = delete_objects(&rig, &signer, &chunk).await;
-    assert!(rig.trip().tripped());
-    let by_key = answers(&resp, &chunk);
-    assert!(by_key.values().all(|c| *c == internal), "{by_key:?}");
-    assert_eq!(live_keys(&rig), live);
-    assert_eq!(tombstones(&rig).await.len(), before + 10);
+    for (trip, chunk) in [(Trip::Fail, &live[..5]), (Trip::Lost, &live[5..10])] {
+        let before = tombstones(&rig).await.len();
+        rig.trip().arm(signed_calls + 3 + 5 + 1, trip);
+        let resp = delete_objects(&rig, &signer, chunk).await;
+        assert!(rig.trip().tripped());
+        let by_key = answers(&resp, chunk);
+        assert!(by_key.values().all(Option::is_none), "{by_key:?}");
+        assert!(chunk.iter().all(|key| !live_keys(&rig).contains(key)));
+        assert_eq!(tombstones(&rig).await.len(), before + 5);
+    }
+    assert_eq!(live_keys(&rig).len(), live.len() - 10);
 
     // Sent again, everything goes.
     let got = codes(&delete_objects(&rig, &signer, &keys).await);
@@ -723,4 +727,130 @@ async fn a_replay_that_starts_under_a_chunk_refuses_its_keys() {
         "{by_key:?}"
     );
     assert_eq!(live_keys(&rig), keys);
+}
+
+/// Each key of a chunk is deleted under the clock reading of its own
+/// tombstone, however long the tombstones of the chunk took to store:
+/// the time the generation was retired at is the time on the record,
+/// and the floor the delete leaves is in the millisecond of the
+/// tombstone, as after a DeleteObject.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_of_a_chunk_is_retired_at_the_time_of_its_tombstone() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+    for key in &keys {
+        rig.put(&signer, BUCKET, key, key.as_bytes())
+            .await
+            .expect(200);
+    }
+    rig.bridge.clock.advance_ms(1000);
+    // Every tombstone takes 300 ms to store.
+    let bridge = Rc::clone(&rig.bridge);
+    *rig.bridge.safety.before_put.borrow_mut() =
+        Some(Box::new(move |_| bridge.clock.advance_ms(300)));
+    let resp = delete_objects(&rig, &signer, &keys).await;
+    *rig.bridge.safety.before_put.borrow_mut() = None;
+    assert!(answers(&resp, &keys).values().all(Option::is_none));
+
+    let records = tombstones(&rig).await;
+    assert_eq!(records.len(), keys.len());
+    for (key, deleted_at) in records {
+        let retired = number(
+            &rig,
+            &format!("SELECT retired_at FROM generations WHERE key = '{key}'"),
+        );
+        assert_eq!(retired, deleted_at, "{key}");
+        let floor = column(
+            &rig,
+            &format!("SELECT floor_id FROM key_floors WHERE key = '{key}'"),
+        );
+        let ms = GenerationId::mint(UnixMs(deleted_at), [0; 8]);
+        assert!(floor[0].starts_with(&ms.as_str()[..15]), "{key} {floor:?}");
+    }
+}
+
+/// A tombstone that was not stored leaves the mark of an unpublished
+/// write on its key: the next delete still has a record to cover.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tombstone_that_was_not_stored_leaves_the_mark_of_its_key() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    snapshot(&rig);
+    // A write that kept its record, on a key without an object and on
+    // one with; and a plain object.
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "bare", b"1")
+        .await
+        .expect_error(500, "InternalError");
+    rig.put(&signer, BUCKET, "over", b"1").await.expect(200);
+    rig.bridge.clock.advance_ms(7);
+    rig.bridge.catalog.sql.fail_batches.set(1);
+    rig.put(&signer, BUCKET, "over", b"2")
+        .await
+        .expect_error(500, "InternalError");
+    rig.put(&signer, BUCKET, "plain", b"1").await.expect(200);
+    rig.bridge.clock.advance_ms(1000);
+    let marks = || {
+        column(
+            &rig,
+            "SELECT key FROM key_floors WHERE unpublished <> 0 ORDER BY key",
+        )
+    };
+    assert_eq!(marks(), ["bare", "over"]);
+
+    let keys: Vec<String> = ["bare", "over", "plain"].map(String::from).to_vec();
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = Some("m/del/".into());
+    let resp = delete_objects(&rig, &signer, &keys).await;
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+    let internal = Some("InternalError".to_string());
+    assert!(answers(&resp, &keys).values().all(|c| *c == internal));
+    assert_eq!(marks(), ["bare", "over"]);
+    assert_eq!(live_keys(&rig), ["over", "plain"]);
+
+    // Sent again, the keys go and stay gone in a replay.
+    let resp = delete_objects(&rig, &signer, &keys).await;
+    assert!(answers(&resp, &keys).values().all(Option::is_none));
+    assert!(marks().is_empty());
+    assert_eq!(tombstones(&rig).await.len(), 3);
+    let mut rig = rig;
+    rollback(&rig);
+    restore(&mut rig).await;
+    assert!(live_keys(&rig).is_empty());
+}
+
+/// The tombstone of a key sorts above its floor also when the floor is
+/// ahead of the clock (a write that began under a later clock reading).
+#[tokio::test(flavor = "current_thread")]
+async fn a_tombstone_of_a_chunk_sorts_above_a_floor_ahead_of_the_clock() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let keys: Vec<String> = ["a", "b"].map(String::from).to_vec();
+    for key in &keys {
+        rig.put(&signer, BUCKET, key, key.as_bytes())
+            .await
+            .expect(200);
+    }
+    let ahead = GenerationId::mint(UnixMs(rig.now().0 + 60_000), [9; 8]);
+    let script = format!(
+        "INSERT OR REPLACE INTO key_floors(bucket_id, key, floor_id) \
+         SELECT bucket_id, key, '{}' FROM objects WHERE key = 'a';",
+        ahead.as_str()
+    );
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.execute_batch(&script).unwrap());
+    rig.bridge.clock.advance_ms(1000);
+    let resp = delete_objects(&rig, &signer, &keys).await;
+    assert!(answers(&resp, &keys).values().all(Option::is_none));
+    assert!(live_keys(&rig).is_empty());
+    let above: Vec<String> = rig
+        .bridge
+        .safety
+        .keys()
+        .into_iter()
+        .filter(|name| name.starts_with("m/del/") && &name[6..] > ahead.as_str())
+        .collect();
+    assert_eq!(above.len(), 1, "{above:?}");
 }

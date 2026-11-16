@@ -294,10 +294,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn delete_objects_before(
         &self,
         bucket: &BucketId,
-        deletes: &[(&str, &GenerationId)],
-        now: UnixMs,
+        deletes: &[(&str, &GenerationId, UnixMs)],
     ) -> Result<bool> {
-        recovery::delete_objects_before(self, bucket, deletes, now).await
+        recovery::delete_objects_before(self, bucket, deletes).await
     }
     async fn replay_tombstone(
         &self,

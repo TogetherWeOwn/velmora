@@ -300,13 +300,13 @@ async fn commit_delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 ///
 /// Every key goes through the steps of [`delete_key_once`] in their
 /// order: the gate, its ids, its floor, its tombstone record, the mark
-/// on the floor, the batch. A step that is one call here fails for all
-/// keys that take it, as it fails for the key of a DeleteObject: they
-/// answer `InternalError` and nothing further is done for them. The
-/// batch deletes all keys that have a live object, or none. When it
-/// deletes none, one of them is held up (a newer id, another delete, a
-/// replay), and each key takes the rest of its attempt alone, under the
-/// tombstone it has.
+/// on the floor, the batch. A step before the batch that is one call
+/// here fails for all keys that take it, as it fails for the key of a
+/// DeleteObject: they answer `InternalError` and nothing further is done
+/// for them. The batch deletes all keys that have a live object, or
+/// none. When it deletes none (one of them is held up by a newer id,
+/// another delete or a replay) or fails, each key takes the rest of its
+/// attempt alone, under the tombstone it has.
 async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
@@ -388,23 +388,25 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         }
     }
     if !batch.is_empty() {
-        let deletes: Vec<(&str, &GenerationId)> =
-            batch.iter().map(|(_, t)| (t.key, &t.id)).collect();
-        // One clock reading for the batch, not older than any tombstone.
+        // Each key under the clock reading of its tombstone, as in
+        // `delete_key_once`: the floor the delete leaves stays in the
+        // millisecond of the tombstone.
+        let deletes: Vec<(&str, &GenerationId, UnixMs)> =
+            batch.iter().map(|(_, t)| (t.key, &t.id, t.now)).collect();
         match bridge
             .catalog
-            .delete_objects_before(&bucket.id, &deletes, bridge.clock.now())
+            .delete_objects_before(&bucket.id, &deletes)
             .await
         {
             Ok(true) => {}
             // Nothing was deleted: one key is held up (a newer id,
-            // another delete, a replay). Each on its own from here.
-            Ok(false) => alone.append(&mut batch),
-            Err(_) => {
-                for (place, _) in batch {
-                    done[place] = Err(DeleteError::Internal);
-                }
-            }
+            // another delete, a replay). Each on its own from here. The
+            // same when the call failed: the tombstones are on record,
+            // so each key still gets its own try at the delete they
+            // announce, and its own answer. Should the batch have been
+            // applied after all, the key finds nothing left below its
+            // tombstone.
+            Ok(false) | Err(_) => alone.append(&mut batch),
         }
     }
     let alone: Vec<(usize, Result<(), DeleteError>)> = stream::iter(alone)

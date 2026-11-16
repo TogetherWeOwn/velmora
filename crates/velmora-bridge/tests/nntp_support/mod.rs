@@ -1042,8 +1042,7 @@ impl Catalog for MemCatalog {
     async fn delete_objects_before(
         &self,
         _: &BucketId,
-        _: &[(&str, &GenerationId)],
-        _: UnixMs,
+        _: &[(&str, &GenerationId, UnixMs)],
     ) -> Result<bool> {
         unused()
     }

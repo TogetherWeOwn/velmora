@@ -585,16 +585,15 @@ pub trait Catalog {
     async fn raise_floors(&self, bucket: &BucketId, ids: &[(&str, &GenerationId)]) -> Result<()>;
     /// [`Self::settle_floor`] for every `(key, id)`, in one batch.
     async fn settle_floors(&self, bucket: &BucketId, ids: &[(&str, &GenerationId)]) -> Result<()>;
-    /// [`Self::delete_object_before`] for every `(key, id)` (each key
-    /// once), in one batch: every key is deleted as that call deletes
-    /// it, in the order given, or nothing is changed. `false` = nothing
-    /// was changed, because for at least one key that call would have
-    /// answered `false`; the caller then asks key by key.
+    /// [`Self::delete_object_before`] for every `(key, id, now)` (each
+    /// key once), in one batch: every key is deleted as that call
+    /// deletes it, in the order given, or nothing is changed. `false` =
+    /// nothing was changed, because for at least one key that call would
+    /// have answered `false`; the caller then asks key by key.
     async fn delete_objects_before(
         &self,
         bucket: &BucketId,
-        deletes: &[(&str, &GenerationId)],
-        now: UnixMs,
+        deletes: &[(&str, &GenerationId, UnixMs)],
     ) -> Result<bool>;
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage>;
     /// Admin view.

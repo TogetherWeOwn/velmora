@@ -36,22 +36,21 @@ pub(super) async fn delete_object_before<S: Sql>(
     }
 }
 
-/// [`delete_object_before`] of a client for every `(key, before)`, each
-/// key once, as one batch: the statements of that call for each key, in
-/// the order given, under one guard against a replay. A guard that
-/// fails for one key leaves every key as it was.
+/// [`delete_object_before`] of a client for every `(key, before, now)`,
+/// each key once, as one batch: the statements of that call for each
+/// key, in the order given, under one guard against a replay. A guard
+/// that fails for one key leaves every key as it was.
 pub(super) async fn delete_objects_before<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &BucketId,
-    deletes: &[(&str, &GenerationId)],
-    now: UnixMs,
+    deletes: &[(&str, &GenerationId, UnixMs)],
 ) -> Result<bool> {
     if deletes.is_empty() {
         return Ok(true);
     }
     let mut stmts = vec![guard_no_replay()];
-    for (key, before) in deletes {
-        delete_before(&mut stmts, bucket, key, before, None, now, true);
+    for (key, before, now) in deletes {
+        delete_before(&mut stmts, bucket, key, before, None, *now, true);
     }
     match c.sql.batch(stmts).await {
         Ok(_) => Ok(true),
