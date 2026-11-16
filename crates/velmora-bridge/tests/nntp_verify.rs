@@ -1221,18 +1221,38 @@ async fn verify_renews_again_when_the_last_renewal_is_old() {
 }
 
 impl Rig {
+    /// Runs the verify stage on a fresh claim and calls `then` once the
+    /// job has made `after` calls to the provider. A stage that ends
+    /// before that fails the test instead of leaving it waiting.
+    async fn verify_interrupted(
+        &self,
+        s: &Seeded,
+        after: usize,
+        then: impl FnOnce(),
+    ) -> JobOutcome {
+        let job = self.job(s).await;
+        let lease = self.claim(s, OutboxStage::Verify).await;
+        let done = std::cell::Cell::new(false);
+        let stage = async {
+            let outcome = self.bridge.verify_stage(&lease, &job).await;
+            done.set(true);
+            outcome
+        };
+        let interrupt = async {
+            while self.bridge.nntp.calls().len() < after {
+                assert!(!done.get(), "the stage ended before call {after}");
+                tokio::task::yield_now().await;
+            }
+            then();
+        };
+        tokio::join!(stage, interrupt).0
+    }
+
     /// Runs the verify stage and takes the row over once the job has
     /// made `after` calls to the provider.
     async fn verify_taken_over(&self, s: &Seeded, after: usize) -> JobOutcome {
-        let job = self.job(s).await;
-        let lease = self.claim(s, OutboxStage::Verify).await;
-        let take_over = async {
-            while self.bridge.nntp.calls().len() < after {
-                tokio::task::yield_now().await;
-            }
-            self.bridge.catalog.take_over(&s.extent);
-        };
-        tokio::join!(self.bridge.verify_stage(&lease, &job), take_over).0
+        self.verify_interrupted(s, after, || self.bridge.catalog.take_over(&s.extent))
+            .await
     }
 }
 
@@ -1293,16 +1313,9 @@ async fn verify_stops_at_the_renewal_that_finds_its_slot_gone() {
     assert_eq!(plan.len(), 3);
     let clock = rig.bridge.clock.clone();
     rig.bridge.nntp.slow(&clock, 8_000);
-    let job = rig.job(&s).await;
-    let lease = rig.claim(&s, OutboxStage::Verify).await;
-    let lose_slot = async {
-        while rig.bridge.nntp.calls().len() < 2 {
-            tokio::task::yield_now().await;
-        }
-        rig.bridge.catalog.drop_permits();
-    };
+    let lose_slot = || rig.bridge.catalog.drop_permits();
 
-    let (outcome, ()) = tokio::join!(rig.bridge.verify_stage(&lease, &job), lose_slot);
+    let outcome = rig.verify_interrupted(&s, 2, lose_slot).await;
 
     assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
     let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();

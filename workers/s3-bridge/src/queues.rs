@@ -220,6 +220,27 @@ fn check_delay(delay_secs: u32) -> Result<()> {
     Ok(())
 }
 
+/// The jobs of each lane that has any, in lane order.
+fn batches(jobs: &[Job], shards: Shards) -> Vec<(Lane, Vec<&Job>)> {
+    shards
+        .lanes()
+        .map(|target| {
+            let batch: Vec<&Job> = jobs.iter().filter(|j| lane(j, shards) == target).collect();
+            (target, batch)
+        })
+        .filter(|(_, batch)| !batch.is_empty())
+        .collect()
+}
+
+/// The outcome of sends that were all made: a queue that refused its
+/// batch did not keep the others from getting theirs.
+fn first_error<E>(sends: Vec<std::result::Result<(), E>>) -> Result<()> {
+    match sends.into_iter().find_map(|sent| sent.err()) {
+        Some(_) => Err(BridgeError::Queue("send failed".into())),
+        None => Ok(()),
+    }
+}
+
 fn send_err(_: worker::Error) -> BridgeError {
     BridgeError::Queue("send failed".into())
 }
@@ -249,17 +270,11 @@ impl JobSink for QueueSink {
             return Err(BridgeError::Queue(format!("batch above {MAX_BATCH} jobs")));
         }
         let shards = self.shards();
-        // A queue that refuses its batch does not keep the others from
-        // getting theirs.
-        let mut result = Ok(());
-        for target in shards.lanes() {
-            let batch: Vec<&Job> = jobs.iter().filter(|j| lane(j, shards) == target).collect();
-            if !batch.is_empty() {
-                let sent = self.queue(target).send_batch(batch).await;
-                result = result.and(sent.map_err(send_err));
-            }
+        let mut sends = Vec::new();
+        for (target, batch) in batches(jobs, shards) {
+            sends.push(self.queue(target).send_batch(batch).await);
         }
-        result
+        first_error(sends)
     }
 }
 
@@ -409,6 +424,46 @@ mod tests {
         );
         // Names above the most this build reads are not looked at.
         assert_eq!(with(&["POST_Q", "POST_Q10"]), Ok(1));
+    }
+
+    #[test]
+    fn a_batch_is_split_by_queue_and_no_job_is_left_out() {
+        let shards = Shards { post: 3, verify: 2 };
+        let mut jobs: Vec<Job> = (0..40u8)
+            .map(|n| Job::Extent {
+                v: JOB_VERSION,
+                extent: ExtentId::new(format!("e_{n}")),
+                generation: GenerationId::new("g_1"),
+                stage: if n % 2 == 0 {
+                    OutboxStage::Post
+                } else {
+                    OutboxStage::Verify
+                },
+            })
+            .collect();
+        jobs.push(Job::Gc { v: JOB_VERSION });
+        let split = batches(&jobs, shards);
+        assert_eq!(
+            split.iter().map(|(_, b)| b.len()).sum::<usize>(),
+            jobs.len()
+        );
+        for (target, batch) in &split {
+            assert!(!batch.is_empty());
+            assert!(batch.iter().all(|j| lane(j, shards) == *target));
+        }
+        let lanes: Vec<Lane> = split.iter().map(|(l, _)| *l).collect();
+        let mut sorted = lanes.clone();
+        sorted.dedup();
+        assert_eq!(lanes, sorted, "one batch per queue");
+        assert!(batches(&[], shards).is_empty());
+    }
+
+    #[test]
+    fn sends_report_the_first_failure_after_all_were_made() {
+        assert!(first_error::<&str>(vec![]).is_ok());
+        assert!(first_error::<&str>(vec![Ok(()), Ok(())]).is_ok());
+        let failed = first_error(vec![Ok(()), Err("second queue"), Ok(())]);
+        assert!(matches!(failed, Err(BridgeError::Queue(_))));
     }
 
     #[test]

@@ -392,7 +392,6 @@ impl MemCatalog {
         f(self.entries.borrow_mut().get_mut(extent).expect("extent"));
     }
 
-    /// Runs `f` on the entry only while the lease still holds.
     /// Every slot is taken away from its holder, as when it ran out and
     /// was given to another job.
     pub fn drop_permits(&self) {
@@ -408,6 +407,7 @@ impl MemCatalog {
         entries.get_mut(extent).expect("seeded").outbox.token += 1;
     }
 
+    /// Runs `f` on the entry only while the lease still holds.
     fn fenced<R>(&self, l: &Lease, f: impl FnOnce(&mut Entry) -> R) -> Option<R> {
         let mut entries = self.entries.borrow_mut();
         let e = entries.get_mut(&l.extent)?;
