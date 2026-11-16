@@ -2275,7 +2275,7 @@ fn wrangler_queues(env: &str) -> (Vec<(String, String)>, Vec<String>) {
 }
 
 /// Every queue the shipped configuration sends jobs to has exactly one
-/// consumer, and the bindings of a kind are numbered without a gap: an
+/// consumer (a queue that is only read is being emptied), and the bindings of a kind are numbered without a gap: an
 /// extent's jobs always go to the same queue, so a queue nobody reads
 /// would hold the same extents back for good.
 #[test]
@@ -2306,11 +2306,18 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
                 .count(),
             "{env}: a producer of another kind"
         );
+        // A consumer without a producer is a queue being emptied before
+        // it is taken away; a producer without a consumer is never right.
         let mut sent: Vec<&String> = producers.iter().map(|(_, queue)| queue).collect();
+        for queue in &sent {
+            let readers = consumers.iter().filter(|c| c == queue).count();
+            assert_eq!(readers, 1, "{env}: consumers of {queue}");
+        }
         let mut read: Vec<&String> = consumers.iter().collect();
-        sent.sort();
         read.sort();
-        assert_eq!(sent, read, "{env}: producers and consumers differ");
+        read.dedup();
+        assert_eq!(read.len(), consumers.len(), "{env}: a queue read twice");
+        sent.sort();
         sent.dedup();
         assert_eq!(sent.len(), producers.len(), "{env}: a queue bound twice");
     }

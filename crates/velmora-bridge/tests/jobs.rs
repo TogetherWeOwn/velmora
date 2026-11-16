@@ -920,16 +920,22 @@ async fn job_charges_against_the_job_limit() {
 
     // Other jobs hold all but 2 MiB of the request limit. Under that limit
     // this job would not fit; under the job limit it does.
+    // A request holds bytes as well, all through the job. A budget of its
+    // own, so that the peak is this phase's.
+    fx.bridge.budget = ByteBudget::new(BUDGET).with_job_capacity(BUDGET / 2 * 3);
     let others = fx.bridge.budget.try_charge_job(BUDGET - 2 * MIB).unwrap();
-    assert!(fx.bridge.budget.try_charge(4 * MIB).is_some());
+    let request = fx.bridge.budget.try_charge(4 * MIB).unwrap();
+    let held = others.bytes() + request.bytes();
+    assert_eq!(fx.bridge.budget.peak(), held);
+    assert!(held > BUDGET);
     fx.clock.advance_secs(delay_secs);
     assert_eq!(
         fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
         JobOutcome::Ack
     );
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
-    assert!(fx.bridge.budget.peak() > BUDGET);
-    assert_eq!(fx.bridge.budget.in_use(), others.bytes());
+    assert!(fx.bridge.budget.peak() > held);
+    assert_eq!(fx.bridge.budget.in_use(), held);
 }
 
 #[tokio::test]
