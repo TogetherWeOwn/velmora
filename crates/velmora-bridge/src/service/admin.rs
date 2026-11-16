@@ -2,13 +2,14 @@
 //!
 //! Every route checks the admin bearer token first, in constant time, so
 //! an unauthenticated caller learns nothing about which routes exist.
+//! Every answer, an error too, carries `cache-control: no-store`.
 //!
 //! | Route | Answer |
 //! |---|---|
 //! | `POST /_admin/buckets` `{name, disposable}` | `200` (a non-disposable bucket only with `"disposable": false`; `403` for one if `REAL_DATA_READY` is unset); `409` name taken |
 //! | `POST /_admin/keys` `{buckets, perm}` | `200` with the secret, once |
 //! | `GET /_admin/keys[?after=<id>]` | `200`: ids, status, created time and grants, never a secret; `next` while more follow |
-//! | `POST /_admin/keys/<access_key_id>/grants` `{bucket, perm}` | `200` `{access_key_id, bucket, perm}`, replacing an earlier grant on that bucket; `404` unknown key or bucket; `400` bad `perm` |
+//! | `POST /_admin/keys/<access_key_id>/grants` `{bucket, perm}` | `200` `{access_key_id, bucket, perm}`, widening (`ro` to `rw`) or repeating an earlier grant on that bucket; `409` `GrantNarrowingRefused` for `rw` to `ro`; `404` unknown key or bucket; `400` bad `perm` |
 //! | `DELETE /_admin/keys/<access_key_id>` | `204` revoked; `404` unknown (so a second call is `404`) |
 //! | `DELETE /_admin/keys/<access_key_id>/grants` | `405`: grants are not removed one by one |
 //! | `GET /_admin/objects/<bucket>/<key>` | `200` per-extent state |
@@ -38,11 +39,15 @@
 //! key and creates buckets grant that key on a new bucket. The write is
 //! one statement that stores the grant only while the key row and the
 //! bucket row both exist, so a revocation or a bucket deletion that
-//! commits around it never leaves an orphaned grant. Grants, like keys,
-//! are catalogue rows only, never recovery records: a catalogue restored
-//! from an export older than a grant does not have it (as it does not
-//! have a key minted after the export), and a replay does not bring it
-//! back.
+//! commits around it never leaves an orphaned grant. A grant is never
+//! narrowed (`rw` to `ro` answers `409`): the only reduction of a key's
+//! access is revocation, which has a recovery record and so survives a
+//! restore, where a narrowed grant would silently be wide again. Grants,
+//! like keys, are catalogue rows only, never recovery records: a
+//! catalogue restored from an export older than a grant does not have
+//! it (as it does not have a key minted after the export), a widening
+//! (`ro` to `rw`) made after the export is lost the same way, and a
+//! replay brings neither back.
 
 use std::rc::Rc;
 
@@ -59,7 +64,7 @@ use crate::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
 use crate::fetch::{read_articles, request_holder, ProviderSession};
 use crate::ingress::{self, check_admin_bearer, IngressError};
 use crate::ports::{
-    BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PermitClass,
+    BlobStore, Bridge, Catalog, Clock, GrantPut, Guard, JobSink, Kek, NntpConnector, PermitClass,
 };
 use crate::post::Stop;
 use crate::recovery::{
@@ -268,12 +273,22 @@ pub(super) async fn handle<
     req: S3Request,
     rest: &str,
 ) -> S3Response {
-    if let Err(e) = check_admin_bearer(&req, bridge.cfg.admin_token.expose()) {
-        return e.response();
+    let mut resp = match check_admin_bearer(&req, bridge.cfg.admin_token.expose()) {
+        Err(e) => e.response(),
+        Ok(_) => match route(bridge, req, rest).await {
+            Ok(r) | Err(r) => r,
+        },
+    };
+    // No admin answer, error or not, belongs in a cache.
+    if !resp
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+    {
+        resp.headers
+            .push(("cache-control".to_string(), "no-store".to_string()));
     }
-    match route(bridge, req, rest).await {
-        Ok(r) | Err(r) => r,
-    }
+    resp
 }
 
 async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
@@ -863,9 +878,18 @@ async fn put_grant<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Ke
         .await
         .or_internal()?
     {
-        Guard::Applied(()) => {}
+        GrantPut::Applied => {}
+        // A restore from an export older than the call would silently
+        // widen it again; revocation is the one reduction that survives.
+        GrantPut::Narrowing => {
+            return Err(fail(
+                409,
+                "GrantNarrowingRefused",
+                "A grant is never narrowed: revoke the key and mint a new one.",
+            ));
+        }
         // The key or the bucket is gone (or never was); say which.
-        Guard::Lost => {
+        GrantPut::Lost => {
             return Err(
                 if bridge.catalog.access_key_exists(akid).await.or_internal()? {
                     no_bucket()

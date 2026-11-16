@@ -77,7 +77,7 @@ mod uploads;
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
 use crate::ports::{
-    Catalog, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
+    Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
     UploadTarget,
 };
 use crate::recovery::Recorded;
@@ -129,7 +129,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         akid: &str,
         bucket: &BucketId,
         perm: Perm,
-    ) -> Result<Guard<()>> {
+    ) -> Result<GrantPut> {
         auth::put_grant_if_present(self, akid, bucket, perm).await
     }
     async fn bucket_in_use(&self, bucket: &BucketId) -> Result<bool> {

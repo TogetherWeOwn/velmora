@@ -192,7 +192,12 @@ curl -X POST -H @<0600 header file with the bearer> -H 'content-type: applicatio
 ```
 
 `200` with `{access_key_id, bucket, perm}`: the key now has `perm`
-(`rw` or `ro`) on the bucket; a second call replaces the permission. A
+(`rw` or `ro`) on the bucket. A second call may repeat the permission
+or widen it from `ro` to `rw`. It never narrows it: `rw` to `ro`
+answers `409 GrantNarrowingRefused` and changes nothing. The only way
+to reduce a key's access is to revoke it (and mint a new one), because
+a revocation has a record and survives a restore, where a narrowed grant
+would silently come back wide. A
 client that holds one key and creates buckets uses this to open each
 new bucket to its key. `404 NoSuchAccessKey` or `404 NoSuchBucket`: no
 such key (also a revoked one) or bucket; `400`: `perm` is not `rw` or
@@ -204,8 +209,9 @@ leaves it behind. Grants are not removed one by one (`DELETE` answers
 `405`); revoke the key instead.
 
 Grants, like keys, are catalogue rows only: a catalogue restored from an
-export older than a grant does not have it, and a replay does not bring
-it back. Grant the key again after such a restore.
+export older than a grant does not have it, a widening (`ro` to `rw`)
+made after the export is lost the same way, and a replay brings neither
+back. Grant the key again after such a restore.
 
 A remote run of `e2e/slice.sh` revokes the keys it made when it exits.
 

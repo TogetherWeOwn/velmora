@@ -3,7 +3,8 @@
 //! keys alone, never shows a secret, and outlives a catalogue restore.
 //!
 //! `POST /_admin/keys/<id>/grants`: grants a key on one more bucket, as
-//! an upsert, only while the key and the bucket both exist.
+//! an upsert that never narrows, only while the key and the bucket both
+//! exist.
 
 mod service_support;
 
@@ -541,7 +542,7 @@ async fn a_grant_opens_another_bucket_to_the_key() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_second_grant_replaces_the_first() {
+async fn a_second_grant_widens_the_first() {
     let rig = rig();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-second", true).await;
@@ -768,14 +769,26 @@ async fn a_guarded_grant_after_revocation_or_bucket_deletion_writes_nothing() {
             .put_grant_if_present(&key.akid, &second.id, Perm::Ro)
             .await
             .unwrap(),
-        Guard::Applied(())
+        GrantPut::Applied
     );
     assert_eq!(
         catalog
             .put_grant_if_present(&key.akid, &second.id, Perm::Rw)
             .await
             .unwrap(),
-        Guard::Applied(())
+        GrantPut::Applied
+    );
+    assert_eq!(
+        catalog.grant(&key.akid, &second.id).await.unwrap(),
+        Some(Perm::Rw)
+    );
+    // Never narrowed: rw stays rw, and the outcome says why.
+    assert_eq!(
+        catalog
+            .put_grant_if_present(&key.akid, &second.id, Perm::Ro)
+            .await
+            .unwrap(),
+        GrantPut::Narrowing
     );
     assert_eq!(
         catalog.grant(&key.akid, &second.id).await.unwrap(),
@@ -794,7 +807,7 @@ async fn a_guarded_grant_after_revocation_or_bucket_deletion_writes_nothing() {
             .put_grant_if_present(&key.akid, &second.id, Perm::Rw)
             .await
             .unwrap(),
-        Guard::Lost
+        GrantPut::Lost
     );
     assert_eq!(rig.count("grants"), 1);
     // Through the route: the bucket name is unknown now.
@@ -819,8 +832,89 @@ async fn a_guarded_grant_after_revocation_or_bucket_deletion_writes_nothing() {
             .put_grant_if_present(&key.akid, &bucket.id, Perm::Rw)
             .await
             .unwrap(),
-        Guard::Lost
+        GrantPut::Lost
     );
     assert_eq!(rig.count("grants"), 0);
     assert_eq!(rig.count("access_keys"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_grant_is_never_narrowed() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let key = mint(&rig, &[BUCKET], "rw").await;
+    // Repeating rw is fine.
+    let r = grant_req(&rig, &key.akid, json!({ "bucket": BUCKET, "perm": "rw" })).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    let r = grant_req(&rig, &key.akid, json!({ "bucket": BUCKET, "perm": "ro" })).await;
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_no_secret(&r, &[&key.secret]);
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["error"], "GrantNarrowingRefused");
+
+    // Nothing changed: the key still writes.
+    assert_eq!(rig.put(&key, BUCKET, "k", b"x").await.status, 200);
+    assert_eq!(
+        listed_grants(&rig, &key.akid).await.unwrap(),
+        json!([{ "bucket": BUCKET, "perm": "rw" }])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn no_grant_is_accepted_while_a_replay_is_unfinished() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    rig.bucket("bkt-second", true).await;
+    let key = mint(&rig, &[BUCKET], "rw").await;
+    rig.bridge.catalog.sql.with_conn(|c| {
+        c.execute(
+            "INSERT INTO restore_state (id, state, since_ms, started_at) \
+             VALUES (1, 'replaying', 0, 1)",
+            [],
+        )
+        .unwrap();
+    });
+    assert!(rig.bridge.catalog.restore_pending().await.unwrap());
+
+    let r = grant_req(
+        &rig,
+        &key.akid,
+        json!({ "bucket": "bkt-second", "perm": "rw" }),
+    )
+    .await;
+    assert_eq!(r.status, 503, "{}", r.text());
+    assert_eq!(rig.count("grants"), 1);
+    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 403);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_admin_answer_is_no_store() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let auth = format!("Bearer {TOKEN}");
+    for (method, target, auth) in [
+        (Method::Get, "/_admin/status", Some(auth.as_str())),
+        (Method::Get, "/_admin/nothing-here", Some(auth.as_str())),
+        (Method::Put, "/_admin/status", Some(auth.as_str())),
+        (Method::Get, "/_admin/status", None),
+        (Method::Get, "/_admin/status", Some("Bearer wrong")),
+    ] {
+        let r = rig
+            .send(admin_req(method.clone(), target, auth, None))
+            .await;
+        assert_eq!(
+            r.header("cache-control"),
+            Some("no-store"),
+            "{method:?} {target} {}",
+            r.status
+        );
+        let n = r
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+            .count();
+        assert_eq!(n, 1, "one cache-control header");
+    }
 }

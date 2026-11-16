@@ -942,7 +942,7 @@ impl Catalog for MemCatalog {
     async fn put_grant(&self, _: &str, _: &BucketId, _: Perm) -> Result<()> {
         unused()
     }
-    async fn put_grant_if_present(&self, _: &str, _: &BucketId, _: Perm) -> Result<Guard<()>> {
+    async fn put_grant_if_present(&self, _: &str, _: &BucketId, _: Perm) -> Result<GrantPut> {
         unused()
     }
     async fn bucket_by_name(&self, _: &str) -> Result<Option<Bucket>> {

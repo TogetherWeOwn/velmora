@@ -7,7 +7,7 @@ use super::objects::{ms, text, Cols};
 use super::replay::guard_no_replay;
 use super::uploads::guarded;
 use super::SqlCatalog;
-use crate::ports::{Guard, Row, Sql, SqlValue};
+use crate::ports::{GrantPut, Guard, Row, Sql, SqlValue};
 use crate::types::{
     AccessKeyRow, AccessKeySummary, BridgeError, Bucket, BucketId, KeyStatus, Perm, Result,
 };
@@ -86,30 +86,48 @@ pub(super) async fn put_grant<S: Sql>(
 }
 
 /// See [`crate::ports::Catalog::put_grant_if_present`]. One statement:
-/// the existence checks and the write commit together. The `WHERE` of
-/// the `SELECT` also keeps SQLite from reading `ON CONFLICT` as a join
-/// constraint.
+/// the existence checks, the no-narrowing check and the write commit
+/// together. The `WHERE` of the `SELECT` also keeps SQLite from reading
+/// `ON CONFLICT` as a join constraint. When the `WHERE` of `DO UPDATE`
+/// fails, SQLite (and D1) count no change.
+///
+/// After no change, the grant row tells the two cases apart: it exists
+/// only while the key and the bucket do (their deletes take it along),
+/// so a row there means the write was a narrowing.
 pub(super) async fn put_grant_if_present<S: Sql>(
     c: &SqlCatalog<S>,
     akid: &str,
     bucket: &BucketId,
     perm: Perm,
-) -> Result<Guard<()>> {
+) -> Result<GrantPut> {
     let changed = c
         .sql
         .exec(
             "INSERT INTO grants(access_key_id, bucket_id, perm) SELECT ?1, ?2, ?3 \
              WHERE EXISTS (SELECT 1 FROM access_keys WHERE access_key_id = ?1) \
                AND EXISTS (SELECT 1 FROM buckets WHERE id = ?2) \
-             ON CONFLICT(access_key_id, bucket_id) DO UPDATE SET perm = excluded.perm",
+             ON CONFLICT(access_key_id, bucket_id) DO UPDATE SET perm = excluded.perm \
+             WHERE excluded.perm = 'rw' OR grants.perm = excluded.perm",
             &[text(akid), text(bucket.as_str()), text(perm.as_str())],
         )
         .await?;
-    Ok(if changed == 1 {
-        Guard::Applied(())
-    } else {
-        Guard::Lost
-    })
+    if changed == 1 {
+        return Ok(GrantPut::Applied);
+    }
+    let rows = c
+        .sql
+        .query(
+            "SELECT EXISTS (SELECT 1 FROM grants WHERE access_key_id = ?1 AND bucket_id = ?2)",
+            &[text(akid), text(bucket.as_str())],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(0)]) => Ok(GrantPut::Lost),
+        Some([SqlValue::Int(_)]) => Ok(GrantPut::Narrowing),
+        _ => Err(BridgeError::Sql(
+            "put_grant_if_present: unexpected row".into(),
+        )),
+    }
 }
 
 pub(super) async fn bucket_by_name<S: Sql>(
