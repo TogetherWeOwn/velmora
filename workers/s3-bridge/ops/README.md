@@ -331,9 +331,9 @@ the code real data relies on. Never roll back past the floor:
 
 Above the floor a rollback is still not free:
 
-- A version from before `REAL_DATA_READY` was set refuses PutObject and
-  DeleteObject on a real bucket (403), while multipart uploads and
-  CopyObject still go through. Clients see failed writes until the
+- A version from before `REAL_DATA_READY` was set refuses PutObject,
+  CopyObject and DeleteObject on a real bucket (403), while multipart
+  uploads still go through. Clients see failed writes until the
   Worker is rolled forward again.
 - The rule of the restore section still holds: no rollback while
   `replay_unfinished` is `true`.
