@@ -741,6 +741,16 @@ impl fmt::Debug for AccessKeyRow {
     }
 }
 
+/// What the admin API lists of an access key: never its secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessKeySummary {
+    pub access_key_id: String,
+    pub status: KeyStatus,
+    pub created_at: UnixMs,
+    /// Bucket name and permission, by bucket name.
+    pub grants: Vec<(String, Perm)>,
+}
+
 /// `generations` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationRow {

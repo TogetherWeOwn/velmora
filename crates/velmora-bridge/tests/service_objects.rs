@@ -453,14 +453,26 @@ async fn denials_do_not_reveal_what_exists() {
         .key("AKIDUNGRANTED0000000", secret(), KeyStatus::Active)
         .await;
 
-    let mut denials = Vec::new();
+    // A key that is unknown or disabled is refused as S3 refuses an
+    // unknown key, whatever bucket it names; a usable key is refused the
+    // same way whether the bucket exists, is granted elsewhere or holds
+    // nothing for it. Neither answer tells what exists.
+    let mut by_key = Vec::new();
+    let mut by_grant = Vec::new();
     for (who, bucket) in [
         (&unknown, BUCKET),       // unknown key
+        (&unknown, "bkt-absent"), // unknown key, bucket does not exist
         (&disabled, "bkt-other"), // disabled key that holds a grant
         (&ungranted, BUCKET),     // valid key, no grant on this bucket
         (&signer, "bkt-other"),   // valid key, granted elsewhere only
         (&signer, "bkt-absent"),  // valid key, bucket does not exist
     ] {
+        let key_refused = who.akid == unknown.akid || who.akid == disabled.akid;
+        let (code, denials) = if key_refused {
+            ("InvalidAccessKeyId", &mut by_key)
+        } else {
+            ("AccessDenied", &mut by_grant)
+        };
         for method in [Method::Get, Method::Head, Method::Put, Method::Delete] {
             let head = method == Method::Head;
             let resp = rig
@@ -468,7 +480,7 @@ async fn denials_do_not_reveal_what_exists() {
                 .await;
             assert_eq!(resp.status, 403, "{} on {bucket}", who.akid);
             if !head {
-                assert_eq!(resp.code(), "AccessDenied");
+                assert_eq!(resp.code(), code);
                 denials.push(resp.body);
             }
         }
@@ -482,11 +494,13 @@ async fn denials_do_not_reveal_what_exists() {
                 b"",
             )
             .await;
-        list.expect_error(403, "AccessDenied");
+        list.expect_error(403, code);
         denials.push(list.body);
     }
-    denials.dedup();
-    assert_eq!(denials.len(), 1, "every denial has the same body");
+    for denials in [&mut by_key, &mut by_grant] {
+        denials.dedup();
+        assert_eq!(denials.len(), 1, "every denial of a kind has the same body");
+    }
     assert_eq!(rig.count("objects"), 1);
 }
 

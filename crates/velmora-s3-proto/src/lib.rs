@@ -35,6 +35,9 @@ pub type Result<T> = std::result::Result<T, ErrorCode>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorCode {
     AccessDenied,
+    /// The access key id names no usable key: unknown, disabled or
+    /// revoked. Says nothing of buckets or objects.
+    InvalidAccessKeyId,
     SignatureDoesNotMatch,
     RequestTimeTooSkewed,
     InvalidRequest,
@@ -63,7 +66,10 @@ pub enum ErrorCode {
 impl ErrorCode {
     pub fn status(self) -> u16 {
         match self {
-            Self::AccessDenied | Self::SignatureDoesNotMatch | Self::RequestTimeTooSkewed => 403,
+            Self::AccessDenied
+            | Self::InvalidAccessKeyId
+            | Self::SignatureDoesNotMatch
+            | Self::RequestTimeTooSkewed => 403,
             Self::PreconditionFailed => 412,
             Self::InvalidRange => 416,
             Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload => 404,

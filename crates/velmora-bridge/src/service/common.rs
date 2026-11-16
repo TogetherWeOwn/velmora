@@ -15,7 +15,7 @@ use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::unwrap_secret;
 use crate::ingress::IngressError;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
-use crate::recovery::{discard_generation, Unpublished};
+use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{Bucket, GenerationRow, KeyStatus, Perm, RespBody, S3Request, S3Response};
 
@@ -67,6 +67,9 @@ pub(super) fn s3_error(code: ErrorCode) -> S3Response {
         ErrorCode::NotImplemented => return S3Response::not_implemented(),
         ErrorCode::SlowDown => return IngressError::SlowDown.response(),
         ErrorCode::InternalError => "We encountered an internal error. Please try again.",
+        ErrorCode::InvalidAccessKeyId => {
+            "The AWS Access Key Id you provided does not exist in our records."
+        }
         _ => "The request is not valid.",
     };
     S3Response::error(code.status(), &format!("{code:?}"), message)
@@ -169,8 +172,9 @@ impl Authed {
 }
 
 /// The one credential this request names, with what it may do to the
-/// addressed bucket. An unknown or disabled key has no secret; a missing
-/// bucket or grant has no permission. Both end in `AccessDenied`.
+/// addressed bucket. An unknown, disabled or revoked key has no secret
+/// (`InvalidAccessKeyId`, whatever the bucket); a missing bucket or grant
+/// has no permission (`AccessDenied`).
 struct OneKey {
     akid: String,
     principal: String,
@@ -231,8 +235,9 @@ pub(super) fn edge_header(name: &str) -> bool {
 }
 
 /// Authenticates and authorizes from the request line and headers only.
-/// The body is never touched. A missing bucket, an unknown or disabled
-/// key and a missing grant are indistinguishable (`AccessDenied`).
+/// The body is never touched. A key with no usable row is
+/// `InvalidAccessKeyId` for every bucket; a missing bucket and a missing
+/// grant are indistinguishable (`AccessDenied`).
 pub(super) async fn authenticate<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
@@ -269,6 +274,20 @@ where
             .await
             .map_err(|_| internal())?
             .filter(|row| row.status == KeyStatus::Active);
+        // Under maintenance the catalogue may be a restored copy that
+        // still holds a key revoked after it was taken, until the first
+        // replay step deletes it; reads are served meanwhile. Its
+        // revocation record is the authority then (one head per request,
+        // in this mode only). Multipart refuses every request earlier.
+        let row = match row {
+            Some(row) if bridge.cfg.maintenance == Maintenance::Restore => {
+                let revoked = revocation_recorded(&bridge.safety, &row.access_key_id)
+                    .await
+                    .map_err(|_| internal())?;
+                (!revoked).then_some(row)
+            }
+            other => other,
+        };
         if let Some(row) = row {
             let secret = unwrap_secret(
                 &bridge.kek,
