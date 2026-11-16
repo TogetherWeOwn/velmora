@@ -253,7 +253,10 @@ async fn recovery_copy(
     // The reason is a class and a status at most. It is logged whether
     // the job is retried or not: past the retry window a job that did
     // nothing is acknowledged, and must not end without a line.
-    if let Some(why) = why {
+    // A hint that is held back while the store is down asked nothing,
+    // and comes again: no line for each of them.
+    let held = pass.0 == 0 && retry && counts.is_none();
+    if let Some(why) = why.filter(|_| !held) {
         console_error!(
             "recovery copy: pass={} retry={retry} stopped: {why:?}",
             pass.0

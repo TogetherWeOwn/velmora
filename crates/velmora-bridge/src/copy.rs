@@ -35,8 +35,10 @@
 //!   only a hint: one that is lost, or that finds the store down for
 //!   longer than [`HINT_RETRY_MS`], leaves the plan to the walk and
 //!   asks for it to come soon. While the store is known to be down
-//!   ([`DOWN_KEY`]) a hint asks nothing of it, so an outage over there
-//!   cannot keep the queue of the jobs busy.
+//!   ([`DOWN_KEY`]) a hint asks nothing of it: in an outage over there
+//!   the hints that are running when it starts each wait for their
+//!   tries once, and then once in [`HINT_PAUSE_MS`], so the queue they
+//!   share with other jobs is held for a small part of the time.
 //! - **A fresh generation record is sent after its article plans.** The
 //!   key of an article plan is random, so a new one cannot be found in
 //!   a listing without reading all of it. The sweep reads which extents
@@ -77,8 +79,11 @@
 //!   [`WALKED_KEY`] holds, the walk starts [`WALK_INTERVAL_MS`] after
 //!   it at the latest: a value that is no time, or a time that has not
 //!   come yet, starts it at once. [`BEGAN_KEY`], [`WANT_KEY`] and
-//!   [`DOWN_KEY`] can only bring a walk forward, or hold the hints back
-//!   for [`HINT_PAUSE_MS`]; none of them can put a walk off.
+//!   [`SWEPT_KEY`] can only bring a walk forward, and [`DOWN_KEY`] can
+//!   only hold the hints back for [`HINT_PAUSE_MS`]; none of them can
+//!   put a walk off. The saved place counts only while a walk is under
+//!   way, that is when one began after the last one ended; otherwise
+//!   the walk starts from the first key.
 //! - **A record of the walk that could not be copied waits for the walk
 //!   to come round**, which it then does [`WALK_SOON_MS`] after the
 //!   last one at the latest. One of the fresh sweep is tried again by
@@ -139,12 +144,18 @@ pub const BEGAN_KEY: &str = "rc/walk-began";
 pub const WANT_KEY: &str = "rc/walk-wanted";
 /// When a hint last found the store down. Decimal milliseconds.
 pub const DOWN_KEY: &str = "rc/down";
+/// The pass whose fresh sweep last came to its end, in decimal
+/// milliseconds. A pass that does not find the pass before it here
+/// asks for the walk: records may have grown too old for the sweep in
+/// the gap (the copy was off, a pass was not started, its jobs were
+/// lost).
+pub const SWEPT_KEY: &str = "rc/swept";
 /// A hint is tried again while it is younger than this, then given up.
 pub const HINT_RETRY_MS: i64 = 10 * 60 * 1000;
 pub const HINT_RETRY_SECS: u32 = 120;
 /// After a hint found the store down, the others ask nothing of it for
 /// this long.
-pub const HINT_PAUSE_MS: i64 = 2 * 60 * 1000;
+pub const HINT_PAUSE_MS: i64 = 5 * 60 * 1000;
 /// The bytes read of a saved time.
 const TIME_BYTES: usize = 20;
 /// How far the fresh generation records came that are not sent yet: a
@@ -237,6 +248,8 @@ pub struct CopyStep {
     pub began: bool,
     /// The step came to the end of the keys: the walk rests.
     pub ended: bool,
+    /// The step came to the end of the fresh sweep.
+    pub swept: bool,
     /// The fresh sweep was left unfinished: its time was up.
     pub late: bool,
     /// What the sweep learned could not be saved ([`SWEEP_KEY`]).
@@ -660,7 +673,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // A fresh sweep that is cut short is late, and says so.
         let age = self.clock.now().0 - pass.0;
         if age >= PASS_INTERVAL_MS {
-            let walking = place.is_some_and(|p| p.walking());
+            let walking = place.as_ref().is_some_and(|p| p.walking());
             let why = (!walking).then_some(StepError::Expired);
             return (JobOutcome::Ack, None, why);
         }
@@ -673,6 +686,17 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         } else {
             JobOutcome::Ack
         };
+        // The first job of a pass: when the sweep of the pass before
+        // did not come to its end (or there was no such pass), records
+        // may have grown too old for this sweep, and the walk is asked
+        // for. The time is before this pass, so that a walk that
+        // begins in it answers.
+        if place.is_none() {
+            let last = self.read_time(SWEPT_KEY).await;
+            if !matches!(last, Ok(Some(at)) if pass.0 - at <= PASS_INTERVAL_MS) {
+                let _ = self.save_time(WANT_KEY, UnixMs(pass.0 - 1)).await;
+            }
+        }
         let step = match self.step(pass, cursor).await {
             Ok(step) => step,
             Err(e) => return (again, None, Some(e)),
@@ -700,6 +724,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // a start that is not saved only brings the next walk forward,
         // and an end that is not saved leaves the place where it was,
         // so that the next pass comes to the end again.
+        // Best effort: without it the next pass asks for the walk.
+        if step.swept {
+            let _ = self.save_time(SWEPT_KEY, pass).await;
+        }
         let mut saved = true;
         if step.began {
             saved &= self.save_time(BEGAN_KEY, pass).await.is_ok();
@@ -753,7 +781,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // A hint is no part of a pass ([`Copier::run_job`] does it).
         let hint = place.phase == Phase::Plan;
         let late = !hint && !place.walking() && budget.started.0 - pass.0 >= SWEEP_MS;
-        let (mut began, mut ended) = (false, false);
+        let (mut began, mut ended, mut swept) = (false, false, false);
         // `None` = the pass is over: the walk rests.
         let mut turn = (!hint).then_some(place);
         if late {
@@ -779,7 +807,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     Phase::Generations,
                     fresh(GENERATION_PREFIX, pass),
                 )),
-                Phase::Generations => self.enter_walk(pass, &mut began).await?,
+                Phase::Generations => {
+                    swept = true;
+                    self.enter_walk(pass, &mut began).await?
+                }
                 Phase::Low => Some(Place::at(Phase::High, TOMBSTONES_END.to_string())),
                 Phase::High => {
                     walk = Some(String::new());
@@ -794,6 +825,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             walk,
             began,
             ended,
+            swept,
             next,
             outage,
             late,
@@ -810,14 +842,28 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         began: &mut bool,
     ) -> std::result::Result<Option<Place>, StepError> {
         let place = walk_from(self.saved_walk().await?, pass);
-        if place.phase != Phase::Low || !place.key.is_empty() {
+        let ended = self.read_time(WALKED_KEY).await;
+        let ended = ended.map_err(|_| StepError::Source)?;
+        let start = self.read_time(BEGAN_KEY).await;
+        // A start that has not come yet is none.
+        let start = start
+            .map_err(|_| StepError::Source)?
+            .filter(|at| *at < pass.0 + PASS_INTERVAL_MS);
+        // A walk is under way when one began after the last one ended.
+        // Only then does the saved place count: a place without such a
+        // start (stale, or written by something else) would make a walk
+        // that began in the middle of the keys end, and rest.
+        let under_way = start.is_some_and(|at| ended.is_none_or(|ended| at > ended));
+        if under_way && (place.phase != Phase::Low || !place.key.is_empty()) {
             return Ok(Some(place));
         }
-        if !self.walk_due(pass).await? {
+        // Under way without a place (the job that began it died before
+        // the place was saved): it begins again.
+        if !under_way && !self.walk_due(pass, ended, start).await {
             return Ok(None);
         }
         *began = true;
-        Ok(Some(place))
+        Ok(Some(Place::at(Phase::Low, String::new())))
     }
 
     /// True when the walk, being at its start, is to start in the pass
@@ -828,32 +874,30 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// one that has not come yet, it starts now. (A time up to one
     /// pass ahead is the end of a walk in a pass that overlaps this
     /// one.)
-    async fn walk_due(&self, pass: UnixMs) -> std::result::Result<bool, StepError> {
-        let ended = self.read_time(WALKED_KEY).await;
-        let Some(ended) = ended.map_err(|_| StepError::Source)? else {
-            return Ok(true);
+    async fn walk_due(&self, pass: UnixMs, ended: Option<i64>, began: Option<i64>) -> bool {
+        let Some(ended) = ended else {
+            return true;
         };
         let rested = pass.0 - ended;
         if rested <= -PASS_INTERVAL_MS || rested >= WALK_INTERVAL_MS {
-            return Ok(true);
+            return true;
         }
         if rested < WALK_SOON_MS {
-            return Ok(false);
+            return false;
         }
         // Sooner when a job left something undone since the last walk
         // began: that walk may have been past it already. A time that
-        // has not come yet asks for nothing. If these cannot be read,
-        // the walk is taken as asked for.
+        // has not come yet asks for nothing. If it cannot be read, the
+        // walk is taken as asked for.
         let want = match self.read_time(WANT_KEY).await {
             Ok(Some(want)) => want,
-            Ok(None) => return Ok(false),
-            Err(_) => return Ok(true),
+            Ok(None) => return false,
+            Err(_) => return true,
         };
         if want >= pass.0 + PASS_INTERVAL_MS {
-            return Ok(false);
+            return false;
         }
-        let began = self.read_time(BEGAN_KEY).await.ok().flatten();
-        Ok(began.is_none_or(|began| want >= began))
+        began.is_none_or(|began| want >= began)
     }
 
     /// The time saved at `key`; `None` when there is none, or what is
@@ -948,7 +992,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 Plan::Down => {
                     counts.failed = 1;
-                    let _ = self.save_time(DOWN_KEY, UnixMs(now)).await;
+                    // The time after the tries, which take a minute
+                    // when no answer comes.
+                    let _ = self.save_time(DOWN_KEY, self.clock.now()).await;
                     Some(down)
                 }
             }
