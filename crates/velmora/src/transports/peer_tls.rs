@@ -74,7 +74,9 @@ pub(crate) async fn write_all_flushed(
 /// key exchange groups, signature algorithms and the protocol versions are
 /// ring's defaults. In wasm there is no AES instruction, so AES-GCM costs
 /// several times the CPU of ChaCha20-Poly1305 per byte; a server that
-/// honours the client's order then picks the cheaper one.
+/// honours the client's order then picks the cheaper one. The order applies
+/// on every target: the native transport (`tokio_tls`) gets it too, where
+/// both suites are cheap.
 fn nntp_crypto_provider() -> rustls::crypto::CryptoProvider {
     use rustls::{CipherSuite, SupportedCipherSuite};
     let mut provider = rustls::crypto::ring::default_provider();
@@ -392,7 +394,8 @@ mod tests {
             p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
         };
         assert_eq!(groups(&ours), groups(&ring));
-        // Same signature verification algorithms.
+        // Same signature schemes (`Debug` lists the schemes only; nothing
+        // here touches that field).
         assert_eq!(
             format!("{:?}", ours.signature_verification_algorithms),
             format!("{:?}", ring.signature_verification_algorithms)
@@ -409,14 +412,10 @@ mod tests {
             negotiated_suite(ring(), rustls::DEFAULT_VERSIONS, false).await,
             S::TLS13_CHACHA20_POLY1305_SHA256
         );
-        let tls12 = negotiated_suite(ring(), &[&rustls::version::TLS12], false).await;
-        assert!(
-            matches!(
-                tls12,
-                S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-                    | S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-            ),
-            "{tls12:?}"
+        // The fixture certificate is ECDSA P-256.
+        assert_eq!(
+            negotiated_suite(ring(), &[&rustls::version::TLS12], false).await,
+            S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
         );
     }
 
@@ -427,14 +426,9 @@ mod tests {
             negotiated_suite(aes_only_provider(), rustls::DEFAULT_VERSIONS, false).await,
             S::TLS13_AES_256_GCM_SHA384
         );
-        let tls12 = negotiated_suite(aes_only_provider(), &[&rustls::version::TLS12], false).await;
-        assert!(
-            matches!(
-                tls12,
-                S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-                    | S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-            ),
-            "{tls12:?}"
+        assert_eq!(
+            negotiated_suite(aes_only_provider(), &[&rustls::version::TLS12], false).await,
+            S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
         );
     }
 
@@ -442,14 +436,15 @@ mod tests {
     async fn a_server_that_imposes_its_own_order_still_connects() {
         // ring's default order puts AES-256-GCM first; a server that ignores
         // the client's order picks it, and the session works as before.
+        use rustls::CipherSuite as S;
+        let ring = rustls::crypto::ring::default_provider;
         assert_eq!(
-            negotiated_suite(
-                rustls::crypto::ring::default_provider(),
-                rustls::DEFAULT_VERSIONS,
-                true
-            )
-            .await,
-            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+            negotiated_suite(ring(), rustls::DEFAULT_VERSIONS, true).await,
+            S::TLS13_AES_256_GCM_SHA384
+        );
+        assert_eq!(
+            negotiated_suite(ring(), &[&rustls::version::TLS12], true).await,
+            S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
         );
     }
 
