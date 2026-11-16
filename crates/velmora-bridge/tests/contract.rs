@@ -281,7 +281,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.hot_cap_bytes, 100 * 1024 * 1024 * 1024);
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     assert_eq!(cfg.maintenance, Maintenance::Off);
-    assert!(!cfg.server_side_copy);
+    assert!(cfg.server_side_copy);
     assert!(!cfg.dev_trust_http);
     assert_eq!(cfg.providers.len(), 2);
     // Production posts on six sockets per job, so that two post jobs fit
