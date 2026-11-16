@@ -1324,7 +1324,10 @@ impl Catalog for MemCatalog {
     async fn revive_referenced(&self, _: u32, _: UnixMs) -> Result<u64> {
         unused()
     }
-    async fn due(&self, _: UnixMs, _: u32) -> Result<Vec<DueRow>> {
+    async fn due(&self, _: UnixMs, _: u32, _: u32) -> Result<Vec<DueRow>> {
+        unused()
+    }
+    async fn mark_sent(&self, _: &[ExtentId], _: UnixMs) -> Result<u64> {
         unused()
     }
     async fn bury_exhausted(&self, _: u32, _: UnixMs) -> Result<u64> {

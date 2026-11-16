@@ -185,7 +185,7 @@ pub(super) async fn claim<S: Sql>(
         .sql
         .query(
             "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = ?4, \
-               lease_until = ?5, attempts = attempts + 1, updated_at = ?6 \
+               lease_until = ?5, attempts = attempts + 1, updated_at = ?6, sent_at = NULL \
              WHERE extent_id = ?1 AND generation_id = ?2 AND stage = ?3 AND next_at <= ?6 \
                AND (lease_until IS NULL OR lease_until < ?6) \
              RETURNING lease_token, attempts, cursor",
@@ -800,16 +800,30 @@ pub(super) async fn finish_release<S: Sql>(
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Rows a job could claim right now: live stage, due, not leased.
-pub(super) async fn due<S: Sql>(c: &SqlCatalog<S>, now: UnixMs, limit: u32) -> Result<Vec<DueRow>> {
+/// Due rows no job holds, oldest first, without the ones the dispatcher
+/// has sent a job for and that job may still be on its way: a row with a
+/// mark (`sent_at`) is left out until `resend_secs` after the mark. A
+/// claim clears the mark, and a due time later than the mark outdates
+/// it, so a row that a job gave back or moved on is listed at once.
+pub(super) async fn due<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+    resend_secs: u32,
+    limit: u32,
+) -> Result<Vec<DueRow>> {
     let rows = c
         .sql
         .query(
             "SELECT extent_id, generation_id, stage FROM outbox \
              WHERE stage IN ('post', 'verify', 'release') AND next_at <= ?1 \
                AND (lease_until IS NULL OR lease_until < ?1) \
+               AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
              ORDER BY next_at, extent_id LIMIT ?2",
-            &[ms(now), SqlValue::Int(i64::from(limit))],
+            &[
+                ms(now),
+                SqlValue::Int(i64::from(limit)),
+                ms(now.plus_ms(-i64::from(resend_secs) * 1000)),
+            ],
         )
         .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -822,6 +836,34 @@ pub(super) async fn due<S: Sql>(c: &SqlCatalog<S>, now: UnixMs, limit: u32) -> R
         });
     }
     Ok(out)
+}
+
+/// Marks rows the dispatcher has just sent a job for (`sent_at = now`).
+/// Only a row that is still due and held by no job is marked: one that
+/// a job claimed since it was listed keeps no mark, so it is listed
+/// again as soon as that job lets go of it. The ids travel as one JSON
+/// array. One row written per marked row; `sent_at` is in no index.
+/// The unary `+` keeps the planner off the due index, which would walk
+/// every due row: each row is found by its id.
+pub(super) async fn mark_sent<S: Sql>(
+    c: &SqlCatalog<S>,
+    extents: &[ExtentId],
+    now: UnixMs,
+) -> Result<u64> {
+    if extents.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<&str> = extents.iter().map(ExtentId::as_str).collect();
+    let ids = serde_json::to_string(&ids).map_err(|_| BridgeError::Sql("mark_sent".into()))?;
+    c.sql
+        .exec(
+            "UPDATE outbox SET sent_at = ?1 \
+             WHERE extent_id IN (SELECT value FROM json_each(?2)) \
+               AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
+               AND (lease_until IS NULL OR lease_until < ?1)",
+            &[ms(now), text(&ids)],
+        )
+        .await
 }
 
 /// Moves unleased rows with more than `max_attempts` claims to `dead`.

@@ -197,7 +197,7 @@ fn shard(extent: &str, queues: usize) -> usize {
 }
 
 /// Post jobs go to a post queue. Every other job goes to a verify queue:
-/// an extent's by its id, the rest (gc, sweep, eviction, recovery copy)
+/// an extent's by its id (a wake-up goes where its job would), the rest (gc, sweep, eviction, recovery copy)
 /// to the first.
 fn lane(job: &Job, shards: Shards) -> Lane {
     match job {
@@ -206,7 +206,14 @@ fn lane(job: &Job, shards: Shards) -> Lane {
             extent,
             ..
         } => Lane::Post(shard(extent.as_str(), shards.post)),
-        Job::Extent { extent, .. } => Lane::Verify(shard(extent.as_str(), shards.verify)),
+        Job::Wake {
+            stage: OutboxStage::Post,
+            extent,
+            ..
+        } => Lane::Post(shard(extent.as_str(), shards.post)),
+        Job::Extent { extent, .. } | Job::Wake { extent, .. } => {
+            Lane::Verify(shard(extent.as_str(), shards.verify))
+        }
         _ => Lane::Verify(0),
     }
 }
@@ -292,7 +299,30 @@ mod tests {
         }
     }
 
+    fn wake_job(stage: OutboxStage) -> Job {
+        Job::Wake {
+            v: JOB_VERSION,
+            extent: ExtentId::new("e_1"),
+            generation: GenerationId::new("g_1"),
+            stage,
+            at: velmora_bridge::UnixMs(1),
+        }
+    }
+
     const ONE: Shards = Shards { post: 1, verify: 1 };
+
+    /// A wake-up waits in the queue its job would be sent to.
+    #[test]
+    fn a_wake_up_uses_the_queue_of_its_job() {
+        let many = Shards { post: 4, verify: 4 };
+        for stage in [OutboxStage::Post, OutboxStage::Verify, OutboxStage::Release] {
+            assert_eq!(lane(&wake_job(stage), many), lane(&extent_job(stage), many));
+        }
+        assert!(matches!(
+            lane(&wake_job(OutboxStage::Release), many),
+            Lane::Verify(_)
+        ));
+    }
 
     #[test]
     fn only_post_jobs_use_the_post_queue() {

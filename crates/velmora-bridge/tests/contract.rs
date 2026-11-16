@@ -18,6 +18,7 @@ use velmora_bridge::config::{
     DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT, MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::jobs::RESEND_SECS;
 use velmora_bridge::recovery::Recorded;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
@@ -719,6 +720,17 @@ fn job_json_is_small_and_strict() {
     let json = job.to_json();
     assert!(json.len() < 200, "{} bytes", json.len());
     assert_eq!(Job::from_json(&json).unwrap(), job);
+    let wake = Job::Wake {
+        v: JOB_VERSION,
+        extent: ExtentId::mint([0xff; 13]),
+        generation: GenerationId::mint(T0, [0xff; 8]),
+        stage: OutboxStage::Release,
+        at: UnixMs(i64::MAX),
+    };
+    let json = wake.to_json();
+    assert!(json.len() < 200, "{} bytes", json.len());
+    assert!(json.starts_with(r#"{"t":"wake","v":1,"#), "{json}");
+    assert_eq!(Job::from_json(&json).unwrap(), wake);
     let gc = Job::Gc { v: JOB_VERSION };
     assert_eq!(gc.to_json(), r#"{"t":"gc","v":1}"#);
     assert!(Job::from_json(r#"{"t":"gc","v":1,"x":0}"#).is_err());
@@ -1211,7 +1223,8 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.body_checks(&extent.id).await;
     let _ = c.begin_release(&lease, 1, &bbs(), "[]", T0).await;
     let _ = c.finish_release(&lease, T0).await;
-    let _ = c.due(T0, 100).await;
+    let _ = c.due(T0, RESEND_SECS, 100).await;
+    let _ = c.mark_sent(std::slice::from_ref(&extent.id), T0).await;
     let _ = c.bury_exhausted(50, T0).await;
     let _ = c.record_dispatch(T0).await;
     let _ = c.outbox_stats().await;
