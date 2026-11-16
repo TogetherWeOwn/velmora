@@ -668,8 +668,9 @@ fi
 
 STEP=5c-move
 SMALL_KEY=a/small.bin
-# The shipped production vars keep SERVER_SIDE_COPY off; the dev ones turn
-# it on. E2E_COPY=1 runs the step against a remote that has it on.
+# A local run does this step by default. A remote run does it with E2E_COPY=1,
+# against a remote with SERVER_SIDE_COPY on (the shipped production and dev
+# vars both have it on; with it off, CopyObject answers 501).
 if [[ ${E2E_COPY:-$([[ $MODE == local ]] && echo 1 || echo 0)} == 1 ]]; then
   log "step $STEP"
   run_aws "MOVE a/small.bin to a/moved.bin" "${S3[@]}" mv "s3://$SB/a/small.bin" "s3://$SB/a/moved.bin" >/dev/null

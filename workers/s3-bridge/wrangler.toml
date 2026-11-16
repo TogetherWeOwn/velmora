@@ -78,10 +78,11 @@ RECOVERY_COPY = "off"
 #     A job is one source address to a provider, however many connections it holds there.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 
-# off | on. Turn on only in a release after the one that added extent
-# references (migration 0005): a rollback must never land on a Worker that
-# cannot read a copy or would collect the extents it shares.
-SERVER_SIDE_COPY = "off"
+# off | on (CopyObject only; UploadPartCopy does not read it). On only in a
+# release after the one that added extent references (migration 0005): a
+# rollback must never land on a Worker that cannot read a copy or would
+# collect the extents it shares. See "Rollback floor" in ops/README.md.
+SERVER_SIDE_COPY = "on"
 
 [[d1_databases]]
 binding = "CATALOG"

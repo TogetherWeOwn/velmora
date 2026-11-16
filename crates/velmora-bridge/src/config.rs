@@ -179,9 +179,12 @@ pub struct BridgeConfig {
     /// bucket need two ids. Never change it for a catalogue in use: its
     /// stamp objects would no longer be found.
     pub catalogue_id: String,
-    /// Serve CopyObject. Off until the version that is rolled back to
-    /// also reads extent references: an older Worker cannot read a copy
-    /// and does not know that the source's extents are shared.
+    /// Serve CopyObject (`SERVER_SIDE_COPY`); off, it answers 501.
+    /// UploadPartCopy does not read it. With it on, never roll back to a
+    /// version that predates extent references (migration 0005): such a
+    /// Worker cannot read a copy and does not know that the source's
+    /// extents are shared. Cloudflare still offers such versions, so the
+    /// rule is "Rollback floor" in `workers/s3-bridge/ops/README.md`.
     pub server_side_copy: bool,
     /// Accept `http://` as if it were HTTPS (`wrangler dev` only).
     pub dev_trust_http: bool,
