@@ -402,6 +402,47 @@ fn the_markers_of_a_truncated_page_continue_the_listing() {
     assert_eq!(values(&run(page, &rows(), 10), "UploadId").len(), 7);
 }
 
+/// A key marker names a group to skip only when it is a common prefix of
+/// this listing: the prefix, then a part that ends at the first
+/// delimiter. The prefix itself, or less than one delimiter after it,
+/// names no group, and nothing under the prefix is left out.
+#[test]
+fn a_key_marker_skips_a_group_only_when_it_ends_at_the_first_delimiter() {
+    let skip = |query: &str| {
+        let page = ListUploads::parse(&target(&format!("/bkt?uploads{query}"))).unwrap();
+        page.skip_prefix().map(str::to_owned)
+    };
+    for (query, skipped) in [
+        // The marker is one group under the prefix.
+        ("&delimiter=%2F&key-marker=dir%2F", Some("dir/")),
+        (
+            "&prefix=dir%2F&delimiter=%2F&key-marker=dir%2Fa%2F",
+            Some("dir/a/"),
+        ),
+        ("&prefix=d&delimiter=--&key-marker=dir--", Some("dir--")),
+        // The marker is the prefix itself.
+        ("&prefix=dir%2F&delimiter=%2F&key-marker=dir%2F", None),
+        ("&prefix=dir--&delimiter=--&key-marker=dir--", None),
+        // Less than one delimiter follows the prefix.
+        ("&prefix=dir&delimiter=--&key-marker=dir-", None),
+        // A key, a deeper group, another prefix, no delimiter, or an
+        // upload id marker beside it.
+        ("&prefix=dir%2F&delimiter=%2F&key-marker=dir%2Fa", None),
+        (
+            "&prefix=dir%2F&delimiter=%2F&key-marker=dir%2Fa%2Fb%2F",
+            None,
+        ),
+        ("&prefix=other%2F&delimiter=%2F&key-marker=dir%2Fa%2F", None),
+        ("&prefix=dir%2F&key-marker=dir%2Fa%2F", None),
+        (
+            "&prefix=dir%2F&delimiter=%2F&key-marker=dir%2Fa%2F&upload-id-marker=01",
+            None,
+        ),
+    ] {
+        assert_eq!(skip(query).as_deref(), skipped, "{query}");
+    }
+}
+
 #[test]
 fn a_page_cut_short_by_the_caller_is_truncated_and_continues() {
     // The caller stops after two rows without reaching the end.

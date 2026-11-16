@@ -109,8 +109,13 @@ impl ListUploads {
             (Some(marker), None) => marker
                 .strip_prefix(prefix.as_str())
                 .filter(|rest| {
+                    // The first delimiter after the prefix ends the
+                    // marker. A marker shorter than that names no group.
                     !delimiter.is_empty()
-                        && rest.find(delimiter.as_str()) == rest.len().checked_sub(delimiter.len())
+                        && rest
+                            .len()
+                            .checked_sub(delimiter.len())
+                            .is_some_and(|at| rest.find(delimiter.as_str()) == Some(at))
                 })
                 .map(|_| marker.clone()),
             _ => None,
