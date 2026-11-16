@@ -28,7 +28,7 @@ All hashes below are SHA-256 of file bytes, not Git object hashes.
 | --- | --- | --- |
 | `velmora-ssrf-guard/src/lib.rs` | `a027eb3f1ddafe6aec55e01dbf6736688e68f869bc5e0344f78f2e40bde40997` | Byte-identical predicate, vectors and tests |
 | `velmora/src/transports/mod.rs` | `f19132f3696309f87bf57f324fa6d4688dfc3e78914c28ee0d884ef734d81d78` | Source (SHA-256 `17896cd32b9bc23b88889004f67fc97e38976bb584486387f4ca23a91c58a30d`) plus the declarations and one doc line for the `worker_socks5` and `proxy_tls` modules, and `peer_tls` also built for the feature `worker-socks5-tls` (2026-11-15) |
-| `velmora/src/transports/peer_tls.rs` | `93846315476f0132cbf90db3b109fbdcc6be833809925050c55b8f3b411f5ebb` | Only `nntune_ssrf_guard` → `velmora_ssrf_guard` |
+| `velmora/src/transports/peer_tls.rs` | `477f9d9f1d5035dde9fbbab375f8ce72d2cb260a5d3cf8b58712a46663ac377e` | Source (SHA-256 `93846315476f0132cbf90db3b109fbdcc6be833809925050c55b8f3b411f5ebb` after the import rename below) plus ChaCha20-Poly1305 offered first in the client's suite list (every target, the native transport included), AES-GCM kept as fallback, same suites, roots, name and time checks and protocol versions, and tests for the order and the negotiated suite (2026-11-16) |
 | `velmora/src/transports/tokio_tls.rs` | `a85904f74b7741df9f0f5aa254483301895466301460da9269c26c3ba95080b0` | Byte-identical |
 | `velmora/src/transports/worker_pinned_tls.rs` | `397aac7929c5a862ac0b0a794bf95f5486a2a7d8eb8a8583fe62b353e54bcacc` | Byte-identical |
 | `velmora/src/transports/worker_socket.rs` | `71bd895e2772f526929af7b0dad48a37c3fe892ada23edfe847894614762bf92` | Source (SHA-256 `0720b9455ce9e5abc3ebc84957fe451596e3b98a897293821005767d3c8d8608` on 2026-11-07) plus an `impl Drop` that asks the runtime to close the socket (velmora #83, 2026-11-14) |
@@ -40,7 +40,10 @@ All hashes below are SHA-256 of file bytes, not Git object hashes.
 
 The source `peer_tls.rs` hash is
 `c53e18716d67424be5c5f6315ded6a8a2aa6c5f18cffb456f53676ee3875a0c0`;
-reversing the single import rename reproduces those exact bytes. The source
+reversing the single import rename on the 2026-11-07 version (SHA-256
+`93846315476f0132cbf90db3b109fbdcc6be833809925050c55b8f3b411f5ebb`) reproduces
+those exact bytes; the current file also carries the suite-order change in its
+row. The source
 SSRF manifest hash is
 `8cf0944c65f87a04229fd8c34a90d0a8debe4042957a7f596a37cd5163209a86`.
 The manifest's historical description and predicate's historical call-site
@@ -51,12 +54,12 @@ and `velmora/src/socks5.rs` are not part of the relocation: they are new in
 this repository (a Workers socket through a SOCKS5 proxy, with TLS to the
 provider made in the Worker on the proxied connection, feature
 `worker-socks5-tls`). They add a connector next to the preserved ones and
-change none of them; `worker_socket.rs` and `peer_tls.rs` keep the hashes
-above.
+change none of them; `worker_socket.rs` keeps its hash above. `peer_tls.rs`
+changed later only in its suite order (see its row).
 
 The proxied connector is a runtime call site for rustls in the Worker, for a
-provider with `proxies` and no other. It builds its client from the preserved
-`peer_tls::public_connector` (Mozilla roots, chain, name and time validation,
+provider with `proxies` and no other. It builds its client from
+`peer_tls::public_connector` (preserved apart from its suite order) (Mozilla roots, chain, name and time validation,
 the explicit ring provider) and does not use `PeerTlsTarget` or the
 `worker_pinned_tls` adapter: the socket is dialled to the proxy, by the
 runtime, and the certificate is checked against the provider's DNS name.
