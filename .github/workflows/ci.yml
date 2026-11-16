@@ -390,9 +390,25 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
         run: bash e2e/slice.sh https://127.0.0.1:8787
 
+  # The console Worker (apps/console): plain JavaScript, no dependencies,
+  # tested with the Node test runner. Cheap, so it runs on every event.
+  console-test:
+    name: console tests (node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Node version
+        run: node --version
+      - name: Unit tests
+        working-directory: apps/console
+        run: node --test test/*.test.js
+
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
