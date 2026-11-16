@@ -309,9 +309,8 @@ jobs:
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
-      # bundle.sh: worker-build, then the `name` and `producers` sections
-      # are dropped. The same script builds the deploy artifact and the
-      # wrangler dev bundle, so the budget measures what ships.
+      # bundle.sh: worker-build, then the `name` section is dropped. The
+      # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
         working-directory: workers/s3-bridge
         run: bash bundle.sh
@@ -320,6 +319,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
+          # The strip found a `name` section and kept the copy that
+          # deploy-build uploads; fails here, not after the merge.
+          test -s symbols/index_bg.unstripped.wasm
           size=$(stat -c %s build/index_bg.wasm)
           echo "index_bg.wasm: ${size} bytes (budget 3000000)"
           test "$size" -lt 3000000
@@ -503,7 +505,8 @@ jobs:
       - name: Install pinned worker-build 0.8.7
         if: steps.fresh.outputs.fresh == 'true'
         run: cargo install --locked worker-build --version 0.8.7
-      # The same build as the worker-build job's size budget (bundle.sh).
+      # The same build as the worker-build job (bundle.sh), and the same
+      # size budget, measured here on the wasm that ships.
       - name: Build the Worker bundle
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -511,6 +514,9 @@ jobs:
           set -euo pipefail
           bash bundle.sh
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
+          size=$(stat -c %s build/index_bg.wasm)
+          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
+          test "$size" -lt 3000000
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:
@@ -520,7 +526,8 @@ jobs:
           retention-days: 1
       # The unstripped wasm of this release: it names the functions in a
       # production trace frame `wasm-function[N]:0xOFF` (same indices and
-      # code offsets). Not deployed.
+      # code offsets). Not deployed. See workers/s3-bridge/ops/README.md,
+      # "Naming a wasm frame".
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:

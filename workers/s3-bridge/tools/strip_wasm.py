@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drops the `name` and `producers` custom sections from the Worker wasm.
+"""Drops the `name` custom section from the Worker wasm.
 
 worker-build 0.8.7 runs wasm-opt with `--debuginfo`, which keeps the
 `name` section (function names, about 600 KB). The Worker never reads
@@ -7,11 +7,12 @@ it: V8 uses it only to print function names in stack traces. This
 script removes it after the build, so the wasm that the size budget
 measures and the deploy uploads is the stripped one.
 
-Only whole custom sections are removed; every other byte is copied
-unchanged, in order. Function indices therefore stay the same, and
-because these sections follow the code section, so do code offsets: a
-trace frame `wasm-function[N]:0xOFF` from the stripped wasm resolves
-against the unstripped copy that `--unstripped` keeps.
+Only the whole section is removed; every other byte (including the
+`producers` section worker-build writes) is copied unchanged, in order.
+Function indices therefore stay the same, and the strip refuses a `name`
+section placed before the code section, so code offsets stay the same
+too: a trace frame `wasm-function[N]:0xOFF` from the stripped wasm
+resolves against the unstripped copy that `--unstripped` keeps.
 
 Usage:
   strip_wasm.py strip WASM [--unstripped COPY]
@@ -20,7 +21,7 @@ Usage:
 `strip` rewrites WASM in place (atomically). With `--unstripped`, the
 input is first copied to COPY when it has a section to drop; a stale
 COPY is removed when it has none. `check` fails if WASM still has a
-section that `strip` drops. Standard library only.
+`name` section. Standard library only.
 """
 
 import os
@@ -29,7 +30,8 @@ import tempfile
 
 MAGIC = b"\x00asm"
 VERSION = b"\x01\x00\x00\x00"
-DROPPED = frozenset({"name", "producers"})
+DROPPED = frozenset({"name"})
+CODE_SECTION = 10
 
 
 class WasmError(ValueError):
@@ -81,8 +83,12 @@ def strip(data):
     """Returns (stripped bytes, list of (name, section bytes) dropped)."""
     kept = [data[:8]]
     dropped = []
+    seen_code = False
     for start, end, sid, name in sections(data):
+        seen_code = seen_code or sid == CODE_SECTION
         if sid == 0 and name in DROPPED:
+            if not seen_code:
+                raise WasmError(f"{name} section at {start} precedes the code section")
             dropped.append((name, end - start))
         else:
             kept.append(data[start:end])

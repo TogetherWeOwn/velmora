@@ -4,12 +4,12 @@
 # budget and the deploy artifact all run this script, so the budget
 # measures the wasm that ships.
 #
-# After worker-build, the `name` and `producers` custom sections are
-# dropped from build/index_bg.wasm (tools/strip_wasm.py). The Worker
-# never reads them; without `name`, stack traces show
+# After worker-build, the `name` custom section (function names, about
+# 600 KB) is dropped from build/index_bg.wasm (tools/strip_wasm.py). The
+# Worker never reads it; without it, stack traces show
 # `wasm-function[N]` instead of Rust function names. The unstripped wasm
 # is kept in symbols/ (outside build/, so it is never uploaded) to
-# resolve such frames.
+# resolve such frames (ops/README.md, "Naming a wasm frame").
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 worker-build --release
