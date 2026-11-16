@@ -2,7 +2,7 @@
 //! delete that a tombstone can replay, and the extent rows a multipart
 //! Complete records before it publishes.
 
-use super::objects::{extent_row, guard_precondition, retire_live, text, EXTENT_COLS};
+use super::objects::{extent_row, guard_precondition, retire_live, text, Stmt, EXTENT_COLS};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Sql, UploadTarget};
@@ -27,6 +27,50 @@ pub(super) async fn delete_object_before<S: Sql>(
     let mut stmts = Vec::new();
     if client {
         stmts.push(guard_no_replay());
+    }
+    delete_before(&mut stmts, bucket, key, before, condition, now, client);
+    match c.sql.batch(stmts).await {
+        Ok(_) => Ok(true),
+        Err(BridgeError::GuardFailed) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`delete_object_before`] of a client for every `(key, before, now)`,
+/// each key once, as one batch: the statements of that call for each
+/// key, in the order given, under one guard against a replay. A guard
+/// that fails for one key leaves every key as it was.
+pub(super) async fn delete_objects_before<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    deletes: &[(&str, &GenerationId, UnixMs)],
+) -> Result<bool> {
+    if deletes.is_empty() {
+        return Ok(true);
+    }
+    let mut stmts = vec![guard_no_replay()];
+    for (key, before, now) in deletes {
+        delete_before(&mut stmts, bucket, key, before, None, *now, true);
+    }
+    match c.sql.batch(stmts).await {
+        Ok(_) => Ok(true),
+        Err(BridgeError::GuardFailed) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The statements that retire the live generation of `(bucket, key)` if
+/// its id sorts before `before`, without the guard against a replay.
+fn delete_before(
+    stmts: &mut Vec<Stmt>,
+    bucket: &BucketId,
+    key: &str,
+    before: &GenerationId,
+    condition: Option<&Precondition>,
+    now: UnixMs,
+    client: bool,
+) {
+    if client {
         // A floor above the tombstone is a write that began after the
         // tombstone was chosen. Its record sorts after the tombstone, so
         // a replay would publish it over this delete; and where it is
@@ -59,11 +103,6 @@ pub(super) async fn delete_object_before<S: Sql>(
         "DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2",
         vec![text(bucket.as_str()), text(key)],
     ));
-    match c.sql.batch(stmts).await {
-        Ok(_) => Ok(true),
-        Err(BridgeError::GuardFailed) => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 /// Extent rows of the parts the upload holds now.

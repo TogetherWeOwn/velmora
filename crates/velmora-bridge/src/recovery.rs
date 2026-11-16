@@ -44,6 +44,7 @@
 //!   such a record, in its place in the order: under every write and
 //!   delete acknowledged after it.
 
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
@@ -684,6 +685,74 @@ pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
     // On record: it covers every generation record of the key that was
     // stored under a lower id and never published.
     catalog.settle_floor(bucket, key, id).await
+}
+
+/// A tombstone to store: the key, the id and the time of the delete.
+pub struct NewTombstone<'a> {
+    pub key: &'a str,
+    pub id: GenerationId,
+    pub now: UnixMs,
+}
+
+/// How many tombstone records of one [`write_tombstones`] call are on
+/// their way to the store at the same time.
+const RECORD_WRITES: usize = 6;
+
+/// [`write_tombstone`] for several keys of one bucket, each key once,
+/// with the catalogue calls of all of them in one batch each: the
+/// floors are raised, then every record is stored, then the floors of
+/// the stored ones are settled. The answer has, for each tombstone in
+/// its order, what `write_tombstone` would have answered; the caller
+/// deletes a key only where it is `Ok`.
+///
+/// `Err` = a catalogue batch failed. Then no key may be deleted on its
+/// tombstone: either no record was stored at all, or the records stand
+/// with their floors raised and not settled, as after a
+/// `write_tombstone` that failed at the same step.
+pub async fn write_tombstones<C: Catalog, B: BlobStore, K: Kek>(
+    catalog: &C,
+    safety: &B,
+    kek: &K,
+    bucket: &BucketId,
+    tombstones: &[NewTombstone<'_>],
+) -> Result<Vec<Result<()>>> {
+    if tombstones.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<(&str, &GenerationId)> = tombstones.iter().map(|t| (t.key, &t.id)).collect();
+    catalog.raise_floors(bucket, &ids).await?;
+    let stored: Vec<Result<()>> = stream::iter(tombstones)
+        .map(|t| async move {
+            let record = Tombstone {
+                v: RECORD_VERSION,
+                id: t.id.as_str().to_owned(),
+                bucket_id: bucket.as_str().to_owned(),
+                key: t.key.to_owned(),
+                deleted_at: t.now.0,
+            };
+            write(
+                safety,
+                kek,
+                &tombstone_key(&t.id),
+                bucket,
+                t.id.as_str(),
+                &record,
+            )
+            .await
+        })
+        .buffered(RECORD_WRITES)
+        .collect()
+        .await;
+    let on_record: Vec<(&str, &GenerationId)> = ids
+        .iter()
+        .zip(&stored)
+        .filter(|(_, stored)| stored.is_ok())
+        .map(|(id, _)| *id)
+        .collect();
+    if !on_record.is_empty() {
+        catalog.settle_floors(bucket, &on_record).await?;
+    }
+    Ok(stored)
 }
 
 /// Writes `m/rk/<access_key_id>`. The caller deletes the key's rows only

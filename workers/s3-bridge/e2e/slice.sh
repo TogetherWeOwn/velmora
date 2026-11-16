@@ -752,6 +752,28 @@ jq -n '{Objects: [range(1001) | {Key: "b/k\(.)"}]}' >"$T/delete.json"
 expect_err "DeleteObjects of 1001 keys" MalformedXML \
   "${S3API[@]}" delete-objects --bucket "$OB" --delete "file://$T/delete.json"
 
+# A full DeleteObjects: 1,000 live keys in one request, with the client's
+# default timeouts (60 s to read the answer) and no retry, so an answer that
+# comes late fails the step instead of being asked for again. Local runs
+# only, unless E2E_DELETE_MANY=1: it uploads 1,000 objects first.
+if [[ ${E2E_DELETE_MANY:-$([[ $MODE == local ]] && echo 1 || echo 0)} == 1 ]]; then
+  mkdir "$T/many"
+  for i in $(seq 1000); do printf 'object %d\n' "$i" >"$T/many/$(printf 'o%04d' "$i")"; done
+  run_aws "PUT 1,000 small objects" "${S3[@]}" cp --recursive "$T/many" "s3://$OB/many/" >/dev/null
+  rm -rf "$T/many"
+  jq -n '{Objects: [range(1; 1001) | {Key: ("many/o" + ("000\(.)" | .[-4:]))}]}' >"$T/delete.json"
+  t0=$(now_ms)
+  json=$(AWS_MAX_ATTEMPTS=1 run_aws "DeleteObjects of 1,000 live keys" \
+    "${S3API[@]}" --output json delete-objects --bucket "$OB" --delete "file://$T/delete.json")
+  took=$(($(now_ms) - t0))
+  log "DeleteObjects of 1,000 live keys: $took ms"
+  jcheck "all 1,000 keys are reported deleted, none with an error" \
+    '((.Errors // []) | length == 0) and (.Deleted | length == 1000) and (.Deleted | map(.Key) | unique | length == 1000)' "$json"
+  json=$(run_aws "ListObjectsV2 of many/ after the delete" \
+    "${S3API[@]}" --output json list-objects-v2 --bucket "$OB" --prefix many/)
+  jcheck "none of the 1,000 keys is still listed" '(.Contents // []) | length == 0' "${json:-{\}}"
+fi
+
 # DeleteBucket. A bucket goes only through the admin token, and only while
 # it never held anything: an S3 key gets BucketNotEmpty for a bucket in use
 # and AccessDenied otherwise, and changes nothing either way.

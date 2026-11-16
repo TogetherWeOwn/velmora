@@ -1030,6 +1030,22 @@ impl Catalog for MemCatalog {
     ) -> Result<bool> {
         unused()
     }
+    async fn key_heads(&self, _: &BucketId, _: &[&str]) -> Result<Vec<velmora_bridge::KeyHead>> {
+        unused()
+    }
+    async fn raise_floors(&self, _: &BucketId, _: &[(&str, &GenerationId)]) -> Result<()> {
+        unused()
+    }
+    async fn settle_floors(&self, _: &BucketId, _: &[(&str, &GenerationId)]) -> Result<()> {
+        unused()
+    }
+    async fn delete_objects_before(
+        &self,
+        _: &BucketId,
+        _: &[(&str, &GenerationId, UnixMs)],
+    ) -> Result<bool> {
+        unused()
+    }
     async fn delete_object_if(
         &self,
         _: &BucketId,
