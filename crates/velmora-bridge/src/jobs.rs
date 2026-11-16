@@ -5,10 +5,17 @@
 //! a row may be due. So:
 //! - `run_job` claims the row before it does anything. A duplicate, early,
 //!   stale or unknown message claims nothing and is acked.
-//! - `dispatch` re-sends a message for every due row, which covers lost
-//!   messages, expired retries and restarts. It reads the catalogue and
-//!   sends to the queue; it never claims a lease, opens a socket, touches a
-//!   blob store or runs crypto.
+//! - `dispatch` sends a message for every due row that no job holds,
+//!   which covers lost messages, expired retries and restarts. It marks
+//!   each row it sent and leaves a marked row alone for [`RESEND_SECS`],
+//!   so a row waiting in a queue is not sent again on every run. It
+//!   reads the catalogue, writes that mark and sends to the queue; it
+//!   never claims a lease, opens a socket, touches a blob store (but for
+//!   the rollback stamp) or runs crypto.
+//! - A job that is due further out than a queue delay reaches (a release
+//!   after the minimum age) travels as a `Wake` message, which is sent
+//!   on until its time has come. So a release does not wait for the
+//!   dispatcher, whose run is bounded.
 //! - The GC job deletes a blob only when the catalogue hands it the key
 //!   (`gc_begin`), and only in the mode `GC_MODE` allows.
 //! - The eviction job keeps R2 a bounded hot tier. It deletes R2 copies
@@ -18,7 +25,9 @@
 //!   `x/<extent>` and `c/<extent>`.
 
 use crate::config::{GcMode, Maintenance};
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector};
+use crate::ports::{
+    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
+};
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
@@ -28,8 +37,31 @@ use crate::types::{
 };
 use crate::verify::release_labels;
 
-/// Outbox rows one dispatcher run re-sends (one queue batch).
-pub const DISPATCH_LIMIT: u32 = 100;
+/// Jobs in one queue batch of the dispatcher (the bound of
+/// [`JobSink::send_many`]).
+pub const DISPATCH_BATCH: u32 = 100;
+/// Queue batches one dispatcher run sends at most.
+pub const DISPATCH_BATCHES: u32 = 20;
+/// Outbox rows one dispatcher run sends at most: 2,000, which at a run
+/// every five minutes is 576,000 a day.
+///
+/// What bounds it is the calls a single invocation may make. A run with
+/// this many rows makes one catalogue read for them, and per batch one
+/// catalogue write (the marks) and one queue call per bound queue: with
+/// the most queues a deployment may bind (8 of each kind) that is at
+/// most 20 + 20 * 16 = 340 calls, beside the two dozen of the rest of
+/// the run. The platform allows 1,000.
+pub const DISPATCH_LIMIT: u32 = DISPATCH_BATCH * DISPATCH_BATCHES;
+/// How long the dispatcher leaves a row alone after it sent a job for
+/// it, unless a job claimed the row meanwhile or its due time moved.
+///
+/// Until a job claims the row, the job the dispatcher sent is taken to
+/// be waiting in its queue; sending another on every run would only add
+/// duplicates, each one a queue delivery and a claim that finds nothing.
+/// A message that was really lost (dropped after its retries, say) costs
+/// its row this long. Nothing but time is at stake: the outbox row
+/// stays, and a release that is late only keeps its safety copy longer.
+pub const RESEND_SECS: u32 = 3600;
 /// Held extents one dispatcher run checks for the re-drive.
 pub const REDRIVE_LIMIT: u32 = 500;
 /// Extents with article rows one dispatcher run looks at to pack their
@@ -92,6 +124,17 @@ where
             // once maintenance ends.
             return JobOutcome::Ack;
         }
+        // A wake-up that came before its time is sent on for the rest
+        // of the wait, before anything is read: no catalogue call. A
+        // new message rather than a retry of this one, so that a long
+        // wait does not use up the deliveries a message is allowed. If
+        // the send fails, the retry is the fallback.
+        if let Some(delay_secs) = self.wake_early(job) {
+            return match self.jobs.send(job, delay_secs).await {
+                Ok(()) => JobOutcome::Ack,
+                Err(_) => JobOutcome::Retry { delay_secs },
+            };
+        }
         // The same while a replay of the recovery records is not
         // finished: the catalogue holds only a part of them, and a job
         // could release or delete what a record still to come needs.
@@ -106,6 +149,13 @@ where
                 extent,
                 generation,
                 stage,
+            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
+            Job::Wake {
+                v,
+                extent,
+                generation,
+                stage,
+                ..
             } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
             Job::Gc { v } if *v == JOB_VERSION => self.run_gc().await,
             Job::Evict { v, remaining } if *v == JOB_VERSION => {
@@ -124,6 +174,25 @@ where
             // the current format.
             _ => JobOutcome::Ack,
         }
+    }
+
+    /// The wait still ahead of a `Wake` job that was delivered before
+    /// its time, as a queue delay. `None` for any other job, and once
+    /// the time has come. Rounded up to a second: a job that arrives
+    /// early cannot claim its row.
+    fn wake_early(&self, job: &Job) -> Option<u32> {
+        let Job::Wake { v, at, .. } = job else {
+            return None;
+        };
+        if *v != JOB_VERSION {
+            return None;
+        }
+        let ahead_ms = at.0.saturating_sub(self.clock.now().0);
+        if ahead_ms <= 0 {
+            return None;
+        }
+        let secs = ahead_ms.saturating_add(999).div_euclid(1000);
+        Some(u32::try_from(secs).map_or(MAX_QUEUE_DELAY_SECS, |s| s.min(MAX_QUEUE_DELAY_SECS)))
     }
 
     async fn run_extent(
@@ -446,20 +515,36 @@ where
             }
         }
 
-        let due = self.catalog.due(now, DISPATCH_LIMIT).await?;
-        let jobs: Vec<Job> = due
-            .into_iter()
-            .map(|row| Job::Extent {
-                v: JOB_VERSION,
-                extent: row.extent_id,
-                generation: row.generation_id,
-                stage: row.stage,
-            })
-            .collect();
-        if !jobs.is_empty() {
-            self.jobs.send_many(&jobs).await?;
+        // Every due row that no job holds and that has no fresh mark,
+        // oldest first, in queue batches. A batch is marked as soon as
+        // it is sent, so the next run does not send it again. A send
+        // that fails ends the sending: the rows not yet sent stay
+        // unmarked, the checks below still run, and then the run fails
+        // unrecorded. A mark that fails ends nothing: its batch is sent
+        // again by the next run, and a duplicate job only finds its row
+        // claimed.
+        let mut send_failed = None;
+        let due = self.catalog.due(now, RESEND_SECS, DISPATCH_LIMIT).await?;
+        for rows in due.chunks(DISPATCH_BATCH as usize) {
+            let jobs: Vec<Job> = rows
+                .iter()
+                .map(|row| Job::Extent {
+                    v: JOB_VERSION,
+                    extent: row.extent_id.clone(),
+                    generation: row.generation_id.clone(),
+                    stage: row.stage,
+                })
+                .collect();
+            if let Err(e) = self.jobs.send_many(&jobs).await {
+                send_failed = Some(e);
+                break;
+            }
+            report.enqueued += u32::try_from(jobs.len()).unwrap_or(u32::MAX);
+            let sent: Vec<ExtentId> = rows.iter().map(|row| row.extent_id.clone()).collect();
+            if self.catalog.mark_sent(&sent, now).await.is_err() {
+                report.mark_failed = true;
+            }
         }
-        report.enqueued = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
 
         let gc_due = match self.cfg.gc_mode {
             GcMode::Off => false,
@@ -488,6 +573,10 @@ where
                 Ok(packed) => report.plans_packed = packed.packed,
                 Err(_) => report.pack_failed = true,
             }
+        }
+
+        if let Some(e) = send_failed {
+            return Err(e);
         }
 
         self.catalog.record_dispatch(now).await?;

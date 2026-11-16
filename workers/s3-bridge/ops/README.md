@@ -394,8 +394,8 @@ the code real data relies on. Never roll back past the floor:
   retries and to the replay of copies. Today the #71 floor is the later
   of the two, so it covers both.
 - **Once `PACKED_PLANS=on` has been deployed:** never to a version older
-  than the first one that knows `PACKED_PLANS` (migrations 0015 and
-  0016). From then on the article plan of an extent can be one value on
+  than the first one that knows `PACKED_PLANS` (migrations 0016 and
+  0017). From then on the article plan of an extent can be one value on
   its row (`extents.plan`) and not rows in `articles`. An older Worker
   sees such an extent as one without a plan: it cannot read it from
   Usenet, and a post job of it would plan and post the extent a second
@@ -531,7 +531,7 @@ above one extent.
 
 The article plan of an extent (where its ciphertext is on Usenet) is
 either one row per article in `articles`, or one value on the extent's
-own row (`extents.plan`, migrations 0015 and 0016). Packed, a 16 MiB
+own row (`extents.plan`, migrations 0016 and 0017). Packed, a 16 MiB
 extent keeps under 1 KiB of plan in the catalogue instead of about
 11 KiB, and its posting writes two rows instead of three per article.
 Every reader takes both forms. The recovery records do not change: the

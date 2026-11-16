@@ -131,7 +131,9 @@ bucket_name = "velmora-cache-enam"
 # To take one away: remove the producer with the highest number, and its
 # consumer only when the queue is empty (the cron run sends a due
 # extent's job again, to a queue that is still bound, so a job left
-# behind delays its extent and loses nothing).
+# behind delays its extent and loses nothing). A verify queue also holds
+# the delayed wake-ups of extents that wait for their minimum age, so it
+# is rarely empty; the same holds for those.
 [[queues.producers]]
 binding = "POST_Q"
 queue = "velmora-post"

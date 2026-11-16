@@ -330,19 +330,43 @@ where
         }
     }
 
-    /// Queue notification for this extent. The outbox row is the
-    /// obligation: the dispatcher re-sends one that is lost or too far out.
-    async fn notify(&self, lease: &Lease, stage: OutboxStage, delay_secs: u32) {
-        if delay_secs > MAX_QUEUE_DELAY_SECS {
-            return;
-        }
-        let job = Job::Extent {
-            v: JOB_VERSION,
-            extent: lease.extent.clone(),
-            generation: lease.generation.clone(),
-            stage,
+    /// Queue notification for this extent, due now. The outbox row is
+    /// the obligation: the dispatcher sends again for one that is lost.
+    async fn notify(&self, lease: &Lease, stage: OutboxStage) {
+        self.notify_at(lease, stage, self.clock.now()).await;
+    }
+
+    /// Queue notification for this extent, due at `at`. Within the
+    /// longest queue delay it is the job itself, delayed until then.
+    /// Further out it is a `Wake` job with the longest delay, which is
+    /// sent on until `at` when it is delivered: a release, due a
+    /// minimum age after the post, is on its way from here on and does
+    /// not wait for the dispatcher to find it.
+    async fn notify_at(&self, lease: &Lease, stage: OutboxStage, at: UnixMs) {
+        // Rounded up: a job that arrives early cannot claim the row.
+        let ahead_ms = at.0.saturating_sub(self.clock.now().0).max(0);
+        let secs = ahead_ms.saturating_add(999).div_euclid(1000);
+        let delay_secs = u32::try_from(secs).unwrap_or(u32::MAX);
+        let (v, extent, generation) = (JOB_VERSION, lease.extent.clone(), lease.generation.clone());
+        let job = match delay_secs > MAX_QUEUE_DELAY_SECS {
+            false => Job::Extent {
+                v,
+                extent,
+                generation,
+                stage,
+            },
+            true => Job::Wake {
+                v,
+                extent,
+                generation,
+                stage,
+                at,
+            },
         };
-        let _ = self.jobs.send(&job, delay_secs).await;
+        let _ = self
+            .jobs
+            .send(&job, delay_secs.min(MAX_QUEUE_DELAY_SECS))
+            .await;
     }
 
     /// A backbone lacks articles. `Some` = the wait before it is read
@@ -435,7 +459,7 @@ where
                 if !self.catalog.defer_at(lease, cursor, now, now).await? {
                     return Err(Stop::Fenced);
                 }
-                self.notify(lease, OutboxStage::Verify, 0).await;
+                self.notify(lease, OutboxStage::Verify).await;
                 return Ok(());
             }
         }
@@ -460,14 +484,7 @@ where
             let plan = self.posted_plan(extent).await?;
             let ready = self.min_age_over(extent, &plan).max(now);
             self.advance(lease, OutboxStage::Release, ready).await?;
-            // Rounded up: a job that arrives early cannot claim the row.
-            let delay = (ready.0 - now.0).saturating_add(999).div_euclid(1000);
-            self.notify(
-                lease,
-                OutboxStage::Release,
-                u32::try_from(delay).unwrap_or(u32::MAX),
-            )
-            .await;
+            self.notify_at(lease, OutboxStage::Release, ready).await;
             return Ok(());
         }
         if groups.is_empty() {
@@ -565,7 +582,7 @@ where
             // Not releasable after all, and nothing worse than missing:
             // back to verify, which owns the retry waits and the record.
             self.advance(lease, OutboxStage::Verify, now).await?;
-            self.notify(lease, OutboxStage::Verify, 0).await;
+            self.notify(lease, OutboxStage::Verify).await;
             return Ok(());
         }
         let mut rows = Vec::new();

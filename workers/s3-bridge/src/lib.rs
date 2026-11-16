@@ -326,6 +326,11 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             if report.redrive_failed {
                 console_error!("dispatch: re-drive failed");
             }
+            if report.mark_failed {
+                console_error!(
+                    "dispatch: the sent mark was not written; due rows are sent again next run"
+                );
+            }
             if report.evict_failed {
                 console_error!("dispatch: hot-tier check failed");
             }

@@ -3002,7 +3002,7 @@ async fn rows_written_per_extent() {
     // The whole life of an extent and of an object: a change that adds a
     // write to either shows up here.
     assert!(
-        packed.0 <= 63,
+        packed.0 <= 64,
         "rows written per packed extent: {}",
         packed.0
     );

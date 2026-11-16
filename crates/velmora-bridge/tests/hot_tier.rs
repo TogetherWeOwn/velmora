@@ -231,6 +231,13 @@ impl Hot {
         self.pump_if(|_| true).await
     }
 
+    /// Runs the queue up to the wait for the minimum age: the wake-up
+    /// that would release the extent once it is old enough is dropped,
+    /// so the clock stays put and the extent stays held.
+    async fn pump_until_held(&self) -> u32 {
+        self.pump_if(|job| !matches!(job, Job::Wake { .. })).await
+    }
+
     /// PUT, post, verify and release: the extent ends evictable.
     async fn released(&self, key: &str) -> ExtentRow {
         let extent = self.put(key).await;
@@ -586,7 +593,7 @@ async fn pinned_extents_are_never_evicted_however_far_over_the_cap() {
     hot.discard_jobs();
     // Posted and verified, but younger than the minimum age.
     let young = hot.put("young").await;
-    hot.pump().await;
+    hot.pump_until_held().await;
     assert_eq!(hot.text(&young, "safety_state"), "held");
     assert_ne!(hot.num(&young, "last_verified_at"), None);
     let cipher = young.cipher_size;
@@ -1623,7 +1630,7 @@ async fn admin_evict_of_a_held_extent_ends_its_counts() {
     .await;
     // Posted and verified, but too young to release.
     let x = hot.put("young").await;
-    hot.pump().await;
+    hot.pump_until_held().await;
     assert_eq!(hot.text(&x, "safety_state"), "held");
     hot.uncounted_fill(&x).await;
     let catalog = &hot.bridge().catalog;

@@ -1228,6 +1228,18 @@ pub enum Job {
         generation: GenerationId,
         stage: OutboxStage,
     },
+    /// An extent job that is due at `at`, further out than a queue
+    /// delay reaches. It is sent with the longest delay; delivered
+    /// before `at` it is sent on for the rest of the wait, at `at` or
+    /// later it runs as the `Extent` job of the same fields. `at` is a
+    /// hint only: the claim of the outbox row decides what is due.
+    Wake {
+        v: u8,
+        extent: ExtentId,
+        generation: GenerationId,
+        stage: OutboxStage,
+        at: UnixMs,
+    },
     Gc {
         v: u8,
     },
@@ -1286,6 +1298,9 @@ pub struct DispatchReport {
     /// `done` extents with too few verified backbones sent back to verify,
     /// and cancelled postings of referenced extents re-armed.
     pub redriven: u64,
+    /// Marking sent rows failed: those rows are sent again by the next
+    /// run. The rest of the run went on.
+    pub mark_failed: bool,
     /// The re-drive failed; the rest of the run went on without it.
     pub redrive_failed: bool,
     /// The hot-tier check failed; the rest of the run went on without it.

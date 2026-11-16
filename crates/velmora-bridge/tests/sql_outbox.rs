@@ -5,8 +5,9 @@
 //! test are the ones the catalogue itself writes. Every statement goes
 //! through [`Probe`], which refuses more than 100 bound parameters.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
+use velmora_bridge::jobs::RESEND_SECS;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
 use velmora_bridge::*;
@@ -22,7 +23,14 @@ fn bbs() -> Vec<String> {
         .to_vec()
 }
 
-struct Probe(RusqliteSql);
+/// The database, and every statement the catalogue ran on it.
+struct Probe(RusqliteSql, RefCell<Vec<(String, Vec<SqlValue>)>>);
+
+impl Probe {
+    fn log(&self, sql: &str, params: &[SqlValue]) {
+        self.1.borrow_mut().push((sql.to_string(), params.to_vec()));
+    }
+}
 
 fn check_params(params: &[SqlValue]) {
     assert!(params.len() <= 100, "statement binds {}", params.len());
@@ -31,14 +39,17 @@ fn check_params(params: &[SqlValue]) {
 impl Sql for Probe {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params);
+        self.log(sql, params);
         self.0.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         check_params(params);
+        self.log(sql, params);
         self.0.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         stmts.iter().for_each(|(_, p)| check_params(p));
+        stmts.iter().for_each(|(sql, p)| self.log(sql, p));
         self.0.batch(stmts).await
     }
 }
@@ -63,7 +74,10 @@ struct Obj {
 impl Fx {
     async fn new() -> Fx {
         let fx = Fx {
-            cat: SqlCatalog::new(Probe(RusqliteSql::with_schema().unwrap())),
+            cat: SqlCatalog::new(Probe(
+                RusqliteSql::with_schema().unwrap(),
+                RefCell::new(Vec::new()),
+            )),
             seed: Cell::new(1),
             bucket: BucketId::mint([0xb1; 8]),
             real_bucket: BucketId::mint([0xb2; 8]),
@@ -426,11 +440,16 @@ async fn next_at_backoff_is_respected() {
     // The lease is free, but the row is not due: no claim, not in `due`.
     let early = retry_at.plus_ms(-1);
     assert!(fx.claim(&o, OutboxStage::Post, early).await.is_none());
-    assert!(fx.cat.due(early, 100).await.unwrap().is_empty());
+    assert!(fx
+        .cat
+        .due(early, RESEND_SECS, 100)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(fx.outbox(&o, "attempts").await, "1");
 
     assert_eq!(
-        fx.cat.due(retry_at, 100).await.unwrap(),
+        fx.cat.due(retry_at, RESEND_SECS, 100).await.unwrap(),
         vec![DueRow {
             extent_id: o.extent.clone(),
             generation_id: o.generation.clone(),
@@ -611,7 +630,7 @@ async fn cancellation_beats_stale_completion() {
     for stage in OutboxStage::ALL {
         assert!(fx.claim(&o, *stage, late).await.is_none());
     }
-    let due = fx.cat.due(late, 100).await.unwrap();
+    let due = fx.cat.due(late, RESEND_SECS, 100).await.unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].extent_id, newer.extent);
 }
@@ -1025,7 +1044,7 @@ async fn release_needs_fresh_evidence() {
     );
     assert!(fx
         .cat
-        .due(done_at.plus_ms(HOUR_MS), 100)
+        .due(done_at.plus_ms(HOUR_MS), RESEND_SECS, 100)
         .await
         .unwrap()
         .is_empty());
@@ -1385,16 +1404,21 @@ async fn dispatcher_reads_are_bounded_and_bury_only_exhausted_rows() {
     for i in 0..5 {
         objs.push(fx.publish(&fx.bucket, &format!("k{i}")).await);
     }
-    assert_eq!(fx.cat.due(T0, 100).await.unwrap().len(), 5);
-    assert_eq!(fx.cat.due(T0, 2).await.unwrap().len(), 2);
-    assert!(fx.cat.due(T0.plus_ms(-1), 100).await.unwrap().is_empty());
+    assert_eq!(fx.cat.due(T0, RESEND_SECS, 100).await.unwrap().len(), 5);
+    assert_eq!(fx.cat.due(T0, RESEND_SECS, 2).await.unwrap().len(), 2);
+    assert!(fx
+        .cat
+        .due(T0.plus_ms(-1), RESEND_SECS, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Leased rows are not re-sent until the lease expires.
     let held = fx.claim(&objs[0], OutboxStage::Post, T0).await.unwrap();
-    assert_eq!(fx.cat.due(T0, 100).await.unwrap().len(), 4);
+    assert_eq!(fx.cat.due(T0, RESEND_SECS, 100).await.unwrap().len(), 4);
     assert_eq!(
         fx.cat
-            .due(T0.plus_ms(LEASE_MS + 1), 100)
+            .due(T0.plus_ms(LEASE_MS + 1), RESEND_SECS, 100)
             .await
             .unwrap()
             .len(),
@@ -1430,7 +1454,7 @@ async fn dispatcher_reads_are_bounded_and_bury_only_exhausted_rows() {
     assert!(fx.claim(&objs[1], OutboxStage::Post, T0).await.is_none());
     assert_eq!(
         fx.cat
-            .due(T0.plus_ms(LEASE_MS + 1), 100)
+            .due(T0.plus_ms(LEASE_MS + 1), RESEND_SECS, 100)
             .await
             .unwrap()
             .len(),
@@ -1968,7 +1992,12 @@ async fn redrive_requeues_underverified_done_extents() {
     let o = fx.done_on_one_backbone("k").await;
     let later = T0.plus_ms(HOUR_MS);
     assert_eq!(fx.outbox(&o, "stage").await, "done");
-    assert!(fx.cat.due(later, 100).await.unwrap().is_empty());
+    assert!(fx
+        .cat
+        .due(later, RESEND_SECS, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Enough backbones count: nothing to do.
     assert_eq!(fx.redrive(&["bb1", "bb2"], 1, 100, later).await, 0);
@@ -1979,7 +2008,7 @@ async fn redrive_requeues_underverified_done_extents() {
     assert_eq!(fx.outbox(&o, "cursor").await, "0");
     assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
     assert_eq!(fx.outbox(&o, "next_at").await, later.0.to_string());
-    assert_eq!(fx.cat.due(later, 100).await.unwrap().len(), 1);
+    assert_eq!(fx.cat.due(later, RESEND_SECS, 100).await.unwrap().len(), 1);
     // Moved once: the row is no longer `done`.
     assert_eq!(fx.redrive(&["bb2"], 1, 100, later).await, 0);
 
@@ -2242,6 +2271,163 @@ async fn renew_all_renews_the_lease_and_each_permit_on_its_own() {
     assert_eq!(slots, vec![false]);
     assert_eq!(fx.outbox(&o, "lease_until").await, before);
     assert_eq!(fx.outbox(&o, "lease_token").await, owner.token.to_string());
+}
+
+// ---------------------------------------------------------------------------
+// The dispatcher's mark of a sent row
+// ---------------------------------------------------------------------------
+
+const RESEND_MS: i64 = RESEND_SECS as i64 * 1000;
+
+impl Fx {
+    async fn due_ids(&self, now: UnixMs) -> Vec<ExtentId> {
+        let rows = self.cat.due(now, RESEND_SECS, 100).await.unwrap();
+        rows.into_iter().map(|r| r.extent_id).collect()
+    }
+
+    async fn mark(&self, objs: &[&Obj], now: UnixMs) -> u64 {
+        let ids: Vec<ExtentId> = objs.iter().map(|o| o.extent.clone()).collect();
+        self.cat.mark_sent(&ids, now).await.unwrap()
+    }
+
+    /// The query plans of the statements the catalogue runs in `f`.
+    async fn plans_of(&self, f: impl std::future::Future<Output = ()>) -> Vec<String> {
+        self.cat.sql.1.borrow_mut().clear();
+        f.await;
+        let ran = std::mem::take(&mut *self.cat.sql.1.borrow_mut());
+        let mut plans = Vec::new();
+        for (sql, params) in ran {
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let rows = self.cat.sql.0.query(&explain, &params).await.unwrap();
+            let lines: Vec<String> = rows
+                .into_iter()
+                .map(|row| match &row[3] {
+                    SqlValue::Text(detail) => detail.clone(),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect();
+            plans.push(lines.join("\n"));
+        }
+        plans
+    }
+}
+
+#[tokio::test]
+async fn a_marked_row_is_not_due_again_until_the_resend_timeout() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    let b = fx.publish(&fx.bucket, "b").await;
+    assert_eq!(fx.due_ids(T0).await.len(), 2);
+
+    // One row written per marked row, and only `sent_at` changes.
+    assert_eq!(fx.mark(&[&a], T0).await, 1);
+    assert_eq!(fx.outbox(&a, "sent_at").await, T0.0.to_string());
+    assert_eq!(fx.outbox(&a, "lease_token").await, "0");
+    assert_eq!(fx.outbox(&a, "attempts").await, "0");
+    assert_eq!(fx.due_ids(T0).await, std::slice::from_ref(&b.extent));
+    let just_before = T0.plus_ms(RESEND_MS - 1);
+    assert_eq!(
+        fx.due_ids(just_before).await,
+        std::slice::from_ref(&b.extent)
+    );
+    // The message is taken for lost: the row is due again.
+    assert_eq!(fx.due_ids(T0.plus_ms(RESEND_MS)).await.len(), 2);
+
+    // The mark gates no claim.
+    assert!(fx.claim(&a, OutboxStage::Post, T0).await.is_some());
+}
+
+#[tokio::test]
+async fn a_claim_clears_the_mark() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    assert_eq!(fx.mark(&[&a], T0).await, 1);
+    assert!(fx.due_ids(T0).await.is_empty());
+
+    // The job the dispatcher sent claims the row and dies. Once its
+    // lease is over the row is due at once, not after the timeout.
+    assert!(fx.claim(&a, OutboxStage::Post, T0).await.is_some());
+    assert_eq!(fx.outbox(&a, "sent_at").await, "NULL");
+    assert!(fx.due_ids(T0.plus_ms(LEASE_MS)).await.is_empty());
+    assert_eq!(fx.due_ids(T0.plus_ms(LEASE_MS + 1)).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_later_due_time_outdates_the_mark() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    assert_eq!(fx.mark(&[&a], T0).await, 1);
+    // Moved on without a claim (as a re-drive does): due again at its
+    // new time, which is after the mark.
+    let later = T0.plus_ms(1000);
+    fx.run("UPDATE outbox SET next_at = ?1", &[SqlValue::Int(later.0)])
+        .await;
+    assert!(fx.due_ids(T0).await.is_empty());
+    assert_eq!(fx.due_ids(later).await.len(), 1);
+}
+
+#[tokio::test]
+async fn only_a_due_row_that_no_job_holds_is_marked() {
+    let fx = Fx::new().await;
+    let held = fx.publish(&fx.bucket, "held").await;
+    let early = fx.publish(&fx.bucket, "early").await;
+    let done = fx.publish(&fx.bucket, "done").await;
+    let due = fx.publish(&fx.bucket, "due").await;
+
+    // Claimed between the dispatcher's read and its mark.
+    assert!(fx.claim(&held, OutboxStage::Post, T0).await.is_some());
+    let later = SqlValue::Int(T0.0 + 1);
+    let id = text(early.extent.as_str());
+    fx.run(
+        "UPDATE outbox SET next_at = ?1 WHERE extent_id = ?2",
+        &[later, id],
+    )
+    .await;
+    let id = text(done.extent.as_str());
+    fx.run(
+        "UPDATE outbox SET stage = 'done' WHERE extent_id = ?1",
+        &[id],
+    )
+    .await;
+
+    assert_eq!(fx.mark(&[&held, &early, &done, &due], T0).await, 1);
+    for (o, sent_at) in [(&held, "NULL"), (&early, "NULL"), (&done, "NULL")] {
+        assert_eq!(fx.outbox(o, "sent_at").await, sent_at);
+    }
+    assert_eq!(fx.outbox(&due, "sent_at").await, T0.0.to_string());
+    // An id the catalogue does not know, and no id at all.
+    let unknown = [ExtentId::mint([0xee; 13])];
+    assert_eq!(fx.cat.mark_sent(&unknown, T0).await.unwrap(), 0);
+    assert_eq!(fx.cat.mark_sent(&[], T0).await.unwrap(), 0);
+}
+
+/// The dispatcher's two statements over the outbox use an index: the
+/// read walks the due rows only (never the rows that are due later, a
+/// day of releases in waiting), and the mark finds each row by its id.
+#[tokio::test]
+async fn the_dispatcher_statements_use_an_index() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    let plans = fx
+        .plans_of(async {
+            assert_eq!(fx.due_ids(T0).await.len(), 1);
+            assert_eq!(fx.mark(&[&a], T0).await, 1);
+        })
+        .await;
+    let [due, mark] = &plans[..] else {
+        panic!("two statements: {plans:?}");
+    };
+    assert!(
+        due.contains("SEARCH outbox USING INDEX outbox_due (stage=? AND next_at<?)"),
+        "{due}"
+    );
+    assert!(
+        mark.contains("SEARCH outbox USING INDEX sqlite_autoindex_outbox_1 (extent_id=?)"),
+        "{mark}"
+    );
+    for plan in [due, mark] {
+        assert!(!plan.contains("SCAN outbox"), "{plan}");
+    }
 }
 
 // ---------------------------------------------------------------------------
