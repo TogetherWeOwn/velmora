@@ -704,16 +704,27 @@ pub async fn write_key_revocation<B: BlobStore, K: Kek>(
         access_key_id: akid.to_owned(),
         revoked_at: now.0,
     };
-    // No bucket: the descriptive metadata names none.
+    // No bucket: the descriptive metadata says "-", as for the other
+    // blobs that belong to none.
     write(
         safety,
         kek,
         &revocation_key(akid),
-        &BucketId::new(""),
+        &BucketId::new("-"),
         akid,
         &record,
     )
     .await
+}
+
+/// Whether a revocation record of `akid` is stored. By its name alone,
+/// as a restore reads them: forging one needs write access to `SAFETY`
+/// and could only refuse a key.
+pub async fn revocation_recorded<B: BlobStore>(safety: &B, akid: &str) -> Result<bool> {
+    if !valid_key_id(akid) {
+        return Ok(false);
+    }
+    Ok(safety.head(&revocation_key(akid)).await?.is_some())
 }
 
 /// Reads the revocation record of `akid`; `None` when there is none.

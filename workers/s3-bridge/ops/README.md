@@ -170,10 +170,13 @@ curl -X DELETE -H @<0600 header file with the bearer> <base-url>/_admin/keys/<ac
 
 `204`: the key is gone. The Worker first stores `m/rk/<id>` in `SAFETY`,
 then deletes the key's row (the wrapped secret with it) and its grants
-in one batch. The next request with the key, signed or presigned (also
+in one batch. Earlier catalogue exports and D1 Time Travel (30 days)
+still hold the wrapped secret, sealed under the KEK like every secret
+in them. The next request with the key, signed or presigned (also
 a URL presigned before), answers `403 InvalidAccessKeyId`. `404`: no
-such key, also for a second call. A `500` changed nothing that matters:
-the key may still work; send the call again. Revocation is accepted
+such key, also for a second call. After a `500` the key may still work,
+and its record may already be stored (a later restore then deletes the
+key): send the call again until it answers `204` or `404`. Revocation is accepted
 under maintenance and during a replay.
 
 `GET /_admin/keys` lists every key: id, status, created time and its
@@ -184,10 +187,13 @@ A remote run of `e2e/slice.sh` revokes the keys it made when it exits.
 
 An export, or a Time Travel point, from before a revocation still holds
 the key's row. The first call of a replay (`since_ms`) deletes every key
-that has a `m/rk/` record before it replays anything. Between bringing
-the database back and that call (Restore, steps 2 to 4) such a key can
-read again, because maintenance refuses writes only: run the replay
-right after step 2. A revocation record is never deleted: every later
+that has a `m/rk/` record before it replays anything. Until then, while
+`MAINTENANCE = "restore"`, every request also checks the key against
+its `m/rk/` record (one `SAFETY` lookup per request, in that mode only),
+so a key revoked after the export stays refused although maintenance
+serves reads. Keep maintenance on until the replay has ended (Restore,
+step 6): with maintenance off, only the replay's first call deletes such
+a key, so that call is never skipped. A revocation record is never deleted: every later
 replay deletes that id again. The ids the Worker mints are random, so a
 new key does not get the id of a revoked one.
 

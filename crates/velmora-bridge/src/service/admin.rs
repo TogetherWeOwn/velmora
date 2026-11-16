@@ -26,7 +26,9 @@
 //! the key up in the catalogue, so the next one, presigned or not, finds
 //! no key. A catalogue export made before the revocation still holds the
 //! row: the first step of a restore (`since_ms`) deletes every key that
-//! has a revocation record before it replays anything. Revocation is
+//! has a revocation record before it replays anything; until then, under
+//! `MAINTENANCE=restore`, authentication checks the record itself
+//! (`service::common`). Revocation is
 //! accepted under maintenance and during a replay, which never touch
 //! keys.
 
@@ -848,7 +850,7 @@ async fn forget_revoked_keys<
 >(
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> crate::types::Result<u64> {
-    let mut after = String::new();
+    let mut after = REVOKED_KEY_PREFIX.to_string();
     let mut forgotten = 0;
     loop {
         let names = bridge

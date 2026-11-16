@@ -565,9 +565,15 @@ rm -f "$T/key2.json"
 RK=(env AWS_SHARED_CREDENTIALS_FILE="$T/aws-credentials-2")
 run_aws "GET a/small.bin with the second key" "${RK[@]}" "${S3[@]}" cp "s3://$SB/a/small.bin" "$T/got-rk.bin" >/dev/null
 same_bytes "GET with the second key equals the upload" "$T/small.bin" "$T/got-rk.bin"
-PRESIGNED=$("${RK[@]}" aws s3 presign "s3://$SB/a/small.bin" --endpoint-url "$BASE" --expires-in 900 2>&1) ||
-  fail "presign a/small.bin with the second key" "aws exits 0" "$PRESIGNED"
-code=$(curl -sS "${CURL_TLS[@]}" -o "$T/got-rk.bin" -w '%{http_code}' --max-time 60 "$PRESIGNED" 2>/dev/null) || code=000
+# The URL is a read credential: it goes to curl through a 0600 config
+# file, never through argv.
+if ! "${RK[@]}" aws s3 presign "s3://$SB/a/small.bin" --endpoint-url "$BASE" --expires-in 900 \
+  >"$T/presigned.url" 2>"$T/presign.err"; then
+  fail "presign a/small.bin with the second key" "aws exits 0" "$(<"$T/presign.err")"
+fi
+printf 'url = "%s"\n' "$(tr -d '\r\n' <"$T/presigned.url")" >"$T/presigned.curl"
+rm -f "$T/presigned.url" "$T/presign.err"
+code=$(curl -sS "${CURL_TLS[@]}" -o "$T/got-rk.bin" -w '%{http_code}' --max-time 60 -K "$T/presigned.curl" 2>/dev/null) || code=000
 [[ $code == 200 ]] || fail "presigned GET with the second key" "HTTP 200" "HTTP $code"
 same_bytes "presigned GET equals the upload" "$T/small.bin" "$T/got-rk.bin"
 rm -f "$T/got-rk.bin"
@@ -594,11 +600,10 @@ code=$(adm_code -X DELETE "$BASE/_admin/keys/$RK_ID")
 # Refused on the very next request: signed, and the URL presigned before.
 expect_err "GET with the revoked key" 'InvalidAccessKeyId' \
   "${RK[@]}" "${S3API[@]}" get-object --bucket "$SB" --key a/small.bin "$T/got-rk.bin"
-code=$(curl -sS "${CURL_TLS[@]}" -o "$T/rk.out" -w '%{http_code}' --max-time 60 "$PRESIGNED" 2>/dev/null) || code=000
+code=$(curl -sS "${CURL_TLS[@]}" -o "$T/rk.out" -w '%{http_code}' --max-time 60 -K "$T/presigned.curl" 2>/dev/null) || code=000
 [[ $code == 403 ]] && grep -q '<Code>InvalidAccessKeyId</Code>' "$T/rk.out" ||
   fail "presigned GET after the revocation" "HTTP 403 InvalidAccessKeyId" "HTTP $code $(head -c 300 "$T/rk.out")"
-unset PRESIGNED
-rm -f "$T/rk.out" "$T/got-rk.bin" "$T/aws-credentials-2"
+rm -f "$T/rk.out" "$T/got-rk.bin" "$T/aws-credentials-2" "$T/presigned.curl"
 code=$(adm_code -X DELETE "$BASE/_admin/keys/$RK_ID")
 [[ $code == 404 ]] || fail "DELETE /_admin/keys/<second key> again" "HTTP 404" "HTTP $code"
 listed_key "$RK_ID" >/dev/null && fail "GET /_admin/keys after the revocation" "the second key absent" "listed"

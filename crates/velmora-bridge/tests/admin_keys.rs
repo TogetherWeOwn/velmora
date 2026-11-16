@@ -434,12 +434,19 @@ async fn a_restore_forgets_keys_revoked_after_the_export() {
     assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
 
     // A catalogue export made before the revocation is loaded: the row
-    // and its grant are back, and the key works again.
+    // and its grant are back.
     rig.key(&doomed.akid, &doomed.secret, KeyStatus::Active)
         .await;
     rig.grant(&doomed.akid, &bucket, Perm::Rw).await;
+    assert_eq!(rig.count("access_keys"), 2);
+    // Under maintenance its revocation record refuses it all the same,
+    // signed or presigned, before any replay step ran.
     let r = rig.call(&doomed, Method::Get, &probe, &[], &[], b"").await;
-    assert_eq!(r.status, 200, "the resurrected key works before the replay");
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    let r = rig.send(presign(&doomed, rig.now(), &probe)).await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    let r = rig.call(&kept, Method::Get, &probe, &[], &[], b"").await;
+    assert_eq!(r.status, 200, "a key without a record still reads");
 
     // The first replay step deletes it before it replays anything.
     let r = admin(
