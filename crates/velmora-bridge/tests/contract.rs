@@ -297,6 +297,9 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
     assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
     assert!(!cfg.intent_sweep);
+    // One object holds at most 10 000 extents unless the variable says
+    // fewer.
+    assert_eq!(cfg.max_object_extents, 10_000);
 
     // The dev environment is complete on its own (envs do not inherit vars).
     let cfg = load(&with_secrets(dev.clone(), PROVIDER_PLAIN)).unwrap();
@@ -489,6 +492,9 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("SLICE_BYTES", "16777217"),
         ("SLICE_BYTES", "6291456"),
         ("SLICE_BYTES", "8m"),
+        ("MAX_OBJECT_EXTENTS", "0"),
+        ("MAX_OBJECT_EXTENTS", "10001"),
+        ("MAX_OBJECT_EXTENTS", "10k"),
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
@@ -515,6 +521,11 @@ fn config_rejects_invalid_and_unsafe_values() {
         assert_eq!(cfg.max_put_bytes.to_string(), put);
         assert_eq!(cfg.slice_bytes.to_string(), slice);
         assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
+    }
+    for n in ["1", "10000"] {
+        let mut capped = prod.clone();
+        capped.insert("MAX_OBJECT_EXTENTS".into(), n.into());
+        assert_eq!(load(&capped).unwrap().max_object_extents.to_string(), n);
     }
     let mut small = prod.clone();
     small.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
@@ -883,6 +894,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "rollback_stamp",
             "scan_cursors",
             "tx_guard",
+            "upload_part_extents",
             "upload_parts",
             "uploads",
             "verifications",

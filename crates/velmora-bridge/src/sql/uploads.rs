@@ -7,6 +7,7 @@
 //! `uploads.revision`, so `revision = R` pins the exact part set a Complete
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
+use super::intents::{part_intents_close, part_intents_open};
 use super::objects::{clear_floor, guard_newest, guard_precondition, successor};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
@@ -15,7 +16,7 @@ use crate::recovery::Recorded;
 use crate::types::{
     BridgeError, BucketId, CompleteUpload, ExtentId, ExtentRow, ExtentState, GenerationId,
     GenerationState, OpenUpload, Precondition, Result, UnixMs, UploadId, UploadListQuery,
-    UploadPartRow, UploadRow, UploadState,
+    UploadPartRow, UploadRow, UploadState, WriteId,
 };
 
 /// A retired extent's key is shredded this long after retirement; its
@@ -163,16 +164,21 @@ fn guard_open(t: &UploadTarget<'_>) -> Stmt {
 }
 
 /// GC rows for this upload's part extents that are still `staged`: all of
-/// them, or only the one currently stored under `part_number`.
+/// them, or only those currently stored under `part_number`. A part of
+/// several extents has its first in `upload_parts` and the others in
+/// `upload_part_extents`.
 fn gc_staged_parts(id: &UploadId, part_number: Option<u16>, now: UnixMs) -> Stmt {
     (
         "INSERT INTO gc(extent_id, action, due_at) \
-         SELECT p.extent_id, a.action, a.due_at FROM upload_parts p \
+         SELECT p.extent_id, a.action, a.due_at FROM \
+           (SELECT extent_id FROM upload_parts \
+             WHERE upload_id = ?1 AND (?4 IS NULL OR part_number = ?4) \
+            UNION ALL SELECT extent_id FROM upload_part_extents \
+             WHERE upload_id = ?1 AND (?4 IS NULL OR part_number = ?4)) p \
          JOIN extents e ON e.id = p.extent_id \
          JOIN (SELECT 'delete_safety' AS action, ?2 AS due_at \
                UNION ALL SELECT 'shred_key', ?3) a \
-         WHERE p.upload_id = ?1 AND e.state = 'staged' \
-           AND (?4 IS NULL OR p.part_number = ?4)",
+         WHERE e.state = 'staged'",
         vec![
             text(id.as_str()),
             ms(now),
@@ -333,8 +339,109 @@ pub(super) async fn upload<S: Sql>(
 // UploadPart and Abort
 // ---------------------------------------------------------------------------
 
-/// Stores one part: the staged extent, the part row (replacing an earlier
-/// upload of the same number, whose extent goes to GC) and `revision + 1`.
+/// The insert of one staged part extent.
+fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
+    Ok((
+        "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
+           plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
+           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
+         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
+        vec![
+            text(e.id.as_str()),
+            text(e.bucket_id.as_str()),
+            int(e.plain_size)?,
+            int(e.cipher_size)?,
+            SqlValue::Blob(e.media_header.clone()),
+            SqlValue::Int(i64::from(e.key_mode)),
+            opt(e.wrapped_file_key.clone(), SqlValue::Blob),
+            SqlValue::Blob(e.plain_md5.to_vec()),
+            SqlValue::Blob(e.plain_sha256.to_vec()),
+            SqlValue::Blob(e.cipher_sha256.to_vec()),
+            text(e.safety_state.as_str()),
+            SqlValue::Int(i64::from(e.plan_rev)),
+            ms(e.created_at),
+        ],
+    ))
+}
+
+/// The statements that make `extents`, in body order, the part: the
+/// staged extents, the part row (replacing an earlier upload of the same
+/// number, whose extents go to GC) and the rows of the extents after the
+/// first. They follow the guards of the batch.
+fn part_statements(
+    t: &UploadTarget<'_>,
+    part: &UploadPartRow,
+    extents: &[ExtentRow],
+    now: UnixMs,
+) -> Result<Vec<Stmt>> {
+    let whole = extents
+        .iter()
+        .try_fold(0u64, |sum, e| sum.checked_add(e.plain_size));
+    let staged = extents.iter().all(|e| {
+        &e.bucket_id == t.bucket && e.state == ExtentState::Staged && e.generation_id.is_none()
+    });
+    let first = extents.first();
+    if &part.upload_id != t.id
+        || first.map(|e| &e.id) != Some(&part.extent_id)
+        || whole != Some(part.size)
+        || !staged
+    {
+        return Err(BridgeError::Invalid(
+            "part does not describe staged extents of this upload",
+        ));
+    }
+    let number = || SqlValue::Int(i64::from(part.part_number));
+    let mut stmts = Vec::with_capacity(2 * extents.len() + 2);
+    // Before the upsert: this still names the part being replaced.
+    stmts.push(gc_staged_parts(t.id, Some(part.part_number), now));
+    for e in extents {
+        stmts.push(staged_extent(e)?);
+    }
+    stmts.push((
+        "INSERT INTO upload_parts(upload_id, part_number, extent_id, size, etag, uploaded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(upload_id, part_number) DO UPDATE SET extent_id = excluded.extent_id, \
+           size = excluded.size, etag = excluded.etag, uploaded_at = excluded.uploaded_at",
+        vec![
+            text(t.id.as_str()),
+            number(),
+            text(part.extent_id.as_str()),
+            int(part.size)?,
+            text(&part.etag),
+            ms(part.uploaded_at),
+        ],
+    ));
+    // The extents after the first of the part that was replaced.
+    stmts.push((
+        "DELETE FROM upload_part_extents WHERE upload_id = ?1 AND part_number = ?2",
+        vec![text(t.id.as_str()), number()],
+    ));
+    for (piece, e) in extents.iter().enumerate().skip(1) {
+        stmts.push((
+            "INSERT INTO upload_part_extents(upload_id, part_number, piece, extent_id) \
+             VALUES (?1, ?2, ?3, ?4)",
+            vec![
+                text(t.id.as_str()),
+                number(),
+                int(piece)?,
+                text(e.id.as_str()),
+            ],
+        ));
+    }
+    Ok(stmts)
+}
+
+fn bump_revision(t: &UploadTarget<'_>) -> Stmt {
+    (
+        "UPDATE uploads SET revision = revision + 1 \
+         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'",
+        target(t),
+    )
+}
+
+/// Stores one part of one extent: the staged extent, the part row
+/// (replacing an earlier upload of the same number, whose extents go to
+/// GC) and `revision + 1`.
 pub(super) async fn put_upload_part<S: Sql>(
     c: &SqlCatalog<S>,
     t: &UploadTarget<'_>,
@@ -342,63 +449,31 @@ pub(super) async fn put_upload_part<S: Sql>(
     e: &ExtentRow,
     now: UnixMs,
 ) -> Result<Guard<()>> {
-    if &part.upload_id != t.id
-        || part.extent_id != e.id
-        || part.size != e.plain_size
-        || &e.bucket_id != t.bucket
-        || e.state != ExtentState::Staged
-        || e.generation_id.is_some()
-    {
-        return Err(BridgeError::Invalid(
-            "part does not describe one staged extent of this upload",
-        ));
-    }
-    let part_number = SqlValue::Int(i64::from(part.part_number));
-    let stmts = vec![
-        guard_open(t),
-        // Before the upsert: this still names the part being replaced.
-        gc_staged_parts(t.id, Some(part.part_number), now),
-        (
-            "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
-               plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
-               plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
-             VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
-            vec![
-                text(e.id.as_str()),
-                text(e.bucket_id.as_str()),
-                int(e.plain_size)?,
-                int(e.cipher_size)?,
-                SqlValue::Blob(e.media_header.clone()),
-                SqlValue::Int(i64::from(e.key_mode)),
-                opt(e.wrapped_file_key.clone(), SqlValue::Blob),
-                SqlValue::Blob(e.plain_md5.to_vec()),
-                SqlValue::Blob(e.plain_sha256.to_vec()),
-                SqlValue::Blob(e.cipher_sha256.to_vec()),
-                text(e.safety_state.as_str()),
-                SqlValue::Int(i64::from(e.plan_rev)),
-                ms(e.created_at),
-            ],
-        ),
-        (
-            "INSERT INTO upload_parts(upload_id, part_number, extent_id, size, etag, uploaded_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(upload_id, part_number) DO UPDATE SET extent_id = excluded.extent_id, \
-               size = excluded.size, etag = excluded.etag, uploaded_at = excluded.uploaded_at",
-            vec![
-                text(t.id.as_str()),
-                part_number,
-                text(e.id.as_str()),
-                int(part.size)?,
-                text(&part.etag),
-                ms(part.uploaded_at),
-            ],
-        ),
-        (
-            "UPDATE uploads SET revision = revision + 1 \
-             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'",
-            target(t),
-        ),
-    ];
+    let mut stmts = vec![guard_open(t)];
+    stmts.extend(part_statements(t, part, std::slice::from_ref(e), now)?);
+    stmts.push(bump_revision(t));
+    guarded(c, stmts).await
+}
+
+/// Stores one part whose body was stored as slices, the write `write`:
+/// one staged extent per slice, in body order. Like [`put_upload_part`],
+/// and in the same batch the intents of the write go: every one of them
+/// is still `open` and names an extent this batch inserted. A write the
+/// sweep took, or one a replay removed, is `Lost` and nothing is written.
+pub(super) async fn put_upload_part_sliced<S: Sql>(
+    c: &SqlCatalog<S>,
+    t: &UploadTarget<'_>,
+    part: &UploadPartRow,
+    extents: &[ExtentRow],
+    write: &WriteId,
+    now: UnixMs,
+) -> Result<Guard<()>> {
+    let mut stmts = vec![guard_open(t), guard_no_replay()];
+    let part_stmts = part_statements(t, part, extents, now)?;
+    stmts.extend(part_intents_open(write, extents.len())?);
+    stmts.extend(part_stmts);
+    stmts.extend(part_intents_close(write, extents.len())?);
+    stmts.push(bump_revision(t));
     guarded(c, stmts).await
 }
 
@@ -430,11 +505,12 @@ pub(super) async fn abort_upload<S: Sql>(
 ///   the ones the caller validated. A completed or aborted upload is
 ///   `Lost` and nothing is published again; the caller answers a retry
 ///   from the stored receipt.
-/// - A placement adopts an extent only if it is a still-staged part of
-///   **this** upload in this bucket. A second guard then requires that
+/// - A placement adopts an extent only if it is a still-staged extent of
+///   a part of **this** upload in this bucket. A second guard then requires that
 ///   exactly `extent_count` extents were adopted and that they tile
 ///   `size` bytes in `seq` order; a foreign, repeated or misplaced extent
-///   id therefore rolls everything back (`Lost`).
+///   id therefore rolls everything back (`Lost`). So does a part of
+///   several extents that is not adopted whole and in body order.
 /// - Parts the request did not list go to GC; the key's previous
 ///   generation is retired; the receipt is stored with `revision + 1`.
 pub(super) async fn complete_upload<S: Sql>(
@@ -502,7 +578,10 @@ pub(super) async fn complete_upload<S: Sql>(
             "UPDATE extents SET generation_id = ?1, seq = ?2, plain_offset = ?3, \
                state = 'committed' \
              WHERE id = ?4 AND bucket_id = ?5 AND state = 'staged' AND generation_id IS NULL \
-               AND id IN (SELECT extent_id FROM upload_parts WHERE upload_id = ?6)",
+               AND (EXISTS (SELECT 1 FROM upload_parts \
+                             WHERE extent_id = ?4 AND upload_id = ?6) \
+                    OR EXISTS (SELECT 1 FROM upload_part_extents \
+                                WHERE extent_id = ?4 AND upload_id = ?6))",
             vec![
                 gen_id(),
                 SqlValue::Int(i64::from(p.seq)),
@@ -534,6 +613,19 @@ pub(super) async fn complete_upload<S: Sql>(
             SqlValue::Int(i64::from(g.extent_count)),
             int(g.size)?,
         ],
+    ));
+    // A part of several extents is adopted whole and in body order.
+    stmts.push((
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM upload_part_extents x \
+              JOIN upload_parts p ON p.upload_id = x.upload_id \
+               AND p.part_number = x.part_number \
+              JOIN extents e0 ON e0.id = p.extent_id \
+              JOIN extents e ON e.id = x.extent_id \
+             WHERE x.upload_id = ?1 \
+               AND ((e.generation_id IS ?2) <> (e0.generation_id IS ?2) \
+                    OR (e0.generation_id IS ?2 AND e.seq <> e0.seq + x.piece)))",
+        vec![text(t.id.as_str()), gen_id()],
     ));
     stmts.push((
         "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \

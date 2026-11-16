@@ -81,6 +81,10 @@ pub const MIGRATION_0014: &str =
 /// The dispatcher's mark of a sent outbox row (`outbox.sent_at`).
 pub const MIGRATION_0015: &str =
     include_str!("../../../workers/s3-bridge/migrations/0015_outbox_sent_at.sql");
+/// The slices of a multipart part stored as several extents
+/// (`upload_part_extents`).
+pub const MIGRATION_0016: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0016_upload_part_extents.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -178,6 +182,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0013)?;
         db.apply(MIGRATION_0014)?;
         db.apply(MIGRATION_0015)?;
+        db.apply(MIGRATION_0016)?;
         Ok(db)
     }
 

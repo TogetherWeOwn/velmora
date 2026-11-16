@@ -455,14 +455,32 @@ here):
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
 
-## A PutObject above one extent
+## A PutObject or an UploadPart above one extent
 
 With `MAX_PUT_BYTES` above `MAX_EXTENT_BYTES` (shipped: 99 MiB over
-16 MiB), the body of one PutObject may be larger than one extent. It is
-stored as slices of `SLICE_BYTES` (8 MiB), each an extent of its own,
-one in memory at a time. The object is one generation with one recovery
-record, like any other, and its ETag is the MD5 of the body. A part of
-a multipart upload stays at `MAX_EXTENT_BYTES`.
+16 MiB), the body of one PutObject or one UploadPart may be larger than
+one extent. It is stored as slices of `SLICE_BYTES` (8 MiB), each an
+extent of its own, one in memory at a time. The object is one
+generation with one recovery record, like any other. The ETag of a
+PutObject, and of a part, is the MD5 of its body. A part made by
+UploadPartCopy stays at `MAX_EXTENT_BYTES`.
+
+**How large an object can be.** One object is made of at most
+`MAX_OBJECT_EXTENTS` extents (10 000, the most this build takes): one
+recovery record names them all, and one request publishes them.
+CompleteMultipartUpload counts the extents of every part the upload
+holds, listed or not, and answers 400 `EntityTooLarge` above the limit.
+The upload stays open.
+
+| Part size | Extents per part | Largest object |
+|---|---|---|
+| 16 MiB (one extent) | 1 | 156 GiB |
+| above 16 MiB, up to 99 MiB | one per 8 MiB | 78 GiB |
+| 5 MiB | 1 | 48 GiB |
+
+A part above 16 MiB saves requests, not extents: 95 MiB is one request
+for twelve extents. For the largest objects use parts of 16 MiB. An
+object above 156 GiB does not fit this build.
 
 - A request body above 100 MiB is refused before the Worker runs, so
   99 MiB is the most `MAX_PUT_BYTES` takes. That limit counts the bytes
@@ -475,10 +493,23 @@ a multipart upload stays at `MAX_EXTENT_BYTES`.
   `--s3-chunk-size 16M` (or `upload_cutoff = 95M` and `chunk_size = 16M`
   in the remote's section of `rclone.conf`). A part of 16 MiB is one
   full extent; rclone's default part of 5 MiB makes about three times as
-  many extents.
+  many extents. Parts up to 95 MiB work too (`--s3-chunk-size 95M`;
+  aws-cli: `multipart_chunksize = 95MB`), within the object size above.
 - Before its first slice is stored, the request writes one row per
   slice into `write_intents`. The commit removes the rows. A request
   that died leaves its rows, and its slices in `SAFETY`.
+- A sliced UploadPart has no recovery record: an open upload is in none
+  (see the table at the top). Its commit stores the part and removes
+  the rows in one batch, and the request raises the rollback stamp
+  after it, before it answers. If that raise fails it answers 503
+  `SlowDown`; the part is stored all the same, and the client's retry
+  replaces it.
+- A build before this one cannot complete an upload that holds a sliced
+  part (it answers 400), and its AbortMultipartUpload leaves the slices
+  after the first in `SAFETY` with nothing that collects them. Before a
+  rollback to such a build, let the open uploads finish or abort them
+  on this one. `SELECT COUNT(DISTINCT upload_id) FROM
+  upload_part_extents` counts them.
 - The request raises the rollback stamp before it writes its recovery
   record, and once more after the commit. If the first raise fails, it
   answers 503 `SlowDown` and publishes nothing.

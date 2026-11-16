@@ -156,6 +156,39 @@ pub(super) fn publish_intents(
     ])
 }
 
+/// The guard a batch that stores a sliced part carries before its
+/// extent inserts: the write has exactly `slices` rows, all `open` and
+/// none under a generation. A part is not a generation: its extents are
+/// staged, and no recovery record names them before Complete.
+pub(super) fn part_intents_open(write: &WriteId, slices: usize) -> Result<[Stmt; 2]> {
+    Ok([
+        guard_open(write, None, slices)?,
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+               (SELECT 1 FROM write_intents WHERE write_id = ?1 AND generation_id IS NOT NULL)",
+            vec![text(write.as_str())],
+        ),
+    ])
+}
+
+/// The statements that batch carries after its extent inserts: every
+/// intent names a staged extent the batch inserted; then the intents go.
+/// An extent row and its intent never exist together.
+pub(super) fn part_intents_close(write: &WriteId, slices: usize) -> Result<[Stmt; 2]> {
+    Ok([
+        (
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+               (SELECT COUNT(*) FROM write_intents w JOIN extents e ON e.id = w.extent_id \
+                 WHERE w.write_id = ?1 AND e.state = 'staged' AND e.generation_id IS NULL) <> ?2",
+            vec![text(write.as_str()), count(slices)?],
+        ),
+        (
+            "DELETE FROM write_intents WHERE write_id = ?1",
+            vec![text(write.as_str())],
+        ),
+    ])
+}
+
 pub(super) async fn abandon_intents<S: Sql>(c: &SqlCatalog<S>, write: &WriteId) -> Result<()> {
     c.sql
         .exec(

@@ -1343,3 +1343,195 @@ async fn a_conditional_complete_is_judged_by_its_own_batch_and_leaves_the_upload
     );
     assert_eq!(fx.read(&t).await.0.state, UploadState::Completed);
 }
+
+// ---------------------------------------------------------------------------
+// A part in several extents
+// ---------------------------------------------------------------------------
+
+impl Fx {
+    /// Stores part `number` as `sizes.len()` extents under intents of
+    /// their own; returns the extents in body order.
+    async fn sliced(
+        &self,
+        t: &UploadTarget<'_>,
+        number: u16,
+        sizes: &[u64],
+    ) -> (Vec<ExtentId>, Guard<()>) {
+        let extents: Vec<ExtentRow> = sizes.iter().map(|s| self.extent(t.bucket, *s)).collect();
+        let ids: Vec<ExtentId> = extents.iter().map(|e| e.id.clone()).collect();
+        let write = WriteId::mint([self.next(); 16]);
+        let opened = self.cat.open_intents(&write, &ids, T0).await.unwrap();
+        assert_eq!(opened, Guard::Applied(()));
+        let part = sliced_row(t, number, &extents);
+        let g = self
+            .cat
+            .put_upload_part_sliced(t, &part, &extents, &write, T0)
+            .await
+            .unwrap();
+        (ids, g)
+    }
+
+    /// The extents of the open parts, as `part:piece:extent`.
+    async fn staged(&self, t: &UploadTarget<'_>) -> Vec<String> {
+        let all = self.cat.upload_extents(t, 1000).await.unwrap();
+        all.iter()
+            .map(|p| format!("{}:{}:{}", p.part_number, p.piece, p.extent.id))
+            .collect()
+    }
+}
+
+fn sliced_row(t: &UploadTarget<'_>, number: u16, extents: &[ExtentRow]) -> UploadPartRow {
+    UploadPartRow {
+        upload_id: t.id.clone(),
+        part_number: number,
+        extent_id: extents[0].id.clone(),
+        size: extents.iter().map(|e| e.plain_size).sum(),
+        etag: format!("\"etag-{number}\""),
+        uploaded_at: T0,
+    }
+}
+
+#[tokio::test]
+async fn a_sliced_part_is_stored_only_under_its_own_open_intents() {
+    let fx = Fx::new().await;
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    let extents: Vec<ExtentRow> = (0..3).map(|_| fx.extent(&fx.bucket, 100)).collect();
+    let ids: Vec<ExtentId> = extents.iter().map(|e| e.id.clone()).collect();
+    let write = WriteId::mint([0xa1; 16]);
+    let other = WriteId::mint([0xa2; 16]);
+    let put = |extents: Vec<ExtentRow>, write: WriteId| {
+        let (fx, t) = (&fx, &t);
+        async move {
+            let part = sliced_row(t, 1, &extents);
+            fx.cat
+                .put_upload_part_sliced(t, &part, &extents, &write, T0)
+                .await
+                .unwrap()
+        }
+    };
+
+    // No rows at all, the rows of another write, fewer extents than
+    // rows, and other extents than the rows name.
+    assert_eq!(put(extents.clone(), write.clone()).await, Guard::Lost);
+    assert_eq!(
+        fx.cat.open_intents(&write, &ids, T0).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(put(extents.clone(), other).await, Guard::Lost);
+    assert_eq!(put(extents[..2].to_vec(), write.clone()).await, Guard::Lost);
+    let mut swapped = extents.clone();
+    swapped[2] = fx.extent(&fx.bucket, 100);
+    assert_eq!(put(swapped, write.clone()).await, Guard::Lost);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM extents").await, 0);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM upload_parts").await, 0);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM write_intents").await, 3);
+    assert_eq!(fx.read(&t).await.0.revision, 0);
+
+    // Rows that were given up store nothing either.
+    fx.cat.abandon_intents(&write).await.unwrap();
+    assert_eq!(put(extents.clone(), write.clone()).await, Guard::Lost);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM extents").await, 0);
+
+    // Under its own open rows the part is stored, and the rows go.
+    let (stored, g) = fx.sliced(&t, 1, &[100, 100, 40]).await;
+    assert_eq!(g, Guard::Applied(()));
+    assert_eq!(
+        fx.staged(&t).await,
+        [
+            format!("1:0:{}", stored[0]),
+            format!("1:1:{}", stored[1]),
+            format!("1:2:{}", stored[2])
+        ]
+    );
+    assert_eq!(fx.count("SELECT COUNT(*) FROM write_intents").await, 3);
+    let (upload, parts) = fx.read(&t).await;
+    assert_eq!((upload.revision, parts.len()), (1, 1));
+    assert_eq!((parts[0].size, &parts[0].extent_id), (240, &stored[0]));
+
+    // One extent in its place: all three go to garbage collection.
+    let (single, _) = fx.part(&t, 1, 100).await;
+    let mut want: Vec<String> = stored.iter().map(|x| x.to_string()).collect();
+    want.sort();
+    assert_eq!(fx.gc_extents().await, want);
+    assert_eq!(fx.staged(&t).await, [format!("1:0:{single}")]);
+    assert_eq!(
+        fx.count("SELECT COUNT(*) FROM upload_part_extents").await,
+        0
+    );
+
+    // And slices in the place of the one extent. Abort takes them all.
+    let (again, _) = fx.sliced(&t, 1, &[100, 100]).await;
+    want.push(single.to_string());
+    want.sort();
+    assert_eq!(fx.gc_extents().await, want);
+    assert_eq!(
+        fx.cat.abort_upload(&t, T0).await.unwrap(),
+        Guard::Applied(())
+    );
+    want.extend(again.iter().map(|x| x.to_string()));
+    want.sort();
+    assert_eq!(fx.gc_extents().await, want);
+    assert_eq!(put(extents, write).await, Guard::Lost);
+}
+
+#[tokio::test]
+async fn complete_adopts_a_sliced_part_whole_and_in_order() {
+    let fx = Fx::new().await;
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    let (s, _) = fx.sliced(&t, 1, &[100, 100, 100]).await;
+    let (d, _) = fx.part(&t, 2, 100).await;
+    let (unlisted, _) = fx.sliced(&t, 3, &[100, 100]).await;
+    let (a, b, c) = (&s[0], &s[1], &s[2]);
+
+    // Not a part of its slices, not in another order, and not with
+    // another part between them.
+    for extents in [
+        vec![a, b, &d],
+        vec![a, c, &d],
+        vec![b, c, &d],
+        vec![a, &d],
+        vec![a, c, b, &d],
+        vec![b, a, c, &d],
+        vec![a, &d, b, c],
+        vec![a, b, c, &d, &unlisted[1]],
+    ] {
+        let sized: Vec<(&ExtentId, u64)> = extents.iter().map(|x| (*x, 100)).collect();
+        let commit = fx.commit(&fx.bucket, KEY, &sized);
+        assert_eq!(
+            fx.cat
+                .publish_upload(&t, 3, &DIGEST, &commit)
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "{} extents",
+            extents.len()
+        );
+    }
+    assert_eq!(fx.count("SELECT COUNT(*) FROM generations").await, 0);
+    assert_eq!(fx.read(&t).await.0.state, UploadState::Open);
+
+    let sized: Vec<(&ExtentId, u64)> = [a, b, c, &d].into_iter().map(|x| (x, 100)).collect();
+    let commit = fx.commit(&fx.bucket, KEY, &sized);
+    assert_eq!(
+        fx.cat
+            .publish_upload(&t, 3, &DIGEST, &commit)
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    let placed = fx
+        .texts(
+            "SELECT id FROM extents WHERE generation_id = ?1 AND state = 'committed' ORDER BY seq",
+            &[text(commit.generation.id.as_str())],
+        )
+        .await;
+    assert_eq!(placed, [a, b, c, &d].map(|x| x.to_string()));
+    assert_eq!(fx.count("SELECT COUNT(*) FROM outbox").await, 4);
+    // Both slices of the part that was not listed are collected.
+    let mut want: Vec<String> = unlisted.iter().map(|x| x.to_string()).collect();
+    want.sort();
+    assert_eq!(fx.gc_extents().await, want);
+    fx.assert_no_live_extent_is_gc_bound().await;
+}

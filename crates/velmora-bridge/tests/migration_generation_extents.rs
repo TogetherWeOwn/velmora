@@ -12,7 +12,7 @@ use service_support::*;
 use velmora_bridge::testkit::{
     RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
     MIGRATION_0006, MIGRATION_0007, MIGRATION_0008, MIGRATION_0009, MIGRATION_0010, MIGRATION_0011,
-    MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0015,
+    MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0015, MIGRATION_0016,
 };
 use velmora_bridge::*;
 
@@ -20,7 +20,9 @@ const BUCKET: &str = "bkt-migrate";
 const KEYS: [&str; 3] = ["one", "big", "over"];
 
 /// Takes a catalogue back to the schema of migration 0004, data kept.
-const UNDO_0005: &str = "DROP TRIGGER generation_extents_on_insert; \
+/// Migration 0016 goes with it: it replaces two triggers of 0005.
+const UNDO_0005: &str = "DROP TABLE upload_part_extents; \
+     DROP TRIGGER generation_extents_on_insert; \
      DROP TRIGGER generation_extents_on_adopt; \
      DROP TRIGGER gc_keep_shared_extents; \
      DROP TRIGGER outbox_keep_shared_extents; \
@@ -178,7 +180,8 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0002,
         MIGRATION_0003,
         MIGRATION_0004,
-        // Later migrations do not touch what 0005 adds; the undo keeps them.
+        // Later migrations do not touch what 0005 adds, except 0016; the
+        // undo keeps the others.
         MIGRATION_0006,
         MIGRATION_0007,
         MIGRATION_0008,
@@ -195,6 +198,7 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
     assert_eq!(schema(db), schema(&old));
 
     db.apply(MIGRATION_0005).unwrap();
+    db.apply(MIGRATION_0016).unwrap();
     assert_eq!(schema(db), schema(&RusqliteSql::with_schema().unwrap()));
     assert_eq!(references(&rig), written);
     assert_eq!(reads(&rig, &bucket, &signer).await, before);

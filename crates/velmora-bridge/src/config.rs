@@ -38,6 +38,12 @@ pub const DEFAULT_SLICE_BYTES: u64 = 8 * 1024 * 1024;
 /// catalogue batches, and one generation holds them.
 pub const MAX_WRITE_SLICES: u64 = 16;
 
+/// Most extents one object may be made of, and `MAX_OBJECT_EXTENTS`
+/// when the variable is absent. One recovery record names them all and
+/// one catalogue batch publishes them, so CompleteMultipartUpload
+/// refuses an upload whose listed parts hold more.
+pub const MAX_OBJECT_EXTENTS_LIMIT: u32 = 10_000;
+
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
 
@@ -163,6 +169,8 @@ pub struct BridgeConfig {
     pub max_put_bytes: u64,
     /// Plaintext bytes of one slice of a sliced body.
     pub slice_bytes: u64,
+    /// Most extents CompleteMultipartUpload publishes as one object.
+    pub max_object_extents: u32,
     /// Delete the safety blobs of sliced writes that were never
     /// published. Off: their `write_intents` rows stay and can be swept
     /// later.
@@ -447,6 +455,13 @@ impl BridgeConfig {
             };
             return Err(ConfigError::Invalid(cause.into()));
         }
+        let max_object_extents = match optional_u64(&get, "MAX_OBJECT_EXTENTS")? {
+            None => MAX_OBJECT_EXTENTS_LIMIT,
+            Some(n) => u32::try_from(n)
+                .ok()
+                .filter(|n| (1..=MAX_OBJECT_EXTENTS_LIMIT).contains(n))
+                .ok_or_else(|| ConfigError::Invalid("MAX_OBJECT_EXTENTS".into()))?,
+        };
         let intent_sweep = match get("INTENT_SWEEP").as_deref().map(str::trim) {
             None | Some("") | Some("off") => false,
             Some("on") => true,
@@ -582,6 +597,7 @@ impl BridgeConfig {
             max_extent_bytes,
             max_put_bytes,
             slice_bytes,
+            max_object_extents,
             intent_sweep,
             required_backbones,
             safety_min_age_secs,

@@ -81,6 +81,18 @@ fn with_length(mut req: Req, body: Vec<u8>) -> Req {
 
 /// A PutObject of `body` to `key` in [`BUCKET`], sent as `mode` sends it.
 pub fn mode_req(rig: &Rig, signer: &Signer, key: &str, body: &[u8], mode: Mode) -> Req {
+    mode_req_at(rig, signer, key, &[], body, mode)
+}
+
+/// The same body modes on `PUT key?query`: an UploadPart.
+pub fn mode_req_at(
+    rig: &Rig,
+    signer: &Signer,
+    key: &str,
+    query: &[(&str, &str)],
+    body: &[u8],
+    mode: Mode,
+) -> Req {
     let now = rig.now();
     let path = path(BUCKET, key);
     let decoded = body.len().to_string();
@@ -94,14 +106,14 @@ pub fn mode_req(rig: &Rig, signer: &Signer, key: &str, body: &[u8], mode: Mode) 
             now,
             Method::Put,
             &path,
-            &[],
+            query,
             extra,
             Vec::new(),
             Some(payload),
         )
     };
     match mode {
-        Mode::Literal => signer.sign(now, Method::Put, &path, &[], &[], body.to_vec()),
+        Mode::Literal => signer.sign(now, Method::Put, &path, query, &[], body.to_vec()),
         Mode::Unsigned => with_length(put(&[], "UNSIGNED-PAYLOAD").0, body.to_vec()),
         Mode::SignedChunks => {
             let (req, seed) = put(&chunked, SIGNED);
@@ -124,6 +136,18 @@ pub fn mode_req(rig: &Rig, signer: &Signer, key: &str, body: &[u8], mode: Mode) 
 
 /// The headers of a PutObject of `len` bytes in `mode`, without a body.
 pub fn declared_req(rig: &Rig, signer: &Signer, key: &str, len: u64, mode: Mode) -> Req {
+    declared_req_at(rig, signer, key, &[], len, mode)
+}
+
+/// The same headers on `PUT key?query`.
+pub fn declared_req_at(
+    rig: &Rig,
+    signer: &Signer,
+    key: &str,
+    query: &[(&str, &str)],
+    len: u64,
+    mode: Mode,
+) -> Req {
     let now = rig.now();
     let path = path(BUCKET, key);
     let decoded = len.to_string();
@@ -144,7 +168,7 @@ pub fn declared_req(rig: &Rig, signer: &Signer, key: &str, len: u64, mode: Mode)
         now,
         Method::Put,
         &path,
-        &[],
+        query,
         extra,
         Vec::new(),
         Some(payload),

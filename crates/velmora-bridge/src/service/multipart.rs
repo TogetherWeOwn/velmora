@@ -11,9 +11,13 @@
 //!   object metadata of the request.
 //! - **UploadPart** seals the body like a single PUT into a fresh extent,
 //!   stores the ciphertext in the safety store and records it as a staged
-//!   part. Nothing is posted before Complete.
+//!   part. A body above one extent is stored as slices, like a PutObject
+//!   of that length, and the part is the list of their extents. Nothing
+//!   is posted before Complete.
 //! - **Complete** validates the listed parts against the upload as read at
-//!   revision `R` and publishes them in one guarded batch pinned to `R`.
+//!   revision `R` and publishes their extents, in part order and body
+//!   order, in one guarded batch pinned to `R`. An upload that holds
+//!   more extents than one object may have is refused and stays open.
 //!   The stored receipt makes a retry return the same ETag without
 //!   publishing again.
 //! - **Abort** closes the upload; its part extents go to garbage
@@ -47,8 +51,9 @@ use crate::config::{BridgeConfig, Maintenance};
 use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
-    UploadReadError,
+    UploadLengths, UploadReadError,
 };
+use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
     PublishOutcome, UploadTarget,
@@ -56,11 +61,14 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
     check_precondition, discard_refused, discard_unless_present, hold_precondition, precondition,
+    restore_gate, writes_refused,
 };
+use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
-    BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, Perm, RespBody, S3Request,
-    S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, JOB_VERSION,
+    Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
+    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
+    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
+    JOB_VERSION,
 };
 
 /// Smallest non-final part.
@@ -74,6 +82,8 @@ pub const MAX_COMPLETE_BODY_BYTES: u64 = 2 * 1024 * 1024;
 const COMPLETE_ATTEMPTS: u32 = 3;
 /// `KeyMode::Random`.
 const KEY_MODE_RANDOM: u8 = 1;
+/// Queue messages of one `send_many`.
+const JOB_BATCH: usize = 100;
 
 /// Headers the edge adds. They are never signed and their values are not
 /// always printable ASCII, so they are dropped before header validation.
@@ -282,7 +292,7 @@ fn policy(cfg: &BridgeConfig) -> Outcome<Policy> {
             header_bytes: 32 * 1024,
             header_count: 128,
             query_pairs: 32,
-            upload_bytes: cfg.max_extent_bytes,
+            upload_bytes: cfg.max_put_bytes,
             clock_skew_seconds: 900,
             presign_seconds: 604_800,
         },
@@ -660,7 +670,12 @@ where
     let (body, charge) = if copy {
         copied_part(bridge, &a, &req.headers, req.body).await?
     } else {
-        let lengths = upload_lengths(&req.headers, bridge.cfg.max_extent_bytes)?;
+        // A part may be as long as a PutObject. Above one extent it is
+        // stored as slices, never read whole.
+        let lengths = upload_lengths(&req.headers, bridge.cfg.max_put_bytes)?;
+        if lengths.decoded > bridge.cfg.max_extent_bytes {
+            return sliced_part(bridge, &a, &target, number, req.body, lengths).await;
+        }
         let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
         let charge = bridge.budget.charge_body(lengths.decoded).await?;
         let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
@@ -746,6 +761,195 @@ where
             Err(ErrorCode::NoSuchUpload.into())
         }
     }
+}
+
+/// A part body above one extent. It is stored as a PutObject of that
+/// length is (`slices.rs`): slice by slice while the rest is still on
+/// the wire, each slice a staged extent with an intent row written
+/// before its blob. The part is the list of those extents in body order,
+/// and its ETag is the MD5 of the whole body.
+///
+/// No recovery record names a staged part, so the stamp is what tells a
+/// restored catalogue from this one: it is raised after the part is
+/// committed and before the answer, and a part whose raise failed is not
+/// acknowledged. The client sends it again, and that replaces it.
+async fn sliced_part<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    a: &Authed,
+    target: &UploadTarget<'_>,
+    number: u16,
+    body: Body,
+    lengths: UploadLengths,
+) -> Outcome<S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let slice_bytes = bridge.cfg.slice_bytes;
+    let count =
+        usize::try_from(lengths.decoded.div_ceil(slice_bytes)).map_err(|_| Fail::Internal)?;
+    let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
+    // One slice of plaintext and one of ciphertext are held at a time,
+    // whatever the length of the part. Nothing is read before this.
+    let charge = bridge.budget.charge_body(slice_bytes).await?;
+
+    let started = bridge.clock.now();
+    let write = WriteId::mint(random()?);
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(ExtentId::mint(random()?));
+    }
+    let bdk = unwrap_bdk(
+        &bridge.kek,
+        a.bucket.kek_version,
+        &a.bucket.id,
+        &a.bucket.bdk_wrapped,
+    )?;
+    // Every slice has its row before its blob exists: whatever happens
+    // to this request from here on, the catalogue names what it stored.
+    match bridge.catalog.open_intents(&write, &ids, started).await? {
+        Guard::Applied(()) => {}
+        // A replay started after this request passed the gate.
+        Guard::Lost => {
+            restore_gate(bridge).await?;
+            return Err(writes_refused().into());
+        }
+    }
+    // From here on a failure gives the rows up. No record of the write
+    // exists anywhere, so the sweep need not wait for them. A row that is
+    // given up no longer passes the guard of the batch below: a batch
+    // whose answer was lost cannot apply after this.
+    let give_up = || async {
+        let _ = bridge.catalog.abandon_intents(&write).await;
+    };
+
+    let mut rng = SystemRng;
+    let sink = SliceSink {
+        safety: &bridge.safety,
+        bdk: &bdk,
+        bucket: &a.bucket.id,
+        ids: &ids,
+        slice_bytes,
+        rng: &mut rng,
+    };
+    let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            give_up().await;
+            return Err(match e {
+                SliceError::Ingress(e) => Fail::Ingress(e),
+                SliceError::Proto(e) => Fail::S3(e),
+                SliceError::Store => Fail::Internal,
+            });
+        }
+    };
+    // The signature of the last chunk, the trailer, the digests and the
+    // length are only known here: until this passes the slices are those
+    // of a body nobody vouched for.
+    let decoded = match validator.finish() {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            give_up().await;
+            return Err(e.into());
+        }
+    };
+    drop(charge);
+    if stored.len() != count {
+        give_up().await;
+        return Err(Fail::Internal);
+    }
+
+    let now = bridge.clock.now();
+    // The ETag of a part is the MD5 of its whole body, whatever the
+    // number of extents it is stored in.
+    let etag = format!("\"{}\"", hex(decoded.md5()));
+    let extents: Vec<ExtentRow> = ids
+        .iter()
+        .zip(stored)
+        .map(|(id, slice)| ExtentRow {
+            id: id.clone(),
+            bucket_id: a.bucket.id.clone(),
+            generation_id: None,
+            state: ExtentState::Staged,
+            seq: None,
+            plain_offset: None,
+            plain_size: slice.plain_size,
+            cipher_size: slice.cipher_size,
+            media_header: slice.sealed.media_header.to_vec(),
+            key_mode: KEY_MODE_RANDOM,
+            wrapped_file_key: Some(slice.sealed.wrapped_file_key.to_vec()),
+            plain_md5: slice.sealed.plain_md5,
+            plain_sha256: slice.sealed.plain_sha256,
+            cipher_sha256: slice.sealed.cipher_sha256,
+            safety_state: SafetyState::Held,
+            article_count: None,
+            plan_rev: 0,
+            last_verified_at: None,
+            release_evidence: None,
+            released_at: None,
+            created_at: now,
+        })
+        .collect();
+    let Some(first) = ids.first() else {
+        give_up().await;
+        return Err(Fail::Internal);
+    };
+    let part = UploadPartRow {
+        upload_id: target.id.clone(),
+        part_number: number,
+        extent_id: first.clone(),
+        size: lengths.decoded,
+        etag: etag.clone(),
+        uploaded_at: now,
+    };
+    // A write this old stops here. The sweep takes `open` rows only
+    // long after this age, and the batch refuses rows it took.
+    if now.0.saturating_sub(started.0) > WRITER_MAX_AGE_MS {
+        give_up().await;
+        return Err(ErrorCode::SlowDown.into());
+    }
+    match bridge
+        .catalog
+        .put_upload_part_sliced(target, &part, &extents, &write, now)
+        .await
+    {
+        Ok(Guard::Applied(())) => {}
+        Ok(Guard::Lost) => {
+            // The batch wrote nothing. The upload was completed or
+            // aborted meanwhile, a replay began, or the rows are no
+            // longer this request's. The slices are left to the sweep.
+            give_up().await;
+            restore_gate(bridge).await?;
+            return Err(match bridge.catalog.upload(target).await? {
+                Some((upload, _)) if upload.state == UploadState::Open => ErrorCode::SlowDown,
+                _ => ErrorCode::NoSuchUpload,
+            }
+            .into());
+        }
+        Err(_) => {
+            // Unknown whether the batch applied. If it did, the rows
+            // are gone and this changes nothing; if not, it cannot
+            // apply any more.
+            give_up().await;
+            return Err(Fail::Internal);
+        }
+    }
+    // Before the answer: a catalogue restored to a point before this
+    // commit is then behind its stamp, the sweep refuses there, and the
+    // slices stay. Without the raise the part is not acknowledged.
+    if bridge.raise_stamp().await.is_err() {
+        restore_gate(bridge).await?;
+        return Err(ErrorCode::SlowDown.into());
+    }
+    Ok(S3Response {
+        status: 200,
+        headers: vec![("etag".into(), etag)],
+        body: RespBody::Empty,
+    })
 }
 
 /// `x-amz-copy-source-range`: `bytes=first-last`, both ends given and
@@ -835,9 +1039,17 @@ fn receipt_digest(listed: &[PartEvidence]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// One listed part as the upload holds it.
+struct ListedPart {
+    number: u16,
+    /// The first extent of the part.
+    first: ExtentId,
+    size: u64,
+}
+
 /// The object a validated part list describes.
 struct Publication {
-    placements: Vec<ExtentPlacement>,
+    parts: Vec<ListedPart>,
     size: u64,
     /// `"<md5 of the concatenated part MD5s>-<parts>"`.
     etag: String,
@@ -847,7 +1059,7 @@ struct Publication {
 /// each must exist with the same ETag, and every part but the last must be
 /// at least [`MIN_PART_BYTES`].
 fn plan(listed: &[PartEvidence], stored: &[UploadPartRow]) -> Outcome<Publication> {
-    let mut placements = Vec::with_capacity(listed.len());
+    let mut parts = Vec::with_capacity(listed.len());
     let mut md5s = Vec::with_capacity(listed.len() * 16);
     let mut size = 0u64;
     let mut too_small = false;
@@ -863,10 +1075,10 @@ fn plan(listed: &[PartEvidence], stored: &[UploadPartRow]) -> Outcome<Publicatio
         // before a size problem.
         too_small |= i + 1 < listed.len() && have.size < MIN_PART_BYTES;
         md5s.extend_from_slice(&part_md5(&have.etag).ok_or(Fail::Internal)?);
-        placements.push(ExtentPlacement {
-            extent_id: have.extent_id.clone(),
-            seq: u32::try_from(i).map_err(|_| Fail::Internal)?,
-            plain_offset: size,
+        parts.push(ListedPart {
+            number: have.part_number,
+            first: have.extent_id.clone(),
+            size: have.size,
         });
         size = size.checked_add(have.size).ok_or(Fail::Internal)?;
     }
@@ -874,11 +1086,46 @@ fn plan(listed: &[PartEvidence], stored: &[UploadPartRow]) -> Outcome<Publicatio
         return Err(ErrorCode::EntityTooSmall.into());
     }
     let etag = format!("\"{}-{}\"", hex(&md5::compute(&md5s).0), listed.len());
-    Ok(Publication {
-        placements,
-        size,
-        etag,
-    })
+    Ok(Publication { parts, size, etag })
+}
+
+/// The extents of the listed parts as the generation will hold them: in
+/// part order and, within a part, in body order. `staged` is ordered by
+/// part number and piece. `None` when it does not hold exactly the parts
+/// that were listed: a part was replaced after the upload was read.
+fn place(parts: &[ListedPart], staged: Vec<PartExtent>) -> Option<Vec<ExtentRow>> {
+    let mut by_part: HashMap<u16, Vec<ExtentRow>> = HashMap::new();
+    for PartExtent {
+        part_number,
+        piece,
+        extent,
+    } in staged
+    {
+        let rows = by_part.entry(part_number).or_default();
+        if usize::try_from(piece).ok() != Some(rows.len()) {
+            return None;
+        }
+        rows.push(extent);
+    }
+    let mut out = Vec::new();
+    let mut offset = 0u64;
+    for part in parts {
+        let rows = by_part.remove(&part.number)?;
+        if rows.first().map(|e| &e.id) != Some(&part.first) {
+            return None;
+        }
+        let start = offset;
+        for mut row in rows {
+            row.seq = Some(u32::try_from(out.len()).ok()?);
+            row.plain_offset = Some(offset);
+            offset = offset.checked_add(row.plain_size)?;
+            out.push(row);
+        }
+        if offset - start != part.size {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 pub(super) async fn complete<
@@ -895,6 +1142,19 @@ pub(super) async fn complete<
     _key: &str,
 ) -> S3Response {
     respond(complete_inner(bridge, req).await)
+}
+
+/// The answer to a Complete of an upload that holds more than `limit`
+/// extents. Nothing was published and the upload is still open.
+fn too_many_extents(limit: u32) -> S3Response {
+    S3Response::error(
+        400,
+        "EntityTooLarge",
+        &format!(
+            "The upload holds more than {limit} stored extents, the most one object may have. \
+             A part above one extent is stored as several. Use a smaller part size."
+        ),
+    )
 }
 
 /// The answer of a Complete whose condition does not hold: `refusal`,
@@ -1019,6 +1279,34 @@ where
             }
         }
         let publication = plan(&listed, &parts)?;
+        drop(parts);
+        // One record names every extent of the object and one batch
+        // publishes them. An upload that holds more than an object may
+        // have is refused before either, and stays open: the client
+        // aborts it, or lists fewer parts after sending some again in
+        // bodies of at most one extent.
+        let limit = bridge.cfg.max_object_extents;
+        let staged = bridge
+            .catalog
+            .upload_extents(&target, limit.saturating_add(1))
+            .await?;
+        if u32::try_from(staged.len()).map_or(true, |n| n > limit) {
+            return Err(too_many_extents(limit).into());
+        }
+        let Some(extents) = place(&publication.parts, staged) else {
+            // An UploadPart replaced a listed part after the upload was
+            // read. The batch would lose its guard: take the same path.
+            lost_at = Some(upload.revision);
+            continue;
+        };
+        let mut placements = Vec::with_capacity(extents.len());
+        for e in &extents {
+            placements.push(ExtentPlacement {
+                extent_id: e.id.clone(),
+                seq: e.seq.ok_or(Fail::Internal)?,
+                plain_offset: e.plain_offset.ok_or(Fail::Internal)?,
+            });
+        }
         let now = bridge.clock.now();
         // The id sorts after everything already on the key, so the order
         // of ids on a key is the order of its commits; the batch checks
@@ -1034,42 +1322,18 @@ where
             checksum_json: None,
             content_json: upload.content_json,
             user_meta_json: upload.user_meta_json,
-            extent_count: u32::try_from(publication.placements.len())
-                .map_err(|_| Fail::Internal)?,
+            extent_count: u32::try_from(placements.len()).map_err(|_| Fail::Internal)?,
             created_at: now,
             retired_at: None,
-        };
-        let commit = CompleteUpload {
-            generation,
-            placements: publication.placements,
-            now,
         };
         // The recovery record is durable before the publication batch.
         // It describes the staged extents as this generation will hold
         // them; the batch applies only if the upload is unchanged.
-        let mut staged: HashMap<ExtentId, ExtentRow> = bridge
-            .catalog
-            .upload_extents(&target)
-            .await?
-            .into_iter()
-            .map(|e| (e.id.clone(), e))
-            .collect();
-        let mut extents = Vec::with_capacity(commit.placements.len());
-        for p in &commit.placements {
-            let Some(mut row) = staged.remove(&p.extent_id) else {
-                break;
-            };
-            row.seq = Some(p.seq);
-            row.plain_offset = Some(p.plain_offset);
-            extents.push(row);
-        }
-        drop(staged);
-        if extents.len() != commit.placements.len() {
-            // An UploadPart replaced a listed part after the upload was
-            // read. The batch would lose its guard: take the same path.
-            lost_at = Some(upload.revision);
-            continue;
-        }
+        let commit = CompleteUpload {
+            generation,
+            placements,
+            now,
+        };
         // A condition that does not hold ends the request with `412`
         // or `404`, before a record exists under this id. The upload is
         // not touched: it stays open with its parts, to be completed
@@ -1110,14 +1374,18 @@ where
             PublishOutcome::Applied => {
                 // The outbox rows are the durable obligation; a lost
                 // notification is picked up by the dispatcher.
-                for p in &commit.placements {
-                    let job = Job::Extent {
+                let jobs: Vec<Job> = commit
+                    .placements
+                    .iter()
+                    .map(|p| Job::Extent {
                         v: JOB_VERSION,
                         extent: p.extent_id.clone(),
                         generation: commit.generation.id.clone(),
                         stage: OutboxStage::Post,
-                    };
-                    let _ = bridge.jobs.send(&job, 0).await;
+                    })
+                    .collect();
+                for batch in jobs.chunks(JOB_BATCH) {
+                    let _ = bridge.jobs.send_many(batch).await;
                 }
                 return complete_response(&a, publication.etag, now.0);
             }

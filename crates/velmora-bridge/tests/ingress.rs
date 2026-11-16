@@ -295,7 +295,7 @@ fn unauthenticated_body_never_read() {
 }
 
 #[test]
-fn a_raised_put_limit_leaves_every_other_body_at_one_extent() {
+fn a_raised_put_limit_covers_parts_and_leaves_every_other_body_at_one_extent() {
     const PUT: u64 = 99 * 1024 * 1024;
     let mut v = vars(true);
     v.insert("MAX_PUT_BYTES".into(), PUT.to_string());
@@ -309,28 +309,29 @@ fn a_raised_put_limit_leaves_every_other_body_at_one_extent() {
     };
     let too_large = Err(IngressError::EntityTooLarge);
 
-    // PutObject, and nothing else, takes up to the raised limit.
-    assert_eq!(decide(Method::Put, "/bucket/key", PUT, &[]), Ok(()));
-    assert_eq!(decide(Method::Put, "/bucket/key", PUT + 1, &[]), too_large);
-    let chunked = |decoded: u64| {
+    // PutObject and UploadPart, and nothing else, take up to the raised
+    // limit.
+    let part = "/bucket/key?partNumber=1&uploadId=u";
+    let chunked = |target: &str, decoded: u64| {
         let decoded = decoded.to_string();
         let headers = [
             ("authorization", SIGV4),
             ("content-encoding", "aws-chunked"),
             ("x-amz-decoded-content-length", decoded.as_str()),
         ];
-        let req = request(Method::Put, "/bucket/key", &headers, Body::Empty);
+        let req = request(Method::Put, target, &headers, Body::Empty);
         check(&req, &cfg, true)
     };
-    assert_eq!(chunked(PUT), Ok(()));
-    assert_eq!(chunked(PUT + 1), too_large);
+    for target in ["/bucket/key", part] {
+        assert_eq!(decide(Method::Put, target, PUT, &[]), Ok(()), "{target}");
+        assert_eq!(decide(Method::Put, target, PUT + 1, &[]), too_large);
+        assert_eq!(chunked(target, PUT), Ok(()), "{target}");
+        assert_eq!(chunked(target, PUT + 1), too_large, "{target}");
+    }
 
-    // A part, a copy that declares a length, and a body of any other
-    // operation stay at one extent.
-    let part = "/bucket/key?partNumber=1&uploadId=u";
+    // A copy that declares a length, and a body of any other operation,
+    // stay at one extent.
     let copy = [("x-amz-copy-source", "/bucket/src")];
-    assert_eq!(decide(Method::Put, part, MAX, &[]), Ok(()));
-    assert_eq!(decide(Method::Put, part, MAX + 1, &[]), too_large);
     assert_eq!(
         decide(Method::Put, "/bucket/key", MAX + 1, &copy),
         too_large

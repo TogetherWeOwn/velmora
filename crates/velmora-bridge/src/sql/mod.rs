@@ -54,10 +54,14 @@ macro_rules! live_ref {
 macro_rules! part_ref {
     ($x:literal) => {
         concat!(
-            "EXISTS (SELECT 1 FROM upload_parts pr JOIN uploads pu ON pu.id = pr.upload_id \
+            "(EXISTS (SELECT 1 FROM upload_parts pr JOIN uploads pu ON pu.id = pr.upload_id \
               WHERE pr.extent_id = ",
             $x,
-            " AND pu.state = 'open')"
+            " AND pu.state = 'open') \
+             OR EXISTS (SELECT 1 FROM upload_part_extents px \
+              JOIN uploads pu ON pu.id = px.upload_id WHERE px.extent_id = ",
+            $x,
+            " AND pu.state = 'open'))"
         )
     };
 }
@@ -87,9 +91,9 @@ use crate::types::{
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload,
-    OutboxStage, OutboxStats, Perm, Precondition, ProviderConfig, ProviderFault, ProviderLoad,
-    Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow, VerificationRow,
-    WriteId,
+    OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig, ProviderFault,
+    ProviderLoad, Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow,
+    VerificationRow, WriteId,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -358,6 +362,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Guard<()>> {
         uploads::put_upload_part(self, t, part, extent, now).await
     }
+    async fn put_upload_part_sliced(
+        &self,
+        t: &UploadTarget<'_>,
+        part: &UploadPartRow,
+        extents: &[ExtentRow],
+        write: &WriteId,
+        now: UnixMs,
+    ) -> Result<Guard<()>> {
+        uploads::put_upload_part_sliced(self, t, part, extents, write, now).await
+    }
     async fn complete_upload(
         &self,
         t: &UploadTarget<'_>,
@@ -369,8 +383,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<PublishOutcome> {
         uploads::complete_upload(self, t, revision, digest, c, condition, record).await
     }
-    async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
-        recovery::upload_extents(self, t).await
+    async fn upload_extents(&self, t: &UploadTarget<'_>, limit: u32) -> Result<Vec<PartExtent>> {
+        recovery::upload_extents(self, t, limit).await
     }
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>> {
         uploads::abort_upload(self, t, now).await
