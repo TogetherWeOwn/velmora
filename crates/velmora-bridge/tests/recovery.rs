@@ -1335,6 +1335,26 @@ async fn a_packed_plan_that_nothing_replaces_is_named() {
         assert_eq!(report.unreadable, [record.as_str()], "{report:?}");
         assert_eq!(rig.count(&stored), 1, "the value stays as it is");
     }
+
+    // A record that does not open has no plan to give either. The
+    // extent is named once: not once for its record and once for the
+    // plan in the catalogue.
+    let garbage = b"not a sealed record".to_vec();
+    let digest = sha256(&garbage);
+    let meta = BlobMeta {
+        bucket: &bucket.id,
+        extent: &extents[0].id,
+        cipher_sha256: &digest,
+    };
+    rig.bridge
+        .safety
+        .inner
+        .put(&record, garbage, &meta)
+        .await
+        .unwrap();
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.unreadable, [record.as_str()], "{report:?}");
+    assert_eq!(rig.count(&stored), 1, "the value stays as it is");
 }
 
 /// A record sealed under another key or stored under another name does
