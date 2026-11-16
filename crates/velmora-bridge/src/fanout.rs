@@ -68,7 +68,7 @@ pub const TOKEN_HEADER: &str = "x-velmora-fanout-token";
 pub const TOKEN_TTL_MS: i64 = 120_000;
 /// Smallest and largest `GET_FANOUT_BYTES`. The upper bound keeps one
 /// sub-range well inside the CPU budget of one invocation (300 s): a
-/// sub-range read from Usenet took about 67 s of CPU per GiB on a
+/// sub-range read from Usenet took 50 to 90 s of CPU per GiB on a
 /// deployed Worker, one read from the cache 20 to 40 s.
 pub const MIN_FANOUT_BYTES: u64 = 1024 * 1024;
 pub const MAX_FANOUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
