@@ -478,8 +478,11 @@ async fn an_unreadable_first_sub_range_is_an_error_response() {
     else {
         panic!("the first sub-range cannot be read");
     };
-    // The 503 a GET in one invocation gives for it, with its document.
+    // The 503 a GET in one invocation gives for it, with its document,
+    // at once: the first sub-range is asked for one time.
     assert_eq!(resp.status, 503);
+    assert_eq!(pipe.sent.borrow().len(), 1);
+    assert!(pipe.slept.borrow().is_empty());
     assert_eq!(header(&resp.headers, "retry-after"), Some("30"));
     let RespBody::Bytes(doc) = resp.body else {
         panic!("a buffered document")

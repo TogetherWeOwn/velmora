@@ -590,13 +590,26 @@ own `cpu_ms`. A smaller GET is served as before.
   response has a `Content-Length`, and the stream is aborted: the client
   sees a broken transfer, never a short one that looks complete. The log
   has `fanout: download aborted (<class>)`. The client asks again with
-  `Range: bytes=<received>-` (aws-cli, rclone and restic retry by
-  themselves). A sub-range that answers 503 before its first byte is
-  asked for again, up to three times, before the download is given up.
+  `Range: bytes=<received>-` and `If-Match: <the ETag it was sent>`:
+  each request reads the object that is live when it arrives, and
+  without the condition a key written to meanwhile would give the rest
+  of another object (with it: 412). A sub-range after the first that
+  answers 503 before its first byte is asked for again, up to three
+  times, before the download is given up; a 503 of the first sub-range
+  is the answer to the client.
 - **Limits.** `GET_FANOUT_BYTES` is from 1 MiB to 2 GiB; a GET of more
   than 8,192 sub-ranges (8 TiB at 1 GiB) is refused with 500 before any
   byte. Sub-requests count against the subrequest limit of the first
   invocation (10,000) and are not billed as requests; their CPU is.
+  One download of 100 sub-ranges was read whole on a deployed Worker.
+  If the platform ever stops a download at a fixed number of
+  sub-requests, the log has `fanout: download aborted (transport)` at
+  the same sub-range each time: raise `GET_FANOUT_BYTES`.
+- **A sub-range that ends short.** A sub-response is refused unless it
+  declares the length asked for. Should its body still end early, the
+  download comes out shorter than its `Content-Length` and the close
+  fails, which aborts it: a client never takes it for a complete
+  response, and must not keep the bytes of a transfer that failed.
 - **A deploy during a download.** The next sub-request is answered by
   the new version. A version that does not know the token (from before
   this feature, or with another token format) refuses it, and the

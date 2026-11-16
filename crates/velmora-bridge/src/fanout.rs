@@ -429,7 +429,9 @@ impl Fanout {
     /// Opens sub-range `index`: a `200` of exactly its length, body
     /// unread. A `503` is tried again after a pause, with a fresh token:
     /// nothing of this sub-range has been sent. Any other answer is
-    /// final.
+    /// final. The first sub-range is not tried again: the client has no
+    /// status line yet and is better served by the `503` now, as a GET
+    /// in one invocation gives it, than by a longer wait.
     async fn open<P: SubPipe>(
         &self,
         pipe: &P,
@@ -445,7 +447,7 @@ impl Fanout {
                     pipe.discard(resp.body).await;
                     return Err((FanoutError::Length, None));
                 }
-                503 if attempt < RETRY_PAUSE_MS.len() && self.retries.get() > 0 => {
+                503 if index > 0 && attempt < RETRY_PAUSE_MS.len() && self.retries.get() > 0 => {
                     self.retries.set(self.retries.get() - 1);
                     pipe.discard(resp.body).await;
                     pipe.sleep(RETRY_PAUSE_MS[attempt]).await;
@@ -457,7 +459,7 @@ impl Fanout {
     }
 
     /// Opens the first sub-range, before the response of the client has a
-    /// status line. A `503` that stays is handed on as it is (it is the
+    /// status line. A `503` is handed on as it is (it is the
     /// answer a GET in one invocation would have given); every other
     /// failure is `fallback`, the caller's `500`.
     pub async fn open_first<P: SubPipe>(
