@@ -38,3 +38,10 @@ with `--content-encoding gzip`) is served with that header. Under the
 runtime's default (`automatic`) the Worker compresses such a body again and
 drops its length. Every response is therefore built with
 `encodeBody: "manual"`, so the stored bytes are sent as they are.
+
+One difference from S3 remains outside the Worker. For a compressible
+`Content-Type` (`text/*`, JSON) and a client that does not accept gzip,
+the runtime in front of the Worker leaves the `Content-Encoding` header out
+of the answer. Under `wrangler dev` this was measured on HEAD, with
+`manual` and `no-transform` set as well. `application/octet-stream` keeps
+it.

@@ -211,8 +211,10 @@ fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
                 .split(',')
                 .any(|d| d.trim().eq_ignore_ascii_case(DIRECTIVE));
             if !present {
-                // A trailing comma is dropped rather than doubled.
-                let base = value.trim().trim_end_matches(',').trim_end();
+                // Trailing commas are dropped rather than doubled.
+                let base = value
+                    .trim()
+                    .trim_end_matches(|c: char| c == ',' || c.is_ascii_whitespace());
                 *value = if base.is_empty() {
                     DIRECTIVE.to_string()
                 } else {
@@ -608,7 +610,13 @@ mod tests {
 
     #[test]
     fn a_trailing_comma_is_not_doubled() {
-        let h = served(&[("cache-control", "max-age=60, ")]);
-        assert_eq!(cache_control(&h), ["max-age=60, no-transform"]);
+        for stored in ["max-age=60, ", "max-age=60, ,", "max-age=60,,"] {
+            let h = served(&[("cache-control", stored)]);
+            assert_eq!(
+                cache_control(&h),
+                ["max-age=60, no-transform"],
+                "{stored:?}"
+            );
+        }
     }
 }

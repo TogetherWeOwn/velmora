@@ -564,6 +564,14 @@ got=$(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/enc.html" gzip gz
   fail "GET a/enc.html with Accept-Encoding: gzip" "the helper exits 0" "$got"
 [[ $got == "200 -" ]] || fail "GET a/enc.html with Accept-Encoding: gzip" "200" "$got"
 same_bytes "GET a/enc.html equals the stored gzip bytes" "$T/enc.html.gz" "$T/got-enc.bin"
+json=$(run_aws "HEAD a/enc.html" "${S3API[@]}" head-object --bucket "$SB" --key a/enc.html)
+enc_len=$(stat -c %s "$T/enc.html.gz")
+enc_md5=$(md5sum "$T/enc.html.gz" | cut -d' ' -f1)
+# Content-Encoding itself is not asserted on HEAD: for a compressible
+# Content-Type and a client that does not accept gzip (aws-cli sends
+# identity), `wrangler dev` leaves it out (see docs/object-responses.md).
+jcheck "HEAD a/enc.html keeps its length and strong ETag" \
+  ".ContentLength == $enc_len and .ETag == \"\\\"$enc_md5\\\"\"" "$json"
 run_aws "DELETE a/enc.html" "${S3API[@]}" delete-object --bucket "$SB" --key a/enc.html >/dev/null
 rm -f "$T/enc.html.gz" "$T/got-enc.bin"
 
