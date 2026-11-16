@@ -1144,7 +1144,7 @@ impl Catalog for MemCatalog {
         _: &Bucket,
         _: &[velmora_bridge::replay::ReplayExtent],
         _: UnixMs,
-    ) -> Result<()> {
+    ) -> Result<Vec<ExtentId>> {
         unused()
     }
     async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {

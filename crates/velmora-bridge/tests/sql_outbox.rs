@@ -3056,6 +3056,133 @@ async fn gc_drops_a_packed_plan_with_the_article_metadata() {
     assert_eq!(fx.extent(&live, "plan IS NULL").await, "0");
 }
 
+/// A replay keeps a packed plan that reads, whatever its form, and
+/// writes no row beside it. One that does not read gives way to the
+/// plan of the record, in the form the replay stores (packed, or the
+/// explicit form when it stores rows); with no plan in the record it
+/// stays, and its extent is named.
+#[tokio::test]
+async fn a_replay_replaces_only_a_packed_plan_that_cannot_be_read() {
+    use velmora_bridge::plan::{expand, pack_explicit};
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let set_plan = "UPDATE extents SET plan = ?2, article_count = 1, plan_rev = 1, \
+                    posted_at = 77 WHERE id = ?1";
+    let no_plan = vec![0xff_u8; 3];
+    // Each extent with the plan of its record, and a stored value.
+    let mut extents = Vec::new();
+    for (key, stored) in [("kept", 0), ("packed", 1), ("rows", 1), ("none", 1)] {
+        let o = fx.publish(&fx.bucket, key).await;
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let rows = fx.whole(&o, key);
+        let explicit = pack_explicit(&o.extent, 1064, &rows).unwrap();
+        let value = match stored {
+            0 => explicit.clone(),
+            _ => no_plan.clone(),
+        };
+        let params = [text(o.extent.as_str()), SqlValue::Blob(value)];
+        assert_eq!(fx.run(set_plan, &params).await, 1);
+        extents.push((o, extent_rows.remove(0), rows, explicit));
+    }
+    // "kept": the record has another plan of the same extent.
+    let other = fx.whole(&extents[0].0, "other");
+    let replay: Vec<ReplayExtent> = vec![
+        ReplayExtent {
+            row: extents[0].1.clone(),
+            packed: Some(pack_explicit(&extents[0].0.extent, 1064, &other).unwrap()),
+            plan: Some(other),
+            safety_present: true,
+        },
+        ReplayExtent {
+            row: extents[1].1.clone(),
+            plan: Some(extents[1].2.clone()),
+            packed: Some(extents[1].3.clone()),
+            safety_present: true,
+        },
+        ReplayExtent {
+            row: extents[2].1.clone(),
+            plan: Some(extents[2].2.clone()),
+            packed: None,
+            safety_present: true,
+        },
+        ReplayExtent {
+            row: extents[3].1.clone(),
+            plan: None,
+            packed: None,
+            safety_present: true,
+        },
+    ];
+    for x in &replay[1..] {
+        assert!(fx.cat.stored_plan(&x.row.id).await.is_err());
+    }
+    let stranded = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(9))
+        .await
+        .unwrap();
+    assert_eq!(stranded, vec![extents[3].0.extent.clone()]);
+    // No row beside a plan, in either form of the replay.
+    assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
+    for (o, _, rows, explicit) in &extents[..3] {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        assert_eq!(stored.packed.as_deref(), Some(&explicit[..]));
+        assert!(velmora_bridge::plan::same_plan(&stored.rows, rows));
+        assert!(expand(&o.extent, 1064, explicit, None, None).is_ok());
+        // The stamps of the row stand.
+        assert_eq!(fx.extent(o, "posted_at").await, "77");
+        assert_eq!(fx.extent(o, "article_count").await, "1");
+    }
+    let stored = fx.extent(&extents[3].0, "hex(plan)").await;
+    assert_eq!(stored, "FFFFFF");
+    // Again: nothing left to do, the same extent is named.
+    let before = fx.dump().await;
+    let again = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(again, stranded);
+    assert_eq!(fx.dump().await, before);
+}
+
+/// One article alone is never marked posted on a packed plan: a row
+/// left beside it is a copy that nothing reads, and stays as it is.
+#[tokio::test]
+async fn mark_posted_leaves_a_row_beside_a_packed_plan() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let lease = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let rows = fx.whole(&o, "k");
+    fx.cat.plan_articles(&lease, &rows).await.unwrap().unwrap();
+    let blob = velmora_bridge::plan::pack_explicit(&o.extent, 1064, &rows).unwrap();
+    let params = [text(o.extent.as_str()), SqlValue::Blob(blob)];
+    let set_plan = "UPDATE extents SET plan = ?2 WHERE id = ?1";
+    assert_eq!(fx.run(set_plan, &params).await, 1);
+    let posted = "SELECT COUNT(*) FROM articles WHERE state = 'posted'";
+    assert!(!fx
+        .cat
+        .mark_posted(&lease, 0, "p1", T0.plus_secs(1))
+        .await
+        .unwrap());
+    assert_eq!(fx.count(posted).await, 0);
+    // Without the plan beside it, the same call marks the row.
+    let o2 = fx.publish(&fx.bucket, "k2").await;
+    let lease2 = fx.claim(&o2, OutboxStage::Post, T0).await.unwrap();
+    let rows2 = fx.whole(&o2, "k2");
+    fx.cat
+        .plan_articles(&lease2, &rows2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fx
+        .cat
+        .mark_posted(&lease2, 0, "p1", T0.plus_secs(1))
+        .await
+        .unwrap());
+    assert_eq!(fx.count(posted).await, 1);
+}
+
 /// Rows left beside a packed plan are a copy of it and go; a plan that
 /// cannot be read is passed over and does not stop the step; a plan of
 /// which only some rows are posted waits.

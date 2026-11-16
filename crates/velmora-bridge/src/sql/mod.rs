@@ -555,7 +555,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         bucket: &Bucket,
         extents: &[ReplayExtent],
         now: UnixMs,
-    ) -> Result<()> {
+    ) -> Result<Vec<ExtentId>> {
         replay::replay_extents(self, bucket, extents, now).await
     }
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {

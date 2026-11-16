@@ -78,9 +78,11 @@ fn bucket_insert(b: &Bucket) -> Stmt {
 
 fn article_insert(a: &ArticleRow) -> Result<Stmt> {
     Ok((
+        // Beside a packed plan a row is never read: none is written.
         "INSERT OR IGNORE INTO articles(extent_id, idx, message_id, newsgroup, headers, \
            cipher_offset, cipher_len, payload_sha256, yenc_name, state) \
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 \
+           WHERE (SELECT plan FROM extents WHERE id = ?1) IS NULL",
         vec![
             text(a.extent_id.as_str()),
             SqlValue::Int(i64::from(a.idx)),
@@ -187,9 +189,18 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
     Ok(())
 }
 
+/// A packed plan in the catalogue that cannot be read.
+struct Unreadable {
+    extent: ExtentId,
+    /// The stored value.
+    stored: Vec<u8>,
+    /// The plan of the extent's record, to put in its place. `None` =
+    /// the record has no plan that this row can hold.
+    plan: Option<Vec<u8>>,
+}
+
 /// The extents of `extents` whose packed plan in the catalogue cannot be
-/// read (a damaged value, the plan of another extent), each with the
-/// stored value and with the plan of its record to put in its place.
+/// read (a damaged value, the plan of another extent).
 ///
 /// A plan the catalogue has is kept, in whatever form, as long as it
 /// can be read. One that cannot is no plan: every reader of the extent
@@ -198,10 +209,9 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
 async fn unreadable_plans<S: Sql>(
     c: &SqlCatalog<S>,
     extents: &[ReplayExtent],
-) -> Result<Vec<(ExtentId, Vec<u8>, Vec<u8>)>> {
-    let with_plan: Vec<&ReplayExtent> = extents.iter().filter(|x| x.plan.is_some()).collect();
+) -> Result<Vec<Unreadable>> {
     let mut out = Vec::new();
-    for chunk in with_plan.chunks(LOST_CHUNK) {
+    for chunk in extents.chunks(LOST_CHUNK) {
         let marks = vec!["?"; chunk.len()].join(",");
         let rows = c
             .sql
@@ -237,23 +247,26 @@ async fn unreadable_plans<S: Sql>(
             };
             // Only a value that reads on this very row is worth
             // writing.
-            if let Some(plan) =
-                plan.filter(|p| crate::plan::expand(&id, cipher_size, p, None, None).is_ok())
-            {
-                out.push((id, stored, plan));
-            }
+            let plan =
+                plan.filter(|p| crate::plan::expand(&id, cipher_size, p, None, None).is_ok());
+            out.push(Unreadable {
+                extent: id,
+                stored,
+                plan,
+            });
         }
     }
     Ok(out)
 }
 
-/// Step 1.
+/// Step 1. Returns the extents whose packed plan cannot be read and
+/// stays so: their record has no plan to put in its place.
 pub(super) async fn replay_extents<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &Bucket,
     extents: &[ReplayExtent],
     now: UnixMs,
-) -> Result<()> {
+) -> Result<Vec<ExtentId>> {
     let unreadable = unreadable_plans(c, extents).await?;
     let mut stmts: Vec<Stmt> = Vec::new();
     for x in extents {
@@ -261,7 +274,8 @@ pub(super) async fn replay_extents<S: Sql>(
             stmts.push(bucket_insert(bucket));
         }
         extent_stmts(x, now, &mut stmts)?;
-        for (_, stored, plan) in unreadable.iter().filter(|(id, ..)| *id == x.row.id) {
+        for u in unreadable.iter().filter(|u| u.extent == x.row.id) {
+            let Some(plan) = &u.plan else { continue };
             // Keyed on the very value that was read: a plan that
             // changed since is another plan, and is left alone.
             stmts.push((
@@ -272,7 +286,7 @@ pub(super) async fn replay_extents<S: Sql>(
                     SqlValue::Int(i64::try_from(x.plan.as_ref().map_or(0, Vec::len)).unwrap_or(0)),
                     SqlValue::Int(i64::from(x.row.plan_rev)),
                     SqlValue::Blob(plan.clone()),
-                    SqlValue::Blob(stored.clone()),
+                    SqlValue::Blob(u.stored.clone()),
                 ],
             ));
         }
@@ -283,7 +297,11 @@ pub(super) async fn replay_extents<S: Sql>(
     if !stmts.is_empty() {
         c.sql.batch(stmts).await?;
     }
-    Ok(())
+    Ok(unreadable
+        .into_iter()
+        .filter(|u| u.plan.is_none())
+        .map(|u| u.extent)
+        .collect())
 }
 
 /// Live generations with an extent that has no copy anywhere: its pinned

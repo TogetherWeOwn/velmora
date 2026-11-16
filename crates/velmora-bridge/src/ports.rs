@@ -729,6 +729,9 @@ pub trait Catalog {
             packed: None,
         })
     }
+    /// Marks one article row posted. A packed plan has no row to mark
+    /// and is posted only as a whole ([`Catalog::mark_posted_many`]):
+    /// on one, nothing is written and the answer is `false`.
     async fn mark_posted(&self, l: &Lease, idx: u32, provider: &str, now: UnixMs) -> Result<bool>;
     /// Marks several articles posted in one atomic write; each entry is
     /// `(idx, provider)`. `false` = fenced, and then nothing was written.
@@ -814,12 +817,17 @@ pub trait Catalog {
     /// Makes the bucket, the extents (new ones staged, without a
     /// generation) and their article plans exist, and records a pinned
     /// copy that is gone.
+    ///
+    /// A plan the catalogue has is kept as long as it can be read. A
+    /// packed plan that cannot gives way to the plan of the extent's
+    /// record; the extents returned are those whose record has none to
+    /// give, so that their plan stays unreadable.
     async fn replay_extents(
         &self,
         bucket: &Bucket,
         extents: &[ReplayExtent],
         now: UnixMs,
-    ) -> Result<()>;
+    ) -> Result<Vec<ExtentId>>;
     /// Extents whose row says the pinned copy is held, in id order after
     /// `after`.
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>>;

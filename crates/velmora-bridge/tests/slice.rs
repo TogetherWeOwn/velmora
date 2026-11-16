@@ -2232,18 +2232,47 @@ async fn rebuild_from_usenet(packed_plans: &str) {
                 rows.map(|r| r.expect("row")).collect()
             })
         };
-        let before = plans(&rig);
+        let mut before = plans(&rig);
         expect_eq(s, "packed plans before", 4, before.len());
+        // The fourth plan reads, and is not what the replay would
+        // store: the same articles in the other packed form.
+        let other_form = {
+            let (id, seeded) = &before[3];
+            let id = ExtentId::new(id.clone());
+            let size: i64 = rig.bridge.catalog.sql.with_conn(|c| {
+                c.query_row(
+                    "SELECT cipher_size FROM extents WHERE id = ?1",
+                    [id.as_str()],
+                    |r| r.get(0),
+                )
+                .expect("cipher size")
+            });
+            let size = u64::try_from(size).expect("a size");
+            let rows = velmora_bridge::plan::expand(&id, size, seeded, None, None)
+                .unwrap_or_else(|e| fail(s, "plan::expand", "Ok", e));
+            velmora_bridge::plan::pack_explicit(&id, size, &rows)
+                .unwrap_or_else(|e| fail(s, "plan::pack_explicit", "Ok", e))
+        };
+        expect(
+            s,
+            "the other form is another value",
+            other_form != before[3].1,
+            String::new(),
+        );
         let mut cut = before[0].1.clone();
         cut.truncate(cut.len() - 1);
         let mut flipped = before[1].1.clone();
         *flipped.last_mut().expect("a plan") ^= 1;
-        // The third extent gets the plan of the fourth, which stays.
+        // The third extent gets the plan of the fourth.
         let damage = [
-            (&before[0].0, cut),
-            (&before[1].0, flipped),
-            (&before[2].0, before[3].1.clone()),
+            (before[0].0.clone(), cut),
+            (before[1].0.clone(), flipped),
+            (before[2].0.clone(), before[3].1.clone()),
+            (before[3].0.clone(), other_form.clone()),
         ];
+        // What the replay must leave: three plans of the records, and
+        // the fourth as it is now.
+        before[3].1 = other_form;
         rig.bridge.catalog.sql.with_conn(|c| {
             for (id, plan) in &damage {
                 let n = c
@@ -2268,11 +2297,12 @@ async fn rebuild_from_usenet(packed_plans: &str) {
                 .replay_step(at)
                 .await
                 .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+            expect_eq(s, "unreadable", Vec::<String>::new(), report.unreadable);
             cursor = report.next.take();
         }
         expect(
             s,
-            "every plan is its record's again",
+            "unreadable plans are their record's again, a plan that reads is kept",
             plans(&rig) == before,
             String::new(),
         );

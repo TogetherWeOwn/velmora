@@ -246,7 +246,9 @@ pub struct ReplayReport {
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
     pub damaged: Vec<String>,
-    /// Records that did not open or parse (blob keys).
+    /// Records that did not open or parse (blob keys). Also the plan
+    /// record of an extent whose packed plan in the catalogue cannot be
+    /// read and whose record has none to put in its place.
     pub unreadable: Vec<String>,
     /// `None` = the replay is complete.
     pub next: Option<ReplayCursor>,
@@ -423,7 +425,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     safety_present,
                 });
             }
-            self.catalog.replay_extents(&bucket, &chunk, now).await?;
+            // A plan in the catalogue that cannot be read and that no
+            // record replaces is named like a record that does not
+            // open: the extent cannot be read from Usenet.
+            for extent in self.catalog.replay_extents(&bucket, &chunk, now).await? {
+                let name = article_key(&extent);
+                if !report.unreadable.contains(&name) {
+                    report.unreadable.push(name);
+                }
+            }
             *budget -= end - at;
             at = end;
             cursor.extent = u32::try_from(at).unwrap_or(u32::MAX);
