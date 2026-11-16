@@ -1167,9 +1167,10 @@ async fn pass_is_idempotent_second_pass_copies_nothing() {
     // find no record. An answer that is not cut is the last one.
     assert_eq!(w.e2.count("GET "), lists + 5);
     assert_eq!(w.e2.count("HEAD "), 7);
-    // MemBlobStore lists by reading (the port's default); the place of
-    // the walk and the name of its store are read once; nothing more.
-    assert_eq!(w.safety.gets(), gets + 9);
+    // MemBlobStore lists by reading (the port's default). What is
+    // saved of the walk is asked for by its size first, and nothing of
+    // it is there (this pass saves none): no read of it.
+    assert_eq!(w.safety.gets(), gets + 7);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4409,5 +4410,55 @@ async fn the_times_of_the_walk_are_about_one_store_only() {
         assert_ne!(w.e2.get("m/art/x_0").as_deref(), Some(&b"other"[..]));
         assert_eq!(time_at(&w, STORE_KEY).await, Some(w.remote.place()));
         assert_eq!(time_at(&w, WALKED_KEY).await, ms(pass(2).0));
+    }
+}
+
+/// A walk is under way, with its place saved, when the copy is pointed
+/// at another store: the place counts for nothing there, and the walk
+/// goes through every key. And while the name of the store cannot be
+/// saved, every pass does, and says so.
+#[tokio::test(flavor = "current_thread")]
+async fn a_walk_under_way_begins_again_at_another_store() {
+    let w = World::new();
+    for i in 0..4 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    w.raw(WALK_KEY, b"m/art/x_2".to_vec()).await;
+    w.raw(BEGAN_KEY, (NOW - PASS_INTERVAL_MS).to_string().into_bytes())
+        .await;
+    w.raw(STORE_KEY, b"0123456789abcdef".to_vec()).await;
+    let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((counts.unwrap().copied, why), (4, None));
+    assert_eq!(time_at(&w, STORE_KEY).await, Some(w.remote.place()));
+    // A body there that is far too large is not read, and is another store.
+    w.raw(STORE_KEY, vec![b'a'; 4096]).await;
+    let gets = w.safety.gets();
+    let pass = UnixMs(NOW + PASS_INTERVAL_MS);
+    w.clock.set(pass);
+    w.e2.set("m/art/x_0", b"other");
+    let (_, counts, why) = w.copier().run_job(&w.jobs, pass, "").await;
+    assert_eq!((counts.unwrap().copied, why), (1, None));
+    assert!(w.safety.gets() > gets);
+    assert_eq!(time_at(&w, STORE_KEY).await, Some(w.remote.place()));
+
+    let w = World::new();
+    for i in 0..4 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    let stuck = NoMark(&w.safety, STORE_KEY);
+    let copier = Copier {
+        safety: &stuck,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    for n in 0..3 {
+        let pass = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        w.clock.set(pass);
+        w.e2.set("m/art/x_0", b"other");
+        let whys = queued_pass(&w, &copier, pass).await;
+        assert!(whys.contains(&StepError::Mark), "pass {n}: {whys:?}");
+        assert_ne!(w.e2.get("m/art/x_0").as_deref(), Some(&b"other"[..]));
     }
 }

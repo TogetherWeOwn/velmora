@@ -286,7 +286,7 @@ impl<H: HttpSend> S3Remote<H> {
     /// another. No secret is in it.
     pub fn place(&self) -> String {
         let cfg = &self.cfg;
-        let named = format!("{}\n{}\n{}", cfg.host, cfg.bucket, cfg.prefix);
+        let named = [cfg.host.as_str(), cfg.bucket.as_str(), cfg.prefix.as_str()].join("\n");
         hex(&Sha256::digest(named.as_bytes())[..8])
     }
 

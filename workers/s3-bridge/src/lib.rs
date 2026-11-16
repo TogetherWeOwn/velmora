@@ -218,18 +218,16 @@ fn copier<'a>(
 /// plan of its extent over to the recovery store now. Without it the
 /// plan waits for the walk (`velmora_bridge::copy`).
 async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &JobOutcome) {
-    if velmora_bridge::copy::plan_hint(job, outcome, UnixMs(0)).is_none() {
+    use velmora_bridge::copy::{posted, send_hint};
+    // Off, or refused: the cron run says so.
+    if posted(job, outcome).is_none()
+        || bridge.cfg.maintenance == velmora_bridge::config::Maintenance::Restore
+        || !env::recovery_copy_on(env)
+    {
         return;
     }
-    // Off, or refused: the cron run says so.
-    let Ok(Some(remote)) = env::recovery_store(env) else {
-        return;
-    };
-    if !copier(bridge, &remote)
-        .hint(&bridge.jobs, job, outcome)
-        .await
-        && bridge.cfg.maintenance != velmora_bridge::config::Maintenance::Restore
-    {
+    let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+    if !send_hint(&bridge.safety, &bridge.jobs, job, outcome, now).await {
         console_error!("recovery copy: a hint was not sent");
     }
 }
@@ -247,6 +245,9 @@ async fn recovery_copy(
         Ok(Some(remote)) => remote,
         // Switched off since the job was sent.
         Ok(None) => return JobOutcome::Ack,
+        // A hint (pass 0) says nothing: there is one for every extent,
+        // and the cron run says it.
+        Err(_) if pass.0 == 0 => return JobOutcome::Ack,
         Err(class) => {
             console_error!("recovery copy: config refused: {class}");
             return JobOutcome::Ack;

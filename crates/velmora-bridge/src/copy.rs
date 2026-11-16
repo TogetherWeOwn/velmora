@@ -100,9 +100,11 @@
 //!   the next pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 
+use futures_util::future::FutureExt;
 use futures_util::stream::{self, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use velmora_s3_proto::sign::Listed;
 
@@ -166,12 +168,12 @@ pub const HINT_RETRY_SECS: u32 = 120;
 /// After a hint found the store down, the others ask nothing of it for
 /// this long.
 pub const HINT_PAUSE_MS: i64 = 5 * 60 * 1000;
-/// The bytes read of a saved time.
 /// Where [`S3Remote::place`] of the store that the times of the walk
 /// are about is saved. When it does not name the store of this pass
 /// (the copy was pointed at another bucket or prefix), those times
 /// count for nothing and the walk begins at once.
 pub const STORE_KEY: &str = "rc/store";
+/// The bytes read of a saved time.
 const TIME_BYTES: usize = 20;
 /// How far the fresh generation records came that are not sent yet: a
 /// JSON object, key of the record to the number of its article plans,
@@ -295,54 +297,55 @@ pub enum StepError {
 }
 
 /// The parts of a pass, in the order they are done.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Fresh tombstones.
-    #[serde(rename = "d")]
+    /// Fresh tombstones (`d` in a cursor).
     Tombstones,
-    /// Fresh generation records, and whatever sorts after them.
-    #[serde(rename = "g")]
+    /// Fresh generation records, and whatever sorts after them (`g`).
     Generations,
-    /// The walk below the fresh tombstones.
-    #[serde(rename = "a")]
+    /// The walk below the fresh tombstones (`a`).
     Low,
-    /// The walk between the tombstones and the fresh generation records.
-    #[serde(rename = "b")]
+    /// The walk between the tombstones and the fresh generation
+    /// records (`b`).
     High,
     /// No part of a pass: a hint, the job of one article plan
-    /// (`key`), made at `made`.
-    #[serde(rename = "x")]
+    /// (`key`), made at `made` (`x`).
     Plan,
 }
 
-/// Where a pass stands: the cursor of a job, as JSON. An empty cursor,
-/// or one that does not parse, is the start of a pass.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The phases and their names in a cursor.
+const PHASES: [(Phase, &str); 5] = [
+    (Phase::Tombstones, "d"),
+    (Phase::Generations, "g"),
+    (Phase::Low, "a"),
+    (Phase::High, "b"),
+    (Phase::Plan, "x"),
+];
+
+/// Where a pass stands: the cursor of a job, as a JSON object. An
+/// empty cursor, or one that does not parse, is the start of a pass.
+///
+/// The members: `p` the phase and `k` the key, both required; `g`, `n`
+/// and `t`, each left out when empty or zero. A member of another name
+/// is passed over; one of another type is no cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Place {
-    #[serde(rename = "p")]
     phase: Phase,
     /// The key the phase goes on after.
-    #[serde(rename = "k")]
     key: String,
     /// A generation record after `key` that an earlier job began, and
     /// how many of its article plans, in order, are over there. They
     /// stay in the cursor until the phase ends; only that record reads
-    /// them.
-    #[serde(rename = "g", default, skip_serializing_if = "String::is_empty")]
+    /// them (`g` and `n`).
     generation: String,
-    #[serde(rename = "n", default, skip_serializing_if = "is_zero")]
     plans: u32,
-    /// When a hint was made ([`Phase::Plan`]).
-    #[serde(rename = "t", default, skip_serializing_if = "no_time")]
+    /// When a hint was made ([`Phase::Plan`]; `t`).
     made: i64,
 }
 
-fn is_zero(n: &u32) -> bool {
-    *n == 0
-}
-
-fn no_time(ms: &i64) -> bool {
-    *ms == 0
+/// A string as JSON. Serializing a string cannot fail.
+fn quoted(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_default()
 }
 
 impl Place {
@@ -356,13 +359,50 @@ impl Place {
         }
     }
 
+    /// Read through the JSON value, and written by hand, rather than
+    /// by derived code: the Worker has a size budget.
     fn parse(cursor: &str) -> Option<Place> {
-        serde_json::from_str(cursor).ok()
+        let value: serde_json::Value = serde_json::from_str(cursor).ok()?;
+        let object = value.as_object()?;
+        let name = object.get("p")?.as_str()?;
+        let phase = PHASES.iter().find(|(_, p)| *p == name)?.0;
+        let key = object.get("k")?.as_str()?.to_string();
+        let generation = match object.get("g") {
+            Some(generation) => generation.as_str()?.to_string(),
+            None => String::new(),
+        };
+        let plans = match object.get("n") {
+            Some(plans) => u32::try_from(plans.as_u64()?).ok()?,
+            None => 0,
+        };
+        let made = match object.get("t") {
+            Some(made) => made.as_i64()?,
+            None => 0,
+        };
+        Some(Place {
+            phase,
+            key,
+            generation,
+            plans,
+            made,
+        })
     }
 
     fn cursor(&self) -> String {
-        // Serializing plain strings and integers cannot fail.
-        serde_json::to_string(self).unwrap_or_default()
+        let name = PHASES.iter().find(|(p, _)| *p == self.phase);
+        let name = name.map_or("", |(_, name)| name);
+        let mut out = format!("{{\"p\":\"{name}\",\"k\":{}", quoted(&self.key));
+        if !self.generation.is_empty() {
+            out.push_str(",\"g\":");
+            out.push_str(&quoted(&self.generation));
+        }
+        for (name, number) in [("n", i64::from(self.plans)), ("t", self.made)] {
+            if number != 0 {
+                out.push_str(&format!(",\"{name}\":{number}"));
+            }
+        }
+        out.push('}');
+        out
     }
 
     fn walking(&self) -> bool {
@@ -575,17 +615,7 @@ pub fn pass_due(now: UnixMs) -> bool {
 /// The hint carries pass 0, a pass that ended long ago: a Worker of a
 /// version that knows no hints acknowledges it and starts no pass.
 pub fn plan_hint(job: &Job, outcome: &JobOutcome, now: UnixMs) -> Option<Job> {
-    let Job::Extent {
-        extent,
-        stage: OutboxStage::Post,
-        ..
-    } = job
-    else {
-        return None;
-    };
-    if *outcome != JobOutcome::Ack {
-        return None;
-    }
+    let extent = posted(job, outcome)?;
     let mut place = Place::at(Phase::Plan, article_key(extent));
     place.made = now.0;
     Some(Job::RecoveryCopy {
@@ -593,6 +623,51 @@ pub fn plan_hint(job: &Job, outcome: &JobOutcome, now: UnixMs) -> Option<Job> {
         pass: UnixMs(0),
         cursor: place.cursor(),
     })
+}
+
+/// The extent of `job`, when `job` is a post job that is done: the one
+/// [`plan_hint`] has a hint for.
+pub fn posted<'j>(job: &'j Job, outcome: &JobOutcome) -> Option<&'j ExtentId> {
+    match job {
+        Job::Extent {
+            extent,
+            stage: OutboxStage::Post,
+            ..
+        } if *outcome == JobOutcome::Ack => Some(extent),
+        _ => None,
+    }
+}
+
+/// Sends the hint of [`plan_hint`]. True when one was sent. One that
+/// cannot be sent asks for the walk instead (best effort). It needs
+/// nothing of the recovery store; the caller does not send it in
+/// `MAINTENANCE=restore`, or with the copy off.
+pub async fn send_hint<B: BlobStore, J: JobSink>(
+    safety: &B,
+    jobs: &J,
+    job: &Job,
+    outcome: &JobOutcome,
+    now: UnixMs,
+) -> bool {
+    let Some(hint) = plan_hint(job, outcome, now) else {
+        return false;
+    };
+    let sent = jobs.send(&hint, 0).await.is_ok();
+    if !sent {
+        let _ = put_mark(safety, WANT_KEY, now.0.to_string().into_bytes()).await;
+    }
+    sent
+}
+
+/// Saves `body` at `key` of the safety bucket, as a mark of the copy.
+async fn put_mark<B: BlobStore>(safety: &B, key: &str, body: Vec<u8>) -> Result<()> {
+    let sha: [u8; 32] = Sha256::digest(&body).into();
+    let meta = BlobMeta {
+        bucket: &BucketId::new("-"),
+        extent: &ExtentId::new("recovery-copy"),
+        cipher_sha256: &sha,
+    };
+    safety.put(key, body, &meta).await
 }
 
 /// A saved time: decimal milliseconds, and nothing else.
@@ -759,7 +834,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             saved = saved && self.save_time(BEGAN_KEY, pass).await.is_ok();
             // Last: until it is there, the next pass begins again.
             let store = self.remote.place().into_bytes();
-            saved = saved && self.put_mark(STORE_KEY, store).await.is_ok();
+            saved = saved && put_mark(self.safety, STORE_KEY, store).await.is_ok();
         }
         let started = saved;
         if step.ended {
@@ -871,21 +946,36 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         pass: UnixMs,
         began: &mut bool,
     ) -> std::result::Result<Option<Place>, StepError> {
-        let left = self.saved_walk().await?;
+        // What is saved of the walk, read in one place of the code (the
+        // Worker has a size budget): its place, its end, its start,
+        // and the store they are about.
+        let here = self.remote.place().into_bytes();
+        let marks = [
+            (WALK_KEY, MAX_KEY_BYTES),
+            (WALKED_KEY, TIME_BYTES),
+            (BEGAN_KEY, TIME_BYTES),
+            (STORE_KEY, here.len()),
+        ];
+        let mut read = [None, None, None, None];
+        for (slot, (key, max)) in read.iter_mut().zip(marks) {
+            let mark = self.read_mark(key, max).await;
+            *slot = mark.map_err(|_| StepError::Source)?;
+        }
+        let [left, ended, start, store] = read;
+        let left = left.and_then(|bytes| String::from_utf8(bytes).ok());
+        let left = left.unwrap_or_default();
         let stale = !left.is_empty();
         let place = walk_from(left, pass);
-        let ended = self.read_time(WALKED_KEY).await;
         // A time that has not come yet is none: an end in the future
         // would otherwise make every pass begin the walk again.
         // And so is a time that is about another store: that one may
         // hold nothing yet.
-        let here = self.remote.place().into_bytes();
-        let store = self.safety.get(STORE_KEY, None).await;
-        let same = store.map_err(|_| StepError::Source)? == Some(here);
-        let come = |at: &i64| same && *at < pass.0 + PASS_INTERVAL_MS;
-        let ended = ended.map_err(|_| StepError::Source)?.filter(come);
-        let start = self.read_time(BEGAN_KEY).await;
-        let start = start.map_err(|_| StepError::Source)?.filter(come);
+        let same = store == Some(here);
+        let time = |mark: Option<Vec<u8>>| {
+            let at = mark.and_then(|bytes| saved_time(&bytes));
+            at.filter(|at| same && *at < pass.0 + PASS_INTERVAL_MS)
+        };
+        let (ended, start) = (time(ended), time(start));
         // A walk is under way when one began after the last one ended.
         // Only then does the saved place count: a place without such a
         // start (stale, or written by something else) would make a walk
@@ -946,26 +1036,30 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
 
     /// The time saved at `key`; `None` when there is none, or what is
     /// there is not a time.
-    async fn read_time(&self, key: &str) -> Result<Option<i64>> {
+    fn read_time<'s>(&'s self, key: &'s str) -> impl Future<Output = Result<Option<i64>>> + 's {
+        self.read_mark(key, TIME_BYTES)
+            .map(|read| read.map(|bytes| bytes.and_then(|bytes| saved_time(&bytes))))
+    }
+
+    /// What is saved at `key`, when it is at most `max` bytes.
+    async fn read_mark(&self, key: &str, max: usize) -> Result<Option<Vec<u8>>> {
         // Its size first: something else may have written it.
         match self.safety.head(key).await? {
-            Some(size) if size <= TIME_BYTES as u64 => {}
+            Some(size) if size <= max as u64 => {}
             _ => return Ok(None),
         }
         let bytes = self.safety.get(key, None).await?;
-        Ok(bytes
-            .filter(|bytes| bytes.len() <= TIME_BYTES)
-            .and_then(|bytes| saved_time(&bytes)))
+        Ok(bytes.filter(|bytes| bytes.len() <= max))
     }
 
-    async fn save_time(&self, key: &str, at: UnixMs) -> Result<()> {
-        self.put_mark(key, at.0.to_string().into_bytes()).await
+    fn save_time<'s>(&'s self, key: &'s str, at: UnixMs) -> impl Future<Output = Result<()>> + 's {
+        put_mark(self.safety, key, at.0.to_string().into_bytes())
     }
 
     /// Asks for the walk to come soon. Best effort: without it the walk
     /// comes [`WALK_INTERVAL_MS`] after the last.
-    async fn want_walk(&self) {
-        let _ = self.save_time(WANT_KEY, self.clock.now()).await;
+    fn want_walk(&self) -> impl Future<Output = ()> + '_ {
+        self.save_time(WANT_KEY, self.clock.now()).map(|_| ())
     }
 
     /// Sends the hint for the article plan of a post job that is done
@@ -975,14 +1069,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         if self.maintenance == Maintenance::Restore {
             return false;
         }
-        let Some(hint) = plan_hint(job, outcome, self.clock.now()) else {
-            return false;
-        };
-        let sent = jobs.send(&hint, 0).await.is_ok();
-        if !sent {
-            self.want_walk().await;
-        }
-        sent
+        send_hint(self.safety, jobs, job, outcome, self.clock.now()).await
     }
 
     /// The job of a hint: makes one article plan equal over there.
@@ -1101,35 +1188,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         }
         // Serializing strings and integers cannot fail.
         let body = serde_json::to_vec(&known.plans).unwrap_or_default();
-        self.put_mark(SWEEP_KEY, body).await.is_ok()
+        put_mark(self.safety, SWEEP_KEY, body).await.is_ok()
     }
 
-    /// The place the walk was saved at; empty when none is, or when it
-    /// is not a key.
-    async fn saved_walk(&self) -> std::result::Result<String, StepError> {
-        let saved = self
-            .safety
-            .get(WALK_KEY, None)
-            .await
-            .map_err(|_| StepError::Source)?;
-        Ok(saved
-            .filter(|bytes| bytes.len() <= MAX_KEY_BYTES)
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .unwrap_or_default())
-    }
-
-    async fn save_walk(&self, at: &str) -> Result<()> {
-        self.put_mark(WALK_KEY, at.as_bytes().to_vec()).await
-    }
-
-    async fn put_mark(&self, key: &str, body: Vec<u8>) -> Result<()> {
-        let sha: [u8; 32] = Sha256::digest(&body).into();
-        let meta = BlobMeta {
-            bucket: &BucketId::new("-"),
-            extent: &ExtentId::new("recovery-copy"),
-            cipher_sha256: &sha,
-        };
-        self.safety.put(key, body, &meta).await
+    fn save_walk(&self, at: &str) -> impl Future<Output = Result<()>> + '_ {
+        put_mark(self.safety, WALK_KEY, at.as_bytes().to_vec())
     }
 
     /// Walks the keys of `span` after `place.key`, and moves the place,
