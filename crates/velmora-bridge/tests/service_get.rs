@@ -368,6 +368,105 @@ async fn read_conditions() {
     .expect_error(412, "PreconditionFailed");
 }
 
+/// Every `cache-control` value of `resp`.
+fn cache_controls(resp: &Resp) -> Vec<&str> {
+    resp.headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// The edge in front of the Worker compresses or rewrites text responses
+/// and then drops `Content-Length` and drops or weakens `ETag`. Every
+/// object answer (HEAD, GET, range GET, 304) is marked `no-transform`,
+/// with the exact length and the strong ETag beside it.
+#[tokio::test(flavor = "current_thread")]
+async fn object_responses_forbid_edge_transforms() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let html = b"<!doctype html><p>mail someone@example.com</p>".repeat(50);
+    let etag = md5_etag(&html);
+    let len = html.len().to_string();
+    for (key, stored, served) in [
+        ("plain.html", None, "no-transform"),
+        ("cc.html", Some("max-age=60"), "max-age=60, no-transform"),
+        ("nt.html", Some("no-transform"), "no-transform"),
+    ] {
+        let mut headers = vec![("content-type", "text/html")];
+        headers.extend(stored.map(|v| ("cache-control", v)));
+        rig.call(
+            &signer,
+            Method::Put,
+            &path(BUCKET, key),
+            &[],
+            &headers,
+            &html,
+        )
+        .await
+        .expect(200);
+
+        let head = rig.head(&signer, BUCKET, key).await;
+        head.expect(200);
+        assert_eq!(cache_controls(&head), [served], "HEAD {key}");
+        assert_eq!(
+            head.header("content-length"),
+            Some(len.as_str()),
+            "HEAD {key}"
+        );
+        assert_eq!(head.header("etag"), Some(etag.as_str()), "HEAD {key}");
+
+        let resp = get(&rig, &signer, key, &[]).await;
+        resp.expect(200);
+        assert_eq!(resp.body, html);
+        assert_eq!(cache_controls(&resp), [served], "GET {key}");
+        assert_eq!(
+            resp.header("content-length"),
+            Some(len.as_str()),
+            "GET {key}"
+        );
+        assert_eq!(resp.header("etag"), Some(etag.as_str()), "GET {key}");
+        assert!(resp.header("content-encoding").is_none(), "GET {key}");
+
+        let resp = get_range(&rig, &signer, key, "bytes=10-109").await;
+        resp.expect(206);
+        assert_eq!(resp.body, html[10..110]);
+        assert_eq!(cache_controls(&resp), [served], "range GET {key}");
+        assert_eq!(
+            resp.header("content-length"),
+            Some("100"),
+            "range GET {key}"
+        );
+        assert_eq!(resp.header("etag"), Some(etag.as_str()), "range GET {key}");
+
+        let resp = get(&rig, &signer, key, &[("if-none-match", &etag)]).await;
+        resp.expect(304);
+        assert_eq!(cache_controls(&resp), [served], "304 {key}");
+        assert_eq!(resp.header("etag"), Some(etag.as_str()), "304 {key}");
+    }
+
+    // Other content types are marked too; an empty object as well.
+    rig.call(
+        &signer,
+        Method::Put,
+        &path(BUCKET, "data.json"),
+        &[],
+        &[("content-type", "application/json")],
+        b"{\"k\":1}",
+    )
+    .await
+    .expect(200);
+    rig.put(&signer, BUCKET, "empty", b"").await.expect(200);
+    for key in ["data.json", "empty"] {
+        let head = rig.head(&signer, BUCKET, key).await;
+        head.expect(200);
+        assert_eq!(cache_controls(&head), ["no-transform"], "HEAD {key}");
+        let resp = get(&rig, &signer, key, &[]).await;
+        resp.expect(200);
+        assert_eq!(cache_controls(&resp), ["no-transform"], "GET {key}");
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn cache_is_tried_before_the_safety_copy() {
     let rig = rig();

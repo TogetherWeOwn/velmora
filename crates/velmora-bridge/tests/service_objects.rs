@@ -94,7 +94,11 @@ async fn put_then_head_reports_the_stored_object() {
         Some("Fri, 15 Jan 2027 08:00:00 GMT")
     );
     assert_eq!(head.header("content-type"), Some("application/x-test"));
-    assert_eq!(head.header("cache-control"), Some("max-age=60"));
+    // Served with `no-transform` appended, so the edge passes it on as is.
+    assert_eq!(
+        head.header("cache-control"),
+        Some("max-age=60, no-transform")
+    );
     assert_eq!(head.header("x-amz-meta-origin"), Some("unit test"));
     assert_eq!(head.header("accept-ranges"), Some("bytes"));
 }

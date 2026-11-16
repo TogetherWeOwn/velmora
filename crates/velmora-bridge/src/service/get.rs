@@ -185,6 +185,43 @@ fn pieces(extents: Vec<ExtentRow>, start: u64, len: u64) -> Option<Vec<Piece>> {
     (covered == len).then_some(out)
 }
 
+/// Marks an object response `no-transform` so the edge in front of the
+/// Worker passes it on as it is.
+///
+/// Without it, the edge compresses responses of compressible types
+/// (`text/*`, JSON, JavaScript, SVG, ...) when the client accepts gzip or
+/// brotli, and rewrites `text/html` (email obfuscation and similar)
+/// whatever the client accepts. Either way it drops `Content-Length` and
+/// drops or weakens the `ETag`, also on HEAD. S3 clients read the size
+/// and the MD5 from exactly those two headers; rclone, for one, takes the
+/// missing length as size 0, calls the upload corrupt and deletes it.
+///
+/// The stored metadata is not changed. A stored `Cache-Control` is kept
+/// and `no-transform` is appended to it (`max-age=60` is served as
+/// `max-age=60, no-transform`), unless it already has the directive; an
+/// object without one is served `Cache-Control: no-transform`.
+fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
+    const DIRECTIVE: &str = "no-transform";
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+    {
+        Some((_, value)) => {
+            let present = value
+                .split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case(DIRECTIVE));
+            if !present {
+                *value = if value.trim().is_empty() {
+                    DIRECTIVE.to_string()
+                } else {
+                    format!("{value}, {DIRECTIVE}")
+                };
+            }
+        }
+        None => headers.push(("cache-control".to_string(), DIRECTIVE.to_string())),
+    }
+}
+
 async fn read<
     C: Catalog + 'static,
     B: BlobStore + 'static,
@@ -230,9 +267,11 @@ async fn read<
         authed.headers.get("x-amz-checksum-mode").is_some(),
     )
     .map_err(s3_error)?;
+    let mut headers = plan.headers;
+    forbid_edge_transform(&mut headers);
     let mut resp = S3Response {
         status: plan.status,
-        headers: plan.headers,
+        headers,
         body: RespBody::Empty,
     };
     let Some(range) = plan.body else {
@@ -505,5 +544,61 @@ where
             stamp_read(bridge, &extent.id, from_cache).await;
             return Ok(held);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forbid_edge_transform;
+
+    fn served(stored: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut headers = stored
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        forbid_edge_transform(&mut headers);
+        headers
+    }
+
+    fn cache_control(headers: &[(String, String)]) -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_object_without_cache_control_gets_no_transform() {
+        let h = served(&[("content-type", "text/html"), ("etag", "\"e\"")]);
+        assert_eq!(cache_control(&h), ["no-transform"]);
+        assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn a_stored_cache_control_is_kept_and_extended() {
+        let h = served(&[("cache-control", "max-age=60, private")]);
+        assert_eq!(cache_control(&h), ["max-age=60, private, no-transform"]);
+    }
+
+    #[test]
+    fn a_stored_no_transform_is_not_repeated() {
+        for stored in [
+            "no-transform",
+            "max-age=60, No-Transform",
+            " no-transform ,public",
+        ] {
+            let h = served(&[("cache-control", stored)]);
+            assert_eq!(cache_control(&h), [stored], "{stored:?}");
+        }
+        // A directive that only contains the word does not count.
+        let h = served(&[("cache-control", "x-no-transform-ish")]);
+        assert_eq!(cache_control(&h), ["x-no-transform-ish, no-transform"]);
+    }
+
+    #[test]
+    fn an_empty_stored_cache_control_becomes_no_transform() {
+        let h = served(&[("Cache-Control", "")]);
+        assert_eq!(cache_control(&h), ["no-transform"]);
     }
 }
