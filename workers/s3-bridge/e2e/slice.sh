@@ -18,7 +18,7 @@
 # started or migrated. The admin bearer comes from the 0600 file named by
 # VELMORA_ADMIN_TOKEN_FILE. Differences from local, per the prod setup with
 # one backbone:
-#   - setup creates run-unique buckets (slice-<8 hex>, other-<8 hex>) and
+#   - setup creates run-unique buckets (slice-, other- and empty-<8 hex>) and
 #     fails if a name is taken; the in-flight peak may be 0 (the status call
 #     can land on another isolate);
 #   - step 4 accepts `verify` (release waits for a second backbone) and polls
@@ -340,6 +340,12 @@ run_aws() {
 
 now_ms() { date +%s%3N; }
 
+# adm_code <curl args...>: admin call; prints only the HTTP status.
+adm_code() {
+  curl -sS "${CURL_TLS[@]}" -o "$T/adm.out" -w '%{http_code}' --max-time 300 -H @"$T/admin.hdr" "$@" 2>"$T/adm.err" ||
+    fail "admin call" "an HTTP answer" "curl: $(<"$T/adm.err")"
+}
+
 # make_bucket <name>: a new disposable bucket. Any answer but 2xx fails the
 # run, a 409 (name taken) included: a run never reuses a bucket.
 make_bucket() {
@@ -356,18 +362,20 @@ log "step $STEP"
 # Remote runs get their own buckets, so a run never touches data it did
 # not write and overlapping runs cannot see each other's objects. Local
 # runs start from an empty throwaway state.
+# EB never holds anything: step 3c deletes it.
 if [[ $MODE == local ]]; then
-  SB=slice OB=other
+  SB=slice OB=other EB=empty
 else
   RUN_ID=$(openssl rand -hex 4)
-  SB=slice-$RUN_ID OB=other-$RUN_ID
+  SB=slice-$RUN_ID OB=other-$RUN_ID EB=empty-$RUN_ID
 fi
-log "buckets: $SB, $OB"
+log "buckets: $SB, $OB, $EB"
 make_bucket "$SB"
 make_bucket "$OB"
+make_bucket "$EB"
 # The key secret goes straight from curl through jq into a 0600 file.
 adm "POST /_admin/keys" -XPOST "$BASE/_admin/keys" -H 'content-type: application/json' \
-  -d "{\"buckets\":[\"$SB\",\"$OB\"],\"perm\":\"rw\"}" >"$T/key.json"
+  -d "{\"buckets\":[\"$SB\",\"$OB\",\"$EB\"],\"perm\":\"rw\"}" >"$T/key.json"
 jq -e '(.access_key_id|type=="string") and (.secret|type=="string")' "$T/key.json" >/dev/null ||
   fail "POST /_admin/keys response" "{access_key_id, secret} strings" "keys: $(jq -c 'keys' "$T/key.json" 2>&1)"
 jq -r '"[default]\naws_access_key_id=\(.access_key_id)\naws_secret_access_key=\(.secret)"' \
@@ -571,6 +579,100 @@ expect_err "UploadPart under another key" NoSuchUpload \
   "${S3API[@]}" upload-part --bucket "$SB" --key a/mp2 --part-number 1 --upload-id "$UP" --body "$T/small.bin"
 run_aws "Abort a/mp under its own bucket and key" \
   "${S3API[@]}" abort-multipart-upload --bucket "$SB" --key a/mp --upload-id "$UP" >/dev/null
+
+# 3c the listings of multipart uploads, DeleteObjects and DeleteBucket.
+STEP=3c-listings-batch-delete-bucket
+log "step $STEP"
+json=$(run_aws "ListMultipartUploads of $OB before any upload" \
+  "${S3API[@]}" --output json list-multipart-uploads --bucket "$OB")
+jcheck "no upload is open in $OB" '(.Uploads // []) | length == 0' "${json:-{\}}"
+json=$(run_aws "CreateMultipartUpload b/mp" "${S3API[@]}" --output json create-multipart-upload --bucket "$OB" --key b/mp)
+UP=$(jq -r .UploadId <<<"$json")
+json=$(run_aws "UploadPart 3 of b/mp" "${S3API[@]}" --output json upload-part --bucket "$OB" --key b/mp \
+  --part-number 3 --upload-id "$UP" --body "$T/small.bin")
+ETAG3=$(jq -r .ETag <<<"$json")
+dd if="$T/big.bin" of="$T/part1.bin" bs=65536 count=1 status=none
+json=$(run_aws "UploadPart 1 of b/mp" "${S3API[@]}" --output json upload-part --bucket "$OB" --key b/mp \
+  --part-number 1 --upload-id "$UP" --body "$T/part1.bin")
+ETAG1=$(jq -r .ETag <<<"$json")
+json=$(run_aws "ListMultipartUploads of $OB" "${S3API[@]}" --output json list-multipart-uploads --bucket "$OB")
+jcheck "the open upload is listed with its key and id" \
+  ".Uploads | length == 1 and .[0].Key == \"b/mp\" and .[0].UploadId == \"$UP\"" "$json"
+json=$(run_aws "ListMultipartUploads of $OB with a delimiter" \
+  "${S3API[@]}" --output json list-multipart-uploads --bucket "$OB" --delimiter /)
+jcheck "the upload folds into its common prefix" \
+  '((.Uploads // []) | length == 0) and (.CommonPrefixes | map(.Prefix) == ["b/"])' "$json"
+json=$(run_aws "ListMultipartUploads of $OB under another prefix" \
+  "${S3API[@]}" --output json list-multipart-uploads --bucket "$OB" --prefix c/)
+jcheck "no upload under another prefix" '(.Uploads // []) | length == 0' "${json:-{\}}"
+json=$(run_aws "ListParts of b/mp" "${S3API[@]}" --output json list-parts --bucket "$OB" --key b/mp --upload-id "$UP")
+jcheck "both parts are listed in order with ETag and size" \
+  ".Parts | map([.PartNumber, .Size, .ETag]) == [[1, 65536, $(jq -c . <<<"\"${ETAG1//\"/\\\"}\"")], [3, 1048576, $(jq -c . <<<"\"${ETAG3//\"/\\\"}\"")]]" "$json"
+json=$(run_aws "ListParts of b/mp, first page of one" "${S3API[@]}" --output json --no-paginate list-parts \
+  --bucket "$OB" --key b/mp --upload-id "$UP" --max-parts 1)
+jcheck "a page of one part is truncated and names the next marker" \
+  '(.Parts | map(.PartNumber) == [1]) and .IsTruncated == true and (.NextPartNumberMarker | tonumber) == 1' "$json"
+json=$(run_aws "ListParts of b/mp, second page" "${S3API[@]}" --output json --no-paginate list-parts \
+  --bucket "$OB" --key b/mp --upload-id "$UP" --max-parts 1 --part-number-marker 1)
+jcheck "the marker continues with the last part" '(.Parts | map(.PartNumber) == [3]) and .IsTruncated == false' "$json"
+expect_err "ListParts under another bucket" NoSuchUpload \
+  "${S3API[@]}" list-parts --bucket "$SB" --key b/mp --upload-id "$UP"
+expect_err "ListParts under another key" NoSuchUpload \
+  "${S3API[@]}" list-parts --bucket "$OB" --key b/mp2 --upload-id "$UP"
+run_aws "Abort b/mp" "${S3API[@]}" abort-multipart-upload --bucket "$OB" --key b/mp --upload-id "$UP" >/dev/null
+expect_err "ListParts of the aborted upload" NoSuchUpload \
+  "${S3API[@]}" list-parts --bucket "$OB" --key b/mp --upload-id "$UP"
+json=$(run_aws "ListMultipartUploads of $OB after the abort" \
+  "${S3API[@]}" --output json list-multipart-uploads --bucket "$OB")
+jcheck "the aborted upload is no longer listed" '(.Uploads // []) | length == 0' "${json:-{\}}"
+
+for key in b/d1 b/d2 'b/d 3 & <more>' b/keep; do
+  run_aws "PUT $key" "${S3API[@]}" put-object --bucket "$OB" --key "$key" --body "$T/part1.bin" >/dev/null
+done
+jq -n '{Objects: [{Key: "b/d1"}, {Key: "b/d2"}, {Key: "b/d 3 & <more>"}, {Key: "b/never"}]}' >"$T/delete.json"
+json=$(run_aws "DeleteObjects of four keys" \
+  "${S3API[@]}" --output json delete-objects --bucket "$OB" --delete "file://$T/delete.json")
+jcheck "every named key is reported deleted, the missing one too" \
+  '((.Errors // []) | length == 0) and (.Deleted | map(.Key) | sort == ["b/d 3 & <more>", "b/d1", "b/d2", "b/never"])' "$json"
+for key in b/d1 b/d2 'b/d 3 & <more>'; do
+  expect_err "HEAD $key after DeleteObjects" '\(404\)' "${S3API[@]}" head-object --bucket "$OB" --key "$key"
+done
+run_aws "HEAD b/keep, which was not named" "${S3API[@]}" head-object --bucket "$OB" --key b/keep >/dev/null
+jq -n '{Objects: [{Key: "b/keep"}], Quiet: true}' >"$T/delete.json"
+json=$(run_aws "DeleteObjects, quiet" \
+  "${S3API[@]}" --output json delete-objects --bucket "$OB" --delete "file://$T/delete.json")
+jcheck "a quiet delete reports nothing" '((.Deleted // []) | length == 0) and ((.Errors // []) | length == 0)' "${json:-{\}}"
+expect_err "HEAD b/keep after the quiet delete" '\(404\)' "${S3API[@]}" head-object --bucket "$OB" --key b/keep
+jq -n '{Objects: [range(1001) | {Key: "b/k\(.)"}]}' >"$T/delete.json"
+expect_err "DeleteObjects of 1001 keys" MalformedXML \
+  "${S3API[@]}" delete-objects --bucket "$OB" --delete "file://$T/delete.json"
+
+# DeleteBucket. A bucket goes only through the admin token, and only while
+# it never held anything: an S3 key gets BucketNotEmpty for a bucket in use
+# and AccessDenied otherwise, and changes nothing either way.
+expect_err "DeleteBucket of a bucket with objects, by an S3 key" 'BucketNotEmpty' \
+  "${S3API[@]}" delete-bucket --bucket "$SB"
+expect_err "DeleteBucket of an empty bucket, by an S3 key" 'AccessDenied' \
+  "${S3API[@]}" delete-bucket --bucket "$EB"
+code=$(adm_code -XDELETE "$BASE/$SB")
+[[ $code == 409 ]] || fail "admin DeleteBucket of $SB, which holds objects" "HTTP 409" "HTTP $code $(<"$T/adm.out")"
+grep -q '<Code>BucketNotEmpty</Code>' "$T/adm.out" ||
+  fail "admin DeleteBucket of $SB" "BucketNotEmpty" "$(<"$T/adm.out")"
+code=$(adm_code -XDELETE "$BASE/$OB")
+[[ $code == 409 ]] || fail "admin DeleteBucket of $OB, whose objects were deleted" "HTTP 409" "HTTP $code $(<"$T/adm.out")"
+run_aws "GET a/small.bin after the refused DeleteBucket" \
+  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin >/dev/null
+run_aws "ListObjectsV2 of the empty bucket" "${S3API[@]}" list-objects-v2 --bucket "$EB" >/dev/null
+code=$(adm_code -XDELETE "$BASE/$EB")
+[[ $code == 204 ]] || fail "admin DeleteBucket of $EB, which never held anything" "HTTP 204" "HTTP $code $(<"$T/adm.out")"
+code=$(adm_code -XDELETE "$BASE/$EB")
+[[ $code == 404 ]] || fail "admin DeleteBucket of $EB again" "HTTP 404" "HTTP $code $(<"$T/adm.out")"
+expect_err "ListObjectsV2 of the deleted bucket" 'AccessDenied|NoSuchBucket' \
+  "${S3API[@]}" list-objects-v2 --bucket "$EB"
+run_aws "HEAD a/small.bin after the other bucket was deleted" \
+  "${S3API[@]}" head-object --bucket "$SB" --key a/small.bin >/dev/null
+run_aws "ListObjectsV2 of $OB after the other bucket was deleted" \
+  "${S3API[@]}" list-objects-v2 --bucket "$OB" >/dev/null
 
 # ---------------------------------------------------------------------------
 # 4 posting + verification reached (poll <= 180 s)

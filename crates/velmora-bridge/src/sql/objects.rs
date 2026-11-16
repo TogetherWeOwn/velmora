@@ -366,13 +366,16 @@ fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
 /// costs nothing. `generation` = the record is a generation manifest:
 /// the floor then also says that a record may exist that was never
 /// published ([`unpublished_floor`]).
+///
+/// Returns the rows changed: 1 when the key now has a floor at or above
+/// `id`, 0 when the catalogue has no such bucket.
 pub(super) async fn raise_floor<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &BucketId,
     key: &str,
     id: &GenerationId,
     generation: bool,
-) -> Result<()> {
+) -> Result<u64> {
     c.sql
         .exec(
             // Nothing for a bucket the catalogue does not have (a replay
@@ -390,7 +393,6 @@ pub(super) async fn raise_floor<S: Sql>(
             ],
         )
         .await
-        .map(|_| ())
 }
 
 /// The tombstone `id` of `(bucket, key)` is stored: it covers every
@@ -639,7 +641,7 @@ pub(super) async fn copy_generation<S: Sql>(
 /// `None` when no such string exists (`s` is empty or all U+10FFFF).
 /// UTF-8 byte order equals code-point order, so this is also the bound in
 /// SQLite's binary text collation.
-fn successor(s: &str) -> Option<String> {
+pub(super) fn successor(s: &str) -> Option<String> {
     let mut chars: Vec<char> = s.chars().collect();
     while let Some(c) = chars.pop() {
         let next = match u32::from(c) {

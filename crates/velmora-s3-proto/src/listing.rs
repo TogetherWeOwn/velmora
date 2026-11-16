@@ -8,6 +8,7 @@
 // by a self-contained HMAC-tagged token whose key the caller supplies, and objects
 // render with StorageClass STANDARD. `max-keys` above 1000 is capped (as S3 does)
 // instead of rejected. ListObjects V1 (`marker`) is added on the same fold.
+// `NS`, `xml_character` and `url_encode` are crate-visible for `multipart_listing`.
 
 //! ListObjectsV2, ListObjects (V1) and ListBuckets: request parsing, the delimiter fold over rows
 //! the caller fetches in key order, continuation tokens, and the XML renderers.
@@ -25,7 +26,7 @@ const TAG_LEN: usize = 32;
 const MAX_TOKEN_CHARS: usize = 8192;
 /// Below this the caller passed the wrong thing, not a derived key.
 const MIN_TOKEN_KEY: usize = 32;
-const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+pub(crate) const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// Everything a continuation token is bound to. A token issued for one scope is
 /// `InvalidArgument` under any other (other bucket, prefix, delimiter, ...).
@@ -482,11 +483,11 @@ pub fn list_buckets_response(buckets: &[BucketEntry]) -> Result<Response> {
     Ok(xml_response(out))
 }
 
-fn xml_character(c: char) -> bool {
+pub(crate) fn xml_character(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
 
-fn url_encode(value: &str) -> String {
+pub(crate) fn url_encode(value: &str) -> String {
     value
         .bytes()
         .map(|b| {

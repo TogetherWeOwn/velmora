@@ -1,7 +1,9 @@
 // Provenance: copied from TogetherWeOwn/qerith at commit fc09396c,
 // original path crates/qerith-core/src/s3/mutation/control.rs. License: MIT.
 // Copied verbatim except: line 4 `use crate::s3::{...}` -> `use crate::{...}`; this header;
-// `parse_complete` names the part checksum element from `ChecksumAlgorithm::name`.
+// `parse_complete` names the part checksum element from `ChecksumAlgorithm::name`;
+// `parse_delete` answers `MalformedXML` (as S3 does) for a list that is empty or
+// longer than the maximum; `DeleteOutcome` and `delete_result` are added.
 
 use quick_xml::{events::Event, Reader};
 
@@ -195,8 +197,11 @@ pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<Del
                     return Err(ErrorCode::InvalidRequest);
                 }
                 let key = node.children[0].leaf()?;
-                if key.is_empty() || keys.len() >= maximum.min(1000) {
+                if key.is_empty() {
                     return Err(ErrorCode::InvalidRequest);
+                }
+                if keys.len() >= maximum.min(1000) {
+                    return Err(ErrorCode::MalformedXML);
                 }
                 keys.push(key.to_owned());
             }
@@ -204,12 +209,56 @@ pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<Del
         }
     }
     if keys.is_empty() {
-        return Err(ErrorCode::InvalidRequest);
+        return Err(ErrorCode::MalformedXML);
     }
     Ok(DeleteRequest {
         keys,
         quiet: quiet.unwrap_or(false),
     })
+}
+
+/// What became of one key of a DeleteObjects request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    /// An S3 error code and its message, for this key only.
+    Failed {
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+/// The `DeleteResult` document, one entry per key in request order. Quiet
+/// mode lists only the keys that failed. Every key came out of the
+/// request XML, so XML can carry it back.
+pub fn delete_result(
+    keys: &[String],
+    outcomes: &[DeleteOutcome],
+    quiet: bool,
+) -> Result<crate::Response> {
+    if keys.len() != outcomes.len() {
+        return Err(ErrorCode::InternalError);
+    }
+    let mut out = format!("<DeleteResult xmlns=\"{}\">", crate::listing::NS);
+    for (key, outcome) in keys.iter().zip(outcomes) {
+        match outcome {
+            DeleteOutcome::Deleted if quiet => {}
+            DeleteOutcome::Deleted => {
+                out.push_str(&format!(
+                    "<Deleted><Key>{}</Key></Deleted>",
+                    crate::xml(key)
+                ));
+            }
+            DeleteOutcome::Failed { code, message } => out.push_str(&format!(
+                "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+                crate::xml(key),
+                crate::xml(code),
+                crate::xml(message)
+            )),
+        }
+    }
+    out.push_str("</DeleteResult>");
+    Ok(crate::xml_response(out))
 }
 
 /// Version IDs, unknown integrity algorithms and duplicate/missing part fields

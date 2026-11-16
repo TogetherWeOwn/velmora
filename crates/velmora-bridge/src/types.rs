@@ -1113,6 +1113,27 @@ pub struct ListQuery {
     pub max_keys: u32,
 }
 
+/// ListMultipartUploads catalogue query: the open uploads of a bucket in
+/// `(key, upload id)` order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadListQuery {
+    pub prefix: String,
+    /// Exclusive lower bound: every key after this one and, with an
+    /// upload id, also the later uploads of the key itself.
+    pub after: Option<(String, Option<String>)>,
+    /// Common prefix already emitted; the scan resumes at its successor.
+    pub skip_prefix: Option<String>,
+    pub limit: u32,
+}
+
+/// One open multipart upload, as a listing shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenUpload {
+    pub key: String,
+    pub id: UploadId,
+    pub initiated_at: UnixMs,
+}
+
 /// One listed object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListEntry {

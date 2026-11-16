@@ -22,6 +22,17 @@ pub struct Target {
     encoded_query: Vec<(String, String)>,
 }
 
+/// The rule an object key is held to wherever a request names one, in
+/// the path or in a DeleteObjects body: at most [`MAX_KEY_BYTES`] and no
+/// character XML 1.0 cannot carry. The empty string passes: a path may
+/// end in `/`, and the caller refuses a key it needs and did not get.
+pub fn storable_key(key: &str) -> bool {
+    key.len() <= MAX_KEY_BYTES
+        && !key
+            .chars()
+            .any(|c| c < ' ' || matches!(c, '\u{fffe}' | '\u{ffff}'))
+}
+
 impl Target {
     pub fn parse(raw: &str, policy: &Policy) -> Result<Self> {
         if raw.len() > policy.limits.target_bytes
@@ -53,11 +64,7 @@ impl Target {
             .transpose()?;
         // S3's key limit; also keeps every listing token under its size cap.
         // Keys XML 1.0 cannot carry are refused so they are never stored.
-        if key.as_ref().is_some_and(|k| {
-            k.len() > MAX_KEY_BYTES
-                || k.chars()
-                    .any(|c| c < ' ' || matches!(c, '\u{fffe}' | '\u{ffff}'))
-        }) {
+        if key.as_ref().is_some_and(|k| !storable_key(k)) {
             return Err(ErrorCode::InvalidArgument);
         }
         let mut pairs = Vec::new();

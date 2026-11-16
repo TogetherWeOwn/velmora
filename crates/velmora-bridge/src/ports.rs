@@ -17,9 +17,9 @@ use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
     FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats, Job,
-    JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm,
-    ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId, UploadPartRow,
-    UploadRow, VerificationRow, WriteId,
+    JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OpenUpload, OutboxStage, OutboxStats,
+    Perm, ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId,
+    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -374,6 +374,26 @@ pub trait Catalog {
     async fn create_access_key(&self, k: &AccessKeyRow) -> Result<()>;
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()>;
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>>;
+    /// `true` while anything of the bucket is on record: a generation
+    /// (live or not; none is ever removed), a key floor, an upload in any
+    /// state, an extent. Such a bucket is never deleted.
+    async fn bucket_in_use(&self, bucket: &BucketId) -> Result<bool>;
+    /// Removes the bucket row and its grants in one guarded batch.
+    /// `Lost` = nothing was changed: the bucket is in use
+    /// ([`Self::bucket_in_use`]), is not there under this id and name any
+    /// more, or a replay of the recovery records is under way.
+    ///
+    /// Only a bucket without history goes. A recovery record is never
+    /// removed, and a replay re-creates the bucket of every record it
+    /// reads, under the name the record carries: the records of a deleted
+    /// bucket would bring it back and, once the name is in use again,
+    /// stand against the records of the bucket that now holds it. A
+    /// bucket that never had a record has none to leave behind: the floor
+    /// of a key is raised before a record is stored
+    /// ([`Self::raise_floor`]), it fails once the bucket is gone, and a
+    /// floor is only taken away by the publication that leaves a
+    /// generation row.
+    async fn delete_bucket(&self, bucket: &Bucket) -> Result<Guard<()>>;
     async fn buckets_for(&self, akid: &str) -> Result<Vec<Bucket>>;
     async fn access_key(&self, akid: &str) -> Result<Option<AccessKeyRow>>;
     async fn grant(&self, akid: &str, bucket: &BucketId) -> Result<Option<Perm>>;
@@ -471,6 +491,8 @@ pub trait Catalog {
     /// becomes of the write: every later id on the key sorts after `id`.
     /// `generation` = the record is a generation manifest, which a
     /// replay publishes if nothing on record sorts after it.
+    /// An error when the catalogue has no such bucket (it was deleted):
+    /// no record is then stored for it.
     async fn raise_floor(
         &self,
         bucket: &BucketId,
@@ -521,6 +543,10 @@ pub trait Catalog {
     /// The row carries state, revision and the completion receipt.
     async fn upload(&self, t: &UploadTarget<'_>)
         -> Result<Option<(UploadRow, Vec<UploadPartRow>)>>;
+    /// The open uploads of the bucket in `(key, upload id)` order, at
+    /// most `q.limit`.
+    async fn list_uploads(&self, bucket: &BucketId, q: &UploadListQuery)
+        -> Result<Vec<OpenUpload>>;
     async fn put_upload_part(
         &self,
         t: &UploadTarget<'_>,

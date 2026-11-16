@@ -85,9 +85,9 @@ use crate::types::{
     AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
     CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
     FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats,
-    JobExtent, ListPage, ListQuery, ObjectStatus, OutboxStage, OutboxStats, Perm, ProviderConfig,
-    ProviderFault, ProviderLoad, Result, SafetyState, UnixMs, UploadPartRow, UploadRow,
-    VerificationRow, WriteId,
+    JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload, OutboxStage, OutboxStats, Perm,
+    ProviderConfig, ProviderFault, ProviderLoad, Result, SafetyState, UnixMs, UploadListQuery,
+    UploadPartRow, UploadRow, VerificationRow, WriteId,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -121,6 +121,12 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()> {
         auth::put_grant(self, akid, bucket, perm).await
+    }
+    async fn bucket_in_use(&self, bucket: &BucketId) -> Result<bool> {
+        auth::bucket_in_use(self, bucket).await
+    }
+    async fn delete_bucket(&self, bucket: &Bucket) -> Result<Guard<()>> {
+        auth::delete_bucket(self, bucket).await
     }
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
         auth::bucket_by_name(self, name).await
@@ -215,7 +221,12 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         id: &GenerationId,
         generation: bool,
     ) -> Result<()> {
-        objects::raise_floor(self, bucket, key, id, generation).await
+        // A record writer asks. Without the bucket there is no floor to
+        // hold the record's id, and no record may be stored.
+        match objects::raise_floor(self, bucket, key, id, generation).await? {
+            0 => Err(BridgeError::Invalid("the bucket of the key does not exist")),
+            _ => Ok(()),
+        }
     }
     async fn settle_floor(&self, bucket: &BucketId, key: &str, id: &GenerationId) -> Result<()> {
         objects::settle_floor(self, bucket, key, id).await
@@ -278,6 +289,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         t: &UploadTarget<'_>,
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         uploads::upload(self, t).await
+    }
+    async fn list_uploads(
+        &self,
+        bucket: &BucketId,
+        q: &UploadListQuery,
+    ) -> Result<Vec<OpenUpload>> {
+        uploads::list_uploads(self, bucket, q).await
     }
     async fn put_upload_part(
         &self,

@@ -2,8 +2,8 @@
 //!
 //! [`classify`] maps method, path shape and sub-resource query names to a
 //! [`Route`]. It never decodes the bucket or key: the handlers parse and
-//! authenticate the raw target themselves. Every operation outside the
-//! slice is `NotImplemented`.
+//! authenticate the raw target themselves. Every operation that is not
+//! served is `NotImplemented`.
 
 mod admin;
 mod bucket;
@@ -14,6 +14,7 @@ mod get;
 pub use get::READ_STAMP_MS;
 mod list;
 mod multipart;
+mod multipart_list;
 mod put;
 mod slices;
 
@@ -35,6 +36,11 @@ pub enum Route<'a> {
     CreateBucket {
         bucket: &'a str,
     },
+    /// Deleted with the admin bearer, and only while nothing of the
+    /// bucket is on record. Signed with an access key it never deletes.
+    DeleteBucket {
+        bucket: &'a str,
+    },
     HeadBucket {
         bucket: &'a str,
     },
@@ -42,6 +48,14 @@ pub enum Route<'a> {
         bucket: &'a str,
     },
     ListObjects {
+        bucket: &'a str,
+    },
+    /// `POST /<bucket>?delete`.
+    DeleteObjects {
+        bucket: &'a str,
+    },
+    /// `GET /<bucket>?uploads`.
+    ListMultipartUploads {
         bucket: &'a str,
     },
     PutObject {
@@ -73,6 +87,11 @@ pub enum Route<'a> {
         key: &'a str,
     },
     AbortMultipartUpload {
+        bucket: &'a str,
+        key: &'a str,
+    },
+    /// `GET /<bucket>/<key>?uploadId=`.
+    ListParts {
         bucket: &'a str,
         key: &'a str,
     },
@@ -191,6 +210,9 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
             (Method::Put, []) => Route::CreateBucket { bucket },
             (Method::Head, []) => Route::HeadBucket { bucket },
             (Method::Get, ["location"]) => Route::GetBucketLocation { bucket },
+            (Method::Delete, []) => Route::DeleteBucket { bucket },
+            (Method::Post, ["delete"]) => Route::DeleteObjects { bucket },
+            (Method::Get, ["uploads"]) => Route::ListMultipartUploads { bucket },
             _ => Route::NotImplemented,
         };
     };
@@ -204,6 +226,7 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
         (Method::Delete, ["uploadId"]) => Route::AbortMultipartUpload { bucket, key },
         (Method::Post, ["uploads"]) => Route::CreateMultipartUpload { bucket, key },
         (Method::Post, ["uploadId"]) => Route::CompleteMultipartUpload { bucket, key },
+        (Method::Get, ["uploadId"]) => Route::ListParts { bucket, key },
         _ => Route::NotImplemented,
     }
 }
@@ -232,6 +255,20 @@ where
                 } else {
                     admin::create_bucket_s3(&self, req, bucket).await
                 }
+            }
+            Route::DeleteBucket { bucket } => {
+                if bucket::is_sigv4(&req) {
+                    bucket::delete_bucket_signed(&self, req).await
+                } else {
+                    admin::delete_bucket_s3(&self, req, bucket).await
+                }
+            }
+            Route::DeleteObjects { bucket } => delete::delete_objects(&self, req, bucket).await,
+            Route::ListMultipartUploads { bucket } => {
+                multipart_list::list_uploads(&self, req, bucket).await
+            }
+            Route::ListParts { bucket, key } => {
+                multipart_list::list_parts(&self, req, bucket, key).await
             }
             Route::HeadBucket { .. } => bucket::head_bucket(&self, req).await,
             Route::GetBucketLocation { .. } => bucket::get_bucket_location(&self, req).await,
@@ -378,13 +415,43 @@ mod tests {
             (Get, "/b/k?acl", Route::NotImplemented),
             (Get, "/b/k?versionId=1", Route::NotImplemented),
             (Get, "/b?versions", Route::NotImplemented),
-            (Get, "/b?uploads", Route::NotImplemented),
-            (Get, "/b/k?uploadId=u", Route::NotImplemented),
-            (Post, "/b?delete", Route::NotImplemented),
+            (
+                Get,
+                "/b?uploads",
+                Route::ListMultipartUploads { bucket: "b" },
+            ),
+            (
+                Get,
+                "/b/?uploads&prefix=a%2F&max-uploads=2",
+                Route::ListMultipartUploads { bucket: "b" },
+            ),
+            (
+                Get,
+                "/b/k?uploadId=u",
+                Route::ListParts {
+                    bucket: "b",
+                    key: "k",
+                },
+            ),
+            (Post, "/b?delete", Route::DeleteObjects { bucket: "b" }),
+            (Post, "/b/?%64elete", Route::DeleteObjects { bucket: "b" }),
+            // Each of the new shapes only under its own method and
+            // sub-resource set.
+            (Put, "/b?delete", Route::NotImplemented),
+            (Get, "/b?delete", Route::NotImplemented),
+            (Post, "/b/k?delete", Route::NotImplemented),
+            (Post, "/b?delete&versionId=1", Route::NotImplemented),
+            (Post, "/b?uploads", Route::NotImplemented),
+            (Get, "/b/k?uploads", Route::NotImplemented),
+            (Get, "/b?uploadId=u", Route::NotImplemented),
+            (Get, "/b/k?uploadId=u&partNumber=1", Route::NotImplemented),
+            (Delete, "/b?delete", Route::NotImplemented),
+            (Delete, "/b?versionId=1", Route::NotImplemented),
             (Put, "/b/k?tagging", Route::NotImplemented),
             (Put, "/b/k?uploadId=u", Route::NotImplemented),
             (Post, "/b/k", Route::NotImplemented),
-            (Delete, "/b", Route::NotImplemented),
+            (Delete, "/b", Route::DeleteBucket { bucket: "b" }),
+            (Delete, "/b/", Route::DeleteBucket { bucket: "b" }),
             (Head, "/b", Route::HeadBucket { bucket: "b" }),
             (Head, "/b/", Route::HeadBucket { bucket: "b" }),
             (Get, "/b?location", Route::GetBucketLocation { bucket: "b" }),

@@ -7,14 +7,15 @@
 //! `uploads.revision`, so `revision = R` pins the exact part set a Complete
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
-use super::objects::{clear_floor, guard_newest};
+use super::objects::{clear_floor, guard_newest, successor};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
 use crate::recovery::Recorded;
 use crate::types::{
     BridgeError, BucketId, CompleteUpload, ExtentId, ExtentRow, ExtentState, GenerationId,
-    GenerationState, Result, UnixMs, UploadId, UploadPartRow, UploadRow, UploadState,
+    GenerationState, OpenUpload, Result, UnixMs, UploadId, UploadListQuery, UploadPartRow,
+    UploadRow, UploadState,
 };
 
 /// A retired extent's key is shredded this long after retirement; its
@@ -189,10 +190,14 @@ pub(super) async fn create_upload<S: Sql>(c: &SqlCatalog<S>, u: &UploadRow) -> R
     if u.state != UploadState::Open || u.revision != 0 || u.completed_generation_id.is_some() {
         return Err(BridgeError::Invalid("a new upload is open at revision 0"));
     }
-    c.sql
+    // Nothing for a bucket the catalogue does not have (it was deleted
+    // after the request was authorized): the upload is not opened.
+    let opened = c
+        .sql
         .exec(
             "INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
-               revision, initiated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', 0, ?6)",
+               revision, initiated_at) SELECT ?1, ?2, ?3, ?4, ?5, 'open', 0, ?6 \
+             WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?2)",
             &[
                 text(u.id.as_str()),
                 text(u.bucket_id.as_str()),
@@ -203,7 +208,66 @@ pub(super) async fn create_upload<S: Sql>(c: &SqlCatalog<S>, u: &UploadRow) -> R
             ],
         )
         .await?;
+    if opened != 1 {
+        return Err(BridgeError::Invalid(
+            "the bucket of the upload does not exist",
+        ));
+    }
     Ok(())
+}
+
+/// An upload id is lowercase hex: this sorts after every one of them.
+const AFTER_EVERY_UPLOAD_ID: &str = "~";
+
+/// The open uploads of a bucket in `(key, upload id)` order. The prefix
+/// is a key range (no `LIKE`); a skipped common prefix moves the lower
+/// bound to its successor.
+pub(super) async fn list_uploads<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    q: &UploadListQuery,
+) -> Result<Vec<OpenUpload>> {
+    if q.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut from = q.prefix.clone(); // inclusive lower bound
+    if let Some(done) = &q.skip_prefix {
+        match successor(done) {
+            Some(s) => from = from.max(s),
+            None => return Ok(Vec::new()),
+        }
+    }
+    let (after_key, after_id) = match &q.after {
+        Some((key, id)) => (key.as_str(), id.as_deref().unwrap_or(AFTER_EVERY_UPLOAD_ID)),
+        None => ("", ""),
+    };
+    let upper = successor(&q.prefix);
+    let sql = format!(
+        "SELECT key, id, initiated_at FROM uploads \
+         WHERE bucket_id = ?1 AND state = 'open' AND key >= ?2 \
+           AND (key > ?3 OR (key = ?3 AND id > ?4)) {} \
+         ORDER BY key, id LIMIT ?5",
+        if upper.is_some() { "AND key < ?6" } else { "" }
+    );
+    let mut params = vec![
+        text(bucket.as_str()),
+        text(&from),
+        text(after_key),
+        text(after_id),
+        SqlValue::Int(i64::from(q.limit)),
+    ];
+    params.extend(upper.as_deref().map(text));
+    let rows = c.sql.query(&sql, &params).await?;
+    rows.into_iter()
+        .map(|row| {
+            let mut r = Cols::new(row);
+            Ok(OpenUpload {
+                key: r.text()?,
+                id: UploadId::new(r.text()?),
+                initiated_at: UnixMs(r.num()?),
+            })
+        })
+        .collect()
 }
 
 /// The upload row is read before its parts: a part written in between
