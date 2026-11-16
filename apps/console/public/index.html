@@ -36,8 +36,10 @@
         <input id="search" type="search" placeholder="Filter this folder" aria-label="Filter this folder">
       </div>
       <div class="actions">
-        <label class="btn">Upload files<input id="pick-files" type="file" multiple hidden></label>
-        <label class="btn">Upload folder<input id="pick-folder" type="file" webkitdirectory multiple hidden></label>
+        <button id="upload-files" type="button">Upload files</button>
+        <button id="upload-folder" type="button">Upload folder</button>
+        <input id="pick-files" type="file" multiple hidden>
+        <input id="pick-folder" type="file" webkitdirectory multiple hidden>
         <button id="new-folder" type="button">New folder</button>
         <button id="delete-selected" type="button" class="danger" disabled>Delete selected</button>
         <button id="pending-btn" type="button" class="ghost">Unfinished uploads</button>

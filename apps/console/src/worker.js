@@ -71,7 +71,8 @@ export function objectKey(v, { allowSlashEnd = true, inPath = true } = {}) {
 
 function prefixOf(v) {
   if (v === undefined || v === null || v === "") return "";
-  objectKey(v);
+  // A prefix travels in the query, never in the path.
+  objectKey(v, { inPath: false });
   return v;
 }
 
@@ -192,8 +193,10 @@ async function api(request, env, s3, claims, url) {
   if (path === "/buckets" && m === "POST") {
     const body = await readJson(request);
     const name = bucketName(body.name);
-    await s3.createBucket(name);
-    // The console's key is scoped to named buckets: it grants itself the new one.
+    // `adopt`: the bucket exists (made elsewhere, or a create whose grant
+    // failed) and the user chose to give the console access to it.
+    if (body.adopt !== true) await s3.createBucket(name);
+    // The console's key is scoped to named buckets: it grants itself the bucket.
     await s3.grant(env.S3_ACCESS_KEY_ID, name, "rw");
     return json(200, { name });
   }

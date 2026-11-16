@@ -54,7 +54,8 @@ key with those buckets, or grant them the same way.
 ## Deploy
 
 1. Copy `wrangler.example.toml` outside the repo and fill it in.
-2. Set the three secrets with `npx wrangler secret put`, value on stdin.
+2. Set the three secrets with `npx wrangler secret put <NAME> -c <copy>`,
+   value on stdin.
 3. Run `npx wrangler deploy -c <copy>`.
 4. Attach the hostname as a Workers custom domain, and put it behind
    Access.

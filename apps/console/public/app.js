@@ -121,9 +121,22 @@ $("new-bucket").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const name = $("new-bucket-name").value.trim();
   try {
-    await api("/buckets", { method: "POST", body: { name } });
+    try {
+      await api("/buckets", { method: "POST", body: { name } });
+      toast(`Bucket ${name} created`);
+    } catch (e) {
+      // Exists already (made elsewhere, or a create whose grant failed):
+      // the console gets access to it only if the user says so.
+      if (e.code !== "BucketAlreadyExists") throw e;
+      const answer = await dialog("Bucket exists", el("p", {}, `${name} already exists. Give this console read-write access to it?`), [
+        ["Cancel", "cancel", "ghost"],
+        ["Give access", "ok"],
+      ]);
+      if (answer !== "ok") return;
+      await api("/buckets", { method: "POST", body: { name, adopt: true } });
+      toast(`Console has access to ${name}`);
+    }
     $("new-bucket-name").value = "";
-    toast(`Bucket ${name} created`);
     await loadBuckets();
     go(name);
   } catch (e) {
@@ -142,6 +155,11 @@ async function open(bucket, prefix) {
   $("search").value = "";
   for (const b of $("buckets").querySelectorAll("button")) b.setAttribute("aria-current", String(b.textContent === bucket));
   renderCrumbs();
+  // No row of the previous folder stays clickable while this one loads.
+  state.folders = [];
+  state.files = [];
+  state.next = null;
+  render();
   if (!bucket) {
     state.folders = [];
     state.files = [];
@@ -449,7 +467,12 @@ async function renameFolder(prefix) {
     toast("A folder cannot move into itself");
     return;
   }
-  const keys = await listAll(bucket, prefix);
+  let keys;
+  try {
+    keys = await listAll(bucket, prefix);
+  } catch (e) {
+    return toast(`Listing ${prefix} failed: ${e.message}`);
+  }
   const t = transfer(`Move ${prefix} → ${to}`, keys.length);
   let done = 0;
   let failed = 0;
@@ -482,7 +505,11 @@ $("new-folder").addEventListener("click", async () => {
 async function deleteKeys(keys, folders) {
   let all = [...keys];
   const bucket = state.bucket;
-  for (const p of folders) all.push(...(await listAll(bucket, p)));
+  try {
+    for (const p of folders) all.push(...(await listAll(bucket, p)));
+  } catch (e) {
+    return toast(`Listing failed, nothing deleted: ${e.message}`);
+  }
   all = [...new Set(all)];
   if (!all.length) return toast("Nothing to delete");
   const what = folders.length ? `${all.length} object(s), including everything in ${folders.length} folder(s)` : `${all.length} object(s)`;
@@ -731,6 +758,9 @@ async function uploadBatch(items, bucket, base) {
   if (state.bucket === bucket) loadPage(false);
 }
 
+// Keyboard-reachable buttons open the (hidden) file inputs.
+$("upload-files").addEventListener("click", () => $("pick-files").click());
+$("upload-folder").addEventListener("click", () => $("pick-folder").click());
 $("pick-files").addEventListener("change", (e) => {
   uploadAll([...e.target.files].map((f) => ({ file: f, path: f.name })));
   e.target.value = "";

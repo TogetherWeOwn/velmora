@@ -447,3 +447,19 @@ test("a source deleted by someone else after the copy counts as moved", async ()
   const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a", to: "b" } });
   assert.equal(res.status, 200);
 });
+
+test("a list prefix with dot segments is allowed (it travels in the query)", async () => {
+  const up = fakeUpstream(() => new Response("<ListBucketResult></ListBucketResult>"));
+  const res = await call(up, "/api/list?bucket=files&prefix=" + encodeURIComponent("a/./"));
+  assert.equal(res.status, 200);
+  assert.equal(up.calls[0].url.searchParams.get("prefix"), "a/./");
+  assert.equal(up.calls[0].url.pathname, "/files");
+});
+
+test("adopting an existing bucket only grants, never creates", async () => {
+  const up = fakeUpstream(() => Response.json({ ok: true }));
+  const res = await call(up, "/api/buckets", { method: "POST", body: { name: "photos", adopt: true } });
+  assert.equal(res.status, 200);
+  assert.equal(up.calls.length, 1);
+  assert.equal(up.calls[0].url.pathname, "/_admin/keys/AKVLTESTTESTTESTTEST/grants");
+});
