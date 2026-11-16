@@ -670,22 +670,43 @@ mod tests {
         assert_eq!(seed_of(&blob).map(|s| s.len()), Some(SEED_LEN));
     }
 
-    /// The stream block is HMAC-SHA256 as the `hmac` crate computes it.
+    /// The stream block is HMAC-SHA256 (RFC 2104) of the label, the article
+    /// index and the block number, keyed with the seed. The answers were
+    /// computed by another implementation of HMAC-SHA256.
     #[test]
     fn a_stream_block_is_hmac_sha256() {
-        use hmac::{Hmac, KeyInit, Mac};
-        for (seed, idx, block) in [
-            ([0u8; SEED_LEN], 0u32, 0u32),
-            (core::array::from_fn(|i| i as u8), 1, 2),
-            ([0xff; SEED_LEN], u32::MAX, u32::MAX - 1),
-            (core::array::from_fn(|i| (i * 37 + 11) as u8), 70_000, 9),
-        ] {
-            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&seed).unwrap();
-            mac.update(STREAM_LABEL);
-            mac.update(&idx.to_be_bytes());
-            mac.update(&block.to_be_bytes());
-            let want: [u8; 32] = mac.finalize().into_bytes().into();
-            assert_eq!(stream_block(&seed, idx, block), want);
+        let vectors: [([u8; SEED_LEN], u32, u32, &str); 4] = [
+            (
+                [0u8; SEED_LEN],
+                0,
+                0,
+                "2658ca661df07cf693d2791b5e4fa16f924a056166397e31fca0c544a911c06a",
+            ),
+            (
+                core::array::from_fn(|i| i as u8),
+                1,
+                2,
+                "9aee911709c77fc5f504584c8bdcdf89f6bdfb842480eaa1503d57dab7e29a5c",
+            ),
+            (
+                [0xff; SEED_LEN],
+                u32::MAX,
+                u32::MAX - 1,
+                "8c0276871911f2fff975e9d917089192f2ecbbb936d5dc7d025cf3ca6b455d3d",
+            ),
+            (
+                core::array::from_fn(|i| (i * 37 + 11) as u8),
+                70_000,
+                9,
+                "24539d2c031a676465c4f5326686d55c88ace8f222050ad18a169015a05f3346",
+            ),
+        ];
+        for (seed, idx, block, want) in vectors {
+            let got: String = stream_block(&seed, idx, block)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(got, want, "idx {idx}, block {block}");
         }
     }
 
