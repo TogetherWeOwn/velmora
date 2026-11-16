@@ -1313,8 +1313,8 @@ where
             continue;
         };
         // A part stored in slices may be here without its stamp: its
-        // request answered `503` and the client took the part from
-        // ListParts. Its write intents are in any catalogue saved while
+        // request answered `503`, or `500` after a commit it could not
+        // confirm, and the client took the part from ListParts. Its write intents are in any catalogue saved while
         // it was stored, and in one restored from there the sweep would
         // take the slices of this object. So the stamp is raised before
         // the record exists, and without it nothing is published.

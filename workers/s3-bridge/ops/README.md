@@ -503,7 +503,16 @@ object above 156 GiB does not fit this build.
   the rows in one batch, and the request raises the rollback stamp
   after it, before it answers. If that raise fails it answers 503
   `SlowDown`; the part is stored all the same, and the client's retry
-  replaces it.
+  replaces it. A client may instead take the part from ListParts, so
+  CompleteMultipartUpload raises the stamp again, before the recovery
+  record, for an upload that holds a sliced part. If that raise fails
+  it answers 503 `SlowDown` and publishes nothing; the upload stays
+  open and the same Complete succeeds once the stamp object (`rs/` in
+  `SAFETY`) can be written.
+- A sliced UploadPart that would take the upload above
+  `MAX_OBJECT_EXTENTS` answers 400 `EntityTooLarge` before its body is
+  stored. Parts in flight at the same moment are not counted, so
+  CompleteMultipartUpload checks again and answers the same.
 - A build before this one cannot complete an upload that holds a sliced
   part (it answers 400), and its AbortMultipartUpload leaves the slices
   after the first in `SAFETY` with nothing that collects them. Before a

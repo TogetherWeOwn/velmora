@@ -78,8 +78,8 @@ INTENT_SWEEP = "off"
 RECOVERY_COPY = "off"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
-#   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload answers
-#     400 EntityTooLarge for an upload that holds more. With slices of 8 MiB that is 78 GiB in parts above
+#   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
+#     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above
 #     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
