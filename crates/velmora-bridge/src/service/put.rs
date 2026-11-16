@@ -21,8 +21,8 @@ use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
-    authenticate, checksum_json, discard_refused, from_proto, internal, metadata_json,
-    mutation_gate, restore_gate, s3_error, writes_refused,
+    authenticate, check_precondition, checksum_json, conditional_gate, discard_before_retry,
+    from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
@@ -34,7 +34,8 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
     Body, Bucket, CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
-    GenerationState, Job, OutboxStage, S3Request, S3Response, SafetyState, WriteId, JOB_VERSION,
+    GenerationState, Job, OutboxStage, Precondition, S3Request, S3Response, SafetyState, WriteId,
+    JOB_VERSION,
 };
 
 /// How often a PUT is published before it answers `SlowDown`: once
@@ -73,12 +74,20 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
 ) -> Result<S3Response, S3Response> {
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
-    mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
+    // `If-None-Match: *` or `If-Match`, held to by the batch that
+    // publishes; any other conditional header is refused here.
+    let condition = conditional_gate(&bridge.cfg, &authed.headers, bucket)?;
     restore_gate(bridge).await?;
     // CopyObject is this request shape with a source header and no body.
     if authed.headers.get("x-amz-copy-source").is_some() {
         let declared = crate::ingress::declared_length(&req.headers).map_err(|e| e.response())?;
-        return super::copy::copy_object(bridge, &authed, declared, req.body).await;
+        return super::copy::copy_object(bridge, &authed, declared, req.body, condition).await;
+    }
+    // A condition that does not hold now is answered before the body is
+    // read. One that holds now proves nothing yet: it is judged again
+    // where the write is published.
+    if let Some(condition) = &condition {
+        check_precondition(bridge, &bucket.id, key, condition).await?;
     }
     let metadata = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
     // For aws-chunked bodies every length below is the decoded one.
@@ -94,6 +103,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             metadata,
             lengths,
             validator,
+            condition,
         };
         return put_sliced(bridge, req.body, upload).await;
     }
@@ -200,6 +210,19 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     };
     let mut attempts = 0;
     let generation_id = loop {
+        // A conditional PUT that lost the key to another write, or to a
+        // delete, ends here with `412` or `404`: before a record exists
+        // under this id, and after the record of an earlier attempt was
+        // removed. The safety copy stays behind unreferenced, as it does
+        // for any PUT that is not published.
+        hold_precondition(
+            bridge,
+            &bucket.id,
+            key,
+            &commit.generation.id,
+            condition.as_ref(),
+        )
+        .await?;
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
@@ -212,7 +235,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .map_err(|_| internal())?;
         let refused = match bridge
             .catalog
-            .commit_generation(&commit, record)
+            .commit_generation(&commit, condition.as_ref(), record)
             .await
             .map_err(|_| internal())?
         {
@@ -222,12 +245,11 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         // The key already carries a newer id: a commit that landed after
         // this id was minted, or one minted by a clock ahead of this
         // one. Publishing under the older id would let a replay of the
-        // records put the other one on top. Nothing was published, so
-        // the record goes, and the PUT is tried again under an id that
-        // sorts after everything on the key.
-        discard_refused(bridge, &commit.generation, refused)
-            .await
-            .map_err(|_| internal())?;
+        // records put the other one on top. Or the condition of the PUT
+        // no longer held. Nothing was published, so the record goes, and
+        // the PUT is tried again under an id that sorts after everything
+        // on the key; its condition is judged again first.
+        discard_before_retry(bridge, &commit.generation, refused, condition.is_some()).await?;
         // Refused as well when a replay started after this request
         // passed the gate.
         restore_gate(bridge).await?;
@@ -290,6 +312,7 @@ struct SlicedUpload<'a> {
     metadata: UploadMetadata,
     lengths: UploadLengths,
     validator: UploadValidator,
+    condition: Option<Precondition>,
 }
 
 /// The request gave up at a point where no recovery record of the write
@@ -313,6 +336,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         metadata,
         lengths,
         mut validator,
+        condition,
     } = upload;
     let len = lengths.decoded;
     let slice_bytes = bridge.cfg.slice_bytes;
@@ -494,6 +518,21 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             restore_gate(bridge).await?;
             return Err(s3_error(ErrorCode::SlowDown));
         }
+        // A conditional PUT whose condition does not hold ends here. No
+        // record exists: none was written under this id, and the one of
+        // an earlier attempt was removed.
+        if let Err(resp) = hold_precondition(
+            bridge,
+            &bucket.id,
+            key,
+            &commit.generation.id,
+            condition.as_ref(),
+        )
+        .await
+        {
+            give_up(bridge, &write).await;
+            return Err(resp);
+        }
         // From the record on, a failure without an answer leaves the
         // rows `open`: the record may exist, and only the sweep's look
         // at `SAFETY` after the grace period decides what the slices
@@ -511,18 +550,18 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         .map_err(|_| internal())?;
         let refused = match bridge
             .catalog
-            .commit_sliced(&commit, &write, record)
+            .commit_sliced(&commit, &write, condition.as_ref(), record)
             .await
             .map_err(|_| internal())?
         {
             PublishOutcome::Applied => break,
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
         };
-        // A newer id on the key, a replay, or rows the sweep took.
+        // A newer id on the key, a condition that no longer holds, a
+        // replay, or rows the sweep took.
         // Nothing was published, so the record goes.
-        discard_refused(bridge, &commit.generation, refused)
-            .await
-            .map_err(|_| internal())?;
+        // The slices are not given up where the record may be left.
+        discard_before_retry(bridge, &commit.generation, refused, condition.is_some()).await?;
         if let Err(resp) = restore_gate(bridge).await {
             give_up(bridge, &write).await;
             return Err(resp);

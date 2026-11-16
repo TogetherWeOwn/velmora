@@ -7,15 +7,15 @@
 //! `uploads.revision`, so `revision = R` pins the exact part set a Complete
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
-use super::objects::{clear_floor, guard_newest, successor};
+use super::objects::{clear_floor, guard_newest, guard_precondition, successor};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
 use crate::recovery::Recorded;
 use crate::types::{
     BridgeError, BucketId, CompleteUpload, ExtentId, ExtentRow, ExtentState, GenerationId,
-    GenerationState, OpenUpload, Result, UnixMs, UploadId, UploadListQuery, UploadPartRow,
-    UploadRow, UploadState,
+    GenerationState, OpenUpload, Precondition, Result, UnixMs, UploadId, UploadListQuery,
+    UploadPartRow, UploadRow, UploadState,
 };
 
 /// A retired extent's key is shredded this long after retirement; its
@@ -443,6 +443,7 @@ pub(super) async fn complete_upload<S: Sql>(
     revision: u64,
     digest: &[u8; 32],
     commit: &CompleteUpload,
+    condition: Option<&Precondition>,
     record: Recorded,
 ) -> Result<PublishOutcome> {
     let g = &commit.generation;
@@ -476,6 +477,7 @@ pub(super) async fn complete_upload<S: Sql>(
         guard,
     ));
     stmts.push(guard_no_replay());
+    stmts.extend(condition.map(|c| guard_precondition(t.bucket, t.key, c)));
     stmts.push(guard_newest(t.bucket, t.key, &g.id));
     stmts.push(clear_floor(t.bucket, t.key, &g.id));
     stmts.push((

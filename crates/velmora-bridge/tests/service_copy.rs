@@ -418,10 +418,20 @@ async fn requests_the_copy_cannot_honour_store_nothing() {
             .await
             .expect_error(400, "InvalidArgument");
     }
-    // A conditional on the destination is refused like on any write.
-    copy(&rig, &signer, &source("a"), "b", &[("if-none-match", "*")])
+    // A condition on the destination that no write evaluates is refused
+    // like on any write, and one that does not hold stops the copy.
+    copy(
+        &rig,
+        &signer,
+        &source("a"),
+        "b",
+        &[("if-unmodified-since", "Fri, 15 Jan 2027 08:00:00 GMT")],
+    )
+    .await
+    .expect_error(501, "NotImplemented");
+    copy(&rig, &signer, &source("a"), "b", &[("if-match", "*")])
         .await
-        .expect_error(501, "NotImplemented");
+        .expect_error(404, "NoSuchKey");
 
     assert_eq!(get(&rig, &signer, "b").await.status, 404);
     assert_eq!(rig.count("generations"), 1);

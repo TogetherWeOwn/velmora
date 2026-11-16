@@ -457,7 +457,10 @@ async fn only_a_refused_publication_gives_its_record_up() {
     }
     let proof = write().await.unwrap();
     assert!(matches!(
-        rig.bridge.catalog.commit_generation(&other, proof).await,
+        rig.bridge
+            .catalog
+            .commit_generation(&other, None, proof)
+            .await,
         Err(BridgeError::Invalid(_))
     ));
     assert_eq!(rig.count("generations"), 1);
@@ -468,7 +471,7 @@ async fn only_a_refused_publication_gives_its_record_up() {
     let PublishOutcome::Refused(refused) = rig
         .bridge
         .catalog
-        .commit_generation(&commit, proof)
+        .commit_generation(&commit, None, proof)
         .await
         .unwrap()
     else {
@@ -2983,7 +2986,8 @@ async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
 /// not stored it yet. A PUT fails now, with its record stored: the
 /// record sorts above the tombstone, so the tombstone does not cover it,
 /// and the delete must not take the mark of the record off the floor
-/// when it finishes. The next delete then leaves a tombstone above the
+/// when it finishes. The delete finds the newer id on the key and
+/// starts again above it: it leaves a second tombstone, above the
 /// record, and a replay does not publish the failed write.
 #[tokio::test(flavor = "current_thread")]
 async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
@@ -3015,23 +3019,22 @@ async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
     };
     let (first, failed) = tokio::join!(first, failed_put);
     first.expect(204);
-    let stored = tombstones(&rig);
-    assert_eq!(stored.len(), 1);
+    let mut stored = tombstones(&rig);
+    stored.sort();
+    assert_eq!(stored.len(), 2, "the one it held, and one above the write");
     assert!(
         failed.as_str() > &stored[0][TOMBSTONE_PREFIX.len()..],
-        "the record of the failed write sorts above the tombstone"
+        "the record of the failed write sorts above the first tombstone"
+    );
+    assert!(
+        &stored[1][TOMBSTONE_PREFIX.len()..] > failed.as_str(),
+        "and below the second"
     );
     assert!(live_ids(&rig).is_empty());
 
-    // The key is empty, and the delete still has something to record.
+    // The failed write is covered: a later delete has nothing to record.
     delete(&rig, &signer, "k").await.expect(204);
-    let stored = tombstones(&rig);
-    assert_eq!(stored.len(), 2, "a tombstone above the failed write");
-    assert!(stored
-        .iter()
-        .any(|t| &t[TOMBSTONE_PREFIX.len()..] > failed.as_str()));
-    delete(&rig, &signer, "k").await.expect(204);
-    assert_eq!(tombstones(&rig).len(), 2, "and only one");
+    assert_eq!(tombstones(&rig).len(), 2, "and only one above the write");
 
     wipe(&rig);
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;

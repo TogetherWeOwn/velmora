@@ -640,14 +640,40 @@ run_aws "GET a/big.bin bytes=8388000-8389000" "${S3API[@]}" get-object --bucket 
 dd if="$T/big.bin" of="$T/range-want.bin" bs=1 skip=8388000 count=1001 status=none
 same_bytes "range body equals bytes 8388000-8389000" "$T/range-want.bin" "$T/range.bin"
 
-# 3b safety rules: conditional write refused before storing; upload ID is
-# bound to its bucket and key.
+# 3a conditional writes: a key is created once (If-None-Match: *) and
+# replaced or deleted only while it holds the object that is named
+# (If-Match). A refused write stores nothing.
+STEP=3a-conditional-writes
+log "step $STEP"
+printf 'second' >"$T/second.bin"
+json=$(run_aws "PUT If-None-Match: * on a free key" \
+  "${S3API[@]}" put-object --bucket "$SB" --key a/cond --body "$T/small.bin" --if-none-match '*')
+COND_ETAG=$(jq -r .ETag <<<"$json")
+expect_err "PUT If-None-Match: * on a live key" 'PreconditionFailed|\(412\)' \
+  "${S3API[@]}" put-object --bucket "$SB" --key a/cond --body "$T/second.bin" --if-none-match '*'
+expect_err "PUT If-Match with another ETag" 'PreconditionFailed|\(412\)' \
+  "${S3API[@]}" put-object --bucket "$SB" --key a/cond --body "$T/second.bin" \
+  --if-match '"0123456789abcdef0123456789abcdef"'
+expect_err "PUT If-Match on a key without an object" 'NoSuchKey|\(404\)' \
+  "${S3API[@]}" put-object --bucket "$SB" --key a/cond-none --body "$T/second.bin" --if-match "$COND_ETAG"
+expect_err "nothing was stored by the refused PUT" '\(404\)' \
+  "${S3API[@]}" head-object --bucket "$SB" --key a/cond-none
+run_aws "GET a/cond after the refused PUTs" "${S3API[@]}" get-object --bucket "$SB" --key a/cond "$T/cond.bin" >/dev/null
+same_bytes "a/cond is the first PUT" "$T/small.bin" "$T/cond.bin"
+run_aws "PUT If-Match with the live ETag" \
+  "${S3API[@]}" put-object --bucket "$SB" --key a/cond --body "$T/second.bin" --if-match "$COND_ETAG" >/dev/null
+run_aws "GET a/cond after the replacement" "${S3API[@]}" get-object --bucket "$SB" --key a/cond "$T/cond.bin" >/dev/null
+same_bytes "a/cond is the second PUT" "$T/second.bin" "$T/cond.bin"
+expect_err "DELETE If-Match with the replaced ETag" 'PreconditionFailed|\(412\)' \
+  "${S3API[@]}" delete-object --bucket "$SB" --key a/cond --if-match "$COND_ETAG"
+run_aws "HEAD a/cond after the refused DELETE" "${S3API[@]}" head-object --bucket "$SB" --key a/cond >/dev/null
+run_aws "DELETE If-Match: *" "${S3API[@]}" delete-object --bucket "$SB" --key a/cond --if-match '*' >/dev/null
+expect_err "a/cond is deleted" '\(404\)' \
+  "${S3API[@]}" head-object --bucket "$SB" --key a/cond
+
+# 3b safety rules: upload ID is bound to its bucket and key.
 STEP=3b-safety-rules
 log "step $STEP"
-expect_err "conditional PUT is refused" NotImplemented \
-  "${S3API[@]}" put-object --bucket "$SB" --key a/cond --body "$T/small.bin" --if-none-match '*'
-expect_err "nothing was stored by the refused PUT" '\(404\)' \
-  "${S3API[@]}" head-object --bucket "$SB" --key a/cond
 json=$(run_aws "CreateMultipartUpload a/mp" "${S3API[@]}" create-multipart-upload --bucket "$SB" --key a/mp)
 UP=$(jq -r .UploadId <<<"$json")
 expect_err "UploadPart under another bucket" NoSuchUpload \

@@ -1152,13 +1152,88 @@ async fn slice_acceptance() {
             Method::Put,
             "/slice/a/cond",
             &[],
-            &[("if-none-match", "*")],
+            &[("if-unmodified-since", "Fri, 13 Nov 2026 00:00:00 GMT")],
             small.clone(),
         )
         .await;
-    expect_error(s, "conditional PUT is refused", 501, "NotImplemented", &r);
+    expect_error(
+        s,
+        "a condition no write evaluates is refused",
+        501,
+        "NotImplemented",
+        &r,
+    );
     let r = rig.head("/slice/a/cond").await;
     expect_eq(s, "HEAD a/cond after the refused PUT", 404, r.status);
+
+    // 3a conditional writes: create once, replace only what is named.
+    let s = "3a conditional-writes";
+    let cond = |headers: &'static [(&'static str, &'static str)], body: Vec<u8>| {
+        rig.s3(Method::Put, "/slice/a/cond", &[], headers, body)
+    };
+    let r = cond(&[("if-none-match", "*")], small.clone()).await;
+    expect_eq(s, "PUT If-None-Match: * on a free key", 200, r.status);
+    let first = r.header("etag").unwrap_or_default().to_string();
+    let r = cond(&[("if-none-match", "*")], small.clone()).await;
+    expect_error(
+        s,
+        "PUT If-None-Match: * on a live key",
+        412,
+        "PreconditionFailed",
+        &r,
+    );
+    let r = cond(
+        &[("if-match", "\"0123456789abcdef0123456789abcdef\"")],
+        b"second".to_vec(),
+    )
+    .await;
+    expect_error(
+        s,
+        "PUT If-Match with another ETag",
+        412,
+        "PreconditionFailed",
+        &r,
+    );
+    let r = rig.get("/slice/a/cond").await;
+    expect_bytes(s, "a/cond after the refused PUTs", &small, &r.body);
+    let r = rig
+        .s3(
+            Method::Put,
+            "/slice/a/cond",
+            &[],
+            &[("if-match", first.as_str())],
+            b"second".to_vec(),
+        )
+        .await;
+    expect_eq(s, "PUT If-Match with the live ETag", 200, r.status);
+    let r = rig
+        .s3(
+            Method::Delete,
+            "/slice/a/cond",
+            &[],
+            &[("if-match", first.as_str())],
+            Vec::new(),
+        )
+        .await;
+    expect_error(
+        s,
+        "DELETE If-Match with the replaced ETag",
+        412,
+        "PreconditionFailed",
+        &r,
+    );
+    let r = rig
+        .s3(
+            Method::Delete,
+            "/slice/a/cond",
+            &[],
+            &[("if-match", "*")],
+            Vec::new(),
+        )
+        .await;
+    expect_eq(s, "DELETE If-Match: *", 204, r.status);
+    let r = rig.head("/slice/a/cond").await;
+    expect_eq(s, "HEAD a/cond after the delete", 404, r.status);
     let r = rig
         .s3(
             Method::Post,

@@ -86,8 +86,9 @@ use crate::types::{
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload,
-    OutboxStage, OutboxStats, Perm, ProviderConfig, ProviderFault, ProviderLoad, Result,
-    SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow, VerificationRow, WriteId,
+    OutboxStage, OutboxStats, Perm, Precondition, ProviderConfig, ProviderFault, ProviderLoad,
+    Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow, VerificationRow,
+    WriteId,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -161,17 +162,19 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn commit_generation(
         &self,
         c: &CommitGeneration,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome> {
-        objects::commit_generation(self, c, None, record).await
+        objects::commit_generation(self, c, None, condition, record).await
     }
     async fn commit_sliced(
         &self,
         c: &CommitGeneration,
         write: &WriteId,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome> {
-        objects::commit_generation(self, c, Some(write), record).await
+        objects::commit_generation(self, c, Some(write), condition, record).await
     }
     async fn open_intents(
         &self,
@@ -250,9 +253,10 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn copy_generation(
         &self,
         c: &CopyGeneration,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome> {
-        objects::copy_generation(self, c, record).await
+        objects::copy_generation(self, c, condition, record).await
     }
     async fn delete_object_before(
         &self,
@@ -261,7 +265,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         before: &GenerationId,
         now: UnixMs,
     ) -> Result<bool> {
-        recovery::delete_object_before(self, bucket, key, before, now, true).await
+        recovery::delete_object_before(self, bucket, key, before, None, now, true).await
+    }
+    async fn delete_object_if(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        before: &GenerationId,
+        condition: &Precondition,
+        now: UnixMs,
+    ) -> Result<bool> {
+        recovery::delete_object_before(self, bucket, key, before, Some(condition), now, true).await
     }
     async fn replay_tombstone(
         &self,
@@ -272,7 +286,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         objects::raise_floor(self, bucket, key, id, false).await?;
         objects::settle_floor(self, bucket, key, id).await?;
-        recovery::delete_object_before(self, bucket, key, id, now, false).await
+        recovery::delete_object_before(self, bucket, key, id, None, now, false).await
     }
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage> {
         objects::list(self, bucket, q).await
@@ -321,9 +335,10 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         revision: u64,
         digest: &[u8; 32],
         c: &CompleteUpload,
+        condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome> {
-        uploads::complete_upload(self, t, revision, digest, c, record).await
+        uploads::complete_upload(self, t, revision, digest, c, condition, record).await
     }
     async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
         recovery::upload_extents(self, t).await

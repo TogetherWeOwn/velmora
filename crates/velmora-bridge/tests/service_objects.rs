@@ -277,14 +277,36 @@ async fn put_succeeds_when_the_wake_up_is_lost() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn conditional_write_is_501_and_stores_nothing() {
+async fn refused_conditional_write_stores_nothing() {
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
-    for (name, value) in [
-        ("if-match", "\"0123456789abcdef0123456789abcdef\""),
-        ("if-none-match", "*"),
-        ("if-modified-since", "Fri, 15 Jan 2027 08:00:00 GMT"),
-        ("if-unmodified-since", "Fri, 15 Jan 2027 08:00:00 GMT"),
+    // `If-Match` on a key without an object, and the conditions no
+    // write evaluates.
+    for (name, value, status, code) in [
+        (
+            "if-match",
+            "\"0123456789abcdef0123456789abcdef\"",
+            404,
+            "NoSuchKey",
+        ),
+        (
+            "if-none-match",
+            "\"0123456789abcdef0123456789abcdef\"",
+            501,
+            "NotImplemented",
+        ),
+        (
+            "if-modified-since",
+            "Fri, 15 Jan 2027 08:00:00 GMT",
+            501,
+            "NotImplemented",
+        ),
+        (
+            "if-unmodified-since",
+            "Fri, 15 Jan 2027 08:00:00 GMT",
+            501,
+            "NotImplemented",
+        ),
     ] {
         let req = signer.sign(
             rig.now(),
@@ -295,12 +317,12 @@ async fn conditional_write_is_501_and_stores_nothing() {
             b"payload".to_vec(),
         );
         let (resp, polled) = rig.send_watched(req).await;
-        resp.expect_error(501, "NotImplemented");
+        resp.expect_error(status, code);
         assert!(!polled, "{name}: the body was read");
         assert_nothing_stored(&rig);
     }
 
-    // A conditional DELETE leaves the object in place.
+    // A DELETE whose condition does not hold leaves the object in place.
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let resp = rig
         .call(
@@ -308,11 +330,11 @@ async fn conditional_write_is_501_and_stores_nothing() {
             Method::Delete,
             &path(BUCKET, "k"),
             &[],
-            &[("if-match", md5_etag(b"payload").as_str())],
+            &[("if-match", md5_etag(b"other").as_str())],
             b"",
         )
         .await;
-    resp.expect_error(501, "NotImplemented");
+    resp.expect_error(412, "PreconditionFailed");
     assert!(rig.live(&bucket, "k").await.is_some());
     rig.head(&signer, BUCKET, "k").await.expect(200);
 }

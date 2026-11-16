@@ -1035,17 +1035,33 @@ async fn upload_id_cross_key_is_nosuchupload() {
 }
 
 #[tokio::test]
-async fn conditional_write_is_501_and_stores_nothing() {
+async fn refused_conditional_write_stores_nothing() {
     let rig = Rig::new().await;
     let id = rig.create("alpha", KEY).await;
     let bytes = test_bytes(1, 2048);
     let etag = rig.part("alpha", KEY, &id, 1, &bytes).await;
 
-    for header in [
-        ("if-none-match", "*"),
-        ("if-match", "\"0123456789abcdef0123456789abcdef\""),
-        ("if-modified-since", "Fri, 13 Nov 2026 00:00:00 GMT"),
-        ("if-unmodified-since", "Fri, 13 Nov 2026 00:00:00 GMT"),
+    // A Complete is held to `If-None-Match: *` and to `If-Match` (here:
+    // on a key without an object). A condition it does not evaluate is
+    // refused, not skipped.
+    for (header, outcome) in [
+        (
+            ("if-match", "\"0123456789abcdef0123456789abcdef\""),
+            "404 NoSuchKey",
+        ),
+        (("if-match", "*"), "404 NoSuchKey"),
+        (
+            ("if-none-match", "\"0123456789abcdef0123456789abcdef\""),
+            "501 NotImplemented",
+        ),
+        (
+            ("if-modified-since", "Fri, 13 Nov 2026 00:00:00 GMT"),
+            "501 NotImplemented",
+        ),
+        (
+            ("if-unmodified-since", "Fri, 13 Nov 2026 00:00:00 GMT"),
+            "501 NotImplemented",
+        ),
     ] {
         let r = rig
             .send(complete_req(
@@ -1057,7 +1073,7 @@ async fn conditional_write_is_501_and_stores_nothing() {
                 &[header],
             ))
             .await;
-        assert_eq!(r.outcome(), "501 NotImplemented", "{}", header.0);
+        assert_eq!(r.outcome(), outcome, "{}", header.0);
     }
     assert!(rig.object(&rig.alpha, KEY).await.is_none());
     assert_eq!(rig.count("SELECT COUNT(*) FROM generations").await, 0);

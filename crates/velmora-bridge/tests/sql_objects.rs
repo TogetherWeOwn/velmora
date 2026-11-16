@@ -1935,3 +1935,251 @@ async fn the_migration_fences_deletes_with_ids_far_ahead() {
         assert!(tombstone > GenerationId::mint(wall.plus_ms(600_000), [0xff; 8]));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conditional writes: the batch that publishes judges the condition
+// ---------------------------------------------------------------------------
+
+fn etag_of(c: &CommitGeneration) -> Precondition {
+    Precondition::Etag(c.generation.etag.clone())
+}
+
+/// The write is refused under `condition` and writes nothing.
+async fn refused_if(fx: &Fx, c: &CommitGeneration, condition: &Precondition) {
+    let before = fx.footprint();
+    assert_eq!(
+        fx.cat.publish_if(c, Some(condition)).await.unwrap(),
+        Guard::Lost,
+        "{condition:?}"
+    );
+    assert_eq!(fx.footprint(), before, "{condition:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_conditional_commit_is_judged_by_its_own_batch() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let other = fx.bucket("beta").await;
+    let at = |s: i64| T0.plus_ms(s * 1_000);
+    // The same key in another bucket, and another key in this one, are
+    // not the object the condition is about.
+    let elsewhere = fx.put(&other.id, "k", at(0)).await;
+    fx.put(&b.id, "k2", at(0)).await;
+
+    // No live object: only `If-None-Match: *` holds.
+    let first = fx.commit(&b.id, "k", 1, at(1));
+    refused_if(&fx, &first, &Precondition::Exists).await;
+    refused_if(&fx, &first, &etag_of(&elsewhere)).await;
+    refused_if(&fx, &first, &etag_of(&first)).await;
+    assert_eq!(
+        fx.cat
+            .publish_if(&first, Some(&Precondition::Absent))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+
+    // A live object: `If-None-Match: *` is refused, `If-Match` holds for
+    // its ETag alone.
+    let second = fx.commit(&b.id, "k", 2, at(2));
+    refused_if(&fx, &second, &Precondition::Absent).await;
+    refused_if(&fx, &second, &etag_of(&second)).await;
+    refused_if(&fx, &second, &etag_of(&elsewhere)).await;
+    assert_eq!(
+        fx.cat
+            .publish_if(&second, Some(&etag_of(&first)))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    let live = fx.cat.live_object(&b.id, "k").await.unwrap().unwrap().0;
+    assert_eq!(live.id, second.generation.id);
+
+    // The ETag of the generation that was overwritten no longer holds.
+    let third = fx.commit(&b.id, "k", 1, at(3));
+    refused_if(&fx, &third, &etag_of(&first)).await;
+    assert_eq!(
+        fx.cat
+            .publish_if(&third, Some(&Precondition::Exists))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+
+    // Deleted: the key is as if it never had an object.
+    assert!(fx.cat.delete_now(&b.id, "k", at(4)).await.unwrap());
+    let fourth = fx.commit(&b.id, "k", 1, at(5));
+    refused_if(&fx, &fourth, &Precondition::Exists).await;
+    refused_if(&fx, &fourth, &etag_of(&third)).await;
+    assert_eq!(
+        fx.cat
+            .publish_if(&fourth, Some(&Precondition::Absent))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_conditional_copy_is_judged_on_its_destination() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let src = fx.put(&b.id, "src", T0).await;
+    let dst = fx.put(&b.id, "dst", T0).await;
+    let t1 = T0.plus_ms(1_000);
+    let lost = |c: CopyGeneration, condition: Precondition| {
+        let fx = &fx;
+        async move {
+            let before = fx.footprint();
+            assert_eq!(
+                fx.cat.publish_copy_if(&c, Some(&condition)).await.unwrap(),
+                Guard::Lost,
+                "{condition:?}"
+            );
+            assert_eq!(fx.footprint(), before, "{condition:?}");
+        }
+    };
+
+    // A live destination: not absent, and not matched by the ETag of
+    // the source.
+    lost(
+        copy_of(&fx, &src.generation, "dst", t1),
+        Precondition::Absent,
+    )
+    .await;
+    lost(copy_of(&fx, &src.generation, "dst", t1), etag_of(&src)).await;
+    // No destination: nothing to match.
+    lost(
+        copy_of(&fx, &src.generation, "new", t1),
+        Precondition::Exists,
+    )
+    .await;
+    lost(copy_of(&fx, &src.generation, "new", t1), etag_of(&src)).await;
+
+    let onto = copy_of(&fx, &src.generation, "dst", t1);
+    assert_eq!(
+        fx.cat
+            .publish_copy_if(&onto, Some(&etag_of(&dst)))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    let fresh = copy_of(&fx, &src.generation, "new", t1);
+    assert_eq!(
+        fx.cat
+            .publish_copy_if(&fresh, Some(&Precondition::Absent))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    for (key, id) in [("dst", &onto.generation.id), ("new", &fresh.generation.id)] {
+        let live = fx.cat.live_object(&b.id, key).await.unwrap().unwrap().0;
+        assert_eq!(&live.id, id, "{key}");
+    }
+}
+
+/// A floor above the tombstone is a write that began after the
+/// tombstone was chosen: its record would outlive the tombstone in a
+/// replay. The delete of a client changes nothing then, plain or
+/// conditional. A floor at or below the tombstone does not stand in the
+/// way, and the replay, which has every record in hand, is not held to
+/// it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_is_refused_under_a_floor_above_its_tombstone() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let at = |s: i64| T0.plus_ms(s * 1_000);
+    let live = fx.put(&b.id, "k", at(0)).await;
+    let tombstone = GenerationId::mint(at(2), [0x00; 8]);
+    let write = GenerationId::mint(at(3), [0x00; 8]);
+    let above = GenerationId::mint(at(4), [0x00; 8]);
+    let cat = &fx.cat;
+    cat.raise_floor(&b.id, "k", &write, true).await.unwrap();
+
+    let before = fx.footprint();
+    assert!(!cat
+        .delete_object_before(&b.id, "k", &tombstone, at(5))
+        .await
+        .unwrap());
+    assert!(!cat
+        .delete_object_if(&b.id, "k", &tombstone, &etag_of(&live), at(5))
+        .await
+        .unwrap());
+    assert_eq!(fx.footprint(), before);
+    let got = cat.live_object(&b.id, "k").await.unwrap();
+    assert_eq!(got.map(|(g, _)| g.id), Some(live.generation.id.clone()));
+
+    // Above the floor, the same delete goes through.
+    assert!(cat
+        .delete_object_before(&b.id, "k", &above, at(5))
+        .await
+        .unwrap());
+    assert!(cat.live_object(&b.id, "k").await.unwrap().is_none());
+
+    // A floor that is the tombstone itself is the delete's own.
+    let live = fx.put(&b.id, "k2", at(0)).await;
+    cat.raise_floor(&b.id, "k2", &tombstone, false)
+        .await
+        .unwrap();
+    assert!(cat
+        .delete_object_if(&b.id, "k2", &tombstone, &etag_of(&live), at(5))
+        .await
+        .unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_conditional_delete_is_judged_by_its_own_batch() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let at = |s: i64| T0.plus_ms(s * 1_000);
+    let old = fx.put(&b.id, "k", at(0)).await;
+    let live = fx.put(&b.id, "k", at(1)).await;
+    let other = fx.put(&b.id, "k2", at(1)).await;
+    let after = GenerationId::mint(at(2), [0xff; 8]);
+    let still_live = || async {
+        let got = fx.cat.live_object(&b.id, "k").await.unwrap();
+        got.map(|(g, _)| g.id)
+    };
+
+    // Another ETag: the one it had before, the one of another key.
+    for wrong in [etag_of(&old), etag_of(&other)] {
+        let before = fx.footprint();
+        assert!(!fx
+            .cat
+            .delete_object_if(&b.id, "k", &after, &wrong, at(2))
+            .await
+            .unwrap());
+        assert_eq!(fx.footprint(), before);
+        assert_eq!(still_live().await, Some(live.generation.id.clone()));
+    }
+    // The right ETag, but the object is not older than the tombstone:
+    // the bound of an unconditional delete holds as well.
+    assert!(!fx
+        .cat
+        .delete_object_if(&b.id, "k", &live.generation.id, &etag_of(&live), at(2))
+        .await
+        .unwrap());
+    assert_eq!(still_live().await, Some(live.generation.id.clone()));
+
+    assert!(fx
+        .cat
+        .delete_object_if(&b.id, "k", &after, &etag_of(&live), at(2))
+        .await
+        .unwrap());
+    assert_eq!(still_live().await, None);
+    // Nothing live: nothing matches.
+    for gone in [Precondition::Exists, etag_of(&live)] {
+        assert!(!fx
+            .cat
+            .delete_object_if(&b.id, "k", &after, &gone, at(3))
+            .await
+            .unwrap());
+    }
+    // `If-Match: *` deletes whatever is live.
+    assert!(fx
+        .cat
+        .delete_object_if(&b.id, "k2", &after, &Precondition::Exists, at(3))
+        .await
+        .unwrap());
+    assert!(fx.cat.live_object(&b.id, "k2").await.unwrap().is_none());
+}

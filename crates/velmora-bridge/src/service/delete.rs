@@ -7,6 +7,11 @@
 //! gate against a replay, the same tombstone record before the catalogue
 //! batch, the same guarded batch. A DeleteObjects request of N keys
 //! leaves what N DeleteObject requests leave.
+//!
+//! A DeleteObject with `If-Match` takes [`delete_key_if`]: it deletes
+//! only the object the condition names, which the batch that deletes
+//! checks itself, and answers `412` or `404` otherwise. DeleteObjects
+//! takes no condition, in a header or per key: `501`.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -17,13 +22,13 @@ use velmora_s3_proto::mutation::{delete_result, parse_delete, DeleteOutcome};
 use velmora_s3_proto::{storable_key, ChecksumAlgorithm, ErrorCode, UploadValidator};
 
 use super::common::{
-    authenticate, from_proto, internal, mutation_gate, policy_with, restore_gate, s3_error,
-    writes_refused,
+    authenticate, check_precondition, conditional_gate, from_proto, internal, mutation_gate,
+    policy_with, restore_gate, s3_error, writes_refused,
 };
 use crate::ingress::{read_upload, upload_lengths, UploadReadError};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{tombstone_id, write_tombstone};
-use crate::types::{Bucket, RespBody, S3Request, S3Response};
+use crate::types::{Bucket, Precondition, RespBody, S3Request, S3Response};
 
 /// Most keys one DeleteObjects request may name (the S3 limit).
 pub const MAX_DELETE_KEYS: usize = 1000;
@@ -40,6 +45,8 @@ enum DeleteError {
     /// A replay of the recovery records is under way, or started while
     /// the delete ran: nothing was deleted.
     Refused,
+    /// The key took a newer id every time the delete was tried.
+    Busy,
 }
 
 impl DeleteError {
@@ -47,6 +54,7 @@ impl DeleteError {
         match self {
             DeleteError::Internal => internal(),
             DeleteError::Refused => writes_refused(),
+            DeleteError::Busy => s3_error(ErrorCode::SlowDown),
         }
     }
 
@@ -61,6 +69,10 @@ impl DeleteError {
                 code: "ServiceUnavailable",
                 message: "Writes are refused until the catalogue has been restored. \
                           Please try again later.",
+            },
+            DeleteError::Busy => DeleteOutcome::Failed {
+                code: "SlowDown",
+                message: "Please reduce your request rate.",
             },
         }
     }
@@ -90,10 +102,14 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 ) -> Result<S3Response, S3Response> {
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
-    mutation_gate(&bridge.cfg, &authed.headers, bucket)?;
-    delete_key(bridge, bucket, key)
-        .await
-        .map_err(|e| e.response())?;
+    match conditional_gate(&bridge.cfg, &authed.headers, bucket)? {
+        None => delete_key(bridge, bucket, key)
+            .await
+            .map_err(|e| e.response())?,
+        // A delete is conditional on the object it deletes only.
+        Some(Precondition::Absent) => return Err(S3Response::not_implemented()),
+        Some(condition) => delete_key_if(bridge, bucket, key, &condition).await?,
+    }
     Ok(S3Response {
         status: 204,
         headers: Vec::new(),
@@ -102,13 +118,43 @@ async fn delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 }
 
 /// Deletes `key` of `bucket` for a request that is authorized to write
-/// the bucket and passed [`mutation_gate`]. `Ok` = the key has no live
-/// generation older than this delete (also when it had none at all).
+/// the bucket and passed [`mutation_gate`]. `Ok` = the delete is the
+/// newest thing that happened to the key: nothing is live on it, and
+/// every write that comes takes an id after the tombstone.
+///
+/// A delete that finds a newer id on the key than its tombstone (a
+/// write that began, or was published, after the tombstone was chosen)
+/// changes nothing and starts again above that id. Its tombstone would
+/// not cover that write in a replay, and a write that is held to the
+/// object this delete removes (`If-Match`) must not be published beside
+/// it: neither here nor by a replay of its record.
 async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
     key: &str,
 ) -> Result<(), DeleteError> {
+    for _ in 0..DELETE_ATTEMPTS {
+        if delete_key_once(bridge, bucket, key).await? {
+            return Ok(());
+        }
+    }
+    Err(DeleteError::Busy)
+}
+
+/// One attempt of [`delete_key`]. `false` = the key took a newer id
+/// than the tombstone of this attempt, and nothing was changed.
+async fn delete_key_once<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    key: &str,
+) -> Result<bool, DeleteError> {
     let failed = |_| DeleteError::Internal;
     if bridge.catalog.restore_pending().await.map_err(failed)? {
         return Err(DeleteError::Refused);
@@ -133,7 +179,7 @@ async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
             .map_err(failed)?
         {
             Some(floor) => floor,
-            None => return Ok(()),
+            None => return Ok(true),
         },
     };
     // The newest id on the key: the live generation, or a floor above
@@ -153,11 +199,10 @@ async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         .map_err(|_| DeleteError::Internal)?;
     // The tombstone is durable before the catalogue batch, so an
     // acknowledged delete stays deleted in a restored catalogue. It
-    // covers every generation older than itself; a generation published
-    // after it (a racing PUT) survives, here and in a replay. The floor
-    // of the key is raised to the tombstone before the record is stored:
-    // when the batch below finds nothing left to delete (another delete
-    // was faster), the record stays, and every later write sorts after it.
+    // covers every generation older than itself. The floor of the key
+    // is raised to the tombstone before the record is stored: when the
+    // batch below finds nothing left to delete (another delete was
+    // faster), the record stays, and every later write sorts after it.
     let tombstone = tombstone_id(now, &newest, rand);
     write_tombstone(
         &bridge.catalog,
@@ -176,13 +221,25 @@ async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         .await
         .map_err(failed)?;
     if deleted {
-        return Ok(());
+        return Ok(true);
     }
-    // Nothing was changed. Either nothing older than the tombstone is
-    // live any more (another delete was faster, or a PUT that sorts
-    // after the tombstone), and the delete holds. Or a replay started
-    // after this request passed the gate: then the object is still
-    // live under its older id, and the delete was not done.
+    // Nothing was changed. A replay started after this request passed
+    // the gate: the delete was not done.
+    if bridge.catalog.restore_pending().await.map_err(failed)? {
+        return Err(DeleteError::Refused);
+    }
+    // Or the key has an id above the tombstone, of a write that is
+    // published or on its way: the next attempt sorts after it.
+    let newest = bridge
+        .catalog
+        .newest_id(&bucket.id, key)
+        .await
+        .map_err(failed)?;
+    if newest.is_some_and(|n| n > tombstone) {
+        return Ok(false);
+    }
+    // Or nothing older than the tombstone was live any more (another
+    // delete was faster), and the delete holds.
     let live = bridge
         .catalog
         .live_object(&bucket.id, key)
@@ -190,8 +247,86 @@ async fn delete_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         .map_err(failed)?;
     match live {
         Some((live, _)) if live.id < tombstone => Err(DeleteError::Refused),
-        _ => Ok(()),
+        _ => Ok(true),
     }
+}
+
+/// How often a delete is tried before it answers `SlowDown`.
+const DELETE_ATTEMPTS: usize = 4;
+
+/// How often a conditional delete is tried before it answers
+/// `SlowDown`: again whenever the key changed between the look at its
+/// live object and the batch, each time judged against what is live then.
+const CONDITIONAL_ATTEMPTS: u32 = 4;
+
+/// Deletes `key` if its live object meets `condition` (`If-Match`), for
+/// a request that is authorized to write the bucket and passed the gate.
+/// `Ok` = this request deleted the object the condition names.
+///
+/// Unlike [`delete_key`] it is not idempotent: without a live object
+/// the answer is `404 NoSuchKey`, with another one `412`.
+///
+/// The tombstone is a record a replay applies whatever became of the
+/// request, and it is never removed. So it is stored only once the floor
+/// of the key stands at its id and the condition held after that: from
+/// then on nothing is published on the key under an id the tombstone
+/// covers, and all it can delete in a replay is the object the condition
+/// named, or one that was gone before it. A request that answers `412`
+/// or `404` stored no tombstone under the id it judged with; one from an
+/// earlier turn covers only what a later write or delete had already
+/// taken the place of.
+async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    key: &str,
+    condition: &Precondition,
+) -> Result<(), S3Response> {
+    for _ in 0..CONDITIONAL_ATTEMPTS {
+        restore_gate(bridge).await?;
+        // Without any id on the key there is no object, and no floor to
+        // raise: the condition fails on that alone.
+        check_precondition(bridge, &bucket.id, key, condition).await?;
+        let Some(newest) = bridge
+            .catalog
+            .newest_id(&bucket.id, key)
+            .await
+            .map_err(|_| internal())?
+        else {
+            continue;
+        };
+        let now = bridge.clock.now();
+        let mut rand = [0u8; 8];
+        SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;
+        let tombstone = tombstone_id(now, &newest, rand);
+        bridge
+            .catalog
+            .raise_floor(&bucket.id, key, &tombstone, false)
+            .await
+            .map_err(|_| internal())?;
+        check_precondition(bridge, &bucket.id, key, condition).await?;
+        write_tombstone(
+            &bridge.catalog,
+            &bridge.safety,
+            &bridge.kek,
+            &bucket.id,
+            key,
+            &tombstone,
+            now,
+        )
+        .await
+        .map_err(|_| internal())?;
+        if bridge
+            .catalog
+            .delete_object_if(&bucket.id, key, &tombstone, condition, now)
+            .await
+            .map_err(|_| internal())?
+        {
+            return Ok(());
+        }
+        // Nothing was deleted: the key changed after the look above, or
+        // a replay began. The next turn says which.
+    }
+    Err(s3_error(ErrorCode::SlowDown))
 }
 
 // ---------------------------------------------------------------------------

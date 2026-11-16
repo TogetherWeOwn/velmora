@@ -2,12 +2,12 @@
 //! delete that a tombstone can replay, and the extent rows a multipart
 //! Complete records before it publishes.
 
-use super::objects::{extent_row, retire_live, text, EXTENT_COLS};
+use super::objects::{extent_row, guard_precondition, retire_live, text, EXTENT_COLS};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
 use crate::ports::{Sql, UploadTarget};
 use crate::types::{
-    BridgeError, BucketId, ExtentRow, GenerationId, GenerationState, Result, UnixMs,
+    BridgeError, BucketId, ExtentRow, GenerationId, GenerationState, Precondition, Result, UnixMs,
 };
 
 /// Retires the live generation of `(bucket, key)` if its id sorts before
@@ -20,13 +20,26 @@ pub(super) async fn delete_object_before<S: Sql>(
     bucket: &BucketId,
     key: &str,
     before: &GenerationId,
+    condition: Option<&Precondition>,
     now: UnixMs,
     client: bool,
 ) -> Result<bool> {
     let mut stmts = Vec::new();
     if client {
         stmts.push(guard_no_replay());
+        // A floor above the tombstone is a write that began after the
+        // tombstone was chosen. Its record sorts after the tombstone, so
+        // a replay would publish it over this delete; and where it is
+        // held to the object this delete removes, it must find the
+        // delete in its way (the floor this batch leaves below). The
+        // caller comes back with a tombstone above that id.
+        stmts.push((
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM key_floors \
+             WHERE bucket_id = ?1 AND key = ?2 AND floor_id > ?3)",
+            vec![text(bucket.as_str()), text(key), text(before.as_str())],
+        ));
     }
+    stmts.extend(condition.map(|c| guard_precondition(bucket, key, c)));
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects \
          WHERE bucket_id = ?1 AND key = ?2 AND generation_id < ?3)",

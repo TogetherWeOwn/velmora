@@ -1133,7 +1133,14 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.grant(akid, b).await;
     let _ = c.live_object(b, "a/k").await;
     let _ = c
-        .commit_generation(&commit, Recorded::for_test(&commit.generation.id))
+        .commit_generation(
+            &commit,
+            Some(&Precondition::Absent),
+            Recorded::for_test(&commit.generation.id),
+        )
+        .await;
+    let _ = c
+        .delete_object_if(b, "a/k", &gen.id, &Precondition::Etag("\"e\"".into()), T0)
         .await;
     let _ = c.list(b, &query).await;
     let _ = c.object_status(b, "a/k").await;
@@ -1149,6 +1156,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
             1,
             &[0; 32],
             &complete,
+            Some(&Precondition::Exists),
             Recorded::for_test(&complete.generation.id),
         )
         .await;

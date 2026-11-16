@@ -1007,6 +1007,48 @@ pub struct ObjectStatus {
     pub extents: Vec<ExtentStatus>,
 }
 
+/// The condition of a conditional write (`If-None-Match: *`, `If-Match`)
+/// on the live object of the key it writes or deletes. A publication or
+/// delete batch that carries one holds it in a guard statement of the
+/// batch itself, so it is judged against the object the batch replaces
+/// and not against one read earlier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Precondition {
+    /// `If-None-Match: *`: the key has no live object.
+    Absent,
+    /// `If-Match: *`: the key has a live object.
+    Exists,
+    /// `If-Match: <etag>`: the key's live object has this ETag, stored
+    /// form (with its quotes).
+    Etag(String),
+}
+
+/// Why a [`Precondition`] does not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreconditionError {
+    /// `412 PreconditionFailed`.
+    Failed,
+    /// `404 NoSuchKey`: `If-Match`, and the key has no live object.
+    NoSuchKey,
+}
+
+impl Precondition {
+    /// The condition against the ETag of the key's live object (`None` =
+    /// the key has none). The guard of the batch
+    /// (`sql::objects::guard_precondition`) decides the same way.
+    pub fn check(&self, live_etag: Option<&str>) -> std::result::Result<(), PreconditionError> {
+        match (self, live_etag) {
+            (Precondition::Absent, None) | (Precondition::Exists, Some(_)) => Ok(()),
+            (Precondition::Absent, Some(_)) => Err(PreconditionError::Failed),
+            (Precondition::Exists | Precondition::Etag(_), None) => {
+                Err(PreconditionError::NoSuchKey)
+            }
+            (Precondition::Etag(want), Some(live)) if want == live => Ok(()),
+            (Precondition::Etag(_), Some(_)) => Err(PreconditionError::Failed),
+        }
+    }
+}
+
 /// Input of a single-PUT publication batch: the new generation and its
 /// freshly sealed extents (inserted as `committed`).
 #[derive(Clone, Debug, PartialEq, Eq)]
