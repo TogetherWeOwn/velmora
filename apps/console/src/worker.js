@@ -37,6 +37,8 @@ function error(status, code, message) {
   return json(status, { error: code, message });
 }
 
+const exists = () => error(409, "DestinationExists", "Something already has that name.");
+
 const forbidden = () => {
   const h = secure(new Headers({ "content-type": "text/plain", "cache-control": "no-store" }));
   return new Response("Forbidden", { status: 403, headers: h });
@@ -56,8 +58,10 @@ export function bucketName(v) {
 }
 
 export function objectKey(v, { allowSlashEnd = true } = {}) {
-  if (typeof v !== "string" || v.length === 0) throw new BadRequest("key");
+  if (typeof v !== "string" || v.length === 0 || !v.isWellFormed()) throw new BadRequest("key");
   if (new TextEncoder().encode(v).length > 1024) throw new BadRequest("key");
+  // A `.` or `..` segment would be resolved away by the URL parser.
+  if (v.split("/").some((seg) => seg === "." || seg === "..")) throw new BadRequest("key");
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(v)) throw new BadRequest("key");
   if (!allowSlashEnd && v.endsWith("/")) throw new BadRequest("key");
@@ -118,6 +122,9 @@ export function sameOrigin(request) {
   const url = new URL(request.url);
   const site = request.headers.get("sec-fetch-site");
   if (request.method === "GET" || request.method === "HEAD") {
+    // The page itself may be reached from elsewhere (the Access login
+    // redirect is cross-site); it holds no data. API reads may not.
+    if (!url.pathname.startsWith("/api")) return true;
     return site === null || site === "same-origin" || site === "none";
   }
   const origin = request.headers.get("origin");
@@ -137,6 +144,15 @@ function contentDisposition(key) {
 async function download(s3, url, request) {
   const bucket = bucketName(url.searchParams.get("bucket"));
   const key = objectKey(url.searchParams.get("key"));
+  if (request.method === "HEAD") {
+    // A HEAD never starts a read of the object's bytes.
+    const head = await s3.head(bucket, key);
+    const h = secure(new Headers({ "cache-control": "private, no-store", "content-type": "application/octet-stream" }), "default-src 'none'; sandbox");
+    h.set("content-length", String(head.size));
+    h.set("accept-ranges", "bytes");
+    if (head.etag) h.set("etag", head.etag);
+    return new Response(null, { status: 200, headers: h });
+  }
   const range = request.headers.get("range");
   // A multi-range or odd value is not forwarded: the whole object comes.
   const upstream = await s3.get(bucket, key, range && RANGE_RE.test(range) ? range : undefined);
@@ -211,8 +227,15 @@ async function api(request, env, s3, claims, url) {
     const bucket = bucketName(q("bucket"));
     const key = objectKey(q("key"), { allowSlashEnd: false });
     const len = declaredLength(request, PART_BYTES);
-    const out = await s3.put(bucket, key, request.body ?? new Uint8Array(0), len, contentType(q("type")));
-    return json(200, out);
+    // Nothing is replaced unless the caller says so: velmora keeps no versions.
+    const extra = q("overwrite") === "1" ? {} : { "if-none-match": "*" };
+    try {
+      const out = await s3.put(bucket, key, request.body ?? new Uint8Array(0), len, contentType(q("type")), extra);
+      return json(200, out);
+    } catch (e) {
+      if (e instanceof UpstreamError && e.status === 412) return exists();
+      throw e;
+    }
   }
 
   if (path === "/folder" && m === "POST") {
@@ -262,7 +285,13 @@ async function api(request, env, s3, claims, url) {
       if (typeof p?.etag !== "string" || !ETAG_RE.test(p.etag)) throw new BadRequest("etag");
       return { partNumber: partNumber(p.partNumber), etag: p.etag };
     });
-    return json(200, await s3.completeUpload(bucket, key, uploadId(body.uploadId), parts));
+    try {
+      return json(200, await s3.completeUpload(bucket, key, uploadId(body.uploadId), parts, body.overwrite === true));
+    } catch (e) {
+      // A refused complete leaves the upload open with its parts.
+      if (e instanceof UpstreamError && e.status === 412) return exists();
+      throw e;
+    }
   }
 
   if (path === "/mpu/abort" && m === "POST") {
@@ -281,10 +310,12 @@ async function api(request, env, s3, claims, url) {
     const from = objectKey(body.from);
     const to = objectKey(body.to);
     if (from === to) throw new BadRequest("same");
+    // An object moved onto `dir/` would become that folder's marker.
+    if (to.endsWith("/") && !from.endsWith("/")) throw new BadRequest("destination-is-folder");
     try {
       await s3.copy(bucket, from, to);
     } catch (e) {
-      if (e instanceof UpstreamError && e.status === 412) return error(409, "DestinationExists", "Something already has that name.");
+      if (e instanceof UpstreamError && e.status === 412) return exists();
       throw e;
     }
     await s3.deleteObject(bucket, from);

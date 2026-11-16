@@ -122,11 +122,23 @@ export function createAccessVerifier({ teamDomain, aud, allowedEmails, fetchCert
     fetchedAt = clock();
   }
 
+  // One certs fetch at a time; concurrent requests wait for it.
+  let inflight = null;
+  function refreshOnce() {
+    if (!inflight) inflight = refresh().finally(() => (inflight = null));
+    return inflight;
+  }
+
   async function keyFor(kid) {
-    if (clock() - fetchedAt > CERTS_TTL_MS) await refresh();
+    if (clock() - fetchedAt > CERTS_TTL_MS) {
+      if (inflight) await inflight;
+      // The last attempt failed, and recently: refuse without fetching again.
+      else if (fetchedAt < lastRefresh && clock() - lastRefresh < REFRESH_MIN_INTERVAL_MS) deny("certs-unavailable");
+      else await refreshOnce();
+    }
     let key = keys.get(kid);
-    if (!key && clock() - lastRefresh >= REFRESH_MIN_INTERVAL_MS) {
-      await refresh();
+    if (!key && (inflight || clock() - lastRefresh >= REFRESH_MIN_INTERVAL_MS)) {
+      await refreshOnce();
       key = keys.get(kid);
     }
     if (!key) deny("unknown-kid");

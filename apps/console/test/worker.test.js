@@ -299,3 +299,88 @@ test("pages get a strict CSP and no wildcard CORS", async () => {
   assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval|\*/);
   assert.equal(res.headers.get("access-control-allow-origin"), null);
 });
+
+// Review fixes.
+
+test("a query value with ( ) ! * is sent encoded exactly as it was signed", async () => {
+  const up = fakeUpstream(() => new Response("<ListBucketResult></ListBucketResult>"));
+  await call(up, "/api/list?bucket=files&prefix=" + encodeURIComponent("Photos (2019)!*/"));
+  const raw = up.calls[0].url.search;
+  assert.match(raw, /prefix=Photos%20%282019%29%21%2A%2F/);
+  // velmora canonicalises the raw query: the signature must be over these bytes.
+  const pairs = raw.slice(1).split("&").map((p) => p.split("="));
+  const { canonicalQuery, uriEncode } = await import("../src/sigv4.js");
+  const decoded = pairs.map(([k, v]) => [decodeURIComponent(k), decodeURIComponent(v)]);
+  assert.deepEqual(
+    pairs.map(([k, v]) => `${k}=${v}`).sort(),
+    canonicalQuery(decoded).split("&").sort(),
+  );
+  assert.equal(uriEncode("(x)"), "%28x%29");
+});
+
+test("keys with . or .. segments never reach velmora", async () => {
+  const up = fakeUpstream(() => Response.json({}));
+  for (const key of ["../../keys", "a/../b", "./a", "a/.", ".."]) {
+    const res = await call(up, "/api/info?bucket=files&key=" + encodeURIComponent(key));
+    assert.equal(res.status, 400, key);
+  }
+  assert.equal(up.calls.length, 0);
+});
+
+test("a malformed (lone surrogate) key is a 400, not a 500", async () => {
+  const up = fakeUpstream(() => Response.json({}));
+  const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a", to: "b\ud800" } });
+  assert.equal(res.status, 400);
+});
+
+test("moving a file onto a folder path is refused", async () => {
+  const up = fakeUpstream(() => new Response(""));
+  const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "report.pdf", to: "archive/" } });
+  assert.equal(res.status, 400);
+  assert.equal(up.calls.length, 0);
+});
+
+test("the page itself may be reached cross-site (Access login redirect)", async () => {
+  const res = await call(fakeUpstream(() => new Response()), "/", { headers: { "sec-fetch-site": "cross-site" } });
+  assert.equal(res.status, 200);
+});
+
+test("small uploads never overwrite unless asked", async () => {
+  let exists = true;
+  const up = fakeUpstream((c) =>
+    exists && c.headers["if-none-match"] === "*"
+      ? new Response("<Error><Code>PreconditionFailed</Code></Error>", { status: 412 })
+      : new Response("", { headers: { etag: '"n"' } }),
+  );
+  const body = new Uint8Array(3);
+  const res = await call(up, "/api/object?bucket=files&key=a.txt&type=text/plain", { method: "PUT", body });
+  assert.equal(res.status, 409);
+  assert.equal(up.calls[0].headers["if-none-match"], "*");
+  await assertSigned(up.calls[0], "UNSIGNED-PAYLOAD");
+  const res2 = await call(up, "/api/object?bucket=files&key=a.txt&type=text/plain&overwrite=1", { method: "PUT", body });
+  assert.equal(res2.status, 200);
+  assert.equal(up.calls[1].headers["if-none-match"], undefined);
+  exists = false;
+});
+
+test("complete is conditional unless overwrite is set", async () => {
+  const up = fakeUpstream((c) =>
+    c.headers["if-none-match"] === "*"
+      ? new Response("<Error><Code>PreconditionFailed</Code></Error>", { status: 412 })
+      : new Response("<CompleteMultipartUploadResult><ETag>&quot;m-1&quot;</ETag></CompleteMultipartUploadResult>"),
+  );
+  const parts = [{ partNumber: 1, etag: '"a1"' }];
+  const res = await call(up, "/api/mpu/complete", { method: "POST", body: { bucket: "files", key: "k", uploadId: "u", parts } });
+  assert.equal(res.status, 409);
+  const res2 = await call(up, "/api/mpu/complete", { method: "POST", body: { bucket: "files", key: "k", uploadId: "u", parts, overwrite: true } });
+  assert.equal(res2.status, 200);
+  await assertSigned(up.calls[1], await sha256Hex(up.calls[1].body));
+});
+
+test("HEAD of a download is a HeadObject, never a GET of the bytes", async () => {
+  const up = fakeUpstream(() => new Response(null, { headers: { "content-length": "42", etag: '"e"' } }));
+  const res = await call(up, "/api/download?bucket=files&key=k", { method: "HEAD" });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-length"), "42");
+  assert.equal(up.calls[0].method, "HEAD");
+});

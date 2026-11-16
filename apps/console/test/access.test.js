@@ -128,3 +128,26 @@ test("worker: unset ACCESS_AUD → 403 even with a token", async () => {
 test("worker: valid JWT reaches the API", async () => {
   assert.deepEqual(await workerStatus(await issuer.token()), { status: 200, calls: 1 });
 });
+
+test("a failing certs endpoint is fetched at most once a minute, by one request at a time", async () => {
+  let fetches = 0;
+  let t = NOW;
+  const v = createAccessVerifier({
+    teamDomain: TEAM,
+    aud: AUD,
+    allowedEmails: [EMAIL],
+    now: () => t,
+    fetchCerts: async () => {
+      fetches++;
+      return new Response("down", { status: 503 });
+    },
+  });
+  const token = await issuer.token();
+  await Promise.allSettled([v(token), v(token), v(token)]);
+  assert.equal(fetches, 1);
+  await denied(v(token), "certs-unavailable");
+  assert.equal(fetches, 1);
+  t += 61 * 1000;
+  await denied(v(await issuer.token({ exp: t / 1000 + 600 })), "certs-status");
+  assert.equal(fetches, 2);
+});

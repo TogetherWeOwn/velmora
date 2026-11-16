@@ -401,8 +401,10 @@ async function listAll(prefix) {
 }
 
 async function renameFile(key) {
-  const to = await ask("Rename or move", "New path in this bucket", key);
-  if (to === null || to === key || !to) return;
+  let to = await ask("Rename or move", "New path in this bucket (end with / to move into a folder)", key);
+  if (to === null || !to) return;
+  if (to.endsWith("/")) to += baseName(key);
+  if (to === key) return;
   try {
     await api("/move", { method: "POST", body: { bucket: state.bucket, from: key, to } });
     toast("Moved");
@@ -556,11 +558,21 @@ async function uploadFile(bucket, key, file) {
   const label = (n) => `${fmtSize(n)} / ${fmtSize(file.size)}`;
   try {
     if (file.size <= PART) {
-      const url = "/api/object?" + new URLSearchParams({ bucket, key, type });
-      await withRetry(() => xhrPut(url, file, (n) => t.progress(n, label(n)), ctl.signal), ctl.signal);
+      const put = (overwrite) => {
+        const url = "/api/object?" + new URLSearchParams({ bucket, key, type, ...(overwrite ? { overwrite: "1" } : {}) });
+        return withRetry(() => xhrPut(url, file, (n) => t.progress(n, label(n)), ctl.signal), ctl.signal);
+      };
+      try {
+        await put(false);
+      } catch (e) {
+        if (e.code !== "DestinationExists" || !(await replaceOk(key))) throw e;
+        await put(true);
+      }
       t.finish("done");
       return true;
     }
+    const count = Math.ceil(file.size / PART);
+    if (count > 10000) throw new ApiError(400, "TooLarge", "larger than 10000 parts of 16 MiB");
     // Multipart, resumable: the upload id is kept until the upload ends.
     const rk = resumeKey(bucket, key, file);
     let uploadId = localStorage.getItem(rk);
@@ -570,7 +582,9 @@ async function uploadFile(bucket, key, file) {
         const { parts } = await api("/mpu/parts", { query: { bucket, key, uploadId } });
         for (const p of parts) done.set(p.partNumber, p);
         t.progress(0, `resuming (${done.size} parts already there)`);
-      } catch {
+      } catch (e) {
+        // Only a gone upload starts over; anything else keeps the id for next time.
+        if (e.status !== 404) throw e;
         uploadId = null;
       }
     }
@@ -587,7 +601,6 @@ async function uploadFile(bucket, key, file) {
         /* listed under unfinished uploads */
       }
     };
-    const count = Math.ceil(file.size / PART);
     const sent = new Map();
     const report = () => {
       let n = 0;
@@ -628,7 +641,15 @@ async function uploadFile(bucket, key, file) {
     t.progress(file.size, "finishing");
     const parts = [];
     for (let n = 1; n <= count; n++) parts.push({ partNumber: n, etag: etags[n] });
-    await withRetry(() => api("/mpu/complete", { method: "POST", body: { bucket, key, uploadId, parts } }), ctl.signal);
+    const complete = (overwrite) =>
+      withRetry(() => api("/mpu/complete", { method: "POST", body: { bucket, key, uploadId, parts, overwrite } }), ctl.signal);
+    try {
+      await complete(false);
+    } catch (e) {
+      // A refused complete leaves the upload open: it can still be finished.
+      if (e.code !== "DestinationExists" || !(await replaceOk(key))) throw e;
+      await complete(true);
+    }
     localStorage.removeItem(rk);
     t.finish("done");
     return true;
@@ -636,6 +657,14 @@ async function uploadFile(bucket, key, file) {
     t.finish(e.code === "Aborted" ? "cancelled" : `failed: ${e.message} (drop the file again to resume)`);
     return false;
   }
+}
+
+async function replaceOk(key) {
+  const answer = await dialog("Replace?", el("p", {}, `${key} already exists. Replace it? The old version is not kept.`), [
+    ["Keep the old one", "cancel", "ghost"],
+    ["Replace", "ok", "danger"],
+  ]);
+  return answer === "ok";
 }
 
 async function uploadAll(items) {

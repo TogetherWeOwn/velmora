@@ -3,7 +3,7 @@
 // returns them or puts them in a response.
 
 import { blocks, decodeEntities, escapeXml, strip, text } from "./xml.js";
-import { EMPTY_SHA256, UNSIGNED_PAYLOAD, encodeKey, sha256Base64, sha256Hex, sign } from "./sigv4.js";
+import { EMPTY_SHA256, UNSIGNED_PAYLOAD, encodeKey, sha256Base64, sha256Hex, sign, uriEncode } from "./sigv4.js";
 
 export class UpstreamError extends Error {
   constructor(status, code, message) {
@@ -44,6 +44,15 @@ function urlDecode(s, encoded) {
 }
 
 /**
+ * Second guard behind key validation: the URL parser must not have
+ * changed the path (dot segments, for one), or the request would go
+ * somewhere other than what was checked and signed.
+ */
+function assertPath(url, path) {
+  if (new URL(url).pathname !== path) throw new UpstreamError(400, "InvalidKey", "The key does not map to a path.");
+}
+
+/**
  * @param {object} cfg
  * @param {{fetch: (req: Request) => Promise<Response>}} cfg.upstream service binding
  * @param {string} cfg.host       the S3 host velmora answers to
@@ -74,15 +83,17 @@ export function createClient(cfg) {
       region: cfg.region,
       now: now(),
     });
-    const qs = query.length
-      ? "?" + query.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v ?? "")}`).join("&")
-      : "";
+    // The query is sent exactly as it was signed: velmora canonicalises
+    // the raw query string, and encodeURIComponent leaves `!'()*` alone.
+    const qs = query.length ? "?" + query.map(([k, v]) => `${uriEncode(k)}=${uriEncode(v ?? "")}`).join("&") : "";
+    const url = `https://${cfg.host}${path}${qs}`;
+    assertPath(url, path);
     const init = { method, headers: signed.headers };
     if (body !== undefined) {
       init.body = body;
       if (body instanceof ReadableStream) init.duplex = "half";
     }
-    return cfg.upstream.fetch(new Request(`https://${cfg.host}${path}${qs}`, init));
+    return cfg.upstream.fetch(new Request(url, init));
   }
 
   async function ok(res) {
@@ -102,7 +113,9 @@ export function createClient(cfg) {
       body = JSON.stringify(json);
       headers["content-type"] = "application/json";
     }
-    const res = await cfg.upstream.fetch(new Request(`https://${cfg.host}/_admin${path}`, { method, headers, body }));
+    const url = `https://${cfg.host}/_admin${path}`;
+    assertPath(url, `/_admin${path}`);
+    const res = await cfg.upstream.fetch(new Request(url, { method, headers, body }));
     if (!res.ok) throw await failure(res);
     return res.status === 204 ? null : res.json();
   }
@@ -214,7 +227,7 @@ export function createClient(cfg) {
       }));
     },
 
-    async completeUpload(bucket, key, uploadId, parts) {
+    async completeUpload(bucket, key, uploadId, parts, overwrite = false) {
       const xml =
         "<CompleteMultipartUpload>" +
         parts
@@ -228,7 +241,7 @@ export function createClient(cfg) {
           bucket,
           key,
           query: [["uploadId", uploadId]],
-          headers: { "content-type": "application/xml" },
+          headers: overwrite ? { "content-type": "application/xml" } : { "content-type": "application/xml", "if-none-match": "*" },
           body: b.body,
           payloadHash: b.payloadHash,
         }),
