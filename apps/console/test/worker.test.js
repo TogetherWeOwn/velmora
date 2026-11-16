@@ -384,3 +384,18 @@ test("HEAD of a download is a HeadObject, never a GET of the bytes", async () =>
   assert.equal(res.headers.get("content-length"), "42");
   assert.equal(up.calls[0].method, "HEAD");
 });
+
+test("DeleteObjects accepts keys with dot segments (they travel in XML, not a path)", async () => {
+  const up = fakeUpstream(() => new Response("<DeleteResult></DeleteResult>"));
+  const res = await call(up, "/api/delete", { method: "POST", body: { bucket: "files", keys: ["a/../b", "./c"] } });
+  assert.equal(res.status, 200);
+  assert.match(new TextDecoder().decode(up.calls[0].body), /<Key>a\/\.\.\/b<\/Key>/);
+  assert.equal(up.calls[0].url.pathname, "/files");
+});
+
+test("head answers existence without velmora state lookups", async () => {
+  const up = fakeUpstream((c) => (c.url.pathname.endsWith("/there") ? new Response(null, { headers: { "content-length": "9" } }) : new Response(null, { status: 404 })));
+  assert.deepEqual(await (await call(up, "/api/head?bucket=files&key=there")).json(), { exists: true, size: 9, etag: null });
+  assert.deepEqual(await (await call(up, "/api/head?bucket=files&key=missing")).json(), { exists: false });
+  assert.ok(up.calls.every((c) => c.method === "HEAD" && !c.url.pathname.startsWith("/_admin")));
+});

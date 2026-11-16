@@ -275,24 +275,32 @@ function downloadUrl(key) {
 // ---------------------------------------------------------------------------
 // Dialogs
 
+// One shared <dialog>: dialogs (some opened by background uploads) wait
+// their turn, so an answer never belongs to another question.
+let dialogChain = Promise.resolve();
+
 function dialog(title, content, buttons) {
-  const d = $("dialog");
-  $("dialog-title").textContent = title;
-  $("dialog-content").replaceChildren(content);
-  $("dialog-buttons").replaceChildren(
-    ...buttons.map(([label, value, cls]) => el("button", { value, class: cls || "", type: "submit" }, label)),
-  );
-  return new Promise((resolve) => {
-    d.addEventListener("close", () => resolve(d.returnValue), { once: true });
-    d.returnValue = "";
-    d.showModal();
-  });
+  const run = () =>
+    new Promise((resolve) => {
+      const d = $("dialog");
+      $("dialog-title").textContent = title;
+      $("dialog-content").replaceChildren(content);
+      $("dialog-buttons").replaceChildren(
+        ...buttons.map(([label, value, cls]) => el("button", { value, class: cls || "", type: "submit" }, label)),
+      );
+      d.addEventListener("close", () => resolve(d.returnValue), { once: true });
+      d.returnValue = "";
+      d.showModal();
+      content.querySelector?.("input")?.focus();
+    });
+  const p = dialogChain.then(run);
+  dialogChain = p.catch(() => {});
+  return p;
 }
 
 async function ask(title, label, value) {
   const input = el("input", { type: "text", value, "aria-label": label });
   const p = dialog(title, el("div", {}, el("p", {}, label), input), [["Cancel", "cancel", "ghost"], ["OK", "ok"]]);
-  input.focus();
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -573,6 +581,13 @@ async function uploadFile(bucket, key, file) {
     }
     const count = Math.ceil(file.size / PART);
     if (count > 10000) throw new ApiError(400, "TooLarge", "larger than 10000 parts of 16 MiB");
+    // Ask before sending gigabytes; the conditional complete still guards a race.
+    let overwrite = false;
+    const { exists } = await api("/head", { query: { bucket, key } });
+    if (exists) {
+      if (!(await replaceOk(key))) throw new ApiError(0, "Aborted", "kept the existing object");
+      overwrite = true;
+    }
     // Multipart, resumable: the upload id is kept until the upload ends.
     const rk = resumeKey(bucket, key, file);
     let uploadId = localStorage.getItem(rk);
@@ -644,7 +659,7 @@ async function uploadFile(bucket, key, file) {
     const complete = (overwrite) =>
       withRetry(() => api("/mpu/complete", { method: "POST", body: { bucket, key, uploadId, parts, overwrite } }), ctl.signal);
     try {
-      await complete(false);
+      await complete(overwrite);
     } catch (e) {
       // A refused complete leaves the upload open: it can still be finished.
       if (e.code !== "DestinationExists" || !(await replaceOk(key))) throw e;
@@ -667,7 +682,15 @@ async function replaceOk(key) {
   return answer === "ok";
 }
 
-async function uploadAll(items) {
+// Batches run one after another, so two drops never race each other.
+let uploadChain = Promise.resolve();
+function uploadAll(items) {
+  const run = uploadChain.then(() => uploadBatch(items));
+  uploadChain = run.catch(() => {});
+  return run;
+}
+
+async function uploadBatch(items) {
   if (!state.bucket) return toast("Pick a bucket first");
   const bucket = state.bucket;
   const base = state.prefix;

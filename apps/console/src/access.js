@@ -78,7 +78,7 @@ export function createAccessVerifier({ teamDomain, aud, allowedEmails, fetchCert
     allowedEmails.length > 0;
   const issuer = `https://${teamDomain}`;
   const certsUrl = `${issuer}/cdn-cgi/access/certs`;
-  const getCerts = fetchCerts ?? ((url) => fetch(url));
+  const getCerts = fetchCerts ?? ((url) => fetch(url, { signal: AbortSignal.timeout(5000) }));
   const clock = now ?? (() => Date.now());
   const allowed = new Set((allowedEmails ?? []).map((e) => String(e).toLowerCase()));
 

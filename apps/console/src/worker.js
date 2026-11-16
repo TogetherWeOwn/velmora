@@ -57,11 +57,12 @@ export function bucketName(v) {
   return v;
 }
 
-export function objectKey(v, { allowSlashEnd = true } = {}) {
+export function objectKey(v, { allowSlashEnd = true, inPath = true } = {}) {
   if (typeof v !== "string" || v.length === 0 || !v.isWellFormed()) throw new BadRequest("key");
   if (new TextEncoder().encode(v).length > 1024) throw new BadRequest("key");
   // A `.` or `..` segment would be resolved away by the URL parser.
-  if (v.split("/").some((seg) => seg === "." || seg === "..")) throw new BadRequest("key");
+  // (Keys sent in an XML body, as for DeleteObjects, are not parsed as a path.)
+  if (inPath && v.split("/").some((seg) => seg === "." || seg === "..")) throw new BadRequest("key");
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(v)) throw new BadRequest("key");
   if (!allowSlashEnd && v.endsWith("/")) throw new BadRequest("key");
@@ -209,6 +210,19 @@ async function api(request, env, s3, claims, url) {
 
   if (path === "/download" && (m === "GET" || m === "HEAD")) return download(s3, url, request);
 
+  // Existence only (no velmora state lookup): used before large uploads.
+  if (path === "/head" && m === "GET") {
+    const bucket = bucketName(q("bucket"));
+    const key = objectKey(q("key"));
+    try {
+      const head = await s3.head(bucket, key);
+      return json(200, { exists: true, size: head.size, etag: head.etag });
+    } catch (e) {
+      if (e instanceof UpstreamError && e.status === 404) return json(200, { exists: false });
+      throw e;
+    }
+  }
+
   if (path === "/info" && m === "GET") {
     const bucket = bucketName(q("bucket"));
     const key = objectKey(q("key"));
@@ -328,7 +342,7 @@ async function api(request, env, s3, claims, url) {
     if (!Array.isArray(body.keys) || body.keys.length === 0 || body.keys.length > MAX_DELETE_KEYS) {
       throw new BadRequest("keys");
     }
-    const keys = body.keys.map((k) => objectKey(k));
+    const keys = body.keys.map((k) => objectKey(k, { inPath: false }));
     return json(200, await s3.deleteObjects(bucket, keys));
   }
 
