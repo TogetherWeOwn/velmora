@@ -308,8 +308,9 @@ where
 /// body is read or anything is stored:
 /// - a conditional header is `501 NotImplemented`, never ignored;
 /// - a catalogue restore in progress is `503`;
-/// - until catalogue recovery is proven, only disposable buckets take
-///   writes.
+/// - a non-disposable bucket takes writes only while `REAL_DATA_READY`
+///   is set. It is set now that a lost catalogue can be rebuilt; the
+///   check stays so that closing the gate again is one constant.
 pub(super) fn mutation_gate(
     cfg: &BridgeConfig,
     headers: &Headers,

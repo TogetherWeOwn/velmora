@@ -85,7 +85,8 @@ pub enum Environment {
     Prod,
 }
 
-/// `GC_MODE`. There is no `full` mode yet; it needs `REAL_DATA_READY`.
+/// `GC_MODE`. There is no `full` mode: nothing collects the extents of a
+/// non-disposable bucket, so `full` is refused as an invalid value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GcMode {
     /// `gc` rows accumulate; nothing is deleted.

@@ -309,6 +309,45 @@ PutObject, CompleteMultipartUpload, CopyObject and DeleteObject are in
 `SAFETY`, where a database restore cannot reach them, and the replay
 brings them back.
 
+## Rollback floor
+
+A Worker rollback (`wrangler rollback <version>`, or the dashboard) can
+go to any of the 100 most recent versions. Some of those are older than
+the code real data relies on. Never roll back past the floor:
+
+- **Real buckets:** never to a version older than the first one built
+  from a commit that contains #71 (`keep generation ids on a key in
+  commit order`). An older Worker refuses a PutObject on a real bucket
+  but still takes multipart uploads on one, with the ordering bugs #71
+  fixed: a recovery record can then sort before the write it should
+  follow, and a replay can bring back the wrong generation.
+- **With `SERVER_SIDE_COPY=on`:** also never to a version older than the
+  first one built from a commit that contains #76 (`harden CopyObject
+  retries, replay and rollback repair`). A Worker from before migration
+  0005 cannot read a copy, and does not know that a copy shares the
+  extents of its source; one from before #76 lacks the fixes to copy
+  retries and to the replay of copies. Today the #71 floor is the later
+  of the two, so it covers both.
+
+The CI auto-rollback only ever goes back to the version that served
+before that run's deploy, which is above the floor once the floor has
+been deployed. The floor matters for a rollback by hand.
+
+To find the floor (version IDs are per account, so they are not listed
+here):
+
+1. List every version, not only the last 10 that
+   `wrangler versions list` shows: `GET
+   /accounts/<account>/workers/scripts/<script>/versions?page=N&per_page=50`
+   on the Cloudflare API, page by page.
+2. A CI deploy carries the message `ci <run>.<attempt> <commit>`. A
+   version made by a secret change (`workers/triggered_by` = `secret`)
+   runs the code of the version before it.
+3. For each version, oldest first, check the commit:
+   `git merge-base --is-ancestor <merge commit of #71> <commit>`. The
+   first version for which it succeeds is the floor; a version without
+   a commit takes the answer of the version before it.
+
 ## A PutObject above one extent
 
 With `MAX_PUT_BYTES` above `MAX_EXTENT_BYTES` (shipped: 99 MiB over
