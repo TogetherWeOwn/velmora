@@ -594,8 +594,12 @@ pub(super) async fn create_bucket_s3<
 /// `MAINTENANCE=restore`, once no replay is unfinished: an operator who
 /// has to remove a stale bucket between two replays does it while no
 /// client can write into that bucket. It is refused while a replay is
-/// under way or still due, here and again in the catalogue batch: the
-/// records not yet read may name the bucket.
+/// under way, or due because the restore was armed or the rollback stamp
+/// found the catalogue set back, here and again in the catalogue batch:
+/// the records not yet read may name the bucket. A restored catalogue
+/// that is neither armed nor found out yet is not known to be one: there
+/// a bucket that looks empty goes with its grants, and the replay makes
+/// it again from its records, without the grants.
 pub(super) async fn delete_bucket_s3<
     C: Catalog,
     B: BlobStore,

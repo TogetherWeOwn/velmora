@@ -133,10 +133,14 @@ Limits to know:
   `other_bucket`. To set it right, stay in `MAINTENANCE=restore` for all
   of this, because the stale bucket has its old grants again and one
   client write into it would keep it for good:
-  1. run the replay to its end;
+  1. run the replay to its end (`catalog-replay.sh` exits with status 2
+     because of the `other_bucket` list; that is expected here);
   2. delete the stale bucket with `DELETE /<bucket>` and the admin
      token. This one change is accepted under maintenance once no replay
-     is unfinished. The answer is `204`;
+     is unfinished. The answer is `204`. Do not delete a bucket after
+     the database was brought back and before the restore is armed
+     (Restore, step 2): the catalogue cannot tell yet that records are
+     still to be read;
   3. run the replay again from the same `since_ms`: it makes the bucket
      of the records and publishes them, and `other_bucket` is empty;
   4. turn `MAINTENANCE` off, make new access keys for the bucket
