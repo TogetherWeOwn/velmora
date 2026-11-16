@@ -130,12 +130,24 @@ Limits to know:
   from before that deletion names the deleted bucket again, so this is
   the case above the other way round: the replay skips the records of
   the new bucket, the one with the data, and lists them under
-  `other_bucket`. To set it right, end the replay, turn `MAINTENANCE`
-  off, delete the stale bucket with `DELETE /<bucket>` (it is empty, so
-  the answer is `204`; a `409` means it holds data and is not the stale
-  one), run the replay again from the same `since_ms`, and grant the
-  access keys the bucket again: the replay makes the bucket of the
-  records, and grants are not in the records.
+  `other_bucket`. To set it right, stay in `MAINTENANCE=restore` for all
+  of this, because the stale bucket has its old grants again and one
+  client write into it would keep it for good:
+  1. run the replay to its end;
+  2. delete the stale bucket with `DELETE /<bucket>` and the admin
+     token. This one change is accepted under maintenance once no replay
+     is unfinished. The answer is `204`;
+  3. run the replay again from the same `since_ms`: it makes the bucket
+     of the records and publishes them, and `other_bucket` is empty;
+  4. turn `MAINTENANCE` off, make new access keys for the bucket
+     (`POST /_admin/keys`) and give them to the clients: grants are not
+     in the records.
+
+  A `409` in step 2 means the bucket in the catalogue has data on record
+  as well. Then both buckets hold data under one name and nothing merges
+  them: leave `MAINTENANCE` on, keep the list under `other_bucket`, and
+  decide which bucket keeps the name as in the case above. The records of
+  the other one stay in the store.
 - A pinned copy is deleted once its extent was read back from Usenet
   and `SAFETY_MIN_AGE_SECS` have passed. A catalogue from before that
   moment still says `held` for the extent, and a replay from the restore

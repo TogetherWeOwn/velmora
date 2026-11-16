@@ -266,14 +266,15 @@ async fn delete_many<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: 
             UploadReadError::Proto(e) => s3_error(e),
         })?;
     let verified = validator.finish().map_err(s3_error)?;
-    // Only the small, validated control document outlives the charge.
-    drop(charge);
     if authed.headers.get("content-md5").is_none() && verified.checksum().is_none() {
         return Err(s3_error(ErrorCode::InvalidRequest));
     }
 
     let request = parse_delete(&body, &xml_policy, MAX_DELETE_KEYS).map_err(s3_error)?;
     drop(body);
+    // Only the list of keys outlives the charge: the document and the
+    // tree read from it are gone.
+    drop(charge);
 
     // Every key takes the path of a DeleteObject on it, once: a key that
     // is named again gets the answer of its first mention, so the request

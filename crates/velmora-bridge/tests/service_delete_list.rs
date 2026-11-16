@@ -263,7 +263,7 @@ async fn delete_objects_takes_a_document_larger_than_an_extent() {
     assert_eq!(resp.expect(200).values("Key").len(), 200);
     assert!(live_keys(&rig).is_empty());
 
-    // The same document with a trailing checksum instead of a header digest
+    // The same document with a checksum header instead of `Content-MD5`
     // is validated against the same limit.
     let crc = crc32c_b64(xml.as_bytes());
     let resp = rig
@@ -1082,27 +1082,42 @@ async fn delete_bucket_keeps_a_bucket_that_holds_or_held_anything() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn delete_bucket_is_refused_under_maintenance_and_during_a_replay() {
+async fn delete_bucket_is_refused_during_a_replay_and_allowed_under_maintenance() {
     let mut rig = rig();
-    rig.standard(BUCKET).await;
-    for mode in [Maintenance::Restore] {
-        set_maintenance(&mut rig, mode);
-        let resp = delete_bucket(&rig, BUCKET).await;
-        resp.expect_error(503, "ServiceUnavailable");
-        assert_eq!(bucket_names(&rig), [BUCKET]);
-    }
-    set_maintenance(&mut rig, Maintenance::Off);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bucket(OTHER, true).await;
+
+    // Under maintenance no client can write, and no replay is under way:
+    // an empty bucket can go, and an S3 key still deletes nothing.
+    set_maintenance(&mut rig, Maintenance::Restore);
+    let signed = rig
+        .call(
+            &signer,
+            Method::Delete,
+            &format!("/{BUCKET}"),
+            &[],
+            &[],
+            b"",
+        )
+        .await;
+    assert_ne!(signed.status, 204);
+    assert_eq!(bucket_names(&rig).len(), 2);
+    delete_bucket(&rig, OTHER).await.expect(204);
+    assert_eq!(bucket_names(&rig), [BUCKET]);
 
     // A replay is under way (its cursor is on record): the records it
-    // has yet to read may name the bucket.
+    // has yet to read may name the bucket. Refused in either mode.
     let now = rig.now();
     let begun = rig.bridge.catalog.restore_begin(UnixMs(0), now).await;
     assert!(begun.unwrap().is_ok());
-    delete_bucket(&rig, BUCKET)
-        .await
-        .expect_error(503, "ServiceUnavailable");
-    assert_eq!(bucket_names(&rig), [BUCKET]);
-    assert_eq!(rig.count("grants"), 1);
+    for mode in [Maintenance::Restore, Maintenance::Off] {
+        set_maintenance(&mut rig, mode);
+        delete_bucket(&rig, BUCKET)
+            .await
+            .expect_error(503, "ServiceUnavailable");
+        assert_eq!(bucket_names(&rig), [BUCKET]);
+        assert_eq!(rig.count("grants"), 1);
+    }
     // The catalogue refuses on its own, whatever the handler checked.
     let bucket = rig.bridge.catalog.bucket_by_name(BUCKET).await.unwrap();
     assert_eq!(
@@ -1169,10 +1184,10 @@ async fn a_write_that_lost_its_bucket_stores_no_record() {
     assert_eq!(rig.bridge.safety.keys(), stored);
 }
 
-/// One replay of every record, as the runbook runs it. Returns how many
-/// records it left out because another bucket holds their bucket's name.
-async fn replay_all(rig: &mut Rig) -> u64 {
-    set_maintenance(rig, Maintenance::Restore);
+/// One replay of every record, under the maintenance the caller set.
+/// Returns how many records it left out because another bucket holds
+/// their bucket's name.
+async fn replay_all(rig: &Rig) -> u64 {
     let mut body = serde_json::json!({ "since_ms": 0, "margin_ms": 0 });
     let mut other_bucket = 0;
     loop {
@@ -1185,7 +1200,6 @@ async fn replay_all(rig: &mut Rig) -> u64 {
         }
         body = serde_json::json!({ "cursor": report["next"] });
     }
-    set_maintenance(rig, Maintenance::Off);
     other_bucket
 }
 
@@ -1194,6 +1208,8 @@ async fn replay_all(rig: &mut Rig) -> u64 {
 /// catalogue names the deleted bucket again, and a replay leaves the
 /// records of the new one out and says so. Deleting the stale bucket,
 /// which is still empty, and replaying again brings the objects back.
+/// All of it runs under maintenance: the stale bucket still has its
+/// grants, and a client write into it would keep it for good.
 #[tokio::test(flavor = "current_thread")]
 async fn a_rollback_to_before_a_bucket_deletion_is_repaired_by_deleting_it_again() {
     let mut rig = rig();
@@ -1221,16 +1237,25 @@ async fn a_rollback_to_before_a_bucket_deletion_is_repaired_by_deleting_it_again
     assert_eq!(bucket_ids(&rig), [stale.id.as_str()]);
 
     // The replay ends, and reports the record it could not place.
-    assert_eq!(replay_all(&mut rig).await, 1);
+    set_maintenance(&mut rig, Maintenance::Restore);
+    assert_eq!(replay_all(&rig).await, 1);
     assert_eq!(bucket_ids(&rig), [stale.id.as_str()]);
     assert!(live_keys(&rig).is_empty());
+
+    // The key is granted the stale bucket again. Maintenance is what
+    // keeps its writes out until that bucket is gone.
+    assert_eq!(rig.count("grants"), 1);
+    let refused = rig.put(&signer, BUCKET, "window", b"payload").await;
+    refused.expect_error(503, "ServiceUnavailable");
+    assert_eq!(rig.count("generations"), 0);
 
     // The stale bucket never held anything, so it can go; the next replay
     // makes the bucket of the records and publishes them.
     delete_bucket(&rig, BUCKET).await.expect(204);
-    assert_eq!(replay_all(&mut rig).await, 0);
+    assert_eq!(replay_all(&rig).await, 0);
     assert_eq!(bucket_ids(&rig), [fresh.id.as_str()]);
     assert_eq!(live_keys(&rig), ["k"]);
+    set_maintenance(&mut rig, Maintenance::Off);
 
     // Grants are not in the records: the key is granted the bucket again.
     assert_eq!(rig.count("grants"), 0);

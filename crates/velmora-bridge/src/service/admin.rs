@@ -589,6 +589,13 @@ pub(super) async fn create_bucket_s3<
 /// needs the admin bearer token. The bucket and its grants go only while
 /// nothing of the bucket is on record ([`Catalog::delete_bucket`]); any
 /// other bucket is `409 BucketNotEmpty`. Errors are S3 XML.
+///
+/// Unlike the other admin mutations it is accepted under
+/// `MAINTENANCE=restore`, once no replay is unfinished: an operator who
+/// has to remove a stale bucket between two replays does it while no
+/// client can write into that bucket. It is refused while a replay is
+/// under way or still due, here and again in the catalogue batch: the
+/// records not yet read may name the bucket.
 pub(super) async fn delete_bucket_s3<
     C: Catalog,
     B: BlobStore,
@@ -604,10 +611,18 @@ pub(super) async fn delete_bucket_s3<
     if check_admin_bearer(&req, bridge.cfg.admin_token.expose()).is_err() {
         return IngressError::AccessDenied.response();
     }
-    if mutable(bridge).await.is_err() {
-        return S3Response::error(503, "ServiceUnavailable", "Maintenance.");
-    }
     let failed = || S3Response::error(500, "InternalError", "The request failed.");
+    match bridge.catalog.restore_pending().await {
+        Ok(false) => {}
+        Ok(true) => {
+            return S3Response::error(
+                503,
+                "ServiceUnavailable",
+                "A replay of the recovery records is not finished.",
+            )
+        }
+        Err(_) => return failed(),
+    }
     let found = match bridge.catalog.bucket_by_name(bucket).await {
         Ok(Some(found)) => found,
         Ok(None) => {
