@@ -22,7 +22,7 @@ use velmora_bridge::{RespBody, S3Response};
 use worker::js_sys::{BigInt, Function, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
-use worker::{console_error, Context, Env, Headers, Response, ResponseBody};
+use worker::{console_error, Context, EncodeBody, Env, Headers, Response, ResponseBody};
 
 /// The binding of this Worker to itself.
 const BINDING: &str = "SELF";
@@ -209,9 +209,13 @@ pub async fn respond(env: &Env, ctx: &Context, resp: S3Response) -> (u16, Respon
         for (name, value) in &headers {
             out.append(name, value)?;
         }
+        // `manual`, as for every other body (`crate::http`): the bytes
+        // are final, and an object's stored `content-encoding` must not
+        // make the runtime encode them again.
         Ok(Response::from_body(ResponseBody::Stream(readable))?
             .with_status(status)
-            .with_headers(out))
+            .with_headers(out)
+            .with_encode_body(EncodeBody::Manual))
     })();
     let Ok(resp) = built else {
         pipe.abort().await;
