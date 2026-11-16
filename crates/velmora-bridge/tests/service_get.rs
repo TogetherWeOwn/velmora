@@ -443,6 +443,20 @@ async fn object_responses_forbid_edge_transforms() {
         resp.expect(304);
         assert_eq!(cache_controls(&resp), [served], "304 {key}");
         assert_eq!(resp.header("etag"), Some(etag.as_str()), "304 {key}");
+
+        let resp = rig
+            .call(
+                &signer,
+                Method::Head,
+                &path(BUCKET, key),
+                &[],
+                &[("if-none-match", &etag)],
+                b"",
+            )
+            .await;
+        resp.expect(304);
+        assert_eq!(cache_controls(&resp), [served], "HEAD 304 {key}");
+        assert_eq!(resp.header("etag"), Some(etag.as_str()), "HEAD 304 {key}");
     }
 
     // Other content types are marked too; an empty object as well.

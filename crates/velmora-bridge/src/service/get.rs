@@ -211,10 +211,12 @@ fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
                 .split(',')
                 .any(|d| d.trim().eq_ignore_ascii_case(DIRECTIVE));
             if !present {
-                *value = if value.trim().is_empty() {
+                // A trailing comma is dropped rather than doubled.
+                let base = value.trim().trim_end_matches(',').trim_end();
+                *value = if base.is_empty() {
                     DIRECTIVE.to_string()
                 } else {
-                    format!("{value}, {DIRECTIVE}")
+                    format!("{base}, {DIRECTIVE}")
                 };
             }
         }
@@ -598,7 +600,15 @@ mod tests {
 
     #[test]
     fn an_empty_stored_cache_control_becomes_no_transform() {
-        let h = served(&[("Cache-Control", "")]);
-        assert_eq!(cache_control(&h), ["no-transform"]);
+        for stored in ["", " ", ","] {
+            let h = served(&[("Cache-Control", stored)]);
+            assert_eq!(cache_control(&h), ["no-transform"], "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_is_not_doubled() {
+        let h = served(&[("cache-control", "max-age=60, ")]);
+        assert_eq!(cache_control(&h), ["max-age=60, no-transform"]);
     }
 }
