@@ -953,3 +953,30 @@ async fn an_unanswered_batch_does_not_delete_a_write_that_came_after() {
         "the write came after the batch in {met} of 40 runs"
     );
 }
+
+/// The batch of a chunk is applied and not answered, and nothing else
+/// is at work on its keys: each key finds itself deleted and says so,
+/// under the one tombstone it has.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unanswered_batch_that_was_applied_answers_deleted() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let keys: Vec<String> = (0..5).map(|i| format!("k{i}")).collect();
+    for key in &keys {
+        rig.put(&signer, BUCKET, key, key.as_bytes())
+            .await
+            .expect(200);
+    }
+    rig.bridge.clock.advance_ms(1000);
+    let signed_calls = {
+        let (_, none) = counted(&rig, delete_objects(&rig, &signer, &["no/such".into()])).await;
+        none.database - 2
+    };
+    rig.trip().arm(signed_calls + 3 + 5 + 1, Trip::Lost);
+    let resp = delete_objects(&rig, &signer, &keys).await;
+    assert!(rig.trip().tripped());
+    let by_key = answers(&resp, &keys);
+    assert!(by_key.values().all(Option::is_none), "{by_key:?}");
+    assert!(live_keys(&rig).is_empty());
+    assert_eq!(tombstones(&rig).await.len(), 5);
+}
