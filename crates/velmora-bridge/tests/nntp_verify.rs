@@ -76,6 +76,18 @@ impl Rig {
             })
             .collect()
     }
+
+    /// The wake-ups sent: the stage, the queue delay and the time each
+    /// one waits for.
+    fn sent_wakes(&self) -> Vec<(OutboxStage, u32, UnixMs)> {
+        let sent = self.bridge.jobs.take();
+        sent.iter()
+            .map(|j| match &j.job {
+                Job::Wake { stage, at, .. } => (*stage, j.delay_secs, *at),
+                other => panic!("unexpected job {other:?}"),
+            })
+            .collect()
+    }
 }
 
 #[tokio::test]
@@ -333,8 +345,15 @@ async fn release_waits_for_the_minimum_age() {
     let outbox = rig.outbox(&s);
     assert_eq!(outbox.stage, OutboxStage::Release);
     assert_eq!(outbox.next_at, T0.plus_secs(week));
-    // Too far out for a queue delay: the dispatcher sends it when due.
-    assert!(rig.sent_stages().is_empty());
+    // Too far out for one queue delay: a wake-up carries the wait on.
+    assert_eq!(
+        rig.sent_wakes(),
+        [(
+            OutboxStage::Release,
+            MAX_QUEUE_DELAY_SECS,
+            T0.plus_secs(week)
+        )]
+    );
 
     // A release job that runs early anyway defers itself.
     rig.bridge
@@ -377,7 +396,10 @@ async fn the_minimum_age_counts_from_the_post_not_from_the_upload() {
     let outbox = rig.outbox(&s);
     assert_eq!(outbox.stage, OutboxStage::Release);
     assert_eq!(outbox.next_at, ready);
-    assert!(rig.sent_stages().is_empty());
+    assert_eq!(
+        rig.sent_wakes(),
+        [(OutboxStage::Release, MAX_QUEUE_DELAY_SECS, ready)]
+    );
 
     // A release job that runs early defers itself and reads nothing, up
     // to the last millisecond.

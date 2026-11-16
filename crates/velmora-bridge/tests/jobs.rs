@@ -16,7 +16,9 @@ use velmora::rng::SystemRng;
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
-use velmora_bridge::jobs::{DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS};
+use velmora_bridge::jobs::{
+    DISPATCH_BATCH, DISPATCH_BATCHES, DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS, RESEND_SECS,
+};
 use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan, Unpublished};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
@@ -34,17 +36,42 @@ const VERIFY_DELAY_SECS: u32 = 30;
 // ---------------------------------------------------------------------------
 
 /// One SQLite database shared by the bridge and the test.
-struct Shared(Rc<RusqliteSql>);
+struct Shared {
+    db: Rc<RusqliteSql>,
+    /// Calls made through this handle. A batch is one call, as on D1.
+    calls: Rc<Cell<u32>>,
+    /// The dispatcher's mark of sent rows fails.
+    no_marks: Rc<Cell<bool>>,
+}
+
+impl Shared {
+    fn new(db: &Rc<RusqliteSql>) -> Shared {
+        Shared {
+            db: Rc::clone(db),
+            calls: Rc::default(),
+            no_marks: Rc::default(),
+        }
+    }
+    fn count(&self) {
+        self.calls.set(self.calls.get() + 1);
+    }
+}
 
 impl Sql for Shared {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        self.0.query(sql, params).await
+        self.count();
+        self.db.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        self.0.exec(sql, params).await
+        self.count();
+        if self.no_marks.get() && sql.contains("SET sent_at = ?1") {
+            return Err(BridgeError::Sql("mark failed".to_string()));
+        }
+        self.db.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
-        self.0.batch(stmts).await
+        self.count();
+        self.db.batch(stmts).await
     }
 }
 
@@ -64,6 +91,8 @@ struct GuardedBlob {
     broken: RefCell<Option<String>>,
     /// Puts of keys with this prefix fail.
     no_put: RefCell<Option<String>>,
+    /// Puts and lists so far (all the dispatcher may do).
+    calls: Cell<u32>,
 }
 
 impl GuardedBlob {
@@ -81,6 +110,7 @@ impl GuardedBlob {
 
 impl BlobStore for GuardedBlob {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.calls.set(self.calls.get() + 1);
         self.check_unless_stamp(key);
         if self
             .no_put
@@ -112,6 +142,7 @@ impl BlobStore for GuardedBlob {
         self.inner.delete_record(refused).await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.calls.set(self.calls.get() + 1);
         self.check_unless_stamp(prefix);
         self.inner.list(prefix, start_after, limit).await
     }
@@ -162,7 +193,7 @@ struct Fx {
     clock: Rc<FixedClock>,
     server: TestNntpServer,
     forbid_io: Rc<Cell<bool>>,
-    seed: Cell<u8>,
+    seed: Cell<u32>,
 }
 
 /// A committed single-extent object.
@@ -260,15 +291,16 @@ impl Fx {
             forbid: Rc::clone(&forbid_io),
             broken: RefCell::new(None),
             no_put: RefCell::new(None),
+            calls: Cell::new(0),
         };
         let bridge = Bridge {
-            catalog: SqlCatalog::new(Shared(Rc::clone(&sql))),
+            catalog: SqlCatalog::new(Shared::new(&sql)),
             safety: blob(),
             cache: blob(),
             nntp: Connector {
                 inner: TcpConnector::default(),
                 forbid: Rc::clone(&forbid_io),
-                thief: SqlCatalog::new(Shared(Rc::clone(&sql))),
+                thief: SqlCatalog::new(Shared::new(&sql)),
                 clock: Rc::clone(&clock),
                 target: RefCell::new(None),
                 stolen: RefCell::new(None),
@@ -289,14 +321,18 @@ impl Fx {
         }
     }
 
-    fn next(&self) -> u8 {
+    /// The bytes of the next id: a counter, so that ids sort in the
+    /// order they were made in and thousands of them stay distinct.
+    fn next<const N: usize>(&self) -> [u8; N] {
         let n = self.seed.get();
         self.seed.set(n + 1);
-        n
+        let mut id = [n as u8; N];
+        id[..4].copy_from_slice(&n.to_be_bytes());
+        id
     }
 
     async fn bucket(&self, name: &str, disposable: bool) -> Bucket {
-        let id = BucketId::mint([self.next(); 8]);
+        let id = BucketId::mint(self.next());
         let bdk = DataKey::generate(&mut SystemRng).unwrap();
         let (kek_version, wrapped) = wrap_bdk(&self.bridge.kek, &id, &bdk, &mut SystemRng).unwrap();
         let bucket = Bucket {
@@ -316,7 +352,7 @@ impl Fx {
     /// What a finished PUT leaves: the sealed extent in both blob stores
     /// and one committed generation. No queue message is sent.
     async fn put(&self, bucket: &Bucket, key: &str, plain: &[u8]) -> Obj {
-        let n = self.next();
+        let n: [u8; 13] = self.next();
         let now = self.clock.now();
         let bdk = unwrap_bdk(
             &self.bridge.kek,
@@ -325,10 +361,10 @@ impl Fx {
             &bucket.bdk_wrapped,
         )
         .unwrap();
-        let extent_id = ExtentId::mint([n; 13]);
+        let extent_id = ExtentId::mint(n);
         let sealed = seal_extent(&bdk, &bucket.id, &extent_id, plain, &mut SystemRng).unwrap();
         let generation = GenerationRow {
-            id: GenerationId::mint(now, [n; 8]),
+            id: GenerationId::mint(now, n[..8].try_into().unwrap()),
             bucket_id: bucket.id.clone(),
             key: key.to_string(),
             state: GenerationState::Live,
@@ -436,6 +472,13 @@ impl Fx {
             out.extend(self.sql.query(sql, &[]).await.unwrap());
         }
         out
+    }
+
+    /// Removes the dispatcher's marks of sent rows, for "nothing else
+    /// changed" checks across a dispatcher run.
+    async fn unmark(&self) {
+        let sql = "UPDATE outbox SET sent_at = NULL";
+        self.sql.exec(sql, &[]).await.unwrap();
     }
 
     fn has_safety(&self, o: &Obj) -> bool {
@@ -1072,7 +1115,7 @@ async fn dispatch_is_bounded() {
     assert_eq!(report.enqueued, DISPATCH_LIMIT);
     assert_eq!(report.buried, 1);
     let sent = fx.bridge.jobs.take();
-    assert_eq!(sent.len(), DISPATCH_LIMIT as usize, "one batch, no more");
+    assert_eq!(sent.len(), DISPATCH_LIMIT as usize, "the limit, no more");
     assert_eq!(fx.outbox(spent, "stage").await, "dead");
     for skipped in [spent, running] {
         assert!(sent.iter().all(|s| s.job != skipped.job(OutboxStage::Post)));
@@ -1082,7 +1125,11 @@ async fn dispatch_is_bounded() {
     assert_eq!(fx.scalar(leased, &[]).await, "1");
     let tried = "SELECT COUNT(*) FROM outbox WHERE attempts > 0 AND stage = 'post'";
     assert_eq!(fx.scalar(tried, &[]).await, "1");
-    assert_eq!(fx.bridge.dispatch().await.unwrap().enqueued, DISPATCH_LIMIT);
+    // The next run sends the rest, and none of the first run again.
+    assert_eq!(fx.bridge.dispatch().await.unwrap().enqueued, 28);
+    let rest = fx.bridge.jobs.take();
+    assert!(rest.iter().all(|r| sent.iter().all(|s| s.job != r.job)));
+    assert_eq!(fx.bridge.dispatch().await.unwrap().enqueued, 0);
 
     let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
     assert_eq!(stats.dead, 1);
@@ -1117,6 +1164,7 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             sweeps_enqueued: 0,
             sweep_failed: false,
             release_paused: false,
+            mark_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -1124,10 +1172,13 @@ async fn dispatch_does_no_blob_or_nntp_io() {
         sent,
         vec![o.job(OutboxStage::Post), Job::Gc { v: JOB_VERSION }]
     );
+    // Its one write: the mark on the row it sent a job for.
+    assert_eq!(fx.outbox(&o, "sent_at").await, fx.clock.now().0.to_string());
+    fx.unmark().await;
     assert_eq!(
         fx.dump().await,
         before,
-        "the dispatcher only reads and sends"
+        "the dispatcher only reads, sends and marks what it sent"
     );
     assert_eq!(fx.scalar(slots, &[]).await, "2", "one slot per connection");
     assert_eq!(fx.bridge.budget.peak(), 0);
@@ -1160,6 +1211,10 @@ async fn gc_off_deletes_nothing() {
         .take()
         .iter()
         .all(|s| s.job != Job::Gc { v: JOB_VERSION }));
+
+    // Apart from the mark on the row it sent a job for, the run wrote
+    // nothing.
+    fx.unmark().await;
 
     // Even a GC message that does arrive does nothing.
     fx.forbid_io.set(true);
@@ -1493,7 +1548,7 @@ impl Fx {
         let (source, _) = cat.live_object(&bucket.id, from).await.unwrap().unwrap();
         let now = self.clock.now();
         let generation = GenerationRow {
-            id: recovery::id_after(now, Some(&source.id), [self.next(); 8]),
+            id: recovery::id_after(now, Some(&source.id), self.next()),
             key: key.to_owned(),
             created_at: now,
             ..source.clone()
@@ -1554,4 +1609,574 @@ async fn dispatch_survives_a_failed_revival() {
     assert_eq!(report.enqueued, 1);
     assert_eq!(fx.bridge.jobs.sent()[0].job, due.job(OutboxStage::Post));
     assert_eq!(fx.outbox(&o, "stage").await, "cancelled");
+}
+
+// ---------------------------------------------------------------------------
+// Release throughput: the wake-up of a release, the dispatcher's batches
+// and its mark of a sent row
+// ---------------------------------------------------------------------------
+
+/// The production minimum age of a safety copy.
+const DAY_SECS: u32 = 86_400;
+/// The cron dispatcher runs every five minutes.
+const TICK_SECS: u32 = 300;
+/// Calls to other services one invocation may make on the platform.
+const SUBREQUEST_LIMIT: u32 = 1000;
+/// Queues one `send_many` may reach: every queue of both kinds a
+/// deployment may bind.
+const QUEUES_MOST: u32 = 16;
+
+impl Fx {
+    /// Like `pump`, with the queue kept by the caller: delivers the jobs
+    /// that are due by `until`, in due order, and leaves the later ones
+    /// in `queue`. The clock ends at `until`. Returns the deliveries.
+    async fn pump_to(&self, queue: &mut Vec<(UnixMs, Job)>, until: UnixMs) -> u32 {
+        let mut runs = 0;
+        loop {
+            let now = self.clock.now();
+            for sent in self.bridge.jobs.take() {
+                queue.push((now.plus_secs(sent.delay_secs), sent.job));
+            }
+            queue.sort_by_key(|(due, _)| *due);
+            if queue.first().is_none_or(|(due, _)| *due > until) {
+                if until > self.clock.now() {
+                    self.clock.set(until);
+                }
+                return runs;
+            }
+            let (due, job) = queue.remove(0);
+            if due > self.clock.now() {
+                self.clock.set(due);
+            }
+            runs += 1;
+            assert!(runs < 2000, "the queue does not drain");
+            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&job).await {
+                queue.push((self.clock.now().plus_secs(delay_secs), job));
+            }
+        }
+    }
+
+    /// The calls to other services made so far, as the platform counts
+    /// them for one invocation: catalogue calls, blob store calls, and
+    /// for every queue call one per queue it may reach.
+    fn calls(&self) -> u32 {
+        let blobs = self.bridge.safety.calls.get() + self.bridge.cache.calls.get();
+        self.bridge.catalog.sql.calls.get() + blobs + self.bridge.jobs.calls() * QUEUES_MOST
+    }
+
+    /// One dispatcher run: the extent jobs it sent and the calls it made.
+    async fn tick(&self) -> (Vec<Job>, u32) {
+        let before = self.calls();
+        let report = self.bridge.dispatch().await.unwrap();
+        let calls = self.calls() - before;
+        let jobs: Vec<Job> = self
+            .bridge
+            .jobs
+            .take()
+            .into_iter()
+            .map(|sent| sent.job)
+            .filter(|job| matches!(job, Job::Extent { .. }))
+            .collect();
+        assert_eq!(report.enqueued as usize, jobs.len());
+        assert!(!report.mark_failed);
+        (jobs, calls)
+    }
+
+    async fn count(&self, sql: &str) -> usize {
+        self.scalar(sql, &[]).await.parse().unwrap()
+    }
+}
+
+impl Obj {
+    fn wake(&self, stage: OutboxStage, at: UnixMs) -> Job {
+        Job::Wake {
+            v: JOB_VERSION,
+            extent: self.extent.clone(),
+            generation: self.generation.clone(),
+            stage,
+            at,
+        }
+    }
+}
+
+/// With the production minimum age a verified extent is released a day
+/// after its post, by a message that was on its way since the verify:
+/// no dispatcher run, no mark, and nothing a moment too early.
+#[tokio::test]
+async fn release_wakes_itself_after_the_minimum_age() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
+    let bucket = fx.bucket("scratch", true).await;
+    let mut objects = Vec::new();
+    for i in 0..20 {
+        let o = fx.put(&bucket, &format!("k{i}"), b"tiny").await;
+        fx.bridge
+            .jobs
+            .send(&o.job(OutboxStage::Post), 0)
+            .await
+            .unwrap();
+        objects.push(o);
+    }
+    let n = objects.len();
+    // Posted at T0, so the minimum age is over a day after T0.
+    let due = T0.plus_secs(DAY_SECS);
+    let verified = T0.plus_secs(VERIFY_DELAY_SECS);
+    let released = "SELECT COUNT(*) FROM extents WHERE safety_state != 'held'";
+    let waiting = format!(
+        "SELECT COUNT(*) FROM outbox WHERE stage = 'release' AND next_at = {}",
+        due.0
+    );
+
+    // Post and verify. Each verify leaves one wake-up with the longest
+    // queue delay, which names the time the release is due.
+    let mut queue = Vec::new();
+    assert_eq!(fx.pump_to(&mut queue, verified).await as usize, 2 * n);
+    assert_eq!(fx.count(&waiting).await, n);
+    let first_hop = verified.plus_secs(MAX_QUEUE_DELAY_SECS);
+    assert_eq!(queue.len(), n);
+    for o in &objects {
+        let wake = (first_hop, o.wake(OutboxStage::Release, due));
+        assert!(queue.contains(&wake), "{queue:?}");
+    }
+    let attempts = "SELECT SUM(attempts) FROM outbox";
+    let claims = fx.scalar(attempts, &[]).await;
+
+    // The wake-up arrives half a day early: it is sent on for the rest
+    // of the wait without a single catalogue call.
+    let sql_calls = fx.bridge.catalog.sql.calls.get();
+    assert_eq!(fx.pump_to(&mut queue, due.plus_ms(-1)).await as usize, n);
+    assert_eq!(fx.bridge.catalog.sql.calls.get(), sql_calls);
+    assert_eq!(fx.scalar(attempts, &[]).await, claims);
+    assert_eq!(queue.len(), n);
+    for o in &objects {
+        let wake = (due, o.wake(OutboxStage::Release, due));
+        assert!(queue.contains(&wake), "{queue:?}");
+    }
+    // A millisecond before the minimum age is over nothing is released,
+    // neither by a job that comes early nor by the dispatcher.
+    for o in &objects {
+        let early = fx.bridge.run_job(&o.job(OutboxStage::Release)).await;
+        assert_eq!(early, JobOutcome::Ack);
+    }
+    assert_eq!(fx.tick().await.0, []);
+    assert_eq!(fx.count(released).await, 0);
+    assert_eq!(fx.count(&waiting).await, n);
+
+    // At the minimum age every wake-up releases its extent.
+    assert_eq!(fx.pump_to(&mut queue, due).await as usize, n);
+    assert!(queue.is_empty());
+    for o in &objects {
+        assert_eq!(fx.outbox(o, "stage").await, "done");
+        assert_eq!(fx.extent(o, "safety_state").await, "released");
+        assert_eq!(fx.extent(o, "released_at").await, due.0.to_string());
+    }
+    // The dispatcher had no part in it and wrote no mark.
+    let marked = "SELECT COUNT(*) FROM outbox WHERE sent_at IS NOT NULL";
+    assert_eq!(fx.count(marked).await, 0);
+    assert_eq!(fx.tick().await.0, []);
+
+    // Every message again, in both forms: nothing is released twice.
+    let before = fx.dump().await;
+    for o in &objects {
+        for job in [
+            o.job(OutboxStage::Release),
+            o.wake(OutboxStage::Release, due),
+        ] {
+            assert_eq!(fx.bridge.run_job(&job).await, JobOutcome::Ack);
+        }
+    }
+    assert_eq!(fx.dump().await, before);
+    assert!(fx.bridge.jobs.take().is_empty());
+}
+
+/// A wake-up is a hint: one that names a time before the row is due
+/// releases nothing, and one of another version is dropped.
+#[tokio::test]
+async fn a_wake_up_cannot_release_early() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    let mut queue = Vec::new();
+    fx.pump_to(&mut queue, T0.plus_secs(VERIFY_DELAY_SECS))
+        .await;
+    assert_eq!(fx.outbox(&o, "stage").await, "release");
+    let before = fx.dump().await;
+
+    // It claims to be due already.
+    let lying = o.wake(OutboxStage::Release, T0);
+    assert_eq!(fx.bridge.run_job(&lying).await, JobOutcome::Ack);
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert!(fx.bridge.jobs.take().is_empty());
+
+    // Far ahead: sent on with the longest delay a queue takes.
+    let far = o.wake(OutboxStage::Release, T0.plus_secs(30 * DAY_SECS));
+    assert_eq!(fx.bridge.run_job(&far).await, JobOutcome::Ack);
+    let sent = fx.bridge.jobs.take();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (&sent[0].job, sent[0].delay_secs),
+        (&far, MAX_QUEUE_DELAY_SECS)
+    );
+    // One of another version is dropped: the dispatcher covers its row.
+    let mut other = far.clone();
+    if let Job::Wake { v, .. } = &mut other {
+        *v = JOB_VERSION + 1;
+    }
+    assert_eq!(fx.bridge.run_job(&other).await, JobOutcome::Ack);
+    assert!(fx.bridge.jobs.take().is_empty());
+    assert_eq!(fx.dump().await, before);
+}
+
+/// The dispatcher alone (every wake-up lost) against 5,000 verified
+/// extents whose minimum age of a day ends at the same moment: nothing
+/// is sent before that, then 2,000 jobs per run, each extent once, and
+/// every run within its budget of calls.
+#[tokio::test]
+async fn dispatch_keeps_pace_with_5000_due_releases() {
+    const EXTENTS: usize = 5000;
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
+    let bucket = fx.bucket("scratch", true).await;
+    for i in 0..EXTENTS {
+        fx.put(&bucket, &format!("k{i}"), b"tiny").await;
+    }
+    // As the verify of each leaves its row (see
+    // `release_wakes_itself_after_the_minimum_age`): at `release`, due a
+    // minimum age after the post.
+    let due = T0.plus_secs(DAY_SECS);
+    fx.sql
+        .exec(
+            "UPDATE outbox SET stage = 'release', next_at = ?1",
+            &[SqlValue::Int(due.0)],
+        )
+        .await
+        .unwrap();
+
+    // Not before the minimum age is over.
+    fx.clock.set(due.plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+
+    fx.clock.set(due);
+    let mut per_tick = Vec::new();
+    let mut most_calls = 0;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let (jobs, calls) = fx.tick().await;
+        most_calls = most_calls.max(calls);
+        for job in &jobs {
+            let Job::Extent { extent, stage, .. } = job else {
+                unreachable!()
+            };
+            assert_eq!(*stage, OutboxStage::Release);
+            assert!(seen.insert(extent.clone()), "{extent:?} sent twice");
+        }
+        per_tick.push(jobs.len());
+        if jobs.is_empty() {
+            break;
+        }
+        fx.clock.advance_secs(TICK_SECS);
+    }
+    let limit = DISPATCH_LIMIT as usize;
+    assert_eq!(per_tick, [limit, limit, EXTENTS - 2 * limit, 0]);
+    assert_eq!(seen.len(), EXTENTS);
+    // Every extent has its job two runs after the first: ten minutes.
+    let drained_after_secs = (per_tick.len() as u32 - 2) * TICK_SECS;
+    assert_eq!(drained_after_secs, 600);
+    // One row written per extent: its mark.
+    let marked = "SELECT COUNT(*) FROM outbox WHERE sent_at IS NOT NULL";
+    assert_eq!(fx.count(marked).await, EXTENTS);
+
+    // The budget of one run: well inside what an invocation may call,
+    // with every queue a deployment may bind counted for every batch.
+    assert_eq!(DISPATCH_LIMIT, DISPATCH_BATCH * DISPATCH_BATCHES);
+    assert!(most_calls >= DISPATCH_BATCHES * (1 + QUEUES_MOST));
+    assert!(most_calls <= SUBREQUEST_LIMIT / 2, "{most_calls} calls");
+
+    // Capacity: three times the migration (75,000 extents a day) with
+    // room to spare.
+    let per_day = u64::from(DISPATCH_LIMIT) * u64::from(DAY_SECS / TICK_SECS);
+    assert_eq!(per_day, 576_000);
+    assert!(per_day >= 2 * 225_000);
+    println!(
+        "release dispatch: {per_tick:?} jobs per run, {EXTENTS} extents sent within \
+         {drained_after_secs} s of the first run, at most {most_calls} calls per run, \
+         {per_day} extents per day"
+    );
+
+    // No job claimed anything, so the messages count as lost once the
+    // resend timeout is over: the rows are sent again, as bounded as
+    // before, in the same order.
+    fx.clock.set(due.plus_secs(RESEND_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(due.plus_secs(RESEND_SECS));
+    assert_eq!(fx.tick().await.0.len(), limit);
+    assert_eq!(fx.tick().await.0, []);
+}
+
+/// A due row is sent once and then left alone: until a job has claimed
+/// it, until it moves on, or until the resend timeout. And however many
+/// jobs are sent for an extent, it is posted and released once.
+#[tokio::test]
+async fn dispatch_sends_a_due_row_once() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let moved = fx.put(&bucket, "moved", b"tiny").await;
+    let crashed = fx.put(&bucket, "crashed", b"tiny").await;
+    let lost = fx.put(&bucket, "lost", b"tiny").await;
+    let post = |o: &Obj| o.job(OutboxStage::Post);
+    let at = |secs: u32| T0.plus_secs(secs);
+    let mut every_job = Vec::new();
+
+    // No PUT's message arrived: the first run sends all three.
+    let (jobs, _) = fx.tick().await;
+    assert_eq!(jobs, [post(&moved), post(&crashed), post(&lost)]);
+    every_job.extend(jobs);
+    // They wait in their queue: the next run adds no duplicate.
+    fx.clock.set(at(300));
+    assert_eq!(fx.tick().await.0, []);
+
+    // One is posted, and its hand-over to verify is lost.
+    fx.bridge.jobs.drop_next(1);
+    assert_eq!(fx.bridge.run_job(&post(&moved)).await, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&moved, "stage").await, "verify");
+    // One is claimed by a job that dies.
+    let claim = fx
+        .bridge
+        .catalog
+        .claim(
+            &crashed.extent,
+            &crashed.generation,
+            OutboxStage::Post,
+            "w",
+            at(300),
+        )
+        .await
+        .unwrap();
+    assert!(claim.is_some());
+
+    // The verify is sent as soon as it is due: the mark of the post job
+    // does not hold it back.
+    fx.clock.set(at(600));
+    let (jobs, _) = fx.tick().await;
+    assert_eq!(jobs, [moved.job(OutboxStage::Verify)]);
+    every_job.extend(jobs);
+    // The dead job's row is sent as soon as its lease is over, not at
+    // the resend timeout: its claim cleared the mark.
+    fx.clock.set(at(300 + LEASE_SECS));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(at(300 + LEASE_SECS + 1));
+    let (jobs, _) = fx.tick().await;
+    assert_eq!(jobs, [post(&crashed)]);
+    every_job.extend(jobs);
+    // The third message was lost and nothing claimed its row: it is sent
+    // again at the resend timeout, and not before.
+    fx.clock.set(at(RESEND_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(at(RESEND_SECS));
+    let (jobs, _) = fx.tick().await;
+    assert_eq!(jobs, [post(&lost)]);
+    every_job.extend(jobs);
+
+    // Every job the dispatcher sent is delivered, twice over.
+    for job in every_job.iter().chain(&every_job) {
+        fx.bridge.jobs.send(job, 0).await.unwrap();
+    }
+    fx.pump().await;
+    for o in [&moved, &crashed, &lost] {
+        assert_eq!(fx.outbox(o, "stage").await, "done");
+        assert_eq!(fx.extent(o, "safety_state").await, "released");
+    }
+    assert_eq!(fx.server.posted_count().await, 3, "one article each, once");
+    let passes = "SELECT COUNT(*) FROM extents WHERE release_evidence IS NOT NULL";
+    assert_eq!(fx.count(passes).await, 3);
+    // And once more, with nothing left to do.
+    let before = fx.dump().await;
+    for o in [&moved, &crashed, &lost] {
+        for stage in [OutboxStage::Post, OutboxStage::Verify, OutboxStage::Release] {
+            assert_eq!(fx.bridge.run_job(&o.job(stage)).await, JobOutcome::Ack);
+        }
+    }
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.tick().await.0, []);
+}
+
+/// A job that holds a newer lease on the row is not disturbed by the
+/// mark, and a job whose lease was taken over cannot release.
+#[tokio::test]
+async fn a_resent_release_job_is_fenced() {
+    let mut fx = Fx::new().await;
+    // The release is due a minute after the post.
+    fx.bridge.cfg.safety_min_age_secs = 60;
+    let due = T0.plus_secs(60);
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    let mut queue = Vec::new();
+    fx.pump_to(&mut queue, T0.plus_secs(VERIFY_DELAY_SECS))
+        .await;
+    assert_eq!(fx.outbox(&o, "stage").await, "release");
+    let release = o.job(OutboxStage::Release);
+    assert_eq!(queue, [(due, release.clone())]);
+    fx.clock.set(due);
+
+    // A first job holds the row when the dispatcher runs: nothing is
+    // sent for it and its lease is untouched.
+    let cat = &fx.bridge.catalog;
+    let now = fx.clock.now();
+    let first = cat
+        .claim(&o.extent, &o.generation, OutboxStage::Release, "first", now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fx.tick().await.0, []);
+    // The first job stalls past its lease. The dispatcher sends the job
+    // again, and the second delivery takes the row over and releases.
+    fx.clock.advance_secs(LEASE_SECS + 1);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    let evidence = fx.extent(&o, "release_evidence").await;
+    let released_at = fx.extent(&o, "released_at").await;
+
+    // The stalled job wakes up with its old lease: every write it could
+    // make is refused, and the release stands as it was made.
+    let later = fx.clock.now().plus_secs(1);
+    assert!(!cat.renew(&first, later).await.unwrap());
+    let counting = ["bb0".to_string()];
+    let begun = cat.begin_release(&first, 1, &counting, "[]", later);
+    assert_eq!(begun.await.unwrap(), Guard::Lost);
+    assert!(!cat.finish_release(&first, later).await.unwrap());
+    assert_eq!(fx.extent(&o, "release_evidence").await, evidence);
+    assert_eq!(fx.extent(&o, "released_at").await, released_at);
+    // The messages still in flight find nothing to do.
+    let before = fx.dump().await;
+    assert_eq!(fx.pump_to(&mut queue, later).await, 1);
+    assert_eq!(fx.dump().await, before);
+}
+
+/// A wake-up that cannot be sent on goes back to its queue for the same
+/// wait: the wait is never cut short and no row is touched.
+#[tokio::test]
+async fn a_wake_up_that_cannot_be_sent_on_is_retried() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    let before = fx.dump().await;
+    let sql_calls = fx.bridge.catalog.sql.calls.get();
+
+    fx.bridge.jobs.fail_after(Some(0));
+    for (ahead, delay_secs) in [(90, 90), (30 * DAY_SECS, MAX_QUEUE_DELAY_SECS)] {
+        let wake = o.wake(OutboxStage::Release, T0.plus_secs(ahead));
+        let outcome = fx.bridge.run_job(&wake).await;
+        assert_eq!(outcome, JobOutcome::Retry { delay_secs });
+    }
+    assert!(fx.bridge.jobs.take().is_empty());
+    assert_eq!(fx.bridge.catalog.sql.calls.get(), sql_calls);
+    assert_eq!(fx.dump().await, before);
+}
+
+/// The dispatcher runs at the very moment a release is due, before the
+/// wake-up is delivered: that costs one duplicate job and one mark, and
+/// the extent is released once.
+#[tokio::test]
+async fn a_dispatcher_run_ahead_of_the_wake_up_costs_one_duplicate() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
+    let due = T0.plus_secs(DAY_SECS);
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    let mut queue = Vec::new();
+    fx.pump_to(&mut queue, due.plus_ms(-1)).await;
+    assert_eq!(queue, [(due, o.wake(OutboxStage::Release, due))]);
+
+    fx.clock.set(due);
+    let release = o.job(OutboxStage::Release);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+    // The row is marked, so the runs that follow leave it alone while
+    // the wake-up waits for a free consumer.
+    fx.clock.advance_secs(TICK_SECS);
+    assert_eq!(fx.tick().await.0, []);
+
+    assert_eq!(fx.pump_to(&mut queue, fx.clock.now()).await, 1);
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    // The dispatcher's job comes last and finds nothing to do.
+    let before = fx.dump().await;
+    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.tick().await.0, []);
+}
+
+/// A queue that refuses a batch ends the sending, not the checks after
+/// it: the batches sent before are marked, the rest stay unmarked for
+/// the next run, and the failed run is not recorded.
+#[tokio::test]
+async fn a_refused_batch_leaves_the_rest_for_the_next_run() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let batch = DISPATCH_BATCH as usize;
+    let total = 2 * batch + 50;
+    for i in 0..total {
+        fx.put(&bucket, &format!("k{i}"), b"tiny").await;
+    }
+    let marked = "SELECT COUNT(*) FROM outbox WHERE sent_at IS NOT NULL";
+
+    fx.bridge.jobs.fail_after(Some(2));
+    let failed = fx.bridge.dispatch().await;
+    assert!(matches!(failed, Err(BridgeError::Queue(_))), "{failed:?}");
+    let first: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
+    assert_eq!(first.len(), 2 * batch);
+    assert_eq!(fx.count(marked).await, 2 * batch);
+    let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
+    assert_eq!(stats.last_dispatch_at, None);
+    // The checks after the sending still ran: the hot-tier check left
+    // its stamp.
+    let checked = "SELECT COUNT(*) FROM meta WHERE k = 'hot_checked_at'";
+    assert_eq!(fx.count(checked).await, 1);
+
+    // The queue takes jobs again: only the rows left over are sent.
+    fx.bridge.jobs.fail_after(None);
+    let (rest, _) = fx.tick().await;
+    assert_eq!(rest.len(), total - 2 * batch);
+    assert!(rest.iter().all(|job| !first.contains(job)));
+    let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
+    assert_eq!(stats.last_dispatch_at, Some(fx.clock.now()));
+    assert_eq!(fx.tick().await.0, []);
+}
+
+/// A mark that cannot be written costs duplicates, not the run.
+#[tokio::test]
+async fn dispatch_survives_a_failed_mark() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    fx.bridge.catalog.sql.no_marks.set(true);
+    for _ in 0..2 {
+        let report = fx.bridge.dispatch().await.unwrap();
+        assert!(report.mark_failed);
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(fx.bridge.jobs.take()[0].job, o.job(OutboxStage::Post));
+    }
+    let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
+    assert_eq!(stats.last_dispatch_at, Some(fx.clock.now()));
+    fx.bridge.catalog.sql.no_marks.set(false);
+    assert_eq!(fx.tick().await.0, [o.job(OutboxStage::Post)]);
+    assert_eq!(fx.tick().await.0, []);
 }
