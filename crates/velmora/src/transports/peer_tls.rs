@@ -67,10 +67,35 @@ pub(crate) async fn write_all_flushed(
     stream.flush().await
 }
 
+/// ring's default provider with the ChaCha20-Poly1305 suites offered
+/// first, within each protocol version (TLS 1.3 suites stay ahead of TLS
+/// 1.2 ones, as in the default). Nothing is added or removed: the AES-GCM
+/// suites stay as fallback for a server that does not take ChaCha20, and
+/// key exchange groups, signature algorithms and the protocol versions are
+/// ring's defaults. In wasm there is no AES instruction, so AES-GCM costs
+/// several times the CPU of ChaCha20-Poly1305 per byte; a server that
+/// honours the client's order then picks the cheaper one.
+fn nntp_crypto_provider() -> rustls::crypto::CryptoProvider {
+    use rustls::{CipherSuite, SupportedCipherSuite};
+    let mut provider = rustls::crypto::ring::default_provider();
+    // Stable sort: the default order is kept inside each group.
+    provider.cipher_suites.sort_by_key(|suite| {
+        let tls12 = matches!(suite, SupportedCipherSuite::Tls12(_));
+        let chacha = matches!(
+            suite.suite(),
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+                | CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                | CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        );
+        (tls12, !chacha)
+    });
+    provider
+}
+
 fn tls_config(roots: RootCertStore) -> io::Result<ClientConfig> {
     // Explicit selection also works when another crate enables a second
     // provider. Never use a global install or a permissive verifier.
-    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    ClientConfig::builder_with_provider(Arc::new(nntp_crypto_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|_| io::Error::other("NNTP TLS configuration unavailable"))
         .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
@@ -260,6 +285,172 @@ mod tests {
         })
         .await
         .expect("buffered TLS writes must reach the server before reading its reply");
+    }
+
+    /// Handshakes the production client config (fixture CA, fixed clock)
+    /// with a server built from `provider` and `versions`, and returns the
+    /// suite both ends agreed on.
+    async fn negotiated_suite(
+        provider: rustls::crypto::CryptoProvider,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        ignore_client_order: bool,
+    ) -> rustls::CipherSuite {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let mut server_config = ServerConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(versions)
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(CERT.to_vec())],
+                    PrivatePkcs8KeyDer::from(KEY.to_vec()).into(),
+                )
+                .unwrap();
+            server_config.ignore_client_order = ignore_client_order;
+            let mut roots = RootCertStore::empty();
+            roots.add(CertificateDer::from(CA.to_vec())).unwrap();
+            let mut client_config = tls_config(roots).unwrap();
+            client_config.time_provider = Arc::new(FixedTime(1_800_000_000));
+            let server = async move {
+                let mut tls = TlsAcceptor::from(Arc::new(server_config))
+                    .accept(server_io)
+                    .await
+                    .unwrap();
+                let suite = tls.get_ref().1.negotiated_cipher_suite().unwrap().suite();
+                tls.write_all(b"200 ok\r\n").await.unwrap();
+                tls.flush().await.unwrap();
+                suite
+            };
+            let client = async move {
+                let mut tls = TlsConnector::from(Arc::new(client_config))
+                    .connect(
+                        ServerName::try_from("nntp.fixture.invalid").unwrap(),
+                        client_io,
+                    )
+                    .await
+                    .unwrap();
+                let mut greeting = [0; 8];
+                tls.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(&greeting, b"200 ok\r\n");
+                tls.get_ref().1.negotiated_cipher_suite().unwrap().suite()
+            };
+            let (client_suite, server_suite) = tokio::join!(client, server);
+            assert_eq!(client_suite, server_suite);
+            client_suite
+        })
+        .await
+        .expect("TLS fixture must not hang")
+    }
+
+    fn suites(provider: &rustls::crypto::CryptoProvider) -> Vec<rustls::CipherSuite> {
+        provider.cipher_suites.iter().map(|s| s.suite()).collect()
+    }
+
+    /// ring's default provider without its ChaCha20-Poly1305 suites: a
+    /// server that does not offer ChaCha20.
+    fn aes_only_provider() -> rustls::crypto::CryptoProvider {
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider
+            .cipher_suites
+            .retain(|s| !format!("{:?}", s.suite()).contains("CHACHA20"));
+        assert!(!provider.cipher_suites.is_empty());
+        provider
+    }
+
+    #[test]
+    fn chacha20_suites_are_offered_first_and_aes_stays_as_fallback() {
+        use rustls::CipherSuite as S;
+        let config = tls_config(RootCertStore::empty()).unwrap();
+        assert_eq!(
+            suites(config.crypto_provider()),
+            [
+                S::TLS13_CHACHA20_POLY1305_SHA256,
+                S::TLS13_AES_256_GCM_SHA384,
+                S::TLS13_AES_128_GCM_SHA256,
+                S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_suite_order_differs_from_ring_defaults() {
+        let ours = nntp_crypto_provider();
+        let ring = rustls::crypto::ring::default_provider();
+        // Same suites, none added or dropped.
+        let mut a = suites(&ours);
+        let mut b = suites(&ring);
+        a.sort_by_key(|s| u16::from(*s));
+        b.sort_by_key(|s| u16::from(*s));
+        assert_eq!(a, b);
+        // Same key exchange groups, in the same order.
+        let groups = |p: &rustls::crypto::CryptoProvider| {
+            p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(groups(&ours), groups(&ring));
+        // Same signature verification algorithms.
+        assert_eq!(
+            format!("{:?}", ours.signature_verification_algorithms),
+            format!("{:?}", ring.signature_verification_algorithms)
+        );
+        // The protocol versions stay `with_safe_default_protocol_versions`
+        // (TLS 1.3 and 1.2): the handshake tests below run both.
+    }
+
+    #[tokio::test]
+    async fn a_server_that_honours_client_order_negotiates_chacha20() {
+        use rustls::CipherSuite as S;
+        let ring = rustls::crypto::ring::default_provider;
+        assert_eq!(
+            negotiated_suite(ring(), rustls::DEFAULT_VERSIONS, false).await,
+            S::TLS13_CHACHA20_POLY1305_SHA256
+        );
+        let tls12 = negotiated_suite(ring(), &[&rustls::version::TLS12], false).await;
+        assert!(
+            matches!(
+                tls12,
+                S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                    | S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            ),
+            "{tls12:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_without_chacha20_falls_back_to_aes_gcm() {
+        use rustls::CipherSuite as S;
+        assert_eq!(
+            negotiated_suite(aes_only_provider(), rustls::DEFAULT_VERSIONS, false).await,
+            S::TLS13_AES_256_GCM_SHA384
+        );
+        let tls12 = negotiated_suite(aes_only_provider(), &[&rustls::version::TLS12], false).await;
+        assert!(
+            matches!(
+                tls12,
+                S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                    | S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            ),
+            "{tls12:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_imposes_its_own_order_still_connects() {
+        // ring's default order puts AES-256-GCM first; a server that ignores
+        // the client's order picks it, and the session works as before.
+        assert_eq!(
+            negotiated_suite(
+                rustls::crypto::ring::default_provider(),
+                rustls::DEFAULT_VERSIONS,
+                true
+            )
+            .await,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+        );
     }
 
     #[test]
