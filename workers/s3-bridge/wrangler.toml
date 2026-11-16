@@ -20,7 +20,9 @@ S3_HOST = "velmora-s3.<account>.workers.dev"
 S3_REGION = "auto"
 MAX_EXTENT_BYTES = "16777216"
 REQUIRED_BACKBONES = "2"
-SAFETY_MIN_AGE_SECS = "604800"
+# A copy is released 24 h after its upload, once two backbones that count
+# still hold it when the release job reads them again.
+SAFETY_MIN_AGE_SECS = "86400"
 VERIFY_DELAY_SECS = "120"
 # One group per article, drawn at random. Each was posted to from every
 # posting account and read back by message-id on every account.
