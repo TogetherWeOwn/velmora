@@ -2146,6 +2146,10 @@ async fn a_refused_batch_leaves_the_rest_for_the_next_run() {
     assert_eq!(fx.count(marked).await, 2 * batch);
     let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
     assert_eq!(stats.last_dispatch_at, None);
+    // The checks after the sending still ran: the hot-tier check left
+    // its stamp.
+    let checked = "SELECT COUNT(*) FROM meta WHERE k = 'hot_checked_at'";
+    assert_eq!(fx.count(checked).await, 1);
 
     // The queue takes jobs again: only the rows left over are sent.
     fx.bridge.jobs.fail_after(None);
