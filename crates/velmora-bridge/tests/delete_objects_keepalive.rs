@@ -321,7 +321,6 @@ async fn a_fast_delete_is_buffered_and_a_slow_one_streamed() {
     assert!(resp
         .headers
         .contains(&("content-type".to_string(), "application/xml".to_string())));
-    assert!(!resp.headers.iter().any(|(n, _)| n == "content-length"));
     let RespBody::Stream(mut body) = resp.body else {
         panic!("a slow answer is streamed");
     };
@@ -363,4 +362,100 @@ async fn a_request_that_fails_before_the_answer_keeps_its_status() {
     assert_eq!(resp.status, 400);
     assert!(!matches!(resp.body, RespBody::Deferred(_)));
     assert_eq!(live_keys(&rig), 4);
+}
+
+/// How the Worker runs it: the work on a task of its own, the body only
+/// waiting for it, and no tick ever firing. The body ends because the
+/// work wakes it; `settle` returns because the work wakes it.
+#[tokio::test(flavor = "current_thread")]
+async fn work_on_its_own_task_wakes_the_body_and_the_window() {
+    let expected = buffered(40).await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            // A timeout that elapses polls its future once more, which
+            // would hide a missing wake: the answer must come well before.
+            let wait = std::time::Duration::from_secs(10);
+            let soon = std::time::Duration::from_secs(3);
+
+            let (rig, signer, keys) = scene(40).await;
+            let mut d = deferred(send(&rig, &signer, &keys).await);
+            tokio::task::spawn_local(d.take_work().unwrap());
+            let body = d.into_stream(never(), 5_000);
+            let t0 = std::time::Instant::now();
+            let (whole, keepalives) = tokio::time::timeout(wait, read_all(body))
+                .await
+                .expect("the work wakes the body");
+            assert!(t0.elapsed() < soon, "the body was not woken");
+            assert_eq!(keepalives, 0);
+            assert_eq!(check_document(&whole), expected.as_slice());
+
+            let (rig, signer, keys) = scene(40).await;
+            let mut d = deferred(send(&rig, &signer, &keys).await);
+            tokio::task::spawn_local(d.take_work().unwrap());
+            let t0 = std::time::Instant::now();
+            let doc = tokio::time::timeout(wait, d.settle(Box::pin(std::future::pending())))
+                .await
+                .expect("the work wakes the window")
+                .unwrap_or_else(|_| panic!("the window never elapses"));
+            assert!(t0.elapsed() < soon, "the window was not woken");
+            assert_eq!(doc, expected);
+        })
+        .await;
+}
+
+/// The window is 2 s and a tick 5 s, and a streamed answer has no length
+/// even if one was set.
+#[tokio::test(flavor = "current_thread")]
+async fn the_window_and_the_ticks_are_asked_of_the_sleeper() {
+    let asked = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = Rc::clone(&asked);
+    let sleeper: Sleeper = Rc::new(move |ms| {
+        seen.borrow_mut().push(ms);
+        Box::pin(async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        })
+    });
+    let (rig, signer, keys) = scene(20).await;
+    *rig.bridge.safety.hold_put_prefix.borrow_mut() = Some(TOMBSTONE_PREFIX.to_string());
+    let mut resp = send(&rig, &signer, &keys).await;
+    resp.headers
+        .push(("content-length".to_string(), "123".to_string()));
+    let resp = keepalive::settle_response(resp, sleeper).await;
+    assert!(!resp.headers.iter().any(|(n, _)| n == "content-length"));
+    let RespBody::Stream(mut body) = resp.body else {
+        panic!("a slow answer is streamed");
+    };
+    for _ in 0..3 {
+        body.next().await.unwrap().unwrap();
+    }
+    *rig.bridge.safety.hold_put_prefix.borrow_mut() = None;
+    read_all(body).await;
+    let asked = asked.borrow();
+    assert_eq!(asked[0], keepalive::BUFFER_WINDOW_MS);
+    assert_eq!(keepalive::BUFFER_WINDOW_MS, 2_000);
+    assert!(asked.len() >= 3);
+    assert!(asked[1..]
+        .iter()
+        .all(|ms| *ms == keepalive::KEEPALIVE_INTERVAL_MS));
+    assert_eq!(keepalive::KEEPALIVE_INTERVAL_MS, 5_000);
+}
+
+/// Work that never ends and is never dropped does not hold the body
+/// forever: after `MAX_STREAM_MS` of ticks it ends with the fallback.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_ends_with_the_fallback_when_the_work_never_answers() {
+    let mut d = Deferred::new(std::future::pending::<Vec<u8>>(), || {
+        b"<DeleteResult>fallback</DeleteResult>".to_vec()
+    });
+    let work = d.take_work().unwrap();
+    let (whole, keepalives) = read_all(d.into_stream(quick_ticks(), 5_000)).await;
+    assert_eq!(
+        keepalives as u32,
+        keepalive::MAX_STREAM_MS / keepalive::KEEPALIVE_INTERVAL_MS - 1
+    );
+    assert!(whole.starts_with(XML_DECLARATION));
+    assert!(whole.ends_with(b"<DeleteResult>fallback</DeleteResult>"));
+    drop(work);
 }

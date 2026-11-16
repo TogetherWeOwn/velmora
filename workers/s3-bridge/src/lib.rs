@@ -61,7 +61,9 @@ struct Slot {
 /// strand it mid-await: the runtime keeps driving it, a withheld body then
 /// fails its read, and every budget `Charge` it holds is dropped. The work
 /// of a deferred body (DeleteObjects) runs there too, after the response
-/// is handed over: it ends whether or not the client reads the answer.
+/// is handed over, so dropping the body does not stop it. Once the client
+/// is gone the runtime gives `waitUntil` at most 30 s more: keys not done
+/// by then stay as they are, and a re-send of the request finishes them.
 async fn handle_detached(
     ctx: &Context,
     bridge: Rc<env::WorkerBridge>,

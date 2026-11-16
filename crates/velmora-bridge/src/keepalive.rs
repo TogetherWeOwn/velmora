@@ -12,12 +12,14 @@
 //! element is `Misc` in the XML grammar, so a strict parser takes it.
 //!
 //! The work is apart from the body. The adapter takes it
-//! ([`Deferred::take_work`]) and drives it to its end whatever becomes of
-//! the client (`waitUntil`), so a client that goes away leaves what a
-//! client that read the answer leaves. Untaken, it is driven by whoever
-//! polls the body. The document never fails: a failure of the work is in
-//! it, and work that ends without one (it was dropped) is answered with
-//! the fallback document. The body always ends with a whole document.
+//! ([`Deferred::take_work`]) and drives it under `waitUntil`, so it does
+//! not stop when the body is dropped. The runtime gives it at most 30 s
+//! once the client is gone: what is left then is not done, and the client
+//! sends the request again. Untaken, the work is driven by whoever polls
+//! the body. The document never fails: a failure of the work is in it,
+//! and work that ends without one (it was dropped) is answered with the
+//! fallback document, as is work that is not done after
+//! [`MAX_STREAM_MS`]. The body always ends with a whole document.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -39,6 +41,11 @@ pub const KEEPALIVE_INTERVAL_MS: u32 = 5_000;
 pub const BUFFER_WINDOW_MS: u32 = 2_000;
 /// What is sent every [`KEEPALIVE_INTERVAL_MS`].
 pub const KEEPALIVE_BYTE: &[u8] = b"\n";
+/// Most time a streamed body waits for its document. Past it the body
+/// ends with the fallback document: work that neither ends nor is
+/// dropped (a call that is never answered) does not hold the client
+/// forever.
+pub const MAX_STREAM_MS: u32 = 600_000;
 
 enum State {
     Running,
@@ -54,12 +61,16 @@ struct Shared {
     waker: Option<Waker>,
 }
 
-impl Shared {
-    fn set(&mut self, state: State) {
-        self.state = state;
-        if let Some(w) = self.waker.take() {
-            w.wake();
-        }
+/// Sets the state and wakes the body, outside the borrow: an executor
+/// that polls inside `wake` finds the cell free.
+fn set(shared: &RefCell<Shared>, state: State) {
+    let waker = {
+        let mut s = shared.borrow_mut();
+        s.state = state;
+        s.waker.take()
+    };
+    if let Some(w) = waker {
+        w.wake();
     }
 }
 
@@ -68,9 +79,9 @@ struct Finish(Rc<RefCell<Shared>>);
 
 impl Drop for Finish {
     fn drop(&mut self) {
-        let mut s = self.0.borrow_mut();
-        if matches!(s.state, State::Running) {
-            s.set(State::Abandoned);
+        let running = matches!(self.0.borrow().state, State::Running);
+        if running {
+            set(&self.0, State::Abandoned);
         }
     }
 }
@@ -97,7 +108,7 @@ impl Deferred {
         let finish = Finish(Rc::clone(&shared));
         let work = async move {
             let doc = doc.await;
-            finish.0.borrow_mut().set(State::Done(doc));
+            set(&finish.0, State::Done(doc));
             drop(finish);
         };
         Deferred {
@@ -126,8 +137,7 @@ impl Deferred {
             State::Done(doc) => Poll::Ready(doc),
             State::Abandoned => {
                 drop(s);
-                let fallback = self.fallback.take();
-                Poll::Ready(fallback.map(|f| f()).unwrap_or_default())
+                Poll::Ready(self.fallback())
             }
             // Never polled again once the document was taken.
             State::Taken => Poll::Ready(Vec::new()),
@@ -137,6 +147,12 @@ impl Deferred {
                 Poll::Pending
             }
         }
+    }
+
+    /// The fallback document, once (the state is `Taken` after it).
+    fn fallback(&mut self) -> Vec<u8> {
+        self.shared.borrow_mut().state = State::Taken;
+        self.fallback.take().map(|f| f()).unwrap_or_default()
     }
 
     /// The document if it is done before `window` elapses, or `self`.
@@ -156,22 +172,26 @@ impl Deferred {
 
     /// The streamed body: [`XML_DECLARATION`] at once, [`KEEPALIVE_BYTE`]
     /// every `interval_ms` (slept with `sleeper`) while the document is
-    /// not done, then the document. Never yields an error.
+    /// not done, then the document; the fallback document instead once
+    /// [`MAX_STREAM_MS`] worth of ticks have passed. Never yields an error.
     pub fn into_stream(self, sleeper: Sleeper, interval_ms: u32) -> ByteStream {
         enum Phase {
             Head(Deferred),
-            Wait(Deferred, LocalBoxFuture<'static, ()>),
+            /// The ticks still allowed, and the next one.
+            Wait(Deferred, u32, LocalBoxFuture<'static, ()>),
             End,
         }
+        let max_ticks = (MAX_STREAM_MS / interval_ms.max(1)).max(1);
         let body = stream::unfold(Phase::Head(self), move |phase| {
             let sleeper = Rc::clone(&sleeper);
             async move {
                 match phase {
                     Phase::Head(d) => {
                         let tick = sleeper(interval_ms);
-                        Some((Ok(XML_DECLARATION.to_vec()), Phase::Wait(d, tick)))
+                        let wait = Phase::Wait(d, max_ticks, tick);
+                        Some((Ok(XML_DECLARATION.to_vec()), wait))
                     }
-                    Phase::Wait(mut d, mut tick) => {
+                    Phase::Wait(mut d, left, mut tick) => {
                         let ready = poll_fn(|cx| {
                             if let Poll::Ready(doc) = d.poll_doc(cx) {
                                 return Poll::Ready(Some(doc));
@@ -181,9 +201,13 @@ impl Deferred {
                         .await;
                         match ready {
                             Some(doc) => Some((Ok(doc), Phase::End)),
+                            // Waited long enough: the keys are not known
+                            // to be deleted.
+                            None if left <= 1 => Some((Ok(d.fallback()), Phase::End)),
                             None => {
                                 let tick = sleeper(interval_ms);
-                                Some((Ok(KEEPALIVE_BYTE.to_vec()), Phase::Wait(d, tick)))
+                                let wait = Phase::Wait(d, left - 1, tick);
+                                Some((Ok(KEEPALIVE_BYTE.to_vec()), wait))
                             }
                         }
                     }

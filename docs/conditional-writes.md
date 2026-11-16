@@ -137,11 +137,14 @@ So DeleteObjects answers the way S3 does for long operations:
   carries `cache-control: no-transform` and no length.
 - A failure once the headers are out is the answer of the keys it hits
   (`InternalError`, `ServiceUnavailable` or `SlowDown`, as above). The
-  body always ends with a whole `DeleteResult`; if the work ends
-  without its answer, every key is reported `InternalError`, and the
-  request can be sent again.
-- The deletes run apart from the body: a client that goes away does
-  not stop them, and they leave what an answered request leaves.
+  body always ends with a whole `DeleteResult`. If the work ends without
+  its answer, or has not answered after 10 minutes, every key is
+  reported `InternalError`, and the request can be sent again.
+- The deletes run apart from the body, so a client that stops reading
+  does not stop them at once. But the runtime gives them at most 30 s
+  more once the client is gone. Keys not done by then stay as they are
+  (each key is deleted whole or not at all, its tombstone first), and
+  the client sends the request again to finish them.
 
 ## Limits
 
