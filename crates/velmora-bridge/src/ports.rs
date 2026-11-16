@@ -10,6 +10,7 @@
 
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
+use crate::plan::{PackReport, StoredPlan};
 use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 pub use crate::types::Result;
@@ -646,6 +647,9 @@ pub trait Catalog {
         now: UnixMs,
     ) -> Result<Option<Lease>>;
     async fn renew(&self, l: &Lease, now: UnixMs) -> Result<bool>;
+    /// Moves the row to stage `to`, due at `next_at`, and frees the
+    /// lease. The new stage starts at its first step: attempts and
+    /// cursor are 0 again.
     async fn advance(
         &self,
         l: &Lease,
@@ -660,6 +664,11 @@ pub trait Catalog {
     async fn set_cursor(&self, l: &Lease, cursor: u32, now: UnixMs) -> Result<bool>;
     /// No permit: frees the lease without consuming an attempt.
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool>;
+    /// [`Self::set_cursor`] and [`Self::defer`] as one fenced write: the
+    /// row is not written twice for one step of progress.
+    async fn defer_at(&self, l: &Lease, cursor: u32, next_at: UnixMs, now: UnixMs) -> Result<bool> {
+        Ok(self.set_cursor(l, cursor, now).await? && self.defer(l, next_at, now).await?)
+    }
     /// Extent + bucket + generation state: `live` while any live
     /// generation references the extent, else the state of the generation
     /// it was written for.
@@ -674,10 +683,33 @@ pub trait Catalog {
         l: &Lease,
         rows: &[ArticleRow],
     ) -> Result<Option<Vec<ArticleRow>>>;
+    /// [`Catalog::plan_articles`] for a packed plan ([`crate::plan`]):
+    /// stored as one value on the extent's row unless the extent already
+    /// has a plan. `cipher_size` is the extent's. Returns the STORED plan
+    /// (`None` = fenced).
+    async fn plan_packed(
+        &self,
+        l: &Lease,
+        cipher_size: u64,
+        plan: &[u8],
+    ) -> Result<Option<StoredPlan>>;
+    /// The plan of the extent, in `idx` order: its packed plan when it
+    /// has one, else its rows. A packed plan is posted as a whole, so
+    /// its articles all have the state and the stamps of their extent.
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>>;
+    /// [`Catalog::articles`], with the packed form when the plan is
+    /// stored packed.
+    async fn stored_plan(&self, extent: &ExtentId) -> Result<StoredPlan> {
+        Ok(StoredPlan {
+            rows: self.articles(extent).await?,
+            packed: None,
+        })
+    }
     async fn mark_posted(&self, l: &Lease, idx: u32, provider: &str, now: UnixMs) -> Result<bool>;
     /// Marks several articles posted in one atomic write; each entry is
     /// `(idx, provider)`. `false` = fenced, and then nothing was written.
+    /// A packed plan is marked only as a whole: by a call that lists
+    /// every one of its articles.
     async fn mark_posted_many(
         &self,
         l: &Lease,
@@ -872,6 +904,13 @@ pub trait Catalog {
     /// one, after a rollback. One call looks at the next `limit` outbox
     /// rows, in a rotation over all of them. Returns how many it re-armed.
     async fn revive_referenced(&self, limit: u32, now: UnixMs) -> Result<u64>;
+    /// Packs plans that are still rows in `articles`: looks at the next
+    /// `limit` extents with article rows, in a rotation over all of
+    /// them, and for each whose articles are all posted stores the
+    /// packed plan on the extent's row and deletes its rows, in one
+    /// atomic write. A plan that is not posted in full stays rows: a
+    /// packed plan is posted as a whole.
+    async fn pack_plans(&self, limit: u32) -> Result<PackReport>;
 
     // hot tier
     /// Pinned and evictable byte totals (`GET /_admin/status`).

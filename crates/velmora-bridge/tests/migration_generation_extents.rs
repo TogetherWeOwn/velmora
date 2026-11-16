@@ -12,7 +12,7 @@ use service_support::*;
 use velmora_bridge::testkit::{
     RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
     MIGRATION_0006, MIGRATION_0007, MIGRATION_0008, MIGRATION_0009, MIGRATION_0010, MIGRATION_0011,
-    MIGRATION_0012, MIGRATION_0013, MIGRATION_0014,
+    MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0015, MIGRATION_0016,
 };
 use velmora_bridge::*;
 
@@ -178,7 +178,9 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0002,
         MIGRATION_0003,
         MIGRATION_0004,
-        // Later migrations do not touch what 0005 adds; the undo keeps them.
+        // Later migrations do not touch what 0005 adds, and the undo
+        // keeps them. All but 0016: it replaces a trigger of 0005, so it
+        // is applied again after it.
         MIGRATION_0006,
         MIGRATION_0007,
         MIGRATION_0008,
@@ -188,12 +190,14 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0012,
         MIGRATION_0013,
         MIGRATION_0014,
+        MIGRATION_0015,
     ] {
         old.apply(migration).unwrap();
     }
     assert_eq!(schema(db), schema(&old));
 
     db.apply(MIGRATION_0005).unwrap();
+    db.apply(MIGRATION_0016).unwrap();
     assert_eq!(schema(db), schema(&RusqliteSql::with_schema().unwrap()));
     assert_eq!(references(&rig), written);
     assert_eq!(reads(&rig, &bucket, &signer).await, before);

@@ -8,8 +8,11 @@
 //! Writes that touch more than one table are batches with that predicate
 //! as their `tx_guard`.
 
+use core::fmt::Write as _;
+
 use super::uploads::{int, ms, text, Cols, Stmt};
 use super::SqlCatalog;
+use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, LEASE_SECS};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, BridgeError, Bucket, BucketId, DueRow, ExtentId,
@@ -256,6 +259,24 @@ pub(super) async fn defer<S: Sql>(
     fenced(c, sql, l, [ms(next_at), ms(now)]).await
 }
 
+pub(super) async fn defer_at<S: Sql>(
+    c: &SqlCatalog<S>,
+    l: &Lease,
+    cursor: u32,
+    next_at: UnixMs,
+    now: UnixMs,
+) -> Result<bool> {
+    let sql = concat!(
+        "UPDATE outbox SET next_at = ?5, updated_at = ?6, cursor = ?7, \
+         attempts = MAX(attempts - 1, 0), ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
+    let cursor = SqlValue::Int(i64::from(cursor));
+    fenced(c, sql, l, [ms(next_at), ms(now), cursor]).await
+}
+
 pub(super) async fn set_cursor<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -337,22 +358,54 @@ pub(super) async fn job_extent<S: Sql>(
     }))
 }
 
-pub(super) async fn articles<S: Sql>(
+/// The plan of `extent`: its packed plan when it has one
+/// (`extents.plan`), else its rows in `articles`. One statement reads
+/// both, the packed plan first.
+pub(super) async fn stored_plan<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
-) -> Result<Vec<ArticleRow>> {
+) -> Result<StoredPlan> {
     let rows = c
         .sql
         .query(
-            "SELECT extent_id, idx, message_id, newsgroup, headers, cipher_offset, cipher_len, \
-               payload_sha256, yenc_name, state, provider_id, posted_at, reposted_at \
-             FROM articles WHERE extent_id = ?1 ORDER BY idx",
+            "SELECT 0 AS packed, id AS extent_id, -1 AS idx, NULL AS message_id, \
+               NULL AS newsgroup, plan AS headers, cipher_size AS cipher_offset, \
+               0 AS cipher_len, NULL AS payload_sha256, NULL AS yenc_name, NULL AS state, \
+               NULL AS provider_id, posted_at, reposted_at \
+             FROM extents WHERE id = ?1 AND plan IS NOT NULL \
+             UNION ALL \
+             SELECT 1, extent_id, idx, message_id, newsgroup, headers, cipher_offset, \
+               cipher_len, payload_sha256, yenc_name, state, provider_id, posted_at, \
+               reposted_at \
+             FROM articles WHERE extent_id = ?1 ORDER BY packed, idx",
             &[text(extent.as_str())],
         )
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
+        if r.num::<i64>()? == 0 {
+            // The packed plan is the plan: rows that are still there are
+            // a copy of it that was not dropped yet.
+            let id = ExtentId::new(r.text()?);
+            r.num::<i64>()?;
+            r.opt_text()?;
+            r.opt_text()?;
+            let packed = r.blob()?;
+            let cipher_size: u64 = r.num()?;
+            r.num::<i64>()?;
+            r.opt_blob()?;
+            r.opt_text()?;
+            r.opt_text()?;
+            r.opt_text()?;
+            let posted_at: Option<i64> = r.opt_num()?;
+            let reposted_at: Option<i64> = r.opt_num()?;
+            let rows = crate::plan::expand(&id, cipher_size, &packed, posted_at, reposted_at)?;
+            return Ok(StoredPlan {
+                rows,
+                packed: Some(packed),
+            });
+        }
         out.push(ArticleRow {
             extent_id: ExtentId::new(r.text()?),
             idx: r.num()?,
@@ -369,7 +422,10 @@ pub(super) async fn articles<S: Sql>(
             reposted_at: r.opt_num()?.map(UnixMs),
         });
     }
-    Ok(out)
+    Ok(StoredPlan {
+        rows: out,
+        packed: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +480,40 @@ pub(super) async fn plan_articles<S: Sql>(
     if !fenced_batch(c, stmts).await? {
         return Ok(None);
     }
-    articles(c, &l.extent).await.map(Some)
+    Ok(Some(stored_plan(c, &l.extent).await?.rows))
+}
+
+/// [`plan_articles`] for a packed plan: the plan is one value on the
+/// extent's row, stored unless the extent already has a plan (packed or
+/// in rows). Returns what is stored; `None` = fenced.
+///
+/// `plan` must expand to a plan of the leased extent, whose ciphertext
+/// has `cipher_size` bytes: a value that does not is refused before
+/// anything is written.
+pub(super) async fn plan_packed<S: Sql>(
+    c: &SqlCatalog<S>,
+    l: &Lease,
+    cipher_size: u64,
+    plan: &[u8],
+) -> Result<Option<StoredPlan>> {
+    let count = crate::plan::expand(&l.extent, cipher_size, plan, None, None)?.len();
+    let stmts: Vec<Stmt> = vec![
+        (held_guard!(), lease_params(l, [])?),
+        (
+            "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3 \
+             WHERE id = ?1 AND article_count IS NULL AND cipher_size = ?4",
+            vec![
+                text(l.extent.as_str()),
+                int(count)?,
+                SqlValue::Blob(plan.to_vec()),
+                int(cipher_size)?,
+            ],
+        ),
+    ];
+    if !fenced_batch(c, stmts).await? {
+        return Ok(None);
+    }
+    stored_plan(c, &l.extent).await.map(Some)
 }
 
 pub(super) async fn mark_posted<S: Sql>(
@@ -446,6 +535,10 @@ pub(super) async fn mark_posted<S: Sql>(
 
 /// Marks every listed article posted, or none: the batch is led by the
 /// lease guard, so a stale lease writes nothing.
+///
+/// A packed plan is posted as a whole: its extent is stamped when the
+/// call lists every article of the plan, and a call that lists fewer
+/// writes nothing for it.
 pub(super) async fn mark_posted_many<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -455,25 +548,62 @@ pub(super) async fn mark_posted_many<S: Sql>(
     if posted.is_empty() {
         return renew_check(c, l).await;
     }
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(posted.len() + 1);
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(3);
     stmts.push((held_guard!(), lease_params(l, [])?));
-    for (idx, provider) in posted {
+    // One statement per provider, not per article.
+    let mut providers: Vec<&str> = Vec::new();
+    for (_, provider) in posted {
+        if !providers.contains(provider) {
+            providers.push(provider);
+        }
+    }
+    for provider in providers {
+        let idxs: Vec<u32> = posted
+            .iter()
+            .filter(|(_, p)| *p == provider)
+            .map(|(idx, _)| *idx)
+            .collect();
         stmts.push((
             "UPDATE articles SET state = 'posted', provider_id = ?3, posted_at = ?4 \
-             WHERE extent_id = ?1 AND idx = ?2",
+             WHERE extent_id = ?1 AND idx IN (SELECT value FROM json_each(?2)) \
+               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL",
             vec![
                 text(l.extent.as_str()),
-                SqlValue::Int(i64::from(*idx)),
+                text(&idx_list(&idxs)),
                 text(provider),
                 ms(now),
             ],
         ));
     }
+    let listed: Vec<u32> = posted.iter().map(|(idx, _)| *idx).collect();
+    // Every article of the plan is `0..article_count`: as many distinct
+    // ones below the count are all of them.
+    stmts.push((
+        "UPDATE extents SET posted_at = ?2 \
+         WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL \
+           AND article_count = \
+               (SELECT COUNT(DISTINCT value) FROM json_each(?3) WHERE value < article_count)",
+        vec![text(l.extent.as_str()), ms(now), text(&idx_list(&listed))],
+    ));
     fenced_batch(c, stmts).await
 }
 
+/// `idxs` as a JSON array, for `json_each`.
+fn idx_list(idxs: &[u32]) -> String {
+    let mut out = String::from("[");
+    for (at, idx) in idxs.iter().enumerate() {
+        if at > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{idx}");
+    }
+    out.push(']');
+    out
+}
+
 /// Stamps every listed article as posted again at `now`, or none: the
-/// batch is led by the lease guard. A stamp never moves back.
+/// batch is led by the lease guard. A stamp never moves back. A packed
+/// plan has one stamp for all its articles, on its extent.
 pub(super) async fn mark_reposted_many<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -483,19 +613,20 @@ pub(super) async fn mark_reposted_many<S: Sql>(
     if idxs.is_empty() {
         return renew_check(c, l).await;
     }
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(idxs.len() + 1);
-    stmts.push((held_guard!(), lease_params(l, [])?));
-    for idx in idxs {
-        stmts.push((
+    let stmts: Vec<Stmt> = vec![
+        (held_guard!(), lease_params(l, [])?),
+        (
             "UPDATE articles SET reposted_at = MAX(COALESCE(reposted_at, ?3), ?3) \
-             WHERE extent_id = ?1 AND idx = ?2",
-            vec![
-                text(l.extent.as_str()),
-                SqlValue::Int(i64::from(*idx)),
-                ms(now),
-            ],
-        ));
-    }
+             WHERE extent_id = ?1 AND idx IN (SELECT value FROM json_each(?2)) \
+               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL",
+            vec![text(l.extent.as_str()), text(&idx_list(idxs)), ms(now)],
+        ),
+        (
+            "UPDATE extents SET reposted_at = MAX(COALESCE(reposted_at, ?2), ?2) \
+             WHERE id = ?1 AND plan IS NOT NULL",
+            vec![text(l.extent.as_str()), ms(now)],
+        ),
+    ];
     fenced_batch(c, stmts).await
 }
 
@@ -884,6 +1015,100 @@ pub(super) async fn revive_referenced<S: Sql>(
     let next = if full { last } else { 0 };
     set_scan_cursor(c, "revive", &next.to_string()).await?;
     Ok(revived)
+}
+
+/// Extents per write of [`pack_plans`] (two statements each).
+const PACK_CHUNK: usize = 25;
+
+/// See [`crate::ports::Catalog::pack_plans`].
+///
+/// The packed plan is made here from the rows as they were read, and the
+/// write that stores it checks that they still are what was read: an
+/// article plan never changes, so that is the extent having no packed
+/// plan yet, the same size and article count, and every article posted.
+/// The stamps are taken from the rows inside the write, so one that a
+/// repost sets meanwhile is not lost. A plan whose articles were posted
+/// at a time nobody knows (rows of a replay) is packed as posted at 0.
+pub(super) async fn pack_plans<S: Sql>(c: &SqlCatalog<S>, limit: u32) -> Result<PackReport> {
+    let after = c
+        .sql
+        .query("SELECT v FROM scan_cursors WHERE k = 'pack'", &[])
+        .await?
+        .into_iter()
+        .next()
+        .map(|row| Cols::new(row).text())
+        .transpose()?
+        .unwrap_or_default();
+    // One row per extent that has article rows, by the primary key.
+    let window = c
+        .sql
+        .query(
+            "SELECT extent_id FROM articles WHERE extent_id > ?1 AND idx = 0 \
+             ORDER BY extent_id LIMIT ?2",
+            &[text(&after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let mut ids = Vec::with_capacity(window.len());
+    for row in window {
+        ids.push(ExtentId::new(Cols::new(row).text()?));
+    }
+    let mut report = PackReport {
+        looked: u32::try_from(ids.len()).unwrap_or(u32::MAX),
+        packed: 0,
+        end: ids.len() < limit as usize,
+    };
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(2 * PACK_CHUNK);
+    for (at, id) in ids.iter().enumerate() {
+        let plan = stored_plan(c, id).await?;
+        let posted = plan.rows.iter().all(|a| a.state == ArticleState::Posted);
+        // The plan covers the whole ciphertext: its end is the size.
+        let cipher_size = plan.rows.last().map(|a| a.cipher_offset + a.cipher_len);
+        let packed = match (plan.packed, cipher_size) {
+            (None, Some(size)) if posted => crate::plan::pack_explicit(id, size, &plan.rows)
+                .ok()
+                .map(|blob| (blob, size)),
+            _ => None,
+        };
+        if let Some((blob, size)) = packed {
+            stmts.push((
+                "UPDATE extents SET plan = ?2, \
+                   posted_at = COALESCE((SELECT MAX(posted_at) FROM articles \
+                                          WHERE extent_id = ?1), ?5), \
+                   reposted_at = (SELECT MAX(reposted_at) FROM articles WHERE extent_id = ?1) \
+                 WHERE id = ?1 AND plan IS NULL AND cipher_size = ?3 AND article_count = ?4 \
+                   AND (SELECT COUNT(*) FROM articles \
+                         WHERE extent_id = ?1 AND state = 'posted') = ?4",
+                vec![
+                    text(id.as_str()),
+                    SqlValue::Blob(blob),
+                    int(size)?,
+                    int(plan.rows.len())?,
+                    SqlValue::Int(crate::plan::POSTED_AT_UNKNOWN),
+                ],
+            ));
+            // Only the rows of a plan that is packed: they are a copy of
+            // it from here on.
+            stmts.push((
+                "DELETE FROM articles WHERE extent_id = ?1 \
+                   AND (SELECT plan FROM extents WHERE id = ?1) IS NOT NULL",
+                vec![text(id.as_str())],
+            ));
+        }
+        if stmts.len() >= 2 * PACK_CHUNK || (at + 1 == ids.len() && !stmts.is_empty()) {
+            let changed = c.sql.batch(core::mem::take(&mut stmts)).await?;
+            let packed: u64 = changed.iter().step_by(2).sum();
+            report.packed += u32::try_from(packed).unwrap_or(u32::MAX);
+        }
+    }
+    // A short window was the end of the table: start over next time.
+    let next = match (report.end, ids.last()) {
+        (false, Some(last)) => last.as_str(),
+        _ => "",
+    };
+    if next != after {
+        set_scan_cursor(c, "pack", next).await?;
+    }
+    Ok(report)
 }
 
 async fn set_redrive_cursor<S: Sql>(c: &SqlCatalog<S>, at: &str) -> Result<()> {

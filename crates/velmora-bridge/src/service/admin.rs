@@ -14,6 +14,7 @@
 //! | `POST /_admin/drill/<bucket>/<key>` | `200` read-back from Usenet only |
 //! | `GET /_admin/status` | `200` |
 //! | `POST /_admin/restore` `{since_ms[, margin_ms]}` or `{cursor}` | `200` with the counts of one replay step and `next`; `409` unless `MAINTENANCE=restore` |
+//! | `POST /_admin/pack-plans[?limit=<n>]` | `200` `{looked, packed, end}`: one step of packing the article plans that are still rows; `409` unless `PACKED_PLANS=on` |
 //! | `POST /_admin/dev/guard-selftest` | `200` in dev, `404` otherwise |
 //!
 //! Secrets: the access key secret exists in the `POST /_admin/keys`
@@ -229,6 +230,18 @@ fn flag(raw_target: &str, name: &str) -> bool {
         .any(|(n, v)| n == name && matches!(v, "1" | "true"))
 }
 
+/// The value of `name` in the query, if it is there.
+fn query_param<'a>(raw_target: &'a str, name: &str) -> Option<&'a str> {
+    let query = raw_target.split_once('?').map_or("", |(_, q)| q);
+    query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find_map(|(n, v)| (n == name).then_some(v))
+}
+
+/// Most extents one `POST /_admin/pack-plans` looks at.
+const MAX_PACK_LIMIT: u32 = 500;
+
 /// S3 bucket naming, without dots: 3–63 of `a-z0-9-`, starting and ending
 /// with a letter or digit. This also keeps `_admin` out of the namespace.
 fn valid_bucket_name(name: &str) -> bool {
@@ -338,6 +351,25 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             create_key(bridge, &body).await
         }
         "/keys" if get => list_keys(bridge, &req.raw_target).await,
+        "/pack-plans" if post => {
+            mutable(bridge).await?;
+            // Not before every Worker reads a packed plan.
+            if !bridge.cfg.packed_plans {
+                return Err(fail(
+                    409,
+                    "PackedPlansOff",
+                    "Article plans are packed only while PACKED_PLANS is on.",
+                ));
+            }
+            let limit = query_param(&req.raw_target, "limit")
+                .map(|v| v.parse::<u32>())
+                .transpose()
+                .map_err(|_| fail(400, "InvalidArgument", "limit must be a number."))?
+                .unwrap_or(crate::jobs::PACK_LIMIT)
+                .clamp(1, MAX_PACK_LIMIT);
+            let report = bridge.catalog.pack_plans(limit).await.or_internal()?;
+            Ok(ok(&json!(report)))
+        }
         "/restore" if post => {
             // The one mutation maintenance allows, and only maintenance.
             if bridge.cfg.maintenance != Maintenance::Restore {
@@ -350,7 +382,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             let body: RestoreBody = read_json(bridge, req).await?;
             restore(bridge, body).await
         }
-        "/status" | "/buckets" | "/keys" | "/restore" => Err(wrong_method()),
+        "/status" | "/buckets" | "/keys" | "/restore" | "/pack-plans" => Err(wrong_method()),
         _ => Err(not_found()),
     }
 }

@@ -310,6 +310,15 @@ where
         }
     }
 
+    /// Ends a verify round that did not pass: the next one reads every
+    /// backbone again, from the first.
+    async fn round_failed(&self, lease: &Lease, class: FailClass) -> Staged<()> {
+        if lease.cursor != 0 {
+            self.cursor(lease, 0).await?;
+        }
+        Err(Stop::Fail(class, Some(REVERIFY_SECS)))
+    }
+
     async fn advance(&self, lease: &Lease, to: OutboxStage, next_at: UnixMs) -> Staged<()> {
         match self
             .catalog
@@ -417,12 +426,13 @@ where
             }
             self.record(lease, extent, provider, &tally, kind).await?;
             let next = index as u32 + 1;
-            self.cursor(lease, next * CURSOR_STEPS).await?;
             if (next as usize) < groups.len() {
                 // The next backbone gets its own job; this is progress,
-                // not a failure, so no attempt is spent.
+                // not a failure, so no attempt is spent. The resume point
+                // goes with the same write.
                 let now = self.clock.now();
-                if !self.catalog.defer(lease, now, now).await? {
+                let cursor = next * CURSOR_STEPS;
+                if !self.catalog.defer_at(lease, cursor, now, now).await? {
                     return Err(Stop::Fenced);
                 }
                 self.notify(lease, OutboxStage::Verify, 0).await;
@@ -430,8 +440,10 @@ where
             }
         }
 
-        // Every backbone has a recorded result for this round.
-        self.cursor(lease, 0).await?;
+        // Every backbone has a recorded result for this round. The next
+        // round starts at the first backbone: a move to another stage
+        // resets the resume point itself ([`Catalog::advance`]), a round
+        // that fails resets it first ([`Self::round_failed`]).
         // Results for backbones that are no longer configured, or that do
         // not count toward a release, are not looked at.
         let mut status = self.catalog.backbone_status(&extent.id).await?;
@@ -465,14 +477,14 @@ where
         }
         let failed = |r| status.iter().any(|s| s.result == r);
         if failed(VerifyResult::Corrupt) {
-            return Err(Stop::Fail(FailClass::Corrupt, Some(REVERIFY_SECS)));
+            return self.round_failed(lease, FailClass::Corrupt).await;
         }
         if status.iter().any(|s| !s.counts) || status.len() < groups.len() || status.is_empty() {
-            return Err(Stop::Fail(FailClass::MissingPending, Some(REVERIFY_SECS)));
+            return self.round_failed(lease, FailClass::MissingPending).await;
         }
         if !status.iter().any(|s| s.kind == VerifyKind::Body) {
             // Passes, but none of them the full check: read again.
-            return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
+            return self.round_failed(lease, FailClass::Internal).await;
         }
         // Every backbone that counts holds the extent, but there are fewer
         // of them than a release needs: the safety copy stays held.
@@ -552,7 +564,6 @@ where
         if !enough && passed + missing == read.len() && missing > 0 {
             // Not releasable after all, and nothing worse than missing:
             // back to verify, which owns the retry waits and the record.
-            self.cursor(lease, 0).await?;
             self.advance(lease, OutboxStage::Verify, now).await?;
             self.notify(lease, OutboxStage::Verify, 0).await;
             return Ok(());
@@ -566,7 +577,6 @@ where
         }
         if !enough && rows.len() < read.len() {
             // A backbone serves damaged articles: verify again later.
-            self.cursor(lease, 0).await?;
             let again = self.clock.now().plus_secs(REVERIFY_SECS);
             return self.advance(lease, OutboxStage::Verify, again).await;
         }

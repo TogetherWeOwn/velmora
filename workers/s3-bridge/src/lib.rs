@@ -337,6 +337,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             if report.sweep_failed {
                 console_error!("dispatch: the sweep of unpublished writes was not sent");
             }
+            if report.pack_failed {
+                console_error!("dispatch: packing article plans failed");
+            }
         }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
     }

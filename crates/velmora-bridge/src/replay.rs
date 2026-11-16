@@ -92,6 +92,10 @@ pub struct ReplayExtent {
     pub row: ExtentRow,
     /// The article plan record, if there is one.
     pub plan: Option<Vec<ArticleRow>>,
+    /// `plan` in its packed form ([`crate::plan`]), when the catalogue
+    /// is to hold it that way: it is then stored on the extent's row,
+    /// and no article row is written.
+    pub packed: Option<Vec<u8>>,
     /// Whether the pinned copy exists.
     pub safety_present: bool,
 }
@@ -387,10 +391,19 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         None
                     }
                 };
+                let mut packed = None;
                 let plan = match record {
                     Some(record) => match record.rows(state) {
                         Ok(rows) => {
                             row.plan_rev = record.plan_rev;
+                            if self.cfg.packed_plans {
+                                packed = crate::plan::repack(
+                                    &row.id,
+                                    row.cipher_size,
+                                    &rows,
+                                    record.packed.as_deref(),
+                                );
+                            }
                             Some(rows)
                         }
                         Err(_) => {
@@ -406,6 +419,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 chunk.push(crate::replay::ReplayExtent {
                     row,
                     plan,
+                    packed,
                     safety_present,
                 });
             }

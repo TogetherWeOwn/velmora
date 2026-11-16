@@ -35,9 +35,7 @@ use std::collections::VecDeque;
 use futures_util::future::{join, join_all, poll_fn};
 use futures_util::lock::Mutex;
 use sha2::{Digest, Sha256};
-use velmora::article::{
-    assemble_article, obfuscate_article, render_obfuscated_headers, OBFUSCATED_YENC_NAME_LEN,
-};
+use velmora::article::{assemble_article, OBFUSCATED_YENC_NAME_LEN};
 use velmora::nntp::{is_retryable_post_error, NntpClient, PostOutcome, MAX_POST_ATTEMPTS};
 use velmora::rng::{uniform_below, SystemRng};
 use velmora::transport::Transport;
@@ -46,13 +44,14 @@ use velmora::yenc::{encode_segment, SegmentParams};
 use crate::articles::article_spans;
 use crate::fetch::{forgiven, job_holder, report_health, Health, ProviderSession};
 use crate::jobs::JOB_OVERHEAD_BYTES;
+use crate::plan::{draw, pack_seeded, StoredPlan};
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
     NntpSession, Permit, PermitClass, LEASE_SECS, MAX_QUEUE_DELAY_SECS, NNTP_CALL_SECS,
     PERMIT_SECS,
 };
-use crate::recovery::write_article_plan;
+use crate::recovery::write_stored_plan;
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
     JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
@@ -205,6 +204,9 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
     }
 }
 
+/// Out of line, so that the hashing code is in the Worker once for all
+/// its callers.
+#[inline(never)]
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -280,8 +282,8 @@ where
         // A job that comes back to an extent it has posted already (a
         // crash before the stage moved on, a revived obligation) needs no
         // provider: it only writes the recovery record again.
-        let stored = self.catalog.articles(&extent.id).await?;
-        if !stored.is_empty() && stored.iter().all(|a| a.state == ArticleState::Posted) {
+        let stored = self.catalog.stored_plan(&extent.id).await?;
+        if !stored.rows.is_empty() && stored.rows.iter().all(|a| a.state == ArticleState::Posted) {
             self.load_planned(lease, extent, stored).await?;
             return self.to_verify(lease).await;
         }
@@ -302,9 +304,10 @@ where
         };
         // The articles left to post are known before the extent is read:
         // every one of a new plan, the planned ones of a stored plan.
-        let todo = match stored.is_empty() {
+        let todo = match stored.rows.is_empty() {
             true => article_spans(extent.cipher_size).len(),
             false => stored
+                .rows
                 .iter()
                 .filter(|a| a.state == ArticleState::Planned)
                 .count(),
@@ -496,7 +499,7 @@ where
         &self,
         lease: &Lease,
         extent: &ExtentRow,
-        stored: Vec<ArticleRow>,
+        stored: StoredPlan,
     ) -> core::result::Result<(Vec<u8>, Vec<ArticleRow>), Stop> {
         let started = self.clock.now();
         let cipher = self
@@ -512,12 +515,12 @@ where
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
-        write_article_plan(&self.safety, &self.kek, extent, &plan)
+        write_stored_plan(&self.safety, &self.kek, extent, &plan)
             .await
             .map_err(|_| Stop::fail(FailClass::BlobError))?;
         let load_ms = self.clock.now().0 - started.0;
         crate::trace::note(&lease.extent, |t| t.load_ms = load_ms);
-        Ok((cipher, plan))
+        Ok((cipher, plan.rows))
     }
 
     /// The authoritative stored plan, created first when the extent has
@@ -533,49 +536,58 @@ where
         lease: &Lease,
         extent: &ExtentRow,
         cipher: &[u8],
-        stored: Vec<ArticleRow>,
-    ) -> core::result::Result<Vec<ArticleRow>, Stop> {
+        stored: StoredPlan,
+    ) -> core::result::Result<StoredPlan, Stop> {
         let spans = article_spans(extent.cipher_size);
         let mut plan = stored;
-        if plan.is_empty() {
+        if plan.rows.is_empty() {
             let groups: Vec<&str> = self.cfg.newsgroups.iter().map(String::as_str).collect();
             let now_secs = self.clock.now().secs().0;
-            let mut rows = Vec::with_capacity(spans.len());
-            for (idx, span) in (0u32..).zip(&spans) {
-                let meta = obfuscate_article(&mut SystemRng, now_secs, &groups)
-                    .map_err(|_| Stop::fail(FailClass::Internal))?;
-                let headers = render_obfuscated_headers(&meta)
-                    .map_err(|_| Stop::fail(FailClass::Internal))?;
-                let mut row = ArticleRow {
-                    extent_id: extent.id.clone(),
-                    idx,
-                    message_id: meta.message_id,
-                    newsgroup: meta.newsgroup,
-                    headers,
-                    cipher_offset: span.start,
-                    cipher_len: span.len,
-                    payload_sha256: [0; 32],
-                    yenc_name: Some(meta.yenc_name),
-                    state: ArticleState::Planned,
-                    provider_id: None,
-                    posted_at: None,
-                    reposted_at: None,
-                };
-                let payload = payload_of(cipher, &row).ok_or(Stop::fail(FailClass::Internal))?;
-                row.payload_sha256 = sha256(payload);
-                rows.push(row);
-            }
-            plan = self
-                .catalog
-                .plan_articles(lease, &rows)
-                .await?
-                .ok_or(Stop::Fenced)?;
+            // Every new plan is drawn from a fresh seed. With the switch
+            // on it is stored packed; a plan that cannot be packed (a
+            // newsgroup list the form does not hold) is stored as rows,
+            // like every plan with the switch off.
+            let (seed, rows) = draw(
+                &mut SystemRng,
+                now_secs,
+                &groups,
+                &extent.id,
+                extent.cipher_size,
+                |span| {
+                    let start = usize::try_from(span.start).ok()?;
+                    let end = usize::try_from(span.end()).ok()?;
+                    cipher.get(start..end).map(sha256)
+                },
+            )
+            .map_err(|_| Stop::fail(FailClass::Internal))?;
+            let packed = match self.cfg.packed_plans {
+                true => pack_seeded(&seed, &extent.id, extent.cipher_size, &rows).ok(),
+                false => None,
+            };
+            plan = match packed {
+                Some(packed) => self
+                    .catalog
+                    .plan_packed(lease, extent.cipher_size, &packed)
+                    .await?
+                    .ok_or(Stop::Fenced)?,
+                None => StoredPlan {
+                    rows: self
+                        .catalog
+                        .plan_articles(lease, &rows)
+                        .await?
+                        .ok_or(Stop::Fenced)?,
+                    packed: None,
+                },
+            };
         }
         // The stored plan must describe this ciphertext article for article.
-        let matches = plan.len() == spans.len()
-            && (0u32..).zip(&plan).zip(&spans).all(|((idx, row), span)| {
-                row.idx == idx && row.cipher_offset == span.start && row.cipher_len == span.len
-            });
+        let matches = plan.rows.len() == spans.len()
+            && (0u32..)
+                .zip(&plan.rows)
+                .zip(&spans)
+                .all(|((idx, row), span)| {
+                    row.idx == idx && row.cipher_offset == span.start && row.cipher_len == span.len
+                });
         if !matches {
             return Err(Stop::fail(FailClass::Internal));
         }
@@ -625,7 +637,14 @@ where
         let mut refused = false;
         // Per article: a POST of it may have landed on a provider that
         // then failed, so the next provider is asked before it is sent.
-        let mut unknown = vec![false; plan.len()];
+        //
+        // Which articles a run posted is kept in the job, not in the
+        // catalogue, until all of them are posted. A job that comes after
+        // a run that failed or died therefore finds them all planned, and
+        // asks before it sends any of them.
+        let mut unknown = vec![lease.attempts > 1; plan.len()];
+        // Per article: the provider that took it in this job.
+        let mut posted_by: Vec<Option<String>> = vec![None; plan.len()];
         for tier in order.chunk_by(|a, b| a.priority == b.priority) {
             // Providers of the tier that have not posted for this job yet.
             let mut untried: Vec<&ProviderConfig> = tier.to_vec();
@@ -686,14 +705,17 @@ where
                 for (flag, landed) in unknown.iter_mut().zip(&ended.unknown) {
                     *flag |= *landed;
                 }
-                for (row, marked) in plan.iter_mut().zip(&ended.marked) {
-                    if *marked {
-                        row.state = ArticleState::Posted;
+                for (at, by) in ended.accepted.into_iter().enumerate() {
+                    if by.is_some() {
+                        plan[at].state = ArticleState::Posted;
+                        posted_by[at] = by;
                     }
                 }
                 busy |= ended.busy;
                 match ended.stop {
-                    None if plan.iter().all(|a| a.state == ArticleState::Posted) => return Ok(()),
+                    None if plan.iter().all(|a| a.state == ArticleState::Posted) => {
+                        return self.record_posted(lease, plan, &posted_by).await;
+                    }
                     None => return Err(Stop::fail(FailClass::Internal)),
                     Some(stop @ Stop::Fail(FailClass::PostRefused | FailClass::NntpError, _)) => {
                         // A connection failed: what this provider took,
@@ -725,6 +747,38 @@ where
             (None, false, Some(until)) => Stop::Cooling(until),
             (None, false, None) => Stop::fail(FailClass::Internal),
         })
+    }
+
+    /// Records the whole plan as posted: every article this job posted,
+    /// in one fenced write. Until here the catalogue has every one of
+    /// them as planned, so a job that dies before this write posts the
+    /// plan again, under the same message-ids, and the providers answer
+    /// that they have it.
+    ///
+    /// A catalogue failure gets one more try: the providers took the
+    /// articles, and the write is what spares a second run.
+    async fn record_posted(
+        &self,
+        lease: &Lease,
+        plan: &[ArticleRow],
+        posted_by: &[Option<String>],
+    ) -> core::result::Result<(), Stop> {
+        let rows: Vec<(u32, &str)> = plan
+            .iter()
+            .zip(posted_by)
+            .filter_map(|(a, by)| Some((a.idx, by.as_deref()?)))
+            .collect();
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let now = self.clock.now();
+            match self.catalog.mark_posted_many(lease, &rows, now).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => return Err(Stop::Fenced),
+                Err(e) if tries == 2 => return Err(e.into()),
+                Err(_) => {}
+            }
+        }
     }
 
     /// Opens up to `post_sockets` posting sessions (never more than
@@ -1004,8 +1058,9 @@ pub(crate) struct Ended {
     /// `None` = every article of the round was accepted (and, when the
     /// round records, recorded). Otherwise why articles are left.
     pub(crate) stop: Option<Stop>,
-    /// Per plan position: recorded as posted in the catalogue.
-    pub(crate) marked: Vec<bool>,
+    /// Per plan position: the provider that took the article in this
+    /// round.
+    pub(crate) accepted: Vec<Option<String>>,
     /// Per plan position: a POST may have landed (see [`post_one`]).
     pub(crate) unknown: Vec<bool>,
     /// A socket found no slot: its permit was gone, or the provider
@@ -1173,7 +1228,11 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         };
         Ended {
             stop,
-            marked: state.marked,
+            accepted: state
+                .accepted
+                .iter()
+                .map(|by| by.map(str::to_owned))
+                .collect(),
             unknown: state.unknown,
             busy,
         }
@@ -1378,10 +1437,11 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         }
         let now = self.clock.now();
         let marked = match self.record.get() {
-            Record::Posted => {
-                let rows: Vec<(u32, &str)> = due.iter().map(|(_, idx, p)| (*idx, *p)).collect();
-                self.catalog.mark_posted_many(self.lease, &rows, now).await
-            }
+            // A first post is recorded once, when the whole plan is
+            // posted, by the job (`Bridge::record_posted`): until then
+            // which articles are posted is kept here, not in the
+            // catalogue.
+            Record::Posted => Ok(true),
             Record::Reposted => {
                 let idxs: Vec<u32> = due.iter().map(|(_, idx, _)| *idx).collect();
                 self.catalog

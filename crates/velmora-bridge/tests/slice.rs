@@ -533,6 +533,13 @@ impl Rig {
 
     /// The dev configuration with `extra` variables set on top of it.
     async fn with_vars(extra: &[(&'static str, &str)]) -> Rig {
+        Rig::with_backbones(extra, 1).await
+    }
+
+    /// As [`Rig::with_vars`], with `backbones` providers: each its own
+    /// login and backbone, all on the one fake server (an article posted
+    /// through one is at once readable through the others).
+    async fn with_backbones(extra: &[(&'static str, &str)], backbones: usize) -> Rig {
         let mut cfg = ServerConfig::for_test();
         cfg.group = GROUP.to_string();
         cfg.users.clear();
@@ -550,21 +557,39 @@ impl Rig {
                 max_connections: 4,
             },
         );
+        for i in 1..backbones {
+            cfg.users.insert(
+                format!("{POSTER_USER}{}", i + 1),
+                UserConfig {
+                    password: POSTER_PASS.to_string(),
+                    max_connections: MAX_CONNS as usize,
+                },
+            );
+        }
         let server = TestNntpServer::spawn(cfg).await;
 
-        let providers = serde_json::json!([{
-            "id": "fake1",
-            "host": server.addr().ip().to_string(),
-            "port": server.addr().port(),
-            "tls": false,
-            "user": POSTER_USER,
-            "pass": POSTER_PASS,
-            "backbone": "fake-backbone",
-            "post": true,
-            "read": true,
-            "max_conns": MAX_CONNS,
-        }])
-        .to_string();
+        let providers: Vec<serde_json::Value> = (0..backbones)
+            .map(|i| {
+                let n = if i == 0 {
+                    String::new()
+                } else {
+                    (i + 1).to_string()
+                };
+                serde_json::json!({
+                    "id": format!("fake{}", i + 1),
+                    "host": server.addr().ip().to_string(),
+                    "port": server.addr().port(),
+                    "tls": false,
+                    "user": format!("{POSTER_USER}{n}"),
+                    "pass": POSTER_PASS,
+                    "backbone": format!("fake-backbone{n}"),
+                    "post": true,
+                    "read": true,
+                    "max_conns": MAX_CONNS,
+                })
+            })
+            .collect();
+        let providers = serde_json::Value::Array(providers).to_string();
         // The `[env.dev]` vars of wrangler.toml, plus the dev secrets.
         let mut vars: BTreeMap<&str, String> = [
             ("ENVIRONMENT", "dev"),
@@ -600,8 +625,10 @@ impl Rig {
 
         let connector = CountingConnector::default();
         let n = Rc::clone(&connector.n);
+        let sql = RusqliteSql::with_schema().expect("schema applies");
+        sql.meter_writes().expect("the write meter installs");
         let bridge = Rc::new(Bridge {
-            catalog: SqlCatalog::new(RusqliteSql::with_schema().expect("schema applies")),
+            catalog: SqlCatalog::new(sql),
             safety: MemBlobStore::new(),
             cache: MemBlobStore::new(),
             nntp: connector,
@@ -855,6 +882,22 @@ impl Rig {
             ),
             Err(e) => fail(step, &format!("object_status {bucket}/{key}"), "Ok", e),
         }
+    }
+
+    /// Bytes in use per table and index (`dbstat`: page size less the
+    /// unused part of each page), largest first.
+    fn db_used(&self) -> BTreeMap<String, i64> {
+        self.bridge.catalog.sql.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT name, SUM(pgsize - unused) FROM dbstat GROUP BY name")
+                .expect("dbstat");
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .expect("dbstat")
+                .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+                .expect("dbstat");
+            rows
+        })
     }
 
     fn sql_count(&self, sql: &str) -> i64 {
@@ -1846,9 +1889,29 @@ async fn permits_never_exceed_max_conns() {
 /// read back from NNTP, byte for byte.
 #[tokio::test(flavor = "current_thread")]
 async fn rebuild_from_usenet_after_losing_the_catalogue() {
+    rebuild_from_usenet("off").await;
+}
+
+/// The same loss and rebuild with every article plan stored packed: the
+/// replay restores the packed plans from their records, without a row
+/// per article, and the objects read back from Usenet.
+#[tokio::test(flavor = "current_thread")]
+async fn rebuild_from_usenet_with_packed_plans() {
+    rebuild_from_usenet("on").await;
+}
+
+/// Catalogue rows that a wipe of the catalogue removes.
+const WIPE: &str = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM key_floors; \
+     DELETE FROM verifications; DELETE FROM articles; \
+     DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
+     DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
+     DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";
+
+async fn rebuild_from_usenet(packed_plans: &str) {
     use velmora_bridge::replay::ReplayCursor;
 
-    let rig = Rig::new().await;
+    let packed = packed_plans == "on";
+    let rig = Rig::with_vars(&[("PACKED_PLANS", packed_plans)]).await;
     let s = "recovery setup";
     rig.setup_buckets_and_key(s).await;
     let small = test_bytes(11, 300_000);
@@ -1951,10 +2014,26 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
         pinned > 0 && released > 0,
         format!("{pinned} pinned, {released} released"),
     );
-    let wipe = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM key_floors; DELETE FROM verifications; DELETE FROM articles; \
-                DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
-                DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
-                DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";
+    let wipe = WIPE;
+    // A packed plan is one value on its extent: no row per article at
+    // any time. As rows there is one per article.
+    let article_rows = rig.sql_count("SELECT COUNT(*) FROM articles");
+    let packed_extents = rig
+        .sql_count("SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL AND posted_at IS NOT NULL");
+    match packed {
+        true => expect_eq(
+            s,
+            "(article rows, packed plans)",
+            (0, 4),
+            (article_rows, packed_extents),
+        ),
+        false => expect(
+            s,
+            "plans are rows",
+            article_rows >= 4 && packed_extents == 0,
+            format!("{article_rows} article rows, {packed_extents} packed plans"),
+        ),
+    }
     rig.bridge
         .catalog
         .sql
@@ -2063,6 +2142,28 @@ async fn rebuild_from_usenet_after_losing_the_catalogue() {
         0,
         rig.outbox_open(),
     );
+    // The replay restores each plan in the form the catalogue stores
+    // them in: packed from the seed in its record (well under a hundred
+    // bytes per article), or one row per article.
+    let article_rows = rig.sql_count("SELECT COUNT(*) FROM articles");
+    let small_plans = rig.sql_count(
+        "SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL AND length(plan) < 1024 \
+           AND posted_at IS NOT NULL",
+    );
+    match packed {
+        true => expect_eq(
+            s,
+            "(article rows, packed plans)",
+            (0, 4),
+            (article_rows, small_plans),
+        ),
+        false => expect(
+            s,
+            "plans are rows again",
+            article_rows >= 4 && small_plans == 0,
+            format!("{article_rows} article rows, {small_plans} packed plans"),
+        ),
+    }
 
     // The key and its grants are issued again, then S3 reads work.
     let s = "recovery read-back";
@@ -2204,10 +2305,7 @@ async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
             rig.bridge.safety.delete(&key).await.expect("safety delete");
         }
     }
-    let wipe = "DELETE FROM generation_extents; DELETE FROM outbox; DELETE FROM key_floors; DELETE FROM verifications; DELETE FROM articles; \
-                DELETE FROM upload_parts; DELETE FROM uploads; DELETE FROM gc; \
-                DELETE FROM objects; DELETE FROM extents; DELETE FROM generations; \
-                DELETE FROM grants; DELETE FROM access_keys; DELETE FROM buckets;";
+    let wipe = WIPE;
     rig.bridge
         .catalog
         .sql
@@ -2395,6 +2493,528 @@ async fn parts_completed_late_keep_their_safety_copy_for_the_minimum_age() {
         );
         expect_eq(s, "stage after the release", "done", stage.as_str());
     }
+}
+
+/// Plans stored as rows are packed by the dispatcher once the switch is
+/// on: every article stays what it was, no recovery record changes, the
+/// objects read from Usenet through the packed plans, and a catalogue
+/// rebuilt from the records gets them packed again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_backfill_packs_posted_plans_and_they_read_from_usenet() {
+    use velmora_bridge::replay::ReplayCursor;
+
+    let mut rig = Rig::new().await;
+    let s = "backfill setup";
+    rig.setup_buckets_and_key(s).await;
+    let small = test_bytes(21, 300_000);
+    let big = test_bytes(22, BIG_LEN);
+    expect_status(
+        s,
+        "PUT b/small.bin",
+        200,
+        &rig.put("/slice/b/small.bin", &small).await,
+    );
+    let r = rig.multipart_put(s, "/slice/b/big.bin", &big, PART).await;
+    expect_status(s, "Complete b/big.bin", 200, &r);
+    rig.pump(s).await;
+    // Uploaded after the others were posted, and not posted itself when
+    // the backfill runs: an extent without a plan is left alone.
+    let late = test_bytes(23, 200_000);
+    expect_status(
+        s,
+        "PUT b/late.bin",
+        200,
+        &rig.put("/slice/b/late.bin", &late).await,
+    );
+
+    let ids: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT DISTINCT extent_id FROM articles ORDER BY extent_id")
+            .expect("extents");
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("extents")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("extents");
+        ids
+    });
+    expect_eq(s, "extents with a plan in rows", 4, ids.len());
+    let mut before = Vec::new();
+    for id in &ids {
+        let id = ExtentId::new(id.as_str());
+        let rows = rig
+            .bridge
+            .catalog
+            .articles(&id)
+            .await
+            .unwrap_or_else(|e| fail(s, "Catalog::articles", "Ok", e));
+        before.push((id, rows));
+    }
+    let records = |rig: &Rig| -> BTreeMap<String, [u8; 32]> {
+        let keys = rig.bridge.safety.keys();
+        let records = keys.into_iter().filter(|k| k.starts_with("m/"));
+        records
+            .map(|k| {
+                let blob = rig.bridge.safety.stored(&k).expect("record");
+                (k, sha256(&blob.bytes))
+            })
+            .collect()
+    };
+    let records_before = records(&rig);
+
+    let s = "backfill";
+    // Off: the dispatcher packs nothing.
+    rig.bridge.clock.advance_secs(CRON_SECS);
+    let report = rig
+        .bridge
+        .dispatch()
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::dispatch", "Ok", e));
+    expect_eq(
+        s,
+        "plans packed with the switch off",
+        0,
+        report.plans_packed,
+    );
+    Rc::get_mut(&mut rig.bridge)
+        .expect("the rig holds the only bridge")
+        .cfg
+        .packed_plans = true;
+    // In steps, as the rotation of the dispatcher does it.
+    let step = |limit| {
+        let rig = &rig;
+        async move {
+            rig.bridge
+                .catalog
+                .pack_plans(limit)
+                .await
+                .unwrap_or_else(|e| fail(s, "Catalog::pack_plans", "Ok", e))
+        }
+    };
+    let first = step(3).await;
+    expect_eq(
+        s,
+        "first step (looked, packed, end)",
+        (3, 3, false),
+        (first.looked, first.packed, first.end),
+    );
+    rig.bridge.clock.advance_secs(CRON_SECS);
+    let report = rig
+        .bridge
+        .dispatch()
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::dispatch", "Ok", e));
+    expect_eq(s, "plans packed by the dispatcher", 1, report.plans_packed);
+    let again = step(3).await;
+    expect_eq(
+        s,
+        "nothing left (looked, packed, end)",
+        (0, 0, true),
+        (again.looked, again.packed, again.end),
+    );
+    expect_eq(
+        s,
+        "article rows",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM articles"),
+    );
+    expect_eq(
+        s,
+        "packed plans",
+        4,
+        rig.sql_count("SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL AND posted_at > 0"),
+    );
+    for (id, rows) in &before {
+        let now = rig
+            .bridge
+            .catalog
+            .articles(id)
+            .await
+            .unwrap_or_else(|e| fail(s, "Catalog::articles", "Ok", e));
+        // All of each article is kept but the provider that took it,
+        // which nothing reads (a recovery record does not keep it either).
+        let mut kept = rows.clone();
+        kept.iter_mut().for_each(|a| a.provider_id = None);
+        expect(
+            s,
+            &format!("extent {} keeps its articles", id.as_str()),
+            now == kept,
+            format!("{} articles before, {} now", rows.len(), now.len()),
+        );
+    }
+    expect(
+        s,
+        "no recovery record changed",
+        records(&rig) == records_before,
+        "records differ",
+    );
+
+    // Cold: no cache, and no safety copy where the hot tier may drop it.
+    let s = "backfill cold read";
+    rig.pump(s).await;
+    let all = u64::MAX / 2;
+    rig.bridge
+        .catalog
+        .hot_drain_set(all)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::hot_drain_set", "Ok", e));
+    rig.bridge
+        .evict_batch(all)
+        .await
+        .unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
+    for key in rig.bridge.cache.keys() {
+        rig.bridge.cache.delete(&key).await.expect("cache delete");
+    }
+    let bodies_before = rig.n.bodies.get();
+    let r = rig.get("/slice/b/big.bin").await;
+    expect_status(s, "GET b/big.bin", 200, &r);
+    expect_bytes(s, "GET b/big.bin body", &big, &r.body);
+    let r = rig.get("/slice/b/small.bin").await;
+    expect_status(s, "GET b/small.bin", 200, &r);
+    expect_bytes(s, "GET b/small.bin body", &small, &r.body);
+    expect(
+        s,
+        "the reads came from NNTP",
+        rig.n.bodies.get() > bodies_before,
+        format!("{} BODY commands", rig.n.bodies.get() - bodies_before),
+    );
+
+    // Everything but the records and Usenet is lost. Their records say
+    // nothing about packing: the replay packs each plan from its articles.
+    let s = "backfill replay";
+    for key in rig.bridge.cache.keys() {
+        rig.bridge.cache.delete(&key).await.expect("cache delete");
+    }
+    for key in rig.bridge.safety.keys() {
+        if !velmora_bridge::recovery::is_protected_key(&key) {
+            rig.bridge.safety.delete(&key).await.expect("safety delete");
+        }
+    }
+    rig.bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.execute_batch(WIPE).expect("wipe"));
+    let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+    while let Some(at) = cursor {
+        let mut report = rig
+            .bridge
+            .replay_step(at)
+            .await
+            .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+        expect(
+            s,
+            "every record opens and publishes",
+            report.unreadable.is_empty() && report.unpublishable.is_empty(),
+            format!("{report:?}"),
+        );
+        cursor = report.next.take();
+    }
+    expect_eq(
+        s,
+        "article rows",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM articles"),
+    );
+    expect_eq(
+        s,
+        "packed plans",
+        5,
+        rig.sql_count("SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL"),
+    );
+    for (id, rows) in &before {
+        let now = rig
+            .bridge
+            .catalog
+            .articles(id)
+            .await
+            .unwrap_or_else(|e| fail(s, "Catalog::articles", "Ok", e));
+        expect(
+            s,
+            &format!("extent {} has the same articles", id.as_str()),
+            velmora_bridge::plan::same_plan(rows, &now),
+            format!("{} articles before, {} now", rows.len(), now.len()),
+        );
+    }
+    let key = rig
+        .admin_json(
+            s,
+            Method::Post,
+            "/keys",
+            Some(serde_json::json!({"buckets": ["slice"], "perm": "rw"})),
+        )
+        .await;
+    *rig.signer.borrow_mut() = Some(Signer {
+        akid: key["access_key_id"].as_str().expect("akid").to_string(),
+        secret: key["secret"].as_str().expect("secret").to_string(),
+        host: S3_HOST.to_string(),
+        region: REGION.to_string(),
+    });
+    let bodies_before = rig.n.bodies.get();
+    for (path, body) in [
+        ("/slice/b/big.bin", &big),
+        ("/slice/b/small.bin", &small),
+        ("/slice/b/late.bin", &late),
+    ] {
+        let r = rig.get(path).await;
+        expect_status(s, &format!("GET {path}"), 200, &r);
+        expect_bytes(s, &format!("GET {path} body"), body, &r.body);
+    }
+    expect(
+        s,
+        "the reads came from NNTP",
+        rig.n.bodies.get() > bodies_before,
+        format!("{} BODY commands", rig.n.bodies.get() - bodies_before),
+    );
+}
+
+/// An article of a packed plan that a provider lost is posted again from
+/// the safety copy: the repost is stamped on the extent, the release
+/// waits for the minimum age after it, and the object reads back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_packed_plan_is_repaired_by_a_repost() {
+    let rig = Rig::with_vars(&[
+        ("PACKED_PLANS", "on"),
+        ("PROPAGATION_GRACE_SECS", "0"),
+        ("SAFETY_MIN_AGE_SECS", "3600"),
+    ])
+    .await;
+    let s = "repair setup";
+    rig.setup_buckets_and_key(s).await;
+    let body = test_bytes(31, 2 * MIB);
+    expect_status(
+        s,
+        "PUT r/one.bin",
+        200,
+        &rig.put("/slice/r/one.bin", &body).await,
+    );
+    // The post job alone.
+    let sent = rig.bridge.jobs.take();
+    expect_eq(s, "jobs after the upload", 1, sent.len());
+    let outcome = rig.bridge.run_job(&sent[0].job).await;
+    expect(
+        s,
+        "the post job is done",
+        outcome == JobOutcome::Ack,
+        format!("{outcome:?}"),
+    );
+    let id: String = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row("SELECT id FROM extents WHERE plan IS NOT NULL", [], |r| {
+            r.get(0)
+        })
+        .expect("one packed extent")
+    });
+    let id = ExtentId::new(id);
+    let plan = rig
+        .bridge
+        .catalog
+        .articles(&id)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::articles", "Ok", e));
+    expect(s, "several articles", plan.len() >= 3, plan.len());
+    expect_eq(
+        s,
+        "article rows",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM articles"),
+    );
+    expect_eq(
+        s,
+        "reposts stamped before any",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM extents WHERE reposted_at IS NOT NULL"),
+    );
+
+    let s = "repair";
+    let lost = &plan[1].message_id;
+    rig.server.hide(lost).await;
+    let posted_at = rig.sql_count("SELECT posted_at FROM extents WHERE plan IS NOT NULL");
+    rig.pump(s).await;
+    expect(
+        s,
+        "the article is back",
+        !rig.server.is_hidden(lost).await,
+        "still hidden",
+    );
+    let reposted_at = rig.sql_count("SELECT reposted_at FROM extents WHERE plan IS NOT NULL");
+    expect(
+        s,
+        "the repost is stamped on the extent, after the post",
+        reposted_at > posted_at,
+        format!("posted {posted_at}, reposted {reposted_at}"),
+    );
+    let now = rig
+        .bridge
+        .catalog
+        .articles(&id)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::articles", "Ok", e));
+    expect(
+        s,
+        "the plan is the same articles",
+        velmora_bridge::plan::same_plan(&plan, &now),
+        "the plan changed",
+    );
+    expect(
+        s,
+        "every article carries the repost time (the plan has one stamp)",
+        now.iter()
+            .all(|a| a.reposted_at == Some(UnixMs(reposted_at))),
+        format!(
+            "{:?}",
+            now.iter().map(|a| a.reposted_at).collect::<Vec<_>>()
+        ),
+    );
+    // The pump stops once nothing is in post or verify: the release
+    // waits for the minimum age after the repost, not after the post.
+    expect_eq(
+        s,
+        "release due",
+        reposted_at + 3_600_000,
+        rig.sql_count("SELECT next_at FROM outbox WHERE stage = 'release'"),
+    );
+    expect_eq(
+        s,
+        "article rows",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM articles"),
+    );
+    let r = rig.get("/slice/r/one.bin").await;
+    expect_status(s, "GET r/one.bin", 200, &r);
+    expect_bytes(s, "GET r/one.bin body", &body, &r.body);
+}
+
+/// What D1 bills, in rows written, for an object over its whole life:
+/// upload, post, verification on two backbones, a day's wait and the
+/// release. Objects of one and of three 16 MiB extents give the cost of an
+/// extent and the cost of an object apart from its extents. Returns
+/// `(rows per extent, rows per object, bytes kept per extent)`: the bytes
+/// are what the catalogue holds for a released extent (`dbstat`, without
+/// the free space of its pages).
+async fn rows_written(packed_plans: &str) -> (u64, u64, i64) {
+    const DAY: u32 = 86_400;
+    const EXTENT: usize = 16 * MIB;
+    let rig = Rig::with_backbones(
+        &[
+            ("SAFETY_MIN_AGE_SECS", "86400"),
+            ("REQUIRED_BACKBONES", "2"),
+            ("VERIFY_DELAY_SECS", "120"),
+            ("MAX_PUT_BYTES", "103809024"),
+            ("PACKED_PLANS", packed_plans),
+        ],
+        2,
+    )
+    .await;
+    let s = "rows written";
+    rig.setup_buckets_and_key(s).await;
+    let sql = &rig.bridge.catalog.sql;
+
+    let cases = [("multipart x1", 1usize), ("multipart x3", 3)];
+    let mut totals = Vec::new();
+    for (i, (label, extents)) in cases.iter().enumerate() {
+        let body = test_bytes(40 + i as u8, extents * EXTENT);
+        let path = format!("/slice/w/{i}.bin");
+        let start = sql.writes();
+        let used_before = rig.db_used();
+        let r = rig.multipart_put(s, &path, &body, EXTENT).await;
+        expect_status(s, "CompleteMultipartUpload", 200, &r);
+        let uploaded = sql.writes();
+        rig.pump(s).await;
+        let verified = sql.writes();
+        rig.bridge.clock.advance_secs(DAY + 600);
+        for _ in 0..20 {
+            if rig.sql_count("SELECT COUNT(*) FROM outbox WHERE stage <> 'done'") == 0 {
+                break;
+            }
+            rig.tick(s).await;
+            rig.bridge.clock.advance_secs(CRON_SECS);
+        }
+        expect_eq(
+            s,
+            "outbox rows not done",
+            0,
+            rig.sql_count("SELECT COUNT(*) FROM outbox WHERE stage <> 'done'"),
+        );
+        let released = sql.writes();
+        println!("== PACKED_PLANS={packed_plans}, {label}: {extents} extent(s)");
+        println!("-- upload\n{}", uploaded.since(&start).render());
+        println!("-- post and verify\n{}", verified.since(&uploaded).render());
+        println!("-- release\n{}", released.since(&verified).render());
+        println!(
+            "== {label}: upload {} + post and verify {} + release {}",
+            uploaded.since(&start).billed(),
+            verified.since(&uploaded).billed(),
+            released.since(&verified).billed()
+        );
+        let used = rig.db_used();
+        let mut grew: Vec<(i64, &String)> = used
+            .iter()
+            .map(|(name, bytes)| (bytes - used_before.get(name).copied().unwrap_or(0), name))
+            .filter(|(bytes, _)| *bytes != 0)
+            .collect();
+        grew.sort_by_key(|(bytes, _)| std::cmp::Reverse(*bytes));
+        println!("-- bytes kept");
+        for (bytes, name) in &grew {
+            println!("{bytes:>8}  {name}");
+        }
+        let kept: i64 = grew.iter().map(|(bytes, _)| bytes).sum();
+        totals.push((*extents as u64, released.since(&start).billed(), kept));
+        // The object reads back whole from Usenet in either form.
+        let r = rig.get(&path).await;
+        expect_status(s, "GetObject after the release", 200, &r);
+        expect_eq(
+            s,
+            "body after the release",
+            hex(&sha256(&body)),
+            hex(&sha256(&r.body)),
+        );
+    }
+    let (e1, w1, b1) = totals[0];
+    let (e3, w3, b3) = totals[1];
+    let per_extent = (w3 - w1) / (e3 - e1);
+    let per_object = w1 - per_extent * e1;
+    let bytes = (b3 - b1) / (e3 - e1) as i64;
+    println!(
+        "rows written, PACKED_PLANS={packed_plans}: {per_extent} per extent + {per_object} per object"
+    );
+    // 10^12 bytes of 16 MiB extents.
+    let per_tb = 1_000_000_000_000 / EXTENT as i64;
+    println!(
+        "bytes kept, PACKED_PLANS={packed_plans}: {bytes} per extent, {:.3} GB per TB \
+         ({:.2} M rows written per TB)",
+        (bytes * per_tb) as f64 / 1e9,
+        (per_extent as i64 * per_tb) as f64 / 1e6,
+    );
+    (per_extent, per_object, bytes)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rows_written_per_extent() {
+    let rows = rows_written("off").await;
+    let packed = rows_written("on").await;
+    println!(
+        "rows written per extent: {} as rows, {} packed",
+        rows.0, packed.0
+    );
+    // A packed plan costs two writes however many articles it has: the
+    // plan and the stamp. As rows, every article is three (the row, its
+    // message-id index entry, the posted mark).
+    assert!(rows.0 >= packed.0 + 3 * 24 - 2, "{rows:?} {packed:?}");
+    // The whole life of an extent and of an object: a change that adds a
+    // write to either shows up here.
+    assert!(
+        packed.0 <= 63,
+        "rows written per packed extent: {}",
+        packed.0
+    );
+    assert!(packed.1 <= 18, "rows written per object: {}", packed.1);
+    // What a 16 MiB extent keeps in the catalogue for good: 0.15 GB per
+    // TB is 2,516 bytes an extent.
+    assert!(
+        packed.2 <= 2_400,
+        "bytes kept per packed extent: {}",
+        packed.2
+    );
+    assert!(rows.2 >= 5 * packed.2, "{rows:?} {packed:?}");
 }
 
 #[test]

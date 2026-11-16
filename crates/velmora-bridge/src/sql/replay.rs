@@ -126,19 +126,34 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
             ms(e.created_at),
         ],
     ));
-    if let Some(plan) = &x.plan {
-        for a in plan {
-            out.push(article_insert(a)?);
-        }
-        out.push((
-            "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
+    match (&x.plan, &x.packed) {
+        // The packed plan goes on the extent's row, and no article row
+        // is written. An extent that has a plan keeps it, as with rows.
+        (Some(plan), Some(packed)) => out.push((
+            "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
              WHERE id = ?1 AND article_count IS NULL",
             vec![
                 id(),
                 SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
                 SqlValue::Int(i64::from(e.plan_rev)),
+                SqlValue::Blob(packed.clone()),
             ],
-        ));
+        )),
+        (Some(plan), None) => {
+            for a in plan {
+                out.push(article_insert(a)?);
+            }
+            out.push((
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
+                 WHERE id = ?1 AND article_count IS NULL",
+                vec![
+                    id(),
+                    SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
+                    SqlValue::Int(i64::from(e.plan_rev)),
+                ],
+            ));
+        }
+        (None, _) => {}
     }
     if !x.safety_present {
         // The pinned copy is given up only after the articles were read
@@ -157,6 +172,12 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
         out.push((
             "UPDATE articles SET state = 'posted' WHERE extent_id = ?1 AND state = 'planned'",
             vec![id()],
+        ));
+        // The same for a packed plan: posted, at a time nobody knows.
+        out.push((
+            "UPDATE extents SET posted_at = ?2 \
+             WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL",
+            vec![id(), SqlValue::Int(crate::plan::POSTED_AT_UNKNOWN)],
         ));
     }
     Ok(())
@@ -195,6 +216,7 @@ pub(super) async fn replay_damaged<S: Sql>(
     const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM generation_extents ge \
          JOIN extents e ON e.id = ge.extent_id \
          WHERE ge.generation_id = o.generation_id AND e.safety_state = 'deleted' \
+           AND e.plan IS NULL \
            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))";
     let count = c
         .sql
@@ -560,7 +582,7 @@ pub(super) async fn restore_advance<S: Sql>(
 }
 
 /// An extent with neither a pinned copy nor an article plan.
-const NO_COPY: &str = "e.safety_state = 'deleted' \
+const NO_COPY: &str = "e.safety_state = 'deleted' AND e.plan IS NULL \
      AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id)";
 
 /// Extent ids per statement of [`has_lost_extent`].
@@ -684,7 +706,7 @@ pub(super) async fn replay_publish<S: Sql>(
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations \
            WHERE bucket_id = ?2 AND key = ?3 AND id < ?1) \
          AND EXISTS (SELECT 1 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' \
+          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' AND e.plan IS NULL \
             AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))",
         vec![gen_id(), bucket(), text(&g.key)],
     ));

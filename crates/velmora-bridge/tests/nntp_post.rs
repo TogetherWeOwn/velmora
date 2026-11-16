@@ -149,7 +149,9 @@ async fn crash_after_post_reposts_the_same_id() {
     let rig = simple_rig().await;
     let s = rig.seed(2, &marked_plaintext(PLAIN_LEN)).await;
 
-    rig.bridge.catalog.fail_mark_posted.set(1);
+    // Both tries of the one write that records the plan fail: the job
+    // ends as a job that died before it.
+    rig.bridge.catalog.fail_mark_posted.set(2);
     assert_eq!(retry_delay(&rig.run_post(&s).await), 60);
     let planned = rig.plan(&s).await;
     assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
@@ -177,7 +179,9 @@ async fn dup_unconfirmed_keeps_message_id() {
     let rig = simple_rig().await;
     let s = rig.seed(3, &marked_plaintext(PLAIN_LEN)).await;
 
-    rig.bridge.catalog.fail_mark_posted.set(1);
+    // Both tries of the one write that records the plan fail: the job
+    // ends as a job that died before it.
+    rig.bridge.catalog.fail_mark_posted.set(2);
     rig.run_post(&s).await;
     let planned = rig.plan(&s).await;
 
@@ -415,7 +419,9 @@ async fn fenced_advance_leaves_the_stage_alone() {
 
 /// The permit slot is taken over mid-stage: at the next renewal the
 /// socket is dropped and the job is deferred, with nothing more posted on
-/// the lost slot. What was accepted before is recorded.
+/// the lost slot. A plan is recorded as posted only as a whole, so the
+/// catalogue still has every article as planned; the next run posts the
+/// same ids and stores nothing twice.
 #[tokio::test]
 async fn lost_permit_stops_posting() {
     let rig = simple_rig().await;
@@ -436,14 +442,22 @@ async fn lost_permit_stops_posting() {
     assert_eq!(outbox.attempts, 0);
     assert_eq!(outbox.stage, OutboxStage::Post);
     let plan = rig.plan(&s).await;
-    let posted = plan.iter().filter(|a| a.state == ArticleState::Posted);
-    assert_eq!(posted.count(), stored);
+    assert!(plan.iter().all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 0);
+
+    rig.bridge.clock.advance_secs(600);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let done = rig.plan(&s).await;
+    assert_eq!(ids(&done), ids(&plan));
+    assert!(done.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(rig.server().posted_ids().await, bracketed(&done));
 }
 
 /// The lease and the permit are renewed on a timer, not per article, and
-/// the accepted articles are recorded in batches.
+/// the accepted articles are recorded in one write, when the last of
+/// them is posted.
 #[tokio::test]
-async fn renews_on_a_timer_and_marks_in_batches() {
+async fn renews_on_a_timer_and_records_once() {
     let rig = simple_rig().await;
     let s = rig.seed(26, &marked_plaintext(LONG_PLAIN_LEN)).await;
 
@@ -458,8 +472,8 @@ async fn renews_on_a_timer_and_marks_in_batches() {
     assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
     // Once before the first POST, once when the timer ran out.
     assert_eq!(rig.bridge.catalog.renewals.get(), 2);
-    // At that renewal and at the end.
-    assert_eq!(rig.bridge.catalog.mark_batches.get(), 2);
+    // Not at that renewal: once, at the end.
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 1);
     // The renewal moved the lease forward; the stage then let it go.
     assert_eq!(
         rig.bridge.catalog.outbox(&s.extent).stage,
@@ -474,7 +488,9 @@ async fn repost_is_byte_identical() {
     let rig = simple_rig().await;
     let s = rig.seed(25, &marked_plaintext(PLAIN_LEN)).await;
 
-    rig.bridge.catalog.fail_mark_posted.set(1);
+    // Both tries of the one write that records the plan fail: the job
+    // ends as a job that died before it.
+    rig.bridge.catalog.fail_mark_posted.set(2);
     rig.run_post(&s).await;
     let id = rig.plan(&s).await[0].message_id.clone();
     let mut client = rig.raw_client(0).await;
