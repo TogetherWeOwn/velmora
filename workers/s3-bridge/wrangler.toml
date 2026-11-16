@@ -98,9 +98,11 @@ SERVER_SIDE_COPY = "on"
 # sub-ranges of this size: the invocation that answers the client asks
 # this Worker for each sub-range in turn through the SELF binding below,
 # and each of those runs under its own CPU limit. One invocation reads
-# about 9 GiB within cpu_ms, so 1 GiB leaves a wide margin. From 1 MiB to
-# 4 GiB; unset or "0" serves every GET in one invocation. A GET of more
-# than 8,192 sub-ranges (8 TiB at 1 GiB) is refused.
+# about 9 GiB from the cache within cpu_ms, and about 4 GiB from Usenet,
+# so 1 GiB leaves a wide margin. From 1 MiB to 2 GiB; unset or "0"
+# serves every GET in one invocation. A GET of more than 8,192
+# sub-ranges (8 TiB at 1 GiB) is refused. See "A GET above
+# GET_FANOUT_BYTES" in ops/README.md.
 GET_FANOUT_BYTES = "1073741824"
 
 # This Worker, bound to itself: `service` must be the name above. The

@@ -143,6 +143,12 @@ impl SubPipe for SelfPipe {
         out
     }
 
+    async fn discard(&self, body: JsValue) {
+        if !body.is_null() && !body.is_undefined() {
+            let _ = call(&body, "cancel", &[]).await;
+        }
+    }
+
     async fn sleep(&self, ms: u32) {
         worker::Delay::from(Duration::from_millis(u64::from(ms))).await;
     }
@@ -218,6 +224,7 @@ pub async fn respond(env: &Env, ctx: &Context, resp: S3Response) -> (u16, Respon
             .with_encode_body(EncodeBody::Manual))
     })();
     let Ok(resp) = built else {
+        pipe.discard(first).await;
         pipe.abort().await;
         return refuse(IngressError::Internal.response());
     };

@@ -58,6 +58,7 @@ struct Loopback<'a> {
     out: RefCell<Vec<u8>>,
     closed: Cell<bool>,
     aborted: Cell<bool>,
+    discarded: Cell<u32>,
 }
 
 impl<'a> Loopback<'a> {
@@ -70,6 +71,7 @@ impl<'a> Loopback<'a> {
             out: RefCell::default(),
             closed: Cell::new(false),
             aborted: Cell::new(false),
+            discarded: Cell::new(0),
         }
     }
 }
@@ -137,6 +139,10 @@ impl SubPipe for Loopback<'_> {
             }
             _ => Vec::new(),
         }
+    }
+
+    async fn discard(&self, _: Self::Body) {
+        self.discarded.set(self.discarded.get() + 1);
     }
 
     async fn sleep(&self, ms: u32) {
@@ -422,6 +428,8 @@ async fn a_sub_range_that_cannot_start_is_retried_then_aborts() {
         [0, 1, 1, 1]
     );
     assert_eq!(*pipe.slept.borrow(), [500, 2000]);
+    // No refusal is left unread: each of the three was cancelled.
+    assert_eq!(pipe.discarded.get(), 3);
 }
 
 #[tokio::test]
@@ -501,17 +509,23 @@ async fn every_sub_range_comes_from_the_generation_the_front_planned() {
     let (rig, bucket, signer, old) = seeded(Some(CHUNK)).await;
     let planned = rig.live(&bucket, "big").await.unwrap().0.id;
     let (_, _, fan) = fanout_of(front(&rig, &signer, "big", &[]).await);
+    let pipe = Loopback::new(&rig);
+    let first = fan
+        .open_first(&pipe, || S3Response::error(500, "InternalError", "x"))
+        .await
+        .unwrap();
 
-    // After the first sub-range the key is overwritten with other bytes
-    // of the same length.
+    // With the download under way (the first sub-range is open, no other
+    // has been asked for) the key is overwritten with other bytes of the
+    // same length.
     let new = pattern(99, SIZE);
     rig.bridge.clock.advance_ms(5);
     rig.put(&signer, BUCKET, "big", &new).await.expect(200);
     let live = rig.live(&bucket, "big").await.unwrap().0.id;
     assert_ne!(live, planned);
 
-    let pipe = Loopback::new(&rig);
-    drive(&fan, &pipe).await.unwrap();
+    fan.pump(&pipe, first).await.unwrap();
+    assert!(pipe.sent.borrow().len() > 2);
     // Every byte is the old object's: no sub-range saw the new one.
     assert_eq!(*pipe.out.borrow(), old);
     let now = rig.now();

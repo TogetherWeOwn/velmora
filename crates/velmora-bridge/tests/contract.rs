@@ -323,15 +323,15 @@ fn config_loads_from_documented_vars() {
         assert_eq!(load(&sized).unwrap().hot_cap_bytes, want, "{value:?}");
     }
     // Dev serves a GET above 8 MiB in sub-ranges. Absent, empty or 0:
-    // never in sub-ranges; a size outside 1 MiB..=4 GiB is refused.
+    // never in sub-ranges; a size outside 1 MiB..=2 GiB is refused.
     assert_eq!(cfg.get_fanout_bytes, Some(8 << 20));
     for (value, want) in [
         ("", Some(None)),
         ("0", Some(None)),
         ("1048575", None),
         ("1048576", Some(Some(1 << 20))),
-        ("4294967296", Some(Some(1 << 32))),
-        ("4294967297", None),
+        ("2147483648", Some(Some(1 << 31))),
+        ("2147483649", None),
         ("1g", None),
         ("-1", None),
     ] {

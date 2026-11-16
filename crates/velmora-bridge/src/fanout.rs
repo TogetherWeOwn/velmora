@@ -44,6 +44,7 @@
 //! `503` is retried a few times first, since nothing of that sub-range
 //! has been sent yet.
 
+use std::cell::Cell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -58,20 +59,28 @@ use crate::types::{BucketId, GenerationId, KekBytes, RespBody, S3Request, S3Resp
 
 /// Origin-form target of a sub-request.
 pub const INTERNAL_TARGET: &str = "/_fanout";
-/// The header that carries the token.
-pub const TOKEN_HEADER: &str = "x-velmora-fanout";
+/// The header that carries the token. Its name has `token` in it: the
+/// platform's request logs leave out the value of such a header.
+pub const TOKEN_HEADER: &str = "x-velmora-fanout-token";
 /// How long a token is good for, from the moment the front mints it. It
 /// only has to cover the start of one sub-request; the front mints one
 /// per sub-request, just before it is sent.
 pub const TOKEN_TTL_MS: i64 = 120_000;
 /// Smallest and largest `GET_FANOUT_BYTES`. The upper bound keeps one
-/// sub-range well inside the CPU budget of one invocation.
+/// sub-range well inside the CPU budget of one invocation (300 s): a
+/// sub-range read from Usenet took about 67 s of CPU per GiB on a
+/// deployed Worker, one read from the cache 20 to 40 s.
 pub const MIN_FANOUT_BYTES: u64 = 1024 * 1024;
-pub const MAX_FANOUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// Most sub-ranges one GET may have: under the default subrequest limit
-/// of an invocation (10,000), with room for the catalogue round trips of
-/// the front and for retries.
+pub const MAX_FANOUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Most sub-ranges one GET may have. With [`MAX_RETRIES`] and the
+/// catalogue round trips of the front it stays under the subrequest
+/// limit of an invocation (10,000). Calls through a service binding one
+/// after the other count against that limit and no other: one request
+/// to a deployed Worker made 9,000 of them.
 pub const MAX_SUBRANGES: u64 = 8192;
+/// Most retries in one download, over all its sub-ranges.
+pub const MAX_RETRIES: u32 = 1024;
+const _: () = assert!(MAX_SUBRANGES + (MAX_RETRIES as u64) < 9_500);
 
 /// Attempts at one sub-request before the download is given up, and the
 /// pause before the second and the third.
@@ -298,6 +307,8 @@ pub struct Fanout {
     chunk: u64,
     /// Mints the token for `(start, len)`; `None` if it cannot.
     mint: Rc<dyn Fn(u64, u64) -> Option<String>>,
+    /// Retries left to this download ([`MAX_RETRIES`]).
+    retries: Cell<u32>,
 }
 
 impl fmt::Debug for Fanout {
@@ -346,6 +357,9 @@ pub trait SubPipe {
     async fn pipe(&self, body: Self::Body) -> Result<(), FanoutError>;
     /// At most `cap` bytes of a refusal's body. Best effort.
     async fn refusal(&self, body: Self::Body, cap: usize) -> Vec<u8>;
+    /// Cancels a body that will not be read, so the invocation that
+    /// makes it stops now and gives back what it holds.
+    async fn discard(&self, body: Self::Body);
     async fn sleep(&self, ms: u32);
     /// Ends the client's stream as complete.
     async fn close(&self) -> Result<(), FanoutError>;
@@ -372,6 +386,7 @@ impl Fanout {
             len,
             chunk,
             mint,
+            retries: Cell::new(MAX_RETRIES),
         })
     }
 
@@ -426,9 +441,13 @@ impl Fanout {
             let resp = pipe.open(&sub).await.map_err(|e| (e, None))?;
             match resp.status {
                 200 if resp.length == Some(sub.len) => return Ok(resp.body),
-                200 => return Err((FanoutError::Length, None)),
-                503 if attempt < RETRY_PAUSE_MS.len() => {
-                    drop(resp.body);
+                200 => {
+                    pipe.discard(resp.body).await;
+                    return Err((FanoutError::Length, None));
+                }
+                503 if attempt < RETRY_PAUSE_MS.len() && self.retries.get() > 0 => {
+                    self.retries.set(self.retries.get() - 1);
+                    pipe.discard(resp.body).await;
                     pipe.sleep(RETRY_PAUSE_MS[attempt]).await;
                     attempt += 1;
                 }
@@ -458,7 +477,12 @@ impl Fanout {
                 resp.headers.push(("retry-after".into(), "30".into()));
                 Err(resp)
             }
-            Err(_) => Err(fallback()),
+            Err((_, body)) => {
+                if let Some(body) = body {
+                    pipe.discard(body).await;
+                }
+                Err(fallback())
+            }
         }
     }
 
@@ -469,8 +493,15 @@ impl Fanout {
         let run = async {
             pipe.pipe(first).await?;
             for index in 1..self.count() {
-                let body = self.open(pipe, index).await.map_err(|(e, _)| e)?;
-                pipe.pipe(body).await?;
+                match self.open(pipe, index).await {
+                    Ok(body) => pipe.pipe(body).await?,
+                    Err((e, body)) => {
+                        if let Some(body) = body {
+                            pipe.discard(body).await;
+                        }
+                        return Err(e);
+                    }
+                }
             }
             pipe.close().await
         };

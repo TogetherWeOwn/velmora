@@ -535,7 +535,7 @@ STEP=1a-get-in-sub-ranges
 log "step $STEP"
 # The route of a sub-request is not for clients: without a token, with a
 # made-up one, and with a valid S3 signature it is refused.
-for hdr in 'x-none: 1' 'x-velmora-fanout: v1.1.9999999999999.0.1.b.g.00'; do
+for hdr in 'x-none: 1' 'x-velmora-fanout-token: v1.1.9999999999999.0.1.b.g.00'; do
   code=$(curl -sS "${CURL_TLS[@]}" -o "$T/fan.out" -w '%{http_code}' --max-time 60 -H "$hdr" "$BASE/_fanout") ||
     fail "GET /_fanout ($hdr)" "an HTTP answer" "curl failed"
   [[ $code == 403 ]] || fail "GET /_fanout ($hdr)" "403" "$code $(head -c 300 "$T/fan.out")"
