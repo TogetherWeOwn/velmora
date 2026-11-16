@@ -117,6 +117,35 @@ about 100 catalogue calls and 1,000 store calls (before: about 7,000 and
 key that keeps meeting newer writes ends as `SlowDown` after four
 tries, as before.
 
+### The answer of a long DeleteObjects
+
+The tombstone puts take time: a request of 1,000 keys can take longer
+than a client waits for an answer (aws-cli: 60 s with nothing read).
+So DeleteObjects answers the way S3 does for long operations:
+
+- Everything that can fail the request comes first: authentication,
+  the gates, the integrity check and the reading of the document. A
+  failure there is answered with its status code, as before.
+- After that the answer is `200`. When all keys are settled within
+  2 s, the `DeleteResult` is sent as one buffered body with its
+  length, byte for byte as before.
+- Otherwise the headers go out at 2 s, with
+  `<?xml version="1.0" encoding="UTF-8"?>` at once, then one newline
+  every 5 s while the keys are deleted, then the `DeleteResult`. White
+  space between the declaration and the root element is allowed by the
+  XML grammar; aws-cli and the JS SDK v3 read it. The streamed body
+  carries `cache-control: no-transform` and no length.
+- A failure once the headers are out is the answer of the keys it hits
+  (`InternalError`, `ServiceUnavailable` or `SlowDown`, as above). The
+  body always ends with a whole `DeleteResult`. If the work ends without
+  its answer, or has not answered after 10 minutes, every key is
+  reported `InternalError`, and the request can be sent again.
+- The deletes run apart from the body, so a client that stops reading
+  does not stop them at once. But the runtime gives them at most 30 s
+  more once the client is gone. Keys not done by then stay as they are
+  (each key is deleted whole or not at all, its tombstone first), and
+  the client sends the request again to finish them.
+
 ## Limits
 
 - The answer `412`/`404` is given only when the recovery record of the

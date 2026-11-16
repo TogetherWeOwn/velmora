@@ -4,10 +4,17 @@
 //! in hex) and asks R2 to check the body against `cipher_sha256`, so a
 //! corrupted upload is refused rather than stored. A ranged `get` returns
 //! exactly the span or fails. Errors carry the operation class only.
+//!
+//! Dev only: `DEV_TOMBSTONE_PUT_DELAY_MS` makes every put of a tombstone
+//! record to the safety store wait that long first (a slow store), so the
+//! local acceptance run can make a DeleteObjects outlast a client's read
+//! timeout. Outside `ENVIRONMENT=dev` the variable is ignored.
 
 use std::collections::HashMap;
 
-use velmora_bridge::recovery::{is_protected_key, Unpublished, ERR_RECORD_DELETE};
+use velmora_bridge::recovery::{
+    is_protected_key, Unpublished, ERR_RECORD_DELETE, TOMBSTONE_PREFIX,
+};
 use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
 use worker::{Bucket, Range};
 
@@ -16,11 +23,45 @@ const MAX_SAFE_OFFSET: u64 = (1 << 53) - 1;
 
 pub struct R2Blobs {
     bucket: Bucket,
+    /// Dev only: the wait before a tombstone put, in milliseconds.
+    tombstone_delay_ms: u32,
+}
+
+/// Name of the dev-only tombstone put delay variable.
+pub const DEV_TOMBSTONE_PUT_DELAY_MS: &str = "DEV_TOMBSTONE_PUT_DELAY_MS";
+
+/// Most a tombstone put may be held back.
+const MAX_TOMBSTONE_DELAY_MS: u32 = 60_000;
+
+/// `dev` is the validated environment. Outside dev the value is never
+/// read (0). In dev, absent or empty is 0, and anything other than an
+/// integer up to [`MAX_TOMBSTONE_DELAY_MS`] is refused.
+pub fn tombstone_delay_from_var(dev: bool, raw: Option<&str>) -> std::result::Result<u32, String> {
+    if !dev {
+        return Ok(0);
+    }
+    match raw.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(v) => v
+            .parse::<u32>()
+            .ok()
+            .filter(|ms| *ms <= MAX_TOMBSTONE_DELAY_MS)
+            .ok_or_else(|| format!("invalid {DEV_TOMBSTONE_PUT_DELAY_MS}")),
+    }
 }
 
 impl R2Blobs {
     pub fn new(bucket: Bucket) -> Self {
-        R2Blobs { bucket }
+        R2Blobs {
+            bucket,
+            tombstone_delay_ms: 0,
+        }
+    }
+
+    /// Dev only (see the module docs).
+    pub fn with_tombstone_delay(mut self, ms: u32) -> Self {
+        self.tombstone_delay_ms = ms;
+        self
     }
 }
 
@@ -65,6 +106,10 @@ fn empty_span(span: ByteSpan, size: u64) -> Result<Vec<u8>> {
 
 impl BlobStore for R2Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        if self.tombstone_delay_ms > 0 && key.starts_with(TOMBSTONE_PREFIX) {
+            let wait = std::time::Duration::from_millis(u64::from(self.tombstone_delay_ms));
+            worker::Delay::from(wait).await;
+        }
         self.bucket
             .put(key, bytes)
             .custom_metadata(custom_metadata(meta))

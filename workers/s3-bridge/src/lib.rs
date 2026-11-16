@@ -24,8 +24,11 @@ use std::task::{Poll, Waker};
 
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
+use velmora_bridge::keepalive;
 use velmora_bridge::service::classify;
-use velmora_bridge::{BridgeError, Job, JobOutcome, OutboxStage, S3Response, UnixMs, JOB_VERSION};
+use velmora_bridge::{
+    BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
+};
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt,
     QueueRetryOptionsBuilder, Request, Response, Result, ScheduleContext, ScheduledEvent,
@@ -56,7 +59,11 @@ struct Slot {
 
 /// Runs `Bridge::handle` under `waitUntil`, so a client disconnect does not
 /// strand it mid-await: the runtime keeps driving it, a withheld body then
-/// fails its read, and every budget `Charge` it holds is dropped.
+/// fails its read, and every budget `Charge` it holds is dropped. The work
+/// of a deferred body (DeleteObjects) runs there too, after the response
+/// is handed over, so dropping the body does not stop it. Once the client
+/// is gone the runtime gives `waitUntil` at most 30 s more: keys not done
+/// by then stay as they are, and a re-send of the request finishes them.
 async fn handle_detached(
     ctx: &Context,
     bridge: Rc<env::WorkerBridge>,
@@ -65,11 +72,20 @@ async fn handle_detached(
     let slot = Rc::new(RefCell::new(Slot::default()));
     let tx = Rc::clone(&slot);
     ctx.wait_until(async move {
-        let resp = bridge.handle(req).await;
-        let mut s = tx.borrow_mut();
-        s.resp = Some(resp);
-        if let Some(w) = s.waker.take() {
-            w.wake();
+        let mut resp = bridge.handle(req).await;
+        let work = match &mut resp.body {
+            RespBody::Deferred(d) => d.take_work(),
+            _ => None,
+        };
+        {
+            let mut s = tx.borrow_mut();
+            s.resp = Some(resp);
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
+        }
+        if let Some(work) = work {
+            work.await;
         }
     });
     poll_fn(|cx| {
@@ -115,7 +131,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let route = classify(&incoming.req.method, &target);
     let resp = match ingress::precheck(&route, &incoming.req, &bridge.cfg, incoming.https) {
         Err(e) => e.response(),
-        Ok(()) => handle_detached(&ctx, Rc::clone(&bridge), incoming.req).await,
+        Ok(()) => {
+            let resp = handle_detached(&ctx, Rc::clone(&bridge), incoming.req).await;
+            // A deferred document: buffered when it is done soon, else
+            // streamed with keepalive whitespace.
+            keepalive::settle_response(resp, env::sleeper()).await
+        }
     };
     console_log!(
         "{}",

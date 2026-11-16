@@ -1440,6 +1440,10 @@ pub enum RespBody {
     Empty,
     Bytes(Vec<u8>),
     Stream(ByteStream),
+    /// An XML document that is still being computed: buffered when it is
+    /// done soon, else streamed with keepalive whitespace (see
+    /// [`crate::keepalive`]).
+    Deferred(crate::keepalive::Deferred),
 }
 
 /// One response.

@@ -23,7 +23,7 @@ use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
 use crate::nntp::WorkerConnector;
 use crate::queues::{DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
-use crate::r2::R2Blobs;
+use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
 /// Wall clock of the Workers runtime (advances on I/O only).
@@ -108,8 +108,9 @@ pub fn bridge(env: &Env) -> Result<Rc<WorkerBridge>, String> {
     Ok(b)
 }
 
-/// Lets a request wait for budget without reading its body.
-fn sleeper() -> Sleeper {
+/// Lets a request wait for budget without reading its body, and paces the
+/// keepalive of a deferred document.
+pub fn sleeper() -> Sleeper {
     Rc::new(|ms| Box::pin(worker::Delay::from(Duration::from_millis(u64::from(ms)))))
 }
 
@@ -119,13 +120,16 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let cfg = BridgeConfig::from_vars(get).map_err(|e| e.to_string())?;
     let kek = KekRing::from_vars(cfg.kek_active, get).map_err(|e| e.to_string())?;
     let drop_notify = DropNotify::from_var(cfg.is_dev(), get(DEV_DROP_NOTIFY_N).as_deref())?;
+    let tombstone_delay =
+        tombstone_delay_from_var(cfg.is_dev(), get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
     if memory_log_from_var(cfg.is_dev(), get(DEV_MEMORY_LOG).as_deref())? {
         MEMORY_LOG.with(|c| c.set(Some(WorkerClock.now().0)));
     }
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
     Ok(Bridge {
         catalog: SqlCatalog::new(D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)),
-        safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?),
+        safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)
+            .with_tombstone_delay(tombstone_delay),
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
         nntp: WorkerConnector::new(),
         jobs: QueueSink::new(
@@ -165,6 +169,23 @@ mod tests {
         // Outside dev the value is never read.
         for raw in [None, Some("on"), Some("garbage")] {
             assert_eq!(memory_log_from_var(false, raw), Ok(false));
+        }
+    }
+
+    #[test]
+    fn tombstone_delay_is_dev_only_and_refuses_garbage() {
+        for raw in [None, Some(""), Some(" ")] {
+            assert_eq!(tombstone_delay_from_var(true, raw), Ok(0));
+        }
+        assert_eq!(tombstone_delay_from_var(true, Some("1500")), Ok(1500));
+        assert_eq!(tombstone_delay_from_var(true, Some("60000")), Ok(60_000));
+        for raw in ["60001", "-1", "1.5", "slow"] {
+            let err = tombstone_delay_from_var(true, Some(raw)).unwrap_err();
+            assert_eq!(err, "invalid DEV_TOMBSTONE_PUT_DELAY_MS");
+        }
+        // Outside dev the value is never read.
+        for raw in [None, Some("1500"), Some("garbage")] {
+            assert_eq!(tombstone_delay_from_var(false, raw), Ok(0));
         }
     }
 }
