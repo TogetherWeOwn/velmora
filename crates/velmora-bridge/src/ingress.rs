@@ -392,6 +392,11 @@ where
     F: FnOnce(S3Request) -> Fut,
     Fut: core::future::Future<Output = S3Response>,
 {
+    // A sub-range request between invocations carries no S3 credential:
+    // its token is its whole authority, and the handler checks it.
+    if crate::fanout::is_internal_target(&req.raw_target) {
+        return handle(req).await;
+    }
     let admin = is_admin_target(&req.raw_target);
     let checked = {
         let route = classify(&req.method, &req.raw_target);

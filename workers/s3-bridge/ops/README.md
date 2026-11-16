@@ -562,6 +562,77 @@ ahead of it (a later phase, a later record, another restore point)
 answers 400, so no part of the records can be left out; a cursor that
 is behind repeats a step, which changes nothing.
 
+## A GET above GET_FANOUT_BYTES
+
+One invocation has `cpu_ms` of CPU (300 s), and every byte of a GET is
+decrypted in it: a single GET stopped after about 9 GiB read from the
+cache, with `exceededCpu`. A GET, whole or ranged, of more plaintext
+than `GET_FANOUT_BYTES` (shipped: 1 GiB) is therefore served in
+sub-ranges of that size. The invocation that answers the client checks
+the signature and the grant and sends the headers, the same as for any
+GET; it then asks this Worker for one sub-range after the other through
+the `SELF` service binding, and the runtime moves each answer into the
+client's response. Each sub-range is an invocation of its own, with its
+own `cpu_ms`. A smaller GET is served as before.
+
+- **The binding.** `[[services]] binding = "SELF"` must name this
+  Worker (`service` equal to `name`; each environment names its own).
+  Without it a GET above the size answers 500 and logs `fanout: no
+  service binding or stream`; smaller GETs are not affected.
+- **A sub-request** is `GET /_fanout` with one header that carries a
+  token: bucket id, generation id, offset, length and an expiry of two
+  minutes, under an HMAC keyed from the active KEK. It is refused (403)
+  if it carries a header that the edge adds to a request from the
+  Internet, or if the token does not verify. Every sub-range of one
+  download is read from the generation the first invocation found,
+  whatever is written to the key meanwhile.
+- **A failure after the first byte** cannot change the status line. The
+  response has a `Content-Length`, and the stream is aborted: the client
+  sees a broken transfer, never a short one that looks complete. The log
+  has `fanout: download aborted (<class>)`. The client asks again with
+  `Range: bytes=<received>-` and `If-Match: <the ETag it was sent>`:
+  each request reads the object that is live when it arrives, and
+  without the condition a key written to meanwhile would give the rest
+  of another object (with it: 412). A sub-range after the first that
+  answers 503 before its first byte is asked for again, up to three
+  times, before the download is given up; a 503 of the first sub-range
+  is the answer to the client.
+- **Limits.** `GET_FANOUT_BYTES` is from 1 MiB to 2 GiB; a GET of more
+  than 8,192 sub-ranges (8 TiB at 1 GiB) is refused with 500 before any
+  byte. Sub-requests count against the subrequest limit of the first
+  invocation (10,000) and are not billed as requests; their CPU is.
+  One download of 100 sub-ranges was read whole on a deployed Worker.
+  If the platform ever stops a download at a fixed number of
+  sub-requests, the log has `fanout: download aborted (transport)` at
+  the same sub-range each time: raise `GET_FANOUT_BYTES`.
+- **A sub-range that ends short.** A sub-response is refused unless it
+  declares the length asked for. Should its body still end early, the
+  download comes out shorter than its `Content-Length` and the close
+  fails, which aborts it: a client never takes it for a complete
+  response, and must not keep the bytes of a transfer that failed.
+- **A deploy during a download.** The next sub-request is answered by
+  the new version. A version that does not know the token (from before
+  this feature, or with another token format) refuses it, and the
+  download aborts as above.
+- **Off.** `GET_FANOUT_BYTES = "0"` (or unset) serves every GET in one
+  invocation, as a version from before this feature does. Nothing is
+  stored for this feature: going back needs nothing else.
+
+Measured on a deployed Worker with an object of 12 GiB (768 extents of
+16 MiB), sub-ranges of 1 GiB:
+
+| | wall | CPU per sub-range of 1 GiB | CPU of the first invocation |
+|---|---|---|---|
+| whole object from the cache | 536 s (22 MiB/s) | 20 to 40 s | under 0.2 s |
+| 5 GiB range from the cache | 252 s (20 MiB/s) | 20 to 40 s | under 0.2 s |
+| 2 GiB range from Usenet | 1,569 s (1.3 MiB/s) | 50 to 90 s | under 0.2 s |
+
+A read from Usenet in one GET goes extent by extent, so it is slow next
+to a client that asks for many ranges at once; the cache is filled
+either way. In the same drill one such GET lost its provider connection
+in the second sub-range: the transfer broke after 1,152 MiB, all of
+them the right bytes, and the client reported a short body.
+
 ## KEK
 
 The escrow file holds one `VELMORA_KEK_<version>=<base64 of 32 bytes>` line

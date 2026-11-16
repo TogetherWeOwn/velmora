@@ -126,6 +126,8 @@ impl Cols {
     }
 }
 
+/// How many columns [`GENERATION_COLS`] selects.
+const GENERATION_WIDTH: usize = 12;
 const GENERATION_COLS: &str = "g.id, g.bucket_id, g.key, g.state, g.size, g.etag, \
      g.checksum_json, g.content_json, g.user_meta_json, g.extent_count, g.created_at, g.retired_at";
 
@@ -187,11 +189,11 @@ pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
 // Reads
 // ---------------------------------------------------------------------------
 
-pub(super) async fn live_object<S: Sql>(
+pub(super) async fn live_generation<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &BucketId,
     key: &str,
-) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
+) -> Result<Option<GenerationRow>> {
     let sql = format!(
         "SELECT {GENERATION_COLS} FROM objects o JOIN generations g \
          ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
@@ -201,10 +203,94 @@ pub(super) async fn live_object<S: Sql>(
         .sql
         .query(&sql, &[text(bucket.as_str()), text(key)])
         .await?;
-    let Some(row) = rows.into_iter().next() else {
+    rows.into_iter().next().map(generation_row).transpose()
+}
+
+pub(super) async fn generation_by_id<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    generation: &GenerationId,
+) -> Result<Option<(crate::types::Bucket, GenerationRow)>> {
+    let sql = format!(
+        "SELECT {GENERATION_COLS}, b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, \
+           b.disposable, b.created_at \
+         FROM generations g JOIN buckets b ON b.id = g.bucket_id \
+         WHERE g.id = ?1 AND g.bucket_id = ?2"
+    );
+    let rows = c
+        .sql
+        .query(&sql, &[text(generation.as_str()), text(bucket.as_str())])
+        .await?;
+    let Some(mut row) = rows.into_iter().next() else {
         return Ok(None);
     };
-    let generation = generation_row(row)?;
+    if row.len() != GENERATION_WIDTH + 7 {
+        return Err(bad("generation and bucket width"));
+    }
+    let bucket = row.split_off(GENERATION_WIDTH);
+    Ok(Some((
+        super::auth::bucket_row(bucket)?,
+        generation_row(row)?,
+    )))
+}
+
+/// The select list of an extent as a generation references it: `seq` and
+/// `plain_offset` come from the reference, not from the generation the
+/// extent was first written for.
+const PLACED_EXTENT_COLS: &str =
+    "e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
+     e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
+     e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
+     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at";
+
+/// Offsets rise with `seq`, so the range is one run of the primary key:
+/// from the last reference that begins at or before `start` to the last
+/// that begins before `end`. Both ends are found by walking the key
+/// backwards, which reads the references behind the range and no extent
+/// row; only the extents of the range itself are joined.
+pub(super) async fn extents_in<S: Sql>(
+    c: &SqlCatalog<S>,
+    generation: &GenerationId,
+    start: u64,
+    end: u64,
+) -> Result<Vec<ExtentRow>> {
+    let (Ok(start), Ok(end)) = (i64::try_from(start), i64::try_from(end)) else {
+        return Err(bad("range offset"));
+    };
+    let sql = format!(
+        "SELECT {PLACED_EXTENT_COLS} \
+         FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+         WHERE ge.generation_id = ?1 \
+           AND ge.seq >= COALESCE((SELECT s.seq FROM generation_extents s \
+                 WHERE s.generation_id = ?1 AND s.plain_offset <= ?2 \
+                 ORDER BY s.seq DESC LIMIT 1), 0) \
+           AND ge.seq <= COALESCE((SELECT s.seq FROM generation_extents s \
+                 WHERE s.generation_id = ?1 AND s.plain_offset < ?3 \
+                 ORDER BY s.seq DESC LIMIT 1), -1) \
+         ORDER BY ge.seq"
+    );
+    let rows = c
+        .sql
+        .query(
+            &sql,
+            &[
+                text(generation.as_str()),
+                SqlValue::Int(start),
+                SqlValue::Int(end),
+            ],
+        )
+        .await?;
+    rows.into_iter().map(extent_row).collect()
+}
+
+pub(super) async fn live_object<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
+    let Some(generation) = live_generation(c, bucket, key).await? else {
+        return Ok(None);
+    };
     // The extents this generation references, placed where it has them:
     // `seq` and `plain_offset` come from the reference, not from the
     // generation the extent was first written for.

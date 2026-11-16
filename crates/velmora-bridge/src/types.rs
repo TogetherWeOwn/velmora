@@ -1459,6 +1459,9 @@ pub enum RespBody {
     /// done soon, else streamed with keepalive whitespace (see
     /// [`crate::keepalive`]).
     Deferred(crate::keepalive::Deferred),
+    /// A large GET body that the runtime fetches in sub-ranges, each from
+    /// an invocation of its own (see [`crate::fanout`]).
+    Fanout(crate::fanout::Fanout),
 }
 
 /// One response.
