@@ -350,6 +350,18 @@ pub enum Guard<T> {
     Lost,
 }
 
+/// Outcome of [`Catalog::put_grant_if_present`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantPut {
+    /// The grant is stored (inserted, or replaced by an equal or wider one).
+    Applied,
+    /// Nothing was written: the key has `rw` on the bucket and `ro` was
+    /// asked for.
+    Narrowing,
+    /// Nothing was written: the key or the bucket does not exist.
+    Lost,
+}
+
 /// Outcome of a publication batch. The batch takes the proof of the
 /// generation's recovery record and turns it into an [`Unpublished`] only
 /// when it wrote nothing, so only then can the record be discarded.
@@ -387,6 +399,18 @@ pub trait Catalog {
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>>;
     async fn create_access_key(&self, k: &AccessKeyRow) -> Result<()>;
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()>;
+    /// Sets the key's permission on the bucket in one statement that
+    /// writes only while both the key row and the bucket row exist, and
+    /// never narrows a grant: an `rw` grant is not replaced by `ro`.
+    /// Revocation and bucket deletion each remove their row and its
+    /// grants in one batch, so a grant stored through this is never left
+    /// behind by either, whichever commits first.
+    async fn put_grant_if_present(
+        &self,
+        akid: &str,
+        bucket: &BucketId,
+        perm: Perm,
+    ) -> Result<GrantPut>;
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>>;
     /// `true` while anything of the bucket is on record: a generation
     /// (live or not; none is ever removed), a key floor, an upload in any
@@ -700,10 +724,20 @@ pub trait Catalog {
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
+    /// The last full read per backbone: its latest `body` row for the
+    /// current `plan_rev`, pass or failure. `counts` is true where it is
+    /// the full check on record: a complete pass that no later check of
+    /// that backbone has cancelled (a later `stat` pass does not hide
+    /// it). A row that is not a complete pass means the backbone holds
+    /// no copy until it is read in full again. A plan that changed (a
+    /// new `plan_rev`) has no rows until it is read again.
+    async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
     /// `counting` = the labels of the backbones that count toward a
-    /// release. The guard is the release rule over rows recorded under
-    /// this claim: `required` of those backbones with a complete pass,
-    /// at least one of them a `body` pass.
+    /// release. The guard is the release rule: `required` of those
+    /// backbones with a complete pass recorded under this claim (a
+    /// `stat` pass is enough, but none counts on a backbone whose last
+    /// full read failed), and at least one of these also has the full
+    /// check on record ([`Catalog::body_checks`]).
     async fn begin_release(
         &self,
         l: &Lease,
@@ -713,7 +747,16 @@ pub trait Catalog {
         now: UnixMs,
     ) -> Result<Guard<()>>;
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
-    async fn due(&self, now: UnixMs, limit: u32) -> Result<Vec<DueRow>>;
+    /// Up to `limit` rows in `post`, `verify` or `release` that are due
+    /// and held by no job, oldest due time first. A row marked by
+    /// [`Self::mark_sent`] is left out until `resend_secs` after the
+    /// mark, unless a job claimed it since (a claim clears the mark) or
+    /// it was given a due time later than the mark.
+    async fn due(&self, now: UnixMs, resend_secs: u32, limit: u32) -> Result<Vec<DueRow>>;
+    /// The dispatcher has sent a job for each of `extents`: marks the
+    /// ones that are still due and held by no job, and returns how many.
+    /// The mark is a hint for [`Self::due`] alone; it gates no claim.
+    async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64>;
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64>;
     /// Stamps `meta.last_dispatch_at` (the dispatcher, once per run).
     async fn record_dispatch(&self, now: UnixMs) -> Result<()>;

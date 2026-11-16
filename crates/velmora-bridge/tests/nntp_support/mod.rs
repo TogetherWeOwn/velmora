@@ -416,12 +416,34 @@ impl MemCatalog {
     }
 
     fn statuses(e: &Entry) -> Vec<BackboneStatus> {
+        Self::latest_rows(e, |_| true)
+    }
+
+    /// As the SQL catalogue: per backbone, the latest `BODY` row, pass
+    /// or failure. `counts` only where it is a complete pass and no
+    /// later check of that backbone failed; a later `STAT` pass does not
+    /// hide it.
+    fn body_checks(e: &Entry) -> Vec<BackboneStatus> {
+        let deciding =
+            |v: &VerificationRow| v.kind == VerifyKind::Body || v.result != VerifyResult::Ok;
+        let on_record = Self::latest_rows(e, deciding);
+        let mut rows = Self::latest_rows(e, |v| v.kind == VerifyKind::Body);
+        for row in &mut rows {
+            row.counts &= on_record
+                .iter()
+                .any(|s| s.backbone == row.backbone && s.kind == VerifyKind::Body && s.counts);
+        }
+        rows
+    }
+
+    /// The latest row per backbone for the current plan among `rows`.
+    fn latest_rows(e: &Entry, rows: impl Fn(&VerificationRow) -> bool) -> Vec<BackboneStatus> {
         let extent = &e.job.extent;
         let mut latest: BTreeMap<&str, &VerificationRow> = BTreeMap::new();
         for v in e
             .verifications
             .iter()
-            .filter(|v| v.plan_rev == extent.plan_rev)
+            .filter(|v| v.plan_rev == extent.plan_rev && rows(v))
         {
             match latest.get(v.backbone.as_str()) {
                 Some(old) if old.verified_at > v.verified_at => {}
@@ -625,6 +647,12 @@ impl Catalog for MemCatalog {
         Ok(entries.get(extent).map(Self::statuses).unwrap_or_default())
     }
 
+    async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
+        let entries = self.entries.borrow();
+        let found = entries.get(extent).map(Self::body_checks);
+        Ok(found.unwrap_or_default())
+    }
+
     async fn begin_release(
         &self,
         l: &Lease,
@@ -637,10 +665,24 @@ impl Catalog for MemCatalog {
             // As the SQL guard: only rows recorded under this claim.
             let claimed = e.outbox.claimed_at;
             let statuses = Self::statuses(e);
+            // A fresh pass is the full check only where a `BODY` pass
+            // is on record.
+            // is on record, and counts for nothing where the last full
+            // read failed.
+            let checks = Self::body_checks(e);
+            let last = |s: &BackboneStatus| checks.iter().find(|b| b.backbone == s.backbone);
+            let failed = |s: &BackboneStatus| {
+                last(s).is_some_and(|b| {
+                    b.result != VerifyResult::Ok || b.articles_ok != b.articles_total
+                })
+            };
             let passes = statuses
                 .iter()
-                .filter(|s| s.counts && s.verified_at >= claimed)
-                .map(|s| (s.backbone.as_str(), s.kind));
+                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
+                .map(|s| match last(s).is_some_and(|b| b.counts) {
+                    true => (s.backbone.as_str(), VerifyKind::Body),
+                    false => (s.backbone.as_str(), VerifyKind::Stat),
+                });
             if !velmora_bridge::verify::releasable(passes, counting, required) {
                 return false;
             }
@@ -940,6 +982,9 @@ impl Catalog for MemCatalog {
         unused()
     }
     async fn put_grant(&self, _: &str, _: &BucketId, _: Perm) -> Result<()> {
+        unused()
+    }
+    async fn put_grant_if_present(&self, _: &str, _: &BucketId, _: Perm) -> Result<GrantPut> {
         unused()
     }
     async fn bucket_by_name(&self, _: &str) -> Result<Option<Bucket>> {
@@ -1282,7 +1327,10 @@ impl Catalog for MemCatalog {
     async fn revive_referenced(&self, _: u32, _: UnixMs) -> Result<u64> {
         unused()
     }
-    async fn due(&self, _: UnixMs, _: u32) -> Result<Vec<DueRow>> {
+    async fn due(&self, _: UnixMs, _: u32, _: u32) -> Result<Vec<DueRow>> {
+        unused()
+    }
+    async fn mark_sent(&self, _: &[ExtentId], _: UnixMs) -> Result<u64> {
         unused()
     }
     async fn bury_exhausted(&self, _: u32, _: UnixMs) -> Result<u64> {

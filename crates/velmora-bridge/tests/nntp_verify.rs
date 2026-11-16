@@ -76,6 +76,18 @@ impl Rig {
             })
             .collect()
     }
+
+    /// The wake-ups sent: the stage, the queue delay and the time each
+    /// one waits for.
+    fn sent_wakes(&self) -> Vec<(OutboxStage, u32, UnixMs)> {
+        let sent = self.bridge.jobs.take();
+        sent.iter()
+            .map(|j| match &j.job {
+                Job::Wake { stage, at, .. } => (*stage, j.delay_secs, *at),
+                other => panic!("unexpected job {other:?}"),
+            })
+            .collect()
+    }
 }
 
 #[tokio::test]
@@ -333,8 +345,15 @@ async fn release_waits_for_the_minimum_age() {
     let outbox = rig.outbox(&s);
     assert_eq!(outbox.stage, OutboxStage::Release);
     assert_eq!(outbox.next_at, T0.plus_secs(week));
-    // Too far out for a queue delay: the dispatcher sends it when due.
-    assert!(rig.sent_stages().is_empty());
+    // Too far out for one queue delay: a wake-up carries the wait on.
+    assert_eq!(
+        rig.sent_wakes(),
+        [(
+            OutboxStage::Release,
+            MAX_QUEUE_DELAY_SECS,
+            T0.plus_secs(week)
+        )]
+    );
 
     // A release job that runs early anyway defers itself.
     rig.bridge
@@ -377,7 +396,10 @@ async fn the_minimum_age_counts_from_the_post_not_from_the_upload() {
     let outbox = rig.outbox(&s);
     assert_eq!(outbox.stage, OutboxStage::Release);
     assert_eq!(outbox.next_at, ready);
-    assert!(rig.sent_stages().is_empty());
+    assert_eq!(
+        rig.sent_wakes(),
+        [(OutboxStage::Release, MAX_QUEUE_DELAY_SECS, ready)]
+    );
 
     // A release job that runs early defers itself and reads nothing, up
     // to the last millisecond.
@@ -434,17 +456,24 @@ async fn release_unpins_the_safety_copy_on_fresh_evidence() {
     assert_eq!(extent.safety_state, SafetyState::Released);
     assert_eq!(extent.released_at, Some(now));
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Done);
-    // Two rows from verify, two fresh ones from this job; the evidence
-    // names only the fresh ones.
+    // Two rows from verify, two fresh ones from this job. The evidence
+    // names the fresh ones, then the full check on record from verify.
     let rows = rig.rows(&s);
     assert_eq!(rows.len(), 4);
     let evidence: serde_json::Value =
         serde_json::from_str(extent.release_evidence.as_deref().unwrap()).unwrap();
     let evidence = evidence.as_array().unwrap();
-    assert_eq!(evidence.len(), 2);
-    for (entry, backbone) in evidence.iter().zip(["bb0", "bb1"]) {
+    assert_eq!(evidence.len(), 3);
+    let expected = [
+        ("bb0", "stat", now),
+        ("bb1", "stat", now),
+        ("bb0", "body", rows[0].verified_at),
+    ];
+    assert!(rows[0].verified_at < now);
+    for (entry, (backbone, kind, at)) in evidence.iter().zip(expected) {
         assert_eq!(entry["backbone"], backbone);
-        assert_eq!(entry["verified_at"], now.0);
+        assert_eq!(entry["kind"], kind);
+        assert_eq!(entry["verified_at"], at.0);
         assert_eq!(
             (entry["ok"].as_u64(), entry["total"].as_u64()),
             (Some(3), Some(3))
@@ -456,9 +485,10 @@ async fn release_unpins_the_safety_copy_on_fresh_evidence() {
     assert_eq!(cold, fetch::ColdFetch::Filled(s.cipher.clone()));
 }
 
-/// An earlier pass is not enough: the release reads every backbone again.
-/// An article that has gone missing since keeps the safety copy and sends
-/// the extent back to verify, which records the loss after its waits.
+/// An earlier pass is not enough: the release asks every backbone again.
+/// An article that has gone missing since (`STAT` answers 430) keeps the
+/// safety copy and sends the extent back to verify, which records the
+/// loss after its waits.
 #[tokio::test]
 async fn release_needs_fresh_evidence() {
     let mut rig = two_backbone_rig().await;
@@ -472,8 +502,12 @@ async fn release_needs_fresh_evidence() {
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
     let outbox = rig.outbox(&s);
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
-    assert_eq!(outbox.next_at, now);
-    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
+    // Verify starts after its usual wait, not at once.
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert!(wait > 0);
+    assert_eq!(outbox.next_at, now.plus_secs(wait));
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
+    rig.bridge.clock.advance_secs(wait);
 
     // Verify walks its waits and then records the second backbone's loss.
     rig.bridge.clock.advance_secs(1);
@@ -504,51 +538,56 @@ async fn release_needs_fresh_evidence() {
     );
 }
 
-/// A corrupt article found at release time is recorded, which cancels the
-/// backbone's earlier pass, and the safety copy stays. The backbone after
-/// it is then the one read in full.
+/// A failure recorded after the full check cancels it: the release finds
+/// no full check on record, asks no provider anything, and sends the
+/// extent back to verify, which reads it in full again.
 #[tokio::test]
 async fn newer_failure_cancels_pass() {
     let rig = two_backbone_rig().await;
-    let (s, plan) = rig.verified_on_two(12).await;
-    // The first backbone's copy of article 2 is replaced by a wrong one.
-    let id = &plan[2].message_id;
-    rig.servers[0].hide(id).await;
-    let mut client = rig.raw_client(0).await;
-    let planted = render(&plan, &plan[2], &s.cipher, true);
-    client.post_article(id, &planted).await.unwrap();
-    client.quit().await;
+    let (s, _) = rig.verified_on_two(12).await;
+    let failed_at = rig.bridge.clock.now();
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.verifications.push(VerificationRow {
+            extent_id: s.extent.clone(),
+            backbone: "bb0".into(),
+            provider_id: "p0".into(),
+            verified_at: failed_at,
+            plan_rev: 1,
+            articles_ok: 2,
+            articles_total: 3,
+            result: VerifyResult::Corrupt,
+            kind: VerifyKind::Body,
+        });
+    });
+    let last = rig.bridge.catalog.body_checks(&s.extent).await.unwrap();
+    assert!(last.iter().all(|b| !b.counts), "{last:?}");
+    rig.bridge.clock.advance_secs(1);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
 
     let now = rig.bridge.clock.now();
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert!(rig.safety_held(&s));
-    // Back to verify, which re-checks after the long wait.
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
     let outbox = rig.outbox(&s);
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
-    assert_eq!(outbox.next_at, now.plus_secs(REVERIFY_SECS));
-    let status = rig.bridge.catalog.backbone_status(&s.extent).await.unwrap();
-    let bb0 = status.iter().find(|b| b.backbone == "bb0").unwrap();
-    assert_eq!(bb0.result, VerifyResult::Corrupt);
-    assert_eq!(bb0.kind, VerifyKind::Body);
-    assert!(!bb0.counts);
-    // No backbone had passed the full check, so the second got it too.
-    let bb1 = status.iter().find(|b| b.backbone == "bb1").unwrap();
-    assert_eq!(
-        (bb1.result, bb1.kind, bb1.counts),
-        (VerifyResult::Ok, VerifyKind::Body, true)
-    );
+    assert_eq!(outbox.next_at, now);
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
+    assert!(rig.bridge.nntp.calls().is_empty());
+    assert_eq!(rig.rows(&s).len(), 3);
 
-    // The next round finds the first backbone still corrupt. The second
-    // one's own full pass of the round before does not spare it the full
-    // check: only a pass on a backbone before it would.
-    rig.servers[1].set_body_gone(true).await;
-    rig.bridge.clock.advance_secs(REVERIFY_SECS);
+    // Verify reads the first backbone in full again; then the release
+    // goes through.
+    rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    let _ = rig.run(&s, OutboxStage::Verify).await;
-    let status = rig.bridge.catalog.backbone_status(&s.extent).await.unwrap();
-    let bb1 = status.iter().find(|b| b.backbone == "bb1").unwrap();
-    assert_eq!(bb1.kind, VerifyKind::Body);
-    assert!(rig.safety_held(&s));
+    assert_eq!(checks(&rig, &s)[3], ok("bb0", VerifyKind::Body));
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
 }
 
 /// A provider list with fewer backbones that count than a release needs:
@@ -659,14 +698,14 @@ async fn verify_reads_one_backbone_in_full_and_stats_the_next() {
     assert_eq!((rows[1].articles_ok, rows[1].articles_total), (3, 3));
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
 
-    // The same rule at release: fresh rows, the same two kinds.
+    // At release both are asked for presence only; the full check is
+    // the one on record.
     rig.bridge.jobs.take();
     rig.bridge.clock.advance_secs(1);
-    let now = rig.bridge.clock.now();
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert_eq!(
         checks(&rig, &s)[2..],
-        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+        [ok("bb0", VerifyKind::Stat), ok("bb1", VerifyKind::Stat)]
     );
     let extent = rig.bridge.catalog.extent(&s.extent);
     assert_eq!(extent.safety_state, SafetyState::Released);
@@ -676,12 +715,283 @@ async fn verify_reads_one_backbone_in_full_and_stats_the_next() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| {
-            assert_eq!(e["verified_at"], now.0);
-            (e["backbone"].as_str().unwrap(), e["kind"].as_str().unwrap())
-        })
+        .map(|e| (e["backbone"].as_str().unwrap(), e["kind"].as_str().unwrap()))
         .collect();
-    assert_eq!(kinds, [("bb0", "body"), ("bb1", "stat")]);
+    assert_eq!(kinds, [("bb0", "stat"), ("bb1", "stat"), ("bb0", "body")]);
+}
+
+/// The calls a job made to the providers since the log was started, by
+/// kind: `(BODY, STAT)`.
+fn reads(rig: &Rig) -> (usize, usize) {
+    let calls = rig.bridge.nntp.calls();
+    let of = |what| calls.iter().filter(|c| c.0 == what).count();
+    (of("body"), of("stat"))
+}
+
+/// The full `BODY` read happens once, at verify, on one backbone. The
+/// release job reads no `BODY` at all: it asks every backbone that counts
+/// for every article with `STAT`.
+#[tokio::test]
+async fn release_reads_no_body_and_stats_every_backbone() {
+    let rig = two_backbone_rig().await;
+    let (s, plan) = rig.posted(40).await;
+    rig.propagate(&s, 0, 1).await;
+    let n = plan.len();
+    assert_eq!(n, 3);
+
+    rig.bridge.nntp.slow(&rig.bridge.clock, 1);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    // Verify: every article read in full once, and asked for once.
+    assert_eq!(reads(&rig), (n, n));
+
+    rig.bridge.clock.advance_secs(1);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    // Release: no `BODY`, one `STAT` per article and backbone.
+    assert_eq!(reads(&rig), (0, 2 * n));
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
+}
+
+/// No release on `STAT` alone for a plan that was never read in full: a
+/// plan that changed after verify has no full check on record. The
+/// release job asks no provider anything and sends the extent back to
+/// verify, which reads the new plan in full; only then is it released.
+#[tokio::test]
+async fn a_changed_plan_is_read_in_full_before_any_release() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.verified_on_two(41).await;
+    assert_eq!(rig.rows(&s)[0].plan_rev, 1);
+    // The same articles under a new plan revision.
+    rig.bridge
+        .catalog
+        .edit(&s.extent, |e| e.job.extent.plan_rev = 2);
+    let on_record = rig.bridge.catalog.body_checks(&s.extent).await.unwrap();
+    assert!(on_record.is_empty(), "{on_record:?}");
+
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    let now = rig.bridge.clock.now();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    assert_eq!(outbox.next_at, now);
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
+    assert!(rig.bridge.nntp.calls().is_empty());
+    assert_eq!(rig.rows(&s).len(), 2);
+
+    // Verify reads the new plan in full, and the release follows.
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.rows(&s);
+    assert_eq!((rows[2].plan_rev, rows[2].kind), (2, VerifyKind::Body));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    assert_eq!(reads(&rig), (3, 3));
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig), (3, 9));
+    let extent = rig.bridge.catalog.extent(&s.extent);
+    assert_eq!(extent.safety_state, SafetyState::Released);
+    let evidence = extent.release_evidence.unwrap();
+    assert!(!evidence.contains("\"plan_rev\":1"), "{evidence}");
+}
+
+/// The full check counts only on a backbone that still answers for every
+/// article. With three backbones, the one read in full at verify lacks an
+/// article at release: the `STAT` passes of the other two release
+/// nothing, and verify reads again.
+#[tokio::test]
+async fn stat_passes_do_not_release_without_the_backbone_read_in_full() {
+    let mut rig = three_backbone_rig().await;
+    rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
+    let (s, plan) = rig.posted(42).await;
+    rig.propagate(&s, 0, 1).await;
+    rig.propagate(&s, 0, 2).await;
+    for _ in 0..3 {
+        assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    }
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.jobs.take();
+    rig.bridge.clock.advance_secs(1);
+    rig.servers[0].hide(&plan[1].message_id).await;
+
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    // The 430 is asked once more, as in every check.
+    assert_eq!(reads(&rig), (0, 10));
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
+    // Nothing recorded: verify owns the waits and the record.
+    assert_eq!(rig.rows(&s).len(), 3);
+}
+
+/// A backbone whose full read failed at verify holds no copy at release,
+/// whatever it answers to `STAT`. With three backbones: the first was
+/// read and found corrupt, the second was read in full, the third lost
+/// an article since. The first and the second both answer `STAT`: that is
+/// one copy, and nothing is released.
+#[tokio::test]
+async fn a_stat_answer_does_not_count_where_the_full_read_failed() {
+    let mut rig = three_backbone_rig().await;
+    rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
+    let (s, plan) = rig.posted(44).await;
+    rig.propagate(&s, 0, 1).await;
+    rig.propagate(&s, 0, 2).await;
+    for _ in 0..3 {
+        assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    }
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.jobs.take();
+    // As verify leaves it when the first backbone served wrong bytes and
+    // the second was read in full.
+    let (first, second) = {
+        let rows = rig.rows(&s);
+        (rows[0].backbone.clone(), rows[1].backbone.clone())
+    };
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        for v in &mut e.verifications {
+            if v.backbone == first {
+                assert_eq!(v.kind, VerifyKind::Body);
+                v.result = VerifyResult::Corrupt;
+                v.articles_ok -= 1;
+            } else if v.backbone == second {
+                v.kind = VerifyKind::Body;
+            }
+        }
+    });
+    rig.bridge.clock.advance_secs(1);
+    rig.servers[2].hide(&plan[1].message_id).await;
+
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig), (0, 10));
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert!(wait > 0);
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    assert_eq!(outbox.next_at, rig.bridge.clock.now().plus_secs(wait));
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
+    assert_eq!(rig.rows(&s).len(), 3);
+
+    // Every backbone answers, and still the first holds no copy: the
+    // second and the third are the two.
+    rig.servers[2].unhide(&plan[1].message_id).await;
+    rig.bridge.clock.advance_secs(wait);
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.outbox.stage = OutboxStage::Release;
+    });
+    rig.bridge.jobs.take();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(!rig.safety_held(&s));
+    let evidence = rig.bridge.catalog.extent(&s.extent).release_evidence;
+    let evidence: serde_json::Value = serde_json::from_str(&evidence.unwrap()).unwrap();
+    let backbones: Vec<&str> = evidence
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["backbone"].as_str().unwrap())
+        .collect();
+    assert!(!backbones.contains(&first.as_str()), "{backbones:?}");
+    assert_eq!(backbones.len(), 3, "{backbones:?}");
+}
+
+/// A backbone whose full read failed recovers: verify reads it with
+/// `BODY` again, also after an earlier backbone has passed the full
+/// check, and the release then takes it. With `STAT` there the release
+/// would refuse it every time and the extent would go round for ever.
+#[tokio::test]
+async fn verify_reads_in_full_again_where_the_full_read_failed() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.verified_on_two(45).await;
+    // As a round leaves it in which neither backbone had the articles
+    // yet, before the round that passed.
+    let stat = rig.rows(&s)[1].clone();
+    assert_eq!(
+        (stat.backbone.as_str(), stat.kind),
+        ("bb1", VerifyKind::Stat)
+    );
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.verifications.push(VerificationRow {
+            verified_at: UnixMs(stat.verified_at.0 - 1),
+            articles_ok: 0,
+            result: VerifyResult::Missing,
+            kind: VerifyKind::Body,
+            ..stat.clone()
+        });
+    });
+
+    // The release does not take the `STAT` answer of that backbone.
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    rig.bridge
+        .clock
+        .advance_secs(rig.bridge.cfg.verify_delay_secs);
+
+    // Verify: both in full this time.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig), (6, 0));
+    let all = checks(&rig, &s);
+    assert_eq!(all[all.len() - 1], ok("bb1", VerifyKind::Body));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
+    // And from then on `STAT` is enough there again.
+    assert_eq!(reads(&rig), (6, 6));
+}
+
+/// An article missing at release (`STAT` answers 430) takes the usual
+/// repair path: back to verify, which posts it to the backbone that
+/// lacks it once the propagation grace is over.
+#[tokio::test]
+async fn an_article_missing_at_release_is_reposted_by_verify() {
+    let mut rig = two_posting_backbones().await;
+    rig.bridge.cfg.propagation_grace_secs = 0;
+    let (s, plan) = rig.verified_on_two(43).await;
+    rig.servers[1].hide(&plan[2].message_id).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    let posts = || {
+        let calls = rig.bridge.nntp.calls();
+        calls.iter().filter(|c| c.0 == "post").count()
+    };
+
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    // The 430 is asked once more, as in every check.
+    assert_eq!(reads(&rig), (0, 7));
+    assert!(rig.safety_held(&s));
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
+    assert_eq!(posts(), 0);
+
+    // Verify: the first backbone in full, then the second, where the one
+    // missing article is posted again.
+    rig.bridge.clock.advance_secs(wait);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    assert_eq!(posts(), 1);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert!(rig.safety_held(&s));
 }
 
 /// A server that answers `STAT` for articles whose `BODY` is gone: the
@@ -716,33 +1026,39 @@ async fn stat_true_body_missing_is_missing_at_verify() {
     assert!(rig.safety_held(&s));
 }
 
-/// The same server at release time, after an honest verify: the fresh
-/// `BODY` fails, the second backbone is then read in full, and one
-/// backbone is not two. The safety copy stays.
+/// What the release no longer sees, by the operator's decision: a
+/// backbone that stopped serving the bodies after verify read them, and
+/// still answers `STAT`. The full check is the one on record, so the
+/// release goes through. Before, the release read every `BODY` again and
+/// this kept the safety copy.
 #[tokio::test]
-async fn stat_true_body_missing_blocks_the_release() {
-    let mut rig = two_backbone_rig().await;
-    rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
+async fn a_body_gone_after_verify_is_not_seen_by_the_release() {
+    let rig = two_backbone_rig().await;
     let (s, _) = rig.verified_on_two(32).await;
     rig.servers[0].set_body_gone(true).await;
 
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert!(rig.safety_held(&s));
-    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
-    let outbox = rig.outbox(&s);
-    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
-    // Missing goes back to verify unrecorded; verify owns the waits.
-    assert_eq!(rig.rows(&s).len(), 2);
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
+    // The safety copy stays in the store, evictable, and serves reads.
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
 }
 
 /// `STAT` passes alone release nothing, however many backbones give
-/// them: with the rows of both backbones turned into `STAT` passes, a
-/// release job's own check is what decides, and the catalogue refuses
-/// the rows as they stand.
+/// them. With no `BODY` pass on record (the rows of verify turned into
+/// `STAT` passes), the catalogue refuses fresh `STAT` passes on both
+/// backbones, and a release job asks no provider and goes back to verify.
 #[tokio::test]
 async fn stat_passes_alone_never_release() {
     let rig = two_backbone_rig().await;
     let (s, _) = rig.verified_on_two(33).await;
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        for row in &mut e.verifications {
+            row.kind = VerifyKind::Stat;
+        }
+    });
     let lease = rig.claim(&s, OutboxStage::Release).await;
     let now = rig.bridge.clock.now();
     for backbone in ["bb0", "bb1"] {
@@ -773,6 +1089,52 @@ async fn stat_passes_alone_never_release() {
         .unwrap();
     assert_eq!(guard, Guard::Lost);
     assert!(rig.safety_held(&s));
+
+    // The release job itself: nothing asked, back to verify.
+    rig.bridge
+        .catalog
+        .edit(&s.extent, |e| e.outbox.lease_until = None);
+    rig.bridge.clock.advance_secs(1);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.bridge.nntp.calls().is_empty());
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+}
+
+/// The full check on record with fresh `STAT` passes: the catalogue's
+/// guard lets the release through, and not before both backbones have
+/// answered under this claim.
+#[tokio::test]
+async fn the_guard_takes_fresh_stat_passes_with_the_full_check_on_record() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.verified_on_two(39).await;
+    let lease = rig.claim(&s, OutboxStage::Release).await;
+    let now = rig.bridge.clock.now();
+    let counting = ["bb0".to_string(), "bb1".to_string()];
+    let begin = || async {
+        let catalog = &rig.bridge.catalog;
+        let guard = catalog.begin_release(&lease, 2, &counting, "[]", now);
+        guard.await.unwrap()
+    };
+    assert_eq!(begin().await, Guard::Lost, "nothing asked under the claim");
+    for (backbone, expected) in [("bb1", Guard::Lost), ("bb0", Guard::Applied(()))] {
+        let row = VerificationRow {
+            extent_id: s.extent.clone(),
+            backbone: backbone.into(),
+            provider_id: "p".into(),
+            verified_at: now,
+            plan_rev: 1,
+            articles_ok: 3,
+            articles_total: 3,
+            result: VerifyResult::Ok,
+            kind: VerifyKind::Stat,
+        };
+        let catalog = &rig.bridge.catalog;
+        assert!(catalog.record_verification(&lease, &row).await.unwrap());
+        assert_eq!(begin().await, expected, "after {backbone}");
+    }
 }
 
 /// A verify round that ends with passes on every backbone and none of
@@ -902,7 +1264,10 @@ async fn a_backbone_that_does_not_count_is_not_checked() {
     rig.bridge.jobs.take();
     rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
-    assert_eq!(checks(&rig, &s)[2..], both);
+    assert_eq!(
+        checks(&rig, &s)[2..],
+        [ok("bb1", VerifyKind::Stat), ok("bb2", VerifyKind::Stat)]
+    );
     let extent = rig.bridge.catalog.extent(&s.extent);
     assert_eq!(extent.safety_state, SafetyState::Released);
     assert!(!extent.release_evidence.unwrap().contains("bb0"));
@@ -941,7 +1306,8 @@ async fn one_counting_backbone_is_not_two() {
     }
 }
 
-/// With three backbones that count, only the first is read in full.
+/// With three backbones that count, only the first is read in full, and
+/// only at verify: the release asks all three for presence.
 #[tokio::test]
 async fn every_backbone_after_the_full_check_is_stat() {
     let rig = three_backbone_rig().await;
@@ -965,7 +1331,7 @@ async fn every_backbone_after_the_full_check_is_stat() {
     assert_eq!(
         checks(&rig, &s)[before..],
         [
-            ok("bb0", VerifyKind::Body),
+            ok("bb0", VerifyKind::Stat),
             ok("bb1", VerifyKind::Stat),
             ok("bb2", VerifyKind::Stat)
         ]

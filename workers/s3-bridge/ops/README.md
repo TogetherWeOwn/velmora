@@ -146,8 +146,9 @@ Limits to know:
   3. run the replay again from the same `since_ms`: it makes the bucket
      of the records and publishes them, and `other_bucket` is empty;
   4. turn `MAINTENANCE` off, make new access keys for the bucket
-     (`POST /_admin/keys`) and give them to the clients: grants are not
-     in the records.
+     (`POST /_admin/keys`, or grant an existing key with
+     `POST /_admin/keys/<id>/grants`) and give them to the clients:
+     grants are not in the records.
 
   A `409` in step 2 means the bucket in the catalogue has data on record
   as well. Then both buckets hold data under one name and nothing merges
@@ -182,6 +183,35 @@ under maintenance and during a replay.
 `GET /_admin/keys` lists every key: id, status, created time and its
 grants (bucket and permission), never a secret, 500 per page in id
 order; follow `next` with `?after=<next>`.
+
+## Granting a key on another bucket
+
+```
+curl -X POST -H @<0600 header file with the bearer> -H 'content-type: application/json' \
+  --data '{"bucket":"<bucket>","perm":"rw"}' <base-url>/_admin/keys/<access key id>/grants
+```
+
+`200` with `{access_key_id, bucket, perm}`: the key now has `perm`
+(`rw` or `ro`) on the bucket. A second call may repeat the permission
+or widen it from `ro` to `rw`. It never narrows it: `rw` to `ro`
+answers `409 GrantNarrowingRefused` and changes nothing. The only way
+to reduce a key's access is to revoke it (and mint a new one), because
+a revocation has a record and survives a restore, where a narrowed grant
+would silently come back wide. A
+client that holds one key and creates buckets uses this to open each
+new bucket to its key. `404 NoSuchAccessKey` or `404 NoSuchBucket`: no
+such key (also a revoked one) or bucket; `400`: `perm` is not `rw` or
+`ro`, or the body has another field. Refused with `503` under
+maintenance and while a replay is unfinished. The grant is stored in
+one statement that writes only while the key and the bucket both exist,
+so a revocation or bucket deletion running at the same time never
+leaves it behind. Grants are not removed one by one (`DELETE` answers
+`405`); revoke the key instead.
+
+Grants, like keys, are catalogue rows only: a catalogue restored from an
+export older than a grant does not have it, a widening (`ro` to `rw`)
+made after the export is lost the same way, and a replay brings neither
+back. Grant the key again after such a restore.
 
 A remote run of `e2e/slice.sh` revokes the keys it made when it exits.
 

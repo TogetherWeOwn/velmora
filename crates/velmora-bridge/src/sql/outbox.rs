@@ -81,9 +81,28 @@ macro_rules! counts {
     };
 }
 
+/// Whether the last full read of the backbone of row `v` failed: its
+/// latest `body` row for the current plan of extent `e` is not a complete
+/// pass. A `STAT` answer says nothing about bytes that were read and
+/// found missing or wrong, so such a backbone holds no copy until it is
+/// read in full again.
+macro_rules! body_failed {
+    () => {
+        "EXISTS (SELECT 1 FROM verifications f \
+           WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
+             AND f.plan_rev = e.plan_rev AND f.kind = 'body' \
+             AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total) \
+             AND NOT EXISTS (SELECT 1 FROM verifications g \
+               WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
+                 AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
+                 AND g.verified_at > f.verified_at))"
+    };
+}
+
 /// A row that is evidence for the release of extent `?1` at `?6`: the one
 /// that speaks for a backbone in the list `?7`, a complete pass, recorded
-/// under the current claim of the outbox row.
+/// under the current claim of the outbox row, on a backbone whose last
+/// full read did not fail ([`body_failed`]).
 macro_rules! fresh_pass {
     () => {
         concat!(
@@ -92,8 +111,27 @@ macro_rules! fresh_pass {
                AND v.backbone IN (SELECT value FROM json_each(?7)) AND ",
             counts!(),
             " AND ",
-            latest!()
+            latest!(),
+            " AND NOT ",
+            body_failed!()
         )
+    };
+}
+
+/// The full check on record for a backbone: row `b` is a complete `body`
+/// pass of the current plan of its extent `e`, and no later check of that
+/// backbone for that plan was another `body` or failed. So there is at
+/// most one per backbone, a later `stat` pass leaves it standing, and a
+/// plan that changed has none until it is read in full again.
+macro_rules! body_on_record {
+    () => {
+        "b.plan_rev = e.plan_rev AND b.kind = 'body' AND b.result = 'ok' \
+           AND b.articles_ok = b.articles_total \
+           AND b.articles_total = COALESCE(e.article_count, -1) \
+           AND NOT EXISTS (SELECT 1 FROM verifications x \
+             WHERE x.extent_id = b.extent_id AND x.backbone = b.backbone \
+               AND x.plan_rev = b.plan_rev AND x.verified_at > b.verified_at \
+               AND (x.kind = 'body' OR x.result <> 'ok'))"
     };
 }
 
@@ -147,7 +185,7 @@ pub(super) async fn claim<S: Sql>(
         .sql
         .query(
             "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = ?4, \
-               lease_until = ?5, attempts = attempts + 1, updated_at = ?6 \
+               lease_until = ?5, attempts = attempts + 1, updated_at = ?6, sent_at = NULL \
              WHERE extent_id = ?1 AND generation_id = ?2 AND stage = ?3 AND next_at <= ?6 \
                AND (lease_until IS NULL OR lease_until < ?6) \
              RETURNING lease_token, attempts, cursor",
@@ -538,8 +576,11 @@ pub(super) async fn record_verification<S: Sql>(
         (
             // Two results for one backbone in the same millisecond: a
             // failure is never replaced, so the pair cannot count as a
-            // pass, and the kind is that of the result that stays. The
-            // tally of a `STAT` goes to `articles_present` (see `tally!`).
+            // pass, and the kind is that of the result that stays. A
+            // `stat` pass never replaces a `body` pass: the row is the
+            // full check on record, which a release needs, and the
+            // `body` pass says all the `stat` pass would. The tally of a
+            // `STAT` goes to `articles_present` (see `tally!`).
             "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
                plan_rev, articles_ok, articles_present, articles_total, result, kind) \
              VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
@@ -550,7 +591,9 @@ pub(super) async fn record_verification<S: Sql>(
                articles_present = excluded.articles_present, \
                articles_total = excluded.articles_total, \
                result = excluded.result, kind = excluded.kind \
-             WHERE verifications.result = 'ok'",
+             WHERE verifications.result = 'ok' \
+               AND NOT (verifications.kind = 'body' AND excluded.kind = 'stat' \
+                 AND excluded.result = 'ok')",
             row,
         ),
         (
@@ -610,13 +653,58 @@ pub(super) async fn backbone_status<S: Sql>(
     Ok(out)
 }
 
+/// The last full read per backbone: its latest `body` row for the current
+/// plan, pass or failure. `counts` is true where that row is the full
+/// check on record ([`body_on_record`]).
+pub(super) async fn body_checks<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+) -> Result<Vec<BackboneStatus>> {
+    let sql = concat!(
+        "SELECT b.backbone, b.provider_id, b.verified_at, b.plan_rev, b.articles_ok, \
+           b.articles_total, b.result, (",
+        body_on_record!(),
+        ") FROM verifications b JOIN extents e ON e.id = b.extent_id \
+         WHERE b.extent_id = ?1 AND b.plan_rev = e.plan_rev AND b.kind = 'body' \
+           AND NOT EXISTS (SELECT 1 FROM verifications g \
+             WHERE g.extent_id = b.extent_id AND g.backbone = b.backbone \
+               AND g.plan_rev = b.plan_rev AND g.kind = 'body' \
+               AND g.verified_at > b.verified_at) \
+         ORDER BY b.backbone"
+    );
+    let rows = c.sql.query(sql, &[text(extent.as_str())]).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut r = Cols::new(row);
+        out.push(BackboneStatus {
+            backbone: r.text()?,
+            provider_id: r.text()?,
+            verified_at: UnixMs(r.num()?),
+            plan_rev: r.num()?,
+            articles_ok: r.num()?,
+            articles_total: r.num()?,
+            result: r.parsed(VerifyResult::parse)?,
+            kind: VerifyKind::Body,
+            counts: r.num::<i64>()? != 0,
+        });
+    }
+    Ok(out)
+}
+
 /// Authorizes unpinning the safety copy (it becomes evictable). One batch whose guard requires:
 /// the release lease still holds, a live generation references the extent, the copy is
-/// `held` (or `releasing`, when re-driven), and the release rule holds over
-/// the rows recorded under this claim (between the claim time and `now`):
-/// at least `required` of the `counting` backbones have a complete pass,
-/// and at least one of those passes is a `body` pass. `stat` passes alone
-/// release nothing, and a pass on a backbone outside `counting` is not
+/// `held` (or `releasing`, when re-driven), and the release rule holds:
+/// - at least `required` of the `counting` backbones have a complete pass
+///   recorded under this claim (between the claim time and `now`); a
+///   `stat` pass is enough here, except on a backbone whose last full
+///   read failed ([`body_failed`]), which holds no copy;
+/// - at least one of those backbones also has the full check on record
+///   ([`body_on_record`]): a complete `body` pass of the current plan,
+///   from verify or from this claim, that no later check has cancelled.
+///
+/// So `stat` passes release nothing for a plan that was never read in
+/// full, nor when the backbone that was read in full no longer answers
+/// for every article. A pass on a backbone outside `counting` is not
 /// looked at. The lease must also be unexpired: an expired lease may
 /// be taken over at any moment. Anything else is `Lost`.
 pub(super) async fn begin_release<S: Sql>(
@@ -647,9 +735,12 @@ pub(super) async fn begin_release<S: Sql>(
         fresh_pass!(),
         ") < ?5 \
          OR NOT EXISTS (SELECT 1 FROM verifications v JOIN extents e ON e.id = v.extent_id \
-              WHERE v.kind = 'body' AND ",
+              WHERE ",
         fresh_pass!(),
-        ")"
+        " AND EXISTS (SELECT 1 FROM verifications b \
+                WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
+        body_on_record!(),
+        "))"
     );
     let stmts = vec![
         (
@@ -709,16 +800,30 @@ pub(super) async fn finish_release<S: Sql>(
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Rows a job could claim right now: live stage, due, not leased.
-pub(super) async fn due<S: Sql>(c: &SqlCatalog<S>, now: UnixMs, limit: u32) -> Result<Vec<DueRow>> {
+/// Due rows no job holds, oldest first, without the ones the dispatcher
+/// has sent a job for and that job may still be on its way: a row with a
+/// mark (`sent_at`) is left out until `resend_secs` after the mark. A
+/// claim clears the mark, and a due time later than the mark outdates
+/// it, so a row that a job gave back or moved on is listed at once.
+pub(super) async fn due<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+    resend_secs: u32,
+    limit: u32,
+) -> Result<Vec<DueRow>> {
     let rows = c
         .sql
         .query(
             "SELECT extent_id, generation_id, stage FROM outbox \
              WHERE stage IN ('post', 'verify', 'release') AND next_at <= ?1 \
                AND (lease_until IS NULL OR lease_until < ?1) \
+               AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
              ORDER BY next_at, extent_id LIMIT ?2",
-            &[ms(now), SqlValue::Int(i64::from(limit))],
+            &[
+                ms(now),
+                SqlValue::Int(i64::from(limit)),
+                ms(now.plus_ms(-i64::from(resend_secs) * 1000)),
+            ],
         )
         .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -731,6 +836,34 @@ pub(super) async fn due<S: Sql>(c: &SqlCatalog<S>, now: UnixMs, limit: u32) -> R
         });
     }
     Ok(out)
+}
+
+/// Marks rows the dispatcher has just sent a job for (`sent_at = now`).
+/// Only a row that is still due and held by no job is marked: one that
+/// a job claimed since it was listed keeps no mark, so it is listed
+/// again as soon as that job lets go of it. The ids travel as one JSON
+/// array. One row written per marked row; `sent_at` is in no index.
+/// The unary `+` keeps the planner off the due index, which would walk
+/// every due row: each row is found by its id.
+pub(super) async fn mark_sent<S: Sql>(
+    c: &SqlCatalog<S>,
+    extents: &[ExtentId],
+    now: UnixMs,
+) -> Result<u64> {
+    if extents.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<&str> = extents.iter().map(ExtentId::as_str).collect();
+    let ids = serde_json::to_string(&ids).map_err(|_| BridgeError::Sql("mark_sent".into()))?;
+    c.sql
+        .exec(
+            "UPDATE outbox SET sent_at = ?1 \
+             WHERE extent_id IN (SELECT value FROM json_each(?2)) \
+               AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
+               AND (lease_until IS NULL OR lease_until < ?1)",
+            &[ms(now), text(&ids)],
+        )
+        .await
 }
 
 /// Moves unleased rows with more than `max_attempts` claims to `dead`.

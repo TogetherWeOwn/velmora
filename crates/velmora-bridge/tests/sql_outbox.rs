@@ -5,8 +5,9 @@
 //! test are the ones the catalogue itself writes. Every statement goes
 //! through [`Probe`], which refuses more than 100 bound parameters.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
+use velmora_bridge::jobs::RESEND_SECS;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
 use velmora_bridge::*;
@@ -22,7 +23,14 @@ fn bbs() -> Vec<String> {
         .to_vec()
 }
 
-struct Probe(RusqliteSql);
+/// The database, and every statement the catalogue ran on it.
+struct Probe(RusqliteSql, RefCell<Vec<(String, Vec<SqlValue>)>>);
+
+impl Probe {
+    fn log(&self, sql: &str, params: &[SqlValue]) {
+        self.1.borrow_mut().push((sql.to_string(), params.to_vec()));
+    }
+}
 
 fn check_params(params: &[SqlValue]) {
     assert!(params.len() <= 100, "statement binds {}", params.len());
@@ -31,14 +39,17 @@ fn check_params(params: &[SqlValue]) {
 impl Sql for Probe {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params);
+        self.log(sql, params);
         self.0.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         check_params(params);
+        self.log(sql, params);
         self.0.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         stmts.iter().for_each(|(_, p)| check_params(p));
+        stmts.iter().for_each(|(sql, p)| self.log(sql, p));
         self.0.batch(stmts).await
     }
 }
@@ -63,7 +74,10 @@ struct Obj {
 impl Fx {
     async fn new() -> Fx {
         let fx = Fx {
-            cat: SqlCatalog::new(Probe(RusqliteSql::with_schema().unwrap())),
+            cat: SqlCatalog::new(Probe(
+                RusqliteSql::with_schema().unwrap(),
+                RefCell::new(Vec::new()),
+            )),
             seed: Cell::new(1),
             bucket: BucketId::mint([0xb1; 8]),
             real_bucket: BucketId::mint([0xb2; 8]),
@@ -426,11 +440,16 @@ async fn next_at_backoff_is_respected() {
     // The lease is free, but the row is not due: no claim, not in `due`.
     let early = retry_at.plus_ms(-1);
     assert!(fx.claim(&o, OutboxStage::Post, early).await.is_none());
-    assert!(fx.cat.due(early, 100).await.unwrap().is_empty());
+    assert!(fx
+        .cat
+        .due(early, RESEND_SECS, 100)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(fx.outbox(&o, "attempts").await, "1");
 
     assert_eq!(
-        fx.cat.due(retry_at, 100).await.unwrap(),
+        fx.cat.due(retry_at, RESEND_SECS, 100).await.unwrap(),
         vec![DueRow {
             extent_id: o.extent.clone(),
             generation_id: o.generation.clone(),
@@ -611,7 +630,7 @@ async fn cancellation_beats_stale_completion() {
     for stage in OutboxStage::ALL {
         assert!(fx.claim(&o, *stage, late).await.is_none());
     }
-    let due = fx.cat.due(late, 100).await.unwrap();
+    let due = fx.cat.due(late, RESEND_SECS, 100).await.unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].extent_id, newer.extent);
 }
@@ -1025,7 +1044,7 @@ async fn release_needs_fresh_evidence() {
     );
     assert!(fx
         .cat
-        .due(done_at.plus_ms(HOUR_MS), 100)
+        .due(done_at.plus_ms(HOUR_MS), RESEND_SECS, 100)
         .await
         .unwrap()
         .is_empty());
@@ -1127,8 +1146,9 @@ async fn release_refuses_both_checks_on_one_backbone() {
             .unwrap(),
         Guard::Lost
     );
-    // The latest row speaks for its backbone, and it is the `STAT` one:
-    // even where one backbone is enough, this is no full check.
+    // The latest row speaks for its backbone, and it is the `STAT` one.
+    // The `BODY` pass before it stays the full check on record, so where
+    // one backbone is enough the rule holds.
     let status = fx.cat.backbone_status(&o.extent).await.unwrap();
     assert_eq!(status[0].kind, VerifyKind::Stat);
     assert_eq!(
@@ -1136,19 +1156,33 @@ async fn release_refuses_both_checks_on_one_backbone() {
             .begin_release(&r, 1, &counting, "[]", T0.plus_ms(3))
             .await
             .unwrap(),
-        Guard::Lost
+        Guard::Applied(())
     );
 }
 
-/// `BODY` on one backbone that counts and `STAT` on another: released.
-/// The evidence has to be from this claim, whatever its kind.
+/// The backbones with the full check on record, with the time of it.
+async fn on_record(fx: &Fx, o: &Obj) -> Vec<(String, UnixMs)> {
+    let mut rows = fx.cat.body_checks(&o.extent).await.unwrap();
+    rows.retain(|b| b.counts);
+    for b in &rows {
+        assert!(b.counts && b.kind == VerifyKind::Body && b.result == VerifyResult::Ok);
+        assert_eq!((b.articles_ok, b.articles_total), (2, 2));
+    }
+    rows.into_iter()
+        .map(|b| (b.backbone, b.verified_at))
+        .collect()
+}
+
+/// The release rule: the full `BODY` check from verify, on record, and a
+/// `STAT` pass under the release claim from every backbone that is to
+/// count, the one read in full among them.
 #[tokio::test]
-async fn release_takes_a_body_pass_and_a_stat_pass_on_two_backbones() {
+async fn release_takes_fresh_stat_passes_with_the_body_pass_on_record() {
     let fx = Fx::new().await;
     let o = fx.publish(&fx.bucket, "k").await;
     let l = fx.posted(&o, 2, T0).await;
     let counting = labels(&["bb-a", "bb-b"]);
-    // The verify stage: the same two passes, before the release claim.
+    // The verify stage, before the release claim.
     assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
     assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
     let later = T0.plus_ms(HOUR_MS);
@@ -1163,18 +1197,269 @@ async fn release_takes_a_body_pass_and_a_stat_pass_on_two_backbones() {
         async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
     };
     assert!(lost(later).await, "passes from before the claim");
-    // Only the `STAT` half again: the old `BODY` pass does not complete it.
     assert!(
         fx.pass(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat)
             .await
     );
-    assert!(lost(later.plus_ms(2)).await, "no fresh full check");
+    assert!(lost(later.plus_ms(2)).await, "one backbone asked");
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Stat)
+            .await
+    );
+    // The `STAT` pass did not hide the full check of an hour before.
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    assert!(!lost(later.plus_ms(4)).await);
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+}
+
+/// The full check counts only on a backbone that answered under this
+/// claim: with it on a backbone that was not asked, or that now lacks an
+/// article, fresh `STAT` passes on two others release nothing.
+#[tokio::test]
+async fn release_refuses_stat_passes_without_the_backbone_read_in_full() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b", "bb-c"]);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let begin = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() }
+    };
+    for backbone in ["bb-b", "bb-c"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    assert_eq!(begin(later.plus_ms(2)).await, Guard::Lost, "not asked");
+    // It lacks an article now: the full check on record is cancelled.
+    let missing = VerifyResult::Missing;
+    assert!(
+        fx.verify(&r, "bb-a", "p-bb-a", later.plus_ms(3), 1, 2, missing)
+            .await
+    );
+    assert_eq!(on_record(&fx, &o).await, []);
+    assert_eq!(begin(later.plus_ms(4)).await, Guard::Lost, "missing");
+    // A `STAT` pass after the failure does not bring the full check back.
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(5), VerifyKind::Stat)
+            .await
+    );
+    assert_eq!(on_record(&fx, &o).await, []);
+    assert_eq!(begin(later.plus_ms(6)).await, Guard::Lost, "cancelled");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // Read in full again: released.
+    let again = later.plus_ms(7);
+    assert!(fx.pass(&r, "bb-a", again, VerifyKind::Body).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), again)]);
+    assert_eq!(begin(later.plus_ms(8)).await, Guard::Applied(()));
+}
+
+/// A backbone whose last full read failed holds no copy, whatever it
+/// answers to `STAT` afterwards: with three backbones, its `STAT` pass
+/// and the full check of another are one copy, not two.
+#[tokio::test]
+async fn release_refuses_a_stat_pass_where_the_full_read_failed() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b", "bb-c"]);
+    let corrupt = VerifyResult::Corrupt;
+    assert!(fx.verify(&l, "bb-a", "p-bb-a", T0, 1, 2, corrupt).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-c", T0, VerifyKind::Stat).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-b".to_string(), T0)]);
+    let checks = fx.cat.body_checks(&o.extent).await.unwrap();
+    let checks: Vec<_> = checks
+        .iter()
+        .map(|b| (&*b.backbone, b.result, b.counts))
+        .collect();
+    let ok = VerifyResult::Ok;
+    assert_eq!(checks, [("bb-a", corrupt, false), ("bb-b", ok, true)]);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let begin = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() }
+    };
+    // The third backbone is not heard from: one copy.
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    assert_eq!(begin(later.plus_ms(2)).await, Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // Read in full and found whole: it holds a copy again.
     assert!(
         fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Body)
             .await
     );
-    assert!(!lost(later.plus_ms(4)).await);
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(begin(later.plus_ms(4)).await, Guard::Applied(()));
+}
+
+/// A failed `STAT` check cancels the full check on record as a failed
+/// `BODY` check does, and a `STAT` pass after it does not bring it back.
+#[tokio::test]
+async fn a_failed_stat_check_cancels_the_full_check_on_record() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    let v = VerificationRow {
+        extent_id: l.extent.clone(),
+        backbone: "bb-a".into(),
+        provider_id: "p-bb-a".into(),
+        verified_at: T0.plus_ms(1),
+        plan_rev: 1,
+        articles_ok: 0,
+        articles_total: 2,
+        result: VerifyResult::Missing,
+        kind: VerifyKind::Stat,
+    };
+    assert!(fx.cat.record_verification(&l, &v).await.unwrap());
+    assert_eq!(on_record(&fx, &o).await, []);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    assert_eq!(on_record(&fx, &o).await, []);
+    let at = later.plus_ms(2);
+    let got = fx.cat.begin_release(&r, 2, &counting, "[]", at).await;
+    assert_eq!(got.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+}
+
+/// No release on `STAT` alone for a plan that was never read in full: the
+/// full check of an earlier plan revision is not on record for this one.
+#[tokio::test]
+async fn release_refuses_a_plan_that_was_never_read_in_full() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    // A full read of the old plan that failed says nothing about the new
+    // one: it does not keep that backbone out further down.
+    let corrupt = VerifyResult::Corrupt;
+    let at = T0.plus_ms(1);
+    assert!(fx.verify(&l, "bb-a", "p-bb-a", at, 1, 2, corrupt).await);
+    // The plan changes: the same number of articles, a new revision.
+    fx.run(
+        "UPDATE extents SET plan_rev = 2 WHERE id = ?1",
+        &[text(o.extent.as_str())],
+    )
+    .await;
+    assert_eq!(on_record(&fx, &o).await, []);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let new_plan = |backbone: &str, at: UnixMs, kind| VerificationRow {
+        extent_id: o.extent.clone(),
+        backbone: backbone.into(),
+        provider_id: format!("p-{backbone}"),
+        verified_at: at,
+        plan_rev: 2,
+        articles_ok: 2,
+        articles_total: 2,
+        result: VerifyResult::Ok,
+        kind,
+    };
+    for backbone in ["bb-a", "bb-b"] {
+        let row = new_plan(backbone, later.plus_ms(1), VerifyKind::Stat);
+        assert!(fx.cat.record_verification(&r, &row).await.unwrap());
+    }
+    assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
+    let before = fx.dump().await;
+    for required in [1, 2] {
+        assert_eq!(
+            fx.cat
+                .begin_release(&r, required, &counting, "[]", later.plus_ms(2))
+                .await
+                .unwrap(),
+            Guard::Lost,
+            "required = {required}"
+        );
+    }
+    assert_eq!(fx.dump().await, before);
+
+    // The new plan read in full: on record, and the release goes through.
+    let row = new_plan("bb-b", later.plus_ms(3), VerifyKind::Body);
+    assert!(fx.cat.record_verification(&r, &row).await.unwrap());
+    assert_eq!(
+        on_record(&fx, &o).await,
+        [("bb-b".to_string(), later.plus_ms(3))]
+    );
+    assert_eq!(
+        fx.cat
+            .begin_release(&r, 2, &counting, "[]", later.plus_ms(4))
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+}
+
+/// A `BODY` pass that a later `BODY` check contradicts is not on record,
+/// and an incomplete one never was.
+#[tokio::test]
+async fn the_full_check_on_record_is_the_latest_body_check() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    assert_eq!(on_record(&fx, &o).await, []);
+    let corrupt = VerifyResult::Corrupt;
+    // One of two articles, recorded as `ok`: not a complete pass.
+    assert!(fx.verify(&l, "bb-a", "p", T0, 1, 2, VerifyResult::Ok).await);
+    assert_eq!(on_record(&fx, &o).await, []);
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-a", T0.plus_ms(2), VerifyKind::Body).await);
+    assert_eq!(
+        on_record(&fx, &o).await,
+        [
+            ("bb-a".to_string(), T0.plus_ms(2)),
+            ("bb-b".to_string(), T0.plus_ms(1))
+        ]
+    );
+    assert!(
+        fx.verify(&l, "bb-b", "p", T0.plus_ms(3), 1, 2, corrupt)
+            .await
+    );
+    assert_eq!(
+        on_record(&fx, &o).await,
+        [("bb-a".to_string(), T0.plus_ms(2))]
+    );
 }
 
 /// What the column means for rows and Workers from before it, and what
@@ -1276,10 +1561,21 @@ async fn a_stat_pass_is_no_read_back_to_a_reader_from_before_kind() {
     // A second result in the same millisecond moves the tally with the kind.
     assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
     assert_eq!(read_backs_before_kind(&fx, &o, "bb-b").await, "1");
+    // A `STAT` pass in the millisecond of a `BODY` pass leaves it as it
+    // is: the full check stays on record.
     assert!(fx.pass(&l, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
-    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "0");
+    assert_eq!(read_backs_before_kind(&fx, &o, "bb-a").await, "1");
     let status = fx.cat.backbone_status(&o.extent).await.unwrap();
     assert!(status.iter().all(|b| b.counts && b.articles_ok == 2));
+    assert!(status.iter().all(|b| b.kind == VerifyKind::Body));
+    assert_eq!(on_record(&fx, &o).await.len(), 2);
+    // A failure in that millisecond still replaces it.
+    let missing = VerifyResult::Missing;
+    assert!(
+        fx.verify(&l, "bb-a", "p", T0.plus_ms(1), 1, 2, missing)
+            .await
+    );
+    assert_eq!(on_record(&fx, &o).await.len(), 1);
 }
 
 #[tokio::test]
@@ -1385,16 +1681,21 @@ async fn dispatcher_reads_are_bounded_and_bury_only_exhausted_rows() {
     for i in 0..5 {
         objs.push(fx.publish(&fx.bucket, &format!("k{i}")).await);
     }
-    assert_eq!(fx.cat.due(T0, 100).await.unwrap().len(), 5);
-    assert_eq!(fx.cat.due(T0, 2).await.unwrap().len(), 2);
-    assert!(fx.cat.due(T0.plus_ms(-1), 100).await.unwrap().is_empty());
+    assert_eq!(fx.cat.due(T0, RESEND_SECS, 100).await.unwrap().len(), 5);
+    assert_eq!(fx.cat.due(T0, RESEND_SECS, 2).await.unwrap().len(), 2);
+    assert!(fx
+        .cat
+        .due(T0.plus_ms(-1), RESEND_SECS, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Leased rows are not re-sent until the lease expires.
     let held = fx.claim(&objs[0], OutboxStage::Post, T0).await.unwrap();
-    assert_eq!(fx.cat.due(T0, 100).await.unwrap().len(), 4);
+    assert_eq!(fx.cat.due(T0, RESEND_SECS, 100).await.unwrap().len(), 4);
     assert_eq!(
         fx.cat
-            .due(T0.plus_ms(LEASE_MS + 1), 100)
+            .due(T0.plus_ms(LEASE_MS + 1), RESEND_SECS, 100)
             .await
             .unwrap()
             .len(),
@@ -1430,7 +1731,7 @@ async fn dispatcher_reads_are_bounded_and_bury_only_exhausted_rows() {
     assert!(fx.claim(&objs[1], OutboxStage::Post, T0).await.is_none());
     assert_eq!(
         fx.cat
-            .due(T0.plus_ms(LEASE_MS + 1), 100)
+            .due(T0.plus_ms(LEASE_MS + 1), RESEND_SECS, 100)
             .await
             .unwrap()
             .len(),
@@ -1968,7 +2269,12 @@ async fn redrive_requeues_underverified_done_extents() {
     let o = fx.done_on_one_backbone("k").await;
     let later = T0.plus_ms(HOUR_MS);
     assert_eq!(fx.outbox(&o, "stage").await, "done");
-    assert!(fx.cat.due(later, 100).await.unwrap().is_empty());
+    assert!(fx
+        .cat
+        .due(later, RESEND_SECS, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     // Enough backbones count: nothing to do.
     assert_eq!(fx.redrive(&["bb1", "bb2"], 1, 100, later).await, 0);
@@ -1979,7 +2285,7 @@ async fn redrive_requeues_underverified_done_extents() {
     assert_eq!(fx.outbox(&o, "cursor").await, "0");
     assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
     assert_eq!(fx.outbox(&o, "next_at").await, later.0.to_string());
-    assert_eq!(fx.cat.due(later, 100).await.unwrap().len(), 1);
+    assert_eq!(fx.cat.due(later, RESEND_SECS, 100).await.unwrap().len(), 1);
     // Moved once: the row is no longer `done`.
     assert_eq!(fx.redrive(&["bb2"], 1, 100, later).await, 0);
 
@@ -2242,4 +2548,161 @@ async fn renew_all_renews_the_lease_and_each_permit_on_its_own() {
     assert_eq!(slots, vec![false]);
     assert_eq!(fx.outbox(&o, "lease_until").await, before);
     assert_eq!(fx.outbox(&o, "lease_token").await, owner.token.to_string());
+}
+
+// ---------------------------------------------------------------------------
+// The dispatcher's mark of a sent row
+// ---------------------------------------------------------------------------
+
+const RESEND_MS: i64 = RESEND_SECS as i64 * 1000;
+
+impl Fx {
+    async fn due_ids(&self, now: UnixMs) -> Vec<ExtentId> {
+        let rows = self.cat.due(now, RESEND_SECS, 100).await.unwrap();
+        rows.into_iter().map(|r| r.extent_id).collect()
+    }
+
+    async fn mark(&self, objs: &[&Obj], now: UnixMs) -> u64 {
+        let ids: Vec<ExtentId> = objs.iter().map(|o| o.extent.clone()).collect();
+        self.cat.mark_sent(&ids, now).await.unwrap()
+    }
+
+    /// The query plans of the statements the catalogue runs in `f`.
+    async fn plans_of(&self, f: impl std::future::Future<Output = ()>) -> Vec<String> {
+        self.cat.sql.1.borrow_mut().clear();
+        f.await;
+        let ran = std::mem::take(&mut *self.cat.sql.1.borrow_mut());
+        let mut plans = Vec::new();
+        for (sql, params) in ran {
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let rows = self.cat.sql.0.query(&explain, &params).await.unwrap();
+            let lines: Vec<String> = rows
+                .into_iter()
+                .map(|row| match &row[3] {
+                    SqlValue::Text(detail) => detail.clone(),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect();
+            plans.push(lines.join("\n"));
+        }
+        plans
+    }
+}
+
+#[tokio::test]
+async fn a_marked_row_is_not_due_again_until_the_resend_timeout() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    let b = fx.publish(&fx.bucket, "b").await;
+    assert_eq!(fx.due_ids(T0).await.len(), 2);
+
+    // One row written per marked row, and only `sent_at` changes.
+    assert_eq!(fx.mark(&[&a], T0).await, 1);
+    assert_eq!(fx.outbox(&a, "sent_at").await, T0.0.to_string());
+    assert_eq!(fx.outbox(&a, "lease_token").await, "0");
+    assert_eq!(fx.outbox(&a, "attempts").await, "0");
+    assert_eq!(fx.due_ids(T0).await, std::slice::from_ref(&b.extent));
+    let just_before = T0.plus_ms(RESEND_MS - 1);
+    assert_eq!(
+        fx.due_ids(just_before).await,
+        std::slice::from_ref(&b.extent)
+    );
+    // The message is taken for lost: the row is due again.
+    assert_eq!(fx.due_ids(T0.plus_ms(RESEND_MS)).await.len(), 2);
+
+    // The mark gates no claim.
+    assert!(fx.claim(&a, OutboxStage::Post, T0).await.is_some());
+}
+
+#[tokio::test]
+async fn a_claim_clears_the_mark() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    assert_eq!(fx.mark(&[&a], T0).await, 1);
+    assert!(fx.due_ids(T0).await.is_empty());
+
+    // The job the dispatcher sent claims the row and dies. Once its
+    // lease is over the row is due at once, not after the timeout.
+    assert!(fx.claim(&a, OutboxStage::Post, T0).await.is_some());
+    assert_eq!(fx.outbox(&a, "sent_at").await, "NULL");
+    assert!(fx.due_ids(T0.plus_ms(LEASE_MS)).await.is_empty());
+    assert_eq!(fx.due_ids(T0.plus_ms(LEASE_MS + 1)).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_later_due_time_outdates_the_mark() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    assert_eq!(fx.mark(&[&a], T0).await, 1);
+    // Moved on without a claim (as a re-drive does): due again at its
+    // new time, which is after the mark.
+    let later = T0.plus_ms(1000);
+    fx.run("UPDATE outbox SET next_at = ?1", &[SqlValue::Int(later.0)])
+        .await;
+    assert!(fx.due_ids(T0).await.is_empty());
+    assert_eq!(fx.due_ids(later).await.len(), 1);
+}
+
+#[tokio::test]
+async fn only_a_due_row_that_no_job_holds_is_marked() {
+    let fx = Fx::new().await;
+    let held = fx.publish(&fx.bucket, "held").await;
+    let early = fx.publish(&fx.bucket, "early").await;
+    let done = fx.publish(&fx.bucket, "done").await;
+    let due = fx.publish(&fx.bucket, "due").await;
+
+    // Claimed between the dispatcher's read and its mark.
+    assert!(fx.claim(&held, OutboxStage::Post, T0).await.is_some());
+    let later = SqlValue::Int(T0.0 + 1);
+    let id = text(early.extent.as_str());
+    fx.run(
+        "UPDATE outbox SET next_at = ?1 WHERE extent_id = ?2",
+        &[later, id],
+    )
+    .await;
+    let id = text(done.extent.as_str());
+    fx.run(
+        "UPDATE outbox SET stage = 'done' WHERE extent_id = ?1",
+        &[id],
+    )
+    .await;
+
+    assert_eq!(fx.mark(&[&held, &early, &done, &due], T0).await, 1);
+    for (o, sent_at) in [(&held, "NULL"), (&early, "NULL"), (&done, "NULL")] {
+        assert_eq!(fx.outbox(o, "sent_at").await, sent_at);
+    }
+    assert_eq!(fx.outbox(&due, "sent_at").await, T0.0.to_string());
+    // An id the catalogue does not know, and no id at all.
+    let unknown = [ExtentId::mint([0xee; 13])];
+    assert_eq!(fx.cat.mark_sent(&unknown, T0).await.unwrap(), 0);
+    assert_eq!(fx.cat.mark_sent(&[], T0).await.unwrap(), 0);
+}
+
+/// The dispatcher's two statements over the outbox use an index: the
+/// read walks the due rows only (never the rows that are due later, a
+/// day of releases in waiting), and the mark finds each row by its id.
+#[tokio::test]
+async fn the_dispatcher_statements_use_an_index() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    let plans = fx
+        .plans_of(async {
+            assert_eq!(fx.due_ids(T0).await.len(), 1);
+            assert_eq!(fx.mark(&[&a], T0).await, 1);
+        })
+        .await;
+    let [due, mark] = &plans[..] else {
+        panic!("two statements: {plans:?}");
+    };
+    assert!(
+        due.contains("SEARCH outbox USING INDEX outbox_due (stage=? AND next_at<?)"),
+        "{due}"
+    );
+    assert!(
+        mark.contains("SEARCH outbox USING INDEX sqlite_autoindex_outbox_1 (extent_id=?)"),
+        "{mark}"
+    );
+    for plan in [due, mark] {
+        assert!(!plan.contains("SCAN outbox"), "{plan}");
+    }
 }

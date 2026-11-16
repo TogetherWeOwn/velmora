@@ -77,7 +77,7 @@ mod uploads;
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
 use crate::ports::{
-    Catalog, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
+    Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
     UploadTarget,
 };
 use crate::recovery::Recorded;
@@ -123,6 +123,14 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()> {
         auth::put_grant(self, akid, bucket, perm).await
+    }
+    async fn put_grant_if_present(
+        &self,
+        akid: &str,
+        bucket: &BucketId,
+        perm: Perm,
+    ) -> Result<GrantPut> {
+        auth::put_grant_if_present(self, akid, bucket, perm).await
     }
     async fn bucket_in_use(&self, bucket: &BucketId) -> Result<bool> {
         auth::bucket_in_use(self, bucket).await
@@ -451,6 +459,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
         outbox::backbone_status(self, extent).await
     }
+    async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
+        outbox::body_checks(self, extent).await
+    }
     async fn begin_release(
         &self,
         l: &Lease,
@@ -464,8 +475,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await
     }
-    async fn due(&self, now: UnixMs, limit: u32) -> Result<Vec<DueRow>> {
-        outbox::due(self, now, limit).await
+    async fn due(&self, now: UnixMs, resend_secs: u32, limit: u32) -> Result<Vec<DueRow>> {
+        outbox::due(self, now, resend_secs, limit).await
+    }
+    async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64> {
+        outbox::mark_sent(self, extents, now).await
     }
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64> {
         outbox::bury_exhausted(self, max_attempts, now).await
