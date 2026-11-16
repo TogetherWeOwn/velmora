@@ -4,7 +4,8 @@
 //!
 //! 1. [`replay_extents`], any number of times, in chunks: the bucket and
 //!    the extents exist (new ones as `staged` rows without a generation,
-//!    like the parts of an open upload), their article plans exist, and
+//!    like the parts of an open upload), their article plans exist (a
+//!    packed plan that cannot be read is replaced by its record's), and
 //!    an extent whose pinned copy is gone says so.
 //! 2. [`replay_publish`], once: one guarded batch that publishes the
 //!    generation. An extent no generation holds yet is adopted, exactly
@@ -186,6 +187,66 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
     Ok(())
 }
 
+/// The extents of `extents` whose packed plan in the catalogue cannot be
+/// read (a damaged value, the plan of another extent), each with the
+/// stored value and with the plan of its record to put in its place.
+///
+/// A plan the catalogue has is kept, in whatever form, as long as it
+/// can be read. One that cannot is no plan: every reader of the extent
+/// fails on it, and the schema keeps it from being dropped while the
+/// extent is in service, so the record is the only way back.
+async fn unreadable_plans<S: Sql>(
+    c: &SqlCatalog<S>,
+    extents: &[ReplayExtent],
+) -> Result<Vec<(ExtentId, Vec<u8>, Vec<u8>)>> {
+    let with_plan: Vec<&ReplayExtent> = extents.iter().filter(|x| x.plan.is_some()).collect();
+    let mut out = Vec::new();
+    for chunk in with_plan.chunks(LOST_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let rows = c
+            .sql
+            .query(
+                &format!(
+                    "SELECT id, cipher_size, plan FROM extents \
+                     WHERE id IN ({marks}) AND plan IS NOT NULL"
+                ),
+                &chunk
+                    .iter()
+                    .map(|x| text(x.row.id.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        for row in rows {
+            let mut r = super::uploads::Cols::new(row);
+            let id = ExtentId::new(r.text()?);
+            let cipher_size: u64 = r.num()?;
+            let stored = r.blob()?;
+            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
+                continue;
+            }
+            let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
+                continue;
+            };
+            // The record's plan in the form the replay stores it in,
+            // and the explicit form when it stores rows: beside a plan
+            // value, rows are not read.
+            let plan = match (&x.packed, &x.plan) {
+                (Some(packed), _) => Some(packed.clone()),
+                (None, Some(rows)) => crate::plan::repack(&id, cipher_size, rows, None),
+                (None, None) => None,
+            };
+            // Only a value that reads on this very row is worth
+            // writing.
+            if let Some(plan) =
+                plan.filter(|p| crate::plan::expand(&id, cipher_size, p, None, None).is_ok())
+            {
+                out.push((id, stored, plan));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Step 1.
 pub(super) async fn replay_extents<S: Sql>(
     c: &SqlCatalog<S>,
@@ -193,12 +254,28 @@ pub(super) async fn replay_extents<S: Sql>(
     extents: &[ReplayExtent],
     now: UnixMs,
 ) -> Result<()> {
+    let unreadable = unreadable_plans(c, extents).await?;
     let mut stmts: Vec<Stmt> = Vec::new();
     for x in extents {
         if stmts.is_empty() {
             stmts.push(bucket_insert(bucket));
         }
         extent_stmts(x, now, &mut stmts)?;
+        for (_, stored, plan) in unreadable.iter().filter(|(id, ..)| *id == x.row.id) {
+            // Keyed on the very value that was read: a plan that
+            // changed since is another plan, and is left alone.
+            stmts.push((
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
+                 WHERE id = ?1 AND plan = ?5",
+                vec![
+                    text(x.row.id.as_str()),
+                    SqlValue::Int(i64::try_from(x.plan.as_ref().map_or(0, Vec::len)).unwrap_or(0)),
+                    SqlValue::Int(i64::from(x.row.plan_rev)),
+                    SqlValue::Blob(plan.clone()),
+                    SqlValue::Blob(stored.clone()),
+                ],
+            ));
+        }
         if stmts.len() >= BATCH_STATEMENTS {
             c.sql.batch(core::mem::take(&mut stmts)).await?;
         }

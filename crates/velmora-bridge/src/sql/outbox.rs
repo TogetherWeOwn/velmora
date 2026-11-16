@@ -563,7 +563,9 @@ pub(super) async fn mark_posted<S: Sql>(
 ) -> Result<bool> {
     let sql = concat!(
         "UPDATE articles SET state = 'posted', provider_id = ?6, posted_at = ?7 \
-         WHERE extent_id = ?1 AND idx = ?5 AND EXISTS (SELECT 1 FROM outbox WHERE ",
+         WHERE extent_id = ?1 AND idx = ?5 \
+           AND (SELECT plan FROM extents WHERE id = ?1) IS NULL \
+           AND EXISTS (SELECT 1 FROM outbox WHERE ",
         held!(),
         ")"
     );
@@ -576,8 +578,9 @@ pub(super) async fn mark_posted<S: Sql>(
 ///
 /// A packed plan is posted as a whole: its extent is stamped when the
 /// call lists every article of the plan. A call that lists fewer writes
-/// nothing at all and returns `false`, as a stale lease does: a plan is
-/// never taken for posted when its stamp was not written.
+/// nothing at all and is an error ([`ERR_PARTIAL_PLAN`]): a plan is
+/// never taken for posted when its stamp was not written, and a caller
+/// that holds its lease never hears that it lost it.
 pub(super) async fn mark_posted_many<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -625,14 +628,29 @@ pub(super) async fn mark_posted_many<S: Sql>(
         vec![text(l.extent.as_str()), ms(now), text(&idx_list(&listed))],
     ));
     // A packed plan that the call did not mark is not posted: nothing
-    // is written, and the caller hears it as it hears a lost lease.
+    // is written.
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
            (SELECT 1 FROM extents WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL)",
         vec![text(l.extent.as_str())],
     ));
-    fenced_batch(c, stmts).await
+    if fenced_batch(c, stmts).await? {
+        return Ok(true);
+    }
+    // Either guard refuses the batch. A lease that is still held was
+    // not the one: the call did not list the whole plan. That is a
+    // fault of the caller, which must not take it for a lost lease and
+    // leave the job without a failed attempt on its row.
+    if renew_check(c, l).await? {
+        return Err(ERR_PARTIAL_PLAN);
+    }
+    Ok(false)
 }
+
+/// A packed plan was marked posted by a call that did not list every
+/// one of its articles.
+const ERR_PARTIAL_PLAN: BridgeError =
+    BridgeError::Invalid("a packed plan is marked posted only as a whole");
 
 /// `idxs` as a JSON array, for `json_each`.
 fn idx_list(idxs: &[u32]) -> String {

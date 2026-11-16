@@ -28,5 +28,5 @@ END;
 
 -- `articles.message_id` is UNIQUE over the rows only: no constraint
 -- compares the message-ids of packed plans. They are drawn from 128
--- random bits per article (a seeded plan: from a 256-bit seed), as they
+-- random bits per article (a seeded plan: from a 128-bit seed), as they
 -- always were, and nothing reads a plan by message-id.

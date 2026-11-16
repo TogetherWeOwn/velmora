@@ -594,6 +594,14 @@ Packing an older plan writes one row for the extent and one per article
 row it deletes. The route answers 409 while the switch is off and 503
 in restore maintenance. See "Rollback floor" before turning it on.
 
+A packed plan carries a digest of itself and of its extent's id, and a
+value that does not match it is never read as a plan: every read of
+that extent fails instead. The schema keeps a plan on an extent in
+service, so such a value is not dropped by hand. The replay (below)
+replaces it: for each extent of a record it reads the stored plan, and
+one that cannot be read gives way to the plan in the extent's record.
+A plan that reads is left as it is.
+
 ## The route
 
 `POST /_admin/restore` (admin bearer; 409 unless `MAINTENANCE=restore`)

@@ -733,8 +733,9 @@ pub trait Catalog {
     /// Marks several articles posted in one atomic write; each entry is
     /// `(idx, provider)`. `false` = fenced, and then nothing was written.
     /// A packed plan is marked only as a whole: by a call that lists
-    /// every one of its articles. A call that lists fewer is answered
-    /// `false` as well, and writes nothing.
+    /// every one of its articles. A call that lists fewer writes
+    /// nothing and is an error: `false` is a lost lease and nothing
+    /// else.
     async fn mark_posted_many(
         &self,
         l: &Lease,

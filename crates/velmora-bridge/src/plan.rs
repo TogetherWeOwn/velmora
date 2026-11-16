@@ -12,13 +12,16 @@
 //!   and the newsgroup list the plan was made from, plus the payload
 //!   hashes. Every identifier is derived from the seed by the same
 //!   obfuscation code that draws them at random ([`obfuscate_article`]),
-//!   fed from a keyed stream ([`SeedRng`]). A digest of the derived plan
-//!   is stored with it: a derivation that ever came out different is an
-//!   error, never a different plan.
+//!   fed from a keyed stream ([`SeedRng`]).
 //! - **Explicit** ([`TAG_EXPLICIT`]): the identifiers themselves, for a
 //!   plan that was drawn at random before plans were seeded. The headers
 //!   are stored as their three variable fields when the stored bytes are
 //!   exactly what those fields render to, and as they are otherwise.
+//!
+//! Either form carries a digest of the plan it expands to and of the id
+//! of the extent it was made for. A value that expands to anything else
+//! (a derivation that came out different, a changed byte, the plan of
+//! another extent) is an error, never a different plan.
 //!
 //! Both expand to the same [`ArticleRow`]s the catalogue used to store,
 //! byte for byte, so every reader of a plan is unchanged. The sealed
@@ -184,22 +187,24 @@ fn derive(
     Ok(rows)
 }
 
-/// Digest of everything a seed derives, so that a derivation that ever
-/// changed is noticed.
-fn check_of(rows: &[ArticleRow]) -> [u8; CHECK_LEN] {
+/// Digest of the plan `rows` of extent `extent`: the extent's id and
+/// everything its articles are posted and read back with. It is stored
+/// with the packed plan, so that a derivation that ever changed, a
+/// changed byte or a plan that is on another extent's row is noticed.
+fn check_of(extent: &ExtentId, rows: &[ArticleRow]) -> [u8; CHECK_LEN] {
     let mut h = Sha256::new();
     h.update(b"velmora article plan v1 check");
+    let mut field = |bytes: &[u8]| {
+        h.update((bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+    };
+    field(extent.as_str().as_bytes());
     for a in rows {
-        let fields: [&[u8]; 4] = [
-            a.message_id.as_bytes(),
-            a.newsgroup.as_bytes(),
-            &a.headers,
-            a.yenc_name.as_deref().unwrap_or("").as_bytes(),
-        ];
-        for bytes in fields {
-            h.update((bytes.len() as u64).to_be_bytes());
-            h.update(bytes);
-        }
+        field(a.message_id.as_bytes());
+        field(a.newsgroup.as_bytes());
+        field(&a.headers);
+        field(a.yenc_name.as_deref().unwrap_or("").as_bytes());
+        field(&a.payload_sha256);
     }
     let full: [u8; 32] = h.finalize().into();
     let mut out = [0u8; CHECK_LEN];
@@ -270,7 +275,7 @@ pub fn pack_seeded(
     out.push(TAG_SEEDED);
     out.extend_from_slice(&seed.seed);
     out.extend_from_slice(&seed.planned_secs.to_be_bytes());
-    out.extend_from_slice(&check_of(rows));
+    out.extend_from_slice(&check_of(extent, rows));
     put_groups(&mut out, &seed.groups)?;
     out.extend_from_slice(
         &u32::try_from(rows.len())
@@ -340,6 +345,7 @@ pub fn pack_explicit(extent: &ExtentId, cipher_size: u64, rows: &[ArticleRow]) -
     }
     let mut out = Vec::with_capacity(16 + rows.len() * 176);
     out.push(TAG_EXPLICIT);
+    out.extend_from_slice(&check_of(extent, rows));
     put_groups(&mut out, &groups)?;
     out.extend_from_slice(
         &u32::try_from(rows.len())
@@ -487,7 +493,9 @@ impl<'a> Reader<'a> {
 ///
 /// Anything that is not exactly a plan of this extent is an error: a
 /// truncated or overlong value, an article count that does not match the
-/// extent's cuts, a seed whose derivation does not match its digest.
+/// extent's cuts, a plan that does not match its digest (a seed whose
+/// derivation came out different, a changed byte, the plan of another
+/// extent).
 pub fn expand(
     extent: &ExtentId,
     cipher_size: u64,
@@ -496,11 +504,11 @@ pub fn expand(
     reposted_at: Option<i64>,
 ) -> Result<Vec<ArticleRow>> {
     let mut r = Reader(blob);
-    let mut rows = match r.u8()? {
+    let (check, mut rows): ([u8; CHECK_LEN], _) = match r.u8()? {
         TAG_SEEDED => {
             let seed: [u8; SEED_LEN] = r.array()?;
             let planned_secs = i64::from_be_bytes(r.array()?);
-            let check: [u8; CHECK_LEN] = r.array()?;
+            let check = r.array()?;
             let groups = r.groups()?;
             let n = r.u32()? as usize;
             // Bounded by what is there, before anything is allocated.
@@ -510,13 +518,10 @@ pub fn expand(
                 planned_secs,
                 groups,
             };
-            let rows = derive(&seed, extent, cipher_size, hashes)?;
-            if check_of(&rows) != check {
-                return Err(ERR_PLAN);
-            }
-            rows
+            (check, derive(&seed, extent, cipher_size, hashes)?)
         }
         TAG_EXPLICIT => {
+            let check = r.array()?;
             let groups = r.groups()?;
             let n = r.u32()? as usize;
             let spans = article_spans(cipher_size);
@@ -562,11 +567,14 @@ pub fn expand(
                     reposted_at: None,
                 });
             }
-            rows
+            (check, rows)
         }
         _ => return Err(ERR_PLAN),
     };
     r.end()?;
+    if check_of(extent, &rows) != check {
+        return Err(ERR_PLAN);
+    }
     if let Some(at) = posted_at {
         let at = (at != POSTED_AT_UNKNOWN).then_some(UnixMs(at));
         for a in &mut rows {
@@ -735,6 +743,19 @@ mod tests {
         assert_eq!(pinned, PINNED, "the derivation of a version-1 seed changed");
         let last = rows.last().unwrap();
         assert_eq!(last.message_id, PINNED_LAST);
+        // The stored bytes of both forms, digest included.
+        let explicit = pack_explicit(&extent(), cipher, &rows).unwrap();
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(
+            (hex(&blob), hex(&explicit)),
+            (PINNED_SEEDED.to_owned(), PINNED_EXPLICIT.to_owned()),
+            "the stored form of a version-1 plan changed"
+        );
     }
 
     const PINNED: (&str, &str, &str) = (
@@ -744,6 +765,10 @@ mod tests {
          Subject: uKGS0KanwsgKO9TdKeGplHWabxuHXHB7\r\nDate: Fri, 15 Jan 2027 13:45:56 +0000\r\n\
          Message-ID: <q9yy2r3oct0dqhkvsazqmeefn0ulktk5@nzij7j50.gq2>\r\n",
     );
+    /// SHA-256 of the seeded and of the explicit form of the pinned plan.
+    const PINNED_SEEDED: &str = "4c0f239031457b405a03c20d83cdd14970477c67674550345c2d26bd3ca45b07";
+    const PINNED_EXPLICIT: &str =
+        "3510e3893ec99c6234835d2b5fcb96fc6ae6e1dbe29544d1c987e1193b73be8f";
     const PINNED_LAST: &str = "nsuzl0xtch3x8o6m8ajfxm15moyfa8du@idmg8en1.48q";
 
     #[test]
@@ -797,6 +822,12 @@ mod tests {
         let mut swapped = rows.clone();
         swapped.swap(0, 1);
         assert!(pack_explicit(&extent(), cipher, &swapped).is_err());
+        // The plan of an extent of the same size is not this extent's.
+        let other = ExtentId::new("fedcba9876543210fedcba9876543210");
+        assert!(expand(&extent(), cipher, &blob, None, None).is_ok());
+        assert!(expand(&other, cipher, &blob, None, None).is_err());
+        assert!(expand(&extent(), cipher, &seeded, None, None).is_ok());
+        assert!(expand(&other, cipher, &seeded, None, None).is_err());
     }
 
     #[test]
@@ -814,16 +845,17 @@ mod tests {
             let mut longer = blob.to_vec();
             longer.push(0);
             assert!(expand(&extent(), cipher, &longer, None, None).is_err());
-        }
-        // A seed that no longer derives what its digest says: every bit
-        // of the seed, the clock and the digest is covered.
-        for at in 1..1 + SEED_LEN + 8 + CHECK_LEN {
-            let mut flipped = seeded.clone();
-            flipped[at] ^= 1;
-            assert!(
-                expand(&extent(), cipher, &flipped, None, None).is_err(),
-                "byte {at}"
-            );
+            // A changed byte anywhere: a seed that no longer derives what
+            // its digest says, another identifier, another payload hash.
+            for at in 0..blob.len() {
+                let mut flipped = blob.to_vec();
+                flipped[at] ^= 1;
+                assert!(
+                    expand(&extent(), cipher, &flipped, None, None).is_err(),
+                    "byte {at} of form {}",
+                    blob[0]
+                );
+            }
         }
         // An unknown form.
         let mut other = seeded.clone();

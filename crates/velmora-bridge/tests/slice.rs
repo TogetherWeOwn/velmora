@@ -2215,6 +2215,69 @@ async fn rebuild_from_usenet(packed_plans: &str) {
         );
     }
 
+    if packed {
+        // A stored plan that cannot be read (a damaged value, the plan
+        // of another extent) is no plan, and the schema keeps it on an
+        // extent in service: the replay puts the record's plan in its
+        // place. A plan that reads is left as it is.
+        let s = "recovery of unreadable plans";
+        let plans = |rig: &Rig| -> Vec<(String, Vec<u8>)> {
+            rig.bridge.catalog.sql.with_conn(|c| {
+                let mut q = c
+                    .prepare("SELECT id, plan FROM extents WHERE plan IS NOT NULL ORDER BY id")
+                    .expect("prepare");
+                let rows = q
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .expect("query");
+                rows.map(|r| r.expect("row")).collect()
+            })
+        };
+        let before = plans(&rig);
+        expect_eq(s, "packed plans before", 4, before.len());
+        let mut cut = before[0].1.clone();
+        cut.truncate(cut.len() - 1);
+        let mut flipped = before[1].1.clone();
+        *flipped.last_mut().expect("a plan") ^= 1;
+        // The third extent gets the plan of the fourth, which stays.
+        let damage = [
+            (&before[0].0, cut),
+            (&before[1].0, flipped),
+            (&before[2].0, before[3].1.clone()),
+        ];
+        rig.bridge.catalog.sql.with_conn(|c| {
+            for (id, plan) in &damage {
+                let n = c
+                    .execute(
+                        "UPDATE extents SET plan = ?2 WHERE id = ?1",
+                        rusqlite::params![id, plan],
+                    )
+                    .expect("damage a plan");
+                assert_eq!(n, 1);
+            }
+        });
+        expect(
+            s,
+            "the plans are damaged",
+            plans(&rig) != before,
+            String::new(),
+        );
+        let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+        while let Some(at) = cursor {
+            let mut report = rig
+                .bridge
+                .replay_step(at)
+                .await
+                .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+            cursor = report.next.take();
+        }
+        expect(
+            s,
+            "every plan is its record's again",
+            plans(&rig) == before,
+            String::new(),
+        );
+    }
+
     // The key and its grants are issued again, then S3 reads work.
     let s = "recovery read-back";
     let key = rig

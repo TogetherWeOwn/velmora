@@ -2816,12 +2816,20 @@ async fn a_packed_plan_is_stored_once_and_posted_as_a_whole() {
         &[(1, "p1"), (1, "p2")],
         &[(0, "p1"), (2, "p1")],
     ] {
+        // An error, not `false`: the lease is held, and a caller that
+        // heard `false` would drop the job as fenced.
+        let refused = fx.cat.mark_posted_many(&post, part, T0.plus_secs(1)).await;
+        assert!(
+            matches!(refused, Err(BridgeError::Invalid(_))),
+            "{part:?} {refused:?}"
+        );
+        assert_eq!(fx.extent(&o, "posted_at").await, "NULL", "{part:?}");
+        // One article alone neither.
         assert!(!fx
             .cat
-            .mark_posted_many(&post, part, T0.plus_secs(1))
+            .mark_posted(&post, part[0].0, "p1", T0.plus_secs(1))
             .await
             .unwrap());
-        assert_eq!(fx.extent(&o, "posted_at").await, "NULL", "{part:?}");
     }
     assert_eq!(fx.dump().await, before);
     let planned = fx.cat.articles(&o.extent).await.unwrap();
