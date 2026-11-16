@@ -75,6 +75,9 @@ pub const MIGRATION_0012: &str =
 /// How a verification row checked the articles (`body` or `stat`).
 pub const MIGRATION_0013: &str =
     include_str!("../../../workers/s3-bridge/migrations/0013_verification_kind.sql");
+/// When an article was last posted again (`articles.reposted_at`).
+pub const MIGRATION_0014: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0014_article_reposted_at.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -170,6 +173,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0011)?;
         db.apply(MIGRATION_0012)?;
         db.apply(MIGRATION_0013)?;
+        db.apply(MIGRATION_0014)?;
         Ok(db)
     }
 

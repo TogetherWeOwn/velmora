@@ -266,6 +266,7 @@ impl Fx {
                 state: ArticleState::Planned,
                 provider_id: None,
                 posted_at: None,
+                reposted_at: None,
             })
             .collect()
     }
@@ -2080,6 +2081,52 @@ fn poster(id: &str, max_conns: u32) -> ProviderConfig {
          \"max_conns\":{max_conns}}}"
     );
     serde_json::from_str(&json).unwrap()
+}
+
+/// The stamp of a repost is written as a whole under a live lease and
+/// not at all under a stale one, changes nothing else of the rows, and
+/// never moves back.
+#[tokio::test]
+async fn mark_reposted_many_is_fenced_and_never_moves_back() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let stale = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let plan = fx.plan(&o, "first", 4);
+    fx.cat.plan_articles(&stale, &plan).await.unwrap().unwrap();
+    let c = &fx.cat;
+    let all = [(0, "p1"), (1, "p1"), (2, "p1"), (3, "p1")];
+    assert!(c.mark_posted_many(&stale, &all, T0).await.unwrap());
+    let posted = c.articles(&o.extent).await.unwrap();
+    assert!(posted.iter().all(|a| a.reposted_at.is_none()));
+    assert!(posted.iter().all(|a| a.last_posted_at() == Some(T0)));
+
+    let at = T0.plus_ms(50);
+    assert!(c.mark_reposted_many(&stale, &[1, 3], at).await.unwrap());
+    let rows = c.articles(&o.extent).await.unwrap();
+    let stamps: Vec<_> = rows.iter().map(|a| a.reposted_at).collect();
+    assert_eq!(stamps, [None, Some(at), None, Some(at)]);
+    assert_eq!(rows[1].last_posted_at(), Some(at));
+    // Only the stamp changed.
+    let mut cleared = rows.clone();
+    cleared.iter_mut().for_each(|a| a.reposted_at = None);
+    assert_eq!(cleared, posted);
+    // An older stamp does not replace a newer one; a newer one does.
+    assert!(c.mark_reposted_many(&stale, &[1], T0).await.unwrap());
+    assert_eq!(c.articles(&o.extent).await.unwrap(), rows);
+    let later = T0.plus_ms(70);
+    assert!(c.mark_reposted_many(&stale, &[3], later).await.unwrap());
+    let rows = c.articles(&o.extent).await.unwrap();
+    assert_eq!(rows[3].reposted_at, Some(later));
+    // Nothing to write: still an answer about the lease.
+    assert!(c.mark_reposted_many(&stale, &[], at).await.unwrap());
+
+    let t1 = T0.plus_ms(LEASE_MS + 1);
+    let _owner = fx.claim(&o, OutboxStage::Post, t1).await.unwrap();
+    let before = fx.dump().await;
+    assert!(!c.mark_reposted_many(&stale, &[0, 2], t1).await.unwrap());
+    assert!(!c.mark_reposted_many(&stale, &[], t1).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(c.articles(&o.extent).await.unwrap(), rows);
 }
 
 /// A batch of posted articles is written as a whole under a live lease

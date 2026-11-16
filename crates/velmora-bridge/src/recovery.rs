@@ -529,6 +529,7 @@ impl ArticleManifest {
                     state,
                     provider_id: None,
                     posted_at: None,
+                    reposted_at: None,
                 })
             })
             .collect()

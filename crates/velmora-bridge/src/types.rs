@@ -840,7 +840,19 @@ pub struct ArticleRow {
     pub yenc_name: Option<String>,
     pub state: ArticleState,
     pub provider_id: Option<String>,
+    /// The first post. The provider's retention counts from here.
     pub posted_at: Option<UnixMs>,
+    /// The last time the article was posted again (a repost to a
+    /// backbone that lacked it). `None` = never.
+    pub reposted_at: Option<UnixMs>,
+}
+
+impl ArticleRow {
+    /// The newest time the article was posted anywhere: the first post or
+    /// a later repost. `None` = no post time is recorded.
+    pub fn last_posted_at(&self) -> Option<UnixMs> {
+        self.posted_at.max(self.reposted_at)
+    }
 }
 
 /// Longest yEnc name an article row may carry (the catalogue's CHECK).

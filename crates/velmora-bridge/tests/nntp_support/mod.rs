@@ -305,6 +305,8 @@ pub struct MemCatalog {
     /// The next `n` `mark_posted` calls fail before writing (a job that
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
+    /// The next `n` `mark_reposted_many` calls fail before writing.
+    pub fail_mark_reposted: Cell<u32>,
     pub fault: Cell<Option<Fault>>,
     /// `renew_all` calls so far (one per renewal tick of a post job).
     pub renewals: Cell<u32>,
@@ -795,6 +797,22 @@ impl Catalog for MemCatalog {
             token: slots[i].token,
             class,
         }))
+    }
+
+    async fn mark_reposted_many(&self, l: &Lease, idxs: &[u32], now: UnixMs) -> Result<bool> {
+        if self.fail_mark_reposted.get() > 0 {
+            self.fail_mark_reposted
+                .set(self.fail_mark_reposted.get() - 1);
+            return Err(BridgeError::Sql("injected mark_reposted failure".into()));
+        }
+        // All or nothing, like the fenced SQL batch.
+        let written = self.fenced(l, |e| {
+            for idx in idxs {
+                let a = &mut e.articles[*idx as usize];
+                a.reposted_at = a.reposted_at.max(Some(now));
+            }
+        });
+        Ok(written.is_some())
     }
 
     async fn mark_posted_many(
