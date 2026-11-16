@@ -419,14 +419,20 @@ impl MemCatalog {
         Self::latest_rows(e, |_| true)
     }
 
-    /// As the SQL catalogue: per backbone, the latest row that is a
-    /// `BODY` row or a failure, if it is a complete `BODY` pass. A later
-    /// `STAT` pass does not hide it.
-    fn body_on_record(e: &Entry) -> Vec<BackboneStatus> {
+    /// As the SQL catalogue: per backbone, the latest `BODY` row, pass
+    /// or failure. `counts` only where it is a complete pass and no
+    /// later check of that backbone failed; a later `STAT` pass does not
+    /// hide it.
+    fn body_checks(e: &Entry) -> Vec<BackboneStatus> {
         let deciding =
             |v: &VerificationRow| v.kind == VerifyKind::Body || v.result != VerifyResult::Ok;
-        let mut rows = Self::latest_rows(e, deciding);
-        rows.retain(|s| s.counts && s.kind == VerifyKind::Body);
+        let on_record = Self::latest_rows(e, deciding);
+        let mut rows = Self::latest_rows(e, |v| v.kind == VerifyKind::Body);
+        for row in &mut rows {
+            row.counts &= on_record
+                .iter()
+                .any(|s| s.backbone == row.backbone && s.kind == VerifyKind::Body && s.counts);
+        }
         rows
     }
 
@@ -641,9 +647,9 @@ impl Catalog for MemCatalog {
         Ok(entries.get(extent).map(Self::statuses).unwrap_or_default())
     }
 
-    async fn body_passes(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
+    async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
         let entries = self.entries.borrow();
-        let found = entries.get(extent).map(Self::body_on_record);
+        let found = entries.get(extent).map(Self::body_checks);
         Ok(found.unwrap_or_default())
     }
 
@@ -661,11 +667,19 @@ impl Catalog for MemCatalog {
             let statuses = Self::statuses(e);
             // A fresh pass is the full check only where a `BODY` pass
             // is on record.
-            let full = Self::body_on_record(e);
+            // is on record, and counts for nothing where the last full
+            // read failed.
+            let checks = Self::body_checks(e);
+            let last = |s: &BackboneStatus| checks.iter().find(|b| b.backbone == s.backbone);
+            let failed = |s: &BackboneStatus| {
+                last(s).is_some_and(|b| {
+                    b.result != VerifyResult::Ok || b.articles_ok != b.articles_total
+                })
+            };
             let passes = statuses
                 .iter()
-                .filter(|s| s.counts && s.verified_at >= claimed)
-                .map(|s| match full.iter().any(|b| b.backbone == s.backbone) {
+                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
+                .map(|s| match last(s).is_some_and(|b| b.counts) {
                     true => (s.backbone.as_str(), VerifyKind::Body),
                     false => (s.backbone.as_str(), VerifyKind::Stat),
                 });

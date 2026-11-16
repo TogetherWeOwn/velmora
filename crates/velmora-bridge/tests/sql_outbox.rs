@@ -1143,7 +1143,8 @@ async fn release_refuses_both_checks_on_one_backbone() {
 
 /// The backbones with the full check on record, with the time of it.
 async fn on_record(fx: &Fx, o: &Obj) -> Vec<(String, UnixMs)> {
-    let rows = fx.cat.body_passes(&o.extent).await.unwrap();
+    let mut rows = fx.cat.body_checks(&o.extent).await.unwrap();
+    rows.retain(|b| b.counts);
     for b in &rows {
         assert!(b.counts && b.kind == VerifyKind::Body && b.result == VerifyResult::Ok);
         assert_eq!((b.articles_ok, b.articles_total), (2, 2));
@@ -1241,6 +1242,98 @@ async fn release_refuses_stat_passes_without_the_backbone_read_in_full() {
     assert!(fx.pass(&r, "bb-a", again, VerifyKind::Body).await);
     assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), again)]);
     assert_eq!(begin(later.plus_ms(8)).await, Guard::Applied(()));
+}
+
+/// A backbone whose last full read failed holds no copy, whatever it
+/// answers to `STAT` afterwards: with three backbones, its `STAT` pass
+/// and the full check of another are one copy, not two.
+#[tokio::test]
+async fn release_refuses_a_stat_pass_where_the_full_read_failed() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b", "bb-c"]);
+    let corrupt = VerifyResult::Corrupt;
+    assert!(fx.verify(&l, "bb-a", "p-bb-a", T0, 1, 2, corrupt).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Body).await);
+    assert!(fx.pass(&l, "bb-c", T0, VerifyKind::Stat).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-b".to_string(), T0)]);
+    let checks = fx.cat.body_checks(&o.extent).await.unwrap();
+    let checks: Vec<_> = checks
+        .iter()
+        .map(|b| (&*b.backbone, b.result, b.counts))
+        .collect();
+    let ok = VerifyResult::Ok;
+    assert_eq!(checks, [("bb-a", corrupt, false), ("bb-b", ok, true)]);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let begin = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() }
+    };
+    // The third backbone is not heard from: one copy.
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    assert_eq!(begin(later.plus_ms(2)).await, Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // Read in full and found whole: it holds a copy again.
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Body)
+            .await
+    );
+    assert_eq!(begin(later.plus_ms(4)).await, Guard::Applied(()));
+}
+
+/// A failed `STAT` check cancels the full check on record as a failed
+/// `BODY` check does, and a `STAT` pass after it does not bring it back.
+#[tokio::test]
+async fn a_failed_stat_check_cancels_the_full_check_on_record() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    let v = VerificationRow {
+        extent_id: l.extent.clone(),
+        backbone: "bb-a".into(),
+        provider_id: "p-bb-a".into(),
+        verified_at: T0.plus_ms(1),
+        plan_rev: 1,
+        articles_ok: 0,
+        articles_total: 2,
+        result: VerifyResult::Missing,
+        kind: VerifyKind::Stat,
+    };
+    assert!(fx.cat.record_verification(&l, &v).await.unwrap());
+    assert_eq!(on_record(&fx, &o).await, []);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    assert_eq!(on_record(&fx, &o).await, []);
+    let at = later.plus_ms(2);
+    let got = fx.cat.begin_release(&r, 2, &counting, "[]", at).await;
+    assert_eq!(got.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
 }
 
 /// No release on `STAT` alone for a plan that was never read in full: the
@@ -1451,16 +1544,14 @@ async fn a_stat_pass_is_no_read_back_to_a_reader_from_before_kind() {
     let status = fx.cat.backbone_status(&o.extent).await.unwrap();
     assert!(status.iter().all(|b| b.counts && b.articles_ok == 2));
     assert!(status.iter().all(|b| b.kind == VerifyKind::Body));
-    let on_record = fx.cat.body_passes(&o.extent).await.unwrap();
-    assert_eq!(on_record.len(), 2);
+    assert_eq!(on_record(&fx, &o).await.len(), 2);
     // A failure in that millisecond still replaces it.
     let missing = VerifyResult::Missing;
     assert!(
         fx.verify(&l, "bb-a", "p", T0.plus_ms(1), 1, 2, missing)
             .await
     );
-    let on_record = fx.cat.body_passes(&o.extent).await.unwrap();
-    assert_eq!(on_record.len(), 1);
+    assert_eq!(on_record(&fx, &o).await.len(), 1);
 }
 
 #[tokio::test]

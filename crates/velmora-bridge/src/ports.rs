@@ -700,16 +700,20 @@ pub trait Catalog {
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool>;
     /// Latest row per backbone for the current `plan_rev`, with `counts`.
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
-    /// The full check on record: per backbone, the latest complete `body`
-    /// pass of the current `plan_rev`, unless a later check of that
-    /// backbone failed. A later `stat` pass does not hide it. A plan
-    /// that changed (a new `plan_rev`) has none until it is read again.
-    async fn body_passes(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
+    /// The last full read per backbone: its latest `body` row for the
+    /// current `plan_rev`, pass or failure. `counts` is true where it is
+    /// the full check on record: a complete pass that no later check of
+    /// that backbone has cancelled (a later `stat` pass does not hide
+    /// it). A row that is not a complete pass means the backbone holds
+    /// no copy until it is read in full again. A plan that changed (a
+    /// new `plan_rev`) has no rows until it is read again.
+    async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
     /// `counting` = the labels of the backbones that count toward a
     /// release. The guard is the release rule: `required` of those
     /// backbones with a complete pass recorded under this claim (a
-    /// `stat` pass is enough), and at least one of these also has the
-    /// full check on record ([`Catalog::body_passes`]).
+    /// `stat` pass is enough, but none counts on a backbone whose last
+    /// full read failed), and at least one of these also has the full
+    /// check on record ([`Catalog::body_checks`]).
     async fn begin_release(
         &self,
         l: &Lease,

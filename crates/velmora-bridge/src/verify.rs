@@ -29,8 +29,14 @@
 //!   record: a complete `BODY` pass of the extent's current `plan_rev`
 //!   that no later check has cancelled, on a backbone whose `STAT` pass
 //!   it has just seen. A backbone counts as the full check only so.
+//! - A backbone whose last `BODY` read of the current plan failed
+//!   (missing or corrupt) holds no copy at release, whatever it answers
+//!   to `STAT`, until verify has read it in full again and it passed.
 //! - A plan that changed (a new `plan_rev`) has no full check on record:
 //!   it goes back to verify and is read in full before any release.
+//! - A release that finds an article missing where it is needed records
+//!   nothing and goes back to verify after `VERIFY_DELAY_SECS`: verify
+//!   owns the waits, the repost and the record.
 //! - What this gives up: a body that a backbone stopped serving between
 //!   verify and release, while it still answers `STAT`, is not seen by
 //!   the release. Only a later read of the bodies would find it.
@@ -546,10 +552,18 @@ where
         // backbone that counts. A plan without one was never read in
         // full (or its pass was cancelled since): back to verify, which
         // reads it, and nothing is asked of a provider here.
-        let mut full = self.catalog.body_passes(&extent.id).await?;
-        full.retain(|b| b.plan_rev == extent.plan_rev && labels.contains(&label(&b.backbone)));
+        let mut checks = self.catalog.body_checks(&extent.id).await?;
+        checks.retain(|b| b.plan_rev == extent.plan_rev && labels.contains(&label(&b.backbone)));
+        // A backbone whose last full read failed holds no copy, whatever
+        // it answers to `STAT`, until verify reads it in full again.
+        let (full, failed): (Vec<_>, Vec<_>) = checks.into_iter().partition(|b| b.counts);
+        let failed: Vec<String> = failed
+            .iter()
+            .filter(|b| b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+            .map(|b| label(&b.backbone))
+            .collect();
         if full.is_empty() {
-            return self.back_to_verify(lease, now).await;
+            return self.back_to_verify(lease, now, 0).await;
         }
         // Presence: only what this job finds now counts. Every backbone
         // that counts is asked with `STAT`, and no `BODY` is read: one
@@ -568,28 +582,36 @@ where
             let name = label(backbone);
             full.iter().any(|b| label(&b.backbone) == name)
         };
-        let passes = read
-            .iter()
-            .filter(|(_, t)| result_of(t) == VerifyResult::Ok)
-            .map(|(p, _)| match read_in_full(&p.backbone) {
-                true => (p.backbone.as_str(), VerifyKind::Body),
-                false => (p.backbone.as_str(), VerifyKind::Stat),
-            });
+        let holds = |(p, t): &(&ProviderConfig, ReadTally)| {
+            result_of(t) == VerifyResult::Ok && !failed.contains(&label(&p.backbone))
+        };
+        let passes =
+            read.iter()
+                .filter(|r| holds(r))
+                .map(|(p, _)| match read_in_full(&p.backbone) {
+                    true => (p.backbone.as_str(), VerifyKind::Body),
+                    false => (p.backbone.as_str(), VerifyKind::Stat),
+                });
         if !releasable(passes, &labels, required) {
-            if read.iter().all(|(_, t)| result_of(t) == VerifyResult::Ok) {
+            if read.iter().all(holds) {
                 return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
             }
-            // An article is missing where it has to be. Nothing is
+            // An article is missing where it has to be, or a backbone
+            // that is needed was last read in full and failed. Nothing is
             // recorded: back to verify, which owns the retry waits, the
-            // repost, the record, and the next full read.
-            return self.back_to_verify(lease, now).await;
+            // repost, the record, and the next full read. It starts
+            // after the usual wait before a verify, so a provider that
+            // answers `STAT` wrongly cannot make the two stages take
+            // turns without a pause, one full read each time.
+            let wait = self.cfg.verify_delay_secs.max(1);
+            return self.back_to_verify(lease, now, wait).await;
         }
         let mut rows = Vec::new();
         for (provider, tally) in &read {
             let row = self
                 .record(lease, extent, provider, tally, VerifyKind::Stat)
                 .await?;
-            if row.result == VerifyResult::Ok {
+            if row.result == VerifyResult::Ok && !failed.contains(&label(&row.backbone)) {
                 rows.push(row);
             }
         }
@@ -636,11 +658,12 @@ where
     }
 
     /// Sends a release that cannot go through back to the start of verify,
-    /// at once and without an attempt spent.
-    async fn back_to_verify(&self, lease: &Lease, now: UnixMs) -> Staged<()> {
+    /// due in `wait_secs` and without an attempt spent.
+    async fn back_to_verify(&self, lease: &Lease, now: UnixMs, wait_secs: u32) -> Staged<()> {
         self.cursor(lease, 0).await?;
-        self.advance(lease, OutboxStage::Verify, now).await?;
-        self.notify(lease, OutboxStage::Verify, 0).await;
+        self.advance(lease, OutboxStage::Verify, now.plus_secs(wait_secs))
+            .await?;
+        self.notify(lease, OutboxStage::Verify, wait_secs).await;
         Ok(())
     }
 

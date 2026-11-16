@@ -480,8 +480,12 @@ async fn release_needs_fresh_evidence() {
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
     let outbox = rig.outbox(&s);
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
-    assert_eq!(outbox.next_at, now);
-    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
+    // Verify starts after its usual wait, not at once.
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert!(wait > 0);
+    assert_eq!(outbox.next_at, now.plus_secs(wait));
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
+    rig.bridge.clock.advance_secs(wait);
 
     // Verify walks its waits and then records the second backbone's loss.
     rig.bridge.clock.advance_secs(1);
@@ -533,8 +537,8 @@ async fn newer_failure_cancels_pass() {
             kind: VerifyKind::Body,
         });
     });
-    let on_record = rig.bridge.catalog.body_passes(&s.extent).await.unwrap();
-    assert!(on_record.is_empty(), "{on_record:?}");
+    let last = rig.bridge.catalog.body_checks(&s.extent).await.unwrap();
+    assert!(last.iter().all(|b| !b.counts), "{last:?}");
     rig.bridge.clock.advance_secs(1);
     rig.bridge.nntp.slow(&rig.bridge.clock, 0);
 
@@ -744,7 +748,7 @@ async fn a_changed_plan_is_read_in_full_before_any_release() {
     rig.bridge
         .catalog
         .edit(&s.extent, |e| e.job.extent.plan_rev = 2);
-    let on_record = rig.bridge.catalog.body_passes(&s.extent).await.unwrap();
+    let on_record = rig.bridge.catalog.body_checks(&s.extent).await.unwrap();
     assert!(on_record.is_empty(), "{on_record:?}");
 
     rig.bridge.nntp.slow(&rig.bridge.clock, 0);
@@ -803,9 +807,82 @@ async fn stat_passes_do_not_release_without_the_backbone_read_in_full() {
     assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
     let outbox = rig.outbox(&s);
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
-    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
     // Nothing recorded: verify owns the waits and the record.
     assert_eq!(rig.rows(&s).len(), 3);
+}
+
+/// A backbone whose full read failed at verify holds no copy at release,
+/// whatever it answers to `STAT`. With three backbones: the first was
+/// read and found corrupt, the second was read in full, the third lost
+/// an article since. The first and the second both answer `STAT`: that is
+/// one copy, and nothing is released.
+#[tokio::test]
+async fn a_stat_answer_does_not_count_where_the_full_read_failed() {
+    let mut rig = three_backbone_rig().await;
+    rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
+    let (s, plan) = rig.posted(44).await;
+    rig.propagate(&s, 0, 1).await;
+    rig.propagate(&s, 0, 2).await;
+    for _ in 0..3 {
+        assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    }
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.jobs.take();
+    // As verify leaves it when the first backbone served wrong bytes and
+    // the second was read in full.
+    let (first, second) = {
+        let rows = rig.rows(&s);
+        (rows[0].backbone.clone(), rows[1].backbone.clone())
+    };
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        for v in &mut e.verifications {
+            if v.backbone == first {
+                assert_eq!(v.kind, VerifyKind::Body);
+                v.result = VerifyResult::Corrupt;
+                v.articles_ok -= 1;
+            } else if v.backbone == second {
+                v.kind = VerifyKind::Body;
+            }
+        }
+    });
+    rig.bridge.clock.advance_secs(1);
+    rig.servers[2].hide(&plan[1].message_id).await;
+
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig), (0, 10));
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert!(wait > 0);
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    assert_eq!(outbox.next_at, rig.bridge.clock.now().plus_secs(wait));
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
+    assert_eq!(rig.rows(&s).len(), 3);
+
+    // Every backbone answers, and still the first holds no copy: the
+    // second and the third are the two.
+    rig.servers[2].unhide(&plan[1].message_id).await;
+    rig.bridge.clock.advance_secs(wait);
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.outbox.stage = OutboxStage::Release;
+    });
+    rig.bridge.jobs.take();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(!rig.safety_held(&s));
+    let evidence = rig.bridge.catalog.extent(&s.extent).release_evidence;
+    let evidence: serde_json::Value = serde_json::from_str(&evidence.unwrap()).unwrap();
+    let backbones: Vec<&str> = evidence
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["backbone"].as_str().unwrap())
+        .collect();
+    assert!(!backbones.contains(&first.as_str()), "{backbones:?}");
+    assert_eq!(backbones.len(), 3, "{backbones:?}");
 }
 
 /// An article missing at release (`STAT` answers 430) takes the usual
@@ -829,12 +906,13 @@ async fn an_article_missing_at_release_is_reposted_by_verify() {
     assert!(rig.safety_held(&s));
     let outbox = rig.outbox(&s);
     assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
-    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
+    let wait = rig.bridge.cfg.verify_delay_secs;
+    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, wait)]);
     assert_eq!(posts(), 0);
 
     // Verify: the first backbone in full, then the second, where the one
     // missing article is posted again.
-    rig.bridge.clock.advance_secs(1);
+    rig.bridge.clock.advance_secs(wait);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
     assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);

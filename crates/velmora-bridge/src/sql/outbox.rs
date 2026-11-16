@@ -81,9 +81,28 @@ macro_rules! counts {
     };
 }
 
+/// Whether the last full read of the backbone of row `v` failed: its
+/// latest `body` row for the current plan of extent `e` is not a complete
+/// pass. A `STAT` answer says nothing about bytes that were read and
+/// found missing or wrong, so such a backbone holds no copy until it is
+/// read in full again.
+macro_rules! body_failed {
+    () => {
+        "EXISTS (SELECT 1 FROM verifications f \
+           WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
+             AND f.plan_rev = e.plan_rev AND f.kind = 'body' \
+             AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total) \
+             AND NOT EXISTS (SELECT 1 FROM verifications g \
+               WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
+                 AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
+                 AND g.verified_at > f.verified_at))"
+    };
+}
+
 /// A row that is evidence for the release of extent `?1` at `?6`: the one
 /// that speaks for a backbone in the list `?7`, a complete pass, recorded
-/// under the current claim of the outbox row.
+/// under the current claim of the outbox row, on a backbone whose last
+/// full read did not fail ([`body_failed`]).
 macro_rules! fresh_pass {
     () => {
         concat!(
@@ -92,7 +111,9 @@ macro_rules! fresh_pass {
                AND v.backbone IN (SELECT value FROM json_each(?7)) AND ",
             counts!(),
             " AND ",
-            latest!()
+            latest!(),
+            " AND NOT ",
+            body_failed!()
         )
     };
 }
@@ -632,19 +653,24 @@ pub(super) async fn backbone_status<S: Sql>(
     Ok(out)
 }
 
-/// The full check on record per backbone ([`body_on_record`]), as a
-/// [`BackboneStatus`] whose `counts` is always true.
-pub(super) async fn body_passes<S: Sql>(
+/// The last full read per backbone: its latest `body` row for the current
+/// plan, pass or failure. `counts` is true where that row is the full
+/// check on record ([`body_on_record`]).
+pub(super) async fn body_checks<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<Vec<BackboneStatus>> {
     let sql = concat!(
         "SELECT b.backbone, b.provider_id, b.verified_at, b.plan_rev, b.articles_ok, \
-           b.articles_total \
-         FROM verifications b JOIN extents e ON e.id = b.extent_id \
-         WHERE b.extent_id = ?1 AND ",
+           b.articles_total, b.result, (",
         body_on_record!(),
-        " ORDER BY b.backbone"
+        ") FROM verifications b JOIN extents e ON e.id = b.extent_id \
+         WHERE b.extent_id = ?1 AND b.plan_rev = e.plan_rev AND b.kind = 'body' \
+           AND NOT EXISTS (SELECT 1 FROM verifications g \
+             WHERE g.extent_id = b.extent_id AND g.backbone = b.backbone \
+               AND g.plan_rev = b.plan_rev AND g.kind = 'body' \
+               AND g.verified_at > b.verified_at) \
+         ORDER BY b.backbone"
     );
     let rows = c.sql.query(sql, &[text(extent.as_str())]).await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -657,9 +683,9 @@ pub(super) async fn body_passes<S: Sql>(
             plan_rev: r.num()?,
             articles_ok: r.num()?,
             articles_total: r.num()?,
-            result: VerifyResult::Ok,
+            result: r.parsed(VerifyResult::parse)?,
             kind: VerifyKind::Body,
-            counts: true,
+            counts: r.num::<i64>()? != 0,
         });
     }
     Ok(out)
@@ -670,7 +696,8 @@ pub(super) async fn body_passes<S: Sql>(
 /// `held` (or `releasing`, when re-driven), and the release rule holds:
 /// - at least `required` of the `counting` backbones have a complete pass
 ///   recorded under this claim (between the claim time and `now`); a
-///   `stat` pass is enough here;
+///   `stat` pass is enough here, except on a backbone whose last full
+///   read failed ([`body_failed`]), which holds no copy;
 /// - at least one of those backbones also has the full check on record
 ///   ([`body_on_record`]): a complete `body` pass of the current plan,
 ///   from verify or from this claim, that no later check has cancelled.
