@@ -672,6 +672,9 @@ pub trait Catalog {
     /// The extent rows of the upload's current parts, ordered by part
     /// number and, within a part, in body order; at most `limit` of them.
     async fn upload_extents(&self, t: &UploadTarget<'_>, limit: u32) -> Result<Vec<PartExtent>>;
+    /// How many extents the upload holds under part numbers other than
+    /// `except`. A count without a guard: Complete decides for real.
+    async fn upload_extents_held(&self, upload: &UploadId, except: u16) -> Result<u64>;
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>>;
 
     // outbox: claim returns the fencing token; everything after takes the Lease

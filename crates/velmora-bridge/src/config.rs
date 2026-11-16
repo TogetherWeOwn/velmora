@@ -41,7 +41,8 @@ pub const MAX_WRITE_SLICES: u64 = 16;
 /// Most extents one object may be made of, and `MAX_OBJECT_EXTENTS`
 /// when the variable is absent. One recovery record names them all and
 /// one catalogue batch publishes them, so CompleteMultipartUpload
-/// refuses an upload whose listed parts hold more.
+/// refuses an upload that holds more, in listed parts or not, and
+/// UploadPart refuses a part of several extents that would take it there.
 pub const MAX_OBJECT_EXTENTS_LIMIT: u32 = 10_000;
 
 /// Upper bound for `max_conns` of one provider.

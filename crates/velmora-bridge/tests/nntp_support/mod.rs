@@ -1119,6 +1119,9 @@ impl Catalog for MemCatalog {
     ) -> Result<bool> {
         unused()
     }
+    async fn upload_extents_held(&self, _: &UploadId, _: u16) -> Result<u64> {
+        unimplemented!("multipart is not part of these tests")
+    }
     async fn upload_extents(&self, _: &UploadTarget<'_>, _: u32) -> Result<Vec<PartExtent>> {
         unused()
     }

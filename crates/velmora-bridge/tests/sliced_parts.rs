@@ -633,8 +633,14 @@ async fn abort_sends_every_slice_to_garbage_collection() {
     assert_eq!(blobs(&s.rig).len(), 9);
     assert!(in_gc(&s.rig).is_empty());
 
+    assert_eq!(s.rig.count("upload_part_extents"), 4 + 2);
     abort(&s.rig, &s.signer, &s.id).await.expect(204);
     assert_eq!(in_gc(&s.rig), all);
+    assert_eq!(
+        s.rig.count("upload_part_extents"),
+        0,
+        "closed: no rows left"
+    );
     assert_eq!(s.rig.count("gc"), 18, "two rows per extent");
     s.part_refused().await;
 
@@ -697,26 +703,49 @@ async fn slices_in_service_are_kept_while_the_upload_is_open() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn complete_refuses_more_extents_than_one_object_may_have() {
+async fn an_upload_never_holds_more_extents_than_one_object_may_have() {
     let mut cfg = small_config();
     cfg.max_object_extents = 5;
     let s = setup_with(cfg).await;
-    let six = body(1, 6 * SLICE);
-    let etag = s.part(1, &six).await;
-    let r = s.complete(std::slice::from_ref(&etag)).await;
-    r.expect_error(400, "EntityTooLarge");
-    assert!(r.message().contains("more than 5 stored extents"));
+
+    // A part of several extents that would take the upload past the
+    // limit is refused before anything of it is stored.
+    let refused = |r: Resp| {
+        r.expect_error(400, "EntityTooLarge");
+        assert!(r.message().contains("more than 5 stored extents"));
+    };
+    refused(send_part(&s.rig, &s.signer, &s.id, 1, &body(1, 6 * SLICE)).await);
+    assert!(blobs(&s.rig).is_empty() && staged(&s.rig).is_empty());
+    assert!(intents(&s.rig).is_empty());
+    let three = body(2, 3 * SLICE);
+    let first = s.part(1, &three).await;
+    refused(send_part(&s.rig, &s.signer, &s.id, 2, &body(3, 3 * SLICE)).await);
+    assert_eq!((blobs(&s.rig).len(), staged(&s.rig).len()), (3, 3));
+    // The part being replaced does not count against its replacement.
+    let five = body(4, 5 * SLICE);
+    let first_of_five = s.part(1, &five).await;
+    assert_ne!(first, first_of_five);
+
+    // A part of one extent is not counted when it arrives. Complete
+    // counts everything the upload holds, listed or not.
+    let small = body(5, 100);
+    s.part(2, &small).await;
+    refused(s.complete(std::slice::from_ref(&first_of_five)).await);
     // Nothing was published and the upload is still open.
     assert!(records(&s.rig).is_empty());
     assert_eq!(s.rig.count("generations"), 0);
     assert_eq!(staged(&s.rig).len(), 6);
-    assert!(in_gc(&s.rig).is_empty());
 
-    // The same part in five slices is published.
-    let five = body(2, 5 * SLICE);
-    let etag = s.part(1, &five).await;
+    // With the first part in four slices the upload is published.
+    let four = body(6, 4 * SLICE);
+    let etag = s.part(1, &four).await;
     s.complete(&[etag]).await.expect(200);
-    assert!(s.read().await == five);
+    assert!(s.read().await == four);
+    assert_eq!(
+        s.rig.count("upload_part_extents"),
+        0,
+        "closed: no rows left"
+    );
 }
 
 // ---------------------------------------------------------------------------

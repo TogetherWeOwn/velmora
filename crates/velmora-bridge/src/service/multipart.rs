@@ -792,6 +792,18 @@ where
     let slice_bytes = bridge.cfg.slice_bytes;
     let count =
         usize::try_from(lengths.decoded.div_ceil(slice_bytes)).map_err(|_| Fail::Internal)?;
+    // Complete refuses an upload that holds more extents than an object
+    // may have. A part that would take it there is refused here, before
+    // its body is read, so the client learns it at this part and not
+    // after it has sent them all. Parts in flight are not counted.
+    let limit = bridge.cfg.max_object_extents;
+    let held = bridge
+        .catalog
+        .upload_extents_held(target.id, number)
+        .await?;
+    if held.saturating_add(count as u64) > u64::from(limit) {
+        return Err(too_many_extents(limit).into());
+    }
     let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
     // One slice of plaintext and one of ciphertext are held at a time,
     // whatever the length of the part. Nothing is read before this.
@@ -1282,9 +1294,9 @@ where
         drop(parts);
         // One record names every extent of the object and one batch
         // publishes them. An upload that holds more than an object may
-        // have is refused before either, and stays open: the client
-        // aborts it, or lists fewer parts after sending some again in
-        // bodies of at most one extent.
+        // have, in listed parts or not, is refused before either, and
+        // stays open: the client aborts it, or sends parts again in
+        // bodies of at most one extent until it holds fewer.
         let limit = bridge.cfg.max_object_extents;
         let staged = bridge
             .catalog

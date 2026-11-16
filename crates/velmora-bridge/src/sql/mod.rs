@@ -386,6 +386,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn upload_extents(&self, t: &UploadTarget<'_>, limit: u32) -> Result<Vec<PartExtent>> {
         recovery::upload_extents(self, t, limit).await
     }
+    async fn upload_extents_held(
+        &self,
+        upload: &crate::types::UploadId,
+        except: u16,
+    ) -> Result<u64> {
+        uploads::extents_held(self, upload, except).await
+    }
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>> {
         uploads::abort_upload(self, t, now).await
     }

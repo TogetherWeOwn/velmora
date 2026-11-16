@@ -188,6 +188,16 @@ fn gc_staged_parts(id: &UploadId, part_number: Option<u16>, now: UnixMs) -> Stmt
     )
 }
 
+/// Removes the rows naming the extents after the first of every part.
+/// For a batch that closes the upload, after the extents were adopted or
+/// sent to GC.
+fn drop_pieces(id: &UploadId) -> Stmt {
+    (
+        "DELETE FROM upload_part_extents WHERE upload_id = ?1",
+        vec![text(id.as_str())],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Create and read
 // ---------------------------------------------------------------------------
@@ -477,7 +487,29 @@ pub(super) async fn put_upload_part_sliced<S: Sql>(
     guarded(c, stmts).await
 }
 
-/// Closes the upload and sends every part extent to GC.
+/// Extents held under the other part numbers of the upload.
+pub(super) async fn extents_held<S: Sql>(
+    c: &SqlCatalog<S>,
+    upload: &UploadId,
+    except: u16,
+) -> Result<u64> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT (SELECT COUNT(*) FROM upload_parts WHERE upload_id = ?1 AND part_number <> ?2) \
+                  + (SELECT COUNT(*) FROM upload_part_extents \
+                      WHERE upload_id = ?1 AND part_number <> ?2)",
+            &[text(upload.as_str()), SqlValue::Int(i64::from(except))],
+        )
+        .await?;
+    match rows.into_iter().next() {
+        Some(row) => Cols::new(row).num(),
+        None => Ok(0),
+    }
+}
+
+/// Closes the upload and sends every part extent to GC. The rows that
+/// name the extents after the first of a part go with it.
 pub(super) async fn abort_upload<S: Sql>(
     c: &SqlCatalog<S>,
     t: &UploadTarget<'_>,
@@ -486,6 +518,7 @@ pub(super) async fn abort_upload<S: Sql>(
     let stmts = vec![
         guard_open(t),
         gc_staged_parts(t.id, None, now),
+        drop_pieces(t.id),
         (
             "UPDATE uploads SET state = 'aborted', revision = revision + 1 \
              WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'",
@@ -634,6 +667,8 @@ pub(super) async fn complete_upload<S: Sql>(
     ));
     // After adoption: whatever is still staged was not listed.
     stmts.push(gc_staged_parts(t.id, None, now));
+    // Nothing reads the order within a part once the upload is closed.
+    stmts.push(drop_pieces(t.id));
     // Retire the generation the live pointer names, before moving it.
     stmts.extend(super::objects::retire_live(
         t.bucket,
