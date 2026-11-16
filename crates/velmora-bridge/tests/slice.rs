@@ -3182,15 +3182,16 @@ async fn rows_written_per_extent() {
     // put off for a provider slot; each such put-off is four more (the
     // claim and the put-off, a row and an index entry each).
     assert!(
-        packed.0 <= 61,
+        packed.0 <= 60,
         "rows written per packed extent: {}",
         packed.0
     );
     assert!(packed.1 <= 21, "rows written per object: {}", packed.1);
     // What a 16 MiB extent keeps in the catalogue for good: 0.15 GB per
-    // TB is 2,516 bytes an extent.
+    // TB is 2,516 bytes an extent. A third of it is the record of its
+    // checks, one row per backbone and check.
     assert!(
-        packed.2 <= 2_400,
+        packed.2 <= 2_516,
         "bytes kept per packed extent: {}",
         packed.2
     );

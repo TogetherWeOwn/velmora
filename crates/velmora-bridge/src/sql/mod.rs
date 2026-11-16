@@ -466,6 +466,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn backbone_status(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
         outbox::backbone_status(self, extent).await
     }
+    async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
+        outbox::body_checks(self, extent).await
+    }
     async fn begin_release(
         &self,
         l: &Lease,
