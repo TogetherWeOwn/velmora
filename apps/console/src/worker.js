@@ -186,7 +186,9 @@ async function api(request, env, s3, claims, url) {
   const m = request.method;
   const q = (n) => url.searchParams.get(n);
 
-  if (path === "/session" && m === "GET") return json(200, { email: claims.email });
+  // `adopt`: whether this deploy lets the console take over any existing
+  // bucket at all (the server still checks each name).
+  if (path === "/session" && m === "GET") return json(200, { email: claims.email, adopt: adoptEnabled(env) });
 
   if (path === "/buckets" && m === "GET") return json(200, { buckets: await s3.listBuckets() });
 
@@ -382,6 +384,14 @@ export function adoptAllowed(env, name) {
     .split(",")
     .map((s) => s.trim())
     .includes(name);
+}
+
+/** Whether adopt is on for some bucket (the UI only offers it then). */
+export function adoptEnabled(env) {
+  if (env.ALLOW_ADOPT === "1") return true;
+  return String(env.ADOPT_BUCKETS ?? "")
+    .split(",")
+    .some((s) => s.trim() !== "");
 }
 
 let cachedVerifier = null;

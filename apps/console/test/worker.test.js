@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { adoptAllowed, handle } from "../src/worker.js";
+import { adoptAllowed, adoptEnabled, handle } from "../src/worker.js";
 import { EMPTY_SHA256, sha256Base64, sha256Hex, sign } from "../src/sigv4.js";
 import { ADMIN, EMAIL, NOW, SECRET, env, fakeUpstream, makeIssuer } from "./helpers.js";
 
@@ -281,7 +281,7 @@ test("upstream errors carry no secret and no admin token", async () => {
 
 test("session answers the verified email", async () => {
   const res = await call(fakeUpstream(() => new Response()), "/api/session");
-  assert.deepEqual(await res.json(), { email: EMAIL });
+  assert.deepEqual(await res.json(), { email: EMAIL, adopt: false });
 });
 
 // Same-origin rules.
@@ -497,4 +497,32 @@ test("adopting an allowed existing bucket only grants, never creates", async () 
   assert.equal(res.status, 200);
   assert.equal(up.calls.length, 1);
   assert.equal(up.calls[0].url.pathname, "/_admin/keys/AKVLTESTTESTTESTTEST/grants");
+});
+
+test("the adopt gate is strict about its configuration", () => {
+  for (const v of [" 1", "1 ", 1, true, "yes", "", "true", undefined]) {
+    assert.equal(adoptAllowed({ ALLOW_ADOPT: v }, "photos"), false, `ALLOW_ADOPT ${JSON.stringify(v)}`);
+  }
+  for (const v of ["", ",", "*", "PHOTOS", " ,  ", "photos2", "photo"]) {
+    assert.equal(adoptAllowed({ ADOPT_BUCKETS: v }, "photos"), false, `ADOPT_BUCKETS ${JSON.stringify(v)}`);
+  }
+  assert.equal(adoptAllowed({ ADOPT_BUCKETS: " photos " }, "photos"), true);
+});
+
+test("adopt of a bucket not on ADOPT_BUCKETS is 403 with no upstream call", async () => {
+  const up = fakeUpstream(() => Response.json({ ok: true }));
+  const res = await call(up, "/api/buckets", { method: "POST", body: { name: "photos", adopt: true } }, { ADOPT_BUCKETS: "music" });
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).error, "AdoptDisabled");
+  assert.equal(up.calls.length, 0);
+});
+
+test("the session says whether adopt is enabled at all", async () => {
+  const up = fakeUpstream(() => new Response());
+  assert.equal((await (await call(up, "/api/session")).json()).adopt, false);
+  assert.equal((await (await call(up, "/api/session", {}, { ADOPT_BUCKETS: "music" })).json()).adopt, true);
+  assert.equal((await (await call(up, "/api/session", {}, { ADOPT_BUCKETS: " , " })).json()).adopt, false);
+  assert.equal((await (await call(up, "/api/session", {}, { ALLOW_ADOPT: "1" })).json()).adopt, true);
+  assert.equal(adoptEnabled({ ALLOW_ADOPT: "yes" }), false);
+  assert.equal(up.calls.length, 0);
 });
