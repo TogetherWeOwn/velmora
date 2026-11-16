@@ -1508,7 +1508,17 @@ async fn release_with_a_backbone_that_never_has_the_extent() {
     assert!(fx.has_safety(&o));
     let evidence = fx.extent(&o, "release_evidence").await;
     let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
-    assert_eq!(evidence.as_array().unwrap().len(), 2);
+    // The two backbones asked at release, then the full check on record.
+    let evidence: Vec<_> = evidence
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["backbone"].as_str().unwrap(), e["kind"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        evidence,
+        [("bb0", "stat"), ("bb1", "stat"), ("bb0", "body")]
+    );
     let status = fx.bridge.catalog.backbone_status(&o.extent).await.unwrap();
     let of = |b: &str| status.iter().find(|s| s.backbone == b).unwrap();
     assert!(of("bb0").counts && of("bb1").counts);
