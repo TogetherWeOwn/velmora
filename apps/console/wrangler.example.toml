@@ -33,6 +33,8 @@ S3_REGION = "auto"
 ACCESS_TEAM_DOMAIN = "<team>.cloudflareaccess.com"
 ACCESS_AUD = "<Access application AUD tag>"
 ALLOWED_EMAILS = "<comma-separated emails, the same as the Access policy>"
+# Optional, off when unset: let the console take over existing buckets
+# (see README, "adopt"). ADOPT_BUCKETS = "<exact names>" or ALLOW_ADOPT = "1".
 
 # Secrets (`npx wrangler secret put <NAME> -c <copy>`, value on stdin):
 #   S3_ACCESS_KEY_ID      the console's velmora access key id

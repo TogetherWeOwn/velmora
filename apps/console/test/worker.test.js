@@ -1,13 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { handle } from "../src/worker.js";
+import { adoptAllowed, handle } from "../src/worker.js";
 import { EMPTY_SHA256, sha256Base64, sha256Hex, sign } from "../src/sigv4.js";
 import { ADMIN, EMAIL, NOW, SECRET, env, fakeUpstream, makeIssuer } from "./helpers.js";
 
 const issuer = await makeIssuer();
 const ORIGIN = "https://files.example.test";
 
-async function call(up, path, { method = "GET", headers = {}, body, origin = ORIGIN } = {}) {
+async function call(up, path, { method = "GET", headers = {}, body, origin = ORIGIN } = {}, extraEnv = {}) {
   const h = { "cf-access-jwt-assertion": await issuer.token(), ...headers };
   if (origin && method !== "GET" && method !== "HEAD") h.origin = origin;
   if (body !== undefined && typeof body === "object" && !(body instanceof Uint8Array)) {
@@ -16,7 +16,7 @@ async function call(up, path, { method = "GET", headers = {}, body, origin = ORI
   }
   if (body !== undefined && !h["content-length"]) h["content-length"] = String(typeof body === "string" ? Buffer.byteLength(body) : body.length);
   const req = new Request(ORIGIN + path, { method, headers: h, body });
-  return handle(req, env(up), { fetchCerts: issuer.fetchCerts, now: () => NOW });
+  return handle(req, env(up, extraEnv), { fetchCerts: issuer.fetchCerts, now: () => NOW });
 }
 
 /** Recomputes the signature of a request velmora received. */
@@ -456,9 +456,44 @@ test("a list prefix with dot segments is allowed (it travels in the query)", asy
   assert.equal(up.calls[0].url.pathname, "/files");
 });
 
-test("adopting an existing bucket only grants, never creates", async () => {
+test("adopt is off by default: 403 and no call to velmora", async () => {
   const up = fakeUpstream(() => Response.json({ ok: true }));
   const res = await call(up, "/api/buckets", { method: "POST", body: { name: "photos", adopt: true } });
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).error, "AdoptDisabled");
+  assert.equal(up.calls.length, 0);
+});
+
+test("ADOPT_BUCKETS allows exact names only", () => {
+  assert.equal(adoptAllowed({ ADOPT_BUCKETS: "photos, music" }, "music"), true);
+  assert.equal(adoptAllowed({ ADOPT_BUCKETS: "photos" }, "photo"), false);
+  assert.equal(adoptAllowed({ ADOPT_BUCKETS: "photos" }, "photos2"), false);
+  assert.equal(adoptAllowed({}, "photos"), false);
+  assert.equal(adoptAllowed({ ALLOW_ADOPT: "true" }, "photos"), false);
+  assert.equal(adoptAllowed({ ALLOW_ADOPT: "1" }, "photos"), true);
+});
+
+test("a create answered BucketAlreadyExists makes no grant call", async () => {
+  const up = fakeUpstream(() => Response.json({ error: "BucketAlreadyExists", message: "taken" }, { status: 409 }));
+  const res = await call(up, "/api/buckets", { method: "POST", body: { name: "photos" } });
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).error, "BucketAlreadyExists");
+  assert.equal(up.calls.length, 1);
+  assert.equal(up.calls[0].url.pathname, "/_admin/buckets");
+});
+
+test("a non-boolean adopt takes the create path", async () => {
+  for (const adopt of ["true", 1, "yes", null]) {
+    const up = fakeUpstream(() => Response.json({ ok: true }));
+    const res = await call(up, "/api/buckets", { method: "POST", body: { name: "photos", adopt } }, { ALLOW_ADOPT: "1" });
+    assert.equal(res.status, 200);
+    assert.equal(up.calls[0].url.pathname, "/_admin/buckets", String(adopt));
+  }
+});
+
+test("adopting an allowed existing bucket only grants, never creates", async () => {
+  const up = fakeUpstream(() => Response.json({ ok: true }));
+  const res = await call(up, "/api/buckets", { method: "POST", body: { name: "photos", adopt: true } }, { ADOPT_BUCKETS: "photos" });
   assert.equal(res.status, 200);
   assert.equal(up.calls.length, 1);
   assert.equal(up.calls[0].url.pathname, "/_admin/keys/AKVLTESTTESTTESTTEST/grants");

@@ -193,9 +193,14 @@ async function api(request, env, s3, claims, url) {
   if (path === "/buckets" && m === "POST") {
     const body = await readJson(request);
     const name = bucketName(body.name);
-    // `adopt`: the bucket exists (made elsewhere, or a create whose grant
-    // failed) and the user chose to give the console access to it.
-    if (body.adopt !== true) await s3.createBucket(name);
+    // `adopt`: grant the console key on a bucket that already exists (made
+    // elsewhere, or a create whose grant failed). Off unless the deploy
+    // allows it: grants are never narrowed, so this cannot be undone.
+    if (body.adopt === true) {
+      if (!adoptAllowed(env, name)) return error(403, "AdoptDisabled", "This console may not take over existing buckets.");
+    } else {
+      await s3.createBucket(name);
+    }
     // The console's key is scoped to named buckets: it grants itself the bucket.
     await s3.grant(env.S3_ACCESS_KEY_ID, name, "rw");
     return json(200, { name });
@@ -368,6 +373,15 @@ async function api(request, env, s3, claims, url) {
   if (path === "/status" && m === "GET") return json(200, await s3.status());
 
   return error(404, "NotFound", "No such route.");
+}
+
+/** `ALLOW_ADOPT=1`, or the exact name in the comma-separated `ADOPT_BUCKETS`. */
+export function adoptAllowed(env, name) {
+  if (env.ALLOW_ADOPT === "1") return true;
+  return String(env.ADOPT_BUCKETS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .includes(name);
 }
 
 let cachedVerifier = null;

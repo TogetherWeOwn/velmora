@@ -6,7 +6,7 @@ const PART_CONCURRENCY = 2;
 const RETRIES = 4;
 
 const $ = (id) => document.getElementById(id);
-const state = { bucket: "", prefix: "", folders: [], files: [], next: null, selected: new Set(), filter: "" };
+const state = { bucket: "", prefix: "", folders: [], files: [], next: null, selected: new Set(), filter: "", listing: "ok" };
 
 function el(tag, props = {}, ...children) {
   const n = document.createElement(tag);
@@ -128,7 +128,7 @@ $("new-bucket").addEventListener("submit", async (ev) => {
       // Exists already (made elsewhere, or a create whose grant failed):
       // the console gets access to it only if the user says so.
       if (e.code !== "BucketAlreadyExists") throw e;
-      const answer = await dialog("Bucket exists", el("p", {}, `${name} already exists. Give this console read-write access to it?`), [
+      const answer = await dialog("Bucket exists", el("p", {}, `${name} already exists. Give this console read-write access to it? This cannot be undone from the console.`), [
         ["Cancel", "cancel", "ghost"],
         ["Give access", "ok"],
       ]);
@@ -177,6 +177,10 @@ async function loadPage(more) {
   // folder or bucket left meanwhile is dropped, success or failure.
   const seq = ++listSeq;
   const { bucket, prefix } = state;
+  if (!more) {
+    state.listing = "loading";
+    render();
+  }
   const token = more ? state.next : null;
   let out = null;
   let failure = null;
@@ -193,7 +197,9 @@ async function loadPage(more) {
   }
   if (failure) {
     toast(`Listing failed: ${failure.message}`);
+    if (!more) state.listing = `Could not list this folder: ${failure.message}`;
   } else {
+    state.listing = "ok";
     state.folders.push(...out.folders);
     // The folder's own marker object is not listed as a file in it.
     state.files.push(...out.files.filter((f) => f.key !== prefix));
@@ -263,7 +269,11 @@ function render() {
     );
   }
   $("rows").replaceChildren(...rows);
-  $("empty").hidden = rows.length > 0 || !state.bucket;
+  // "Empty" only after a listing that succeeded; otherwise say what is going on.
+  const listing = state.listing || "ok";
+  $("empty").textContent =
+    listing === "loading" ? "Loading…" : listing === "ok" ? "Empty folder. Drop files or folders here." : listing;
+  $("empty").hidden = !state.bucket || rows.length > 0;
   $("more").hidden = !state.next;
   $("select-all").checked = false;
   updateSelection();
@@ -312,6 +322,19 @@ function downloadUrl(key) {
 // their turn, so an answer never belongs to another question.
 let dialogChain = Promise.resolve();
 
+// A click that lands in the first 300 ms of a dialog was meant for what
+// was under the pointer before (a double click, a queued dialog).
+$("dialog-buttons").addEventListener(
+  "click",
+  (e) => {
+    if (Date.now() - Number($("dialog").dataset.openedAt || 0) < 300) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  },
+  true,
+);
+
 function dialog(title, content, buttons) {
   const run = () =>
     new Promise((resolve) => {
@@ -323,6 +346,7 @@ function dialog(title, content, buttons) {
       );
       d.addEventListener("close", () => resolve(d.returnValue), { once: true });
       d.returnValue = "";
+      d.dataset.openedAt = String(Date.now());
       d.showModal();
       content.querySelector?.("input")?.focus();
     });

@@ -51,6 +51,22 @@ a bucket, it calls `POST /_admin/keys/<id>/grants` to grant its own key
 `rw` on the new bucket. To use the console with existing buckets, mint its
 key with those buckets, or grant them the same way.
 
+### Taking over an existing bucket (`adopt`, off by default)
+
+When a create hits `BucketAlreadyExists` (a bucket made elsewhere, or a
+create whose grant step failed), the page can ask to grant the console's
+key `rw` on that bucket instead. The Worker refuses this with `403
+AdoptDisabled` unless the deploy allows it:
+
+- `ADOPT_BUCKETS = "name1,name2"`: those exact bucket names only; or
+- `ALLOW_ADOPT = "1"`: any existing bucket.
+
+Once a bucket is adopted, every user on the Access allow list can read
+and write it through the console. velmora never narrows a grant
+(`ro` to `rw` is one-way), so the console cannot undo an adoption: only
+revoking the console's key, and minting and configuring a new one, takes
+the access away.
+
 ## Deploy
 
 1. Copy `wrangler.example.toml` outside the repo and fill it in.
