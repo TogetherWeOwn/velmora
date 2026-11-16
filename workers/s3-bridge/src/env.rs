@@ -155,6 +155,12 @@ pub fn recovery_store(env: &Env) -> Result<Option<S3Remote<FetchHttp>>, String> 
     Ok(cfg.map(|cfg| S3Remote::new(cfg, FetchHttp)))
 }
 
+/// True when `RECOVERY_COPY` is `on`, whatever the rest of its
+/// configuration is ([`recovery_store`] checks that).
+pub fn recovery_copy_on(env: &Env) -> bool {
+    lookup(env, "RECOVERY_COPY").is_some_and(|v| v.trim() == "on")
+}
+
 /// The queues of one kind that are bound: `first` (`POST_Q`), then
 /// `POST_Q2`, `POST_Q3`, ... A missing first binding or a gap in the
 /// numbers is refused ([`bound_queues`]).

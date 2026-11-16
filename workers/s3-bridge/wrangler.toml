@@ -60,9 +60,14 @@ MAX_PUT_BYTES = "103809024"
 # off; /_admin/status counts what it would take (write_intents:
 # waiting_writes, oldest_waiting_at).
 INTENT_SWEEP = "off"
-# off | on. On: every 15 minutes a pass copies each recovery record of
-# SAFETY (m/) to a bucket at another S3-compatible provider, so that the
-# records survive the loss of this account. It puts only what is missing
+# off | on. On: the recovery records of SAFETY (m/) are copied to a
+# bucket at another S3-compatible provider, so that the records survive
+# the loss of this account. Every 15 minutes a pass sends the records of
+# the last hour (deletes, writes and their article plans); an article
+# plan written later is sent by a job of its own when its extent is
+# posted; and once a day a walk compares every record with the copy (in
+# three hours when a job left something undone), so that what a pass
+# lists follows what is written, not what is stored. It puts only what is missing
 # or different there (key, size, MD5), proves each put with a HEAD, and
 # never deletes there. Tenant keys (m/tk/) are not copied, a generation
 # record is copied once it is two minutes old, and no pass runs while
