@@ -1008,6 +1008,87 @@ async fn a_delete_answered_after_a_write_deletes_what_it_wrote() {
     }
 }
 
+/// Both wait. The delete is stopped at every one of its calls in turn
+/// (or has not begun), the write, which comes later, at every one of
+/// its own; then the delete runs to its end and is answered, and the
+/// write goes on, unable to remove a record. Wherever the two stood,
+/// the write was held to the object the delete removed and cannot be
+/// published after it: the key is empty, and stays empty when the
+/// catalogue is rebuilt from the records.
+///
+/// This holds the order of [`hold_precondition`]'s two steps: the id of
+/// the write is on the key before the write looks at it. A write that
+/// looked first could pass, lose the object to a delete that saw no id
+/// above its tombstone, and then store a record above that tombstone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_write_stopped_anywhere_is_not_published_over_a_delete() {
+    for writer in WRITERS {
+        let (mut most, mut refused) = (0, 0);
+        // `None`: the delete begins when the write has been stopped.
+        let mut at = None;
+        loop {
+            let mut stops = 0;
+            let mut delete_ended = false;
+            for n in 0.. {
+                let s = scene().await;
+                let rig = &s.rig;
+                let etag = md5_etag(&small(1));
+
+                let mut delete = Some(start(rig, delete_req(rig, &s.signer, "k", &[])));
+                if let Some(d) = at {
+                    match run_until(rig, delete.take().unwrap(), d, Trip::Stall).await {
+                        Ran::Stalled(stalled) => delete = Some(stalled),
+                        Ran::Done(_) => {
+                            rig.trip().disarm();
+                            delete_ended = true;
+                            break;
+                        }
+                    }
+                    tick(rig);
+                }
+                let write = start(rig, s.write(writer, &[("if-match", &etag)]));
+                let Ran::Stalled(write) = run_until(rig, write, n, Trip::Stall).await else {
+                    rig.trip().disarm();
+                    break;
+                };
+                stops += 1;
+                rig.trip().disarm();
+                tick(rig);
+                delete.unwrap().await.expect(204);
+                rig.bridge.safety.fail_record_deletes.set(u32::MAX);
+                let answer = write.await;
+                rig.bridge.safety.fail_record_deletes.set(0);
+
+                let what = format!(
+                    "{writer:?} stopped at call {n}, delete at {at:?}: {}",
+                    answer.status
+                );
+                // Published before the delete (and deleted by it), or
+                // not at all.
+                assert!(
+                    matches!(answer.status, 200 | 404 | 500),
+                    "{what}: {}",
+                    answer.text()
+                );
+                refused += usize::from(answer.status != 200);
+                get(rig, &s.signer, "k").await.expect(404);
+                assert!(orphaned_rows(rig).is_empty(), "{what}");
+                let signer = lose_and_replay(rig).await;
+                assert!(live_ids(rig).iter().all(|l| !l.starts_with("k=")), "{what}");
+                get(rig, &signer, "k").await.expect(404);
+            }
+            if delete_ended {
+                break;
+            }
+            most = most.max(stops);
+            at = Some(at.map_or(0, |d| d + 1));
+        }
+        assert!(at > Some(5), "{writer:?}: the delete made {at:?} calls");
+        assert!(most > 5, "{writer:?}: the write made {most} calls");
+        assert!(refused > 2, "{writer:?}: refused at {refused} stops");
+    }
+}
+
 /// Extent rows of a generation that was never published.
 fn orphaned_rows(rig: &Rig) -> Vec<String> {
     column(

@@ -1143,10 +1143,9 @@ where
                         return Err(Fail::Internal);
                     }
                     // The batch does not say which guard refused it. If
-                    // the condition fails now, that is the answer. The
-                    // key can change without a newer id on it (a delete
-                    // whose tombstone was chosen before this id), so the
-                    // upload is not blamed below for what the key did.
+                    // the condition fails now, that is the answer, so
+                    // the upload is not blamed below for what the key
+                    // did.
                     if let Err(refusal) =
                         check_precondition(bridge, &a.bucket.id, &a.key, condition).await
                     {

@@ -89,3 +89,8 @@ A delete that meets a newer write several times in a row is answered
   has already read it, the answer is `500` and the outcome is not known
   to the client; the record that stays sorts below the write that took
   the key, so a replay keeps that write on top.
+- A DeleteObject stores its tombstone before it changes the catalogue.
+  One that is then answered `500` or `503`, or not answered at all, may
+  have deleted nothing now and still take effect when the catalogue is
+  rebuilt from the recovery records: the outcome of such a delete is not
+  known until it is sent again and answered.
