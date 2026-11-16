@@ -713,7 +713,16 @@ pub trait Catalog {
         now: UnixMs,
     ) -> Result<Guard<()>>;
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
-    async fn due(&self, now: UnixMs, limit: u32) -> Result<Vec<DueRow>>;
+    /// Up to `limit` rows in `post`, `verify` or `release` that are due
+    /// and held by no job, oldest due time first. A row marked by
+    /// [`Self::mark_sent`] is left out until `resend_secs` after the
+    /// mark, unless a job claimed it since (a claim clears the mark) or
+    /// it was given a due time later than the mark.
+    async fn due(&self, now: UnixMs, resend_secs: u32, limit: u32) -> Result<Vec<DueRow>>;
+    /// The dispatcher has sent a job for each of `extents`: marks the
+    /// ones that are still due and held by no job, and returns how many.
+    /// The mark is a hint for [`Self::due`] alone; it gates no claim.
+    async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64>;
     async fn bury_exhausted(&self, max_attempts: u32, now: UnixMs) -> Result<u64>;
     /// Stamps `meta.last_dispatch_at` (the dispatcher, once per run).
     async fn record_dispatch(&self, now: UnixMs) -> Result<()>;

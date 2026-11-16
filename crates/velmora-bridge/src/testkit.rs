@@ -78,6 +78,9 @@ pub const MIGRATION_0013: &str =
 /// When an article was last posted again (`articles.reposted_at`).
 pub const MIGRATION_0014: &str =
     include_str!("../../../workers/s3-bridge/migrations/0014_article_reposted_at.sql");
+/// The dispatcher's mark of a sent outbox row (`outbox.sent_at`).
+pub const MIGRATION_0015: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0015_outbox_sent_at.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -174,6 +177,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0012)?;
         db.apply(MIGRATION_0013)?;
         db.apply(MIGRATION_0014)?;
+        db.apply(MIGRATION_0015)?;
         Ok(db)
     }
 
@@ -416,6 +420,7 @@ pub struct FakeJobs {
     sent: RefCell<Vec<SentJob>>,
     drop_next: Cell<u32>,
     dropped: Cell<u32>,
+    calls: Cell<u32>,
 }
 
 /// `send_many` bound (Queues `sendBatch`).
@@ -433,6 +438,11 @@ impl FakeJobs {
     /// Jobs lost by `drop_next` so far.
     pub fn dropped(&self) -> u32 {
         self.dropped.get()
+    }
+
+    /// Calls of `send` and `send_many` so far, lost ones included.
+    pub fn calls(&self) -> u32 {
+        self.calls.get()
     }
 
     pub fn sent(&self) -> Vec<SentJob> {
@@ -459,6 +469,7 @@ impl FakeJobs {
 
 impl JobSink for FakeJobs {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
+        self.calls.set(self.calls.get() + 1);
         if delay_secs > MAX_QUEUE_DELAY_SECS {
             return Err(BridgeError::Queue("delay over 12 hours".into()));
         }
@@ -467,6 +478,7 @@ impl JobSink for FakeJobs {
     }
 
     async fn send_many(&self, jobs: &[Job]) -> Result<()> {
+        self.calls.set(self.calls.get() + 1);
         if jobs.len() > MAX_SEND_MANY {
             return Err(BridgeError::Queue("send_many over 100 jobs".into()));
         }
