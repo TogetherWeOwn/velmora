@@ -82,12 +82,13 @@ use crate::ports::{
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::types::{
-    AccessKeyRow, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId, CommitGeneration,
-    CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
-    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats,
-    JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload, OutboxStage, OutboxStats, Perm,
-    Precondition, ProviderConfig, ProviderFault, ProviderLoad, Result, SafetyState, UnixMs,
-    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, WriteId,
+    AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId,
+    CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
+    ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
+    IntentFence, IntentStats, JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload,
+    OutboxStage, OutboxStats, Perm, Precondition, ProviderConfig, ProviderFault, ProviderLoad,
+    Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow, VerificationRow,
+    WriteId,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -139,6 +140,15 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn grant(&self, akid: &str, bucket: &BucketId) -> Result<Option<Perm>> {
         auth::grant(self, akid, bucket).await
+    }
+    async fn access_key_exists(&self, akid: &str) -> Result<bool> {
+        auth::access_key_exists(self, akid).await
+    }
+    async fn list_access_keys(&self, after: &str, limit: u32) -> Result<Vec<AccessKeySummary>> {
+        auth::list_access_keys(self, after, limit).await
+    }
+    async fn delete_access_keys(&self, akids: &[String]) -> Result<u64> {
+        auth::delete_access_keys(self, akids).await
     }
 
     // objects

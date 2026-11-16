@@ -7,6 +7,8 @@
 //! |---|---|
 //! | `POST /_admin/buckets` `{name, disposable}` | `200` (a non-disposable bucket only with `"disposable": false`; `403` for one if `REAL_DATA_READY` is unset); `409` name taken |
 //! | `POST /_admin/keys` `{buckets, perm}` | `200` with the secret, once |
+//! | `GET /_admin/keys[?after=<id>]` | `200`: ids, status, created time and grants, never a secret; `next` while more follow |
+//! | `DELETE /_admin/keys/<access_key_id>` | `204` revoked; `404` unknown (so a second call is `404`) |
 //! | `GET /_admin/objects/<bucket>/<key>` | `200` per-extent state |
 //! | `POST /_admin/evict/<bucket>/<key>[?include_safety=1]` | `200`; `403` for `include_safety` on a non-disposable bucket |
 //! | `POST /_admin/drill/<bucket>/<key>` | `200` read-back from Usenet only |
@@ -17,6 +19,18 @@
 //! Secrets: the access key secret exists in the `POST /_admin/keys`
 //! response body and nowhere else. No error body carries request data,
 //! key material or backend error text.
+//!
+//! Revocation: `DELETE /_admin/keys/<id>` first stores the recovery
+//! record `m/rk/<id>` in `SAFETY`, then deletes the key row (and with it
+//! the wrapped secret) and its grants in one batch. Every request looks
+//! the key up in the catalogue, so the next one, presigned or not, finds
+//! no key. A catalogue export made before the revocation still holds the
+//! row: the first step of a restore (`since_ms`) deletes every key that
+//! has a revocation record before it replays anything; until then, under
+//! `MAINTENANCE=restore`, authentication checks the record itself
+//! (`service::common`). Revocation is
+//! accepted under maintenance and during a replay, which never touch
+//! keys.
 
 use std::rc::Rc;
 
@@ -36,7 +50,9 @@ use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector, PermitClass,
 };
 use crate::post::Stop;
-use crate::recovery::delete_blob;
+use crate::recovery::{
+    delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
+};
 use crate::replay::ReplayCursor;
 use crate::types::{
     AccessKeyRow, ArticleRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow,
@@ -50,6 +66,10 @@ const MAX_BODY_BYTES: u64 = 64 * 1024;
 const MAX_GRANTS: usize = 32;
 /// Extents whose cache presence one status request looks up.
 const MAX_CACHE_PROBES: usize = 200;
+/// Keys one `GET /_admin/keys` lists.
+const KEY_PAGE: u32 = 500;
+/// Revocation records one listing call reads during a restore.
+const REVOCATION_PAGE: u32 = 500;
 /// `owner` and `principal` of everything the admin API creates.
 const ADMIN_PRINCIPAL: &str = "admin";
 
@@ -92,6 +112,10 @@ fn no_bucket() -> S3Response {
 
 fn no_key() -> S3Response {
     fail(404, "NoSuchKey", "The object does not exist.")
+}
+
+fn no_access_key() -> S3Response {
+    fail(404, "NoSuchAccessKey", "The access key does not exist.")
 }
 
 fn busy() -> S3Response {
@@ -281,6 +305,12 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         let include_safety = flag(&req.raw_target, "include_safety");
         return evict(bridge, bucket, &key, include_safety).await;
     }
+    if let Some(akid) = rest.strip_prefix("/keys/") {
+        if method != Method::Delete {
+            return Err(wrong_method());
+        }
+        return revoke_key(bridge, akid).await;
+    }
     if let Some(target) = rest.strip_prefix("/drill/") {
         if !post {
             return Err(wrong_method());
@@ -307,6 +337,7 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             let body: CreateKeyBody = read_json(bridge, req).await?;
             create_key(bridge, &body).await
         }
+        "/keys" if get => list_keys(bridge, &req.raw_target).await,
         "/restore" if post => {
             // The one mutation maintenance allows, and only maintenance.
             if bridge.cfg.maintenance != Maintenance::Restore {
@@ -406,6 +437,9 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                 return Err(bad());
             }
             let from = crate::types::UnixMs(since.saturating_sub(margin).max(0));
+            // Before anything else: the catalogue may come from an
+            // export that still holds keys revoked since.
+            forget_revoked_keys(bridge).await.or_internal()?;
             // From here until the last step, the catalogue refuses
             // writes, whatever MAINTENANCE says.
             let run = bridge
@@ -701,8 +735,8 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     bridge.catalog.create_access_key(&row).await.or_internal()?;
     // A grant that fails leaves a key row with some of its grants. That
     // key cannot be used: its secret exists only in this buffer and is
-    // returned only after every grant is stored. The catalogue has no call
-    // to disable or delete a key, so the row stays.
+    // returned only after every grant is stored. The row stays until
+    // `DELETE /_admin/keys/<id>` removes it (`GET /_admin/keys` lists it).
     for bucket in &grants {
         bridge
             .catalog
@@ -729,6 +763,112 @@ async fn create_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         ],
         body: RespBody::Bytes(out),
     })
+}
+
+/// `GET /_admin/keys[?after=<id>]`: one page of keys in id order. No
+/// column of the secret is read.
+async fn list_keys<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    raw_target: &str,
+) -> Admin<S3Response> {
+    let bad = || fail(400, "InvalidArgument", "after is an access key id.");
+    let query = raw_target.split_once('?').map_or("", |(_, q)| q);
+    let mut after = String::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("after", v)) if valid_key_id(v) => v.clone_into(&mut after),
+            _ => return Err(bad()),
+        }
+    }
+    let keys = bridge
+        .catalog
+        .list_access_keys(&after, KEY_PAGE)
+        .await
+        .or_internal()?;
+    let next = (keys.len() >= KEY_PAGE as usize)
+        .then(|| keys.last().map(|k| k.access_key_id.clone()))
+        .flatten();
+    let keys: Vec<Value> = keys
+        .iter()
+        .map(|k| {
+            json!({
+                "access_key_id": k.access_key_id,
+                "status": k.status.as_str(),
+                "created_at": k.created_at.0,
+                "grants": k.grants.iter().map(|(bucket, perm)| json!({
+                    "bucket": bucket,
+                    "perm": perm.as_str(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let mut resp = ok(&json!({ "keys": keys, "next": next }));
+    resp.headers
+        .push(("cache-control".to_string(), "no-store".to_string()));
+    Ok(resp)
+}
+
+/// `DELETE /_admin/keys/<id>`: the record first, then the rows. A
+/// failure between the two leaves the key usable and the record stored;
+/// the call is repeated and then finds the key again.
+async fn revoke_key<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    akid: &str,
+) -> Admin<S3Response> {
+    // An id that could not have been minted names no key; it reaches
+    // neither the catalogue nor a blob name.
+    if !valid_key_id(akid) {
+        return Err(no_access_key());
+    }
+    if !bridge.catalog.access_key_exists(akid).await.or_internal()? {
+        return Err(no_access_key());
+    }
+    write_key_revocation(&bridge.safety, &bridge.kek, akid, bridge.clock.now())
+        .await
+        .or_internal()?;
+    bridge
+        .catalog
+        .delete_access_keys(&[akid.to_string()])
+        .await
+        .or_internal()?;
+    Ok(S3Response {
+        status: 204,
+        headers: vec![("cache-control".to_string(), "no-store".to_string())],
+        body: RespBody::Bytes(Vec::new()),
+    })
+}
+
+/// Deletes every key that has a revocation record, a page of records
+/// per catalogue batch. Idempotent: a key that is not there is skipped.
+async fn forget_revoked_keys<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+) -> crate::types::Result<u64> {
+    let mut after = REVOKED_KEY_PREFIX.to_string();
+    let mut forgotten = 0;
+    loop {
+        let names = bridge
+            .safety
+            .list(REVOKED_KEY_PREFIX, &after, REVOCATION_PAGE)
+            .await?;
+        // A name that is no key id cannot name a catalogue row.
+        let ids: Vec<String> = names
+            .iter()
+            .filter_map(|n| revoked_key_id(n))
+            .map(str::to_string)
+            .collect();
+        forgotten += bridge.catalog.delete_access_keys(&ids).await?;
+        match names.last() {
+            Some(last) if names.len() >= REVOCATION_PAGE as usize => last.clone_into(&mut after),
+            _ => return Ok(forgotten),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

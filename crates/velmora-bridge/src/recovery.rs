@@ -121,6 +121,34 @@ pub fn plan_keys(plain: &[u8]) -> Option<Vec<String>> {
 /// it, so a replay does not read one as a record.
 pub const TENANT_KEY_PREFIX: &str = "m/tk/";
 
+/// Revoked access keys: `m/rk/` + an access key id. It lies under
+/// [`RECORD_PREFIX`], so no delete removes one and the recovery copy
+/// carries it, and none of the record kinds a replay reads match it.
+pub const REVOKED_KEY_PREFIX: &str = "m/rk/";
+
+/// Longest access key id the admin API takes (the ones it mints have 20
+/// characters).
+pub const MAX_KEY_ID_LEN: usize = 128;
+
+/// An access key id the admin API accepts: 1 to [`MAX_KEY_ID_LEN`] ASCII
+/// letters and digits. Nothing else reaches a catalogue query or a blob
+/// name.
+pub fn valid_key_id(akid: &str) -> bool {
+    (1..=MAX_KEY_ID_LEN).contains(&akid.len()) && akid.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The name of the revocation record of `akid`.
+pub fn revocation_key(akid: &str) -> String {
+    format!("{REVOKED_KEY_PREFIX}{akid}")
+}
+
+/// The access key id a revocation record is named for; `None` for a
+/// name that is not one.
+pub fn revoked_key_id(name: &str) -> Option<&str> {
+    name.strip_prefix(REVOKED_KEY_PREFIX)
+        .filter(|akid| valid_key_id(akid))
+}
+
 /// Whether `key` names a recovery record.
 pub fn is_record_key(key: &str) -> bool {
     key.starts_with(RECORD_PREFIX)
@@ -328,6 +356,16 @@ pub struct Tombstone {
     pub bucket_id: String,
     pub key: String,
     pub deleted_at: i64,
+}
+
+/// `m/rk/<access_key_id>`: the key was revoked. A catalogue export made
+/// before that still holds its row; a restore deletes every key named
+/// by such a record before it replays anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRevocation {
+    pub v: u32,
+    pub access_key_id: String,
+    pub revoked_at: i64,
 }
 
 /// One planned article.
@@ -646,6 +684,56 @@ pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
     // On record: it covers every generation record of the key that was
     // stored under a lower id and never published.
     catalog.settle_floor(bucket, key, id).await
+}
+
+/// Writes `m/rk/<access_key_id>`. The caller deletes the key's rows only
+/// after this returned `Ok`, so no key is gone from the catalogue
+/// without the record that keeps it gone across a restore. Writing it
+/// again (a revocation that is retried) stores the same facts.
+pub async fn write_key_revocation<B: BlobStore, K: Kek>(
+    safety: &B,
+    kek: &K,
+    akid: &str,
+    now: UnixMs,
+) -> Result<()> {
+    if !valid_key_id(akid) {
+        return Err(BridgeError::Invalid("access key id is malformed"));
+    }
+    let record = KeyRevocation {
+        v: RECORD_VERSION,
+        access_key_id: akid.to_owned(),
+        revoked_at: now.0,
+    };
+    // No bucket: the descriptive metadata says "-", as for the other
+    // blobs that belong to none.
+    write(
+        safety,
+        kek,
+        &revocation_key(akid),
+        &BucketId::new("-"),
+        akid,
+        &record,
+    )
+    .await
+}
+
+/// Whether a revocation record of `akid` is stored. By its name alone,
+/// as a restore reads them: forging one needs write access to `SAFETY`
+/// and could only refuse a key.
+pub async fn revocation_recorded<B: BlobStore>(safety: &B, akid: &str) -> Result<bool> {
+    if !valid_key_id(akid) {
+        return Ok(false);
+    }
+    Ok(safety.head(&revocation_key(akid)).await?.is_some())
+}
+
+/// Reads the revocation record of `akid`; `None` when there is none.
+pub async fn read_key_revocation<B: BlobStore, K: Kek>(
+    safety: &B,
+    kek: &K,
+    akid: &str,
+) -> Result<Option<KeyRevocation>> {
+    read(safety, kek, &revocation_key(akid)).await
 }
 
 /// Writes `m/art/<extent_id>` from the plan the catalogue holds. An

@@ -1,0 +1,466 @@
+//! `GET /_admin/keys` and `DELETE /_admin/keys/<id>`: revocation takes
+//! effect on the next request (header-signed and presigned), leaves other
+//! keys alone, never shows a secret, and outlives a catalogue restore.
+
+mod service_support;
+
+use hmac::{Hmac, KeyInit, Mac};
+use serde_json::{json, Value};
+use service_support::*;
+use sha2::Sha256;
+use velmora_bridge::config::Maintenance;
+use velmora_bridge::recovery::{read_key_revocation, REVOKED_KEY_PREFIX};
+use velmora_bridge::*;
+
+const BUCKET: &str = "bkt-keys";
+const TOKEN: &str = "admin-token-fixture-admin-token-fixture";
+
+fn admin_req(method: Method, target: &str, auth: Option<&str>, body: Option<&Value>) -> Req {
+    let mut headers = Vec::new();
+    if let Some(auth) = auth {
+        headers.push(("authorization".to_string(), auth.to_string()));
+    }
+    let body = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
+    if !body.is_empty() {
+        headers.push(("content-type".to_string(), "application/json".to_string()));
+        headers.push(("content-length".to_string(), body.len().to_string()));
+    }
+    Req {
+        method,
+        target: target.to_string(),
+        headers,
+        body,
+    }
+}
+
+async fn admin<N: NntpConnector + 'static>(
+    rig: &Rig<N>,
+    method: Method,
+    target: &str,
+    body: Option<Value>,
+) -> Resp {
+    let auth = format!("Bearer {TOKEN}");
+    rig.send(admin_req(method, target, Some(&auth), body.as_ref()))
+        .await
+}
+
+/// Mints a key through the API; returns its signer.
+async fn mint<N: NntpConnector + 'static>(rig: &Rig<N>, buckets: &[&str], perm: &str) -> Signer {
+    let r = admin(
+        rig,
+        Method::Post,
+        "/_admin/keys",
+        Some(json!({ "buckets": buckets, "perm": perm })),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    Signer::new(
+        v["access_key_id"].as_str().unwrap(),
+        v["secret"].as_str().unwrap(),
+    )
+}
+
+async fn revoke<N: NntpConnector + 'static>(rig: &Rig<N>, akid: &str) -> Resp {
+    admin(rig, Method::Delete, &format!("/_admin/keys/{akid}"), None).await
+}
+
+async fn list<N: NntpConnector + 'static>(rig: &Rig<N>, query: &str) -> Resp {
+    admin(rig, Method::Get, &format!("/_admin/keys{query}"), None).await
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// A presigned GET of `raw_path`, signed at `now` and valid for an hour.
+fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
+    let (stamp, scope, key) = signer.scope(now);
+    let credential = format!("{}/{scope}", signer.akid);
+    let mut q: Vec<(String, String)> = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", credential.as_str()),
+        ("X-Amz-Date", stamp.as_str()),
+        ("X-Amz-Expires", "3600"),
+        ("X-Amz-SignedHeaders", "host"),
+    ]
+    .iter()
+    .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
+    .collect();
+    q.sort();
+    let query = q
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical = format!("GET\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD");
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+        hex(&sha256(canonical.as_bytes()))
+    );
+    let signature = hex(&hmac(&key, to_sign.as_bytes()));
+    Req {
+        method: Method::Get,
+        target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
+        headers: vec![("host".to_string(), HOST.to_string())],
+        body: Vec::new(),
+    }
+}
+
+/// No response may carry a secret or the name of a secret column.
+fn assert_no_secret(resp: &Resp, secrets: &[&str]) {
+    let text = resp.text();
+    for s in secrets {
+        assert!(!text.contains(s), "a secret leaked: {}", resp.status);
+        assert!(
+            resp.headers.iter().all(|(_, v)| !v.contains(s)),
+            "a secret leaked into a header"
+        );
+    }
+    assert!(!text.contains("secret_wrapped"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn revoked_key_is_refused_on_the_next_request_signed_or_presigned() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let doomed = mint(&rig, &[BUCKET], "rw").await;
+    let kept = mint(&rig, &[BUCKET], "ro").await;
+    let secrets = [doomed.secret.as_str(), kept.secret.as_str()];
+    let obj = path(BUCKET, "a.bin");
+
+    let put = rig.put(&doomed, BUCKET, "a.bin", b"payload").await;
+    assert_eq!(put.status, 200, "{}", put.text());
+    // Both credentials work before the revocation.
+    let get = rig.call(&doomed, Method::Get, &obj, &[], &[], b"").await;
+    assert_eq!(get.status, 200);
+    let url = presign(&doomed, rig.now(), &obj);
+    let target = url.target.clone();
+    let pre = rig.send(url).await;
+    assert_eq!(pre.status, 200, "{}", pre.text());
+    assert_eq!(pre.body, b"payload");
+    assert_eq!(rig.count("access_keys"), 2);
+    assert_eq!(rig.count("grants"), 2);
+
+    let r = revoke(&rig, &doomed.akid).await;
+    assert_eq!(r.status, 204, "{}", r.text());
+    assert!(r.body.is_empty());
+    assert_no_secret(&r, &secrets);
+
+    // The row (with its wrapped secret) and its grant are gone.
+    assert_eq!(rig.count("access_keys"), 1);
+    assert_eq!(rig.count("grants"), 1);
+
+    // Header-signed: every kind of request, the bucket listing included.
+    for (method, target) in [
+        (Method::Get, obj.as_str()),
+        (Method::Head, obj.as_str()),
+        (Method::Get, "/"),
+        (Method::Get, &format!("/{BUCKET}")),
+    ] {
+        let r = rig
+            .call(&doomed, method.clone(), target, &[], &[], b"")
+            .await;
+        assert_eq!(r.status, 403, "{method:?} {target}");
+        if method != Method::Head {
+            assert_eq!(r.code(), "InvalidAccessKeyId", "{method:?} {target}");
+        }
+        assert_no_secret(&r, &secrets);
+    }
+    let r = rig.put(&doomed, BUCKET, "b.bin", b"late").await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    // The multipart routes look the key up on their own path.
+    let r = rig
+        .call(
+            &doomed,
+            Method::Post,
+            &path(BUCKET, "c.bin"),
+            &[("uploads", "")],
+            &[],
+            b"",
+        )
+        .await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    assert_eq!(rig.count("uploads"), 0);
+
+    // The presigned URL made before the revocation, sent again.
+    let r = rig
+        .send(Req {
+            method: Method::Get,
+            target,
+            headers: vec![("host".to_string(), HOST.to_string())],
+            body: Vec::new(),
+        })
+        .await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    assert_no_secret(&r, &secrets);
+    // And one presigned after it.
+    let r = rig.send(presign(&doomed, rig.now(), &obj)).await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+
+    // The other key is untouched.
+    let r = rig.call(&kept, Method::Get, &obj, &[], &[], b"").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, b"payload");
+    let r = rig.send(presign(&kept, rig.now(), &obj)).await;
+    assert_eq!(r.status, 200);
+
+    // Idempotent: the second call finds no key.
+    let r = revoke(&rig, &doomed.akid).await;
+    assert_eq!(r.status, 404);
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["error"], "NoSuchAccessKey");
+    assert_no_secret(&r, &secrets);
+
+    // The recovery record exists, opens, and holds no secret.
+    let rec = read_key_revocation(&rig.bridge.safety, &rig.bridge.kek, &doomed.akid)
+        .await
+        .unwrap()
+        .expect("revocation record");
+    assert_eq!(rec.access_key_id, doomed.akid);
+    assert_eq!(rec.revoked_at, rig.now().0);
+    let names = rig
+        .bridge
+        .safety
+        .list(REVOKED_KEY_PREFIX, "", 100)
+        .await
+        .unwrap();
+    assert_eq!(names, vec![format!("{REVOKED_KEY_PREFIX}{}", doomed.akid)]);
+    let raw = rig
+        .bridge
+        .safety
+        .get(&names[0], None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!raw
+        .windows(doomed.secret.len())
+        .any(|w| w == doomed.secret.as_bytes()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_or_malformed_ids_are_404_and_change_nothing() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let key = mint(&rig, &[BUCKET], "rw").await;
+    for id in [
+        "AKVLNOSUCHKEY0000000",
+        "akvl-not-an-id",
+        "AKVL%2F..%2Fx",
+        "..",
+        "AKVL/extra",
+        &"A".repeat(129),
+    ] {
+        let r = revoke(&rig, id).await;
+        assert_eq!(r.status, 404, "{id}");
+        assert_no_secret(&r, &[&key.secret]);
+    }
+    let r = admin(&rig, Method::Delete, "/_admin/keys/", None).await;
+    assert_eq!(r.status, 404);
+    // Nothing was written and the key still works.
+    assert!(rig
+        .bridge
+        .safety
+        .list(REVOKED_KEY_PREFIX, "", 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(rig.count("access_keys"), 1);
+    let r = rig.put(&key, BUCKET, "k", b"x").await;
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_record_write_leaves_the_key_and_a_retry_revokes_it() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let key = mint(&rig, &[BUCKET], "rw").await;
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = Some(REVOKED_KEY_PREFIX.to_string());
+    let r = revoke(&rig, &key.akid).await;
+    assert_eq!(r.status, 500);
+    assert_no_secret(&r, &[&key.secret]);
+    // No record, so the key was not deleted either.
+    assert_eq!(rig.count("access_keys"), 1);
+    assert_eq!(rig.put(&key, BUCKET, "k", b"x").await.status, 200);
+
+    *rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+    assert_eq!(revoke(&rig, &key.akid).await.status, 204);
+    assert_eq!(rig.put(&key, BUCKET, "k", b"x").await.status, 403);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_shows_ids_grants_and_times_never_secrets() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    rig.bucket("bkt-other", true).await;
+    let a = mint(&rig, &[BUCKET, "bkt-other"], "rw").await;
+    let b = mint(&rig, &["bkt-other"], "ro").await;
+
+    let r = list(&rig, "").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_no_secret(&r, &[&a.secret, &b.secret]);
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert!(v["next"].is_null());
+    let keys = v["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    let find = |id: &str| keys.iter().find(|k| k["access_key_id"] == id).unwrap();
+    assert_eq!(
+        find(&a.akid),
+        &json!({
+            "access_key_id": a.akid,
+            "status": "active",
+            "created_at": rig.now().0,
+            "grants": [
+                { "bucket": BUCKET, "perm": "rw" },
+                { "bucket": "bkt-other", "perm": "rw" },
+            ],
+        })
+    );
+    assert_eq!(
+        find(&b.akid)["grants"],
+        json!([{ "bucket": "bkt-other", "perm": "ro" }])
+    );
+    // Only the documented fields.
+    for k in keys {
+        let mut fields: Vec<&String> = k.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(fields, ["access_key_id", "created_at", "grants", "status"]);
+    }
+
+    // `after` pages by id.
+    let first = keys[0]["access_key_id"].as_str().unwrap().to_string();
+    let r = list(&rig, &format!("?after={first}")).await;
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    assert_ne!(v["keys"][0]["access_key_id"], first.as_str());
+    for bad in ["?after=a-b", "?after=", "?other=1", "?after"] {
+        assert_eq!(list(&rig, bad).await.status, 400, "{bad}");
+    }
+
+    // A revoked key is no longer listed.
+    assert_eq!(revoke(&rig, &a.akid).await.status, 204);
+    let v: Value = serde_json::from_slice(&list(&rig, "").await.body).unwrap();
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(v["keys"][0]["access_key_id"], b.akid.as_str());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn list_pages_past_five_hundred_keys() {
+    let rig = rig();
+    let bucket = rig.bucket(BUCKET, true).await;
+    for i in 0..501 {
+        let akid = format!("AKVLPAGE{i:012}");
+        rig.key(&akid, "secret-secret-secret-secret-0000", KeyStatus::Active)
+            .await;
+        rig.grant(&akid, &bucket, Perm::Ro).await;
+    }
+    let v: Value = serde_json::from_slice(&list(&rig, "").await.body).unwrap();
+    assert_eq!(v["keys"].as_array().unwrap().len(), 500);
+    assert_eq!(v["next"], "AKVLPAGE000000000499");
+    let v: Value =
+        serde_json::from_slice(&list(&rig, "?after=AKVLPAGE000000000499").await.body).unwrap();
+    assert_eq!(v["keys"].as_array().unwrap().len(), 1);
+    assert!(v["next"].is_null());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_the_admin_bearer_reaches_the_key_routes() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let key = mint(&rig, &[BUCKET], "rw").await;
+    let target = format!("/_admin/keys/{}", key.akid);
+    for (method, target) in [
+        (Method::Delete, target.as_str()),
+        (Method::Get, "/_admin/keys"),
+    ] {
+        for auth in [None, Some("Bearer ")] {
+            let r = rig
+                .send(admin_req(method.clone(), target, auth, None))
+                .await;
+            assert_eq!(r.status, 401, "{method:?} {target} {auth:?}");
+            assert_no_secret(&r, &[&key.secret]);
+        }
+        for auth in ["Bearer wrong", &format!("Bearer {TOKEN}x")] {
+            let r = rig
+                .send(admin_req(method.clone(), target, Some(auth), None))
+                .await;
+            assert_eq!(r.status, 403, "{method:?} {target}");
+            assert_no_secret(&r, &[&key.secret]);
+        }
+        // An S3 signature, even of a valid key, is not the admin bearer.
+        let r = rig.call(&key, method.clone(), target, &[], &[], b"").await;
+        assert!(
+            matches!(r.status, 401 | 403),
+            "{method:?} {target}: {}",
+            r.status
+        );
+        assert_no_secret(&r, &[&key.secret]);
+    }
+    // Nothing was revoked.
+    assert_eq!(rig.count("access_keys"), 1);
+    assert_eq!(rig.put(&key, BUCKET, "k", b"x").await.status, 200);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_restore_forgets_keys_revoked_after_the_export() {
+    let mut cfg = config(Vec::new());
+    cfg.maintenance = Maintenance::Restore;
+    let rig = rig_with(NoNntp, cfg);
+    let bucket = rig.bucket(BUCKET, true).await;
+    let doomed = rig
+        .key(
+            "AKVLDOOMED0000000001",
+            "secret-doomed-secret-doomed-0001",
+            KeyStatus::Active,
+        )
+        .await;
+    rig.grant(&doomed.akid, &bucket, Perm::Rw).await;
+    let kept = rig
+        .key(
+            "AKVLKEPT000000000001",
+            "secret-kept-secret-kept-000000001",
+            KeyStatus::Active,
+        )
+        .await;
+    rig.grant(&kept.akid, &bucket, Perm::Ro).await;
+    let probe = format!("/{BUCKET}");
+
+    // Revocation is accepted under maintenance.
+    assert_eq!(revoke(&rig, &doomed.akid).await.status, 204);
+    let r = rig.call(&doomed, Method::Get, &probe, &[], &[], b"").await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+
+    // A catalogue export made before the revocation is loaded: the row
+    // and its grant are back.
+    rig.key(&doomed.akid, &doomed.secret, KeyStatus::Active)
+        .await;
+    rig.grant(&doomed.akid, &bucket, Perm::Rw).await;
+    assert_eq!(rig.count("access_keys"), 2);
+    // Under maintenance its revocation record refuses it all the same,
+    // signed or presigned, before any replay step ran.
+    let r = rig.call(&doomed, Method::Get, &probe, &[], &[], b"").await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    let r = rig.send(presign(&doomed, rig.now(), &probe)).await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    let r = rig.call(&kept, Method::Get, &probe, &[], &[], b"").await;
+    assert_eq!(r.status, 200, "a key without a record still reads");
+
+    // The first replay step deletes it before it replays anything.
+    let r = admin(
+        &rig,
+        Method::Post,
+        "/_admin/restore",
+        Some(json!({ "since_ms": 0 })),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = rig.call(&doomed, Method::Get, &probe, &[], &[], b"").await;
+    assert_eq!((r.status, r.code().as_str()), (403, "InvalidAccessKeyId"));
+    assert_eq!(rig.count("access_keys"), 1);
+    assert_eq!(rig.count("grants"), 1);
+    let r = rig.call(&kept, Method::Get, &probe, &[], &[], b"").await;
+    assert_eq!(r.status, 200);
+}

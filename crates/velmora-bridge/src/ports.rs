@@ -14,12 +14,13 @@ use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 pub use crate::types::Result;
 use crate::types::{
-    AccessKeyRow, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan, CommitGeneration,
-    CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId, ExtentPlacement, ExtentRow,
-    FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats, IntentFence, IntentStats, Job,
-    JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus, OpenUpload, OutboxStage, OutboxStats,
-    Perm, Precondition, ProviderConfig, ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId,
-    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, WriteId,
+    AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan,
+    CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
+    ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
+    IntentFence, IntentStats, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
+    OpenUpload, OutboxStage, OutboxStats, Perm, Precondition, ProviderConfig, ProviderFault,
+    ProviderLoad, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow, UploadRow,
+    VerificationRow, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -397,6 +398,15 @@ pub trait Catalog {
     async fn buckets_for(&self, akid: &str) -> Result<Vec<Bucket>>;
     async fn access_key(&self, akid: &str) -> Result<Option<AccessKeyRow>>;
     async fn grant(&self, akid: &str, bucket: &BucketId) -> Result<Option<Perm>>;
+    /// `true` while the key has a row, whatever its status.
+    async fn access_key_exists(&self, akid: &str) -> Result<bool>;
+    /// Up to `limit` keys whose id sorts after `after`, in id order, each
+    /// with its grants. Never the wrapped secret.
+    async fn list_access_keys(&self, after: &str, limit: u32) -> Result<Vec<AccessKeySummary>>;
+    /// Deletes the rows of these keys and their grants in one batch, so a
+    /// lookup finds either the key with all its grants or nothing.
+    /// Returns how many key rows went; unknown ids are no error.
+    async fn delete_access_keys(&self, akids: &[String]) -> Result<u64>;
 
     // objects
     async fn live_object(

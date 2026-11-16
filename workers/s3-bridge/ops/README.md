@@ -12,6 +12,8 @@ kept outside it:
    - `m/del/<tombstone id>`: one per DeleteObject that found an object.
    - `m/art/<extent id>`: the article plan of an extent (message ids,
      newsgroup, headers, spans, digests), written before its first POST.
+   - `m/rk/<access key id>`: one per revoked access key (the id and the
+     time, never the secret), written before the key's row is deleted.
 
    Each record is sealed with XChaCha20-Poly1305 under a key derived from
    the KEK and is bound to its own name. Ids are time-ordered, so "every
@@ -30,7 +32,7 @@ the records do not hold (access keys, grants, verification history).
 | Acknowledged PutObject, CopyObject, CompleteMultipartUpload, DeleteObject | up to the export | all of them |
 | Buckets | yes | those with at least one write |
 | Article plans | yes | for every extent that reached posting |
-| Access keys and grants | yes | no: issue them again |
+| Access keys and grants | yes, less the keys revoked since: the first replay step deletes them | no: issue them again |
 | Verification history | yes | no: pinned extents are posted (a no-op for articles that exist) and verified again; released extents come back as done, and every read still checks every byte |
 | Open multipart uploads | up to the export | no: clients restart them |
 
@@ -160,6 +162,41 @@ Limits to know:
   in `held_missing_total`; a replay from `0` sets them right.
 - An empty bucket that never had a write is not in the records.
 
+## Revoking an access key
+
+```
+curl -X DELETE -H @<0600 header file with the bearer> <base-url>/_admin/keys/<access key id>
+```
+
+`204`: the key is gone. The Worker first stores `m/rk/<id>` in `SAFETY`,
+then deletes the key's row (the wrapped secret with it) and its grants
+in one batch. Earlier catalogue exports and D1 Time Travel (30 days)
+still hold the wrapped secret, sealed under the KEK like every secret
+in them. The next request with the key, signed or presigned (also
+a URL presigned before), answers `403 InvalidAccessKeyId`. `404`: no
+such key, also for a second call. After a `500` the key may still work,
+and its record may already be stored (a later restore then deletes the
+key): send the call again until it answers `204` or `404`. Revocation is accepted
+under maintenance and during a replay.
+
+`GET /_admin/keys` lists every key: id, status, created time and its
+grants (bucket and permission), never a secret, 500 per page in id
+order; follow `next` with `?after=<next>`.
+
+A remote run of `e2e/slice.sh` revokes the keys it made when it exits.
+
+An export, or a Time Travel point, from before a revocation still holds
+the key's row. The first call of a replay (`since_ms`) deletes every key
+that has a `m/rk/` record before it replays anything. Until then, while
+`MAINTENANCE = "restore"`, every request also checks the key against
+its `m/rk/` record (one `SAFETY` lookup per request, in that mode only),
+so a key revoked after the export stays refused although maintenance
+serves reads. Keep maintenance on until the replay has ended (Restore,
+step 6): with maintenance off, only the replay's first call deletes such
+a key, so that call is never skipped. A revocation record is never deleted: every later
+replay deletes that id again. The ids the Worker mints are random, so a
+new key does not get the id of a revoked one.
+
 ## Routine: export
 
 `ops/catalog-export.sh` runs `wrangler d1 export` and stores the SQL file
@@ -214,7 +251,8 @@ exists: restore it to a timestamp, then replay from that timestamp.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
-   database was rebuilt from the records alone.
+   database was rebuilt from the records alone. Keys revoked after the
+   restore point stay revoked (`GET /_admin/keys` to check).
 
 From the first call of the replay to its last, the catalogue itself
 refuses every write with 503, also when `MAINTENANCE` is already `off`:

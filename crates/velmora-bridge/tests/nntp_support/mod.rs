@@ -936,6 +936,15 @@ impl Catalog for MemCatalog {
     async fn grant(&self, _: &str, _: &BucketId) -> Result<Option<Perm>> {
         unused()
     }
+    async fn access_key_exists(&self, _: &str) -> Result<bool> {
+        unused()
+    }
+    async fn list_access_keys(&self, _: &str, _: u32) -> Result<Vec<AccessKeySummary>> {
+        unused()
+    }
+    async fn delete_access_keys(&self, _: &[String]) -> Result<u64> {
+        unused()
+    }
     async fn live_object(
         &self,
         _: &BucketId,

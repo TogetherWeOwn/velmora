@@ -63,8 +63,9 @@ pub struct Credential<'a> {
 }
 
 /// Local credential/scope/revocation hooks, not AWS IAM/STS. Unknown, expired,
-/// disabled or revoked keys must return None. Authorization must not disclose
-/// existence. Recheck it when queuing, publishing and admitting serving reads.
+/// disabled or revoked keys must return None (`verify` then answers
+/// `InvalidAccessKeyId`). Authorization must not disclose the existence of a
+/// bucket or object. Recheck it when queuing, publishing and admitting serving reads.
 pub trait Authority {
     fn credential(&self, access_key: &str) -> Option<Credential<'_>>;
     fn authorize(&self, principal: &str, method: &str, target: &Target) -> bool;
@@ -271,9 +272,11 @@ pub fn verify(
         "{ALGORITHM}\n{date}\n{scope_string}\n{}",
         hex(&Sha256::digest(canonical.as_bytes()))
     );
+    // As S3 answers: the key id is not a secret, and it is all this
+    // tells. A revoked key is refused here on its first request after.
     let key = authority
         .credential(scope[0])
-        .ok_or(ErrorCode::AccessDenied)?;
+        .ok_or(ErrorCode::InvalidAccessKeyId)?;
     let signing_key = signing_key(key.secret, scope[1], scope[2]);
     let signature = unhex(signature).map_err(|_| ErrorCode::SignatureDoesNotMatch)?;
     let mut verifier =
