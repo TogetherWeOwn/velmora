@@ -1,12 +1,16 @@
 // velmora console UI. Plain DOM, no framework. User data only ever goes
 // into the page through textContent / properties, never innerHTML.
 
+import { emptyListing, mergePage, releaseToken, takeMoreToken } from "./listing.js";
+
 const PART = 16 * 1024 * 1024;
 const PART_CONCURRENCY = 2;
 const RETRIES = 4;
 
 const $ = (id) => document.getElementById(id);
-const state = { bucket: "", prefix: "", folders: [], files: [], next: null, selected: new Set(), filter: "", listing: "ok" };
+// What the server says about this session (see /api/session).
+const session = { email: "", adopt: null }; // null: not known yet
+const state = { bucket: "", prefix: "", ...emptyListing(), selected: new Set(), filter: "", listing: "ok" };
 
 function el(tag, props = {}, ...children) {
   const n = document.createElement(tag);
@@ -128,12 +132,21 @@ $("new-bucket").addEventListener("submit", async (ev) => {
       // Exists already (made elsewhere, or a create whose grant failed):
       // the console gets access to it only if the user says so.
       if (e.code !== "BucketAlreadyExists") throw e;
+      const operatorMust = `${name} already exists; an operator must list it in ADOPT_BUCKETS to use it here.`;
+      // Offered only where the deploy allows adopting at all.
+      // Unknown (session not loaded) still offers it: the server decides.
+      if (session.adopt === false) return toast(operatorMust);
       const answer = await dialog("Bucket exists", el("p", {}, `${name} already exists. Give this console read-write access to it? This cannot be undone from the console.`), [
         ["Cancel", "cancel", "ghost"],
         ["Give access", "ok"],
       ]);
       if (answer !== "ok") return;
-      await api("/buckets", { method: "POST", body: { name, adopt: true } });
+      try {
+        await api("/buckets", { method: "POST", body: { name, adopt: true } });
+      } catch (e2) {
+        if (e2.code === "AdoptDisabled") return toast(operatorMust);
+        throw e2;
+      }
       toast(`Console has access to ${name}`);
     }
     $("new-bucket-name").value = "";
@@ -156,54 +169,69 @@ async function open(bucket, prefix) {
   for (const b of $("buckets").querySelectorAll("button")) b.setAttribute("aria-current", String(b.textContent === bucket));
   renderCrumbs();
   // No row of the previous folder stays clickable while this one loads.
-  state.folders = [];
-  state.files = [];
-  state.next = null;
+  Object.assign(state, emptyListing());
+  // A "Load more" still running for the folder left must not block this
+  // one; its late answer is dropped by the sequence check.
+  moreInFlight = false;
+  $("more").disabled = false;
   render();
-  if (!bucket) {
-    state.folders = [];
-    state.files = [];
-    state.next = null;
-    render();
-    return;
-  }
+  if (!bucket) return;
   await loadPage(false);
 }
 
 let listSeq = 0;
+let moreInFlight = false;
 
 async function loadPage(more) {
+  const { bucket, prefix } = state;
+  let token = null;
+  if (more) {
+    // One "Load more" at a time, each token once, and never page 1 again.
+    if (moreInFlight) return;
+    token = takeMoreToken(state);
+    if (!token) return render();
+    moreInFlight = true;
+  }
   // Only the newest listing may change the view: a slow answer for a
   // folder or bucket left meanwhile is dropped, success or failure.
   const seq = ++listSeq;
-  const { bucket, prefix } = state;
   if (!more) {
+    // A fresh listing supersedes any "Load more" still running.
+    moreInFlight = false;
+    $("more").disabled = false;
     state.listing = "loading";
     render();
+  } else {
+    $("more").disabled = true;
   }
-  const token = more ? state.next : null;
   let out = null;
   let failure = null;
   try {
     out = await api("/list", { query: { bucket, prefix, ...(token ? { token } : {}) } });
   } catch (e) {
     failure = e;
+  } finally {
+    // Only the newest request may release the button.
+    if (more && seq === listSeq) {
+      moreInFlight = false;
+      $("more").disabled = false;
+    }
   }
   if (seq !== listSeq || bucket !== state.bucket || prefix !== state.prefix) return;
-  if (!more) {
-    state.folders = [];
-    state.files = [];
-    state.next = null;
-  }
   if (failure) {
     toast(`Listing failed: ${failure.message}`);
-    if (!more) state.listing = `Could not list this folder: ${failure.message}`;
+    if (!more) {
+      Object.assign(state, emptyListing());
+      state.listing = `Could not list this folder: ${failure.message}`;
+    } else {
+      // The page was not loaded: its token may be tried again.
+      releaseToken(state, token);
+      // A failed "Load more" keeps the rows; it must not leave "Loading…" behind.
+      if (state.listing === "loading") state.listing = "ok";
+    }
   } else {
     state.listing = "ok";
-    state.folders.push(...out.folders);
-    // The folder's own marker object is not listed as a file in it.
-    state.files.push(...out.files.filter((f) => f.key !== prefix));
-    state.next = out.truncated ? out.next : null;
+    mergePage(state, out, { more, prefix });
   }
   render();
 }
@@ -916,7 +944,8 @@ $("status-btn").addEventListener("click", async () => {
 
 (async () => {
   try {
-    const { email } = await api("/session");
+    Object.assign(session, await api("/session"));
+    const { email } = session;
     $("who").textContent = email;
   } catch {
     /* shown by the failing calls below */
