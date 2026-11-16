@@ -195,6 +195,20 @@ where
         Ok(plan)
     }
 
+    /// When the minimum age of the extent's safety copy is over: the
+    /// minimum age after the newest time any of its articles was posted,
+    /// a repost included. The safety copy has to outlast a soak of the
+    /// articles on Usenet, and an article may be posted long after its
+    /// extent was stored: a multipart upload completed days after its
+    /// parts, a posting backlog, a repost to a backbone that lacked it.
+    /// Never earlier than the minimum age after the extent was stored.
+    fn min_age_over(&self, extent: &ExtentRow, plan: &[ArticleRow]) -> UnixMs {
+        let posted = plan.iter().filter_map(ArticleRow::last_posted_at).max();
+        posted
+            .map_or(extent.created_at, |at| at.max(extent.created_at))
+            .plus_secs(self.cfg.safety_min_age_secs)
+    }
+
     /// Checks every article on one backbone, with `BODY` and the payload
     /// hash or with `STAT` (`kind`), through its first provider in pool
     /// order with a free slot. Providers that still retain the
@@ -428,10 +442,11 @@ where
             .map(|s| (s.backbone.as_str(), s.kind));
         let now = self.clock.now();
         if releasable(passes, &labels, self.cfg.required_backbones) {
-            let ready = extent
-                .created_at
-                .plus_secs(self.cfg.safety_min_age_secs)
-                .max(now);
+            // Read again: a repost by this job stamped its articles after
+            // the plan was loaded. The release job reads the plan itself
+            // and is the gate; this only keeps the due time right.
+            let plan = self.posted_plan(extent).await?;
+            let ready = self.min_age_over(extent, &plan).max(now);
             self.advance(lease, OutboxStage::Release, ready).await?;
             // Rounded up: a job that arrives early cannot claim the row.
             let delay = (ready.0 - now.0).saturating_add(999).div_euclid(1000);
@@ -500,7 +515,9 @@ where
             }
             return Ok(());
         }
-        let ready = extent.created_at.plus_secs(self.cfg.safety_min_age_secs);
+        // The plan first: the minimum age counts from its newest post.
+        let plan = self.posted_plan(extent).await?;
+        let ready = self.min_age_over(extent, &plan);
         if now < ready {
             if !self.catalog.defer(lease, ready, now).await? {
                 return Err(Stop::Fenced);
@@ -512,7 +529,6 @@ where
         // that counts is checked: one that lacks the extent does not hold
         // the release up while enough others pass. `BODY` until one
         // backbone has passed it, `STAT` on the ones after.
-        let plan = self.posted_plan(extent).await?;
         let groups = release_backbones(&self.cfg.providers);
         let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
         let mut read = Vec::new();

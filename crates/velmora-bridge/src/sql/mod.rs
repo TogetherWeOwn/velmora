@@ -371,6 +371,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         outbox::mark_posted_many(self, l, posted, now).await
     }
+    async fn mark_reposted_many(&self, l: &Lease, idxs: &[u32], now: UnixMs) -> Result<bool> {
+        outbox::mark_reposted_many(self, l, idxs, now).await
+    }
     async fn renew_all(
         &self,
         l: &Lease,

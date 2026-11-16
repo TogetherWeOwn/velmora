@@ -765,6 +765,19 @@ impl Rig {
     /// Create, upload the parts concurrently, complete. Returns the
     /// Complete response.
     async fn multipart_put(&self, step: &str, path: &str, body: &[u8], part: usize) -> Resp {
+        self.multipart_put_after(step, path, body, part, 0).await
+    }
+
+    /// [`Rig::multipart_put`] with `wait_secs` between the last part and
+    /// the Complete.
+    async fn multipart_put_after(
+        &self,
+        step: &str,
+        path: &str,
+        body: &[u8],
+        part: usize,
+        wait_secs: u32,
+    ) -> Resp {
         let r = self
             .s3(Method::Post, path, &[("uploads", "")], &[], Vec::new())
             .await;
@@ -802,6 +815,7 @@ impl Rig {
             ));
         }
         xml.push_str("</CompleteMultipartUpload>");
+        self.bridge.clock.advance_secs(wait_secs);
         self.s3(
             Method::Post,
             path,
@@ -2190,6 +2204,118 @@ async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
         Some(format!("\"{:x}\"", md5::compute(&body))),
         r.header("etag").map(str::to_string),
     );
+}
+
+/// One row per extent: when it was stored, its outbox stage and due time,
+/// when the newest of its articles was posted, and its safety state.
+type Soak = (i64, String, i64, i64, String);
+
+impl Rig {
+    fn soaks(&self) -> Vec<Soak> {
+        self.bridge.catalog.sql.with_conn(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT e.created_at, o.stage, o.next_at, \
+                       (SELECT MAX(a.posted_at) FROM articles a WHERE a.extent_id = e.id), \
+                       e.safety_state \
+                     FROM extents e JOIN outbox o ON o.extent_id = e.id ORDER BY e.seq",
+                )
+                .expect("soak query");
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .expect("soak rows")
+                .collect::<std::result::Result<Vec<Soak>, _>>()
+                .expect("soak rows");
+            rows
+        })
+    }
+
+    /// One cron tick, and every job it sends run once.
+    async fn tick(&self, step: &str) {
+        let b = &self.bridge;
+        if let Err(e) = b.dispatch().await {
+            fail(step, "Bridge::dispatch (cron tick)", "Ok", e);
+        }
+        for sent in b.jobs.take() {
+            b.run_job(&sent.job).await;
+        }
+    }
+}
+
+/// The parts of a multipart upload are stored when they are uploaded and
+/// posted only once the upload is completed, here two days later. The
+/// minimum age of their safety copies counts from the post: they are not
+/// released the moment the articles are verified, although the extents
+/// are twice the minimum age old by then.
+#[tokio::test(flavor = "current_thread")]
+async fn parts_completed_late_keep_their_safety_copy_for_the_minimum_age() {
+    const DAY: u32 = 86_400;
+    let rig = Rig::with_vars(&[("SAFETY_MIN_AGE_SECS", "86400")]).await;
+    let s = "late complete";
+    rig.setup_buckets_and_key(s).await;
+    let body = test_bytes(31, BIG_LEN);
+    let uploaded = rig.bridge.clock.now();
+    let r = rig
+        .multipart_put_after(s, "/slice/a/late.bin", &body, PART, 2 * DAY)
+        .await;
+    expect_status(s, "CompleteMultipartUpload a/late.bin", 200, &r);
+    let completed = rig.bridge.clock.now();
+    expect_eq(
+        s,
+        "the Complete is two days late",
+        uploaded.plus_secs(2 * DAY),
+        completed,
+    );
+
+    rig.pump(s).await;
+    let soaks = rig.soaks();
+    expect_eq(s, "extents", 3, soaks.len());
+    for (created, stage, next_at, posted, safety) in &soaks {
+        expect(s, "stored at UploadPart", *created <= uploaded.0, created);
+        expect(
+            s,
+            "posted after the Complete",
+            *posted >= completed.0,
+            posted,
+        );
+        expect_eq(s, "stage", "release", stage.as_str());
+        expect_eq(
+            s,
+            "release due the minimum age after the post",
+            UnixMs(*posted).plus_secs(DAY).0,
+            *next_at,
+        );
+        expect_eq(s, "safety copy", "held", safety.as_str());
+    }
+
+    // Up to the last cron tick before the first one is due, nothing is
+    // released.
+    let first = soaks.iter().map(|r| r.2).min().expect("extents");
+    let last = soaks.iter().map(|r| r.2).max().expect("extents");
+    rig.bridge.clock.set(UnixMs(first - 1));
+    rig.tick(s).await;
+    for (.., safety) in rig.soaks() {
+        expect_eq(
+            s,
+            "safety copy before the minimum age",
+            "held",
+            safety.as_str(),
+        );
+    }
+
+    rig.bridge.clock.set(UnixMs(last));
+    rig.tick(s).await;
+    for (_, stage, .., safety) in rig.soaks() {
+        expect_eq(
+            s,
+            "safety copy after the minimum age",
+            "released",
+            safety.as_str(),
+        );
+        expect_eq(s, "stage after the release", "done", stage.as_str());
+    }
 }
 
 #[test]

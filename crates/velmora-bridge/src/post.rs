@@ -559,6 +559,7 @@ where
                     state: ArticleState::Planned,
                     provider_id: None,
                     posted_at: None,
+                    reposted_at: None,
                 };
                 let payload = payload_of(cipher, &row).ok_or(Stop::fail(FailClass::Internal))?;
                 row.payload_sha256 = sha256(payload);
@@ -676,7 +677,11 @@ where
                 let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan)
                     .kept_at(kept_at);
                 let ended = round
-                    .run(sessions, todo.iter().map(|at| (*at, unknown[*at])), true)
+                    .run(
+                        sessions,
+                        todo.iter().map(|at| (*at, unknown[*at])),
+                        Record::Posted,
+                    )
                     .await;
                 for (flag, landed) in unknown.iter_mut().zip(&ended.unknown) {
                     *flag |= *landed;
@@ -815,8 +820,12 @@ where
     /// Posts the articles `missing` (by `ArticleRow::idx`) of a posted
     /// extent once more, straight to `providers`, from the safety copy
     /// and under the stored message-ids and headers: a provider that has
-    /// an article after all is not sent it again. The article rows are
-    /// left as they are; the first provider stays the recorded one.
+    /// an article after all is not sent it again. The first provider
+    /// stays the recorded one; the articles are stamped as posted again
+    /// (`ArticleRow::reposted_at`), because the minimum age of the safety
+    /// copy counts from the newest post. The stamp is written before
+    /// anything is sent, so a job that dies after a POST leaves it
+    /// behind, and again as each article is accepted.
     ///
     /// `Ok(false)` = it cannot be done now (no provider that posts, no
     /// intact safety copy, or the providers refused): the caller carries
@@ -869,11 +878,24 @@ where
         if sessions.is_empty() {
             return Err(Stop::NoPermit);
         }
+        // Stamped before the first POST: without the stamp nothing may
+        // be sent, or a release could follow the repost at once.
+        let idxs: Vec<u32> = todo.iter().map(|at| plan[*at].idx).collect();
+        let stamped = self
+            .catalog
+            .mark_reposted_many(lease, &idxs, self.clock.now())
+            .await;
+        if !matches!(stamped, Ok(true)) {
+            close_all(sessions).await;
+            return Err(match stamped {
+                Ok(_) => Stop::Fenced,
+                Err(_) => Stop::Catalog,
+            });
+        }
         let round = Round::new(&self.catalog, &self.clock, lease, extent, &cipher, plan);
         // `true`: each article is looked up before it is sent.
-        let ended = round
-            .run(sessions, todo.into_iter().map(|at| (at, true)), false)
-            .await;
+        let todo = todo.into_iter().map(|at| (at, true));
+        let ended = round.run(sessions, todo, Record::Reposted).await;
         match ended.stop {
             None => Ok(true),
             Some(stop @ (Stop::Fenced | Stop::Catalog | Stop::NoPermit)) => Err(stop),
@@ -986,6 +1008,17 @@ pub(crate) struct Ended {
     pub(crate) busy: bool,
 }
 
+/// How a round records an article a provider accepted.
+#[derive(Clone, Copy)]
+pub(crate) enum Record {
+    /// The first post: the row becomes `posted`, with the provider and
+    /// the time.
+    Posted,
+    /// A repost of a posted article: only the time of the repost is
+    /// stamped. The first provider stays the recorded one.
+    Reposted,
+}
+
 /// One pass of a job over its open sockets. The sockets share the queue,
 /// the time of the last renewal and the pending catalogue writes; the job runs on
 /// one thread, so the state is only ever borrowed between two awaits.
@@ -996,8 +1029,8 @@ pub(crate) struct Round<'a, C: Catalog, T: Clock> {
     extent: &'a ExtentRow,
     cipher: &'a [u8],
     plan: &'a [ArticleRow],
-    /// Whether accepted articles are recorded as posted.
-    record: Cell<bool>,
+    /// How accepted articles are recorded.
+    record: Cell<Record>,
     /// Serialises renewals: one socket renews, the others wait for it.
     tick: Mutex<()>,
     state: RefCell<RoundState<'a>>,
@@ -1019,7 +1052,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             extent,
             cipher,
             plan,
-            record: Cell::new(false),
+            record: Cell::new(Record::Posted),
             tick: Mutex::new(()),
             state: RefCell::new(RoundState {
                 queue: VecDeque::new(),
@@ -1046,13 +1079,13 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
 
     /// Posts the articles of `todo` (positions in the plan, each with its
     /// `unknown` flag, see [`post_one`]) over `sessions`, all sockets at
-    /// once, and closes every session. With `record` the accepted
-    /// articles are marked posted in the catalogue, under the lease.
+    /// once, and closes every session. The accepted articles are
+    /// recorded in the catalogue as `record` says, under the lease.
     pub(crate) async fn run<N: NntpConnector>(
         self,
         sessions: Vec<ProviderSession<'a, C, N, T>>,
         todo: impl Iterator<Item = (usize, bool)>,
-        record: bool,
+        record: Record,
     ) -> Ended {
         self.record.set(record);
         let mut providers: Vec<&'a str> = Vec::new();
@@ -1316,7 +1349,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         self.flush(false).await;
     }
 
-    /// Records the articles accepted so far as posted, all in one fenced
+    /// Records the articles accepted so far ([`Record`]), all in one fenced
     /// write. A stale lease writes nothing and stops the round. `last` =
     /// the round is over: one more try even after a catalogue failure.
     async fn flush(&self, last: bool) {
@@ -1327,7 +1360,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 Some(Fatal::Catalog) => !last,
                 Some(Fatal::Fenced) => true,
             };
-            if stopped || !self.record.get() {
+            if stopped {
                 return;
             }
             (0..self.plan.len())
@@ -1338,9 +1371,19 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         if due.is_empty() {
             return;
         }
-        let rows: Vec<(u32, &str)> = due.iter().map(|(_, idx, p)| (*idx, *p)).collect();
         let now = self.clock.now();
-        let marked = self.catalog.mark_posted_many(self.lease, &rows, now).await;
+        let marked = match self.record.get() {
+            Record::Posted => {
+                let rows: Vec<(u32, &str)> = due.iter().map(|(_, idx, p)| (*idx, *p)).collect();
+                self.catalog.mark_posted_many(self.lease, &rows, now).await
+            }
+            Record::Reposted => {
+                let idxs: Vec<u32> = due.iter().map(|(_, idx, _)| *idx).collect();
+                self.catalog
+                    .mark_reposted_many(self.lease, &idxs, now)
+                    .await
+            }
+        };
         let mut state = self.state.borrow_mut();
         match marked {
             Ok(true) => due.iter().for_each(|(at, ..)| state.marked[*at] = true),

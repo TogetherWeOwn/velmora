@@ -345,7 +345,7 @@ pub(super) async fn articles<S: Sql>(
         .sql
         .query(
             "SELECT extent_id, idx, message_id, newsgroup, headers, cipher_offset, cipher_len, \
-               payload_sha256, yenc_name, state, provider_id, posted_at \
+               payload_sha256, yenc_name, state, provider_id, posted_at, reposted_at \
              FROM articles WHERE extent_id = ?1 ORDER BY idx",
             &[text(extent.as_str())],
         )
@@ -366,6 +366,7 @@ pub(super) async fn articles<S: Sql>(
             state: r.parsed(ArticleState::parse)?,
             provider_id: r.opt_text()?,
             posted_at: r.opt_num()?.map(UnixMs),
+            reposted_at: r.opt_num()?.map(UnixMs),
         });
     }
     Ok(out)
@@ -464,6 +465,33 @@ pub(super) async fn mark_posted_many<S: Sql>(
                 text(l.extent.as_str()),
                 SqlValue::Int(i64::from(*idx)),
                 text(provider),
+                ms(now),
+            ],
+        ));
+    }
+    fenced_batch(c, stmts).await
+}
+
+/// Stamps every listed article as posted again at `now`, or none: the
+/// batch is led by the lease guard. A stamp never moves back.
+pub(super) async fn mark_reposted_many<S: Sql>(
+    c: &SqlCatalog<S>,
+    l: &Lease,
+    idxs: &[u32],
+    now: UnixMs,
+) -> Result<bool> {
+    if idxs.is_empty() {
+        return renew_check(c, l).await;
+    }
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(idxs.len() + 1);
+    stmts.push((held_guard!(), lease_params(l, [])?));
+    for idx in idxs {
+        stmts.push((
+            "UPDATE articles SET reposted_at = MAX(COALESCE(reposted_at, ?3), ?3) \
+             WHERE extent_id = ?1 AND idx = ?2",
+            vec![
+                text(l.extent.as_str()),
+                SqlValue::Int(i64::from(*idx)),
                 ms(now),
             ],
         ));

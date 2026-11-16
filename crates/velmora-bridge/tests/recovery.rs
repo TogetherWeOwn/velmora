@@ -3133,6 +3133,7 @@ async fn plan_record(
             state: ArticleState::Planned,
             provider_id: None,
             posted_at: None,
+            reposted_at: None,
         })
         .collect();
     velmora_bridge::recovery::write_article_plan(
