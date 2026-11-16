@@ -9,7 +9,7 @@ compatibility_date = "2026-11-01"
 [build]
 # worker-build 0.8.7 matches the locked workers-rs 0.8.7 (the 0.7 line does
 # not). `--locked` installs it from its own lockfile.
-command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
+command = "cargo install -q --locked worker-build@0.8.7 && bash bundle.sh"
 
 [limits]
 cpu_ms = 300000              # crypto-heavy fetch + queue handlers; measure, then lower
