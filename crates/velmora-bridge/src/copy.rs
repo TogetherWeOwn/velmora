@@ -730,7 +730,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         }
         let mut saved = true;
         if step.began {
-            saved &= self.save_time(BEGAN_KEY, pass).await.is_ok();
+            // The place of an earlier walk goes first: a start with
+            // such a place under it would go on from there.
+            saved &= self.save_walk("").await.is_ok();
+            saved = saved && self.save_time(BEGAN_KEY, pass).await.is_ok();
         }
         if step.ended {
             saved &= self.save_time(WALKED_KEY, pass).await.is_ok();
@@ -843,12 +846,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     ) -> std::result::Result<Option<Place>, StepError> {
         let place = walk_from(self.saved_walk().await?, pass);
         let ended = self.read_time(WALKED_KEY).await;
-        let ended = ended.map_err(|_| StepError::Source)?;
+        // A time that has not come yet is none: an end in the future
+        // would otherwise make every pass begin the walk again.
+        let come = |at: &i64| *at < pass.0 + PASS_INTERVAL_MS;
+        let ended = ended.map_err(|_| StepError::Source)?.filter(come);
         let start = self.read_time(BEGAN_KEY).await;
-        // A start that has not come yet is none.
-        let start = start
-            .map_err(|_| StepError::Source)?
-            .filter(|at| *at < pass.0 + PASS_INTERVAL_MS);
+        let start = start.map_err(|_| StepError::Source)?.filter(come);
         // A walk is under way when one began after the last one ended.
         // Only then does the saved place count: a place without such a
         // start (stale, or written by something else) would make a walk

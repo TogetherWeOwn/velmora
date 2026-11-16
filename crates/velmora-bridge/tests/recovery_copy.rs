@@ -4222,3 +4222,68 @@ async fn a_gap_in_the_passes_asks_for_the_walk() {
         assert_eq!(time_at(&w, SWEPT_KEY).await, ms(NOW));
     }
 }
+
+/// An end of the walk that has not come yet is no end. A walk longer
+/// than a pass still goes on from its place, and comes to its end; it
+/// does not begin again in every pass.
+#[tokio::test(flavor = "current_thread")]
+async fn an_end_in_the_future_does_not_begin_the_walk_in_every_pass() {
+    let w = World::new();
+    for i in 0..(2 * JOB_COPIES + 1) {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    let far = (NOW + 400 * 24 * 3_600_000).to_string();
+    w.raw(WALKED_KEY, far.into_bytes()).await;
+    // One job of the walk in a pass; the rest of its jobs are lost.
+    let mut passes = 0;
+    while time_at(&w, WALKED_KEY).await != ms(w.clock.now().0) {
+        passes += 1;
+        assert!(passes <= 4, "the walk does not end");
+        let pass = UnixMs(NOW + passes * PASS_INTERVAL_MS);
+        w.clock.set(pass);
+        let (_, _, why) = w.copier().run_job(&w.jobs, pass, "").await;
+        assert_eq!(why, None);
+        w.jobs.take();
+        assert_eq!(time_at(&w, BEGAN_KEY).await, ms(NOW + PASS_INTERVAL_MS));
+    }
+    assert_eq!((passes, w.e2.puts()), (3, 2 * JOB_COPIES + 1));
+}
+
+/// A walk begins over the place of an earlier one, and its job dies
+/// when its start is saved and its own place is not. The job that
+/// comes again does not go on from the old place: the walk begins
+/// again, and ends only when it has been through every key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_start_saved_over_an_old_place_does_not_go_on_from_it() {
+    let w = World::new();
+    for i in 0..4 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    w.raw(WALK_KEY, b"m/art/x_2".to_vec()).await;
+    // The start is saved after the old place is cleared: with the place
+    // not writable, no start is saved either.
+    let stuck = NoMark(&w.safety, WALK_KEY);
+    let copier = Copier {
+        safety: &stuck,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let (_, _, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!(why, Some(StepError::Mark));
+    assert_eq!(time_at(&w, BEGAN_KEY).await, None);
+    w.jobs.take();
+    // And a start that is there with the old place still under it (a
+    // job of the version before died there) is never trusted with it
+    // again once a walk begins: the place is cleared first.
+    let w = World::new();
+    for i in 0..4 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+    }
+    w.raw(WALK_KEY, b"m/art/x_2".to_vec()).await;
+    let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    assert_eq!((counts.unwrap().copied, why), (4, None));
+    assert_eq!(saved(&w).await.as_deref(), Some(""));
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+}
