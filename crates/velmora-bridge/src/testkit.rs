@@ -421,6 +421,7 @@ pub struct FakeJobs {
     drop_next: Cell<u32>,
     dropped: Cell<u32>,
     calls: Cell<u32>,
+    fail_after: Cell<Option<u32>>,
 }
 
 /// `send_many` bound (Queues `sendBatch`).
@@ -438,6 +439,23 @@ impl FakeJobs {
     /// Jobs lost by `drop_next` so far.
     pub fn dropped(&self) -> u32 {
         self.dropped.get()
+    }
+
+    /// The next `n` calls succeed and every call after them fails, until
+    /// `None` is set.
+    pub fn fail_after(&self, n: Option<u32>) {
+        self.fail_after.set(n);
+    }
+
+    fn refused(&self) -> Result<()> {
+        match self.fail_after.get() {
+            None => Ok(()),
+            Some(0) => Err(BridgeError::Queue("send refused".into())),
+            Some(n) => {
+                self.fail_after.set(Some(n - 1));
+                Ok(())
+            }
+        }
     }
 
     /// Calls of `send` and `send_many` so far, lost ones included.
@@ -470,6 +488,7 @@ impl FakeJobs {
 impl JobSink for FakeJobs {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
         self.calls.set(self.calls.get() + 1);
+        self.refused()?;
         if delay_secs > MAX_QUEUE_DELAY_SECS {
             return Err(BridgeError::Queue("delay over 12 hours".into()));
         }
@@ -479,6 +498,7 @@ impl JobSink for FakeJobs {
 
     async fn send_many(&self, jobs: &[Job]) -> Result<()> {
         self.calls.set(self.calls.get() + 1);
+        self.refused()?;
         if jobs.len() > MAX_SEND_MANY {
             return Err(BridgeError::Queue("send_many over 100 jobs".into()));
         }

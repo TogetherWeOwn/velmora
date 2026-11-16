@@ -514,9 +514,12 @@ where
         // Every due row that no job holds and that has no fresh mark,
         // oldest first, in queue batches. A batch is marked as soon as
         // it is sent, so the next run does not send it again. A send
-        // that fails ends the run: the rows not yet sent stay unmarked.
-        // A mark that fails does not: its batch is sent again by the
-        // next run, and a duplicate job only finds its row claimed.
+        // that fails ends the sending: the rows not yet sent stay
+        // unmarked, the checks below still run, and then the run fails
+        // unrecorded. A mark that fails ends nothing: its batch is sent
+        // again by the next run, and a duplicate job only finds its row
+        // claimed.
+        let mut send_failed = None;
         let due = self.catalog.due(now, RESEND_SECS, DISPATCH_LIMIT).await?;
         for rows in due.chunks(DISPATCH_BATCH as usize) {
             let jobs: Vec<Job> = rows
@@ -528,7 +531,10 @@ where
                     stage: row.stage,
                 })
                 .collect();
-            self.jobs.send_many(&jobs).await?;
+            if let Err(e) = self.jobs.send_many(&jobs).await {
+                send_failed = Some(e);
+                break;
+            }
             report.enqueued += u32::try_from(jobs.len()).unwrap_or(u32::MAX);
             let sent: Vec<ExtentId> = rows.iter().map(|row| row.extent_id.clone()).collect();
             if self.catalog.mark_sent(&sent, now).await.is_err() {
@@ -555,6 +561,9 @@ where
         // Unpublished sliced writes whose slices are due for deletion.
         self.sweep_check(now, &mut report).await;
 
+        if let Some(e) = send_failed {
+            return Err(e);
+        }
         self.catalog.record_dispatch(now).await?;
         Ok(report)
     }

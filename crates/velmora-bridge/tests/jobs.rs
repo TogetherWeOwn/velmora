@@ -1912,7 +1912,7 @@ async fn dispatch_keeps_pace_with_5000_due_releases() {
 
     // No job claimed anything, so the messages count as lost once the
     // resend timeout is over: the rows are sent again, as bounded as
-    // before, oldest mark first.
+    // before, in the same order.
     fx.clock.set(due.plus_secs(RESEND_SECS).plus_ms(-1));
     assert_eq!(fx.tick().await.0, []);
     fx.clock.set(due.plus_secs(RESEND_SECS));
@@ -2063,6 +2063,98 @@ async fn a_resent_release_job_is_fenced() {
     let before = fx.dump().await;
     assert_eq!(fx.pump_to(&mut queue, later).await, 1);
     assert_eq!(fx.dump().await, before);
+}
+
+/// A wake-up that cannot be sent on goes back to its queue for the same
+/// wait: the wait is never cut short and no row is touched.
+#[tokio::test]
+async fn a_wake_up_that_cannot_be_sent_on_is_retried() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    let before = fx.dump().await;
+    let sql_calls = fx.bridge.catalog.sql.calls.get();
+
+    fx.bridge.jobs.fail_after(Some(0));
+    for (ahead, delay_secs) in [(90, 90), (30 * DAY_SECS, MAX_QUEUE_DELAY_SECS)] {
+        let wake = o.wake(OutboxStage::Release, T0.plus_secs(ahead));
+        let outcome = fx.bridge.run_job(&wake).await;
+        assert_eq!(outcome, JobOutcome::Retry { delay_secs });
+    }
+    assert!(fx.bridge.jobs.take().is_empty());
+    assert_eq!(fx.bridge.catalog.sql.calls.get(), sql_calls);
+    assert_eq!(fx.dump().await, before);
+}
+
+/// The dispatcher runs at the very moment a release is due, before the
+/// wake-up is delivered: that costs one duplicate job and one mark, and
+/// the extent is released once.
+#[tokio::test]
+async fn a_dispatcher_run_ahead_of_the_wake_up_costs_one_duplicate() {
+    let mut fx = Fx::new().await;
+    fx.bridge.cfg.safety_min_age_secs = DAY_SECS;
+    let due = T0.plus_secs(DAY_SECS);
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    fx.bridge
+        .jobs
+        .send(&o.job(OutboxStage::Post), 0)
+        .await
+        .unwrap();
+    let mut queue = Vec::new();
+    fx.pump_to(&mut queue, due.plus_ms(-1)).await;
+    assert_eq!(queue, [(due, o.wake(OutboxStage::Release, due))]);
+
+    fx.clock.set(due);
+    let release = o.job(OutboxStage::Release);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
+    assert_eq!(fx.outbox(&o, "sent_at").await, due.0.to_string());
+    // The row is marked, so the runs that follow leave it alone while
+    // the wake-up waits for a free consumer.
+    fx.clock.advance_secs(TICK_SECS);
+    assert_eq!(fx.tick().await.0, []);
+
+    assert_eq!(fx.pump_to(&mut queue, fx.clock.now()).await, 1);
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    // The dispatcher's job comes last and finds nothing to do.
+    let before = fx.dump().await;
+    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.tick().await.0, []);
+}
+
+/// A queue that refuses a batch ends the sending, not the checks after
+/// it: the batches sent before are marked, the rest stay unmarked for
+/// the next run, and the failed run is not recorded.
+#[tokio::test]
+async fn a_refused_batch_leaves_the_rest_for_the_next_run() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let batch = DISPATCH_BATCH as usize;
+    let total = 2 * batch + 50;
+    for i in 0..total {
+        fx.put(&bucket, &format!("k{i}"), b"tiny").await;
+    }
+    let marked = "SELECT COUNT(*) FROM outbox WHERE sent_at IS NOT NULL";
+
+    fx.bridge.jobs.fail_after(Some(2));
+    let failed = fx.bridge.dispatch().await;
+    assert!(matches!(failed, Err(BridgeError::Queue(_))), "{failed:?}");
+    let first: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
+    assert_eq!(first.len(), 2 * batch);
+    assert_eq!(fx.count(marked).await, 2 * batch);
+    let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
+    assert_eq!(stats.last_dispatch_at, None);
+
+    // The queue takes jobs again: only the rows left over are sent.
+    fx.bridge.jobs.fail_after(None);
+    let (rest, _) = fx.tick().await;
+    assert_eq!(rest.len(), total - 2 * batch);
+    assert!(rest.iter().all(|job| !first.contains(job)));
+    let stats = fx.bridge.catalog.outbox_stats().await.unwrap();
+    assert_eq!(stats.last_dispatch_at, Some(fx.clock.now()));
+    assert_eq!(fx.tick().await.0, []);
 }
 
 /// A mark that cannot be written costs duplicates, not the run.

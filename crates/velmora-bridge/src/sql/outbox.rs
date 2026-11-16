@@ -709,7 +709,6 @@ pub(super) async fn finish_release<S: Sql>(
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Rows a job could claim right now: live stage, due, not leased.
 /// Due rows no job holds, oldest first, without the ones the dispatcher
 /// has sent a job for and that job may still be on its way: a row with a
 /// mark (`sent_at`) is left out until `resend_secs` after the mark. A
