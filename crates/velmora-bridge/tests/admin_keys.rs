@@ -918,3 +918,111 @@ async fn every_admin_answer_is_no_store() {
         assert_eq!(n, 1, "one cache-control header");
     }
 }
+
+/// The Worker's own path: `ingress::front` runs the precheck (which
+/// refuses a missing or wrong bearer itself) and then the bridge. Every
+/// admin answer of either carries `no-store`; an S3 refusal does not
+/// get one added.
+#[tokio::test(flavor = "current_thread")]
+async fn admin_refusals_of_the_precheck_are_no_store() {
+    let rig = rig();
+    rig.bucket(BUCKET, true).await;
+    let key = mint(&rig, &[BUCKET], "rw").await;
+    let grants = format!("/_admin/keys/{}/grants", key.akid);
+    let body = json!({ "bucket": BUCKET, "perm": "rw" });
+    let good = format!("Bearer {TOKEN}");
+    let through_front = |req: Req, https: bool| {
+        let bridge = std::rc::Rc::clone(&rig.bridge);
+        async move {
+            let resp = ingress::front(req.into_request(), &bridge.cfg, https, |r| {
+                std::rc::Rc::clone(&bridge).handle(r)
+            })
+            .await;
+            Resp::collect(resp).await
+        }
+    };
+    for (method, target, auth, https, status) in [
+        (Method::Get, "/_admin/status", None, true, 401),
+        (
+            Method::Get,
+            "/_admin/status",
+            Some("Bearer wrong"),
+            true,
+            403,
+        ),
+        (Method::Post, grants.as_str(), None, true, 401),
+        (
+            Method::Post,
+            grants.as_str(),
+            Some("Bearer wrong"),
+            true,
+            403,
+        ),
+        (Method::Get, "/_admin", None, true, 401),
+        // Plain http is refused before the bearer is looked at.
+        (
+            Method::Get,
+            "/_admin/status",
+            Some(good.as_str()),
+            false,
+            403,
+        ),
+        // And the bridge's own answers keep theirs.
+        (
+            Method::Get,
+            "/_admin/status",
+            Some(good.as_str()),
+            true,
+            200,
+        ),
+        (
+            Method::Post,
+            grants.as_str(),
+            Some(good.as_str()),
+            true,
+            200,
+        ),
+    ] {
+        let with_body = (method == Method::Post).then_some(&body);
+        let r = through_front(admin_req(method.clone(), target, auth, with_body), https).await;
+        assert_eq!(
+            r.status,
+            status,
+            "{method:?} {target} {auth:?}: {}",
+            r.text()
+        );
+        assert_eq!(
+            r.header("cache-control"),
+            Some("no-store"),
+            "{method:?} {target} {auth:?}"
+        );
+        let n = r
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+            .count();
+        assert_eq!(n, 1, "one cache-control header");
+    }
+    // An S3 request refused by the precheck is not an admin answer.
+    let r = through_front(
+        admin_req(Method::Get, &format!("/{BUCKET}"), None, None),
+        true,
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.header("cache-control"), None);
+
+    // The URL form the Worker sees before it parses the request.
+    for (url, admin) in [
+        ("https://h/_admin", true),
+        ("https://h/_admin/keys?after=x", true),
+        ("https://h/_admin?x=1", true),
+        ("https://h/_adminx", false),
+        ("https://h/bkt/_admin/k", false),
+        ("https://h/", false),
+        // Unreadable: treated as admin, so the refusal is not cached.
+        ("not a url", true),
+    ] {
+        assert_eq!(ingress::is_admin_url(url), admin, "{url}");
+    }
+}

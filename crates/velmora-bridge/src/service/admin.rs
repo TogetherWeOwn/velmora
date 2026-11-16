@@ -279,15 +279,9 @@ pub(super) async fn handle<
             Ok(r) | Err(r) => r,
         },
     };
-    // No admin answer, error or not, belongs in a cache.
-    if !resp
-        .headers
-        .iter()
-        .any(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
-    {
-        resp.headers
-            .push(("cache-control".to_string(), "no-store".to_string()));
-    }
+    // No admin answer, error or not, belongs in a cache. The Worker's
+    // own refusals before this point get it from `ingress::front`.
+    ingress::no_store(&mut resp);
     resp
 }
 
@@ -856,8 +850,8 @@ struct GrantBody {
 }
 
 /// `POST /_admin/keys/<id>/grants`: sets the key's permission on one
-/// more bucket (or replaces it on one it has). The key id was checked by
-/// the router. The catalogue writes the grant only while the key and the
+/// more bucket, or widens or repeats its grant on one it has; never
+/// narrows it. The key id was checked by the router. The catalogue writes the grant only while the key and the
 /// bucket both exist ([`Catalog::put_grant_if_present`]).
 async fn put_grant<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
