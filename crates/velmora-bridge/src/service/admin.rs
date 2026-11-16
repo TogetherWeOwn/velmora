@@ -5,7 +5,7 @@
 //!
 //! | Route | Answer |
 //! |---|---|
-//! | `POST /_admin/buckets` `{name, disposable}` | `200`; `403` for a non-disposable bucket while real data is not allowed; `409` name taken |
+//! | `POST /_admin/buckets` `{name, disposable}` | `200` (a non-disposable bucket only with `"disposable": false`; `403` for one if `REAL_DATA_READY` is unset); `409` name taken |
 //! | `POST /_admin/keys` `{buckets, perm}` | `200` with the secret, once |
 //! | `GET /_admin/objects/<bucket>/<key>` | `200` per-extent state |
 //! | `POST /_admin/evict/<bucket>/<key>[?include_safety=1]` | `200`; `403` for `include_safety` on a non-disposable bucket |
@@ -514,8 +514,7 @@ async fn create_bucket<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
             "Use 3-63 lower-case letters, digits and hyphens.",
         ));
     }
-    // Until catalogue recovery is proven, only data that may be lost is
-    // accepted.
+    // With the gate closed, only data that may be lost is accepted.
     if !disposable && !REAL_DATA_READY {
         return Err(fail(
             403,
@@ -550,8 +549,8 @@ async fn create_bucket<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 }
 
 /// S3 `PUT /<bucket>`: admin only, so it needs the admin bearer token. It
-/// creates a non-disposable bucket, which is refused until real data is
-/// allowed. Errors are S3 XML.
+/// creates a non-disposable bucket (refused only if `REAL_DATA_READY` is
+/// unset). Errors are S3 XML.
 pub(super) async fn create_bucket_s3<
     C: Catalog,
     B: BlobStore,

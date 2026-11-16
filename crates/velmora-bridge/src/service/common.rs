@@ -308,8 +308,11 @@ where
 /// body is read or anything is stored:
 /// - a conditional header is `501 NotImplemented`, never ignored;
 /// - a catalogue restore in progress is `503`;
-/// - until catalogue recovery is proven, only disposable buckets take
-///   writes.
+/// - PutObject, CopyObject (the same request shape) and DeleteObject on a
+///   non-disposable bucket are refused while `REAL_DATA_READY` is false
+///   (it is true now that a lost catalogue can be rebuilt). The multipart
+///   routes do not pass this gate, so the constant alone does not make an
+///   existing real bucket read-only.
 pub(super) fn mutation_gate(
     cfg: &BridgeConfig,
     headers: &Headers,

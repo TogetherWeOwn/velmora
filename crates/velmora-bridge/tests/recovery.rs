@@ -650,6 +650,49 @@ async fn records_alone_rebuild_the_catalogue() {
     assert_eq!(dump(&rig), settled);
 }
 
+/// A real bucket comes back from the records as a real bucket: it takes
+/// writes, and its pinned copies are still not given up by an evict.
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_bucket_stays_real_through_a_replay() {
+    // This test describes the open gate; closing it must revisit it.
+    const { assert!(REAL_DATA_READY) }
+    let rig = rig();
+    let real = rig.bucket(BUCKET, false).await;
+    let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
+    rig.grant(AKID, &real, Perm::Rw).await;
+    rig.put(&signer, BUCKET, "k", b"before").await.expect(200);
+    tick(&rig);
+
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(report.published, 1, "{report:?}");
+    assert_eq!(report.damaged_total, 0, "{report:?}");
+    let back = rig
+        .bridge
+        .catalog
+        .bucket_by_name(BUCKET)
+        .await
+        .unwrap()
+        .expect("the replay restored the bucket");
+    assert_eq!(back.id, real.id);
+    assert!(!back.disposable, "the replay made the bucket disposable");
+    assert_eq!(count(&rig, "SELECT disposable FROM buckets"), 0);
+
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"before");
+    rig.put(&signer, BUCKET, "after", b"after")
+        .await
+        .expect(200);
+    assert_eq!(get(&rig, &signer, "after").await.expect(200).body, b"after");
+
+    let pinned = rig.bridge.safety.keys();
+    let refused = admin(&rig, "/evict/vault/k?include_safety=1", json!({})).await;
+    refused.expect(403);
+    assert!(refused.text().contains("SafetyEvictRefused"));
+    assert_eq!(rig.bridge.safety.keys(), pinned);
+    assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"before");
+}
+
 // ---------------------------------------------------------------------------
 // Copies: two generations share extents
 // ---------------------------------------------------------------------------
