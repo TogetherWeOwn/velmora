@@ -434,3 +434,16 @@ test("head answers existence without velmora state lookups", async () => {
   assert.deepEqual(await (await call(up, "/api/head?bucket=files&key=missing")).json(), { exists: false });
   assert.ok(up.calls.every((c) => c.method === "HEAD" && !c.url.pathname.startsWith("/_admin")));
 });
+
+test("move with no source ETag moves nothing", async () => {
+  const up = fakeUpstream((c) => (c.method === "HEAD" ? new Response(null, { headers: { "content-length": "1" } }) : new Response("")));
+  const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a", to: "b" } });
+  assert.equal(res.status, 502);
+  assert.equal(up.calls.length, 1);
+});
+
+test("a source deleted by someone else after the copy counts as moved", async () => {
+  const up = moveUpstream({ deleteStatus: 404 });
+  const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a", to: "b" } });
+  assert.equal(res.status, 200);
+});

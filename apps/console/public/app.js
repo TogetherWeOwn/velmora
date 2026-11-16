@@ -152,25 +152,34 @@ async function open(bucket, prefix) {
   await loadPage(false);
 }
 
+let listSeq = 0;
+
 async function loadPage(more) {
+  // Only the newest listing may change the view: a slow answer for a
+  // folder or bucket left meanwhile is dropped, success or failure.
+  const seq = ++listSeq;
+  const { bucket, prefix } = state;
+  const token = more ? state.next : null;
+  let out = null;
+  let failure = null;
   try {
-    const out = await api("/list", { query: { bucket: state.bucket, prefix: state.prefix, ...(more && state.next ? { token: state.next } : {}) } });
-    if (!more) {
-      state.folders = [];
-      state.files = [];
-    }
+    out = await api("/list", { query: { bucket, prefix, ...(token ? { token } : {}) } });
+  } catch (e) {
+    failure = e;
+  }
+  if (seq !== listSeq || bucket !== state.bucket || prefix !== state.prefix) return;
+  if (!more) {
+    state.folders = [];
+    state.files = [];
+    state.next = null;
+  }
+  if (failure) {
+    toast(`Listing failed: ${failure.message}`);
+  } else {
     state.folders.push(...out.folders);
     // The folder's own marker object is not listed as a file in it.
-    state.files.push(...out.files.filter((f) => f.key !== state.prefix));
+    state.files.push(...out.files.filter((f) => f.key !== prefix));
     state.next = out.truncated ? out.next : null;
-  } catch (e) {
-    toast(`Listing failed: ${e.message}`);
-    // Never show rows of another bucket or folder under this one.
-    if (!more) {
-      state.folders = [];
-      state.files = [];
-      state.next = null;
-    }
   }
   render();
 }
@@ -415,12 +424,13 @@ async function listAll(bucket, prefix) {
 }
 
 async function renameFile(key) {
+  const bucket = state.bucket;
   let to = await ask("Rename or move", "New path in this bucket (end with / to move into a folder)", key);
   if (to === null || !to) return;
   if (to.endsWith("/")) to += baseName(key);
   if (to === key) return;
   try {
-    await api("/move", { method: "POST", body: { bucket: state.bucket, from: key, to } });
+    await api("/move", { method: "POST", body: { bucket, from: key, to } });
     toast("Moved");
   } catch (e) {
     toast(`Move failed: ${e.message}`);
@@ -429,6 +439,8 @@ async function renameFile(key) {
 }
 
 async function renameFolder(prefix) {
+  // The bucket is fixed when the operation starts, whatever is browsed meanwhile.
+  const bucket = state.bucket;
   let to = await ask("Rename or move folder", "New folder path in this bucket", prefix);
   if (to === null || !to) return;
   if (!to.endsWith("/")) to += "/";
@@ -437,8 +449,6 @@ async function renameFolder(prefix) {
     toast("A folder cannot move into itself");
     return;
   }
-  // The bucket is fixed when the operation starts, whatever is browsed meanwhile.
-  const bucket = state.bucket;
   const keys = await listAll(bucket, prefix);
   const t = transfer(`Move ${prefix} → ${to}`, keys.length);
   let done = 0;
@@ -458,10 +468,11 @@ async function renameFolder(prefix) {
 
 $("new-folder").addEventListener("click", async () => {
   if (!state.bucket) return toast("Pick a bucket first");
+  const { bucket, prefix } = state;
   const name = await ask("New folder", "Folder name", "");
   if (!name) return;
   try {
-    await api("/folder", { method: "POST", body: { bucket: state.bucket, prefix: state.prefix + name.replace(/^\/+/, "") } });
+    await api("/folder", { method: "POST", body: { bucket, prefix: prefix + name.replace(/^\/+/, "") } });
   } catch (e) {
     toast(`Failed: ${e.message}`);
   }
@@ -703,15 +714,17 @@ async function replaceOk(key) {
 // Batches run one after another, so two drops never race each other.
 let uploadChain = Promise.resolve();
 function uploadAll(items) {
-  const run = uploadChain.then(() => uploadBatch(items));
+  // The destination is where the files were dropped, not where the user
+  // is by the time an earlier batch has finished.
+  if (!state.bucket) return toast("Pick a bucket first");
+  const bucket = state.bucket;
+  const base = state.prefix;
+  const run = uploadChain.then(() => uploadBatch(items, bucket, base));
   uploadChain = run.catch(() => {});
   return run;
 }
 
-async function uploadBatch(items) {
-  if (!state.bucket) return toast("Pick a bucket first");
-  const bucket = state.bucket;
-  const base = state.prefix;
+async function uploadBatch(items, bucket, base) {
   let ok = 0;
   for (const { file, path } of items) {
     if (await uploadFile(bucket, base + path, file)) ok++;

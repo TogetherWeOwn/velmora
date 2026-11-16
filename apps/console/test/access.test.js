@@ -151,3 +151,16 @@ test("a failing certs endpoint is fetched at most once a minute, by one request 
   await denied(v(await issuer.token({ exp: t / 1000 + 600 })), "certs-status");
   assert.equal(fetches, 2);
 });
+
+test("a hung certs fetch is not waited on forever", async () => {
+  const v = createAccessVerifier({
+    teamDomain: TEAM,
+    aud: AUD,
+    allowedEmails: [EMAIL],
+    now: () => NOW,
+    fetchCerts: () => new Promise(() => {}),
+  });
+  const started = Date.now();
+  await denied(v(await issuer.token()), "certs-timeout");
+  assert.ok(Date.now() - started < 8000);
+});

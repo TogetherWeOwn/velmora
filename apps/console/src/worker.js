@@ -329,6 +329,7 @@ async function api(request, env, s3, claims, url) {
     // The move is of this version of the source: the copy takes only it,
     // and the delete removes only it, so a concurrent replacement is kept.
     const { etag } = await s3.head(bucket, from);
+    if (!etag) return error(502, "UpstreamError", "The source has no ETag; nothing was moved.");
     try {
       await s3.copy(bucket, from, to, etag);
     } catch (e) {
@@ -340,9 +341,11 @@ async function api(request, env, s3, claims, url) {
     try {
       await s3.deleteObject(bucket, from, etag);
     } catch (e) {
-      if (e instanceof UpstreamError && (e.status === 412 || e.status === 404)) {
+      if (e instanceof UpstreamError && e.status === 412) {
         return error(409, "SourceChanged", "Copied, but the source changed meanwhile and was kept.");
       }
+      // Deleted by someone else in between: the copy stands, so it moved.
+      if (e instanceof UpstreamError && e.status === 404) return json(200, { from, to });
       throw e;
     }
     return json(200, { from, to });

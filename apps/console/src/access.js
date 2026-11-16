@@ -12,6 +12,7 @@ const CERTS_TTL_MS = 10 * 60 * 1000;
 // An unknown `kid` forces a certs refresh at most this often, so forged
 // tokens cannot make every request fetch the certs.
 const REFRESH_MIN_INTERVAL_MS = 60 * 1000;
+const INFLIGHT_MAX_MS = 6000;
 const TEAM_DOMAIN_RE = /^[a-z0-9][a-z0-9-]{0,62}\.cloudflareaccess\.com$/;
 const AUD_RE = /^[0-9a-f]{64}$/;
 
@@ -123,22 +124,41 @@ export function createAccessVerifier({ teamDomain, aud, allowedEmails, fetchCert
   }
 
   // One certs fetch at a time; concurrent requests wait for it.
+  // A fetch started by a request that was then cancelled may never
+  // settle; after INFLIGHT_MAX_MS it is no longer waited on.
   let inflight = null;
+  let inflightAt = 0;
   function refreshOnce() {
-    if (!inflight) inflight = refresh().finally(() => (inflight = null));
+    if (inflight && clock() - inflightAt > INFLIGHT_MAX_MS) inflight = null;
+    if (!inflight) {
+      inflightAt = clock();
+      const p = refresh().finally(() => {
+        if (inflight === p) inflight = null;
+      });
+      inflight = p;
+    }
     return inflight;
+  }
+
+  // Each wait has its own bound, whoever started the fetch.
+  function waitFor(p) {
+    let timer;
+    const limit = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new AccessDenied("certs-timeout")), INFLIGHT_MAX_MS);
+    });
+    return Promise.race([p, limit]).finally(() => clearTimeout(timer));
   }
 
   async function keyFor(kid) {
     if (clock() - fetchedAt > CERTS_TTL_MS) {
-      if (inflight) await inflight;
+      if (inflight && clock() - inflightAt <= INFLIGHT_MAX_MS) await waitFor(inflight);
       // The last attempt failed, and recently: refuse without fetching again.
       else if (fetchedAt < lastRefresh && clock() - lastRefresh < REFRESH_MIN_INTERVAL_MS) deny("certs-unavailable");
-      else await refreshOnce();
+      else await waitFor(refreshOnce());
     }
     let key = keys.get(kid);
-    if (!key && (inflight || clock() - lastRefresh >= REFRESH_MIN_INTERVAL_MS)) {
-      await refreshOnce();
+    if (!key && ((inflight && clock() - inflightAt <= INFLIGHT_MAX_MS) || clock() - lastRefresh >= REFRESH_MIN_INTERVAL_MS)) {
+      await waitFor(refreshOnce());
       key = keys.get(kid);
     }
     if (!key) deny("unknown-kid");
