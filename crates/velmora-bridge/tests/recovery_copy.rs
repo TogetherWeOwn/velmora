@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
 use velmora_bridge::copy::{
-    pass_due, Copier, CopyCounts, StepError, FRESH_MS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
-    RETRY_WINDOW_MS, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, WALK_KEY,
+    pass_due, plan_hint, Copier, CopyCounts, StepError, BEGAN_KEY, DOWN_KEY, FRESH_MS,
+    HINT_PAUSE_MS, HINT_RETRY_MS, HINT_RETRY_SECS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
+    RETRY_WINDOW_MS, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, WALKED_KEY,
+    WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
@@ -1506,6 +1508,8 @@ async fn a_key_written_by_something_else_is_counted_and_passed() {
     );
     assert!(counts.clean());
     assert!(w.jobs.take().is_empty());
+    // The next walk, a day later.
+    w.clock.advance_ms(WALK_INTERVAL_MS);
     let total = w.pass().await;
     assert_eq!(
         (total.same, total.copied, total.foreign, total.extra),
@@ -1578,8 +1582,10 @@ async fn a_record_that_always_fails_does_not_hold_back_the_others() {
     assert!(w.e2.get("m/art/x_19").is_some());
 
     // Alone in its job (the steady state: everything else is copied),
-    // one failing record is not taken for an outage either.
-    let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+    // one failing record is not taken for an outage either. The walk
+    // comes again soon, because of what the last one left undone.
+    w.clock.advance_ms(WALK_SOON_MS);
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, w.clock.now(), "").await;
     assert_eq!(why, None);
     let counts = counts.unwrap();
     assert_eq!(outcome, JobOutcome::Ack);
@@ -2374,7 +2380,12 @@ async fn any_saved_place_of_the_walk_is_safe() {
         assert_eq!(counts.unwrap().copied, first, "{place}");
         assert!(w.jobs.take().is_empty());
         assert_eq!(saved(&w).await.as_deref(), Some(""));
+        // What lies before a place that no walk saved waits for the
+        // next walk: no longer than a walk rests.
         let (_, counts, _) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+        assert_eq!(counts.unwrap().copied, 0, "{place}");
+        w.clock.advance_ms(WALK_INTERVAL_MS);
+        let (_, counts, _) = w.copier().run_job(&w.jobs, w.clock.now(), "").await;
         assert_eq!(counts.unwrap().copied, 4 - first, "{place}");
         assert_eq!(w.e2.objects.borrow().len(), 4);
     }
@@ -3361,5 +3372,708 @@ async fn a_sweep_that_cannot_be_read_is_not_written_over() {
         let step = w.copier().step(UnixMs(NOW), "").await.unwrap();
         assert_eq!((step.counts.pending, step.unsaved), (1, false));
         assert_eq!(known(&w).await, format!("{{\"{other}\":5,\"{key}\":1}}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The walk rests; the sweep and the hints bring over what is new
+// ---------------------------------------------------------------------------
+
+/// A safety bucket that counts the list requests it gets.
+struct Counted<'a>(&'a MemBlobStore, Cell<u64>);
+
+impl BlobStore for Counted<'_> {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.0.put(key, bytes, meta).await
+    }
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        self.0.get(key, span).await
+    }
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.0.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0.delete(key).await
+    }
+    async fn delete_record(&self, refused: &recovery::Unpublished) -> Result<()> {
+        self.0.delete_record(refused).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.1.set(self.1.get() + 1);
+        self.0.list(prefix, start_after, limit).await
+    }
+    // One request, as in the adapter whose listing carries size and MD5.
+    async fn list_entries(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<BlobEntry>> {
+        self.1.set(self.1.get() + 1);
+        self.0.list_entries(prefix, after, limit).await
+    }
+}
+
+/// The time saved at `key`, as it is stored.
+async fn time_at(w: &World, key: &str) -> Option<String> {
+    let bytes = w.safety.get(key, None).await.unwrap()?;
+    Some(String::from_utf8(bytes).unwrap())
+}
+
+fn ms(at: i64) -> Option<String> {
+    Some(at.to_string())
+}
+
+/// The post job of `extent`.
+fn post_job(extent: &str) -> Job {
+    Job::Extent {
+        v: JOB_VERSION,
+        extent: ExtentId::new(extent),
+        generation: GenerationId::new("g_0000000000001_a"),
+        stage: OutboxStage::Post,
+    }
+}
+
+/// The hint for the article plan of `extent`, made now: pass and cursor.
+fn hint_for(w: &World, extent: &str) -> (UnixMs, String) {
+    match plan_hint(&post_job(extent), &JobOutcome::Ack, w.clock.now()) {
+        Some(Job::RecoveryCopy { pass, cursor, .. }) => (pass, cursor),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// List requests of a day of passes, 96 of them, over a store that is
+/// equal already and gets a write and a delete before every pass:
+/// to the safety bucket, to the recovery store, and to both in a pass
+/// in which nothing is walked. `every_pass` is the walk as it was
+/// before it rested: started again by every pass.
+async fn lists_of_a_day(plans: usize, every_pass: bool) -> (u64, usize, u64) {
+    let w = World::new();
+    for i in 0..plans {
+        w.record(&format!("m/art/x_{i:05}"), b"plan").await;
+    }
+    for i in 0..plans / 10 {
+        let id = format!("{:013x}_{i:05}", NOW - OLD - i as i64);
+        w.record(&format!("m/del/g_{id}"), b"gone").await;
+        w.generation(&format!("m/g_{id}"), &[]).await;
+    }
+    let safety = Counted(&w.safety, Cell::new(0));
+    let copier = Copier {
+        safety: &safety,
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    // The first pass fills the store and ends the walk.
+    assert!(queued_pass(&w, &copier, UnixMs(NOW)).await.is_empty());
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    safety.1.set(0);
+    w.e2.asked.borrow_mut().clear();
+    let mut resting = 0;
+    for n in 1..=96 {
+        let start = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        w.clock.set(start);
+        let minted = start.0 - 180_000;
+        let plan = format!("m/art/x_new{n:02}");
+        let written = format!("m/g_{minted:013x}_new");
+        let deleted = format!("m/del/g_{minted:013x}_new");
+        w.generation(&written, &[&plan["m/art/".len()..]]).await;
+        w.record(&deleted, b"gone").await;
+        // The extent is posted, and its hint is the job before the pass.
+        w.record(&plan, b"plan").await;
+        let (pass, cursor) = hint_for(&w, &plan["m/art/".len()..]);
+        let (_, _, why) = copier.run_job(&w.jobs, pass, &cursor).await;
+        assert_eq!(why, None);
+        if every_pass {
+            assert!(w.safety.lose(WALKED_KEY));
+        }
+        let before = (safety.1.get(), w.e2.asked.borrow().len() as u64);
+        assert!(queued_pass(&w, &copier, start).await.is_empty());
+        if n == 1 {
+            resting = safety.1.get() - before.0 + w.e2.asked.borrow().len() as u64 - before.1;
+        }
+        for key in [&plan, &written, &deleted] {
+            assert!(w.e2.get(key).is_some(), "{key}");
+        }
+    }
+    (safety.1.get(), w.e2.asked.borrow().len(), resting)
+}
+
+/// What the copy asks follows what is written, not what is stored. A
+/// day of passes over a store five times the size lists five times as
+/// much when every pass walks, as before. With the walk at rest a pass
+/// lists the same few pages whatever the store holds, and the day has
+/// one walk in it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_day_of_passes_lists_what_is_new_and_walks_once() {
+    let mut days = Vec::new();
+    for plans in [2_000, 10_000] {
+        let before = lists_of_a_day(plans, true).await;
+        let after = lists_of_a_day(plans, false).await;
+        println!(
+            "LIST requests of 96 passes, {} records: before safety={} store={}; after safety={} store={} (a pass at rest: {} to both)",
+            plans + 2 * (plans / 10),
+            before.0,
+            before.1,
+            after.0,
+            after.1,
+            after.2
+        );
+        days.push((before, after));
+    }
+    let (small, large) = (days[0], days[1]);
+    // Before: with the records. What a pass lists of the fresh records
+    // (at most four pages of each side) is the same in both.
+    let walked = |day: (u64, usize, u64)| (day.0 - 96 * 4, day.1 as u64 - 96 * 4);
+    assert!(walked(large.0).0 > 2 * walked(small.0).0, "{days:?}");
+    assert!(walked(large.0).1 > 2 * walked(small.0).1, "{days:?}");
+    // After: a pass at rest asks the same of both sizes, and little.
+    assert_eq!(small.1 .2, large.1 .2, "{days:?}");
+    assert!(small.1 .2 <= 8, "{days:?}");
+    // A day is 95 such passes and one walk.
+    let pages = |records: u64| records.div_ceil(1000) + 4;
+    for ((_, after), records) in days.iter().zip([2_400, 12_000]) {
+        assert!(after.0 <= 96 * 4 + pages(records), "{days:?}");
+        assert!(after.1 as u64 <= 96 * 4 + pages(records), "{days:?}");
+    }
+    assert!(large.1 .0 * 4 < large.0 .0, "{days:?}");
+}
+
+/// An article plan written long after its generation record, between
+/// two walks: no listing finds it (its key is random, and the walk
+/// rests), so the post job that is done sends a hint, and the job of
+/// the hint sends the plan. It is over there before the next pass.
+#[tokio::test(flavor = "current_thread")]
+async fn an_article_plan_written_between_walks_is_over_there_by_its_hint() {
+    let w = World::new();
+    w.generation(&generation(OLD, "_o"), &["x_late"]).await;
+    w.record("m/art/x_0001", b"plan").await;
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    assert_eq!(time_at(&w, BEGAN_KEY).await, ms(NOW));
+    assert_eq!(w.e2.puts(), 2);
+
+    // The extent is posted an hour later. The passes of that hour, and
+    // the one after, do not find the plan: the walk rests, and they
+    // list nothing below the fresh records.
+    w.clock.advance_ms(4 * PASS_INTERVAL_MS);
+    let plan = w.record("m/art/x_late", b"late plan").await;
+    w.e2.asked.borrow_mut().clear();
+    assert!(queued_pass(&w, &w.copier(), w.clock.now()).await.is_empty());
+    assert_eq!(w.e2.get("m/art/x_late"), None);
+    assert!(
+        w.e2.asked
+            .borrow()
+            .iter()
+            .all(|a| a.starts_with("m/del/g_") || a.starts_with("m/g_")),
+        "{:?}",
+        w.e2.asked
+    );
+    let lists = w.e2.asked.borrow().len();
+
+    // Only a post job that is done has a hint.
+    let post = post_job("x_late");
+    let Job::Extent {
+        extent, generation, ..
+    } = post.clone()
+    else {
+        unreachable!()
+    };
+    for stage in [OutboxStage::Verify, OutboxStage::Release] {
+        let other = Job::Extent {
+            v: JOB_VERSION,
+            extent: extent.clone(),
+            generation: generation.clone(),
+            stage,
+        };
+        assert!(!w.copier().hint(&w.jobs, &other, &JobOutcome::Ack).await);
+    }
+    let retried = JobOutcome::Retry { delay_secs: 30 };
+    assert!(!w.copier().hint(&w.jobs, &post, &retried).await);
+    assert!(
+        !w.copier()
+            .hint(&w.jobs, &Job::Gc { v: JOB_VERSION }, &JobOutcome::Ack)
+            .await
+    );
+    assert!(w.jobs.take().is_empty());
+
+    assert!(w.copier().hint(&w.jobs, &post, &JobOutcome::Ack).await);
+    let sent = w.jobs.take();
+    assert_eq!((sent.len(), sent[0].delay_secs), (1, 0));
+    let Job::RecoveryCopy { v, pass, cursor } = &sent[0].job else {
+        panic!("another job");
+    };
+    // Pass 0: a version that knows no hints takes it for a job of a
+    // pass that ended long ago, and does nothing.
+    assert_eq!((*v, *pass), (JOB_VERSION, UnixMs(0)));
+    assert!(!pass_due(*pass) || w.clock.now().0 - pass.0 >= PASS_INTERVAL_MS);
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().copied, 1);
+    assert_eq!(w.e2.get("m/art/x_late"), Some(plan));
+    // One record: no list, no next job, and nothing saved of it.
+    assert_eq!(w.e2.asked.borrow().len(), lists);
+    assert!(w.jobs.take().is_empty());
+    assert_eq!(time_at(&w, WANT_KEY).await, None);
+
+    // A second hint for it (a post job that came twice) sends nothing.
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, *pass, cursor).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!((counts.unwrap().same, w.e2.puts()), (1, 3));
+}
+
+/// A hint is only a hint: it names one article plan, sends nothing
+/// else, and whatever becomes of it the walk is not put off.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hint_names_one_article_plan_and_nothing_else() {
+    let w = World::new();
+    let g = generation(OLD, "_o");
+    w.record(&g, b"old").await;
+    w.record("m/tk/tenant", b"a key").await;
+    w.raw("m/art/x_bad", b"does not open".to_vec()).await;
+    let cursor = |key: &str| format!("{{\"p\":\"x\",\"k\":\"{key}\",\"t\":{NOW}}}");
+    // Not article plans: nothing is read, nothing is asked.
+    for key in [g.as_str(), "m/tk/tenant", "m/art/", "rc/walk", "", "x/x_1"] {
+        let (outcome, counts, why) = w.copier().run_job(&w.jobs, UnixMs(0), &cursor(key)).await;
+        assert_eq!(
+            (outcome, counts, why),
+            (JobOutcome::Ack, None, None),
+            "{key}"
+        );
+    }
+    // Not written (or the hint of a job that posted nothing).
+    let (outcome, counts, why) = w
+        .copier()
+        .run_job(&w.jobs, UnixMs(0), &cursor("m/art/x_none"))
+        .await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap(), CopyCounts::default());
+    // One that does not open is not sent.
+    let (outcome, counts, why) = w
+        .copier()
+        .run_job(&w.jobs, UnixMs(0), &cursor("m/art/x_bad"))
+        .await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().source_unreadable, 1);
+    assert!(w.e2.log.borrow().is_empty(), "{:?}", w.e2.log);
+    assert!(w.jobs.take().is_empty());
+    assert_eq!(time_at(&w, WANT_KEY).await, None);
+
+    // The step of a pass does nothing with the cursor of a hint.
+    let step = w
+        .copier()
+        .step(UnixMs(0), &cursor("m/art/x_bad"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (step.counts, step.next, step.walk),
+        (CopyCounts::default(), None, None)
+    );
+    assert!(w.e2.log.borrow().is_empty());
+
+    // In a restore no hint is sent, and none is done.
+    let mut restoring = w.copier();
+    restoring.maintenance = Maintenance::Restore;
+    assert!(
+        !restoring
+            .hint(&w.jobs, &post_job("x_1"), &JobOutcome::Ack)
+            .await
+    );
+    let (outcome, counts, why) = restoring
+        .run_job(&w.jobs, UnixMs(0), &cursor("m/art/x_bad"))
+        .await;
+    assert_eq!((outcome, counts, why), (JobOutcome::Ack, None, None));
+    assert!(w.jobs.take().is_empty());
+
+    // A hint that cannot be sent asks for the walk.
+    assert!(
+        !w.copier()
+            .hint(&NoQueue, &post_job("x_1"), &JobOutcome::Ack)
+            .await
+    );
+    assert_eq!(time_at(&w, WANT_KEY).await, ms(NOW));
+
+    // A plan the store refuses: not tried again, and the walk is asked.
+    let w = World::new();
+    w.record("m/art/x_1", b"plan").await;
+    w.e2.put_status.set(Some(403));
+    let (pass, at) = hint_for(&w, "x_1");
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &at).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().refused, 1);
+    assert_eq!(time_at(&w, WANT_KEY).await, ms(NOW));
+}
+
+/// The store is down for longer than a record is fresh. The sweep
+/// cannot send what was written meanwhile, and the hints are given up;
+/// the walk that comes soon after sends all of it. While the store is
+/// down, one hint in two minutes asks it; the others ask nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn what_the_sweep_and_the_hints_missed_in_an_outage_is_caught_by_the_walk() {
+    let w = World::new();
+    w.record("m/art/x_0001", b"plan").await;
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    assert_eq!(w.e2.puts(), 1);
+
+    // Down from minute 14. A delete and a write at minute 16; the
+    // extent of the write is posted at minute 20, another at minute 21.
+    w.e2.status.set(Some(503));
+    let minted = NOW + 16 * 60_000;
+    let deleted = format!("m/del/g_{minted:013x}_t");
+    let written = format!("m/g_{minted:013x}_w");
+    w.record(&deleted, b"gone").await;
+    w.generation(&written, &["x_out1", "x_out2"]).await;
+    let missed = [
+        deleted.as_str(),
+        written.as_str(),
+        "m/art/x_out1",
+        "m/art/x_out2",
+    ];
+    let behind = |e2: &FakeE2| missed.iter().filter(|k| e2.get(k).is_none()).count();
+
+    let down = StepError::Store(RemoteError::Unavailable);
+    let (whys, retries) = retried_pass(&w, UnixMs(NOW + PASS_INTERVAL_MS)).await;
+    assert!(
+        retries > 0
+            && whys
+                .iter()
+                .all(|why| *why == down || *why == StepError::Expired),
+        "{whys:?}"
+    );
+
+    w.clock.set(UnixMs(NOW + 20 * 60_000));
+    w.record("m/art/x_out1", b"plan one").await;
+    let (pass, first) = hint_for(&w, "x_out1");
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &first).await;
+    let again = JobOutcome::Retry {
+        delay_secs: HINT_RETRY_SECS,
+    };
+    assert_eq!((outcome, why), (again, Some(down)));
+    assert_eq!(counts.unwrap().failed, 1);
+    // The time of the job that found it down (its tries took seconds).
+    let found_down = NOW + 20 * 60_000;
+    assert_eq!(time_at(&w, DOWN_KEY).await, ms(found_down));
+
+    // The next hint, a minute later, asks nothing of the store.
+    w.clock.set(UnixMs(NOW + 21 * 60_000));
+    assert!(w.clock.now().0 - found_down < HINT_PAUSE_MS);
+    w.record("m/art/x_out2", b"plan two").await;
+    let (pass, second) = hint_for(&w, "x_out2");
+    let asked = w.e2.log.borrow().len();
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &second).await;
+    assert_eq!((outcome, counts, why), (again, None, Some(down)));
+    assert_eq!(w.e2.log.borrow().len(), asked);
+    // After the pause one asks again, and finds it down again.
+    w.clock.set(UnixMs(found_down + HINT_PAUSE_MS));
+    let (outcome, _, _) = w.copier().run_job(&w.jobs, pass, &second).await;
+    assert_eq!(outcome, again);
+    assert!(w.e2.log.borrow().len() > asked);
+    // A hint is given up when it is ten minutes old, held back or not.
+    w.safety.lose(WANT_KEY);
+    for (made, cursor) in [(NOW + 20 * 60_000, &first), (NOW + 21 * 60_000, &second)] {
+        w.clock.set(UnixMs(made + HINT_RETRY_MS - 1));
+        let (outcome, _, _) = w.copier().run_job(&w.jobs, pass, cursor).await;
+        assert_eq!(outcome, again);
+        assert_eq!(time_at(&w, WANT_KEY).await, None);
+        w.clock.set(UnixMs(made + HINT_RETRY_MS));
+        let (outcome, _, why) = w.copier().run_job(&w.jobs, pass, cursor).await;
+        assert_eq!((outcome, why), (JobOutcome::Ack, Some(down)));
+        assert_eq!(time_at(&w, WANT_KEY).await, ms(made + HINT_RETRY_MS));
+        w.safety.lose(WANT_KEY);
+    }
+    assert!(w.jobs.take().is_empty());
+
+    // Down until minute 100: the passes get nowhere, and say so.
+    for n in 2..=6 {
+        let (whys, _) = retried_pass(&w, UnixMs(NOW + n * PASS_INTERVAL_MS)).await;
+        assert!(
+            whys.contains(&down)
+                && whys
+                    .iter()
+                    .all(|why| *why == down || *why == StepError::Expired),
+            "{whys:?}"
+        );
+    }
+    let wanted: i64 = time_at(&w, WANT_KEY).await.unwrap().parse().unwrap();
+    assert!(wanted > NOW + 6 * PASS_INTERVAL_MS);
+    assert_eq!(behind(w.e2), 4);
+
+    // The store is back. What was written at minute 16 is not fresh any
+    // more: the sweep does not see it, and the walk rests.
+    w.e2.status.set(None);
+    let last_rest = WALK_SOON_MS / PASS_INTERVAL_MS - 1;
+    for n in 7..=last_rest {
+        let start = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        w.clock.set(start);
+        assert!(queued_pass(&w, &w.copier(), start).await.is_empty());
+        assert_eq!(behind(w.e2), 4, "pass {n}");
+    }
+    // Three hours after the last walk ended the walk comes, because it
+    // was asked for: a day is not waited.
+    let start = UnixMs(NOW + WALK_SOON_MS);
+    w.clock.set(start);
+    assert!(queued_pass(&w, &w.copier(), start).await.is_empty());
+    assert_eq!(behind(w.e2), 0);
+    for key in missed {
+        assert_eq!(
+            w.e2.get(key),
+            w.safety.stored(key).map(|b| b.bytes),
+            "{key}"
+        );
+    }
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(start.0));
+    assert_eq!(time_at(&w, BEGAN_KEY).await, ms(start.0));
+
+    // That walk answered what was asked: the next one is a day later.
+    w.e2.set("m/art/x_0001", b"damaged over there");
+    for (after, mended) in [
+        (WALK_SOON_MS, false),
+        (WALK_INTERVAL_MS - PASS_INTERVAL_MS, false),
+        (WALK_INTERVAL_MS, true),
+    ] {
+        let at = UnixMs(start.0 + after);
+        w.clock.set(at);
+        assert!(queued_pass(&w, &w.copier(), at).await.is_empty());
+        let equal = w.e2.get("m/art/x_0001") == w.safety.stored("m/art/x_0001").map(|b| b.bytes);
+        assert_eq!(equal, mended, "{after}");
+    }
+}
+
+/// A record nobody knows is missing over there (no job failed, nothing
+/// asked for the walk) is sent by the walk of the next day; so is one
+/// whose copy was damaged over there.
+#[tokio::test(flavor = "current_thread")]
+async fn what_nobody_knows_is_missing_is_caught_by_the_daily_walk() {
+    let w = World::new();
+    w.record("m/art/x_0001", b"plan").await;
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    // A plan whose hint was lost, and a copy that went bad.
+    w.clock.advance_ms(PASS_INTERVAL_MS);
+    w.record("m/art/x_0002", b"plan without a hint").await;
+    w.e2.set("m/art/x_0001", b"damaged");
+    let whole = |e2: &FakeE2| {
+        ["m/art/x_0001", "m/art/x_0002"]
+            .iter()
+            .all(|k| e2.get(k) == w.safety.stored(k).map(|b| b.bytes))
+    };
+    let mut walks = 0;
+    for n in 1..=96 {
+        let start = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        w.clock.set(start);
+        w.e2.asked.borrow_mut().clear();
+        assert!(queued_pass(&w, &w.copier(), start).await.is_empty());
+        let walked = w.e2.asked.borrow().iter().any(|a| a.is_empty());
+        walks += usize::from(walked);
+        assert_eq!(whole(w.e2), n == 96, "pass {n}");
+        assert_eq!(walked, n == 96, "pass {n}");
+    }
+    assert_eq!(walks, 1);
+    assert_eq!(time_at(&w, WANT_KEY).await, None);
+}
+
+/// A walk longer than a pass goes on from pass to pass, and through a
+/// job that is lost, from the place that was saved. Its start is saved
+/// once, its end when it comes to the end of the keys; then it rests
+/// for a day, and starts again from the first key.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_goes_on_across_passes_then_rests_for_a_day() {
+    const RECORDS: usize = 900;
+    let w = World::new();
+    for i in 0..RECORDS {
+        w.record(&format!("m/art/x_{i:04}"), b"plan").await;
+    }
+    // One key per answer of the store, a second per request.
+    w.e2.page.set(1);
+    let clock = TickClock(w.clock.clone());
+    let copier = Copier {
+        safety: &w.safety,
+        kek: &w.kek,
+        clock: &clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let behind = |e2: &FakeE2| RECORDS - e2.objects.borrow().len();
+    let mut places: Vec<String> = Vec::new();
+    let mut ended_in = None;
+    for n in 0..8 {
+        let start = UnixMs(NOW + n * PASS_INTERVAL_MS);
+        if w.clock.now().0 < start.0 {
+            w.clock.set(start);
+        }
+        assert!(copier.start_pass(&w.jobs, start).await.unwrap());
+        let mut jobs = 0;
+        loop {
+            let sent = w.jobs.take();
+            if sent.is_empty() {
+                break;
+            }
+            let Job::RecoveryCopy { pass, cursor, .. } = &sent[0].job else {
+                panic!("another job");
+            };
+            jobs += 1;
+            // The third job of the second pass is lost.
+            if (n, jobs) == (1, 3) {
+                break;
+            }
+            let (outcome, _, why) = copier.run_job(&w.jobs, *pass, cursor).await;
+            assert_eq!((outcome, why), (JobOutcome::Ack, None), "pass {n}");
+        }
+        if ended_in.is_some() {
+            // At rest: one job, the sweep, and nothing of the walk.
+            assert_eq!(jobs, 1, "pass {n}");
+            continue;
+        }
+        // The start is the first pass, whichever pass goes on.
+        assert_eq!(time_at(&w, BEGAN_KEY).await, ms(NOW), "pass {n}");
+        let place = saved(&w).await.unwrap();
+        if behind(w.e2) == 0 && place.is_empty() {
+            assert_eq!(time_at(&w, WALKED_KEY).await, ms(start.0));
+            ended_in = Some(n);
+        } else {
+            // Under way: no end is saved, and the place moved on.
+            assert_eq!(time_at(&w, WALKED_KEY).await, None, "pass {n}");
+            assert!(places.last().is_none_or(|last| *last < place), "{places:?}");
+            places.push(place);
+        }
+    }
+    let ended_in = ended_in.expect("the walk ended");
+    assert!((3..=6).contains(&ended_in), "{ended_in} {places:?}");
+    // Each record was sent once: no pass went back over what was done.
+    assert_eq!(w.e2.puts(), RECORDS);
+    let ended = NOW + ended_in * PASS_INTERVAL_MS;
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(ended));
+    assert_eq!(time_at(&w, WANT_KEY).await, None);
+
+    // A day after the pass that ended it, and not a pass sooner, the
+    // walk starts from the first key again.
+    for (at, starts) in [
+        (ended + WALK_INTERVAL_MS - PASS_INTERVAL_MS, false),
+        (ended + WALK_INTERVAL_MS, true),
+    ] {
+        w.clock.set(UnixMs(at));
+        w.e2.asked.borrow_mut().clear();
+        let (_, counts, why) = copier.run_job(&w.jobs, UnixMs(at), "").await;
+        assert_eq!(why, None);
+        assert_eq!(counts.unwrap().same > 0, starts);
+        assert_eq!(w.e2.asked.borrow().iter().any(|a| a.is_empty()), starts);
+        let began = if starts { at } else { NOW };
+        assert_eq!(time_at(&w, BEGAN_KEY).await, ms(began));
+        w.jobs.take();
+    }
+}
+
+/// The times saved of the walk are hints. Whatever stands in them, the
+/// walk starts a day after the last end that is believed, at the
+/// latest; the others can only bring it forward.
+#[tokio::test(flavor = "current_thread")]
+async fn any_saved_time_of_the_walk_is_safe() {
+    /// A world with one record of the walk, and these times saved.
+    async fn world(times: &[(&str, &[u8])]) -> World {
+        let w = World::new();
+        w.record("m/art/x_1", b"plan").await;
+        for (key, body) in times {
+            w.raw(key, body.to_vec()).await;
+        }
+        w
+    }
+    async fn walks(w: &World, at: i64) -> bool {
+        w.clock.set(UnixMs(at));
+        let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(at), "").await;
+        assert_eq!(why, None);
+        w.jobs.take();
+        counts.unwrap().records > 0
+    }
+    let t = |at: i64| at.to_string().into_bytes();
+    let hour = 3_600_000;
+    let long = vec![b'1'; 1024 * 1024];
+
+    // An end that is no time, or has not come: the walk starts now.
+    let not_times: [&[u8]; 9] = [
+        b"",
+        b"soon",
+        b"-5",
+        b"+5",
+        b" 1800000000000",
+        b"1.8e12",
+        b"\xff\xfe",
+        b"999999999999999999999",
+        &long,
+    ];
+    for body in not_times {
+        let w = world(&[(WALKED_KEY, body)]).await;
+        assert!(walks(&w, NOW).await, "{:?}", &body[..body.len().min(24)]);
+    }
+    for ahead in [PASS_INTERVAL_MS, hour, 400 * 24 * hour] {
+        let w = world(&[(WALKED_KEY, &t(NOW + ahead))]).await;
+        assert!(walks(&w, NOW).await, "{ahead}");
+    }
+    let w = world(&[]).await;
+    assert!(walks(&w, NOW).await);
+
+    // An end that is past is believed, and for a day only, whatever the
+    // other times say.
+    let far = t(NOW + 400 * 24 * hour);
+    let others: [&[u8]; 5] = [b"", b"soon", &far, &t(0), &long];
+    for want in others {
+        for began in others {
+            let times = [
+                (WALKED_KEY, t(NOW - hour)),
+                (WANT_KEY, want.to_vec()),
+                (BEGAN_KEY, began.to_vec()),
+                (DOWN_KEY, want.to_vec()),
+            ];
+            let times: Vec<(&str, &[u8])> = times.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+            let w = world(&times).await;
+            assert!(!walks(&w, NOW).await);
+            assert!(walks(&w, NOW + 23 * hour).await);
+        }
+    }
+
+    // Between three hours and a day after the end, the walk starts
+    // when it was asked for since the last one began.
+    let ended = NOW - 4 * hour;
+    let cases: [(Option<i64>, Option<i64>, bool); 7] = [
+        (None, None, false),
+        (None, Some(ended), false),
+        // Asked, and no start is known: taken as asked since.
+        (Some(NOW - hour), None, true),
+        (Some(NOW - hour), Some(ended), true),
+        (Some(ended), Some(ended), true),
+        // Asked before the last walk began: that walk answered it.
+        (Some(ended - hour), Some(ended), false),
+        // A time that has not come asks for nothing.
+        (Some(NOW + PASS_INTERVAL_MS), Some(ended), false),
+    ];
+    for (want, began, starts) in cases {
+        let mut times = vec![(WALKED_KEY, t(ended))];
+        times.extend(want.map(|at| (WANT_KEY, t(at))));
+        times.extend(began.map(|at| (BEGAN_KEY, t(at))));
+        let times: Vec<(&str, &[u8])> = times.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+        let w = world(&times).await;
+        assert_eq!(walks(&w, NOW).await, starts, "{want:?} {began:?}");
+        // Asked or not, it does not start in the first three hours.
+        let w = world(&times).await;
+        w.raw(WALKED_KEY, t(NOW - 3 * hour + 1)).await;
+        assert!(!walks(&w, NOW).await, "{want:?} {began:?}");
+    }
+
+    // A walk that is under way goes on, whatever the times say.
+    let w = world(&[(WALKED_KEY, &t(NOW)), (WALK_KEY, b"m/art/x_0")]).await;
+    assert!(walks(&w, NOW).await);
+
+    // The time the store was found down holds a hint back for two
+    // minutes after it, and no other value holds one back.
+    let held: [(&[u8], bool); 7] = [
+        (&t(NOW), true),
+        (&t(NOW - HINT_PAUSE_MS + 1), true),
+        (&t(NOW - HINT_PAUSE_MS), false),
+        (&t(NOW + 1), false),
+        (&far, false),
+        (b"down", false),
+        (&long, false),
+    ];
+    for (body, holds) in held {
+        let w = world(&[(DOWN_KEY, body)]).await;
+        let (pass, cursor) = hint_for(&w, "x_1");
+        let (outcome, counts, _) = w.copier().run_job(&w.jobs, pass, &cursor).await;
+        assert_eq!(outcome != JobOutcome::Ack, holds);
+        assert_eq!(counts.is_none(), holds);
+        assert_eq!(w.e2.get("m/art/x_1").is_none(), holds);
     }
 }

@@ -179,6 +179,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             _ => bridge.run_job(&job).await,
         };
         log_post_trace(&job, &outcome);
+        plan_hint(&env, &bridge, &job, &outcome).await;
         match outcome {
             JobOutcome::Ack => msg.ack(),
             JobOutcome::Retry { delay_secs } => msg.retry_with_options(
@@ -207,7 +208,27 @@ fn copier<'a>(
     }
 }
 
-/// One job of a pass of the recovery copy. Logs counts only. A job
+/// After a post job that is done: the hint that brings the article
+/// plan of its extent over to the recovery store now. Without it the
+/// plan waits for the walk (`velmora_bridge::copy`).
+async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &JobOutcome) {
+    if velmora_bridge::copy::plan_hint(job, outcome, UnixMs(0)).is_none() {
+        return;
+    }
+    // Off, or refused: the cron run says so.
+    let Ok(Some(remote)) = env::recovery_store(env) else {
+        return;
+    };
+    if !copier(bridge, &remote)
+        .hint(&bridge.jobs, job, outcome)
+        .await
+        && bridge.cfg.maintenance != velmora_bridge::config::Maintenance::Restore
+    {
+        console_error!("recovery copy: a hint was not sent");
+    }
+}
+
+/// One job of a pass of the recovery copy, or of a hint (pass 0). Logs counts only. A job
 /// that is retried does its work again and logs it again with
 /// `retry=true`: a sum over a pass takes the other lines only.
 async fn recovery_copy(
