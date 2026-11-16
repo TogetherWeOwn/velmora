@@ -32,6 +32,8 @@
 //! - A backbone whose last `BODY` read of the current plan failed
 //!   (missing or corrupt) holds no copy at release, whatever it answers
 //!   to `STAT`, until verify has read it in full again and it passed.
+//!   Verify therefore reads such a backbone with `BODY`, not `STAT`,
+//!   also when an earlier backbone has passed the full check.
 //! - A plan that changed (a new `plan_rev`) has no full check on record:
 //!   it goes back to verify and is read in full before any release.
 //! - A release that finds an article missing where it is needed records
@@ -405,6 +407,17 @@ where
         Ok(Some(wait.min(left.max(1))))
     }
 
+    /// Whether the last `BODY` read of `backbone` for the current plan is
+    /// on record as a failure.
+    async fn full_read_failed(&self, extent: &ExtentRow, backbone: &str) -> Staged<bool> {
+        let checks = self.catalog.body_checks(&extent.id).await?;
+        Ok(checks.iter().any(|b| {
+            b.plan_rev == extent.plan_rev
+                && label(&b.backbone) == backbone
+                && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+        }))
+    }
+
     async fn verify_extent(&self, lease: &Lease, extent: &ExtentRow) -> Staged<()> {
         let plan = self.posted_plan(extent).await?;
         let groups = release_backbones(&self.cfg.providers);
@@ -412,7 +425,10 @@ where
         let index = (lease.cursor / CURSOR_STEPS) as usize;
 
         if let Some((name, providers)) = groups.get(index) {
-            // `BODY` until a backbone before this one has passed it.
+            // `BODY` until a backbone before this one has passed it, and
+            // `BODY` again on a backbone whose last full read failed: the
+            // release takes no `STAT` answer from it until it has passed
+            // one, so `STAT` here would send the extent round for ever.
             let mut kind = VerifyKind::Body;
             if index > 0 {
                 let status = self.catalog.backbone_status(&extent.id).await?;
@@ -421,7 +437,7 @@ where
                         && s.kind == VerifyKind::Body
                         && labels[..index].contains(&label(&s.backbone))
                 };
-                if status.iter().any(full) {
+                if status.iter().any(full) && !self.full_read_failed(extent, name).await? {
                     kind = VerifyKind::Stat;
                 }
             }

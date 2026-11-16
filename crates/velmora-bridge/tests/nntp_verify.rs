@@ -885,6 +885,57 @@ async fn a_stat_answer_does_not_count_where_the_full_read_failed() {
     assert_eq!(backbones.len(), 3, "{backbones:?}");
 }
 
+/// A backbone whose full read failed recovers: verify reads it with
+/// `BODY` again, also after an earlier backbone has passed the full
+/// check, and the release then takes it. With `STAT` there the release
+/// would refuse it every time and the extent would go round for ever.
+#[tokio::test]
+async fn verify_reads_in_full_again_where_the_full_read_failed() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.verified_on_two(45).await;
+    // As a round leaves it in which neither backbone had the articles
+    // yet, before the round that passed.
+    let stat = rig.rows(&s)[1].clone();
+    assert_eq!(
+        (stat.backbone.as_str(), stat.kind),
+        ("bb1", VerifyKind::Stat)
+    );
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.verifications.push(VerificationRow {
+            verified_at: UnixMs(stat.verified_at.0 - 1),
+            articles_ok: 0,
+            result: VerifyResult::Missing,
+            kind: VerifyKind::Body,
+            ..stat.clone()
+        });
+    });
+
+    // The release does not take the `STAT` answer of that backbone.
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    rig.bridge
+        .clock
+        .advance_secs(rig.bridge.cfg.verify_delay_secs);
+
+    // Verify: both in full this time.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig), (6, 0));
+    let all = checks(&rig, &s);
+    assert_eq!(all[all.len() - 1], ok("bb1", VerifyKind::Body));
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
+    // And from then on `STAT` is enough there again.
+    assert_eq!(reads(&rig), (6, 6));
+}
+
 /// An article missing at release (`STAT` answers 430) takes the usual
 /// repair path: back to verify, which posts it to the backbone that
 /// lacks it once the propagation grace is over.

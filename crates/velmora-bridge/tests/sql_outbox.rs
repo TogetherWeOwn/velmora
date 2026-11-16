@@ -1347,6 +1347,11 @@ async fn release_refuses_a_plan_that_was_never_read_in_full() {
     assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Body).await);
     assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
     assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    // A full read of the old plan that failed says nothing about the new
+    // one: it does not keep that backbone out further down.
+    let corrupt = VerifyResult::Corrupt;
+    let at = T0.plus_ms(1);
+    assert!(fx.verify(&l, "bb-a", "p-bb-a", at, 1, 2, corrupt).await);
     // The plan changes: the same number of articles, a new revision.
     fx.run(
         "UPDATE extents SET plan_rev = 2 WHERE id = ?1",
