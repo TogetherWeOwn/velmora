@@ -329,6 +329,17 @@ the code real data relies on. Never roll back past the floor:
   retries and to the replay of copies. Today the #71 floor is the later
   of the two, so it covers both.
 
+Above the floor a rollback is still not free:
+
+- A version from before `REAL_DATA_READY` was set refuses PutObject and
+  DeleteObject on a real bucket (403), while multipart uploads and
+  CopyObject still go through. Clients see failed writes until the
+  Worker is rolled forward again.
+- The rule of the restore section still holds: no rollback while
+  `replay_unfinished` is `true`.
+- (Versions from before the recovery records, #64, write no record at
+  all; they are below the #71 floor anyway.)
+
 The CI auto-rollback only ever goes back to the version that served
 before that run's deploy, which is above the floor once the floor has
 been deployed. The floor matters for a rollback by hand.
@@ -345,8 +356,9 @@ here):
    runs the code of the version before it.
 3. For each version, oldest first, check the commit:
    `git merge-base --is-ancestor <merge commit of #71> <commit>`. The
-   first version for which it succeeds is the floor; a version without
-   a commit takes the answer of the version before it.
+   first version for which it succeeds is the floor. A secret-change
+   version takes the answer of the version before it. Treat any other
+   version without a CI message (an upload by hand) as below the floor.
 
 ## A PutObject above one extent
 
