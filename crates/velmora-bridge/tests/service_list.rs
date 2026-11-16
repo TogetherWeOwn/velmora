@@ -400,7 +400,7 @@ async fn list_buckets_shows_only_granted_buckets() {
     resp.expect(200);
     assert!(resp.values("Name").is_empty());
 
-    // Unknown and disabled keys are denied like any other request.
+    // Unknown and disabled keys are refused as S3 refuses an unknown key.
     let unknown = Signer::new("AKIDUNKNOWN000000000", secret());
     let disabled = rig
         .key("AKIDDISABLED00000000", secret(), KeyStatus::Disabled)
@@ -409,7 +409,7 @@ async fn list_buckets_shows_only_granted_buckets() {
     for who in [&unknown, &disabled] {
         rig.call(who, Method::Get, "/", &[], &[], b"")
             .await
-            .expect_error(403, "AccessDenied");
+            .expect_error(403, "InvalidAccessKeyId");
     }
 }
 

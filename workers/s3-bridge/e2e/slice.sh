@@ -106,6 +106,8 @@ DEV_VARS_WRITTEN=0
 SECRETS=()
 # Extra curl arguments (the local TLS trust anchor).
 CURL_TLS=()
+# Access key ids this run minted; a remote run revokes them on exit.
+KEY_IDS=()
 
 # Kills a process and its whole process group (wrangler spawns workerd).
 stop_group() {
@@ -121,6 +123,16 @@ not_running() { ! kill -0 "$1" 2>/dev/null; }
 cleanup() {
   local rc=$?
   set +e
+  # A remote run leaves no key behind, also when it failed. Best effort:
+  # a 404 is a key that is gone already.
+  if [[ $MODE == remote && -f $T/admin.hdr ]]; then
+    local id code
+    for id in "${KEY_IDS[@]}"; do
+      code=$(curl -sS "${CURL_TLS[@]}" -o /dev/null -w '%{http_code}' --max-time 60 \
+        -H @"$T/admin.hdr" -X DELETE "$BASE/_admin/keys/$id" 2>/dev/null)
+      log "revoke $id on exit: HTTP $code"
+    done
+  fi
   stop_group "$WRANGLER_PID"
   stop_group "$FAKESRV_PID"
   if [[ $DEV_VARS_WRITTEN == 1 ]]; then rm -f "$WORKER_DIR/.dev.vars"; fi
@@ -378,6 +390,7 @@ adm "POST /_admin/keys" -XPOST "$BASE/_admin/keys" -H 'content-type: application
   -d "{\"buckets\":[\"$SB\",\"$OB\",\"$EB\"],\"perm\":\"rw\"}" >"$T/key.json"
 jq -e '(.access_key_id|type=="string") and (.secret|type=="string")' "$T/key.json" >/dev/null ||
   fail "POST /_admin/keys response" "{access_key_id, secret} strings" "keys: $(jq -c 'keys' "$T/key.json" 2>&1)"
+KEY_IDS+=("$(jq -r .access_key_id "$T/key.json")")
 jq -r '"[default]\naws_access_key_id=\(.access_key_id)\naws_secret_access_key=\(.secret)"' \
   "$T/key.json" >"$T/aws-credentials"
 rm -f "$T/key.json"
@@ -531,6 +544,67 @@ got=$("${SIGV4_GET[@]}" gzip identity "$T/got-ae.bin" 2>&1) ||
 [[ $got == "403 SignatureDoesNotMatch" ]] ||
   fail "GET a/small.bin, signed gzip, sent identity" "403 SignatureDoesNotMatch" "$got"
 rm -f "$T/got-ae.bin"
+
+# ---------------------------------------------------------------------------
+# 1c an access key: minted, used, revoked, refused
+# ---------------------------------------------------------------------------
+
+STEP=1c-key-revoke
+log "step $STEP"
+# A second, read-only key. Its secret goes from curl through jq into its
+# own 0600 credentials file, as the first one did; the presigned URL stays
+# in a variable and is never printed.
+adm "POST /_admin/keys (second key)" -XPOST "$BASE/_admin/keys" -H 'content-type: application/json' \
+  -d "{\"buckets\":[\"$SB\"],\"perm\":\"ro\"}" >"$T/key2.json"
+RK_ID=$(jq -r '.access_key_id // empty' "$T/key2.json")
+[[ $RK_ID =~ ^[A-Za-z0-9]+$ ]] || fail "POST /_admin/keys (second key)" "an access key id" "keys: $(jq -c 'keys' "$T/key2.json" 2>&1)"
+KEY_IDS+=("$RK_ID")
+jq -r '"[default]\naws_access_key_id=\(.access_key_id)\naws_secret_access_key=\(.secret)"' \
+  "$T/key2.json" >"$T/aws-credentials-2"
+rm -f "$T/key2.json"
+RK=(env AWS_SHARED_CREDENTIALS_FILE="$T/aws-credentials-2")
+run_aws "GET a/small.bin with the second key" "${RK[@]}" "${S3[@]}" cp "s3://$SB/a/small.bin" "$T/got-rk.bin" >/dev/null
+same_bytes "GET with the second key equals the upload" "$T/small.bin" "$T/got-rk.bin"
+PRESIGNED=$("${RK[@]}" aws s3 presign "s3://$SB/a/small.bin" --endpoint-url "$BASE" --expires-in 900 2>&1) ||
+  fail "presign a/small.bin with the second key" "aws exits 0" "$PRESIGNED"
+code=$(curl -sS "${CURL_TLS[@]}" -o "$T/got-rk.bin" -w '%{http_code}' --max-time 60 "$PRESIGNED" 2>/dev/null) || code=000
+[[ $code == 200 ]] || fail "presigned GET with the second key" "HTTP 200" "HTTP $code"
+same_bytes "presigned GET equals the upload" "$T/small.bin" "$T/got-rk.bin"
+rm -f "$T/got-rk.bin"
+# Listed with its grant, without a secret; followed page by page.
+listed_key() {
+  local after='' page
+  while :; do
+    page=$(adm "GET /_admin/keys" "$BASE/_admin/keys${after:+?after=$after}")
+    jq -e '(.keys | type == "array") and all(.keys[]; keys == ["access_key_id", "created_at", "grants", "status"])' >/dev/null <<<"$page" ||
+      fail "GET /_admin/keys" "a key list without a secret" "fields: $(jq -c '[.keys[0] | keys?]' <<<"$page" 2>&1)"
+    if jq -e --arg id "$1" '.keys | map(select(.access_key_id == $id)) | length > 0' >/dev/null <<<"$page"; then
+      jq -c --arg id "$1" '.keys[] | select(.access_key_id == $id)' <<<"$page"
+      return 0
+    fi
+    after=$(jq -r '.next // empty' <<<"$page")
+    [[ -n $after ]] || return 1
+  done
+}
+json=$(listed_key "$RK_ID") || fail "GET /_admin/keys" "the second key listed" "absent"
+jcheck "the second key is listed as read-only on $SB" \
+  "(.grants == [{\"bucket\": \"$SB\", \"perm\": \"ro\"}]) and .status == \"active\" and (.created_at | type == \"number\")" "$json"
+code=$(adm_code -X DELETE "$BASE/_admin/keys/$RK_ID")
+[[ $code == 204 ]] || fail "DELETE /_admin/keys/<second key>" "HTTP 204" "HTTP $code $(<"$T/adm.out")"
+# Refused on the very next request: signed, and the URL presigned before.
+expect_err "GET with the revoked key" 'InvalidAccessKeyId' \
+  "${RK[@]}" "${S3API[@]}" get-object --bucket "$SB" --key a/small.bin "$T/got-rk.bin"
+code=$(curl -sS "${CURL_TLS[@]}" -o "$T/rk.out" -w '%{http_code}' --max-time 60 "$PRESIGNED" 2>/dev/null) || code=000
+[[ $code == 403 ]] && grep -q '<Code>InvalidAccessKeyId</Code>' "$T/rk.out" ||
+  fail "presigned GET after the revocation" "HTTP 403 InvalidAccessKeyId" "HTTP $code $(head -c 300 "$T/rk.out")"
+unset PRESIGNED
+rm -f "$T/rk.out" "$T/got-rk.bin" "$T/aws-credentials-2"
+code=$(adm_code -X DELETE "$BASE/_admin/keys/$RK_ID")
+[[ $code == 404 ]] || fail "DELETE /_admin/keys/<second key> again" "HTTP 404" "HTTP $code"
+listed_key "$RK_ID" >/dev/null && fail "GET /_admin/keys after the revocation" "the second key absent" "listed"
+# The first key is untouched.
+run_aws "GET a/small.bin with the first key after the revocation" "${S3[@]}" cp "s3://$SB/a/small.bin" "$T/got-small.bin" >/dev/null
+same_bytes "GET with the first key equals the upload" "$T/small.bin" "$T/got-small.bin"
 
 # ---------------------------------------------------------------------------
 # 2 HEAD / LIST / multipart ETag shape / a key with reserved characters

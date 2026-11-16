@@ -8,7 +8,9 @@ use super::replay::guard_no_replay;
 use super::uploads::guarded;
 use super::SqlCatalog;
 use crate::ports::{Guard, Row, Sql, SqlValue};
-use crate::types::{AccessKeyRow, Bucket, BucketId, KeyStatus, Perm, Result};
+use crate::types::{
+    AccessKeyRow, AccessKeySummary, BridgeError, Bucket, BucketId, KeyStatus, Perm, Result,
+};
 
 fn bucket_row(row: Row) -> Result<Bucket> {
     let mut c = Cols::new(row);
@@ -215,4 +217,87 @@ pub(super) async fn grant<S: Sql>(
         return Ok(None);
     };
     Cols::new(row).parsed(Perm::parse).map(Some)
+}
+
+/// See [`crate::ports::Catalog::access_key_exists`].
+pub(super) async fn access_key_exists<S: Sql>(c: &SqlCatalog<S>, akid: &str) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT EXISTS (SELECT 1 FROM access_keys WHERE access_key_id = ?1)",
+            &[text(akid)],
+        )
+        .await?;
+    match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(n)]) => Ok(*n != 0),
+        _ => Err(BridgeError::Sql("access_key_exists: unexpected row".into())),
+    }
+}
+
+/// See [`crate::ports::Catalog::list_access_keys`]. One query: the page
+/// of keys, each joined to its grants. `secret_wrapped` is not selected.
+pub(super) async fn list_access_keys<S: Sql>(
+    c: &SqlCatalog<S>,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<AccessKeySummary>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT k.access_key_id, k.status, k.created_at, b.name, g.perm \
+             FROM (SELECT access_key_id, status, created_at FROM access_keys \
+                   WHERE access_key_id > ?1 ORDER BY access_key_id LIMIT ?2) k \
+             LEFT JOIN grants g ON g.access_key_id = k.access_key_id \
+             LEFT JOIN buckets b ON b.id = g.bucket_id \
+             ORDER BY k.access_key_id, b.name",
+            &[text(after), SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
+    let mut keys: Vec<AccessKeySummary> = Vec::new();
+    for row in rows {
+        let mut r = Cols::new(row);
+        let akid = r.text()?;
+        let status = r.parsed(KeyStatus::parse)?;
+        let created_at = r.ms()?;
+        let bucket = r.opt_text()?;
+        let perm = r.opt_text()?;
+        if keys.last().is_none_or(|k| k.access_key_id != akid) {
+            keys.push(AccessKeySummary {
+                access_key_id: akid,
+                status,
+                created_at,
+                grants: Vec::new(),
+            });
+        }
+        if let (Some(bucket), Some(perm), Some(key)) = (bucket, perm, keys.last_mut()) {
+            let perm = Perm::parse(&perm)
+                .ok_or_else(|| BridgeError::Sql("list_access_keys: unknown perm".into()))?;
+            key.grants.push((bucket, perm));
+        }
+    }
+    Ok(keys)
+}
+
+/// See [`crate::ports::Catalog::delete_access_keys`]. The ids travel as
+/// one JSON array, so a page of any size is two statements.
+pub(super) async fn delete_access_keys<S: Sql>(c: &SqlCatalog<S>, akids: &[String]) -> Result<u64> {
+    if akids.is_empty() {
+        return Ok(0);
+    }
+    let ids = serde_json::to_string(akids)
+        .map_err(|_| BridgeError::Sql("delete_access_keys: encode".into()))?;
+    let changed = c
+        .sql
+        .batch(vec![
+            (
+                "DELETE FROM grants WHERE access_key_id IN (SELECT value FROM json_each(?1))",
+                vec![text(&ids)],
+            ),
+            (
+                "DELETE FROM access_keys WHERE access_key_id IN (SELECT value FROM json_each(?1))",
+                vec![text(&ids)],
+            ),
+        ])
+        .await?;
+    Ok(changed.get(1).copied().unwrap_or(0))
 }
