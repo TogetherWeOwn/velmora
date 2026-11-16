@@ -18,9 +18,9 @@ use crate::ports::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
     NntpSession, Permit, PermitClass,
 };
-use crate::post::{sha256, Stop};
+use crate::post::{sha256, Stop, KEEP_EVERY_MS};
 use crate::types::{
-    ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, ProviderFault, Result,
+    ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, ProviderFault, Result, UnixMs,
 };
 
 /// One provider connection slot and the session opened under it.
@@ -41,6 +41,10 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     health: Health,
     /// The host's timer, if the caller has one: bounds a renewal.
     timer: Option<Sleeper>,
+    /// When the catalogue last confirmed the permit of a background job
+    /// (the time read before that round trip), and whether it confirmed
+    /// the job's lease with it. See [`Self::keep`].
+    kept: Option<(UnixMs, bool)>,
 }
 
 /// The permit holder of a job run. One claim of an outbox row is one
@@ -167,6 +171,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             session: None,
             health: None,
             timer: None,
+            kept: None,
         }))
     }
 
@@ -185,8 +190,29 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     /// else. On a lost permit the socket is dropped at once, and so it is
     /// when the renewal of a read's permit did not come back in time
     /// ([`PermitClass::renew_secs`]).
+    ///
+    /// A background job is not renewed again while its last renewal is
+    /// less than [`KEEP_EVERY_MS`] old. That renewal holds the slot for
+    /// [`PERMIT_SECS`](crate::ports::PERMIT_SECS) and the lease for longer
+    /// ([`LEASE_SECS`](crate::ports::LEASE_SECS)), each counted from the
+    /// time read before its round trip, so a call that starts now ends
+    /// with [`POST_RESERVE_MS`](crate::post::POST_RESERVE_MS) minus its
+    /// own time to spare on both, as
+    /// in a post job. Nobody else can be given the slot or the row before
+    /// then. A read inside a request renews every time: its permit is
+    /// short.
     pub(crate) async fn keep(&mut self, lease: Option<&Lease>) -> core::result::Result<(), Stop> {
         let now = self.clock.now();
+        if self.permit.class == PermitClass::Background {
+            let fresh = self.kept.is_some_and(|(at, leased)| {
+                (0..KEEP_EVERY_MS).contains(&(now.0 - at.0)) && (leased || lease.is_none())
+            });
+            if fresh {
+                return Ok(());
+            }
+        }
+        // Not counted on again unless the renewal below succeeds.
+        self.kept = None;
         if let Some(lease) = lease {
             if !self.catalog.renew(lease, now).await? {
                 return Err(Stop::Fenced);
@@ -218,7 +244,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
                 self.clock.now().0.saturating_sub(now.0) > i64::from(secs) * 1000
             });
         match renewed {
-            Ok(true) if !late => Ok(()),
+            Ok(true) if !late => {
+                self.kept = Some((now, lease.is_some()));
+                Ok(())
+            }
             Ok(_) => {
                 self.session = None;
                 Err(Stop::NoPermit)
@@ -515,7 +544,8 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
 ///
 /// A `430` is retried once at the end of the pass, on the same session
 /// (a fresh article can be invisible for a moment). With a `lease`, the
-/// lease is renewed before every article and a stale lease stops the read.
+/// lease is renewed with the slot ([`ProviderSession::keep`]) and a stale
+/// lease stops the read.
 pub(crate) async fn read_articles<C: Catalog, N: NntpConnector, T: Clock>(
     session: &mut ProviderSession<'_, C, N, T>,
     lease: Option<&Lease>,

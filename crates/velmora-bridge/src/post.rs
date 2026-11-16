@@ -844,12 +844,15 @@ where
         // Unlike the rest of its stage, a repost holds the whole extent. A
         // repost larger than the budget still has to run, alone: next to
         // what its own stage already holds.
-        let room = self.budget.capacity().saturating_sub(JOB_OVERHEAD_BYTES);
+        let room = self
+            .budget
+            .job_capacity()
+            .saturating_sub(JOB_OVERHEAD_BYTES);
         let bytes = extent
             .cipher_size
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
             .min(room);
-        let Ok(_charge) = self.budget.charge(bytes).await else {
+        let Ok(_charge) = self.budget.charge_job(bytes).await else {
             return Err(Stop::NoPermit);
         };
         let cipher = match self.safety.get(&extent.id.safety_key(), None).await {
@@ -936,12 +939,14 @@ async fn close_all<C: Catalog, N: NntpConnector, T: Clock>(
 }
 
 /// The lease and every permit of a posting job are renewed together, in
-/// one catalogue round trip, once the last renewal is this old.
-const KEEP_EVERY_MS: i64 = 20_000;
+/// one catalogue round trip, once the last renewal is this old. A job that
+/// reads (verify, repost) renews its lease and its permit at the same
+/// age ([`ProviderSession::keep`]).
+pub(crate) const KEEP_EVERY_MS: i64 = 20_000;
 /// The longest one call to the connector may take ([`NNTP_CALL_SECS`])
 /// plus a margin. No connect, lookup or POST starts with less than this
 /// left on the lease or on its permit.
-const POST_RESERVE_MS: i64 = 90_000;
+pub(crate) const POST_RESERVE_MS: i64 = 90_000;
 const _: () = assert!(POST_RESERVE_MS >= NNTP_CALL_SECS as i64 * 1000 + 10_000);
 // A renewal at most `KEEP_EVERY_MS` old leaves the reserve on both.
 const _: () = assert!(PERMIT_SECS as i64 * 1000 - KEEP_EVERY_MS >= POST_RESERVE_MS);

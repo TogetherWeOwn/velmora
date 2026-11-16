@@ -28,16 +28,21 @@ VERIFY_DELAY_SECS = "120"
 # posting account and read back by message-id on every account.
 NEWSGROUPS = "alt.binaries.boneless,alt.binaries.misc,alt.binaries.multimedia,alt.binaries.test"
 VELMORA_KEK_ACTIVE = "1"
-INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate
+INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may charge
+# What requests and background jobs may charge together, per isolate. A
+# job charges under this limit, a request under INFLIGHT_BUDGET_BYTES. It
+# may be up to 1.5 times INFLIGHT_BUDGET_BYTES: a request holds up to 1.5
+# bytes per byte it charges (the upload's ciphertext is copied once more
+# on its way to R2), a job holds about what it charges.
+JOB_BUDGET_BYTES = "75497472"        # 72 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
 MAINTENANCE = "off"                  # off | restore
 # Sockets per post job, spread over the posting tier. A post job charges
 # its extent (16 MiB) plus 1 MiB per socket to the isolate's byte budget,
-# and the queue's invocations share isolates. At 6, two post jobs and a
-# verify job fit the 48 MiB budget at once; at 8 only one post job fits
-# and the others wait for it (measured on a test deployment: 3.6 MiB/s
-# at 8, 5.2 MiB/s at 6).
+# and the invocations of one queue share an isolate. At 6, three post
+# jobs and a verify job fit the 72 MiB job budget at once; at 8 only two
+# post jobs fit beside a verify job and the third waits for them.
 POST_SOCKETS = "6"
 # The largest PutObject body: 99 MiB, the most this build takes. A request
 # body above 100 MiB is refused before it reaches the Worker, and the
@@ -76,6 +81,7 @@ RECOVERY_COPY = "off"
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
+#   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 
 # off | on (CopyObject only; UploadPartCopy does not read it). On only in a
@@ -100,36 +106,102 @@ bucket_name = "velmora-safety-enam"
 binding = "CACHE"
 bucket_name = "velmora-cache-enam"
 
+# Jobs are spread over several queues of each kind. The invocations of one
+# queue's consumer mostly land in one isolate: one byte budget
+# (JOB_BUDGET_BYTES) and one thread, which a post job or a full verify
+# read keeps busy for about a second per extent. Measured: eight
+# invocations on one queue posted no faster than three (they wait for the
+# budget and are deferred), while four queues of three ran in seven
+# isolates and posted four times as fast. So throughput is raised by
+# adding a queue, not by raising max_concurrency.
+#
+# The bindings of one kind are POST_Q, POST_Q2, POST_Q3, ... (VERIFY_Q,
+# VERIFY_Q2, ...), read up to the first name that is not bound, 8 at most.
+# An extent's jobs always go to the same queue of a kind (by a hash of its
+# id); jobs without an extent (gc, sweeps) go to VERIFY_Q. To add a queue:
+# create it, then add its producer and its consumer here. To take one
+# away: remove its producer first, and its consumer only when the queue is
+# empty (the cron run sends a due extent's job again, to a queue that is
+# still bound, so a job left behind delays its extent and loses nothing).
 [[queues.producers]]
 binding = "POST_Q"
 queue = "velmora-post"
 
 [[queues.producers]]
+binding = "POST_Q2"
+queue = "velmora-post2"
+
+[[queues.producers]]
+binding = "POST_Q3"
+queue = "velmora-post3"
+
+[[queues.producers]]
+binding = "POST_Q4"
+queue = "velmora-post4"
+
+[[queues.producers]]
 binding = "VERIFY_Q"
 queue = "velmora-verify"
 
+[[queues.producers]]
+binding = "VERIFY_Q2"
+queue = "velmora-verify2"
+
+# The post queues. max_concurrency is a secondary bound; provider_permits
+# is the real gate. The measured providers limit the source addresses an
+# account may connect from at once, not only its connections. A provider's
+# `max_ips` (in NNTP_PROVIDERS) is that limit: at most so many jobs and
+# requests hold connections there at once, and `max_conns` bounds the
+# connections they hold together. A job without a slot, refused at login,
+# or without room in the isolate's byte budget is deferred, not failed,
+# and comes back after 15 to 59 s. Three per queue is what the job budget
+# holds (see POST_SOCKETS above).
 [[queues.consumers]]
 queue = "velmora-post"
 max_batch_size = 1
-# Secondary bound only; provider_permits is the real gate. Kept small on
-# purpose: the measured providers limit the source addresses an account
-# may connect from at once (1 to 4), not only its connections, and
-# parallel invocations mostly leave from different addresses. A provider's
-# `max_ips` (in NNTP_PROVIDERS) is that limit: at most so many jobs and
-# requests hold connections there at once, and `max_conns` bounds the
-# connections they hold together. Throughput comes from sockets per job
-# (POST_SOCKETS), which share one address. A job without a slot, refused
-# at login, or without room in the isolate's byte budget is deferred, not
-# failed.
 max_concurrency = 3
 max_retries = 20
 retry_delay = 60
 dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
+queue = "velmora-post2"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post3"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post4"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+# The verify queues. A verify job reads every article of an extent on one
+# backbone (about a second of CPU for 16 MiB) and holds one connection.
+[[queues.consumers]]
 queue = "velmora-verify"
 max_batch_size = 1
-max_concurrency = 2
+max_concurrency = 4
+max_retries = 20
+retry_delay = 120
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-verify2"
+max_batch_size = 1
+max_concurrency = 4
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"

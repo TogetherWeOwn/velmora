@@ -22,7 +22,7 @@ use worker::Env;
 use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
 use crate::nntp::WorkerConnector;
-use crate::queues::{DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
+use crate::queues::{binding_name, DropNotify, QueueSink, DEV_DROP_NOTIFY_N, MAX_QUEUES};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
@@ -132,14 +132,13 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
             .with_tombstone_delay(tombstone_delay),
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
         nntp: WorkerConnector::new(),
-        jobs: QueueSink::new(
-            env.queue("POST_Q").map_err(binding("POST_Q"))?,
-            env.queue("VERIFY_Q").map_err(binding("VERIFY_Q"))?,
-            drop_notify,
-        ),
+        jobs: QueueSink::new(queues(env, "POST_Q"), queues(env, "VERIFY_Q"), drop_notify)
+            .map_err(|name| format!("missing binding {name}"))?,
         kek,
         clock: WorkerClock,
-        budget: ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(sleeper()),
+        budget: ByteBudget::new(cfg.inflight_budget_bytes)
+            .with_job_capacity(cfg.job_budget_bytes)
+            .with_sleeper(sleeper()),
         cfg,
     })
 }
@@ -150,6 +149,15 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
 pub fn recovery_store(env: &Env) -> Result<Option<S3Remote<FetchHttp>>, String> {
     let cfg = RemoteConfig::from_vars(|name| lookup(env, name)).map_err(|e| e.to_string())?;
     Ok(cfg.map(|cfg| S3Remote::new(cfg, FetchHttp)))
+}
+
+/// The queues of one kind that are bound: `first` (`POST_Q`), then
+/// `POST_Q2`, `POST_Q3`, ... up to the first name that is not bound. Empty
+/// when `first` itself is not bound.
+fn queues(env: &Env, first: &str) -> Vec<worker::Queue> {
+    (0..MAX_QUEUES)
+        .map_while(|index| env.queue(&binding_name(first, index)).ok())
+        .collect()
 }
 
 #[cfg(test)]

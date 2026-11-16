@@ -174,9 +174,9 @@ where
         };
         let bytes = job_bytes(stage, row.extent.cipher_size, self.cfg.post_sockets);
         // A job larger than the whole budget still has to run: alone.
-        let bytes = bytes.min(self.budget.capacity());
+        let bytes = bytes.min(self.budget.job_capacity());
         let waited_from = self.clock.now();
-        let charged = self.budget.charge(bytes).await;
+        let charged = self.budget.charge_job(bytes).await;
         let wait_ms = self.clock.now().0 - waited_from.0;
         crate::trace::note(extent, |t| t.wait_ms = wait_ms);
         let Ok(_charge) = charged else {

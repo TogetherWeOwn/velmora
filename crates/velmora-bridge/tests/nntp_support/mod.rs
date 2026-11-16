@@ -318,6 +318,8 @@ pub struct MemCatalog {
     pub renew_takes: RefCell<Option<(FixedClock, i64)>>,
     /// The time of each permit renewal that held.
     pub permit_renewed_at: RefCell<Vec<UnixMs>>,
+    /// The time of each lease renewal on its own (not in `renew_all`).
+    pub lease_renewed_at: RefCell<Vec<UnixMs>>,
     /// `mark_posted_many` calls so far.
     pub mark_batches: Cell<u32>,
     /// Most permits ever held at once, per provider.
@@ -469,6 +471,7 @@ impl Catalog for MemCatalog {
     }
 
     async fn renew(&self, l: &Lease, now: UnixMs) -> Result<bool> {
+        self.lease_renewed_at.borrow_mut().push(now);
         Ok(self
             .fenced(l, |e| {
                 e.outbox.lease_until = Some(now.plus_secs(LEASE_SECS))
@@ -1403,6 +1406,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
         inflight_budget_bytes: 48 * 1024 * 1024,
+        job_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,

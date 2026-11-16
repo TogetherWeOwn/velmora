@@ -410,13 +410,39 @@ pub type Sleeper = Rc<dyn Fn(u32) -> LocalBoxFuture<'static, ()>>;
 #[derive(Debug)]
 struct BudgetState {
     capacity: u64,
-    in_use: Cell<u64>,
+    /// The limit of what background jobs charge, at least `capacity`.
+    job_capacity: u64,
+    /// Bytes charged by requests.
+    requests: Cell<u64>,
+    /// Bytes charged by background jobs.
+    jobs: Cell<u64>,
     peak: Cell<u64>,
+}
+
+impl BudgetState {
+    /// Whether `requests` and `jobs` bytes may be charged together: each
+    /// kind takes its share of its own limit and the shares sum to at
+    /// most one, `requests / capacity + jobs / job_capacity <= 1`. With
+    /// equal limits that is `requests + jobs <= capacity`.
+    fn fits(&self, requests: u64, jobs: u64) -> bool {
+        let (cap, job_cap) = (u128::from(self.capacity), u128::from(self.job_capacity));
+        u128::from(requests) * job_cap + u128::from(jobs) * cap <= cap * job_cap
+    }
 }
 
 /// Per-isolate in-flight byte budget (`INFLIGHT_BUDGET_BYTES`). One per
 /// isolate in the Worker (the bridge is built once per isolate), an `Rc` in
 /// native tests. A [`Charge`] releases its bytes when dropped.
+///
+/// Two kinds of charge share it. A request charges against `capacity`. A
+/// background job charges against `job_capacity` (`JOB_BUDGET_BYTES`),
+/// which may be larger: a request holds more memory than it charges (an
+/// upload's ciphertext is copied once more on its way to the blob store),
+/// a job holds about what it charges. A charge fits while the two shares
+/// sum to at most one: `requests / capacity + jobs / job_capacity <= 1`.
+/// So with requests weighed at `job_capacity / capacity` bytes of memory
+/// per byte charged, requests and jobs together never stand for more than
+/// `job_capacity` bytes, in any mix.
 pub struct ByteBudget {
     state: Rc<BudgetState>,
     sleeper: Option<Sleeper>,
@@ -426,7 +452,9 @@ impl fmt::Debug for ByteBudget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ByteBudget")
             .field("capacity", &self.state.capacity)
-            .field("in_use", &self.state.in_use.get())
+            .field("job_capacity", &self.state.job_capacity)
+            .field("requests", &self.state.requests.get())
+            .field("jobs", &self.state.jobs.get())
             .field("peak", &self.state.peak.get())
             .finish_non_exhaustive()
     }
@@ -434,15 +462,36 @@ impl fmt::Debug for ByteBudget {
 
 impl ByteBudget {
     /// A budget that never waits: a charge that does not fit right away is
-    /// `SlowDown`. Add a sleeper with [`ByteBudget::with_sleeper`].
+    /// `SlowDown`. Add a sleeper with [`ByteBudget::with_sleeper`]. Jobs
+    /// and requests share the one `capacity` until
+    /// [`ByteBudget::with_job_capacity`] says otherwise.
     pub fn new(capacity: u64) -> Self {
         ByteBudget {
             state: Rc::new(BudgetState {
                 capacity,
-                in_use: Cell::new(0),
+                job_capacity: capacity,
+                requests: Cell::new(0),
+                jobs: Cell::new(0),
                 peak: Cell::new(0),
             }),
             sleeper: None,
+        }
+    }
+
+    /// Sets the limit of [`ByteBudget::charge_job`]. A value under the
+    /// capacity is raised to it: a job is never held to less than a
+    /// request. Call it while building the budget, before any charge.
+    pub fn with_job_capacity(self, job_capacity: u64) -> Self {
+        let s = &self.state;
+        ByteBudget {
+            state: Rc::new(BudgetState {
+                capacity: s.capacity,
+                job_capacity: job_capacity.max(s.capacity),
+                requests: Cell::new(0),
+                jobs: Cell::new(0),
+                peak: Cell::new(0),
+            }),
+            sleeper: self.sleeper,
         }
     }
 
@@ -456,6 +505,12 @@ impl ByteBudget {
         self.state.capacity
     }
 
+    /// The limit of what background jobs charge
+    /// ([`ByteBudget::charge_job`]).
+    pub fn job_capacity(&self) -> u64 {
+        self.state.job_capacity
+    }
+
     /// The host sleeper, if this budget may wait. Other bounded waits on
     /// the same request path (a cold read waiting for a provider slot)
     /// poll with it too, so a budget without one never waits anywhere.
@@ -463,9 +518,12 @@ impl ByteBudget {
         self.sleeper.as_ref()
     }
 
-    /// Bytes charged right now.
+    /// Bytes charged right now, by requests and jobs together.
     pub fn in_use(&self) -> u64 {
-        self.state.in_use.get()
+        self.state
+            .requests
+            .get()
+            .saturating_add(self.state.jobs.get())
     }
 
     /// Highest `in_use` seen by this isolate (`inflight_peak_bytes`).
@@ -473,33 +531,63 @@ impl ByteBudget {
         self.state.peak.get()
     }
 
-    /// Charges `bytes` if they fit now.
+    /// Charges `bytes` for a request if they fit now.
     pub fn try_charge(&self, bytes: u64) -> Option<Charge> {
+        self.try_charge_as(bytes, false)
+    }
+
+    /// Charges `bytes` for a background job if they fit now.
+    pub fn try_charge_job(&self, bytes: u64) -> Option<Charge> {
+        self.try_charge_as(bytes, true)
+    }
+
+    fn try_charge_as(&self, bytes: u64, job: bool) -> Option<Charge> {
         let s = &self.state;
-        let next = s.in_use.get().checked_add(bytes)?;
-        if next > s.capacity {
+        let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
+        let next_requests = s.requests.get().checked_add(requests)?;
+        let next_jobs = s.jobs.get().checked_add(jobs)?;
+        if !s.fits(next_requests, next_jobs) {
             return None;
         }
-        s.in_use.set(next);
-        if next > s.peak.get() {
-            s.peak.set(next);
+        s.requests.set(next_requests);
+        s.jobs.set(next_jobs);
+        let in_use = next_requests.saturating_add(next_jobs);
+        if in_use > s.peak.get() {
+            s.peak.set(in_use);
         }
         Some(Charge {
             state: Rc::clone(&self.state),
-            bytes,
+            requests,
+            jobs,
         })
     }
 
-    /// Charges `bytes`, waiting up to [`CHARGE_WAIT_MS`] for room (only with
-    /// a sleeper), then `SlowDown`. A charge larger than the whole capacity
-    /// can never fit and fails at once. The caller has not read the body.
+    /// Charges `bytes` for a request, waiting up to [`CHARGE_WAIT_MS`] for
+    /// room (only with a sleeper), then `SlowDown`. A charge larger than
+    /// the whole capacity can never fit and fails at once. The caller has
+    /// not read the body.
     pub async fn charge(&self, bytes: u64) -> Result<Charge, IngressError> {
-        if bytes > self.state.capacity {
+        self.charge_as(bytes, false).await
+    }
+
+    /// [`ByteBudget::charge`] for a background job: the same wait, against
+    /// the job limit.
+    pub async fn charge_job(&self, bytes: u64) -> Result<Charge, IngressError> {
+        self.charge_as(bytes, true).await
+    }
+
+    async fn charge_as(&self, bytes: u64, job: bool) -> Result<Charge, IngressError> {
+        let limit = if job {
+            self.state.job_capacity
+        } else {
+            self.state.capacity
+        };
+        if bytes > limit {
             return Err(IngressError::SlowDown);
         }
         let mut waited = 0u32;
         loop {
-            if let Some(c) = self.try_charge(bytes) {
+            if let Some(c) = self.try_charge_as(bytes, job) {
                 return Ok(c);
             }
             let Some(sleep) = &self.sleeper else {
@@ -524,20 +612,25 @@ impl ByteBudget {
 #[must_use = "dropping a charge releases it"]
 pub struct Charge {
     state: Rc<BudgetState>,
-    bytes: u64,
+    /// Bytes charged as a request.
+    requests: u64,
+    /// Bytes charged as a background job.
+    jobs: u64,
 }
 
 impl Charge {
     pub fn bytes(&self) -> u64 {
-        self.bytes
+        self.requests.saturating_add(self.jobs)
     }
 
     /// Takes over what `other` holds, so that one charge stands for both.
     /// A charge against another budget is released instead.
     pub fn absorb(&mut self, mut other: Charge) {
         if Rc::ptr_eq(&self.state, &other.state) {
-            self.bytes = self.bytes.saturating_add(other.bytes);
-            other.bytes = 0;
+            self.requests = self.requests.saturating_add(other.requests);
+            self.jobs = self.jobs.saturating_add(other.jobs);
+            other.requests = 0;
+            other.jobs = 0;
         }
     }
 }
@@ -545,7 +638,7 @@ impl Charge {
 impl fmt::Debug for Charge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Charge")
-            .field("bytes", &self.bytes)
+            .field("bytes", &self.bytes())
             .finish()
     }
 }
@@ -553,7 +646,9 @@ impl fmt::Debug for Charge {
 impl Drop for Charge {
     fn drop(&mut self) {
         let s = &self.state;
-        s.in_use.set(s.in_use.get().saturating_sub(self.bytes));
+        s.requests
+            .set(s.requests.get().saturating_sub(self.requests));
+        s.jobs.set(s.jobs.get().saturating_sub(self.jobs));
     }
 }
 

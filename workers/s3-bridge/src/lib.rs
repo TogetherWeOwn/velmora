@@ -188,6 +188,9 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             ),
         }
     }
+    if let Some(line) = env::memory_line(&bridge) {
+        console_log!("{line}");
+    }
     Ok(())
 }
 
