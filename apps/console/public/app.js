@@ -165,6 +165,12 @@ async function loadPage(more) {
     state.next = out.truncated ? out.next : null;
   } catch (e) {
     toast(`Listing failed: ${e.message}`);
+    // Never show rows of another bucket or folder under this one.
+    if (!more) {
+      state.folders = [];
+      state.files = [];
+      state.next = null;
+    }
   }
   render();
 }
@@ -397,11 +403,11 @@ async function info(key) {
 // ---------------------------------------------------------------------------
 // Rename, move, folders, delete
 
-async function listAll(prefix) {
+async function listAll(bucket, prefix) {
   const keys = [];
   let token;
   do {
-    const out = await api("/list", { query: { bucket: state.bucket, prefix, recursive: "1", ...(token ? { token } : {}) } });
+    const out = await api("/list", { query: { bucket, prefix, recursive: "1", ...(token ? { token } : {}) } });
     keys.push(...out.files.map((f) => f.key));
     token = out.truncated ? out.next : null;
   } while (token);
@@ -431,14 +437,16 @@ async function renameFolder(prefix) {
     toast("A folder cannot move into itself");
     return;
   }
-  const keys = await listAll(prefix);
+  // The bucket is fixed when the operation starts, whatever is browsed meanwhile.
+  const bucket = state.bucket;
+  const keys = await listAll(bucket, prefix);
   const t = transfer(`Move ${prefix} → ${to}`, keys.length);
   let done = 0;
   let failed = 0;
   for (const k of keys) {
     if (t.cancelled) break;
     try {
-      await api("/move", { method: "POST", body: { bucket: state.bucket, from: k, to: to + k.slice(prefix.length) } });
+      await api("/move", { method: "POST", body: { bucket, from: k, to: to + k.slice(prefix.length) } });
     } catch {
       failed++;
     }
@@ -462,7 +470,8 @@ $("new-folder").addEventListener("click", async () => {
 
 async function deleteKeys(keys, folders) {
   let all = [...keys];
-  for (const p of folders) all.push(...(await listAll(p)));
+  const bucket = state.bucket;
+  for (const p of folders) all.push(...(await listAll(bucket, p)));
   all = [...new Set(all)];
   if (!all.length) return toast("Nothing to delete");
   const what = folders.length ? `${all.length} object(s), including everything in ${folders.length} folder(s)` : `${all.length} object(s)`;
@@ -470,7 +479,7 @@ async function deleteKeys(keys, folders) {
   let failed = 0;
   for (let i = 0; i < all.length; i += 1000) {
     try {
-      const out = await api("/delete", { method: "POST", body: { bucket: state.bucket, keys: all.slice(i, i + 1000) } });
+      const out = await api("/delete", { method: "POST", body: { bucket, keys: all.slice(i, i + 1000) } });
       failed += out.errors.length;
     } catch (e) {
       failed += Math.min(1000, all.length - i);
@@ -527,6 +536,7 @@ function transfer(name, total) {
 /** PUT with upload progress (fetch has none). */
 function xhrPut(url, blob, onProgress, signal) {
   return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(new ApiError(0, "Aborted", "cancelled"));
     const x = new XMLHttpRequest();
     x.open("PUT", url);
     x.responseType = "json";
@@ -546,6 +556,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function withRetry(fn, signal) {
   for (let i = 0; ; i++) {
+    if (signal.aborted) throw new ApiError(0, "Aborted", "cancelled");
     try {
       return await fn();
     } catch (e) {
@@ -651,7 +662,14 @@ async function uploadFile(bucket, key, file) {
         report();
       }
     };
-    await Promise.all(Array.from({ length: PART_CONCURRENCY }, worker));
+    try {
+      await Promise.all(Array.from({ length: PART_CONCURRENCY }, worker));
+    } catch (e) {
+      // One part failed for good: stop the other uploader too. The upload
+      // stays open, so dropping the file again resumes it.
+      ctl.abort();
+      throw e;
+    }
     if (ctl.signal.aborted) throw new ApiError(0, "Aborted", "cancelled");
     t.progress(file.size, "finishing");
     const parts = [];

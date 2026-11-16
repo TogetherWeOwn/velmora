@@ -1,6 +1,9 @@
 # Example deploy config for the velmora console. Copy it outside the repo,
 # fill in the placeholders, and deploy with `npx wrangler deploy -c <copy>`.
 # Keep the real copy private: it names your hostnames and Access app.
+# Paths in a config resolve relative to the config file itself: in a copy
+# kept elsewhere, point `main` and `[assets].directory` at this app's
+# `src/worker.js` and `public/` (relative to the copy, or absolute).
 
 name = "velmora-console"
 main = "src/worker.js"

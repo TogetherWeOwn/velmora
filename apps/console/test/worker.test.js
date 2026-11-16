@@ -190,25 +190,60 @@ test("DeleteObjects carries a checksum of its body", async () => {
   await assertSigned(c, await sha256Hex(c.body));
 });
 
-test("move copies with If-None-Match then deletes the source", async () => {
-  const up = fakeUpstream((c) => new Response(c.method === "PUT" ? "<CopyObjectResult/>" : null, { status: c.method === "PUT" ? 200 : 204 }));
+function moveUpstream({ copyStatus = 200, deleteStatus = 204 } = {}) {
+  return fakeUpstream((c) => {
+    if (c.method === "HEAD") return new Response(null, { headers: { etag: '"src-1"', "content-length": "3" } });
+    if (c.method === "PUT") {
+      return copyStatus === 200
+        ? new Response("<CopyObjectResult/>")
+        : new Response("<Error><Code>PreconditionFailed</Code></Error>", { status: copyStatus });
+    }
+    return new Response(deleteStatus === 204 ? null : "<Error><Code>PreconditionFailed</Code></Error>", { status: deleteStatus });
+  });
+}
+
+test("move copies only this version of the source, then deletes only it", async () => {
+  const up = moveUpstream();
   const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a b.txt", to: "dir/c.txt" } });
   assert.equal(res.status, 200);
-  const [copy, del] = up.calls;
+  const [head, copy, del] = up.calls;
+  assert.equal(head.method, "HEAD");
   assert.equal(copy.method, "PUT");
   assert.equal(copy.url.pathname, "/files/dir/c.txt");
   assert.equal(copy.headers["x-amz-copy-source"], "/files/a%20b.txt");
+  assert.equal(copy.headers["x-amz-copy-source-if-match"], '"src-1"');
   assert.equal(copy.headers["if-none-match"], "*");
   await assertSigned(copy, EMPTY_SHA256);
   assert.equal(del.method, "DELETE");
   assert.equal(del.url.pathname, "/files/a%20b.txt");
+  assert.equal(del.headers["if-match"], '"src-1"');
+  await assertSigned(del, EMPTY_SHA256);
 });
 
 test("move onto an existing key is refused and deletes nothing", async () => {
-  const up = fakeUpstream(() => new Response("<Error><Code>PreconditionFailed</Code></Error>", { status: 412 }));
+  const up = moveUpstream({ copyStatus: 412 });
   const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a", to: "b" } });
   assert.equal(res.status, 409);
-  assert.equal(up.calls.length, 1);
+  assert.ok(up.calls.every((c) => c.method !== "DELETE"));
+});
+
+test("a source replaced during the move is kept", async () => {
+  const up = moveUpstream({ deleteStatus: 412 });
+  const res = await call(up, "/api/move", { method: "POST", body: { bucket: "files", from: "a", to: "b" } });
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).error, "SourceChanged");
+});
+
+test("unfinished uploads are listed across pages", async () => {
+  const up = fakeUpstream((c) =>
+    c.url.searchParams.get("key-marker") === null
+      ? new Response("<ListMultipartUploadsResult><IsTruncated>true</IsTruncated><NextKeyMarker>k1</NextKeyMarker><NextUploadIdMarker>u1</NextUploadIdMarker><Upload><Key>k1</Key><UploadId>u1</UploadId></Upload></ListMultipartUploadsResult>")
+      : new Response("<ListMultipartUploadsResult><IsTruncated>false</IsTruncated><Upload><Key>k2</Key><UploadId>u2</UploadId></Upload></ListMultipartUploadsResult>"),
+  );
+  const out = await (await call(up, "/api/mpu/list?bucket=files")).json();
+  assert.deepEqual(out.uploads.map((u) => u.uploadId), ["u1", "u2"]);
+  assert.equal(up.calls[1].url.searchParams.get("upload-id-marker"), "u1");
+  await assertSigned(up.calls[1], EMPTY_SHA256);
 });
 
 test("create bucket: admin create (non-disposable) then grant of the console key", async () => {

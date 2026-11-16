@@ -219,12 +219,23 @@ export function createClient(cfg) {
     },
 
     async listUploads(bucket) {
-      const xml = await (await ok(await send({ method: "GET", bucket, query: [["uploads", ""]] }))).text();
-      return blocks(xml, "Upload").map((b) => ({
-        key: text(b, "Key"),
-        uploadId: text(b, "UploadId"),
-        initiated: text(b, "Initiated"),
-      }));
+      const uploads = [];
+      let keyMarker;
+      let idMarker;
+      for (let page = 0; page < 50; page++) {
+        const query = [["uploads", ""]];
+        if (keyMarker !== undefined) query.push(["key-marker", keyMarker], ["upload-id-marker", idMarker ?? ""]);
+        const xml = await (await ok(await send({ method: "GET", bucket, query }))).text();
+        for (const b of blocks(xml, "Upload")) {
+          uploads.push({ key: text(b, "Key"), uploadId: text(b, "UploadId"), initiated: text(b, "Initiated") });
+        }
+        const top = strip(xml, "Upload");
+        if (text(top, "IsTruncated") !== "true") break;
+        keyMarker = text(top, "NextKeyMarker");
+        idMarker = text(top, "NextUploadIdMarker");
+        if (!keyMarker) break;
+      }
+      return uploads;
     },
 
     async completeUpload(bucket, key, uploadId, parts, overwrite = false) {
@@ -256,16 +267,21 @@ export function createClient(cfg) {
       await ok(await send({ method: "DELETE", bucket, key, query: [["uploadId", uploadId]] }));
     },
 
-    /** Same-bucket copy that never overwrites an existing destination. */
-    async copy(bucket, from, to) {
+    /**
+     * Same-bucket copy that never overwrites an existing destination,
+     * and copies only the source version with `sourceEtag`.
+     */
+    async copy(bucket, from, to, sourceEtag) {
       const headers = { "x-amz-copy-source": `/${bucket}/${encodeKey(from)}`, "if-none-match": "*" };
+      if (sourceEtag) headers["x-amz-copy-source-if-match"] = sourceEtag;
       const res = await ok(await send({ method: "PUT", bucket, key: to, headers }));
       const out = await res.text();
       if (blocks(out, "Error").length) throw new UpstreamError(500, text(out, "Code") || "InternalError", text(out, "Message"));
     },
 
-    async deleteObject(bucket, key) {
-      await ok(await send({ method: "DELETE", bucket, key }));
+    /** With `ifMatch`, only that version is deleted (else 412). */
+    async deleteObject(bucket, key, ifMatch) {
+      await ok(await send({ method: "DELETE", bucket, key, headers: ifMatch ? { "if-match": ifMatch } : {} }));
     },
 
     async deleteObjects(bucket, keys) {

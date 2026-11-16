@@ -326,13 +326,25 @@ async function api(request, env, s3, claims, url) {
     if (from === to) throw new BadRequest("same");
     // An object moved onto `dir/` would become that folder's marker.
     if (to.endsWith("/") && !from.endsWith("/")) throw new BadRequest("destination-is-folder");
+    // The move is of this version of the source: the copy takes only it,
+    // and the delete removes only it, so a concurrent replacement is kept.
+    const { etag } = await s3.head(bucket, from);
     try {
-      await s3.copy(bucket, from, to);
+      await s3.copy(bucket, from, to, etag);
     } catch (e) {
-      if (e instanceof UpstreamError && e.status === 412) return exists();
+      if (e instanceof UpstreamError && e.status === 412) {
+        return error(409, "MoveRefused", "The destination exists or the source changed; nothing was moved.");
+      }
       throw e;
     }
-    await s3.deleteObject(bucket, from);
+    try {
+      await s3.deleteObject(bucket, from, etag);
+    } catch (e) {
+      if (e instanceof UpstreamError && (e.status === 412 || e.status === 404)) {
+        return error(409, "SourceChanged", "Copied, but the source changed meanwhile and was kept.");
+      }
+      throw e;
+    }
     return json(200, { from, to });
   }
 
