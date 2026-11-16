@@ -387,6 +387,17 @@ pub trait Catalog {
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>>;
     async fn create_access_key(&self, k: &AccessKeyRow) -> Result<()>;
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()>;
+    /// [`Self::put_grant`] in one statement that writes only while both
+    /// the key row and the bucket row exist. `Lost` = either is gone,
+    /// nothing was written. Revocation and bucket deletion each remove
+    /// their row and its grants in one batch, so a grant stored through
+    /// this is never left behind by either, whichever commits first.
+    async fn put_grant_if_present(
+        &self,
+        akid: &str,
+        bucket: &BucketId,
+        perm: Perm,
+    ) -> Result<Guard<()>>;
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>>;
     /// `true` while anything of the bucket is on record: a generation
     /// (live or not; none is ever removed), a key floor, an upload in any

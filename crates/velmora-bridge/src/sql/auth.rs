@@ -85,6 +85,33 @@ pub(super) async fn put_grant<S: Sql>(
         .map(|_| ())
 }
 
+/// See [`crate::ports::Catalog::put_grant_if_present`]. One statement:
+/// the existence checks and the write commit together. The `WHERE` of
+/// the `SELECT` also keeps SQLite from reading `ON CONFLICT` as a join
+/// constraint.
+pub(super) async fn put_grant_if_present<S: Sql>(
+    c: &SqlCatalog<S>,
+    akid: &str,
+    bucket: &BucketId,
+    perm: Perm,
+) -> Result<Guard<()>> {
+    let changed = c
+        .sql
+        .exec(
+            "INSERT INTO grants(access_key_id, bucket_id, perm) SELECT ?1, ?2, ?3 \
+             WHERE EXISTS (SELECT 1 FROM access_keys WHERE access_key_id = ?1) \
+               AND EXISTS (SELECT 1 FROM buckets WHERE id = ?2) \
+             ON CONFLICT(access_key_id, bucket_id) DO UPDATE SET perm = excluded.perm",
+            &[text(akid), text(bucket.as_str()), text(perm.as_str())],
+        )
+        .await?;
+    Ok(if changed == 1 {
+        Guard::Applied(())
+    } else {
+        Guard::Lost
+    })
+}
+
 pub(super) async fn bucket_by_name<S: Sql>(
     c: &SqlCatalog<S>,
     name: &str,

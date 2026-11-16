@@ -124,6 +124,14 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()> {
         auth::put_grant(self, akid, bucket, perm).await
     }
+    async fn put_grant_if_present(
+        &self,
+        akid: &str,
+        bucket: &BucketId,
+        perm: Perm,
+    ) -> Result<Guard<()>> {
+        auth::put_grant_if_present(self, akid, bucket, perm).await
+    }
     async fn bucket_in_use(&self, bucket: &BucketId) -> Result<bool> {
         auth::bucket_in_use(self, bucket).await
     }
