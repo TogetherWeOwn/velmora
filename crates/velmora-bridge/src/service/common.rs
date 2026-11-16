@@ -548,11 +548,32 @@ pub(crate) async fn discard_refused<
     generation: &GenerationRow,
     refused: Unpublished,
 ) -> crate::types::Result<()> {
-    let mut last = Ok(());
+    discard_unless_present(bridge, generation, refused)
+        .await
+        .map(|_| ())
+}
+
+/// [`discard_refused`], and whether the record is gone: `false` when a
+/// row exists under the id and the record was kept for it.
+pub(super) async fn discard_unless_present<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    generation: &GenerationRow,
+    refused: Unpublished,
+) -> crate::types::Result<bool> {
+    let mut last = Ok(false);
     for _ in 0..DISCARD_ATTEMPTS {
         last = match bridge.catalog.replay_probe(generation).await {
-            Ok(ReplayProbe::Present) => return Ok(()),
-            Ok(_) => discard_generation(&bridge.safety, &refused).await,
+            Ok(ReplayProbe::Present) => return Ok(false),
+            Ok(_) => discard_generation(&bridge.safety, &refused)
+                .await
+                .map(|()| true),
             Err(e) => Err(e),
         };
         if last.is_ok() {
@@ -560,6 +581,32 @@ pub(crate) async fn discard_refused<
         }
     }
     last
+}
+
+/// [`discard_refused`] for a write that goes on to another attempt or
+/// to an answer. A record that cannot be removed ends the request with
+/// `500`. For a conditional write so does a record that was kept
+/// because a row exists under its id: the write may then be published
+/// (a replay read its record), and the request must neither say that it
+/// was refused nor publish it a second time.
+pub(super) async fn discard_before_retry<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    generation: &GenerationRow,
+    refused: Unpublished,
+    conditional: bool,
+) -> Result<(), S3Response> {
+    match discard_unless_present(bridge, generation, refused).await {
+        Ok(true) => Ok(()),
+        Ok(false) if !conditional => Ok(()),
+        _ => Err(internal()),
+    }
 }
 
 const DISCARD_ATTEMPTS: usize = 3;

@@ -55,7 +55,7 @@ use crate::ports::{
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
-    check_precondition, discard_refused, hold_precondition, precondition,
+    check_precondition, discard_refused, discard_unless_present, hold_precondition, precondition,
 };
 use crate::types::{
     BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
@@ -897,6 +897,35 @@ pub(super) async fn complete<
     respond(complete_inner(bridge, req).await)
 }
 
+/// The answer of a Complete whose condition does not hold: `refusal`,
+/// unless the upload was completed in the meantime by the same request
+/// sent twice. Then the object the condition met may be the one this
+/// upload published, and the answer is the receipt, as for any retry of
+/// a Complete that won.
+async fn refused_unless_completed<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    target: &UploadTarget<'_>,
+    digest: &[u8; 32],
+    a: &Authed,
+    refusal: S3Response,
+) -> Outcome<S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    if let Some((upload, _)) = bridge.catalog.upload(target).await? {
+        if upload.state == UploadState::Completed && upload.complete_digest == Some(*digest) {
+            let etag = upload.result_etag.ok_or(Fail::Internal)?;
+            return complete_response(a, etag, bridge.clock.now().0);
+        }
+    }
+    Err(refusal.into())
+}
+
 fn complete_response(a: &Authed, etag: String, modified_ms: i64) -> Outcome<S3Response> {
     let result = CommitResult {
         bucket: a.target.bucket.clone(),
@@ -981,6 +1010,14 @@ where
             // a race: the catalogue would not adopt the listed parts.
             return Err(ErrorCode::InvalidPart.into());
         }
+        // A condition that does not hold now is answered before anything
+        // is written for this attempt, the floor of the key included.
+        if let Some(condition) = &condition {
+            if let Err(refusal) = check_precondition(bridge, &a.bucket.id, &a.key, condition).await
+            {
+                return refused_unless_completed(bridge, &target, &digest, &a, refusal).await;
+            }
+        }
         let publication = plan(&listed, &parts)?;
         let now = bridge.clock.now();
         // The id sorts after everything already on the key, so the order
@@ -1037,14 +1074,17 @@ where
         // or `404`, before a record exists under this id. The upload is
         // not touched: it stays open with its parts, to be completed
         // again or aborted.
-        hold_precondition(
+        if let Err(refusal) = hold_precondition(
             bridge,
             &a.bucket.id,
             &a.key,
             &commit.generation.id,
             condition.as_ref(),
         )
-        .await?;
+        .await
+        {
+            return refused_unless_completed(bridge, &target, &digest, &a, refusal).await;
+        }
         let record = write_generation(
             &bridge.catalog,
             &bridge.safety,
@@ -1087,7 +1127,7 @@ where
                 // record left behind replays as a PUT that failed, and
                 // under everything that follows it on the key, which
                 // the floor raised for it holds to a later id.
-                let discarded = discard_refused(bridge, &commit.generation, record).await;
+                let discarded = discard_unless_present(bridge, &commit.generation, record).await;
                 // Refused as well when a replay started after this
                 // request passed the gate.
                 if bridge.catalog.restore_pending().await? {
@@ -1097,13 +1137,22 @@ where
                     // A conditional Complete says `412` or `404` only
                     // when no record of it is left: with one, a replay
                     // could publish what the answer says was refused.
-                    discarded?;
+                    // The same for a record that was kept because a row
+                    // exists under its id: a replay may have published it.
+                    if !discarded? {
+                        return Err(Fail::Internal);
+                    }
                     // The batch does not say which guard refused it. If
                     // the condition fails now, that is the answer. The
                     // key can change without a newer id on it (a delete
                     // whose tombstone was chosen before this id), so the
                     // upload is not blamed below for what the key did.
-                    check_precondition(bridge, &a.bucket.id, &a.key, condition).await?;
+                    if let Err(refusal) =
+                        check_precondition(bridge, &a.bucket.id, &a.key, condition).await
+                    {
+                        return refused_unless_completed(bridge, &target, &digest, &a, refusal)
+                            .await;
+                    }
                 }
                 // Otherwise refused for the id (the key took a newer one
                 // since it was read) or for the upload. Only the second

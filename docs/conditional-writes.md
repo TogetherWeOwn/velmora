@@ -1,8 +1,9 @@
 # Conditional writes
 
 A write can be held to the state of the key it writes. The condition is
-judged inside the database batch that publishes the write, so two
-requests that race for one key cannot both pass it.
+judged inside the database batch that publishes the write, so no write
+is published on a condition that another write has made false in the
+meantime.
 
 ## What is understood
 
@@ -32,17 +33,28 @@ separate headers and not part of this.
 
 - A PutObject whose condition does not hold when the request arrives is
   answered before its body is read.
-- A write that is refused leaves no published generation, no catalogue
-  row of its own and no recovery record: a replay of the recovery
-  records does not bring it back. A refused DeleteObject leaves no
-  tombstone that deletes anything.
+- A write that is refused leaves no published generation, no object
+  row and no recovery record: a replay of the recovery records does not
+  bring it back. A refused DeleteObject leaves no tombstone that deletes
+  anything.
+- A write whose condition does not hold when it is first looked at
+  leaves nothing at all. One that loses its key during the request
+  (a race) can leave the internal marker of the newest id of the key
+  (its floor), as any write that is not published can. A bucket with
+  such a marker counts as in use for DeleteBucket until the key is
+  written again.
 - A PutObject that loses the key after its body was stored leaves the
   stored bytes behind unreferenced, like any PUT that is not published,
   and they are handled the same way.
-- Of two conditional writes that race for one key, one is published. The
-  other is answered `412` (or `404`, when the object it named was
-  deleted). After several lost rounds in a row a request is answered
-  `503 SlowDown` instead and can be sent again.
+- Of two writes that race for one key under a condition the first one
+  makes false (`If-None-Match: *`, or `If-Match` on an ETag the write
+  replaces by another), one is published. The other is answered `412`
+  (or `404`, when the object it named was deleted). After several lost
+  rounds in a row a request is answered `503 SlowDown` instead and can
+  be sent again.
+- A condition that still holds after another write is not a lock: two
+  `If-Match: *` writes on a live key both succeed, one after the other,
+  and so do two `If-Match` writes that leave the ETag as it was.
 
 ## CompleteMultipartUpload
 
@@ -54,21 +66,26 @@ A Complete that is sent again after it succeeded is answered `200` from
 the result of the first one, whatever the key holds by then: it is the
 same request, not a second write.
 
+## DeleteObject beside a write
+
+A DeleteObject, with or without a condition, is answered `204` only as
+the newest thing that happened to its key. When a write on the key began
+or was published after the delete chose its place in the order, the
+delete changes nothing and starts again after that write:
+
+- a write that was answered before the delete is deleted by it;
+- a conditional write that is still under way when the delete is done
+  finds the key empty (`404`, or `412` for another object by then), and
+  its recovery record, should it stay behind, sorts below the delete: a
+  replay of the records does not publish it over the delete.
+
+A delete that meets a newer write several times in a row is answered
+`503 SlowDown` (in DeleteObjects: for that key) and can be sent again.
+
 ## Limits
 
 - The answer `412`/`404` is given only when the recovery record of the
-  refused write is gone. If the record cannot be removed, the answer is
-  `500` and the outcome is not known to the client; the record that
-  stays sorts below the write that took the key, so a replay keeps that
-  write on top.
-- One case is not covered by that ordering. A DeleteObject without a
-  condition, started before a conditional write and finished between
-  the write's look at the key and its batch, makes the batch refuse the
-  write. If the process dies before the record of that write is removed,
-  and the catalogue is later lost and replayed from the records, the
-  replay publishes the write: its condition held when the record was
-  stored. No acknowledged write is lost by this, and no client was told
-  `412` for it.
-- A DeleteObject without a condition that races with a write may answer
-  `204` and leave the object of that write in place. Conditional deletes
-  do not change this.
+  refused write is gone. If the record cannot be removed, or a replay
+  has already read it, the answer is `500` and the outcome is not known
+  to the client; the record that stays sorts below the write that took
+  the key, so a replay keeps that write on top.

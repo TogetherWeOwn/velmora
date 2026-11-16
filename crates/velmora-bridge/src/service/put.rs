@@ -21,8 +21,8 @@ use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
-    authenticate, check_precondition, checksum_json, conditional_gate, discard_refused, from_proto,
-    hold_precondition, internal, metadata_json, restore_gate, s3_error, writes_refused,
+    authenticate, check_precondition, checksum_json, conditional_gate, discard_before_retry,
+    from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
@@ -249,9 +249,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         // no longer held. Nothing was published, so the record goes, and
         // the PUT is tried again under an id that sorts after everything
         // on the key; its condition is judged again first.
-        discard_refused(bridge, &commit.generation, refused)
-            .await
-            .map_err(|_| internal())?;
+        discard_before_retry(bridge, &commit.generation, refused, condition.is_some()).await?;
         // Refused as well when a replay started after this request
         // passed the gate.
         restore_gate(bridge).await?;
@@ -562,9 +560,8 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         // A newer id on the key, a condition that no longer holds, a
         // replay, or rows the sweep took.
         // Nothing was published, so the record goes.
-        discard_refused(bridge, &commit.generation, refused)
-            .await
-            .map_err(|_| internal())?;
+        // The slices are not given up where the record may be left.
+        discard_before_retry(bridge, &commit.generation, refused, condition.is_some()).await?;
         if let Err(resp) = restore_gate(bridge).await {
             give_up(bridge, &write).await;
             return Err(resp);

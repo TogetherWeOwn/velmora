@@ -531,7 +531,9 @@ pub trait Catalog {
     /// of the key only if its id sorts before `before`, the id of the
     /// tombstone written for this delete. `false` = nothing was changed:
     /// nothing was live, the live generation is newer than the
-    /// tombstone, or a replay of the recovery records is under way. A
+    /// tombstone, the floor of the key is above the tombstone (a write
+    /// began after the tombstone was chosen: the caller starts again
+    /// above it), or a replay of the recovery records is under way. A
     /// replay applies the tombstone with [`Self::replay_tombstone`].
     async fn delete_object_before(
         &self,

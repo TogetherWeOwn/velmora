@@ -168,6 +168,15 @@ fn tombstones(rig: &Rig) -> usize {
     keys.iter().filter(|k| k.starts_with("m/del/")).count()
 }
 
+/// The ids of the tombstones, in the shape of [`records`].
+fn tombstone_ids(rig: &Rig) -> Vec<String> {
+    let keys = rig.bridge.safety.keys();
+    keys.iter()
+        .filter_map(|k| k.strip_prefix("m/del/"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Everything a request can leave: every catalogue row that says
 /// something about an object, and every key of the safety store.
 fn footprint(rig: &Rig) -> (Vec<i64>, Vec<String>) {
@@ -542,8 +551,9 @@ async fn a_copy_is_held_to_the_condition_on_its_destination() {
     }
     assert_eq!(footprint(&rig), before);
     assert_eq!(get(&rig, &signer, "dst").await.expect(200).body, small(2));
-    // Each of them raised the floor of the key it judged, and no more.
-    assert_eq!(rig.count("key_floors"), floors + 2, "`dst` and `new`");
+    // Refused before anything was written: no floor on the key either,
+    // which would keep an otherwise empty bucket in use.
+    assert_eq!(rig.count("key_floors"), floors);
 
     rig.send(copy_req(
         &rig,
@@ -609,6 +619,7 @@ async fn a_refused_complete_leaves_the_upload_open() {
         .expect_error(404, "NoSuchKey");
     }
     assert_eq!(footprint(&rig), before);
+    assert_eq!(rig.count("key_floors"), 0);
     assert_eq!(upload_state(&rig, &open.0), "open");
     let done = rig
         .send(complete_req(
@@ -889,6 +900,114 @@ async fn a_delete_under_a_conditional_write_is_seen_by_its_batch() {
     }
 }
 
+/// The same schedule, and the write cannot remove its record once it
+/// is refused: the record stays in the store, with an id above the
+/// tombstone the delete chose first. A tombstone covers what is older
+/// than itself, so that one would leave the record to a replay, which
+/// would publish the write over the delete that was answered `204`. The
+/// delete therefore does not finish under a newer id on the key: it
+/// starts again with a tombstone above it. The delete is plain or held
+/// to the object itself.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_is_not_undone_by_the_record_of_a_write_it_refused() {
+    for writer in WRITERS {
+        for held in [false, true] {
+            let mut stops = 0;
+            for n in 0.. {
+                let s = scene().await;
+                let rig = &s.rig;
+                let etag = md5_etag(&small(1));
+                let kept = records(rig);
+
+                let condition = [("if-match", etag.as_str())];
+                let headers: &[(&str, &str)] = if held { &condition } else { &[] };
+                let delete = start(rig, delete_req(rig, &s.signer, "k", headers));
+                let Ran::Stalled(delete) = run_until(rig, delete, n, Trip::Stall).await else {
+                    rig.trip().disarm();
+                    break;
+                };
+                stops += 1;
+                tick(rig);
+                let write = start(rig, s.write(writer, &condition));
+                let write = step_to(rig, write, |rig| records(rig).len() > kept.len())
+                    .await
+                    .stalled();
+                rig.trip().disarm();
+                rig.bridge.safety.fail_record_deletes.set(u32::MAX);
+                delete.await.expect(204);
+                let answer = write.await;
+                rig.bridge.safety.fail_record_deletes.set(0);
+
+                let what = format!("{writer:?}, held {held}, delete stopped at call {n}");
+                // The write was not done, and could not say that
+                // nothing of it is left.
+                assert_eq!(answer.status, 500, "{what}: {}", answer.text());
+                get(rig, &s.signer, "k").await.expect(404);
+                assert_eq!(upload_state(rig, &s.open.0), "open", "{what}");
+                let left: Vec<String> = records(rig)
+                    .into_iter()
+                    .filter(|r| !kept.contains(r))
+                    .collect();
+                assert!(!left.is_empty(), "{what}: its record");
+                let newest = tombstone_ids(rig).into_iter().max().unwrap();
+                for record in &left {
+                    let id = record.split('/').next().unwrap();
+                    assert!(newest.as_str() > id, "{what}: {newest} covers {record}");
+                }
+                let signer = lose_and_replay(rig).await;
+                assert!(live_ids(rig).iter().all(|l| !l.starts_with("k=")), "{what}");
+                get(rig, &signer, "k").await.expect(404);
+            }
+            assert!(stops > 5, "{writer:?}: the delete made {stops} calls");
+        }
+    }
+}
+
+/// The other order: the write is done and answered while the delete
+/// waits. It was held to the object the delete came for, so it ran
+/// before the delete, and the delete, answered `204` after it, removes
+/// what it wrote. A delete that kept the tombstone it chose before the
+/// write would delete nothing and still say `204`. Stopped before it
+/// has read the key, the delete has not begun; stopped after its batch,
+/// it is done and the write finds no object.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_answered_after_a_write_deletes_what_it_wrote() {
+    for writer in WRITERS {
+        for held in [false, true] {
+            let (mut stops, mut written) = (0, 0);
+            for n in 0.. {
+                let s = scene().await;
+                let rig = &s.rig;
+                let etag = md5_etag(&small(1));
+                let condition = [("if-match", etag.as_str())];
+
+                let delete = start(rig, delete_req(rig, &s.signer, "k", &[]));
+                let Ran::Stalled(delete) = run_until(rig, delete, n, Trip::Stall).await else {
+                    rig.trip().disarm();
+                    break;
+                };
+                stops += 1;
+                tick(rig);
+                rig.trip().disarm();
+                let headers: &[(&str, &str)] = if held { &condition } else { &[] };
+                let answer = rig.send(s.write(writer, headers)).await;
+                let what = format!("{writer:?}, held {held}, delete stopped at call {n}");
+                assert_eq!(answer.status, 200, "{what}: {}", answer.text());
+                written += 1;
+                delete.await.expect(204);
+
+                get(rig, &s.signer, "k").await.expect(404);
+                assert!(orphaned_rows(rig).is_empty(), "{what}");
+                let signer = lose_and_replay(rig).await;
+                assert!(live_ids(rig).iter().all(|l| !l.starts_with("k=")), "{what}");
+                get(rig, &signer, "k").await.expect(404);
+            }
+            assert!(stops > 5, "{writer:?}: the delete made {stops} calls");
+            assert_eq!(written, stops, "{writer:?}");
+        }
+    }
+}
+
 /// Extent rows of a generation that was never published.
 fn orphaned_rows(rig: &Rig) -> Vec<String> {
     column(
@@ -896,6 +1015,88 @@ fn orphaned_rows(rig: &Rig) -> Vec<String> {
         "SELECT id FROM extents WHERE generation_id IS NOT NULL \
          AND generation_id NOT IN (SELECT id FROM generations)",
     )
+}
+
+/// One Complete sent twice at once (a client that retries early), on the
+/// condition that the key is free. One of the two creates the object.
+/// The other meets that object, of its own upload: it is answered from
+/// the receipt like any retry of a Complete that won, not with `412`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_sent_twice_at_once_is_answered_twice() {
+    let mut overlapped = 0;
+    for seed in 0..SEEDS {
+        let ran = race(seed, true, |s| {
+            [
+                s.write(Writer::Complete, &[("if-none-match", "*")]),
+                s.write(Writer::Complete, &[("if-none-match", "*")]),
+            ]
+        })
+        .await;
+        let rig = &ran.s.rig;
+        for answer in &ran.answers {
+            assert!(
+                answer.status == 200
+                    || (answer.status, answer.code().as_str()) == (503, "SlowDown"),
+                "seed {seed}: {} {}",
+                answer.status,
+                answer.text()
+            );
+        }
+        assert!(ran.answers.iter().any(|a| a.status == 200), "seed {seed}");
+        overlapped += usize::from(ran.answers.iter().all(|a| a.status == 200));
+        let published = number(
+            rig,
+            "SELECT COUNT(*) FROM generations WHERE key = 'k' AND state = 'live'",
+        );
+        assert_eq!(published, 1, "seed {seed}");
+        assert_eq!(upload_state(rig, &ran.s.open.0), "completed");
+        replay_gives_the_same(rig, &format!("seed {seed}")).await;
+        assert_eq!(ran.body().await, Some(small(6)), "seed {seed}");
+    }
+    assert!(overlapped as u64 > SEEDS / 2, "{overlapped} of {SEEDS}");
+}
+
+/// A refused write whose record a replay has published in the meantime
+/// (a row exists under its id): the write does not say `412`, and does
+/// not publish a second time. It says `500`, and the record stays.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_write_that_is_published_after_all_does_not_answer_412() {
+    for writer in WRITERS {
+        let s = scene().await;
+        let rig = &s.rig;
+        delete_if(rig, &s.signer, "k", &[]).await.expect(204);
+        tick(rig);
+        let kept = records(rig);
+        let write = start(rig, s.write(writer, &[("if-none-match", "*")]));
+        let write = step_to(rig, write, |rig| records(rig).len() > kept.len())
+            .await
+            .stalled();
+        rig.trip().disarm();
+        let mine: Vec<String> = records(rig)
+            .into_iter()
+            .filter(|id| !kept.contains(id))
+            .collect();
+        assert_eq!(mine.len(), 1, "{writer:?}");
+        put_if(rig, &s.signer, "k", &small(9), &[])
+            .await
+            .expect(200);
+        // What a replay of the record leaves under its id.
+        sql(
+            rig,
+            &format!(
+                "INSERT INTO generations SELECT '{}', bucket_id, key, 'superseded', size, etag, \
+                 checksum_json, content_json, user_meta_json, extent_count, created_at, \
+                 created_at FROM generations WHERE key = 'k' AND state = 'live';",
+                mine[0]
+            ),
+        );
+        let generations = rig.count("generations");
+        let answer = write.await;
+        assert_eq!(answer.status, 500, "{writer:?}: {}", answer.text());
+        assert!(records(rig).contains(&mine[0]), "{writer:?}: the record");
+        assert_eq!(rig.count("generations"), generations, "{writer:?}");
+        assert_eq!(get(rig, &s.signer, "k").await.expect(200).body, small(9));
+    }
 }
 
 /// The other way round: the key is written while a conditional write

@@ -25,8 +25,8 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    discard_refused, hold_precondition, internal, metadata_json, restore_gate, s3_error,
-    stored_checksum, stored_headers, unavailable, Authed,
+    check_precondition, discard_before_retry, hold_precondition, internal, metadata_json,
+    restore_gate, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
@@ -187,6 +187,12 @@ where
     }
 
     for _ in 0..ATTEMPTS {
+        // A condition on the destination that does not hold now is
+        // answered before anything is written for the copy, the floor of
+        // the key included.
+        if let Some(condition) = &condition {
+            check_precondition(bridge, &bucket.id, key, condition).await?;
+        }
         let (from, extents) = source_object(bridge, &authed.headers, bucket, &source).await?;
         // The copy keeps the checksum stored with the source. Computing
         // another one would mean reading every byte.
@@ -283,9 +289,7 @@ where
         // Nothing was published under this id, so its record must not
         // publish it in a replay either. A record that cannot be removed
         // ends the request: no copy was made, and the caller is told so.
-        discard_refused(bridge, &copy.generation, refused)
-            .await
-            .map_err(|_| internal())?;
+        discard_before_retry(bridge, &copy.generation, refused, condition.is_some()).await?;
         // Refused as well when a replay started after this request
         // passed the gate.
         restore_gate(bridge).await?;

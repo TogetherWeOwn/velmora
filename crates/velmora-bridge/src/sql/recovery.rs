@@ -27,6 +27,17 @@ pub(super) async fn delete_object_before<S: Sql>(
     let mut stmts = Vec::new();
     if client {
         stmts.push(guard_no_replay());
+        // A floor above the tombstone is a write that began after the
+        // tombstone was chosen. Its record sorts after the tombstone, so
+        // a replay would publish it over this delete; and where it is
+        // held to the object this delete removes, it must find the
+        // delete in its way (the floor this batch leaves below). The
+        // caller comes back with a tombstone above that id.
+        stmts.push((
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM key_floors \
+             WHERE bucket_id = ?1 AND key = ?2 AND floor_id > ?3)",
+            vec![text(bucket.as_str()), text(key), text(before.as_str())],
+        ));
     }
     stmts.extend(condition.map(|c| guard_precondition(bucket, key, c)));
     stmts.push((

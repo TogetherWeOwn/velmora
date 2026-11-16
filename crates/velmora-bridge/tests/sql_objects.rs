@@ -2078,6 +2078,55 @@ async fn a_conditional_copy_is_judged_on_its_destination() {
     }
 }
 
+/// A floor above the tombstone is a write that began after the
+/// tombstone was chosen: its record would outlive the tombstone in a
+/// replay. The delete of a client changes nothing then, plain or
+/// conditional. A floor at or below the tombstone does not stand in the
+/// way, and the replay, which has every record in hand, is not held to
+/// it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_is_refused_under_a_floor_above_its_tombstone() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let at = |s: i64| T0.plus_ms(s * 1_000);
+    let live = fx.put(&b.id, "k", at(0)).await;
+    let tombstone = GenerationId::mint(at(2), [0x00; 8]);
+    let write = GenerationId::mint(at(3), [0x00; 8]);
+    let above = GenerationId::mint(at(4), [0x00; 8]);
+    let cat = &fx.cat;
+    cat.raise_floor(&b.id, "k", &write, true).await.unwrap();
+
+    let before = fx.footprint();
+    assert!(!cat
+        .delete_object_before(&b.id, "k", &tombstone, at(5))
+        .await
+        .unwrap());
+    assert!(!cat
+        .delete_object_if(&b.id, "k", &tombstone, &etag_of(&live), at(5))
+        .await
+        .unwrap());
+    assert_eq!(fx.footprint(), before);
+    let got = cat.live_object(&b.id, "k").await.unwrap();
+    assert_eq!(got.map(|(g, _)| g.id), Some(live.generation.id.clone()));
+
+    // Above the floor, the same delete goes through.
+    assert!(cat
+        .delete_object_before(&b.id, "k", &above, at(5))
+        .await
+        .unwrap());
+    assert!(cat.live_object(&b.id, "k").await.unwrap().is_none());
+
+    // A floor that is the tombstone itself is the delete's own.
+    let live = fx.put(&b.id, "k2", at(0)).await;
+    cat.raise_floor(&b.id, "k2", &tombstone, false)
+        .await
+        .unwrap();
+    assert!(cat
+        .delete_object_if(&b.id, "k2", &tombstone, &etag_of(&live), at(5))
+        .await
+        .unwrap());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_conditional_delete_is_judged_by_its_own_batch() {
     let fx = Fx::new();
