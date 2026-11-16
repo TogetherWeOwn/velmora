@@ -305,8 +305,10 @@ async fn commit_delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 /// DeleteObject: they answer `InternalError` and nothing further is done
 /// for them. The batch deletes all keys that have a live object, or
 /// none. When it deletes none (one of them is held up by a newer id,
-/// another delete or a replay) or fails, each key takes the rest of its
-/// attempt alone, under the tombstone it has.
+/// another delete or a replay), each key takes the rest of its attempt
+/// alone, under the tombstone it has, and its later attempts. When the
+/// batch is not answered, each key takes the rest of its attempt alone
+/// and no later one ([`after_unanswered`]).
 async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &Bucket,
@@ -383,7 +385,7 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     for (((place, live), tombstone), stored) in places.into_iter().zip(&tombstones).zip(stored) {
         match stored {
             Ok(()) if live => batch.push((place, tombstone)),
-            Ok(()) => alone.push((place, tombstone)),
+            Ok(()) => alone.push((place, tombstone, false)),
             Err(_) => done[place] = Err(DeleteError::Internal),
         }
     }
@@ -400,21 +402,22 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         {
             Ok(true) => {}
             // Nothing was deleted: one key is held up (a newer id,
-            // another delete, a replay). Each on its own from here. The
-            // same when the call failed: the tombstones are on record,
-            // so each key still gets its own try at the delete they
-            // announce, and its own answer. Should the batch have been
-            // applied after all, the key finds nothing left below its
-            // tombstone.
-            Ok(false) | Err(_) => alone.append(&mut batch),
+            // another delete, a replay). Each on its own from here.
+            Ok(false) => alone.extend(batch.into_iter().map(|(p, t)| (p, t, false))),
+            // No answer: the batch failed, or it was applied. The
+            // tombstones are on record, so each key still gets its own
+            // try under the tombstone it has, but no later attempt (see
+            // below).
+            Err(_) => alone.extend(batch.into_iter().map(|(p, t)| (p, t, true))),
         }
     }
     let alone: Vec<(usize, Result<(), DeleteError>)> = stream::iter(alone)
-        .map(|(place, tombstone)| async move {
+        .map(|(place, tombstone, unanswered)| async move {
             let key = tombstone.key;
             let result =
                 match commit_delete(bridge, bucket, key, &tombstone.id, tombstone.now).await {
                     Ok(true) => Ok(()),
+                    Ok(false) if unanswered => after_unanswered(bridge, bucket, key).await,
                     Ok(false) => delete_key_in(bridge, bucket, key, DELETE_ATTEMPTS - 1).await,
                     Err(e) => Err(e),
                 };
@@ -427,6 +430,42 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         done[place] = result;
     }
     done
+}
+
+/// The answer for a key whose chunk batch was not answered, when its
+/// own batch under the same tombstone changed nothing and the key has an
+/// id above the tombstone.
+///
+/// That id is the floor the chunk batch left when it was applied, or a
+/// write that came after. A later attempt would store a tombstone above
+/// it, and where the chunk batch was applied that deletes an object
+/// that was written after this delete was done: a write that held
+/// `If-None-Match: *` and was told so would be gone. So there is no
+/// later attempt. The key is answered as deleted when nothing is live
+/// on it and no record of an unpublished write is left for a replay;
+/// otherwise the outcome is not known, as for a DeleteObject whose
+/// batch was not answered.
+async fn after_unanswered<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &Bucket,
+    key: &str,
+) -> Result<(), DeleteError> {
+    match bridge
+        .catalog
+        .key_heads(&bucket.id, &[key])
+        .await
+        .as_deref()
+    {
+        Ok([head]) if head.live.is_none() && !head.unpublished => Ok(()),
+        _ => Err(DeleteError::Internal),
+    }
 }
 
 /// Cuts `keys` into the chunks [`delete_chunk`] takes, in order.

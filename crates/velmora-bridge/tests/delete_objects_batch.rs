@@ -577,6 +577,8 @@ async fn a_chunk_whose_batch_is_refused_finishes_key_by_key() {
     let bridge = Rc::clone(&rig.bridge);
     let newer = GenerationId::mint(UnixMs(rig.now().0 + 5000), [7; 8]);
     *rig.bridge.safety.before_put.borrow_mut() = Some(Box::new(move |_| {
+        // The clock moves on while the tombstones are stored.
+        bridge.clock.advance_ms(300);
         let script = format!(
             "UPDATE key_floors SET floor_id = '{}', unpublished = 1 WHERE key = 'k07';",
             newer.as_str()
@@ -593,6 +595,15 @@ async fn a_chunk_whose_batch_is_refused_finishes_key_by_key() {
     let records = tombstones(&rig).await;
     assert_eq!(records.len(), 61);
     assert_eq!(records.iter().filter(|(key, _)| key == "k07").count(), 2);
+    // Each key was retired at the time on a tombstone of its own, also
+    // the keys that went on alone.
+    for key in &keys {
+        let retired = number(
+            &rig,
+            &format!("SELECT retired_at FROM generations WHERE key = '{key}'"),
+        );
+        assert!(records.contains(&(key.clone(), retired)), "{key}");
+    }
     // The first chunk took its batch key by key; the second did not.
     assert!(
         calls.database > 50 && calls.database < 100,
@@ -745,7 +756,7 @@ async fn a_key_of_a_chunk_is_retired_at_the_time_of_its_tombstone() {
             .expect(200);
     }
     rig.bridge.clock.advance_ms(1000);
-    // Every tombstone takes 300 ms to store.
+    // The clock moves on while the tombstones are stored.
     let bridge = Rc::clone(&rig.bridge);
     *rig.bridge.safety.before_put.borrow_mut() =
         Some(Box::new(move |_| bridge.clock.advance_ms(300)));
@@ -853,4 +864,92 @@ async fn a_tombstone_of_a_chunk_sorts_above_a_floor_ahead_of_the_clock() {
         .filter(|name| name.starts_with("m/del/") && &name[6..] > ahead.as_str())
         .collect();
     assert_eq!(above.len(), 1, "{above:?}");
+    // One tombstone a key: the first one of `a` was above its floor.
+    assert_eq!(tombstones(&rig).await.len(), 2);
+}
+
+/// The batch of a chunk is applied and not answered, and before the
+/// request goes on, a write that holds `If-None-Match: *` takes the key
+/// that is now free. The delete was done before that write: it must not
+/// come back for the key under a new tombstone and delete the write.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unanswered_batch_does_not_delete_a_write_that_came_after() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let mut met = 0;
+    for seed in 0..40 {
+        let rig = rig();
+        let (_, signer) = rig.standard(BUCKET).await;
+        snapshot(&rig);
+        rig.put(&signer, BUCKET, "k", b"old").await.expect(200);
+        rig.bridge.clock.advance_ms(1000);
+        let keys = vec!["k".to_string()];
+        let signed_calls = {
+            let (_, none) = counted(&rig, delete_objects(&rig, &signer, &["no/such".into()])).await;
+            none.database - 2
+        };
+        // The calls of the request yield now and then: it can be left
+        // between two of them.
+        rig.trip().jitter(seed);
+        rig.trip().arm(signed_calls + 3 + 1 + 1, Trip::Lost);
+        let mut delete = Box::pin(delete_objects(&rig, &signer, &keys));
+        let mut answer = None;
+        while answer.is_none() && !rig.trip().tripped() {
+            answer = std::future::poll_fn(|cx| match delete.as_mut().poll(cx) {
+                Poll::Ready(resp) => Poll::Ready(Some(resp)),
+                Poll::Pending => Poll::Ready(None),
+            })
+            .await;
+            // Lets the wake-ups of the request through.
+            tokio::task::yield_now().await;
+        }
+        assert!(rig.trip().tripped());
+        // The batch was applied.
+        assert!(live_keys(&rig).is_empty());
+        let put = match answer {
+            // The request is somewhere after its batch: the write.
+            None => Some(
+                rig.call(
+                    &signer,
+                    Method::Put,
+                    &path(BUCKET, "k"),
+                    &[],
+                    &[("if-none-match", "*")],
+                    b"new",
+                )
+                .await,
+            ),
+            Some(_) => None,
+        };
+        let resp = match answer {
+            Some(resp) => resp,
+            None => delete.as_mut().await,
+        };
+        drop(delete);
+        let code = answers(&resp, &keys)["k"].clone();
+        match put {
+            Some(put) if put.status == 200 => {
+                met += 1;
+                assert_eq!(live_keys(&rig), ["k"], "seed {seed}: {code:?}");
+                // The key is not reported deleted while it holds an
+                // object.
+                assert_eq!(code.as_deref(), Some("InternalError"), "seed {seed}");
+            }
+            _ => assert!(live_keys(&rig).is_empty(), "seed {seed}"),
+        }
+        // Never a second tombstone, and a replay agrees with the
+        // catalogue.
+        assert_eq!(tombstones(&rig).await.len(), 1, "seed {seed}");
+        let live = live_keys(&rig);
+        let mut rig = rig;
+        rig.trip().disarm();
+        rollback(&rig);
+        restore(&mut rig).await;
+        assert_eq!(live_keys(&rig), live, "seed {seed}");
+    }
+    assert!(
+        met >= 5,
+        "the write came after the batch in {met} of 40 runs"
+    );
 }

@@ -102,9 +102,14 @@ tombstones are stored one record a key, six at a time within a chunk.
   chunk: they are reported with `InternalError`, the keys of the other
   chunks are not affected.
 - When the deleting batch of a chunk is refused (a write or another
-  delete moved one of its keys meanwhile) or fails, nothing of it is
-  applied and each of its keys goes on alone, on the path of a
-  DeleteObject, with the tombstone it already has on record.
+  delete moved one of its keys meanwhile), nothing of it is applied and
+  each of its keys goes on alone, on the path of a DeleteObject, with
+  the tombstone it already has on record.
+- When the deleting batch of a chunk is not answered, it failed or it
+  was applied. Each of its keys is tried once more alone, under the
+  tombstone it has, and never under a new one: a key is reported
+  deleted when it is gone, and with `InternalError` when a write has
+  taken it meanwhile or the outcome cannot be told.
 
 A request of 1,000 live keys with nothing else at work on them makes
 about 100 catalogue calls and 1,000 store calls (before: about 7,000 and
