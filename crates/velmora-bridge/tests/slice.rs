@@ -954,6 +954,14 @@ impl Rig {
     /// no outbox row is in `post` or `verify`. Queue delays are honoured by
     /// moving the fixed clock; nothing sleeps.
     async fn pump(&self, step: &str) {
+        self.pump_jobs(step, false).await;
+    }
+
+    /// `pump`, with the jobs that are due at one time run one after the
+    /// other when `in_turn`: no job is ever put off because another one
+    /// holds the provider's slots, so the catalogue writes of a run do
+    /// not depend on how the jobs happen to interleave.
+    async fn pump_jobs(&self, step: &str, in_turn: bool) {
         let b = &self.bridge;
         let mut pending: Vec<(UnixMs, Job)> = Vec::new();
         for _ in 0..MAX_ROUNDS {
@@ -982,7 +990,16 @@ impl Rig {
                 }
                 continue;
             }
-            let outcomes = join_all(due.iter().map(|(_, job)| b.run_job(job))).await;
+            let outcomes = match in_turn {
+                false => join_all(due.iter().map(|(_, job)| b.run_job(job))).await,
+                true => {
+                    let mut outcomes = Vec::new();
+                    for (_, job) in &due {
+                        outcomes.push(b.run_job(job).await);
+                    }
+                    outcomes
+                }
+            };
             for ((_, job), outcome) in due.into_iter().zip(outcomes) {
                 if let JobOutcome::Retry { delay_secs } = outcome {
                     pending.push((now.plus_secs(delay_secs), job));
@@ -2165,6 +2182,39 @@ async fn rebuild_from_usenet(packed_plans: &str) {
         ),
     }
 
+    if packed {
+        // A catalogue that lost the packed plans alone (each extent
+        // still has its article count) gets them back from the records.
+        let s = "recovery of lost plans";
+        rig.bridge.catalog.sql.with_conn(|c| {
+            c.execute_batch(
+                "DROP TRIGGER extents_keep_plan_in_service; UPDATE extents SET plan = NULL;",
+            )
+            .expect("lose the plans");
+        });
+        let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+        let mut damaged = u64::MAX;
+        while let Some(at) = cursor {
+            let mut report = rig
+                .bridge
+                .replay_step(at)
+                .await
+                .unwrap_or_else(|e| fail(s, "Bridge::replay_step", "Ok", e));
+            damaged = report.damaged_total;
+            cursor = report.next.take();
+        }
+        expect_eq(s, "damaged generations", 0, damaged);
+        expect_eq(
+            s,
+            "packed plans",
+            4,
+            rig.sql_count(
+                "SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL AND length(plan) < 1024 \
+                   AND posted_at IS NOT NULL",
+            ),
+        );
+    }
+
     // The key and its grants are issued again, then S3 reads work.
     let s = "recovery read-back";
     let key = rig
@@ -2883,6 +2933,134 @@ async fn a_packed_plan_is_repaired_by_a_repost() {
     expect_bytes(s, "GET r/one.bin body", &body, &r.body);
 }
 
+/// The crash window of a packed plan, on the SQL catalogue: the provider
+/// accepts every article, and the job ends before the plan is recorded
+/// as posted. The next job did not draw the plan, so it asks for every
+/// article before it sends one: it finds them all and sends nothing. The
+/// plan is stamped once, and a second delivery of the job at the same
+/// time writes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
+    let rig = Rig::with_vars(&[("PACKED_PLANS", "on")]).await;
+    let s = "crash window setup";
+    rig.setup_buckets_and_key(s).await;
+    let body = test_bytes(37, 2 * MIB);
+    expect_status(
+        s,
+        "PUT w/one.bin",
+        200,
+        &rig.put("/slice/w/one.bin", &body).await,
+    );
+    let sent = rig.bridge.jobs.take();
+    expect_eq(s, "jobs after the upload", 1, sent.len());
+    let job = &sent[0].job;
+    let stamped = "SELECT COUNT(*) FROM extents WHERE posted_at IS NOT NULL";
+
+    // The write that records the plan as posted fails, each time the
+    // job tries it: the job ends as one that died there.
+    let s = "crash window";
+    rig.bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch(
+            "CREATE TRIGGER the_job_dies BEFORE UPDATE OF posted_at ON extents \
+             BEGIN SELECT RAISE(ABORT, 'the job dies here'); END;",
+        )
+        .expect("create trigger");
+    });
+    let outcome = rig.bridge.run_job(job).await;
+    expect(
+        s,
+        "the post job did not finish",
+        matches!(outcome, JobOutcome::Retry { .. }),
+        format!("{outcome:?}"),
+    );
+    let articles = rig.server.posted_ids().await.len();
+    expect(
+        s,
+        "the provider took several articles",
+        articles >= 3,
+        articles,
+    );
+    expect_eq(
+        s,
+        "(packed plans, article rows, plans recorded as posted)",
+        (1, 0, 0),
+        (
+            rig.sql_count("SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL"),
+            rig.sql_count("SELECT COUNT(*) FROM articles"),
+            rig.sql_count(stamped),
+        ),
+    );
+    expect_eq(
+        s,
+        "outbox rows still to post",
+        1,
+        rig.sql_count("SELECT COUNT(*) FROM outbox WHERE stage = 'post'"),
+    );
+
+    // The provider takes no POST from here on: a job that sent an
+    // article before it asked for it would fail.
+    let s = "crash window, the next job";
+    rig.bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch("DROP TRIGGER the_job_dies")
+            .expect("drop trigger");
+    });
+    rig.server.set_posting_allowed(false).await;
+    rig.bridge.clock.advance_secs(3600);
+    let outcomes = join_all([rig.bridge.run_job(job), rig.bridge.run_job(job)]).await;
+    expect(
+        s,
+        "the job is done, and its second delivery has nothing to do",
+        outcomes.iter().all(|o| *o == JobOutcome::Ack),
+        format!("{outcomes:?}"),
+    );
+    expect_eq(s, "plans recorded as posted", 1, rig.sql_count(stamped));
+    expect_eq(
+        s,
+        "articles on the provider",
+        articles,
+        rig.server.posted_ids().await.len(),
+    );
+    expect_eq(
+        s,
+        "outbox rows still to post",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM outbox WHERE stage = 'post'"),
+    );
+    let posted_at = rig.sql_count("SELECT posted_at FROM extents WHERE plan IS NOT NULL");
+    // Delivered once more, long after: the stamp stands.
+    rig.bridge.clock.advance_secs(600);
+    let outcome = rig.bridge.run_job(job).await;
+    expect(
+        s,
+        "a late delivery",
+        outcome == JobOutcome::Ack,
+        format!("{outcome:?}"),
+    );
+    expect_eq(
+        s,
+        "the time the plan was posted",
+        posted_at,
+        rig.sql_count("SELECT posted_at FROM extents WHERE plan IS NOT NULL"),
+    );
+
+    // The rest of the pipeline, and the object from Usenet alone.
+    let s = "crash window, read-back";
+    rig.server.set_posting_allowed(true).await;
+    rig.pump(s).await;
+    expect_eq(
+        s,
+        "articles on the provider",
+        articles,
+        rig.server.posted_ids().await.len(),
+    );
+    for key in rig.bridge.cache.keys() {
+        rig.bridge.cache.delete(&key).await.expect("cache delete");
+    }
+    let r = rig.get("/slice/w/one.bin").await;
+    expect_status(s, "GET w/one.bin", 200, &r);
+    expect_bytes(s, "GET w/one.bin body", &body, &r.body);
+}
+
 /// What D1 bills, in rows written, for an object over its whole life:
 /// upload, post, verification on two backbones, a day's wait and the
 /// release. Objects of one and of three 16 MiB extents give the cost of an
@@ -2918,7 +3096,7 @@ async fn rows_written(packed_plans: &str) -> (u64, u64, i64) {
         let r = rig.multipart_put(s, &path, &body, EXTENT).await;
         expect_status(s, "CompleteMultipartUpload", 200, &r);
         let uploaded = sql.writes();
-        rig.pump(s).await;
+        rig.pump_jobs(s, true).await;
         let verified = sql.writes();
         rig.bridge.clock.advance_secs(DAY + 600);
         for _ in 0..20 {
@@ -3000,13 +3178,15 @@ async fn rows_written_per_extent() {
     // message-id index entry, the posted mark).
     assert!(rows.0 >= packed.0 + 3 * 24 - 2, "{rows:?} {packed:?}");
     // The whole life of an extent and of an object: a change that adds a
-    // write to either shows up here.
+    // write to either shows up here. The jobs run in turn, so none is
+    // put off for a provider slot; each such put-off is four more (the
+    // claim and the put-off, a row and an index entry each).
     assert!(
-        packed.0 <= 64,
+        packed.0 <= 61,
         "rows written per packed extent: {}",
         packed.0
     );
-    assert!(packed.1 <= 18, "rows written per object: {}", packed.1);
+    assert!(packed.1 <= 21, "rows written per object: {}", packed.1);
     // What a 16 MiB extent keeps in the catalogue for good: 0.15 GB per
     // TB is 2,516 bytes an extent.
     assert!(

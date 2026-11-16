@@ -746,13 +746,22 @@ async fn a_socket_that_lost_its_permit_mid_post_stops() {
     assert_eq!(rig.bridge.catalog.mark_batches.get(), 0);
     assert_eq!(rig.bridge.nntp.live(), 0);
 
-    // The next run posts the same ids: each article is stored once.
+    // The next run did not draw the plan, and the run before it spent
+    // no attempt: it asks for every article before it sends one, and
+    // sends only what the provider does not have.
     rig.bridge.clock.advance_secs(600);
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
     let done = rig.plan(&s).await;
     assert!(done.iter().all(|a| a.state == ArticleState::Posted));
     assert_eq!(stored(&rig, 0).await, id_set(&done));
     assert_eq!(rig.servers[0].posted_count().await, done.len());
+    let calls = rig.bridge.nntp.calls();
+    let count = |what: &str| {
+        let second = &calls[calls_then.get()..];
+        second.iter().filter(|c| c.0 == what).count()
+    };
+    assert_eq!(count("stat"), done.len(), "{calls:?}");
+    assert_eq!(count("post"), done.len() - on_server.len(), "{calls:?}");
 }
 
 /// An account that allows one source address and six connections: one

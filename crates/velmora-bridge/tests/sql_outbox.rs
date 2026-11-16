@@ -2532,19 +2532,21 @@ async fn a_packed_plan_is_stored_once_and_posted_as_a_whole() {
     assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
     assert_eq!(fx.cat.stored_plan(&o.extent).await.unwrap(), stored);
 
-    // Fewer than every article: the lease holds, the plan is not posted.
+    // Fewer than every article: refused, and the plan is not posted.
+    let before = fx.dump().await;
     for part in [
         &[(0, "p1")][..],
         &[(1, "p1"), (1, "p2")],
         &[(0, "p1"), (2, "p1")],
     ] {
-        assert!(fx
+        assert!(!fx
             .cat
             .mark_posted_many(&post, part, T0.plus_secs(1))
             .await
             .unwrap());
         assert_eq!(fx.extent(&o, "posted_at").await, "NULL", "{part:?}");
     }
+    assert_eq!(fx.dump().await, before);
     let planned = fx.cat.articles(&o.extent).await.unwrap();
     assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
     assert!(planned.iter().all(|a| a.posted_at.is_none()));
@@ -2754,4 +2756,84 @@ async fn gc_drops_a_packed_plan_with_the_article_metadata() {
     );
     assert_eq!(fx.extent(&live, "plan IS NULL").await, "0");
     assert_eq!(fx.cat.articles(&live.extent).await.unwrap().len(), 1);
+    // The schema keeps it too, whatever statement asks.
+    let err = fx
+        .cat
+        .sql
+        .0
+        .exec(
+            "UPDATE extents SET plan = NULL WHERE id = ?1",
+            &[text(live.extent.as_str())],
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("extent is in service"), "{err}");
+    assert_eq!(fx.extent(&live, "plan IS NULL").await, "0");
+}
+
+/// Rows left beside a packed plan are a copy of it and go; a plan that
+/// cannot be read is passed over and does not stop the step; a plan of
+/// which only some rows are posted waits.
+#[tokio::test]
+async fn pack_plans_drops_stray_rows_and_passes_what_it_cannot_pack() {
+    let fx = Fx::new().await;
+    let t = T0.plus_secs(3);
+    let posted_rows = async |key: &str| {
+        let o = fx.publish(&fx.bucket, key).await;
+        let lease = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+        let rows = fx.whole(&o, key);
+        fx.cat.plan_articles(&lease, &rows).await.unwrap().unwrap();
+        let one = [(0, "p1")];
+        assert!(fx.cat.mark_posted_many(&lease, &one, t).await.unwrap());
+        (o, rows)
+    };
+    let set_plan = "UPDATE extents SET plan = ?2 WHERE id = ?1";
+    // a: its rows, and beside them the same plan packed.
+    let (a, rows_a) = posted_rows("a").await;
+    let blob = velmora_bridge::plan::pack_explicit(&a.extent, 1064, &rows_a).unwrap();
+    let params = [text(a.extent.as_str()), SqlValue::Blob(blob.clone())];
+    assert_eq!(fx.run(set_plan, &params).await, 1);
+    // b: its rows, and beside them a value that is no plan.
+    let (b, _) = posted_rows("b").await;
+    let params = [text(b.extent.as_str()), SqlValue::Blob(vec![0xff; 3])];
+    assert_eq!(fx.run(set_plan, &params).await, 1);
+    assert!(fx.cat.stored_plan(&b.extent).await.is_err());
+    // c: two rows, one of them posted.
+    let c = fx.two_articles("c").await;
+    let lc = fx.claim(&c, OutboxStage::Post, T0).await.unwrap();
+    let (_, rows_c) = fx.seeded(&c, 1);
+    fx.cat.plan_articles(&lc, &rows_c).await.unwrap().unwrap();
+    let one = [(1, "p1")];
+    assert!(fx.cat.mark_posted_many(&lc, &one, t).await.unwrap());
+    // d: posted rows, as before.
+    let (d, _) = posted_rows("d").await;
+
+    let rows_of = async |o: &Obj| {
+        let sql = format!(
+            "SELECT COUNT(*) FROM articles WHERE extent_id = '{}'",
+            o.extent.as_str()
+        );
+        fx.count(&sql).await
+    };
+    let report = fx.cat.pack_plans(10).await.unwrap();
+    assert_eq!((report.looked, report.packed, report.end), (4, 1, true));
+    assert_eq!(rows_of(&a).await, 0);
+    let stored = fx.cat.stored_plan(&a.extent).await.unwrap();
+    assert_eq!(stored.packed.as_deref(), Some(&blob[..]));
+    assert!(velmora_bridge::plan::same_plan(&stored.rows, &rows_a));
+    assert_eq!(rows_of(&b).await, 1, "what cannot be read is not touched");
+    assert_eq!(rows_of(&c).await, 2);
+    assert_eq!(fx.extent(&c, "plan IS NULL").await, "1");
+    assert_eq!(rows_of(&d).await, 0);
+    assert_eq!(fx.extent(&d, "plan IS NOT NULL").await, "1");
+
+    // The other row of c is posted: the next pass packs it.
+    let other = [(0, "p2")];
+    assert!(fx.cat.mark_posted_many(&lc, &other, t).await.unwrap());
+    let report = fx.cat.pack_plans(10).await.unwrap();
+    assert_eq!((report.looked, report.packed), (2, 1));
+    assert_eq!(rows_of(&c).await, 0);
+    let packed_c = fx.cat.articles(&c.extent).await.unwrap();
+    assert!(velmora_bridge::plan::same_plan(&packed_c, &rows_c));
+    assert!(packed_c.iter().all(|x| x.state == ArticleState::Posted));
 }

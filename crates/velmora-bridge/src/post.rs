@@ -345,7 +345,7 @@ where
             self.load_planned(lease, extent, stored),
         )
         .await;
-        let (cipher, mut plan) = match loaded {
+        let (cipher, mut plan, drawn) = match loaded {
             Ok(loaded) => loaded,
             Err(stop) => {
                 close_all(held).await;
@@ -361,7 +361,9 @@ where
                 probing,
             };
             let posted = self
-                .post_with_failover(lease, extent, &mut plan, &cipher, &order, cooling, opened)
+                .post_with_failover(
+                    lease, extent, &mut plan, &cipher, &order, cooling, opened, drawn,
+                )
                 .await;
             let post_ms = self.clock.now().0 - started.0;
             crate::trace::note(&lease.extent, |t| t.post_ms = post_ms);
@@ -494,13 +496,14 @@ where
     }
 
     /// The verified ciphertext of the extent and its stored article plan,
-    /// with the recovery record of the plan written.
+    /// with the recovery record of the plan written. The flag: this job
+    /// drew the plan, so no article of it was ever sent.
     async fn load_planned(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
         stored: StoredPlan,
-    ) -> core::result::Result<(Vec<u8>, Vec<ArticleRow>), Stop> {
+    ) -> core::result::Result<(Vec<u8>, Vec<ArticleRow>, bool), Stop> {
         let started = self.clock.now();
         let cipher = self
             .safety
@@ -511,7 +514,7 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Err(Stop::fail(FailClass::Corrupt));
         }
-        let plan = self.stored_plan(lease, extent, &cipher, stored).await?;
+        let (plan, drawn) = self.stored_plan(lease, extent, &cipher, stored).await?;
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
@@ -520,7 +523,7 @@ where
             .map_err(|_| Stop::fail(FailClass::BlobError))?;
         let load_ms = self.clock.now().0 - started.0;
         crate::trace::note(&lease.extent, |t| t.load_ms = load_ms);
-        Ok((cipher, plan.rows))
+        Ok((cipher, plan.rows, drawn))
     }
 
     /// The authoritative stored plan, created first when the extent has
@@ -531,15 +534,20 @@ where
     /// lease. Only the lease holder writes a plan, so it is still the
     /// stored one; a stale job that planned meanwhile is answered by the
     /// fenced insert, which returns the plan that won.
+    ///
+    /// The flag: the stored plan is the one this job drew just now. Any
+    /// other plan was there before this job, and a run before it may
+    /// have sent articles of it that the catalogue does not know of.
     async fn stored_plan(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
         cipher: &[u8],
         stored: StoredPlan,
-    ) -> core::result::Result<StoredPlan, Stop> {
+    ) -> core::result::Result<(StoredPlan, bool), Stop> {
         let spans = article_spans(extent.cipher_size);
         let mut plan = stored;
+        let mut drawn = false;
         if plan.rows.is_empty() {
             let groups: Vec<&str> = self.cfg.newsgroups.iter().map(String::as_str).collect();
             let now_secs = self.clock.now().secs().0;
@@ -579,6 +587,7 @@ where
                     packed: None,
                 },
             };
+            drawn = plan.rows.first().map(|a| &a.message_id) == rows.first().map(|a| &a.message_id);
         }
         // The stored plan must describe this ciphertext article for article.
         let matches = plan.rows.len() == spans.len()
@@ -591,7 +600,7 @@ where
         if !matches {
             return Err(Stop::fail(FailClass::Internal));
         }
-        Ok(plan)
+        Ok((plan, drawn))
     }
 
     /// Posts the planned articles, priority tier by priority tier. The
@@ -627,6 +636,7 @@ where
         order: &[&'a ProviderConfig],
         cooling: Option<UnixMs>,
         first: Opened<'a, C, N, T>,
+        drawn: bool,
     ) -> core::result::Result<(), Stop> {
         let holder = job_holder(lease);
         let probing = first.probing.clone();
@@ -639,10 +649,11 @@ where
         // then failed, so the next provider is asked before it is sent.
         //
         // Which articles a run posted is kept in the job, not in the
-        // catalogue, until all of them are posted. A job that comes after
-        // a run that failed or died therefore finds them all planned, and
-        // asks before it sends any of them.
-        let mut unknown = vec![lease.attempts > 1; plan.len()];
+        // catalogue, until all of them are posted. A job that finds a
+        // plan it did not draw itself comes after a run that failed,
+        // died or was put off (which spends no attempt): it finds every
+        // article planned, and asks before it sends any of them.
+        let mut unknown = vec![!drawn; plan.len()];
         // Per article: the provider that took it in this job.
         let mut posted_by: Vec<Option<String>> = vec![None; plan.len()];
         for tier in order.chunk_by(|a, b| a.priority == b.priority) {

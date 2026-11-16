@@ -128,10 +128,13 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
     ));
     match (&x.plan, &x.packed) {
         // The packed plan goes on the extent's row, and no article row
-        // is written. An extent that has a plan keeps it, as with rows.
+        // is written. An extent that has a plan keeps it, as with rows;
+        // one that lost its plan (the count is all that is left of it)
+        // gets it back.
         (Some(plan), Some(packed)) => out.push((
             "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
-             WHERE id = ?1 AND article_count IS NULL",
+             WHERE id = ?1 AND plan IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM articles WHERE extent_id = ?1)",
             vec![
                 id(),
                 SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),

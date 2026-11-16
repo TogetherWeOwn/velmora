@@ -537,8 +537,9 @@ pub(super) async fn mark_posted<S: Sql>(
 /// lease guard, so a stale lease writes nothing.
 ///
 /// A packed plan is posted as a whole: its extent is stamped when the
-/// call lists every article of the plan, and a call that lists fewer
-/// writes nothing for it.
+/// call lists every article of the plan. A call that lists fewer writes
+/// nothing at all and returns `false`, as a stale lease does: a plan is
+/// never taken for posted when its stamp was not written.
 pub(super) async fn mark_posted_many<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -548,7 +549,7 @@ pub(super) async fn mark_posted_many<S: Sql>(
     if posted.is_empty() {
         return renew_check(c, l).await;
     }
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(3);
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(4);
     stmts.push((held_guard!(), lease_params(l, [])?));
     // One statement per provider, not per article.
     let mut providers: Vec<&str> = Vec::new();
@@ -584,6 +585,13 @@ pub(super) async fn mark_posted_many<S: Sql>(
            AND article_count = \
                (SELECT COUNT(DISTINCT value) FROM json_each(?3) WHERE value < article_count)",
         vec![text(l.extent.as_str()), ms(now), text(&idx_list(&listed))],
+    ));
+    // A packed plan that the call did not mark is not posted: nothing
+    // is written, and the caller hears it as it hears a lost lease.
+    stmts.push((
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM extents WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL)",
+        vec![text(l.extent.as_str())],
     ));
     fenced_batch(c, stmts).await
 }
@@ -1100,45 +1108,63 @@ pub(super) async fn pack_plans<S: Sql>(c: &SqlCatalog<S>, limit: u32) -> Result<
         end: ids.len() < limit as usize,
     };
     let mut stmts: Vec<Stmt> = Vec::with_capacity(2 * PACK_CHUNK);
+    // Per statement of the batch: it packs a plan.
+    let mut packs: Vec<bool> = Vec::with_capacity(2 * PACK_CHUNK);
     for (at, id) in ids.iter().enumerate() {
-        let plan = stored_plan(c, id).await?;
-        let posted = plan.rows.iter().all(|a| a.state == ArticleState::Posted);
-        // The plan covers the whole ciphertext: its end is the size.
-        let cipher_size = plan.rows.last().map(|a| a.cipher_offset + a.cipher_len);
-        let packed = match (plan.packed, cipher_size) {
-            (None, Some(size)) if posted => crate::plan::pack_explicit(id, size, &plan.rows)
-                .ok()
-                .map(|blob| (blob, size)),
-            _ => None,
-        };
-        if let Some((blob, size)) = packed {
-            stmts.push((
-                "UPDATE extents SET plan = ?2, \
-                   posted_at = COALESCE((SELECT MAX(posted_at) FROM articles \
-                                          WHERE extent_id = ?1), ?5), \
-                   reposted_at = (SELECT MAX(reposted_at) FROM articles WHERE extent_id = ?1) \
-                 WHERE id = ?1 AND plan IS NULL AND cipher_size = ?3 AND article_count = ?4 \
-                   AND (SELECT COUNT(*) FROM articles \
-                         WHERE extent_id = ?1 AND state = 'posted') = ?4",
-                vec![
-                    text(id.as_str()),
-                    SqlValue::Blob(blob),
-                    int(size)?,
-                    int(plan.rows.len())?,
-                    SqlValue::Int(crate::plan::POSTED_AT_UNKNOWN),
-                ],
-            ));
-            // Only the rows of a plan that is packed: they are a copy of
-            // it from here on.
-            stmts.push((
-                "DELETE FROM articles WHERE extent_id = ?1 \
-                   AND (SELECT plan FROM extents WHERE id = ?1) IS NOT NULL",
-                vec![text(id.as_str())],
-            ));
+        // A plan that cannot be read stays as it is: the step goes on
+        // with the next extent, and the readers of this one report it.
+        if let Ok(plan) = stored_plan(c, id).await {
+            let posted = plan.rows.iter().all(|a| a.state == ArticleState::Posted);
+            // The plan covers the whole ciphertext: its end is the size.
+            let cipher_size = plan.rows.last().map(|a| a.cipher_offset + a.cipher_len);
+            // Rows beside a packed plan are a copy that was not dropped.
+            let mut copy = plan.packed.is_some();
+            let packed = match (&plan.packed, cipher_size) {
+                (None, Some(size)) if posted => crate::plan::pack_explicit(id, size, &plan.rows)
+                    .ok()
+                    .map(|blob| (blob, size)),
+                _ => None,
+            };
+            if let Some((blob, size)) = packed {
+                stmts.push((
+                    "UPDATE extents SET plan = ?2, \
+                       posted_at = COALESCE((SELECT MAX(posted_at) FROM articles \
+                                              WHERE extent_id = ?1), ?5), \
+                       reposted_at = (SELECT MAX(reposted_at) FROM articles \
+                                       WHERE extent_id = ?1) \
+                     WHERE id = ?1 AND plan IS NULL AND cipher_size = ?3 \
+                       AND article_count = ?4 \
+                       AND (SELECT COUNT(*) FROM articles \
+                             WHERE extent_id = ?1 AND state = 'posted') = ?4",
+                    vec![
+                        text(id.as_str()),
+                        SqlValue::Blob(blob),
+                        int(size)?,
+                        int(plan.rows.len())?,
+                        SqlValue::Int(crate::plan::POSTED_AT_UNKNOWN),
+                    ],
+                ));
+                packs.push(true);
+                copy = true;
+            }
+            if copy {
+                // Only the rows of a plan that is packed: they are a
+                // copy of it from here on.
+                stmts.push((
+                    "DELETE FROM articles WHERE extent_id = ?1 \
+                       AND (SELECT plan FROM extents WHERE id = ?1) IS NOT NULL",
+                    vec![text(id.as_str())],
+                ));
+                packs.push(false);
+            }
         }
         if stmts.len() >= 2 * PACK_CHUNK || (at + 1 == ids.len() && !stmts.is_empty()) {
             let changed = c.sql.batch(core::mem::take(&mut stmts)).await?;
-            let packed: u64 = changed.iter().step_by(2).sum();
+            let packed: u64 = changed
+                .iter()
+                .zip(packs.drain(..))
+                .filter_map(|(n, packs)| packs.then_some(*n))
+                .sum();
             report.packed += u32::try_from(packed).unwrap_or(u32::MAX);
         }
     }

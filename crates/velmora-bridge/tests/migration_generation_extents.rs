@@ -26,6 +26,7 @@ const UNDO_0005: &str = "DROP TRIGGER generation_extents_on_insert; \
      DROP TRIGGER outbox_keep_shared_extents; \
      DROP TRIGGER extents_keep_key_in_service; \
      DROP TRIGGER articles_keep_in_service; \
+     DROP TRIGGER extents_keep_plan_in_service; \
      DROP INDEX upload_parts_by_extent; \
      DROP TABLE generation_extents;";
 
