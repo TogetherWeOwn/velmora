@@ -9,6 +9,9 @@
     --accent: #7fb8a4; --accent-ink: #10201b; --danger: #e0796a; --hover: #2a2a27; }
 }
 * { box-sizing: border-box; }
+/* `hidden` always hides, whatever display a class sets (the Load more
+   button has display: block and stayed visible after the last page). */
+[hidden] { display: none !important; }
 body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; }
 button, .btn, input { font: inherit; color: inherit; }
 button, .btn {

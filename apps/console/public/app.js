@@ -1,6 +1,8 @@
 // velmora console UI. Plain DOM, no framework. User data only ever goes
 // into the page through textContent / properties, never innerHTML.
 
+import { emptyListing, mergePage, takeMoreToken } from "./listing.js";
+
 const PART = 16 * 1024 * 1024;
 const PART_CONCURRENCY = 2;
 const RETRIES = 4;
@@ -8,7 +10,7 @@ const RETRIES = 4;
 const $ = (id) => document.getElementById(id);
 // What the server says about this session (see /api/session).
 const session = { email: "", adopt: null }; // null: not known yet
-const state = { bucket: "", prefix: "", folders: [], files: [], next: null, selected: new Set(), filter: "", listing: "ok" };
+const state = { bucket: "", prefix: "", ...emptyListing(), selected: new Set(), filter: "", listing: "ok" };
 
 function el(tag, props = {}, ...children) {
   const n = document.createElement(tag);
@@ -167,56 +169,61 @@ async function open(bucket, prefix) {
   for (const b of $("buckets").querySelectorAll("button")) b.setAttribute("aria-current", String(b.textContent === bucket));
   renderCrumbs();
   // No row of the previous folder stays clickable while this one loads.
-  state.folders = [];
-  state.files = [];
-  state.next = null;
+  Object.assign(state, emptyListing());
   render();
-  if (!bucket) {
-    state.folders = [];
-    state.files = [];
-    state.next = null;
-    render();
-    return;
-  }
+  if (!bucket) return;
   await loadPage(false);
 }
 
 let listSeq = 0;
+let moreInFlight = false;
 
 async function loadPage(more) {
+  const { bucket, prefix } = state;
+  let token = null;
+  if (more) {
+    // One "Load more" at a time, each token once, and never page 1 again.
+    if (moreInFlight) return;
+    token = takeMoreToken(state);
+    if (!token) return render();
+    moreInFlight = true;
+  }
   // Only the newest listing may change the view: a slow answer for a
   // folder or bucket left meanwhile is dropped, success or failure.
   const seq = ++listSeq;
-  const { bucket, prefix } = state;
   if (!more) {
     state.listing = "loading";
     render();
+  } else {
+    $("more").disabled = true;
   }
-  const token = more ? state.next : null;
   let out = null;
   let failure = null;
   try {
     out = await api("/list", { query: { bucket, prefix, ...(token ? { token } : {}) } });
   } catch (e) {
     failure = e;
+  } finally {
+    if (more) {
+      moreInFlight = false;
+      $("more").disabled = false;
+    }
   }
   if (seq !== listSeq || bucket !== state.bucket || prefix !== state.prefix) return;
-  if (!more) {
-    state.folders = [];
-    state.files = [];
-    state.next = null;
-  }
   if (failure) {
     toast(`Listing failed: ${failure.message}`);
-    if (!more) state.listing = `Could not list this folder: ${failure.message}`;
-    // A failed "Load more" keeps the rows; it must not leave "Loading…" behind.
-    else if (state.listing === "loading") state.listing = "ok";
+    if (!more) {
+      Object.assign(state, emptyListing());
+      state.listing = `Could not list this folder: ${failure.message}`;
+    } else {
+      // The page was not loaded: its token may be tried again.
+      state.used.delete(token);
+      // A failed "Load more" keeps the rows; it must not leave "Loading…" behind.
+      if (state.listing === "loading") state.listing = "ok";
+    }
   } else {
     state.listing = "ok";
-    state.folders.push(...out.folders);
-    // The folder's own marker object is not listed as a file in it.
-    state.files.push(...out.files.filter((f) => f.key !== prefix));
-    state.next = out.truncated ? out.next : null;
+    mergePage(state, out, { more, prefix });
   }
   render();
 }
