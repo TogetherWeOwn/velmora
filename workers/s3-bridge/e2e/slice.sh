@@ -668,7 +668,7 @@ fi
 
 STEP=5c-move
 SMALL_KEY=a/small.bin
-# A local run always does this step. A remote run does it with E2E_COPY=1,
+# A local run does this step by default. A remote run does it with E2E_COPY=1,
 # against a remote with SERVER_SIDE_COPY on (the shipped production and dev
 # vars both have it on; with it off, CopyObject answers 501).
 if [[ ${E2E_COPY:-$([[ $MODE == local ]] && echo 1 || echo 0)} == 1 ]]; then
