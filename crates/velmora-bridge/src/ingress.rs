@@ -36,7 +36,7 @@ use subtle::ConstantTimeEq;
 use velmora_s3_proto::{is_aws_chunked, ErrorCode, UploadValidator};
 
 use crate::config::BridgeConfig;
-use crate::service::Route;
+use crate::service::{classify, Route};
 use crate::types::{Body, S3Request, S3Response};
 
 /// How long a request may wait for budget before `503 SlowDown`.
@@ -353,6 +353,58 @@ pub fn has_s3_credential(req: &S3Request) -> bool {
             .iter()
             .any(|n| n.as_slice() == b"X-Amz-Signature" || n.as_slice() == b"X-Amz-Credential")
     })
+}
+
+/// Whether an origin-form target (`/path?query`) is an admin route:
+/// `/_admin` or below it.
+pub fn is_admin_target(raw_target: &str) -> bool {
+    matches!(
+        classify(&crate::types::Method::Get, raw_target),
+        Route::Admin { .. }
+    )
+}
+
+/// [`is_admin_target`] of a full request URL. A URL whose target cannot
+/// be read counts as an admin one, so its refusal is not cached either.
+pub fn is_admin_url(url: &str) -> bool {
+    origin_form(url).map_or(true, is_admin_target)
+}
+
+/// Adds `cache-control: no-store` unless the response has a
+/// `cache-control` already. Every admin answer gets it.
+pub fn no_store(resp: &mut S3Response) {
+    if !resp
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+    {
+        resp.headers
+            .push(("cache-control".to_string(), "no-store".to_string()));
+    }
+}
+
+/// The front of every fetch once the request is parsed: [`precheck`],
+/// then `handle` (the bridge, however the runtime drives it). Every
+/// answer for an admin route, a refusal of the precheck too, carries
+/// `cache-control: no-store`.
+pub async fn front<F, Fut>(req: S3Request, cfg: &BridgeConfig, https: bool, handle: F) -> S3Response
+where
+    F: FnOnce(S3Request) -> Fut,
+    Fut: core::future::Future<Output = S3Response>,
+{
+    let admin = is_admin_target(&req.raw_target);
+    let checked = {
+        let route = classify(&req.method, &req.raw_target);
+        precheck(&route, &req, cfg, https)
+    };
+    let mut resp = match checked {
+        Err(e) => e.response(),
+        Ok(()) => handle(req).await,
+    };
+    if admin {
+        no_store(&mut resp);
+    }
+    resp
 }
 
 /// Headers-only checks run before routing into the bridge. Never reads the

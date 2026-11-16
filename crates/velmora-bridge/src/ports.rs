@@ -350,6 +350,18 @@ pub enum Guard<T> {
     Lost,
 }
 
+/// Outcome of [`Catalog::put_grant_if_present`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantPut {
+    /// The grant is stored (inserted, or replaced by an equal or wider one).
+    Applied,
+    /// Nothing was written: the key has `rw` on the bucket and `ro` was
+    /// asked for.
+    Narrowing,
+    /// Nothing was written: the key or the bucket does not exist.
+    Lost,
+}
+
 /// Outcome of a publication batch. The batch takes the proof of the
 /// generation's recovery record and turns it into an [`Unpublished`] only
 /// when it wrote nothing, so only then can the record be discarded.
@@ -387,6 +399,18 @@ pub trait Catalog {
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>>;
     async fn create_access_key(&self, k: &AccessKeyRow) -> Result<()>;
     async fn put_grant(&self, akid: &str, bucket: &BucketId, perm: Perm) -> Result<()>;
+    /// Sets the key's permission on the bucket in one statement that
+    /// writes only while both the key row and the bucket row exist, and
+    /// never narrows a grant: an `rw` grant is not replaced by `ro`.
+    /// Revocation and bucket deletion each remove their row and its
+    /// grants in one batch, so a grant stored through this is never left
+    /// behind by either, whichever commits first.
+    async fn put_grant_if_present(
+        &self,
+        akid: &str,
+        bucket: &BucketId,
+        perm: Perm,
+    ) -> Result<GrantPut>;
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>>;
     /// `true` while anything of the bucket is on record: a generation
     /// (live or not; none is ever removed), a key floor, an upload in any

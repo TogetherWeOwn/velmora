@@ -25,7 +25,6 @@ use std::task::{Poll, Waker};
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
 use velmora_bridge::keepalive;
-use velmora_bridge::service::classify;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
@@ -104,6 +103,16 @@ async fn handle_detached(
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let method = req.inner().method();
+    // Every answer for an admin route carries `no-store`, the early
+    // refusals below too.
+    let admin = ingress::is_admin_url(&req.inner().url());
+    let early = |resp: S3Response| {
+        let mut resp = resp;
+        if admin {
+            ingress::no_store(&mut resp);
+        }
+        http::to_response(resp)
+    };
     let request_id = req
         .headers()
         .get("cf-ray")
@@ -114,7 +123,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         Ok(bridge) => bridge,
         Err(class) => {
             console_error!("config refused: {class}");
-            return Ok(http::internal_error());
+            return Ok(early(ingress::IngressError::Internal.response()));
         }
     };
     let incoming = match http::to_s3_request(req) {
@@ -124,20 +133,17 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "{}",
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
-            return Ok(http::to_response(e.response()));
+            return Ok(early(e.response()));
         }
     };
     let target = incoming.req.raw_target.clone();
-    let route = classify(&incoming.req.method, &target);
-    let resp = match ingress::precheck(&route, &incoming.req, &bridge.cfg, incoming.https) {
-        Err(e) => e.response(),
-        Ok(()) => {
-            let resp = handle_detached(&ctx, Rc::clone(&bridge), incoming.req).await;
-            // A deferred document: buffered when it is done soon, else
-            // streamed with keepalive whitespace.
-            keepalive::settle_response(resp, env::sleeper()).await
-        }
-    };
+    let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
+        let resp = handle_detached(&ctx, Rc::clone(&bridge), req).await;
+        // A deferred document: buffered when it is done soon, else
+        // streamed with keepalive whitespace.
+        keepalive::settle_response(resp, env::sleeper()).await
+    })
+    .await;
     console_log!(
         "{}",
         ingress::log_line(&method, &target, resp.status, &request_id)
