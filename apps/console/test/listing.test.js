@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { emptyListing, mergePage, takeMoreToken } from "../public/listing.js";
+import { emptyListing, mergePage, releaseToken, takeMoreToken } from "../public/listing.js";
 
 const page = (n, last) => ({
   folders: [`d-${n}/`],
@@ -67,4 +67,21 @@ test("a truncated page without a token offers no Load more", () => {
 test("[hidden] always hides, whatever a class sets", () => {
   const css = readFileSync(new URL("../public/app.css", import.meta.url), "utf8");
   assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;?\s*\}/);
+});
+
+test("a failed Load more frees its token for a retry", () => {
+  const l = emptyListing();
+  mergePage(l, page(0), { more: false, prefix: "" });
+  const token = takeMoreToken(l);
+  assert.equal(takeMoreToken(l), null);
+  releaseToken(l, token);
+  assert.equal(takeMoreToken(l), "t1");
+});
+
+test("a server that repeats a token offers no Load more", () => {
+  const l = emptyListing();
+  mergePage(l, page(0), { more: false, prefix: "" });
+  takeMoreToken(l); // t1 sent
+  mergePage(l, { folders: [], files: [], truncated: true, next: "t1" }, { more: true, prefix: "" });
+  assert.equal(l.next, null);
 });

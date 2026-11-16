@@ -42,4 +42,11 @@ export function mergePage(listing, out, { more, prefix }) {
     listing.files.push(f);
   }
   listing.next = out.truncated && out.next ? out.next : null;
+  // A token that was sent already would only repeat a page: no Load more.
+  if (listing.next && listing.used.has(listing.next)) listing.next = null;
+}
+
+/** After a failed "Load more", its token may be tried again. */
+export function releaseToken(listing, token) {
+  listing.used.delete(token);
 }

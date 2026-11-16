@@ -1,7 +1,7 @@
 // velmora console UI. Plain DOM, no framework. User data only ever goes
 // into the page through textContent / properties, never innerHTML.
 
-import { emptyListing, mergePage, takeMoreToken } from "./listing.js";
+import { emptyListing, mergePage, releaseToken, takeMoreToken } from "./listing.js";
 
 const PART = 16 * 1024 * 1024;
 const PART_CONCURRENCY = 2;
@@ -170,6 +170,10 @@ async function open(bucket, prefix) {
   renderCrumbs();
   // No row of the previous folder stays clickable while this one loads.
   Object.assign(state, emptyListing());
+  // A "Load more" still running for the folder left must not block this
+  // one; its late answer is dropped by the sequence check.
+  moreInFlight = false;
+  $("more").disabled = false;
   render();
   if (!bucket) return;
   await loadPage(false);
@@ -192,6 +196,9 @@ async function loadPage(more) {
   // folder or bucket left meanwhile is dropped, success or failure.
   const seq = ++listSeq;
   if (!more) {
+    // A fresh listing supersedes any "Load more" still running.
+    moreInFlight = false;
+    $("more").disabled = false;
     state.listing = "loading";
     render();
   } else {
@@ -204,7 +211,8 @@ async function loadPage(more) {
   } catch (e) {
     failure = e;
   } finally {
-    if (more) {
+    // Only the newest request may release the button.
+    if (more && seq === listSeq) {
       moreInFlight = false;
       $("more").disabled = false;
     }
@@ -217,7 +225,7 @@ async function loadPage(more) {
       state.listing = `Could not list this folder: ${failure.message}`;
     } else {
       // The page was not loaded: its token may be tried again.
-      state.used.delete(token);
+      releaseToken(state, token);
       // A failed "Load more" keeps the rows; it must not leave "Loading…" behind.
       if (state.listing === "loading") state.listing = "ok";
     }
