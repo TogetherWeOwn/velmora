@@ -1083,6 +1083,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         state: ArticleState::Planned,
         provider_id: None,
         posted_at: None,
+        reposted_at: None,
     };
     let verification = VerificationRow {
         extent_id: extent.id.clone(),

@@ -589,6 +589,10 @@ pub trait Catalog {
         posted: &[(u32, &str)],
         now: UnixMs,
     ) -> Result<bool>;
+    /// Stamps the articles `idxs` as posted again at `now`
+    /// (`ArticleRow::reposted_at`), in one atomic write. A stamp never
+    /// moves back. `false` = fenced, and then nothing was written.
+    async fn mark_reposted_many(&self, l: &Lease, idxs: &[u32], now: UnixMs) -> Result<bool>;
     /// Renews the lease and every permit in one round trip. `.0` = the
     /// lease still holds; `.1[i]` = `permits[i]` is still held. Each
     /// renewal stands on its own: a lost lease does not undo the permits.

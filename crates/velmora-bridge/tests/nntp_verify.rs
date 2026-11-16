@@ -20,6 +20,12 @@ fn backoff(attempts: u32) -> u32 {
     60 << (attempts - 1)
 }
 
+/// The rows as they were before any repost was stamped on them.
+fn without_repost_stamps(mut plan: Vec<ArticleRow>) -> Vec<ArticleRow> {
+    plan.iter_mut().for_each(|a| a.reposted_at = None);
+    plan
+}
+
 fn retry_delay(outcome: &JobOutcome) -> u32 {
     match outcome {
         JobOutcome::Retry { delay_secs } => *delay_secs,
@@ -348,6 +354,70 @@ async fn release_waits_for_the_minimum_age() {
         rig.bridge.catalog.extent(&s.extent).safety_state,
         SafetyState::Released
     );
+}
+
+/// The minimum age counts from the post, not from the upload: an extent
+/// stored twice the minimum age before it was posted is not released
+/// until the articles themselves are that old.
+#[tokio::test]
+async fn the_minimum_age_counts_from_the_post_not_from_the_upload() {
+    let mut rig = simple_rig().await;
+    let day = 24 * 3600;
+    rig.bridge.cfg.safety_min_age_secs = day;
+    let s = rig.seed(40, &marked_plaintext(PLAIN_LEN)).await;
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).created_at, T0);
+    // A posting backlog: the extent waits two days for its post.
+    rig.bridge.clock.advance_secs(2 * day);
+    let plan = rig.post(&s).await;
+    let posted = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
+    assert!(posted >= T0.plus_secs(2 * day));
+    let ready = posted.plus_secs(day);
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let outbox = rig.outbox(&s);
+    assert_eq!(outbox.stage, OutboxStage::Release);
+    assert_eq!(outbox.next_at, ready);
+    assert!(rig.sent_stages().is_empty());
+
+    // A release job that runs early defers itself and reads nothing, up
+    // to the last millisecond.
+    for early in [rig.bridge.clock.now(), UnixMs(ready.0 - 1)] {
+        rig.bridge.clock.set(early);
+        rig.bridge
+            .catalog
+            .edit(&s.extent, |e| e.outbox.next_at = early);
+        let connects = rig.bridge.nntp.connects();
+        assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+        assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+        assert_eq!(rig.outbox(&s).next_at, ready);
+        assert_eq!(rig.bridge.nntp.connects(), connects);
+        assert!(rig.safety_held(&s));
+    }
+
+    rig.bridge.clock.set(ready);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
+}
+
+/// An extent posted before it was stored (a clock that stepped back)
+/// still waits the minimum age from when it was stored: nothing is
+/// released earlier than it was before the post time counted.
+#[tokio::test]
+async fn the_minimum_age_never_ends_before_it_would_from_the_upload() {
+    let mut rig = simple_rig().await;
+    let day = 24 * 3600;
+    rig.bridge.cfg.safety_min_age_secs = day;
+    let (s, _) = rig.posted(41).await;
+    let later = rig.bridge.clock.now().plus_secs(3600);
+    rig.bridge
+        .catalog
+        .edit(&s.extent, |e| e.job.extent.created_at = later);
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).next_at, later.plus_secs(day));
 }
 
 #[tokio::test]
@@ -1200,7 +1270,7 @@ async fn missing_after_the_grace_is_posted_to_the_backbone_that_lacks_it() {
         assert!(ids.contains(&format!("<{}>", row.message_id)));
     }
     // The first provider stays the recorded one.
-    assert_eq!(rig.plan(&s).await, plan);
+    assert_eq!(without_repost_stamps(rig.plan(&s).await), plan);
     assert_eq!(rig.servers[0].posted_count().await, 3);
     assert_eq!(rig.bridge.nntp.live(), 0);
 
@@ -1218,6 +1288,111 @@ async fn missing_after_the_grace_is_posted_to_the_backbone_that_lacks_it() {
         rig.bridge.catalog.extent(&s.extent).safety_state,
         SafetyState::Released
     );
+}
+
+/// A repost starts the minimum age again: the safety copy outlasts a soak
+/// of the reposted articles, however old the first post is. Without it a
+/// release could follow the repost within minutes, on a `STAT` of the
+/// backbone that only just got the articles.
+#[tokio::test]
+async fn a_repost_moves_the_release_later() {
+    let mut rig = two_posting_backbones().await;
+    let day = 24 * 3600;
+    rig.bridge.cfg.safety_min_age_secs = day;
+    let (s, plan) = rig.waited_out_the_grace(36).await;
+    let posted = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
+    assert!(plan.iter().all(|a| a.reposted_at.is_none()));
+    rig.propagate_one(&plan[0]).await;
+
+    let reposted = rig.bridge.clock.now();
+    // Hours after the first post, which is when the extent was stored.
+    assert_eq!(
+        reposted,
+        posted.plus_secs(rig.bridge.cfg.propagation_grace_secs)
+    );
+    assert!(reposted > T0.plus_secs(3600));
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    // Only the articles that were posted again are stamped, and nothing
+    // else of the rows changes.
+    let now = rig.plan(&s).await;
+    let stamps: Vec<_> = now.iter().map(|a| a.reposted_at).collect();
+    assert_eq!(stamps, [None, Some(reposted), Some(reposted)]);
+    assert_eq!(without_repost_stamps(now), plan);
+
+    rig.bridge.clock.advance_secs(delay);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let ready = reposted.plus_secs(day);
+    let outbox = rig.outbox(&s);
+    assert_eq!(outbox.stage, OutboxStage::Release);
+    assert_eq!(outbox.next_at, ready);
+
+    // Not released before then, even by a release job that runs early.
+    rig.bridge.clock.set(UnixMs(ready.0 - 1));
+    rig.bridge
+        .catalog
+        .edit(&s.extent, |e| e.outbox.next_at = T0);
+    let connects = rig.bridge.nntp.connects();
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.outbox(&s).next_at, ready);
+    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert!(rig.safety_held(&s));
+
+    rig.bridge.clock.set(ready);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.catalog.extent(&s.extent).safety_state,
+        SafetyState::Released
+    );
+}
+
+/// The stamp of a repost is the time the provider took the article, not
+/// only the time the job set out to send it: the minimum age starts
+/// when the last POST of the repost has been answered.
+#[tokio::test]
+async fn a_repost_is_stamped_when_the_provider_has_taken_it() {
+    let mut rig = two_posting_backbones().await;
+    let day = 24 * 3600;
+    rig.bridge.cfg.safety_min_age_secs = day;
+    let (s, _) = rig.waited_out_the_grace(38).await;
+    // Every call to a provider takes two seconds from here on.
+    rig.bridge.nntp.slow(&rig.bridge.clock, 2000);
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    let calls = rig.bridge.nntp.calls();
+    let posts = calls.iter().filter(|c| c.0 == "post").map(|c| c.1);
+    let answered = posts.max().expect("a POST").plus_ms(2000);
+    let plan = rig.plan(&s).await;
+    for row in &plan {
+        assert!(row.reposted_at >= Some(answered), "{:?}", row.reposted_at);
+    }
+    let newest = plan.iter().filter_map(|a| a.reposted_at).max().unwrap();
+
+    rig.bridge.clock.advance_secs(delay);
+    while rig.outbox(&s).stage == OutboxStage::Verify {
+        assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    }
+    let outbox = rig.outbox(&s);
+    assert_eq!(outbox.stage, OutboxStage::Release);
+    assert_eq!(outbox.next_at, newest.plus_secs(day));
+}
+
+/// The repost is stamped before anything is sent: when the stamp cannot
+/// be written, nothing is posted, so no repost exists that the minimum
+/// age does not know of.
+#[tokio::test]
+async fn nothing_is_reposted_without_its_stamp() {
+    let rig = two_posting_backbones().await;
+    let (s, plan) = rig.waited_out_the_grace(37).await;
+    rig.bridge.catalog.fail_mark_reposted.set(1);
+
+    assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    assert_eq!(rig.plan(&s).await, plan);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_ne!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
 /// A repost that is larger than the whole budget runs alone, next to the
@@ -1372,7 +1547,7 @@ async fn an_article_the_posting_provider_lost_is_posted_there_again() {
     let rows = rig.rows(&s);
     assert_eq!(rows.last().unwrap().result, VerifyResult::Ok);
     // The same message-ids throughout, and the rows as they were.
-    assert_eq!(rig.plan(&s).await, plan);
+    assert_eq!(without_repost_stamps(rig.plan(&s).await), plan);
     let ids = rig.servers[0].posted_ids().await;
     for row in &plan {
         assert!(ids.contains(&format!("<{}>", row.message_id)));
@@ -1428,7 +1603,7 @@ async fn a_revived_extent_is_not_posted_again() {
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     assert!(rig.bridge.nntp.calls().iter().all(|c| c.0 != "post"));
-    assert_eq!(rig.plan(&s).await, plan);
+    assert_eq!(without_repost_stamps(rig.plan(&s).await), plan);
     assert_eq!(rig.servers[0].posted_count().await, plan.len());
     assert_eq!(rig.servers[1].posted_count().await, plan.len());
 }
