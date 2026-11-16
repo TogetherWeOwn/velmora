@@ -185,6 +185,72 @@ fn pieces(extents: Vec<ExtentRow>, start: u64, len: u64) -> Option<Vec<Piece>> {
     (covered == len).then_some(out)
 }
 
+/// Marks an object response `no-transform` so the edge in front of the
+/// Worker passes it on as it is.
+///
+/// Without it, the edge compresses responses of compressible types
+/// (`text/*`, JSON, JavaScript, SVG, ...) when the client accepts gzip or
+/// brotli, and rewrites `text/html` (email obfuscation and similar)
+/// whatever the client accepts. Either way it drops `Content-Length` and
+/// drops or weakens the `ETag`, also on HEAD. S3 clients read the size
+/// and the MD5 from exactly those two headers; rclone, for one, takes the
+/// missing length as size 0, calls the upload corrupt and deletes it.
+///
+/// The stored metadata is not changed. A stored `Cache-Control` is kept
+/// and `no-transform` is appended to it (`max-age=60` is served as
+/// `max-age=60, no-transform`), unless it already has the directive; an
+/// object without one is served `Cache-Control: no-transform`.
+fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
+    const DIRECTIVE: &str = "no-transform";
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+    {
+        Some((_, value)) => {
+            let present = directives(value)
+                .iter()
+                .any(|d| d.trim().eq_ignore_ascii_case(DIRECTIVE));
+            if !present {
+                // Trailing commas are dropped rather than doubled.
+                let base = value
+                    .trim()
+                    .trim_end_matches(|c: char| c == ',' || c.is_ascii_whitespace());
+                *value = if base.is_empty() {
+                    DIRECTIVE.to_string()
+                } else {
+                    format!("{base}, {DIRECTIVE}")
+                };
+            }
+        }
+        None => headers.push(("cache-control".to_string(), DIRECTIVE.to_string())),
+    }
+}
+
+/// The directives of a `Cache-Control` value: split at the commas outside
+/// quoted strings (`private="a, b"` is one directive), a backslash escaping
+/// the next character inside one.
+fn directives(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
+}
+
 async fn read<
     C: Catalog + 'static,
     B: BlobStore + 'static,
@@ -230,9 +296,11 @@ async fn read<
         authed.headers.get("x-amz-checksum-mode").is_some(),
     )
     .map_err(s3_error)?;
+    let mut headers = plan.headers;
+    forbid_edge_transform(&mut headers);
     let mut resp = S3Response {
         status: plan.status,
-        headers: plan.headers,
+        headers,
         body: RespBody::Empty,
     };
     let Some(range) = plan.body else {
@@ -504,6 +572,92 @@ where
             let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
             stamp_read(bridge, &extent.id, from_cache).await;
             return Ok(held);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forbid_edge_transform;
+
+    fn served(stored: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut headers = stored
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        forbid_edge_transform(&mut headers);
+        headers
+    }
+
+    fn cache_control(headers: &[(String, String)]) -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_object_without_cache_control_gets_no_transform() {
+        let h = served(&[("content-type", "text/html"), ("etag", "\"e\"")]);
+        assert_eq!(cache_control(&h), ["no-transform"]);
+        assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn a_stored_cache_control_is_kept_and_extended() {
+        let h = served(&[("cache-control", "max-age=60, private")]);
+        assert_eq!(cache_control(&h), ["max-age=60, private, no-transform"]);
+    }
+
+    #[test]
+    fn a_stored_no_transform_is_not_repeated() {
+        for stored in [
+            "no-transform",
+            "max-age=60, No-Transform",
+            " no-transform ,public",
+        ] {
+            let h = served(&[("cache-control", stored)]);
+            assert_eq!(cache_control(&h), [stored], "{stored:?}");
+        }
+        // A directive that only contains the word does not count.
+        let h = served(&[("cache-control", "x-no-transform-ish")]);
+        assert_eq!(cache_control(&h), ["x-no-transform-ish, no-transform"]);
+    }
+
+    #[test]
+    fn a_quoted_argument_is_not_a_directive() {
+        // RFC 9111 field-name lists: the quoted `no-transform` is a name.
+        let stored = r#"private="x-a,no-transform,x-b""#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [format!("{stored}, no-transform")]);
+        // An escaped quote does not end the quoted string.
+        let stored = r#"private="a\",no-transform", max-age=5"#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [format!("{stored}, no-transform")]);
+        // A real directive after a quoted argument counts.
+        let stored = r#"no-cache="set-cookie, x", no-transform"#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [stored]);
+    }
+
+    #[test]
+    fn an_empty_stored_cache_control_becomes_no_transform() {
+        for stored in ["", " ", ","] {
+            let h = served(&[("Cache-Control", stored)]);
+            assert_eq!(cache_control(&h), ["no-transform"], "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_is_not_doubled() {
+        for stored in ["max-age=60, ", "max-age=60, ,", "max-age=60,,"] {
+            let h = served(&[("cache-control", stored)]);
+            assert_eq!(
+                cache_control(&h),
+                ["max-age=60, no-transform"],
+                "{stored:?}"
+            );
         }
     }
 }
