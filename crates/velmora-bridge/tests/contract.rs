@@ -265,7 +265,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.required_backbones, 2);
     assert_eq!(cfg.max_extent_bytes, 16 * 1024 * 1024);
     assert_eq!(cfg.inflight_budget_bytes, 48 * 1024 * 1024);
-    assert_eq!(cfg.safety_min_age_secs, 604_800);
+    assert_eq!(cfg.safety_min_age_secs, 86_400);
     assert_eq!(cfg.verify_delay_secs, 120);
     assert_eq!(
         cfg.newsgroups,
