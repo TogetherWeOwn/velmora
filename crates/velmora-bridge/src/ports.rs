@@ -48,7 +48,7 @@ pub type Row = Vec<SqlValue>;
 /// statement is an error too, and in both cases nothing was written.
 ///
 /// As on D1: at most [`MAX_SQL_PARAMS`] bound parameters per statement
-/// (more is an error), and `exec`/`batch` run every statement to
+/// and [`MAX_SQL_VALUE_BYTES`] per bound value (more is an error), and `exec`/`batch` run every statement to
 /// completion, so `RETURNING` and `SELECT` statements are accepted (their
 /// rows are discarded; a `SELECT` changes 0 rows).
 pub trait Sql {
@@ -57,10 +57,47 @@ pub trait Sql {
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64>;
     /// Atomic. Returns rows changed per statement.
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>>;
+    /// What one statement may carry on this database. An adapter for a
+    /// database with other limits says so here; catalogue code never
+    /// writes such a figure down itself.
+    fn limits(&self) -> SqlLimits {
+        SqlLimits::D1
+    }
 }
+
+// The limits of the database behind [`Sql`] live here and nowhere else:
+// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`] and [`SqlLimits`]. They are
+// D1's. The statements themselves are plain SQLite and run unchanged on
+// any SQLite behind the port.
 
 /// D1's bound-parameter limit per statement.
 pub const MAX_SQL_PARAMS: usize = 100;
+
+/// D1's limit on one bound text or blob value, in bytes. More is an error.
+pub const MAX_SQL_VALUE_BYTES: usize = 2_000_000;
+
+/// How much a set-based statement may carry: one that takes its rows from
+/// a single JSON parameter (the publish of a generation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlLimits {
+    /// Largest bound value such a statement is built with, in bytes.
+    pub value_bytes: usize,
+    /// Most rows one such value describes.
+    pub set_rows: usize,
+}
+
+impl SqlLimits {
+    /// D1, as measured with a publish of 65,536 extents in one batch:
+    /// values of up to 1.3 MB were accepted, 25,000 rows a value. The
+    /// byte limit stays under [`MAX_SQL_VALUE_BYTES`].
+    pub const D1: SqlLimits = SqlLimits {
+        value_bytes: 1_900_000,
+        set_rows: 25_000,
+    };
+}
+
+// A value the publish builds is one D1 takes.
+const _: () = assert!(SqlLimits::D1.value_bytes < MAX_SQL_VALUE_BYTES);
 
 /// Whether a database error message is the `tx_guard` CHECK firing
 /// (`CHECK (ok = 1)` in `0001_init.sql`). SQLite and D1 both report
@@ -974,6 +1011,14 @@ pub trait Catalog {
         placements: &[ExtentPlacement],
         now: UnixMs,
     ) -> Result<ReplayPublish>;
+    /// The id of the live generation of the key of `g`, if it is the
+    /// same object: the same size and ETag, and exactly these extents at
+    /// these places. No extent row is loaded.
+    async fn replay_twin(
+        &self,
+        g: &GenerationRow,
+        placements: &[ExtentPlacement],
+    ) -> Result<Option<GenerationId>>;
 
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()>;

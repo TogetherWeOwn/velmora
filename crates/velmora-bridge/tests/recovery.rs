@@ -2097,6 +2097,136 @@ async fn two_records_of_one_object_are_not_reported_as_a_loss() {
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
 }
 
+/// D1 charges a batch that did not commit in full, and can answer the
+/// statements after a large one with "overloaded" for some seconds. The
+/// fence of Complete is the first of them: it settles nothing then, so
+/// the record of the attempt stays and the upload stays open.
+#[tokio::test(flavor = "current_thread")]
+async fn an_overloaded_catalogue_after_a_failed_complete_keeps_the_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    // The batch gets no answer, and neither the fence nor anything
+    // asked after it in this request gets one that says something.
+    let sql = &rig.bridge.catalog.sql;
+    sql.fail_publish.set(Some(PublishFault::Overloaded(1_000)));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    assert!(sql.overloaded.get() < 1_000, "the fence was sent");
+    sql.overloaded.set(0);
+    assert_eq!(records(&rig).len(), before + 1);
+    // Nothing is published, and the upload is open as it was.
+    get(&rig, &signer, "big").await.expect(404);
+    let (state, revision): (String, i64) = sql.with_conn(|c| {
+        c.query_row("SELECT state, revision FROM uploads", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    });
+    assert_eq!((state.as_str(), revision), ("open", 2));
+
+    // The same Complete then goes through.
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(records(&rig).len(), before + 2);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+
+    // From the records alone: both name the same extents, the later
+    // one stands.
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.duplicate), (2, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+/// The same after a batch that a guard refused: the catalogue said that
+/// nothing was published, but cannot be asked whether a row stands
+/// under the id. The record goes only on that answer, so here it stays.
+#[tokio::test(flavor = "current_thread")]
+async fn an_overloaded_catalogue_after_a_refused_complete_keeps_the_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    let sql = &rig.bridge.catalog.sql;
+    sql.fail_publish
+        .set(Some(PublishFault::RefusedOverloaded(1_000)));
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(500);
+    // Asked more than once, and never answered.
+    assert!(sql.overloaded.get() < 999);
+    sql.overloaded.set(0);
+    assert_eq!(records(&rig).len(), before + 1);
+    get(&rig, &signer, "big").await.expect(404);
+    let staged: i64 = sql.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND generation_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(staged, 2);
+
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(records(&rig).len(), before + 2);
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+    tick(&rig);
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.duplicate), (2, 0), "{report:?}");
+    assert!(report.unpublishable.is_empty(), "{report:?}");
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
+}
+
+/// One overloaded answer, and then the catalogue says that no row
+/// stands under the id: only then is the record of the refused attempt
+/// removed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_complete_drops_its_record_once_the_catalogue_answers() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let (id, etags, _) = two_parts(&rig, &signer, "big").await;
+    let before = records(&rig).len();
+    tick(&rig);
+
+    let sql = &rig.bridge.catalog.sql;
+    sql.fail_publish
+        .set(Some(PublishFault::RefusedOverloaded(1)));
+    // Nothing changed the upload, so the refusal is put down to its
+    // parts: the injected guard looks like that to the service.
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(400);
+    assert_eq!(sql.overloaded.get(), 0);
+    assert_eq!(records(&rig).len(), before);
+    get(&rig, &signer, "big").await.expect(404);
+
+    tick(&rig);
+    complete(&rig, &signer, "big", &id, &etags)
+        .await
+        .expect(200);
+    assert_eq!(records(&rig).len(), before + 1);
+    tick(&rig);
+    replay_answers_the_same(&rig, &signer, &["big"]).await;
+}
+
 /// A Complete that got no answer leaves its record; a delete of the key
 /// lands; the Complete is sent again and succeeds. The object must
 /// stand under the id of the second record, or the tombstone, which

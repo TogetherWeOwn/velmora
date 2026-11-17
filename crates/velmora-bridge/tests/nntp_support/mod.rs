@@ -1232,6 +1232,13 @@ impl Catalog for MemCatalog {
     ) -> Result<velmora_bridge::replay::ReplayPublish> {
         unused()
     }
+    async fn replay_twin(
+        &self,
+        _: &GenerationRow,
+        _: &[velmora_bridge::ExtentPlacement],
+    ) -> Result<Option<GenerationId>> {
+        unused()
+    }
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {
         unused()
     }
