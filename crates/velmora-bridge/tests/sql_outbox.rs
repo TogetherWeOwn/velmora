@@ -2172,7 +2172,8 @@ async fn cursor_and_labels_behave_as_the_jobs_expect() {
         .unwrap());
     let v = fx.claim(&o, OutboxStage::Verify, t1).await.unwrap();
     assert_eq!((v.cursor, v.attempts), (10, 2));
-    // Next backbone, handed to a fresh job without spending an attempt.
+    // The resume point of the next backbone, and the row given back
+    // without spending an attempt.
     assert!(fx.cat.set_cursor(&v, 2 * 8, t1).await.unwrap());
     assert!(fx.cat.defer(&v, t1, t1).await.unwrap());
     let v = fx.claim(&o, OutboxStage::Verify, t1).await.unwrap();
