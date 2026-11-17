@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use velmora_bridge::ingress::ByteBudget;
-use velmora_bridge::jobtable::{JobTable, JOB_BEAT_MS, JOB_MAX_AGE_MS, JOB_QUIET_MS};
+use velmora_bridge::jobtable::{JobTable, Ran, JOB_BEAT_MS, JOB_MAX_AGE_MS, JOB_QUIET_MS};
 use velmora_bridge::{JobOutcome, UnixMs};
 
 /// Name of the dev-only variable that abandons post jobs.
@@ -97,6 +97,10 @@ fn abandon_this_one() -> bool {
 /// polled again, so its mark goes stale and another invocation drops
 /// the job after `JOB_QUIET_MS`.
 ///
+/// A job that has not ended after `JOB_WAIT_MS` is dropped here and the
+/// message is tried again: with the beat pending, the runtime no longer
+/// ends an invocation whose job waits on something that cannot come.
+///
 /// `None`: the job was dropped while this invocation still ran. That
 /// takes an invocation whose timer did not fire for `JOB_QUIET_MS`, or a
 /// job older than the platform lets an invocation be. This invocation
@@ -108,34 +112,32 @@ pub async fn run(
     post: bool,
     job: impl Future<Output = JobOutcome> + 'static,
 ) -> Option<JobOutcome> {
-    let mut running = TABLE.with(|t| t.run(now, job));
+    let running = TABLE.with(|t| t.run(now, job));
     if !(post && abandon_this_one()) {
         // The job is marked for as long as this invocation runs: were
         // it cancelled, the timer would not fire again and the mark
         // would go stale.
-        let mut marked = now;
-        loop {
-            let beat = Box::pin(worker::Delay::from(Duration::from_millis(
-                JOB_BEAT_MS as u64,
-            )));
-            match select(running, beat).await {
-                Either::Left((None, _)) => {
-                    // How late this invocation's timer was: what
-                    // `JOB_QUIET_MS` has to exceed.
-                    let late = worker::Date::now().as_millis() as i64 - marked.0;
-                    worker::console_error!(
-                        "job table: a running job was dropped: unmarked_ms={late}"
-                    );
-                    return None;
-                }
-                Either::Left((outcome, _)) => return outcome,
-                Either::Right(((), r)) => {
-                    running = r;
-                    marked = UnixMs(worker::Date::now().as_millis() as i64);
-                    running.seen(marked);
-                }
+        let clock = || UnixMs(worker::Date::now().as_millis() as i64);
+        let beat = || worker::Delay::from(Duration::from_millis(JOB_BEAT_MS as u64));
+        return match running.marked(now, clock, beat).await {
+            Ran::Done(outcome) => Some(outcome),
+            Ran::Dropped { unmarked_ms } => {
+                // How late this invocation's timer was: what
+                // `JOB_QUIET_MS` has to exceed.
+                worker::console_error!(
+                    "job table: a running job was dropped: unmarked_ms={unmarked_ms}"
+                );
+                None
             }
-        }
+            Ran::Overdue { waited_ms } => {
+                worker::console_error!(
+                    "job table: a job did not end and was given up: waited_ms={waited_ms}"
+                );
+                Some(JobOutcome::Retry {
+                    delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
+                })
+            }
+        };
     }
     let pause = Box::pin(worker::Delay::from(ABANDON_AFTER));
     match select(running, pause).await {

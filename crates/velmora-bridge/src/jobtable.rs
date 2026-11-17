@@ -52,6 +52,40 @@ pub const JOB_BEAT_MS: i64 = 5_000;
 /// longer runs: twelve marks in a row were missed.
 pub const JOB_QUIET_MS: i64 = 60_000;
 
+/// How long an invocation waits for its job: 13 minutes. After that it
+/// drops the job and has the message tried again.
+///
+/// The beat is a timer that is always pending, so the runtime never
+/// sees an invocation whose job waits on something that cannot come as
+/// hung, which it ended at once when the job was awaited alone. This
+/// limit ends such an invocation instead. It is under the 15 minutes
+/// the platform gives an invocation of a queue consumer, so the job is
+/// dropped inside its own invocation and the retry is asked for rather
+/// than left to the platform; and it is about twice the longest
+/// invocation that succeeded in a day of production (393 s), so no job
+/// that was going to end is cut short. A job has no shorter limit of
+/// its own to go by: it renews its lease for as long as it runs.
+pub const JOB_WAIT_MS: i64 = 13 * 60 * 1000;
+
+const _: () = assert!(JOB_WAIT_MS < JOB_MAX_AGE_MS - 2 * 60 * 1000);
+const _: () = assert!(JOB_BEAT_MS * 4 <= JOB_QUIET_MS);
+
+/// How a job ended for the invocation that waited for it
+/// ([`Running::marked`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ran<T> {
+    Done(T),
+    /// Another invocation dropped the job (`reap`, `reap_quiet`) while
+    /// this one still ran; its last mark was `unmarked_ms` ago.
+    Dropped {
+        unmarked_ms: i64,
+    },
+    /// The job did not end within [`JOB_WAIT_MS`] and was dropped here.
+    Overdue {
+        waited_ms: i64,
+    },
+}
+
 struct Slot<'a, T> {
     id: u64,
     started: UnixMs,
@@ -205,6 +239,47 @@ impl<T> Running<'_, T> {
         if let Some(slot) = slots.iter_mut().find(|s| s.id == self.id) {
             if now.0 > slot.seen.0 {
                 slot.seen = now;
+            }
+        }
+    }
+}
+
+impl<T> Running<'_, T> {
+    /// Waits for the job, which began at `started`, and marks it after
+    /// every `beat` (a timer of [`JOB_BEAT_MS`] of the invocation's
+    /// own; `now` is its clock). Gives up at [`JOB_WAIT_MS`]: the job is
+    /// then dropped, in this invocation, with all it holds.
+    pub async fn marked<B>(
+        mut self,
+        started: UnixMs,
+        now: impl Fn() -> UnixMs,
+        beat: impl Fn() -> B,
+    ) -> Ran<T>
+    where
+        B: Future<Output = ()>,
+    {
+        use futures_util::future::{select, Either};
+        let mut marked = started;
+        loop {
+            let timer = Box::pin(beat());
+            match select(self, timer).await {
+                Either::Left((Some(out), _)) => return Ran::Done(out),
+                Either::Left((None, _)) => {
+                    return Ran::Dropped {
+                        unmarked_ms: now().0.saturating_sub(marked.0),
+                    }
+                }
+                Either::Right(((), running)) => {
+                    self = running;
+                    marked = now();
+                    let waited_ms = marked.0.saturating_sub(started.0);
+                    if waited_ms >= JOB_WAIT_MS {
+                        // `self` is dropped on return, and the job
+                        // with it.
+                        return Ran::Overdue { waited_ms };
+                    }
+                    self.seen(marked);
+                }
             }
         }
     }
@@ -455,5 +530,85 @@ mod tests {
         assert_eq!((&mut job).now_or_never(), Some(None));
         assert_eq!(seen.get(), 100);
         assert!(table.is_empty());
+    }
+
+    /// Beats that are over at once and move the clock on by one beat.
+    fn beats(clock: &Rc<Cell<i64>>) -> impl Fn() -> LocalBoxFuture<'static, ()> + '_ {
+        move || {
+            let clock = Rc::clone(clock);
+            Box::pin(async move { clock.set(clock.get() + JOB_BEAT_MS) })
+        }
+    }
+
+    /// The beat keeps an invocation busy for good, so a job that waits
+    /// on something that never comes is given up at `JOB_WAIT_MS`: the
+    /// job is dropped there, its bytes are back, and the caller is told
+    /// to try the message again.
+    #[test]
+    fn a_job_that_never_ends_is_given_up_at_the_wait_limit() {
+        let budget = Rc::new(ByteBudget::new(72 * MIB));
+        let table = JobTable::new();
+        let clock = Rc::new(Cell::new(1_000));
+        let running = table.run(UnixMs(1_000), stuck(Rc::clone(&budget), 22 * MIB));
+        let ran = running
+            .marked(UnixMs(1_000), || UnixMs(clock.get()), beats(&clock))
+            .now_or_never()
+            .expect("ends without anything waking it but the beats");
+        assert_eq!(
+            ran,
+            Ran::Overdue {
+                waited_ms: JOB_WAIT_MS
+            }
+        );
+        assert_eq!((table.len(), budget.in_use()), (0, 0));
+        // Dropped by its own invocation, not by a reap.
+        assert_eq!(table.reaped(), 0);
+    }
+
+    /// Up to the limit the job is marked at every beat, so the quiet
+    /// drop leaves it alone; and a job that ends is not held to the
+    /// limit.
+    #[test]
+    fn a_waited_job_is_marked_until_it_ends() {
+        let table = JobTable::new();
+        let clock = Rc::new(Cell::new(0));
+        let c = Rc::clone(&clock);
+        let t = table.clone();
+        // Ends once ten minutes have passed; every poll looks for a
+        // quiet job as another invocation would.
+        let job = std::future::poll_fn(move |_| {
+            assert_eq!(t.reap_quiet(UnixMs(c.get()), JOB_QUIET_MS), 0);
+            if c.get() >= 10 * 60 * 1000 {
+                Poll::Ready(7)
+            } else {
+                Poll::Pending
+            }
+        });
+        let ran = table
+            .run(UnixMs(0), job)
+            .marked(UnixMs(0), || UnixMs(clock.get()), beats(&clock))
+            .now_or_never();
+        assert_eq!(ran, Some(Ran::Done(7)));
+        assert_eq!(table.len(), 0);
+    }
+
+    /// A job another invocation dropped: the waiting one says how long
+    /// ago it last marked it.
+    #[test]
+    fn a_job_dropped_under_its_invocation_reports_how_late_the_mark_was() {
+        let table = JobTable::new();
+        let clock = Rc::new(Cell::new(0));
+        let running = table.run(UnixMs(0), pending::<i32>());
+        assert_eq!(table.reap_quiet(UnixMs(70_000), JOB_QUIET_MS), 1);
+        clock.set(70_000);
+        let ran = running
+            .marked(UnixMs(0), || UnixMs(clock.get()), beats(&clock))
+            .now_or_never();
+        assert_eq!(
+            ran,
+            Some(Ran::Dropped {
+                unmarked_ms: 70_000
+            })
+        );
     }
 }
