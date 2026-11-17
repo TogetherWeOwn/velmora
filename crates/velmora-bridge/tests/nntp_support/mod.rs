@@ -504,6 +504,7 @@ impl Catalog for MemCatalog {
             token: o.token,
             attempts: o.attempts,
             cursor: o.cursor,
+            claimed_at: now,
         }))
     }
 

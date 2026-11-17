@@ -213,6 +213,7 @@ pub(super) async fn claim<S: Sql>(
         token: r.num()?,
         attempts: r.num()?,
         cursor: r.num()?,
+        claimed_at: now,
     }))
 }
 
