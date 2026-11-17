@@ -432,15 +432,17 @@ the code real data relies on. Never roll back past the floor:
   retries, replay and rollback repair`). A Worker from before migration
   0005 cannot read a copy, and does not know that a copy shares the
   extents of its source; one from before #76 lacks the fixes to copy
-  retries and to the replay of copies. Today the #71 floor is the later
-  of the two, so it covers both.
+  retries and to the replay of copies. The #71 floor is later than
+  #76, so it covers both.
 - **Once `PACKED_PLANS=on` has been deployed:** never to a version older
   than the first one that knows `PACKED_PLANS` (migrations 0016 and
   0017). From then on the article plan of an extent can be one value on
   its row (`extents.plan`) and not rows in `articles`. An older Worker
   sees such an extent as one without a plan: it cannot read it from
-  Usenet, and a post job of it would plan and post the extent a second
-  time. A rollback to a version that knows the switch is safe with the
+  Usenet (cold reads answer unavailable), and its post, verify and
+  release jobs of that extent fail and retry until they reach the
+  dead-letter queue. With the switch on, this is the latest floor, so
+  it covers the #71 and #76 floors too. A rollback to a version that knows the switch is safe with the
   switch on or off: off only stops new plans from being packed, and
   every such version reads both forms.
 
@@ -469,9 +471,11 @@ here):
 2. A CI deploy carries the message `ci <run>.<attempt> <commit>`. A
    version made by a secret change (`workers/triggered_by` = `secret`)
    runs the code of the version before it.
-3. For each version, oldest first, check the commit:
-   `git merge-base --is-ancestor <merge commit of #71> <commit>`. The
-   first version for which it succeeds is the floor. A secret-change
+3. Take the latest floor that applies: the merge commit of #121 (the
+   one that brought `PACKED_PLANS`) once the switch has been deployed
+   on, else the merge commit of #71. For each version, oldest first,
+   check the commit: `git merge-base --is-ancestor <that merge commit>
+   <commit>`. The first version for which it succeeds is the floor. A secret-change
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
 
