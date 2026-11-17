@@ -111,22 +111,33 @@ impl<'a, T> JobTable<'a, T> {
     /// Drops every job that began `max_age_ms` or longer before `now`,
     /// and says how many. Each is dropped once: the future that ran it
     /// finds it gone, and gives back nothing a second time.
+    ///
+    /// The future that ran a dropped job is not woken, on purpose: were
+    /// its invocation cancelled, a wake would resume that invocation
+    /// inside this one. Should it be alive after all, it learns of the
+    /// drop when something else wakes it.
     pub fn reap(&self, now: UnixMs, max_age_ms: i64) -> usize {
-        let old: Vec<Slot<'a, T>> = {
-            let mut slots = self.inner.slots.borrow_mut();
-            let (old, young) = std::mem::take(&mut *slots)
-                .into_iter()
-                .partition(|s| now.0.saturating_sub(s.started.0) >= max_age_ms);
-            *slots = young;
-            old
-        };
-        let n = old.len();
-        self.inner
-            .reaped
-            .set(self.inner.reaped.get().saturating_add(n as u64));
-        // Dropped here, with the table free.
-        drop(old);
-        n
+        let mut n = 0;
+        // One at a time, each off the table and counted before it is
+        // dropped, with the table free: should a destructor fail, the
+        // jobs behind it are still in the table for the next call.
+        loop {
+            let old = {
+                let mut slots = self.inner.slots.borrow_mut();
+                let at = slots
+                    .iter()
+                    .position(|s| now.0.saturating_sub(s.started.0) >= max_age_ms);
+                at.map(|at| slots.swap_remove(at))
+            };
+            let Some(old) = old else {
+                return n;
+            };
+            n += 1;
+            self.inner
+                .reaped
+                .set(self.inner.reaped.get().saturating_add(1));
+            drop(old);
+        }
     }
 
     /// Jobs in the table now.

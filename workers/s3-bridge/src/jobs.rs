@@ -91,7 +91,9 @@ fn abandon_this_one() -> bool {
 
 /// Runs `job` in the isolate's table. `None`: the job was dropped for
 /// its age while this invocation still ran, which the platform's limit
-/// on an invocation rules out; the caller retries the message.
+/// on an invocation rules out. This invocation is not woken by the drop:
+/// it sees `None` when something the job waited for wakes it. The caller
+/// retries the message; the row stays leased until the lease runs out.
 pub async fn run(
     now: UnixMs,
     post: bool,
