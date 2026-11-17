@@ -296,7 +296,7 @@ async fn spread_post_is_idempotent_after_a_crash() {
     let rig = spread_rig().await;
     let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
 
-    rig.bridge.catalog.fail_mark_posted.set(1);
+    rig.bridge.catalog.fail_mark_posted.set(2);
     assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
     let planned = rig.plan(&s).await;
     assert!(planned.iter().all(|a| a.state == ArticleState::Planned));
@@ -612,37 +612,33 @@ async fn a_lost_reply_is_remembered_across_providers() {
     assert!(all_posted_by(&plan, "p1"));
 }
 
-/// The catalogue fails while a job records its first article. The job
-/// stops, and what the provider had accepted by then is still recorded
-/// on the way out, under the same fenced lease.
+/// The catalogue fails when the job records the plan as posted. The
+/// providers have every article by then, so the job tries the write
+/// once more, under the same fenced lease, and the plan is recorded.
 #[tokio::test]
-async fn accepted_articles_are_recorded_after_a_catalogue_failure() {
+async fn a_catalogue_failure_at_the_record_is_tried_again() {
     let mut rig = rig(&[spec("bb0", 5)]).await;
     rig.bridge.cfg.post_sockets = 1;
     let s = rig.seed(1, &marked_plaintext(1_400_000)).await;
-    // Slow calls: the job records what it has between two articles.
-    rig.bridge.nntp.slow(&rig.bridge.clock, 25_000);
     rig.bridge.catalog.fail_mark_posted.set(1);
 
-    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
 
     let plan = rig.plan(&s).await;
     assert!(plan.len() >= 2);
-    let posted = plan.iter().filter(|a| a.state == ArticleState::Posted);
-    assert_eq!(posted.count(), 1);
-    assert_eq!(rig.servers[0].posted_count().await, 1);
+    assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(rig.servers[0].posted_count().await, plan.len());
     assert_eq!(rig.bridge.catalog.mark_batches.get(), 2);
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
-/// The same, with the lease lost instead: nothing is recorded, on the
-/// way out either.
+/// The lease is lost before that write: it is refused as a whole, it is
+/// not tried again, and nothing is recorded.
 #[tokio::test]
-async fn a_stale_lease_records_nothing_on_the_way_out() {
+async fn a_stale_lease_records_nothing() {
     let mut rig = rig(&[spec("bb0", 5)]).await;
     rig.bridge.cfg.post_sockets = 1;
     let s = rig.seed(1, &marked_plaintext(1_400_000)).await;
-    rig.bridge.nntp.slow(&rig.bridge.clock, 25_000);
     rig.bridge
         .catalog
         .fault
@@ -652,7 +648,8 @@ async fn a_stale_lease_records_nothing_on_the_way_out() {
 
     let plan = rig.plan(&s).await;
     assert!(plan.iter().all(|a| a.state == ArticleState::Planned));
-    assert_eq!(rig.servers[0].posted_count().await, 1);
+    assert_eq!(rig.servers[0].posted_count().await, plan.len());
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 1);
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
@@ -696,10 +693,11 @@ async fn a_job_without_a_slot_does_not_load_the_extent() {
 
 /// Two sockets. While one has a POST in flight, the permits are taken
 /// over and the other socket's renewal finds them gone. The first socket
-/// makes no call after its POST returns, and the article that POST
-/// delivered is recorded: marking is fenced by the lease, not the permit.
+/// makes no call after its POST returns. Nothing is recorded (a plan is
+/// recorded as posted only as a whole), and the next run finds what the
+/// provider took and stores nothing twice.
 #[tokio::test]
-async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
+async fn a_socket_that_lost_its_permit_mid_post_stops() {
     let mut rig = rig(&[spec("bb0", 5)]).await;
     rig.bridge.cfg.post_sockets = 2;
     let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
@@ -739,17 +737,31 @@ async fn a_socket_that_lost_its_permit_mid_post_stops_and_is_recorded() {
     // No call began after the takeover, on either socket.
     let calls = rig.bridge.nntp.calls();
     assert_eq!(calls.len(), calls_then.get(), "{calls:?}");
-    // Every article a provider took is recorded, the parked one included.
+    // The provider took some articles, the parked one included; the
+    // catalogue has none of them as posted.
     let plan = rig.plan(&s).await;
     let on_server = stored(&rig, 0).await;
     assert!(on_server.len() >= 2 && on_server.len() < plan.len());
-    let posted: BTreeSet<String> = plan
-        .iter()
-        .filter(|a| a.state == ArticleState::Posted)
-        .map(|a| format!("<{}>", a.message_id))
-        .collect();
-    assert_eq!(posted, on_server);
+    assert!(plan.iter().all(|a| a.state == ArticleState::Planned));
+    assert_eq!(rig.bridge.catalog.mark_batches.get(), 0);
     assert_eq!(rig.bridge.nntp.live(), 0);
+
+    // The next run did not draw the plan, and the run before it spent
+    // no attempt: it asks for every article before it sends one, and
+    // sends only what the provider does not have.
+    rig.bridge.clock.advance_secs(600);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let done = rig.plan(&s).await;
+    assert!(done.iter().all(|a| a.state == ArticleState::Posted));
+    assert_eq!(stored(&rig, 0).await, id_set(&done));
+    assert_eq!(rig.servers[0].posted_count().await, done.len());
+    let calls = rig.bridge.nntp.calls();
+    let count = |what: &str| {
+        let second = &calls[calls_then.get()..];
+        second.iter().filter(|c| c.0 == what).count()
+    };
+    assert_eq!(count("stat"), done.len(), "{calls:?}");
+    assert_eq!(count("post"), done.len() - on_server.len(), "{calls:?}");
 }
 
 /// An account that allows one source address and six connections: one

@@ -153,6 +153,7 @@ impl Fx {
             max_put_bytes: 16 * 1024 * 1024,
             slice_bytes: 8 * 1024 * 1024,
             intent_sweep: false,
+            packed_plans: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: 1,
@@ -473,6 +474,7 @@ fn routes() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
         ("GET", "/_admin/objects/scratch/k", None),
         ("POST", "/_admin/evict/scratch/k?include_safety=1", None),
         ("POST", "/_admin/drill/scratch/k", None),
+        ("POST", "/_admin/pack-plans?limit=1", None),
         ("POST", "/_admin/dev/guard-selftest", None),
         ("POST", "/_admin/dev/suppress-notify?n=1", None),
         ("GET", "/_admin/no-such-route", None),
@@ -1549,4 +1551,62 @@ async fn evict_keeps_the_pinned_copy_when_the_read_back_is_on_a_backbone_that_do
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(r.json()["safety_deleted"], 1);
     assert!(!fx.has_safety(&o));
+}
+
+// ---------------------------------------------------------------------------
+// Packing article plans
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pack_plans_packs_a_step_only_while_the_switch_is_on() {
+    let mut fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let a = fx.put(&bucket, "a", &plaintext()).await;
+    let b = fx.put(&bucket, "b", &plaintext()).await;
+    fx.drive(&a, OutboxStage::Verify).await;
+    fx.drive(&b, OutboxStage::Verify).await;
+    let rows = "SELECT COUNT(*) FROM articles";
+    let packed = "SELECT COUNT(*) FROM extents WHERE plan IS NOT NULL";
+    assert_ne!(fx.scalar(rows, &[]).await, "0", "the plans are rows");
+
+    // Off: a Worker that cannot read a packed plan may still be running.
+    let r = fx.post("/pack-plans").await;
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert!(r.text().contains("PackedPlansOff"), "{}", r.text());
+    assert_eq!(fx.scalar(packed, &[]).await, "0");
+
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.packed_plans = true;
+    for bad in ["/pack-plans?limit=many", "/pack-plans?limit=-1"] {
+        let r = fx.post(bad).await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.text());
+    }
+    assert_eq!(fx.scalar(packed, &[]).await, "0");
+    assert_eq!(fx.get("/pack-plans").await.status, 405);
+
+    let r = fx.post("/pack-plans?limit=1").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json(), json!({ "looked": 1, "packed": 1, "end": false }));
+    assert_eq!(fx.scalar(packed, &[]).await, "1");
+    // No limit: the dispatcher's step, which is more than what is left.
+    let r = fx.post("/pack-plans").await;
+    assert_eq!(r.json(), json!({ "looked": 1, "packed": 1, "end": true }));
+    assert_eq!(fx.scalar(rows, &[]).await, "0");
+    assert_eq!(fx.scalar(packed, &[]).await, "2");
+    // A limit of 0 or far too many is clamped, not refused.
+    for path in ["/pack-plans?limit=0", "/pack-plans?limit=4000000000"] {
+        let r = fx.post(path).await;
+        assert_eq!(r.json(), json!({ "looked": 0, "packed": 0, "end": true }));
+    }
+
+    // Both objects still pass verification and release from their plans.
+    fx.drive(&a, OutboxStage::Done).await;
+    fx.drive(&b, OutboxStage::Done).await;
+}
+
+#[tokio::test]
+async fn pack_plans_is_refused_in_restore_maintenance() {
+    let mut fx = Fx::with(Environment::Dev, Maintenance::Restore).await;
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.packed_plans = true;
+    let r = fx.post("/pack-plans").await;
+    assert_eq!(r.status, 503, "{}", r.text());
 }

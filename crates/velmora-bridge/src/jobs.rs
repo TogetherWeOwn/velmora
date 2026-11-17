@@ -64,6 +64,10 @@ pub const DISPATCH_LIMIT: u32 = DISPATCH_BATCH * DISPATCH_BATCHES;
 pub const RESEND_SECS: u32 = 3600;
 /// Held extents one dispatcher run checks for the re-drive.
 pub const REDRIVE_LIMIT: u32 = 500;
+/// Extents with article rows one dispatcher run looks at to pack their
+/// plans. A run packs at most this many: each is one read, and a share
+/// of a write that deletes its rows.
+pub const PACK_LIMIT: u32 = 50;
 /// Claims after which the dispatcher moves an unleased row to `dead`.
 pub const MAX_ATTEMPTS: u32 = 50;
 /// GC rows one GC job handles before it re-enqueues itself.
@@ -561,9 +565,20 @@ where
         // Unpublished sliced writes whose slices are due for deletion.
         self.sweep_check(now, &mut report).await;
 
+        // Plans from before packed plans are packed a few at a time,
+        // once the switch says that every Worker reads a packed plan.
+        // An extra, like the checks above.
+        if self.cfg.packed_plans {
+            match self.catalog.pack_plans(PACK_LIMIT).await {
+                Ok(packed) => report.plans_packed = packed.packed,
+                Err(_) => report.pack_failed = true,
+            }
+        }
+
         if let Some(e) = send_failed {
             return Err(e);
         }
+
         self.catalog.record_dispatch(now).await?;
         Ok(report)
     }

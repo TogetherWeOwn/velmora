@@ -528,6 +528,8 @@ impl Catalog for MemCatalog {
                 e.outbox.stage = to;
                 e.outbox.next_at = next_at;
                 e.outbox.lease_until = None;
+                // As the SQL catalogue: a new stage starts at its first step.
+                e.outbox.cursor = 0;
             })
             .is_some())
     }
@@ -574,6 +576,18 @@ impl Catalog for MemCatalog {
             }
             e.articles.clone()
         }))
+    }
+
+    async fn plan_packed(
+        &self,
+        l: &Lease,
+        cipher_size: u64,
+        plan: &[u8],
+    ) -> Result<Option<velmora_bridge::plan::StoredPlan>> {
+        // This catalogue keeps every plan as rows.
+        let rows = velmora_bridge::plan::expand(&l.extent, cipher_size, plan, None, None)?;
+        let rows = self.plan_articles(l, &rows).await?;
+        Ok(rows.map(|rows| velmora_bridge::plan::StoredPlan { rows, packed: None }))
     }
 
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>> {
@@ -1143,7 +1157,7 @@ impl Catalog for MemCatalog {
         _: &Bucket,
         _: &[velmora_bridge::replay::ReplayExtent],
         _: UnixMs,
-    ) -> Result<()> {
+    ) -> Result<Vec<ExtentId>> {
         unused()
     }
     async fn held_extents(&self, _: &str, _: u32) -> Result<Vec<ExtentId>> {
@@ -1340,6 +1354,9 @@ impl Catalog for MemCatalog {
     async fn revive_referenced(&self, _: u32, _: UnixMs) -> Result<u64> {
         unused()
     }
+    async fn pack_plans(&self, _: u32) -> Result<velmora_bridge::plan::PackReport> {
+        unused()
+    }
     async fn due(&self, _: UnixMs, _: u32, _: u32) -> Result<Vec<DueRow>> {
         unused()
     }
@@ -1474,6 +1491,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
         intent_sweep: false,
+        packed_plans: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,

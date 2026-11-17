@@ -12,7 +12,7 @@ use service_support::*;
 use velmora_bridge::testkit::{
     RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
     MIGRATION_0006, MIGRATION_0007, MIGRATION_0008, MIGRATION_0009, MIGRATION_0010, MIGRATION_0011,
-    MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0015,
+    MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0015, MIGRATION_0016, MIGRATION_0017,
 };
 use velmora_bridge::*;
 
@@ -25,7 +25,8 @@ const UNDO_0005: &str = "DROP TRIGGER generation_extents_on_insert; \
      DROP TRIGGER gc_keep_shared_extents; \
      DROP TRIGGER outbox_keep_shared_extents; \
      DROP TRIGGER extents_keep_key_in_service; \
-     DROP TRIGGER articles_keep_in_service; \
+     DROP TRIGGER articles_keep_unpacked_in_service; \
+     DROP TRIGGER extents_keep_plan_in_service; \
      DROP INDEX upload_parts_by_extent; \
      DROP TABLE generation_extents;";
 
@@ -178,7 +179,9 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0002,
         MIGRATION_0003,
         MIGRATION_0004,
-        // Later migrations do not touch what 0005 adds; the undo keeps them.
+        // Later migrations do not touch what 0005 adds, and the undo
+        // keeps them. All but 0017: it replaces a trigger of 0005, so it
+        // is applied again after it.
         MIGRATION_0006,
         MIGRATION_0007,
         MIGRATION_0008,
@@ -189,12 +192,14 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0013,
         MIGRATION_0014,
         MIGRATION_0015,
+        MIGRATION_0016,
     ] {
         old.apply(migration).unwrap();
     }
     assert_eq!(schema(db), schema(&old));
 
     db.apply(MIGRATION_0005).unwrap();
+    db.apply(MIGRATION_0017).unwrap();
     assert_eq!(schema(db), schema(&RusqliteSql::with_schema().unwrap()));
     assert_eq!(references(&rig), written);
     assert_eq!(reads(&rig, &bucket, &signer).await, before);
@@ -369,6 +374,97 @@ async fn old_workers_cannot_take_a_shared_extent_out_of_service() {
     old_retire(&rig, &bucket, "src").await.unwrap();
     assert_eq!(rig.count("gc"), 6);
     db.batch(vec![(SHRED, vec![shared.clone()])]).await.unwrap();
+}
+
+/// The statements of a migration, one at a time. A trigger ends at its
+/// `END;`, anything else at the `;` that ends a line.
+fn statements(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for line in script.lines() {
+        if line.trim_start().starts_with("--") {
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+        let ends = if current.trim_start().starts_with("CREATE TRIGGER") {
+            line.trim() == "END;"
+        } else {
+            line.trim_end().ends_with(';')
+        };
+        if ends {
+            out.push(std::mem::take(&mut current).trim().to_owned());
+        }
+    }
+    assert!(current.trim().is_empty(), "{current}");
+    out
+}
+
+/// Migration 0017 replaces the rule of migration 0005 that keeps the
+/// article rows of an extent in service. Applied one statement at a
+/// time, it leaves the rows of an extent whose plan is not packed
+/// covered after every one of them.
+#[tokio::test(flavor = "current_thread")]
+async fn the_article_rule_holds_after_every_statement_of_its_replacement() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", &pattern(1, 1000))
+        .await
+        .expect(200);
+    let (_, extents) = rig.live(&bucket, "one").await.unwrap();
+    let extent = SqlValue::Text(extents[0].id.as_str().to_owned());
+    let db = &rig.bridge.catalog.sql;
+    db.with_conn(|c| {
+        c.execute(
+            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, \
+               cipher_offset, cipher_len, payload_sha256, state) \
+             SELECT id, 0, id, 'g', x'', 0, 1, x'', 'planned' FROM extents",
+            [],
+        )
+        .unwrap()
+    });
+    let covered = |after: &str| {
+        let refused = db.with_conn(|c| {
+            c.execute(
+                "DELETE FROM articles WHERE extent_id = ?1",
+                [extent_text(&extent)],
+            )
+        });
+        let refused = refused.unwrap_err();
+        assert!(
+            refused.to_string().contains("in service"),
+            "{after}: {refused}"
+        );
+        assert_eq!(rig.count("articles"), 1, "{after}");
+    };
+
+    // Back to the schema before 0017: the rule of 0005, as it was written.
+    let old_rule = statements(MIGRATION_0005)
+        .into_iter()
+        .find(|s| s.starts_with("CREATE TRIGGER articles_keep_in_service "))
+        .unwrap();
+    db.apply(
+        "DROP TRIGGER articles_keep_unpacked_in_service; \
+         DROP TRIGGER extents_keep_plan_in_service;",
+    )
+    .unwrap();
+    db.apply(&old_rule).unwrap();
+    covered("before the migration");
+
+    let steps = statements(MIGRATION_0017);
+    assert_eq!(steps.len(), 3);
+    for step in &steps {
+        db.apply(step).unwrap();
+        covered(step);
+    }
+    assert_eq!(schema(db), schema(&RusqliteSql::with_schema().unwrap()));
+}
+
+fn extent_text(value: &SqlValue) -> &str {
+    match value {
+        SqlValue::Text(text) => text,
+        other => panic!("not a text value: {other:?}"),
+    }
 }
 
 /// The schema stops an older Worker only while the generation an extent

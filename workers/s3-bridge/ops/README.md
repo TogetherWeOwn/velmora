@@ -78,6 +78,15 @@ Limits to know:
   fails loudly.
 - An article plan record that does not open is listed under
   `unreadable` and its extent is restored without a plan.
+- A packed plan in the catalogue that cannot be read is replaced by the
+  plan of the extent's record. When the record has no plan to give (it
+  is absent, it does not open, or its plan does not fit the row), the
+  stored value stays as it is, and the name of the extent's plan record
+  (`m/art/<extent id>`) is listed under `unreadable`, whether or not
+  such a record exists. That extent cannot be read from Usenet, and
+  it is not counted in `damaged`. When it has no pinned copy either and
+  its key has an older generation, its record is not published over
+  that generation and is listed under `damaged_unpublished`, as below.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
   lists it under `damaged`. The exception: when the key has an older
@@ -94,8 +103,10 @@ Limits to know:
     (the client's log, the application that owns the key).
     - Not acknowledged (a failed upload): nothing. The key holds what it
       should.
-    - Acknowledged: the object is lost. Put it again from its source,
-      or tell its owner.
+    - Acknowledged: the object cannot be read. Put it again from its
+      source, or tell its owner. (When the cause is a packed plan that
+      cannot be read, listed under `unreadable`, the articles may still
+      be on Usenet; without a plan nothing finds them.)
   - The record stays in `SAFETY` either way, and no command removes it.
     A replay leaves it out only while the key has a live object that
     is newer than the record, so a PutObject on the key ends the report
@@ -423,6 +434,15 @@ the code real data relies on. Never roll back past the floor:
   extents of its source; one from before #76 lacks the fixes to copy
   retries and to the replay of copies. Today the #71 floor is the later
   of the two, so it covers both.
+- **Once `PACKED_PLANS=on` has been deployed:** never to a version older
+  than the first one that knows `PACKED_PLANS` (migrations 0016 and
+  0017). From then on the article plan of an extent can be one value on
+  its row (`extents.plan`) and not rows in `articles`. An older Worker
+  sees such an extent as one without a plan: it cannot read it from
+  Usenet, and a post job of it would plan and post the extent a second
+  time. A rollback to a version that knows the switch is safe with the
+  switch on or off: off only stops new plans from being packed, and
+  every such version reads both forms.
 
 Above the floor a rollback is still not free:
 
@@ -547,6 +567,51 @@ Going back to a Worker version from before this table needs nothing
 else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
+
+## Packed article plans
+
+The article plan of an extent (where its ciphertext is on Usenet) is
+either one row per article in `articles`, or one value on the extent's
+own row (`extents.plan`, migrations 0016 and 0017). Packed, a 16 MiB
+extent keeps under 1 KiB of plan in the catalogue instead of about
+11 KiB, and its posting writes two rows instead of three per article.
+Every reader takes both forms. The recovery records do not change: the
+record of a plan (`m/art/<extent id>`) lists every article in both
+cases, so a replay rebuilds either form from it.
+
+To turn it on:
+
+1. Apply the migrations and deploy with `PACKED_PLANS` unset (off).
+   This is the first version that reads a packed plan.
+2. In a later deploy set `PACKED_PLANS = "on"`. From then on:
+   - a new extent's plan is stored packed;
+   - a replay stores the plans it restores packed;
+   - each cron tick packs up to 50 older plans and deletes their rows.
+     Only a plan whose articles are all posted is packed; one that is
+     still being posted is packed by a later tick.
+3. A large backlog of older plans is packed faster by hand, 1 to 500
+   extents a call:
+
+   ```
+   curl -sS -X POST -H @<bearer header file> '<base-url>/_admin/pack-plans?limit=500'
+   ```
+
+   The answer is `{"looked": n, "packed": n, "end": bool}`. Repeat until
+   a call answers `"end": true`: the pass has been over every extent
+   that has article rows. Rows that are left belong to plans that are
+   not posted in full yet (`SELECT COUNT(*) FROM articles`).
+
+Packing an older plan writes one row for the extent and one per article
+row it deletes. The route answers 409 while the switch is off and 503
+in restore maintenance. See "Rollback floor" before turning it on.
+
+A packed plan carries a digest of itself and of its extent's id, and a
+value that does not match it is never read as a plan: every read of
+that extent fails instead. The schema keeps a plan on an extent in
+service, so such a value is not dropped by hand. The replay (below)
+replaces it: for each extent of a record it reads the stored plan, and
+one that cannot be read gives way to the plan in the extent's record.
+A plan that reads is left as it is.
 
 ## The route
 

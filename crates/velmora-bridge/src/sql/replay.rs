@@ -4,7 +4,8 @@
 //!
 //! 1. [`replay_extents`], any number of times, in chunks: the bucket and
 //!    the extents exist (new ones as `staged` rows without a generation,
-//!    like the parts of an open upload), their article plans exist, and
+//!    like the parts of an open upload), their article plans exist (a
+//!    packed plan that cannot be read is replaced by its record's), and
 //!    an extent whose pinned copy is gone says so.
 //! 2. [`replay_publish`], once: one guarded batch that publishes the
 //!    generation. An extent no generation holds yet is adopted, exactly
@@ -77,9 +78,11 @@ fn bucket_insert(b: &Bucket) -> Stmt {
 
 fn article_insert(a: &ArticleRow) -> Result<Stmt> {
     Ok((
+        // Beside a packed plan a row is never read: none is written.
         "INSERT OR IGNORE INTO articles(extent_id, idx, message_id, newsgroup, headers, \
            cipher_offset, cipher_len, payload_sha256, yenc_name, state) \
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 \
+           WHERE (SELECT plan FROM extents WHERE id = ?1) IS NULL",
         vec![
             text(a.extent_id.as_str()),
             SqlValue::Int(i64::from(a.idx)),
@@ -126,19 +129,37 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
             ms(e.created_at),
         ],
     ));
-    if let Some(plan) = &x.plan {
-        for a in plan {
-            out.push(article_insert(a)?);
-        }
-        out.push((
-            "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
-             WHERE id = ?1 AND article_count IS NULL",
+    match (&x.plan, &x.packed) {
+        // The packed plan goes on the extent's row, and no article row
+        // is written. An extent that has a plan keeps it, as with rows;
+        // one that lost its plan (the count is all that is left of it)
+        // gets it back.
+        (Some(plan), Some(packed)) => out.push((
+            "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
+             WHERE id = ?1 AND plan IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM articles WHERE extent_id = ?1)",
             vec![
                 id(),
                 SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
                 SqlValue::Int(i64::from(e.plan_rev)),
+                SqlValue::Blob(packed.clone()),
             ],
-        ));
+        )),
+        (Some(plan), None) => {
+            for a in plan {
+                out.push(article_insert(a)?);
+            }
+            out.push((
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
+                 WHERE id = ?1 AND article_count IS NULL",
+                vec![
+                    id(),
+                    SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
+                    SqlValue::Int(i64::from(e.plan_rev)),
+                ],
+            ));
+        }
+        (None, _) => {}
     }
     if !x.safety_present {
         // The pinned copy is given up only after the articles were read
@@ -158,23 +179,117 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
             "UPDATE articles SET state = 'posted' WHERE extent_id = ?1 AND state = 'planned'",
             vec![id()],
         ));
+        // The same for a packed plan: posted, at a time nobody knows.
+        out.push((
+            "UPDATE extents SET posted_at = ?2 \
+             WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL",
+            vec![id(), SqlValue::Int(crate::plan::POSTED_AT_UNKNOWN)],
+        ));
     }
     Ok(())
 }
 
-/// Step 1.
+/// A packed plan in the catalogue that cannot be read.
+struct Unreadable {
+    extent: ExtentId,
+    /// The stored value.
+    stored: Vec<u8>,
+    /// The plan of the extent's record, to put in its place. `None` =
+    /// the record has no plan that this row can hold.
+    plan: Option<Vec<u8>>,
+}
+
+/// The extents of `extents` whose packed plan in the catalogue cannot be
+/// read (a damaged value, the plan of another extent).
+///
+/// A plan the catalogue has is kept, in whatever form, as long as it
+/// can be read. One that cannot is no plan: every reader of the extent
+/// fails on it, and the schema keeps it from being dropped while the
+/// extent is in service, so the record is the only way back.
+async fn unreadable_plans<S: Sql>(
+    c: &SqlCatalog<S>,
+    extents: &[ReplayExtent],
+) -> Result<Vec<Unreadable>> {
+    let mut out = Vec::new();
+    for chunk in extents.chunks(LOST_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let rows = c
+            .sql
+            .query(
+                &format!(
+                    "SELECT id, cipher_size, plan FROM extents \
+                     WHERE id IN ({marks}) AND plan IS NOT NULL"
+                ),
+                &chunk
+                    .iter()
+                    .map(|x| text(x.row.id.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        for row in rows {
+            let mut r = super::uploads::Cols::new(row);
+            let id = ExtentId::new(r.text()?);
+            let cipher_size: u64 = r.num()?;
+            let stored = r.blob()?;
+            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
+                continue;
+            }
+            let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
+                continue;
+            };
+            // The record's plan in the form the replay stores it in,
+            // and the explicit form when it stores rows: beside a plan
+            // value, rows are not read.
+            let plan = match (&x.packed, &x.plan) {
+                (Some(packed), _) => Some(packed.clone()),
+                (None, Some(rows)) => crate::plan::repack(&id, cipher_size, rows, None),
+                (None, None) => None,
+            };
+            // Only a value that reads on this very row is worth
+            // writing.
+            let plan =
+                plan.filter(|p| crate::plan::expand(&id, cipher_size, p, None, None).is_ok());
+            out.push(Unreadable {
+                extent: id,
+                stored,
+                plan,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Step 1. Returns the extents whose packed plan cannot be read and
+/// stays so: their record has no plan to put in its place.
 pub(super) async fn replay_extents<S: Sql>(
     c: &SqlCatalog<S>,
     bucket: &Bucket,
     extents: &[ReplayExtent],
     now: UnixMs,
-) -> Result<()> {
+) -> Result<Vec<ExtentId>> {
+    let unreadable = unreadable_plans(c, extents).await?;
     let mut stmts: Vec<Stmt> = Vec::new();
     for x in extents {
         if stmts.is_empty() {
             stmts.push(bucket_insert(bucket));
         }
         extent_stmts(x, now, &mut stmts)?;
+        for u in unreadable.iter().filter(|u| u.extent == x.row.id) {
+            let Some(plan) = &u.plan else { continue };
+            // Keyed on the very value that was read: a plan that
+            // changed since is another plan, and is left alone.
+            stmts.push((
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
+                 WHERE id = ?1 AND plan = ?5",
+                vec![
+                    text(x.row.id.as_str()),
+                    SqlValue::Int(i64::try_from(x.plan.as_ref().map_or(0, Vec::len)).unwrap_or(0)),
+                    SqlValue::Int(i64::from(x.row.plan_rev)),
+                    SqlValue::Blob(plan.clone()),
+                    SqlValue::Blob(u.stored.clone()),
+                ],
+            ));
+        }
         if stmts.len() >= BATCH_STATEMENTS {
             c.sql.batch(core::mem::take(&mut stmts)).await?;
         }
@@ -182,7 +297,11 @@ pub(super) async fn replay_extents<S: Sql>(
     if !stmts.is_empty() {
         c.sql.batch(stmts).await?;
     }
-    Ok(())
+    Ok(unreadable
+        .into_iter()
+        .filter(|u| u.plan.is_none())
+        .map(|u| u.extent)
+        .collect())
 }
 
 /// Live generations with an extent that has no copy anywhere: its pinned
@@ -195,6 +314,7 @@ pub(super) async fn replay_damaged<S: Sql>(
     const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM generation_extents ge \
          JOIN extents e ON e.id = ge.extent_id \
          WHERE ge.generation_id = o.generation_id AND e.safety_state = 'deleted' \
+           AND e.plan IS NULL \
            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))";
     let count = c
         .sql
@@ -560,7 +680,7 @@ pub(super) async fn restore_advance<S: Sql>(
 }
 
 /// An extent with neither a pinned copy nor an article plan.
-const NO_COPY: &str = "e.safety_state = 'deleted' \
+const NO_COPY: &str = "e.safety_state = 'deleted' AND e.plan IS NULL \
      AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id)";
 
 /// Extent ids per statement of [`has_lost_extent`].
@@ -590,6 +710,60 @@ async fn has_lost_extent<S: Sql>(
     Ok(false)
 }
 
+/// Whether one of the extents has no pinned copy and a packed plan that
+/// cannot be read. Such a value is no plan ([`unreadable_plans`]), so
+/// the extent has no copy anywhere, though its row holds a value and
+/// [`NO_COPY`] does not see it.
+async fn has_unread_extent<S: Sql>(
+    c: &SqlCatalog<S>,
+    placements: &[ExtentPlacement],
+) -> Result<bool> {
+    for chunk in placements.chunks(LOST_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let rows = c
+            .sql
+            .query(
+                &format!(
+                    "SELECT id, cipher_size, plan FROM extents \
+                     WHERE id IN ({marks}) AND safety_state = 'deleted' AND plan IS NOT NULL"
+                ),
+                &chunk
+                    .iter()
+                    .map(|p| text(p.extent_id.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        for row in rows {
+            let mut r = super::uploads::Cols::new(row);
+            let id = ExtentId::new(r.text()?);
+            let cipher_size: u64 = r.num()?;
+            let stored = r.blob()?;
+            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_err() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the catalogue knows an older generation of the key of `g`,
+/// live or not.
+async fn has_older<S: Sql>(c: &SqlCatalog<S>, g: &GenerationRow) -> Result<bool> {
+    let older = c
+        .sql
+        .query(
+            "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
+               AND id < ?3 LIMIT 1",
+            &[
+                text(g.bucket_id.as_str()),
+                text(&g.key),
+                text(g.id.as_str()),
+            ],
+        )
+        .await?;
+    Ok(!older.is_empty())
+}
+
 /// Step 2. `Refused` = the generation is already there, a newer
 /// generation of the key is live, or the extents do not tile it (one of
 /// them is missing, in another bucket, still a part of an upload under
@@ -614,6 +788,14 @@ pub(super) async fn replay_publish<S: Sql>(
         return Err(BridgeError::Invalid(
             "replay does not describe one live generation",
         ));
+    }
+    // A packed plan that cannot be read is no plan, and the guard of
+    // the batch below cannot tell: it sees a value. So it is asked
+    // here, of the rows the batch will find (nothing else writes during
+    // a replay), and only for a key that has an older generation: the
+    // one case in which it decides.
+    if has_older(c, g).await? && has_unread_extent(c, placements).await? {
+        return Ok(ReplayPublish::Damaged);
     }
     let gen_id = || text(g.id.as_str());
     let bucket = || text(g.bucket_id.as_str());
@@ -684,7 +866,7 @@ pub(super) async fn replay_publish<S: Sql>(
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations \
            WHERE bucket_id = ?2 AND key = ?3 AND id < ?1) \
          AND EXISTS (SELECT 1 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' \
+          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' AND e.plan IS NULL \
             AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))",
         vec![gen_id(), bucket(), text(&g.key)],
     ));
@@ -740,15 +922,7 @@ pub(super) async fn replay_publish<S: Sql>(
         Err(BridgeError::GuardFailed) => {
             // Which guard refused it. Nothing else writes during a
             // replay, so the catalogue is as the batch found it.
-            let older = c
-                .sql
-                .query(
-                    "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
-                       AND id < ?3 LIMIT 1",
-                    &[bucket(), text(&g.key), gen_id()],
-                )
-                .await?;
-            if !older.is_empty() && has_lost_extent(c, placements).await? {
+            if has_older(c, g).await? && has_lost_extent(c, placements).await? {
                 Ok(ReplayPublish::Damaged)
             } else {
                 Ok(ReplayPublish::Refused)

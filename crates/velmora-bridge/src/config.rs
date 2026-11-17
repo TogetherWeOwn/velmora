@@ -167,6 +167,13 @@ pub struct BridgeConfig {
     /// published. Off: their `write_intents` rows stay and can be swept
     /// later.
     pub intent_sweep: bool,
+    /// Store the article plan of a new extent packed on its row
+    /// (`PACKED_PLANS`, [`crate::plan`]) instead of as one row per
+    /// article. Every Worker from the one that knows this switch reads
+    /// both forms; one from before cannot read a packed plan. So the
+    /// switch goes on only once no older version can come back, and a
+    /// rollback after that is to a version that knows it, with it off.
+    pub packed_plans: bool,
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
     pub verify_delay_secs: u32,
@@ -458,6 +465,11 @@ impl BridgeConfig {
             Some("on") => true,
             Some(_) => return Err(ConfigError::Invalid("INTENT_SWEEP".into())),
         };
+        let packed_plans = match get("PACKED_PLANS").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("PACKED_PLANS".into())),
+        };
 
         let required_backbones: u32 = number(&get, "REQUIRED_BACKBONES")?;
         if required_backbones == 0 {
@@ -599,6 +611,7 @@ impl BridgeConfig {
             max_put_bytes,
             slice_bytes,
             intent_sweep,
+            packed_plans,
             required_backbones,
             safety_min_age_secs,
             verify_delay_secs,

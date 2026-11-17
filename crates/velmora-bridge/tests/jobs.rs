@@ -265,6 +265,7 @@ impl Fx {
             max_put_bytes: 16 * 1024 * 1024,
             slice_bytes: 8 * 1024 * 1024,
             intent_sweep: false,
+            packed_plans: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: VERIFY_DELAY_SECS,
@@ -1166,6 +1167,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             sweep_failed: false,
             release_paused: false,
             mark_failed: false,
+            plans_packed: 0,
+            pack_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

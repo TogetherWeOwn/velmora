@@ -50,6 +50,7 @@ use sha2::{Digest, Sha256};
 use velmora::rng::SystemRng;
 
 use crate::crypto::{open_manifest, seal_manifest};
+use crate::plan::StoredPlan;
 use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow,
@@ -288,6 +289,29 @@ mod b64 {
     }
 }
 
+mod opt_b64 {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(bytes) => s.serialize_str(&STANDARD.encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(text) => STANDARD
+                .decode(text)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 /// `buckets` row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketRecord {
@@ -399,6 +423,12 @@ pub struct ArticleManifest {
     pub plan_rev: u32,
     /// In `idx` order.
     pub articles: Vec<ArticleRecord>,
+    /// The same plan in its seeded packed form ([`crate::plan`]), when
+    /// the catalogue holds it that way: a replay gives the catalogue the
+    /// small form back, after it has checked it against `articles`. A
+    /// reader from before this field skips it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_b64")]
+    pub packed: Option<Vec<u8>>,
 }
 
 fn digest<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
@@ -522,6 +552,19 @@ impl GenerationManifest {
 }
 
 impl ArticleManifest {
+    /// The record of a plan with its packed form, when it has a seeded
+    /// one. The other packed form holds what `articles` holds, and is
+    /// made from it again.
+    pub fn of(extent: &ExtentRow, plan: &StoredPlan) -> Self {
+        let packed = plan.packed.as_ref();
+        ArticleManifest {
+            packed: packed
+                .filter(|p| crate::plan::seed_of(p).is_some())
+                .cloned(),
+            ..Self::new(extent, &plan.rows)
+        }
+    }
+
     pub fn new(extent: &ExtentRow, plan: &[ArticleRow]) -> Self {
         ArticleManifest {
             v: RECORD_VERSION,
@@ -529,6 +572,7 @@ impl ArticleManifest {
             // A stored plan has revision 1 or more; `extent` may have
             // been read before the plan was stored.
             plan_rev: extent.plan_rev.max(1),
+            packed: None,
             articles: plan
                 .iter()
                 .map(|a| ArticleRecord {
@@ -816,8 +860,28 @@ pub async fn write_article_plan<B: BlobStore, K: Kek>(
     extent: &ExtentRow,
     plan: &[ArticleRow],
 ) -> Result<()> {
+    write_stored_plan(
+        safety,
+        kek,
+        extent,
+        &StoredPlan {
+            rows: plan.to_vec(),
+            packed: None,
+        },
+    )
+    .await
+}
+
+/// [`write_article_plan`] for a plan as the catalogue holds it: the
+/// record also carries its seeded packed form.
+pub async fn write_stored_plan<B: BlobStore, K: Kek>(
+    safety: &B,
+    kek: &K,
+    extent: &ExtentRow,
+    plan: &StoredPlan,
+) -> Result<()> {
     let name = article_key(&extent.id);
-    let record = ArticleManifest::new(extent, plan);
+    let record = ArticleManifest::of(extent, plan);
     write(
         safety,
         kek,

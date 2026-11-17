@@ -34,7 +34,7 @@ sha2 = "0.11"
 md5 = "0.8"
 subtle = { version = "2", default-features = false }
 zeroize = "1"
-rusqlite = { version = "0.42", features = ["bundled"], optional = true }
+rusqlite = { version = "0.42", features = ["bundled", "preupdate_hook"], optional = true }
 
 [dev-dependencies]
 # Self dev-dependency: integration tests get the testkit feature.

@@ -149,6 +149,11 @@ pub(super) async fn gc_begin<S: Sql>(
                     ident(),
                 ),
                 (apply, vec![text(row.extent_id.as_str())]),
+                // The article metadata of a packed plan is the plan.
+                (
+                    "UPDATE extents SET plan = NULL WHERE id = ?1 AND ?2 = 'drop_articles_meta'",
+                    vec![text(row.extent_id.as_str()), text(row.action.as_str())],
+                ),
                 close,
             ];
             if guarded(c, stmts).await? == Guard::Applied(()) {

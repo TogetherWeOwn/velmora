@@ -18,6 +18,7 @@ pub mod ingress;
 pub mod intents;
 pub mod jobs;
 pub mod keepalive;
+pub mod plan;
 mod pool;
 pub mod ports;
 pub mod post;
@@ -31,6 +32,8 @@ pub mod trace;
 pub mod types;
 pub mod verify;
 
+#[cfg(feature = "testkit")]
+pub mod meter;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 

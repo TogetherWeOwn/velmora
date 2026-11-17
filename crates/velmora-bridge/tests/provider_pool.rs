@@ -893,9 +893,9 @@ async fn planned_then_peered_to_p1(rig: &mut Rig, s: &Seeded) -> Vec<ArticleRow>
 }
 
 /// The second provider already holds the articles (the first provider
-/// took them and they peered across) and the first one now refuses to
-/// post: the second answers "duplicate", which is confirmed, and each
-/// article is recorded once.
+/// took them and they peered across). The first one cannot show them and
+/// now refuses to post: the second is asked, has them, and each article
+/// is recorded once.
 #[tokio::test]
 async fn duplicate_on_the_failover_provider_confirms() {
     let mut rig = pool_rig(2).await;
@@ -903,6 +903,8 @@ async fn duplicate_on_the_failover_provider_confirms() {
     let planned = planned_then_peered_to_p1(&mut rig, &s).await;
     let on_p0 = rig.servers[0].posted_count().await;
 
+    // A run that failed came before, so this one asks before it sends.
+    rig.servers[0].set_stat_lag(true).await;
     rig.servers[0].set_posting_allowed(false).await;
     rig.bridge.clock.advance_secs(3600);
     let plan = rig.post(&s).await;
