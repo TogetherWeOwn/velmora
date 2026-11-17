@@ -2223,3 +2223,125 @@ async fn dispatch_survives_a_failed_mark() {
     assert_eq!(fx.tick().await.0, [o.job(OutboxStage::Post)]);
     assert_eq!(fx.tick().await.0, []);
 }
+
+// ---------------------------------------------------------------------------
+// A job whose invocation ends without it
+// ---------------------------------------------------------------------------
+
+/// Advances the fixed clock instead of sleeping, so a wait for budget
+/// takes no real time.
+fn clock_sleeper(clock: &Rc<FixedClock>) -> velmora_bridge::ingress::Sleeper {
+    let clock = Rc::clone(clock);
+    Rc::new(move |ms| {
+        clock.advance_ms(i64::from(ms));
+        Box::pin(async {})
+    })
+}
+
+/// Polls `job` until it holds its bytes: it is then in the middle of its
+/// work.
+async fn poll_until_charged<F: std::future::Future + Unpin>(job: &mut F, budget: &ByteBudget) {
+    for _ in 0..10_000 {
+        let once = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::pin::Pin::new(&mut *job).poll(cx).is_pending())
+        });
+        assert!(once.await, "the job ended");
+        if budget.in_use() > 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the job never charged the budget");
+}
+
+/// A job that is dropped in the middle of its work gives its bytes back:
+/// the charge is released by its destructor.
+#[tokio::test]
+async fn a_job_dropped_mid_flight_gives_its_bytes_back() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    let job = o.job(OutboxStage::Post);
+
+    let mut running = Box::pin(fx.bridge.run_job(&job));
+    poll_until_charged(&mut running, &fx.bridge.budget).await;
+    assert!(fx.bridge.budget.in_use() >= o.plain.len() as u64);
+    drop(running);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// The production stall. The runtime cancels the invocation of a job in
+/// the middle of its work: the future is never polled again and never
+/// dropped, so no destructor runs and its bytes stay charged in an
+/// isolate that goes on serving. Every later job then waits the full
+/// time for room, is put off without spending an attempt, and posts
+/// nothing, for as long as the isolate lives.
+///
+/// Held in the isolate's job table, the abandoned job is dropped once it
+/// is older than an invocation can be: its bytes come back, the jobs
+/// behind it run, and its own extent is posted by the next job for it.
+#[tokio::test]
+async fn an_abandoned_job_does_not_hold_the_budget_for_ever() {
+    use velmora_bridge::ingress::CHARGE_WAIT_MS;
+    use velmora_bridge::jobtable::{JobTable, JOB_MAX_AGE_MS};
+
+    let mut fx = Fx::new().await;
+    // Room for one post job of this size, not for two.
+    let room = plaintext().len() as u64 + 6 * 1024 * 1024;
+    fx.bridge.budget = ByteBudget::new(room).with_sleeper(clock_sleeper(&fx.clock));
+    let bucket = fx.bucket("scratch", true).await;
+    let first = fx.put(&bucket, "first", &plaintext()).await;
+    let second = fx.put(&bucket, "second", &plaintext()).await;
+    let (first_job, second_job) = (first.job(OutboxStage::Post), second.job(OutboxStage::Post));
+
+    // The invocation begins its job, and is cancelled mid-flight.
+    let table = JobTable::new();
+    let began = fx.clock.now();
+    let mut abandoned = table.run(began, fx.bridge.run_job(&first_job));
+    poll_until_charged(&mut abandoned, &fx.bridge.budget).await;
+    std::mem::forget(abandoned);
+    let held = fx.bridge.budget.in_use();
+    assert!(held >= first.plain.len() as u64);
+
+    // The symptom: each job behind it waits the full time and is put
+    // off; no attempt is spent, no error is recorded, nothing is posted.
+    for _ in 0..3 {
+        let waited_from = fx.clock.now();
+        let outcome = fx.bridge.run_job(&second_job).await;
+        let JobOutcome::Retry { delay_secs } = outcome else {
+            panic!("expected a job that is put off, got {outcome:?}");
+        };
+        assert!(fx.clock.now().0 - waited_from.0 >= i64::from(CHARGE_WAIT_MS));
+        assert_eq!(fx.outbox(&second, "stage").await, "post");
+        assert_eq!(fx.outbox(&second, "attempts").await, "0");
+        assert_eq!(fx.outbox(&second, "last_error").await, "NULL");
+        assert_eq!(fx.bridge.budget.in_use(), held);
+        // Nobody is counted as waiting once the job has given up.
+        assert_eq!(fx.bridge.budget.waiting(), 0);
+        fx.clock.advance_secs(delay_secs);
+        // Too young to be dropped: its invocation may still be running.
+        assert_eq!(table.reap(fx.clock.now(), JOB_MAX_AGE_MS), 0);
+    }
+    assert_eq!(fx.bridge.budget.refused(), 3);
+
+    // Older than any invocation: the next invocation drops it.
+    fx.clock
+        .advance_ms(began.0 + JOB_MAX_AGE_MS - fx.clock.now().0);
+    let reaped = table.reap(fx.clock.now(), JOB_MAX_AGE_MS);
+    assert_eq!(
+        fx.bridge.budget.in_use(),
+        0,
+        "an abandoned job still holds the isolate's budget"
+    );
+    assert_eq!((reaped, table.len(), table.reaped()), (1, 0, 1));
+    assert_eq!(fx.bridge.run_job(&second_job).await, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&second, "stage").await, "verify");
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+
+    // The extent of the abandoned job is not lost: its lease runs out
+    // and the next job for it posts it.
+    fx.clock.advance_secs(3600);
+    assert_eq!(fx.bridge.run_job(&first_job).await, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&first, "stage").await, "verify");
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}

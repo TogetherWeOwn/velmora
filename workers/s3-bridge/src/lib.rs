@@ -14,6 +14,7 @@ mod e2;
 mod env;
 mod fanout;
 mod http;
+mod jobs;
 mod nntp;
 mod queues;
 mod r2;
@@ -105,6 +106,9 @@ async fn handle_detached(
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // What a GET read from Usenet, one line per run of cold extents.
     velmora_bridge::trace::log_cold_reads(|line| console_log!("cold read: {line}"));
+    if let Ok(bridge) = env::bridge(&env) {
+        log_budget(&bridge);
+    }
     let method = req.inner().method();
     // Every answer for an admin route carries `no-store`, the early
     // refusals below too.
@@ -170,6 +174,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             return Err(worker::Error::RustError("config refused".into()));
         }
     };
+    log_budget(&bridge);
     for msg in batch.messages()? {
         let Ok(job) = serde_json::from_value::<Job>(msg.body().clone()) else {
             // A job only names an outbox row; the dispatcher re-drives it.
@@ -188,7 +193,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                     JobOutcome::Ack
                 }
             }
-            _ => bridge.run_job(&job).await,
+            _ => run_in_table(&bridge, &job).await,
         };
         log_post_trace(&job, &outcome);
         plan_hint(&env, &bridge, &job, &outcome).await;
@@ -201,10 +206,51 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             ),
         }
     }
+    log_budget(&bridge);
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
     Ok(())
+}
+
+/// Runs a job in the isolate's job table, where a later invocation can
+/// drop it should this one be cancelled: a cancelled invocation is not
+/// dropped, and the job would keep its bytes of the budget (`jobs`).
+async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
+    let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+    // A wake that is due runs its stage too.
+    let post = matches!(
+        job,
+        Job::Extent {
+            stage: OutboxStage::Post,
+            ..
+        } | Job::Wake {
+            stage: OutboxStage::Post,
+            ..
+        }
+    );
+    let (b, j) = (Rc::clone(bridge), job.clone());
+    match jobs::run(now, post, async move { b.run_job(&j).await }).await {
+        Some(outcome) => outcome,
+        None => {
+            console_error!("job table: a running job was dropped for its age");
+            JobOutcome::Retry {
+                delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
+            }
+        }
+    }
+}
+
+/// Drops the jobs of invocations that are gone, and says when the byte
+/// budget of this isolate stays full. Counts, sizes and times only.
+fn log_budget(bridge: &env::WorkerBridge) {
+    let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+    if let Some(line) = jobs::reap(&bridge.budget, env::isolate(), now) {
+        console_error!("{line}");
+    }
+    if let Some(line) = jobs::watch_line(&bridge.budget, env::isolate(), now) {
+        console_error!("{line}");
+    }
 }
 
 fn copier<'a>(

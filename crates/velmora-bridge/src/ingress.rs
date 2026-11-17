@@ -482,6 +482,8 @@ struct BudgetState {
     /// Bytes charged by background jobs.
     jobs: Cell<u64>,
     peak: Cell<u64>,
+    /// Charges that waited the full time and found no room.
+    refused: Cell<u64>,
     /// The number the next charge that waits is given.
     next_wait: Cell<u64>,
     /// The charges that wait for room now: the lowest number came
@@ -599,6 +601,7 @@ impl ByteBudget {
                 requests: Cell::new(0),
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
+                refused: Cell::new(0),
                 next_wait: Cell::new(0),
                 waiting: RefCell::new(Vec::new()),
             }),
@@ -620,6 +623,7 @@ impl ByteBudget {
                 requests: Cell::new(0),
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
+                refused: Cell::new(0),
                 next_wait: Cell::new(0),
                 waiting: RefCell::new(Vec::new()),
             }),
@@ -686,6 +690,25 @@ impl ByteBudget {
             .requests
             .get()
             .saturating_add(self.state.jobs.get())
+    }
+
+    /// Bytes charged right now by background jobs.
+    pub fn jobs_in_use(&self) -> u64 {
+        self.state.jobs.get()
+    }
+
+    /// Charges that waited [`CHARGE_WAIT_MS`] and found no room, since
+    /// the isolate began: each is a moment at which the budget had been
+    /// full for that long. A count that keeps rising while little is
+    /// charged and released says that bytes are held by work that no
+    /// longer runs.
+    pub fn refused(&self) -> u64 {
+        self.state.refused.get()
+    }
+
+    /// Charges that wait for room now.
+    pub fn waiting(&self) -> usize {
+        self.state.waiting.borrow().len()
     }
 
     /// Highest `in_use` seen by this isolate (`inflight_peak_bytes`).
@@ -807,6 +830,8 @@ impl ByteBudget {
                 return Err(IngressError::SlowDown);
             };
             if waited >= CHARGE_WAIT_MS {
+                let s = &self.state;
+                s.refused.set(s.refused.get().saturating_add(1));
                 return Err(IngressError::SlowDown);
             }
             if waiting.is_none() {
