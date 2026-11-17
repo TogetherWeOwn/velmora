@@ -268,7 +268,7 @@ pub fn states(rig: &Rig) -> Vec<(String, usize)> {
     out
 }
 
-fn keys_under(rig: &Rig, prefix: &str) -> Vec<String> {
+pub fn keys_under(rig: &Rig, prefix: &str) -> Vec<String> {
     let mut keys: Vec<String> = rig
         .bridge
         .safety

@@ -256,6 +256,7 @@ where
             &bridge.catalog,
             &bridge.safety,
             &bridge.kek,
+            &bridge.cfg.records,
             bucket,
             &generation,
             &extents,

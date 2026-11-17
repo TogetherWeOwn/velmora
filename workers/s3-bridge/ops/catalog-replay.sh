@@ -90,6 +90,7 @@ while :; do
     | .damaged_unpublished = ((.damaged_unpublished // []) + $s.damaged_unpublished)
     | .unreadable = (((.unreadable // []) + $s.unreadable) | unique)
     | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
+    | .twins = (((.twins // []) + ($s.twins // [])) | unique)
     | .held_missing = ((.held_missing // []) + $s.held_missing)
     | .damaged_total = $s.damaged_total
     | .damaged = $s.damaged' "$WORK/step.json" >"$WORK/total.next"
@@ -107,7 +108,7 @@ if [ "$(jq -r '.held_missing_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: run it again with restore point 0 before leaving maintenance" >&2
   exit 2
 fi
-if [ "$(jq -r '(.unpublishable | length) + (.damaged_unpublished | length) + (.unreadable | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
+if [ "$(jq -r '(.unpublishable | length) + (.damaged_unpublished | length) + (.unreadable | length) + (.twins | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
   exit 2
 fi

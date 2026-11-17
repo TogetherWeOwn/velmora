@@ -1513,6 +1513,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
         required_backbones: 1,
         safety_min_age_secs: 0,

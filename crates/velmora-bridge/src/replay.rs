@@ -5,6 +5,8 @@
 //! The catalogue after a replay is the fold of the records in id order:
 //! the live generation of a key is its newest manifest, unless a newer
 //! tombstone exists. Manifests go first, oldest first, then tombstones.
+//! The records of both layouts ([`Layout`]) are read, as one list in id
+//! order: where a record is stored says nothing about its place in it.
 //! Every step is idempotent, so a replay can be repeated, resumed from
 //! its cursor, or run over a catalogue that already holds some or all of
 //! the records.
@@ -31,8 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{
-    article_key, read_article_plan, read_generation, read_tombstone, start_after,
-    GenerationManifest, GENERATION_PREFIX, TOMBSTONE_PREFIX,
+    read_article_plan, read_generation, read_tombstone, record_name, start_after,
+    GenerationManifest, Layout, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
 use crate::types::{
     ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
@@ -116,7 +118,9 @@ pub struct ReplayCursor {
     /// Records minted at or after this time are replayed.
     pub since_ms: i64,
     pub phase: ReplayPhase,
-    /// Blob key of the last finished record.
+    /// The last finished record: its blob key in the flat layout,
+    /// whichever layout it is stored in. The place is one id, and the
+    /// records of every layout after that id are still to come.
     pub after: String,
     /// Extents already handled of the record after `after`.
     pub extent: u32,
@@ -245,6 +249,12 @@ pub struct ReplayReport {
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
     pub damaged: Vec<String>,
+    /// The same id is stored under the names of both layouts: the blob
+    /// keys of the tenant layout of such ids. The flat name is replayed,
+    /// and the other one only when the flat name gives no record (it
+    /// does not open, or is gone). A write stores its record once, so
+    /// this is the trace of a record that was put there by hand.
+    pub twins: Vec<String>,
     /// Records that did not open or parse (blob keys). Also the name
     /// of the plan record of an extent whose packed plan in the
     /// catalogue cannot be read and stays so, because the record has no
@@ -294,36 +304,41 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         report: &mut ReplayReport,
     ) -> Result<Option<ReplayCursor>> {
         let names = self
-            .safety
-            .list(GENERATION_PREFIX, &cursor.after, limits.records)
+            .listed(GENERATION_PREFIX, &cursor.after, limits.records, report)
             .await?;
         let mut budget = limits.extents;
-        for name in &names {
-            let manifest = match read_generation(&self.safety, &self.kek, name).await {
-                Ok(Some(m)) => m,
-                // Removed by an operator since the listing.
-                Ok(None) => {
-                    cursor = finished(cursor, name);
-                    continue;
+        for listed in &names {
+            let flat = &listed.flat;
+            // The first name of the id that opens: a name that does not
+            // must not hide a record of the same id that does.
+            let mut opened = None;
+            for (name, layout) in listed.names() {
+                match read_generation(&self.safety, &self.kek, name).await {
+                    Ok(Some(m)) => {
+                        opened = Some((m, layout));
+                        break;
+                    }
+                    // Removed by an operator since the listing.
+                    Ok(None) => {}
+                    Err(crate::types::BridgeError::Blob(e)) => {
+                        return Err(crate::types::BridgeError::Blob(e))
+                    }
+                    Err(_) => report.unreadable.push(name.clone()),
                 }
-                Err(crate::types::BridgeError::Blob(e)) => {
-                    return Err(crate::types::BridgeError::Blob(e))
-                }
-                Err(_) => {
-                    report.unreadable.push(name.clone());
-                    cursor = finished(cursor, name);
-                    continue;
-                }
+            }
+            let Some((manifest, layout)) = opened else {
+                cursor = finished(cursor, flat);
+                continue;
             };
             if !self
-                .replay_manifest(&manifest, &mut cursor, &mut budget, report)
+                .replay_manifest(&manifest, layout, &mut cursor, &mut budget, report)
                 .await?
             {
                 // Out of budget inside this record.
                 return Ok(Some(cursor));
             }
             report.manifests += 1;
-            cursor = finished(cursor, name);
+            cursor = finished(cursor, flat);
         }
         if names.len() as u64 == u64::from(limits.records) {
             return Ok(Some(cursor));
@@ -339,6 +354,9 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     async fn replay_manifest(
         &self,
         m: &GenerationManifest,
+        // The layout the record is stored in: where the article plans
+        // of its extents are looked for first.
+        layout: &Layout,
         cursor: &mut ReplayCursor,
         budget: &mut usize,
         report: &mut ReplayReport,
@@ -385,16 +403,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 // replay: it is reported and the extent is restored
                 // without a plan. A store that cannot be reached still
                 // fails the call, so that the caller retries.
-                let record = match read_article_plan(&self.safety, &self.kek, &row.id).await {
-                    Ok(record) => record,
-                    Err(crate::types::BridgeError::Blob(e)) => {
-                        return Err(crate::types::BridgeError::Blob(e))
-                    }
-                    Err(_) => {
-                        report.unreadable.push(article_key(&row.id));
-                        None
-                    }
-                };
+                // The plan may be in the other layout than the record:
+                // an extent is posted after its object is published,
+                // and a copy names the extents of an older object.
+                let read = read_article_plan(&self.safety, &self.kek, &row.id, layout).await?;
+                let mut unopened = read.unreadable;
+                let record = read.record;
                 let mut packed = None;
                 let plan = match record {
                     Some(record) => match record.rows(state) {
@@ -411,12 +425,17 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                             Some(rows)
                         }
                         Err(_) => {
-                            report.unreadable.push(article_key(&row.id));
+                            unopened.extend(read.name);
                             None
                         }
                     },
                     None => None,
                 };
+                for name in unopened {
+                    if !report.unreadable.contains(&name) {
+                        report.unreadable.push(name);
+                    }
+                }
                 report.extents += 1;
                 report.article_plans += u32::from(plan.is_some());
                 report.safety_missing += u32::from(!safety_present);
@@ -431,9 +450,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             // record replaces is named like a record that does not
             // open: the extent cannot be read from Usenet.
             for extent in self.catalog.replay_extents(&bucket, &chunk, now).await? {
-                let name = article_key(&extent);
-                if !report.unreadable.contains(&name) {
-                    report.unreadable.push(name);
+                let named = Layout::all().iter().any(|l| {
+                    let name = l.article_key(&extent);
+                    report.unreadable.contains(&name)
+                });
+                if !named {
+                    report.unreadable.push(layout.article_key(&extent));
                 }
             }
             *budget -= end - at;
@@ -502,31 +524,39 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         report: &mut ReplayReport,
     ) -> Result<Option<ReplayCursor>> {
         let names = self
-            .safety
-            .list(TOMBSTONE_PREFIX, &cursor.after, limits.records)
+            .listed(TOMBSTONE_PREFIX, &cursor.after, limits.records, report)
             .await?;
         let now = self.clock.now();
-        for name in &names {
-            match read_tombstone(&self.safety, &self.kek, name).await {
-                Ok(Some(t)) => {
-                    let (bucket, id) = (BucketId::new(t.bucket_id), GenerationId::new(t.id));
-                    // The floor is raised also when nothing is deleted
-                    // here: a write after the replay sorts after every
-                    // tombstone on record.
-                    let deleted = self
-                        .catalog
-                        .replay_tombstone(&bucket, &t.key, &id, now)
-                        .await?;
-                    report.tombstones += 1;
-                    report.deleted += u32::from(deleted);
+        for listed in &names {
+            let flat = &listed.flat;
+            // As for a generation: the first name of the id that opens.
+            let mut opened = None;
+            for (name, _) in listed.names() {
+                match read_tombstone(&self.safety, &self.kek, name).await {
+                    Ok(Some(t)) => {
+                        opened = Some(t);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(crate::types::BridgeError::Blob(e)) => {
+                        return Err(crate::types::BridgeError::Blob(e))
+                    }
+                    Err(_) => report.unreadable.push(name.clone()),
                 }
-                Ok(None) => {}
-                Err(crate::types::BridgeError::Blob(e)) => {
-                    return Err(crate::types::BridgeError::Blob(e))
-                }
-                Err(_) => report.unreadable.push(name.clone()),
             }
-            cursor = finished(cursor, name);
+            if let Some(t) = opened {
+                let (bucket, id) = (BucketId::new(t.bucket_id), GenerationId::new(t.id));
+                // The floor is raised also when nothing is deleted
+                // here: a write after the replay sorts after every
+                // tombstone on record.
+                let deleted = self
+                    .catalog
+                    .replay_tombstone(&bucket, &t.key, &id, now)
+                    .await?;
+                report.tombstones += 1;
+                report.deleted += u32::from(deleted);
+            }
+            cursor = finished(cursor, flat);
         }
         if names.len() as u64 == u64::from(limits.records) {
             return Ok(Some(cursor));
@@ -537,6 +567,66 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             extent: 0,
             ..cursor
         }))
+    }
+
+    /// The next records of one kind after `after`, at most `limit`, from
+    /// every layout, in the order of their ids. `prefix` and `after` are
+    /// keys of the flat layout ([`GENERATION_PREFIX`] or
+    /// [`TOMBSTONE_PREFIX`], and the place of the cursor).
+    ///
+    /// Each layout is listed from the same place, `limit` keys at most.
+    /// The first `limit` of them all together are then the next ones:
+    /// none of them sorts after the last key of a listing that was cut,
+    /// so no record that was not listed lies before one that is
+    /// answered. Fewer than `limit` = the records have ended.
+    async fn listed(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: u32,
+        report: &mut ReplayReport,
+    ) -> Result<Vec<Listed>> {
+        let mut all: Vec<Listed> = Vec::new();
+        for layout in Layout::all() {
+            let names = self
+                .safety
+                .list(&layout.of_flat(prefix), &layout.of_flat(after), limit)
+                .await?;
+            for name in names {
+                // A key under the prefix that is no record name (it
+                // has a `/` after the id) is read where it is, and
+                // reported as what does not open.
+                let flat = match record_name(&name) {
+                    Some(parsed) => parsed.flat(),
+                    None => format!(
+                        "{}{}",
+                        crate::recovery::RECORD_PREFIX,
+                        &name[layout.root().len().min(name.len())..]
+                    ),
+                };
+                all.push(Listed {
+                    name,
+                    flat,
+                    layout: layout.clone(),
+                    twin: None,
+                });
+            }
+        }
+        // Stable: of two names of one id, the flat one stays first.
+        all.sort_by(|a, b| a.flat.cmp(&b.flat));
+        let mut next: Vec<Listed> = Vec::new();
+        for record in all {
+            let full = next.len() as u64 == u64::from(limit);
+            match next.last_mut() {
+                Some(last) if last.flat == record.flat => {
+                    report.twins.push(record.name.clone());
+                    last.twin = Some((record.name, record.layout));
+                }
+                _ if full => break,
+                _ => next.push(record),
+            }
+        }
+        Ok(next)
     }
 
     /// A replay from a restore point does not read the records of older
@@ -572,10 +662,32 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     }
 }
 
-/// The cursor after the record at `name` is done.
-fn finished(cursor: ReplayCursor, name: &str) -> ReplayCursor {
+/// A record a replay step is to read.
+struct Listed {
+    /// Its blob key.
+    name: String,
+    /// The blob key of the same id in the flat layout: its place in
+    /// the order, and what the cursor holds.
+    flat: String,
+    /// The layout it is stored in.
+    layout: Layout,
+    /// The name and layout of the same id in the other layout, when
+    /// both are stored: read when the first name gives no record.
+    twin: Option<(String, Layout)>,
+}
+
+impl Listed {
+    /// The names the record is stored under, the one to read first.
+    fn names(&self) -> impl Iterator<Item = (&String, &Layout)> {
+        std::iter::once((&self.name, &self.layout))
+            .chain(self.twin.as_ref().map(|(name, layout)| (name, layout)))
+    }
+}
+
+/// The cursor after the record whose flat name is `flat` is done.
+fn finished(cursor: ReplayCursor, flat: &str) -> ReplayCursor {
     ReplayCursor {
-        after: name.to_owned(),
+        after: flat.to_owned(),
         extent: 0,
         ..cursor
     }

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use futures_util::StreamExt;
 
 use velmora_bridge::recovery::{
-    is_protected_key, Unpublished, ERR_RECORD_DELETE, TOMBSTONE_PREFIX,
+    is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
 use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
 use worker::{Bucket, Range};
@@ -111,7 +111,9 @@ fn empty_span(span: ByteSpan, size: u64) -> Result<Vec<u8>> {
 
 impl BlobStore for R2Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
-        if self.tombstone_delay_ms > 0 && key.starts_with(TOMBSTONE_PREFIX) {
+        if self.tombstone_delay_ms > 0
+            && record_name(key).is_some_and(|n| n.kind == RecordKind::Tombstone)
+        {
             let wait = std::time::Duration::from_millis(u64::from(self.tombstone_delay_ms));
             worker::Delay::from(wait).await;
         }
