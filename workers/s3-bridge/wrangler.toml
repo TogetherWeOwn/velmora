@@ -44,15 +44,16 @@ MAINTENANCE = "off"                  # off | restore
 # jobs and a verify job fit the 72 MiB job budget at once; at 8 only two
 # post jobs fit beside a verify job and the third waits for them.
 POST_SOCKETS = "6"
-# The largest PutObject body: 99 MiB, the most this build takes. A request
-# body above 100 MiB is refused before it reaches the Worker, and the
-# margin is for chunked framing. A body above MAX_EXTENT_BYTES is stored
-# as slices of SLICE_BYTES, one in memory at a time. Without the variable
-# the limit is MAX_EXTENT_BYTES. A part of a multipart upload stays at
-# MAX_EXTENT_BYTES.
+# The largest body of a PutObject or an UploadPart: 99 MiB, the most this
+# build takes. A request body above 100 MiB is refused before it reaches
+# the Worker, and the margin is for chunked framing. A body above
+# MAX_EXTENT_BYTES is stored as slices of SLICE_BYTES, one in memory at a
+# time. Without the variable the limit is MAX_EXTENT_BYTES. A part made
+# by UploadPartCopy stays at MAX_EXTENT_BYTES.
 MAX_PUT_BYTES = "103809024"
 # off | on. On: the cron tick removes the slices of a sliced PutObject
-# that was never published, a day after it began. It deletes nothing of
+# that was never published, or of a sliced UploadPart that was never
+# stored, a day after it began. It deletes nothing of
 # a write that has a recovery record, nothing while a replay is under
 # way, and nothing while the catalogue is behind its rollback stamp.
 # Independent of GC_MODE. Off: the slices and their rows stay, and a
@@ -81,7 +82,10 @@ INTENT_SWEEP = "off"
 # every cron run; it never stops the S3 service.
 RECOVERY_COPY = "off"
 # Optional vars and their defaults (production sets POST_SOCKETS explicitly):
-#   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
+#   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
+#   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
+#     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above
+#     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.

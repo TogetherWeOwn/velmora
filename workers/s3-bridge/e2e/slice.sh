@@ -512,6 +512,51 @@ if [[ ${E2E_SLICED:-1} == 1 ]]; then
   run_aws "DELETE s/sliced.bin" "${S3API[@]}" delete-object --bucket "$SB" --key s/sliced.bin >/dev/null
   run_aws "DELETE s/over.bin" "${S3API[@]}" delete-object --bucket "$SB" --key s/over.bin >/dev/null
   rm -f "$T/sliced.bin" "$T/got-sliced.bin" "$T/sliced-want.bin"
+
+  # A multipart upload in parts above one extent: 300 MiB in parts of
+  # 95 MiB (three of them, and one of 15 MiB), each stored as slices.
+  # Three at a time: each counts two slices against the 48 MiB budget.
+  STEP=0d-sliced-parts
+  log "step $STEP"
+  cp "$T/aws-config" "$T/aws-config-95"
+  PARTS95=(env "AWS_CONFIG_FILE=$T/aws-config-95")
+  "${PARTS95[@]}" aws configure set default.s3.multipart_chunksize 95MB
+  "${PARTS95[@]}" aws configure set default.s3.max_concurrent_requests 3
+  head -c 314572800 /dev/urandom >"$T/parts.bin"
+  WANT_ETAG=$(python3 - "$T/parts.bin" <<'PY'
+import hashlib, sys
+md5s, n = b"", 0
+with open(sys.argv[1], "rb") as f:
+    while chunk := f.read(95 * 1024 * 1024):
+        md5s += hashlib.md5(chunk).digest()
+        n += 1
+print(f"{hashlib.md5(md5s).hexdigest()}-{n}")
+PY
+  )
+  t0=$(now_ms)
+  run_aws "multipart PUT s/parts.bin (parts of 95 MiB)" "${PARTS95[@]}" "${S3[@]}" cp "$T/parts.bin" "s3://$SB/s/parts.bin" >/dev/null
+  log "multipart PUT s/parts.bin: $(($(now_ms) - t0)) ms for 314572800 bytes"
+  json=$(run_aws "HEAD s/parts.bin" "${S3API[@]}" head-object --bucket "$SB" --key s/parts.bin)
+  jcheck "HEAD s/parts.bin: 300 MiB, and the ETag of four parts" \
+    ".ContentLength == 314572800 and .ETag == \"\\\"$WANT_ETAG\\\"\"" "$json"
+  json=$(adm "GET /_admin/objects/$SB/s/parts.bin" "$BASE/_admin/objects/$SB/s/parts.bin")
+  # Twelve slices for each part of 95 MiB, one extent for the last part.
+  jcheck "s/parts.bin is 37 extents" '.extents | length == 37' "$json"
+  run_aws "GET s/parts.bin" "${S3[@]}" cp "s3://$SB/s/parts.bin" "$T/got-parts.bin" >/dev/null
+  same_bytes "GET s/parts.bin equals the upload" "$T/parts.bin" "$T/got-parts.bin"
+  # A range over the end of the first part (95 MiB = 99614720 bytes).
+  run_aws "GET s/parts.bin bytes=99614220-99615220" "${S3API[@]}" get-object --bucket "$SB" --key s/parts.bin \
+    --range bytes=99614220-99615220 "$T/got-parts.bin" >/dev/null
+  dd if="$T/parts.bin" of="$T/parts-want.bin" bs=1 skip=99614220 count=1001 status=none
+  same_bytes "range body equals bytes 99614220-99615220" "$T/parts-want.bin" "$T/got-parts.bin"
+  if [[ $MODE == local ]]; then
+    json=$(adm "GET /_admin/status" "$BASE/_admin/status")
+    jcheck "no write is open, waiting or kept after the sliced parts" \
+      '.write_intents | .open_writes == 0 and .waiting_writes == 0 and .kept_writes == 0 and .anomalies == 0' "$json"
+  fi
+  run_aws "DELETE s/parts.bin" "${S3API[@]}" delete-object --bucket "$SB" --key s/parts.bin >/dev/null
+  rm -f "$T/parts.bin" "$T/got-parts.bin" "$T/parts-want.bin" "$T/aws-config-95"
+  STEP=0c-sliced-put
 else
   log "step $STEP skipped (E2E_SLICED is not 1)"
 fi

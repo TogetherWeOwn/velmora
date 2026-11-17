@@ -19,9 +19,9 @@ use crate::types::{
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
-    OpenUpload, OutboxStage, OutboxStats, Perm, Precondition, ProviderConfig, ProviderFault,
-    ProviderLoad, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow, UploadRow,
-    VerificationRow, WriteId,
+    OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig,
+    ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow,
+    UploadRow, VerificationRow, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -669,6 +669,19 @@ pub trait Catalog {
         extent: &ExtentRow,
         now: UnixMs,
     ) -> Result<Guard<()>>;
+    /// Stores a part whose body was stored as the slices of `write`:
+    /// `extents` in body order, the first of them `part.extent_id`. The
+    /// intents of the write go in the same batch. `Lost` when the upload
+    /// is not open, or the intents are no longer this write's (the sweep
+    /// took them, or a replay began).
+    async fn put_upload_part_sliced(
+        &self,
+        t: &UploadTarget<'_>,
+        part: &UploadPartRow,
+        extents: &[ExtentRow],
+        write: &WriteId,
+        now: UnixMs,
+    ) -> Result<Guard<()>>;
     /// Publishes the staged part extents in place (see [`CompleteUpload`]).
     async fn complete_upload(
         &self,
@@ -679,8 +692,12 @@ pub trait Catalog {
         condition: Option<&Precondition>,
         record: Recorded,
     ) -> Result<PublishOutcome>;
-    /// The extent rows of the upload's current parts, in no order.
-    async fn upload_extents(&self, t: &UploadTarget<'_>) -> Result<Vec<ExtentRow>>;
+    /// The extent rows of the upload's current parts, ordered by part
+    /// number and, within a part, in body order; at most `limit` of them.
+    async fn upload_extents(&self, t: &UploadTarget<'_>, limit: u32) -> Result<Vec<PartExtent>>;
+    /// How many extents the upload holds under part numbers other than
+    /// `except`. A count without a guard: Complete decides for real.
+    async fn upload_extents_held(&self, upload: &UploadId, except: u16) -> Result<u64>;
     async fn abort_upload(&self, t: &UploadTarget<'_>, now: UnixMs) -> Result<Guard<()>>;
 
     // outbox: claim returns the fencing token; everything after takes the Lease

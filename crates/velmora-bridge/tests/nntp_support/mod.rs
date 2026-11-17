@@ -1146,7 +1146,10 @@ impl Catalog for MemCatalog {
     ) -> Result<bool> {
         unused()
     }
-    async fn upload_extents(&self, _: &UploadTarget<'_>) -> Result<Vec<ExtentRow>> {
+    async fn upload_extents_held(&self, _: &UploadId, _: u16) -> Result<u64> {
+        unimplemented!("multipart is not part of these tests")
+    }
+    async fn upload_extents(&self, _: &UploadTarget<'_>, _: u32) -> Result<Vec<PartExtent>> {
         unused()
     }
     async fn replay_probe(&self, _: &GenerationRow) -> Result<velmora_bridge::replay::ReplayProbe> {
@@ -1260,6 +1263,16 @@ impl Catalog for MemCatalog {
         _: &UploadTarget<'_>,
         _: &UploadPartRow,
         _: &ExtentRow,
+        _: UnixMs,
+    ) -> Result<Guard<()>> {
+        unused()
+    }
+    async fn put_upload_part_sliced(
+        &self,
+        _: &UploadTarget<'_>,
+        _: &UploadPartRow,
+        _: &[ExtentRow],
+        _: &WriteId,
         _: UnixMs,
     ) -> Result<Guard<()>> {
         unused()
@@ -1490,6 +1503,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
+        max_object_extents: 10_000,
         intent_sweep: false,
         packed_plans: false,
         required_backbones: 1,

@@ -479,6 +479,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
+        max_object_extents: 10_000,
         intent_sweep: false,
         packed_plans: false,
         required_backbones: 1,

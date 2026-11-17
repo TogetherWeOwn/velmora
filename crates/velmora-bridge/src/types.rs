@@ -941,6 +941,15 @@ pub struct UploadPartRow {
     pub uploaded_at: UnixMs,
 }
 
+/// One extent of a part of an open upload. A part body above one extent
+/// is stored as several, numbered in body order from 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartExtent {
+    pub part_number: u16,
+    pub piece: u32,
+    pub extent: ExtentRow,
+}
+
 /// `gc` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GcRow {

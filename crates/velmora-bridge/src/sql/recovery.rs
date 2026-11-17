@@ -2,12 +2,12 @@
 //! delete that a tombstone can replay, and the extent rows a multipart
 //! Complete records before it publishes.
 
-use super::objects::{extent_row, guard_precondition, retire_live, text, Stmt, EXTENT_COLS};
+use super::objects::{extent_row, guard_precondition, retire_live, text, Cols, Stmt, EXTENT_COLS};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
-use crate::ports::{Sql, UploadTarget};
+use crate::ports::{Sql, SqlValue, UploadTarget};
 use crate::types::{
-    BridgeError, BucketId, ExtentRow, GenerationId, GenerationState, Precondition, Result, UnixMs,
+    BridgeError, BucketId, GenerationId, GenerationState, PartExtent, Precondition, Result, UnixMs,
 };
 
 /// Retires the live generation of `(bucket, key)` if its id sorts before
@@ -105,22 +105,48 @@ fn delete_before(
     ));
 }
 
-/// Extent rows of the parts the upload holds now.
+/// Extent rows of the parts the upload holds now, by part number and,
+/// within a part, in body order.
 pub(super) async fn upload_extents<S: Sql>(
     c: &SqlCatalog<S>,
     t: &UploadTarget<'_>,
-) -> Result<Vec<ExtentRow>> {
+    limit: u32,
+) -> Result<Vec<PartExtent>> {
     let sql = format!(
-        "SELECT {EXTENT_COLS} FROM extents WHERE bucket_id = ?2 AND id IN \
-           (SELECT p.extent_id FROM upload_parts p JOIN uploads u ON u.id = p.upload_id \
-            WHERE u.id = ?1 AND u.bucket_id = ?2 AND u.key = ?3)"
+        "SELECT p.part_number, p.piece, {EXTENT_COLS} FROM \
+           (SELECT part_number, 0 AS piece, extent_id FROM upload_parts WHERE upload_id = ?1 \
+            UNION ALL \
+            SELECT part_number, piece, extent_id FROM upload_part_extents \
+             WHERE upload_id = ?1) p \
+         JOIN extents ON extents.id = p.extent_id \
+         WHERE extents.bucket_id = ?2 AND EXISTS \
+           (SELECT 1 FROM uploads u WHERE u.id = ?1 AND u.bucket_id = ?2 AND u.key = ?3) \
+         ORDER BY p.part_number, p.piece LIMIT ?4"
     );
     let rows = c
         .sql
         .query(
             &sql,
-            &[text(t.id.as_str()), text(t.bucket.as_str()), text(t.key)],
+            &[
+                text(t.id.as_str()),
+                text(t.bucket.as_str()),
+                text(t.key),
+                SqlValue::Int(i64::from(limit)),
+            ],
         )
         .await?;
-    rows.into_iter().map(extent_row).collect()
+    rows.into_iter()
+        .map(|mut row| {
+            if row.len() < 2 {
+                return Err(BridgeError::Sql("row decode: missing column".into()));
+            }
+            let rest = row.split_off(2);
+            let mut at = Cols::new(row);
+            Ok(PartExtent {
+                part_number: at.num()?,
+                piece: at.num()?,
+                extent: extent_row(rest)?,
+            })
+        })
+        .collect()
 }

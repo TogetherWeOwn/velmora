@@ -89,6 +89,10 @@ pub const MIGRATION_0016: &str =
 /// Article rows of a packed plan may be deleted while in service.
 pub const MIGRATION_0017: &str =
     include_str!("../../../workers/s3-bridge/migrations/0017_packed_plan_rows.sql");
+/// The slices of a multipart part stored as several extents
+/// (`upload_part_extents`).
+pub const MIGRATION_0018: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0018_upload_part_extents.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -216,6 +220,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0015)?;
         db.apply(MIGRATION_0016)?;
         db.apply(MIGRATION_0017)?;
+        db.apply(MIGRATION_0018)?;
         Ok(db)
     }
 
