@@ -121,6 +121,15 @@ pub async fn run(
 
 /// Drops the jobs of invocations that are gone. `Some(line)` when there
 /// were any.
+///
+/// The drop runs in another invocation than the one that made the job,
+/// so every destructor on a job's path runs outside its request. One
+/// that lets a JavaScript exception out ends the whole Wasm instance,
+/// and with it every job running in the isolate. That happened with
+/// wasm-streams 0.7.0: dropping the reader of an R2 body called
+/// `releaseLock()`, which throws outside the reader's request. 0.7.1
+/// ignores that throw; `the_stream_reader_drop_does_not_throw` holds the
+/// lockfile to it.
 pub fn reap(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<String> {
     let before = budget.in_use();
     let (n, left, total) = TABLE.with(|t| (t.reap(now, JOB_MAX_AGE_MS), t.len(), t.reaped()));
@@ -220,6 +229,31 @@ pub fn watch_line(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job dropped for its age is dropped outside its request. Before
+    /// 0.7.1, wasm-streams' reader called `releaseLock()` in its
+    /// destructor without catching what it throws there, which ended
+    /// the Wasm instance (see [`reap`]).
+    #[test]
+    fn the_stream_reader_drop_does_not_throw() {
+        let lock = include_str!("../../../Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .filter_map(|p| p.trim_start().strip_prefix("name = \"wasm-streams\"\n"))
+            .filter_map(|p| p.lines().next()?.strip_prefix("version = \""))
+            .filter_map(|v| v.strip_suffix('"'))
+            .map(|v| {
+                v.split('.')
+                    .map(|n| n.parse::<u32>().expect("a numeric version part"))
+                    .collect::<Vec<_>>()
+            })
+            .min()
+            .expect("wasm-streams is in the lockfile");
+        assert!(
+            version >= vec![0, 7, 1],
+            "wasm-streams {version:?} lets releaseLock() throw out of a destructor"
+        );
+    }
 
     #[test]
     fn abandon_is_dev_only_and_refuses_garbage() {
