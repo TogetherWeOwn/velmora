@@ -14,7 +14,9 @@ use service_support::*;
 use velmora::rng::SystemRng;
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk};
 use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
-use velmora_bridge::ingress::{ByteBudget, Charge, Sleeper, Spawner, CHARGE_POLL_MS};
+use velmora_bridge::ingress::{
+    ByteBudget, Charge, Sleeper, Spawner, CHARGE_POLL_MS, CHARGE_WAIT_MS,
+};
 use velmora_bridge::service::PIECE_WAIT_MS;
 use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::*;
@@ -1487,6 +1489,151 @@ async fn a_body_that_has_begun_waits_longer_for_room() {
         assert!(looks.get() >= 300, "it waited: {}", looks.get());
         assert!(body.next().await.is_none());
         assert_eq!(budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// A request that has sent nothing waits for room once and is then told
+/// to slow down: only a body that has begun waits longer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_that_has_sent_nothing_waits_for_room_once() {
+    let looks = Rc::new(Cell::new(0u32));
+    let real = real_sleeper();
+    let n = Rc::clone(&looks);
+    let sleeper: Sleeper = Rc::new(move |ms| {
+        if ms == CHARGE_POLL_MS {
+            n.set(n.get() + 1);
+        }
+        real(ms)
+    });
+    let cold = cold_rig_with(2, Some(sleeper)).await;
+    let rig = &cold.rig;
+    let body = pattern(150, 300_000);
+    rig.put(&cold.signer, BUCKET, "k", &body).await.expect(200);
+    let budget = &rig.bridge.budget;
+    let held = budget.try_charge(budget.capacity()).unwrap();
+    looks.set(0);
+    let resp = get(rig, &cold.signer, "k", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    let once = CHARGE_WAIT_MS / CHARGE_POLL_MS;
+    assert!(
+        (once..once + 10).contains(&looks.get()),
+        "it looked {} times",
+        looks.get()
+    );
+    drop(held);
+    assert!(get(rig, &cold.signer, "k", &[]).await.expect(200).body == body);
+}
+
+/// A read that found every provider slot taken waits for room in turn
+/// before it tries again, as a request that waits for room: a body that
+/// runs ahead of its reader, and holds a piece or the room for the next
+/// one at every moment, lets it have the room, and it is served while
+/// that body still runs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_that_waits_for_a_slot_gets_its_room_beside_a_body_ahead_of_its_reader() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // A look for room and a look for a slot take 100 ms; the looks
+        // for a slot are counted.
+        let slot_looks = Rc::new(Cell::new(0u32));
+        let real = real_sleeper();
+        let n = Rc::clone(&slot_looks);
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            if ms > CHARGE_POLL_MS {
+                return real(ms);
+            }
+            if ms != CHARGE_POLL_MS {
+                n.set(n.get() + 1);
+            }
+            Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100)))
+        });
+        let cold = cold_rig_on(4, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..32u8).map(|n| pattern(160 + n, 100_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let extents = commit_parts(rig, &cold.signer, &cold.bucket, "warm", &slices).await;
+        let cipher = extents.iter().map(|e| e.cipher_size).max().unwrap();
+        let lone = pattern(159, 200_000);
+        let extent = cold.put_and_post("cold.bin", &lone).await;
+        evict(rig, &extent).await;
+        let held = hold_all_slots(rig).await;
+        let budget = &rig.bridge.budget;
+        // The cold read fits only while the body holds nothing; the
+        // body has room for one piece that waits and for making one
+        // more.
+        let need =
+            velmora_bridge::fetch::cold_step_bytes(extent.cipher_size, rig.bridge.cfg.cold_sockets);
+        let room = need + 50_000;
+        assert!(room >= cipher + 250_000, "room {room}, cipher {cipher}");
+        let other = budget.try_charge(budget.capacity() - room).unwrap();
+        let sign = |key: &str| {
+            cold.signer.sign(
+                rig.now(),
+                Method::Get,
+                &path(BUCKET, key),
+                &[],
+                &[],
+                Vec::new(),
+            )
+        };
+        let resp = Rc::clone(&rig.bridge)
+            .handle(sign("warm").into_request())
+            .await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("a piece is made ahead", || {
+            budget.in_use() == other.bytes() + 200_000
+        })
+        .await;
+        let read: Rc<RefCell<Option<Vec<u8>>>> = Rc::default();
+        let (bridge, slot, req) = (Rc::clone(&rig.bridge), Rc::clone(&read), sign("cold.bin"));
+        tokio::task::spawn_local(async move {
+            let resp = bridge.handle(req.into_request()).await;
+            assert_eq!(resp.status, 200);
+            let RespBody::Stream(mut body) = resp.body else {
+                panic!("a GET body is a stream");
+            };
+            let mut all = Vec::new();
+            while let Some(chunk) = body.next().await {
+                all.extend_from_slice(&chunk.unwrap());
+            }
+            *slot.borrow_mut() = Some(all);
+        });
+        // The reader of the body takes a piece every 50 ms, between the
+        // looks of the cold read. Once that has found no slot, the
+        // slots are given back. A read that only looked for room, and
+        // was not waited for, would find it by chance after some
+        // forty pieces or when the body has ended; this one has it
+        // after six.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let mut held = Some(held);
+        let mut taken = 0;
+        for part in &parts[..20] {
+            if read.borrow().is_some() {
+                break;
+            }
+            if slot_looks.get() > 0 {
+                for permit in held.take().into_iter().flatten() {
+                    rig.bridge.catalog.release_permit(&permit).await.unwrap();
+                }
+            }
+            assert!(body.next().await.unwrap().unwrap() == *part);
+            taken += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(slot_looks.get() > 0, "the cold read found a slot at once");
+        assert!(
+            read.borrow().as_deref() == Some(&lone[..]),
+            "not served while the body ran ({taken} pieces taken)"
+        );
+        for part in &parts[taken..] {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), other.bytes());
     };
     local.run_until(test).await;
 }

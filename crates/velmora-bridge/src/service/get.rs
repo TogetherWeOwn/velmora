@@ -27,10 +27,11 @@ use crate::fetch::{
     cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
     COLD_WAIT_MS,
 };
-use crate::ingress::{ByteBudget, Charge, Spawner};
+use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
+    UnixMs,
 };
 
 /// Least time between two `last_read_at` writes for one extent. The
@@ -948,6 +949,9 @@ where
     /// Whether a piece of the body was made before: its reader has part
     /// of it already.
     mid: bool,
+    /// When the wait of the piece being made for a provider ends, once
+    /// it has begun: no wait for room is begun after it.
+    until: Option<UnixMs>,
 }
 
 /// How many times a body that has begun waits
@@ -1001,6 +1005,7 @@ where
             spent: Rc::default(),
             room: Rc::new(bridge.budget.for_request()),
             mid: false,
+            until: None,
         }
     }
 
@@ -1096,6 +1101,9 @@ where
         let mut room = self.wait(budget.charge_in_turn(need)).await;
         let mut waits = 1;
         while room.is_err() && self.mid && waits < MID_BODY_WAITS {
+            if self.until.is_some_and(|end| bridge.clock.now() >= end) {
+                break;
+            }
             room = self.wait(budget.charge_in_turn(need)).await;
             waits += 1;
         }
@@ -1188,6 +1196,7 @@ where
     async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
+        self.until = None;
         let span =
             cipher_span(extent.plain_size, piece.off, piece.len).ok_or(ReadFail::Internal)?;
         match self.warm(bucket, piece, span).await {
@@ -1215,12 +1224,16 @@ where
         // includes the catalogue and blob round trips of each poll; the sum of
         // the sleeps is a backstop in case the clock does not move. The
         // budget charge is released for each wait so
-        // waiting readers do not starve the budget, and taken again without
-        // waiting: each retry only sleeps here, inside the same bound. After
+        // waiting readers do not starve the budget. Before the next try
+        // there must be room for the read again: that is waited for in
+        // turn, as a request that waits for room, inside the same bound,
+        // so that a body that runs ahead of its reader lets this read
+        // have it. After
         // each wait the cache is checked again: another reader may have
         // filled it in the meantime.
         let waiter = WAITERS.fetch_add(1, Ordering::Relaxed);
         let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
+        self.until = Some(deadline);
         let mut slept = 0u32;
         let mut attempt = 0u64;
         let mut interrupted = 0u32;
@@ -1304,9 +1317,28 @@ where
                 slept = slept.saturating_add(ms);
                 // Until there is room for the read, which is released
                 // again here: what follows takes what it needs.
-                if room.try_charge(need).is_some() {
+                if room.try_charge_in_turn(need).is_some() {
                     break;
                 }
+                let now = bridge.clock.now();
+                let left = (deadline.0 - now.0).min(i64::from(COLD_WAIT_MS - slept));
+                let Ok(left @ 1..) = u32::try_from(left) else {
+                    return Err(ReadFail::Busy);
+                };
+                let listed = async {
+                    let listed = core::pin::pin!(room.charge_in_turn(need));
+                    match select(listed, sleep(left)).await {
+                        Either::Left((found, _)) => Some(found.is_ok()),
+                        Either::Right(_) => None,
+                    }
+                };
+                match beside(&mut self.put, listed).await {
+                    Some(true) => break,
+                    Some(false) => {}
+                    None => return Err(ReadFail::Busy),
+                }
+                // The clock may stand still: the wait is counted too.
+                slept = slept.saturating_add(CHARGE_WAIT_MS);
             }
             // Another reader may have filled the cache in the meantime.
             match self.warm(bucket, piece, span).await {

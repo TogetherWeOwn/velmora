@@ -778,9 +778,12 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
   the two take turns. The download waits for it five seconds at most. A
   request that other requests keep out, or that fits beside the
   download, is not waited for: a small read is not slowed down by a
-  large upload that waits. A download that has begun waits up to a
-  minute for room before it ends short; a request that has sent nothing
-  waits twenty seconds and answers `503 SlowDown`.
+  large upload that waits. A read that found every provider connection
+  taken waits for its room the same way before it tries again, inside
+  its forty seconds. A download that has begun waits up to a minute for
+  room before it ends short, and no longer once those forty seconds are
+  over; a request that has sent nothing waits twenty seconds and
+  answers `503 SlowDown`.
 - **The log.** Each invocation that read from Usenet writes one line,
   `cold read: extents=64 opened=8 open_ms=70 broken=0 slow=0
   refetched=0 p1=1536/1074007040 warm_ms=... read_ms=... wait_ms=...
