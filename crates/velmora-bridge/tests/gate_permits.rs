@@ -88,6 +88,8 @@ struct World {
     ops: Cell<u32>,
     /// No gate can be reached.
     down: Cell<bool>,
+    /// Requests to a gate do not arrive while this is set.
+    stall: Cell<bool>,
 }
 
 impl World {
@@ -100,6 +102,7 @@ impl World {
             calls: Cell::new(0),
             ops: Cell::new(0),
             down: Cell::new(false),
+            stall: Cell::new(false),
         })
     }
 
@@ -229,6 +232,11 @@ struct Wire(Rc<World>);
 
 impl GateTransport for Wire {
     async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        core::future::poll_fn(|_| match self.0.stall.get() {
+            true => core::task::Poll::Pending,
+            false => core::task::Poll::Ready(()),
+        })
+        .await;
         if self.0.down.get() {
             return Err(BridgeError::Sql("gate: unreachable".into()));
         }
@@ -1612,10 +1620,43 @@ async fn a_dropped_call_does_not_strand_the_calls_it_carried() {
     // Both are queued.
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert!(second.as_mut().poll(&mut cx).is_pending());
-    // The first takes both questions with it and is dropped before it
-    // is polled to the end.
+    // The first is dropped while both still wait in the queue: the
+    // second sends both questions.
     drop(first);
     assert!(second.await.unwrap());
+}
+
+/// The same once the request is on its way: the caller that sent the
+/// questions of both is dropped before the answer comes. The other is
+/// told that its question was lost and asks again alone.
+#[tokio::test]
+async fn a_call_dropped_in_flight_does_not_strand_the_calls_it_carried() {
+    let w = World::new();
+    let providers = [provider("p", 4)];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let a = take(&c, &w, &providers[0], READ, "read-1").await.unwrap();
+    let b = take(&c, &w, &providers[0], READ, "read-1").await.unwrap();
+    let now = w.now();
+    let calls = w.calls.get();
+
+    let mut first = Box::pin(c.renew_permit(&a, now));
+    let mut second = Box::pin(c.renew_permit(&b, now));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    // The first sends both questions; the request does not arrive.
+    w.stall.set(true);
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    // The second finds the queue taken and waits for its answer.
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(w.calls.get(), calls);
+    drop(first);
+    w.stall.set(false);
+    assert!(second.await.unwrap());
+    // One request: that of the second, alone.
+    assert_eq!(w.calls.get(), calls + 1);
+    assert_eq!(c.provider_load(now).await.unwrap()[0].held, 2);
 }
 
 // ---------------------------------------------------------------------------
