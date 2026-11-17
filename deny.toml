@@ -4,7 +4,11 @@
 # f7c9f6d (the extraction baseline): `cargo deny check` must pass for the
 # committed root Cargo.lock and is a required CI job wired fail-closed into
 # `ci-ok`. Findings are resolved by updating or replacing the dependency,
-# never by weakening this policy to get green.
+# never by weakening this policy to get green. The one exception path: a
+# finding no update or replacement can resolve (the crate is required by a
+# dependency we cannot drop) may be ignored by its advisory ID alone, with
+# the reason recorded below, owner approval, and a [bans] rule that keeps
+# the crate out of every other path.
 #
 # License inventory: every crate in the lock is a subset of the nntunev2
 # root lock reviewed there, all under permissive licenses. The only
@@ -25,6 +29,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # A yanked dependency (e.g. inout 0.2.3, fixed by updating) must fail the
 # gate: silently building on yanked code is not acceptable.
 yanked = "deny"
+# The one advisory exception, by ID only: every other advisory, including
+# any later chrono advisory under another ID, still fails the gate.
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained: pulled in only by worker (workers-rs), which requires chrono with no alternative (also in worker 0.9.0); our code has no chrono dependency; revisit when workers-rs drops it" },
+]
 
 [licenses]
 # Dev-dependencies ship in no artifact but still enter the tree; check them
@@ -57,6 +66,11 @@ allow = [
 # an explicit range.
 multiple-versions = "warn"
 wildcards = "deny"
+# chrono is allowed only as a dependency of worker (workers-rs); see the
+# RUSTSEC-2026-0543 exception above. A direct or other use fails here.
+deny = [
+  { crate = "chrono", wrappers = ["worker"], reason = "allowed only through workers-rs (RUSTSEC-2026-0543 exception)" },
+]
 
 [sources]
 # Every dependency must come from crates.io. A new git or registry source

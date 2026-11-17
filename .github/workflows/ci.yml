@@ -37,7 +37,7 @@ jobs:
       actions: read # Nested OSV reads same-run comparison artifacts.
       contents: read
       security-events: write # Nested OSV uploads comparison SARIF.
-    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@feb1e0e2111da007f38ca75ee95c6f6944723d36 # v0.5.0
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@c05610872587137c3c492b7025f02585a1b8ba7d # v0.11.0
 
   rust-test:
     name: rust test (native)
@@ -184,7 +184,8 @@ jobs:
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # the committed lockfile. Findings are fixed by updating the dependency,
-  # never by weakening the policy. Keep this job id in ci-ok's needs.
+  # never by weakening the policy; the single reviewed exception path is
+  # described in deny.toml's header. Keep this job id in ci-ok's needs.
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
