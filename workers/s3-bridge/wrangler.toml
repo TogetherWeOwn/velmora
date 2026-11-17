@@ -162,8 +162,10 @@ bucket_name = "velmora-cache-enam"
 #
 # The bindings of one kind are POST_Q, POST_Q2, POST_Q3, ... (VERIFY_Q,
 # VERIFY_Q2, ...), 8 at most, numbered without a gap: the Worker refuses
-# to start with POST_Q3 bound and POST_Q2 not. An extent's jobs always go
-# to the same queue of a kind (by a hash of its id); jobs without an
+# to start with POST_Q3 bound and POST_Q2 not. While the count of queues
+# stays the same, an extent's jobs go to the same queue of a kind (by a
+# hash of its id); a message sent before the count changed is still
+# consumed where it is, and a duplicate is acked at its claim. Jobs without an
 # extent (gc, sweeps) go to VERIFY_Q. Every queue needs its consumer: the
 # extents of a queue nobody reads are never posted.
 # To add a queue: create it, then add its producer and its consumer here.
@@ -225,7 +227,10 @@ queue = "velmora-verify4"
 # Measured: a post job takes about 7 s for a 16 MiB extent under load
 # (about 2.2 MiB/s per job); four queues of three posted about 23 MiB/s,
 # below a sustained ingest of about 30 MiB/s. Six queues of three are 18
-# jobs, 108 sockets at most, against the posting tier's permits.
+# jobs. Permits still bind first: background jobs get max_conns - 1 slots
+# and max_ips - 1 holders per provider, so p2 and p6 take 8 post jobs
+# each and the rest goes to p7; jobs past that post on fewer sockets or
+# are deferred.
 [[queues.consumers]]
 queue = "velmora-post"
 max_batch_size = 1
