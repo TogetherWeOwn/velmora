@@ -376,11 +376,21 @@ fn config_loads_from_documented_vars() {
             ),
         }
     }
-    // A budget with room for one extent, its copy and two more sockets
-    // lowers the count instead of refusing every cold read.
+    // A budget with room for the ciphertext of one extent, its copy and
+    // two more sockets lowers the count instead of refusing every cold
+    // read. The room is counted from the ciphertext: two plaintext
+    // extents and two sockets are 8288 bytes short of it.
     sized.insert("COLD_SOCKETS".to_string(), "8".to_string());
-    sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), "36700160".to_string());
-    assert_eq!(load(&sized).unwrap().cold_sockets, 3);
+    for (budget, want) in [("36708448", 3), ("36708447", 2), ("36700160", 2)] {
+        sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), budget.to_string());
+        let cfg = load(&sized).unwrap();
+        assert_eq!(cfg.cold_sockets, want, "{budget}");
+        let cipher = velmora::media::ciphertext_size(cfg.max_extent_bytes).unwrap();
+        assert!(
+            velmora_bridge::fetch::cold_read_bytes(cipher, want) <= cfg.inflight_budget_bytes,
+            "{budget}"
+        );
+    }
     sized.remove("COLD_SOCKETS");
     sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), "50331648".to_string());
     // The catalogue id is one path segment of the stamp keys.

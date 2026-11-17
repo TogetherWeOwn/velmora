@@ -16,7 +16,7 @@ use crate::ingress::Sleeper;
 use crate::pool::Pool;
 use crate::ports::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
-    NntpSession, Permit, PermitClass,
+    NntpSession, Permit, PermitClass, QUIT_SECS, READ_PERMIT_SECS, READ_SLACK_SECS,
 };
 use crate::post::{sha256, Stop, KEEP_EVERY_MS};
 use crate::types::{
@@ -45,6 +45,9 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// before that round trip), and whether it confirmed a job's lease
     /// with it. See [`Self::keep`].
     kept: Option<(UnixMs, bool)>,
+    /// The time the permit's expiry counts from: the one it was taken
+    /// with, or its last renewal that succeeded.
+    held_from: UnixMs,
 }
 
 /// The permit holder of a job run. One claim of an outbox row is one
@@ -178,6 +181,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             // A read renews once after it connected, as it always did:
             // its permit is short and the connect is not.
             kept: (class == PermitClass::Background).then_some((asked, false)),
+            held_from: asked,
         }))
     }
 
@@ -264,6 +268,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         match renewed {
             Ok(true) if !late => {
                 self.kept = Some((now, lease.is_some()));
+                self.held_from = now;
                 Ok(())
             }
             Ok(_) => {
@@ -776,9 +781,28 @@ struct Board {
     /// not asked again.
     asks: Vec<u8>,
     providers: usize,
+    /// Counts the articles that sockets gave back, read or not.
+    turn: u64,
+    /// Sockets with nothing to read that wait for the next turn.
+    waiting: Vec<core::task::Waker>,
 }
 
 impl Board {
+    /// Whether a socket of `provider` may still get an article that
+    /// another socket is reading now: that one may give it back.
+    fn pending(&self, provider: usize, wanted: impl Fn(usize) -> bool) -> bool {
+        (0..self.have.len()).any(|a| self.taken[a] && self.open(a, provider) && wanted(a))
+    }
+
+    /// An article is no longer being read: the sockets that wait are
+    /// woken. They are returned to be woken once the board is free.
+    #[must_use]
+    fn give_back(&mut self, article: usize) -> Vec<core::task::Waker> {
+        self.taken[article] = false;
+        self.turn += 1;
+        core::mem::take(&mut self.waiting)
+    }
+
     fn asks(&self, article: usize, provider: usize) -> u8 {
         self.asks[article * self.providers + provider]
     }
@@ -819,9 +843,9 @@ enum Out {
 /// to `sockets` sessions and reuses them for the next extent, so a run
 /// of extents costs one login per socket, not one per extent. Call
 /// [`Self::close`] on every exit path. A reader must not sit idle with
-/// open sessions: a slot is renewed only before an article is asked for,
-/// so only a caller that goes from one extent straight to the next may
-/// keep it across extents.
+/// open sessions for longer than [`Self::idle_ms`]: between extents a
+/// slot is not renewed, so a caller that waits for something else ends
+/// the sessions when that time is over.
 pub(crate) struct ColdReader<'a, C: Catalog, N: NntpConnector, T: Clock> {
     catalog: &'a C,
     nntp: &'a N,
@@ -840,6 +864,20 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// Ends every session and frees its slot.
     pub(crate) async fn close(mut self) {
         ProviderSession::close_all(core::mem::take(&mut self.sessions)).await;
+    }
+
+    /// How long the reader may still sit with its sessions open and
+    /// read nothing, in milliseconds: until the slot that was renewed
+    /// longest ago has only the goodbye and the slack left. `None`: no
+    /// session is open. A caller that waits for anything else ends the
+    /// sessions when this is over ([`Self::close`]).
+    pub(crate) fn idle_ms(&self) -> Option<u32> {
+        let oldest = self.sessions.iter().map(|s| s.held_from.0).min()?;
+        let life = i64::from(READ_PERMIT_SECS - QUIT_SECS - READ_SLACK_SECS) * 1000;
+        let left = oldest
+            .saturating_add(life)
+            .saturating_sub(self.clock.now().0);
+        Some(u32::try_from(left.clamp(0, life)).unwrap_or(0))
     }
 
     /// What the reader did so far.
@@ -911,6 +949,31 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     if asked.len() < need && mine == turn && self.held(order[i]) + mine < work[i] {
                         asked.push(i);
                     }
+                }
+            }
+            // A connect may take as long as a call. The sessions that
+            // wait for it have their slots renewed first, so none runs
+            // out while its socket is open; one that lost its slot is
+            // ended.
+            if !asked.is_empty() && !self.sessions.is_empty() {
+                let kept = join_all(self.sessions.iter_mut().map(|s| s.keep(None))).await;
+                let mut lost = Vec::new();
+                let mut fatal = false;
+                for (session, kept) in core::mem::take(&mut self.sessions).into_iter().zip(kept) {
+                    match kept {
+                        Ok(()) => self.sessions.push(session),
+                        Err(stop) => {
+                            fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
+                            lost.push(session);
+                        }
+                    }
+                }
+                self.stats.borrow_mut().broken += lost.len() as u32;
+                ProviderSession::close_all(lost).await;
+                if fatal {
+                    return Err(BridgeError::Sql(
+                        "catalogue failed during a cold read".into(),
+                    ));
                 }
             }
             let began = self.clock.now();
@@ -1009,6 +1072,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             taken: vec![false; plan.len()],
             asks: vec![0u8; plan.len() * order.len()],
             providers: order.len(),
+            turn: 0,
+            waiting: Vec::new(),
         });
         let mut out: Vec<Option<Out>> = vec![None; order.len()];
         let mut full = vec![false; order.len()];
@@ -1036,6 +1101,19 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 if !(0..order.len()).any(|i| work[i] > 0 && out[i].is_none()) {
                     break;
                 }
+                // Only the best tier that has work reads: a session of
+                // another tier, kept from the extent before or from an
+                // article only its tier had, is ended, not left idle and
+                // not given articles the better tier has.
+                let tier = (0..order.len())
+                    .filter(|&i| work[i] > 0 && out[i].is_none())
+                    .map(|i| order[i].priority)
+                    .min();
+                let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
+                    .into_iter()
+                    .partition(|s| Some(s.provider.priority) == tier);
+                self.sessions = kept;
+                ProviderSession::close_all(other).await;
                 if let Err(e) = self.staff(&order, &work, &mut out, &mut full).await {
                     failure = Some(e);
                     break 'phases;
@@ -1043,6 +1121,22 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 let index = |s: &ProviderSession<'a, C, N, T>| {
                     order.iter().position(|p| p.id == s.provider.id)
                 };
+                // No session for any of the work that is left: nothing
+                // would be read, and the same pass would come again. The
+                // providers of the tier are out instead, so every pass
+                // either reads or ends with fewer providers.
+                let staffed = self
+                    .sessions
+                    .iter()
+                    .any(|s| index(s).is_some_and(|i| work[i] > 0 && out[i].is_none()));
+                if !staffed {
+                    for i in 0..order.len() {
+                        if Some(order[i].priority) == tier && work[i] > 0 && out[i].is_none() {
+                            out[i] = Some(Out::Busy);
+                        }
+                    }
+                    continue;
+                }
                 let ended = join_all(self.sessions.iter_mut().map(|session| {
                     let (board, plan, wanted, out) = (&board, &plan, &wanted, &out);
                     let provider = index(session);
@@ -1110,6 +1204,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 // the next pass opens another in its place while the
                 // reader has replacements left; after that the reader
                 // goes on with one connection less.
+                // Its slot is free again: the provider is not full.
+                for i in 0..order.len() {
+                    full[i] &= !slow.iter().any(|s| s.provider.id == order[i].id);
+                }
                 (self.sockets, self.replacements) =
                     after_slow(self.sockets, self.replacements, slow.len());
                 stats.borrow_mut().slow += slow.len() as u32;
@@ -1163,6 +1261,12 @@ struct Pace {
     articles: u32,
     ms: i64,
 }
+
+/// How long a socket with nothing to read waits for an article to come
+/// back before it looks at its slot again. Under
+/// [`READ_RENEW_SECS`](crate::ports::READ_RENEW_SECS), so a slot is
+/// renewed at twice this age at most.
+const IDLE_KEEP_MS: u32 = 4_000;
 
 /// A connection is slow when an article takes it this many times as long
 /// as it takes the connection in the middle, and longer than
@@ -1239,18 +1343,54 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
     let mut pace = Pace::default();
     loop {
         let Some(article) = board.borrow_mut().take(provider, &wanted) else {
-            return Ok(pace);
+            // Nothing is free for this provider. An article another
+            // socket is reading may still come back. A host with a timer
+            // waits for that, and renews the slot meanwhile: the socket
+            // must not sit there logged in while its slot runs out
+            // (another socket may be on its third attempt of a `BODY`).
+            let timer = match board.borrow().pending(provider, &wanted) {
+                true => session.timer.clone(),
+                false => None,
+            };
+            let Some(sleep) = timer else {
+                return Ok(pace);
+            };
+            let seen = board.borrow().turn;
+            let turned = core::future::poll_fn(|cx| {
+                let mut b = board.borrow_mut();
+                if b.turn != seen {
+                    return core::task::Poll::Ready(());
+                }
+                b.waiting.push(cx.waker().clone());
+                core::task::Poll::Pending
+            });
+            select(core::pin::pin!(turned), sleep(IDLE_KEEP_MS)).await;
+            session.keep(None).await?;
+            continue;
         };
         let row = &plan[article];
-        let began = session.clock.now();
         let read = match session.keep(None).await {
-            Ok(()) => read_one(session, None, row, Ask::Wire, &mut wire, &mut reconnects).await,
+            Ok(()) => {
+                // The pace of a connection is what its articles take
+                // once it stands: a login is not counted, nor is an
+                // article that was not delivered.
+                let stands = session.session.is_some();
+                let began = session.clock.now();
+                let read =
+                    read_one(session, None, row, Ask::Wire, &mut wire, &mut reconnects).await;
+                if stands && matches!(read, Ok(Checked::Wire)) {
+                    pace.articles += 1;
+                    pace.ms += session.clock.now().0 - began.0;
+                }
+                read
+            }
             Err(stop) => Err(stop),
         };
-        pace.articles += 1;
-        pace.ms += session.clock.now().0 - began.0;
+        let woken = board.borrow_mut().give_back(article);
+        for socket in woken {
+            socket.wake();
+        }
         let mut b = board.borrow_mut();
-        b.taken[article] = false;
         let slot = article * b.providers + provider;
         match read? {
             Checked::Wire => {
@@ -1342,6 +1482,30 @@ where
         Ok(true)
     }
 
+    /// Reads `extents` from Usenet one after the other with one reader,
+    /// as the body of a GET does, and caches nothing: what each read
+    /// gave, and what the reader did.
+    #[cfg(feature = "testkit")]
+    pub async fn fetch_cold_run(
+        &self,
+        extents: &[ExtentRow],
+    ) -> Result<(Vec<ColdFetch>, ColdStats)> {
+        let mut reader = self.cold_reader()?;
+        let mut read = Vec::new();
+        for extent in extents {
+            match reader.fetch(extent).await {
+                Ok(one) => read.push(one),
+                Err(e) => {
+                    reader.close().await;
+                    return Err(e);
+                }
+            }
+        }
+        let stats = reader.stats();
+        reader.close().await;
+        Ok((read, stats))
+    }
+
     /// Rebuilds an extent's ciphertext from Usenet when neither blob store
     /// has it ([`ColdReader::fetch`]). The assembled extent is checked
     /// against `cipher_sha256` and written to the cache before it is
@@ -1354,7 +1518,9 @@ where
         reader.close().await;
         match read? {
             ColdFetch::Filled(cipher) => {
-                self.cache_fill(extent, cipher.clone()).await?;
+                // Verified already: a cache that does not take the copy
+                // does not fail the read.
+                let _ = self.cache_fill(extent, cipher.clone()).await;
                 Ok(ColdFetch::Filled(cipher))
             }
             other => Ok(other),

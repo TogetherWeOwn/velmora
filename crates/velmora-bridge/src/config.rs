@@ -544,12 +544,16 @@ impl BridgeConfig {
         if inflight_budget_bytes < max_extent_bytes.saturating_mul(2) {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }
-        // Only as many sockets as the budget has room for beside one
-        // extent and its copy: a cold read that could never be charged
-        // would fail every time.
-        let spare = inflight_budget_bytes - max_extent_bytes.saturating_mul(2);
-        let fit = 1 + spare / crate::fetch::COLD_SOCKET_BYTES;
-        let cold_sockets = cold_sockets.min(u32::try_from(fit).unwrap_or(u32::MAX));
+        // Only as many sockets as the budget has room for: what a cold
+        // read of the largest extent charges is counted from the
+        // ciphertext, which is a little larger than the plaintext. A
+        // read that could never be charged would fail every time.
+        let cipher = velmora::media::ciphertext_size(max_extent_bytes)
+            .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
+        let fits = |sockets: &u32| {
+            crate::fetch::cold_read_bytes(cipher, *sockets) <= inflight_budget_bytes
+        };
+        let cold_sockets = (1..=cold_sockets).rev().find(fits).unwrap_or(1);
         // Never under the request limit, and never more than half as much
         // again (see `MAX_JOB_BUDGET_NUM`).
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {

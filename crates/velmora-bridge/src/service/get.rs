@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures_util::future::{poll_fn, FutureExt, LocalBoxFuture};
+use futures_util::future::{poll_fn, select, Either, FutureExt, LocalBoxFuture};
 use futures_util::stream::{self, Stream, StreamExt};
 use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
 
@@ -483,6 +483,10 @@ struct Shared<T> {
     reader: RefCell<Option<Waker>>,
     /// The spawned task, waiting for its item to be taken.
     task: RefCell<Option<Waker>>,
+    /// The reader asked for an item and found none: it is waiting.
+    wanted: Cell<bool>,
+    /// The future runs as a task of the host.
+    spawned: bool,
 }
 
 impl<T> Shared<T> {
@@ -493,6 +497,15 @@ impl<T> Shared<T> {
             if running.as_mut().poll(cx).is_ready() {
                 *work = None;
             }
+        }
+    }
+
+    /// Wakes whoever waits in `who`. The waker is taken out first, so it
+    /// runs after the borrow ended.
+    fn wake(who: &RefCell<Option<Waker>>) {
+        let waker = who.borrow_mut().take();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -508,10 +521,45 @@ impl<T> Out<T> {
     /// future is polled again after that: by the stream when it is asked
     /// for the next item, or by its task, which the stream wakes.
     async fn send(&self, item: T) {
+        self.shared.wanted.set(false);
         *self.shared.slot.borrow_mut() = Some(item);
         poll_fn(|_| match self.shared.slot.borrow().is_some() {
             true => Poll::Pending,
             false => Poll::Ready(()),
+        })
+        .await;
+    }
+
+    /// As [`Self::send`], but only until `patience` is over: an item
+    /// that was not taken by then is taken back and dropped, with all it
+    /// holds. `false` = taken back; the caller produces it again when
+    /// the reader asks ([`Self::wanted`]).
+    async fn send_within(&self, item: T, patience: impl Future<Output = ()>) -> bool {
+        let sent = core::pin::pin!(self.send(item));
+        let patience = core::pin::pin!(patience);
+        if let Either::Left(_) = select(sent, patience).await {
+            return true;
+        }
+        let back = self.shared.slot.borrow_mut().take();
+        back.is_none()
+    }
+
+    /// Whether the future runs ahead of its reader, as a task of the
+    /// host. Otherwise it runs only while the reader asks.
+    fn ahead(&self) -> bool {
+        self.shared.spawned
+    }
+
+    /// Whether the reader is waiting for an item now.
+    fn is_wanted(&self) -> bool {
+        self.shared.wanted.get()
+    }
+
+    /// Returns once the reader is waiting for an item.
+    async fn wanted(&self) {
+        poll_fn(|_| match self.is_wanted() {
+            true => Poll::Ready(()),
+            false => Poll::Pending,
         })
         .await;
     }
@@ -542,6 +590,8 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
         work: RefCell::new(None),
         reader: RefCell::new(None),
         task: RefCell::new(None),
+        wanted: Cell::new(false),
+        spawned: spawner.is_some(),
     });
     let work = make(Out {
         shared: Rc::clone(&shared),
@@ -555,9 +605,7 @@ fn driven<T: 'static, F: Future<Output = ()> + 'static>(
                 shared.run(cx);
                 let over = shared.work.borrow().is_none();
                 if over || shared.slot.borrow().is_some() {
-                    if let Some(reader) = shared.reader.borrow_mut().take() {
-                        reader.wake();
-                    }
+                    Shared::<T>::wake(&shared.reader);
                 }
                 match over {
                     true => Poll::Ready(()),
@@ -581,15 +629,14 @@ impl<T> Stream for Driven<T> {
         let take = || {
             let item = shared.slot.borrow_mut().take()?;
             // The task may go on to the next item.
-            if let Some(task) = shared.task.borrow_mut().take() {
-                task.wake();
-            }
+            Shared::<T>::wake(&shared.task);
             Some(item)
         };
         if let Some(item) = take() {
             return Poll::Ready(Some(item));
         }
         if !self.spawned {
+            shared.wanted.set(true);
             shared.run(cx);
             if let Some(item) = take() {
                 return Poll::Ready(Some(item));
@@ -600,6 +647,11 @@ impl<T> Stream for Driven<T> {
         }
         if self.spawned {
             *shared.reader.borrow_mut() = Some(cx.waker().clone());
+            // A task that holds an item back until it is asked for
+            // learns here that it is.
+            if !shared.wanted.replace(true) {
+                Shared::<T>::wake(&shared.task);
+            }
         }
         Poll::Pending
     }
@@ -614,9 +666,7 @@ impl<T> Drop for Driven<T> {
         let item = self.shared.slot.borrow_mut().take();
         drop(item);
         // The task finds its future gone and ends.
-        if let Some(task) = self.shared.task.borrow_mut().take() {
-            task.wake();
-        }
+        Shared::<T>::wake(&self.shared.task);
     }
 }
 
@@ -652,23 +702,72 @@ async fn relay<C, B, N, J, K, T>(
 {
     let mut cold = Cold::new(&bridge);
     let last = todo.len() - 1;
+    let timer = bridge.budget.sleeper();
+    // Whether pieces are produced ahead of the reader: on a host that
+    // runs this as a task and has a timer to watch a piece that waits.
+    let can_run_ahead = out.ahead() && timer.is_some();
+    // After a piece waited too long for the reader, it is produced
+    // again when the reader asks, and the body runs ahead again from
+    // the piece after it.
+    let mut eager = can_run_ahead;
     for (at, piece) in todo.iter().enumerate() {
-        let item = cold.piece(&bucket, piece).await;
-        // Before the last item and before an error: the reader of the
-        // body may never ask again after either, and the last extent
-        // would then be missing from the cache and the provider slots
-        // would be held until they expire.
-        if at == last || item.is_err() {
-            cold.end().await;
-        }
-        let failed = item.is_err();
-        let sent = Spent::time(&bridge.clock, &cold.spent.send, out.send(item));
-        beside(&mut cold.put, sent).await;
-        if failed {
-            return;
+        loop {
+            if out.ahead() && !eager && !out.is_wanted() {
+                // Nothing is held while the reader is busy: neither a
+                // piece nor a provider slot.
+                cold.end().await;
+                out.wanted().await;
+            }
+            let item = cold.piece(&bucket, piece).await;
+            let failed = item.is_err();
+            // Before the last item and before an error: the reader of
+            // the body may never ask again after either, and the last
+            // extent would then be missing from the cache and the
+            // provider slots would be held until they expire.
+            if at == last || failed {
+                cold.end().await;
+            }
+            let spent = Rc::clone(&cold.spent);
+            match timer {
+                // A piece that is not taken in time is taken back, with
+                // its charge: a reader that stalls must not keep an
+                // extent of the byte budget from every other request.
+                // The connections are ended earlier if their slots run
+                // out first.
+                Some(sleep) if eager && !failed => {
+                    let sent = out.send_within(item, sleep(PIECE_WAIT_MS));
+                    let sent = Spent::time(&bridge.clock, &spent.send, sent);
+                    if !cold.wait(sent).await {
+                        eager = false;
+                        continue;
+                    }
+                }
+                _ => {
+                    // The reader is waiting on a host that runs this as
+                    // a task. On any other host this runs only while
+                    // the reader asks, and nobody watches the time
+                    // until then: the connections do not stay open.
+                    if !out.ahead() {
+                        cold.hang_up().await;
+                    }
+                    let sent = Spent::time(&bridge.clock, &spent.send, out.send(item));
+                    beside(&mut cold.put, sent).await;
+                    eager = can_run_ahead;
+                }
+            }
+            if failed {
+                return;
+            }
+            break;
         }
     }
 }
+
+/// How long a piece that was produced ahead waits for the reader of the
+/// body before it is taken back. Well under the time a request waits for
+/// room in the byte budget, so a reader that stalls costs another
+/// request this wait and not its answer.
+pub const PIECE_WAIT_MS: u32 = 5_000;
 
 /// Plaintext `[start, start + len)` of an object, in memory, for a copy
 /// that seals it again. Every byte comes through [`read_piece`], so it was
@@ -893,30 +992,75 @@ where
         }
     }
 
-    /// Lets the cache write end, then the connections.
+    /// Lets the cache write end, then the connections (or the
+    /// connections first, if the write takes longer than their slots
+    /// allow).
     async fn end(&mut self) {
-        if let Some(writing) = self.put.take() {
-            writing.await;
-        }
+        self.settle().await;
         self.hang_up().await;
     }
 
-    /// Room for the next step. When it is not there beside the cache
-    /// write that is under way, the write ends first: the read then
-    /// needs no more than it would alone.
+    /// A timer for the time the connections may still sit idle
+    /// ([`ColdReader::idle_ms`]). `None`: none is open, or the host has
+    /// no timer.
+    fn limit(&self) -> Option<LocalBoxFuture<'static, ()>> {
+        let ms = self.reader.as_ref()?.idle_ms()?;
+        Some(self.bridge.budget.sleeper()?(ms))
+    }
+
+    /// Runs `f` beside the cache write. `f` is something the read waits
+    /// for that is not a provider: if the slots of the open connections
+    /// would run out meanwhile, the connections are ended.
+    async fn wait<F: Future>(&mut self, f: F) -> F::Output {
+        let mut f = core::pin::pin!(f);
+        let over = match self.limit() {
+            None => false,
+            Some(limit) => {
+                let first = core::pin::pin!(beside(&mut self.put, f.as_mut()));
+                match select(first, limit).await {
+                    Either::Left((out, _)) => return out,
+                    Either::Right(_) => true,
+                }
+            }
+        };
+        if over {
+            self.hang_up().await;
+        }
+        beside(&mut self.put, f).await
+    }
+
+    /// Lets the cache write end, with the connections watched as in
+    /// [`Self::wait`].
+    async fn settle(&mut self) {
+        if let (Some(limit), Some(put)) = (self.limit(), self.put.as_mut()) {
+            if matches!(select(put, limit).await, Either::Left(_)) {
+                self.put = None;
+                return;
+            }
+            self.hang_up().await;
+        }
+        if let Some(writing) = self.put.take() {
+            writing.await;
+        }
+    }
+
+    /// Room for the next step, all of it at once: nothing is held while
+    /// this waits. When it is not there beside the cache write that is
+    /// under way, the write ends first: the read then needs no more than
+    /// it would alone.
     async fn charge(&mut self, need: u64) -> core::result::Result<Charge, ReadFail> {
-        let budget = &self.bridge.budget;
-        if let Some(charge) = budget.try_charge(need) {
+        let bridge = self.bridge;
+        if let Some(charge) = bridge.budget.try_charge(need) {
             return Ok(charge);
         }
-        let put = self.put.take();
-        let wait = async {
-            if let Some(writing) = put {
-                writing.await;
-            }
-            budget.charge(need).await.map_err(|_| ReadFail::Busy)
-        };
-        Spent::time(&self.bridge.clock, &self.spent.wait, wait).await
+        let spent = Rc::clone(&self.spent);
+        let began = bridge.clock.now();
+        self.settle().await;
+        let room = self.wait(bridge.budget.charge(need)).await;
+        spent
+            .wait
+            .set(spent.wait.get() + bridge.clock.now().0 - began.0);
+        room.map_err(|_| ReadFail::Busy)
     }
 
     /// Room for reading one extent: all of `need` when no cache write
@@ -936,37 +1080,64 @@ where
     /// skipped, never served: the next source is tried instead, and
     /// `Unavailable` says that neither has it.
     ///
-    /// The ciphertext span is charged before a store is asked and the
-    /// plaintext only when a copy is there, so asking for an extent that
-    /// turns out to be cold fits beside the cache write of the one
-    /// before it.
+    /// The ciphertext span and the plaintext are one charge, taken
+    /// before a store is asked. Beside the cache write of the extent
+    /// before there may be room for the span only: then the span is
+    /// charged and the rest when a copy is there, if it fits at once.
+    /// If it does not, the copy and the charge are given up, all of it
+    /// is waited for with nothing held, and the store is asked again:
+    /// two reads that each held a part and waited for the rest would
+    /// wait for each other.
     async fn warm(&mut self, bucket: &Bucket, piece: &Piece, span: ByteSpan) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
-        let mut work = self.charge(span.len).await?;
-        let mut whole = false;
-        for from_cache in [true, false] {
-            let asked = async {
-                match from_cache {
-                    true => warm(&bridge.cache, &extent.id.cache_key(), span).await,
-                    false => warm(&bridge.safety, &extent.id.safety_key(), span).await,
+        let spent = Rc::clone(&self.spent);
+        let all = span.len + piece.len;
+        let mut work = match bridge.budget.try_charge(all) {
+            Some(work) => work,
+            None => {
+                let lean = match self.put.is_some() {
+                    true => bridge.budget.try_charge(span.len),
+                    false => None,
+                };
+                match lean {
+                    Some(work) => work,
+                    None => self.charge(all).await?,
                 }
-            };
-            let asked = Spent::time(&bridge.clock, &self.spent.warm, asked);
-            let Some(src) = beside(&mut self.put, asked).await else {
-                continue;
-            };
-            if !core::mem::replace(&mut whole, true) {
-                let more = self.charge(piece.len).await?;
-                work.absorb(more);
             }
-            let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) else {
-                continue;
-            };
-            drop(src);
-            let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
-            beside(&mut self.put, stamp_read(bridge, &extent.id, from_cache)).await;
-            return Ok(held);
+        };
+        for from_cache in [true, false] {
+            loop {
+                let asked = async {
+                    match from_cache {
+                        true => warm(&bridge.cache, &extent.id.cache_key(), span).await,
+                        false => warm(&bridge.safety, &extent.id.safety_key(), span).await,
+                    }
+                };
+                let asked = Spent::time(&bridge.clock, &spent.warm, asked);
+                let Some(src) = self.wait(asked).await else {
+                    break;
+                };
+                let short = all.saturating_sub(work.bytes());
+                if short > 0 {
+                    match bridge.budget.try_charge(short) {
+                        Some(more) => work.absorb(more),
+                        None => {
+                            drop(src);
+                            drop(work);
+                            work = self.charge(all).await?;
+                            continue;
+                        }
+                    }
+                }
+                let Some(plain) = open(&bridge.kek, bucket, piece, span.start, &src) else {
+                    break;
+                };
+                drop(src);
+                let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
+                self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
+                return Ok(held);
+            }
         }
         Err(ReadFail::Unavailable)
     }
@@ -1019,23 +1190,27 @@ where
             match read {
                 Ok(ColdFetch::Filled(cipher)) => {
                     // One cache write at a time.
-                    if let Some(writing) = self.put.take() {
-                        Spent::time(&bridge.clock, &self.spent.wait, writing).await;
-                    }
+                    let began = bridge.clock.now();
+                    self.settle().await;
+                    let waited = bridge.clock.now().0 - began.0;
+                    self.spent.wait.set(self.spent.wait.get() + waited);
                     // What a read beside that write left uncharged. The
-                    // write has just released at least as much.
+                    // write has released as much, but another request
+                    // may have taken it. Then the extent is given up
+                    // and read again under a charge for all of it, taken
+                    // with nothing held: a read never waits for room
+                    // while it holds some.
                     let short = need.saturating_sub(work.bytes());
                     if short > 0 {
-                        let more = match bridge.budget.try_charge(short) {
-                            Some(more) => more,
+                        match bridge.budget.try_charge(short) {
+                            Some(more) => work.absorb(more),
                             None => {
-                                let room = bridge.budget.charge(short);
-                                Spent::time(&bridge.clock, &self.spent.wait, room)
-                                    .await
-                                    .map_err(|_| ReadFail::Busy)?
+                                drop(cipher);
+                                drop(work);
+                                work = self.charge(need).await?;
+                                continue;
                             }
-                        };
-                        work.absorb(more);
+                        }
                     }
                     let plain = open(&bridge.kek, bucket, piece, 0, &cipher)
                         .ok_or(ReadFail::Unavailable)?;
@@ -1094,6 +1269,9 @@ where
             match self.warm(bucket, piece, span).await {
                 Err(ReadFail::Unavailable) => {}
                 found => return found,
+            }
+            if bridge.clock.now() >= deadline {
+                return Err(ReadFail::Busy);
             }
             // Not in the cache: read it, under a charge taken as above.
             work = self.step(need, lean).await?;
@@ -1211,6 +1389,70 @@ mod tests {
     /// Polls `stream` once with a waker that counts.
     fn pull_with<S: Stream + Unpin>(stream: &mut S, reader: &Arc<Woken>) -> Poll<Option<S::Item>> {
         stream.poll_next_unpin(&mut Context::from_waker(&waker(Arc::clone(reader))))
+    }
+
+    /// An item that is not taken before the patience is over is taken
+    /// back and dropped with what it holds, the reader finds nothing,
+    /// and the future is woken when the reader asks: it hands the item
+    /// over again. An item that was taken in time is not handed over
+    /// twice.
+    #[test]
+    fn an_item_that_is_not_taken_in_time_is_taken_back() {
+        let host = Host::default();
+        let reader = Arc::new(Woken::default());
+        let patience = Rc::new(Cell::new(false));
+        let held = Rc::new(());
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (over, item, notes) = (Rc::clone(&patience), Rc::clone(&held), Rc::clone(&log));
+        let mut items = Box::pin(driven(
+            Some(&host.spawner()),
+            move |out: Out<(u32, Rc<()>)>| async move {
+                for n in 1..=2u32 {
+                    loop {
+                        let wait = poll_fn(|_| match over.get() {
+                            true => Poll::Ready(()),
+                            false => Poll::Pending,
+                        });
+                        if out.send_within((n, Rc::clone(&item)), wait).await {
+                            notes.borrow_mut().push(("sent", n));
+                            break;
+                        }
+                        notes.borrow_mut().push(("back", n));
+                        assert!(!out.is_wanted());
+                        out.wanted().await;
+                        over.set(false);
+                    }
+                }
+            },
+        ));
+        host.turn();
+        assert_eq!(Rc::strong_count(&held), 3, "the item waits");
+        patience.set(true);
+        host.turn();
+        assert_eq!(*log.borrow(), [("back", 1)]);
+        assert_eq!(Rc::strong_count(&held), 2, "what it held is given up");
+        host.turn();
+        assert_eq!(Rc::strong_count(&held), 2, "nothing is made unasked");
+        let woken = host.woken.times();
+        assert_eq!(pull_with(&mut items, &reader), Poll::Pending);
+        assert_eq!(host.woken.times(), woken + 1, "asking wakes the task");
+        host.turn();
+        assert!(matches!(
+            pull_with(&mut items, &reader),
+            Poll::Ready(Some((1, _)))
+        ));
+        host.turn();
+        assert_eq!(*log.borrow(), [("back", 1), ("sent", 1)]);
+        // Taken just as the patience ends: not handed over again.
+        patience.set(true);
+        assert!(matches!(
+            pull_with(&mut items, &reader),
+            Poll::Ready(Some((2, _)))
+        ));
+        host.turn();
+        assert_eq!(*log.borrow(), [("back", 1), ("sent", 1), ("sent", 2)]);
+        assert_eq!(pull_with(&mut items, &reader), Poll::Ready(None));
+        assert_eq!(host.running(), 0);
     }
 
     /// A spawned future runs without its reader, one item ahead and no

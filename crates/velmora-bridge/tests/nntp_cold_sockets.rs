@@ -144,6 +144,61 @@ async fn a_lower_tier_only_reads_what_the_tier_above_lacks() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+/// A reader that goes on to the next extent with connections to a lower
+/// tier, which the extent before needed, does not read on over them:
+/// the better tier has the next extent, and it reads all of it.
+#[tokio::test]
+async fn a_lower_tier_kept_from_the_extent_before_reads_nothing_the_tier_above_has() {
+    let mut rig = rig_of(&[4, 4], 4).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    // The first is on p1 only, the second on both.
+    let (first, plan) = rig.posted_cold(7, PLAIN_LEN).await;
+    rig.peer(1, &plan.iter().collect::<Vec<_>>()).await;
+    for row in &plan {
+        rig.servers[0].hide(&row.message_id).await;
+    }
+    let (second, plan) = rig.posted_cold(8, PLAIN_LEN).await;
+    rig.peer(1, &plan.iter().collect::<Vec<_>>()).await;
+
+    let extents = [
+        rig.bridge.catalog.extent(&first.extent),
+        rig.bridge.catalog.extent(&second.extent),
+    ];
+    let (read, stats) = rig.bridge.fetch_cold_run(&extents).await.unwrap();
+    assert_eq!(
+        read,
+        [
+            ColdFetch::Filled(first.cipher.clone()),
+            ColdFetch::Filled(second.cipher.clone())
+        ]
+    );
+    let articles = |id: &str| {
+        stats
+            .share
+            .iter()
+            .find(|s| s.0 == id)
+            .map_or(0, |s| s.1 as usize)
+    };
+    assert_eq!(articles("p1"), plan.len(), "the first extent only");
+    assert_eq!(articles("p0"), plan.len(), "all of the second");
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The extent was read and verified: a cache that does not take the
+/// copy does not fail the read.
+#[tokio::test]
+async fn a_cache_that_refuses_the_copy_does_not_fail_the_read() {
+    let rig = rig_of(&[4], 4).await;
+    let (s, _) = rig.posted_cold(9, PLAIN_LEN).await;
+    rig.bridge.cache.refuse_puts(true);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert_eq!(rig.cached(&s), None);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    rig.bridge.cache.refuse_puts(false);
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    assert_eq!(rig.cached(&s), Some(s.cipher.clone()));
+}
+
 /// An article that one provider has with other bytes, and one it does
 /// not have, come from the other provider; without them there, the
 /// extent is not returned and not cached.
