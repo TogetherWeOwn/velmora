@@ -92,7 +92,7 @@ RECOVERY_COPY = "off"
 #     A job is one source address to a provider, however many connections it holds there.
 #   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
-#   PACKED_PLANS (off): off | on. On: the article plan of a new extent is one value on its row
+#   PACKED_PLANS (off; production sets it on below): off | on. On: the article plan of a new extent is one value on its row
 #     (extents.plan) instead of one row per article, a replay stores plans that way, and each
 #     cron tick packs up to 50 older plans whose articles are all posted and deletes their rows
 #     (POST /_admin/pack-plans does a step by hand). A Worker from before this switch
@@ -104,6 +104,10 @@ RECOVERY_COPY = "off"
 # rollback must never land on a Worker that cannot read a copy or would
 # collect the extents it shares. See "Rollback floor" in ops/README.md.
 SERVER_SIDE_COPY = "on"
+# Packed article plans (see PACKED_PLANS above). On from the second deploy that
+# knows the switch; from then on, never roll back below the first one that knows
+# it ("Rollback floor" in ops/README.md).
+PACKED_PLANS = "on"
 # A GET (or ranged GET) of more plaintext bytes than this is served in
 # sub-ranges of this size: the invocation that answers the client asks
 # this Worker for each sub-range in turn through the SELF binding below,
@@ -312,7 +316,7 @@ crons = ["*/5 * * * *"]
 # invocations, which is never the looser count.
 
 [env.dev]
-vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608" }
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.

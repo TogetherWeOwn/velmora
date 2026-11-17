@@ -285,6 +285,7 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
     assert_eq!(cfg.maintenance, Maintenance::Off);
     assert!(cfg.server_side_copy);
+    assert!(cfg.packed_plans);
     // A GET above 1 GiB is served in sub-ranges of 1 GiB.
     assert_eq!(cfg.get_fanout_bytes, Some(1 << 30));
     assert!(!cfg.dev_trust_http);
@@ -446,6 +447,15 @@ fn missing_secret_fails_closed() {
                 let copy =
                     velmora_bridge::remote::RemoteConfig::from_vars(|n| vars.get(n).cloned());
                 assert!(copy.unwrap().is_none());
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
+        // Packed plans: absent or blank is off, the way a catalogue was
+        // before the switch existed.
+        if name == "PACKED_PLANS" {
+            for _ in 0..2 {
+                assert!(!load(&vars).unwrap().packed_plans);
                 vars.insert(name.clone(), "  ".into());
             }
             continue;
