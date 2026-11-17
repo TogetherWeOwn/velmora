@@ -88,7 +88,7 @@ while :; do
         ($t[0]; .[$k] = ((.[$k] // 0) + $s[$k]))
     | .unpublishable = ((.unpublishable // []) + $s.unpublishable)
     | .damaged_unpublished = ((.damaged_unpublished // []) + $s.damaged_unpublished)
-    | .unreadable = ((.unreadable // []) + $s.unreadable)
+    | .unreadable = (((.unreadable // []) + $s.unreadable) | unique)
     | .other_bucket = ((.other_bucket // []) + $s.other_bucket)
     | .held_missing = ((.held_missing // []) + $s.held_missing)
     | .damaged_total = $s.damaged_total

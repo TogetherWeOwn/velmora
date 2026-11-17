@@ -697,6 +697,29 @@ async fn slices_in_service_are_kept_while_the_upload_is_open() {
             .with_conn(|c| c.execute_batch(&shred));
         assert!(refused.is_err(), "{id}");
     }
+    // The same for the article rows of a slice whose plan is not packed,
+    // and for the plan of one whose plan is.
+    let run = |q: String| {
+        let db = &s.rig.bridge.catalog.sql;
+        db.with_conn(|c| c.execute_batch(&q))
+    };
+    for id in &ids {
+        run(format!(
+            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, cipher_offset,              cipher_len, payload_sha256, state) VALUES ('{id}', 0, 'm-{id}', 'g', x'00', 0, 1,              x'00', 'planned')"
+        ))
+        .unwrap();
+        let rows = format!("DELETE FROM articles WHERE extent_id = '{id}'");
+        assert!(run(rows.clone()).is_err(), "{id}");
+        run(format!("UPDATE extents SET plan = x'00' WHERE id = '{id}'")).unwrap();
+        let plan = format!("UPDATE extents SET plan = NULL WHERE id = '{id}'");
+        assert!(run(plan).is_err(), "{id}");
+        // Packed: the rows are a copy and may go.
+        run(rows).unwrap();
+        run(format!("UPDATE extents SET plan = NULL WHERE id = '{id}'")).unwrap_err();
+    }
+    sql(&s.rig, "DROP TRIGGER extents_keep_plan_in_service");
+    sql(&s.rig, "DROP TRIGGER extents_keep_plan_of_slices");
+    sql(&s.rig, "UPDATE extents SET plan = NULL");
     let bytes = body(1, 3 * SLICE);
     s.complete(&[md5_etag(&bytes)]).await.expect(200);
     assert!(s.read().await == bytes);

@@ -18,6 +18,7 @@ use super::common::{
     authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
+use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{cold_poll_ms, ColdFetch, COLD_WAIT_MS};
 use crate::ingress::{ByteBudget, Charge};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
@@ -158,12 +159,16 @@ pub(super) async fn head_object<
 }
 
 /// The pieces of `extents` that cover plaintext `[start, start + len)` of
-/// the object, in order. `None` unless the extents tile that range
-/// exactly: a gap would otherwise be served as a short or shifted body.
+/// the object, in order. `extents` is a run of the object's extents: all
+/// of them, or those of the range alone ([`Catalog::extents_in`]). `None`
+/// unless they tile the range exactly, the first beginning at or before
+/// `start` and each next one where the last ended: a gap would otherwise
+/// be served as a short or shifted body.
 fn pieces(extents: Vec<ExtentRow>, start: u64, len: u64) -> Option<Vec<Piece>> {
     let end = start.checked_add(len)?;
     let mut out = Vec::new();
-    let mut expect = 0u64; // where the next extent must begin
+    // Where the next extent must begin.
+    let mut expect = extents.first()?.plain_offset.filter(|&at| at <= start)?;
     let mut covered = 0u64;
     for extent in extents {
         if extent.plain_offset != Some(expect) {
@@ -185,6 +190,72 @@ fn pieces(extents: Vec<ExtentRow>, start: u64, len: u64) -> Option<Vec<Piece>> {
     (covered == len).then_some(out)
 }
 
+/// Marks an object response `no-transform` so the edge in front of the
+/// Worker passes it on as it is.
+///
+/// Without it, the edge compresses responses of compressible types
+/// (`text/*`, JSON, JavaScript, SVG, ...) when the client accepts gzip or
+/// brotli, and rewrites `text/html` (email obfuscation and similar)
+/// whatever the client accepts. Either way it drops `Content-Length` and
+/// drops or weakens the `ETag`, also on HEAD. S3 clients read the size
+/// and the MD5 from exactly those two headers; rclone, for one, takes the
+/// missing length as size 0, calls the upload corrupt and deletes it.
+///
+/// The stored metadata is not changed. A stored `Cache-Control` is kept
+/// and `no-transform` is appended to it (`max-age=60` is served as
+/// `max-age=60, no-transform`), unless it already has the directive; an
+/// object without one is served `Cache-Control: no-transform`.
+fn forbid_edge_transform(headers: &mut Vec<(String, String)>) {
+    const DIRECTIVE: &str = "no-transform";
+    match headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+    {
+        Some((_, value)) => {
+            let present = directives(value)
+                .iter()
+                .any(|d| d.trim().eq_ignore_ascii_case(DIRECTIVE));
+            if !present {
+                // Trailing commas are dropped rather than doubled.
+                let base = value
+                    .trim()
+                    .trim_end_matches(|c: char| c == ',' || c.is_ascii_whitespace());
+                *value = if base.is_empty() {
+                    DIRECTIVE.to_string()
+                } else {
+                    format!("{base}, {DIRECTIVE}")
+                };
+            }
+        }
+        None => headers.push(("cache-control".to_string(), DIRECTIVE.to_string())),
+    }
+}
+
+/// The directives of a `Cache-Control` value: split at the commas outside
+/// quoted strings (`private="a, b"` is one directive), a backslash escaping
+/// the next character inside one.
+fn directives(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&value[start..]);
+    out
+}
+
 async fn read<
     C: Catalog + 'static,
     B: BlobStore + 'static,
@@ -199,9 +270,9 @@ async fn read<
 ) -> core::result::Result<S3Response, S3Response> {
     let authed = authenticate(bridge, &req).await?;
     let (bucket, key) = authed.object()?;
-    let Some((generation, extents)) = bridge
+    let Some(generation) = bridge
         .catalog
-        .live_object(&bucket.id, key)
+        .live_generation(&bucket.id, key)
         .await
         .map_err(|_| internal())?
     else {
@@ -230,16 +301,136 @@ async fn read<
         authed.headers.get("x-amz-checksum-mode").is_some(),
     )
     .map_err(s3_error)?;
+    let mut headers = plan.headers;
+    forbid_edge_transform(&mut headers);
     let mut resp = S3Response {
         status: plan.status,
-        headers: plan.headers,
+        headers,
         body: RespBody::Empty,
     };
     let Some(range) = plan.body else {
         return Ok(resp);
     };
 
-    let mut todo = pieces(extents, range.start, range.length())
+    // A body above the fan-out size is not read here: the runtime asks
+    // for it in sub-ranges, each from an invocation of its own, all
+    // pinned to this generation.
+    if let Some(chunk) = bridge.cfg.get_fanout_bytes {
+        if range.length() > chunk {
+            let mint = {
+                let bridge = Rc::clone(bridge);
+                let (bucket, generation) = (bucket.id.clone(), generation.id.clone());
+                Rc::new(move |start: u64, len: u64| {
+                    Grant {
+                        bucket: bucket.clone(),
+                        generation: generation.clone(),
+                        start,
+                        len,
+                        expires: bridge.clock.now().plus_ms(TOKEN_TTL_MS),
+                    }
+                    .seal(&bridge.kek)
+                })
+            };
+            // A range with more sub-ranges than one invocation may ask
+            // for is refused, never served in part.
+            let fanout =
+                Fanout::new(range.start, range.length(), chunk, mint).ok_or_else(internal)?;
+            resp.body = RespBody::Fanout(fanout);
+            return Ok(resp);
+        }
+    }
+    let end = range
+        .start
+        .checked_add(range.length())
+        .ok_or_else(internal)?;
+    let extents = bridge
+        .catalog
+        .extents_in(&generation.id, range.start, end)
+        .await
+        .map_err(|_| internal())?;
+    resp.body = body(bridge, bucket.clone(), extents, range.start, range.length()).await?;
+    Ok(resp)
+}
+
+/// Serves one sub-range of a large GET (see [`crate::fanout`]): the
+/// plaintext the request's token grants, from the generation it names,
+/// as a `200` of exactly that length. A request without a valid token is
+/// `403`, whatever is wrong with it.
+pub(super) async fn fanout_piece<
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    req: S3Request,
+) -> S3Response {
+    let Ok(grant) = admit(&bridge.kek, &req, bridge.clock.now()) else {
+        return s3_error(ErrorCode::AccessDenied);
+    };
+    match granted(bridge, &grant).await {
+        Ok(resp) | Err(resp) => resp,
+    }
+}
+
+async fn granted<
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    grant: &Grant,
+) -> core::result::Result<S3Response, S3Response> {
+    // The grant was minted for a generation that existed and a range
+    // inside it; anything else here is a fault, not a client error.
+    let (bucket, generation) = bridge
+        .catalog
+        .generation_by_id(&grant.bucket, &grant.generation)
+        .await
+        .map_err(|_| internal())?
+        .ok_or_else(internal)?;
+    let end = grant
+        .start
+        .checked_add(grant.len)
+        .filter(|&end| end <= generation.size)
+        .ok_or_else(internal)?;
+    let extents = bridge
+        .catalog
+        .extents_in(&generation.id, grant.start, end)
+        .await
+        .map_err(|_| internal())?;
+    Ok(S3Response {
+        status: 200,
+        headers: vec![
+            ("content-length".into(), grant.len.to_string()),
+            ("content-type".into(), "application/octet-stream".into()),
+        ],
+        body: body(bridge, bucket, extents, grant.start, grant.len).await?,
+    })
+}
+
+/// The stream of plaintext `[start, start + len)` from `extents`, which
+/// must tile it.
+async fn body<
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    bucket: Bucket,
+    extents: Vec<ExtentRow>,
+    start: u64,
+    len: u64,
+) -> core::result::Result<RespBody, S3Response> {
+    let mut todo = pieces(extents, start, len)
         .ok_or_else(internal)?
         .into_iter();
     let Some(first) = todo.next() else {
@@ -247,7 +438,6 @@ async fn read<
     };
     // The first piece is produced before the status line goes out, so an
     // object that cannot be read is an error response, not a cut-off 200.
-    let bucket = bucket.clone();
     let ready = read_piece(bridge, &bucket, &first)
         .await
         .map_err(|fail| fail.response())?;
@@ -256,7 +446,7 @@ async fn read<
     // charge is released when the item is handed over or the body is
     // dropped. A later failure ends the stream with an error; the client
     // sees a body shorter than Content-Length.
-    resp.body = RespBody::Stream(
+    Ok(RespBody::Stream(
         stream::unfold(
             (Rc::clone(bridge), bucket, todo, Some(ready)),
             |(bridge, bucket, mut todo, ready)| async move {
@@ -276,8 +466,7 @@ async fn read<
             },
         )
         .boxed_local(),
-    );
-    Ok(resp)
+    ))
 }
 
 /// Plaintext `[start, start + len)` of an object, in memory, for a copy
@@ -504,6 +693,92 @@ where
             let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
             stamp_read(bridge, &extent.id, from_cache).await;
             return Ok(held);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forbid_edge_transform;
+
+    fn served(stored: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut headers = stored
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        forbid_edge_transform(&mut headers);
+        headers
+    }
+
+    fn cache_control(headers: &[(String, String)]) -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("cache-control"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_object_without_cache_control_gets_no_transform() {
+        let h = served(&[("content-type", "text/html"), ("etag", "\"e\"")]);
+        assert_eq!(cache_control(&h), ["no-transform"]);
+        assert_eq!(h.len(), 3);
+    }
+
+    #[test]
+    fn a_stored_cache_control_is_kept_and_extended() {
+        let h = served(&[("cache-control", "max-age=60, private")]);
+        assert_eq!(cache_control(&h), ["max-age=60, private, no-transform"]);
+    }
+
+    #[test]
+    fn a_stored_no_transform_is_not_repeated() {
+        for stored in [
+            "no-transform",
+            "max-age=60, No-Transform",
+            " no-transform ,public",
+        ] {
+            let h = served(&[("cache-control", stored)]);
+            assert_eq!(cache_control(&h), [stored], "{stored:?}");
+        }
+        // A directive that only contains the word does not count.
+        let h = served(&[("cache-control", "x-no-transform-ish")]);
+        assert_eq!(cache_control(&h), ["x-no-transform-ish, no-transform"]);
+    }
+
+    #[test]
+    fn a_quoted_argument_is_not_a_directive() {
+        // RFC 9111 field-name lists: the quoted `no-transform` is a name.
+        let stored = r#"private="x-a,no-transform,x-b""#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [format!("{stored}, no-transform")]);
+        // An escaped quote does not end the quoted string.
+        let stored = r#"private="a\",no-transform", max-age=5"#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [format!("{stored}, no-transform")]);
+        // A real directive after a quoted argument counts.
+        let stored = r#"no-cache="set-cookie, x", no-transform"#;
+        let h = served(&[("cache-control", stored)]);
+        assert_eq!(cache_control(&h), [stored]);
+    }
+
+    #[test]
+    fn an_empty_stored_cache_control_becomes_no_transform() {
+        for stored in ["", " ", ","] {
+            let h = served(&[("Cache-Control", stored)]);
+            assert_eq!(cache_control(&h), ["no-transform"], "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_is_not_doubled() {
+        for stored in ["max-age=60, ", "max-age=60, ,", "max-age=60,,"] {
+            let h = served(&[("cache-control", stored)]);
+            assert_eq!(
+                cache_control(&h),
+                ["max-age=60, no-transform"],
+                "{stored:?}"
+            );
         }
     }
 }

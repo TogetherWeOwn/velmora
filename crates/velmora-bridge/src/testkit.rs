@@ -18,6 +18,8 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection};
 use sha2::{Digest, Sha256};
 
+use crate::meter::Meter;
+pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
     UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
@@ -81,10 +83,16 @@ pub const MIGRATION_0014: &str =
 /// The dispatcher's mark of a sent outbox row (`outbox.sent_at`).
 pub const MIGRATION_0015: &str =
     include_str!("../../../workers/s3-bridge/migrations/0015_outbox_sent_at.sql");
+/// The article plan packed on the extent's row (`extents.plan`).
+pub const MIGRATION_0016: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0016_packed_plan.sql");
+/// Article rows of a packed plan may be deleted while in service.
+pub const MIGRATION_0017: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0017_packed_plan_rows.sql");
 /// The slices of a multipart part stored as several extents
 /// (`upload_part_extents`).
-pub const MIGRATION_0016: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0016_upload_part_extents.sql");
+pub const MIGRATION_0018: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0018_upload_part_extents.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -93,6 +101,8 @@ pub const MIGRATION_0016: &str =
 /// `Sql` over SQLite. Foreign keys are enforced, as on D1.
 pub struct RusqliteSql {
     conn: RefCell<Connection>,
+    /// Counts rows written the way D1 bills them, once switched on.
+    meter: RefCell<Option<Meter>>,
 }
 
 fn to_value(v: &SqlValue) -> Value {
@@ -161,7 +171,33 @@ impl RusqliteSql {
             .map_err(map_err)?;
         Ok(RusqliteSql {
             conn: RefCell::new(conn),
+            meter: RefCell::new(None),
         })
+    }
+
+    /// Starts counting rows written as D1 bills them (see
+    /// [`crate::meter`]). Switch it on after the schema is applied.
+    pub fn meter_writes(&self) -> Result<()> {
+        let meter = Meter::install(&mut self.conn.borrow_mut()).map_err(map_err)?;
+        *self.meter.borrow_mut() = Some(meter);
+        Ok(())
+    }
+
+    /// Rows written since the meter was switched on or last reset. Empty
+    /// when the meter is off.
+    pub fn writes(&self) -> WriteReport {
+        self.meter
+            .borrow()
+            .as_ref()
+            .map(Meter::report)
+            .unwrap_or_default()
+    }
+
+    /// Zeroes the meter (and re-reads the schema at the next write).
+    pub fn reset_writes(&self) {
+        if let Some(m) = self.meter.borrow_mut().as_mut() {
+            m.reset();
+        }
     }
 
     /// In-memory database with every migration applied, in order.
@@ -183,6 +219,8 @@ impl RusqliteSql {
         db.apply(MIGRATION_0014)?;
         db.apply(MIGRATION_0015)?;
         db.apply(MIGRATION_0016)?;
+        db.apply(MIGRATION_0017)?;
+        db.apply(MIGRATION_0018)?;
         Ok(db)
     }
 
@@ -201,6 +239,10 @@ impl Sql for RusqliteSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params)?;
         let conn = self.conn.borrow();
+        // Whatever a failed statement left behind was rolled back.
+        if let Some(m) = self.meter.borrow_mut().as_mut() {
+            m.discard();
+        }
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
         let cols = stmt.column_count();
         let mut rows = stmt
@@ -214,24 +256,73 @@ impl Sql for RusqliteSql {
             }
             out.push(r);
         }
+        drop(rows);
+        drop(stmt);
+        // A statement with RETURNING writes too.
+        if let Some(m) = self.meter.borrow_mut().as_mut() {
+            let priced = m.price(&conn).map_err(map_err)?;
+            m.commit(sql, priced);
+        }
         Ok(out)
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        run_to_completion(&self.conn.borrow(), sql, params)
+        let conn = self.conn.borrow();
+        let mut meter = self.meter.borrow_mut();
+        // What a failed query left behind was rolled back.
+        if let Some(m) = meter.as_mut() {
+            m.discard();
+        }
+        let changed = match run_to_completion(&conn, sql, params) {
+            Ok(n) => n,
+            Err(e) => {
+                if let Some(m) = meter.as_mut() {
+                    m.discard();
+                }
+                return Err(e);
+            }
+        };
+        if let Some(m) = meter.as_mut() {
+            let priced = m.price(&conn).map_err(map_err)?;
+            m.commit(sql, priced);
+        }
+        Ok(changed)
     }
 
     /// One transaction: the first failing statement (a guard CHECK or any
     /// other error) rolls back every statement of the batch.
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         let mut conn = self.conn.borrow_mut();
+        let mut meter = self.meter.borrow_mut();
+        // What a failed query left behind was rolled back.
+        if let Some(m) = meter.as_mut() {
+            m.discard();
+        }
         let tx = conn.transaction().map_err(map_err)?;
         let mut changed = Vec::with_capacity(stmts.len());
+        let mut priced = Vec::new();
         for (sql, params) in &stmts {
-            // On error `tx` drops here, which rolls back.
-            changed.push(run_to_completion(&tx, sql, params)?);
+            // On error `tx` drops here, which rolls back; nothing of the
+            // batch was written, so nothing of it is metered.
+            match run_to_completion(&tx, sql, params) {
+                Ok(n) => changed.push(n),
+                Err(e) => {
+                    if let Some(m) = meter.as_mut() {
+                        m.discard();
+                    }
+                    return Err(e);
+                }
+            }
+            if let Some(m) = meter.as_mut() {
+                priced.push((*sql, m.price(&tx).map_err(map_err)?));
+            }
         }
         tx.commit().map_err(map_err)?;
+        if let Some(m) = meter.as_mut() {
+            for (sql, p) in priced {
+                m.commit(sql, p);
+            }
+        }
         Ok(changed)
     }
 }

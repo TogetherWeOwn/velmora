@@ -306,13 +306,22 @@ jobs:
       - name: Install pinned worker-build 0.8.7
         run: cargo install --locked worker-build --version 0.8.7
       - run: cargo clippy --locked -p velmora-s3-bridge --target wasm32-unknown-unknown -- -D warnings
+      - name: Test the wasm section stripper
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_strip_wasm.py
+      # bundle.sh: worker-build, then the `name` section is dropped. The
+      # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
         working-directory: workers/s3-bridge
-        run: worker-build --release
+        run: bash bundle.sh
       - name: Size budget (index_bg.wasm under 3 MB)
         working-directory: workers/s3-bridge
         run: |
           set -euo pipefail
+          python3 -I tools/strip_wasm.py check build/index_bg.wasm
+          # The strip found a `name` section and kept the copy that
+          # deploy-build uploads; fails here, not after the merge.
+          test -s symbols/index_bg.unstripped.wasm
           size=$(stat -c %s build/index_bg.wasm)
           echo "index_bg.wasm: ${size} bytes (budget 3000000)"
           test "$size" -lt 3000000
@@ -390,9 +399,25 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
         run: bash e2e/slice.sh https://127.0.0.1:8787
 
+  # The console Worker (apps/console): plain JavaScript, no dependencies,
+  # tested with the Node test runner. Cheap, so it runs on every event.
+  console-test:
+    name: console tests (node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Node version
+        run: node --version
+      - name: Unit tests
+        working-directory: apps/console
+        run: node --test test/*.test.js
+
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -480,10 +505,18 @@ jobs:
       - name: Install pinned worker-build 0.8.7
         if: steps.fresh.outputs.fresh == 'true'
         run: cargo install --locked worker-build --version 0.8.7
+      # The same build as the worker-build job (bundle.sh), and the same
+      # size budget, measured here on the wasm that ships.
       - name: Build the Worker bundle
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
-        run: worker-build --release
+        run: |
+          set -euo pipefail
+          bash bundle.sh
+          python3 -I tools/strip_wasm.py check build/index_bg.wasm
+          size=$(stat -c %s build/index_bg.wasm)
+          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
+          test "$size" -lt 3000000
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:
@@ -491,6 +524,17 @@ jobs:
           path: workers/s3-bridge/build/
           if-no-files-found: error
           retention-days: 1
+      # The unstripped wasm of this release: it names the functions in a
+      # production trace frame `wasm-function[N]:0xOFF` (same indices and
+      # code offsets). Not deployed. See workers/s3-bridge/ops/README.md,
+      # "Naming a wasm frame".
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.fresh.outputs.fresh == 'true'
+        with:
+          name: s3-bridge-symbols
+          path: workers/s3-bridge/symbols/index_bg.unstripped.wasm
+          if-no-files-found: error
+          retention-days: 90
 
   deploy:
     name: deploy (production)

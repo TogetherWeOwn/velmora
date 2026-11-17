@@ -266,6 +266,7 @@ impl Fx {
             slice_bytes: 8 * 1024 * 1024,
             max_object_extents: 10_000,
             intent_sweep: false,
+            packed_plans: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: VERIFY_DELAY_SECS,
@@ -279,6 +280,7 @@ impl Fx {
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
             maintenance,
             server_side_copy: false,
+            get_fanout_bytes: None,
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
             providers,
@@ -1166,6 +1168,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             sweep_failed: false,
             release_paused: false,
             mark_failed: false,
+            plans_packed: 0,
+            pack_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

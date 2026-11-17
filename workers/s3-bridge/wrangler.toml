@@ -9,7 +9,7 @@ compatibility_date = "2026-11-01"
 [build]
 # worker-build 0.8.7 matches the locked workers-rs 0.8.7 (the 0.7 line does
 # not). `--locked` installs it from its own lockfile.
-command = "cargo install -q --locked worker-build@0.8.7 && worker-build --release"
+command = "cargo install -q --locked worker-build@0.8.7 && bash bundle.sh"
 
 [limits]
 cpu_ms = 300000              # crypto-heavy fetch + queue handlers; measure, then lower
@@ -61,9 +61,14 @@ MAX_PUT_BYTES = "103809024"
 # off; /_admin/status counts what it would take (write_intents:
 # waiting_writes, oldest_waiting_at).
 INTENT_SWEEP = "off"
-# off | on. On: every 15 minutes a pass copies each recovery record of
-# SAFETY (m/) to a bucket at another S3-compatible provider, so that the
-# records survive the loss of this account. It puts only what is missing
+# off | on. On: the recovery records of SAFETY (m/) are copied to a
+# bucket at another S3-compatible provider, so that the records survive
+# the loss of this account. Every 15 minutes a pass sends the records of
+# the last hour (deletes, writes and their article plans); an article
+# plan written later is sent by a job of its own when its extent is
+# posted; and once a day a walk compares every record with the copy (in
+# three hours when a job left something undone), so that what a pass
+# lists follows what is written, not what is stored. It puts only what is missing
 # or different there (key, size, MD5), proves each put with a HEAD, and
 # never deletes there. Tenant keys (m/tk/) are not copied, a generation
 # record is copied once it is two minutes old, and no pass runs while
@@ -87,12 +92,35 @@ RECOVERY_COPY = "off"
 #     A job is one source address to a provider, however many connections it holds there.
 #   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
+#   PACKED_PLANS (off): off | on. On: the article plan of a new extent is one value on its row
+#     (extents.plan) instead of one row per article, a replay stores plans that way, and each
+#     cron tick packs up to 50 older plans whose articles are all posted and deletes their rows
+#     (POST /_admin/pack-plans does a step by hand). A Worker from before this switch
+#     cannot read a packed plan: turn it on in a deploy AFTER the one that brought the switch,
+#     and from then on never roll back past that one (see "Rollback floor" in ops/README.md).
 
 # off | on (CopyObject only; UploadPartCopy does not read it). On only in a
 # release after the one that added extent references (migration 0005): a
 # rollback must never land on a Worker that cannot read a copy or would
 # collect the extents it shares. See "Rollback floor" in ops/README.md.
 SERVER_SIDE_COPY = "on"
+# A GET (or ranged GET) of more plaintext bytes than this is served in
+# sub-ranges of this size: the invocation that answers the client asks
+# this Worker for each sub-range in turn through the SELF binding below,
+# and each of those runs under its own CPU limit. One invocation reads
+# about 9 GiB from the cache within cpu_ms, and 3 to 6 GiB from Usenet,
+# so 1 GiB leaves a wide margin. From 1 MiB to 2 GiB; unset or "0"
+# serves every GET in one invocation. A GET of more than 8,192
+# sub-ranges (8 TiB at 1 GiB) is refused. See "A GET above
+# GET_FANOUT_BYTES" in ops/README.md.
+GET_FANOUT_BYTES = "1073741824"
+
+# This Worker, bound to itself: `service` must be the name above. The
+# sub-requests of a large GET go through it and never through the
+# internet; one that arrives from the internet is refused.
+[[services]]
+binding = "SELF"
+service = "velmora-s3"
 
 [[d1_databases]]
 binding = "CATALOG"
@@ -284,10 +312,14 @@ crons = ["*/5 * * * *"]
 # invocations, which is never the looser count.
 
 [env.dev]
-vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on" }
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.
+
+[[env.dev.services]]
+binding = "SELF"
+service = "velmora-s3-dev"
 
 [[env.dev.d1_databases]]
 binding = "CATALOG"

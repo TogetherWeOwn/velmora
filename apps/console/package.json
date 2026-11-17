@@ -1,0 +1,10 @@
+{
+  "name": "velmora-console",
+  "private": true,
+  "type": "module",
+  "description": "A small web file manager for velmora, as a Cloudflare Worker.",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=20" }
+}

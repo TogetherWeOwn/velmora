@@ -78,6 +78,15 @@ Limits to know:
   fails loudly.
 - An article plan record that does not open is listed under
   `unreadable` and its extent is restored without a plan.
+- A packed plan in the catalogue that cannot be read is replaced by the
+  plan of the extent's record. When the record has no plan to give (it
+  is absent, it does not open, or its plan does not fit the row), the
+  stored value stays as it is, and the name of the extent's plan record
+  (`m/art/<extent id>`) is listed under `unreadable`, whether or not
+  such a record exists. That extent cannot be read from Usenet, and
+  it is not counted in `damaged`. When it has no pinned copy either and
+  its key has an older generation, its record is not published over
+  that generation and is listed under `damaged_unpublished`, as below.
 - An extent with neither a pinned copy nor an article plan record cannot
   be read. Its object is restored anyway, reads of it fail, and the replay
   lists it under `damaged`. The exception: when the key has an older
@@ -94,8 +103,10 @@ Limits to know:
     (the client's log, the application that owns the key).
     - Not acknowledged (a failed upload): nothing. The key holds what it
       should.
-    - Acknowledged: the object is lost. Put it again from its source,
-      or tell its owner.
+    - Acknowledged: the object cannot be read. Put it again from its
+      source, or tell its owner. (When the cause is a packed plan that
+      cannot be read, listed under `unreadable`, the articles may still
+      be on Usenet; without a plan nothing finds them.)
   - The record stays in `SAFETY` either way, and no command removes it.
     A replay leaves it out only while the key has a live object that
     is newer than the record, so a PutObject on the key ends the report
@@ -423,6 +434,15 @@ the code real data relies on. Never roll back past the floor:
   extents of its source; one from before #76 lacks the fixes to copy
   retries and to the replay of copies. Today the #71 floor is the later
   of the two, so it covers both.
+- **Once `PACKED_PLANS=on` has been deployed:** never to a version older
+  than the first one that knows `PACKED_PLANS` (migrations 0016 and
+  0017). From then on the article plan of an extent can be one value on
+  its row (`extents.plan`) and not rows in `articles`. An older Worker
+  sees such an extent as one without a plan: it cannot read it from
+  Usenet, and a post job of it would plan and post the extent a second
+  time. A rollback to a version that knows the switch is safe with the
+  switch on or off: off only stops new plans from being packed, and
+  every such version reads both forms.
 
 Above the floor a rollback is still not free:
 
@@ -588,6 +608,51 @@ else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
 
+## Packed article plans
+
+The article plan of an extent (where its ciphertext is on Usenet) is
+either one row per article in `articles`, or one value on the extent's
+own row (`extents.plan`, migrations 0016 and 0017). Packed, a 16 MiB
+extent keeps under 1 KiB of plan in the catalogue instead of about
+11 KiB, and its posting writes two rows instead of three per article.
+Every reader takes both forms. The recovery records do not change: the
+record of a plan (`m/art/<extent id>`) lists every article in both
+cases, so a replay rebuilds either form from it.
+
+To turn it on:
+
+1. Apply the migrations and deploy with `PACKED_PLANS` unset (off).
+   This is the first version that reads a packed plan.
+2. In a later deploy set `PACKED_PLANS = "on"`. From then on:
+   - a new extent's plan is stored packed;
+   - a replay stores the plans it restores packed;
+   - each cron tick packs up to 50 older plans and deletes their rows.
+     Only a plan whose articles are all posted is packed; one that is
+     still being posted is packed by a later tick.
+3. A large backlog of older plans is packed faster by hand, 1 to 500
+   extents a call:
+
+   ```
+   curl -sS -X POST -H @<bearer header file> '<base-url>/_admin/pack-plans?limit=500'
+   ```
+
+   The answer is `{"looked": n, "packed": n, "end": bool}`. Repeat until
+   a call answers `"end": true`: the pass has been over every extent
+   that has article rows. Rows that are left belong to plans that are
+   not posted in full yet (`SELECT COUNT(*) FROM articles`).
+
+Packing an older plan writes one row for the extent and one per article
+row it deletes. The route answers 409 while the switch is off and 503
+in restore maintenance. See "Rollback floor" before turning it on.
+
+A packed plan carries a digest of itself and of its extent's id, and a
+value that does not match it is never read as a plan: every read of
+that extent fails instead. The schema keeps a plan on an extent in
+service, so such a value is not dropped by hand. The replay (below)
+replaces it: for each extent of a record it reads the stored plan, and
+one that cannot be read gives way to the plan in the extent's record.
+A plan that reads is left as it is.
+
 ## The route
 
 `POST /_admin/restore` (admin bearer; 409 unless `MAINTENANCE=restore`)
@@ -602,9 +667,101 @@ ahead of it (a later phase, a later record, another restore point)
 answers 400, so no part of the records can be left out; a cursor that
 is behind repeats a step, which changes nothing.
 
+## A GET above GET_FANOUT_BYTES
+
+One invocation has `cpu_ms` of CPU (300 s), and every byte of a GET is
+decrypted in it: a single GET stopped after about 9 GiB read from the
+cache, with `exceededCpu`. A GET, whole or ranged, of more plaintext
+than `GET_FANOUT_BYTES` (shipped: 1 GiB) is therefore served in
+sub-ranges of that size. The invocation that answers the client checks
+the signature and the grant and sends the headers, the same as for any
+GET; it then asks this Worker for one sub-range after the other through
+the `SELF` service binding, and the runtime moves each answer into the
+client's response. Each sub-range is an invocation of its own, with its
+own `cpu_ms`. A smaller GET is served as before.
+
+- **The binding.** `[[services]] binding = "SELF"` must name this
+  Worker (`service` equal to `name`; each environment names its own).
+  Without it a GET above the size answers 500 and logs `fanout: no
+  service binding or stream`; smaller GETs are not affected.
+- **A sub-request** is `GET /_fanout` with one header that carries a
+  token: bucket id, generation id, offset, length and an expiry of two
+  minutes, under an HMAC keyed from the active KEK. It is refused (403)
+  if it carries a header that the edge adds to a request from the
+  Internet, or if the token does not verify. Every sub-range of one
+  download is read from the generation the first invocation found,
+  whatever is written to the key meanwhile.
+- **A failure after the first byte** cannot change the status line. The
+  response has a `Content-Length`, and the stream is aborted: the client
+  sees a broken transfer, never a short one that looks complete. The log
+  has `fanout: download aborted (<class>)`. The client asks again with
+  `Range: bytes=<received>-` and `If-Match: <the ETag it was sent>`:
+  each request reads the object that is live when it arrives, and
+  without the condition a key written to meanwhile would give the rest
+  of another object (with it: 412). A sub-range after the first that
+  answers 503 before its first byte is asked for again, up to three
+  times, before the download is given up; a 503 of the first sub-range
+  is the answer to the client.
+- **Limits.** `GET_FANOUT_BYTES` is from 1 MiB to 2 GiB; a GET of more
+  than 8,192 sub-ranges (8 TiB at 1 GiB) is refused with 500 before any
+  byte. Sub-requests count against the subrequest limit of the first
+  invocation (10,000) and are not billed as requests; their CPU is.
+  One download of 100 sub-ranges was read whole on a deployed Worker.
+  If the platform ever stops a download at a fixed number of
+  sub-requests, the log has `fanout: download aborted (transport)` at
+  the same sub-range each time: raise `GET_FANOUT_BYTES`.
+- **A sub-range that ends short.** A sub-response is refused unless it
+  declares the length asked for. Should its body still end early, the
+  download comes out shorter than its `Content-Length` and the close
+  fails, which aborts it: a client never takes it for a complete
+  response, and must not keep the bytes of a transfer that failed.
+- **A deploy during a download.** The next sub-request is answered by
+  the new version. A version that does not know the token (from before
+  this feature, or with another token format) refuses it, and the
+  download aborts as above.
+- **Off.** `GET_FANOUT_BYTES = "0"` (or unset) serves every GET in one
+  invocation, as a version from before this feature does. Nothing is
+  stored for this feature: going back needs nothing else.
+
+Measured on a deployed Worker with an object of 12 GiB (768 extents of
+16 MiB), sub-ranges of 1 GiB:
+
+| | wall | CPU per sub-range of 1 GiB | CPU of the first invocation |
+|---|---|---|---|
+| whole object from the cache | 536 s (22 MiB/s) | 20 to 40 s | under 0.2 s |
+| 5 GiB range from the cache | 252 s (20 MiB/s) | 20 to 40 s | under 0.2 s |
+| 2 GiB range from Usenet | 1,569 s (1.3 MiB/s) | 50 to 90 s | under 0.2 s |
+
+A read from Usenet in one GET goes extent by extent, so it is slow next
+to a client that asks for many ranges at once; the cache is filled
+either way. In the same drill one such GET lost its provider connection
+in the second sub-range: the transfer broke after 1,152 MiB, all of
+them the right bytes, and the client reported a short body.
+
 ## KEK
 
 The escrow file holds one `VELMORA_KEK_<version>=<base64 of 32 bytes>` line
 per version, mode 0600, outside any repository. `ops/kek-restore.sh` sets
 each one as a Worker secret through stdin. Nothing else can replace a lost
 KEK.
+
+## Naming a wasm frame
+
+The deployed wasm has no `name` section (bundle.sh drops it to stay
+under the size budget), so a panic's message is logged as before but
+its trace frames read `wasm-function[N]:0xOFF` instead of Rust function
+names. To name a frame:
+
+1. Find the deployed version's message, `ci <run id>.<attempt> <sha>`
+   (`wrangler deployments list`, or the dashboard).
+2. Download the `s3-bridge-symbols` artifact of that CI run (kept 90
+   days): `gh run download <run id> -n s3-bridge-symbols`. It holds
+   `index_bg.unstripped.wasm`, the same wasm with the names kept.
+3. Function `N` is entry `N` of its `name` section. Any wasm tool reads
+   it; `wasm-tools print index_bg.unstripped.wasm` prints it as the line
+   `(func $<name> (;N;) ...`. Function indices and code offsets are the
+   same in both files.
+
+After 90 days, rebuild at `<sha>` with the same toolchain
+(`bash bundle.sh`) and use `symbols/index_bg.unstripped.wasm`; a
+different rustc may number the functions differently.

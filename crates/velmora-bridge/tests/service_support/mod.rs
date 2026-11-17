@@ -481,6 +481,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
         intent_sweep: false,
+        packed_plans: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
@@ -494,6 +495,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
         maintenance: Maintenance::Off,
         server_side_copy: true,
+        get_fanout_bytes: None,
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         providers,
@@ -1040,6 +1042,7 @@ impl Resp {
                     }
                 }
             }
+            RespBody::Fanout(_) => panic!("a body in sub-ranges is collected by its own test"),
         }
         Resp {
             status: resp.status,

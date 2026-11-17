@@ -14,7 +14,7 @@
 use futures_util::StreamExt;
 use velmora_bridge::ingress::{self, IngressError};
 use velmora_bridge::{Body, BridgeError, Method, RespBody, S3Request, S3Response};
-use worker::{FixedLengthStream, Headers, Request, Response, ResponseBody};
+use worker::{EncodeBody, FixedLengthStream, Headers, Request, Response, ResponseBody};
 
 /// One request as the bridge sees it, plus what the edge knows about it.
 pub struct Incoming {
@@ -102,6 +102,9 @@ fn try_response(resp: S3Response) -> worker::Result<Response> {
             )
             .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into()))),
         )?,
+        // `fetch` serves a body in sub-ranges itself (`crate::fanout`);
+        // one that reaches this point has no stream to go to.
+        RespBody::Fanout(_) => return Err(worker::Error::RustError("fanout body".into())),
         RespBody::Stream(stream) => {
             let stream = stream
                 .map(|chunk| chunk.map_err(|_| worker::Error::RustError("body stream".into())));
@@ -115,7 +118,14 @@ fn try_response(resp: S3Response) -> worker::Result<Response> {
             }
         }
     };
-    Ok(out.with_status(resp.status).with_headers(headers))
+    // `manual`: the body is sent as it is. Every body is final; a
+    // `content-encoding` header can only be an object's stored metadata,
+    // which describes the stored bytes. The default (`automatic`) would
+    // compress such an object again and drop its length.
+    Ok(out
+        .with_status(resp.status)
+        .with_headers(headers)
+        .with_encode_body(EncodeBody::Manual))
 }
 
 /// A class-only `500` (fail closed). Never names a variable or value.

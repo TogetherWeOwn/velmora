@@ -200,7 +200,8 @@ async fn repost_is_byte_identical_in(form: Form, n: u8) {
         });
         rig.bridge.clock.advance_secs(LEASE_SECS + 1);
     }
-    rig.bridge.catalog.fail_mark_posted.set(1);
+    // The job dies before it records the plan (both tries fail).
+    rig.bridge.catalog.fail_mark_posted.set(2);
     rig.run_post(&s).await;
     let plan = rig.plan(&s).await;
     assert_eq!(plan[0].yenc_name.is_some(), form == Form::Standalone);
@@ -280,4 +281,84 @@ async fn the_plan_record_keeps_each_rows_form() {
     let names: Vec<_> = rows.iter().map(|a| a.yenc_name.clone()).collect();
     let want: Vec<_> = plan.iter().map(|a| a.yenc_name.clone()).collect();
     assert_eq!(names, want);
+}
+
+/// The record of a seeded plan carries the seeded form next to the
+/// rows, for a replay to give the catalogue the small form back. A
+/// record of any other plan is the same bytes as before, and a reader
+/// from before the field reads both.
+#[tokio::test]
+async fn the_plan_record_carries_a_seeded_plan() {
+    use velmora_bridge::plan::{
+        expand, pack_explicit, plan_seeded, repack, same_plan, seed_of, StoredPlan,
+    };
+    use velmora_bridge::recovery::ArticleRecord;
+
+    /// The record as a Worker from before packed plans reads it.
+    #[derive(serde::Deserialize)]
+    struct Before {
+        plan_rev: u32,
+        articles: Vec<ArticleRecord>,
+    }
+
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted_as(8, Form::Standalone).await;
+    let extent = rig.bridge.catalog.extent(&s.extent);
+    let size = extent.cipher_size;
+    let groups = ["alt.binaries.test"];
+    let rng = &mut velmora::rng::SystemRng;
+    let (blob, rows) = plan_seeded(rng, 1_800_000_000, &groups, &extent.id, size, |span| {
+        plan.iter()
+            .find(|a| a.cipher_offset == span.start)
+            .map(|a| a.payload_sha256)
+    })
+    .unwrap();
+    assert_eq!(rows.len(), plan.len());
+
+    let seeded = StoredPlan {
+        rows: rows.clone(),
+        packed: Some(blob.clone()),
+    };
+    let record = ArticleManifest::of(&extent, &seeded);
+    assert_eq!(record.packed.as_deref(), Some(&blob[..]));
+    assert_eq!(
+        record.articles,
+        ArticleManifest::new(&extent, &rows).articles
+    );
+    let json = serde_json::to_value(&record).unwrap();
+    assert!(json["packed"].is_string());
+    let back: ArticleManifest = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(back, record);
+    let before: Before = serde_json::from_value(json).unwrap();
+    assert_eq!((before.plan_rev, &before.articles), (1, &record.articles));
+    // A replay takes the seeded form when it is these very rows.
+    let replayed = back.rows(ArticleState::Posted).unwrap();
+    assert!(same_plan(&replayed, &rows));
+    let again = repack(&extent.id, size, &replayed, back.packed.as_deref());
+    assert_eq!(again.as_deref(), Some(&blob[..]));
+
+    // A plan that was drawn at random: its packed form is made from the
+    // rows of the record, so the record does not carry it.
+    let explicit = pack_explicit(&extent.id, size, &plan).unwrap();
+    let stored = StoredPlan {
+        rows: plan.clone(),
+        packed: Some(explicit.clone()),
+    };
+    let record = ArticleManifest::of(&extent, &stored);
+    assert_eq!(record, ArticleManifest::new(&extent, &plan));
+    let json = serde_json::to_value(&record).unwrap();
+    assert!(json.get("packed").is_none());
+    let replayed = record.rows(ArticleState::Posted).unwrap();
+    assert_eq!(repack(&extent.id, size, &replayed, None), Some(explicit));
+
+    // A seeded form that is not the rows of its record is not taken:
+    // the rows are what was posted.
+    let got = repack(&extent.id, size, &replayed, Some(&blob)).unwrap();
+    assert_eq!(seed_of(&got), None);
+    let expanded = expand(&extent.id, size, &got, None, None).unwrap();
+    assert!(same_plan(&expanded, &plan));
+    // Rows that are not the engine's cuts stay rows.
+    let mut odd = replayed.clone();
+    odd[0].cipher_len -= 1;
+    assert_eq!(repack(&extent.id, size, &odd, Some(&blob)), None);
 }

@@ -1325,6 +1325,10 @@ pub struct DispatchReport {
     /// Fewer backbones count toward a release than `REQUIRED_BACKBONES`:
     /// nothing is released until the provider list is put right.
     pub release_paused: bool,
+    /// Plans that were rows in `articles` and are packed now.
+    pub plans_packed: u32,
+    /// Packing failed; the rest of the run went on without it.
+    pub pack_failed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1472,9 @@ pub enum RespBody {
     /// done soon, else streamed with keepalive whitespace (see
     /// [`crate::keepalive`]).
     Deferred(crate::keepalive::Deferred),
+    /// A large GET body that the runtime fetches in sub-ranges, each from
+    /// an invocation of its own (see [`crate::fanout`]).
+    Fanout(crate::fanout::Fanout),
 }
 
 /// One response.

@@ -80,6 +80,7 @@ mod uploads;
 
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
+use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{
     Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
     UploadTarget,
@@ -171,6 +172,24 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         key: &str,
     ) -> Result<Option<(GenerationRow, Vec<ExtentRow>)>> {
         objects::live_object(self, bucket, key).await
+    }
+    async fn live_generation(&self, bucket: &BucketId, key: &str) -> Result<Option<GenerationRow>> {
+        objects::live_generation(self, bucket, key).await
+    }
+    async fn generation_by_id(
+        &self,
+        bucket: &BucketId,
+        generation: &GenerationId,
+    ) -> Result<Option<(Bucket, GenerationRow)>> {
+        objects::generation_by_id(self, bucket, generation).await
+    }
+    async fn extents_in(
+        &self,
+        generation: &GenerationId,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ExtentRow>> {
+        objects::extents_in(self, generation, start, end).await
     }
     async fn commit_generation(
         &self,
@@ -435,6 +454,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn defer(&self, l: &Lease, next_at: UnixMs, now: UnixMs) -> Result<bool> {
         outbox::defer(self, l, next_at, now).await
     }
+    async fn defer_at(&self, l: &Lease, cursor: u32, next_at: UnixMs, now: UnixMs) -> Result<bool> {
+        outbox::defer_at(self, l, cursor, next_at, now).await
+    }
     async fn job_extent(
         &self,
         extent: &ExtentId,
@@ -449,8 +471,19 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<Vec<ArticleRow>>> {
         outbox::plan_articles(self, l, rows).await
     }
+    async fn plan_packed(
+        &self,
+        l: &Lease,
+        cipher_size: u64,
+        plan: &[u8],
+    ) -> Result<Option<StoredPlan>> {
+        outbox::plan_packed(self, l, cipher_size, plan).await
+    }
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>> {
-        outbox::articles(self, extent).await
+        Ok(outbox::stored_plan(self, extent).await?.rows)
+    }
+    async fn stored_plan(&self, extent: &ExtentId) -> Result<StoredPlan> {
+        outbox::stored_plan(self, extent).await
     }
     async fn mark_posted(&self, l: &Lease, idx: u32, provider: &str, now: UnixMs) -> Result<bool> {
         outbox::mark_posted(self, l, idx, provider, now).await
@@ -561,7 +594,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         bucket: &Bucket,
         extents: &[ReplayExtent],
         now: UnixMs,
-    ) -> Result<()> {
+    ) -> Result<Vec<ExtentId>> {
         replay::replay_extents(self, bucket, extents, now).await
     }
     async fn held_extents(&self, after: &str, limit: u32) -> Result<Vec<ExtentId>> {
@@ -665,6 +698,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn revive_referenced(&self, limit: u32, now: UnixMs) -> Result<u64> {
         outbox::revive_referenced(self, limit, now).await
+    }
+    async fn pack_plans(&self, limit: u32) -> Result<PackReport> {
+        outbox::pack_plans(self, limit).await
     }
 
     // hot tier

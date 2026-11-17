@@ -23,30 +23,32 @@ CREATE TABLE upload_part_extents (
 ) WITHOUT ROWID;
 CREATE INDEX upload_part_extents_by_extent ON upload_part_extents(extent_id);
 
--- The two triggers of 0005 that keep an extent of an open upload in
--- service, extended to the slices named above.
+-- An extent of an open upload is in service: its key, its packed plan
+-- and its unpacked article rows stay (migrations 0005 and 0017). The
+-- same for the slices named above. These triggers stand beside the
+-- ones that are there, which are not touched: each aborts on its own,
+-- so no statement of this file leaves an extent uncovered.
 
-DROP TRIGGER extents_keep_key_in_service;
-CREATE TRIGGER extents_keep_key_in_service BEFORE UPDATE OF wrapped_file_key ON extents
-WHEN OLD.wrapped_file_key IS NOT NULL AND NEW.wrapped_file_key IS NULL AND (
-  EXISTS (SELECT 1 FROM generation_extents r JOIN generations g ON g.id = r.generation_id
-           WHERE r.extent_id = OLD.id AND g.state = 'live')
-  OR EXISTS (SELECT 1 FROM upload_parts p JOIN uploads u ON u.id = p.upload_id
+CREATE TRIGGER extents_keep_key_of_slices BEFORE UPDATE OF wrapped_file_key ON extents
+WHEN OLD.wrapped_file_key IS NOT NULL AND NEW.wrapped_file_key IS NULL
+ AND EXISTS (SELECT 1 FROM upload_part_extents p JOIN uploads u ON u.id = p.upload_id
               WHERE p.extent_id = OLD.id AND u.state = 'open')
-  OR EXISTS (SELECT 1 FROM upload_part_extents p JOIN uploads u ON u.id = p.upload_id
-              WHERE p.extent_id = OLD.id AND u.state = 'open'))
 BEGIN
   SELECT RAISE(ABORT, 'extent is in service');
 END;
 
-DROP TRIGGER articles_keep_in_service;
-CREATE TRIGGER articles_keep_in_service BEFORE DELETE ON articles
-WHEN EXISTS (SELECT 1 FROM generation_extents r JOIN generations g ON g.id = r.generation_id
-              WHERE r.extent_id = OLD.extent_id AND g.state = 'live')
-  OR EXISTS (SELECT 1 FROM upload_parts p JOIN uploads u ON u.id = p.upload_id
+CREATE TRIGGER articles_keep_unpacked_of_slices BEFORE DELETE ON articles
+WHEN (SELECT plan FROM extents WHERE id = OLD.extent_id) IS NULL
+ AND EXISTS (SELECT 1 FROM upload_part_extents p JOIN uploads u ON u.id = p.upload_id
               WHERE p.extent_id = OLD.extent_id AND u.state = 'open')
-  OR EXISTS (SELECT 1 FROM upload_part_extents p JOIN uploads u ON u.id = p.upload_id
-              WHERE p.extent_id = OLD.extent_id AND u.state = 'open')
+BEGIN
+  SELECT RAISE(ABORT, 'extent is in service');
+END;
+
+CREATE TRIGGER extents_keep_plan_of_slices BEFORE UPDATE OF plan ON extents
+WHEN OLD.plan IS NOT NULL AND NEW.plan IS NULL
+ AND EXISTS (SELECT 1 FROM upload_part_extents p JOIN uploads u ON u.id = p.upload_id
+              WHERE p.extent_id = OLD.id AND u.state = 'open')
 BEGIN
   SELECT RAISE(ABORT, 'extent is in service');
 END;

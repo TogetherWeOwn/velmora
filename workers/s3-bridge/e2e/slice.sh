@@ -573,6 +573,55 @@ run_aws "GET a/small.bin" "${S3[@]}" cp "s3://$SB/a/small.bin" "$T/got-small.bin
 same_bytes "GET a/small.bin equals the upload" "$T/small.bin" "$T/got-small.bin"
 
 # ---------------------------------------------------------------------------
+# 1a a GET in sub-ranges (GET_FANOUT_BYTES; 8 MiB in the dev environment)
+# ---------------------------------------------------------------------------
+
+STEP=1a-get-in-sub-ranges
+log "step $STEP"
+# The route of a sub-request is not for clients: without a token, with a
+# made-up one, and with a valid S3 signature it is refused.
+for hdr in 'x-none: 1' 'x-velmora-fanout-token: v1.1.9999999999999.0.1.b.g.00'; do
+  code=$(curl -sS "${CURL_TLS[@]}" -o "$T/fan.out" -w '%{http_code}' --max-time 60 -H "$hdr" "$BASE/_fanout") ||
+    fail "GET /_fanout ($hdr)" "an HTTP answer" "curl failed"
+  [[ $code == 403 ]] || fail "GET /_fanout ($hdr)" "403" "$code $(head -c 300 "$T/fan.out")"
+done
+expect_err "signed GET /_fanout" 'AccessDenied|403|Forbidden' "${S3API[@]}" list-objects-v2 --bucket _fanout
+# sub_requests: the sub-requests this Worker has answered with 200 so far.
+sub_requests() { grep -c 'bucket=_fanout key#=- status=200' "$T/wrangler.log" || true; }
+if [[ $MODE == local ]]; then
+  # One GET of the whole object (aws s3 cp asks for 8 MiB ranges, which
+  # are one sub-range each and are served directly).
+  before=$(sub_requests)
+  json=$(run_aws "GET a/big.bin in one request" "${S3API[@]}" get-object --bucket "$SB" --key a/big.bin "$T/got-fan.bin")
+  jcheck "GET a/big.bin in one request: 96 MiB" '.ContentLength == 100663296' "$json"
+  same_bytes "GET a/big.bin in one request equals the upload" "$T/big.bin" "$T/got-fan.bin"
+  after=$(sub_requests)
+  ((after - before == 12)) ||
+    fail "GET a/big.bin in one request" "12 sub-requests of 8 MiB" "$((after - before))"
+  # A range that begins and ends inside a sub-range: 35,000,001 bytes, 5 sub-ranges.
+  before=$after
+  json=$(run_aws "GET a/big.bin bytes=5000000-40000000" "${S3API[@]}" get-object --bucket "$SB" --key a/big.bin \
+    --range bytes=5000000-40000000 "$T/got-fan.bin")
+  jcheck "the range is a 206 of 35,000,001 bytes" \
+    '.ContentLength == 35000001 and .ContentRange == "bytes 5000000-40000000/100663296"' "$json"
+  head -c 40000001 "$T/big.bin" | tail -c 35000001 >"$T/fan-want.bin"
+  same_bytes "range body equals bytes 5000000-40000000" "$T/fan-want.bin" "$T/got-fan.bin"
+  after=$(sub_requests)
+  ((after - before == 5)) ||
+    fail "GET a/big.bin bytes=5000000-40000000" "5 sub-requests" "$((after - before))"
+  # One sub-range and one byte, to the end of the object.
+  json=$(run_aws "GET a/big.bin bytes=-8388609" "${S3API[@]}" get-object --bucket "$SB" --key a/big.bin \
+    --range bytes=-8388609 "$T/got-fan.bin")
+  jcheck "the suffix range is a 206 of 8,388,609 bytes" '.ContentLength == 8388609' "$json"
+  tail -c 8388609 "$T/big.bin" >"$T/fan-want.bin"
+  same_bytes "suffix range body equals the last 8,388,609 bytes" "$T/fan-want.bin" "$T/got-fan.bin"
+  ((($(sub_requests)) - after == 2)) ||
+    fail "GET a/big.bin bytes=-8388609" "2 sub-requests" "$(($(sub_requests) - after))"
+  rm -f "$T/got-fan.bin" "$T/fan-want.bin"
+fi
+rm -f "$T/fan.out"
+
+# ---------------------------------------------------------------------------
 # 1b a signed Accept-Encoding (rclone's default; aws-cli never signs it)
 # ---------------------------------------------------------------------------
 
@@ -593,6 +642,32 @@ got=$("${SIGV4_GET[@]}" gzip identity "$T/got-ae.bin" 2>&1) ||
 [[ $got == "403 SignatureDoesNotMatch" ]] ||
   fail "GET a/small.bin, signed gzip, sent identity" "403 SignatureDoesNotMatch" "$got"
 rm -f "$T/got-ae.bin"
+
+# ---------------------------------------------------------------------------
+# 1b2 a stored Content-Encoding is served as stored
+# ---------------------------------------------------------------------------
+
+STEP=1b2-stored-content-encoding
+log "step $STEP"
+# An object uploaded already gzipped, with Content-Encoding: gzip, comes
+# back as the stored bytes: the runtime must not compress it again.
+for i in $(seq 1 200); do printf '<p>stored gzip line %d</p>\n' "$i"; done | gzip -n -c >"$T/enc.html.gz"
+run_aws "PUT a/enc.html (Content-Encoding: gzip)" "${S3API[@]}" put-object --bucket "$SB" --key a/enc.html \
+  --body "$T/enc.html.gz" --content-type text/html --content-encoding gzip >/dev/null
+got=$(python3 -I "$WORKER_DIR/e2e/sigv4_get.py" "$BASE" "$SB/a/enc.html" gzip gzip "$T/got-enc.bin" 2>&1) ||
+  fail "GET a/enc.html with Accept-Encoding: gzip" "the helper exits 0" "$got"
+[[ $got == "200 -" ]] || fail "GET a/enc.html with Accept-Encoding: gzip" "200" "$got"
+same_bytes "GET a/enc.html equals the stored gzip bytes" "$T/enc.html.gz" "$T/got-enc.bin"
+json=$(run_aws "HEAD a/enc.html" "${S3API[@]}" head-object --bucket "$SB" --key a/enc.html)
+enc_len=$(stat -c %s "$T/enc.html.gz")
+enc_md5=$(md5sum "$T/enc.html.gz" | cut -d' ' -f1)
+# Content-Encoding itself is not asserted on HEAD: for a compressible
+# Content-Type and a client that does not accept gzip (aws-cli sends
+# identity), `wrangler dev` leaves it out (see docs/object-responses.md).
+jcheck "HEAD a/enc.html keeps its length and strong ETag" \
+  ".ContentLength == $enc_len and .ETag == \"\\\"$enc_md5\\\"\"" "$json"
+run_aws "DELETE a/enc.html" "${S3API[@]}" delete-object --bucket "$SB" --key a/enc.html >/dev/null
+rm -f "$T/enc.html.gz" "$T/got-enc.bin"
 
 # ---------------------------------------------------------------------------
 # 1c an access key: minted, used, revoked, refused
@@ -927,6 +1002,22 @@ log "cold GET a/big.bin: $(($(now_ms) - t0)) ms for $(stat -c %s "$T/cold-big.bi
 same_bytes "cold GET a/big.bin equals the upload" "$T/big.bin" "$T/cold-big.bin"
 json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
 jcheck "every extent refilled into the cache" '.extents | length > 0 and all(.cache == "present")' "$json"
+
+if [[ $MODE == local ]]; then
+  # The same from NNTP in one request: every sub-request fills the cache
+  # for its own sub-range.
+  json=$(adm "POST /_admin/evict a/big.bin (again)" -XPOST "$BASE/_admin/evict/$SB/a/big.bin?include_safety=1")
+  jcheck "evict removed the refilled blobs" '.evicted > 0' "$json"
+  before=$(sub_requests)
+  t0=$(now_ms)
+  run_aws "cold GET a/big.bin in one request" "${S3API[@]}" get-object --bucket "$SB" --key a/big.bin "$T/cold-big.bin" >/dev/null
+  log "cold GET a/big.bin in one request: $(($(now_ms) - t0)) ms"
+  same_bytes "cold GET a/big.bin in one request equals the upload" "$T/big.bin" "$T/cold-big.bin"
+  ((($(sub_requests)) - before == 12)) ||
+    fail "cold GET a/big.bin in one request" "12 sub-requests" "$(($(sub_requests) - before))"
+  json=$(adm "GET /_admin/objects/$SB/a/big.bin" "$BASE/_admin/objects/$SB/a/big.bin")
+  jcheck "every extent refilled into the cache again" '.extents | length > 0 and all(.cache == "present")' "$json"
+fi
 
 if [[ $MODE == remote ]]; then
   # 5b drill: read back from Usenet only, without the cache.

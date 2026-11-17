@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>velmora files</title>
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>velmora <span>files</span></h1>
+    <div class="top-actions">
+      <button id="status-btn" type="button" class="ghost">Status</button>
+      <span id="who" class="who"></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" aria-label="Buckets">
+      <div class="side-head">
+        <h2>Buckets</h2>
+        <button id="refresh-buckets" type="button" class="icon" title="Refresh" aria-label="Refresh buckets">&#x21bb;</button>
+      </div>
+      <ul id="buckets" class="buckets"></ul>
+      <form id="new-bucket" class="new-bucket">
+        <input id="new-bucket-name" name="name" placeholder="new-bucket-name" autocomplete="off"
+               pattern="[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]" title="3-63 lower-case letters, digits and hyphens" required>
+        <button type="submit">Create</button>
+      </form>
+    </nav>
+
+    <main class="main">
+      <div class="toolbar">
+        <ol id="crumbs" class="crumbs" aria-label="Folder path"></ol>
+        <input id="search" type="search" placeholder="Filter this folder" aria-label="Filter this folder">
+      </div>
+      <div class="actions">
+        <button id="upload-files" type="button">Upload files</button>
+        <button id="upload-folder" type="button">Upload folder</button>
+        <input id="pick-files" type="file" multiple hidden>
+        <input id="pick-folder" type="file" webkitdirectory multiple hidden>
+        <button id="new-folder" type="button">New folder</button>
+        <button id="delete-selected" type="button" class="danger" disabled>Delete selected</button>
+        <button id="pending-btn" type="button" class="ghost">Unfinished uploads</button>
+      </div>
+
+      <section id="drop" class="drop" aria-label="Files">
+        <table class="files">
+          <thead>
+            <tr>
+              <th class="c-check"><input id="select-all" type="checkbox" aria-label="Select all"></th>
+              <th>Name</th><th class="c-size">Size</th><th class="c-date">Modified</th><th class="c-act"></th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="empty" class="empty" hidden>Empty folder. Drop files or folders here.</div>
+        <button id="more" type="button" class="ghost more" hidden>Load more</button>
+        <div class="drop-hint">Drop files or folders anywhere in this panel to upload them here.</div>
+      </section>
+
+      <section id="transfers" class="transfers" hidden>
+        <h2>Transfers</h2>
+        <ul id="transfer-list"></ul>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="dialog">
+    <form method="dialog" class="dialog-body">
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-content"></div>
+      <menu id="dialog-buttons"></menu>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

@@ -12,6 +12,7 @@
 mod d1;
 mod e2;
 mod env;
+mod fanout;
 mod http;
 mod nntp;
 mod queues;
@@ -144,14 +145,17 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         keepalive::settle_response(resp, env::sleeper()).await
     })
     .await;
+    // A body in sub-ranges: the first one is opened before the status is
+    // known to the client.
+    let (status, out) = fanout::respond(&env, &ctx, resp).await;
     console_log!(
         "{}",
-        ingress::log_line(&method, &target, resp.status, &request_id)
+        ingress::log_line(&method, &target, status, &request_id)
     );
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
-    Ok(http::to_response(resp))
+    Ok(out)
 }
 
 #[event(queue)]
@@ -185,6 +189,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
             _ => bridge.run_job(&job).await,
         };
         log_post_trace(&job, &outcome);
+        plan_hint(&env, &bridge, &job, &outcome).await;
         match outcome {
             JobOutcome::Ack => msg.ack(),
             JobOutcome::Retry { delay_secs } => msg.retry_with_options(
@@ -213,7 +218,27 @@ fn copier<'a>(
     }
 }
 
-/// One job of a pass of the recovery copy. Logs counts only. A job
+/// After a post job that is done: the hint that brings the article
+/// plan of its extent over to the recovery store now. Without it the
+/// plan waits for the walk (`velmora_bridge::copy`).
+async fn plan_hint(env: &Env, bridge: &env::WorkerBridge, job: &Job, outcome: &JobOutcome) {
+    use velmora_bridge::copy::{posted, send_hint};
+    // Nothing to hint at, or no copy. A configuration that is refused
+    // is found by the job of the hint, which says nothing: the cron
+    // run says it.
+    if posted(job, outcome).is_none()
+        || bridge.cfg.maintenance == velmora_bridge::config::Maintenance::Restore
+        || !env::recovery_copy_on(env)
+    {
+        return;
+    }
+    let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+    if !send_hint(&bridge.safety, &bridge.jobs, job, outcome, now).await {
+        console_error!("recovery copy: a hint was not sent");
+    }
+}
+
+/// One job of a pass of the recovery copy, or of a hint (pass 0). Logs counts only. A job
 /// that is retried does its work again and logs it again with
 /// `retry=true`: a sum over a pass takes the other lines only.
 async fn recovery_copy(
@@ -226,6 +251,9 @@ async fn recovery_copy(
         Ok(Some(remote)) => remote,
         // Switched off since the job was sent.
         Ok(None) => return JobOutcome::Ack,
+        // A hint (pass 0) says nothing: there is one for every extent,
+        // and the cron run says it.
+        Err(_) if pass.0 == 0 => return JobOutcome::Ack,
         Err(class) => {
             console_error!("recovery copy: config refused: {class}");
             return JobOutcome::Ack;
@@ -238,7 +266,10 @@ async fn recovery_copy(
     // The reason is a class and a status at most. It is logged whether
     // the job is retried or not: past the retry window a job that did
     // nothing is acknowledged, and must not end without a line.
-    if let Some(why) = why {
+    // A hint that is held back while the store is down asked nothing,
+    // and comes again: no line for each of them.
+    let held = pass.0 == 0 && retry && counts.is_none();
+    if let Some(why) = why.filter(|_| !held) {
         console_error!(
             "recovery copy: pass={} retry={retry} stopped: {why:?}",
             pass.0
@@ -347,6 +378,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
             if report.sweep_failed {
                 console_error!("dispatch: the sweep of unpublished writes was not sent");
+            }
+            if report.pack_failed {
+                console_error!("dispatch: packing article plans failed");
             }
         }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
