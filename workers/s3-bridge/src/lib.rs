@@ -218,9 +218,13 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
 /// dropped, and the job would keep its bytes of the budget (`jobs`).
 async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+    // A wake that is due runs its stage too.
     let post = matches!(
         job,
         Job::Extent {
+            stage: OutboxStage::Post,
+            ..
+        } | Job::Wake {
             stage: OutboxStage::Post,
             ..
         }
