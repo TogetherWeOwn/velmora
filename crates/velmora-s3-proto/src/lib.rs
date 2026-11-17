@@ -17,6 +17,7 @@
 mod auth;
 mod checksum;
 pub mod chunked;
+mod civil;
 pub mod listing;
 pub mod multipart_listing;
 pub mod mutation;
@@ -131,9 +132,7 @@ pub(crate) fn xml_response(body: String) -> Response {
 
 /// ISO 8601 with milliseconds, as S3 renders `LastModified` and `CreationDate`.
 pub(crate) fn iso_date_ms(unix_ms: i64) -> Result<String> {
-    chrono::DateTime::from_timestamp_millis(unix_ms)
-        .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-        .ok_or(ErrorCode::InternalError)
+    civil::iso_ms(unix_ms).ok_or(ErrorCode::InternalError)
 }
 
 /// No Default: production numbers must be explicitly selected and validated.

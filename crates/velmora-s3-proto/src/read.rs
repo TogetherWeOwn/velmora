@@ -6,7 +6,6 @@
 // `StoredChecksum::algorithm()` is added for the commit renderers.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use super::{decimal, upload::digest_value, ChecksumAlgorithm, ErrorCode, Headers, Result};
@@ -108,7 +107,7 @@ impl ObjectMetadata {
     ) -> Result<Self> {
         if generation.is_empty()
             || !valid_tag(&etag)
-            || DateTime::from_timestamp(modified, 0).is_none()
+            || !crate::civil::in_range(modified)
             || content_headers.iter().any(|(k, v)| {
                 !super::wire::persistent_metadata(k)
                     || !super::wire::valid_header_name(k)
@@ -260,33 +259,13 @@ fn http_date(value: &str) -> Option<i64> {
         let seconds = parsed.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
         return i64::try_from(seconds).ok();
     }
-    // httpdate 1.0.3 rejects years before 1970 before producing SystemTime.
-    // Use the existing calendar parser for the four-digit pre-epoch forms;
-    // round-trip to retain the HTTP grammar, weekday and non-leap-second rules.
-    let value = value.trim();
-    [
-        ("%a, %d %b %Y %H:%M:%S GMT", 29, 12..16),
-        ("%a %b %e %H:%M:%S %Y", 24, 20..24),
-    ]
-    .into_iter()
-    .find_map(|(format, length, year)| {
-        if value.len() != length || !value.as_bytes().get(year)?.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        let parsed = chrono::NaiveDateTime::parse_from_str(value, format).ok()?;
-        let utc = parsed.and_utc();
-        (utc.timestamp() < 0
-            && utc.timestamp_subsec_nanos() == 0
-            && parsed.format(format).to_string() == value)
-            .then_some(utc.timestamp())
-    })
+    // httpdate 1.0.3 rejects years before 1970 before producing SystemTime;
+    // the four-digit pre-epoch forms are parsed here.
+    crate::civil::parse_pre_epoch_http_date(value)
 }
 
 fn format_date(value: i64) -> String {
-    DateTime::<Utc>::from_timestamp(value, 0)
-        .expect("metadata timestamp validated")
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
+    crate::civil::http_date(value).expect("metadata timestamp validated")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

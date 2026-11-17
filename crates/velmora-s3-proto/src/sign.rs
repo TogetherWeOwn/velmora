@@ -113,11 +113,7 @@ fn valid_value(value: &str) -> bool {
 /// `YYYYMMDDTHHMMSSZ` for a Unix time in seconds, of a year of four
 /// digits (a time in milliseconds is refused, not signed).
 fn amz_date(unix_secs: i64) -> Result<String> {
-    chrono::DateTime::from_timestamp(unix_secs, 0)
-        .filter(|_| unix_secs >= 0)
-        .map(|t| t.format("%Y%m%dT%H%M%SZ").to_string())
-        .filter(|date| date.len() == 16)
-        .ok_or(ErrorCode::InvalidArgument)
+    crate::civil::amz_date(unix_secs).ok_or(ErrorCode::InvalidArgument)
 }
 
 /// What to sign. `query` keys and values are escaped by the signer.
