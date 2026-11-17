@@ -398,6 +398,9 @@ jobs:
         env:
           FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
           WRANGLER_SEND_METRICS: "false"
+          # This run takes provider permits from the gate object; the
+          # HTTP run above takes them from the catalogue's slot rows.
+          E2E_PERMITS: "do"
         run: bash e2e/slice.sh https://127.0.0.1:8787
 
   # The console Worker (apps/console): plain JavaScript, no dependencies,

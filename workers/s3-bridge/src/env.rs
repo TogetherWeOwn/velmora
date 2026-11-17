@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use velmora_bridge::config::{BridgeConfig, KekRing};
+use velmora_bridge::gate::{shards_from_var, GateClient, GateSharding, PermitMode};
 use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::{Bridge, Clock, UnixMs};
@@ -21,6 +22,7 @@ use worker::Env;
 
 use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
+use crate::gate::{DoTransport, GATE_BINDING};
 use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
 use crate::nntp::WorkerConnector;
 use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, AUX_Q, DEV_DROP_NOTIFY_N};
@@ -61,6 +63,15 @@ thread_local! {
 pub fn isolate() -> i64 {
     ISOLATE.with(Cell::get)
 }
+
+/// `d1` (default): provider permits are slot rows of the catalogue.
+/// `do`: they are held in memory by the permit gate.
+pub const PERMITS: &str = "PERMITS";
+/// `account` (default): gates per account, and per pool of accounts
+/// that share a limit. `one`: the same gates for every provider.
+pub const PERMIT_GATES: &str = "PERMIT_GATES";
+/// How many gates share one account or pool (default 1).
+pub const PERMIT_SHARDS: &str = "PERMIT_SHARDS";
 
 /// Name of the dev-only memory log variable.
 pub const DEV_MEMORY_LOG: &str = "DEV_MEMORY_LOG";
@@ -138,8 +149,32 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     ISOLATE.with(|c| c.set(built_at));
     set_abandon(abandon);
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
+    let catalog = D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?);
+    // `PERMITS`: where provider permits come from. With the gate bound,
+    // a Worker on `d1` still tells a gate that holds slot rows to let
+    // go, so the switch can be turned back.
+    let permits = PermitMode::from_var(get(PERMITS).as_deref())?;
+    let sharding = GateSharding::from_var(get(PERMIT_GATES).as_deref())?;
+    let shards = shards_from_var(get(PERMIT_SHARDS).as_deref())?;
+    let catalog = match env.durable_object(GATE_BINDING) {
+        Ok(namespace) => SqlCatalog::with_gate(
+            catalog,
+            GateClient::new(
+                DoTransport::new(namespace),
+                permits,
+                sharding,
+                shards,
+                &cfg.providers,
+            )
+            .into_gate(),
+        ),
+        Err(_) if permits == PermitMode::Gate => {
+            return Err(format!("missing binding {GATE_BINDING}"))
+        }
+        Err(_) => SqlCatalog::new(catalog),
+    };
     Ok(Bridge {
-        catalog: SqlCatalog::new(D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)),
+        catalog,
         safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)
             .with_tombstone_delay(tombstone_delay),
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),

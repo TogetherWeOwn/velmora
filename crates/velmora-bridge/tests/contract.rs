@@ -571,6 +571,19 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // Where permits come from: absent or blank is the catalogue's
+        // slot rows, as before the switch existed. The Worker reads it,
+        // not this configuration.
+        if name == "PERMITS" {
+            use velmora_bridge::gate::PermitMode;
+            for _ in 0..2 {
+                load(&vars).unwrap();
+                let mode = PermitMode::from_var(vars.get(name).map(String::as_str));
+                assert_eq!(mode, Ok(PermitMode::Catalog));
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // The job budget: absent or blank is the request budget, which
         // is the smaller of the two bounds, so nothing fails open.
         if name == "JOB_BUDGET_BYTES" {

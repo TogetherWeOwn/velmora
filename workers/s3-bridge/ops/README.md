@@ -519,6 +519,10 @@ the code real data relies on. Never roll back past the floor:
   switch on or off: off only stops new plans from being packed, and
   every such version reads both forms.
 
+- **Once a version that knows `PERMITS` has been deployed:** never to
+  an older one by `wrangler rollback`; Cloudflare refuses it, because
+  that deploy added a Durable Object class. See "Permit gate".
+
 - **Once `RECORD_LAYOUT=tenant` has been deployed:** never to a version
   older than the first one that knows `RECORD_LAYOUT`. From then on a
   recovery record can be stored under `m/x/<tenant id>/`. An older
@@ -763,6 +767,129 @@ service, so such a value is not dropped by hand. The replay (below)
 replaces it: for each extent of a record it reads the stored plan, and
 one that cannot be read gives way to the plan in the extent's record.
 A plan that reads is left as it is.
+
+## Permit gate
+
+A provider permit is the right to hold one connection to one provider
+account: `max_conns`, `max_ips` and the pool limits are enforced by
+handing permits out. `PERMITS` chooses where they are kept:
+
+- `d1` (default, also when unset): slot rows in the catalogue
+  (`provider_permits`). Every acquire, renew and release writes a row.
+- `do`: in the memory of a Durable Object (`PermitGate`, binding
+  `PERMIT_GATE`). An acquire, a renew and a release are requests to the
+  object and write nothing. Calls a job makes at the same moment travel
+  in one request. The object stores one small record: written when a
+  busy period starts, again every 10 minutes while permits are live,
+  and cleared 2 seconds after the last permit is gone.
+
+There is one object per provider account, named
+`permits:account.<id>:0`. Accounts that share `pool_max_conns` have one
+object for the pool (`permits:pool.<pool>:0`): a limit can only be kept
+by an object that sees everything under it. Two optional vars change
+that:
+
+- `PERMIT_SHARDS` (1 to 64, default 1) divides each account or pool
+  over that many objects, `permits:<unit>:<shard>`. One object answers
+  its requests in turn, about 1,000 a second; an account needs a second
+  object only when its permit calls come near that. Each object takes
+  the slots `n` with `n % shards == shard` and the matching part of
+  `max_ips` and of the pool limit. No account gets more objects than
+  its smallest limit (`max_conns`, `max_ips`, `pool_max_conns`), so
+  that every object has a connection and an address to hand out. A
+  holder asks one object first and the others only when that one has
+  nothing left.
+- `PERMIT_GATES = "one"` puts every account behind the same objects
+  (`permits:all:<shard>`). That is the least duration to pay for (see
+  "Cost") and the lowest ceiling on requests.
+
+Change `PERMIT_SHARDS`, `PERMIT_GATES`, or (with more than one shard) a
+provider's limits only while `PERMITS` is `d1` and no gate holds rows
+(the query below is empty). A change while gates are in use never
+breaks a limit, but an object keeps the rows it seized under the old
+division, and the objects of the new one wait for them without end.
+
+A permit is a limit on connections, not a guard of data: the lease
+token of a job in the catalogue is unchanged and still fences every
+write.
+
+### Restarts
+
+The object loses its memory when it is evicted, when its host moves it
+and at every deploy. It then knows no holder, while Workers may still
+hold connections under permits of its last life. So:
+
+- An object that starts without a stored record was idle; it hands out
+  at once.
+- One that starts with a record waits until every permit of its last
+  life has run out: up to 125 s for jobs and 40 s for reads (the lease
+  lengths plus 5 s), counted from the first request after the start.
+  During the jobs' wait a read may use only the connection and the
+  address that are kept back for reads.
+- Permits from before a start are neither renewed nor released by the
+  new object. A job that cannot renew stops and is retried by the
+  queue, as it does when a slot row is lost.
+
+Every start logs one line, `permit gate started: jobs_until=…
+reads_until=… seized=…`. Many of them in an hour without a deploy mean
+the object does not stay in memory between requests.
+
+### Turning it on, and back
+
+Old and new Workers run side by side during a deploy, one side asking
+the catalogue and one the gate. The slot rows decide between them, so
+the two together never exceed a limit: the gate hands out on a provider
+only while it holds every slot row of its part of it (and of every
+account of its pool) under the holder `do-gate:<gate>`. It takes a row only when the
+row is free, so it starts once the catalogue's callers have let go; and
+it gives the rows back only when none of its own permits is live.
+
+1. Deploy a version that knows `PERMITS`, with `PERMITS = "d1"`. The
+   deploy adds the object class (a migration). Nothing calls it.
+2. In a deploy of its own, set `PERMITS = "do"`. Do not change a
+   provider's limits, pools or the provider list in that deploy, and do
+   not split its traffic by percentage: both sides must agree on the
+   slots. Jobs and cold reads pause until the rows have changed hands:
+   at most the length of the permits still held (120 s for jobs, 35 s
+   for reads), usually a few seconds.
+3. Check:
+
+   ```
+   SELECT provider_id, holder, COUNT(*) FROM provider_permits
+    WHERE holder IS NOT NULL GROUP BY 1, 2;
+   ```
+
+   Every row reads `do-gate:<gate>`. `/_admin/status` shows the permits
+   in use as before.
+
+To go back, set `PERMITS = "d1"` in a deploy of its own and keep the
+`PERMIT_GATE` binding. The first acquire that finds no free slot (and
+the cron, every 5 minutes) tells each gate that still holds rows to
+retire; the gate frees them once its permits have run out. The query
+above is then empty or shows job holders.
+
+A rollback to a version from before step 1 is not possible once step 1
+is deployed: Cloudflare refuses a rollback across a Durable Object
+migration. This includes the automatic rollback of the deploy that
+carries step 1; if that deploy fails, fix forward. Roll back to a
+version that does not know `PERMITS` only while `PERMITS` is `d1` and
+the query above shows no `do-gate:` row; such rows never run out by
+themselves. To clear them by hand, with no Worker in `do` mode:
+
+```
+UPDATE provider_permits SET holder = NULL, lease_until = 0
+ WHERE holder LIKE 'do-gate:%';
+```
+
+### Cost
+
+Per 16 MiB extent the gate saves about 18 rows written to the
+catalogue and costs a handful of Durable Object requests. An object is
+billed for the time it is in memory, and it stays there while one of
+its permits is live: one object that never sleeps is about 332,000 GB-s
+a month. A paid plan includes 400,000 GB-s; above that, each object
+that is busy all month costs about $4.15. With `PERMIT_GATES = "one"`
+and one shard there is one object, inside the allowance however busy.
 
 ## The route
 

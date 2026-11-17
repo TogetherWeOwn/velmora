@@ -13,6 +13,7 @@ mod d1;
 mod e2;
 mod env;
 mod fanout;
+mod gate;
 mod http;
 mod jobs;
 mod nntp;

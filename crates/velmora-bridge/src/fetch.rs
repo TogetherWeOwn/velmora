@@ -381,6 +381,16 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             return;
         };
         let (catalog, clock) = (first.catalog, first.clock);
+        // Every session ends first, then every slot is freed in one
+        // round: a catalogue that batches calls made together
+        // ([`crate::gate`]) frees them with one request.
+        let mut sessions = sessions;
+        join_all(sessions.iter_mut().map(|session| async move {
+            if let Some(open) = session.session.take() {
+                open.quit().await;
+            }
+        }))
+        .await;
         let ended = join_all(sessions.into_iter().map(|session| {
             let id = session.provider.id.as_str();
             async move { (id, session.finish().await) }

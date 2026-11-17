@@ -48,6 +48,8 @@
 #   VELMORA_ADMIN_TOKEN_FILE  admin bearer file, mode 0600 (remote only)
 #   STEP4_TIMEOUT_SECS        step 4 poll limit (default 180 local, 900 remote)
 #   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
+#   E2E_PERMITS               local: d1 or do, the PERMITS the Worker runs
+#                             with (default: the dev var in wrangler.toml)
 #   E2E_SLICED                0 skips step 0c (a 99 MiB PutObject) against a
 #                             remote that runs without MAX_PUT_BYTES
 #
@@ -221,6 +223,8 @@ if [[ $MODE == local ]]; then
       printf 'DEV_DROP_NOTIFY_N=%s\n' "$1"
       # Dev only: every tombstone put waits this long first (step 7b).
       printf 'DEV_TOMBSTONE_PUT_DELAY_MS=%s\n' "${2:-0}"
+      # Where provider permits come from; unset leaves the shipped var.
+      if [[ -n ${E2E_PERMITS:-} ]]; then printf 'PERMITS=%s\n' "$E2E_PERMITS"; fi
     } >"$WORKER_DIR/.dev.vars"
     chmod 600 "$WORKER_DIR/.dev.vars"
   }

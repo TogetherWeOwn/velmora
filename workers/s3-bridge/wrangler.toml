@@ -131,6 +131,15 @@ INTENT_SWEEP = "off"
 # A missing or refused value stops the copy only, with an error line on
 # every cron run; it never stops the S3 service.
 RECOVERY_COPY = "off"
+# d1 | do. Where provider connection permits come from. d1: slot rows of
+# the catalogue (provider_permits), a row write for every acquire,
+# renewal and release. do: the permit gate below holds them in memory
+# and the catalogue writes none. Both kinds of Worker can run against one
+# catalogue: a gate hands out nothing on an account until it holds every
+# slot row of it, and gives the rows back only once nothing it handed out
+# is live. Change it in a deploy of its own, with the provider limits and
+# pools unchanged in that deploy. See "Permit gate" in ops/README.md.
+PERMITS = "d1"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
@@ -182,6 +191,21 @@ GET_FANOUT_BYTES = "1073741824"
 [[services]]
 binding = "SELF"
 service = "velmora-s3"
+
+# The permit gate (src/gate.rs): provider permits in memory, for
+# PERMITS = "do". With PERMITS = "d1" nothing calls it. One object per
+# provider account (per pool, for accounts that share pool_max_conns),
+# named permits:<unit>:<shard>. Optional vars: PERMIT_SHARDS (1 to 64,
+# default 1) divides each account over that many objects; PERMIT_GATES
+# (account | one, default account) = "one" puts every account behind the
+# same objects, which is the least Durable Object duration.
+[[durable_objects.bindings]]
+name = "PERMIT_GATE"
+class_name = "PermitGate"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PermitGate"]
 
 [[d1_databases]]
 binding = "CATALOG"
@@ -394,7 +418,7 @@ crons = ["*/5 * * * *"]
 # invocations, which is never the looser count.
 
 [env.dev]
-vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608" }
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608", PERMITS = "d1" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.
@@ -402,6 +426,10 @@ vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "
 [[env.dev.services]]
 binding = "SELF"
 service = "velmora-s3-dev"
+
+[[env.dev.durable_objects.bindings]]
+name = "PERMIT_GATE"
+class_name = "PermitGate"
 
 [[env.dev.d1_databases]]
 binding = "CATALOG"
