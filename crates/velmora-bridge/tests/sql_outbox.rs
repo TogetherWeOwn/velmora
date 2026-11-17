@@ -2679,6 +2679,62 @@ async fn only_a_due_row_that_no_job_holds_is_marked() {
     assert_eq!(fx.cat.mark_sent(&[], T0).await.unwrap(), 0);
 }
 
+/// A long backlog of post rows does not keep the dispatcher from
+/// sending the verify and release rows that are due: each stage has a
+/// third of a run to itself, and what a stage leaves goes to the oldest
+/// rows of the others.
+#[tokio::test]
+async fn every_stage_gets_its_share_of_a_dispatcher_run() {
+    let fx = Fx::new().await;
+    let mut objs = Vec::new();
+    for i in 0..9 {
+        objs.push(fx.publish(&fx.bucket, &format!("k{i}")).await);
+    }
+    // Six post rows, the oldest; then two verify rows and a release row.
+    for (i, o) in objs.iter().enumerate() {
+        let (stage, next_at) = match i {
+            0..=5 => ("post", T0.0 - 1_000 + i as i64),
+            6 | 7 => ("verify", T0.0 - 10 + i as i64),
+            _ => ("release", T0.0),
+        };
+        fx.run(
+            "UPDATE outbox SET stage = ?2, next_at = ?3 WHERE extent_id = ?1",
+            &[text(o.extent.as_str()), text(stage), SqlValue::Int(next_at)],
+        )
+        .await;
+    }
+    let ids = |range: std::ops::Range<usize>| -> Vec<ExtentId> {
+        objs[range].iter().map(|o| o.extent.clone()).collect()
+    };
+    let due = |limit: u32| {
+        let cat = &fx.cat;
+        async move {
+            let rows = cat.due(T0, RESEND_SECS, limit).await.unwrap();
+            rows.into_iter().map(|r| r.extent_id).collect::<Vec<_>>()
+        }
+    };
+
+    // Two each; the release stage has one, so the slot it leaves goes
+    // to the oldest row not yet taken, a post row. Oldest first.
+    let mut want = ids(0..3);
+    want.extend(ids(6..9));
+    assert_eq!(due(6).await, want);
+    // Room for all: all, oldest first.
+    assert_eq!(due(100).await, ids(0..9));
+    // Fewer slots than stages: still no more than the limit.
+    assert_eq!(due(2).await.len(), 2);
+    assert_eq!(due(1).await, ids(0..1));
+
+    // With only post rows due, they take the whole run.
+    fx.run(
+        "UPDATE outbox SET next_at = ?1 WHERE stage <> 'post'",
+        &[SqlValue::Int(T0.0 + 1)],
+    )
+    .await;
+    assert_eq!(due(6).await, ids(0..6));
+    assert_eq!(due(4).await, ids(0..4));
+}
+
 /// The dispatcher's two statements over the outbox use an index: the
 /// read walks the due rows only (never the rows that are due later, a
 /// day of releases in waiting), and the mark finds each row by its id.
@@ -2692,18 +2748,24 @@ async fn the_dispatcher_statements_use_an_index() {
             assert_eq!(fx.mark(&[&a], T0).await, 1);
         })
         .await;
-    let [due, mark] = &plans[..] else {
-        panic!("two statements: {plans:?}");
+    // One statement per stage, then the mark.
+    let [post, verify, release, mark] = &plans[..] else {
+        panic!("four statements: {plans:?}");
     };
-    assert!(
-        due.contains("SEARCH outbox USING INDEX outbox_due (stage=? AND next_at<?)"),
-        "{due}"
-    );
+    for due in [post, verify, release] {
+        assert!(
+            due.contains("SEARCH outbox USING INDEX outbox_due (stage=? AND next_at<?)"),
+            "{due}"
+        );
+        // In the order of the index: the statement stops at its limit
+        // and sorts nothing.
+        assert!(!due.contains("TEMP B-TREE"), "{due}");
+    }
     assert!(
         mark.contains("SEARCH outbox USING INDEX sqlite_autoindex_outbox_1 (extent_id=?)"),
         "{mark}"
     );
-    for plan in [due, mark] {
+    for plan in &plans {
         assert!(!plan.contains("SCAN outbox"), "{plan}");
     }
 }

@@ -23,7 +23,7 @@ use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
 use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
 use crate::nntp::WorkerConnector;
-use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
+use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, AUX_Q, DEV_DROP_NOTIFY_N};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
@@ -147,6 +147,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         jobs: QueueSink::new(
             queues(env, "POST_Q")?,
             queues(env, "VERIFY_Q")?,
+            env.queue(AUX_Q).ok(),
             drop_notify,
         )
         .map_err(|name| format!("missing binding {name}"))?,

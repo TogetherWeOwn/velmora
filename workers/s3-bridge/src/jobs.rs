@@ -5,8 +5,11 @@
 //! keeps its bytes of the budget and its extent in memory. Every job
 //! therefore runs in the isolate's [`JobTable`], and each invocation
 //! first drops the jobs there that are older than any invocation can be
-//! ([`reap`]). A budget that stays full is said in the log, at most once
-//! a minute per isolate ([`Watch`]): sizes, counts and times only.
+//! ([`reap`]). A live invocation marks its job every few seconds, on a
+//! timer of its own; the timers of a cancelled one never fire, so a job
+//! that has not been marked for a minute is dropped as well. A budget
+//! that stays full is said in the log, at most once a minute per isolate
+//! ([`Watch`]): sizes, counts and times only.
 //!
 //! Dev only: `DEV_ABANDON_JOB_N=<n>` abandons every n-th post job of an
 //! isolate two seconds after it began, as a cancelled invocation does:
@@ -19,7 +22,7 @@ use std::time::Duration;
 
 use futures_util::future::{select, Either};
 use velmora_bridge::ingress::ByteBudget;
-use velmora_bridge::jobtable::{JobTable, JOB_MAX_AGE_MS};
+use velmora_bridge::jobtable::{JobTable, JOB_BEAT_MS, JOB_MAX_AGE_MS, JOB_QUIET_MS};
 use velmora_bridge::{JobOutcome, UnixMs};
 
 /// Name of the dev-only variable that abandons post jobs.
@@ -89,19 +92,39 @@ fn abandon_this_one() -> bool {
     })
 }
 
-/// Runs `job` in the isolate's table. `None`: the job was dropped for
-/// its age while this invocation still ran, which the platform's limit
-/// on an invocation rules out. This invocation is not woken by the drop:
-/// it sees `None` when something the job waited for wakes it. The caller
-/// retries the message; the row stays leased until the lease runs out.
+/// Runs `job` in the isolate's table and marks it every `JOB_BEAT_MS`
+/// on this invocation's own timer. A cancelled invocation is never
+/// polled again, so its mark goes stale and another invocation drops
+/// the job after `JOB_QUIET_MS`.
+///
+/// `None`: the job was dropped while this invocation still ran. That
+/// takes an invocation whose timer did not fire for `JOB_QUIET_MS`, or a
+/// job older than the platform lets an invocation be. This invocation
+/// is not woken by the drop: it sees `None` at its next beat. The
+/// caller retries the message; the row stays leased until the lease
+/// runs out.
 pub async fn run(
     now: UnixMs,
     post: bool,
     job: impl Future<Output = JobOutcome> + 'static,
 ) -> Option<JobOutcome> {
-    let running = TABLE.with(|t| t.run(now, job));
+    let mut running = TABLE.with(|t| t.run(now, job));
     if !(post && abandon_this_one()) {
-        return running.await;
+        // The job is marked for as long as this invocation runs: were
+        // it cancelled, the timer would not fire again and the mark
+        // would go stale.
+        loop {
+            let beat = Box::pin(worker::Delay::from(Duration::from_millis(
+                JOB_BEAT_MS as u64,
+            )));
+            match select(running, beat).await {
+                Either::Left((outcome, _)) => return outcome,
+                Either::Right(((), r)) => {
+                    running = r;
+                    running.seen(UnixMs(worker::Date::now().as_millis() as i64));
+                }
+            }
+        }
     }
     let pause = Box::pin(worker::Delay::from(ABANDON_AFTER));
     match select(running, pause).await {
@@ -140,10 +163,14 @@ pub async fn run(
 /// without catching brings the failure back.
 pub fn reap(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<String> {
     let before = budget.in_use();
-    let (n, left, total) = TABLE.with(|t| (t.reap(now, JOB_MAX_AGE_MS), t.len(), t.reaped()));
+    let (quiet, old, left, total) = TABLE.with(|t| {
+        let quiet = t.reap_quiet(now, JOB_QUIET_MS);
+        (quiet, t.reap(now, JOB_MAX_AGE_MS), t.len(), t.reaped())
+    });
+    let n = quiet + old;
     (n > 0).then(|| {
         format!(
-            "job table: abandoned jobs dropped: isolate={isolate} dropped={n} \
+            "job table: abandoned jobs dropped: isolate={isolate} dropped={n} quiet={quiet} \
              budget_in_use_before={before} budget_in_use={} running_jobs={left} dropped_total={total}",
             budget.in_use(),
         )

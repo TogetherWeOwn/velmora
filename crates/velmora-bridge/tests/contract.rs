@@ -2454,11 +2454,15 @@ fn wrangler_queues(env: &str) -> (Vec<(String, String)>, Vec<String>) {
 /// Every queue the shipped configuration sends jobs to has exactly one
 /// consumer (a queue that is only read is being emptied), and the bindings of a kind are numbered without a gap: an
 /// extent's jobs always go to the same queue, so a queue nobody reads
-/// would hold the same extents back for good.
+/// would hold the same extents back for good. Production also binds the
+/// queue of the jobs without an extent (`AUX_Q`); dev leaves it out, which
+/// keeps the fallback to the first verify queue in use.
 #[test]
 fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
     for env in ["", "env.dev."] {
         let (producers, consumers) = wrangler_queues(env);
+        let aux = producers.iter().filter(|(b, _)| b == "AUX_Q").count();
+        assert_eq!(aux, usize::from(env.is_empty()), "{env}AUX_Q bindings");
         for kind in ["POST_Q", "VERIFY_Q"] {
             let mut numbers: Vec<u32> = producers
                 .iter()
@@ -2479,7 +2483,9 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
             producers.len(),
             producers
                 .iter()
-                .filter(|(b, _)| b.starts_with("POST_Q") || b.starts_with("VERIFY_Q"))
+                .filter(|(b, _)| {
+                    b.starts_with("POST_Q") || b.starts_with("VERIFY_Q") || b == "AUX_Q"
+                })
                 .count(),
             "{env}: a producer of another kind"
         );

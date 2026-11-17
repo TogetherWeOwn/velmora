@@ -18,6 +18,16 @@
 //! platform ends every invocation before that: [`JobTable::reap`] drops
 //! it, which gives back its charge and its memory together. A charge is
 //! therefore never given back while its memory may still be in use.
+//!
+//! Sixteen minutes is long: cancelled invocations come in bursts, and a
+//! few of them hold the budget of an isolate until then. So a live
+//! invocation also marks its job every [`JOB_BEAT_MS`]
+//! ([`Running::seen`]), on a timer of its own. The timers of a cancelled
+//! invocation never fire, so its job stops being marked, and
+//! [`JobTable::reap_quiet`] drops a job not marked for [`JOB_QUIET_MS`].
+//! Should a live invocation be that late once, its job is dropped and
+//! its message is tried again: nothing is given back twice, and no
+//! memory stays in use behind a charge that was returned.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -35,9 +45,18 @@ use crate::types::UnixMs;
 /// that. Only for jobs that run inside one such invocation.
 pub const JOB_MAX_AGE_MS: i64 = 16 * 60 * 1000;
 
+/// How often a live invocation marks its job as seen.
+pub const JOB_BEAT_MS: i64 = 5_000;
+
+/// A job not marked for this long belongs to an invocation that no
+/// longer runs: twelve marks in a row were missed.
+pub const JOB_QUIET_MS: i64 = 60_000;
+
 struct Slot<'a, T> {
     id: u64,
     started: UnixMs,
+    /// When its invocation last showed it was running.
+    seen: UnixMs,
     /// `None` while the job is being polled.
     job: Option<LocalBoxFuture<'a, T>>,
 }
@@ -100,6 +119,7 @@ impl<'a, T> JobTable<'a, T> {
         self.inner.slots.borrow_mut().push(Slot {
             id,
             started: now,
+            seen: now,
             job: Some(Box::pin(job)),
         });
         Running {
@@ -117,6 +137,17 @@ impl<'a, T> JobTable<'a, T> {
     /// inside this one. Should it be alive after all, it learns of the
     /// drop when something else wakes it.
     pub fn reap(&self, now: UnixMs, max_age_ms: i64) -> usize {
+        self.reap_where(|s| now.0.saturating_sub(s.started.0) >= max_age_ms)
+    }
+
+    /// Drops every job whose invocation has not marked it
+    /// ([`Running::seen`]) for `max_quiet_ms`, and says how many. As
+    /// [`Self::reap`] otherwise.
+    pub fn reap_quiet(&self, now: UnixMs, max_quiet_ms: i64) -> usize {
+        self.reap_where(|s| now.0.saturating_sub(s.seen.0) >= max_quiet_ms)
+    }
+
+    fn reap_where(&self, gone: impl Fn(&Slot<'a, T>) -> bool) -> usize {
         let mut n = 0;
         // One at a time, each off the table and counted before it is
         // dropped, with the table free: should a destructor fail, the
@@ -124,9 +155,7 @@ impl<'a, T> JobTable<'a, T> {
         loop {
             let old = {
                 let mut slots = self.inner.slots.borrow_mut();
-                let at = slots
-                    .iter()
-                    .position(|s| now.0.saturating_sub(s.started.0) >= max_age_ms);
+                let at = slots.iter().position(&gone);
                 at.map(|at| slots.swap_remove(at))
             };
             let Some(old) = old else {
@@ -165,6 +194,20 @@ impl<'a, T> JobTable<'a, T> {
 pub struct Running<'a, T> {
     inner: Rc<Inner<'a, T>>,
     id: u64,
+}
+
+impl<T> Running<'_, T> {
+    /// Marks the job as seen running at `now`. Its invocation calls
+    /// this on a timer of its own, every [`JOB_BEAT_MS`], for as long as
+    /// it waits for the job. Never moves the mark back.
+    pub fn seen(&self, now: UnixMs) {
+        let mut slots = self.inner.slots.borrow_mut();
+        if let Some(slot) = slots.iter_mut().find(|s| s.id == self.id) {
+            if now.0 > slot.seen.0 {
+                slot.seen = now;
+            }
+        }
+    }
 }
 
 impl<T> Future for Running<'_, T> {
@@ -287,6 +330,78 @@ mod tests {
         assert_eq!((table.len(), budget.in_use()), (0, 0));
         assert_eq!(table.reaped(), 3);
         assert!(budget.try_charge_job(22 * MIB).is_some());
+    }
+
+    /// A cancelled invocation stops marking its job, and the bytes come
+    /// back after [`JOB_QUIET_MS`], not after sixteen minutes. A job of
+    /// a live invocation is kept however long it runs.
+    #[test]
+    fn a_job_whose_invocation_went_quiet_gives_its_bytes_back_soon() {
+        let budget = Rc::new(ByteBudget::new(72 * MIB));
+        let table = JobTable::new();
+        let mut live = table.run(UnixMs(1_000), stuck(Rc::clone(&budget), 22 * MIB));
+        assert!((&mut live).now_or_never().is_none());
+        for _ in 0..2 {
+            let mut job = table.run(UnixMs(1_000), stuck(Rc::clone(&budget), 22 * MIB));
+            assert!((&mut job).now_or_never().is_none());
+            job.seen(UnixMs(3_000));
+            // Cancelled: never polled, marked or dropped again.
+            std::mem::forget(job);
+        }
+        assert!(budget.try_charge_job(22 * MIB).is_none());
+
+        // The live invocation marks its job every few seconds.
+        let mut now = 3_000;
+        while now + JOB_BEAT_MS < 3_000 + JOB_QUIET_MS {
+            now += JOB_BEAT_MS;
+            live.seen(UnixMs(now));
+            assert_eq!(table.reap_quiet(UnixMs(now), JOB_QUIET_MS), 0);
+        }
+        assert_eq!(
+            table.reap_quiet(UnixMs(3_000 + JOB_QUIET_MS - 1), JOB_QUIET_MS),
+            0
+        );
+        assert_eq!((table.len(), budget.in_use()), (3, 66 * MIB));
+
+        live.seen(UnixMs(3_000 + JOB_QUIET_MS));
+        assert_eq!(
+            table.reap_quiet(UnixMs(3_000 + JOB_QUIET_MS), JOB_QUIET_MS),
+            2
+        );
+        assert_eq!((table.len(), budget.in_use()), (1, 22 * MIB));
+        assert_eq!(table.reaped(), 2);
+        assert!(budget.try_charge_job(22 * MIB).is_some());
+
+        // Long after, the live job is still there: it is not its age
+        // that drops it.
+        let late = 3_000 + 10 * JOB_QUIET_MS;
+        live.seen(UnixMs(late));
+        assert_eq!(
+            table.reap_quiet(UnixMs(late + JOB_BEAT_MS), JOB_QUIET_MS),
+            0
+        );
+        assert!((&mut live).now_or_never().is_none());
+        assert_eq!(table.len(), 1);
+    }
+
+    /// A job that was never marked counts from when it began, and a
+    /// mark never moves a job back in time.
+    #[test]
+    fn an_unmarked_job_is_quiet_from_its_start() {
+        let table: JobTable<'_, i32> = JobTable::new();
+        let job = table.run(UnixMs(5_000), pending());
+        job.seen(UnixMs(4_000));
+        assert_eq!(
+            table.reap_quiet(UnixMs(5_000 + JOB_QUIET_MS - 1), JOB_QUIET_MS),
+            0
+        );
+        assert_eq!(
+            table.reap_quiet(UnixMs(5_000 + JOB_QUIET_MS), JOB_QUIET_MS),
+            1
+        );
+        // The invocation was alive after all: it finds the job gone.
+        job.seen(UnixMs(5_000 + JOB_QUIET_MS));
+        assert_eq!(job.now_or_never(), Some(None));
     }
 
     /// A job that was dropped for its age gives its bytes back once: not
