@@ -561,7 +561,9 @@ impl Core {
             .find(|h| h.provider == p.provider && h.slot == p.slot && h.token == p.token)
         {
             Some(h) => {
-                h.until = now.0 + ttl_ms(h.background);
+                // Never earlier: a renewal that was held up does not
+                // undo one that came after it.
+                h.until = h.until.max(now.0 + ttl_ms(h.background));
                 true
             }
             None => false,

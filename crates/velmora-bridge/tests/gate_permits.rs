@@ -1450,6 +1450,20 @@ async fn a_request_that_fails_keeps_no_slot() {
     assert_eq!(w.held("permits:all:0", "p").await, 0);
 }
 
+/// A renewal that arrives late, after a later one of the same permit,
+/// does not move the expiry back.
+#[test]
+fn a_late_renewal_does_not_shorten_a_permit() {
+    let p = GateProvider::from(&provider("p", 2));
+    let mut core = Core::new(UnixMs(T0));
+    let now = UnixMs(T0);
+    let permit = core.acquire(&p, &[], true, "job", now, Warm::Done).unwrap();
+    assert!(core.renew(&permit, UnixMs(T0 + 60_000)));
+    assert!(core.renew(&permit, UnixMs(T0 + 30_000)));
+    // Still held where the later renewal put it.
+    assert!(core.renew(&permit, UnixMs(T0 + 60_000 + JOB_MS)));
+}
+
 /// A caller dropped before its question was sent is not asked for: the
 /// slot would be nobody's.
 #[tokio::test]

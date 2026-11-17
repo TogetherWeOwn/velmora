@@ -805,12 +805,16 @@ that:
   (`permits:all:<shard>`). That is the least duration to pay for (see
   "Cost") and the lowest ceiling on requests.
 
-Change `PERMIT_SHARDS`, `PERMIT_GATES`, or (with more than one shard) a
-provider's limits only while `PERMITS` is `d1` and no gate holds rows
-(the query below is empty). A change while gates are in use is not
-meant to break a limit (the tests mix divisions at random), but an
-object keeps the rows it seized under the old division, and the
-objects of the new one wait for them without end.
+Change `PERMIT_SHARDS`, `PERMIT_GATES`, which pool an account is in, or
+(with more than one shard) a provider's limits only while `PERMITS` is
+`d1` and no gate holds rows (the query below is empty). An object
+keeps the rows it seized under the old division, and the objects of
+the new one wait for them without end: an account moved out of a pool
+that still has other members gets no permit, and one moved into
+another pool stops that pool too, until a round trip through `d1`.
+With three or more shards, a change of `max_conns` while both versions
+of a deploy run can also move address shares between objects and pass
+`max_ips` for that time.
 
 A permit is a limit on connections, not a guard of data: the lease
 token of a job in the catalogue is unchanged and still fences every
