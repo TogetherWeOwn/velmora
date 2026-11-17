@@ -686,36 +686,33 @@ async fn slices_in_service_are_kept_while_the_upload_is_open() {
     }
     collect(&s.rig).await;
     assert_eq!(blobs(&s.rig).len(), 3);
-    // The trigger refuses a shred of a slice after the first as well.
-    for id in &ids {
-        let shred = format!("UPDATE extents SET wrapped_file_key = NULL WHERE id = '{id}'");
-        let refused = s
-            .rig
-            .bridge
-            .catalog
-            .sql
-            .with_conn(|c| c.execute_batch(&shred));
-        assert!(refused.is_err(), "{id}");
-    }
-    // The same for the article rows of a slice whose plan is not packed,
-    // and for the plan of one whose plan is.
+    // The triggers refuse a shred of a slice after the first as well;
+    // the same for the article rows of a slice whose plan is not
+    // packed, and for the plan of one whose plan is.
     let run = |q: String| {
         let db = &s.rig.bridge.catalog.sql;
         db.with_conn(|c| c.execute_batch(&q))
     };
+    let refused = |q: &str| {
+        let e = run(q.to_owned()).unwrap_err().to_string();
+        assert!(e.contains("extent is in service"), "{q}: {e}");
+    };
     for id in &ids {
+        refused(&format!(
+            "UPDATE extents SET wrapped_file_key = NULL WHERE id = '{id}'"
+        ));
         run(format!(
-            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, cipher_offset,              cipher_len, payload_sha256, state) VALUES ('{id}', 0, 'm-{id}', 'g', x'00', 0, 1,              x'00', 'planned')"
+            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, \
+             cipher_offset, cipher_len, payload_sha256, state) \
+             VALUES ('{id}', 0, 'm-{id}', 'g', x'00', 0, 1, x'00', 'planned')"
         ))
         .unwrap();
         let rows = format!("DELETE FROM articles WHERE extent_id = '{id}'");
-        assert!(run(rows.clone()).is_err(), "{id}");
+        refused(&rows);
         run(format!("UPDATE extents SET plan = x'00' WHERE id = '{id}'")).unwrap();
-        let plan = format!("UPDATE extents SET plan = NULL WHERE id = '{id}'");
-        assert!(run(plan).is_err(), "{id}");
-        // Packed: the rows are a copy and may go.
+        // Packed: the rows are a copy and may go; the plan stays.
         run(rows).unwrap();
-        run(format!("UPDATE extents SET plan = NULL WHERE id = '{id}'")).unwrap_err();
+        refused(&format!("UPDATE extents SET plan = NULL WHERE id = '{id}'"));
     }
     sql(&s.rig, "DROP TRIGGER extents_keep_plan_in_service");
     sql(&s.rig, "DROP TRIGGER extents_keep_plan_of_slices");
