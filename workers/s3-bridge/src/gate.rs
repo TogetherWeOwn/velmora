@@ -72,6 +72,8 @@ pub struct PermitGate {
     /// One that has not looked for [`TICK_LOST_MS`] was cancelled by
     /// the runtime, and the next request starts another.
     ticking: Rc<Cell<(u64, i64)>>,
+    /// The start has been logged.
+    logged: Cell<bool>,
 }
 
 impl PermitGate {
@@ -116,6 +118,7 @@ impl DurableObject for PermitGate {
             state,
             gate,
             ticking: Rc::new(Cell::new((0, 0))),
+            logged: Cell::new(false),
         }
     }
 
@@ -132,9 +135,8 @@ impl DurableObject for PermitGate {
         let Some(request) = request else {
             return Response::error("gate: bad request", 400);
         };
-        let fresh = gate.record().is_none();
         let answered = gate.handle(request, WorkerClock.now()).await;
-        if fresh {
+        if !self.logged.replace(gate.record().is_some()) {
             // Once per start: how often the object loses its memory.
             if let Some(record) = gate.record() {
                 console_log!(

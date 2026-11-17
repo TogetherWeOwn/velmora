@@ -193,7 +193,8 @@ binding = "SELF"
 service = "velmora-s3"
 
 # The permit gate (src/gate.rs): provider permits in memory, for
-# PERMITS = "do". With PERMITS = "d1" nothing calls it. One object per
+# PERMITS = "do". With PERMITS = "d1" it is called only to retire a
+# gate that still holds slot rows (after a change back). One object per
 # provider account (per pool, for accounts that share pool_max_conns),
 # named permits:<unit>:<shard>. Optional vars: PERMIT_SHARDS (1 to 64,
 # default 1) divides each account over that many objects; PERMIT_GATES

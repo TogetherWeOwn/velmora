@@ -224,7 +224,11 @@ if [[ $MODE == local ]]; then
       # Dev only: every tombstone put waits this long first (step 7b).
       printf 'DEV_TOMBSTONE_PUT_DELAY_MS=%s\n' "${2:-0}"
       # Where provider permits come from; unset leaves the shipped var.
-      if [[ -n ${E2E_PERMITS:-} ]]; then printf 'PERMITS=%s\n' "$E2E_PERMITS"; fi
+      case ${E2E_PERMITS:-} in
+        '') ;;
+        d1 | do) printf 'PERMITS=%s\n' "$E2E_PERMITS" ;;
+        *) fail "E2E_PERMITS" "d1 or do" "$E2E_PERMITS" ;;
+      esac
     } >"$WORKER_DIR/.dev.vars"
     chmod 600 "$WORKER_DIR/.dev.vars"
   }
@@ -1233,6 +1237,15 @@ if [[ $MODE == local ]]; then
   else
     log "rclone not on PATH: its purge is skipped"
   fi
+fi
+
+# With E2E_PERMITS=do the permits of this run came from the gate: its
+# start is in the Worker's log.
+if [[ $MODE == local && ${E2E_PERMITS:-} == do ]]; then
+  STEP=permits
+  n=$(grep -c 'permit gate started' "$T/wrangler.log" || true)
+  [[ $n -ge 1 ]] || fail "the permit gate served this run" "a 'permit gate started' line in the Worker's log" "$n lines"
+  log "permit gate: started $n time(s)"
 fi
 
 STEP=finished
