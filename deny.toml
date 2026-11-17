@@ -25,6 +25,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # A yanked dependency (e.g. inout 0.2.3, fixed by updating) must fail the
 # gate: silently building on yanked code is not acceptable.
 yanked = "deny"
+# The one advisory exception, by ID only: every other advisory, including
+# any later chrono advisory under another ID, still fails the gate.
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained: pulled in only by worker (workers-rs), which requires chrono with no alternative (also in worker 0.9.0); our code has no chrono dependency; revisit when workers-rs drops it" },
+]
 
 [licenses]
 # Dev-dependencies ship in no artifact but still enter the tree; check them

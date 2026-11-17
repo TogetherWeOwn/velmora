@@ -6,7 +6,6 @@
 // the `STREAMING-*` (aws-chunked) payload values, the streaming seed in `VerifiedRequest`
 // and the `signing_key`/`sign` helpers.
 
-use chrono::NaiveDateTime;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
@@ -192,12 +191,7 @@ pub fn verify(
     {
         return Err(ErrorCode::AccessDenied);
     }
-    let timestamp = NaiveDateTime::parse_from_str(date, "%Y%m%dT%H%M%SZ")
-        .map_err(|_| ErrorCode::AccessDenied)?;
-    if timestamp.format("%Y%m%dT%H%M%SZ").to_string() != date {
-        return Err(ErrorCode::AccessDenied);
-    }
-    let time = timestamp.and_utc().timestamp();
+    let time = crate::civil::parse_amz_date(date).ok_or(ErrorCode::AccessDenied)?;
     let skew = i64::from(policy.limits.clock_skew_seconds);
     if presigned {
         let ttl = decimal(

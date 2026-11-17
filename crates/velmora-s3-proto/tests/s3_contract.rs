@@ -1095,12 +1095,8 @@ fn signed_or_expanded_http_date_years_are_ignored() {
                 "{value}"
             );
         }
-        let before = chrono::NaiveDate::from_ymd_opt(-2, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp();
+        // -0002-01-01T00:00:00Z (proleptic Gregorian).
+        let before = -62_230_291_200;
         let m =
             ObjectMetadata::new("g".into(), 10, "\"opaque\"".into(), before, vec![], None).unwrap();
         let c = Conditions {
