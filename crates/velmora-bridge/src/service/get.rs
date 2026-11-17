@@ -707,8 +707,8 @@ async fn relay<C, B, N, J, K, T>(
     // runs this as a task and has a timer to watch a piece that waits.
     let can_run_ahead = out.ahead() && timer.is_some();
     // After a piece waited too long for the reader, it is produced
-    // again when the reader asks, and the body runs ahead again from
-    // the piece after it.
+    // again when the reader asks, and the body runs ahead again once
+    // the reader asks for a piece soon after it took the one before.
     let mut eager = can_run_ahead;
     for (at, piece) in todo.iter().enumerate() {
         loop {
@@ -752,7 +752,23 @@ async fn relay<C, B, N, J, K, T>(
                     }
                     let sent = Spent::time(&bridge.clock, &spent.send, out.send(item));
                     beside(&mut cold.put, sent).await;
-                    eager = can_run_ahead;
+                    // A reader that let a piece wait too long gets
+                    // pieces ahead again once it asks for the next one
+                    // in less than that time. Until then each piece is
+                    // made when it is asked for: a slow reader would
+                    // otherwise have every extent read twice, once to
+                    // be taken back and once to be served.
+                    eager = match timer {
+                        Some(sleep) if can_run_ahead && at != last && !failed => {
+                            let asked = async {
+                                let asked = core::pin::pin!(out.wanted());
+                                let late = sleep(PIECE_WAIT_MS);
+                                matches!(select(asked, late).await, Either::Left(_))
+                            };
+                            cold.wait(asked).await
+                        }
+                        _ => false,
+                    };
                 }
             }
             if failed {
@@ -1047,16 +1063,19 @@ where
     /// Room for the next step, all of it at once: nothing is held while
     /// this waits. When it is not there beside the cache write that is
     /// under way, the write ends first: the read then needs no more than
-    /// it would alone.
+    /// it would alone. Taken in turn, after every request that waits
+    /// for room already: a body that runs ahead of its reader charges
+    /// again as soon as a piece is taken, and would otherwise take the
+    /// room of a request that waits every time.
     async fn charge(&mut self, need: u64) -> core::result::Result<Charge, ReadFail> {
         let bridge = self.bridge;
-        if let Some(charge) = bridge.budget.try_charge(need) {
+        if let Some(charge) = bridge.budget.try_charge_in_turn(need) {
             return Ok(charge);
         }
         let spent = Rc::clone(&self.spent);
         let began = bridge.clock.now();
         self.settle().await;
-        let room = self.wait(bridge.budget.charge(need)).await;
+        let room = self.wait(bridge.budget.charge_in_turn(need)).await;
         spent
             .wait
             .set(spent.wait.get() + bridge.clock.now().0 - began.0);
@@ -1068,7 +1087,7 @@ where
     /// extent is opened. The write ends before that.
     async fn step(&mut self, need: u64, lean: u64) -> core::result::Result<Charge, ReadFail> {
         if self.put.is_some() && lean < need {
-            if let Some(charge) = self.bridge.budget.try_charge(lean) {
+            if let Some(charge) = self.bridge.budget.try_charge_in_turn(lean) {
                 return Ok(charge);
             }
         }
@@ -1093,11 +1112,11 @@ where
         let extent = &piece.extent;
         let spent = Rc::clone(&self.spent);
         let all = span.len + piece.len;
-        let mut work = match bridge.budget.try_charge(all) {
+        let mut work = match bridge.budget.try_charge_in_turn(all) {
             Some(work) => work,
             None => {
                 let lean = match self.put.is_some() {
-                    true => bridge.budget.try_charge(span.len),
+                    true => bridge.budget.try_charge_in_turn(span.len),
                     false => None,
                 };
                 match lean {

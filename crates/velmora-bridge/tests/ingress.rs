@@ -919,6 +919,73 @@ async fn byte_budget_waiter_gets_released_bytes() {
     assert_eq!(budget.in_use(), 0);
 }
 
+/// Sleeper whose wait is one turn of the executor.
+fn turn_sleeper() -> Sleeper {
+    Rc::new(|_| Box::pin(tokio::task::yield_now()))
+}
+
+/// A charge that takes its turn is not served while one that waited
+/// before it is not, even when it would fit: a caller that charges again
+/// and again cannot keep taking the room a waiting request needs. A
+/// plain charge is not held back.
+#[tokio::test]
+async fn a_charge_in_turn_is_served_after_those_that_waited_before_it() {
+    let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
+    let held = RefCell::new(Some(budget.try_charge(60).unwrap()));
+    assert!(budget.try_charge_in_turn(10).is_some(), "nobody waits");
+    let order = RefCell::new(Vec::new());
+    let first = async {
+        let charge = budget.charge(90).await.unwrap();
+        order.borrow_mut().push("first");
+        charge
+    };
+    let second = async {
+        // The first one is waiting by now.
+        tokio::task::yield_now().await;
+        assert!(budget.try_charge_in_turn(10).is_none(), "someone waits");
+        assert!(budget.try_charge(10).is_some(), "a plain charge fits");
+        let charge = budget.charge_in_turn(10).await.unwrap();
+        order.borrow_mut().push("second");
+        charge
+    };
+    let release = async {
+        for _ in 0..5 {
+            assert!(order.borrow().is_empty(), "10 fit all along");
+            tokio::task::yield_now().await;
+        }
+        held.borrow_mut().take();
+    };
+    let (a, b, ()) = futures_util::future::join3(first, second, release).await;
+    assert_eq!(*order.borrow(), ["first", "second"]);
+    assert_eq!(budget.in_use(), 100);
+    drop((a, b));
+    assert!(budget.try_charge_in_turn(100).is_some(), "nobody waits");
+}
+
+/// A charge that gave up waiting, or was dropped while it waited, holds
+/// nobody back.
+#[tokio::test]
+async fn a_charge_that_no_longer_waits_holds_nobody_back() {
+    use futures_util::FutureExt;
+    let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
+    let held = budget.try_charge(60).unwrap();
+    let mut waiting = Box::pin(budget.charge(90));
+    assert!(waiting.as_mut().now_or_never().is_none());
+    assert!(budget.try_charge_in_turn(10).is_none(), "someone waits");
+    drop(waiting);
+    assert!(budget.try_charge_in_turn(10).is_some(), "dropped");
+
+    assert_eq!(budget.charge(90).await.unwrap_err(), IngressError::SlowDown);
+    assert!(budget.try_charge_in_turn(10).is_some(), "gave up");
+    // One that takes its turn does not wait for itself.
+    drop(held);
+    let all = budget.try_charge(100).unwrap();
+    let mut own = Box::pin(budget.charge_in_turn(50));
+    assert!(own.as_mut().now_or_never().is_none());
+    drop(all);
+    assert_eq!(own.await.unwrap().bytes(), 50);
+}
+
 // ---------------------------------------------------------------------------
 // Log redaction
 // ---------------------------------------------------------------------------

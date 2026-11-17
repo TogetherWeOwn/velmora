@@ -767,7 +767,14 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
   extent comes from the cache. The connections are also ended when the
   download waits for anything but a provider (room in the byte budget,
   a cache write) for longer than their slots allow: no connection sits
-  idle on a slot that ran out.
+  idle on a slot that ran out. After that the next extents are read
+  only when the client asks for them, until it asks for one within
+  five seconds of taking the one before; a client slower than about
+  3 MiB/s is served that way throughout.
+- **Other requests in the same isolate.** A download charges the byte
+  budget for each extent after every request that already waits for
+  room, so a second large request is not kept waiting until the
+  download ends; the two then take turns.
 - **The log.** Each invocation that read from Usenet writes one line,
   `cold read: extents=64 opened=8 open_ms=70 broken=0 slow=0
   refetched=0 p1=1536/1074007040 warm_ms=... read_ms=... wait_ms=...
@@ -784,15 +791,16 @@ proxy, `COLD_SOCKETS = "8"`, sub-ranges of 1 GiB:
 | | wall | CPU per sub-range of 1 GiB |
 |---|---|---|
 | 2 GiB range from Usenet, before (one connection) | 812 s (2.5 MiB/s) | 50 to 90 s |
-| 2 GiB range from Usenet, seven runs | 151 to 178 s (11 to 14 MiB/s) in four, 244 to 298 s (7 to 8 MiB/s) in three | 41 to 50 s in the fast runs, 55 to 74 s in the slow ones |
+| 2 GiB range from Usenet, eleven runs | 152 to 212 s (10 to 13 MiB/s) in seven, 244 to 298 s (7 to 8 MiB/s) in four | 42 to 60 s in the faster runs, 55 to 89 s in the slower ones |
 | whole object from Usenet, two runs | 393 and 400 s (15 MiB/s) | 34 to 37 s |
 
 The cache write sets the pace: one extent takes one to two seconds to
 write, and only one write fits in the byte budget beside the next read.
-The runs differ by the machine the Worker ran on, not by the provider:
-in a slow run the same work costs more CPU time, every part of it is
-slower by about the same factor, and no connection is opened again and
-no article is asked for twice.
+In a slower run every part is slower by about the same factor, and the
+CPU time rises with the wall time (about 0.6 s of CPU per second in
+every run), while no article is asked for twice and at most a few slow
+connections are replaced. Why one run is slower than the next was not
+found.
 The earlier drill (an object of 12 GiB, in the first table) read a 2 GiB
 range from Usenet at 1.3 MiB/s, and one such GET lost its provider
 connection in the second sub-range and broke after 1,152 MiB; a

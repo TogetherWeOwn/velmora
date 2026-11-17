@@ -788,10 +788,10 @@ struct Board {
 }
 
 impl Board {
-    /// Whether a socket of `provider` may still get an article that
-    /// another socket is reading now: that one may give it back.
-    fn pending(&self, provider: usize, wanted: impl Fn(usize) -> bool) -> bool {
-        (0..self.have.len()).any(|a| self.taken[a] && self.open(a, provider) && wanted(a))
+    /// Whether any socket is reading an article now. Until none is, the
+    /// pass goes on, and every socket in it stays logged in.
+    fn reading(&self) -> bool {
+        self.taken.iter().any(|taken| *taken)
     }
 
     /// An article is no longer being read: the sockets that wait are
@@ -1137,6 +1137,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     }
                     continue;
                 }
+                // A session of a provider that is out reads nothing in
+                // this pass: it is ended, not left logged in beside the
+                // others with nobody renewing its slot.
+                let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
+                    .into_iter()
+                    .partition(|s| index(s).is_some_and(|i| out[i].is_none()));
+                self.sessions = kept;
+                ProviderSession::close_all(other).await;
                 let ended = join_all(self.sessions.iter_mut().map(|session| {
                     let (board, plan, wanted, out) = (&board, &plan, &wanted, &out);
                     let provider = index(session);
@@ -1343,12 +1351,14 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
     let mut pace = Pace::default();
     loop {
         let Some(article) = board.borrow_mut().take(provider, &wanted) else {
-            // Nothing is free for this provider. An article another
-            // socket is reading may still come back. A host with a timer
-            // waits for that, and renews the slot meanwhile: the socket
-            // must not sit there logged in while its slot runs out
+            // Nothing is free for this provider. While another socket
+            // still reads, of this provider or not, the pass is not
+            // over: its article may come back to this socket, and this
+            // socket stays logged in until the pass ends either way. A
+            // host with a timer waits, and renews the slot meanwhile:
+            // the socket must not sit there while its slot runs out
             // (another socket may be on its third attempt of a `BODY`).
-            let timer = match board.borrow().pending(provider, &wanted) {
+            let timer = match board.borrow().reading() {
                 true => session.timer.clone(),
                 false => None,
             };

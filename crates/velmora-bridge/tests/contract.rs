@@ -381,7 +381,12 @@ fn config_loads_from_documented_vars() {
     // read. The room is counted from the ciphertext: two plaintext
     // extents and two sockets are 8288 bytes short of it.
     sized.insert("COLD_SOCKETS".to_string(), "8".to_string());
-    for (budget, want) in [("36708448", 3), ("36708447", 2), ("36700160", 2)] {
+    for (budget, want) in [
+        ("36708448", 3),
+        ("36708447", 2),
+        ("36700160", 2),
+        ("33562720", 1),
+    ] {
         sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), budget.to_string());
         let cfg = load(&sized).unwrap();
         assert_eq!(cfg.cold_sockets, want, "{budget}");
@@ -683,6 +688,16 @@ fn config_rejects_invalid_and_unsafe_values() {
         set(&prod, "INFLIGHT_BUDGET_BYTES", "33554431"),
         invalid("INFLIGHT_BUDGET_BYTES")
     );
+    // Twice the plaintext is not enough: a cold read charges twice the
+    // ciphertext (33,562,720 bytes for the largest extent), and a budget
+    // under that could never charge one.
+    for short in ["33554432", "33562719"] {
+        assert_eq!(
+            set(&prod, "INFLIGHT_BUDGET_BYTES", short),
+            invalid("INFLIGHT_BUDGET_BYTES"),
+            "{short}"
+        );
+    }
     // The job budget: from the request budget to 1.5 times it.
     for bad in ["50331647", "75497473", "72MiB", "-1"] {
         assert_eq!(

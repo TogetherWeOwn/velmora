@@ -553,7 +553,11 @@ impl BridgeConfig {
         let fits = |sockets: &u32| {
             crate::fetch::cold_read_bytes(cipher, *sockets) <= inflight_budget_bytes
         };
-        let cold_sockets = (1..=cold_sockets).rev().find(fits).unwrap_or(1);
+        // Not even one socket: the budget is under twice the ciphertext.
+        let cold_sockets = (1..=cold_sockets)
+            .rev()
+            .find(fits)
+            .ok_or_else(|| ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))?;
         // Never under the request limit, and never more than half as much
         // again (see `MAX_JOB_BUDGET_NUM`).
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {

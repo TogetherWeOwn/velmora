@@ -1244,6 +1244,137 @@ async fn a_piece_that_waits_too_long_is_taken_back_and_produced_again() {
     local.run_until(test).await;
 }
 
+/// A reader that let a piece wait too long gets nothing ahead until it
+/// asks for a piece soon after it took the one before: each piece is
+/// then made when it is asked for, so a slow reader does not have every
+/// extent read once to be taken back and once more to be served. A
+/// reader that is quick again gets pieces ahead again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slow_reader_gets_each_piece_when_it_asks_until_it_is_quick_again() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // The wait for the reader is 20 ms here.
+        let sleeper = timed_sleeper(|ms| match ms == PIECE_WAIT_MS {
+            true => 20,
+            false => ms.into(),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(113, 300_000),
+            pattern(114, 300_000),
+            pattern(115, 300_000),
+            pattern(116, 300_000),
+            pattern(117, 300_000),
+            pattern(118, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("the second piece is taken back", || {
+            cached(rig, &extents[1])
+                && rig.bridge.budget.in_use() == parts[0].len() as u64
+                && rig.bridge.nntp.live() == 0
+        })
+        .await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        // The reader is slow again: nothing is read for it meanwhile.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!cached(rig, &extents[2]), "nothing is made ahead");
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        // It asks for two pieces one right after the other: the pieces
+        // after them are made ahead again.
+        assert!(body.next().await.unwrap().unwrap() == parts[2]);
+        assert!(body.next().await.unwrap().unwrap() == parts[3]);
+        eventually("the next piece is made ahead", || cached(rig, &extents[4])).await;
+        assert!(body.next().await.unwrap().unwrap() == parts[4]);
+        assert!(body.next().await.unwrap().unwrap() == parts[5]);
+        assert!(body.next().await.is_none());
+        assert!(extents.iter().all(|e| cached(rig, e)));
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// A body that is produced ahead of a reader that keeps up holds a
+/// piece or the room for the next one at every moment. A request that
+/// waits for more room than is left beside one piece is served all the
+/// same: the body charges for its next piece in turn, after the request
+/// that waited before it, and goes on when there is room again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_ahead_of_its_reader_lets_a_waiting_request_have_its_room() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..8u8).map(|n| pattern(120 + n, 300_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let extents = commit_parts(rig, &cold.signer, &cold.bucket, "warm", &slices).await;
+        let cipher = extents.iter().map(|e| e.cipher_size).max().unwrap();
+        let budget = &rig.bridge.budget;
+        // Room for one piece that waits and one more being made; the
+        // other request needs all of it but 100,000 bytes, so it fits
+        // only while the body holds nothing.
+        let room = cipher + 650_000;
+        let other = budget.try_charge(budget.capacity() - room).unwrap();
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "warm"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("a piece is made ahead", || {
+            budget.in_use() == other.bytes() + 600_000
+        })
+        .await;
+        let served = Rc::new(RefCell::new(None));
+        let (bridge, slot) = (Rc::clone(&rig.bridge), Rc::clone(&served));
+        tokio::task::spawn_local(async move {
+            let charge = bridge.budget.charge(room - 100_000).await;
+            *slot.borrow_mut() = Some(charge);
+        });
+        // It waits by now, and the reader keeps up.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(served.borrow().is_none());
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        eventually("the request that waited is served", || {
+            served.borrow().is_some()
+        })
+        .await;
+        let charge = served.borrow_mut().take().unwrap().unwrap();
+        assert_eq!(budget.in_use(), other.bytes() + room - 100_000);
+        drop(charge);
+        for part in &parts[2..] {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), other.bytes());
+    };
+    local.run_until(test).await;
+}
+
 /// A body that waits for room in the byte budget ends its connections
 /// before their slots run out, and reads on once the room is there.
 #[tokio::test(flavor = "current_thread")]

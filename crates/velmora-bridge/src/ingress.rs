@@ -24,7 +24,7 @@
 //! (dev only) is set, so every request that reaches a handler arrived over
 //! trusted transport and the handler passes `https = true` to SigV4.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 
@@ -475,6 +475,27 @@ struct BudgetState {
     /// Bytes charged by background jobs.
     jobs: Cell<u64>,
     peak: Cell<u64>,
+    /// The number the next charge that waits is given.
+    next_wait: Cell<u64>,
+    /// The charges that wait for room now, by number: the lowest came
+    /// first.
+    waiting: RefCell<Vec<u64>>,
+}
+
+/// One charge that waits for room, from its first wait until it is
+/// served, gives up or is dropped.
+struct Waiting {
+    state: Rc<BudgetState>,
+    number: u64,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.state
+            .waiting
+            .borrow_mut()
+            .retain(|n| *n != self.number);
+    }
 }
 
 impl BudgetState {
@@ -536,6 +557,8 @@ impl ByteBudget {
                 requests: Cell::new(0),
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
+                next_wait: Cell::new(0),
+                waiting: RefCell::new(Vec::new()),
             }),
             sleeper: None,
             spawner: None,
@@ -554,6 +577,8 @@ impl ByteBudget {
                 requests: Cell::new(0),
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
+                next_wait: Cell::new(0),
+                waiting: RefCell::new(Vec::new()),
             }),
             sleeper: self.sleeper,
             spawner: self.spawner,
@@ -641,21 +666,44 @@ impl ByteBudget {
         })
     }
 
+    /// As [`Self::try_charge`], but not while another charge waits for
+    /// room: for a caller that would otherwise take, again and again,
+    /// the room a waiting request needs (a body that is produced ahead
+    /// of its reader).
+    pub fn try_charge_in_turn(&self, bytes: u64) -> Option<Charge> {
+        match self.state.waiting.borrow().is_empty() {
+            true => self.try_charge(bytes),
+            false => None,
+        }
+    }
+
+    /// As [`Self::charge`], but after every charge that was waiting
+    /// before this one: see [`Self::try_charge_in_turn`]. Those wait no
+    /// longer than this one does, so it is not kept from its own try.
+    pub async fn charge_in_turn(&self, bytes: u64) -> Result<Charge, IngressError> {
+        self.charge_as(bytes, false, true).await
+    }
+
     /// Charges `bytes` for a request, waiting up to [`CHARGE_WAIT_MS`] for
     /// room (only with a sleeper), then `SlowDown`. A charge larger than
     /// the whole capacity can never fit and fails at once. The caller has
     /// not read the body.
     pub async fn charge(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, false).await
+        self.charge_as(bytes, false, false).await
     }
 
     /// [`ByteBudget::charge`] for a background job: the same wait, against
     /// the job limit.
     pub async fn charge_job(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, true).await
+        self.charge_as(bytes, true, false).await
     }
 
-    async fn charge_as(&self, bytes: u64, job: bool) -> Result<Charge, IngressError> {
+    async fn charge_as(
+        &self,
+        bytes: u64,
+        job: bool,
+        in_turn: bool,
+    ) -> Result<Charge, IngressError> {
         let limit = if job {
             self.state.job_capacity
         } else {
@@ -665,15 +713,35 @@ impl ByteBudget {
             return Err(IngressError::SlowDown);
         }
         let mut waited = 0u32;
+        // Listed while this waits, so a charge that takes its turn sees
+        // it; taken off the list when this returns or is dropped.
+        let mut waiting: Option<Waiting> = None;
         loop {
-            if let Some(c) = self.try_charge_as(bytes, job) {
-                return Ok(c);
+            // Someone who waited before this one is served first.
+            let behind = in_turn && {
+                let mine = waiting.as_ref().map(|w| w.number);
+                let list = self.state.waiting.borrow();
+                list.iter().any(|n| mine.is_none_or(|mine| *n < mine))
+            };
+            if !behind {
+                if let Some(c) = self.try_charge_as(bytes, job) {
+                    return Ok(c);
+                }
             }
             let Some(sleep) = &self.sleeper else {
                 return Err(IngressError::SlowDown);
             };
             if waited >= CHARGE_WAIT_MS {
                 return Err(IngressError::SlowDown);
+            }
+            if waiting.is_none() {
+                let number = self.state.next_wait.get();
+                self.state.next_wait.set(number.wrapping_add(1));
+                self.state.waiting.borrow_mut().push(number);
+                waiting = Some(Waiting {
+                    state: Rc::clone(&self.state),
+                    number,
+                });
             }
             sleep(CHARGE_POLL_MS).await;
             waited = waited.saturating_add(CHARGE_POLL_MS);
