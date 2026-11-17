@@ -162,8 +162,10 @@ bucket_name = "velmora-cache-enam"
 #
 # The bindings of one kind are POST_Q, POST_Q2, POST_Q3, ... (VERIFY_Q,
 # VERIFY_Q2, ...), 8 at most, numbered without a gap: the Worker refuses
-# to start with POST_Q3 bound and POST_Q2 not. An extent's jobs always go
-# to the same queue of a kind (by a hash of its id); jobs without an
+# to start with POST_Q3 bound and POST_Q2 not. While the count of queues
+# stays the same, an extent's jobs go to the same queue of a kind (by a
+# hash of its id); a message sent before the count changed is still
+# consumed where it is, and a duplicate is acked at its claim. Jobs without an
 # extent (gc, sweeps) go to VERIFY_Q. Every queue needs its consumer: the
 # extents of a queue nobody reads are never posted.
 # To add a queue: create it, then add its producer and its consumer here.
@@ -190,6 +192,14 @@ binding = "POST_Q4"
 queue = "velmora-post4"
 
 [[queues.producers]]
+binding = "POST_Q5"
+queue = "velmora-post5"
+
+[[queues.producers]]
+binding = "POST_Q6"
+queue = "velmora-post6"
+
+[[queues.producers]]
 binding = "VERIFY_Q"
 queue = "velmora-verify"
 
@@ -214,6 +224,13 @@ queue = "velmora-verify4"
 # or without room in the isolate's byte budget is deferred, not failed,
 # and comes back after 15 to 59 s. Three per queue is what the job budget
 # holds (see POST_SOCKETS above).
+# Measured: a post job takes about 7 s for a 16 MiB extent under load
+# (about 2.2 MiB/s per job); four queues of three posted about 23 MiB/s,
+# below a sustained ingest of about 30 MiB/s. Six queues of three are 18
+# jobs. Permits still bind first: background jobs get max_conns - 1 slots
+# and max_ips - 1 holders per provider, so p2 and p6 take 8 post jobs
+# each and the rest goes to p7; jobs past that post on fewer sockets or
+# are deferred.
 [[queues.consumers]]
 queue = "velmora-post"
 max_batch_size = 1
@@ -240,6 +257,22 @@ dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
 queue = "velmora-post4"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post5"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post6"
 max_batch_size = 1
 max_concurrency = 3
 max_retries = 20
