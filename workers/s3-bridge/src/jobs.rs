@@ -9,9 +9,9 @@
 //! a minute per isolate ([`Watch`]): sizes, counts and times only.
 //!
 //! Dev only: `DEV_ABANDON_JOB_N=<n>` abandons every n-th post job of an
-//! isolate two seconds after it began, as a cancelled invocation does
-//! (the job is neither polled again nor dropped, and the invocation
-//! never ends by itself).
+//! isolate two seconds after it began, as a cancelled invocation does:
+//! the job is neither polled again nor dropped, and the invocation ends
+//! with its message put back.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -108,10 +108,13 @@ pub async fn run(
         Either::Left((outcome, _)) => outcome,
         Either::Right(((), running)) => {
             worker::console_log!("dev: a post job is abandoned");
-            // As a cancelled invocation leaves it: in this frame, never
-            // polled again and never dropped.
-            let _held = running;
-            futures_util::future::pending::<Option<JobOutcome>>().await
+            // As a cancelled invocation leaves it: never polled again
+            // and never dropped. The invocation ends, so nothing the
+            // job began goes on either.
+            std::mem::forget(running);
+            Some(JobOutcome::Retry {
+                delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
+            })
         }
     }
 }
