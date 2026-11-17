@@ -1066,6 +1066,93 @@ async fn a_replay_references_no_extent_of_its_own_twice() {
     assert_eq!(dumps[0], dumps[1]);
 }
 
+/// A record that places two extents at one `seq`, the second of them
+/// an extent another generation holds: the reference is not written a
+/// second time at that `seq`, so the count guard refuses the record and
+/// nothing is written. The replay goes on and lists it as one it could
+/// not publish. The statements before these failed the batch with a
+/// constraint error instead, which stopped the replay.
+#[tokio::test]
+async fn a_replay_refuses_two_extents_at_one_seq() {
+    // Extents of its own, then extents of the other generation; the
+    // last placement takes the `seq` of the first.
+    let cases = [
+        ("two shared", 0, 2, 1),
+        ("its own, then a shared one", 1, 1, 1),
+        (
+            "its own in the first value, a shared one in the second",
+            ROWS,
+            1,
+            2,
+        ),
+    ];
+    for (what, own, shared, values) in cases {
+        for old in [false, true] {
+            let fx = Fx::new(old).await;
+            let held = fx.replayed(&[100, 100]).await;
+            let first = (
+                fx.generation(&fx.bucket, "a", T0, &[100, 100]),
+                placed(&held, &[100, 100]),
+            );
+            assert_eq!(fx.replay(&first).await, ReplayPublish::Published);
+
+            let sizes = vec![100; own + shared];
+            let mut ids = fx.replayed(&sizes[..own]).await;
+            ids.extend(held[..shared].iter().cloned());
+            let g = fx.generation(&fx.bucket, "b", T0.plus_ms(1), &sizes);
+            let good = placed(&ids, &sizes);
+            let mut twice = good.clone();
+            twice.last_mut().unwrap().seq = 0;
+
+            let before = fx.dump().await;
+            let outcome = fx.cat.replay_publish(&g, &twice, T0.plus_secs(9)).await;
+            assert_eq!(fx.dump().await, before, "{what}, {old}");
+            if old {
+                assert!(
+                    matches!(&outcome, Err(BridgeError::Sql(_))),
+                    "{what}: {outcome:?}"
+                );
+                continue;
+            }
+            assert_eq!(outcome.unwrap(), ReplayPublish::Refused, "{what}");
+            assert_eq!(fx.last_set_statements().len(), 2 * values, "{what}");
+            assert_eq!(
+                fx.cat.replay_twin(&g, &twice).await.unwrap(),
+                None,
+                "{what}"
+            );
+
+            // With the object live as the record should have named it,
+            // these placements are still not that object.
+            assert_eq!(
+                fx.replay(&(g.clone(), good.clone())).await,
+                ReplayPublish::Published,
+                "{what}"
+            );
+            let mut again = g.clone();
+            again.id = GenerationId::mint(T0.plus_secs(60), [9; 8]);
+            assert_eq!(
+                fx.cat.replay_twin(&again, &good).await.unwrap(),
+                Some(g.id.clone()),
+                "{what}"
+            );
+            assert_eq!(
+                fx.cat.replay_twin(&again, &twice).await.unwrap(),
+                None,
+                "{what}"
+            );
+            // Every extent is a shared one now.
+            let before = fx.dump().await;
+            assert_eq!(
+                fx.replay(&(again, twice)).await,
+                ReplayPublish::Refused,
+                "{what}"
+            );
+            assert_eq!(fx.dump().await, before, "{what}");
+        }
+    }
+}
+
 /// The checks that read the extents of the placements go through every
 /// value, not the first: the extent that cannot be read is the last of
 /// 120, on a key that has an older generation.
@@ -1288,6 +1375,43 @@ async fn an_overloaded_fence_leaves_the_outcome_unknown() {
         assert_eq!(fx.count(&rows).await, 0, "{table}");
     }
     assert_eq!(fx.complete(&s, None).await, Guard::Lost);
+}
+
+/// The batch committed and its answer was lost; the fence then runs.
+/// It finds the upload completed and changes nothing, so the outcome
+/// is the error of the batch and never `Fenced`: `Fenced` would say
+/// that nothing is published under this id, and the caller would drop
+/// the record of a live object.
+#[tokio::test]
+async fn a_fence_after_a_batch_that_committed_is_not_fenced() {
+    let fx = Fx::new(false).await;
+    let s = fx.staged_large().await;
+    fx.sql()
+        .faults
+        .borrow_mut()
+        .push_back(Fault::Unreported("D1_ERROR: Network connection lost."));
+    let outcome = complete_outcome(&fx, &s).await;
+    assert!(
+        matches!(&outcome, Err(BridgeError::Sql(m)) if m.contains("Network connection lost")),
+        "{outcome:?}"
+    );
+    // The fence ran, and no fault was left to answer it.
+    assert_eq!(fx.sql().batches.borrow().last().unwrap().len(), 2);
+    assert!(fx.sql().faults.borrow().is_empty());
+    let g = &s.commit.generation.id;
+    let live = format!("SELECT COUNT(*) FROM objects WHERE generation_id = '{g}'");
+    assert_eq!(fx.count(&live).await, 1);
+    let adopted = format!("SELECT COUNT(*) FROM generation_extents WHERE generation_id = '{g}'");
+    assert_eq!(fx.count(&adopted).await, s.extents.len() as i64);
+    // Completed at the revision the batch left: the fence moved nothing.
+    let t = target(&fx.bucket, KEY, &s.id);
+    assert_eq!(fx.revision(&t).await, s.revision + 1);
+    let completed = format!(
+        "SELECT COUNT(*) FROM uploads WHERE id = '{}' AND state = 'completed' \
+         AND completed_generation_id = '{g}'",
+        s.id.as_str()
+    );
+    assert_eq!(fx.count(&completed).await, 1);
 }
 
 // ---------------------------------------------------------------------------
