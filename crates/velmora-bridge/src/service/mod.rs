@@ -11,7 +11,7 @@ mod common;
 mod copy;
 mod delete;
 mod get;
-pub use get::READ_STAMP_MS;
+pub use get::{INTERRUPTED_RETRIES, READ_STAMP_MS};
 mod list;
 mod multipart;
 mod multipart_list;

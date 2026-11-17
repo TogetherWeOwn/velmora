@@ -14,8 +14,9 @@ use std::rc::Rc;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
-    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
-    DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT, MAX_PUT_BYTES_LIMIT,
+    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_COLD_SOCKETS,
+    DEFAULT_HOT_CAP_BYTES, DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT,
+    MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::RESEND_SECS;
@@ -352,6 +353,36 @@ fn config_loads_from_documented_vars() {
     }
     sized.remove("GET_FANOUT_BYTES");
     assert_eq!(load(&sized).unwrap().get_fanout_bytes, None);
+    // A cold read uses four connections unless told otherwise, from one
+    // to eight, and never more than fit the byte budget beside one extent
+    // and its copy: 48 MiB less 32 MiB leaves room for ten more.
+    assert_eq!(cfg.cold_sockets, 4);
+    for (value, want) in [
+        ("", Some(4)),
+        ("1", Some(1)),
+        ("8", Some(8)),
+        ("0", None),
+        ("9", None),
+        ("many", None),
+    ] {
+        sized.insert("COLD_SOCKETS".to_string(), value.to_string());
+        let got = load(&sized).map(|c| c.cold_sockets);
+        match want {
+            Some(want) => assert_eq!(got.unwrap(), want, "{value:?}"),
+            None => assert_eq!(
+                got.unwrap_err(),
+                ConfigError::Invalid("COLD_SOCKETS".into()),
+                "{value:?}"
+            ),
+        }
+    }
+    // A budget with room for one extent, its copy and two more sockets
+    // lowers the count instead of refusing every cold read.
+    sized.insert("COLD_SOCKETS".to_string(), "8".to_string());
+    sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), "36700160".to_string());
+    assert_eq!(load(&sized).unwrap().cold_sockets, 3);
+    sized.remove("COLD_SOCKETS");
+    sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), "50331648".to_string());
     // The catalogue id is one path segment of the stamp keys.
     assert_eq!(cfg.catalogue_id, "main");
     for (value, want) in [("", Some("main")), (" eu-1 ", Some("eu-1")), ("a/b", None)] {
@@ -421,6 +452,14 @@ fn missing_secret_fails_closed() {
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
             vars.insert(name.clone(), "  ".into());
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
+            continue;
+        }
+        // Connections of a read from Usenet: absent or blank is the
+        // default of four.
+        if name == "COLD_SOCKETS" {
+            assert_eq!(load(&vars).unwrap().cold_sockets, DEFAULT_COLD_SOCKETS);
+            vars.insert(name.clone(), "  ".into());
+            assert_eq!(load(&vars).unwrap().cold_sockets, DEFAULT_COLD_SOCKETS);
             continue;
         }
         // Sliced PutObject: absent or blank, a PUT is one extent as
@@ -527,6 +566,8 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("POST_SOCKETS", "0"),
         ("POST_SOCKETS", "9"),
         ("POST_SOCKETS", "four"),
+        ("COLD_SOCKETS", "0"),
+        ("COLD_SOCKETS", "9"),
         ("PROPAGATION_GRACE_SECS", "-1"),
         ("PROPAGATION_GRACE_SECS", "6h"),
         // Below one extent, above what the edge lets through, not a number.

@@ -462,6 +462,9 @@ pub fn precheck(
 /// Sleeps the given number of milliseconds on the host runtime.
 pub type Sleeper = Rc<dyn Fn(u32) -> LocalBoxFuture<'static, ()>>;
 
+/// Runs a future to its end on the host runtime, beside the caller.
+pub type Spawner = Rc<dyn Fn(LocalBoxFuture<'static, ()>)>;
+
 #[derive(Debug)]
 struct BudgetState {
     capacity: u64,
@@ -505,6 +508,7 @@ impl BudgetState {
 pub struct ByteBudget {
     state: Rc<BudgetState>,
     sleeper: Option<Sleeper>,
+    spawner: Option<Spawner>,
 }
 
 impl fmt::Debug for ByteBudget {
@@ -534,6 +538,7 @@ impl ByteBudget {
                 peak: Cell::new(0),
             }),
             sleeper: None,
+            spawner: None,
         }
     }
 
@@ -551,12 +556,20 @@ impl ByteBudget {
                 peak: Cell::new(0),
             }),
             sleeper: self.sleeper,
+            spawner: self.spawner,
         }
     }
 
     /// Lets [`ByteBudget::charge`] wait up to [`CHARGE_WAIT_MS`] for room.
     pub fn with_sleeper(mut self, sleeper: Sleeper) -> Self {
         self.sleeper = Some(sleeper);
+        self
+    }
+
+    /// Lets the body of a GET be produced beside the client that reads
+    /// it, one piece ahead (see [`ByteBudget::spawner`]).
+    pub fn with_spawner(mut self, spawner: Spawner) -> Self {
+        self.spawner = Some(spawner);
         self
     }
 
@@ -575,6 +588,13 @@ impl ByteBudget {
     /// poll with it too, so a budget without one never waits anywhere.
     pub fn sleeper(&self) -> Option<&Sleeper> {
         self.sleeper.as_ref()
+    }
+
+    /// The host spawner, if there is one. It sits here beside the sleeper
+    /// as the other thing only the host runtime can do. Without one a
+    /// body is produced only while its reader asks for the next piece.
+    pub fn spawner(&self) -> Option<&Spawner> {
+        self.spawner.as_ref()
     }
 
     /// Bytes charged right now, by requests and jobs together.

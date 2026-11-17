@@ -103,6 +103,8 @@ async fn handle_detached(
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    // What a GET read from Usenet, one line per run of cold extents.
+    velmora_bridge::trace::log_cold_reads(|line| console_log!("cold read: {line}"));
     let method = req.inner().method();
     // Every answer for an admin route carries `no-store`, the early
     // refusals below too.

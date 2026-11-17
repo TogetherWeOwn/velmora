@@ -1511,6 +1511,9 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
         post_sockets: 4,
+        // One socket: the tests of the read path count connections and
+        // calls. A test of several sockets sets its own number.
+        cold_sockets: 1,
         propagation_grace_secs: 21_600,
         newsgroups: vec!["alt.binaries.test".to_string()],
         kek_active: 1,
