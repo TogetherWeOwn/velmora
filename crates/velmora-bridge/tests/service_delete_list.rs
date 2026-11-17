@@ -1156,6 +1156,7 @@ async fn a_write_that_lost_its_bucket_stores_no_record() {
         &rig.bridge.catalog,
         &rig.bridge.safety,
         &rig.bridge.kek,
+        &rig.bridge.cfg.records,
         &bucket.id,
         "k",
         &id,

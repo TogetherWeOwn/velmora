@@ -11,8 +11,17 @@
 //! | `m/del/<tombstone_id>` | [`Tombstone`]: bucket, key | before the delete batch |
 //! | `m/art/<extent_id>` | [`ArticleManifest`]: the article plan | after the plan is stored, before any POST |
 //!
+//! Those are the names of the **flat layout**, which every record
+//! written before the tenant layout has and keeps: a record is never
+//! renamed. The **tenant layout** ([`Layout`]) puts the same three names
+//! in a directory of their tenant, `m/t/<tenant id>/`, in place of
+//! `m/`: `m/t/<tenant id>/g_…`, `m/t/<tenant id>/del/g_…`,
+//! `m/t/<tenant id>/art/<extent_id>`. Which of the two a new record gets
+//! is a setting (`RECORD_LAYOUT`); every reader reads both, whatever the
+//! setting, and for ever.
+//!
 //! Generation and tombstone ids start with their mint time, so the blob
-//! keys list in time order and a replay can start at a restore point.
+//! keys of one layout list in time order and a replay can start at a restore point.
 //! On one key the ids are also in commit order. Before a record is
 //! stored, the catalogue raises the key's floor to the record's id
 //! ([`Catalog::raise_floor`], inside [`write_generation`] and
@@ -59,29 +68,208 @@ use crate::types::{
 
 /// Every recovery record lives under this prefix.
 pub const RECORD_PREFIX: &str = "m/";
-/// Generation manifests: `m/` + a generation id (`g_…`).
+/// Generation manifests of the flat layout: `m/` + a generation id
+/// (`g_…`).
 pub const GENERATION_PREFIX: &str = "m/g_";
-/// Tombstones: `m/del/` + a tombstone id (`g_…`).
+/// Tombstones of the flat layout: `m/del/` + a tombstone id (`g_…`).
 pub const TOMBSTONE_PREFIX: &str = "m/del/g_";
-const TOMBSTONE_DIR: &str = "m/del/";
-/// Article plans: `m/art/` + an extent id.
-pub(crate) const ARTICLE_DIR: &str = "m/art/";
+/// The records of the tenant layout: `m/t/` + a tenant id + `/`, then
+/// what the flat layout has after its `m/`. It lies under
+/// [`RECORD_PREFIX`], so no delete removes such a key, in a Worker of
+/// any version, and the walk of the recovery copy reaches it.
+pub const TENANT_DIR: &str = "m/t/";
+/// The one tenant there is: the owner of every bucket.
+pub const DEFAULT_TENANT: &str = "t_0000000000000000";
+/// Longest tenant id a record name takes, after its `t_`.
+const MAX_TENANT_ID_LEN: usize = 64;
+
+const GENERATION_NAME: &str = "g_";
+const TOMBSTONE_NAME: &str = "del/g_";
+const ARTICLE_NAME: &str = "art/";
 
 /// Format version of every record.
 const RECORD_VERSION: u32 = 1;
 
 const ERR_RECORD: BridgeError = BridgeError::Invalid("recovery record is malformed");
 
+/// A tenant id as a record name takes it: `t_`, then 1 to 64 lowercase
+/// ASCII letters and digits.
+pub fn valid_tenant_id(id: &str) -> bool {
+    id.strip_prefix("t_").is_some_and(|rest| {
+        (1..=MAX_TENANT_ID_LEN).contains(&rest.len())
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+/// Where the records of a write are stored: the directory their names
+/// start with. The flat layout is `m/`; the tenant layout is
+/// `m/t/<tenant id>/`. After it the names are the same in both.
+///
+/// A record is sealed under its whole name, so one moved from a layout
+/// to the other does not open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    root: String,
+}
+
+impl Layout {
+    /// The flat layout: every record written before the tenant layout.
+    pub fn flat() -> Layout {
+        Layout {
+            root: RECORD_PREFIX.to_owned(),
+        }
+    }
+
+    /// The layout of `tenant`; `None` for what is not a tenant id.
+    pub fn tenant(tenant: &str) -> Option<Layout> {
+        valid_tenant_id(tenant).then(|| Layout {
+            root: format!("{TENANT_DIR}{tenant}/"),
+        })
+    }
+
+    /// The layout of [`DEFAULT_TENANT`].
+    pub fn default_tenant() -> Layout {
+        Layout {
+            root: format!("{TENANT_DIR}{DEFAULT_TENANT}/"),
+        }
+    }
+
+    /// Every layout a record can be in, in the order readers look: the
+    /// flat one first.
+    pub fn all() -> [Layout; 2] {
+        [Layout::flat(), Layout::default_tenant()]
+    }
+
+    /// The directory: every name of the layout starts with it.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn is_flat(&self) -> bool {
+        self.root == RECORD_PREFIX
+    }
+
+    /// Every generation record of the layout starts with it.
+    pub fn generation_prefix(&self) -> String {
+        format!("{}{GENERATION_NAME}", self.root)
+    }
+
+    /// Every tombstone of the layout starts with it.
+    pub fn tombstone_prefix(&self) -> String {
+        format!("{}{TOMBSTONE_NAME}", self.root)
+    }
+
+    pub fn generation_key(&self, id: &GenerationId) -> String {
+        format!("{}{}", self.root, id.as_str())
+    }
+
+    pub fn tombstone_key(&self, id: &GenerationId) -> String {
+        format!("{}del/{}", self.root, id.as_str())
+    }
+
+    pub fn article_key(&self, extent: &ExtentId) -> String {
+        format!("{}{ARTICLE_NAME}{}", self.root, extent.as_str())
+    }
+
+    /// The key of this layout for the same record as `flat`, a key of
+    /// the flat layout.
+    pub fn of_flat(&self, flat: &str) -> String {
+        format!(
+            "{}{}",
+            self.root,
+            flat.strip_prefix(RECORD_PREFIX).unwrap_or(flat)
+        )
+    }
+}
+
+/// What a record name says the record is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordKind {
+    Generation,
+    Tombstone,
+    ArticlePlan,
+}
+
+/// A record name taken apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordName<'a> {
+    pub kind: RecordKind,
+    pub layout: Layout,
+    /// The generation id, tombstone id or extent id.
+    pub id: &'a str,
+}
+
+impl RecordName<'_> {
+    /// The name of the same record in the flat layout. Two names with
+    /// the same flat form are of one id: readers put the records of
+    /// both layouts in one order by it.
+    pub fn flat(&self) -> String {
+        let dir = match self.kind {
+            RecordKind::Generation => "",
+            RecordKind::Tombstone => "del/",
+            RecordKind::ArticlePlan => ARTICLE_NAME,
+        };
+        format!("{RECORD_PREFIX}{dir}{}", self.id)
+    }
+}
+
+/// Takes `key` apart when it is the name of a generation record, a
+/// tombstone or an article plan, of either layout and of any tenant.
+/// `None` for every other key, also for the other keys under `m/`.
+pub fn record_name(key: &str) -> Option<RecordName<'_>> {
+    let rest = key.strip_prefix(RECORD_PREFIX)?;
+    let (layout, rest) = match rest.strip_prefix("t/") {
+        Some(rest) => {
+            let (tenant, rest) = rest.split_once('/')?;
+            (Layout::tenant(tenant)?, rest)
+        }
+        None => (Layout::flat(), rest),
+    };
+    let (kind, id) = if let Some(id) = rest.strip_prefix(ARTICLE_NAME) {
+        (RecordKind::ArticlePlan, id)
+    } else if let Some(id) = rest.strip_prefix("del/") {
+        (RecordKind::Tombstone, id)
+    } else {
+        (RecordKind::Generation, rest)
+    };
+    let named = match kind {
+        RecordKind::ArticlePlan => !id.is_empty(),
+        RecordKind::Generation | RecordKind::Tombstone => id.starts_with(GENERATION_NAME),
+    };
+    (named && !id.contains('/')).then_some(RecordName { kind, layout, id })
+}
+
+/// The name of the article plan of the same extent in the other layout
+/// of the two that [`Layout::all`] names; `None` when `key` is no
+/// article plan of one of them.
+pub fn other_plan_key(key: &str) -> Option<String> {
+    let name = record_name(key).filter(|n| n.kind == RecordKind::ArticlePlan)?;
+    let [flat, tenant] = Layout::all();
+    let other = if name.layout == flat {
+        tenant
+    } else if name.layout == tenant {
+        flat
+    } else {
+        return None;
+    };
+    Some(format!("{}{ARTICLE_NAME}{}", other.root, name.id))
+}
+
+/// The name of a generation record in the flat layout.
 pub fn generation_key(id: &GenerationId) -> String {
-    format!("{RECORD_PREFIX}{}", id.as_str())
+    Layout::flat().generation_key(id)
 }
 
+/// The name of a tombstone in the flat layout.
 pub fn tombstone_key(id: &GenerationId) -> String {
-    format!("{TOMBSTONE_DIR}{}", id.as_str())
+    Layout::flat().tombstone_key(id)
 }
 
+/// The name of an article plan in the flat layout.
 pub fn article_key(extent: &ExtentId) -> String {
-    format!("{ARTICLE_DIR}{}", extent.as_str())
+    Layout::flat().article_key(extent)
 }
 
 /// The first blob key of generation manifests (or tombstones, with
@@ -93,10 +281,10 @@ pub fn start_after(prefix: &str, since: UnixMs) -> String {
 }
 
 /// The blob keys of the article plans that a generation record names,
-/// in the order of its extents, from the plaintext of the record.
-/// `None` = the plaintext does not name its extents, or names one that
-/// is not an extent id.
-pub fn plan_keys(plain: &[u8]) -> Option<Vec<String>> {
+/// in the order of its extents, from the plaintext of the record, as
+/// `layout` names them. `None` = the plaintext does not name its
+/// extents, or names one that is not an extent id.
+pub fn plan_keys(plain: &[u8], layout: &Layout) -> Option<Vec<String>> {
     #[derive(Deserialize)]
     struct Extent {
         id: String,
@@ -115,7 +303,7 @@ pub fn plan_keys(plain: &[u8]) -> Option<Vec<String>> {
     named
         .extents
         .iter()
-        .map(|e| id(&e.id).then(|| format!("{ARTICLE_DIR}{}", e.id)))
+        .map(|e| id(&e.id).then(|| format!("{}{ARTICLE_NAME}{}", layout.root, e.id)))
         .collect()
 }
 
@@ -186,6 +374,8 @@ pub async fn delete_blob<B: BlobStore>(store: &B, key: &str) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Recorded {
     generation: GenerationId,
+    /// The name the record was stored under.
+    key: String,
 }
 
 impl Recorded {
@@ -194,9 +384,10 @@ impl Recorded {
         &self.generation
     }
 
-    /// Blob key of the record.
+    /// Blob key of the record: the name it was stored under, whatever
+    /// the layout of new records is by now.
     pub fn key(&self) -> String {
-        generation_key(&self.generation)
+        self.key.clone()
     }
 
     /// The catalogue refused the publication and wrote nothing under
@@ -205,6 +396,7 @@ impl Recorded {
     pub(crate) fn refused(self, _: crate::sql::GuardRefused) -> Unpublished {
         Unpublished {
             generation: self.generation,
+            key: self.key,
         }
     }
 
@@ -214,6 +406,7 @@ impl Recorded {
     pub fn for_test(generation: &GenerationId) -> Recorded {
         Recorded {
             generation: generation.clone(),
+            key: generation_key(generation),
         }
     }
 }
@@ -225,6 +418,8 @@ impl Recorded {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Unpublished {
     generation: GenerationId,
+    /// The name the record was stored under.
+    key: String,
 }
 
 impl Unpublished {
@@ -233,9 +428,10 @@ impl Unpublished {
         &self.generation
     }
 
-    /// Blob key of the record.
+    /// Blob key of the record: the name it was stored under, whatever
+    /// the layout of new records is by now.
     pub fn key(&self) -> String {
-        generation_key(&self.generation)
+        self.key.clone()
     }
 }
 
@@ -669,13 +865,14 @@ async fn read<B: BlobStore, K: Kek, R: for<'de> Deserialize<'de>>(
         .map_err(|_| ERR_RECORD)
 }
 
-/// Writes `m/<generation_id>`, after it raised the floor of the key to
-/// the id, and returns the proof of it, without which the catalogue
-/// publishes nothing.
+/// Writes the generation record (`m/<generation_id>` in the flat
+/// layout), after it raised the floor of the key to the id, and returns
+/// the proof of it, without which the catalogue publishes nothing.
 pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
     catalog: &C,
     safety: &B,
     kek: &K,
+    layout: &Layout,
     bucket: &Bucket,
     generation: &GenerationRow,
     extents: &[ExtentRow],
@@ -684,7 +881,7 @@ pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
     catalog
         .raise_floor(&bucket.id, &generation.key, &generation.id, true)
         .await?;
-    let name = generation_key(&generation.id);
+    let name = layout.generation_key(&generation.id);
     write(
         safety,
         kek,
@@ -696,15 +893,19 @@ pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
     .await?;
     Ok(Recorded {
         generation: generation.id.clone(),
+        key: name,
     })
 }
 
-/// Writes `m/del/<id>`, after it raised the floor of the key to the id.
-/// The caller deletes only after this returned `Ok`.
+/// Writes the tombstone (`m/del/<id>` in the flat layout), after it
+/// raised the floor of the key to the id. The caller deletes only after
+/// this returned `Ok`.
+#[allow(clippy::too_many_arguments)]
 pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
     catalog: &C,
     safety: &B,
     kek: &K,
+    layout: &Layout,
     bucket: &BucketId,
     key: &str,
     id: &GenerationId,
@@ -721,7 +922,7 @@ pub async fn write_tombstone<C: Catalog, B: BlobStore, K: Kek>(
     write(
         safety,
         kek,
-        &tombstone_key(id),
+        &layout.tombstone_key(id),
         bucket,
         id.as_str(),
         &record,
@@ -758,6 +959,7 @@ pub async fn write_tombstones<C: Catalog, B: BlobStore, K: Kek>(
     catalog: &C,
     safety: &B,
     kek: &K,
+    layout: &Layout,
     bucket: &BucketId,
     tombstones: &[NewTombstone<'_>],
 ) -> Result<Vec<Result<()>>> {
@@ -778,7 +980,7 @@ pub async fn write_tombstones<C: Catalog, B: BlobStore, K: Kek>(
             write(
                 safety,
                 kek,
-                &tombstone_key(&t.id),
+                &layout.tombstone_key(&t.id),
                 bucket,
                 t.id.as_str(),
                 &record,
@@ -850,19 +1052,22 @@ pub async fn read_key_revocation<B: BlobStore, K: Kek>(
     read(safety, kek, &revocation_key(akid)).await
 }
 
-/// Writes `m/art/<extent_id>` from the plan the catalogue holds. An
+/// Writes the article plan record (`m/art/<extent_id>` in the flat
+/// layout) from the plan the catalogue holds. An
 /// extent's plan never changes, so a second write stores the same plan
 /// again; it also replaces a record that no longer opens. The caller
 /// posts only after this returned `Ok`.
 pub async fn write_article_plan<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
+    layout: &Layout,
     extent: &ExtentRow,
     plan: &[ArticleRow],
 ) -> Result<()> {
     write_stored_plan(
         safety,
         kek,
+        layout,
         extent,
         &StoredPlan {
             rows: plan.to_vec(),
@@ -877,10 +1082,11 @@ pub async fn write_article_plan<B: BlobStore, K: Kek>(
 pub async fn write_stored_plan<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
+    layout: &Layout,
     extent: &ExtentRow,
     plan: &StoredPlan,
 ) -> Result<()> {
-    let name = article_key(&extent.id);
+    let name = layout.article_key(&extent.id);
     let record = ArticleManifest::of(extent, plan);
     write(
         safety,
@@ -893,7 +1099,25 @@ pub async fn write_stored_plan<B: BlobStore, K: Kek>(
     .await
 }
 
-/// Reads the record stored at `name` (a key from a listing).
+/// Whether `name` is the name of a record of `kind` with the id `id`,
+/// in either layout.
+fn names(name: &str, kind: RecordKind, id: &str) -> bool {
+    record_name(name).is_some_and(|n| n.kind == kind && n.id == id)
+}
+
+/// Whether a generation record of `id` is stored, under the name of any
+/// layout.
+pub async fn generation_recorded<B: BlobStore>(safety: &B, id: &GenerationId) -> Result<bool> {
+    for layout in Layout::all() {
+        if safety.head(&layout.generation_key(id)).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Reads the record stored at `name` (a key from a listing, of either
+/// layout).
 pub async fn read_generation<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
@@ -902,13 +1126,13 @@ pub async fn read_generation<B: BlobStore, K: Kek>(
     let record: Option<GenerationManifest> = read(safety, kek, name).await?;
     match &record {
         // The record must be the one its name promises.
-        Some(m) if generation_key(&GenerationId::new(m.generation.id.clone())) != name => {
-            Err(ERR_RECORD)
-        }
+        Some(m) if !names(name, RecordKind::Generation, &m.generation.id) => Err(ERR_RECORD),
         _ => Ok(record),
     }
 }
 
+/// Reads the tombstone stored at `name` (a key from a listing, of
+/// either layout).
 pub async fn read_tombstone<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
@@ -916,19 +1140,49 @@ pub async fn read_tombstone<B: BlobStore, K: Kek>(
 ) -> Result<Option<Tombstone>> {
     let record: Option<Tombstone> = read(safety, kek, name).await?;
     match &record {
-        Some(t) if tombstone_key(&GenerationId::new(t.id.clone())) != name => Err(ERR_RECORD),
+        Some(t) if !names(name, RecordKind::Tombstone, &t.id) => Err(ERR_RECORD),
         _ => Ok(record),
     }
 }
 
+/// The article plan record of one extent, as [`read_article_plan`]
+/// found it.
+#[derive(Debug, Default)]
+pub struct PlanRead {
+    /// The record; `None` = there is none that opens.
+    pub record: Option<ArticleManifest>,
+    /// The names of the records of the extent that are stored and did
+    /// not open or parse.
+    pub unreadable: Vec<String>,
+}
+
+/// Reads the article plan record of `extent`, whichever layout it was
+/// written in: the name of `first` is looked at first, then those of
+/// the other layouts, until a record opens. An extent has one plan, so
+/// two records of it hold the same one.
+///
+/// `Err` = the store could not be asked. A record that does not open
+/// is named in the answer and is no error.
 pub async fn read_article_plan<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
     extent: &ExtentId,
-) -> Result<Option<ArticleManifest>> {
-    let record: Option<ArticleManifest> = read(safety, kek, &article_key(extent)).await?;
-    match &record {
-        Some(a) if a.extent_id != extent.as_str() => Err(ERR_RECORD),
-        _ => Ok(record),
+    first: &Layout,
+) -> Result<PlanRead> {
+    let mut found = PlanRead::default();
+    let others = Layout::all().into_iter().filter(|l| l != first);
+    for layout in std::iter::once(first.clone()).chain(others) {
+        let name = layout.article_key(extent);
+        match read::<B, K, ArticleManifest>(safety, kek, &name).await {
+            Ok(Some(a)) if a.extent_id == extent.as_str() => {
+                found.record = Some(a);
+                break;
+            }
+            Ok(Some(_)) => found.unreadable.push(name),
+            Ok(None) => {}
+            Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+            Err(_) => found.unreadable.push(name),
+        }
     }
+    Ok(found)
 }

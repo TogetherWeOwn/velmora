@@ -449,6 +449,42 @@ fn recovery_copy_is_off_by_default_and_cannot_stop_the_service() {
     }
 }
 
+/// `RECORD_LAYOUT` chooses where new recovery records are written. The
+/// shipped configuration does not set it, so a deploy keeps the flat
+/// names until an operator turns the tenant layout on, and a value that
+/// is neither of the two refuses to start instead of picking one.
+#[test]
+fn record_layout_is_flat_unless_tenant_is_asked_for() {
+    use velmora_bridge::recovery::Layout;
+    let (prod, dev) = wrangler_vars();
+    for shipped in [&prod, &dev] {
+        assert!(
+            !shipped.contains_key("RECORD_LAYOUT"),
+            "the shipped configuration must not choose a record layout"
+        );
+    }
+    let mut vars = with_secrets(prod, &prod_providers());
+    assert!(load(&vars).unwrap().records.is_flat());
+    for flat in ["", "  ", "flat", " flat "] {
+        vars.insert("RECORD_LAYOUT".into(), flat.into());
+        assert_eq!(load(&vars).unwrap().records, Layout::flat(), "{flat:?}");
+    }
+    for tenant in ["tenant", " tenant "] {
+        vars.insert("RECORD_LAYOUT".into(), tenant.into());
+        let records = load(&vars).unwrap().records;
+        assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
+        assert_eq!(records.root(), "m/t/t_0000000000000000/");
+    }
+    for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/t/", "tenant,flat"] {
+        vars.insert("RECORD_LAYOUT".into(), bad.into());
+        assert_eq!(
+            load(&vars).unwrap_err(),
+            ConfigError::Invalid("RECORD_LAYOUT".into()),
+            "{bad:?}"
+        );
+    }
+}
+
 #[test]
 fn missing_secret_fails_closed() {
     let (prod, _) = wrangler_vars();

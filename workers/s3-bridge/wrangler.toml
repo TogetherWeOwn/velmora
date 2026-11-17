@@ -100,6 +100,11 @@ RECOVERY_COPY = "off"
 #   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
 #     provider permit. Fewer are used when INFLIGHT_BUDGET_BYTES has no room for that many beside an extent and its cache write.
 #   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
+#   RECORD_LAYOUT (flat): flat | tenant. Where NEW recovery records are written: flat is m/<id>, m/del/<id> and m/art/<extent>;
+#     tenant is the same names under m/t/<tenant id>/. Every reader reads both, always, and no record is ever renamed.
+#     A Worker from before this switch does not read the tenant names (its replay would pass over them): set tenant in a
+#     deploy AFTER the one that brought the switch, and from then on never roll back past that one (see "Rollback floor"
+#     and "Record layout" in ops/README.md). Not set here: production writes the flat names.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 #   PACKED_PLANS (off; production sets it on below): off | on. On: the article plan of a new extent is one value on its row
 #     (extents.plan) instead of one row per article, a replay stores plans that way, and each

@@ -467,10 +467,25 @@ fn walk(key: &str) -> String {
     format!("{{\"p\":\"a\",\"k\":\"{key}\"}}")
 }
 
+/// The cursor of a job of the last part of the walk, after the records
+/// of the tenant layout, that goes on after `key`.
+fn tail(key: &str) -> String {
+    format!("{{\"p\":\"z\",\"k\":\"{key}\"}}")
+}
+
 /// The cursor of a job of the fresh sweep that goes on after `key`.
 fn sweep(key: &str) -> String {
     format!("{{\"p\":\"g\",\"k\":\"{key}\"}}")
 }
+
+/// What the fresh sweep lists: the tombstones and the generation
+/// records of the flat layout and of the tenant layout.
+const FRESH: [&str; 4] = [
+    "m/del/g_",
+    "m/g_",
+    "m/t/t_0000000000000000/del/g_",
+    "m/t/t_0000000000000000/g_",
+];
 
 /// Older than the fresh sweep reaches: a record of the walk.
 const OLD: i64 = 2 * 3_600_000;
@@ -1162,10 +1177,12 @@ async fn pass_is_idempotent_second_pass_copies_nothing() {
     let counts = w.pass().await;
     assert_eq!((counts.copied, counts.same, counts.records), (0, 7, 7));
     assert_eq!(w.e2.puts(), puts);
-    // Five list requests: the range of the source page and what
-    // follows it, and one for each of the three parts of a pass that
-    // find no record. An answer that is not cut is the last one.
-    assert_eq!(w.e2.count("GET "), lists + 5);
+    // Ten list requests: the range of the source page and what
+    // follows it, and one for each of the eight parts of a pass that
+    // find no record (three of the flat layout, five of the tenant
+    // layout and what follows it). An answer that is not cut is the
+    // last one.
+    assert_eq!(w.e2.count("GET "), lists + 10);
     assert_eq!(w.e2.count("HEAD "), 7);
     // MemBlobStore lists by reading (the port's default). What is
     // saved of the walk is asked for by its size first, and nothing of
@@ -1242,8 +1259,8 @@ async fn pass_never_deletes_extra_at_e2_and_counts_it() {
     assert_eq!(w.e2.objects.borrow().len(), 6);
     // No list request more than is needed: one for the range of the
     // source page, one for what follows it, which is not cut, and one
-    // for each of the three parts of a pass that find no record.
-    assert_eq!(w.e2.count("GET "), 5);
+    // for each of the eight parts of a pass that find no record.
+    assert_eq!(w.e2.count("GET "), 10);
 
     // The same when an answer is cut exactly at the end of the page.
     let w = World::new();
@@ -1255,7 +1272,7 @@ async fn pass_never_deletes_extra_at_e2_and_counts_it() {
     let lists = w.e2.count("GET ");
     let counts = w.pass().await;
     assert_eq!((counts.same, counts.extra), (2, 1));
-    assert_eq!(w.e2.count("GET "), lists + 5);
+    assert_eq!(w.e2.count("GET "), lists + 10);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1801,10 +1818,10 @@ async fn a_pass_goes_on_from_a_key_that_something_else_wrote() {
 async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     let w = World::new();
     // Five copies and ten list requests take the job past its time
-    // before the next page.
+    // before the next page. The tenant keys are in the last part of
+    // the walk, after the records of every tenant.
     for i in 0..5 {
-        w.generation(&generation(600_000, &format!("_{i}")), &[])
-            .await;
+        w.record(&format!("m/t/t_1/art/x_{i}"), b"plan").await;
     }
     // More tenant keys than fill the first source page.
     for i in 0..1_000 {
@@ -1813,7 +1830,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     }
     w.record("m/x_9", b"plan").await;
     for i in 0..9 {
-        w.e2.set(&format!("m/g_zz{i}"), b"left over");
+        w.e2.set(&format!("m/t/t_1/zz{i}"), b"left over");
     }
     w.e2.page.set(1);
     let clock = TickClock(w.clock.clone());
@@ -1824,7 +1841,9 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
         remote: &w.remote,
         maintenance: Maintenance::Off,
     };
-    let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
+    let (outcome, counts, why) = copier
+        .run_job(&w.jobs, UnixMs(NOW), &tail("m/t/t_1/"))
+        .await;
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
     let counts = counts.unwrap();
     assert_eq!((counts.records, counts.copied), (5, 5));
@@ -1832,7 +1851,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     let sent = w.jobs.take();
     assert_eq!(sent.len(), 1);
     assert!(
-        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == sweep("m/tk0")),
+        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == tail("m/tk0")),
         "{:?}",
         sent[0].job
     );
@@ -3120,12 +3139,14 @@ async fn the_plans_of_a_record_stop_at_the_bounds_of_a_job() {
     w.generation(&key, &["x_1"]).await;
     w.record("m/art/x_1", b"plan").await;
     for i in 0..3 {
-        w.record(&format!("m/zz{i}"), b"other").await;
-        w.e2.put_500_keys.borrow_mut().push(format!("m/zz{i}"));
+        // After the generation records, and in the same part of the
+        // sweep: before the tenant layout.
+        w.record(&format!("m/sz{i}"), b"other").await;
+        w.e2.put_500_keys.borrow_mut().push(format!("m/sz{i}"));
     }
     let step = w.copier().step(UnixMs(NOW), &sweep(&start)).await.unwrap();
     assert!(step.outage);
-    assert_eq!(step.next, Some(sweep("m/zz2")));
+    assert_eq!(step.next, Some(sweep("m/sz2")));
     assert!(w.e2.log.borrow().iter().all(|l| !l.contains("m/art/")));
     assert_eq!((step.counts.failed, step.counts.pending), (3, 1));
     assert_eq!(put_at(w.e2, &key), None);
@@ -3573,18 +3594,21 @@ async fn a_day_of_passes_lists_what_is_new_and_walks_once() {
     }
     let (small, large) = (days[0], days[1]);
     // Before: with the records. What a pass lists of the fresh records
-    // (at most four pages of each side) is the same in both.
-    let walked = |day: (u64, usize, u64)| (day.0 - 96 * 4, day.1 as u64 - 96 * 4);
+    // (at most six pages of each side: two for each kind of record of
+    // the flat layout, which has them, and one for each kind of the
+    // tenant layout, which has none) is the same in both.
+    let walked = |day: (u64, usize, u64)| (day.0 - 96 * 6, day.1 as u64 - 96 * 6);
     assert!(walked(large.0).0 > 2 * walked(small.0).0, "{days:?}");
     assert!(walked(large.0).1 > 2 * walked(small.0).1, "{days:?}");
     // After: a pass at rest asks the same of both sizes, and little.
     assert_eq!(small.1 .2, large.1 .2, "{days:?}");
-    assert!(small.1 .2 <= 8, "{days:?}");
+    assert!(small.1 .2 <= 12, "{days:?}");
     // A day is 95 such passes and one walk.
-    let pages = |records: u64| records.div_ceil(1000) + 4;
+    // The walk has five parts; three of them hold no record here.
+    let pages = |records: u64| records.div_ceil(1000) + 4 + 3;
     for ((_, after), records) in days.iter().zip([2_400, 12_000]) {
-        assert!(after.0 <= 96 * 4 + pages(records), "{days:?}");
-        assert!(after.1 as u64 <= 96 * 4 + pages(records), "{days:?}");
+        assert!(after.0 <= 96 * 6 + pages(records), "{days:?}");
+        assert!(after.1 as u64 <= 96 * 6 + pages(records), "{days:?}");
     }
     assert!(large.1 .0 * 4 < large.0 .0, "{days:?}");
 }
@@ -3615,7 +3639,7 @@ async fn an_article_plan_written_between_walks_is_over_there_by_its_hint() {
         w.e2.asked
             .borrow()
             .iter()
-            .all(|a| a.starts_with("m/del/g_") || a.starts_with("m/g_")),
+            .all(|a| FRESH.iter().any(|fresh| a.starts_with(fresh))),
         "{:?}",
         w.e2.asked
     );
@@ -4506,4 +4530,339 @@ async fn a_mark_of_the_walk_that_cannot_be_read_stops_the_job() {
             assert_eq!(w.e2.get("m/art/x_2"), None, "{key} head={head}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The two layouts of record names: `m/…` and `m/t/<tenant id>/…`
+// ---------------------------------------------------------------------------
+
+/// The directory of the tenant layout as this version writes it.
+const TENANT: &str = "m/t/t_0000000000000000/";
+
+/// The key of the tenant layout for the same record as `flat`.
+fn in_tenant(flat: &str) -> String {
+    format!("{TENANT}{}", &flat["m/".len()..])
+}
+
+/// A pass copies the records of the flat layout and of the tenant
+/// layout, each under the name it has: old and fresh, of every kind,
+/// and also what this version cannot name (the records of another
+/// tenant, a kind of record a later version adds, the keys on the
+/// bounds of the parts of a pass). Tenant keys stay.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_copies_the_records_of_both_layouts_under_their_names() {
+    let w = World::new();
+    let old = generation(OLD, "_o");
+    let fresh = generation(600_000, "_f");
+    let mut keys = Vec::new();
+    for dir in ["m/", TENANT, "m/t/t_1/", "m/t/t_zz/"] {
+        let of = |flat: &str| format!("{dir}{}", &flat["m/".len()..]);
+        for key in [
+            "m/art/x_1".to_string(),
+            "m/del/g_0000000000001_t".to_string(),
+            format!("m/del/{}", &fresh["m/".len()..]),
+        ] {
+            w.record(&of(&key), b"record").await;
+            keys.push(of(&key));
+        }
+        for key in [&old, &fresh] {
+            w.generation(&of(key), &[]).await;
+            keys.push(of(key));
+        }
+    }
+    for key in [
+        "m/rk/AK1".to_string(),
+        "m/sz".to_string(),
+        "m/t/a".to_string(),
+        "m/zz".to_string(),
+        in_tenant("m/seg/s_1/0"),
+        in_tenant("m/del0"),
+        in_tenant("m/h"),
+        in_tenant("m/zz"),
+    ] {
+        w.record(&key, b"record").await;
+        keys.push(key);
+    }
+    w.raw("m/tk/t_1", b"tenant key".to_vec()).await;
+
+    let counts = w.pass().await;
+    assert_eq!(counts.copied as usize, keys.len(), "{counts:?}");
+    assert_eq!((counts.failed, counts.pending, counts.young), (0, 0, 0));
+    for key in &keys {
+        let source = w.safety.get(key, None).await.unwrap().unwrap();
+        assert_eq!(w.e2.get(key), Some(source), "{key}");
+    }
+    assert_eq!(w.e2.objects.borrow().len(), keys.len());
+    assert_eq!(w.e2.get("m/tk/t_1"), None);
+
+    // And once: the next pass finds every one of them equal.
+    let puts = w.e2.puts();
+    let counts = w.pass().await;
+    assert_eq!(
+        (counts.copied, counts.same as usize, counts.extra),
+        (0, keys.len(), 0),
+        "{counts:?}"
+    );
+    assert_eq!(w.e2.puts(), puts);
+}
+
+/// The fresh records of the tenant layout are over there by the next
+/// pass, as those of the flat layout are, with the walk at rest: the
+/// pass lists the fresh tombstones and generation records of both
+/// layouts and nothing else. A generation record goes after the
+/// article plans it names, under whichever name each plan is stored.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_at_rest_copies_the_fresh_records_of_the_tenant_layout() {
+    let w = World::new();
+    w.record("m/art/x_0001", b"plan").await;
+    w.record(&in_tenant("m/art/x_0002"), b"plan").await;
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    assert_eq!(w.e2.puts(), 2);
+
+    let start = UnixMs(NOW + PASS_INTERVAL_MS);
+    w.clock.set(start);
+    let id = format!("{:013x}_new", start.0 - 180_000);
+    // A record of the tenant layout: a plan under the name of its
+    // layout, one under the flat name (its extent was posted before the
+    // layout changed, or is shared with an older object).
+    let record = format!("{TENANT}g_{id}");
+    w.generation(&record, &["x_t", "x_f"]).await;
+    let plan_t = in_tenant("m/art/x_t");
+    w.record(&plan_t, b"plan t").await;
+    w.record("m/art/x_f", b"plan f").await;
+    let gone = format!("{TENANT}del/g_{id}");
+    w.record(&gone, b"gone").await;
+    // A record of the flat layout whose plan is in the tenant layout.
+    let flat = format!("m/g_{id}");
+    w.generation(&flat, &["x_o"]).await;
+    let plan_o = in_tenant("m/art/x_o");
+    w.record(&plan_o, b"plan o").await;
+
+    w.e2.asked.borrow_mut().clear();
+    assert!(queued_pass(&w, &w.copier(), start).await.is_empty());
+    for key in [&record, &plan_t, &gone, &flat, &plan_o] {
+        let source = w.safety.get(key, None).await.unwrap().unwrap();
+        assert_eq!(w.e2.get(key), Some(source), "{key}");
+    }
+    assert!(w.e2.get("m/art/x_f").is_some());
+    for (plan, record) in [
+        (plan_t.as_str(), &record),
+        ("m/art/x_f", &record),
+        (plan_o.as_str(), &flat),
+    ] {
+        assert!(put_at(w.e2, plan) < put_at(w.e2, record), "{plan}");
+    }
+    // No plan was made up under a name it is not stored under.
+    for key in [
+        "m/art/x_t".to_string(),
+        "m/art/x_o".to_string(),
+        in_tenant("m/art/x_f"),
+    ] {
+        assert_eq!(w.e2.get(&key), None, "{key}");
+    }
+    // The walk rested: only the fresh records were listed.
+    assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    assert!(
+        w.e2.asked
+            .borrow()
+            .iter()
+            .all(|a| FRESH.iter().any(|fresh| a.starts_with(fresh))),
+        "{:?}",
+        w.e2.asked
+    );
+}
+
+/// A fresh generation record whose article plan cannot be sent is held
+/// back, in the tenant layout as in the flat one, and under whichever
+/// name the plan is stored.
+#[tokio::test(flavor = "current_thread")]
+async fn a_plan_of_the_other_layout_that_cannot_be_sent_holds_the_record_back() {
+    for (record, plan) in [
+        (
+            in_tenant(&generation(600_000, "_r")),
+            "m/art/x_1".to_string(),
+        ),
+        (generation(600_000, "_r"), in_tenant("m/art/x_1")),
+        (
+            in_tenant(&generation(600_000, "_r")),
+            in_tenant("m/art/x_1"),
+        ),
+    ] {
+        let w = World::new();
+        w.generation(&record, &["x_1"]).await;
+        w.record(&plan, b"plan").await;
+        w.e2.put_500_keys.borrow_mut().push(plan.clone());
+        let counts = w.pass().await;
+        assert!(counts.pending >= 1, "{record}: {counts:?}");
+        assert_eq!(w.e2.get(&record), None, "{record}");
+        assert_eq!(w.e2.get(&plan), None, "{record}");
+
+        w.e2.put_500_keys.borrow_mut().clear();
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        w.pass().await;
+        assert!(put_at(w.e2, &plan) < put_at(w.e2, &record), "{record}");
+        assert!(w.e2.get(&record).is_some(), "{record}");
+    }
+}
+
+/// The hint of a post job names the article plan by its flat name. The
+/// plan is sent under the name it is stored under, also when that is
+/// the one of the tenant layout; and a hint that names it so is one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hint_finds_the_article_plan_in_the_tenant_layout() {
+    let w = World::new();
+    assert!(queued_pass(&w, &w.copier(), UnixMs(NOW)).await.is_empty());
+    w.clock.advance_ms(4 * PASS_INTERVAL_MS);
+    let key = in_tenant("m/art/x_late");
+    let plan = w.record(&key, b"late plan").await;
+    let (pass, cursor) = hint_for(&w, "x_late");
+    assert!(cursor.contains("m/art/x_late") && !cursor.contains(TENANT));
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &cursor).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().copied, 1);
+    assert_eq!(w.e2.get(&key), Some(plan));
+    assert_eq!(w.e2.get("m/art/x_late"), None);
+    assert!(w.jobs.take().is_empty());
+
+    let other = in_tenant("m/art/x_more");
+    let more = w.record(&other, b"more").await;
+    let named = cursor.replace("m/art/x_late", &other);
+    let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &named).await;
+    assert_eq!((outcome, why), (JobOutcome::Ack, None));
+    assert_eq!(counts.unwrap().copied, 1);
+    assert_eq!(w.e2.get(&other), Some(more));
+
+    // Nothing but an article plan: a generation record, a tombstone
+    // and a key of the directory are no hint.
+    let puts = w.e2.puts();
+    for not in [
+        in_tenant(&generation(OLD, "_o")),
+        in_tenant("m/del/g_0000000000001_t"),
+        in_tenant("m/art/"),
+        "m/t/art/x_1".to_string(),
+    ] {
+        w.record(&not, b"record").await;
+        let named = cursor.replace("m/art/x_late", &not);
+        let (_, counts, _) = w.copier().run_job(&w.jobs, pass, &named).await;
+        assert_eq!(counts.map(|c| c.copied), None, "{not}");
+    }
+    assert_eq!(w.e2.puts(), puts);
+}
+
+/// The saved place of a walk can be a key of the tenant layout: the
+/// walk that is under way goes on from it, and what lies before it was
+/// done by the passes before. A place that no walk saved, or one inside
+/// what the sweep lists, starts the walk from the first key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_saved_place_in_the_tenant_layout_is_safe() {
+    let old = generation(OLD, "_o");
+    let flat = ["m/art/x_1", "m/art/x_5", "m/del/g_0000000000001_t", &old];
+    let world = || async {
+        let w = World::new();
+        for key in flat {
+            w.record(key, b"record").await;
+            w.record(&in_tenant(key), b"record").await;
+        }
+        w.record("m/t/t_1/art/x_1", b"record").await;
+        w
+    };
+    let began = (NOW - PASS_INTERVAL_MS).to_string().into_bytes();
+    let fresh_tombstone = in_tenant(&format!("m/del/g_{:013x}_x", NOW - 600_000));
+    let fresh_generation = in_tenant(&generation(600_000, "_x"));
+    // (the place, and the records after it when the walk goes on)
+    for (place, rest) in [
+        ("m/t/".to_string(), 5),
+        (TENANT.to_string(), 5),
+        (in_tenant("m/art/x_3"), 4),
+        (in_tenant("m/del0"), 2),
+        (in_tenant(&old), 1),
+        (in_tenant("m/g`"), 1),
+        ("m/t/t_1/art/x_1".to_string(), 0),
+        // Inside the sweep: no walk saves it.
+        (fresh_tombstone, 9),
+        (fresh_generation, 9),
+    ] {
+        // No walk is under way: all of them, from the first key.
+        let w = world().await;
+        w.raw(WALK_KEY, place.as_bytes().to_vec()).await;
+        let counts = w.pass().await;
+        assert_eq!(counts.copied, 9, "{place}");
+        assert_eq!(w.e2.objects.borrow().len(), 9);
+
+        // A walk is under way.
+        let w = world().await;
+        known_store(&w).await;
+        w.raw(WALK_KEY, place.as_bytes().to_vec()).await;
+        w.raw(BEGAN_KEY, began.clone()).await;
+        let (_, counts, why) = w.copier().run_job(&w.jobs, UnixMs(NOW), "").await;
+        assert_eq!(why, None);
+        assert_eq!(counts.unwrap().copied, rest, "{place}");
+        assert!(w.jobs.take().is_empty());
+        assert_eq!(saved(&w).await.as_deref(), Some(""));
+        assert_eq!(time_at(&w, WALKED_KEY).await, ms(NOW));
+    }
+}
+
+/// The cursors of the parts of a pass that this version adds are not
+/// known to a version before it, which starts the pass again from them
+/// (the same as from a cursor it cannot read); this version reads the
+/// cursors of that one. So the names are fixed: `d`, `g`, `a`, `b` and
+/// `x` as before, `e`, `h`, `c`, `f` and `z` for the tenant layout.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cursors_of_a_pass_keep_their_names() {
+    // Old and fresh records of both layouts and of another tenant: the
+    // jobs of the pass name the parts in order.
+    let w = World::new();
+    for i in 0..3 {
+        w.record(&format!("m/art/x_{i}"), b"plan").await;
+        w.record(&in_tenant(&format!("m/art/x_{i}")), b"plan").await;
+        w.record(&format!("m/t/t_1/art/x_{i}"), b"plan").await;
+        let id = format!("{:013x}_{i}", NOW - 600_000);
+        for dir in ["m/", TENANT] {
+            w.record(&format!("{dir}del/g_{id}"), b"gone").await;
+            w.generation(&format!("{dir}g_{id}"), &[]).await;
+            let id = format!("{:013x}_{i}", NOW - OLD);
+            w.generation(&format!("{dir}g_{id}"), &[]).await;
+        }
+    }
+    // One copy to a job: every part with a record ends a job.
+    let clock = TickClock(w.clock.clone());
+    let copier = Copier {
+        safety: &w.safety,
+        kek: &w.kek,
+        clock: &clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let mut parts = Vec::new();
+    let mut cursor = Some(String::new());
+    let mut jobs = 0;
+    while let Some(at) = cursor {
+        jobs += 1;
+        assert!(jobs < 1_000);
+        let step = copier.step(UnixMs(NOW), &at).await.unwrap();
+        cursor = step.next;
+        if let Some(next) = &cursor {
+            let value: serde_json::Value = serde_json::from_str(next).unwrap();
+            let part = value["p"].as_str().unwrap().to_string();
+            let key = value["k"].as_str().unwrap().to_string();
+            // The part says which keys the cursor is in.
+            let tenant = key.starts_with("m/t/");
+            assert_eq!(tenant, "ehcfz".contains(&part), "{next}");
+            if parts.last() != Some(&part) {
+                parts.push(part);
+            }
+        }
+    }
+    assert_eq!(w.e2.objects.borrow().len(), 27);
+    let order: Vec<&str> = "d g e h a b c f z".split(' ').collect();
+    let mut last = 0;
+    for part in &parts {
+        let at = order.iter().position(|p| p == part).expect("a known part");
+        assert!(at >= last, "{parts:?}");
+        last = at;
+    }
+    let named = |names: &str| parts.iter().any(|p| names.contains(p.as_str()));
+    assert!(named("dgab") && named("ehcfz"), "{parts:?}");
 }

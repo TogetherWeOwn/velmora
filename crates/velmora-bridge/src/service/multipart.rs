@@ -1376,6 +1376,7 @@ where
             &bridge.catalog,
             &bridge.safety,
             &bridge.kek,
+            &bridge.cfg.records,
             &a.bucket,
             &commit.generation,
             &extents,

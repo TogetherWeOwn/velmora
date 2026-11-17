@@ -237,6 +237,7 @@ async fn delete_key_once<
         &bridge.catalog,
         &bridge.safety,
         &bridge.kek,
+        &bridge.cfg.records,
         &bucket.id,
         key,
         &tombstone,
@@ -363,6 +364,7 @@ async fn delete_chunk<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
         &bridge.catalog,
         &bridge.safety,
         &bridge.kek,
+        &bridge.cfg.records,
         &bucket.id,
         &tombstones,
     )
@@ -545,6 +547,7 @@ async fn delete_key_if<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
             &bridge.catalog,
             &bridge.safety,
             &bridge.kek,
+            &bridge.cfg.records,
             &bucket.id,
             key,
             &tombstone,
