@@ -23,7 +23,7 @@
 //! job starts at step 1 with them.
 
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
-use crate::recovery::{delete_blob, generation_key};
+use crate::recovery::{delete_blob, generation_recorded};
 use crate::types::{
     DispatchReport, IntentFence, Job, JobOutcome, Result, UnixMs, WriteId, JOB_VERSION,
 };
@@ -99,12 +99,9 @@ where
             return Ok(JobOutcome::Ack);
         };
         if let Some(generation) = &generation {
-            if self
-                .safety
-                .head(&generation_key(generation))
-                .await?
-                .is_some()
-            {
+            // Under the name of either layout: the record may be of a
+            // Worker that was set to the other one.
+            if generation_recorded(&self.safety, generation).await? {
                 self.catalog.keep_intents(write).await?;
                 return Ok(JobOutcome::Ack);
             }

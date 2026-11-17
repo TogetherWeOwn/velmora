@@ -19,7 +19,9 @@ use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{
     DISPATCH_BATCH, DISPATCH_BATCHES, DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS, RESEND_SECS,
 };
-use velmora_bridge::recovery::{article_key, read_article_plan, write_article_plan, Unpublished};
+use velmora_bridge::recovery::{
+    article_key, read_article_plan, write_article_plan, Layout, Unpublished,
+};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
     FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
@@ -266,6 +268,7 @@ impl Fx {
             slice_bytes: 8 * 1024 * 1024,
             max_object_extents: 10_000,
             intent_sweep: false,
+            records: velmora_bridge::recovery::Layout::flat(),
             packed_plans: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
@@ -621,10 +624,16 @@ async fn no_post_before_the_article_plan_record() {
         JobOutcome::Ack
     );
     assert_eq!(fx.server.posted_count().await, 3);
-    let record = read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
-        .await
-        .unwrap()
-        .expect("the record exists");
+    let record = read_article_plan(
+        &fx.bridge.safety,
+        &fx.bridge.kek,
+        &o.extent,
+        &Layout::flat(),
+    )
+    .await
+    .unwrap()
+    .record
+    .expect("the record exists");
     // The record names the revision the catalogue gave the plan.
     assert_eq!(fx.extent(&o, "plan_rev").await, "1");
     assert_eq!(record.plan_rev, 1);
@@ -650,11 +659,17 @@ async fn no_post_before_the_article_plan_record() {
     // A record that no longer opens is replaced by the next write.
     let name = article_key(&o.extent);
     assert!(fx.bridge.safety.inner.corrupt(&name, |b| b[8] ^= 1));
-    assert!(
-        read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
-            .await
-            .is_err()
-    );
+    // It is named, and is no plan.
+    let broken = read_article_plan(
+        &fx.bridge.safety,
+        &fx.bridge.kek,
+        &o.extent,
+        &Layout::flat(),
+    )
+    .await
+    .unwrap();
+    assert!(broken.record.is_none());
+    assert_eq!(broken.unreadable, std::slice::from_ref(&name));
     let (_, extents) = fx
         .bridge
         .catalog
@@ -662,13 +677,25 @@ async fn no_post_before_the_article_plan_record() {
         .await
         .unwrap()
         .unwrap();
-    write_article_plan(&fx.bridge.safety, &fx.bridge.kek, &extents[0], &planned)
-        .await
-        .unwrap();
-    let again = read_article_plan(&fx.bridge.safety, &fx.bridge.kek, &o.extent)
-        .await
-        .unwrap()
-        .unwrap();
+    write_article_plan(
+        &fx.bridge.safety,
+        &fx.bridge.kek,
+        &Layout::flat(),
+        &extents[0],
+        &planned,
+    )
+    .await
+    .unwrap();
+    let again = read_article_plan(
+        &fx.bridge.safety,
+        &fx.bridge.kek,
+        &o.extent,
+        &Layout::flat(),
+    )
+    .await
+    .unwrap()
+    .record
+    .unwrap();
     assert_eq!(again.rows(ArticleState::Planned).unwrap().len(), 3);
 }
 

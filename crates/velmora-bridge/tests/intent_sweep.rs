@@ -384,6 +384,50 @@ async fn killed_between_record_and_publish_everything_is_kept_and_a_replay_publi
     assert_eq!(intent_status(&s.rig).await["kept_writes"], 0);
 }
 
+/// The same with the record in the tenant layout (`RECORD_LAYOUT`), and
+/// the sweep run by a Worker that is set to the flat layout again: the
+/// record is found under the name it has, so the slices it names are
+/// kept, and a replay publishes the write.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_of_the_tenant_layout_keeps_its_slices_from_the_sweep() {
+    use velmora_bridge::recovery::Layout;
+
+    let tenant = Layout::default_tenant();
+    let in_tenant = |rig: &Rig| keys_under(rig, &tenant.generation_prefix()).len();
+    let mut cfg = small_config();
+    cfg.records = tenant.clone();
+    let mut s = setup_with(cfg).await;
+    assert_eq!((in_tenant(&s.rig), records(&s.rig).len()), (1, 0));
+    drop(
+        step_to(&s.rig, s.put(), |rig| in_tenant(rig) == 2)
+            .await
+            .stalled(),
+    );
+    s.rig.trip().disarm();
+    assert_eq!(s.rig.count("generations"), 1, "not published");
+    assert!(records(&s.rig).is_empty(), "no record of the flat layout");
+
+    Rc::get_mut(&mut s.rig.bridge)
+        .expect("no request is under way")
+        .cfg
+        .records = Layout::flat();
+    s.rig.bridge.clock.advance_ms(DAY_MS);
+    assert_eq!(sweep_tick(&s.rig).await, 1);
+    assert!(kept(&s.rig));
+    assert_eq!(intent_status(&s.rig).await["anomalies"], 1);
+    assert_eq!(orphans(&s.rig).len(), SLICES);
+    s.rig.bridge.clock.advance_ms(DAY_MS);
+    assert_eq!(sweep_tick(&s.rig).await, 0);
+    assert_eq!(orphans(&s.rig).len(), SLICES);
+    assert!(s.body().await == s.old);
+
+    restore(&mut s.rig).await;
+    assert!(s.body().await == s.new);
+    assert!(orphans(&s.rig).is_empty() && broken(&s.rig).is_empty());
+    assert!(intents(&s.rig).is_empty());
+    assert_eq!(in_tenant(&s.rig), 2);
+}
+
 // ---------------------------------------------------------------------------
 // A refused publish
 // ---------------------------------------------------------------------------

@@ -5,8 +5,9 @@
 //! this order:
 //!
 //! 1. **The fresh sweep.** The tombstones, then the generation records,
-//!    minted in the last [`FRESH_MS`]. Their keys start with the time,
-//!    so this is a short range of the listing however many records the
+//!    minted in the last [`FRESH_MS`], of the flat layout and then of
+//!    the tenant layout ([`Layout`]). Their keys start with the time,
+//!    so each is a short range of the listing however many records the
 //!    bucket holds. A new write or delete is over there one pass later.
 //!    The sweep has the first [`SWEEP_MS`] of a pass; what it did not
 //!    reach by then is left to the next pass, and reported.
@@ -62,6 +63,13 @@
 //!   the wait. The copy then stays, like a record that could not be
 //!   removed here: it replays as an object nobody was told exists, below
 //!   whatever was published on the key after it.
+//! - **Both layouts are copied, under the names they have.** The walk
+//!   goes through every key under `m/`, so it reaches the records of
+//!   any layout and any tenant, also of one this version does not
+//!   know. The sweep knows the flat layout and the one of the default
+//!   tenant. The article plan of an extent is looked for under the
+//!   name of either layout: a plan can be in the other one than the
+//!   generation record that names it, or than its hint says.
 //! - **Tenant keys (`m/tk/`) never leave**, and neither do their names.
 //! - **What something else wrote over there is counted (`foreign`) and
 //!   passed.** It is never a copy, and it does not stop the pass. (One
@@ -112,8 +120,8 @@ use crate::config::Maintenance;
 use crate::crypto::open_manifest;
 use crate::ports::{BlobEntry, BlobMeta, BlobStore, Clock, JobSink, Kek};
 use crate::recovery::{
-    article_key, plan_keys, start_after, ARTICLE_DIR, GENERATION_PREFIX, RECORD_PREFIX,
-    TENANT_KEY_PREFIX, TOMBSTONE_PREFIX,
+    article_key, other_plan_key, plan_keys, record_name, start_after, Layout, RecordKind,
+    RECORD_PREFIX, TENANT_DIR, TENANT_KEY_PREFIX,
 };
 use crate::remote::{md5_hex, HttpSend, RemoteError, S3Remote, MAX_KEY_BYTES};
 use crate::types::{BucketId, ExtentId, Job, JobOutcome, OutboxStage, Result, UnixMs, JOB_VERSION};
@@ -210,8 +218,11 @@ pub const LIST_PAGES: u32 = 10;
 /// the store is down. Fewer are taken as a fault of those records.
 pub const OUTAGE_MIN: usize = 3;
 
-/// The key after the last tombstone.
+/// The key after the last tombstone (of the flat layout, as the next
+/// one: [`Layout::of_flat`] makes them the keys of another).
 const TOMBSTONES_END: &str = "m/del0";
+/// The key after the last generation record.
+const GENERATIONS_END: &str = "m/g`";
 
 /// What one job did. Counts only.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -299,28 +310,96 @@ pub enum StepError {
 /// The parts of a pass, in the order they are done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    /// Fresh tombstones (`d` in a cursor).
+    /// Fresh tombstones of the flat layout (`d` in a cursor).
     Tombstones,
-    /// Fresh generation records, and whatever sorts after them (`g`).
+    /// Fresh generation records of the flat layout, and whatever sorts
+    /// after them and before the tenant layout (`g`).
     Generations,
+    /// Fresh tombstones of the tenant layout (`e`).
+    TenantTombstones,
+    /// Fresh generation records of the tenant layout (`h`).
+    TenantGenerations,
     /// The walk below the fresh tombstones (`a`).
     Low,
     /// The walk between the tombstones and the fresh generation
     /// records (`b`).
     High,
+    /// The walk of the tenant layout below its fresh tombstones (`c`).
+    TenantLow,
+    /// The walk between the tombstones and the fresh generation
+    /// records of the tenant layout (`f`).
+    TenantHigh,
+    /// The walk of whatever sorts after the generation records of the
+    /// tenant layout, to the last key (`z`).
+    Tail,
     /// No part of a pass: a hint, the job of one article plan
     /// (`key`), made at `made` (`x`).
     Plan,
 }
 
 /// The phases and their names in a cursor.
-const PHASES: [(Phase, &str); 5] = [
+const PHASES: [(Phase, &str); 10] = [
     (Phase::Tombstones, "d"),
     (Phase::Generations, "g"),
+    (Phase::TenantTombstones, "e"),
+    (Phase::TenantGenerations, "h"),
     (Phase::Low, "a"),
     (Phase::High, "b"),
+    (Phase::TenantLow, "c"),
+    (Phase::TenantHigh, "f"),
+    (Phase::Tail, "z"),
     (Phase::Plan, "x"),
 ];
+
+impl Phase {
+    /// Whether the phase is a part of the walk.
+    fn walking(self) -> bool {
+        use Phase::*;
+        matches!(self, Low | High | TenantLow | TenantHigh | Tail)
+    }
+
+    /// The layout whose keys the phase goes through.
+    fn layout(self) -> Layout {
+        use Phase::*;
+        match self {
+            TenantTombstones | TenantGenerations | TenantLow | TenantHigh | Tail => {
+                Layout::default_tenant()
+            }
+            Tombstones | Generations | Low | High | Plan => Layout::flat(),
+        }
+    }
+
+    /// The key the phase starts after, in the pass that started at
+    /// `pass`.
+    fn first(self, pass: UnixMs) -> String {
+        use Phase::*;
+        let layout = self.layout();
+        match self {
+            Tombstones | TenantTombstones => fresh(&layout.tombstone_prefix(), pass),
+            Generations | TenantGenerations => fresh(&layout.generation_prefix(), pass),
+            Low | Plan => String::new(),
+            TenantLow => TENANT_DIR.to_string(),
+            High | TenantHigh => layout.of_flat(TOMBSTONES_END),
+            Tail => layout.of_flat(GENERATIONS_END),
+        }
+    }
+
+    /// The phase after this one, in the sweep and in the walk; `None`
+    /// at the end of either.
+    fn then(self) -> Option<Phase> {
+        use Phase::*;
+        match self {
+            Tombstones => Some(Generations),
+            Generations => Some(TenantTombstones),
+            TenantTombstones => Some(TenantGenerations),
+            Low => Some(High),
+            High => Some(TenantLow),
+            TenantLow => Some(TenantHigh),
+            TenantHigh => Some(Tail),
+            TenantGenerations | Tail | Plan => None,
+        }
+    }
+}
 
 /// Where a pass stands: the cursor of a job, as a JSON object. An
 /// empty cursor, or one that does not parse, is the start of a pass.
@@ -407,12 +486,17 @@ impl Place {
     }
 
     fn walking(&self) -> bool {
-        matches!(self.phase, Phase::Low | Phase::High)
+        self.phase.walking()
     }
 
     /// Where a pass starts.
     fn start(pass: UnixMs) -> Place {
-        Place::at(Phase::Tombstones, fresh(TOMBSTONE_PREFIX, pass))
+        Place::first(Phase::Tombstones, pass)
+    }
+
+    /// The start of `phase` in the pass that started at `pass`.
+    fn first(phase: Phase, pass: UnixMs) -> Place {
+        Place::at(phase, phase.first(pass))
     }
 }
 
@@ -422,8 +506,9 @@ struct Span {
     until: Option<String>,
     /// Generation records are sent after their article plans.
     plans: bool,
-    /// Every fresh generation record sorts after this key.
-    first: String,
+    /// A generation record is fresh when its id was minted at or
+    /// after this time, in milliseconds.
+    since: i64,
     /// A generation record up to this key is not fresh any more when
     /// the next pass starts: it is not held back.
     last: String,
@@ -435,35 +520,60 @@ fn fresh(prefix: &str, pass: UnixMs) -> String {
     start_after(prefix, UnixMs(pass.0 - FRESH_MS))
 }
 
+/// The parts of the key space, in key order, with `T` for the directory
+/// of the tenant layout (`m/x/<tenant id>/`):
+///
+/// | Keys | Phase |
+/// |---|---|
+/// | up to the fresh tombstones (`m/art/`, older `m/del/`) | walk: `Low` |
+/// | fresh `m/del/g_` | sweep: `Tombstones` |
+/// | older `m/g_` | walk: `High` |
+/// | fresh `m/g_`, and on up to `m/x/` (`m/rk/` and every other family) | sweep: `Generations` |
+/// | `m/x/` up to the fresh tombstones of `T` (`T art/`, older `T del/`) | walk: `TenantLow` |
+/// | fresh `T del/g_` | sweep: `TenantTombstones` |
+/// | older `T g_` | walk: `TenantHigh` |
+/// | fresh `T g_` | sweep: `TenantGenerations` |
+/// | everything after `T g_` | walk: `Tail` |
+///
+/// Every key under `m/` is in one part of the walk or of the sweep, in
+/// every pass, wherever the fresh records begin.
 fn span(phase: Phase, pass: UnixMs) -> Span {
+    let layout = phase.layout();
     let until = match phase {
-        Phase::Generations => None,
-        Phase::Tombstones => Some(TOMBSTONES_END.to_string()),
-        Phase::Low => Some(fresh(TOMBSTONE_PREFIX, pass)),
-        Phase::High => Some(fresh(GENERATION_PREFIX, pass)),
+        Phase::Tombstones | Phase::TenantTombstones => Some(layout.of_flat(TOMBSTONES_END)),
+        Phase::Generations => Some(TENANT_DIR.to_string()),
+        Phase::TenantGenerations => Some(layout.of_flat(GENERATIONS_END)),
+        Phase::Low | Phase::TenantLow => Some(fresh(&layout.tombstone_prefix(), pass)),
+        Phase::High | Phase::TenantHigh => Some(fresh(&layout.generation_prefix(), pass)),
+        Phase::Tail => None,
         // No key lies in it: a hint is not a part of a pass.
         Phase::Plan => Some(String::new()),
     };
     Span {
         until,
-        plans: phase == Phase::Generations,
-        first: fresh(GENERATION_PREFIX, pass),
+        plans: matches!(phase, Phase::Generations | Phase::TenantGenerations),
+        since: pass.0 - FRESH_MS,
         last: start_after(
-            GENERATION_PREFIX,
+            &layout.generation_prefix(),
             UnixMs(pass.0 - FRESH_MS + PASS_INTERVAL_MS),
         ),
     }
 }
 
 /// Where the walk of a pass starts, from the place that was saved. A
-/// place outside the two parts of the walk is read as the start.
+/// place outside the parts of the walk is read as the start.
 fn walk_from(saved: String, pass: UnixMs) -> Place {
-    if saved < fresh(TOMBSTONE_PREFIX, pass) {
-        Place::at(Phase::Low, saved)
-    } else if saved.as_str() >= TOMBSTONES_END && saved < fresh(GENERATION_PREFIX, pass) {
-        Place::at(Phase::High, saved)
-    } else {
-        Place::at(Phase::Low, String::new())
+    use Phase::*;
+    // The last part of the walk the place is at or after the start of;
+    // the place is in it when it is also before its end.
+    let part = [Tail, TenantHigh, TenantLow, High, Low]
+        .into_iter()
+        .find(|part| saved >= part.first(pass));
+    match part {
+        Some(part) if span(part, pass).until.is_none_or(|until| saved < until) => {
+            Place::at(part, saved)
+        }
+        _ => Place::at(Low, String::new()),
     }
 }
 
@@ -680,9 +790,16 @@ fn saved_time(bytes: &[u8]) -> Option<i64> {
     text.parse().ok()
 }
 
-/// Milliseconds in the id of a generation record's key.
+/// Whether `key` names a generation record, of either layout.
+fn generation(key: &str) -> bool {
+    record_name(key).is_some_and(|n| n.kind == RecordKind::Generation)
+}
+
+/// Milliseconds in the id of a generation record's key, of either
+/// layout.
 fn minted_ms(key: &str) -> Option<i64> {
-    let hex = key.strip_prefix(GENERATION_PREFIX)?.get(..13)?;
+    let name = record_name(key).filter(|n| n.kind == RecordKind::Generation)?;
+    let hex = name.id.strip_prefix("g_")?.get(..13)?;
     i64::from_str_radix(hex, 16).ok()
 }
 
@@ -908,22 +1025,20 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             if walked != Walked::End {
                 break (Some(place.cursor()), walked == Walked::Outage);
             }
-            turn = match place.phase {
-                Phase::Tombstones => Some(Place::at(
-                    Phase::Generations,
-                    fresh(GENERATION_PREFIX, pass),
-                )),
-                Phase::Generations => {
+            turn = match (place.phase, place.phase.then()) {
+                (_, Some(then)) => Some(Place::first(then, pass)),
+                // The last phase of the sweep.
+                (Phase::TenantGenerations, None) => {
                     swept = true;
                     self.enter_walk(pass, &mut began).await?
                 }
-                Phase::Low => Some(Place::at(Phase::High, TOMBSTONES_END.to_string())),
-                Phase::High => {
+                // The last phase of the walk.
+                (Phase::Tail, None) => {
                     walk = Some(String::new());
                     ended = true;
                     None
                 }
-                Phase::Plan => None,
+                (_, None) => None,
             };
         };
         Ok(CopyStep {
@@ -1081,9 +1196,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// to wait for a store that does not answer.
     async fn run_hint(&self, hint: &Place) -> (JobOutcome, Option<CopyCounts>, Option<StepError>) {
         let key = hint.key.as_str();
-        let plan = key
-            .strip_prefix(ARTICLE_DIR)
-            .is_some_and(|id| !id.is_empty())
+        let plan = record_name(key).is_some_and(|n| n.kind == RecordKind::ArticlePlan)
             && key.len() <= MAX_KEY_BYTES;
         if !plan {
             return (JobOutcome::Ack, None, None);
@@ -1172,7 +1285,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let before = saved.len();
         known.plans = saved
             .into_iter()
-            .filter(|(key, _)| key.starts_with(GENERATION_PREFIX) && *key > span.first)
+            .filter(|(key, _)| minted_ms(key).is_some_and(|ms| ms >= span.since))
             .take(SWEEP_RECORDS)
             .collect();
         known.changed = known.plans.len() < before;
@@ -1343,7 +1456,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             });
         let read: Vec<(usize, Read)> = stream::iter(work)
             .map(|(i, entry, copy)| async move {
-                if plans && entry.key.starts_with(GENERATION_PREFIX) {
+                if plans && generation(&entry.key) {
                     (i, self.read_generation(&entry.key, copy).await)
                 } else {
                     (i, Read::Is(self.copy_one(&entry.key, copy).await))
@@ -1548,14 +1661,35 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             return Read::Is(Copied::Same);
         }
         // Without the extents it names, its plans cannot be sent first.
-        match plan_keys(&plain) {
+        // As the layout of the record names them; [`Copier::plan`]
+        // looks under the other name too.
+        let layout = record_name(key).map_or_else(Layout::flat, |n| n.layout);
+        match plan_keys(&plain, &layout) {
             Some(plans) => Read::Generation { bytes, plans },
             None => Read::Is(Copied::Unreadable),
         }
     }
 
-    /// Makes the article plan at `key` equal over there.
+    /// Makes the article plan at `key` equal over there, or the plan of
+    /// the same extent under the name of the other layout, when there
+    /// is none at `key` or it does not open: an extent has one plan,
+    /// whichever name it was written under.
     async fn plan(&self, key: &str) -> Plan {
+        let plan = self.plan_at(key).await;
+        if !matches!(plan, Plan::Absent | Plan::Unreadable) {
+            return plan;
+        }
+        match other_plan_key(key) {
+            Some(other) => match self.plan_at(&other).await {
+                Plan::Absent => plan,
+                found => found,
+            },
+            None => plan,
+        }
+    }
+
+    /// Makes the article plan at `key` equal over there.
+    async fn plan_at(&self, key: &str) -> Plan {
         let bytes = match self.safety.get(key, None).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Plan::Absent,
