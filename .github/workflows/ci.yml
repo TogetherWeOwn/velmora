@@ -184,7 +184,8 @@ jobs:
 
   # Dependency/security gate: the reviewed deny.toml policy must pass for
   # the committed lockfile. Findings are fixed by updating the dependency,
-  # never by weakening the policy. Keep this job id in ci-ok's needs.
+  # never by weakening the policy; the single reviewed exception path is
+  # described in deny.toml's header. Keep this job id in ci-ok's needs.
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
