@@ -21,6 +21,7 @@ use worker::Env;
 
 use crate::d1::D1Sql;
 use crate::e2::FetchHttp;
+use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
 use crate::nntp::WorkerConnector;
 use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, DEV_DROP_NOTIFY_N};
 use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
@@ -52,6 +53,13 @@ thread_local! {
     /// When the memory log is on: the time this isolate built its bridge,
     /// which names the isolate in the log.
     static MEMORY_LOG: Cell<Option<i64>> = const { Cell::new(None) };
+    /// The time this isolate built its bridge.
+    static ISOLATE: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Names the isolate in a log line: the time it built its bridge.
+pub fn isolate() -> i64 {
+    ISOLATE.with(Cell::get)
 }
 
 /// Name of the dev-only memory log variable.
@@ -122,9 +130,13 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let drop_notify = DropNotify::from_var(cfg.is_dev(), get(DEV_DROP_NOTIFY_N).as_deref())?;
     let tombstone_delay =
         tombstone_delay_from_var(cfg.is_dev(), get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
+    let abandon = abandon_from_var(cfg.is_dev(), get(DEV_ABANDON_JOB_N).as_deref())?;
+    let built_at = WorkerClock.now().0;
     if memory_log_from_var(cfg.is_dev(), get(DEV_MEMORY_LOG).as_deref())? {
-        MEMORY_LOG.with(|c| c.set(Some(WorkerClock.now().0)));
+        MEMORY_LOG.with(|c| c.set(Some(built_at)));
     }
+    ISOLATE.with(|c| c.set(built_at));
+    set_abandon(abandon);
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
     Ok(Bridge {
         catalog: SqlCatalog::new(D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)),

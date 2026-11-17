@@ -17,6 +17,7 @@ pub mod hosts;
 pub mod ingress;
 pub mod intents;
 pub mod jobs;
+pub mod jobtable;
 pub mod keepalive;
 pub mod plan;
 mod pool;
