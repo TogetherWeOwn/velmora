@@ -2144,6 +2144,41 @@ async fn cold_read_waits_for_a_slot_then_slows_down() {
     assert!(resp.body == body);
 }
 
+/// The room is gone when the last wait for a slot is over: the read
+/// ends as `SlowDown` there, and begins no wait for room.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_for_a_slot_that_is_over_does_not_go_on_as_a_wait_for_room() {
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let weak = Rc::new(RefCell::new(Weak::new()));
+    let hook = PollHook::default();
+    let sleeper = fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone(), 0);
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
+    let body = pattern(48, 300_000);
+    let extent = cold.put_and_post("cold.bin", &body).await;
+    evict(rig, &extent).await;
+
+    // The slots are held throughout, and another request takes the
+    // whole budget during the wait that reaches the bound.
+    let held = hold_all_slots(rig).await;
+    let taken: Rc<RefCell<Option<Charge>>> = Rc::default();
+    let (renew, total, slot) = (renewing(held), Rc::clone(&asked), Rc::clone(&taken));
+    *hook.borrow_mut() = Some(Box::new(move |poll, bridge| {
+        if total.get() >= u64::from(COLD_WAIT_MS) {
+            *slot.borrow_mut() = bridge.budget.try_charge(bridge.budget.capacity());
+        }
+        renew(poll, bridge)
+    }));
+
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    assert!(taken.borrow().is_some(), "the budget was not taken");
+    assert!(asked.get() < u64::from(COLD_WAIT_MS + COLD_POLL_MS + COLD_JITTER_MS));
+    assert!(rig.bridge.cache.keys().is_empty());
+}
+
 /// Readers that were cut off (their clients hung up) release nothing:
 /// their slots run out by themselves. A read that finds every slot held
 /// by them waits that out and is served; it does not give up first.

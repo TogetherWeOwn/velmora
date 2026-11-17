@@ -1321,7 +1321,7 @@ where
                     break;
                 }
                 let now = bridge.clock.now();
-                let left = (deadline.0 - now.0).min(i64::from(COLD_WAIT_MS - slept));
+                let left = (deadline.0 - now.0).min(i64::from(COLD_WAIT_MS.saturating_sub(slept)));
                 let Ok(left @ 1..) = u32::try_from(left) else {
                     return Err(ReadFail::Busy);
                 };
