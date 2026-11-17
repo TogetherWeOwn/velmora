@@ -14,7 +14,10 @@ use service_support::*;
 use velmora::rng::SystemRng;
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk};
 use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
-use velmora_bridge::ingress::{ByteBudget, Sleeper, CHARGE_POLL_MS};
+use velmora_bridge::ingress::{
+    ByteBudget, Charge, Sleeper, Spawner, CHARGE_POLL_MS, CHARGE_WAIT_MS,
+};
+use velmora_bridge::service::PIECE_WAIT_MS;
 use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -701,6 +704,12 @@ async fn cold_rig() -> Cold {
 /// A cold-read rig whose provider allows `max_conns` connections and whose
 /// byte budget polls with `sleeper` (none: nothing ever waits).
 async fn cold_rig_with(max_conns: u32, sleeper: Option<Sleeper>) -> Cold {
+    cold_rig_on(max_conns, sleeper, None).await
+}
+
+/// The same, on a host that runs the body of a GET as a task of its own
+/// when there is a `spawner`.
+async fn cold_rig_on(max_conns: u32, sleeper: Option<Sleeper>, spawner: Option<Spawner>) -> Cold {
     let mut server_cfg = ServerConfig::for_test();
     server_cfg.articles = Vec::new();
     server_cfg.missing_ids.clear();
@@ -718,6 +727,9 @@ async fn cold_rig_with(max_conns: u32, sleeper: Option<Sleeper>) -> Cold {
     let mut budget = ByteBudget::new(cfg.inflight_budget_bytes);
     if let Some(sleeper) = sleeper {
         budget = budget.with_sleeper(sleeper);
+    }
+    if let Some(spawner) = spawner {
+        budget = budget.with_spawner(spawner);
     }
     let rig = rig_with_budget(TcpConnector::default(), cfg, budget);
     rig.bridge
@@ -786,7 +798,8 @@ async fn cold_read_refills_the_cache_from_usenet() {
     let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
     resp.expect(200);
     assert!(resp.body == body, "cold read returned other bytes");
-    assert_eq!(rig.bridge.nntp.connects(), connects + 1);
+    // Every slot the provider has (two) was used, under four sockets.
+    assert_eq!(rig.bridge.nntp.connects(), connects + 2);
     assert_eq!(rig.bridge.nntp.live(), 0);
 
     // The verified ciphertext is now in the cache, and only there.
@@ -798,8 +811,928 @@ async fn cold_read_refills_the_cache_from_usenet() {
     let resp = get_range(rig, &cold.signer, "cold.bin", "bytes=999990-1000009").await;
     assert_eq!(resp.expect(206).body, body[999_990..=1_000_009]);
     assert!(get(rig, &cold.signer, "cold.bin", &[]).await.body == body);
-    assert_eq!(rig.bridge.nntp.connects(), connects + 1);
+    assert_eq!(rig.bridge.nntp.connects(), connects + 2);
     assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// An object of several extents on Usenet only: every extent posted and
+/// evicted, except those of `keep` (left in the cache) and of `lost`
+/// (evicted without ever being posted).
+async fn cold_parts(
+    cold: &Cold,
+    key: &str,
+    parts: &[Vec<u8>],
+    keep: &[usize],
+    lost: &[usize],
+) -> Vec<ExtentRow> {
+    let rig = &cold.rig;
+    let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    let extents = commit_parts(rig, &cold.signer, &cold.bucket, key, &slices).await;
+    for (i, extent) in extents.iter().enumerate() {
+        if !lost.contains(&i) {
+            cold.post(extent.generation_id.as_ref().unwrap(), extent)
+                .await;
+        }
+        if !keep.contains(&i) {
+            evict(rig, extent).await;
+        }
+    }
+    extents
+}
+
+fn cached(rig: &Rig<TcpConnector>, extent: &ExtentRow) -> bool {
+    rig.bridge
+        .cache
+        .stored(&extent.id.cache_key())
+        .is_some_and(|blob| sha256(&blob.bytes) == extent.cipher_sha256)
+}
+
+/// A body of several cold extents is read over one set of connections
+/// where it is produced ahead of its reader, and every extent is in the
+/// cache when the body ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_keeps_its_connections_from_extent_to_extent() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        // Two articles each.
+        let parts = [
+            pattern(71, 1_000_000),
+            pattern(72, 900_000),
+            pattern(73, 1_100_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        assert!(rig.bridge.cache.keys().is_empty());
+        let connects = rig.bridge.nntp.connects();
+
+        let resp = get(rig, &cold.signer, "multi", &[]).await;
+        resp.expect(200);
+        assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+        assert!(resp.body == parts.concat());
+        // Both slots of the provider, once: not once per extent.
+        assert_eq!(rig.bridge.nntp.connects(), connects + 2);
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert!(extents.iter().all(|e| cached(rig, e)));
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// Where the body runs only while its reader asks, nobody watches the
+/// time between two pieces: the connections are ended before each piece
+/// is handed over, so none sits idle on a slot that runs out.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_read_on_demand_keeps_no_connection_between_pieces() {
+    let cold = cold_rig().await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(71, 1_000_000),
+        pattern(72, 900_000),
+        pattern(73, 1_100_000),
+    ];
+    let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+    let connects = rig.bridge.nntp.connects();
+
+    let resp = get(rig, &cold.signer, "multi", &[]).await;
+    resp.expect(200);
+    assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+    assert!(resp.body == parts.concat());
+    assert_eq!(rig.bridge.nntp.connects(), connects + 6);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    assert!(extents.iter().all(|e| cached(rig, e)));
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// An extent that is in the cache, between two that are not, ends the
+/// connections: they are not kept idle past their slots.
+#[tokio::test(flavor = "current_thread")]
+async fn a_warm_extent_ends_the_connections_of_a_cold_body() {
+    let cold = cold_rig().await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(74, 1_000_000),
+        pattern(75, 100_000),
+        pattern(76, 1_000_000),
+    ];
+    let extents = cold_parts(&cold, "multi", &parts, &[1], &[]).await;
+    let connects = rig.bridge.nntp.connects();
+
+    let resp = get(rig, &cold.signer, "multi", &[]).await;
+    resp.expect(200);
+    assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+    assert!(resp.body == parts.concat());
+    assert_eq!(rig.bridge.nntp.connects(), connects + 4);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    assert!(cached(rig, &extents[0]) && cached(rig, &extents[2]));
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// The piece handed over is charged until it is pulled, and nothing
+/// else is: its ciphertext went to the cache beside the hand-over. No
+/// connection is open while a piece waits for a reader that nobody
+/// watches. The last piece comes after its cache write; a body that is
+/// dropped gives everything back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
+    let cold = cold_rig().await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(77, 300_000),
+        pattern(78, 200_000),
+        pattern(79, 250_000),
+    ];
+    let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+    let budget = &rig.bridge.budget;
+    let open = || {
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        Rc::clone(&rig.bridge).handle(req.into_request())
+    };
+
+    let resp = open().await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(budget.in_use(), 300_000);
+    assert!(cached(rig, &extents[0]) && !cached(rig, &extents[1]));
+    assert_eq!(rig.bridge.nntp.live(), 0, "no connection sits idle");
+    assert_eq!(free_slots(rig).await, 2);
+    let RespBody::Stream(mut body) = resp.body else {
+        panic!("a GET body is a stream");
+    };
+    assert_eq!(body.next().await.unwrap().unwrap(), parts[0]);
+    assert_eq!(budget.in_use(), 0);
+    assert!(
+        !cached(rig, &extents[1]),
+        "nothing is read ahead of the pull"
+    );
+
+    assert_eq!(body.next().await.unwrap().unwrap(), parts[1]);
+    assert!(cached(rig, &extents[1]) && !cached(rig, &extents[2]));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+
+    // The last piece: nothing is left to do after it.
+    assert_eq!(body.next().await.unwrap().unwrap(), parts[2]);
+    assert!(extents.iter().all(|e| cached(rig, e)));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    assert_eq!(budget.in_use(), 0);
+    assert!(body.next().await.is_none());
+
+    // A reader that goes away after the first piece.
+    for extent in &extents {
+        evict(rig, extent).await;
+    }
+    let resp = open().await;
+    let RespBody::Stream(mut body) = resp.body else {
+        panic!("a GET body is a stream");
+    };
+    assert_eq!(body.next().await.unwrap().unwrap(), parts[0]);
+    drop(body);
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    // Its slots are free again at the latest when they expire; the next
+    // read does not depend on them.
+    rig.bridge.clock.advance_secs(60);
+    let resp = get(rig, &cold.signer, "multi", &[]).await;
+    assert!(resp.expect(200).body == parts.concat());
+}
+
+/// With room for one extent and no more, the body is read all the same:
+/// each cache write ends before the next extent is read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_without_room_beside_the_cache_write_reads_one_extent_at_a_time() {
+    let cold = cold_rig().await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(80, 300_000),
+        pattern(81, 300_000),
+        pattern(82, 300_000),
+    ];
+    let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+    let step = extents
+        .iter()
+        .map(|e| velmora_bridge::fetch::cold_step_bytes(e.cipher_size, rig.bridge.cfg.cold_sockets))
+        .max()
+        .unwrap();
+    let held = rig
+        .bridge
+        .budget
+        .try_charge(rig.bridge.cfg.inflight_budget_bytes - step)
+        .unwrap();
+
+    let resp = get(rig, &cold.signer, "multi", &[]).await;
+    resp.expect(200);
+    assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+    assert!(resp.body == parts.concat());
+    assert!(extents.iter().all(|e| cached(rig, e)));
+    drop(held);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// A later extent that Usenet does not have ends the body with an error
+/// after the bytes before it. What was read is in the cache, and the
+/// connections are ended before the error is handed over.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_that_fails_leaves_the_cache_what_it_read_and_no_connection() {
+    let cold = cold_rig().await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(83, 300_000),
+        pattern(84, 300_000),
+        pattern(85, 300_000),
+    ];
+    let extents = cold_parts(&cold, "multi", &parts, &[], &[1]).await;
+
+    let resp = get(rig, &cold.signer, "multi", &[]).await;
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.stream_error.is_some(),
+        "the stream must end in an error"
+    );
+    assert!(resp.body == parts[0], "only verified bytes were sent");
+    assert!(cached(rig, &extents[0]));
+    assert!(!cached(rig, &extents[1]) && !cached(rig, &extents[2]));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// Spawns on the `LocalSet` the test runs in.
+fn local_spawner() -> Spawner {
+    Rc::new(|task| {
+        tokio::task::spawn_local(task);
+    })
+}
+
+/// On a host that can spawn, the body is produced by a task beside its
+/// reader: the bytes, the cache and what is held at the end are the same.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_produced_by_a_task_is_the_same_body() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, None, Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(91, 1_000_000),
+            pattern(92, 900_000),
+            pattern(93, 1_100_000),
+            pattern(94, 300_000),
+        ];
+        // The third still has a copy, the others are on Usenet only.
+        let extents = cold_parts(&cold, "multi", &parts, &[2], &[]).await;
+
+        let resp = get(rig, &cold.signer, "multi", &[]).await;
+        resp.expect(200);
+        assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+        assert!(resp.body == parts.concat());
+        for (i, extent) in extents.iter().enumerate() {
+            // The third was served from the copy it had.
+            assert!(i == 2 || cached(rig, extent));
+        }
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+
+        // A range that begins inside one extent and ends inside another.
+        for extent in &extents {
+            evict(rig, extent).await;
+        }
+        let resp = get_range(rig, &cold.signer, "multi", "bytes=999990-1900009").await;
+        resp.expect(206);
+        assert!(resp.body == parts.concat()[999_990..1_900_010]);
+    };
+    local.run_until(test).await;
+}
+
+/// The task runs one piece ahead of its reader and no further, and a
+/// body that is dropped takes the task's work along at once: nothing
+/// stays charged for a client that went away.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_produced_by_a_task_stops_with_its_reader() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(95, 300_000),
+            pattern(96, 300_000),
+            pattern(97, 300_000),
+            pattern(98, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        // The reader is away: the task goes on to the second piece and
+        // stays there.
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if cached(rig, &extents[1]) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(cached(rig, &extents[0]) && cached(rig, &extents[1]));
+        assert!(!cached(rig, &extents[2]), "one piece ahead, not two");
+        assert_eq!(
+            rig.bridge.budget.in_use(),
+            parts[1].len() as u64,
+            "the piece that waits is charged"
+        );
+        drop(body);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!cached(rig, &extents[2]) && !cached(rig, &extents[3]));
+    };
+    local.run_until(test).await;
+}
+
+/// Polls until `done` holds, for two seconds at most.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("never happened: {what}");
+}
+
+/// A piece that was produced ahead and is not taken in time is taken
+/// back: a reader that stalls holds none of the byte budget and no
+/// provider slot, and nothing more is read for it. When it asks again,
+/// the piece is produced again and the body is the same.
+#[tokio::test(flavor = "current_thread")]
+async fn a_piece_that_waits_too_long_is_taken_back_and_produced_again() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // The wait for the reader is 20 ms here; the other timers take
+        // the time they say.
+        let sleeper = timed_sleeper(|ms| match ms == PIECE_WAIT_MS {
+            true => 20,
+            false => ms.into(),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(101, 300_000),
+            pattern(102, 300_000),
+            pattern(103, 300_000),
+            pattern(104, 300_000),
+            pattern(111, 300_000),
+            pattern(112, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        // The answer holds the first piece. The reader stalls before
+        // it takes that one, and again later.
+        let mut next = 0;
+        for (ahead, held) in [(1, parts[0].len() as u64), (3, 0)] {
+            eventually("the piece is taken back", || {
+                cached(rig, &extents[ahead])
+                    && rig.bridge.budget.in_use() == held
+                    && rig.bridge.nntp.live() == 0
+            })
+            .await;
+            assert_eq!(free_slots(rig).await, 2);
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            assert_eq!(rig.bridge.budget.in_use(), held);
+            assert!(
+                !cached(rig, &extents[ahead + 1]),
+                "nothing is read for a reader that is away"
+            );
+            // It takes all there is, and one more that it waits for.
+            while next <= ahead {
+                assert!(body.next().await.unwrap().unwrap() == parts[next]);
+                next += 1;
+            }
+            assert!(body.next().await.unwrap().unwrap() == parts[next]);
+            next += 1;
+        }
+        for part in &parts[next..] {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+        }
+        assert!(body.next().await.is_none());
+        assert!(extents.iter().all(|e| cached(rig, e)));
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// A reader that let a piece wait too long gets nothing ahead until it
+/// asks for a piece soon after it took the one before: each piece is
+/// then made when it is asked for, so a slow reader does not have every
+/// extent read once to be taken back and once more to be served. A
+/// reader that is quick again gets pieces ahead again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slow_reader_gets_each_piece_when_it_asks_until_it_is_quick_again() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // The wait for the reader is 20 ms here.
+        let sleeper = timed_sleeper(|ms| match ms == PIECE_WAIT_MS {
+            true => 20,
+            false => ms.into(),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(113, 300_000),
+            pattern(114, 300_000),
+            pattern(115, 300_000),
+            pattern(116, 300_000),
+            pattern(117, 300_000),
+            pattern(118, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("the second piece is taken back", || {
+            cached(rig, &extents[1])
+                && rig.bridge.budget.in_use() == parts[0].len() as u64
+                && rig.bridge.nntp.live() == 0
+        })
+        .await;
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        // The reader is slow again: nothing is read for it meanwhile.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!cached(rig, &extents[2]), "nothing is made ahead");
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        // It asks for two pieces one right after the other: the pieces
+        // after them are made ahead again.
+        assert!(body.next().await.unwrap().unwrap() == parts[2]);
+        assert!(body.next().await.unwrap().unwrap() == parts[3]);
+        eventually("the next piece is made ahead", || cached(rig, &extents[4])).await;
+        assert!(body.next().await.unwrap().unwrap() == parts[4]);
+        assert!(body.next().await.unwrap().unwrap() == parts[5]);
+        assert!(body.next().await.is_none());
+        assert!(extents.iter().all(|e| cached(rig, e)));
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// A body that is produced ahead of a reader that keeps up holds a
+/// piece or the room for the next one at every moment. A request that
+/// waits for more room than is left beside one piece is served all the
+/// same: the body charges for its next piece in turn, after the request
+/// that waited before it, and goes on when there is room again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_ahead_of_its_reader_lets_a_waiting_request_have_its_room() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // A look for room takes the 100 ms it says, the other timers as
+        // in `real_sleeper`.
+        let real = real_sleeper();
+        let sleeper: Sleeper = Rc::new(move |ms| match ms {
+            CHARGE_POLL_MS => Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100))),
+            _ => real(ms),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..8u8).map(|n| pattern(120 + n, 300_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let extents = commit_parts(rig, &cold.signer, &cold.bucket, "warm", &slices).await;
+        let cipher = extents.iter().map(|e| e.cipher_size).max().unwrap();
+        let budget = &rig.bridge.budget;
+        // Room for one piece that waits and for making one more; the
+        // other request needs all of it but 100,000 bytes, so it fits
+        // only while the body holds nothing.
+        let room = cipher + 650_000;
+        let other = budget.try_charge(budget.capacity() - room).unwrap();
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "warm"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("a piece is made ahead", || {
+            budget.in_use() == other.bytes() + 600_000
+        })
+        .await;
+        // The other request is served once and gives its room back.
+        let served = Rc::new(Cell::new(false));
+        let (bridge, slot) = (Rc::clone(&rig.bridge), Rc::clone(&served));
+        tokio::task::spawn_local(async move {
+            let charge = bridge.budget.charge(room - 100_000).await.unwrap();
+            assert_eq!(charge.bytes(), room - 100_000);
+            slot.set(true);
+        });
+        // It waits by now, and looks for room every 100 ms. The reader
+        // takes a piece every 50 ms, between those looks: a body that
+        // did not wait its turn would have made the next piece each
+        // time before the other request looked, which would never see
+        // the room.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(!served.get());
+        for part in &parts[..7] {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(served.get(), "served before the body ended");
+        assert!(body.next().await.unwrap().unwrap() == parts[7]);
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), other.bytes());
+    };
+    local.run_until(test).await;
+}
+
+/// A request that waits for nearly the whole budget does not hold back
+/// a body it has room beside: a small object is read at once, piece
+/// after piece, while the large request still waits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_small_body_does_not_wait_for_a_large_request_that_waits() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..6u8).map(|n| pattern(130 + n, 1_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        commit_parts(rig, &cold.signer, &cold.bucket, "small", &slices).await;
+        let budget = &rig.bridge.budget;
+        // The large request has no room beside the other one, and all
+        // of the small body fits beside it.
+        let other = budget.try_charge(200_000).unwrap();
+        let large = budget.capacity() - 100_000;
+        let served = Rc::new(Cell::new(false));
+        let (bridge, slot) = (Rc::clone(&rig.bridge), Rc::clone(&served));
+        let waiting = tokio::task::spawn_local(async move {
+            let charge = bridge.budget.charge(large).await;
+            slot.set(true);
+            charge
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let began = std::time::Instant::now();
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "small"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        for part in &parts {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+        }
+        assert!(body.next().await.is_none());
+        // No piece waited a turn (5 s) or for room (20 s).
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!served.get(), "the large request still waits");
+        drop(other);
+        assert_eq!(waiting.await.unwrap().unwrap().bytes(), large);
+    };
+    local.run_until(test).await;
+}
+
+/// A body that has begun waits for room longer than a request that has
+/// sent nothing: its reader has a part already, and an end after one
+/// wait would be an error in the middle of a download.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_that_has_begun_waits_longer_for_room() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // The room is given back at the 300th look for it: a wait and a
+        // half.
+        let looks = Rc::new(Cell::new(0u32));
+        let taken: Rc<RefCell<Option<Charge>>> = Rc::default();
+        let real = real_sleeper();
+        let (n, slot) = (Rc::clone(&looks), Rc::clone(&taken));
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            if ms == CHARGE_POLL_MS {
+                n.set(n.get() + 1);
+                if n.get() == 300 {
+                    slot.borrow_mut().take();
+                }
+            }
+            real(ms)
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..3u8).map(|n| pattern(140 + n, 300_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        commit_parts(rig, &cold.signer, &cold.bucket, "begun", &slices).await;
+        let budget = &rig.bridge.budget;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "begun"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("a piece is made ahead", || budget.in_use() == 600_000).await;
+        // Another request takes all the rest: the last piece has no
+        // room, also once the two before it are taken.
+        *taken.borrow_mut() = budget.try_charge(budget.capacity() - 600_000);
+        assert!(taken.borrow().is_some());
+        looks.set(0);
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        assert!(body.next().await.unwrap().unwrap() == parts[2]);
+        assert!(looks.get() >= 300, "it waited: {}", looks.get());
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// A request that has sent nothing waits for room once and is then told
+/// to slow down: only a body that has begun waits longer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_that_has_sent_nothing_waits_for_room_once() {
+    let looks = Rc::new(Cell::new(0u32));
+    let real = real_sleeper();
+    let n = Rc::clone(&looks);
+    let sleeper: Sleeper = Rc::new(move |ms| {
+        if ms == CHARGE_POLL_MS {
+            n.set(n.get() + 1);
+        }
+        real(ms)
+    });
+    let cold = cold_rig_with(2, Some(sleeper)).await;
+    let rig = &cold.rig;
+    let body = pattern(150, 300_000);
+    rig.put(&cold.signer, BUCKET, "k", &body).await.expect(200);
+    let budget = &rig.bridge.budget;
+    let held = budget.try_charge(budget.capacity()).unwrap();
+    looks.set(0);
+    let resp = get(rig, &cold.signer, "k", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    let once = CHARGE_WAIT_MS / CHARGE_POLL_MS;
+    assert!(
+        (once..once + 10).contains(&looks.get()),
+        "it looked {} times",
+        looks.get()
+    );
+    drop(held);
+    assert!(get(rig, &cold.signer, "k", &[]).await.expect(200).body == body);
+}
+
+/// A read that found every provider slot taken waits for room in turn
+/// before it tries again, as a request that waits for room: a body that
+/// runs ahead of its reader, and holds a piece or the room for the next
+/// one at every moment, lets it have the room, and it is served while
+/// that body still runs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_that_waits_for_a_slot_gets_its_room_beside_a_body_ahead_of_its_reader() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // A look for room and a look for a slot take 100 ms; the looks
+        // for a slot are counted.
+        let slot_looks = Rc::new(Cell::new(0u32));
+        let real = real_sleeper();
+        let n = Rc::clone(&slot_looks);
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            if ms > CHARGE_POLL_MS {
+                return real(ms);
+            }
+            if ms != CHARGE_POLL_MS {
+                n.set(n.get() + 1);
+            }
+            Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100)))
+        });
+        let cold = cold_rig_on(4, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..32u8).map(|n| pattern(160 + n, 100_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let extents = commit_parts(rig, &cold.signer, &cold.bucket, "warm", &slices).await;
+        let cipher = extents.iter().map(|e| e.cipher_size).max().unwrap();
+        let lone = pattern(159, 200_000);
+        let extent = cold.put_and_post("cold.bin", &lone).await;
+        evict(rig, &extent).await;
+        let held = hold_all_slots(rig).await;
+        let budget = &rig.bridge.budget;
+        // The cold read fits only while the body holds nothing; the
+        // body has room for one piece that waits and for making one
+        // more.
+        let need =
+            velmora_bridge::fetch::cold_step_bytes(extent.cipher_size, rig.bridge.cfg.cold_sockets);
+        let room = need + 50_000;
+        assert!(room >= cipher + 250_000, "room {room}, cipher {cipher}");
+        let other = budget.try_charge(budget.capacity() - room).unwrap();
+        let sign = |key: &str| {
+            cold.signer.sign(
+                rig.now(),
+                Method::Get,
+                &path(BUCKET, key),
+                &[],
+                &[],
+                Vec::new(),
+            )
+        };
+        let resp = Rc::clone(&rig.bridge)
+            .handle(sign("warm").into_request())
+            .await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("a piece is made ahead", || {
+            budget.in_use() == other.bytes() + 200_000
+        })
+        .await;
+        let read: Rc<RefCell<Option<Vec<u8>>>> = Rc::default();
+        let (bridge, slot, req) = (Rc::clone(&rig.bridge), Rc::clone(&read), sign("cold.bin"));
+        tokio::task::spawn_local(async move {
+            let resp = bridge.handle(req.into_request()).await;
+            assert_eq!(resp.status, 200);
+            let RespBody::Stream(mut body) = resp.body else {
+                panic!("a GET body is a stream");
+            };
+            let mut all = Vec::new();
+            while let Some(chunk) = body.next().await {
+                all.extend_from_slice(&chunk.unwrap());
+            }
+            *slot.borrow_mut() = Some(all);
+        });
+        // The reader of the body takes a piece every 50 ms, between the
+        // looks of the cold read. Once that has found no slot, the
+        // slots are given back. A read that only looked for room, and
+        // was not waited for, would find it by chance after some
+        // forty pieces or when the body has ended; this one has it
+        // after six.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let mut held = Some(held);
+        let mut taken = 0;
+        for part in &parts[..20] {
+            if read.borrow().is_some() {
+                break;
+            }
+            if slot_looks.get() > 0 {
+                for permit in held.take().into_iter().flatten() {
+                    rig.bridge.catalog.release_permit(&permit).await.unwrap();
+                }
+            }
+            assert!(body.next().await.unwrap().unwrap() == *part);
+            taken += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(slot_looks.get() > 0, "the cold read found a slot at once");
+        assert!(
+            read.borrow().as_deref() == Some(&lone[..]),
+            "not served while the body ran ({taken} pieces taken)"
+        );
+        for part in &parts[taken..] {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), other.bytes());
+    };
+    local.run_until(test).await;
+}
+
+/// A body that waits for room in the byte budget ends its connections
+/// before their slots run out, and reads on once the room is there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // The time the connections may sit idle is 20 ms here; a piece
+        // waits for its reader as long as it says.
+        let sleeper = timed_sleeper(|ms| match ms > 20_000 {
+            true => 20,
+            false => ms.into(),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(105, 300_000),
+            pattern(106, 300_000),
+            pattern(107, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
+        let budget = &rig.bridge.budget;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("the first piece waits", || {
+            cached(rig, &extents[0]) && budget.in_use() == 300_000
+        })
+        .await;
+        assert!(rig.bridge.nntp.live() > 0, "kept for the next extent");
+        let connects = rig.bridge.nntp.connects();
+        // Another request takes all the room there is.
+        let other = budget.try_charge(budget.capacity() - 300_000).unwrap();
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        eventually("the connections are ended", || rig.bridge.nntp.live() == 0).await;
+        assert!(!cached(rig, &extents[1]));
+        assert_eq!(free_slots(rig).await, 2);
+        drop(other);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        assert!(body.next().await.unwrap().unwrap() == parts[2]);
+        assert!(body.next().await.is_none());
+        assert!(rig.bridge.nntp.connects() > connects, "it connected again");
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
+/// Two bodies of extents that have a copy, with room for the ciphertext
+/// of both and the plaintext of neither beside it: each takes all it
+/// needs at once or nothing, so one of them always goes on. Neither
+/// holds a part and waits for the rest.
+#[tokio::test(flavor = "current_thread")]
+async fn two_warm_bodies_do_not_wait_for_each_other_s_room() {
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let cold = cold_rig_with(2, Some(short_sleeper(asked.clone(), polls.clone()))).await;
+    let rig = &cold.rig;
+    let parts = [
+        pattern(108, 300_000),
+        pattern(109, 300_000),
+        pattern(110, 300_000),
+    ];
+    let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    let extents = commit_parts(rig, &cold.signer, &cold.bucket, "warm", &slices).await;
+    let cipher = extents.iter().map(|e| e.cipher_size).max().unwrap();
+    let budget = &rig.bridge.budget;
+    let room = 2 * cipher + 200_000;
+    let other = budget.try_charge(budget.capacity() - room).unwrap();
+
+    let (a, b) = futures_util::future::join(
+        get(rig, &cold.signer, "warm", &[]),
+        get(rig, &cold.signer, "warm", &[]),
+    )
+    .await;
+    for resp in [a, b] {
+        resp.expect(200);
+        assert!(resp.stream_error.is_none(), "{:?}", resp.stream_error);
+        assert!(resp.body == parts.concat());
+    }
+    assert!(
+        asked.get() < u64::from(velmora_bridge::ingress::CHARGE_WAIT_MS),
+        "neither waited as long as a request may"
+    );
+    drop(other);
+    assert_eq!(budget.in_use(), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -893,10 +1826,59 @@ async fn cold_read_without_a_free_connection_is_slow_down() {
     assert!(resp.body == body);
 }
 
+/// Whether a sleeper is asked for a timer that watches over something
+/// else (a renewal, a piece that waits, connections that sit idle), and
+/// not for the pause between two polls: those are short.
+fn is_watch(ms: u32) -> bool {
+    ms > CHARGE_POLL_MS
+}
+
+/// Sleeper for a rig on real time: a poll is 1 ms. `watch` gives the
+/// real milliseconds of a timer that watches over something.
+fn timed_sleeper(watch: impl Fn(u32) -> u64 + 'static) -> Sleeper {
+    Rc::new(move |ms| {
+        let real = match is_watch(ms) {
+            true => watch(ms),
+            false => 1,
+        };
+        Box::pin(tokio::time::sleep(std::time::Duration::from_millis(real)))
+    })
+}
+
+/// [`timed_sleeper`] whose watching timers take the time they say: none
+/// of them fires in a test that does not wait for it.
+fn real_sleeper() -> Sleeper {
+    timed_sleeper(u64::from)
+}
+
+/// How many read slots of the rig's provider are free.
+async fn free_slots(rig: &Rig<TcpConnector>) -> usize {
+    let provider = &rig.bridge.cfg.providers[0];
+    let mut held = Vec::new();
+    while let Some(permit) = rig
+        .bridge
+        .catalog
+        .acquire_permit(provider, PermitClass::Read, "other", rig.now())
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+    }
+    for permit in &held {
+        rig.bridge.catalog.release_permit(permit).await.unwrap();
+    }
+    held.len()
+}
+
 /// Sleeper that really sleeps 1 ms per poll (so sessions in flight make
 /// progress) and adds up the milliseconds the bridge asked for.
 fn short_sleeper(asked: Rc<Cell<u64>>, polls: Rc<Cell<u32>>) -> Sleeper {
     Rc::new(move |ms| {
+        if is_watch(ms) {
+            return Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
+                ms.into(),
+            )));
+        }
         assert!(
             (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) || ms == CHARGE_POLL_MS
         );
@@ -1010,6 +1992,10 @@ fn fake_cold_sleeper(
     overhead_ms: i64,
 ) -> Sleeper {
     Rc::new(move |ms| {
+        if is_watch(ms) {
+            // No real time passes here: nothing is watched.
+            return Box::pin(std::future::pending());
+        }
         assert!((COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms));
         asked.set(asked.get() + u64::from(ms));
         polls.set(polls.get() + 1);
@@ -1053,6 +2039,62 @@ fn renewing(held: Vec<Permit>) -> OnPoll {
             }
         })
     })
+}
+
+/// A read that every provider broke off is begun again after a wait: a
+/// provider's or a proxy's bad moment does not end the response. One
+/// that keeps breaking off ends as `SlowDown` after a few tries.
+#[tokio::test(flavor = "current_thread")]
+async fn an_interrupted_cold_read_is_begun_again() {
+    for heals in [true, false] {
+        let asked = Rc::new(Cell::new(0u64));
+        let polls = Rc::new(Cell::new(0u32));
+        let weak = Rc::new(RefCell::new(Weak::new()));
+        let hook = PollHook::default();
+        let sleeper =
+            fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone(), 0);
+        let cold = cold_rig_with(2, Some(sleeper)).await;
+        *weak.borrow_mut() = Rc::downgrade(&cold.rig.bridge);
+        let body = pattern(53, 1_500_000);
+        let extent = cold.put_and_post("cold.bin", &body).await;
+        evict(&cold.rig, &extent).await;
+        // Every `BODY` breaks off.
+        cold.server.drop_next_bodies(usize::MAX).await;
+        let Cold {
+            rig,
+            server,
+            signer,
+            ..
+        } = cold;
+        let server = Rc::new(server);
+        if heals {
+            // The provider is well again by the time the read has waited.
+            let server = Rc::clone(&server);
+            *hook.borrow_mut() = Some(Box::new(move |_, _| {
+                let server = Rc::clone(&server);
+                Box::pin(async move { server.drop_next_bodies(0).await })
+            }));
+        }
+
+        let resp = get(&rig, &signer, "cold.bin", &[]).await;
+        match heals {
+            true => {
+                resp.expect(200);
+                assert!(resp.body == body, "the read returned other bytes");
+                assert_eq!(polls.get(), 1);
+                let cached = rig.bridge.cache.stored(&extent.id.cache_key()).unwrap();
+                assert_eq!(sha256(&cached.bytes), extent.cipher_sha256);
+            }
+            false => {
+                resp.expect_error(503, "SlowDown");
+                assert!(resp.header("retry-after").is_some());
+                assert_eq!(polls.get(), service::INTERRUPTED_RETRIES);
+                assert!(rig.bridge.cache.keys().is_empty());
+            }
+        }
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1100,6 +2142,41 @@ async fn cold_read_waits_for_a_slot_then_slows_down() {
     let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
     resp.expect(200);
     assert!(resp.body == body);
+}
+
+/// The room is gone when the last wait for a slot is over: the read
+/// ends as `SlowDown` there, and begins no wait for room.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_for_a_slot_that_is_over_does_not_go_on_as_a_wait_for_room() {
+    let asked = Rc::new(Cell::new(0u64));
+    let polls = Rc::new(Cell::new(0u32));
+    let weak = Rc::new(RefCell::new(Weak::new()));
+    let hook = PollHook::default();
+    let sleeper = fake_cold_sleeper(asked.clone(), polls.clone(), weak.clone(), hook.clone(), 0);
+    let cold = cold_rig_with(4, Some(sleeper)).await;
+    let rig = &cold.rig;
+    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
+    let body = pattern(48, 300_000);
+    let extent = cold.put_and_post("cold.bin", &body).await;
+    evict(rig, &extent).await;
+
+    // The slots are held throughout, and another request takes the
+    // whole budget during the wait that reaches the bound.
+    let held = hold_all_slots(rig).await;
+    let taken: Rc<RefCell<Option<Charge>>> = Rc::default();
+    let (renew, total, slot) = (renewing(held), Rc::clone(&asked), Rc::clone(&taken));
+    *hook.borrow_mut() = Some(Box::new(move |poll, bridge| {
+        if total.get() >= u64::from(COLD_WAIT_MS) {
+            *slot.borrow_mut() = bridge.budget.try_charge(bridge.budget.capacity());
+        }
+        renew(poll, bridge)
+    }));
+
+    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    assert!(taken.borrow().is_some(), "the budget was not taken");
+    assert!(asked.get() < u64::from(COLD_WAIT_MS + COLD_POLL_MS + COLD_JITTER_MS));
+    assert!(rig.bridge.cache.keys().is_empty());
 }
 
 /// Readers that were cut off (their clients hung up) release nothing:
@@ -1302,40 +2379,6 @@ async fn each_extent_of_a_stream_gets_its_own_wait() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn interrupted_cold_read_is_slow_down_without_waiting() {
-    // A read that breaks off in transit is not slot contention: it is
-    // SlowDown at once, never retried in the wait loop.
-    let asked = Rc::new(Cell::new(0u64));
-    let polls = Rc::new(Cell::new(0u32));
-    let weak = Rc::new(RefCell::new(Weak::new()));
-    let sleeper = fake_cold_sleeper(
-        asked.clone(),
-        polls.clone(),
-        weak.clone(),
-        PollHook::default(),
-        0,
-    );
-    let cold = cold_rig_with(4, Some(sleeper)).await;
-    let rig = &cold.rig;
-    *weak.borrow_mut() = Rc::downgrade(&rig.bridge);
-    let body = pattern(67, 300_000);
-    let extent = cold.put_and_post("cold.bin", &body).await;
-    evict(rig, &extent).await;
-    let connects = rig.bridge.nntp.connects();
-
-    // Every reconnect the read is allowed breaks off mid-body.
-    cold.server.drop_next_bodies(3).await;
-    let resp = get(rig, &cold.signer, "cold.bin", &[]).await;
-    resp.expect_error(503, "SlowDown");
-    assert!(resp.header("retry-after").is_some());
-    assert_eq!(polls.get(), 0, "an interrupted read was retried");
-    assert_eq!(rig.bridge.nntp.connects() - connects, 3, "one fetch only");
-    assert!(rig.bridge.cache.keys().is_empty());
-    assert_eq!(rig.bridge.nntp.live(), 0);
-    assert_eq!(rig.bridge.budget.in_use(), 0);
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn never_posted_object_without_copies_is_unavailable() {
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
@@ -1357,9 +2400,12 @@ async fn cold_read_without_budget_for_the_extent_is_slow_down() {
     evict(rig, &extent).await;
     let connects = rig.bridge.nntp.connects();
     let capacity = rig.bridge.cfg.inflight_budget_bytes;
-    // A cold read holds the ciphertext twice: once while it is verified
-    // and once more for the cache write.
-    let need = 2 * extent.cipher_size;
+    // A cold read holds the ciphertext and, while it reads, the wire
+    // text of an article on every socket after the first: more, for an
+    // extent this small, than the plaintext it holds afterwards.
+    let need =
+        velmora_bridge::fetch::cold_step_bytes(extent.cipher_size, rig.bridge.cfg.cold_sockets);
+    assert!(need > 2 * extent.cipher_size);
 
     // One byte short: the small range is affordable warm, the extent is not.
     let held = rig.bridge.budget.try_charge(capacity - need + 1).unwrap();
@@ -1405,6 +2451,9 @@ async fn largest_extent_fits_the_smallest_allowed_budget_cold() {
     let mut cfg = config(vec![provider(&server)]);
     cfg.max_extent_bytes = MIB as u64;
     cfg.inflight_budget_bytes = 3 * MIB as u64;
+    // What a deployment with this budget reads over: the configuration
+    // lowers `COLD_SOCKETS` to what fits beside the extent and its copy.
+    cfg.cold_sockets = 1;
     let rig = rig_with(TcpConnector::default(), cfg);
     rig.bridge
         .catalog

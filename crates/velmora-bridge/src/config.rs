@@ -141,6 +141,15 @@ pub const DEFAULT_HOT_CAP_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 /// the addresses an account connects from; each socket also holds one
 /// article in memory.
 pub const DEFAULT_POST_SOCKETS: u32 = 4;
+/// Sockets of one invocation's cold reads when `COLD_SOCKETS` is unset
+/// (see [`crate::fetch::ColdFetch`]). They leave from one address, as a
+/// post job's do, and each holds the wire text of one article
+/// ([`crate::fetch::COLD_SOCKET_BYTES`]).
+pub const DEFAULT_COLD_SOCKETS: u32 = 4;
+/// Most `COLD_SOCKETS`. A deployment whose `INFLIGHT_BUDGET_BYTES` has
+/// no room for that many beside one extent and its copy for the cache
+/// reads over as many as fit ([`crate::fetch::cold_read_bytes`]).
+pub const MAX_COLD_SOCKETS: u32 = 8;
 /// `JOB_BUDGET_BYTES` may be at most `INFLIGHT_BUDGET_BYTES` times this
 /// ratio (3/2).
 ///
@@ -188,6 +197,9 @@ pub struct BridgeConfig {
     pub verify_delay_secs: u32,
     /// NNTP sockets one post job opens at most, over all its providers.
     pub post_sockets: u32,
+    /// Connections one invocation reads cold extents over
+    /// (`COLD_SOCKETS`, 1 to [`MAX_COLD_SOCKETS`]).
+    pub cold_sockets: u32,
     /// How long a posted article may take to reach another backbone on
     /// its own. Past it, verification posts an article a backbone still
     /// lacks straight to a provider of that backbone.
@@ -499,6 +511,12 @@ impl BridgeConfig {
         let verify_delay_secs: u32 = number(&get, "VERIFY_DELAY_SECS")?;
 
         let post_sockets = number_or(&get, "POST_SOCKETS", DEFAULT_POST_SOCKETS, (1, 8))?;
+        let cold_sockets = number_or(
+            &get,
+            "COLD_SOCKETS",
+            DEFAULT_COLD_SOCKETS,
+            (1, MAX_COLD_SOCKETS),
+        )?;
         let propagation_grace_secs = number_or(
             &get,
             "PROPAGATION_GRACE_SECS",
@@ -526,6 +544,20 @@ impl BridgeConfig {
         if inflight_budget_bytes < max_extent_bytes.saturating_mul(2) {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }
+        // Only as many sockets as the budget has room for: what a cold
+        // read of the largest extent charges is counted from the
+        // ciphertext, which is a little larger than the plaintext. A
+        // read that could never be charged would fail every time.
+        let cipher = velmora::media::ciphertext_size(max_extent_bytes)
+            .ok_or_else(|| ConfigError::Invalid("MAX_EXTENT_BYTES".into()))?;
+        let fits = |sockets: &u32| {
+            crate::fetch::cold_read_bytes(cipher, *sockets) <= inflight_budget_bytes
+        };
+        // Not even one socket: the budget is under twice the ciphertext.
+        let cold_sockets = (1..=cold_sockets)
+            .rev()
+            .find(fits)
+            .ok_or_else(|| ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()))?;
         // Never under the request limit, and never more than half as much
         // again (see `MAX_JOB_BUDGET_NUM`).
         let job_budget_bytes: u64 = match get("JOB_BUDGET_BYTES") {
@@ -633,6 +665,7 @@ impl BridgeConfig {
             safety_min_age_secs,
             verify_delay_secs,
             post_sockets,
+            cold_sockets,
             propagation_grace_secs,
             newsgroups,
             kek_active,

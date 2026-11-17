@@ -142,7 +142,8 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         clock: WorkerClock,
         budget: ByteBudget::new(cfg.inflight_budget_bytes)
             .with_job_capacity(cfg.job_budget_bytes)
-            .with_sleeper(sleeper()),
+            .with_sleeper(sleeper())
+            .with_spawner(Rc::new(worker::wasm_bindgen_futures::spawn_local)),
         cfg,
     })
 }

@@ -350,6 +350,7 @@ pub struct StoredBlob {
 pub struct MemBlobStore {
     blobs: RefCell<BTreeMap<String, StoredBlob>>,
     gets: Cell<u64>,
+    refuse_puts: Cell<bool>,
 }
 
 impl MemBlobStore {
@@ -359,6 +360,11 @@ impl MemBlobStore {
 
     pub fn contains(&self, key: &str) -> bool {
         self.blobs.borrow().contains_key(key)
+    }
+
+    /// While set, every `put` fails and stores nothing.
+    pub fn refuse_puts(&self, refuse: bool) {
+        self.refuse_puts.set(refuse);
     }
 
     /// `get` calls so far.
@@ -397,6 +403,9 @@ impl BlobStore for MemBlobStore {
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if digest != *meta.cipher_sha256 {
             return Err(BridgeError::Blob("mem: put digest mismatch".into()));
+        }
+        if self.refuse_puts.get() {
+            return Err(BridgeError::Blob("mem: put refused".into()));
         }
         self.blobs.borrow_mut().insert(
             key.to_string(),

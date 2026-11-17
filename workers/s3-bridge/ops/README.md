@@ -734,13 +734,86 @@ Measured on a deployed Worker with an object of 12 GiB (768 extents of
 |---|---|---|---|
 | whole object from the cache | 536 s (22 MiB/s) | 20 to 40 s | under 0.2 s |
 | 5 GiB range from the cache | 252 s (20 MiB/s) | 20 to 40 s | under 0.2 s |
-| 2 GiB range from Usenet | 1,569 s (1.3 MiB/s) | 50 to 90 s | under 0.2 s |
 
-A read from Usenet in one GET goes extent by extent, so it is slow next
-to a client that asks for many ranges at once; the cache is filled
-either way. In the same drill one such GET lost its provider connection
-in the second sub-range: the transfer broke after 1,152 MiB, all of
-them the right bytes, and the client reported a short body.
+A read from Usenet (an extent that is neither in the cache nor a safety
+copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
+
+- **Verified, then sent.** The articles of an extent arrive on whichever
+  connection is free, each is checked against its hash, the extent
+  against its own, and only then is it decrypted and sent. The cache
+  write of an extent runs beside the read of the next one and is not
+  waited for by the client; a cache write that fails does not fail the
+  read.
+- **One step ahead, no further.** The Worker reads one extent ahead of
+  the client and holds one cache write, all within
+  `INFLIGHT_BUDGET_BYTES`. A client that stops reading stops the Worker
+  after that extent, and a client that goes away ends the read.
+- **A failed article.** An article a provider lacks, or sends wrong, is
+  asked for from the next provider that has a connection or a permit. A
+  connection that breaks is opened again a bounded number of times,
+  and a provider that keeps failing is left for the others. The
+  read fails only when no provider can supply an article, and then the
+  download breaks as described above: never a short body that looks
+  complete.
+- **A slow connection.** A connection that takes over three times as
+  long per article as the others, and over a second, holds up every
+  extent. It is ended and another is opened in its place, at most
+  eight times for one set of connections (a download opens a new set
+  after it ended one, see the next point); after that the read goes on
+  with fewer connections.
+- **A client that stalls.** A verified extent waits five seconds for
+  the client. Then it is dropped, with its share of the byte budget,
+  and the connections are ended; when the client reads again, the
+  extent comes from the cache. The connections are also ended when the
+  download waits for anything but a provider (room in the byte budget,
+  a cache write) for longer than their slots allow: no connection sits
+  idle on a slot that ran out. After that the next extents are read
+  only when the client asks for them, until it asks for one within
+  five seconds of taking the one before; a client slower than about
+  3 MiB/s is served that way throughout.
+- **Other requests in the same isolate.** A request that waits for
+  room in the byte budget, and that the download alone keeps out, goes
+  first: the download charges for its next extent after it, so a
+  second large request is not kept waiting until the download ends, and
+  the two take turns. The download waits for it five seconds at most. A
+  request that other requests keep out, or that fits beside the
+  download, is not waited for: a small read is not slowed down by a
+  large upload that waits. A read that found every provider connection
+  taken waits for its room the same way before it tries again, inside
+  its forty seconds. A download that has begun waits up to a minute for
+  room before it ends short, and no longer once those forty seconds are
+  over; a request that has sent nothing waits twenty seconds and
+  answers `503 SlowDown`.
+- **The log.** Each invocation that read from Usenet writes one line,
+  `cold read: extents=64 opened=8 open_ms=70 broken=0 slow=0
+  refetched=0 p1=1536/1074007040 warm_ms=... read_ms=... wait_ms=...
+  send_ms=... put_ms=...`: connections opened, broken and ended for
+  being slow, articles asked for a second time, articles and bytes per
+  provider id, and the milliseconds spent asking the cache, reading,
+  waiting for room in the byte budget, waiting for the client, and
+  writing to the cache. It names no key, bucket, message-id or host.
+
+Measured on a deployed Worker with an object of 6 GiB (384 extents of
+16 MiB) that was in neither bucket, one provider reached through a
+proxy, `COLD_SOCKETS = "8"`, sub-ranges of 1 GiB:
+
+| | wall | CPU per sub-range of 1 GiB |
+|---|---|---|
+| 2 GiB range from Usenet, before (one connection) | 812 s (2.5 MiB/s) | 50 to 90 s |
+| 2 GiB range from Usenet, eleven runs | 152 to 212 s (10 to 13 MiB/s) in seven, 244 to 298 s (7 to 8 MiB/s) in four | 42 to 60 s in the faster runs, 55 to 89 s in the slower ones |
+| whole object from Usenet, six runs | 393 and 400 s (15 MiB/s) in two, 666 to 803 s (8 to 9 MiB/s) in four, some hours later | 34 to 37 s in the faster runs, 56 to 77 s in the slower ones |
+
+The cache write sets the pace: one extent takes one to two seconds to
+write, and only one write fits in the byte budget beside the next read.
+In a slower run every part is slower by about the same factor, and the
+CPU time rises with the wall time (about 0.6 s of CPU per second in
+every run), while no article is asked for twice and at most a few slow
+connections are replaced. Why one run is slower than the next was not
+found.
+The earlier drill (an object of 12 GiB, in the first table) read a 2 GiB
+range from Usenet at 1.3 MiB/s, and one such GET lost its provider
+connection in the second sub-range and broke after 1,152 MiB; a
+connection lost now is opened again.
 
 ## KEK
 

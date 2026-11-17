@@ -44,6 +44,13 @@ MAINTENANCE = "off"                  # off | restore
 # jobs and a verify job fit the 72 MiB job budget at once; at 8 only two
 # post jobs fit beside a verify job and the third waits for them.
 POST_SOCKETS = "6"
+# Connections one GET reads extents from Usenet over, 1 to 8. They leave
+# from one address and each is one provider permit; a read that gets
+# fewer permits reads over fewer. At 8 an invocation holds one extent,
+# the articles on the wire and the cache write of the extent before it
+# within the 48 MiB above. See "A GET above GET_FANOUT_BYTES" in
+# ops/README.md for what was measured.
+COLD_SOCKETS = "8"
 # The largest body of a PutObject or an UploadPart: 99 MiB, the most this
 # build takes. A request body above 100 MiB is refused before it reaches
 # the Worker, and the margin is for chunked framing. A body above
@@ -81,7 +88,7 @@ INTENT_SWEEP = "off"
 # A missing or refused value stops the copy only, with an error line on
 # every cron run; it never stops the S3 service.
 RECOVERY_COPY = "off"
-# Optional vars and their defaults (production sets POST_SOCKETS explicitly):
+# Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
 #     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above
@@ -90,6 +97,8 @@ RECOVERY_COPY = "off"
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
 #     A job is one source address to a provider, however many connections it holds there.
+#   COLD_SOCKETS (4; production sets 8 above): connections one GET reads from Usenet over, 1 to 8, each on its own
+#     provider permit. Fewer are used when INFLIGHT_BUDGET_BYTES has no room for that many beside an extent and its cache write.
 #   JOB_BUDGET_BYTES (the value of INFLIGHT_BUDGET_BYTES): see above; from that value to 1.5 times it.
 #   PROPAGATION_GRACE_SECS (21600, 6 h): after it, an article a backbone still lacks is posted to that backbone.
 #   PACKED_PLANS (off; production sets it on below): off | on. On: the article plan of a new extent is one value on its row
@@ -112,7 +121,7 @@ PACKED_PLANS = "on"
 # sub-ranges of this size: the invocation that answers the client asks
 # this Worker for each sub-range in turn through the SELF binding below,
 # and each of those runs under its own CPU limit. One invocation reads
-# about 9 GiB from the cache within cpu_ms, and 3 to 6 GiB from Usenet,
+# about 9 GiB from the cache within cpu_ms, and 4 to 7 GiB from Usenet,
 # so 1 GiB leaves a wide margin. From 1 MiB to 2 GiB; unset or "0"
 # serves every GET in one invocation. A GET of more than 8,192
 # sub-ranges (8 TiB at 1 GiB) is refused. See "A GET above

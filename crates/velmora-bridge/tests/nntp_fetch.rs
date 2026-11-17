@@ -196,9 +196,10 @@ async fn cold_read_without_a_slot_is_busy() {
 }
 
 /// A read renews its slot before it connects and again before the first
-/// `BODY` on the new connection: every call to the provider starts on a
-/// slot renewed at that moment, so a slot is never counted on for more
-/// than one call. A read's slot lives only a little longer than that.
+/// `BODY` on the new connection when the connect was slow: every call
+/// to the provider that takes longer than the renewal is counted on
+/// starts on a slot renewed at that moment. A read's slot lives only a
+/// little longer than one call.
 #[tokio::test]
 async fn a_read_renews_its_slot_after_connecting() {
     let rig = simple_rig().await;
@@ -218,6 +219,35 @@ async fn a_read_renews_its_slot_after_connecting() {
     assert_eq!(calls.len(), 1 + plan.len());
     for (what, at) in &calls {
         assert!(renewed.contains(at), "{what} at {at:?} on a stale slot");
+    }
+}
+
+/// Calls that follow a renewal closely need none of their own: a
+/// renewal is counted on for `READ_RENEW_SECS` from the time read before
+/// it, the bound a slow renewal has, and for no call that starts later.
+#[tokio::test]
+async fn a_read_counts_on_a_renewal_only_for_the_renewal_window() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted_cold(8).await;
+    let window = i64::from(PermitClass::Read.renew_secs().unwrap()) * 1000;
+    let call_ms = 2_000;
+    rig.bridge.nntp.slow(&rig.bridge.clock, call_ms);
+    rig.bridge.catalog.permit_renewed_at.borrow_mut().clear();
+
+    assert_eq!(rig.fetch(&s).await, ColdFetch::Filled(s.cipher.clone()));
+    let calls = rig.bridge.nntp.calls();
+    let renewed = rig.bridge.catalog.permit_renewed_at.borrow().clone();
+    assert_eq!(calls.len(), 1 + plan.len());
+    for (what, at) in &calls {
+        let last = renewed.iter().filter(|r| r.0 <= at.0).max_by_key(|r| r.0);
+        let age = at.0 - last.expect("a call before any renewal").0;
+        assert!(age < window, "{what} began {age} ms after the last renewal");
+    }
+    // Calls of two seconds: two more start inside the window of each
+    // renewal, so there is one renewal for every three calls.
+    assert_eq!(renewed.len(), calls.len().div_ceil(3));
+    for pair in renewed.windows(2) {
+        assert!(pair[1].0 - pair[0].0 >= window);
     }
 }
 

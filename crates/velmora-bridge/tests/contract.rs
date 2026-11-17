@@ -14,8 +14,9 @@ use std::rc::Rc;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
-    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_HOT_CAP_BYTES,
-    DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT, MAX_PUT_BYTES_LIMIT,
+    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_COLD_SOCKETS,
+    DEFAULT_HOT_CAP_BYTES, DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT,
+    MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::RESEND_SECS;
@@ -352,6 +353,51 @@ fn config_loads_from_documented_vars() {
     }
     sized.remove("GET_FANOUT_BYTES");
     assert_eq!(load(&sized).unwrap().get_fanout_bytes, None);
+    // A cold read uses four connections unless told otherwise, from one
+    // to eight, and never more than fit the byte budget beside one extent
+    // and its copy: 48 MiB less 32 MiB leaves room for ten more.
+    assert_eq!(cfg.cold_sockets, 4);
+    for (value, want) in [
+        ("", Some(4)),
+        ("1", Some(1)),
+        ("8", Some(8)),
+        ("0", None),
+        ("9", None),
+        ("many", None),
+    ] {
+        sized.insert("COLD_SOCKETS".to_string(), value.to_string());
+        let got = load(&sized).map(|c| c.cold_sockets);
+        match want {
+            Some(want) => assert_eq!(got.unwrap(), want, "{value:?}"),
+            None => assert_eq!(
+                got.unwrap_err(),
+                ConfigError::Invalid("COLD_SOCKETS".into()),
+                "{value:?}"
+            ),
+        }
+    }
+    // A budget with room for the ciphertext of one extent, its copy and
+    // two more sockets lowers the count instead of refusing every cold
+    // read. The room is counted from the ciphertext: two plaintext
+    // extents and two sockets are 8288 bytes short of it.
+    sized.insert("COLD_SOCKETS".to_string(), "8".to_string());
+    for (budget, want) in [
+        ("36708448", 3),
+        ("36708447", 2),
+        ("36700160", 2),
+        ("33562720", 1),
+    ] {
+        sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), budget.to_string());
+        let cfg = load(&sized).unwrap();
+        assert_eq!(cfg.cold_sockets, want, "{budget}");
+        let cipher = velmora::media::ciphertext_size(cfg.max_extent_bytes).unwrap();
+        assert!(
+            velmora_bridge::fetch::cold_read_bytes(cipher, want) <= cfg.inflight_budget_bytes,
+            "{budget}"
+        );
+    }
+    sized.remove("COLD_SOCKETS");
+    sized.insert("INFLIGHT_BUDGET_BYTES".to_string(), "50331648".to_string());
     // The catalogue id is one path segment of the stamp keys.
     assert_eq!(cfg.catalogue_id, "main");
     for (value, want) in [("", Some("main")), (" eu-1 ", Some("eu-1")), ("a/b", None)] {
@@ -421,6 +467,14 @@ fn missing_secret_fails_closed() {
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
             vars.insert(name.clone(), "  ".into());
             assert_eq!(load(&vars).unwrap().post_sockets, DEFAULT_POST_SOCKETS);
+            continue;
+        }
+        // Connections of a read from Usenet: absent or blank is the
+        // default of four.
+        if name == "COLD_SOCKETS" {
+            assert_eq!(load(&vars).unwrap().cold_sockets, DEFAULT_COLD_SOCKETS);
+            vars.insert(name.clone(), "  ".into());
+            assert_eq!(load(&vars).unwrap().cold_sockets, DEFAULT_COLD_SOCKETS);
             continue;
         }
         // Sliced PutObject: absent or blank, a PUT is one extent as
@@ -527,6 +581,8 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("POST_SOCKETS", "0"),
         ("POST_SOCKETS", "9"),
         ("POST_SOCKETS", "four"),
+        ("COLD_SOCKETS", "0"),
+        ("COLD_SOCKETS", "9"),
         ("PROPAGATION_GRACE_SECS", "-1"),
         ("PROPAGATION_GRACE_SECS", "6h"),
         // Below one extent, above what the edge lets through, not a number.
@@ -632,6 +688,16 @@ fn config_rejects_invalid_and_unsafe_values() {
         set(&prod, "INFLIGHT_BUDGET_BYTES", "33554431"),
         invalid("INFLIGHT_BUDGET_BYTES")
     );
+    // Twice the plaintext is not enough: a cold read charges twice the
+    // ciphertext (33,562,720 bytes for the largest extent), and a budget
+    // under that could never charge one.
+    for short in ["33554432", "33562719"] {
+        assert_eq!(
+            set(&prod, "INFLIGHT_BUDGET_BYTES", short),
+            invalid("INFLIGHT_BUDGET_BYTES"),
+            "{short}"
+        );
+    }
     // The job budget: from the request budget to 1.5 times it.
     for bad in ["50331647", "75497473", "72MiB", "-1"] {
         assert_eq!(

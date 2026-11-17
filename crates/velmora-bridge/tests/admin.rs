@@ -159,6 +159,7 @@ impl Fx {
             safety_min_age_secs: 0,
             verify_delay_secs: 1,
             post_sockets: 4,
+            cold_sockets: 4,
             propagation_grace_secs: 21_600,
             newsgroups: vec!["alt.binaries.test".to_string()],
             kek_active: 1,

@@ -24,7 +24,7 @@
 //! (dev only) is set, so every request that reaches a handler arrived over
 //! trusted transport and the handler passes `https = true` to SigV4.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 
@@ -44,6 +44,13 @@ pub const CHARGE_WAIT_MS: u32 = 20_000;
 
 /// Poll interval while waiting for budget.
 pub const CHARGE_POLL_MS: u32 = 100;
+
+/// How long a charge taken in turn ([`ByteBudget::charge_in_turn`]) lets
+/// the charges that waited before it go first. One that is polled takes
+/// the room within a poll of it being free; one that is listed but not
+/// polled any more (its request is stopped, or busy elsewhere) holds
+/// the others back no longer than this.
+pub const TURN_WAIT_MS: u32 = 5_000;
 
 /// Longest accepted `Content-Length` value (digits). `u64::MAX` has 20.
 const MAX_LENGTH_DIGITS: usize = 20;
@@ -462,6 +469,9 @@ pub fn precheck(
 /// Sleeps the given number of milliseconds on the host runtime.
 pub type Sleeper = Rc<dyn Fn(u32) -> LocalBoxFuture<'static, ()>>;
 
+/// Runs a future to its end on the host runtime, beside the caller.
+pub type Spawner = Rc<dyn Fn(LocalBoxFuture<'static, ()>)>;
+
 #[derive(Debug)]
 struct BudgetState {
     capacity: u64,
@@ -472,6 +482,35 @@ struct BudgetState {
     /// Bytes charged by background jobs.
     jobs: Cell<u64>,
     peak: Cell<u64>,
+    /// The number the next charge that waits is given.
+    next_wait: Cell<u64>,
+    /// The charges that wait for room now: the lowest number came
+    /// first.
+    waiting: RefCell<Vec<Listed>>,
+}
+
+/// A charge that waits for room, as the others see it.
+#[derive(Clone, Copy, Debug)]
+struct Listed {
+    number: u64,
+    requests: u64,
+    jobs: u64,
+}
+
+/// One charge that waits for room, from its first wait until it is
+/// served, gives up or is dropped.
+struct Waiting {
+    state: Rc<BudgetState>,
+    number: u64,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.state
+            .waiting
+            .borrow_mut()
+            .retain(|w| w.number != self.number);
+    }
 }
 
 impl BudgetState {
@@ -486,6 +525,30 @@ impl BudgetState {
             return requests == 0 && jobs == 0;
         }
         u128::from(requests) * job_cap + u128::from(jobs) * cap <= cap * job_cap
+    }
+
+    /// Whether a charge of `requests` and `jobs` bytes, of a request
+    /// that holds `held` bytes already, would keep out a charge that
+    /// waited before it (before `mine`, when this one is listed too):
+    /// one that has room beside what all the others hold, and none when
+    /// this request is counted too. A charge that the others keep out
+    /// is not waiting for this request, and one that fits beside all of
+    /// it is not kept out: neither is waited for.
+    fn in_the_way(&self, requests: u64, jobs: u64, held: u64, mine: Option<u64>) -> bool {
+        let others = self.requests.get().saturating_sub(held);
+        let own = requests.saturating_add(held);
+        self.waiting
+            .borrow()
+            .iter()
+            .filter(|w| mine.is_none_or(|mine| w.number < mine))
+            .any(|w| {
+                let (requests, all_jobs) = (
+                    others.saturating_add(w.requests),
+                    self.jobs.get().saturating_add(w.jobs),
+                );
+                self.fits(requests, all_jobs)
+                    && !self.fits(requests.saturating_add(own), all_jobs.saturating_add(jobs))
+            })
     }
 }
 
@@ -505,6 +568,10 @@ impl BudgetState {
 pub struct ByteBudget {
     state: Rc<BudgetState>,
     sleeper: Option<Sleeper>,
+    spawner: Option<Spawner>,
+    /// The bytes held by the charges taken through this handle, when it
+    /// stands for one request ([`ByteBudget::for_request`]).
+    held: Option<Rc<Cell<u64>>>,
 }
 
 impl fmt::Debug for ByteBudget {
@@ -532,8 +599,12 @@ impl ByteBudget {
                 requests: Cell::new(0),
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
+                next_wait: Cell::new(0),
+                waiting: RefCell::new(Vec::new()),
             }),
             sleeper: None,
+            spawner: None,
+            held: None,
         }
     }
 
@@ -549,14 +620,39 @@ impl ByteBudget {
                 requests: Cell::new(0),
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
+                next_wait: Cell::new(0),
+                waiting: RefCell::new(Vec::new()),
             }),
             sleeper: self.sleeper,
+            spawner: self.spawner,
+            held: None,
+        }
+    }
+
+    /// The same budget for one request: what is charged through the
+    /// handle returned is counted as held by that request, until each
+    /// charge is dropped. A charge taken in turn through it
+    /// ([`Self::charge_in_turn`]) is weighed together with what the
+    /// request holds.
+    pub fn for_request(&self) -> ByteBudget {
+        ByteBudget {
+            state: Rc::clone(&self.state),
+            sleeper: self.sleeper.clone(),
+            spawner: self.spawner.clone(),
+            held: Some(Rc::default()),
         }
     }
 
     /// Lets [`ByteBudget::charge`] wait up to [`CHARGE_WAIT_MS`] for room.
     pub fn with_sleeper(mut self, sleeper: Sleeper) -> Self {
         self.sleeper = Some(sleeper);
+        self
+    }
+
+    /// Lets the body of a GET be produced beside the client that reads
+    /// it, one piece ahead (see [`ByteBudget::spawner`]).
+    pub fn with_spawner(mut self, spawner: Spawner) -> Self {
+        self.spawner = Some(spawner);
         self
     }
 
@@ -575,6 +671,13 @@ impl ByteBudget {
     /// poll with it too, so a budget without one never waits anywhere.
     pub fn sleeper(&self) -> Option<&Sleeper> {
         self.sleeper.as_ref()
+    }
+
+    /// The host spawner, if there is one. It sits here beside the sleeper
+    /// as the other thing only the host runtime can do. Without one a
+    /// body is produced only while its reader asks for the next piece.
+    pub fn spawner(&self) -> Option<&Spawner> {
+        self.spawner.as_ref()
     }
 
     /// Bytes charged right now, by requests and jobs together.
@@ -614,11 +717,45 @@ impl ByteBudget {
         if in_use > s.peak.get() {
             s.peak.set(in_use);
         }
+        if let Some(held) = &self.held {
+            held.set(held.get().saturating_add(bytes));
+        }
         Some(Charge {
             state: Rc::clone(&self.state),
             requests,
             jobs,
+            held: self.held.clone(),
         })
+    }
+
+    /// The bytes the request of this handle holds now
+    /// ([`Self::for_request`]), 0 for the budget itself.
+    fn held(&self) -> u64 {
+        self.held.as_ref().map_or(0, |held| held.get())
+    }
+
+    /// As [`Self::try_charge`], but not while a charge waits that this
+    /// request alone keeps out: one that has room beside what the other
+    /// requests hold, and none beside these bytes and what this request
+    /// holds already (see [`Self::for_request`]). For a caller that
+    /// would otherwise take, again and again, the room a waiting request
+    /// needs (a body that is produced ahead of its reader). A charge
+    /// that fits beside this request, or that others keep out, is not
+    /// waited for: a small read goes on while a large upload waits.
+    pub fn try_charge_in_turn(&self, bytes: u64) -> Option<Charge> {
+        match self.state.in_the_way(bytes, 0, self.held(), None) {
+            true => None,
+            false => self.try_charge(bytes),
+        }
+    }
+
+    /// As [`Self::charge`], but after the charges that were waiting
+    /// before this one and that this request alone keeps out: see
+    /// [`Self::try_charge_in_turn`]. They are let first for
+    /// [`TURN_WAIT_MS`] at most, then this charge takes what is free
+    /// like any other.
+    pub async fn charge_in_turn(&self, bytes: u64) -> Result<Charge, IngressError> {
+        self.charge_as(bytes, false, true).await
     }
 
     /// Charges `bytes` for a request, waiting up to [`CHARGE_WAIT_MS`] for
@@ -626,16 +763,21 @@ impl ByteBudget {
     /// the whole capacity can never fit and fails at once. The caller has
     /// not read the body.
     pub async fn charge(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, false).await
+        self.charge_as(bytes, false, false).await
     }
 
     /// [`ByteBudget::charge`] for a background job: the same wait, against
     /// the job limit.
     pub async fn charge_job(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, true).await
+        self.charge_as(bytes, true, false).await
     }
 
-    async fn charge_as(&self, bytes: u64, job: bool) -> Result<Charge, IngressError> {
+    async fn charge_as(
+        &self,
+        bytes: u64,
+        job: bool,
+        in_turn: bool,
+    ) -> Result<Charge, IngressError> {
         let limit = if job {
             self.state.job_capacity
         } else {
@@ -645,15 +787,41 @@ impl ByteBudget {
             return Err(IngressError::SlowDown);
         }
         let mut waited = 0u32;
+        // Listed while this waits, so a charge that takes its turn sees
+        // it; taken off the list when this returns or is dropped.
+        let mut waiting: Option<Waiting> = None;
         loop {
-            if let Some(c) = self.try_charge_as(bytes, job) {
-                return Ok(c);
+            // Someone who waited before this one, and whom only its
+            // request keeps out, is served first: for a bounded time.
+            let behind = in_turn && waited < TURN_WAIT_MS && {
+                let mine = waiting.as_ref().map(|w| w.number);
+                let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
+                self.state.in_the_way(requests, jobs, self.held(), mine)
+            };
+            if !behind {
+                if let Some(c) = self.try_charge_as(bytes, job) {
+                    return Ok(c);
+                }
             }
             let Some(sleep) = &self.sleeper else {
                 return Err(IngressError::SlowDown);
             };
             if waited >= CHARGE_WAIT_MS {
                 return Err(IngressError::SlowDown);
+            }
+            if waiting.is_none() {
+                let number = self.state.next_wait.get();
+                self.state.next_wait.set(number.wrapping_add(1));
+                let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
+                self.state.waiting.borrow_mut().push(Listed {
+                    number,
+                    requests,
+                    jobs,
+                });
+                waiting = Some(Waiting {
+                    state: Rc::clone(&self.state),
+                    number,
+                });
             }
             sleep(CHARGE_POLL_MS).await;
             waited = waited.saturating_add(CHARGE_POLL_MS);
@@ -675,9 +843,21 @@ pub struct Charge {
     requests: u64,
     /// Bytes charged as a background job.
     jobs: u64,
+    /// The count of what its request holds, which these bytes are in.
+    held: Option<Rc<Cell<u64>>>,
 }
 
 impl Charge {
+    /// Takes `bytes` off the count of the request, or puts them on.
+    fn count(&self, bytes: u64, on: bool) {
+        if let Some(held) = &self.held {
+            held.set(match on {
+                true => held.get().saturating_add(bytes),
+                false => held.get().saturating_sub(bytes),
+            });
+        }
+    }
+
     pub fn bytes(&self) -> u64 {
         self.requests.saturating_add(self.jobs)
     }
@@ -686,6 +866,8 @@ impl Charge {
     /// A charge against another budget is released instead.
     pub fn absorb(&mut self, mut other: Charge) {
         if Rc::ptr_eq(&self.state, &other.state) {
+            other.count(other.bytes(), false);
+            self.count(other.bytes(), true);
             self.requests = self.requests.saturating_add(other.requests);
             self.jobs = self.jobs.saturating_add(other.jobs);
             other.requests = 0;
@@ -704,6 +886,7 @@ impl fmt::Debug for Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
+        self.count(self.bytes(), false);
         let s = &self.state;
         s.requests
             .set(s.requests.get().saturating_sub(self.requests));
