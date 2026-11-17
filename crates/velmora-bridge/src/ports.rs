@@ -87,9 +87,11 @@ pub struct SqlLimits {
 }
 
 impl SqlLimits {
-    /// D1, as measured with a publish of 65,536 extents in one batch:
-    /// values of up to 1.3 MB were accepted, 25,000 rows a value. The
-    /// byte limit stays under [`MAX_SQL_VALUE_BYTES`].
+    /// D1. 25,000 rows a value is what a publish of 65,536 extents was
+    /// measured with there, in values of up to 1.3 MB. The byte limit is
+    /// not from that measurement: it is D1's documented limit of a bound
+    /// value ([`MAX_SQL_VALUE_BYTES`]) less a margin, and no value of
+    /// 25,000 placements comes near it.
     pub const D1: SqlLimits = SqlLimits {
         value_bytes: 1_900_000,
         set_rows: 25_000,

@@ -1066,6 +1066,56 @@ async fn a_replay_references_no_extent_of_its_own_twice() {
     assert_eq!(dumps[0], dumps[1]);
 }
 
+/// The checks that read the extents of the placements go through every
+/// value, not the first: the extent that cannot be read is the last of
+/// 120, on a key that has an older generation.
+#[tokio::test]
+async fn a_replay_finds_an_extent_without_a_copy_in_any_value() {
+    for (what, damage) in [
+        (
+            "lost",
+            "UPDATE extents SET safety_state = 'deleted' WHERE id = ?1",
+        ),
+        (
+            "unread",
+            "UPDATE extents SET safety_state = 'deleted', plan = x'00' WHERE id = ?1",
+        ),
+    ] {
+        let fx = Fx::new(false).await;
+        let r = fx.recorded().await;
+        assert_eq!(fx.replay(&r.first).await, ReplayPublish::Published);
+        let sizes = [100; 120];
+        let ids = fx.replayed(&sizes).await;
+        let g = (
+            fx.generation(&fx.bucket, "a", T0.plus_ms(3), &sizes),
+            placed(&ids, &sizes),
+        );
+        // In the first value it is found as well.
+        for at in [119, 0] {
+            let id = [text(ids[at].as_str())];
+            let whole = fx
+                .sql()
+                .db
+                .query("SELECT safety_state, plan FROM extents WHERE id = ?1", &id);
+            let whole = whole.await.unwrap().remove(0);
+            assert_eq!(fx.run(damage, &id).await, 1, "{what}");
+            let before = fx.dump().await;
+            assert_eq!(fx.replay(&g).await, ReplayPublish::Damaged, "{what} {at}");
+            assert_eq!(fx.dump().await, before, "{what} {at}");
+            let mut back = whole;
+            back.push(id[0].clone());
+            let restored = fx
+                .run(
+                    "UPDATE extents SET safety_state = ?1, plan = ?2 WHERE id = ?3",
+                    &back,
+                )
+                .await;
+            assert_eq!(restored, 1);
+        }
+        assert_eq!(fx.replay(&g).await, ReplayPublish::Published, "{what}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The live generation, compared a value at a time
 // ---------------------------------------------------------------------------
@@ -1114,6 +1164,9 @@ async fn a_twin_is_the_same_extents_at_the_same_places() {
             }),
         ),
         ("a seq twice", differs(&|_, p| p[7].seq = 6)),
+        // Every row of it matches a reference, and the count is right:
+        // only the order of the `seq` tells.
+        ("a placement twice", differs(&|_, p| p[7] = p[6].clone())),
         (
             "an extent short",
             differs(&|_, p| {
@@ -1226,11 +1279,14 @@ async fn an_overloaded_fence_leaves_the_outcome_unknown() {
     ));
     let t = target(&fx.bucket, KEY, &s.id);
     assert_eq!(fx.revision(&t).await, s.revision + 1);
-    assert_eq!(
-        fx.count(&live.replace(s.commit.generation.id.as_str(), "none"))
-            .await,
-        0
-    );
+    // Nothing stands under the id of the attempt, live or not.
+    for table in ["objects WHERE generation_id", "generations WHERE id"] {
+        let rows = format!(
+            "SELECT COUNT(*) FROM {table} = '{}'",
+            s.commit.generation.id
+        );
+        assert_eq!(fx.count(&rows).await, 0, "{table}");
+    }
     assert_eq!(fx.complete(&s, None).await, Guard::Lost);
 }
 
