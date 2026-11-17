@@ -771,10 +771,16 @@ copy) goes extent by extent, over `COLD_SOCKETS` connections at once:
   only when the client asks for them, until it asks for one within
   five seconds of taking the one before; a client slower than about
   3 MiB/s is served that way throughout.
-- **Other requests in the same isolate.** A download charges the byte
-  budget for each extent after every request that already waits for
-  room, so a second large request is not kept waiting until the
-  download ends; the two then take turns.
+- **Other requests in the same isolate.** A request that waits for
+  room in the byte budget, and that the download alone keeps out, goes
+  first: the download charges for its next extent after it, so a
+  second large request is not kept waiting until the download ends, and
+  the two take turns. The download waits for it five seconds at most. A
+  request that other requests keep out, or that fits beside the
+  download, is not waited for: a small read is not slowed down by a
+  large upload that waits. A download that has begun waits up to a
+  minute for room before it ends short; a request that has sent nothing
+  waits twenty seconds and answers `503 SlowDown`.
 - **The log.** Each invocation that read from Usenet writes one line,
   `cold read: extents=64 opened=8 open_ms=70 broken=0 slow=0
   refetched=0 p1=1536/1074007040 warm_ms=... read_ms=... wait_ms=...
@@ -792,7 +798,7 @@ proxy, `COLD_SOCKETS = "8"`, sub-ranges of 1 GiB:
 |---|---|---|
 | 2 GiB range from Usenet, before (one connection) | 812 s (2.5 MiB/s) | 50 to 90 s |
 | 2 GiB range from Usenet, eleven runs | 152 to 212 s (10 to 13 MiB/s) in seven, 244 to 298 s (7 to 8 MiB/s) in four | 42 to 60 s in the faster runs, 55 to 89 s in the slower ones |
-| whole object from Usenet, two runs | 393 and 400 s (15 MiB/s) | 34 to 37 s |
+| whole object from Usenet, five runs | 393 and 400 s (15 MiB/s) in two, 666 to 770 s (8 to 9 MiB/s) in three, some hours later | 34 to 37 s in the faster runs, 56 to 75 s in the slower ones |
 
 The cache write sets the pace: one extent takes one to two seconds to
 write, and only one write fits in the byte budget beside the next read.

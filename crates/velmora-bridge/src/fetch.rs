@@ -1109,18 +1109,25 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     .filter(|&i| work[i] > 0 && out[i].is_none())
                     .map(|i| order[i].priority)
                     .min();
+                // Nor is a session of a provider that is out kept: it
+                // would read nothing, with nobody renewing its slot, and
+                // would count among the sockets a provider with work may
+                // open.
+                let index = |s: &ProviderSession<'a, C, N, T>| {
+                    order.iter().position(|p| p.id == s.provider.id)
+                };
                 let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
                     .into_iter()
-                    .partition(|s| Some(s.provider.priority) == tier);
+                    .partition(|s| {
+                        Some(s.provider.priority) == tier
+                            && index(s).is_some_and(|i| out[i].is_none())
+                    });
                 self.sessions = kept;
                 ProviderSession::close_all(other).await;
                 if let Err(e) = self.staff(&order, &work, &mut out, &mut full).await {
                     failure = Some(e);
                     break 'phases;
                 }
-                let index = |s: &ProviderSession<'a, C, N, T>| {
-                    order.iter().position(|p| p.id == s.provider.id)
-                };
                 // No session for any of the work that is left: nothing
                 // would be read, and the same pass would come again. The
                 // providers of the tier are out instead, so every pass
@@ -1137,9 +1144,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     }
                     continue;
                 }
-                // A session of a provider that is out reads nothing in
-                // this pass: it is ended, not left logged in beside the
-                // others with nobody renewing its slot.
+                // A provider may have gone out while sockets were
+                // opened: its sessions are ended as above.
                 let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
                     .into_iter()
                     .partition(|s| index(s).is_some_and(|i| out[i].is_none()));

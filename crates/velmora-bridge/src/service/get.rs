@@ -718,6 +718,7 @@ async fn relay<C, B, N, J, K, T>(
                 cold.end().await;
                 out.wanted().await;
             }
+            cold.mid = at > 0;
             let item = cold.piece(&bucket, piece).await;
             let failed = item.is_err();
             // Before the last item and before an error: the reader of
@@ -941,7 +942,20 @@ where
     reader: Option<ColdReader<'b, C, N, T>>,
     put: Option<LocalBoxFuture<'b, ()>>,
     spent: Rc<Spent>,
+    /// The byte budget, counting what this body holds: its charges are
+    /// taken through it.
+    room: Rc<ByteBudget>,
+    /// Whether a piece of the body was made before: its reader has part
+    /// of it already.
+    mid: bool,
 }
+
+/// How many times a body that has begun waits
+/// [`CHARGE_WAIT_MS`](crate::ingress::CHARGE_WAIT_MS) for
+/// room before it ends short. Its reader has a part already and gets
+/// an error if the rest does not come; a request that has sent nothing
+/// waits once and is told to slow down.
+const MID_BODY_WAITS: u32 = 3;
 
 /// Milliseconds of one cold body by what it was waiting for, for the log.
 /// The clock of a Worker stands still while code runs, so each number is
@@ -985,6 +999,8 @@ where
             reader: None,
             put: None,
             spent: Rc::default(),
+            room: Rc::new(bridge.budget.for_request()),
+            mid: false,
         }
     }
 
@@ -1064,18 +1080,25 @@ where
     /// this waits. When it is not there beside the cache write that is
     /// under way, the write ends first: the read then needs no more than
     /// it would alone. Taken in turn, after every request that waits
-    /// for room already: a body that runs ahead of its reader charges
-    /// again as soon as a piece is taken, and would otherwise take the
-    /// room of a request that waits every time.
+    /// for room already and has none beside what this body holds: a
+    /// body that runs ahead of its reader charges again as soon as a
+    /// piece is taken, and would otherwise take the room of a request
+    /// that waits every time.
     async fn charge(&mut self, need: u64) -> core::result::Result<Charge, ReadFail> {
         let bridge = self.bridge;
-        if let Some(charge) = bridge.budget.try_charge_in_turn(need) {
+        let budget = Rc::clone(&self.room);
+        if let Some(charge) = budget.try_charge_in_turn(need) {
             return Ok(charge);
         }
         let spent = Rc::clone(&self.spent);
         let began = bridge.clock.now();
         self.settle().await;
-        let room = self.wait(bridge.budget.charge_in_turn(need)).await;
+        let mut room = self.wait(budget.charge_in_turn(need)).await;
+        let mut waits = 1;
+        while room.is_err() && self.mid && waits < MID_BODY_WAITS {
+            room = self.wait(budget.charge_in_turn(need)).await;
+            waits += 1;
+        }
         spent
             .wait
             .set(spent.wait.get() + bridge.clock.now().0 - began.0);
@@ -1087,7 +1110,7 @@ where
     /// extent is opened. The write ends before that.
     async fn step(&mut self, need: u64, lean: u64) -> core::result::Result<Charge, ReadFail> {
         if self.put.is_some() && lean < need {
-            if let Some(charge) = self.bridge.budget.try_charge_in_turn(lean) {
+            if let Some(charge) = self.room.try_charge_in_turn(lean) {
                 return Ok(charge);
             }
         }
@@ -1112,11 +1135,12 @@ where
         let extent = &piece.extent;
         let spent = Rc::clone(&self.spent);
         let all = span.len + piece.len;
-        let mut work = match bridge.budget.try_charge_in_turn(all) {
+        let room = Rc::clone(&self.room);
+        let mut work = match room.try_charge_in_turn(all) {
             Some(work) => work,
             None => {
                 let lean = match self.put.is_some() {
-                    true => bridge.budget.try_charge_in_turn(span.len),
+                    true => room.try_charge_in_turn(span.len),
                     false => None,
                 };
                 match lean {
@@ -1139,7 +1163,7 @@ where
                 };
                 let short = all.saturating_sub(work.bytes());
                 if short > 0 {
-                    match bridge.budget.try_charge(short) {
+                    match room.try_charge(short) {
                         Some(more) => work.absorb(more),
                         None => {
                             drop(src);
@@ -1153,7 +1177,7 @@ where
                     break;
                 };
                 drop(src);
-                let held = retain(&bridge.budget, work, plain).ok_or(ReadFail::Internal)?;
+                let held = retain(&room, work, plain).ok_or(ReadFail::Internal)?;
                 self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
                 return Ok(held);
             }
@@ -1180,6 +1204,7 @@ where
         // text on the sockets are live; while it is opened, the
         // ciphertext and the plaintext. The warm span and its plaintext
         // are never larger than that.
+        let room = Rc::clone(&self.room);
         let need = cold_step_bytes(extent.cipher_size, bridge.cfg.cold_sockets);
         let lean = cold_fetch_bytes(extent.cipher_size, bridge.cfg.cold_sockets);
         let mut work = self.step(need, lean).await?;
@@ -1221,7 +1246,7 @@ where
                     // while it holds some.
                     let short = need.saturating_sub(work.bytes());
                     if short > 0 {
-                        match bridge.budget.try_charge(short) {
+                        match room.try_charge(short) {
                             Some(more) => work.absorb(more),
                             None => {
                                 drop(cipher);
@@ -1239,11 +1264,10 @@ where
                     // release and the two charges, and together they are
                     // never more than what was released.
                     drop(work);
-                    let held = bridge
-                        .budget
+                    let held = room
                         .try_charge(plain.len() as u64)
                         .ok_or(ReadFail::Internal)?;
-                    if let Some(copy) = bridge.budget.try_charge(cipher.len() as u64) {
+                    if let Some(copy) = room.try_charge(cipher.len() as u64) {
                         let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
                         let write = async move {
                             // Verified already: a cache that does not
@@ -1280,7 +1304,7 @@ where
                 slept = slept.saturating_add(ms);
                 // Until there is room for the read, which is released
                 // again here: what follows takes what it needs.
-                if bridge.budget.try_charge(need).is_some() {
+                if room.try_charge(need).is_some() {
                     break;
                 }
             }

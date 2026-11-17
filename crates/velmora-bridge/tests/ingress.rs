@@ -925,41 +925,124 @@ fn turn_sleeper() -> Sleeper {
 }
 
 /// A charge that takes its turn is not served while one that waited
-/// before it is not, even when it would fit: a caller that charges again
-/// and again cannot keep taking the room a waiting request needs. A
-/// plain charge is not held back.
+/// before it, and that only its request keeps out, is not: even when it
+/// would fit. A request that charges again and again cannot keep taking
+/// the room a waiting request needs. A plain charge is not held back.
 #[tokio::test]
 async fn a_charge_in_turn_is_served_after_those_that_waited_before_it() {
     let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
-    let held = RefCell::new(Some(budget.try_charge(60).unwrap()));
-    assert!(budget.try_charge_in_turn(10).is_some(), "nobody waits");
+    let request = budget.for_request();
+    let held = RefCell::new(Some(request.try_charge(60).unwrap()));
+    assert!(request.try_charge_in_turn(40).is_some(), "nobody waits");
     let order = RefCell::new(Vec::new());
     let first = async {
-        let charge = budget.charge(90).await.unwrap();
+        let charge = budget.charge(70).await.unwrap();
         order.borrow_mut().push("first");
-        charge
+        tokio::task::yield_now().await;
+        drop(charge);
     };
     let second = async {
         // The first one is waiting by now.
         tokio::task::yield_now().await;
-        assert!(budget.try_charge_in_turn(10).is_none(), "someone waits");
-        assert!(budget.try_charge(10).is_some(), "a plain charge fits");
-        let charge = budget.charge_in_turn(10).await.unwrap();
+        assert!(request.try_charge_in_turn(40).is_none(), "someone waits");
+        assert!(budget.try_charge(40).is_some(), "a plain charge fits");
+        let charge = request.charge_in_turn(40).await.unwrap();
         order.borrow_mut().push("second");
         charge
     };
     let release = async {
         for _ in 0..5 {
-            assert!(order.borrow().is_empty(), "10 fit all along");
+            assert!(order.borrow().is_empty(), "40 fit all along");
             tokio::task::yield_now().await;
         }
         held.borrow_mut().take();
     };
-    let (a, b, ()) = futures_util::future::join3(first, second, release).await;
+    let ((), b, ()) = futures_util::future::join3(first, second, release).await;
     assert_eq!(*order.borrow(), ["first", "second"]);
-    assert_eq!(budget.in_use(), 100);
-    drop((a, b));
-    assert!(budget.try_charge_in_turn(100).is_some(), "nobody waits");
+    assert_eq!(budget.in_use(), 40);
+    drop(b);
+    assert!(request.try_charge_in_turn(100).is_some(), "nobody waits");
+}
+
+/// A charge in turn is held back only by a waiting charge that its
+/// request alone keeps out. One that others keep out is not waited
+/// for, nor one that fits beside the request: a small read goes on
+/// while a large upload waits. What the request holds already is
+/// weighed with the charge.
+#[tokio::test]
+async fn a_charge_in_turn_is_not_held_back_by_one_it_does_not_keep_out() {
+    use futures_util::FutureExt;
+    let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
+    let request = budget.for_request();
+    let other = budget.try_charge(60).unwrap();
+    let mut waiting = Box::pin(budget.charge(80));
+    assert!(waiting.as_mut().now_or_never().is_none());
+    // The other one keeps it out, whatever this request does.
+    assert!(request.try_charge_in_turn(40).is_some(), "not in its way");
+    let free = request.charge_in_turn(40).now_or_never();
+    assert!(free.is_some_and(|c| c.is_ok()), "served at once");
+    drop(other);
+    // Now 80 and 20 fit together, and no more.
+    assert!(request.try_charge_in_turn(20).is_some(), "leaves room");
+    assert!(request.try_charge_in_turn(21).is_none(), "leaves none");
+    let small = request.charge_in_turn(20).now_or_never();
+    assert!(small.is_some_and(|c| c.is_ok()), "served at once");
+
+    // A request that holds 15 already keeps the waiting one out with
+    // 10 more, and not once it holds nothing.
+    let mut first = request.try_charge(10).unwrap();
+    first.absorb(request.try_charge(5).unwrap());
+    assert_eq!(first.bytes(), 15);
+    assert!(request.try_charge_in_turn(10).is_none(), "holds 15");
+    assert!(request.try_charge_in_turn(5).is_some(), "80 + 15 + 5");
+    // So would another request: the waiting one has room beside the
+    // 15, and none beside 10 more.
+    assert!(budget.for_request().try_charge_in_turn(10).is_none());
+    assert!(budget.for_request().try_charge_in_turn(5).is_some());
+    drop(first);
+    assert!(request.try_charge_in_turn(10).is_some(), "holds nothing");
+
+    // A charge taken over by one of another request is counted there:
+    // the others then hold 26 and keep the waiting one out themselves.
+    let mut theirs = budget.for_request().try_charge(11).unwrap();
+    let mine = request.try_charge(15).unwrap();
+    assert!(request.try_charge_in_turn(20).is_none(), "holds 15");
+    theirs.absorb(mine);
+    assert_eq!(theirs.bytes(), 26);
+    assert!(request.try_charge_in_turn(20).is_some(), "gave 15 away");
+    drop(theirs);
+    let served = waiting.await.unwrap();
+    assert_eq!((served.bytes(), budget.in_use()), (80, 80));
+}
+
+/// A charge that is listed as waiting but is not polled any more holds
+/// a charge in turn back for `TURN_WAIT_MS` and no longer.
+#[tokio::test]
+async fn a_charge_in_turn_waits_no_longer_than_its_turn() {
+    use futures_util::FutureExt;
+    // The first sleep never ends, the others end at once.
+    let calls = Rc::new(Cell::new(0u32));
+    let c = calls.clone();
+    let budget = ByteBudget::new(100).with_sleeper(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        match c.get() {
+            1 => Box::pin(std::future::pending()),
+            _ => Box::pin(async {}),
+        }
+    }));
+    let request = budget.for_request();
+    let held = request.try_charge(50).unwrap();
+    // Polled once, then left: it stays listed.
+    let mut stale = Box::pin(budget.charge(70));
+    assert!(stale.as_mut().now_or_never().is_none());
+    let before = calls.get();
+    let charge = request.charge_in_turn(40).await.unwrap();
+    assert_eq!(
+        calls.get() - before,
+        ingress::TURN_WAIT_MS / ingress::CHARGE_POLL_MS
+    );
+    assert_eq!(charge.bytes(), 40);
+    drop((held, stale));
 }
 
 /// A charge that gave up waiting, or was dropped while it waited, holds
@@ -968,19 +1051,20 @@ async fn a_charge_in_turn_is_served_after_those_that_waited_before_it() {
 async fn a_charge_that_no_longer_waits_holds_nobody_back() {
     use futures_util::FutureExt;
     let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
-    let held = budget.try_charge(60).unwrap();
+    let request = budget.for_request();
+    let held = request.try_charge(60).unwrap();
     let mut waiting = Box::pin(budget.charge(90));
     assert!(waiting.as_mut().now_or_never().is_none());
-    assert!(budget.try_charge_in_turn(10).is_none(), "someone waits");
+    assert!(request.try_charge_in_turn(20).is_none(), "someone waits");
     drop(waiting);
-    assert!(budget.try_charge_in_turn(10).is_some(), "dropped");
+    assert!(request.try_charge_in_turn(20).is_some(), "dropped");
 
     assert_eq!(budget.charge(90).await.unwrap_err(), IngressError::SlowDown);
-    assert!(budget.try_charge_in_turn(10).is_some(), "gave up");
+    assert!(request.try_charge_in_turn(20).is_some(), "gave up");
     // One that takes its turn does not wait for itself.
     drop(held);
     let all = budget.try_charge(100).unwrap();
-    let mut own = Box::pin(budget.charge_in_turn(50));
+    let mut own = Box::pin(request.charge_in_turn(50));
     assert!(own.as_mut().now_or_never().is_none());
     drop(all);
     assert_eq!(own.await.unwrap().bytes(), 50);

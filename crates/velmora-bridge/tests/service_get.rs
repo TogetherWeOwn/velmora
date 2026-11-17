@@ -14,7 +14,7 @@ use service_support::*;
 use velmora::rng::SystemRng;
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk};
 use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
-use velmora_bridge::ingress::{ByteBudget, Sleeper, Spawner, CHARGE_POLL_MS};
+use velmora_bridge::ingress::{ByteBudget, Charge, Sleeper, Spawner, CHARGE_POLL_MS};
 use velmora_bridge::service::PIECE_WAIT_MS;
 use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::*;
@@ -1319,14 +1319,21 @@ async fn a_slow_reader_gets_each_piece_when_it_asks_until_it_is_quick_again() {
 async fn a_body_ahead_of_its_reader_lets_a_waiting_request_have_its_room() {
     let local = tokio::task::LocalSet::new();
     let test = async {
-        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        // A look for room takes the 100 ms it says, the other timers as
+        // in `real_sleeper`.
+        let real = real_sleeper();
+        let sleeper: Sleeper = Rc::new(move |ms| match ms {
+            CHARGE_POLL_MS => Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100))),
+            _ => real(ms),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
         let rig = &cold.rig;
         let parts: Vec<Vec<u8>> = (0..8u8).map(|n| pattern(120 + n, 300_000)).collect();
         let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         let extents = commit_parts(rig, &cold.signer, &cold.bucket, "warm", &slices).await;
         let cipher = extents.iter().map(|e| e.cipher_size).max().unwrap();
         let budget = &rig.bridge.budget;
-        // Room for one piece that waits and one more being made; the
+        // Room for one piece that waits and for making one more; the
         // other request needs all of it but 100,000 bytes, so it fits
         // only while the body holds nothing.
         let room = cipher + 650_000;
@@ -1348,29 +1355,138 @@ async fn a_body_ahead_of_its_reader_lets_a_waiting_request_have_its_room() {
             budget.in_use() == other.bytes() + 600_000
         })
         .await;
-        let served = Rc::new(RefCell::new(None));
+        // The other request is served once and gives its room back.
+        let served = Rc::new(Cell::new(false));
         let (bridge, slot) = (Rc::clone(&rig.bridge), Rc::clone(&served));
         tokio::task::spawn_local(async move {
-            let charge = bridge.budget.charge(room - 100_000).await;
-            *slot.borrow_mut() = Some(charge);
+            let charge = bridge.budget.charge(room - 100_000).await.unwrap();
+            assert_eq!(charge.bytes(), room - 100_000);
+            slot.set(true);
         });
-        // It waits by now, and the reader keeps up.
+        // It waits by now, and looks for room every 100 ms. The reader
+        // takes a piece every 50 ms, between those looks: a body that
+        // did not wait its turn would have made the next piece each
+        // time before the other request looked, which would never see
+        // the room.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(!served.get());
+        for part in &parts[..7] {
+            assert!(body.next().await.unwrap().unwrap() == *part);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(served.get(), "served before the body ended");
+        assert!(body.next().await.unwrap().unwrap() == parts[7]);
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), other.bytes());
+    };
+    local.run_until(test).await;
+}
+
+/// A request that waits for nearly the whole budget does not hold back
+/// a body it has room beside: a small object is read at once, piece
+/// after piece, while the large request still waits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_small_body_does_not_wait_for_a_large_request_that_waits() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let cold = cold_rig_on(2, Some(real_sleeper()), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..6u8).map(|n| pattern(130 + n, 1_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        commit_parts(rig, &cold.signer, &cold.bucket, "small", &slices).await;
+        let budget = &rig.bridge.budget;
+        // The large request has no room beside the other one, and all
+        // of the small body fits beside it.
+        let other = budget.try_charge(200_000).unwrap();
+        let large = budget.capacity() - 100_000;
+        let served = Rc::new(Cell::new(false));
+        let (bridge, slot) = (Rc::clone(&rig.bridge), Rc::clone(&served));
+        let waiting = tokio::task::spawn_local(async move {
+            let charge = bridge.budget.charge(large).await;
+            slot.set(true);
+            charge
+        });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(served.borrow().is_none());
-        assert!(body.next().await.unwrap().unwrap() == parts[0]);
-        assert!(body.next().await.unwrap().unwrap() == parts[1]);
-        eventually("the request that waited is served", || {
-            served.borrow().is_some()
-        })
-        .await;
-        let charge = served.borrow_mut().take().unwrap().unwrap();
-        assert_eq!(budget.in_use(), other.bytes() + room - 100_000);
-        drop(charge);
-        for part in &parts[2..] {
+        let began = std::time::Instant::now();
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "small"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        for part in &parts {
             assert!(body.next().await.unwrap().unwrap() == *part);
         }
         assert!(body.next().await.is_none());
-        assert_eq!(budget.in_use(), other.bytes());
+        // No piece waited a turn (5 s) or for room (20 s).
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!served.get(), "the large request still waits");
+        drop(other);
+        assert_eq!(waiting.await.unwrap().unwrap().bytes(), large);
+    };
+    local.run_until(test).await;
+}
+
+/// A body that has begun waits for room longer than a request that has
+/// sent nothing: its reader has a part already, and an end after one
+/// wait would be an error in the middle of a download.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_that_has_begun_waits_longer_for_room() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        // The room is given back at the 300th look for it: a wait and a
+        // half.
+        let looks = Rc::new(Cell::new(0u32));
+        let taken: Rc<RefCell<Option<Charge>>> = Rc::default();
+        let real = real_sleeper();
+        let (n, slot) = (Rc::clone(&looks), Rc::clone(&taken));
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            if ms == CHARGE_POLL_MS {
+                n.set(n.get() + 1);
+                if n.get() == 300 {
+                    slot.borrow_mut().take();
+                }
+            }
+            real(ms)
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts: Vec<Vec<u8>> = (0..3u8).map(|n| pattern(140 + n, 300_000)).collect();
+        let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        commit_parts(rig, &cold.signer, &cold.bucket, "begun", &slices).await;
+        let budget = &rig.bridge.budget;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "begun"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        eventually("a piece is made ahead", || budget.in_use() == 600_000).await;
+        // Another request takes all the rest: the last piece has no
+        // room, also once the two before it are taken.
+        *taken.borrow_mut() = budget.try_charge(budget.capacity() - 600_000);
+        assert!(taken.borrow().is_some());
+        looks.set(0);
+        assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        assert!(body.next().await.unwrap().unwrap() == parts[1]);
+        assert!(body.next().await.unwrap().unwrap() == parts[2]);
+        assert!(looks.get() >= 300, "it waited: {}", looks.get());
+        assert!(body.next().await.is_none());
+        assert_eq!(budget.in_use(), 0);
     };
     local.run_until(test).await;
 }
