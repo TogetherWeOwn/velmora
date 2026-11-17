@@ -521,15 +521,15 @@ fn fresh(prefix: &str, pass: UnixMs) -> String {
 }
 
 /// The parts of the key space, in key order, with `T` for the directory
-/// of the tenant layout (`m/t/<tenant id>/`):
+/// of the tenant layout (`m/x/<tenant id>/`):
 ///
 /// | Keys | Phase |
 /// |---|---|
 /// | up to the fresh tombstones (`m/art/`, older `m/del/`) | walk: `Low` |
 /// | fresh `m/del/g_` | sweep: `Tombstones` |
 /// | older `m/g_` | walk: `High` |
-/// | fresh `m/g_`, and on up to `m/t/` (`m/rk/`) | sweep: `Generations` |
-/// | `m/t/` up to the fresh tombstones of `T` (`T art/`, older `T del/`) | walk: `TenantLow` |
+/// | fresh `m/g_`, and on up to `m/x/` (`m/rk/` and every other family) | sweep: `Generations` |
+/// | `m/x/` up to the fresh tombstones of `T` (`T art/`, older `T del/`) | walk: `TenantLow` |
 /// | fresh `T del/g_` | sweep: `TenantTombstones` |
 /// | older `T g_` | walk: `TenantHigh` |
 /// | fresh `T g_` | sweep: `TenantGenerations` |

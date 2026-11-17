@@ -14,9 +14,9 @@
 //! Those are the names of the **flat layout**, which every record
 //! written before the tenant layout has and keeps: a record is never
 //! renamed. The **tenant layout** ([`Layout`]) puts the same three names
-//! in a directory of their tenant, `m/t/<tenant id>/`, in place of
-//! `m/`: `m/t/<tenant id>/g_…`, `m/t/<tenant id>/del/g_…`,
-//! `m/t/<tenant id>/art/<extent_id>`. Which of the two a new record gets
+//! in a directory of their tenant, `m/x/<tenant id>/`, in place of
+//! `m/`: `m/x/<tenant id>/g_…`, `m/x/<tenant id>/del/g_…`,
+//! `m/x/<tenant id>/art/<extent_id>`. Which of the two a new record gets
 //! is a setting (`RECORD_LAYOUT`); every reader reads both, whatever the
 //! setting, and for ever.
 //!
@@ -73,11 +73,16 @@ pub const RECORD_PREFIX: &str = "m/";
 pub const GENERATION_PREFIX: &str = "m/g_";
 /// Tombstones of the flat layout: `m/del/` + a tombstone id (`g_…`).
 pub const TOMBSTONE_PREFIX: &str = "m/del/g_";
-/// The records of the tenant layout: `m/t/` + a tenant id + `/`, then
+/// The records of the tenant layout: `m/x/` + a tenant id + `/`, then
 /// what the flat layout has after its `m/`. It lies under
 /// [`RECORD_PREFIX`], so no delete removes such a key, in a Worker of
-/// any version, and the walk of the recovery copy reaches it.
-pub const TENANT_DIR: &str = "m/t/";
+/// any version, and the walk of the recovery copy reaches it. It sorts
+/// after every other family under `m/` (`m/art/`, `m/del/`, `m/g_`,
+/// `m/rk/`, `m/tk/`, and `m/k/`, `m/t/`, `m/tref/`, `m/u/`, which are
+/// left free for records about a tenant itself), so the sweep of the
+/// recovery copy that ends here passes over all of them, and holds
+/// nothing but these records.
+pub const TENANT_DIR: &str = "m/x/";
 /// The one tenant there is: the owner of every bucket.
 pub const DEFAULT_TENANT: &str = "t_0000000000000000";
 /// Longest tenant id a record name takes, after its `t_`.
@@ -105,7 +110,7 @@ pub fn valid_tenant_id(id: &str) -> bool {
 
 /// Where the records of a write are stored: the directory their names
 /// start with. The flat layout is `m/`; the tenant layout is
-/// `m/t/<tenant id>/`. After it the names are the same in both.
+/// `m/x/<tenant id>/`. After it the names are the same in both.
 ///
 /// A record is sealed under its whole name, so one moved from a layout
 /// to the other does not open.
@@ -219,13 +224,12 @@ impl RecordName<'_> {
 /// tombstone or an article plan, of either layout and of any tenant.
 /// `None` for every other key, also for the other keys under `m/`.
 pub fn record_name(key: &str) -> Option<RecordName<'_>> {
-    let rest = key.strip_prefix(RECORD_PREFIX)?;
-    let (layout, rest) = match rest.strip_prefix("t/") {
+    let (layout, rest) = match key.strip_prefix(TENANT_DIR) {
         Some(rest) => {
             let (tenant, rest) = rest.split_once('/')?;
             (Layout::tenant(tenant)?, rest)
         }
-        None => (Layout::flat(), rest),
+        None => (Layout::flat(), key.strip_prefix(RECORD_PREFIX)?),
     };
     let (kind, id) = if let Some(id) = rest.strip_prefix(ARTICLE_NAME) {
         (RecordKind::ArticlePlan, id)
@@ -1151,6 +1155,8 @@ pub async fn read_tombstone<B: BlobStore, K: Kek>(
 pub struct PlanRead {
     /// The record; `None` = there is none that opens.
     pub record: Option<ArticleManifest>,
+    /// The name `record` was read from.
+    pub name: Option<String>,
     /// The names of the records of the extent that are stored and did
     /// not open or parse.
     pub unreadable: Vec<String>,
@@ -1176,6 +1182,7 @@ pub async fn read_article_plan<B: BlobStore, K: Kek>(
         match read::<B, K, ArticleManifest>(safety, kek, &name).await {
             Ok(Some(a)) if a.extent_id == extent.as_str() => {
                 found.record = Some(a);
+                found.name = Some(name);
                 break;
             }
             Ok(Some(_)) => found.unreadable.push(name),

@@ -250,10 +250,11 @@ pub struct ReplayReport {
     /// copy anywhere. `damaged` holds the first ids of `damaged_total`.
     pub damaged_total: u64,
     pub damaged: Vec<String>,
-    /// Records passed over: the same id is stored under the names of
-    /// both layouts, and the one of the flat layout was replayed. A
-    /// write stores its record once, so this is the trace of a record
-    /// that was put there by hand. The blob keys that were passed over.
+    /// The same id is stored under the names of both layouts: the blob
+    /// keys of the tenant layout of such ids. The flat name is replayed,
+    /// and the other one only when the flat name gives no record (it
+    /// does not open, or is gone). A write stores its record once, so
+    /// this is the trace of a record that was put there by hand.
     pub twins: Vec<String>,
     /// Records that did not open or parse (blob keys). Also the name
     /// of the plan record of an extent whose packed plan in the
@@ -307,22 +308,28 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             .listed(GENERATION_PREFIX, &cursor.after, limits.records, report)
             .await?;
         let mut budget = limits.extents;
-        for Listed { name, flat, layout } in &names {
-            let manifest = match read_generation(&self.safety, &self.kek, name).await {
-                Ok(Some(m)) => m,
-                // Removed by an operator since the listing.
-                Ok(None) => {
-                    cursor = finished(cursor, flat);
-                    continue;
+        for listed in &names {
+            let flat = &listed.flat;
+            // The first name of the id that opens: a name that does not
+            // must not hide a record of the same id that does.
+            let mut opened = None;
+            for (name, layout) in listed.names() {
+                match read_generation(&self.safety, &self.kek, name).await {
+                    Ok(Some(m)) => {
+                        opened = Some((m, layout));
+                        break;
+                    }
+                    // Removed by an operator since the listing.
+                    Ok(None) => {}
+                    Err(crate::types::BridgeError::Blob(e)) => {
+                        return Err(crate::types::BridgeError::Blob(e))
+                    }
+                    Err(_) => report.unreadable.push(name.clone()),
                 }
-                Err(crate::types::BridgeError::Blob(e)) => {
-                    return Err(crate::types::BridgeError::Blob(e))
-                }
-                Err(_) => {
-                    report.unreadable.push(name.clone());
-                    cursor = finished(cursor, flat);
-                    continue;
-                }
+            }
+            let Some((manifest, layout)) = opened else {
+                cursor = finished(cursor, flat);
+                continue;
             };
             if !self
                 .replay_manifest(&manifest, layout, &mut cursor, &mut budget, report)
@@ -419,7 +426,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                             Some(rows)
                         }
                         Err(_) => {
-                            unopened.push(layout.article_key(&row.id));
+                            unopened.extend(read.name);
                             None
                         }
                     },
@@ -541,25 +548,34 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             .listed(TOMBSTONE_PREFIX, &cursor.after, limits.records, report)
             .await?;
         let now = self.clock.now();
-        for Listed { name, flat, .. } in &names {
-            match read_tombstone(&self.safety, &self.kek, name).await {
-                Ok(Some(t)) => {
-                    let (bucket, id) = (BucketId::new(t.bucket_id), GenerationId::new(t.id));
-                    // The floor is raised also when nothing is deleted
-                    // here: a write after the replay sorts after every
-                    // tombstone on record.
-                    let deleted = self
-                        .catalog
-                        .replay_tombstone(&bucket, &t.key, &id, now)
-                        .await?;
-                    report.tombstones += 1;
-                    report.deleted += u32::from(deleted);
+        for listed in &names {
+            let flat = &listed.flat;
+            // As for a generation: the first name of the id that opens.
+            let mut opened = None;
+            for (name, _) in listed.names() {
+                match read_tombstone(&self.safety, &self.kek, name).await {
+                    Ok(Some(t)) => {
+                        opened = Some(t);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(crate::types::BridgeError::Blob(e)) => {
+                        return Err(crate::types::BridgeError::Blob(e))
+                    }
+                    Err(_) => report.unreadable.push(name.clone()),
                 }
-                Ok(None) => {}
-                Err(crate::types::BridgeError::Blob(e)) => {
-                    return Err(crate::types::BridgeError::Blob(e))
-                }
-                Err(_) => report.unreadable.push(name.clone()),
+            }
+            if let Some(t) = opened {
+                let (bucket, id) = (BucketId::new(t.bucket_id), GenerationId::new(t.id));
+                // The floor is raised also when nothing is deleted
+                // here: a write after the replay sorts after every
+                // tombstone on record.
+                let deleted = self
+                    .catalog
+                    .replay_tombstone(&bucket, &t.key, &id, now)
+                    .await?;
+                report.tombstones += 1;
+                report.deleted += u32::from(deleted);
             }
             cursor = finished(cursor, flat);
         }
@@ -613,6 +629,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     name,
                     flat,
                     layout: layout.clone(),
+                    twin: None,
                 });
             }
         }
@@ -620,9 +637,13 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         all.sort_by(|a, b| a.flat.cmp(&b.flat));
         let mut next: Vec<Listed> = Vec::new();
         for record in all {
-            match next.last() {
-                Some(last) if last.flat == record.flat => report.twins.push(record.name),
-                _ if next.len() as u64 == u64::from(limit) => break,
+            let full = next.len() as u64 == u64::from(limit);
+            match next.last_mut() {
+                Some(last) if last.flat == record.flat => {
+                    report.twins.push(record.name.clone());
+                    last.twin = Some((record.name, record.layout));
+                }
+                _ if full => break,
                 _ => next.push(record),
             }
         }
@@ -671,6 +692,17 @@ struct Listed {
     flat: String,
     /// The layout it is stored in.
     layout: Layout,
+    /// The name and layout of the same id in the other layout, when
+    /// both are stored: read when the first name gives no record.
+    twin: Option<(String, Layout)>,
+}
+
+impl Listed {
+    /// The names the record is stored under, the one to read first.
+    fn names(&self) -> impl Iterator<Item = (&String, &Layout)> {
+        std::iter::once((&self.name, &self.layout))
+            .chain(self.twin.as_ref().map(|(name, layout)| (name, layout)))
+    }
 }
 
 /// The cursor after the record whose flat name is `flat` is done.

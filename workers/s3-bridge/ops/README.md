@@ -16,9 +16,9 @@ kept outside it:
      time, never the secret), written before the key's row is deleted.
 
    With `RECORD_LAYOUT=tenant` the first three are written under the
-   tenant they belong to instead: `m/t/<tenant id>/<generation id>`,
-   `m/t/<tenant id>/del/<tombstone id>` and
-   `m/t/<tenant id>/art/<extent id>` (see "Record layout" below). Both
+   tenant they belong to instead: `m/x/<tenant id>/<generation id>`,
+   `m/x/<tenant id>/del/<tombstone id>` and
+   `m/x/<tenant id>/art/<extent id>` (see "Record layout" below). Both
    forms are read, always.
 
    Each record is sealed with XChaCha20-Poly1305 under a key derived from
@@ -179,10 +179,12 @@ Limits to know:
   row against the store at its end and counts the ones without a copy
   in `held_missing_total`; a replay from `0` sets them right.
 - One id stored under the names of both layouts (`m/<id>` and
-  `m/t/<tenant id>/<id>`) is replayed once, from the flat name, and the
-  other name is listed under `twins`. A write stores its record under
-  one name only, so a twin is the trace of a record that was put into
-  `SAFETY` by hand; `catalog-replay.sh` exits with status 2 for it.
+  `m/x/<tenant id>/<id>`) is replayed once. The flat name is read
+  first, and the tenant name only when the flat one gives no record
+  (it does not open, and is then listed under `unreadable`). The tenant
+  name is listed under `twins` either way. A write stores its record
+  under one name only, so a twin is the trace of a blob that was put
+  into `SAFETY` by hand; `catalog-replay.sh` exits with status 2 for it.
 - An empty bucket that never had a write is not in the records.
 
 ## Revoking an access key
@@ -346,10 +348,10 @@ generation, tombstone and article plan records:
 | `RECORD_LAYOUT` | Generation | Tombstone | Article plan |
 |---|---|---|---|
 | `flat` (default, also when unset) | `m/<id>` | `m/del/<id>` | `m/art/<extent>` |
-| `tenant` | `m/t/<tenant>/<id>` | `m/t/<tenant>/del/<id>` | `m/t/<tenant>/art/<extent>` |
+| `tenant` | `m/x/<tenant>/<id>` | `m/x/<tenant>/del/<id>` | `m/x/<tenant>/art/<extent>` |
 
 Every write belongs to tenant `t_0000000000000000` today. The names
-under `m/t/<tenant>/seg/` are reserved for records that hold a part of
+under `m/x/<tenant>/seg/` are reserved for records that hold a part of
 an article plan. Any other value of the variable refuses to start.
 
 - A record is never renamed, moved or rewritten: it is sealed under its
@@ -369,6 +371,15 @@ an article plan. Any other value of the variable refuses to start.
   them under the same names.
 - Revocation records (`m/rk/`) and tenant keys (`m/tk/`) keep their
   names in both settings.
+- The directory is `m/x/`, after every other name under `m/` in key
+  order, and it holds these records only. The names `m/t/`, `m/k/`,
+  `m/u/` and `m/tref/` are left free for records about a tenant itself
+  (its state, keys and usage), which are listed and numbered in ways
+  that must not meet millions of object records.
+- The tenant id is the whole prefix; there is no shard in the name. A
+  record is never renamed, and a tenant can be moved from one shard to
+  another, so the name holds what does not change. A shard is found
+  from the tenant.
 
 Turning it on, in two deploys:
 
@@ -383,7 +394,11 @@ the floor: the tenant records that were written stay.
 
 With the recovery copy on, a pass that finds nothing to send costs 6
 list calls here and 6 at the other provider (4 and 4 before), in either
-setting, because both layouts are listed.
+setting, because both layouts are listed. Each of the four sweeps (the
+tombstones and the generations of each layout) costs one more call on
+each side while it holds records of the last hour, so a pass in the
+hour after the setting changed, with fresh records in both layouts, can
+cost 8 and 8.
 
 ## The rollback stamp
 
@@ -506,23 +521,37 @@ the code real data relies on. Never roll back past the floor:
 
 - **Once `RECORD_LAYOUT=tenant` has been deployed:** never to a version
   older than the first one that knows `RECORD_LAYOUT`. From then on a
-  recovery record can be stored under `m/t/<tenant id>/`. An older
+  recovery record can be stored under `m/x/<tenant id>/`. An older
   Worker reads the flat names only:
   - its replay lists `m/g_` and `m/del/g_` and so passes over every
     write and delete recorded in the tenant layout: after a restore
     those objects are missing and those deletes are undone, with no
     error;
+  - its replay looks for the article plan of an extent under
+    `m/art/<extent id>` only. An extent whose plan was written in the
+    tenant layout comes back without a plan and without a report, also
+    when its object has a flat record (an extent is posted after its
+    object is published; a copy shares the extents of its source). Once
+    its pinned copy is released, such an extent cannot be read;
   - with `INTENT_SWEEP=on` it looks for the record of a sliced write
-    under `m/<id>` only, finds none, and removes the slices of an
-    acknowledged object a day after the write.
+    under `m/<id>` only. For a write whose record is stored and whose
+    commit is not in the catalogue (the write stalled or failed after
+    the record, or the catalogue was brought back to a point before
+    it) it finds none and removes the slices a day after the write; a
+    later replay then publishes an object whose data is gone;
+  - its recovery copy still sends the tenant records (they are under
+    `m/`), but as plain keys: a generation record goes out without the
+    two-minute wait and without its article plans first, a plan of the
+    tenant layout is not sent when its extent is posted but by the next
+    pass, and every pass lists the whole tenant layout (one list call
+    per 1000 records, every 15 minutes).
 
-  Its recovery copy still sends the tenant records, and the store still
-  refuses to delete them, because they are under `m/`. A rollback to a
-  version that knows the switch is safe with either value: every such
-  version reads both layouts. Setting the variable back to `flat` does
-  not lower the floor, because the tenant records that were written
-  stay. This floor is independent of the `PACKED_PLANS` floor: the later
-  of the two versions is the floor.
+  The store still refuses to delete the tenant records, because they
+  are under `m/`. A rollback to a version that knows the switch is safe
+  with either value: every such version reads both layouts. Setting the
+  variable back to `flat` does not lower the floor, because the tenant
+  records that were written stay. This floor is independent of the
+  `PACKED_PLANS` floor: the later of the two versions is the floor.
 
 Above the floor a rollback is still not free:
 

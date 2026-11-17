@@ -3554,11 +3554,11 @@ async fn a_generation_record_names_the_article_plans_of_its_extents() {
 }
 
 // ---------------------------------------------------------------------------
-// The two layouts of record names: `m/…` and `m/t/<tenant id>/…`
+// The two layouts of record names: `m/…` and `m/x/<tenant id>/…`
 // ---------------------------------------------------------------------------
 
 /// The directory of the tenant layout as this version writes it.
-const TENANT: &str = "m/t/t_0000000000000000/";
+const TENANT: &str = "m/x/t_0000000000000000/";
 
 /// New records are written in `layout` from here on, as after a deploy
 /// with another `RECORD_LAYOUT`. What is stored stays where it is.
@@ -3573,13 +3573,13 @@ fn write_in(rig: &mut Rig, layout: Layout) {
 fn by_layout(rig: &Rig) -> (Vec<String>, Vec<String>) {
     records(rig)
         .into_iter()
-        .partition(|k| !k.starts_with("m/t/"))
+        .partition(|k| !k.starts_with("m/x/"))
 }
 
 /// `RECORD_LAYOUT=tenant`: every record of every kind of write is under
 /// the directory of the tenant, with the name the flat layout gives it
 /// after `m/`, and the flat layout gets nothing new. Flat, the default,
-/// writes nothing under `m/t/`.
+/// writes nothing under `m/x/`.
 #[tokio::test(flavor = "current_thread")]
 async fn the_tenant_layout_puts_every_new_record_under_the_tenant() {
     use velmora_bridge::recovery::{is_protected_key, record_name, RecordKind};
@@ -3706,7 +3706,7 @@ async fn answers_of_a_replay(
         cursor = step.next.take();
         if let Some(next) = &cursor {
             let text = serde_json::to_string(next).unwrap();
-            assert!(!text.contains("m/t/"), "{text}");
+            assert!(!text.contains("m/x/"), "{text}");
         }
         assert!(step.twins.is_empty(), "{:?}", step.twins);
         add(&mut total, step);
@@ -3936,7 +3936,8 @@ async fn a_record_moved_to_the_other_layout_does_not_open() {
 
 /// One id under the names of both layouts (no writer makes that: an id
 /// is minted once and written in one layout): the flat record is the
-/// one replayed, once, and the other name is reported.
+/// one replayed, once, and the other name is reported. (When the flat
+/// name does not open, the other one is replayed: the test below.)
 #[tokio::test(flavor = "current_thread")]
 async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
     let rig = rig();
@@ -3975,6 +3976,74 @@ async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
         let signer = reissue_key(&rig).await;
         assert_eq!(get(&rig, &signer, "k").await.expect(200).body, b"body");
         assert_eq!(get(&rig, &signer, "other").await.expect(200).body, b"other");
+    }
+}
+
+/// A blob under the flat name of an id whose record is stored in the
+/// tenant layout (put there by hand; it cannot open, a record is sealed
+/// under its name) does not hide the record: the replay reads the
+/// tenant name when the flat one gives nothing, for a write and for a
+/// delete, and reports both names.
+#[tokio::test(flavor = "current_thread")]
+async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
+    let mut rig = rig();
+    write_in(&mut rig, Layout::default_tenant());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "kept", b"body").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "gone", b"gone").await.expect(200);
+    tick(&rig);
+    delete(&rig, &signer, "gone").await.expect(204);
+    let (flat, tenant) = by_layout(&rig);
+    assert!(flat.is_empty(), "{flat:?}");
+    let root = Layout::default_tenant().root().to_owned();
+    let mut real: Vec<String> = tenant
+        .into_iter()
+        .filter(|k| !k.contains("/art/"))
+        .collect();
+    real.sort();
+    // Two writes and one delete.
+    assert_eq!(real.len(), 3, "{real:?}");
+    let extent = ExtentId::new("x_none");
+    let mut shadows = Vec::new();
+    for name in &real {
+        let shadow = format!("m/{}", &name[root.len()..]);
+        let sealed = rig.bridge.safety.stored(name).unwrap().bytes;
+        let digest = sha256(&sealed);
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &extent,
+            cipher_sha256: &digest,
+        };
+        rig.bridge
+            .safety
+            .inner
+            .put(&shadow, sealed, &meta)
+            .await
+            .unwrap();
+        shadows.push(shadow);
+    }
+    shadows.sort();
+
+    for records in [1, 1000] {
+        wipe(&rig);
+        let limits = ReplayLimits {
+            records,
+            ..ReplayLimits::default()
+        };
+        let (mut report, _) = replay(&rig, UnixMs(0), limits).await;
+        report.twins.sort();
+        report.unreadable.sort();
+        assert_eq!(report.twins, real, "{report:?}");
+        assert_eq!(report.unreadable, shadows, "{report:?}");
+        assert_eq!(
+            (report.manifests, report.tombstones, report.deleted),
+            (2, 1, 1),
+            "{report:?}"
+        );
+        let signer = reissue_key(&rig).await;
+        assert_eq!(get(&rig, &signer, "kept").await.expect(200).body, b"body");
+        get(&rig, &signer, "gone").await.expect(404);
     }
 }
 
@@ -4038,7 +4107,7 @@ async fn plan_keys_are_named_in_the_layout_asked_for() {
         "m/art/",
         "m/rk/AK1",
         "m/tk/t_1",
-        "m/t/art/x_1",
+        "m/x/art/x_1",
     ] {
         assert_eq!(other_plan_key(none), None, "{none}");
     }

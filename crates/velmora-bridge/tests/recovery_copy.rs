@@ -467,12 +467,6 @@ fn walk(key: &str) -> String {
     format!("{{\"p\":\"a\",\"k\":\"{key}\"}}")
 }
 
-/// The cursor of a job of the last part of the walk, after the records
-/// of the tenant layout, that goes on after `key`.
-fn tail(key: &str) -> String {
-    format!("{{\"p\":\"z\",\"k\":\"{key}\"}}")
-}
-
 /// The cursor of a job of the fresh sweep that goes on after `key`.
 fn sweep(key: &str) -> String {
     format!("{{\"p\":\"g\",\"k\":\"{key}\"}}")
@@ -483,8 +477,8 @@ fn sweep(key: &str) -> String {
 const FRESH: [&str; 4] = [
     "m/del/g_",
     "m/g_",
-    "m/t/t_0000000000000000/del/g_",
-    "m/t/t_0000000000000000/g_",
+    "m/x/t_0000000000000000/del/g_",
+    "m/x/t_0000000000000000/g_",
 ];
 
 /// Older than the fresh sweep reaches: a record of the walk.
@@ -1818,10 +1812,10 @@ async fn a_pass_goes_on_from_a_key_that_something_else_wrote() {
 async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     let w = World::new();
     // Five copies and ten list requests take the job past its time
-    // before the next page. The tenant keys are in the last part of
-    // the walk, after the records of every tenant.
+    // before the next page.
     for i in 0..5 {
-        w.record(&format!("m/t/t_1/art/x_{i}"), b"plan").await;
+        w.generation(&generation(600_000, &format!("_{i}")), &[])
+            .await;
     }
     // More tenant keys than fill the first source page.
     for i in 0..1_000 {
@@ -1830,7 +1824,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     }
     w.record("m/x_9", b"plan").await;
     for i in 0..9 {
-        w.e2.set(&format!("m/t/t_1/zz{i}"), b"left over");
+        w.e2.set(&format!("m/g_zz{i}"), b"left over");
     }
     w.e2.page.set(1);
     let clock = TickClock(w.clock.clone());
@@ -1841,9 +1835,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
         remote: &w.remote,
         maintenance: Maintenance::Off,
     };
-    let (outcome, counts, why) = copier
-        .run_job(&w.jobs, UnixMs(NOW), &tail("m/t/t_1/"))
-        .await;
+    let (outcome, counts, why) = copier.run_job(&w.jobs, UnixMs(NOW), "").await;
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
     let counts = counts.unwrap();
     assert_eq!((counts.records, counts.copied), (5, 5));
@@ -1851,7 +1843,7 @@ async fn a_job_that_ends_at_tenant_keys_sends_no_name_of_one() {
     let sent = w.jobs.take();
     assert_eq!(sent.len(), 1);
     assert!(
-        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == tail("m/tk0")),
+        matches!(&sent[0].job, Job::RecoveryCopy { cursor, .. } if *cursor == sweep("m/tk0")),
         "{:?}",
         sent[0].job
     );
@@ -4533,11 +4525,11 @@ async fn a_mark_of_the_walk_that_cannot_be_read_stops_the_job() {
 }
 
 // ---------------------------------------------------------------------------
-// The two layouts of record names: `m/…` and `m/t/<tenant id>/…`
+// The two layouts of record names: `m/…` and `m/x/<tenant id>/…`
 // ---------------------------------------------------------------------------
 
 /// The directory of the tenant layout as this version writes it.
-const TENANT: &str = "m/t/t_0000000000000000/";
+const TENANT: &str = "m/x/t_0000000000000000/";
 
 /// The key of the tenant layout for the same record as `flat`.
 fn in_tenant(flat: &str) -> String {
@@ -4555,7 +4547,7 @@ async fn a_pass_copies_the_records_of_both_layouts_under_their_names() {
     let old = generation(OLD, "_o");
     let fresh = generation(600_000, "_f");
     let mut keys = Vec::new();
-    for dir in ["m/", TENANT, "m/t/t_1/", "m/t/t_zz/"] {
+    for dir in ["m/", TENANT, "m/x/t_1/", "m/x/t_zz/"] {
         let of = |flat: &str| format!("{dir}{}", &flat["m/".len()..]);
         for key in [
             "m/art/x_1".to_string(),
@@ -4573,7 +4565,7 @@ async fn a_pass_copies_the_records_of_both_layouts_under_their_names() {
     for key in [
         "m/rk/AK1".to_string(),
         "m/sz".to_string(),
-        "m/t/a".to_string(),
+        "m/x/a".to_string(),
         "m/zz".to_string(),
         in_tenant("m/seg/s_1/0"),
         in_tenant("m/del0"),
@@ -4740,7 +4732,7 @@ async fn a_hint_finds_the_article_plan_in_the_tenant_layout() {
         in_tenant(&generation(OLD, "_o")),
         in_tenant("m/del/g_0000000000001_t"),
         in_tenant("m/art/"),
-        "m/t/art/x_1".to_string(),
+        "m/x/art/x_1".to_string(),
     ] {
         w.record(&not, b"record").await;
         let named = cursor.replace("m/art/x_late", &not);
@@ -4764,7 +4756,7 @@ async fn a_saved_place_in_the_tenant_layout_is_safe() {
             w.record(key, b"record").await;
             w.record(&in_tenant(key), b"record").await;
         }
-        w.record("m/t/t_1/art/x_1", b"record").await;
+        w.record("m/x/t_1/art/x_1", b"record").await;
         w
     };
     let began = (NOW - PASS_INTERVAL_MS).to_string().into_bytes();
@@ -4772,13 +4764,13 @@ async fn a_saved_place_in_the_tenant_layout_is_safe() {
     let fresh_generation = in_tenant(&generation(600_000, "_x"));
     // (the place, and the records after it when the walk goes on)
     for (place, rest) in [
-        ("m/t/".to_string(), 5),
+        ("m/x/".to_string(), 5),
         (TENANT.to_string(), 5),
         (in_tenant("m/art/x_3"), 4),
         (in_tenant("m/del0"), 2),
         (in_tenant(&old), 1),
         (in_tenant("m/g`"), 1),
-        ("m/t/t_1/art/x_1".to_string(), 0),
+        ("m/x/t_1/art/x_1".to_string(), 0),
         // Inside the sweep: no walk saves it.
         (fresh_tombstone, 9),
         (fresh_generation, 9),
@@ -4817,7 +4809,7 @@ async fn the_cursors_of_a_pass_keep_their_names() {
     for i in 0..3 {
         w.record(&format!("m/art/x_{i}"), b"plan").await;
         w.record(&in_tenant(&format!("m/art/x_{i}")), b"plan").await;
-        w.record(&format!("m/t/t_1/art/x_{i}"), b"plan").await;
+        w.record(&format!("m/x/t_1/art/x_{i}"), b"plan").await;
         let id = format!("{:013x}_{i}", NOW - 600_000);
         for dir in ["m/", TENANT] {
             w.record(&format!("{dir}del/g_{id}"), b"gone").await;
@@ -4848,7 +4840,7 @@ async fn the_cursors_of_a_pass_keep_their_names() {
             let part = value["p"].as_str().unwrap().to_string();
             let key = value["k"].as_str().unwrap().to_string();
             // The part says which keys the cursor is in.
-            let tenant = key.starts_with("m/t/");
+            let tenant = key.starts_with("m/x/");
             assert_eq!(tenant, "ehcfz".contains(&part), "{next}");
             if parts.last() != Some(&part) {
                 parts.push(part);

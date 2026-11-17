@@ -473,9 +473,9 @@ fn record_layout_is_flat_unless_tenant_is_asked_for() {
         vars.insert("RECORD_LAYOUT".into(), tenant.into());
         let records = load(&vars).unwrap().records;
         assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
-        assert_eq!(records.root(), "m/t/t_0000000000000000/");
+        assert_eq!(records.root(), "m/x/t_0000000000000000/");
     }
-    for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/t/", "tenant,flat"] {
+    for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/x/", "tenant,flat"] {
         vars.insert("RECORD_LAYOUT".into(), bad.into());
         assert_eq!(
             load(&vars).unwrap_err(),
