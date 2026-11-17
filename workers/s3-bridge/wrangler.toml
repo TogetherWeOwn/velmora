@@ -100,6 +100,10 @@ RECOVERY_COPY = "off"
 # rollback must never land on a Worker that cannot read a copy or would
 # collect the extents it shares. See "Rollback floor" in ops/README.md.
 SERVER_SIDE_COPY = "on"
+# Packed article plans (see PACKED_PLANS above). On from the second deploy that
+# knows the switch; from then on, never roll back below the first one that knows
+# it ("Rollback floor" in ops/README.md).
+PACKED_PLANS = "on"
 # A GET (or ranged GET) of more plaintext bytes than this is served in
 # sub-ranges of this size: the invocation that answers the client asks
 # this Worker for each sub-range in turn through the SELF binding below,
