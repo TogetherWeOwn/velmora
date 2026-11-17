@@ -737,7 +737,10 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()> {
         permits::seed_permits(self, providers).await?;
-        permits::sweep_gates(self, self.gate.as_deref()).await
+        // A gate that cannot be reached is told again by the next call:
+        // the rest of the caller's work does not wait for it.
+        let _ = permits::sweep_gates(self, self.gate.as_deref()).await;
+        Ok(())
     }
     async fn acquire_permit(
         &self,

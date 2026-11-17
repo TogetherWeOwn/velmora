@@ -35,6 +35,8 @@ const RECORD_KEY: &str = "record";
 /// The longest the timer sleeps between two looks at the gate.
 const TICK_MAX_MS: i64 = 5_000;
 const TICK_MIN_MS: i64 = 250;
+/// A timer silent for this long is taken to be gone.
+const TICK_LOST_MS: i64 = 60_000;
 
 /// The record as one JSON string in the object's storage.
 struct DoStore(Storage);
@@ -66,8 +68,10 @@ pub struct PermitGate {
     state: State,
     /// `None`: the catalogue binding is missing; every request fails.
     gate: Option<Rc<Gate<D1Sql, DoStore>>>,
-    /// The timer is running.
-    ticking: Rc<Cell<bool>>,
+    /// The timer: which one runs, and when it last looked at the gate.
+    /// One that has not looked for [`TICK_LOST_MS`] was cancelled by
+    /// the runtime, and the next request starts another.
+    ticking: Rc<Cell<(u64, i64)>>,
 }
 
 impl PermitGate {
@@ -75,18 +79,29 @@ impl PermitGate {
     /// housekeeping, and ends once the gate has nothing live and
     /// nothing stored, so that the object can leave memory.
     fn keep_awake(&self, gate: &Rc<Gate<D1Sql, DoStore>>) {
-        if self.ticking.get() || gate.next_wake(WorkerClock.now()).is_none() {
+        let now = WorkerClock.now().0;
+        let (run, beat) = self.ticking.get();
+        let running = beat != 0 && (now - beat).abs() < TICK_LOST_MS;
+        if running || gate.next_wake(WorkerClock.now()).is_none() {
             return;
         }
-        self.ticking.set(true);
+        let run = run.wrapping_add(1);
+        self.ticking.set((run, now));
         let (gate, ticking) = (Rc::clone(gate), Rc::clone(&self.ticking));
         self.state.wait_until(async move {
             while let Some(wake) = gate.next_wake(WorkerClock.now()) {
                 let ms = (wake.0 - WorkerClock.now().0).clamp(TICK_MIN_MS, TICK_MAX_MS);
                 worker::Delay::from(Duration::from_millis(ms as u64)).await;
+                // Another was started in its place: one is enough.
+                if ticking.get().0 != run {
+                    return;
+                }
+                ticking.set((run, WorkerClock.now().0));
                 gate.tick(WorkerClock.now()).await;
             }
-            ticking.set(false);
+            if ticking.get().0 == run {
+                ticking.set((run, 0));
+            }
         });
     }
 }
@@ -100,7 +115,7 @@ impl DurableObject for PermitGate {
         PermitGate {
             state,
             gate,
-            ticking: Rc::new(Cell::new(false)),
+            ticking: Rc::new(Cell::new((0, 0))),
         }
     }
 

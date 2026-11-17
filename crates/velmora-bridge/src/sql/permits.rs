@@ -51,7 +51,7 @@
 
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
-use crate::gate::{PermitGate, GATE_HOLDER_PREFIX, SEIZED_UNTIL_MS};
+use crate::gate::{PermitGate, GATE_HOLDER_PREFIX, GATE_IDLE_PREFIX, SEIZED_UNTIL_MS};
 use crate::ports::{Permit, PermitClass, Sql, SqlValue};
 use crate::types::{ProviderConfig, Result, UnixMs};
 
@@ -114,8 +114,14 @@ pub(super) async fn sweep_gates<S: Sql>(
     let mut seized_by = Vec::with_capacity(rows.len());
     for row in rows {
         let holder = Cols::new(row).text()?;
-        if let Some(name) = holder.strip_prefix(GATE_HOLDER_PREFIX) {
-            seized_by.push(name.to_string());
+        // A retired gate that has not freed its rows yet is told again.
+        let name = holder
+            .strip_prefix(GATE_HOLDER_PREFIX)
+            .or_else(|| holder.strip_prefix(GATE_IDLE_PREFIX));
+        if let Some(name) = name {
+            if !seized_by.iter().any(|n| n == name) {
+                seized_by.push(name.to_string());
+            }
         }
     }
     gate.sweep(&seized_by).await

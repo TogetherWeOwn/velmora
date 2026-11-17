@@ -795,19 +795,22 @@ that:
   object only when its permit calls come near that. Each object takes
   the slots `n` with `n % shards == shard` and the matching part of
   `max_ips` and of the pool limit. No account gets more objects than
-  its smallest limit (`max_conns`, `max_ips`, `pool_max_conns`), so
-  that every object has a connection and an address to hand out. A
-  holder asks one object first and the others only when that one has
-  nothing left.
+  its smallest limit (`max_conns`, `max_ips`, `pool_max_conns`) less
+  the one connection or address that limit keeps back for reads, so
+  that every object has a connection and an address to hand out to a
+  job. (`max_ips = 2` therefore means one object, whatever
+  `PERMIT_SHARDS` says.) A holder asks one object first and the others
+  only when that one has nothing left.
 - `PERMIT_GATES = "one"` puts every account behind the same objects
   (`permits:all:<shard>`). That is the least duration to pay for (see
   "Cost") and the lowest ceiling on requests.
 
 Change `PERMIT_SHARDS`, `PERMIT_GATES`, or (with more than one shard) a
 provider's limits only while `PERMITS` is `d1` and no gate holds rows
-(the query below is empty). A change while gates are in use never
-breaks a limit, but an object keeps the rows it seized under the old
-division, and the objects of the new one wait for them without end.
+(the query below is empty). A change while gates are in use is not
+meant to break a limit (the tests mix divisions at random), but an
+object keeps the rows it seized under the old division, and the
+objects of the new one wait for them without end.
 
 A permit is a limit on connections, not a guard of data: the lease
 token of a job in the catalogue is unchanged and still fences every
@@ -839,10 +842,19 @@ the object does not stay in memory between requests.
 Old and new Workers run side by side during a deploy, one side asking
 the catalogue and one the gate. The slot rows decide between them, so
 the two together never exceed a limit: the gate hands out on a provider
-only while it holds every slot row of its part of it (and of every
-account of its pool) under the holder `do-gate:<gate>`. It takes a row only when the
-row is free, so it starts once the catalogue's callers have let go; and
-it gives the rows back only when none of its own permits is live.
+only while it holds every slot row of its part of it under the holder
+`do-gate:<gate>`, and every other row of the account (and of every
+account of its pool) is held by a gate of the same account or pool. It
+takes a row only when the row is free, so the gates start once the
+catalogue's callers have let go of the whole account. A gate told to
+retire keeps its rows, renamed `do-gate-idle:<gate>`, once none of its
+own permits is live; the rows of an account or pool become free
+together, when its last gate has retired. With several shards the
+address and pool limits are shared out among the gates, so the account
+is either all the gates' or all the catalogue's, never part of each.
+
+A gate does not rely on what it stored about the rows: at every start,
+and whenever it is put back in charge, it asks the catalogue.
 
 1. Deploy a version that knows `PERMITS`, with `PERMITS = "d1"`. The
    deploy adds the object class (a migration). Nothing calls it.
@@ -865,20 +877,28 @@ it gives the rows back only when none of its own permits is live.
 To go back, set `PERMITS = "d1"` in a deploy of its own and keep the
 `PERMIT_GATE` binding. The first acquire that finds no free slot (and
 the cron, every 5 minutes) tells each gate that still holds rows to
-retire; the gate frees them once its permits have run out. The query
-above is then empty or shows job holders.
+retire; the gates free them once their permits have run out. The query
+above is then empty or shows job holders. In `d1` mode a gate that
+cannot be reached delays only this hand-back, not the cron's other
+work.
+
+`PERMITS = "d1"` is not quite the code from before the gate: the cron
+and an acquire that finds no free slot (at most every 30 s) read the
+slot rows once more, to find gates to retire, and a job closes its
+provider sessions before it frees their slots.
 
 A rollback to a version from before step 1 is not possible once step 1
 is deployed: Cloudflare refuses a rollback across a Durable Object
 migration. This includes the automatic rollback of the deploy that
 carries step 1; if that deploy fails, fix forward. Roll back to a
 version that does not know `PERMITS` only while `PERMITS` is `d1` and
-the query above shows no `do-gate:` row; such rows never run out by
-themselves. To clear them by hand, with no Worker in `do` mode:
+the query above shows no `do-gate:` or `do-gate-idle:` row; such rows
+never run out by themselves. To clear them by hand, only with no Worker
+in `do` mode and after the longest permit has run out (125 s):
 
 ```
-UPDATE provider_permits SET holder = NULL, lease_until = 0
- WHERE holder LIKE 'do-gate:%';
+UPDATE provider_permits SET holder = NULL, lease_until = 0, pool = NULL
+ WHERE holder LIKE 'do-gate:%' OR holder LIKE 'do-gate-idle:%';
 ```
 
 ### Cost

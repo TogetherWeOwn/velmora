@@ -101,6 +101,22 @@ pub fn gate_holder(name: &str) -> String {
     format!("{GATE_HOLDER_PREFIX}{name}")
 }
 
+/// Prefix of the holder name of a retired gate on the rows it no longer
+/// hands out but that are not free yet: the gates of one account (or
+/// pool) free their rows together, once every one of them is done.
+pub const GATE_IDLE_PREFIX: &str = "do-gate-idle:";
+
+/// The holder name of the retired gate `name` on its slot rows.
+pub fn gate_idle_holder(name: &str) -> String {
+    format!("{GATE_IDLE_PREFIX}{name}")
+}
+
+/// `name` without its shard: what the gates of one account or pool
+/// have in common, with the colon that ends it.
+fn unit_prefix(name: &str) -> &str {
+    name.rfind(':').map_or(name, |at| &name[..=at])
+}
+
 /// Expiry of a seized slot row: 2100-01-01. Only the gate frees it.
 pub const SEIZED_UNTIL_MS: i64 = 4_102_444_800_000;
 
@@ -599,6 +615,7 @@ pub enum GateMode {
 /// All a gate stores. Written when the horizon moves, when a provider's
 /// rows are seized or freed and when the mode changes: never per permit.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GateRecord {
     /// No job's slot handed out so far is held after this time.
     pub jobs_until: i64,
@@ -606,7 +623,8 @@ pub struct GateRecord {
     pub reads_until: i64,
     pub mode: GateMode,
     /// The accounts, or parts of accounts ([`GateProvider::part`]),
-    /// whose slot rows are all this gate's, with their count.
+    /// whose slot rows are all this gate's, with their count. Stored
+    /// for the log only: a start asks the catalogue again.
     pub seized: BTreeMap<String, u32>,
 }
 
@@ -669,12 +687,37 @@ const SEIZE: &str = "UPDATE provider_permits \
      SET token = token + 1, holder = ?2, lease_until = ?3, pool = ?5, background = 0 \
      WHERE provider_id = ?1 AND lease_until < ?4 AND slot % ?6 = ?7";
 
-const OWNED: &str = "SELECT COUNT(*), \
-       COALESCE(SUM(CASE WHEN holder = ?2 AND lease_until >= ?3 THEN 1 ELSE 0 END), 0) \
-     FROM provider_permits WHERE provider_id = ?1 AND slot % ?4 = ?5";
+// A retired gate's own rows, taken back into use (`?1` its name as a
+// retired holder, `?2` as an active one).
+const WAKE: &str = "UPDATE provider_permits SET holder = ?2 WHERE holder = ?1";
 
+// Of the account `?1`: the rows of this part (`slot % ?4 = ?5`), those
+// of them this gate holds, all rows, and those of all rows that a gate
+// of the same account or pool holds, active (`?6`) or retired (`?7`).
+// A part hands out only when the last two are equal: while a catalogue
+// caller holds, or can take, any row of the account, its address and
+// pool counts are not the gates' to share out.
+const OWNED: &str = "SELECT \
+       COALESCE(SUM(CASE WHEN slot % ?4 = ?5 THEN 1 ELSE 0 END), 0), \
+       COALESCE(SUM(CASE WHEN slot % ?4 = ?5 AND holder = ?2 AND lease_until >= ?3 \
+                         THEN 1 ELSE 0 END), 0), \
+       COUNT(*), \
+       COALESCE(SUM(CASE WHEN lease_until >= ?3 AND (substr(holder, 1, length(?6)) = ?6 \
+                           OR substr(holder, 1, length(?7)) = ?7) THEN 1 ELSE 0 END), 0) \
+     FROM provider_permits WHERE provider_id = ?1";
+
+// A retired gate with nothing live keeps its rows, under its retired
+// name (`?2`): a catalogue caller still sees them held.
+const IDLE: &str = "UPDATE provider_permits SET holder = ?2 WHERE holder = ?1";
+
+// The rows of the retired gates of one account or pool (`?1`, a holder
+// prefix) become free in one statement, and only when no gate of it is
+// active (`?2`): a gate that still hands out has the whole account.
 const HAND_BACK: &str = "UPDATE provider_permits \
-     SET lease_until = 0, holder = NULL, pool = NULL WHERE holder = ?1";
+     SET lease_until = 0, holder = NULL, pool = NULL \
+     WHERE substr(holder, 1, length(?1)) = ?1 \
+       AND NOT EXISTS (SELECT 1 FROM provider_permits \
+                       WHERE substr(holder, 1, length(?2)) = ?2)";
 
 fn text(s: &str) -> SqlValue {
     SqlValue::Text(s.to_string())
@@ -708,7 +751,11 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         if self.inner.borrow().is_some() {
             return Ok(());
         }
-        let record = self.store.load().await?.unwrap_or_default();
+        let mut record = self.store.load().await?.unwrap_or_default();
+        let saved = record.clone();
+        // What the gate owned is asked of the catalogue again: the rows
+        // may have changed hands while the gate was not in memory.
+        record.seized.clear();
         let mut inner = self.inner.borrow_mut();
         if inner.is_some() {
             return Ok(());
@@ -725,7 +772,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             core: Core::new(now),
             warm_jobs: wait(record.jobs_until, true),
             warm_reads: wait(record.reads_until, false),
-            saved: record.clone(),
+            saved,
             record,
             busy: 0,
             empty_since: None,
@@ -803,7 +850,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         if self.with(|i| i.record.mode != GateMode::Active) {
             return Ok(());
         }
-        let holder = gate_holder(&name);
+        let (holder, idle) = (gate_holder(&name), gate_idle_holder(&name));
         let pool = match p.pool_limit() {
             Some((pool, _)) => text(pool),
             None => SqlValue::Null,
@@ -814,6 +861,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                     SEED,
                     vec![text(&p.id), SqlValue::Int(i64::from(p.max_conns))],
                 ),
+                (WAKE, vec![text(&idle), text(&holder)]),
                 (
                     SEIZE,
                     vec![
@@ -838,17 +886,29 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                     SqlValue::Int(now.0),
                     SqlValue::Int(i64::from(p.shards.max(1))),
                     SqlValue::Int(i64::from(p.shard)),
+                    text(&gate_holder(unit_prefix(&name))),
+                    text(&gate_idle_holder(unit_prefix(&name))),
                 ],
             )
             .await?;
         let row = rows
             .first()
             .ok_or_else(|| BridgeError::Sql("gate: no count".into()))?;
-        let (all, mine) = (int(row, 0)?, int(row, 1)?);
-        if all == mine && all >= i64::from(p.count(0..p.max_conns)) {
-            let n = u32::try_from(all).unwrap_or(u32::MAX);
-            self.with(|i| i.record.seized.insert(p.part_name(), n));
-        }
+        let (part, mine, all, gates) = (int(row, 0)?, int(row, 1)?, int(row, 2)?, int(row, 3)?);
+        let whole = part == mine
+            && part >= i64::from(p.count(0..p.max_conns))
+            && all == gates
+            && all >= i64::from(p.max_conns);
+        // Under the lock still: a retirement has not come between.
+        self.with(|i| match whole && i.record.mode == GateMode::Active {
+            true => {
+                let n = u32::try_from(part).unwrap_or(u32::MAX);
+                i.record.seized.insert(p.part_name(), n);
+            }
+            false => {
+                i.record.seized.remove(&p.part_name());
+            }
+        });
         Ok(())
     }
 
@@ -936,7 +996,14 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
     }
 
     async fn activate(&self, providers: &[GateProvider], now: UnixMs) -> Result<bool> {
-        self.with(|i| i.record.mode = GateMode::Active);
+        // Back in charge: what it owned before is asked again, at once.
+        self.with(|i| {
+            if i.record.mode != GateMode::Active {
+                i.record.mode = GateMode::Active;
+                i.record.seized.clear();
+                i.seize_tried.clear();
+            }
+        });
         for p in providers {
             if !self.owned(p) {
                 self.seize(p, now).await?;
@@ -968,12 +1035,23 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         let Some(name) = self.with(|i| i.name.clone()).filter(|_| idle) else {
             return Ok(false);
         };
-        // Forgotten in storage before the rows are freed: a start
-        // between the two steps finds rows it has to seize again, never
-        // rows it only believes it owns.
         self.persist().await?;
+        // Its rows stay held, under the retired name, until every gate
+        // of the account or pool is done: then all of them are freed in
+        // one statement. A gate of it that still hands out counts on
+        // no catalogue caller being on the account.
+        let unit = unit_prefix(&name);
         self.sql
-            .exec(HAND_BACK, &[text(&gate_holder(&name))])
+            .batch(vec![
+                (
+                    IDLE,
+                    vec![text(&gate_holder(&name)), text(&gate_idle_holder(&name))],
+                ),
+                (
+                    HAND_BACK,
+                    vec![text(&gate_idle_holder(unit)), text(&gate_holder(unit))],
+                ),
+            ])
             .await?;
         Ok(true)
     }
@@ -989,18 +1067,37 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         if self.with(|i| i.name.as_deref() != Some(request.gate.as_str())) {
             return Err(BridgeError::Invalid("gate asked under another name"));
         }
-        let mut answers = Vec::with_capacity(request.ops.len());
-        for op in &request.ops {
+        let mut taken = Vec::new();
+        let answers = self.answer(&request.ops, now, &mut taken).await;
+        if answers.is_err() {
+            // The caller learns of none of them.
+            self.with(|i| taken.iter().for_each(|p| i.core.release(p)));
+        }
+        self.with(|i| i.note_empty(now));
+        Ok(GateReply { answers: answers? })
+    }
+
+    async fn answer(
+        &self,
+        ops: &[GateOp],
+        now: UnixMs,
+        taken: &mut Vec<GatePermit>,
+    ) -> Result<Vec<GateAnswer>> {
+        let mut answers = Vec::with_capacity(ops.len());
+        for op in ops {
             answers.push(match op {
                 GateOp::Acquire {
                     provider,
                     peers,
                     background,
                     holder,
-                } => GateAnswer::Acquired(
-                    self.acquire(provider, peers, *background, holder, now)
-                        .await?,
-                ),
+                } => {
+                    let permit = self
+                        .acquire(provider, peers, *background, holder, now)
+                        .await?;
+                    taken.extend(permit.clone());
+                    GateAnswer::Acquired(permit)
+                }
                 GateOp::Renew { permits } => GateAnswer::Renewed(self.renew(permits, now).await?),
                 GateOp::Release { permits } => {
                     self.with(|i| permits.iter().for_each(|p| i.core.release(p)));
@@ -1013,8 +1110,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 GateOp::Retire => GateAnswer::Retired(self.retire(now).await?),
             });
         }
-        self.with(|i| i.note_empty(now));
-        Ok(GateReply { answers })
+        Ok(answers)
     }
 
     /// Housekeeping between requests: once nothing has been held for
@@ -1029,7 +1125,9 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             let clear = i.busy == 0
                 && now.0 >= i.warm_jobs.max(i.warm_reads)
                 && i.empty_since.is_some_and(|at| now.0 - at >= LINGER_MS)
-                && (i.record.jobs_until != 0 || i.record.reads_until != 0);
+                && [&i.record, &i.saved]
+                    .iter()
+                    .any(|r| r.jobs_until != 0 || r.reads_until != 0);
             if clear {
                 i.record.jobs_until = 0;
                 i.record.reads_until = 0;
@@ -1037,7 +1135,8 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             clear
         });
         if clear {
-            // A failed save is tried again by the next tick: the stored
+            // A failed save is tried again by the next tick (the saved
+            // copy still has the horizon): until then the stored
             // horizon is only later than it has to be.
             let _ = self.persist().await;
         }
@@ -1209,6 +1308,8 @@ struct Slot {
     /// The call that carried the question was dropped before its
     /// answer came.
     lost: bool,
+    /// The caller that asked was dropped.
+    gone: bool,
     waker: Option<core::task::Waker>,
 }
 
@@ -1253,6 +1354,18 @@ pub struct GateClient<T: GateTransport> {
 
 /// Returns `Pending` once, so that calls started together are all in
 /// the queue before the first of them sends it.
+/// Marks its slot when the caller that asked is dropped.
+struct Asking(Rc<RefCell<Slot>>);
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        self.0.borrow_mut().gone = true;
+    }
+}
+
+// Resumes in the same round of the event loop it was awaited in: a
+// batch is made of the calls one request started together, never of
+// those of a later request.
 struct YieldOnce(bool);
 
 impl core::future::Future for YieldOnce {
@@ -1300,9 +1413,9 @@ impl<T: GateTransport> GateClient<T> {
     }
 
     /// How many gates serve the unit of `p`: `PERMIT_SHARDS`, and no
-    /// more than the smallest limit in the unit, so that every gate has
-    /// a connection and an address to hand out. Every provider of a
-    /// unit has the same answer.
+    /// more than the smallest limit in the unit less its read reserve,
+    /// so that every gate has a connection and an address to hand out
+    /// to a job. Every provider of a unit has the same answer.
     fn shards_of(&self, p: &GateProvider) -> u32 {
         let unit = self.sharding.unit_of(p);
         self.providers
@@ -1310,6 +1423,7 @@ impl<T: GateTransport> GateClient<T> {
             .filter(|q| self.sharding.unit_of(q) == unit)
             .flat_map(|q| [Some(q.max_conns), q.max_ips, q.pool_max_conns])
             .flatten()
+            .map(|limit| limit - reserve(limit))
             .fold(self.shards, u32::min)
             .max(1)
     }
@@ -1362,8 +1476,12 @@ impl<T: GateTransport> GateClient<T> {
             .entry(gate.to_string())
             .or_default()
             .push((op.clone(), slot.clone()));
+        let _asking = Asking(slot.clone());
         YieldOnce(false).await;
-        let batch = self.queue.borrow_mut().remove(gate).unwrap_or_default();
+        let mut batch = self.queue.borrow_mut().remove(gate).unwrap_or_default();
+        // Nobody is left to use a slot asked for by a caller that has
+        // gone. What a gone caller gives back is still given back.
+        batch.retain(|(op, slot)| !(slot.borrow().gone && matches!(op, GateOp::Acquire { .. })));
         if !batch.is_empty() {
             let (ops, slots): (Vec<GateOp>, Vec<_>) = batch.into_iter().unzip();
             let mut carried = Carried(slots);
@@ -1537,14 +1655,19 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
                 PermitMode::Catalog => BTreeMap::new(),
             };
             // The others first: what they free, the gates in use seize.
+            let mut first_error = Ok(());
             for gate in seized_by.iter().filter(|g| !mine.contains_key(*g)) {
-                self.send(gate, vec![GateOp::Retire]).await?;
+                if let Err(e) = self.send(gate, vec![GateOp::Retire]).await {
+                    first_error = first_error.and(Err(e));
+                }
             }
             for (gate, providers) in mine {
-                self.send(&gate, vec![GateOp::Activate { providers }])
-                    .await?;
+                let told = self.send(&gate, vec![GateOp::Activate { providers }]);
+                if let Err(e) = told.await {
+                    first_error = first_error.and(Err(e));
+                }
             }
-            Ok(())
+            first_error
         })
     }
 }

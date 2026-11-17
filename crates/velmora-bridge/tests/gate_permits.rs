@@ -86,6 +86,8 @@ struct World {
     gates: RefCell<BTreeMap<String, Rc<Gate<Db, Store>>>>,
     calls: Cell<u32>,
     ops: Cell<u32>,
+    /// No gate can be reached.
+    down: Cell<bool>,
 }
 
 impl World {
@@ -97,6 +99,7 @@ impl World {
             gates: RefCell::default(),
             calls: Cell::new(0),
             ops: Cell::new(0),
+            down: Cell::new(false),
         })
     }
 
@@ -226,6 +229,9 @@ struct Wire(Rc<World>);
 
 impl GateTransport for Wire {
     async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        if self.0.down.get() {
+            return Err(BridgeError::Sql("gate: unreachable".into()));
+        }
         self.0.calls.set(self.0.calls.get() + 1);
         self.0.ops.set(self.0.ops.get() + request.ops.len() as u32);
         // As on the wire: the request and the reply are JSON.
@@ -1153,6 +1159,9 @@ async fn a_holder_finds_room_in_the_other_gate_of_its_account() {
     let mut jobs = Vec::new();
     for _ in 0..3 {
         jobs.push(take(&c, &w, &p, JOB, "job").await.unwrap());
+        // The gate asked first hands out once it has seen that the
+        // other has its rows: at its next look at the catalogue.
+        w.pass(SEIZE_EVERY_MS);
     }
     let mut slots: Vec<u32> = jobs.iter().map(|j| j.slot).collect();
     slots.sort_unstable();
@@ -1190,8 +1199,10 @@ async fn a_holder_finds_room_in_the_other_gate_of_its_account() {
     assert_eq!(w.held(even, "p").await + w.held(odd, "p").await, 0);
 }
 
-/// No more gates than the smallest limit of the account: each of them
-/// has a connection and an address to hand out.
+/// No more gates than the smallest limit of the account less what it
+/// keeps for reads: each of them has a connection and an address to
+/// hand out to a job. Two addresses, one of them kept for reads, are
+/// one gate: a second would hold the reads' address and serve no job.
 #[tokio::test]
 async fn an_account_has_no_more_gates_than_its_smallest_limit() {
     let w = World::new();
@@ -1211,9 +1222,255 @@ async fn an_account_has_no_more_gates_than_its_smallest_limit() {
             "SELECT COUNT(DISTINCT holder) FROM provider_permits WHERE holder LIKE 'do-gate:%'"
         )
         .await,
-        2
+        1
     );
     assert_eq!(w.rows_of_gates("p").await, 8);
+
+    // Four addresses, one for reads: three gates, and each serves jobs.
+    let w = World::new();
+    let p = with_ips(provider("p", 9), 4);
+    let providers = [p.clone()];
+    let c = w.catalog_of(PermitMode::Gate, GateSharding::Account, 5, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    w.pass(SEIZE_EVERY_MS);
+    let mut gates = Vec::new();
+    for i in 0..3 {
+        assert!(take(&c, &w, &p, JOB, &format!("job-{i}")).await.is_some());
+    }
+    assert!(take(&c, &w, &p, JOB, "job-3").await.is_none(), "addresses");
+    for shard in 0..3 {
+        gates.push(w.held(&format!("permits:account.p:{shard}"), "p").await);
+    }
+    assert_eq!(gates.iter().sum::<u32>(), 3);
+    assert_eq!(
+        w.count(
+            "SELECT COUNT(DISTINCT holder) FROM provider_permits WHERE holder LIKE 'do-gate:%'"
+        )
+        .await,
+        3
+    );
+}
+
+/// Workers that use the slot rows beside Workers that divide each
+/// account over several gates: a gate hands out only while every row
+/// of the account is a gate's, so the address and pool limits, which
+/// the gates share out among themselves, are never counted twice.
+#[tokio::test]
+async fn slot_rows_and_several_gates_keep_the_limits_together() {
+    let mut gates_took = 0;
+    for shards in [2, 3] {
+        for seed in 1..=12u64 {
+            let taken = storm(
+                &[(PermitMode::Catalog, 1), (PermitMode::Gate, shards)],
+                seed,
+            )
+            .await;
+            gates_took += taken[1];
+        }
+    }
+    // Both kinds ask all the time, so the rows keep changing hands only
+    // through the periodic step: the gates get their turns.
+    assert!(gates_took > 0, "the gates never took charge");
+}
+
+/// One gate of two is retired and idle while the other still has a job
+/// running: the rows of both stay out of the catalogue callers' reach
+/// until the last gate is done, then all become free together.
+#[tokio::test]
+async fn the_gates_of_an_account_free_its_rows_together() {
+    let w = World::new();
+    let p = with_ips(provider("p", 4), 3);
+    let providers = [p.clone()];
+    let new = w.catalog_of(PermitMode::Gate, GateSharding::Account, 2, &providers);
+    new.seed_permits(&providers).await.unwrap();
+    w.pass(SEIZE_EVERY_MS);
+    let job = take(&new, &w, &p, JOB, "new-job").await.unwrap();
+    let busy = format!("permits:account.p:{}", job.slot % 2);
+    let idle = format!("permits:account.p:{}", 1 - job.slot % 2);
+    assert_eq!(w.held(&busy, "p").await, 1);
+
+    let back = w.catalog(PermitMode::Catalog, GateSharding::Account, &providers);
+    back.seed_permits(&providers).await.unwrap();
+    let rows = |holder: String| {
+        let w = &w;
+        async move {
+            let sql = format!("SELECT COUNT(*) FROM provider_permits WHERE holder = '{holder}'");
+            w.count(&sql).await
+        }
+    };
+    assert_eq!(rows(gate_idle_holder(&idle)).await, 2, "kept, not freed");
+    assert_eq!(rows(gate_holder(&busy)).await, 2);
+    for holder in ["back-1", "back-2", "back-3"] {
+        assert!(take(&back, &w, &p, READ, holder).await.is_none());
+        assert!(take(&back, &w, &p, JOB, holder).await.is_none());
+    }
+
+    // Forwards again before the job is done: the idle gate takes its
+    // rows back and both hand out.
+    new.seed_permits(&providers).await.unwrap();
+    assert_eq!(rows(gate_holder(&idle)).await, 2);
+    w.pass(SEIZE_EVERY_MS);
+    let second = take(&new, &w, &p, JOB, "new-job-2").await.unwrap();
+    new.release_permit(&second).await.unwrap();
+
+    // And back for good.
+    back.seed_permits(&providers).await.unwrap();
+    assert_eq!(rows(gate_idle_holder(&idle)).await, 2);
+    new.release_permit(&job).await.unwrap();
+    back.seed_permits(&providers).await.unwrap();
+    assert_eq!(w.rows_of_gates("p").await, 0);
+    assert_eq!(rows(gate_idle_holder(&idle)).await, 0);
+    assert!(take(&back, &w, &p, JOB, "back-1").await.is_some());
+}
+
+/// The rows are cleared by hand while the gate is not in memory, and
+/// catalogue callers take them. A gate that starts again does not rely
+/// on what it stored: it asks the catalogue and waits.
+#[tokio::test]
+async fn a_gate_does_not_trust_what_it_stored_about_the_rows() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let new = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let job = take(&new, &w, &p, JOB, "new-job").await.unwrap();
+    new.release_permit(&job).await.unwrap();
+    let stored = w.store("permits:all:0").record.borrow().clone().unwrap();
+    assert_eq!(stored.seized.get("p"), Some(&2));
+
+    w.restart();
+    w.db.exec(
+        "UPDATE provider_permits SET lease_until = 0, holder = NULL, pool = NULL",
+        &[],
+    )
+    .await
+    .unwrap();
+    w.pass(JOB_MS + SKEW_MS + 1);
+    let old = w.old_catalog();
+    assert!(take(&old, &w, &p, JOB, "old-job").await.is_some());
+    assert!(take(&old, &w, &p, READ, "old-read").await.is_some());
+
+    for _ in 0..3 {
+        assert!(take(&new, &w, &p, JOB, "new-job").await.is_none());
+        assert!(take(&new, &w, &p, READ, "new-read").await.is_none());
+        w.pass(SEIZE_EVERY_MS);
+    }
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
+}
+
+/// The same for a gate that stays in memory through a retirement that
+/// someone else undid: back in charge, it asks the catalogue again.
+#[tokio::test]
+async fn a_gate_back_in_charge_asks_the_catalogue_again() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let new = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let job = take(&new, &w, &p, JOB, "new-job").await.unwrap();
+    new.release_permit(&job).await.unwrap();
+    let back = w.catalog(PermitMode::Catalog, GateSharding::One, &providers);
+    back.seed_permits(&providers).await.unwrap();
+    assert_eq!(w.rows_of_gates("p").await, 0);
+    assert!(take(&back, &w, &p, JOB, "back-job").await.is_some());
+    assert!(take(&back, &w, &p, READ, "back-read").await.is_some());
+
+    new.seed_permits(&providers).await.unwrap();
+    w.pass(SEIZE_EVERY_MS);
+    assert!(take(&new, &w, &p, JOB, "new-job").await.is_none());
+    assert!(take(&new, &w, &p, READ, "new-read").await.is_none());
+}
+
+/// The save that clears the horizon fails: the next look tries again,
+/// and only then may the object leave memory.
+#[tokio::test]
+async fn a_clear_that_failed_is_tried_again() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let store = w.store("permits:all:0");
+    let job = take(&c, &w, &p, JOB, "job").await.unwrap();
+    c.release_permit(&job).await.unwrap();
+    let gate = w.gate("permits:all:0");
+
+    store.fail.set(true);
+    w.pass(LINGER_MS + 1);
+    w.tick().await;
+    assert!(store.record.borrow().as_ref().unwrap().jobs_until > 0);
+    assert!(gate.next_wake(w.now()).is_some(), "not done yet");
+
+    store.fail.set(false);
+    w.pass(1000);
+    w.tick().await;
+    assert_eq!(store.record.borrow().as_ref().unwrap().jobs_until, 0);
+    assert!(gate.next_wake(w.now()).is_none(), "may leave memory");
+}
+
+/// In slot-rows mode a gate that cannot be reached does not stop the
+/// periodic step, nor an acquire.
+#[tokio::test]
+async fn an_unreachable_gate_does_not_stop_the_slot_rows_mode() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let new = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let job = take(&new, &w, &p, JOB, "new-job").await.unwrap();
+    new.release_permit(&job).await.unwrap();
+    w.pass(JOB_MS + SKEW_MS);
+
+    let back = w.catalog(PermitMode::Catalog, GateSharding::One, &providers);
+    w.down.set(true);
+    back.seed_permits(&providers).await.unwrap();
+    assert!(take(&back, &w, &p, JOB, "back-job").await.is_none());
+    assert_eq!(w.rows_of_gates("p").await, 2, "nobody told the gate");
+
+    w.down.set(false);
+    back.seed_permits(&providers).await.unwrap();
+    assert_eq!(w.rows_of_gates("p").await, 0);
+    assert!(take(&back, &w, &p, JOB, "back-job").await.is_some());
+}
+
+/// A request of several questions that fails at one of them hands out
+/// nothing: the caller hears of no slot, so none stays taken.
+#[tokio::test]
+async fn a_request_that_fails_keeps_no_slot() {
+    let w = World::new();
+    let whole = GateProvider::from(&provider("p", 2));
+    let acquire = |provider: GateProvider| GateOp::Acquire {
+        provider,
+        peers: Vec::new(),
+        background: true,
+        holder: "job".into(),
+    };
+    let gate = w.gate("permits:all:0");
+    let ask = GateRequest {
+        gate: "permits:all:0".into(),
+        ops: vec![acquire(whole.clone()), acquire(whole.clone().part(2, 2))],
+    };
+    assert!(gate.handle(ask, w.now()).await.is_err());
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
+}
+
+/// A caller dropped before its question was sent is not asked for: the
+/// slot would be nobody's.
+#[tokio::test]
+async fn a_caller_that_has_gone_takes_no_slot() {
+    let w = World::new();
+    let providers = [provider("p", 4)];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    w.ops.set(0);
+    let now = w.now();
+
+    let mut gone = Box::pin(c.acquire_permit(&providers[0], JOB, "job-1", now));
+    let mut stays = Box::pin(c.acquire_permit(&providers[0], JOB, "job-1", now));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = core::task::Context::from_waker(&waker);
+    assert!(gone.as_mut().poll(&mut cx).is_pending());
+    assert!(stays.as_mut().poll(&mut cx).is_pending());
+    drop(gone);
+    assert!(stays.await.unwrap().is_some());
+    assert_eq!(w.ops.get(), 1);
+    assert_eq!(w.held("permits:all:0", "p").await, 1);
 }
 
 /// A gate asked for a part of an account that does not exist refuses.
