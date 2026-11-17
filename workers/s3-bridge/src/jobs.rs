@@ -128,8 +128,16 @@ pub async fn run(
 /// and with it every job running in the isolate. That happened with
 /// wasm-streams 0.7.0: dropping the reader of an R2 body called
 /// `releaseLock()`, which throws outside the reader's request. 0.7.1
-/// ignores that throw; `the_stream_reader_drop_does_not_throw` holds the
-/// lockfile to it.
+/// ignores that throw and leaves the stream locked;
+/// `the_stream_reader_drop_does_not_throw` holds the lockfile to it.
+///
+/// The other destructors a queue job can hold, as read in worker 0.8.7:
+/// the transports close their socket through `Socket.close`, whose
+/// binding catches; `worker::Socket` has no destructor of its own;
+/// `worker::Delay` calls `clearTimeout`, which does not catch and was
+/// not seen to throw; futures, closures and the D1, R2 and queue
+/// handles make no call on drop. A new one that calls the runtime
+/// without catching brings the failure back.
 pub fn reap(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<String> {
     let before = budget.in_use();
     let (n, left, total) = TABLE.with(|t| (t.reap(now, JOB_MAX_AGE_MS), t.len(), t.reaped()));
