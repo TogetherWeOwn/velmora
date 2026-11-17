@@ -246,6 +246,12 @@ where
         Self: 'static,
     {
         let target = req.raw_target.clone();
+        // A sub-range of a large GET, asked for by another invocation of
+        // this Worker. It is told apart by its target alone and admitted
+        // by its token alone, before any S3 routing.
+        if crate::fanout::is_internal_target(&target) {
+            return get::fanout_piece(&self, req).await;
+        }
         match classify(&req.method, &target) {
             Route::Admin { rest } => admin::handle(&self, req, rest).await,
             Route::ListBuckets => list::list_buckets(&self, req).await,

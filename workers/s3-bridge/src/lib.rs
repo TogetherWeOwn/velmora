@@ -12,6 +12,7 @@
 mod d1;
 mod e2;
 mod env;
+mod fanout;
 mod http;
 mod nntp;
 mod queues;
@@ -144,14 +145,17 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         keepalive::settle_response(resp, env::sleeper()).await
     })
     .await;
+    // A body in sub-ranges: the first one is opened before the status is
+    // known to the client.
+    let (status, out) = fanout::respond(&env, &ctx, resp).await;
     console_log!(
         "{}",
-        ingress::log_line(&method, &target, resp.status, &request_id)
+        ingress::log_line(&method, &target, status, &request_id)
     );
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
-    Ok(http::to_response(resp))
+    Ok(out)
 }
 
 #[event(queue)]
