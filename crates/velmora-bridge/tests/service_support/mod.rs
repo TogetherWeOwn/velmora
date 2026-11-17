@@ -381,6 +381,9 @@ pub struct FailSql {
     /// Fails this many batches, the next ones: a commit that does not
     /// go through while single statements still do.
     pub fail_batches: Cell<u32>,
+    /// Answers this many statements, the next ones of any kind, the way
+    /// D1 does after a large batch that did not commit ([`OVERLOADED`]).
+    pub overloaded: Cell<u32>,
     /// Every call crosses it first.
     pub trip: Tripwire,
 }
@@ -393,7 +396,19 @@ pub enum PublishFault {
     Applied,
     /// Not applied, and the batch after it fails as well.
     Down,
+    /// Not applied, and D1 answers the given number of statements after
+    /// it, reads included, with [`OVERLOADED`].
+    Overloaded(u32),
+    /// Run in full and refused by a guard at its end, and then as
+    /// `Overloaded`: what D1 did after a large refused batch.
+    RefusedOverloaded(u32),
 }
+
+/// What D1 answers while a database is over its budget of the last ten
+/// seconds. A batch that is refused is charged in full, so the first
+/// statement after a large one can get this.
+pub const OVERLOADED: &str =
+    "D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.";
 
 impl FailSql {
     fn refused(&self, sql: &str) -> bool {
@@ -407,6 +422,17 @@ impl FailSql {
             _ => false,
         }
     }
+
+    /// Whether this statement is one of those answered "overloaded".
+    fn over_budget(&self) -> Result<()> {
+        match self.overloaded.get() {
+            0 => Ok(()),
+            n => {
+                self.overloaded.set(n - 1);
+                Err(BridgeError::Sql(OVERLOADED.into()))
+            }
+        }
+    }
 }
 
 impl std::ops::Deref for FailSql {
@@ -418,6 +444,7 @@ impl std::ops::Deref for FailSql {
 
 impl Sql for FailSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.over_budget()?;
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
@@ -426,6 +453,7 @@ impl Sql for FailSql {
             .await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.over_budget()?;
         if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
@@ -433,7 +461,8 @@ impl Sql for FailSql {
             .guard(sql_down, self.inner.exec(sql, params))
             .await
     }
-    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+    async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        self.over_budget()?;
         if self.fail_writes.get() {
             return Err(BridgeError::Sql("database down".into()));
         }
@@ -459,6 +488,15 @@ impl Sql for FailSql {
                 Some(PublishFault::Applied) => {
                     self.inner.batch(stmts).await?;
                     return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::Overloaded(n)) => {
+                    self.overloaded.set(n);
+                    return Err(BridgeError::Sql("no answer".into()));
+                }
+                Some(PublishFault::RefusedOverloaded(n)) => {
+                    self.overloaded.set(n);
+                    stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
+                    return self.inner.batch(stmts).await;
                 }
                 None => {}
             }
@@ -537,6 +575,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),
+                overloaded: Cell::new(0),
             }),
             safety: Blobs {
                 trip,

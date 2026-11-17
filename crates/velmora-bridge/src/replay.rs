@@ -37,8 +37,7 @@ use crate::recovery::{
     GenerationManifest, Layout, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
 use crate::types::{
-    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, GenerationRow,
-    Result, UnixMs,
+    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
 };
 
 /// How much one call does. The default keeps a call far below a Worker
@@ -506,36 +505,16 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     // manifest, over the first. What is refused and has a
                     // live twin was published before: by an earlier run,
                     // or because a newer record of the object is live.
-                    ReplayPublish::Refused => match self.live_twin(&generation, &placements).await?
-                    {
-                        Some(_) => report.duplicate += 1,
-                        None => report.unpublishable.push(id),
-                    },
+                    ReplayPublish::Refused => {
+                        match self.catalog.replay_twin(&generation, &placements).await? {
+                            Some(_) => report.duplicate += 1,
+                            None => report.unpublishable.push(id),
+                        }
+                    }
                 }
             }
         }
         Ok(true)
-    }
-
-    /// The id of the live generation of the key, if it is the same
-    /// object as `g`: the same extents at the same places.
-    async fn live_twin(
-        &self,
-        g: &GenerationRow,
-        placements: &[ExtentPlacement],
-    ) -> Result<Option<GenerationId>> {
-        let Some((live, extents)) = self.catalog.live_object(&g.bucket_id, &g.key).await? else {
-            return Ok(None);
-        };
-        let same = live.size == g.size
-            && live.etag == g.etag
-            && extents.len() == placements.len()
-            && extents.iter().zip(placements).all(|(e, p)| {
-                e.id == p.extent_id
-                    && e.seq == Some(p.seq)
-                    && e.plain_offset == Some(p.plain_offset)
-            });
-        Ok(same.then_some(live.id))
     }
 
     async fn replay_tombstones(

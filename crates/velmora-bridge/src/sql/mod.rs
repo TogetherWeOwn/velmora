@@ -74,6 +74,7 @@ mod intents;
 mod objects;
 mod outbox;
 mod permits;
+mod publish;
 mod recovery;
 mod replay;
 mod uploads;
@@ -650,6 +651,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
     ) -> Result<ReplayPublish> {
         replay::replay_publish(self, g, placements, now).await
+    }
+    async fn replay_twin(
+        &self,
+        g: &GenerationRow,
+        placements: &[ExtentPlacement],
+    ) -> Result<Option<GenerationId>> {
+        replay::replay_twin(self, g, placements).await
     }
 
     // provider permits

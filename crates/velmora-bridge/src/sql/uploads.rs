@@ -539,7 +539,9 @@ pub(super) async fn abort_upload<S: Sql>(
 ///   `Lost` and nothing is published again; the caller answers a retry
 ///   from the stored receipt.
 /// - A placement adopts an extent only if it is a still-staged extent of
-///   a part of **this** upload in this bucket. A second guard then requires that
+///   a part of **this** upload in this bucket. The placements are bound
+///   as a few JSON values ([`super::publish`]), so the batch does not
+///   grow with the extents. A second guard then requires that
 ///   exactly `extent_count` extents were adopted and that they tile
 ///   `size` bytes in `seq` order; a foreign, repeated or misplaced extent
 ///   id therefore rolls everything back (`Lost`). So does a part of
@@ -577,7 +579,11 @@ pub(super) async fn complete_upload<S: Sql>(
     let gen_id = || text(g.id.as_str());
     let key = || vec![text(t.bucket.as_str()), text(t.key)];
 
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(13 + commit.placements.len());
+    // Built before any statement runs: placements that do not fit the
+    // database's statements are refused here, with nothing written.
+    let values = super::publish::placement_values(&commit.placements, c.sql.limits())?;
+
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(17 + values.len());
     let mut guard = target(t);
     guard.push(int(revision)?);
     stmts.push((
@@ -606,25 +612,14 @@ pub(super) async fn complete_upload<S: Sql>(
             ms(g.created_at),
         ],
     ));
-    for p in &commit.placements {
-        stmts.push((
-            "UPDATE extents SET generation_id = ?1, seq = ?2, plain_offset = ?3, \
-               state = 'committed' \
-             WHERE id = ?4 AND bucket_id = ?5 AND state = 'staged' AND generation_id IS NULL \
-               AND (EXISTS (SELECT 1 FROM upload_parts \
-                             WHERE extent_id = ?4 AND upload_id = ?6) \
-                    OR EXISTS (SELECT 1 FROM upload_part_extents \
-                                WHERE extent_id = ?4 AND upload_id = ?6))",
-            vec![
-                gen_id(),
-                SqlValue::Int(i64::from(p.seq)),
-                int(p.plain_offset)?,
-                text(p.extent_id.as_str()),
-                text(t.bucket.as_str()),
-                text(t.id.as_str()),
-            ],
-        ));
-    }
+    // One statement per value of placements, not one per extent. Only a
+    // staged extent of a part of this upload is taken.
+    stmts.extend(super::publish::adopt(
+        &g.id,
+        t.bucket,
+        super::publish::Source::Upload(t.id),
+        &values,
+    ));
     // The references reads go through. `OR IGNORE`: the migration's
     // trigger records the same rows for the adoptions above.
     stmts.push((

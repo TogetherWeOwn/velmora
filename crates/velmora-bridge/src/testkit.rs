@@ -22,7 +22,7 @@ use crate::meter::Meter;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
-    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS,
+    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
 };
 use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
@@ -144,6 +144,17 @@ fn check_params(params: &[SqlValue]) -> Result<()> {
         return Err(BridgeError::Sql(format!(
             "too many bound parameters: {} > {MAX_SQL_PARAMS}",
             params.len()
+        )));
+    }
+    // D1 refuses a bound value above `MAX_SQL_VALUE_BYTES` as well.
+    let size = |v: &SqlValue| match v {
+        SqlValue::Text(t) => t.len(),
+        SqlValue::Blob(b) => b.len(),
+        SqlValue::Null | SqlValue::Int(_) => 0,
+    };
+    if let Some(n) = params.iter().map(size).find(|n| *n > MAX_SQL_VALUE_BYTES) {
+        return Err(BridgeError::Sql(format!(
+            "bound value too large: {n} > {MAX_SQL_VALUE_BYTES}"
         )));
     }
     Ok(())

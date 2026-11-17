@@ -21,7 +21,7 @@
 use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::uploads::int;
 use super::SqlCatalog;
-use crate::ports::{Sql, SqlValue};
+use crate::ports::{Sql, SqlLimits, SqlValue};
 use crate::recovery::{start_after, GENERATION_PREFIX, RECORD_PREFIX};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::stamp::StampRow;
@@ -683,24 +683,27 @@ pub(super) async fn restore_advance<S: Sql>(
 const NO_COPY: &str = "e.safety_state = 'deleted' AND e.plan IS NULL \
      AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id)";
 
-/// Extent ids per statement of [`has_lost_extent`].
+/// Extent ids per statement of [`unreadable_plans`].
 const LOST_CHUNK: usize = 50;
 
-/// Whether one of the extents has no copy anywhere.
-async fn has_lost_extent<S: Sql>(
-    c: &SqlCatalog<S>,
-    placements: &[ExtentPlacement],
-) -> Result<bool> {
-    for chunk in placements.chunks(LOST_CHUNK) {
-        let marks = vec!["?"; chunk.len()].join(",");
+/// Extents per query of [`has_unread_extent`]. Each row it returns
+/// carries a packed plan, so the answer is bounded by this and not by
+/// what a statement value may hold.
+const UNREAD_ROWS: usize = 500;
+
+/// Whether one of the extents has no copy anywhere. One query per value
+/// of placements ([`super::publish::placement_values`]).
+async fn has_lost_extent<S: Sql>(c: &SqlCatalog<S>, values: &[String]) -> Result<bool> {
+    for value in values {
         let rows = c
             .sql
             .query(
-                &format!("SELECT 1 FROM extents e WHERE e.id IN ({marks}) AND {NO_COPY} LIMIT 1"),
-                &chunk
-                    .iter()
-                    .map(|p| text(p.extent_id.as_str()))
-                    .collect::<Vec<_>>(),
+                &format!(
+                    "SELECT 1 FROM json_each(?1) j \
+                       CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
+                      WHERE {NO_COPY} LIMIT 1"
+                ),
+                &[SqlValue::Text(value.clone())],
             )
             .await?;
         if !rows.is_empty() {
@@ -717,20 +720,20 @@ async fn has_lost_extent<S: Sql>(
 async fn has_unread_extent<S: Sql>(
     c: &SqlCatalog<S>,
     placements: &[ExtentPlacement],
+    limits: SqlLimits,
 ) -> Result<bool> {
-    for chunk in placements.chunks(LOST_CHUNK) {
-        let marks = vec!["?"; chunk.len()].join(",");
+    let window = SqlLimits {
+        set_rows: limits.set_rows.min(UNREAD_ROWS),
+        ..limits
+    };
+    for value in super::publish::placement_values(placements, window)? {
         let rows = c
             .sql
             .query(
-                &format!(
-                    "SELECT id, cipher_size, plan FROM extents \
-                     WHERE id IN ({marks}) AND safety_state = 'deleted' AND plan IS NOT NULL"
-                ),
-                &chunk
-                    .iter()
-                    .map(|p| text(p.extent_id.as_str()))
-                    .collect::<Vec<_>>(),
+                "SELECT e.id, e.cipher_size, e.plan FROM json_each(?1) j \
+                   CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
+                  WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL",
+                &[SqlValue::Text(value)],
             )
             .await?;
         for row in rows {
@@ -744,6 +747,63 @@ async fn has_unread_extent<S: Sql>(
         }
     }
     Ok(false)
+}
+
+/// The id of the live generation of the key of `g`, if it is the same
+/// object: the same size and ETag, and exactly the extents of
+/// `placements` at their places. The placements are compared in SQL, a
+/// value at a time; no extent row is loaded.
+pub(super) async fn replay_twin<S: Sql>(
+    c: &SqlCatalog<S>,
+    g: &GenerationRow,
+    placements: &[ExtentPlacement],
+) -> Result<Option<GenerationId>> {
+    let Some(live) = super::objects::live_generation(c, &g.bucket_id, &g.key).await? else {
+        return Ok(None);
+    };
+    // Each `seq` once: together with the counts below, every reference
+    // of the live generation is then matched by exactly one placement.
+    let distinct = placements.windows(2).all(|w| w[0].seq < w[1].seq);
+    if live.size != g.size
+        || live.etag != g.etag
+        || usize::try_from(live.extent_count).ok() != Some(placements.len())
+        || !distinct
+    {
+        return Ok(None);
+    }
+    let count = |rows: Vec<crate::ports::Row>| match rows.first().map(Vec::as_slice) {
+        Some([SqlValue::Int(n)]) => {
+            u64::try_from(*n).map_err(|_| BridgeError::Sql("row decode: twin count".into()))
+        }
+        _ => Err(BridgeError::Sql("row decode: twin count".into())),
+    };
+    let wanted = placements.len() as u64;
+    let held = count(
+        c.sql
+            .query(
+                "SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1",
+                &[text(live.id.as_str())],
+            )
+            .await?,
+    )?;
+    if held != wanted {
+        return Ok(None);
+    }
+    let mut same = 0u64;
+    for value in super::publish::placement_values(placements, c.sql.limits())? {
+        same += count(
+            c.sql
+                .query(
+                    "SELECT COUNT(*) FROM json_each(?2) j CROSS JOIN generation_extents ge \
+                         ON ge.generation_id = ?1 AND ge.seq = json_extract(j.value,'$[1]') \
+                      WHERE ge.extent_id = json_extract(j.value,'$[0]') \
+                        AND ge.plain_offset = json_extract(j.value,'$[2]')",
+                    &[text(live.id.as_str()), SqlValue::Text(value)],
+                )
+                .await?,
+        )?;
+    }
+    Ok((same == wanted).then_some(live.id))
 }
 
 /// Whether the catalogue knows an older generation of the key of `g`,
@@ -794,12 +854,14 @@ pub(super) async fn replay_publish<S: Sql>(
     // here, of the rows the batch will find (nothing else writes during
     // a replay), and only for a key that has an older generation: the
     // one case in which it decides.
-    if has_older(c, g).await? && has_unread_extent(c, placements).await? {
+    let limits = c.sql.limits();
+    if has_older(c, g).await? && has_unread_extent(c, placements, limits).await? {
         return Ok(ReplayPublish::Damaged);
     }
+    let values = super::publish::placement_values(placements, limits)?;
     let gen_id = || text(g.id.as_str());
     let bucket = || text(g.bucket_id.as_str());
-    let mut stmts: Vec<Stmt> = Vec::with_capacity(10 + 2 * placements.len());
+    let mut stmts: Vec<Stmt> = Vec::with_capacity(12 + 2 * values.len());
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
          OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
@@ -808,38 +870,16 @@ pub(super) async fn replay_publish<S: Sql>(
     ));
     stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
     stmts.push(insert_live(g)?);
-    for p in placements {
-        stmts.push((
-            "UPDATE extents SET generation_id = ?1, seq = ?2, plain_offset = ?3, \
-               state = 'committed' \
-             WHERE id = ?4 AND bucket_id = ?5 AND state = 'staged' AND generation_id IS NULL",
-            vec![
-                gen_id(),
-                SqlValue::Int(i64::from(p.seq)),
-                uint(p.plain_offset)?,
-                text(p.extent_id.as_str()),
-                bucket(),
-            ],
-        ));
-        // An extent another generation holds is shared with it: this
-        // generation is a copy of that one, or that one of this. The
-        // adoption above already wrote the reference for an extent it
-        // took (trigger `generation_extents_on_adopt`), and such an
-        // extent no longer matches here.
-        stmts.push((
-            "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
-             SELECT ?1, ?2, e.id, ?3 FROM extents e \
-              WHERE e.id = ?4 AND e.bucket_id = ?5 AND e.state = 'committed' \
-                AND e.generation_id <> ?1",
-            vec![
-                gen_id(),
-                SqlValue::Int(i64::from(p.seq)),
-                uint(p.plain_offset)?,
-                text(p.extent_id.as_str()),
-                bucket(),
-            ],
-        ));
-    }
+    // An extent no generation holds is adopted; one another generation
+    // holds is shared with it (this generation is a copy of that one, or
+    // that one of this) and gets a second reference. Two statements per
+    // value of placements, not two per extent.
+    stmts.extend(super::publish::adopt(
+        &g.id,
+        &g.bucket_id,
+        super::publish::Source::Record,
+        &values,
+    ));
     // The referenced extents tile the object exactly, each with its key.
     stmts.push((
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
@@ -922,7 +962,7 @@ pub(super) async fn replay_publish<S: Sql>(
         Err(BridgeError::GuardFailed) => {
             // Which guard refused it. Nothing else writes during a
             // replay, so the catalogue is as the batch found it.
-            if has_older(c, g).await? && has_lost_extent(c, placements).await? {
+            if has_older(c, g).await? && has_lost_extent(c, &values).await? {
                 Ok(ReplayPublish::Damaged)
             } else {
                 Ok(ReplayPublish::Refused)
