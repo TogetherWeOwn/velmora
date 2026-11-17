@@ -232,12 +232,10 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
     let (b, j) = (Rc::clone(bridge), job.clone());
     match jobs::run(now, post, async move { b.run_job(&j).await }).await {
         Some(outcome) => outcome,
-        None => {
-            console_error!("job table: a running job was dropped");
-            JobOutcome::Retry {
-                delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
-            }
-        }
+        // `jobs::run` has logged it.
+        None => JobOutcome::Retry {
+            delay_secs: velmora_bridge::jobs::INFRA_RETRY_SECS,
+        },
     }
 }
 

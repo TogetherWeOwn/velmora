@@ -46,10 +46,11 @@ pub const DISPATCH_BATCHES: u32 = 20;
 /// every five minutes is 576,000 a day.
 ///
 /// What bounds it is the calls a single invocation may make. A run with
-/// this many rows makes one catalogue read for them, and per batch one
-/// catalogue write (the marks) and one queue call per bound queue: with
-/// the most queues a deployment may bind (8 of each kind) that is at
-/// most 20 + 20 * 16 = 340 calls, beside the two dozen of the rest of
+/// this many rows makes three catalogue reads for them (one per stage),
+/// and per batch one catalogue write (the marks) and one queue call per
+/// bound queue: with the most queues a deployment may bind (8 of each
+/// kind, and the one of the jobs without an extent) that is at most
+/// 3 + 20 + 20 * 17 = 363 calls, beside the two dozen of the rest of
 /// the run. The platform allows 1,000.
 pub const DISPATCH_LIMIT: u32 = DISPATCH_BATCH * DISPATCH_BATCHES;
 /// How long the dispatcher leaves a row alone after it sent a job for

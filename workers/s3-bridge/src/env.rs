@@ -147,7 +147,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         jobs: QueueSink::new(
             queues(env, "POST_Q")?,
             queues(env, "VERIFY_Q")?,
-            env.queue(AUX_Q).ok(),
+            aux_queue(env)?,
             drop_notify,
         )
         .map_err(|name| format!("missing binding {name}"))?,
@@ -178,6 +178,19 @@ pub fn recovery_copy_on(env: &Env) -> bool {
 /// The queues of one kind that are bound: `first` (`POST_Q`), then
 /// `POST_Q2`, `POST_Q3`, ... A missing first binding or a gap in the
 /// numbers is refused ([`bound_queues`]).
+/// The queue of the jobs without an extent: `None` when `AUX_Q` is not
+/// bound. A binding of that name that is not a queue is refused, since
+/// the jobs would otherwise go to the first verify queue unnoticed.
+fn aux_queue(env: &Env) -> Result<Option<worker::Queue>, String> {
+    let bound = worker::js_sys::Reflect::get(env, &worker::wasm_bindgen::JsValue::from_str(AUX_Q))
+        .is_ok_and(|v| !v.is_undefined() && !v.is_null());
+    match env.queue(AUX_Q) {
+        Ok(queue) => Ok(Some(queue)),
+        Err(_) if !bound => Ok(None),
+        Err(_) => Err(format!("binding {AUX_Q} is not a queue")),
+    }
+}
+
 fn queues(env: &Env, first: &str) -> Result<Vec<worker::Queue>, String> {
     let count = bound_queues(first, |name| env.queue(name).is_ok())?;
     (0..count)

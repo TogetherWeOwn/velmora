@@ -885,7 +885,10 @@ pub trait Catalog {
     ) -> Result<Guard<()>>;
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
-    /// and held by no job, oldest due time first. A row marked by
+    /// and held by no job, oldest due time first. Each stage has a third
+    /// of `limit` to itself, so these are not always the oldest `limit`
+    /// rows of all stages: a stage with fewer due rows than its share
+    /// gets all of them listed. A row marked by
     /// [`Self::mark_sent`] is left out until `resend_secs` after the
     /// mark, unless a job claimed it since (a claim clears the mark) or
     /// it was given a due time later than the mark.

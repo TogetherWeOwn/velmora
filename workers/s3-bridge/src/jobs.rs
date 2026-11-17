@@ -113,15 +113,26 @@ pub async fn run(
         // The job is marked for as long as this invocation runs: were
         // it cancelled, the timer would not fire again and the mark
         // would go stale.
+        let mut marked = now;
         loop {
             let beat = Box::pin(worker::Delay::from(Duration::from_millis(
                 JOB_BEAT_MS as u64,
             )));
             match select(running, beat).await {
+                Either::Left((None, _)) => {
+                    // How late this invocation's timer was: what
+                    // `JOB_QUIET_MS` has to exceed.
+                    let late = worker::Date::now().as_millis() as i64 - marked.0;
+                    worker::console_error!(
+                        "job table: a running job was dropped: unmarked_ms={late}"
+                    );
+                    return None;
+                }
                 Either::Left((outcome, _)) => return outcome,
                 Either::Right(((), r)) => {
                     running = r;
-                    running.seen(UnixMs(worker::Date::now().as_millis() as i64));
+                    marked = UnixMs(worker::Date::now().as_millis() as i64);
+                    running.seen(marked);
                 }
             }
         }

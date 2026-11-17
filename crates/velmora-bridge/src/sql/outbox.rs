@@ -974,7 +974,10 @@ const DUE_STAGES: [&str; 3] = ["post", "verify", "release"];
 /// rows of the other stages that were due were not sent at all.
 ///
 /// One statement per stage, each along `outbox_due` in its order (the
-/// rowid breaks a tie), so a statement stops at `limit` rows.
+/// rowid breaks a tie), with no sort: a statement stops at `limit` rows
+/// it lists. The marks and the leases are not in the index, so it also
+/// reads the due rows it passes over on the way, which are at most the
+/// rows marked within `resend_secs` and the ones a job holds.
 pub(super) async fn due<S: Sql>(
     c: &SqlCatalog<S>,
     now: UnixMs,
