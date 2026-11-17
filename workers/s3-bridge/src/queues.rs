@@ -111,16 +111,27 @@ pub struct QueueSink {
     post: Vec<Queue>,
     /// Never empty.
     verify: Vec<Queue>,
+    /// The queue of the jobs that name no extent ([`AUX_Q`]), when
+    /// bound.
+    aux: Option<Queue>,
     drop_notify: DropNotify,
 }
+
+/// The binding of the queue for jobs that name no extent: gc, sweep,
+/// eviction and recovery copy. Optional: without it they go to the first
+/// verify queue, as before. There they wait in front of that queue's
+/// verify and release jobs, which then fall hours behind the other
+/// verify queues' whenever many recovery-copy jobs are sent.
+pub const AUX_Q: &str = "AUX_Q";
 
 impl QueueSink {
     /// `post` and `verify` hold the queues of each kind in binding order,
     /// at least one each: an empty list is refused, with the name of the
-    /// first binding of the kind.
+    /// first binding of the kind. `aux` is the queue bound as [`AUX_Q`].
     pub fn new(
         post: Vec<Queue>,
         verify: Vec<Queue>,
+        aux: Option<Queue>,
         drop_notify: DropNotify,
     ) -> std::result::Result<Self, &'static str> {
         if post.is_empty() {
@@ -132,6 +143,7 @@ impl QueueSink {
         Ok(QueueSink {
             post,
             verify,
+            aux,
             drop_notify,
         })
     }
@@ -140,6 +152,7 @@ impl QueueSink {
         Shards {
             post: self.post.len(),
             verify: self.verify.len(),
+            aux: self.aux.is_some(),
         }
     }
 
@@ -147,6 +160,8 @@ impl QueueSink {
         match lane {
             Lane::Post(shard) => &self.post[shard],
             Lane::Verify(shard) => &self.verify[shard],
+            // `lane` names it only when it is bound.
+            Lane::Aux => self.aux.as_ref().unwrap_or(&self.verify[0]),
         }
     }
 }
@@ -156,6 +171,8 @@ impl QueueSink {
 enum Lane {
     Post(usize),
     Verify(usize),
+    /// The queue of the jobs that name no extent.
+    Aux,
 }
 
 /// How many queues of each kind are bound, at least one each.
@@ -163,6 +180,8 @@ enum Lane {
 struct Shards {
     post: usize,
     verify: usize,
+    /// The queue for jobs that name no extent is bound.
+    aux: bool,
 }
 
 impl Shards {
@@ -171,6 +190,7 @@ impl Shards {
         (0..self.post)
             .map(Lane::Post)
             .chain((0..self.verify).map(Lane::Verify))
+            .chain(self.aux.then_some(Lane::Aux))
     }
 }
 
@@ -197,8 +217,9 @@ fn shard(extent: &str, queues: usize) -> usize {
 }
 
 /// Post jobs go to a post queue. Every other job goes to a verify queue:
-/// an extent's by its id (a wake-up goes where its job would), the rest (gc, sweep, eviction, recovery copy)
-/// to the first.
+/// an extent's by its id (a wake-up goes where its job would). The rest
+/// (gc, sweep, eviction, recovery copy) go to their own queue when it is
+/// bound, and to the first verify queue when it is not.
 fn lane(job: &Job, shards: Shards) -> Lane {
     match job {
         Job::Extent {
@@ -214,6 +235,7 @@ fn lane(job: &Job, shards: Shards) -> Lane {
         Job::Extent { extent, .. } | Job::Wake { extent, .. } => {
             Lane::Verify(shard(extent.as_str(), shards.verify))
         }
+        _ if shards.aux => Lane::Aux,
         _ => Lane::Verify(0),
     }
 }
@@ -309,12 +331,20 @@ mod tests {
         }
     }
 
-    const ONE: Shards = Shards { post: 1, verify: 1 };
+    const ONE: Shards = Shards {
+        post: 1,
+        verify: 1,
+        aux: false,
+    };
 
     /// A wake-up waits in the queue its job would be sent to.
     #[test]
     fn a_wake_up_uses_the_queue_of_its_job() {
-        let many = Shards { post: 4, verify: 4 };
+        let many = Shards {
+            post: 4,
+            verify: 4,
+            aux: false,
+        };
         for stage in [OutboxStage::Post, OutboxStage::Verify, OutboxStage::Release] {
             assert_eq!(lane(&wake_job(stage), many), lane(&extent_job(stage), many));
         }
@@ -371,7 +401,11 @@ mod tests {
 
     #[test]
     fn an_extent_keeps_its_queue_and_extents_spread_over_all() {
-        let shards = Shards { post: 4, verify: 2 };
+        let shards = Shards {
+            post: 4,
+            verify: 2,
+            aux: false,
+        };
         let mut post = [0u32; 4];
         let mut verify = [0u32; 2];
         for n in 0..4000u32 {
@@ -407,8 +441,47 @@ mod tests {
     }
 
     #[test]
+    fn jobs_without_an_extent_use_their_own_queue_when_it_is_bound() {
+        let shards = Shards {
+            post: 4,
+            verify: 3,
+            aux: true,
+        };
+        for job in other_jobs() {
+            assert_eq!(lane(&job, shards), Lane::Aux);
+        }
+        // An extent's jobs stay where they were.
+        assert_eq!(
+            lane(&extent_job(OutboxStage::Post), shards),
+            lane(
+                &extent_job(OutboxStage::Post),
+                Shards {
+                    aux: false,
+                    ..shards
+                }
+            )
+        );
+        assert!(matches!(
+            lane(&extent_job(OutboxStage::Verify), shards),
+            Lane::Verify(_)
+        ));
+        // Their batch is sent apart from the verify queues' batches.
+        let mut jobs = other_jobs();
+        jobs.push(extent_job(OutboxStage::Verify));
+        let sent = batches(&jobs, shards);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].0, Lane::Aux);
+        assert_eq!(sent[1].1.len(), jobs.len() - 1);
+        assert_eq!(shards.lanes().count(), 8);
+    }
+
+    #[test]
     fn jobs_without_an_extent_use_the_first_verify_queue() {
-        let shards = Shards { post: 4, verify: 3 };
+        let shards = Shards {
+            post: 4,
+            verify: 3,
+            aux: false,
+        };
         for job in other_jobs() {
             assert_eq!(lane(&job, shards), Lane::Verify(0));
         }
@@ -416,7 +489,11 @@ mod tests {
 
     #[test]
     fn every_lane_is_listed_once_and_one_queue_takes_everything() {
-        let shards = Shards { post: 3, verify: 2 };
+        let shards = Shards {
+            post: 3,
+            verify: 2,
+            aux: false,
+        };
         let lanes: Vec<Lane> = shards.lanes().collect();
         assert_eq!(
             lanes,
@@ -458,7 +535,11 @@ mod tests {
 
     #[test]
     fn a_batch_is_split_by_queue_and_no_job_is_left_out() {
-        let shards = Shards { post: 3, verify: 2 };
+        let shards = Shards {
+            post: 3,
+            verify: 2,
+            aux: false,
+        };
         let mut jobs: Vec<Job> = (0..40u8)
             .map(|n| Job::Extent {
                 v: JOB_VERSION,

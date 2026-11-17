@@ -168,9 +168,14 @@ bucket_name = "velmora-cache-enam"
 # The bindings of one kind are POST_Q, POST_Q2, POST_Q3, ... (VERIFY_Q,
 # VERIFY_Q2, ...), 8 at most, numbered without a gap: the Worker refuses
 # to start with POST_Q3 bound and POST_Q2 not. An extent's jobs always go
-# to the same queue of a kind (by a hash of its id); jobs without an
-# extent (gc, sweeps) go to VERIFY_Q. Every queue needs its consumer: the
-# extents of a queue nobody reads are never posted.
+# to the same queue of a kind (by a hash of its id). Jobs without an
+# extent (gc, sweeps, the hints that a recovery copy is due) go to AUX_Q,
+# and to VERIFY_Q when AUX_Q is not bound. They are many and cheap; in
+# VERIFY_Q they stood in front of the verify and release jobs of every
+# extent that hashes there (measured: a backlog of 145,000 to 235,000
+# messages, and 1,310 of 1,312 overdue verify rows on that one queue).
+# Every queue needs its consumer: the extents of a queue nobody reads are
+# never posted.
 # To add a queue: create it, then add its producer and its consumer here.
 # To take one away: remove the producer with the highest number, and its
 # consumer only when the queue is empty (the cron run sends a due
@@ -209,6 +214,12 @@ queue = "velmora-verify3"
 [[queues.producers]]
 binding = "VERIFY_Q4"
 queue = "velmora-verify4"
+
+# Create this queue before the deploy that binds it:
+#   npx wrangler queues create velmora-aux
+[[queues.producers]]
+binding = "AUX_Q"
+queue = "velmora-aux"
 
 # The post queues. max_concurrency is a secondary bound; provider_permits
 # is the real gate. The measured providers limit the source addresses an
@@ -282,6 +293,16 @@ dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
 queue = "velmora-verify4"
+max_batch_size = 1
+max_concurrency = 6
+max_retries = 20
+retry_delay = 120
+dead_letter_queue = "velmora-dlq"
+
+# The queue of the jobs without an extent. They hold no extent bytes and
+# most take under a second, so one queue is enough.
+[[queues.consumers]]
+queue = "velmora-aux"
 max_batch_size = 1
 max_concurrency = 6
 max_retries = 20

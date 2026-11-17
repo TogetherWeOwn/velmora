@@ -958,42 +958,76 @@ pub(super) async fn finish_release<S: Sql>(
 // Dispatcher
 // ---------------------------------------------------------------------------
 
+/// The stages the dispatcher sends jobs for.
+const DUE_STAGES: [&str; 3] = ["post", "verify", "release"];
+
 /// Due rows no job holds, oldest first, without the ones the dispatcher
 /// has sent a job for and that job may still be on its way: a row with a
 /// mark (`sent_at`) is left out until `resend_secs` after the mark. A
 /// claim clears the mark, and a due time later than the mark outdates
 /// it, so a row that a job gave back or moved on is listed at once.
+///
+/// At most `limit` rows. Each stage has a third of them to itself, its
+/// oldest rows; what a stage does not use goes to the oldest rows left
+/// of the others. Without the shares, a backlog of one stage longer
+/// than `limit` (post rows, when posting is behind) took every run, and
+/// rows of the other stages that were due were not sent at all.
+///
+/// One statement per stage, each along `outbox_due` in its order (the
+/// rowid breaks a tie), with no sort: a statement stops at `limit` rows
+/// it lists. The marks and the leases are not in the index, so it also
+/// reads the due rows it passes over on the way, which are at most the
+/// rows marked within `resend_secs` and the ones a job holds.
 pub(super) async fn due<S: Sql>(
     c: &SqlCatalog<S>,
     now: UnixMs,
     resend_secs: u32,
     limit: u32,
 ) -> Result<Vec<DueRow>> {
-    let rows = c
-        .sql
-        .query(
-            "SELECT extent_id, generation_id, stage FROM outbox \
-             WHERE stage IN ('post', 'verify', 'release') AND next_at <= ?1 \
-               AND (lease_until IS NULL OR lease_until < ?1) \
-               AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
-             ORDER BY next_at, extent_id LIMIT ?2",
-            &[
-                ms(now),
-                SqlValue::Int(i64::from(limit)),
-                ms(now.plus_ms(-i64::from(resend_secs) * 1000)),
-            ],
-        )
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut r = Cols::new(row);
-        out.push(DueRow {
-            extent_id: ExtentId::new(r.text()?),
-            generation_id: GenerationId::new(r.text()?),
-            stage: r.parsed(OutboxStage::parse)?,
-        });
+    let limit_rows = limit as usize;
+    let share = limit_rows / DUE_STAGES.len();
+    // (next_at, order within its stage, row)
+    let mut kept: Vec<(i64, usize, DueRow)> = Vec::new();
+    let mut spare: Vec<(i64, usize, DueRow)> = Vec::new();
+    for stage in DUE_STAGES {
+        let rows = c
+            .sql
+            .query(
+                "SELECT extent_id, generation_id, stage, next_at FROM outbox \
+                 WHERE stage = ?4 AND next_at <= ?1 \
+                   AND (lease_until IS NULL OR lease_until < ?1) \
+                   AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
+                 ORDER BY next_at, rowid LIMIT ?2",
+                &[
+                    ms(now),
+                    SqlValue::Int(i64::from(limit)),
+                    ms(now.plus_ms(-i64::from(resend_secs) * 1000)),
+                    text(stage),
+                ],
+            )
+            .await?;
+        for (at, row) in rows.into_iter().enumerate() {
+            let mut r = Cols::new(row);
+            let due = DueRow {
+                extent_id: ExtentId::new(r.text()?),
+                generation_id: GenerationId::new(r.text()?),
+                stage: r.parsed(OutboxStage::parse)?,
+            };
+            let next_at: i64 = r.num()?;
+            if at < share {
+                kept.push((next_at, at, due));
+            } else {
+                spare.push((next_at, at, due));
+            }
+        }
     }
-    Ok(out)
+    // Stable sorts: rows due at the same time keep the order of the
+    // stages, and of their stage.
+    spare.sort_by_key(|(next_at, at, _)| (*next_at, *at));
+    let room = limit_rows.saturating_sub(kept.len());
+    kept.extend(spare.into_iter().take(room));
+    kept.sort_by_key(|(next_at, at, _)| (*next_at, *at));
+    Ok(kept.into_iter().map(|(_, _, due)| due).collect())
 }
 
 /// Marks rows the dispatcher has just sent a job for (`sent_at = now`).
