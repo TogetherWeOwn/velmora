@@ -1166,6 +1166,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
         token: 1,
         attempts: 1,
         cursor: 0,
+        claimed_at: T0,
     };
     let article = ArticleRow {
         extent_id: extent.id.clone(),
@@ -1408,6 +1409,7 @@ fn lease_carries_attempts_and_cursor() {
         token: 7,
         attempts: 1,
         cursor: 2,
+        claimed_at: T0,
     };
     assert_eq!(backoff(&lease), Some(120));
     lease.attempts = 4;

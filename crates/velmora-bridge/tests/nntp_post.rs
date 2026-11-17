@@ -470,8 +470,9 @@ async fn renews_on_a_timer_and_records_once() {
     let plan = rig.plan(&s).await;
     assert!(plan.len() >= 8);
     assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
-    // Once before the first POST, once when the timer ran out.
-    assert_eq!(rig.bridge.catalog.renewals.get(), 2);
+    // None before the first POST, which starts on the claim; once when
+    // the timer ran out.
+    assert_eq!(rig.bridge.catalog.renewals.get(), 1);
     // Not at that renewal: once, at the end.
     assert_eq!(rig.bridge.catalog.mark_batches.get(), 1);
     // The renewal moved the lease forward; the stage then let it go.

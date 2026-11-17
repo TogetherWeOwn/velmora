@@ -159,8 +159,12 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         class: PermitClass,
         holder: &str,
     ) -> Result<Option<Self>> {
+        // The slot is held from this time on, as after a renewal at it:
+        // a background job does not write the same expiry a second time
+        // before its first call ([`Self::keep`]).
+        let asked = clock.now();
         let permit = catalog
-            .acquire_permit(provider, class, holder, clock.now())
+            .acquire_permit(provider, class, holder, asked)
             .await?;
         Ok(permit.map(|permit| ProviderSession {
             catalog,
@@ -171,7 +175,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             session: None,
             health: None,
             timer: None,
-            kept: None,
+            kept: Some((asked, false)),
         }))
     }
 
@@ -204,8 +208,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     pub(crate) async fn keep(&mut self, lease: Option<&Lease>) -> core::result::Result<(), Stop> {
         let now = self.clock.now();
         if self.permit.class == PermitClass::Background {
+            // The claim of the lease and the acquisition of the slot
+            // each count as a renewal at the time they were made with.
             let fresh = self.kept.is_some_and(|(at, leased)| {
-                (0..KEEP_EVERY_MS).contains(&(now.0 - at.0)) && (leased || lease.is_none())
+                (0..KEEP_EVERY_MS).contains(&(now.0 - at.0))
+                    && (leased || lease.is_none_or(|l| l.fresh_at(now)))
             });
             if fresh {
                 return Ok(());

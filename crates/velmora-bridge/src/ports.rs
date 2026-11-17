@@ -289,6 +289,28 @@ pub struct Lease {
     pub attempts: u32,
     /// `outbox.cursor` at claim time (verify/release: backbone index).
     pub cursor: u32,
+    /// The time the claim was made with, read before its round trip:
+    /// the row is held for [`LEASE_SECS`] from it, as after a renewal
+    /// at that time.
+    pub claimed_at: UnixMs,
+}
+
+impl Lease {
+    /// Whether the claim itself still stands for a renewal: it is less
+    /// than the renewal interval old at `now`, so the row is held for as
+    /// long from here as a renewal that old would hold it. A job that
+    /// starts its work right after its claim does not write the same
+    /// expiry a second time.
+    ///
+    /// The claim says the row was this job's at `claimed_at`, and no
+    /// other job can claim it before the lease expires. A row that was
+    /// moved without a claim meanwhile (a cancelled posting) is found by
+    /// the next renewal, at most one renewal interval later, as it is
+    /// between any two renewals; every write of the job is fenced by
+    /// the token whatever its renewals say.
+    pub fn fresh_at(&self, now: UnixMs) -> bool {
+        (0..crate::post::KEEP_EVERY_MS).contains(&(now.0 - self.claimed_at.0))
+    }
 }
 
 /// A held provider connection slot (fenced by `token`).

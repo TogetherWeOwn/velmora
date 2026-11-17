@@ -46,7 +46,6 @@ impl Rig {
         let (s, plan) = self.posted(n).await;
         self.propagate(&s, 0, 1).await;
         assert_eq!(self.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-        assert_eq!(self.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
         assert_eq!(self.outbox(&s).stage, OutboxStage::Release);
         assert_eq!(self.outbox(&s).cursor, 0);
         self.bridge.jobs.take();
@@ -238,8 +237,6 @@ async fn stat_transport_failure_records_nothing() {
     let rig = two_backbone_rig().await;
     let (s, _) = rig.posted(31).await;
     rig.propagate(&s, 0, 1).await;
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
 
     rig.servers[1].drop_next_stats(3).await;
     let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
@@ -248,47 +245,90 @@ async fn stat_transport_failure_records_nothing() {
     let outbox = rig.outbox(&s);
     assert_eq!(outbox.stage, OutboxStage::Verify);
     assert_eq!(outbox.last_error, Some(FailClass::NntpError));
+    // The failed job says where it got to: the next one starts at the
+    // second backbone.
+    assert_eq!(outbox.cursor, 8);
     assert!(rig.safety_held(&s));
 
     // One more break is replaced inside the job, and the answer counts.
+    // The first backbone is not read again.
     rig.servers[1].drop_next_stats(1).await;
     rig.bridge.clock.advance_secs(delay);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig).0, 0);
     assert_eq!(
         checks(&rig, &s),
         [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
     );
 }
 
-/// One backbone per job; the cursor carries the position between jobs and
-/// moving on spends no attempt.
+/// One job reads every backbone under one claim: no job in between, no
+/// attempt spent, and the resume point is never written on the way.
 #[tokio::test]
-async fn verify_walks_one_backbone_per_job() {
+async fn verify_reads_every_backbone_in_one_job() {
     let rig = two_backbone_rig().await;
     let (s, _) = rig.posted(6).await;
     rig.propagate(&s, 0, 1).await;
-    let now = rig.bridge.clock.now();
     let attempts = rig.outbox(&s).attempts;
-
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(rig.rows(&s).len(), 1);
-    assert_eq!(rig.rows(&s)[0].backbone, "bb0");
-    let outbox = rig.outbox(&s);
-    assert_eq!(outbox.stage, OutboxStage::Verify);
-    assert_eq!(outbox.cursor, 8);
-    assert_eq!(outbox.next_at, now);
-    assert_eq!(outbox.attempts, attempts);
-    assert_eq!(rig.sent_stages(), [(OutboxStage::Verify, 0)]);
 
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     let rows = rig.rows(&s);
     assert_eq!(rows.len(), 2);
     assert_eq!(
+        (rows[0].backbone.as_str(), rows[0].provider_id.as_str()),
+        ("bb0", "p0")
+    );
+    assert_eq!(
         (rows[1].backbone.as_str(), rows[1].provider_id.as_str()),
         ("bb1", "p1")
     );
-    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
+    let outbox = rig.outbox(&s);
+    assert_eq!(outbox.stage, OutboxStage::Release);
+    assert_eq!(outbox.cursor, 0);
+    // One claim for the whole round.
+    assert_eq!(outbox.attempts, attempts + 1);
     assert_eq!(rig.sent_stages(), [(OutboxStage::Release, 0)]);
+}
+
+/// A row left at the second backbone, by a job that stopped there or by
+/// a Worker that read one backbone per job: the next job starts at the
+/// second backbone and does not read the first one again.
+#[tokio::test]
+async fn verify_resumes_at_the_backbone_the_row_names() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.posted(6).await;
+    rig.propagate(&s, 0, 1).await;
+    // As the one-backbone job left it: the first backbone's pass on
+    // record and the row at the second.
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    let now = rig.bridge.clock.now();
+    let pass = VerificationRow {
+        extent_id: s.extent.clone(),
+        backbone: "bb0".into(),
+        provider_id: "p0".into(),
+        verified_at: now,
+        plan_rev: 1,
+        articles_ok: 3,
+        articles_total: 3,
+        result: VerifyResult::Ok,
+        kind: VerifyKind::Body,
+    };
+    let catalog = &rig.bridge.catalog;
+    assert!(catalog.record_verification(&lease, &pass).await.unwrap());
+    assert!(catalog.defer_at(&lease, 8, now, now).await.unwrap());
+    assert_eq!(rig.outbox(&s).cursor, 8);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+    // The first backbone is not read again.
+    assert_eq!(reads(&rig), (0, 3));
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Release, 0));
 }
 
 /// The second backbone never gets the articles: no release, and the safety
@@ -299,7 +339,6 @@ async fn unverified_second_backbone_blocks_release() {
     rig.bridge.cfg.propagation_grace_secs = LONG_GRACE_SECS;
     let (s, _) = rig.posted(7).await;
 
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     for wait in MISSING_BACKOFF_SECS {
         assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), wait);
         rig.bridge.clock.advance_secs(wait);
@@ -511,7 +550,6 @@ async fn release_needs_fresh_evidence() {
 
     // Verify walks its waits and then records the second backbone's loss.
     rig.bridge.clock.advance_secs(1);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     for wait in MISSING_BACKOFF_SECS {
         assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), wait);
         rig.bridge.clock.advance_secs(wait);
@@ -526,7 +564,6 @@ async fn release_needs_fresh_evidence() {
     // The article comes back: verify passes and the release goes through.
     rig.servers[1].unhide(&plan[0].message_id).await;
     rig.bridge.clock.advance_secs(REVERIFY_SECS);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     rig.bridge.clock.advance_secs(1);
@@ -580,7 +617,6 @@ async fn newer_failure_cancels_pass() {
     rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(checks(&rig, &s)[3], ok("bb0", VerifyKind::Body));
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
@@ -687,9 +723,6 @@ async fn verify_reads_one_backbone_in_full_and_stats_the_next() {
     rig.servers[1].set_body_gone(true).await;
 
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
-    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(
         checks(&rig, &s),
         [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
@@ -741,7 +774,6 @@ async fn release_reads_no_body_and_stats_every_backbone() {
 
     rig.bridge.nntp.slow(&rig.bridge.clock, 1);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     // Verify: every article read in full once, and asked for once.
     assert_eq!(reads(&rig), (n, n));
@@ -788,7 +820,6 @@ async fn a_changed_plan_is_read_in_full_before_any_release() {
     // Verify reads the new plan in full, and the release follows.
     rig.bridge.clock.advance_secs(1);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     let rows = rig.rows(&s);
     assert_eq!((rows[2].plan_rev, rows[2].kind), (2, VerifyKind::Body));
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
@@ -813,9 +844,8 @@ async fn stat_passes_do_not_release_without_the_backbone_read_in_full() {
     let (s, plan) = rig.posted(42).await;
     rig.propagate(&s, 0, 1).await;
     rig.propagate(&s, 0, 2).await;
-    for _ in 0..3 {
-        assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    }
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.rows(&s).len(), 3);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     rig.bridge.jobs.take();
     rig.bridge.clock.advance_secs(1);
@@ -847,9 +877,8 @@ async fn a_stat_answer_does_not_count_where_the_full_read_failed() {
     let (s, plan) = rig.posted(44).await;
     rig.propagate(&s, 0, 1).await;
     rig.propagate(&s, 0, 2).await;
-    for _ in 0..3 {
-        assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    }
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.rows(&s).len(), 3);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     rig.bridge.jobs.take();
     // As verify leaves it when the first backbone served wrong bytes and
@@ -943,7 +972,6 @@ async fn verify_reads_in_full_again_where_the_full_read_failed() {
     // Verify: both in full this time.
     rig.bridge.nntp.slow(&rig.bridge.clock, 0);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(reads(&rig), (6, 0));
     let all = checks(&rig, &s);
     assert_eq!(all[all.len() - 1], ok("bb1", VerifyKind::Body));
@@ -986,9 +1014,9 @@ async fn an_article_missing_at_release_is_reposted_by_verify() {
     // Verify: the first backbone in full, then the second, where the one
     // missing article is posted again.
     rig.bridge.clock.advance_secs(wait);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
     assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    assert_eq!(reads(&rig).0, 3);
     assert_eq!(posts(), 1);
     assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
     assert!(rig.safety_held(&s));
@@ -1011,17 +1039,17 @@ async fn stat_true_body_missing_is_missing_at_verify() {
         rig.bridge.clock.advance_secs(wait);
     }
     // The waits are used up: the loss is recorded and the walk moves on.
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    let missing = ("bb0".to_string(), VerifyKind::Body, VerifyResult::Missing);
-    assert_eq!(checks(&rig, &s), std::slice::from_ref(&missing));
-    assert_eq!(rig.rows(&s)[0].articles_ok, 0);
     // No backbone has passed the full check yet: the second is read in
     // full, and one backbone is still not two.
     assert_eq!(
         retry_delay(&rig.run(&s, OutboxStage::Verify).await),
         REVERIFY_SECS
     );
+    let missing = ("bb0".to_string(), VerifyKind::Body, VerifyResult::Missing);
+    assert_eq!(rig.rows(&s)[0].articles_ok, 0);
     assert_eq!(checks(&rig, &s), [missing, ok("bb1", VerifyKind::Body)]);
+    // The round is over: the next one starts at the first backbone.
+    assert_eq!(rig.outbox(&s).cursor, 0);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
     assert!(rig.safety_held(&s));
 }
@@ -1176,7 +1204,6 @@ async fn verify_with_only_stat_passes_reads_again() {
     rig.bridge.clock.advance_secs(REVERIFY_SECS);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(checks(&rig, &s)[2], ok("bb0", VerifyKind::Body));
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
 }
 
@@ -1255,7 +1282,6 @@ async fn a_backbone_that_does_not_count_is_not_checked() {
     rig.propagate(&s, 0, 1).await;
     rig.propagate(&s, 0, 2).await;
 
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     let both = [ok("bb1", VerifyKind::Body), ok("bb2", VerifyKind::Stat)];
     assert_eq!(checks(&rig, &s), both);
@@ -1449,7 +1475,6 @@ async fn removed_backbone_does_not_count() {
     let (s, _) = rig.posted(19).await;
     rig.propagate(&s, 0, 1).await;
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
 
     // The second backbone is dropped from the configuration.
@@ -1533,12 +1558,13 @@ async fn stale_lease_records_nothing() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
-/// A verify job renews its lease and its slot once for calls that all
-/// start within 20 s of that renewal, not once per article: each renewal
-/// is two catalogue round trips, and a slot renewed less than 20 s ago
-/// outlasts any one call with time to spare.
+/// A verify job renews neither its lease nor its slot for calls that all
+/// start within 20 s of the claim and of the slot being taken: each of
+/// those wrote the expiry a renewal would write, each renewal is two
+/// catalogue writes, and a slot taken less than 20 s ago outlasts any
+/// one call with time to spare.
 #[tokio::test]
-async fn verify_renews_once_for_a_quick_pass() {
+async fn verify_renews_nothing_for_a_quick_pass() {
     let rig = simple_rig().await;
     let (s, plan) = rig.posted(40).await;
     assert!(plan.len() > 1);
@@ -1550,17 +1576,20 @@ async fn verify_renews_once_for_a_quick_pass() {
 
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
 
-    assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
-    assert_eq!(*rig.bridge.catalog.permit_renewed_at.borrow(), [start]);
-    assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), [start]);
+    let calls = rig.bridge.nntp.calls();
+    assert_eq!(calls.len(), 1 + plan.len());
+    assert!(calls.iter().all(|(_, at)| at.0 - start.0 < 20_000));
+    assert_eq!(*rig.bridge.catalog.permit_renewed_at.borrow(), []);
+    assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), []);
     assert_eq!(rig.rows(&s)[0].result, VerifyResult::Ok);
 }
 
-/// A slow pass renews again before the first call that would start 20 s
-/// or more after the last renewal: no call starts on an older one, and
-/// the lease is renewed whenever the slot is.
+/// A slow pass renews before the first call that would start 20 s or
+/// more after the claim, and again 20 s after each renewal: no call
+/// starts on an older one, and the lease is renewed whenever the slot
+/// is.
 #[tokio::test]
-async fn verify_renews_again_when_the_last_renewal_is_old() {
+async fn verify_renews_when_the_claim_or_the_last_renewal_is_old() {
     let rig = simple_rig().await;
     let (s, plan) = rig.posted(41).await;
     assert_eq!(plan.len(), 3);
@@ -1573,17 +1602,58 @@ async fn verify_renews_again_when_the_last_renewal_is_old() {
 
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
 
-    // connect at 0, BODY at 8 s and 16 s, renewal, BODY at 24 s.
+    // Claimed at 0: connect at 0, BODY at 8 s and 16 s, renewal, BODY
+    // at 24 s.
     let renewed = rig.bridge.catalog.permit_renewed_at.borrow().clone();
-    assert_eq!(renewed, [start, start.plus_ms(3 * call_ms)]);
+    assert_eq!(renewed, [start.plus_ms(3 * call_ms)]);
     assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), renewed);
     let calls = rig.bridge.nntp.calls();
     assert_eq!(calls.len(), 1 + plan.len());
+    // The claim and the slot hold from `start` as a renewal at it would.
+    let held: Vec<UnixMs> = [start].into_iter().chain(renewed).collect();
     for (what, at) in &calls {
-        let age = renewed.iter().filter(|r| r.0 <= at.0).map(|r| at.0 - r.0);
-        let age = age.min().expect("renewed before the call");
+        let age = held.iter().filter(|r| r.0 <= at.0).map(|r| at.0 - r.0);
+        let age = age.min().expect("held before the call");
         assert!(age < 20_000, "{what} on a renewal {age} ms old");
     }
+}
+
+/// A claim that is 20 s old when the job gets to its first call stands
+/// for nothing: the job renews before the call, and a row taken over in
+/// between stops it there, before any socket is opened.
+#[tokio::test]
+async fn verify_renews_first_on_a_claim_that_is_old() {
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted(44).await;
+    let clock = rig.bridge.clock.clone();
+    rig.bridge.nntp.slow(&clock, 1_000);
+    rig.bridge.catalog.permit_renewed_at.borrow_mut().clear();
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+
+    let job = rig.job(&s).await;
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    clock.advance_secs(20);
+    let start = clock.now();
+    assert_eq!(rig.bridge.verify_stage(&lease, &job).await, JobOutcome::Ack);
+    assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
+    assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), [start]);
+    assert_eq!(*rig.bridge.catalog.permit_renewed_at.borrow(), [start]);
+
+    // The same with the row taken over while the claim aged.
+    let (s, _) = rig.posted(45).await;
+    rig.bridge.nntp.slow(&clock, 1_000);
+    rig.bridge.catalog.lease_renewed_at.borrow_mut().clear();
+    let job = rig.job(&s).await;
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    clock.advance_secs(20);
+    rig.bridge.catalog.take_over(&s.extent);
+    let at = clock.now();
+    rig.bridge.verify_stage(&lease, &job).await;
+    assert!(rig.bridge.nntp.calls().is_empty());
+    assert_eq!(*rig.bridge.catalog.lease_renewed_at.borrow(), [at]);
+    assert!(rig.rows(&s).is_empty());
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
 impl Rig {
@@ -1638,12 +1708,13 @@ async fn verify_stops_at_the_renewal_that_finds_its_lease_gone() {
     // Taken over once the first BODY is out: connect, BODY.
     rig.verify_taken_over(&s, 2).await;
 
-    // connect at 0, BODY at 8 s and 16 s; the renewal due at 24 s stops it.
+    // Claimed at 0: connect at 0, BODY at 8 s and 16 s; the renewal due
+    // at 24 s stops it.
     let calls: Vec<&str> = rig.bridge.nntp.calls().iter().map(|c| c.0).collect();
     assert_eq!(calls, ["connect", "body", "body"]);
     assert_eq!(
         *rig.bridge.catalog.lease_renewed_at.borrow(),
-        [start, start.plus_ms(24_000)]
+        [start.plus_ms(24_000)]
     );
     assert!(rig.rows(&s).is_empty());
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
@@ -1664,7 +1735,7 @@ async fn a_pass_read_on_a_lease_lost_meanwhile_records_nothing() {
     rig.verify_taken_over(&s, 2).await;
 
     assert_eq!(rig.bridge.nntp.calls().len(), 1 + plan.len());
-    assert_eq!(rig.bridge.catalog.lease_renewed_at.borrow().len(), 1);
+    assert_eq!(rig.bridge.catalog.lease_renewed_at.borrow().len(), 0);
     assert!(rig.rows(&s).is_empty());
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
     assert_eq!(rig.bridge.nntp.live(), 0);
@@ -1717,6 +1788,78 @@ async fn verify_without_a_slot_is_deferred() {
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
 }
 
+/// A later backbone has no free slot: the job is put off without an
+/// attempt spent, and the same write says where it got to. The job that
+/// comes back asks the second backbone only.
+#[tokio::test]
+async fn a_put_off_job_resumes_at_the_backbone_it_reached() {
+    let rig = two_backbone_rig().await;
+    let (s, _) = rig.posted(46).await;
+    rig.propagate(&s, 0, 1).await;
+    let now = rig.bridge.clock.now();
+    let class = PermitClass::Background;
+    let mut held = Vec::new();
+    let second = &rig.bridge.cfg.providers[1];
+    while let Some(permit) = rig
+        .bridge
+        .catalog
+        .acquire_permit(second, class, "t", now)
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+    }
+    assert!(!held.is_empty());
+    let attempts = rig.outbox(&s).attempts;
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert!((15..=60).contains(&delay), "delay {delay}");
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+    let outbox = rig.outbox(&s);
+    assert_eq!(
+        (outbox.stage, outbox.cursor, outbox.attempts),
+        (OutboxStage::Verify, 8, attempts)
+    );
+    assert_eq!(outbox.next_at, now.plus_secs(delay));
+
+    for permit in held {
+        rig.bridge.catalog.release_permit(&permit).await.unwrap();
+    }
+    rig.bridge.clock.advance_secs(60);
+    rig.bridge.nntp.slow(&rig.bridge.clock, 0);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(reads(&rig), (0, 3));
+    assert_eq!(
+        checks(&rig, &s),
+        [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
+    );
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Release, 0));
+}
+
+/// A lease lost while a later backbone is read: the first backbone's
+/// result, written under the lease, stays; nothing more is written, and
+/// the new holder's row is as its claim found it.
+#[tokio::test]
+async fn a_lease_lost_on_a_later_backbone_writes_nothing_more() {
+    let rig = two_backbone_rig().await;
+    let (s, plan) = rig.posted(47).await;
+    rig.propagate(&s, 0, 1).await;
+    rig.bridge.nntp.slow(&rig.bridge.clock, 1_000);
+
+    // Taken over once the second backbone is being asked: connect and
+    // one BODY per article, connect, STAT.
+    let after = 1 + plan.len() + 2;
+    assert_eq!(rig.verify_taken_over(&s, after).await, JobOutcome::Ack);
+
+    assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.cursor), (OutboxStage::Verify, 0));
+    assert!(rig.sent_stages().is_empty());
+    assert!(rig.safety_held(&s));
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
 /// Two backbones that both post and read. `p1` is a backup, so the post
 /// stage puts every article on `p0` only; `bb1` gets them by propagation.
 async fn two_posting_backbones() -> Rig {
@@ -1739,7 +1882,8 @@ impl Rig {
         let (s, plan) = self.posted(n).await;
         let posted_at = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
         let grace_ends = posted_at.plus_secs(self.bridge.cfg.propagation_grace_secs);
-        assert_eq!(self.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+        // The first job reads the first backbone and goes on to the second
+        // one; every later job starts at the second.
         for wait in MISSING_BACKOFF_SECS {
             let left = (grace_ends.0 - self.bridge.clock.now().0) / 1000;
             if left <= 0 {
@@ -2123,7 +2267,6 @@ async fn a_revived_extent_is_not_posted_again() {
     }
     rig.bridge.clock.advance_secs(3600);
     assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     assert!(rig.bridge.nntp.calls().iter().all(|c| c.0 != "post"));
     assert_eq!(without_repost_stamps(rig.plan(&s).await), plan);
@@ -2139,8 +2282,9 @@ async fn no_grace_reposts_at_once() {
     rig.bridge.cfg.propagation_grace_secs = 0;
     let (s, _) = rig.posted(31).await;
 
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    // One job: the first backbone passes, the second is posted to.
     assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), 30);
+    assert_eq!(rig.rows(&s).len(), 1);
     assert_eq!(rig.servers[1].posted_count().await, 3);
     assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
 }
@@ -2169,7 +2313,6 @@ async fn refused_repost_is_recorded_as_missing_and_tried_next_round() {
     // The next round: the provider posts again.
     rig.servers[1].set_posting_allowed(true).await;
     rig.bridge.clock.advance_secs(REVERIFY_SECS);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), 30);
     assert_eq!(rig.servers[1].posted_count().await, 3);
     rig.bridge.clock.advance_secs(30);

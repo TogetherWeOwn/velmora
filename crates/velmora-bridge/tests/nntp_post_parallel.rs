@@ -38,7 +38,8 @@ fn all_posted_by(plan: &[ArticleRow], provider: &str) -> bool {
 }
 
 /// One job, four sockets: every article is posted once, on four permits,
-/// with one renewal and one catalogue write for the lot.
+/// with one catalogue write for the lot and, for a job this quick, no
+/// renewal: it starts every call on its claim.
 #[tokio::test]
 async fn posts_on_several_sockets_at_once() {
     // Five slots: one stays reserved for reads.
@@ -55,7 +56,7 @@ async fn posts_on_several_sockets_at_once() {
     assert_eq!(rig.bridge.nntp.peak(), 4);
     assert_eq!(rig.bridge.nntp.live(), 0);
     assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 4);
-    assert_eq!(rig.bridge.catalog.renewals.get(), 1);
+    assert_eq!(rig.bridge.catalog.renewals.get(), 0);
     assert_eq!(rig.bridge.catalog.mark_batches.get(), 1);
     assert_eq!(
         rig.bridge.catalog.outbox(&s.extent).stage,
@@ -255,7 +256,7 @@ async fn articles_spread_over_the_providers_of_a_tier() {
     assert_eq!(rig.bridge.nntp.live(), 0);
     assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p0"], 2);
     assert_eq!(rig.bridge.catalog.permit_peak.borrow()["p1"], 2);
-    assert_eq!(rig.bridge.catalog.renewals.get(), 1);
+    assert_eq!(rig.bridge.catalog.renewals.get(), 0);
     assert_eq!(rig.bridge.catalog.mark_batches.get(), 1);
     assert_eq!(
         rig.bridge.catalog.outbox(&s.extent).stage,
@@ -486,8 +487,8 @@ async fn a_login_refused_for_the_limit_defers_the_job() {
 /// Every call to the provider is slow, each well inside its own time
 /// limit, and together they take longer than a permit lasts. The lease
 /// and the permits are renewed between the calls of one article, not
-/// only between articles: no connect, lookup or POST starts on a renewal
-/// older than the timer.
+/// only between articles: no connect, lookup or POST starts on a claim
+/// or a renewal older than the timer.
 #[tokio::test]
 async fn slow_calls_never_start_on_an_old_renewal() {
     let mut rig = rig(&[spec("bb0", 5)]).await;
@@ -496,11 +497,16 @@ async fn slow_calls_never_start_on_an_old_renewal() {
     // The first reply is lost: that article is looked up after a reconnect.
     rig.servers[0].drop_next_posts(1).await;
     rig.bridge.nntp.slow(&rig.bridge.clock, 55_000);
+    let claimed = rig.bridge.clock.now();
 
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
 
     let calls = rig.bridge.nntp.calls();
-    let renewed = rig.bridge.catalog.renewed_at.borrow().clone();
+    // The claim holds the lease, and the slots taken after it, as a
+    // renewal at its time would.
+    let mut renewed = rig.bridge.catalog.renewed_at.borrow().clone();
+    assert!(renewed.iter().all(|r| *r > claimed));
+    renewed.push(claimed);
     for what in ["connect", "stat", "post"] {
         assert!(calls.iter().any(|c| c.0 == what), "no {what} was made");
     }
@@ -966,8 +972,8 @@ async fn sockets_connect_while_the_extent_loads() {
     let posts: Vec<usize> = (0..events.len()).filter(|i| events[*i] == "post").collect();
     assert_eq!(posts.len(), 10);
     assert!(posts.iter().all(|at| *at > plan), "{events:?}");
-    // The renewal the sockets connected under is the round's first.
-    assert_eq!(rig.bridge.catalog.renewals.get(), 1);
+    // The sockets connected under the claim: nothing was renewed.
+    assert_eq!(rig.bridge.catalog.renewals.get(), 0);
     assert_eq!(rig.bridge.nntp.connects(), 4);
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
@@ -996,16 +1002,20 @@ async fn a_post_job_leaves_its_timings() {
     assert_eq!(trace::take(&s.extent), None);
 }
 
-/// A renewal that takes too long leaves no time for a connect: the job
-/// connects nothing while the extent loads, and the round connects and
-/// posts after renewing again.
+/// A job whose claim is old by the time it holds its slots renews
+/// before any connect, and a renewal that takes too long leaves no time
+/// for one: the job connects nothing while the extent loads, and the
+/// round connects and posts after renewing again.
 #[tokio::test]
 async fn a_slow_renewal_leaves_the_connects_to_the_round() {
     let rig = rig(&[spec("bb0", 5)]).await;
     let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
     *rig.bridge.catalog.slow_next_renewal.borrow_mut() = Some((rig.bridge.clock.clone(), 25_000));
 
-    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    let lease = rig.claim(&s, OutboxStage::Post).await;
+    let job = rig.job(&s).await;
+    rig.bridge.clock.advance_secs(20);
+    assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
 
     let events = events();
     let plan = events.iter().position(|e| *e == "plan").expect("planned");
@@ -1042,4 +1052,43 @@ async fn sockets_that_failed_together_are_one_strike() {
         rig.bridge.catalog.outbox(&s.extent).last_error,
         Some(FailClass::Corrupt)
     );
+}
+
+/// A claim that is 20 s old when the job holds its slots stands for
+/// nothing: the job renews before any connect. A row taken over since
+/// the claim stops it at that renewal: no socket, nothing read from the
+/// extent, nothing posted, and its slots given back.
+#[tokio::test]
+async fn an_old_claim_is_renewed_before_any_connect() {
+    let rig = rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let lease = rig.claim(&s, OutboxStage::Post).await;
+    let job = rig.job(&s).await;
+    rig.bridge.clock.advance_secs(20);
+    let at = rig.bridge.clock.now();
+    assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+    assert_eq!(*rig.bridge.catalog.renewed_at.borrow(), [at]);
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+
+    let s = rig.seed(2, &marked_plaintext(PLAIN_LEN)).await;
+    let connects = rig.bridge.nntp.connects();
+    let posted = rig.servers[0].posted_count().await;
+    let lease = rig.claim(&s, OutboxStage::Post).await;
+    let job = rig.job(&s).await;
+    rig.bridge.clock.advance_secs(20);
+    rig.bridge.catalog.take_over(&s.extent);
+    rig.bridge.post_stage(&lease, &job).await;
+    assert_eq!(rig.bridge.catalog.renewals.get(), 2);
+    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert_eq!(rig.servers[0].posted_count().await, posted);
+    assert!(rig.plan(&s).await.is_empty());
+    assert_eq!(rig.bridge.nntp.live(), 0);
+    let now = rig.bridge.clock.now();
+    let free = rig.bridge.catalog.acquire_permit(
+        &rig.bridge.cfg.providers[0],
+        PermitClass::Background,
+        "other",
+        now,
+    );
+    assert!(free.await.unwrap().is_some());
 }

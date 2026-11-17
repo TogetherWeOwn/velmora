@@ -64,7 +64,7 @@ use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
     MAX_QUEUE_DELAY_SECS,
 };
-use crate::post::{settle, Stop};
+use crate::post::{settle, settle_at, Stop};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, ExtentRow, FailClass, GenerationState, Job,
     JobExtent, JobOutcome, OutboxStage, ProviderConfig, SafetyState, UnixMs, VerificationRow,
@@ -186,12 +186,19 @@ where
     K: Kek,
     T: Clock,
 {
-    /// Runs the verify stage for a claimed extent: one backbone per job,
-    /// then the decision once every backbone has a recorded result.
+    /// Runs the verify stage for a claimed extent: every backbone that
+    /// counts, one after the other in this job, then the decision once
+    /// each has a recorded result.
+    ///
+    /// A job that stops part way (no slot on the next backbone, a broken
+    /// connection) leaves the row at the first backbone without a
+    /// result, so the next job does not read the ones before it again:
+    /// the resume point goes with the write that gives the lease back.
     pub async fn verify_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.verify_extent(lease, &job.extent).await {
+        let mut reached = None;
+        match self.verify_extent(lease, &job.extent, &mut reached).await {
             Ok(()) => JobOutcome::Ack,
-            Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
+            Err(stop) => settle_at(&self.catalog, &self.clock, lease, stop, reached).await,
         }
     }
 
@@ -352,13 +359,9 @@ where
         }
     }
 
-    /// Queue notification for this extent, due now. The outbox row is
-    /// the obligation: the dispatcher sends again for one that is lost.
-    async fn notify(&self, lease: &Lease, stage: OutboxStage) {
-        self.notify_at(lease, stage, self.clock.now()).await;
-    }
-
-    /// Queue notification for this extent, due at `at`. Within the
+    /// Queue notification for this extent, due at `at`. The outbox row
+    /// is the obligation: the dispatcher sends again for one that is
+    /// lost. Within the
     /// longest queue delay it is the job itself, delayed until then.
     /// Further out it is a `Wake` job with the longest delay, which is
     /// sent on until `at` when it is delivered: a release, due a
@@ -392,7 +395,10 @@ where
     }
 
     /// A backbone lacks articles. `Some` = the wait before it is read
-    /// again; `None` = record the result now.
+    /// again; `None` = record the result now. `cursor` is the resume
+    /// point of that backbone in this job: the row's own for the
+    /// backbone the job started at, without retries for a later one.
+    /// What is stored here names the backbone and its retries both.
     ///
     /// Until the propagation grace is over the articles may still arrive
     /// on their own, so the backbone is only read again. Once it is over
@@ -405,8 +411,9 @@ where
         plan: &[ArticleRow],
         backbone: &str,
         missing: &[u32],
+        cursor: u32,
     ) -> Staged<Option<u32>> {
-        let retries = lease.cursor % CURSOR_STEPS;
+        let retries = cursor % CURSOR_STEPS;
         if retries == REPOSTED {
             return Ok(None);
         }
@@ -425,15 +432,14 @@ where
                 .filter(|p| p.post && p.enabled && label(&p.backbone) == backbone)
                 .collect();
             if self.repost(lease, extent, plan, missing, &posters).await? {
-                self.cursor(lease, lease.cursor - retries + REPOSTED)
-                    .await?;
+                self.cursor(lease, cursor - retries + REPOSTED).await?;
                 return Ok(Some(self.cfg.verify_delay_secs.max(1)));
             }
         }
         let Some(&wait) = MISSING_BACKOFF_SECS.get(retries as usize) else {
             return Ok(None);
         };
-        self.cursor(lease, lease.cursor + 1).await?;
+        self.cursor(lease, cursor + 1).await?;
         // Never past the end of the grace: the repost is due then.
         let left = grace_ends.map(|ends| (ends.0 - now.0).saturating_add(999).div_euclid(1000));
         let left = left.map_or(u32::MAX, |secs| u32::try_from(secs).unwrap_or(u32::MAX));
@@ -451,13 +457,28 @@ where
         }))
     }
 
-    async fn verify_extent(&self, lease: &Lease, extent: &ExtentRow) -> Staged<()> {
+    /// `reached` is the resume point the job has got to and the row does
+    /// not say yet: `Some` once a backbone has its result and until a
+    /// write stores a resume point or the reads are over. The caller
+    /// stores it when the job stops ([`settle_at`]).
+    async fn verify_extent(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+        reached: &mut Option<u32>,
+    ) -> Staged<()> {
         let plan = self.posted_plan(extent).await?;
         let groups = release_backbones(&self.cfg.providers);
         let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
-        let index = (lease.cursor / CURSOR_STEPS) as usize;
+        let first = (lease.cursor / CURSOR_STEPS) as usize;
 
-        if let Some((name, providers)) = groups.get(index) {
+        for (index, (name, providers)) in groups.iter().enumerate().skip(first) {
+            // The retries used count for the backbone the row names;
+            // a later one starts without.
+            let cursor = match index == first {
+                true => lease.cursor,
+                false => index as u32 * CURSOR_STEPS,
+            };
             // `BODY` until a backbone before this one has passed it, and
             // `BODY` again on a backbone whose last full read failed: the
             // release takes no `STAT` answer from it until it has passed
@@ -476,29 +497,36 @@ where
             }
             let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
             if result_of(&tally) == VerifyResult::Missing {
+                // What this stores is the resume point of this backbone.
+                let stored = reached.take();
                 let wait = self
-                    .missing_wait(lease, extent, &plan, name, &tally.missing)
-                    .await?;
+                    .missing_wait(lease, extent, &plan, name, &tally.missing, cursor)
+                    .await;
+                let wait = match wait {
+                    Ok(wait) => wait,
+                    Err(stop) => {
+                        // Nothing may have been stored: the job still
+                        // has to say where it got to.
+                        *reached = stored;
+                        return Err(stop);
+                    }
+                };
                 if let Some(wait) = wait {
                     // Not recorded yet: read this backbone again later.
                     return Err(Stop::Fail(FailClass::MissingPending, Some(wait)));
                 }
+                *reached = stored;
             }
             self.record(lease, extent, provider, &tally, kind).await?;
-            let next = index as u32 + 1;
-            if (next as usize) < groups.len() {
-                // The next backbone gets its own job; this is progress,
-                // not a failure, so no attempt is spent. The resume point
-                // goes with the same write.
-                let now = self.clock.now();
-                let cursor = next * CURSOR_STEPS;
-                if !self.catalog.defer_at(lease, cursor, now, now).await? {
-                    return Err(Stop::Fenced);
-                }
-                self.notify(lease, OutboxStage::Verify).await;
-                return Ok(());
-            }
+            // The next backbone is read by this job, under the same
+            // claim. Its resume point is stored only if the job stops
+            // before the round is over.
+            *reached = Some((index as u32 + 1) * CURSOR_STEPS);
         }
+        // The reads are over: a stop from here on stores no resume
+        // point. A job that comes back finds the row where its claim
+        // found it and reads again from there.
+        *reached = None;
 
         // Every backbone has a recorded result for this round. The next
         // round starts at the first backbone: a move to another stage

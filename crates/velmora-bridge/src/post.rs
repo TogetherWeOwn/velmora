@@ -157,7 +157,29 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
     lease: &Lease,
     stop: Stop,
 ) -> JobOutcome {
+    settle_at(catalog, clock, lease, stop, None).await
+}
+
+/// [`settle`] for a job that got further than its row says: `cursor`
+/// is the resume point it reached, stored with the write that gives the
+/// lease back, or just before it. Nothing is stored where nothing is
+/// written (a lost lease, a failing catalogue): the next job then
+/// starts where this one did, and only repeats work.
+pub(crate) async fn settle_at<C: Catalog, T: Clock>(
+    catalog: &C,
+    clock: &T,
+    lease: &Lease,
+    stop: Stop,
+    cursor: Option<u32>,
+) -> JobOutcome {
     let now = clock.now();
+    // A put-off stores the resume point in its own write.
+    let defer = |next_at: UnixMs| async move {
+        match cursor {
+            Some(cursor) => catalog.defer_at(lease, cursor, next_at, now).await,
+            None => catalog.defer(lease, next_at, now).await,
+        }
+    };
     let stop = match stop {
         Stop::Session(e) => e.into(),
         stop => stop,
@@ -173,7 +195,7 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
                 .and_then(|j| u32::try_from(j).ok())
                 .unwrap_or(0);
             let delay_secs = NO_PERMIT_MIN_SECS + jitter;
-            match catalog.defer(lease, now.plus_secs(delay_secs), now).await {
+            match defer(now.plus_secs(delay_secs)).await {
                 Ok(false) => JobOutcome::Ack,
                 _ => JobOutcome::Retry { delay_secs },
             }
@@ -184,13 +206,19 @@ pub(crate) async fn settle<C: Catalog, T: Clock>(
             let delay_secs = u32::try_from(secs)
                 .unwrap_or(0)
                 .clamp(1, MAX_QUEUE_DELAY_SECS);
-            match catalog.defer(lease, until.max(now), now).await {
+            match defer(until.max(now)).await {
                 Ok(false) => JobOutcome::Ack,
                 _ => JobOutcome::Retry { delay_secs },
             }
         }
         Stop::Fail(class, delay) => {
             let delay_secs = delay.unwrap_or_else(|| backoff_secs(lease.attempts));
+            // A failure keeps its own write. The resume point goes
+            // first, under the lease: if it is not stored, the failure
+            // is recorded all the same.
+            if let Some(cursor) = cursor {
+                let _ = catalog.set_cursor(lease, cursor, now).await;
+            }
             match catalog
                 .fail(lease, class, now.plus_secs(delay_secs), now)
                 .await
@@ -325,15 +353,23 @@ where
         if held.is_empty() {
             return Err(Stop::NoPermit);
         }
-        // One renewal confirms the lease and every permit before any
-        // connect, as `Round::keep` does. A lease that is gone stops the
+        // The lease and every permit are confirmed before any connect,
+        // as `Round::keep` does. A claim less than a renewal interval
+        // old is that confirmation, with nothing written: the lease
+        // holds from it, and every slot was taken after it, so each
+        // holds at least as long as after a renewal at the claim's
+        // time. Past that (a wait for memory, a slow catalogue) one
+        // renewal confirms them all, and a lease that is gone stops the
         // job here, before it reads the extent.
-        let kept_at = match self.renew_held(lease, &held).await {
-            Ok(kept_at) => kept_at,
-            Err(stop) => {
-                close_all(held).await;
-                return Err(stop);
-            }
+        let kept_at = match lease.fresh_at(self.clock.now()) {
+            true => Some(lease.claimed_at),
+            false => match self.renew_held(lease, &held).await {
+                Ok(kept_at) => kept_at,
+                Err(stop) => {
+                    close_all(held).await;
+                    return Err(stop);
+                }
+            },
         };
         // The sockets connect while the extent is read, checked and
         // planned and its record stored. Nothing is posted before that
@@ -401,8 +437,9 @@ where
         Ok((confirmed && in_time).then_some(now))
     }
 
-    /// Connects every held session at once when `kept_at` says a renewal
-    /// confirmed the lease and their permits ([`Self::renew_held`]).
+    /// Connects every held session at once when `kept_at` says the lease
+    /// and their permits were confirmed: by the claim and the taking of
+    /// the slots, or by a renewal ([`Self::renew_held`]).
     /// Returns the providers that turned a connect away.
     ///
     /// A session whose connect the provider refused is ended at once and
@@ -425,9 +462,10 @@ where
         kept_at: Option<UnixMs>,
     ) -> TurnedAway<'a> {
         let mut away = TurnedAway::default();
-        let Some(now) = kept_at else {
+        if kept_at.is_none() {
             return away;
-        };
+        }
+        let now = self.clock.now();
         // A connect ends within `NNTP_CALL_SECS` like any call, and the
         // round could not end before it either: it would wait for the
         // article that socket had taken.

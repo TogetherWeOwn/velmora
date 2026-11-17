@@ -3275,8 +3275,10 @@ async fn rows_written_per_extent() {
     // write to either shows up here. The jobs run in turn, so none is
     // put off for a provider slot; each such put-off is four more (the
     // claim and the put-off, a row and an index entry each).
+    // A verify job reads every backbone under one claim, and a job
+    // that makes its calls within 20 s of its claim renews nothing.
     assert!(
-        packed.0 <= 60,
+        packed.0 <= 46,
         "rows written per packed extent: {}",
         packed.0
     );
