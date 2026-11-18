@@ -99,6 +99,7 @@ use velmora::media::{
     HEADER_SIZE, PLAIN_CHUNK_SIZE,
 };
 use velmora::rng::FillRandom;
+use velmora_s3_proto::DecodedUpload;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ports::Kek;
@@ -559,11 +560,16 @@ impl fmt::Debug for SealedExtent {
     }
 }
 
-/// MD5 and SHA-256 of one plaintext, taken while it was received.
+/// MD5 and SHA-256 of one plaintext.
+///
+/// There are two ways to have one: hash the plaintext ([`Self::of`]), or
+/// take what the upload validator computed over a body of that length
+/// ([`Self::validated`]). The fields are private so that nothing else can
+/// name digests for a seal.
 #[derive(Clone, Copy)]
 pub struct PlainDigests {
-    pub md5: [u8; 16],
-    pub sha256: [u8; 32],
+    md5: [u8; 16],
+    sha256: [u8; 32],
 }
 
 impl PlainDigests {
@@ -572,6 +578,16 @@ impl PlainDigests {
             md5: md5::compute(plaintext).0,
             sha256: Sha256::digest(plaintext).into(),
         }
+    }
+
+    /// The digests a finished upload validation took, for the body it
+    /// was fed. `None` when the validator saw another number of bytes
+    /// than `body` holds: they are then not the digests of `body`.
+    pub fn validated(decoded: &DecodedUpload, body: &[u8]) -> Option<Self> {
+        (decoded.length() == body.len() as u64).then(|| PlainDigests {
+            md5: *decoded.md5(),
+            sha256: *decoded.sha256(),
+        })
     }
 }
 

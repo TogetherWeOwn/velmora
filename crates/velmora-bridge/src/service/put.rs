@@ -141,13 +141,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     .map_err(|_| internal())?;
     // The validator hashed exactly the bytes in `body`, in the pass that
     // checked them against the request: its digests are the extent's.
-    if decoded.length() != body.len() as u64 {
-        return Err(internal());
-    }
-    let digests = PlainDigests {
-        md5: *decoded.md5(),
-        sha256: *decoded.sha256(),
-    };
+    let digests = PlainDigests::validated(&decoded, &body).ok_or_else(internal)?;
     let sealed = seal_extent_hashed(&bdk, &bucket.id, &extent_id, &body, digests, &mut rng)
         .map_err(|_| internal())?;
     drop(body);

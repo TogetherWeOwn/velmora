@@ -683,13 +683,7 @@ where
         let decoded = validator.finish()?;
         // The validator hashed exactly the bytes in `body`, in the pass
         // that checked them against the request.
-        if decoded.length() != body.len() as u64 {
-            return Err(ErrorCode::InternalError.into());
-        }
-        let digests = PlainDigests {
-            md5: *decoded.md5(),
-            sha256: *decoded.sha256(),
-        };
+        let digests = PlainDigests::validated(&decoded, &body).ok_or(ErrorCode::InternalError)?;
         (body, charge, Some(digests))
     };
     let declared = body.len() as u64;
