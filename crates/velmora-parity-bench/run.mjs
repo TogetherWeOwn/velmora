@@ -55,12 +55,15 @@ if (checkOnly) process.exit(0);
 
 const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
 const time = (run, want) => {
+  // Every call must return the expected byte count: the warm-up and each
+  // timed one. The result is compared outside the timed span.
   if (run() !== want) throw new Error("benchmark step failed");
   const times = [];
   for (let i = 0; i < reps; i++) {
     const t0 = performance.now();
-    run();
+    const got = run();
     times.push(performance.now() - t0);
+    if (got !== want) throw new Error("benchmark step failed");
   }
   return median(times);
 };
