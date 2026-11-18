@@ -369,6 +369,148 @@ async fn a_backbone_verify_did_not_pass_does_not_count_at_release() {
     assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
 }
 
+/// Three backbones under the light check, two of them needed.
+async fn three_backbone_rig(specs: [(&'static str, bool); 3]) -> Rig {
+    let spec = |(backbone, post)| Spec {
+        backbone,
+        post,
+        max_conns: 2,
+    };
+    let mut rig = rig(&specs.map(spec)).await;
+    rig.bridge.cfg.required_backbones = 2;
+    rig.bridge.cfg.propagation_grace_secs = 0;
+    rig.bridge.cfg.verify = VerifyConfig {
+        mode: VerifyMode::Light,
+        sample_ppm: 0,
+        escalate_secs: ESCALATE_SECS,
+        size_commands: Vec::new(),
+    };
+    rig
+}
+
+/// Puts `backbone` under full reads from now on, as a failed sample of
+/// another extent would.
+async fn raise(rig: &Rig, backbone: &str) -> VerifyEscalation {
+    let now = rig.bridge.clock.now();
+    let raised = VerifyEscalation {
+        backbone: backbone.to_string(),
+        until: now.plus_secs(ESCALATE_SECS),
+        raised_at: now,
+        extent_id: ExtentId::mint([0xee; 13]),
+        result: VerifyResult::Corrupt,
+    };
+    rig.bridge.catalog.escalate_verify(&raised).await.unwrap();
+    raised
+}
+
+/// The release records nothing for a backbone verify did not pass: its
+/// answer to `STAT` now must not become the last word on it, or a
+/// release that is tried again would count it.
+#[tokio::test]
+async fn the_release_records_nothing_for_a_backbone_verify_did_not_pass() {
+    let rig = three_backbone_rig([("bb0", true), ("bb1", false), ("bb2", false)]).await;
+    let (s, _) = rig.on_two(21).await;
+    let mut outcome = rig.run(&s, OutboxStage::Verify).await;
+    while outcome != JobOutcome::Ack {
+        rig.wait_until_due(&s);
+        outcome = rig.run(&s, OutboxStage::Verify).await;
+    }
+    assert_eq!(rig.stage(&s), OutboxStage::Release);
+    let missing = row("bb2", VerifyKind::Stat, VerifyResult::Missing);
+    assert_eq!(rig.checks(&s).last().unwrap(), &missing);
+
+    // The third backbone gets the extent: the release asks it and it
+    // answers, but the two that verify passed are the release.
+    rig.propagate(&s, 0, 2).await;
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.state(&s), SafetyState::Released);
+    let rows = rig.checks(&s);
+    let of_third: Vec<_> = rows.iter().filter(|r| r.0 == "bb2").collect();
+    assert_eq!(of_third, [&missing]);
+    assert!(rig.evidence(&s).iter().all(|e| e.0 != "bb2"));
+}
+
+/// A backbone under full reads that lacks the extent does not hold the
+/// release for good while enough others have it: one of them is read in
+/// full instead, and the extent is released on those.
+#[tokio::test]
+async fn another_backbone_is_read_in_full_when_the_one_named_lacks_the_extent() {
+    let rig = three_backbone_rig([("bb0", true), ("bb1", false), ("bb2", false)]).await;
+    raise(&rig, "bb2").await;
+    rig.bridge.clock.advance_secs(1);
+    // Stored while the third backbone is under full reads, and never
+    // copied to it.
+    let (s, plan) = rig.on_two(22).await;
+    for _ in 0..12 {
+        rig.logged(&s, OutboxStage::Verify).await;
+        if rig.stage(&s) == OutboxStage::Release {
+            break;
+        }
+        rig.wait_until_due(&s);
+    }
+    assert_eq!(rig.stage(&s), OutboxStage::Release);
+    let rows = rig.checks(&s);
+    assert!(rows.contains(&ok("bb0", VerifyKind::Sampled)));
+    assert!(rows.contains(&row("bb2", VerifyKind::Sampled, VerifyResult::Missing)));
+    // One full read stands in, not one per backbone.
+    assert!(!rows.contains(&ok("bb1", VerifyKind::Sampled)));
+    assert_eq!(rig.calls().0, 2 * plan.len());
+
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.state(&s), SafetyState::Released);
+    let evidence = rig.evidence(&s);
+    assert!(evidence.contains(&entry("bb0", "sampled", None)));
+    assert!(evidence.iter().all(|e| e.0 != "bb2"));
+}
+
+/// Two providers on one backbone may answer differently. A full read
+/// that finds an article missing is held against the `STAT` of the same
+/// provider: what another provider of the backbone says of the article
+/// neither makes the first one a provider that answers for bytes it
+/// lacks nor clears it of that.
+#[tokio::test]
+async fn a_failed_full_read_is_held_against_the_stat_of_the_same_provider() {
+    let rig = three_backbone_rig([("bb0", true), ("bb1", false), ("bb1", false)]).await;
+    let raised = raise(&rig, "bb1").await;
+    rig.bridge.clock.advance_secs(1);
+    let (s, plan) = rig.on_two(23).await;
+    rig.propagate(&s, 0, 2).await;
+    // The first provider of the backbone lacks one article, for `BODY`
+    // and for `STAT`. The second lists them all and serves no body.
+    rig.servers[1].hide(&plan[0].message_id).await;
+    rig.servers[2].set_body_gone(true).await;
+
+    let missing = |rig: &Rig| {
+        let rows = rig.bridge.catalog.verifications(&s.extent);
+        let row = rows.into_iter().find(|r| r.result == VerifyResult::Missing);
+        row.map(|r| (r.backbone, r.provider_id))
+    };
+    for _ in 0..12 {
+        assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+        if missing(&rig).is_some() {
+            break;
+        }
+        rig.wait_until_due(&s);
+    }
+    let (backbone, provider) = missing(&rig).expect("a missing row");
+    assert_eq!(backbone, "bb1");
+    let now = rig.bridge.catalog.escalations.borrow().clone();
+    match provider.as_str() {
+        // Nothing was raised by this read: the row is the one from
+        // before, though the other provider answers `STAT` for it.
+        "p1" => assert_eq!(now, [raised]),
+        // Raised by this read, though the other provider says with
+        // `STAT` that the article is not there.
+        "p2" => assert_eq!(
+            (&now[0].extent_id, now[0].result),
+            (&s.extent, VerifyResult::Missing)
+        ),
+        other => panic!("read by {other}"),
+    }
+}
+
 /// One backbone is not two under the light check either.
 #[tokio::test]
 async fn one_backbone_releases_nothing_under_the_light_check() {
@@ -463,16 +605,20 @@ async fn a_corrupt_sample_raises_the_backbone_to_full_reads() {
     );
     assert_eq!(rig.state(&bad), SafetyState::Held);
     let raised = rig.bridge.catalog.escalations.borrow().clone();
-    assert_eq!(
-        raised,
-        [VerifyEscalation {
-            backbone: name.to_string(),
-            until: now.plus_secs(ESCALATE_SECS),
-            raised_at: now,
-            extent_id: bad.extent.clone(),
-            result: VerifyResult::Corrupt,
-        }]
-    );
+    let expected = VerifyEscalation {
+        backbone: name.to_string(),
+        until: now.plus_secs(ESCALATE_SECS),
+        raised_at: now,
+        extent_id: bad.extent.clone(),
+        result: VerifyResult::Corrupt,
+    };
+    assert!(raised.contains(&expected));
+    // The other backbone has a copy of the same corrupt article. Where
+    // it came after the failed read it was read in full to stand in for
+    // it, and was raised too. The rest follows the one that was drawn.
+    assert!(raised.len() <= 2);
+    let all = &rig.bridge.catalog.escalations;
+    all.borrow_mut().retain(|e| e.backbone == name);
 
     // From here on nothing is in the sample by its id.
     rig.bridge.cfg.verify.sample_ppm = 0;

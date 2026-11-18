@@ -3819,6 +3819,56 @@ async fn the_light_guard_reads_the_escalations_itself() {
     assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
 }
 
+/// With a third backbone that counts: an extent under an escalation is
+/// released only with a full check on record, also when the backbone
+/// under full reads is not one of those that hold it and the job had
+/// read the escalations before this one was raised. The full read of
+/// another backbone is that check; the backbone under full reads still
+/// does not count.
+#[tokio::test]
+async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
+    let fx = Fx::new().await;
+    let (o, r) = fx.at_release("k").await;
+    let counting = labels(&["bb-a", "bb-b", "bb-c"]);
+    let stored = UnixMs(fx.extent(&o, "created_at").await.parse().unwrap());
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
+    let raised = VerifyEscalation {
+        backbone: "bb-c".to_string(),
+        until: stored.plus_secs(3_600),
+        raised_at: stored,
+        extent_id: ExtentId::mint([7; 13]),
+        result: VerifyResult::Corrupt,
+    };
+    fx.cat.escalate_verify(&raised).await.unwrap();
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+
+    // A `STAT` pass of the backbone under full reads adds nothing.
+    assert!(fx.pass(&r, "bb-c", T0.plus_ms(3), VerifyKind::Stat).await);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 3, &counting, "[]", T0.plus_ms(4), false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+
+    assert!(
+        fx.pass(&r, "bb-a", T0.plus_ms(5), VerifyKind::Sampled)
+            .await
+    );
+    let light = fx
+        .cat
+        .begin_release_light(&r, 3, &counting, "[]", T0.plus_ms(6), false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(6), false);
+    assert_eq!(light.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+}
+
 /// The backbones read in full for a while: one row per backbone, the
 /// later end wins, and a row whose time is over is not listed.
 #[tokio::test]

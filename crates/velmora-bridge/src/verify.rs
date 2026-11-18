@@ -214,6 +214,12 @@ impl Light {
     fn need_full(&self) -> bool {
         self.sampled || !self.escalated.is_empty()
     }
+
+    /// Whether the backbone `name`, at `index` among those that count,
+    /// is one this extent is read in full on.
+    fn names(&self, index: usize, name: &str) -> bool {
+        self.escalated.iter().any(|e| e == name) || (self.sampled && index == self.sample_index)
+    }
 }
 
 /// A backbone label as it is compared and recorded: trimmed, lower case.
@@ -700,6 +706,31 @@ where
         }))
     }
 
+    /// Whether a backbone the light check does not name for `extent` is
+    /// read in full all the same: the release needs a full check, none
+    /// is on record for the current plan, and every backbone that was
+    /// named has failed its own. Without this an extent whose named
+    /// backbone lacks it would wait for that backbone for good, however
+    /// many others hold it.
+    async fn full_read_owed(
+        &self,
+        extent: &ExtentRow,
+        labels: &[String],
+        light: &Light,
+    ) -> Staged<bool> {
+        let mut checks = self.catalog.body_checks(&extent.id).await?;
+        checks.retain(|b| b.plan_rev == extent.plan_rev && labels.contains(&label(&b.backbone)));
+        if checks.iter().any(|b| b.counts) {
+            return Ok(false);
+        }
+        let failed = |name: &String| checks.iter().any(|b| label(&b.backbone) == *name);
+        let mut named = labels
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| light.names(*i, n));
+        Ok(named.all(|(_, name)| failed(name)))
+    }
+
     /// `reached` is the resume point the job has got to and the row does
     /// not say yet: `Some` once a backbone has its result and until a
     /// write stores a resume point or the reads are over. The caller
@@ -735,8 +766,8 @@ where
                 // reads, and for the sample; the size or `STAT` else.
                 kind = if self.full_read_failed(extent, name).await? {
                     VerifyKind::Body
-                } else if light.escalated.contains(name)
-                    || (light.sampled && index == light.sample_index)
+                } else if light.names(index, name)
+                    || (need_full && self.full_read_owed(extent, &labels, light).await?)
                 {
                     VerifyKind::Sampled
                 } else if self.has_size_command(providers) {
@@ -981,6 +1012,13 @@ where
         }
         let mut rows = Vec::new();
         for (provider, tally) in &read {
+            if light.is_some() && failed.contains(&label(&provider.backbone)) {
+                // Under the light check the last row of a backbone is
+                // what verify found there. A `STAT` pass of this job on a
+                // backbone verify did not pass would hide that, and a
+                // release that is tried again would count it.
+                continue;
+            }
             let row = self
                 .record(lease, extent, provider, tally, VerifyKind::Stat)
                 .await?;

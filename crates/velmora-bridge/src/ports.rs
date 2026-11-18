@@ -272,9 +272,12 @@ pub trait NntpSession {
 }
 
 /// Most articles in one [`NntpSession::ask_many`]: the articles of a
-/// whole extent of the largest size, so its check is one round trip per
-/// provider. The commands of that many are a few kilobytes, the answers
-/// (a header block each at most) well under a megabyte.
+/// whole extent of the largest size, so its check is one call per
+/// provider. A size command writes all of them ahead of their replies;
+/// `STAT` writes them in the client's groups (16 at a time), so a full
+/// call of `STAT` is two round trips. The commands of that many are a
+/// few kilobytes, the answers (a header block each at most) well under
+/// a megabyte.
 pub const ASK_MANY: usize = 32;
 
 /// The longest one `connect`, `post`, `stat`, `body` or `quit` may take, whatever its

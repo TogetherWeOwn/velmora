@@ -8,7 +8,9 @@
 --               full for a while after a failed read;
 --   'size'    = presence and the size of every article as the
 --               provider counted it (`kind = 'stat'`). A size that came
---               with the article is checked too, but leaves `mode` NULL.
+--               with the article is checked too: where it fits the row
+--               keeps `mode` NULL (presence is all it proves), where it
+--               does not the row is 'size' with `result = 'corrupt'`.
 -- `kind` keeps its two values, so a Worker from before this column
 -- reads a 'sampled' row as the full read it is and a 'size' row as the
 -- presence check it also is, and its own inserts leave `mode` NULL: it
