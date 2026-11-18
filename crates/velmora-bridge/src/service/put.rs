@@ -25,7 +25,7 @@ use super::common::{
     from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
-use crate::crypto::{seal_extent, unwrap_bdk};
+use crate::crypto::{seal_extent_hashed, unwrap_bdk, PlainDigests};
 use crate::ingress::{read_upload, upload_lengths, UploadLengths, UploadReadError};
 use crate::intents::WRITER_MAX_AGE_MS;
 use crate::ports::{
@@ -139,8 +139,17 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         &bucket.bdk_wrapped,
     )
     .map_err(|_| internal())?;
-    let sealed =
-        seal_extent(&bdk, &bucket.id, &extent_id, &body, &mut rng).map_err(|_| internal())?;
+    // The validator hashed exactly the bytes in `body`, in the pass that
+    // checked them against the request: its digests are the extent's.
+    if decoded.length() != body.len() as u64 {
+        return Err(internal());
+    }
+    let digests = PlainDigests {
+        md5: *decoded.md5(),
+        sha256: *decoded.sha256(),
+    };
+    let sealed = seal_extent_hashed(&bdk, &bucket.id, &extent_id, &body, digests, &mut rng)
+        .map_err(|_| internal())?;
     drop(body);
 
     let etag = format!("\"{}\"", hex(&sealed.plain_md5));

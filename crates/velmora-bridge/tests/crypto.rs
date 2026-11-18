@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use velmora::media::{self, FileKey, ReadAt, CIPHER_CHUNK_SIZE, HEADER_SIZE, PLAIN_CHUNK_SIZE};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_bridge::crypto::{
-    cipher_span, list_token_key, open_range, profile, seal_extent, unwrap_bdk, unwrap_file_key,
-    unwrap_secret, wrap_bdk, wrap_file_key, wrap_secret, DataKey, OffsetBuf, SealedExtent,
-    WrappedKey, MAX_SECRET_LEN, WRAPPED_KEY_LEN, WRAP_OVERHEAD,
+    cipher_span, list_token_key, open_range, profile, seal_extent, seal_extent_hashed, unwrap_bdk,
+    unwrap_file_key, unwrap_secret, wrap_bdk, wrap_file_key, wrap_secret, DataKey, OffsetBuf,
+    PlainDigests, SealedExtent, WrappedKey, MAX_SECRET_LEN, WRAPPED_KEY_LEN, WRAP_OVERHEAD,
 };
 use velmora_bridge::testkit::TestKek;
 use velmora_bridge::{
@@ -1293,4 +1293,50 @@ fn recovery_record_opens_only_under_its_name_and_key() {
     for err in &errors {
         assert!(matches!(err, BridgeError::Crypto(_)), "{err:?}");
     }
+}
+
+/// A seal given the digests of its plaintext is the seal that takes them
+/// itself: same stream, same recorded digests, same wrapped key.
+#[test]
+fn a_seal_given_its_digests_is_the_seal_that_takes_them() {
+    for len in [0, 1, PLAIN_CHUNK_SIZE as usize, 200_000] {
+        let (k, b, x) = (bdk("bdk hashed"), bucket(1), extent(1));
+        let plain = pattern(len);
+        let taken = seal_extent(&k, &b, &x, &plain, &mut TestRng::new("hashed")).unwrap();
+        let given = seal_extent_hashed(
+            &k,
+            &b,
+            &x,
+            &plain,
+            PlainDigests::of(&plain),
+            &mut TestRng::new("hashed"),
+        )
+        .unwrap();
+        assert_eq!(given.ciphertext, taken.ciphertext);
+        assert_eq!(given.media_header, taken.media_header);
+        assert_eq!(
+            given.wrapped_file_key.as_ref(),
+            taken.wrapped_file_key.as_ref()
+        );
+        assert_eq!(given.plain_md5, taken.plain_md5);
+        assert_eq!(given.plain_sha256, taken.plain_sha256);
+        assert_eq!(given.cipher_sha256, taken.cipher_sha256);
+        assert_eq!(given.plain_sha256, <[u8; 32]>::from(Sha256::digest(&plain)));
+        assert_eq!(given.plain_md5, md5::compute(&plain).0);
+    }
+}
+
+/// Digests of other bytes are refused where assertions are compiled in.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "digests are not of this plaintext")]
+fn a_seal_refuses_digests_of_other_bytes() {
+    let _ = seal_extent_hashed(
+        &bdk("bdk hashed"),
+        &bucket(1),
+        &extent(1),
+        b"these bytes",
+        PlainDigests::of(b"other bytes"),
+        &mut TestRng::new("hashed"),
+    );
 }

@@ -559,6 +559,22 @@ impl fmt::Debug for SealedExtent {
     }
 }
 
+/// MD5 and SHA-256 of one plaintext, taken while it was received.
+#[derive(Clone, Copy)]
+pub struct PlainDigests {
+    pub md5: [u8; 16],
+    pub sha256: [u8; 32],
+}
+
+impl PlainDigests {
+    pub fn of(plaintext: &[u8]) -> Self {
+        PlainDigests {
+            md5: md5::compute(plaintext).0,
+            sha256: Sha256::digest(plaintext).into(),
+        }
+    }
+}
+
 /// Seals one request body as one independent media stream under a fresh
 /// file key, and wraps that key for `(bucket, extent)`.
 ///
@@ -572,8 +588,40 @@ pub fn seal_extent<R: FillRandom>(
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<SealedExtent> {
+    seal_extent_hashed(
+        bdk,
+        bucket,
+        extent,
+        plaintext,
+        PlainDigests::of(plaintext),
+        rng,
+    )
+}
+
+/// [`seal_extent`] for a plaintext whose digests are already known.
+///
+/// `digests` must be the MD5 and SHA-256 of exactly `plaintext`: the
+/// upload validator's, taken over the same bytes as they were received
+/// and checked against what the client declared. They are recorded as
+/// they are, so the plaintext is not hashed a second time. A debug build
+/// (every native test) computes both again and refuses a difference, and
+/// the restore drill compares the recorded SHA-256 with the bytes it
+/// decrypts. The SHA-256 of the ciphertext is always computed here.
+pub fn seal_extent_hashed<R: FillRandom>(
+    bdk: &DataKey,
+    bucket: &BucketId,
+    extent: &ExtentId,
+    plaintext: &[u8],
+    digests: PlainDigests,
+    rng: &mut R,
+) -> Result<SealedExtent> {
     // Refuse a bad binding before any key exists.
     file_key_aad(bucket, extent)?;
+    debug_assert!(
+        digests.md5 == md5::compute(plaintext).0
+            && digests.sha256 == <[u8; 32]>::from(Sha256::digest(plaintext)),
+        "digests are not of this plaintext"
+    );
 
     let file_key = FileKey::generate(rng).map_err(|_| ERR_RNG)?;
     let sealer = Sealer::random(&profile(), &file_key, rng).map_err(|_| ERR_RNG)?;
@@ -583,8 +631,8 @@ pub fn seal_extent<R: FillRandom>(
 
     Ok(SealedExtent {
         media_header,
-        plain_md5: md5::compute(plaintext).0,
-        plain_sha256: Sha256::digest(plaintext).into(),
+        plain_md5: digests.md5,
+        plain_sha256: digests.sha256,
         cipher_sha256: Sha256::digest(&ciphertext).into(),
         ciphertext,
         wrapped_file_key,

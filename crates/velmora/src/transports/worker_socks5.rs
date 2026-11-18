@@ -37,10 +37,11 @@ use tokio::io::AsyncReadExt;
 use tokio_rustls::client::TlsStream;
 use worker::js_sys::{Object, Reflect};
 use worker::wasm_bindgen::JsValue;
-use worker::{worker_sys, Delay, Socket};
+use worker::{worker_sys, Delay};
 
 use super::proxy_tls;
 use super::worker_socket::with_timeout;
+use super::worker_stream::WorkerStream;
 use crate::nntp::NntpConfig;
 use crate::socks5::{self, Progress, Socks5Proxy};
 use crate::transport::Transport;
@@ -61,26 +62,15 @@ fn set(object: &Object, key: &str, value: JsValue) -> io::Result<()> {
         .map_err(|_| open_failed())
 }
 
-/// Asks the runtime to close the connection when dropped: with the
-/// transport, or with a connect that failed, ran out of time or was
-/// dropped by its caller. `close()` is called and its promise let go, as
-/// for a direct socket (`WorkerTransport`'s `Drop`, with the same limit:
-/// a stalled write may keep the socket until the invocation ends).
-struct CloseOnDrop(worker_sys::Socket);
-
-impl Drop for CloseOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.close();
-    }
-}
-
 /// An NNTP connection to a provider through a SOCKS5 proxy, under TLS
 /// made in the Worker. There is no plain stream to reach.
 pub struct WorkerProxiedTransport {
-    tls: TlsStream<Socket>,
+    // Dropping the stream asks the runtime to close the connection: with
+    // the transport, or with a connect that failed, ran out of time or was
+    // dropped by its caller (`worker_stream`; a stalled write may keep the
+    // socket until the invocation ends, as for a direct socket).
+    tls: TlsStream<WorkerStream>,
     timeout: Duration,
-    // After `tls`: the stream is dropped first, then the close is asked.
-    _close: CloseOnDrop,
 }
 
 impl WorkerProxiedTransport {
@@ -126,10 +116,10 @@ impl WorkerProxiedTransport {
         // TLS records only.
         set(&options, "secureTransport", JsValue::from_str("off"))?;
         let raw = worker_sys::connect(address.into(), options.into()).map_err(|_| open_failed())?;
-        let close = CloseOnDrop(raw.clone());
+        let stream = WorkerStream::new(raw).map_err(|_| open_failed())?;
 
         let tls = proxy_tls::connect(
-            Socket::from(raw),
+            stream,
             &connector,
             config,
             proxy,
@@ -140,7 +130,6 @@ impl WorkerProxiedTransport {
         Ok(WorkerProxiedTransport {
             tls,
             timeout: config.timeout,
-            _close: close,
         })
     }
 }
