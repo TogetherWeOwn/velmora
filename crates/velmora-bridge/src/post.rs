@@ -83,9 +83,9 @@ pub async fn stored_size<T: Transport>(
 /// [`stored_size`] (or `STAT`, when `how` is `None`) for each of
 /// `message_ids`, in that order, with the commands written ahead of
 /// their replies: one round trip for all of them instead of one each.
-/// The answers are those of the commands sent one by one. The few that
-/// need a `STAT` after their own answer are asked again once every reply
-/// has been read.
+/// The answers are those of the commands sent one by one. Those that
+/// need a `STAT` after their own answer are asked again, together, once
+/// every reply has been read.
 ///
 /// An `Err` leaves the session in an unknown state, with replies that
 /// may still be on their way: drop it. No answer of the call counts.
@@ -153,17 +153,29 @@ pub async fn stored_sizes<T: Transport>(
             None => None,
         });
     }
-    let mut sizes = Vec::with_capacity(out.len());
-    for (id, answer) in message_ids.iter().zip(out) {
-        sizes.push(match answer {
-            Some(answer) => answer,
-            None => match NntpSession::stat(client, id).await? {
-                true => SizeOutcome::Present(None),
-                false => SizeOutcome::Missing,
-            },
-        });
+    // Those are asked together too: a provider that refuses the size
+    // command refuses it for every article.
+    let asked = message_ids.iter().zip(&out);
+    let again: Vec<&str> = asked
+        .filter(|(_, answer)| answer.is_none())
+        .map(|(id, _)| *id)
+        .collect();
+    let mut found = Vec::new();
+    if !again.is_empty() {
+        found = client.stat_many(&again).await?;
     }
-    Ok(sizes)
+    if found.len() != again.len() {
+        return Err(BridgeError::Invalid("STAT answers"));
+    }
+    let mut found = found.into_iter();
+    let sizes = out.into_iter().map(|answer| match answer {
+        Some(answer) => answer,
+        None => match found.next() {
+            Some(true) => SizeOutcome::Present(None),
+            _ => SizeOutcome::Missing,
+        },
+    });
+    Ok(sizes.collect())
 }
 
 /// A size in a provider's answer, and whose count it is.
