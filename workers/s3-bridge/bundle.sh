@@ -16,6 +16,8 @@
 # (https://developers.cloudflare.com/workers/runtime-apis/webassembly/,
 # "Supported proposals"). A runtime without it rejects the module at
 # load, so the local e2e (workerd) fails loudly rather than run slowly.
+# RUSTFLAGS in the environment replaces any `rustflags` of a cargo config
+# file; the repo has none. Add flags here, not there.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+simd128" worker-build --release

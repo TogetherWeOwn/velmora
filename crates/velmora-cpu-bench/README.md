@@ -28,7 +28,8 @@ node crates/velmora-cpu-bench/top.mjs prof/*.cpuprofile
 `run.mjs` first runs the module's self-check and refuses to time a build
 that fails it. The self-check hashes every byte the hot paths produce for
 a fixed extent (ciphertext, digests, rendered articles, bytes read back,
-opened plaintext), compares the fast yEnc encoder with the byte-at-a-time
+opened plaintext) and every answer of the decoder to a few thousand
+hostile articles, compares the fast yEnc encoder with the byte-at-a-time
 reference on a few hundred lengths, and compares the result with the
 value the native test pins (`FINGERPRINT`). CI runs it on the simd128
 build, so the bytes of that build are checked against the native ones on
