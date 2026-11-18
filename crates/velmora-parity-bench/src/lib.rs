@@ -8,7 +8,7 @@
 //! native build pins ([`FINGERPRINT`]), so the two back ends are checked
 //! against each other and against the native scalar code on every change.
 //!
-//! The exported functions take and return plain integers; there is no
+//! The functions are exported by name in the wasm build only. They take and return plain integers; there is no
 //! JavaScript glue.
 
 use std::sync::Mutex;
@@ -242,13 +242,13 @@ struct Bench {
 static BENCH: Mutex<Option<Bench>> = Mutex::new(None);
 
 /// 1 if this build's kernel and codec produce the pinned bytes, else 0.
-#[no_mangle]
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
 pub extern "C" fn selfcheck() -> u32 {
     u32::from(kernel_agrees() && fingerprint().as_deref() == Some(FINGERPRINT))
 }
 
 /// 1 if this module was built with the simd128 kernel.
-#[no_mangle]
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
 pub extern "C" fn simd128() -> u32 {
     u32::from(cfg!(all(
         target_arch = "wasm32",
@@ -259,7 +259,7 @@ pub extern "C" fn simd128() -> u32 {
 /// Prepares one extent of `plain_bytes` plaintext bytes with `parity`
 /// parity shards. Returns the number of data shards (articles), 0 on
 /// failure.
-#[no_mangle]
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
 pub extern "C" fn setup(plain_bytes: u32, parity: u32) -> u32 {
     let lens = article_lens(u64::from(plain_bytes));
     let data = stripe(42, &lens);
@@ -281,7 +281,7 @@ pub extern "C" fn setup(plain_bytes: u32, parity: u32) -> u32 {
 
 /// Encodes every parity shard of the prepared extent. Returns the bytes
 /// produced, 0 on failure.
-#[no_mangle]
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
 pub extern "C" fn bench_encode() -> u32 {
     let Ok(bench) = BENCH.lock() else {
         return 0;
@@ -297,7 +297,7 @@ pub extern "C" fn bench_encode() -> u32 {
 
 /// Rebuilds the first `lost` data shards of the prepared extent from the
 /// rest. Returns the bytes rebuilt, 0 on failure.
-#[no_mangle]
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
 pub extern "C" fn bench_decode(lost: u32) -> u32 {
     let Ok(bench) = BENCH.lock() else {
         return 0;

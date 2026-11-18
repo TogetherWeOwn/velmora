@@ -8,7 +8,9 @@
 // script exits 1. Then, for each configured geometry, CPU milliseconds per
 // MiB of extent plaintext for encoding all parity shards and for rebuilding
 // 1..m lost data shards: the median of `reps` runs after one warm-up run.
-// The module is single threaded and does no I/O, so wall time is CPU time.
+// What is timed is elapsed time. The module is single threaded and does no
+// I/O, so on an idle host that is its CPU time; on a busy host it also
+// counts time the process was not running, and is an upper bound.
 import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
@@ -21,15 +23,16 @@ const reps = Number(flag("--reps", "15"));
 const expectSimd = flag("--expect-simd", null);
 const checkOnly = args.includes("--check-only") && args.splice(args.indexOf("--check-only"), 1).length > 0;
 const wasmPath = args[0];
-if (!wasmPath) {
+if (!wasmPath || (expectSimd !== null && expectSimd !== "on" && expectSimd !== "off")) {
   console.error("usage: node run.mjs <bench.wasm> [--reps 15] [--check-only] [--expect-simd on|off]");
   process.exit(2);
 }
 
 const bytes = readFileSync(wasmPath);
 const module = new WebAssembly.Module(bytes);
-// The module is self-contained. Any import is a function nothing here
-// calls (the system RNG of the engine crate); it throws if it ever is.
+// The module is self-contained. Its imports are wasm-bindgen
+// placeholders that the engine crate's dependencies leave in the module
+// and that nothing here calls; each one throws if it ever is.
 const imports = {};
 for (const { module: m, name } of WebAssembly.Module.imports(module)) {
   (imports[m] ??= {})[name] = () => {
@@ -65,7 +68,7 @@ const time = (run, want) => {
 // (extent MiB, parity shards): the configured geometries.
 const FIRST = 721120;
 const NEXT = 721072;
-console.log(`median of ${reps}; ms per MiB of extent plaintext (ms per call)`);
+console.log(`median of ${reps}; elapsed ms per MiB of extent plaintext (ms per call)`);
 for (const [mib, m] of [[8, 2], [16, 3]]) {
   const k = wasm.setup(mib * 1048576, m);
   if (k === 0) throw new Error("setup failed");

@@ -44,9 +44,11 @@ themselves are pinned to an independent model by
 
 ## Results
 
-node 24 (V8), x86_64 host, CPU ms per MiB of extent plaintext (ms per
-call in brackets), best of two runs of the median of 21. The host was
-busy; single figures moved by up to 25% between runs.
+node 24 (V8), x86_64 host, elapsed ms per MiB of extent plaintext (ms
+per call in brackets), best of two runs of the median of 21. The module
+is single threaded and does no I/O, so elapsed time is an upper bound on
+its CPU time. The host was busy; single figures moved by up to 25%
+between runs.
 
 | extent | step | scalar | simd128 |
 |---|---|---:|---:|

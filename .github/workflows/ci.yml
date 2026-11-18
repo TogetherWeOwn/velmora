@@ -110,15 +110,15 @@ jobs:
       # profile, as the Worker is built) must both produce the bytes the
       # native build pins. run.mjs runs the module's self-check under V8
       # and fails on any difference, and on a build whose simd128 state is
-      # not the one named. The timings it prints are not a gate.
+      # not the one named. Nothing is timed here.
       - name: Parity codec self-check under wasm (scalar, then simd128)
         run: |
           set -euo pipefail
           wasm=target/wasm32-unknown-unknown/release/velmora_parity_bench.wasm
           cargo build --locked --release -p velmora-parity-bench --target wasm32-unknown-unknown
-          node crates/velmora-parity-bench/run.mjs "$wasm" --expect-simd off --reps 3
+          node crates/velmora-parity-bench/run.mjs "$wasm" --expect-simd off --check-only
           RUSTFLAGS="-C target-feature=+simd128" cargo build --locked --release -p velmora-parity-bench --target wasm32-unknown-unknown
-          node crates/velmora-parity-bench/run.mjs "$wasm" --expect-simd on --reps 3
+          node crates/velmora-parity-bench/run.mjs "$wasm" --expect-simd on --check-only
       # S3 bridge core and protocol crates are runtime-agnostic and must
       # build for the Worker target without engine transport features.
       - run: cargo check --locked -p velmora-bridge -p velmora-s3-proto --target wasm32-unknown-unknown

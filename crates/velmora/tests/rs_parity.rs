@@ -9,7 +9,9 @@
 use sha2::{Digest, Sha256};
 use velmora::article::{ARTICLE_PAYLOAD_BYTES, ARTICLE_ZERO_PAYLOAD_BYTES};
 use velmora::media::ciphertext_size;
-use velmora::rs::{encode, reconstruct, shard_len, DataShard, ParityShard, RsError};
+use velmora::rs::{
+    encode, reconstruct, shard_len, DataShard, ParityShard, RsError, MAX_PARITY_SHARDS,
+};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -575,6 +577,30 @@ fn malformed_stripes_are_refused() {
             parity: 1_456
         })
     );
+    // A stated length that cannot be rounded up to even.
+    let mut huge = present(&s.data);
+    huge[3] = DataShard::Lost { len: usize::MAX };
+    assert_eq!(
+        reconstruct(&huge, &[p(0)]),
+        Err(RsError::ShardLengthMismatch {
+            expected: usize::MAX,
+            parity: 1_456
+        })
+    );
+    // More parity shards than one call takes: refused before any work,
+    // also when as many shards are lost.
+    let rows: Vec<u16> = (0..65).collect();
+    let too_many: Vec<ParityShard<'_>> = rows
+        .iter()
+        .map(|&row| ParityShard {
+            row,
+            bytes: &s.parity[0],
+        })
+        .collect();
+    assert_eq!(
+        reconstruct(&shards, &too_many),
+        Err(RsError::TooManyParityShards { count: 65 })
+    );
     // The longest shard lost and said to be shorter: the stripe would be
     // shorter than its parity.
     let mut first_short = present(&s.data);
@@ -822,4 +848,31 @@ fn errors_render_without_shard_bytes() {
         "parity: 3 data shards lost, 2 parity shards supplied: not recoverable"
     );
     let _: &dyn std::error::Error = &RsError::SingularMatrix;
+}
+
+/// The most parity shards one call takes: 64 rows over 70 data shards,
+/// 64 of them lost.
+#[test]
+fn the_largest_call_round_trips() {
+    let lens: Vec<usize> = (0..70).map(|i| 40 + i).collect();
+    let data = stripe(9, &lens);
+    let rows: Vec<u16> = (0..MAX_PARITY_SHARDS as u16).map(|j| j * 500).collect();
+    let parity = encode(&refs(&data), &rows).unwrap();
+    let shards: Vec<DataShard<'_>> = data
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if i >= 6 {
+                DataShard::Lost { len: d.len() }
+            } else {
+                DataShard::Present(d)
+            }
+        })
+        .collect();
+    let supplied: Vec<ParityShard<'_>> = rows
+        .iter()
+        .zip(&parity)
+        .map(|(&row, bytes)| ParityShard { row, bytes })
+        .collect();
+    assert_eq!(reconstruct(&shards, &supplied).unwrap(), data[6..].to_vec());
 }

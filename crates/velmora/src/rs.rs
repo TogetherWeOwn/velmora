@@ -43,14 +43,23 @@
 //! many parity shards as losses there is no redundancy left to check
 //! against. The caller must check every rebuilt shard against the digest it
 //! holds for that article before using a byte of it, and should check every
-//! shard it passes in the same way.
+//! shard it passes in the same way. Parity shards beyond the number of
+//! losses are not used as a cross-check. If a rebuilt shard fails its
+//! digest, one of the shards passed in is wrong: the caller finds it by
+//! its own digests, or tries again with other parity shards.
 //!
 //! # Cost
 //!
 //! Encoding `m` rows over `k` data shards is `k * m` multiply-accumulate
 //! passes over `L / 2` words. Rebuilding `t` shards is `t * (k - t)` passes
-//! for the syndromes plus `t * t` for the solve. Working memory is one
-//! shard of scratch plus `m` (encode) or `2 * t` (decode) shards.
+//! for the syndromes plus `t * t` for the solve. All data shards of the
+//! stripe are passed in at once. On top of them and of the shards returned,
+//! working memory peaks at one shard of scratch plus `m + 1` shards
+//! (encode: the `m` rows as words, and one row being copied out as bytes)
+//! or `t + 2` shards (decode: `t` syndromes, the scratch, and one shard
+//! being copied out), plus two `t * t` matrices of 2-byte entries for the
+//! solve (16 KiB at the limit). One call takes at most
+//! [`MAX_PARITY_SHARDS`] parity shards.
 
 use std::fmt;
 
@@ -64,6 +73,12 @@ pub const MAX_DATA_SHARDS: usize = 0x8000;
 /// `0x8000 | row`.
 pub const MAX_PARITY_ROW: u16 = 0x7FFF;
 
+/// Most parity shards in one call: rows asked of [`encode`], or parity
+/// shards handed to [`reconstruct`] (so also the most lost data shards one
+/// call rebuilds). Far above any configured stripe; it bounds the decode
+/// matrix (`t * t` entries, solved in `t^3` steps) and the working memory.
+pub const MAX_PARITY_SHARDS: usize = 64;
+
 /// Why an encode or a reconstruction was refused. No variant carries shard
 /// bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +87,9 @@ pub enum RsError {
     NoDataShards,
     /// The stripe has more than [`MAX_DATA_SHARDS`] data shards.
     TooManyDataShards { count: usize },
+    /// More than [`MAX_PARITY_SHARDS`] parity rows or parity shards in one
+    /// call.
+    TooManyParityShards { count: usize },
     /// A parity row number is above [`MAX_PARITY_ROW`].
     RowOutOfRange { row: u16 },
     /// The same parity row number was given twice.
@@ -105,6 +123,10 @@ impl fmt::Display for RsError {
             RsError::TooManyDataShards { count } => write!(
                 f,
                 "parity: {count} data shards, the limit is {MAX_DATA_SHARDS}"
+            ),
+            RsError::TooManyParityShards { count } => write!(
+                f,
+                "parity: {count} parity shards in one call, the limit is {MAX_PARITY_SHARDS}"
             ),
             RsError::RowOutOfRange { row } => write!(
                 f,
@@ -197,6 +219,13 @@ fn check_data_count(count: usize) -> Result<(), RsError> {
     Ok(())
 }
 
+fn check_parity_count(count: usize) -> Result<(), RsError> {
+    if count > MAX_PARITY_SHARDS {
+        return Err(RsError::TooManyParityShards { count });
+    }
+    Ok(())
+}
+
 fn check_rows<I: IntoIterator<Item = u16>>(rows: I) -> Result<(), RsError> {
     let mut seen: Vec<u16> = Vec::new();
     for row in rows {
@@ -246,11 +275,13 @@ fn words_to_bytes(words: &[u16]) -> Vec<u8> {
 ///
 /// `data[i]` is data shard `i` (unpadded; lengths may differ, none may be
 /// empty). Returns one parity shard per entry of `rows`, in the same order,
-/// each [`shard_len`] bytes long. The result is a pure function of the data
+/// each [`shard_len`] bytes long. At most [`MAX_PARITY_SHARDS`] rows per
+/// call. The result is a pure function of the data
 /// bytes and the row numbers: a repeat gives the same bytes, and a row
 /// computed alone equals the same row computed with others.
 pub fn encode(data: &[&[u8]], rows: &[u16]) -> Result<Vec<Vec<u8>>, RsError> {
     check_data_count(data.len())?;
+    check_parity_count(rows.len())?;
     check_rows(rows.iter().copied())?;
     if let Some(index) = data.iter().position(|shard| shard.is_empty()) {
         return Err(RsError::EmptyDataShard { index });
@@ -266,7 +297,11 @@ pub fn encode(data: &[&[u8]], rows: &[u16]) -> Result<Vec<Vec<u8>>, RsError> {
             gf16::madd(acc, &scratch, coefficient(*row, index)?);
         }
     }
-    Ok(parity.iter().map(|words| words_to_bytes(words)).collect())
+    // Each row's words are freed as soon as its bytes exist.
+    Ok(parity
+        .into_iter()
+        .map(|words| words_to_bytes(&words))
+        .collect())
 }
 
 /// Inverts the square matrix `a` (row-major, `n * n` entries) over
@@ -312,7 +347,7 @@ fn invert(mut a: Vec<u16>, n: usize) -> Option<Vec<u16>> {
 /// `parity` holds surviving parity shards, each with the row number it was
 /// encoded under. With `t` shards lost, the first `t` entries of `parity`
 /// are used; further entries are validated (row, length) and otherwise
-/// ignored.
+/// ignored. At most [`MAX_PARITY_SHARDS`] entries.
 ///
 /// Returns the rebuilt shards in the order of their index in `data`, each
 /// cut to its stated length. With nothing lost the result is empty and
@@ -348,6 +383,7 @@ pub fn reconstruct(
     if lost.is_empty() {
         return Ok(Vec::new());
     }
+    check_parity_count(parity.len())?;
     let t = lost.len();
     if parity.len() < t {
         return Err(RsError::TooManyLosses {
@@ -373,7 +409,12 @@ pub fn reconstruct(
         DataShard::Present(bytes) => bytes.len(),
         DataShard::Lost { len } => len,
     }))
-    .ok_or(RsError::NoDataShards)?;
+    // `None` only for a stated length that cannot be rounded up: no real
+    // shard is that long.
+    .ok_or(RsError::ShardLengthMismatch {
+        expected: usize::MAX,
+        parity: len,
+    })?;
     if expected != len {
         return Err(RsError::ShardLengthMismatch {
             expected,
@@ -604,6 +645,14 @@ mod tests {
             encode(&[&a], &[4, 1, 4]),
             Err(RsError::DuplicateRow { row: 4 })
         );
+        let rows: Vec<u16> = (0..=MAX_PARITY_SHARDS as u16).collect();
+        assert_eq!(
+            encode(&[&a], &rows),
+            Err(RsError::TooManyParityShards {
+                count: MAX_PARITY_SHARDS + 1
+            })
+        );
+        assert_eq!(encode(&[&a], &rows[1..]).unwrap().len(), MAX_PARITY_SHARDS);
         let many: Vec<&[u8]> = vec![&a; MAX_DATA_SHARDS + 1];
         assert_eq!(
             encode(&many, &[0]),
