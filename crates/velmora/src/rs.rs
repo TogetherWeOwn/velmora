@@ -6,6 +6,10 @@
 //! shards can be rebuilt from the surviving data shards and any `t` parity
 //! shards.
 //!
+//! Nothing here depends on that reading. The shard count, the parity rows
+//! and the shard lengths are arguments, so a stripe can as well be a group
+//! of extents with one extent per shard.
+//!
 //! # The code
 //!
 //! - **Field:** GF(2^16) with the polynomial `0x1100B`, through the kernel

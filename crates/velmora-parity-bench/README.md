@@ -31,7 +31,7 @@ The self-check
    with the scalar loop and with the field multiplication, on word counts
    around the 8-word vector chunk and on a shard-sized buffer;
 2. encodes and rebuilds fixed stripes (every loss pattern up to the parity
-   count at 1+1, 12+2 and 24+3 shards with small shards shaped like the
+   count at 1+1, 12+2, 24+3 and 24+4 shards with small shards shaped like the
    real cuts, then the real 8 MiB and 16 MiB article sizes), requires
    every rebuilt shard to equal the original, and hashes every parity and
    rebuilt byte;
@@ -59,6 +59,11 @@ between runs.
 | 16 MiB (24+3) | rebuild 1 lost article | 0.93 (14.9) | 0.17 (2.8) |
 | 16 MiB (24+3) | rebuild 2 lost articles | 1.77 (28.3) | 0.33 (5.3) |
 | 16 MiB (24+3) | rebuild 3 lost articles | 2.64 (42.3) | 0.48 (7.5) |
+| 16 MiB (24+4) | encode 4 parity shards | 3.44 (55.0) | 0.61 (9.7) |
+| 16 MiB (24+4) | rebuild 1 lost article | 0.85 (13.6) | 0.16 (2.6) |
+| 16 MiB (24+4) | rebuild 2 lost articles | 1.68 (27.0) | 0.31 (5.0) |
+| 16 MiB (24+4) | rebuild 3 lost articles | 2.54 (40.6) | 0.45 (7.2) |
+| 16 MiB (24+4) | rebuild 4 lost articles | 3.36 (53.8) | 0.60 (9.7) |
 
 These are compute inside the module on a desktop CPU. A Worker's CPU for
 the same work has not been measured.

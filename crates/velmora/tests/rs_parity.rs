@@ -187,7 +187,7 @@ impl Stripe {
 }
 
 /// The configured geometries: (plain bytes of the extent, parity count).
-const GEOMETRIES: [(u64, usize); 3] = [(5, 1), (8 * MIB, 2), (16 * MIB, 3)];
+const GEOMETRIES: [(u64, usize); 4] = [(5, 1), (8 * MIB, 2), (16 * MIB, 3), (16 * MIB, 4)];
 
 /// A stripe with the geometry's shard count but small shards, keeping the
 /// shape of the real cuts: a longer first shard, equal middle shards, and a
@@ -262,7 +262,7 @@ fn tiny_vectors_match_the_independent_model() {
 }
 
 /// (stream seed, plain bytes, parity row, SHA-256 of the parity shard).
-const PARITY_DIGESTS: [(u64, u64, u16, &str); 13] = [
+const PARITY_DIGESTS: [(u64, u64, u16, &str); 14] = [
     // one article of 69 B, (1,1), shard 70 B
     (
         1,
@@ -309,7 +309,8 @@ const PARITY_DIGESTS: [(u64, u64, u16, &str); 13] = [
         1,
         "9f74612171a71f95210cb87a24627beb6236ac3ab0456b3c1587892fb30003ec",
     ),
-    // 16 MiB: 24 articles, the last 196,656 B, (24,3)
+    // 16 MiB: 24 articles, the last 196,656 B: rows 0 to 2 are (24,3),
+    // rows 0 to 3 are (24,4)
     (
         5,
         16_777_216,
@@ -327,6 +328,12 @@ const PARITY_DIGESTS: [(u64, u64, u16, &str); 13] = [
         16_777_216,
         2,
         "7ec919640d7a0388aace64a1df7c9cabd135d90833a38e38cb541ccaee2fef5b",
+    ),
+    (
+        5,
+        16_777_216,
+        3,
+        "1900987439b7c20ce00d4db5fa31740b234ebaa1ff440b9798f3dcfc27315abd",
     ),
     // 8 MiB again, rows a later top-up would use
     (
@@ -382,7 +389,8 @@ fn the_geometries_are_the_ones_the_vectors_name() {
 
 /// Every pattern of up to `m` lost shards among the `k + m`, at each
 /// configured shard count, with the shape of the real cuts (unequal
-/// shards, short odd last shard). 3 + 106 + 3,304 patterns.
+/// shards, short odd last shard). 3 + 106 + 3,304 + 24,158 patterns at
+/// (1,1), (12,2), (24,3) and (24,4).
 #[test]
 fn every_loss_pattern_up_to_the_parity_count_recovers() {
     let mut patterns = 0usize;
@@ -396,7 +404,7 @@ fn every_loss_pattern_up_to_the_parity_count_recovers() {
             }
         }
     }
-    assert_eq!(patterns, 3 + 106 + 3_304);
+    assert_eq!(patterns, 3 + 106 + 3_304 + 24_158);
 }
 
 /// One loss more than the parity count is refused for every pattern: an
@@ -421,15 +429,16 @@ fn every_pattern_one_past_the_parity_count_is_refused() {
             patterns += 1;
         }
     }
-    // C(2,2) + C(14,3) + C(27,4)
-    assert_eq!(patterns, 1 + 364 + 17_550);
+    // C(2,2) + C(14,3) + C(27,4) + C(28,5)
+    assert_eq!(patterns, 1 + 364 + 17_550 + 98_280);
 }
 
 /// The real article sizes. (1,1) and (12,2): every pattern (3 and 106).
-/// (24,3): every single loss, and every pattern that loses three of the
-/// first article, its neighbour, the last full article, the short last
-/// article and the three parity shards (the patterns differ from the
-/// small-shard run above only in shard length, which these cover).
+/// (24,3) and (24,4): every single loss, and every pattern that loses as
+/// many shards as there is parity among the first article, its neighbour,
+/// the last full article, the short last article and the parity shards
+/// (the patterns differ from the small-shard run above only in shard
+/// length, which these cover).
 #[test]
 fn full_size_extents_recover() {
     for (at, (plain, m)) in GEOMETRIES.into_iter().enumerate() {
@@ -447,8 +456,9 @@ fn full_size_extents_recover() {
         for i in 0..k + m {
             s.assert_recovers(&[i]);
         }
-        let corners = [0, 1, k - 2, k - 1, k, k + 1, k + 2];
-        for pick in subsets(corners.len(), 3) {
+        let mut corners = vec![0, 1, k - 2, k - 1];
+        corners.extend(k..k + m);
+        for pick in subsets(corners.len(), m) {
             let lost: Vec<usize> = pick.iter().map(|&p| corners[p]).collect();
             s.assert_recovers(&lost);
         }

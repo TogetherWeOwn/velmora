@@ -104,7 +104,7 @@ for name, seed, plain, rows in [
     ("two articles, short odd last, (2,2)", 2, 720896 + 1, [0, 1]),
     ("8 articles, short last, (8,2)", 3, 5 * 1048576 + 17, [0, 1]),
     ("8 MiB, (12,2)", 4, 8 * 1048576, [0, 1]),
-    ("16 MiB, (24,3)", 5, 16 * 1048576, [0, 1, 2]),
+    ("16 MiB, (24,3) and (24,4)", 5, 16 * 1048576, [0, 1, 2, 3]),
     ("8 MiB, top-up rows", 4, 8 * 1048576, [2, 0x7FFF]),
 ]:
     lens = article_lens(plain)

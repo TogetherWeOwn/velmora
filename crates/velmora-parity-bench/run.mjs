@@ -69,7 +69,7 @@ const time = (run, want) => {
 const FIRST = 721120;
 const NEXT = 721072;
 console.log(`median of ${reps}; elapsed ms per MiB of extent plaintext (ms per call)`);
-for (const [mib, m] of [[8, 2], [16, 3]]) {
+for (const [mib, m] of [[8, 2], [16, 3], [16, 4]]) {
   const k = wasm.setup(mib * 1048576, m);
   if (k === 0) throw new Error("setup failed");
   const label = `${mib} MiB (${k}+${m})`;

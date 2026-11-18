@@ -21,10 +21,10 @@ use velmora::rs::{encode, reconstruct, DataShard, ParityShard};
 
 /// SHA-256 over every byte [`fingerprint`] produces. Pinned by the native
 /// test; every wasm build must reproduce it.
-pub const FINGERPRINT: &str = "dc20e925327a7d655a275482de2286b99c8567fcf110258be43280e9b2ac9cfd";
+pub const FINGERPRINT: &str = "b848b32868cb22045e77a67eadbc50c396e4421a0592d789d69bb75e9cedf5b0";
 
 /// The configured geometries: (plain bytes of the extent, parity count).
-const GEOMETRIES: [(u64, usize); 3] = [(5, 1), (8 << 20, 2), (16 << 20, 3)];
+const GEOMETRIES: [(u64, usize); 4] = [(5, 1), (8 << 20, 2), (16 << 20, 3), (16 << 20, 4)];
 
 struct SplitMix(u64);
 
