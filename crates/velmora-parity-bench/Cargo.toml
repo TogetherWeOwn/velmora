@@ -1,0 +1,19 @@
+[package]
+name = "velmora-parity-bench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Self-check and CPU benchmark of the velmora repair-parity codec, built as plain wasm32 and run under node"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+
+# `cdylib`: the wasm that `run.mjs` checks and times. `rlib`: the native
+# test that pins the fingerprint.
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+velmora = { version = "0.1.0", path = "../velmora", default-features = false }
+sha2 = "0.11"

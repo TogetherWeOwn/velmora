@@ -22,6 +22,9 @@
 //! - [`par2`]: PAR2 recovery-set parsing and verification, plus the creator
 //!   (GF(2^16) Reed-Solomon, one set per file at 10%). Repair is native-only
 //!   (it shells out to `par2cmdline-turbo` in a Container).
+//! - [`rs`]: Reed-Solomon erasure code over article-sized shards (Cauchy
+//!   matrix on the [`par2::gf16`] kernel): the repair-parity codec. Pure
+//!   computation; nothing calls it yet.
 //! - [`segment_identity`]: the one shared segment message-id rule (250-byte
 //!   wire ceiling, bare shape, no normalization) enforced identically by
 //!   ingest intake, the probe/body envelopes, play, and the wire adapters.
@@ -40,6 +43,7 @@ pub mod nzb;
 pub mod par2;
 pub mod pinned_transport;
 pub mod rng;
+pub mod rs;
 pub mod segment_identity;
 pub mod socks5;
 pub mod transport;
