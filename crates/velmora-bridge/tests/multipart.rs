@@ -552,6 +552,10 @@ impl Rig {
             let mut part = vec![0u8; extent.plain_size as usize];
             let n = open_range(&bdk, &bucket.id, extent, 0, &blob.bytes, 0, &mut part).unwrap();
             assert_eq!(n, part.len());
+            // The recorded digests are of the plaintext this extent holds,
+            // however the request body was framed.
+            assert_eq!(extent.plain_sha256, sha256(&part));
+            assert_eq!(extent.plain_md5, md5::compute(&part).0);
             plain.extend_from_slice(&part);
         }
         assert_eq!(plain.len() as u64, generation.size);
@@ -1484,6 +1488,8 @@ async fn aws_chunked_put_and_upload_part_round_trip() {
     let r = rig.send_in(with_body(r, body, false), 5).await;
     assert_eq!(r.outcome(), "200", "{}", r.body);
     assert_eq!(r.header("x-amz-checksum-crc64nvme"), Some("bgGah9vCkZ4="));
+    let etag = format!("\"{}\"", hex(&md5::compute(&small).0));
+    assert_eq!(r.header("etag"), Some(etag.as_str()));
     let (generation, plain) = rig.object(&rig.alpha, "small.txt").await.unwrap();
     assert_eq!(plain, small);
     // The trailer checksum is stored for GET/HEAD with checksum mode, and

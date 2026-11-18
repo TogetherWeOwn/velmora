@@ -48,7 +48,7 @@ use velmora_s3_proto::{
 use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
-use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
+use crate::crypto::{seal_extent_hashed, unwrap_bdk, unwrap_secret, PlainDigests};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
     UploadLengths, UploadReadError,
@@ -667,8 +667,9 @@ where
     // Plaintext and ciphertext live together while sealing: the charge
     // covers both and is held until the ciphertext has been handed over.
     // For aws-chunked bodies every length below is the decoded one.
-    let (body, charge) = if copy {
-        copied_part(bridge, &a, &req.headers, req.body).await?
+    let (body, charge, digests) = if copy {
+        let (body, charge) = copied_part(bridge, &a, &req.headers, req.body).await?;
+        (body, charge, None)
     } else {
         // A part may be as long as a PutObject. Above one extent it is
         // stored as slices, never read whole.
@@ -679,8 +680,11 @@ where
         let mut validator = UploadValidator::new(&a.headers, &a.verified, &a.policy)?;
         let charge = bridge.budget.charge_body(lengths.decoded).await?;
         let body = read_upload(req.body, lengths, &charge, &mut validator).await?;
-        validator.finish()?;
-        (body, charge)
+        let decoded = validator.finish()?;
+        // The validator hashed exactly the bytes in `body`, in the pass
+        // that checked them against the request.
+        let digests = PlainDigests::validated(&decoded, &body).ok_or(ErrorCode::InternalError)?;
+        (body, charge, Some(digests))
     };
     let declared = body.len() as u64;
 
@@ -692,7 +696,16 @@ where
     )?;
     // A fresh id per seal: the key wrap binds the id, never a version.
     let extent_id = ExtentId::mint(random()?);
-    let sealed = seal_extent(&bdk, &a.bucket.id, &extent_id, &body, &mut SystemRng)?;
+    // A copied part has no validator: its digests are taken here.
+    let digests = digests.unwrap_or_else(|| PlainDigests::of(&body));
+    let sealed = seal_extent_hashed(
+        &bdk,
+        &a.bucket.id,
+        &extent_id,
+        &body,
+        digests,
+        &mut SystemRng,
+    )?;
     drop(body);
     let now = bridge.clock.now();
     let etag = format!("\"{}\"", hex(&sealed.plain_md5));
