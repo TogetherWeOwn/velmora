@@ -518,7 +518,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>> {
         outbox::body_checks(self, extent).await
     }
-    async fn begin_release(
+    async fn release(
         &self,
         l: &Lease,
         required: u32,
@@ -526,9 +526,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(self, l, required, counting, evidence_json, now, None).await
+        outbox::release(self, l, required, counting, evidence_json, now, None).await
     }
-    async fn begin_release_light(
+    async fn release_light(
         &self,
         l: &Lease,
         required: u32,
@@ -537,7 +537,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         now: UnixMs,
         need_full: bool,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(
+        outbox::release(
             self,
             l,
             required,

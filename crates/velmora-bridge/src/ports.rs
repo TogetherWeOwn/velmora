@@ -935,13 +935,15 @@ pub trait Catalog {
     /// no copy until it is read in full again. A plan that changed (a
     /// new `plan_rev`) has no rows until it is read again.
     async fn body_checks(&self, extent: &ExtentId) -> Result<Vec<BackboneStatus>>;
+    /// Releases the extent in one batch: `held` → `released` with the
+    /// evidence, and the row done. `Lost` wrote nothing.
     /// `counting` = the labels of the backbones that count toward a
     /// release. The guard is the release rule: `required` of those
     /// backbones with a complete pass recorded under this claim (a
     /// `stat` pass is enough, but none counts on a backbone whose last
     /// full read failed), and at least one of these also has the full
     /// check on record ([`Catalog::body_checks`]).
-    async fn begin_release(
+    async fn release(
         &self,
         l: &Lease,
         required: u32,
@@ -949,7 +951,7 @@ pub trait Catalog {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>>;
-    /// [`Catalog::begin_release`] under the light check
+    /// [`Catalog::release`] under the light check
     /// (`VERIFY_MODE=light`). `required` backbones with a complete pass
     /// under this claim are needed, and none counts on a backbone whose
     /// last check of the bytes failed. With `need_full` false (an extent
@@ -961,7 +963,7 @@ pub trait Catalog {
     /// a backbone under full reads counts only with its own full check
     /// on record, and with any counting backbone under full reads the
     /// full check is asked for whatever `need_full` says.
-    async fn begin_release_light(
+    async fn release_light(
         &self,
         l: &Lease,
         required: u32,
@@ -986,6 +988,9 @@ pub trait Catalog {
     /// backbones of those that had not ended when it was stored (`at` =
     /// its `created_at`), whenever its job runs.
     async fn verify_escalations(&self, at: UnixMs) -> Result<Vec<VerifyEscalation>>;
+    /// `releasing` → `released`, row done: finishes a release that a
+    /// Worker of an older version left half done. `false`: the lease no
+    /// longer holds, or the extent is not `releasing`.
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third

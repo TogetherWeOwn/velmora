@@ -101,7 +101,7 @@
 //!   full reads, and that backbone holds a copy only with its own full
 //!   check on record.
 //! - An extent outside the sample is released without a full check
-//!   ([`Catalog::begin_release_light`]). What this gives up: for such an
+//!   ([`Catalog::release_light`]). What this gives up: for such an
 //!   extent no byte was read back from any provider. A provider that
 //!   answers for articles whose bytes it does not serve is found by the
 //!   sample, not for each extent.
@@ -965,7 +965,8 @@ where
         let required = self.cfg.required_backbones;
         match extent.safety_state {
             SafetyState::Held => {}
-            // A job died between the release decision and its last step.
+            // A job of an older version died between the release decision
+            // and its last step (a release is one write now).
             SafetyState::Releasing => return self.finish_release(lease, extent).await,
             SafetyState::Released | SafetyState::Deleted => {
                 return self.advance(lease, OutboxStage::Done, now).await;
@@ -1158,17 +1159,18 @@ where
         let begun = match light {
             None => {
                 self.catalog
-                    .begin_release(lease, required, &labels, &evidence, at)
+                    .release(lease, required, &labels, &evidence, at)
                     .await?
             }
             Some(_) => {
                 self.catalog
-                    .begin_release_light(lease, required, &labels, &evidence, at, need_full)
+                    .release_light(lease, required, &labels, &evidence, at, need_full)
                     .await?
             }
         };
         match begun {
-            Guard::Applied(()) => self.finish_release(lease, extent).await,
+            // Released and the row done, in that one batch.
+            Guard::Applied(()) => Ok(()),
             // The lease is gone or a newer result cancelled a pass. If the
             // lease still holds, the job comes back and reads again.
             Guard::Lost => Err(Stop::fail(FailClass::Internal)),
