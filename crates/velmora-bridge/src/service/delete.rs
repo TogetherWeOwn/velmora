@@ -188,13 +188,15 @@ async fn delete_key_once<
     if bridge.catalog.restore_pending().await.map_err(failed)? {
         return Err(DeleteError::Refused);
     }
+    // The generation row alone: a delete needs the id, and the extents
+    // of a large object are many rows.
     let live = bridge
         .catalog
-        .live_object(&bucket.id, key)
+        .live_generation(&bucket.id, key)
         .await
         .map_err(failed)?;
     let seen = match live {
-        Some((live, _)) => live.id,
+        Some(live) => live.id,
         // Nothing live. A write that was not published may still have
         // its record (its batch failed, or the record could not be
         // removed): a replay would publish it, over this delete. The
@@ -286,11 +288,11 @@ async fn commit_delete<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
     // delete was faster), and the delete holds.
     let live = bridge
         .catalog
-        .live_object(&bucket.id, key)
+        .live_generation(&bucket.id, key)
         .await
         .map_err(failed)?;
     match live {
-        Some((live, _)) if live.id < *tombstone => Err(DeleteError::Refused),
+        Some(live) if live.id < *tombstone => Err(DeleteError::Refused),
         _ => Ok(true),
     }
 }

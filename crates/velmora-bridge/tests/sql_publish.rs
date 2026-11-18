@@ -138,6 +138,17 @@ struct Rec {
     batches: RefCell<Vec<Vec<Stmt>>>,
     /// Every query as the catalogue sent it.
     queries: RefCell<Vec<(String, Vec<SqlValue>)>>,
+    /// Limits other than the ones of the tests above.
+    limits: Cell<Option<SqlLimits>>,
+    /// Answer reads as overloaded once a batch was refused by a guard,
+    /// until something waits: what D1 does after a large refused batch.
+    throttles: Cell<bool>,
+    throttled: Cell<bool>,
+    /// Whether [`Sql::query_after_refusal`] waits the way the D1
+    /// adapter does. Without it the method is the one of the trait.
+    patient: Cell<bool>,
+    /// Reads that waited.
+    waited: Cell<u32>,
 }
 
 impl Sql for Rec {
@@ -145,7 +156,16 @@ impl Sql for Rec {
         self.queries
             .borrow_mut()
             .push((sql.to_owned(), params.to_vec()));
+        if self.throttled.get() {
+            return Err(BridgeError::Sql(OVERLOADED.into()));
+        }
         self.db.query(sql, params).await
+    }
+    async fn query_after_refusal(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        if self.patient.get() && self.throttled.replace(false) {
+            self.waited.set(self.waited.get() + 1);
+        }
+        self.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         self.db.exec(sql, params).await
@@ -158,7 +178,7 @@ impl Sql for Rec {
             stmts
         };
         let fault = self.faults.borrow_mut().pop_front();
-        match fault {
+        let ran = match fault {
             None => self.db.batch(stmts).await,
             Some(Fault::Guard) => {
                 stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
@@ -169,13 +189,17 @@ impl Sql for Rec {
                 self.db.batch(stmts).await?;
                 Err(BridgeError::Sql(message.into()))
             }
+        };
+        if self.throttles.get() && matches!(ran, Err(BridgeError::GuardFailed)) {
+            self.throttled.set(true);
         }
+        ran
     }
     fn limits(&self) -> SqlLimits {
-        SqlLimits {
+        self.limits.get().unwrap_or(SqlLimits {
             set_rows: ROWS,
             ..SqlLimits::D1
-        }
+        })
     }
 }
 
@@ -224,6 +248,11 @@ impl Fx {
                 faults: RefCell::new(VecDeque::new()),
                 batches: RefCell::new(Vec::new()),
                 queries: RefCell::new(Vec::new()),
+                limits: Cell::new(None),
+                throttles: Cell::new(false),
+                throttled: Cell::new(false),
+                patient: Cell::new(false),
+                waited: Cell::new(0),
             }),
             seed: Cell::new(1),
             bucket: BucketId::mint([0xb1; 8]),
@@ -1448,4 +1477,163 @@ async fn rows_written_at_ten_thousand_extents() {
     let (set, per_extent) = rows_written(10_000).await;
     println!("rows written per publish at 10,000 extents: set {set}, per extent {per_extent}");
     assert_eq!(set, per_extent);
+}
+
+// ---------------------------------------------------------------------------
+// Reads around a refused batch
+// ---------------------------------------------------------------------------
+
+/// A refused batch is charged in full, and D1 then answers "overloaded"
+/// for some seconds. The reads that tell why a replay was refused go
+/// through `query_after_refusal`, which the D1 adapter makes wait: with
+/// it the replay gets its answer, and without it the replay fails with
+/// nothing published, to be run again.
+#[tokio::test]
+async fn the_reads_after_a_refused_replay_wait_out_an_overloaded_database() {
+    for lost in [false, true] {
+        let fx = Fx::new(false).await;
+        let r = fx.recorded().await;
+        // An older record under a newer live generation is refused; a
+        // newer one that lost an extent is damage.
+        let (live, again, expected) = if lost {
+            let id = [text(r.newer.1[3].extent_id.as_str())];
+            let gone = "UPDATE extents SET safety_state = 'deleted' WHERE id = ?1";
+            assert_eq!(fx.run(gone, &id).await, 1);
+            (&r.first, &r.newer, ReplayPublish::Damaged)
+        } else {
+            (&r.newer, &r.first, ReplayPublish::Refused)
+        };
+        assert_eq!(fx.replay(live).await, ReplayPublish::Published);
+        let before = fx.dump().await;
+        let replay = || fx.cat.replay_publish(&again.0, &again.1, T0.plus_secs(9));
+
+        // An adapter that does not wait: the read is refused as well.
+        fx.sql().throttles.set(true);
+        let failed = replay().await;
+        assert!(
+            matches!(&failed, Err(BridgeError::Sql(m)) if m.contains("overloaded")),
+            "{failed:?}"
+        );
+        assert_eq!(fx.sql().waited.get(), 0);
+        fx.sql().throttled.set(false);
+        assert_eq!(fx.dump().await, before, "lost: {lost}");
+
+        // One that waits: the answer of a database that was never busy.
+        fx.sql().patient.set(true);
+        assert_eq!(replay().await.unwrap(), expected, "lost: {lost}");
+        assert_eq!(fx.sql().waited.get(), 1);
+        assert!(!fx.sql().throttled.get());
+        assert_eq!(fx.dump().await, before, "lost: {lost}");
+
+        // The comparison with the live generation is asked right after
+        // a refusal too, and waits the same way.
+        fx.sql().throttled.set(true);
+        let twin = fx.cat.replay_twin(&live.0, &live.1).await.unwrap();
+        assert_eq!(twin, Some(live.0.id.clone()));
+        assert_eq!(fx.sql().waited.get(), 2);
+        fx.sql().throttled.set(true);
+        fx.sql().patient.set(false);
+        assert!(fx.cat.replay_twin(&live.0, &live.1).await.is_err());
+    }
+}
+
+/// The check for a plan that cannot be read asks for plans by their
+/// bytes, not by a number of rows: first which extents have one and how
+/// large, then the plans in runs that fit one answer. A plan that is
+/// damaged is found wherever it sits, and a plan larger than an answer
+/// is asked for alone.
+#[tokio::test]
+async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
+    let fx = Fx::new(false).await;
+    let r = fx.recorded().await;
+    assert_eq!(fx.replay(&r.first).await, ReplayPublish::Published);
+    let sizes = [100; 520];
+    let ids = fx.replayed(&sizes).await;
+    let g = (
+        fx.generation(&fx.bucket, "a", T0.plus_ms(3), &sizes),
+        placed(&ids, &sizes),
+    );
+    let mut plan_bytes = 0;
+    for id in &ids {
+        let (plan, _) = velmora_bridge::plan::plan_seeded(
+            &mut velmora::rng::SystemRng,
+            T0.0 / 1000,
+            &["alt.binaries.test"],
+            id,
+            164,
+            |span| Some([span.start as u8; 32]),
+        )
+        .unwrap();
+        plan_bytes = plan.len();
+        let set = "UPDATE extents SET safety_state = 'deleted', plan = ?2 WHERE id = ?1";
+        let bound = [text(id.as_str()), SqlValue::Blob(plan)];
+        assert_eq!(fx.run(set, &bound).await, 1);
+    }
+    // Ten plans to an answer, and more than 500 extents to a value of
+    // placements.
+    fx.sql().limits.set(Some(SqlLimits {
+        set_rows: 600,
+        result_bytes: plan_bytes * 10,
+        ..SqlLimits::D1
+    }));
+
+    let asked = |fx: &Fx, text: &str| -> Vec<usize> {
+        let queries = fx.sql().queries.borrow();
+        queries
+            .iter()
+            .filter(|(sql, _)| sql.contains(text))
+            .map(|(_, params)| match &params[0] {
+                SqlValue::Text(json) => {
+                    let ids: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+                    ids.len()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    const SIZES: &str = "length(e.plan)";
+    const PLANS: &str = "e.cipher_size, e.plan";
+
+    // Every plan reads: all of them are asked for, ten at a time, the
+    // extents 500 at a time.
+    fx.sql().queries.borrow_mut().clear();
+    let before = fx.dump().await;
+    let published = fx.replay(&g).await;
+    assert_eq!(asked(&fx, SIZES), [500, 20]);
+    let runs = asked(&fx, PLANS);
+    assert_eq!(runs.len(), 52);
+    assert!(runs.iter().all(|n| *n == 10), "{runs:?}");
+    assert_ne!(published, ReplayPublish::Damaged);
+
+    // The same record with the plan of its last extent damaged, in a
+    // catalogue as it was before: found in the last run.
+    let fx2 = Fx::new(false).await;
+    drop((fx, before, published));
+    let fx = fx2;
+    let r = fx.recorded().await;
+    assert_eq!(fx.replay(&r.first).await, ReplayPublish::Published);
+    let ids = fx.replayed(&sizes).await;
+    let g = (
+        fx.generation(&fx.bucket, "a", T0.plus_ms(3), &sizes),
+        placed(&ids, &sizes),
+    );
+    let huge = vec![0u8; plan_bytes * 25];
+    for (id, plan) in [(&ids[3], &huge), (&ids[519], &vec![0u8])] {
+        let set = "UPDATE extents SET safety_state = 'deleted', plan = ?2 WHERE id = ?1";
+        let bound = [text(id.as_str()), SqlValue::Blob(plan.clone())];
+        assert_eq!(fx.run(set, &bound).await, 1);
+    }
+    fx.sql().limits.set(Some(SqlLimits {
+        set_rows: 600,
+        result_bytes: plan_bytes * 10,
+        ..SqlLimits::D1
+    }));
+    // Only the damaged last one first.
+    let whole = "UPDATE extents SET safety_state = 'held', plan = NULL WHERE id = ?1";
+    assert_eq!(fx.run(whole, &[text(ids[3].as_str())]).await, 1);
+    let before = fx.dump().await;
+    assert_eq!(fx.replay(&g).await, ReplayPublish::Damaged);
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(asked(&fx, SIZES), [500, 20]);
+    assert_eq!(asked(&fx, PLANS), [1]);
 }

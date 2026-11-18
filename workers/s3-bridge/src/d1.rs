@@ -16,6 +16,15 @@
 //! `batch` as one transaction, so a failing statement rolls the whole batch
 //! back. Every other failure is `BridgeError::Sql` with a class only: no
 //! SQL text, parameter or database message.
+//!
+//! D1 charges a refused batch in full, and answers the statements after
+//! a large one with "D1 DB is overloaded" until the database is back
+//! under its budget of the last ten seconds. That answer has its own
+//! class, and a read that follows a refused batch
+//! (`Sql::query_after_refusal`) waits and asks again.
+
+use std::future::Future;
+use std::time::Duration;
 
 use velmora_bridge::{
     is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_PARAMS,
@@ -28,6 +37,17 @@ use worker::D1Database;
 
 /// Largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_SAFE_INT: i64 = (1 << 53) - 1;
+
+/// The class of a statement D1 refused because the database is over its
+/// budget of the last ten seconds.
+const OVERLOADED: &str = "d1: overloaded";
+
+/// How long a read after a refused batch waits before each further try,
+/// in milliseconds: it is asked again 5, 10 and 20 seconds after the
+/// first answer. The budget D1 holds a database to covers ten seconds,
+/// and a read 15 seconds after a refused batch of 65,536 extents was
+/// answered.
+const OVERLOADED_PAUSES_MS: [u32; 3] = [5_000, 5_000, 10_000];
 
 /// Talks to the raw binding so that only `meta.changes` is read from a
 /// result: the workers-rs `D1ResultMeta` decodes `size_after` as a 32-bit
@@ -69,6 +89,14 @@ impl Sql for D1Sql {
             .collect()
     }
 
+    async fn query_after_refusal(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        patiently(
+            || self.query(sql, params),
+            |ms| async move { worker::Delay::from(Duration::from_millis(u64::from(ms))).await },
+        )
+        .await
+    }
+
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         changes(&settle(self.statement(sql, params)?.run()).await?)
     }
@@ -87,6 +115,30 @@ impl Sql for D1Sql {
             return Err(decode_err());
         }
         results.iter().map(|r| changes(&r)).collect()
+    }
+}
+
+/// What `ask` answers, asked again after each pause of
+/// [`OVERLOADED_PAUSES_MS`] for as long as the answer is [`OVERLOADED`].
+/// Any other answer, and the overloaded one after the last pause, is
+/// returned as it is. For reads only: a statement is run once per try.
+async fn patiently<T, A, P>(
+    mut ask: impl FnMut() -> A,
+    mut pause: impl FnMut(u32) -> P,
+) -> Result<T>
+where
+    A: Future<Output = Result<T>>,
+    P: Future<Output = ()>,
+{
+    let mut pauses = OVERLOADED_PAUSES_MS.iter();
+    loop {
+        match ask().await {
+            Err(BridgeError::Sql(class)) if class == OVERLOADED => match pauses.next() {
+                Some(ms) => pause(*ms).await,
+                None => return Err(BridgeError::Sql(class)),
+            },
+            answer => return answer,
+        }
     }
 }
 
@@ -227,6 +279,8 @@ fn classify(text: &str) -> BridgeError {
         BridgeError::GuardFailed
     } else if text.contains("constraint failed") {
         BridgeError::Sql("d1: constraint violation".into())
+    } else if text.contains("D1 DB is overloaded") {
+        BridgeError::Sql(OVERLOADED.into())
     } else {
         BridgeError::Sql("d1: statement failed".into())
     }
@@ -270,11 +324,72 @@ mod tests {
                 "D1_ERROR: near \"SELEC\": syntax error | p=secret",
                 "d1: statement failed",
             ),
+            // As D1 answered the first read after a refused batch of
+            // 65,536 extents.
+            (
+                "D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 \
+                 second window.",
+                OVERLOADED,
+            ),
         ] {
             assert!(
                 matches!(classify(text), BridgeError::Sql(m) if m == class),
                 "{text}"
             );
         }
+    }
+
+    /// `patiently` over a database that answers "overloaded" `busy`
+    /// times: the answer, how often it was asked, and the pauses.
+    fn asked(busy: u32, then: Result<u8>) -> (Result<u8>, u32, Vec<u32>) {
+        use futures_util::FutureExt;
+        let calls = std::cell::Cell::new(0u32);
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let mut then = Some(then);
+        let answer = patiently(
+            || {
+                calls.set(calls.get() + 1);
+                let answer = if calls.get() <= busy {
+                    Err(BridgeError::Sql(OVERLOADED.into()))
+                } else {
+                    then.take().expect("asked again after an answer")
+                };
+                async move { answer }
+            },
+            |ms| {
+                pauses.borrow_mut().push(ms);
+                async {}
+            },
+        )
+        .now_or_never()
+        .expect("nothing here waits");
+        (answer, calls.get(), pauses.into_inner())
+    }
+
+    #[test]
+    fn a_read_after_a_refused_batch_waits_out_an_overloaded_database() {
+        // Answered at once: asked once, no pause.
+        let (answer, calls, pauses) = asked(0, Ok(7));
+        assert!(matches!(answer, Ok(7)) && calls == 1 && pauses.is_empty());
+        // Overloaded twice, then answered.
+        let (answer, calls, pauses) = asked(2, Ok(7));
+        assert!(matches!(answer, Ok(7)) && calls == 3);
+        assert_eq!(pauses, [5_000, 5_000]);
+        // Another failure ends it at once, also after a pause: only
+        // "overloaded" is waited out.
+        for busy in [0, 1] {
+            let (answer, calls, _) =
+                asked(busy, Err(BridgeError::Sql("d1: statement failed".into())));
+            assert!(matches!(answer, Err(BridgeError::Sql(m)) if m == "d1: statement failed"));
+            assert_eq!(calls, busy + 1);
+            let (answer, calls, _) = asked(busy, Err(BridgeError::GuardFailed));
+            assert!(matches!(answer, Err(BridgeError::GuardFailed)) && calls == busy + 1);
+        }
+        // Still overloaded after the last pause: the error, after a
+        // bounded number of tries.
+        let (answer, calls, pauses) = asked(u32::MAX, Ok(7));
+        assert!(matches!(answer, Err(BridgeError::Sql(m)) if m == OVERLOADED));
+        assert_eq!(calls, 4);
+        assert_eq!(pauses, OVERLOADED_PAUSES_MS);
     }
 }

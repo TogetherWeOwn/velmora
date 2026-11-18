@@ -28,6 +28,7 @@ use super::common::{
     check_precondition, discard_before_retry, hold_precondition, internal, metadata_json,
     restore_gate, s3_error, stored_checksum, stored_headers, unavailable, Authed,
 };
+use crate::config::SINGLE_RECORD_EXTENTS;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
@@ -82,9 +83,76 @@ pub(super) fn source_key(
     Ok(key)
 }
 
-/// The live object a copy reads from, after its
-/// `x-amz-copy-source-if-*` conditions held.
-pub(super) async fn source_object<C, B, N, J, K, T>(
+/// Judges the `x-amz-copy-source-if-*` conditions of a copy on the
+/// generation it reads from.
+fn check_source(headers: &Headers, generation: &GenerationRow) -> Result<(), S3Response> {
+    let metadata = ObjectMetadata::new(
+        generation.id.as_str().to_owned(),
+        generation.size,
+        generation.etag.clone(),
+        generation.created_at.secs().0,
+        stored_headers(generation).ok_or_else(internal)?,
+        stored_checksum(generation),
+    )
+    .map_err(|_| internal())?;
+    Conditions::from_copy_source(headers)
+        .check_copy_source(&metadata)
+        .map_err(s3_error)
+}
+
+/// The live generation a copy reads from, after its
+/// `x-amz-copy-source-if-*` conditions held: the generation row alone.
+/// UploadPartCopy reads the extents of its range by the id of this
+/// generation, as a GET does.
+pub(super) async fn source_generation<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    headers: &Headers,
+    bucket: &Bucket,
+    key: &str,
+) -> Result<GenerationRow, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let Some(generation) = bridge
+        .catalog
+        .live_generation(&bucket.id, key)
+        .await
+        .map_err(|_| internal())?
+    else {
+        return Err(s3_error(ErrorCode::NoSuchKey));
+    };
+    check_source(headers, &generation)?;
+    Ok(generation)
+}
+
+/// The answer to a CopyObject whose source has more extents than one
+/// copy takes ([`SINGLE_RECORD_EXTENTS`]). S3 refuses a CopyObject of
+/// more than 5 GB the same way, and clients copy a large object in
+/// parts.
+fn source_too_large() -> S3Response {
+    S3Response::error(
+        400,
+        "InvalidRequest",
+        "The specified copy source is larger than the maximum allowable size for a copy \
+         source. Copy it in parts with UploadPartCopy.",
+    )
+}
+
+/// The live object a CopyObject shares its extents with, every extent
+/// row of it, after the `x-amz-copy-source-if-*` conditions held.
+///
+/// A copy names every extent of its source in one recovery record and
+/// loads every row for that, so a source of more than
+/// [`SINGLE_RECORD_EXTENTS`] extents is refused, and it is refused on
+/// its generation row, before any extent row is read. The key can get
+/// another generation between the two reads, so what was loaded is
+/// judged again.
+async fn source_object<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     headers: &Headers,
     bucket: &Bucket,
@@ -98,6 +166,10 @@ where
     K: Kek,
     T: Clock,
 {
+    let seen = source_generation(bridge, headers, bucket, key).await?;
+    if seen.extent_count > SINGLE_RECORD_EXTENTS {
+        return Err(source_too_large());
+    }
     let Some((generation, extents)) = bridge
         .catalog
         .live_object(&bucket.id, key)
@@ -106,18 +178,13 @@ where
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
-    let metadata = ObjectMetadata::new(
-        generation.id.as_str().to_owned(),
-        generation.size,
-        generation.etag.clone(),
-        generation.created_at.secs().0,
-        stored_headers(&generation).ok_or_else(internal)?,
-        stored_checksum(&generation),
-    )
-    .map_err(|_| internal())?;
-    Conditions::from_copy_source(headers)
-        .check_copy_source(&metadata)
-        .map_err(s3_error)?;
+    if generation.id != seen.id {
+        check_source(headers, &generation)?;
+    }
+    let count = u32::try_from(extents.len()).unwrap_or(u32::MAX);
+    if generation.extent_count.max(count) > SINGLE_RECORD_EXTENTS {
+        return Err(source_too_large());
+    }
     Ok((generation, extents))
 }
 
