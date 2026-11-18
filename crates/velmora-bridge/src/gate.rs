@@ -58,9 +58,11 @@
 //!   another name that finds no session, inside the horizon, counts the
 //!   places of each class as taken for one lifetime of the class (no
 //!   old slot was renewed since), and stores that wait with the new
-//!   name: one write per deploy. Reads have short slots: after their
-//!   wait, a read may use what jobs could never hold (the slot and the
-//!   address kept back for reads) while the jobs' wait still runs.
+//!   name. Reads have short slots: after their wait, a read may use
+//!   what jobs could never hold (the slot and the address kept back
+//!   for reads) while the jobs' wait still runs. Every first start of
+//!   new code also forgets which slot rows the gate had seized and
+//!   asks the catalogue again: two writes per deploy.
 //!
 //! A start of the same code waits for nothing: its sessions are its
 //! slots. What that leaves open is a reset that cuts sessions without a
@@ -542,6 +544,37 @@ impl Core {
         warm: Warm,
     ) -> Option<GatePermit> {
         let (holder, session) = by;
+        let slot = self.free(p, peers, background, holder, now, warm)?;
+        let token = self.next();
+        self.held.push(Held {
+            provider: p.id.clone(),
+            slot,
+            token,
+            holder: holder.to_string(),
+            background,
+            pool: p.pool_limit().map(|(pool, _)| pool.to_string()),
+            until: now.0 + ttl_ms(background),
+            session,
+        });
+        *self.uses.entry(p.id.clone()).or_insert(0) += 1;
+        Some(GatePermit {
+            provider: p.id.clone(),
+            slot,
+            token,
+        })
+    }
+
+    /// The slot [`Self::acquire`] would take for `holder`, or none.
+    /// Nothing is taken.
+    pub fn free(
+        &mut self,
+        p: &GateProvider,
+        peers: &[GateProvider],
+        background: bool,
+        holder: &str,
+        now: UnixMs,
+        warm: Warm,
+    ) -> Option<u32> {
         self.prune(now.0);
         // Places of holders this object does not know.
         let old_jobs = match (warm, background) {
@@ -599,7 +632,7 @@ impl Core {
         let taken: BTreeSet<u32> = self.held.iter().filter(here).map(|h| h.slot).collect();
         // Jobs fill from the bottom and stay below the slot kept back;
         // reads fill from the top, and above the old jobs' slots.
-        let slot = match background {
+        match background {
             true => p
                 .slots()
                 .take_while(|s| *s < p.background_conns())
@@ -611,24 +644,7 @@ impl Core {
                     .take_while(|s| *s >= floor)
                     .find(|s| !taken.contains(s))
             }
-        }?;
-        let token = self.next();
-        self.held.push(Held {
-            provider: p.id.clone(),
-            slot,
-            token,
-            holder: holder.to_string(),
-            background,
-            pool: p.pool_limit().map(|(pool, _)| pool.to_string()),
-            until: now.0 + ttl_ms(background),
-            session,
-        });
-        *self.uses.entry(p.id.clone()).or_insert(0) += 1;
-        Some(GatePermit {
-            provider: p.id.clone(),
-            slot,
-            token,
-        })
+        }
     }
 
     /// The class of a slot that `p` still holds at `now`.
@@ -853,7 +869,8 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
     /// sleep cuts every connection, and so do other resets. The first
     /// start under new code that finds no session inside the horizon
     /// therefore waits the old slots out, and stores that wait with
-    /// the new `boot`, so that a later start keeps to it.
+    /// the new `boot`, so that a later start keeps to it. Under new
+    /// code the gate also forgets which slot rows it had seized.
     pub async fn resume(&self, sessions: Vec<SessionState>, now: UnixMs) -> Result<()> {
         if self.started() {
             return Ok(());
@@ -874,6 +891,11 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             record.warm_jobs = record.warm_jobs.max(wait(record.jobs_until, true));
             record.warm_reads = record.warm_reads.max(wait(record.reads_until, false));
             record.boot.clone_from(&self.boot);
+            // What was stored about the slot rows is from before: a
+            // deploy is how `PERMITS` changes, and the rows may have
+            // been cleared by hand in between. The first acquire asks
+            // the catalogue again.
+            record.seized.clear();
         }
         {
             let mut inner = self.inner.borrow_mut();
@@ -1091,6 +1113,14 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         }
         if !self.own(p, peers, now).await? {
             return Ok(Err(Unowned));
+        }
+        let warm = self.warm(now);
+        // Nothing free: nothing is promised, and the horizon stays. A
+        // class that only ever asked has no slot to wait out after a
+        // deploy.
+        let free = self.with(|i| i.core.free(p, peers, background, holder, now, warm));
+        if free.is_none() {
+            return Ok(Ok(None));
         }
         self.cover(background, now.0 + ttl_ms(background)).await?;
         let warm = self.warm(now);

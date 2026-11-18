@@ -881,9 +881,11 @@ together, when its last gate has retired. With several shards the
 address and pool limits are shared out among the gates, so the account
 is either all the gates' or all the catalogue's, never part of each.
 
-A gate that comes into memory takes what it stored about the rows; the
-cron (every 5 minutes) and every return to charge ask the catalogue
-again. Do not edit `do-gate:` rows by hand while `PERMITS` is `do`.
+A gate that comes into memory under the version it last ran as takes
+what it stored about the rows. Its first start under a new version
+(every change of `PERMITS` is one), the cron (every 5 minutes) and
+every return to charge ask the catalogue again. Do not edit `do-gate:`
+rows by hand while `PERMITS` is `do`.
 
 1. Deploy a version that knows `PERMITS`, with `PERMITS = "d1"`. The
    deploy adds the object class (a migration). Nothing calls it.

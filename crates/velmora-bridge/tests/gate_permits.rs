@@ -893,6 +893,27 @@ async fn nothing_is_promised_past_the_stored_horizon() {
     assert_eq!(w.held("permits:all:0", "p").await, 0);
 }
 
+/// A class that is refused moves no horizon: nothing was promised, and
+/// a deploy has nothing of that class to wait out.
+#[tokio::test]
+async fn a_refused_class_stores_nothing() {
+    let w = World::new();
+    let p = provider("p", 1);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let _held = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    let store = w.store("permits:all:0");
+    let saves = store.saves.get();
+    for _ in 0..3 {
+        assert!(take(&c, &w, &p, READ, "read-1").await.is_none());
+        w.pass(1000);
+    }
+    assert_eq!(store.saves.get(), saves);
+    let stored = store.record.borrow().clone().unwrap();
+    assert_eq!(stored.reads_until, 0);
+}
+
 /// The cost in storage: one write when a class first takes a slot and
 /// one per [`HORIZON_STEP_MS`] while slots stay in use. Never one per
 /// permit, none when all is quiet again, none for leaving memory.
@@ -946,11 +967,12 @@ async fn storage_is_written_per_horizon_step_not_per_permit() {
     );
 }
 
-/// New code is one write per gate: the first start under it, and only
-/// that one. Starts of the same code (the object left memory) write
-/// nothing and ask the catalogue nothing.
+/// New code is two writes per gate: the first start under it, and the
+/// slot rows it then finds to be its own still. Starts of the same code
+/// (the object left memory) write nothing and ask the catalogue
+/// nothing.
 #[tokio::test]
-async fn a_deploy_is_one_write_and_a_start_is_none() {
+async fn a_deploy_is_two_writes_and_a_start_is_none() {
     let w = World::new();
     let providers = [provider("p", 4)];
     let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
@@ -976,12 +998,13 @@ async fn a_deploy_is_one_write_and_a_start_is_none() {
         w.pass(1000);
         assert!(take(&c, &w, &providers[0], JOB, "job-2").await.is_none());
     }
-    assert_eq!(store.saves.get(), saves + 1);
+    assert_eq!(store.saves.get(), saves + 2, "and the rows asked for once");
     // The wait is not forgotten with the memory, nor begun again.
     w.pass(JOB_MS + SKEW_MS - 10_000);
     w.hibernate();
     assert!(take(&c, &w, &providers[0], JOB, "job-2").await.is_some());
     assert_eq!(w.db.0.writes().billed(), 0, "no catalogue row");
+    assert_eq!(store.saves.get(), saves + 2);
 }
 
 /// A second deploy during the wait of the first does not cut the wait
@@ -1630,8 +1653,9 @@ async fn the_gates_of_an_account_free_its_rows_together() {
 }
 
 /// The rows are cleared by hand while the gate is not in memory, and
-/// catalogue callers take them. The gate does not rely for long on what
-/// it stored: the periodic step asks the catalogue every time.
+/// catalogue callers take them. A gate under new code (a deploy is how
+/// `PERMITS` changes) does not rely on what it stored: its first
+/// acquire asks the catalogue, before any periodic step.
 #[tokio::test]
 async fn a_gate_does_not_trust_what_it_stored_about_the_rows() {
     let w = World::new();
@@ -1655,8 +1679,6 @@ async fn a_gate_does_not_trust_what_it_stored_about_the_rows() {
     assert!(take(&old, &w, &p, JOB, "old-job").await.is_some());
     assert!(take(&old, &w, &p, READ, "old-read").await.is_some());
 
-    // The periodic step asks the catalogue, whatever the gate stored.
-    new.seed_permits(&providers).await.unwrap();
     for _ in 0..3 {
         assert!(take(&new, &w, &p, JOB, "new-job").await.is_none());
         assert!(take(&new, &w, &p, READ, "new-read").await.is_none());
