@@ -18,7 +18,7 @@ use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{
     resend_secs, DISPATCH_BATCH, DISPATCH_BATCHES, DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS,
-    RESEND_MAX_SECS, RESEND_SECS, RESEND_SLACK_SECS,
+    QUEUE_RETENTION_MAX_SECS, RESEND_MAX_SECS, RESEND_SECS, RESEND_SLACK_SECS,
 };
 use velmora_bridge::recovery::{
     article_key, read_article_plan, write_article_plan, Layout, Unpublished,
@@ -2131,18 +2131,28 @@ fn the_resend_wait_is_the_age_of_the_oldest_message_within_its_bounds() {
         resend_secs(now, ago(RESEND_MAX_SECS - RESEND_SLACK_SECS)),
         RESEND_MAX_SECS
     );
-    assert_eq!(resend_secs(now, ago(30 * DAY_SECS)), RESEND_MAX_SECS);
-    for at in [UnixMs(0), UnixMs(1), UnixMs(i64::MIN), UnixMs(-1)] {
-        assert_eq!(resend_secs(now, Oldest::At(at)), RESEND_MAX_SECS, "{at:?}");
+    assert_eq!(resend_secs(now, ago(3 * DAY_SECS)), RESEND_MAX_SECS);
+    assert_eq!(
+        resend_secs(now, ago(QUEUE_RETENTION_MAX_SECS)),
+        RESEND_MAX_SECS
+    );
+    // A time no message in a queue can have is not believed: seconds
+    // read as milliseconds, the epoch, a stale value.
+    assert_eq!(
+        resend_secs(now, ago(QUEUE_RETENTION_MAX_SECS + 1)),
+        RESEND_SECS
+    );
+    assert_eq!(resend_secs(now, ago(30 * DAY_SECS)), RESEND_SECS);
+    let in_secs = UnixMs(now.0 / 1000);
+    for at in [UnixMs(0), UnixMs(1), in_secs, UnixMs(i64::MIN), UnixMs(-1)] {
+        assert_eq!(resend_secs(now, Oldest::At(at)), RESEND_SECS, "{at:?}");
     }
     // A time ahead of this clock is no age.
     for at in [now.plus_ms(1), now.plus_secs(DAY_SECS), UnixMs(i64::MAX)] {
         assert_eq!(resend_secs(now, Oldest::At(at)), RESEND_SECS, "{at:?}");
     }
-    assert_eq!(
-        resend_secs(UnixMs(i64::MAX), Oldest::At(UnixMs(i64::MIN))),
-        RESEND_MAX_SECS
-    );
+    let far = resend_secs(UnixMs(i64::MAX), Oldest::At(UnixMs(i64::MIN)));
+    assert_eq!(far, RESEND_SECS);
     const { assert!(RESEND_SLACK_SECS >= 2 * TICK_SECS) };
     const { assert!(RESEND_SECS < RESEND_MAX_SECS) };
 }

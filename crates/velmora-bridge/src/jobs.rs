@@ -79,31 +79,44 @@ pub const RESEND_MAX_SECS: u32 = 86_400;
 ///
 /// A mark carries the time its dispatcher run began, and the message
 /// the time the queue took it, later in that run: a run lasts well
-/// under this, so a message still in a queue is never older than its
+/// under this, so a message still in a queue is never newer than its
 /// row's mark by this much. It also covers a clock of the queues that
 /// is not this one, and a message that was delivered and whose job has
 /// not claimed its row yet.
 pub const RESEND_SLACK_SECS: u32 = 600;
+
+/// The oldest a message in a queue can be: the longest a queue keeps
+/// one (14 days). A queue that names an older time for its oldest
+/// message is not believed.
+pub const QUEUE_RETENTION_MAX_SECS: u32 = 14 * 86_400;
 
 /// How long the dispatcher leaves a sent row alone at `now`, given the
 /// oldest message its queues still hold.
 ///
 /// A queue hands its messages out oldest first, near enough. While it
 /// holds one from before a row's mark (less [`RESEND_SLACK_SECS`]), the
-/// row's own message is taken to wait behind it, and sending another
-/// would only make the queue longer. Once every message left is from
-/// after the mark and the row is still unclaimed, its message is gone.
-/// So the wait is the age of the oldest message plus the slack, never
-/// under [`RESEND_SECS`] and never over [`RESEND_MAX_SECS`].
+/// row's own message may wait behind it, and sending another would only
+/// make the queue longer. Once every message left is from after the
+/// mark and the row is still unclaimed, its message is gone. So the
+/// wait is the age of the oldest message plus the slack, never under
+/// [`RESEND_SECS`] and never over [`RESEND_MAX_SECS`].
 ///
-/// An empty queue, and one that does not say, give [`RESEND_SECS`]: as
-/// before there was anything to ask.
+/// The oldest message may be one that waits out a delay or a retry and
+/// holds nothing up. Then the wait is longer than it had to be, within
+/// the same bound.
+///
+/// An empty queue, one that does not say, and one that names a time no
+/// message of its can have (older than [`QUEUE_RETENTION_MAX_SECS`])
+/// give [`RESEND_SECS`]: as before there was anything to ask.
 pub fn resend_secs(now: UnixMs, oldest: Oldest) -> u32 {
     let Oldest::At(at) = oldest else {
         return RESEND_SECS;
     };
     // Rounded up, and a time ahead of `now` is no age at all.
     let age_secs = now.0.saturating_sub(at.0).max(0).saturating_add(999) / 1000;
+    if age_secs > i64::from(QUEUE_RETENTION_MAX_SECS) {
+        return RESEND_SECS;
+    }
     let wait = age_secs.saturating_add(i64::from(RESEND_SLACK_SECS));
     u32::try_from(wait)
         .unwrap_or(RESEND_MAX_SECS)

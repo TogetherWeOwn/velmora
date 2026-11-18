@@ -290,17 +290,23 @@ const METRICS_TIMEOUT_MS: u64 = 5_000;
 /// number of messages it can deliver now and the time the oldest was
 /// sent, in ms.
 ///
-/// The time decides. The queues were seen to leave a message that waits
-/// out a delay out of the count while they name its time: so a count of
-/// zero says the queue is empty only when no time is named. A time that
-/// cannot be one, and a queue with messages and no time, are not known.
+/// The queues were seen to leave a message that waits out a delay out
+/// of the count while they name its time. A job the dispatcher sends
+/// has no delay, and the queues that take them always hold delayed
+/// messages of other kinds (a wake-up waits up to twelve hours). So a
+/// count of zero is an empty queue for the dispatcher, whatever time is
+/// named: nothing it sent can be waiting there. With messages to
+/// deliver, the time is that of the oldest message, delayed or not;
+/// without a time that can be one, the queue is not known.
 fn oldest_of(count: Option<f64>, oldest_ms: Option<f64>) -> Oldest {
-    match (oldest_ms, count) {
+    match (count, oldest_ms) {
+        (Some(0.0), _) => Oldest::Empty,
         // Under 2^53: an exact integer.
-        (Some(ms), _) if (1.0..9_007_199_254_740_992.0).contains(&ms) => {
+        (Some(n), Some(ms))
+            if n.is_finite() && n > 0.0 && (1.0..9_007_199_254_740_992.0).contains(&ms) =>
+        {
             Oldest::At(UnixMs(ms as i64))
         }
-        (None, Some(0.0)) => Oldest::Empty,
         _ => Oldest::Unknown,
     }
 }
@@ -460,27 +466,26 @@ mod tests {
     fn a_queue_says_what_it_holds_or_is_not_known() {
         const SENT: f64 = 1_762_992_000_123.0;
         let at = Oldest::At(UnixMs(1_762_992_000_123));
-        assert_eq!(oldest_of(Some(0.0), None), Oldest::Empty);
         assert_eq!(oldest_of(Some(3.0), Some(SENT)), at);
-        // A message that waits out a delay is not in the count, and
-        // its time is named: the queue is not empty.
-        assert_eq!(oldest_of(Some(0.0), Some(SENT)), at);
-        // The time alone is enough.
-        assert_eq!(oldest_of(None, Some(SENT)), at);
-        assert_eq!(oldest_of(Some(f64::NAN), Some(SENT)), at);
+        // Nothing to deliver: empty, also when messages that wait out
+        // a delay are named by their time, or the time is none.
+        for oldest_ms in [None, Some(SENT), Some(0.0), Some(f64::NAN)] {
+            assert_eq!(oldest_of(Some(0.0), oldest_ms), Oldest::Empty);
+        }
         for (count, oldest_ms) in [
             (None, None),
+            (None, Some(SENT)),
             (Some(3.0), None),
             (Some(-1.0), None),
+            (Some(-1.0), Some(SENT)),
             (Some(f64::NAN), None),
-            (Some(f64::INFINITY), None),
+            (Some(f64::NAN), Some(SENT)),
+            (Some(f64::INFINITY), Some(SENT)),
             // A queue that names the epoch for its oldest message, or
-            // a time that is none: empty or not, it is not known.
+            // a time that is none.
             (Some(3.0), Some(0.0)),
-            (Some(0.0), Some(0.0)),
             (Some(3.0), Some(-1.0)),
             (Some(3.0), Some(f64::NAN)),
-            (Some(0.0), Some(f64::NAN)),
             (Some(3.0), Some(f64::INFINITY)),
             (Some(3.0), Some(1e300)),
         ] {
