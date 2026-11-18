@@ -344,6 +344,26 @@ pub fn assemble_article(headers: &[u8], body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// [`assemble_article`] without the second article-sized buffer: the header
+/// block and blank line go into one `Vec` sized for `body_capacity` more
+/// bytes, `write_body` appends the body to it, and the appended bytes get
+/// the same framing check. The result is byte-identical to building the
+/// body separately and calling [`assemble_article`]; an error from
+/// `write_body` is returned as is, before any framing check.
+pub fn assemble_article_with(
+    headers: &[u8],
+    body_capacity: usize,
+    write_body: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(headers.len() + 2 + body_capacity);
+    out.extend_from_slice(headers);
+    out.extend_from_slice(b"\r\n");
+    let body_start = out.len();
+    write_body(&mut out)?;
+    check_body_framing(&out[body_start..])?;
+    Ok(out)
+}
+
 /// Fails closed on framing-breaking header values: CR, LF, or any control
 /// character (which includes DEL via `is_control`). Printable values pass;
 /// the 998-byte ceiling is enforced at render.
@@ -364,6 +384,10 @@ fn check_header_value(name: &str, value: &str) -> Result<()> {
 /// with CRLF line endings (headers via [`ArticleHeaders::render`], yEnc via
 /// `yenc::encode_segment`).
 fn check_body_framing(body: &[u8]) -> Result<()> {
+    if crate::transport::crlf_framing_is_clean(body) {
+        return Ok(());
+    }
+    // Something is off: walk the bytes to name the first violation.
     let mut i = 0;
     while i < body.len() {
         match body[i] {

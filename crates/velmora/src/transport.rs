@@ -65,10 +65,21 @@ pub fn is_article_limit_error(error: &io::Error) -> bool {
 /// CRLF line framing and NNTP dot-block reading over any [`Transport`].
 pub struct BufferedTransport<T: Transport> {
     inner: T,
+    /// Bytes received and not yet handed out start at `head`; everything
+    /// before it is consumed and is dropped at the next read.
     buf: Vec<u8>,
+    head: usize,
+    /// Landing area for one transport read. A read that is cancelled
+    /// mid-flight leaves `buf` exactly as it was.
+    chunk: Vec<u8>,
     max_article_bytes: usize,
     usable: bool,
 }
+
+/// Bytes asked of the transport per read. A whole article body arrives in
+/// a few reads instead of one per 4 KiB, which matters where every read is
+/// a call out of the runtime (a Workers socket).
+const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Borrow-safe cancellation cleanup for [`BufferedTransport::read_dot_block`].
 ///
@@ -126,14 +137,17 @@ impl<T: Transport> Drop for InvalidateOnDrop<'_, T> {
 impl<T: Transport> DotBlockCancelGuard<'_, T> {
     async fn run(&mut self) -> io::Result<()> {
         loop {
-            let line = self.transport.read_line().await?;
+            // The cancel guard already covers this await: an error or a
+            // dropped future rolls `out` back and poisons the connection.
+            let range = self.transport.next_line().await?;
+            let line = &self.transport.buf[range];
             if line == b"." {
                 return Ok(());
             }
             let content = if line.starts_with(b"..") {
                 &line[1..]
             } else {
-                &line[..]
+                line
             };
             let remaining = self
                 .transport
@@ -163,6 +177,8 @@ impl<T: Transport> BufferedTransport<T> {
         BufferedTransport {
             inner,
             buf: Vec::with_capacity(4096),
+            head: 0,
+            chunk: vec![0u8; READ_CHUNK_BYTES],
             max_article_bytes: max_article_bytes.min(MAX_ARTICLE_BYTES),
             usable: true,
         }
@@ -172,6 +188,7 @@ impl<T: Transport> BufferedTransport<T> {
     pub(crate) fn invalidate(&mut self) {
         self.usable = false;
         self.buf.clear();
+        self.head = 0;
     }
 
     /// The effective per-dot-block receive cap in bytes (already clamped to
@@ -221,29 +238,47 @@ impl<T: Transport> BufferedTransport<T> {
     }
 
     async fn read_line_inner(&mut self) -> io::Result<Vec<u8>> {
+        let range = self.next_line().await?;
+        Ok(self.buf[range].to_vec())
+    }
+
+    /// Receives up to the next line end and returns where the line (without
+    /// its CRLF or bare-LF terminator) sits in `buf`. The line is consumed;
+    /// its bytes stay in place until the next call that has to read.
+    async fn next_line(&mut self) -> io::Result<std::ops::Range<usize>> {
+        // Pending bytes already searched for a line end.
+        let mut searched = 0usize;
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let pending = &self.buf[self.head..];
+            if let Some(found) = memchr::memchr(b'\n', &pending[searched..]) {
+                let pos = searched + found;
                 if pos >= MAX_LINE_BYTES {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "NNTP line exceeds 16 KiB",
                     ));
                 }
-                let mut line = self.buf.drain(..=pos).collect::<Vec<u8>>();
-                line.pop();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
+                let start = self.head;
+                let mut end = start + pos;
+                self.head = end + 1;
+                if end > start && self.buf[end - 1] == b'\r' {
+                    end -= 1;
                 }
-                return Ok(line);
+                return Ok(start..end);
             }
-            if self.buf.len() >= MAX_LINE_BYTES {
+            if pending.len() >= MAX_LINE_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "NNTP line exceeds 16 KiB",
                 ));
             }
-            let mut chunk = [0u8; 4096];
-            let n = self.inner.read(&mut chunk).await?;
+            searched = pending.len();
+            // Drop the consumed prefix: what stays is one partial line.
+            if self.head > 0 {
+                self.buf.drain(..self.head);
+                self.head = 0;
+            }
+            let n = self.inner.read(&mut self.chunk).await?;
             if n == 0 {
                 if self.buf.is_empty() {
                     return Err(io::Error::new(
@@ -256,7 +291,7 @@ impl<T: Transport> BufferedTransport<T> {
                     "NNTP connection closed without CRLF",
                 ));
             }
-            self.buf.extend_from_slice(&chunk[..n]);
+            self.buf.extend_from_slice(&self.chunk[..n]);
         }
     }
 
@@ -306,42 +341,19 @@ impl<T: Transport> BufferedTransport<T> {
         // up front (like the POST path) and callers that rely on this check
         // agree: a refused block never reaches the wire.
         check_dot_block_framing(data)?;
+        // The framing check above leaves only CRLF line ends, so a `.`
+        // starts a line exactly when it is the first byte or follows an
+        // LF. Everything between two such dots is copied in one piece.
         let mut stuffed = Vec::with_capacity(data.len() + 64);
-        let mut at_line_start = true;
-        let mut i = 0;
-        while i < data.len() {
-            match data[i] {
-                b'\r' => {
-                    // Checked by `check_dot_block_framing` above; re-checked
-                    // here as defence in depth.
-                    if data.get(i + 1) != Some(&b'\n') {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "NNTP dot-block holds a bare CR outside CRLF",
-                        ));
-                    }
-                    stuffed.extend_from_slice(b"\r\n");
-                    i += 2;
-                    at_line_start = true;
-                }
-                b'\n' => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "NNTP dot-block holds a bare LF outside CRLF",
-                    ));
-                }
-                b'.' if at_line_start => {
-                    stuffed.extend_from_slice(b"..");
-                    i += 1;
-                    at_line_start = false;
-                }
-                b => {
-                    stuffed.push(b);
-                    i += 1;
-                    at_line_start = false;
-                }
+        let mut copied = 0usize;
+        for at in memchr::memchr_iter(b'.', data) {
+            if at == 0 || data[at - 1] == b'\n' {
+                stuffed.extend_from_slice(&data[copied..=at]);
+                stuffed.push(b'.');
+                copied = at + 1;
             }
         }
+        stuffed.extend_from_slice(&data[copied..]);
         if !stuffed.ends_with(b"\r\n") {
             stuffed.extend_from_slice(b"\r\n");
         }
@@ -394,6 +406,10 @@ impl<T: Transport> BufferedTransport<T> {
 /// path validates ahead of the `POST` command, keeping the server out of
 /// send-article state on a refusal).
 pub(crate) fn check_dot_block_framing(data: &[u8]) -> io::Result<()> {
+    if crlf_framing_is_clean(data) {
+        return Ok(());
+    }
+    // Something is off: walk the bytes to name the first violation.
     let mut i = 0;
     while i < data.len() {
         match data[i] {
@@ -416,4 +432,21 @@ pub(crate) fn check_dot_block_framing(data: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether every CR in `data` is followed by an LF and every LF follows a
+/// CR, found with vector scans instead of a byte walk.
+///
+/// Each LF is checked for the CR right before it. Those CRs are all
+/// different bytes, so when the total CR count equals the LF count there is
+/// no CR left over that an LF does not follow.
+pub(crate) fn crlf_framing_is_clean(data: &[u8]) -> bool {
+    let mut line_ends = 0usize;
+    for at in memchr::memchr_iter(b'\n', data) {
+        if at == 0 || data[at - 1] != b'\r' {
+            return false;
+        }
+        line_ends += 1;
+    }
+    memchr::memchr_iter(b'\r', data).count() == line_ends
 }

@@ -494,6 +494,32 @@ fn check_payload(row: &ArticleRow, wire: &[u8]) -> Checked {
     }
 }
 
+/// Decodes a `BODY` reply straight into `place`, the article's bytes of
+/// the extent's ciphertext, and says whether it is exactly the planned
+/// payload: right length, right SHA-256. `place` is `cipher_len` long.
+fn place_payload(row: &ArticleRow, wire: &[u8], place: &mut [u8]) -> bool {
+    let len = place.len();
+    decode_part_to(&row.message_id, wire, place).is_ok_and(|part| part.written == len)
+        && sha256(place) == row.payload_sha256
+}
+
+/// [`check_payload`] for the CPU benchmark (`velmora-cpu-bench`): the
+/// payload if the reply is the planned one. Not an API.
+#[doc(hidden)]
+pub fn bench_check_payload(row: &ArticleRow, wire: &[u8]) -> Option<Vec<u8>> {
+    match check_payload(row, wire) {
+        Checked::Good(payload) => Some(payload),
+        _ => None,
+    }
+}
+
+/// [`place_payload`] for the CPU benchmark (`velmora-cpu-bench`). Not an
+/// API.
+#[doc(hidden)]
+pub fn bench_place_payload(row: &ArticleRow, wire: &[u8], place: &mut [u8]) -> bool {
+    place_payload(row, wire, place)
+}
+
 /// One `BODY`, checked, or one `STAT` (`ask`). A `430` leaves the session in use. Any session
 /// error drops the session and resumes at the same message-id on a new
 /// one, while `reconnects` lasts. A connect the provider refused is not
@@ -1416,9 +1442,7 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
                 // Another socket may have supplied it meanwhile only if
                 // it was not taken, and it was: the place is this one's.
                 let place = &mut b.cipher[start..start + len];
-                let good = decode_part_to(&row.message_id, &wire, place)
-                    .is_ok_and(|part| part.written == len)
-                    && sha256(place) == row.payload_sha256;
+                let good = place_payload(row, &wire, place);
                 if good {
                     b.have[article] = true;
                     stats

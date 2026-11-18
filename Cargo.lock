@@ -1523,6 +1523,7 @@ dependencies = [
  "hmac",
  "libc",
  "md5",
+ "memchr",
  "miniz_oxide",
  "quick-xml",
  "ring",
@@ -1562,6 +1563,14 @@ dependencies = [
  "velmora-s3-proto",
  "velmora-test-nntp",
  "zeroize",
+]
+
+[[package]]
+name = "velmora-cpu-bench"
+version = "0.1.0"
+dependencies = [
+ "velmora",
+ "velmora-bridge",
 ]
 
 [[package]]

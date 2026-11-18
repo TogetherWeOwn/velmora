@@ -1,0 +1,18 @@
+[package]
+name = "velmora-cpu-bench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "CPU benchmark of the velmora bridge hot paths (ingest, post, verify, cold read), built as plain wasm32 and timed under node"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+
+# `cdylib`: the wasm that `run.mjs` times. `rlib`: the native smoke test.
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+velmora = { version = "0.1.0", path = "../velmora", default-features = false }
+velmora-bridge = { version = "0.1.0", path = "../velmora-bridge" }

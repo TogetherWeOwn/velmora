@@ -104,8 +104,17 @@ jobs:
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport
       - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport -- -D warnings
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
-      # Wasm SIMD; consumers enable it via this RUSTFLAGS).
+      # Wasm SIMD; workers/s3-bridge/bundle.sh builds with this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
+      # The hot paths as the Worker bundle compiles them (wasm32, simd128,
+      # release profile) must produce the bytes the native build pins:
+      # run.mjs runs the self-check of velmora-cpu-bench under V8 and
+      # fails on any difference. The timings it prints are not a gate.
+      - name: Hot-path self-check under wasm simd128
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-C target-feature=+simd128" cargo build --locked --release -p velmora-cpu-bench --target wasm32-unknown-unknown
+          node crates/velmora-cpu-bench/run.mjs target/wasm32-unknown-unknown/release/velmora_cpu_bench.wasm --mib 2 --reps 1
       # S3 bridge core and protocol crates are runtime-agnostic and must
       # build for the Worker target without engine transport features.
       - run: cargo check --locked -p velmora-bridge -p velmora-s3-proto --target wasm32-unknown-unknown
