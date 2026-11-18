@@ -8,6 +8,10 @@ repository = "https://github.com/TogetherWeOwn/velmora"
 # Uses as_chunks, is_multiple_of and is_none_or; same MSRV as the workspace.
 rust-version = "1.89"
 
+[features]
+# Opt in to the wider CRC tables; default builds keep the byte-at-a-time path.
+sliced-crc = []
+
 # Pins copied from TogetherWeOwn/qerith crates/qerith-core/Cargo.toml at fc09396c.
 [dependencies]
 base64 = "=0.22.1"
