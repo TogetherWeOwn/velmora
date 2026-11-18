@@ -130,6 +130,15 @@ async fn ranges_over_several_extents_and_headers_the_lookup_cannot_read() {
         let resp = get(&rig, &signer, "k", &[("range", range)]).await;
         assert!(resp.expect(206).body == want, "{range}");
     }
+    // Every extent is stamped by now: a read over several of them is
+    // one round trip too.
+    for range in [None, Some("bytes=70000-400000"), Some("bytes=-200000")] {
+        let before = round_trips(&rig);
+        let headers: Vec<_> = range.iter().map(|r| ("range", *r)).collect();
+        let resp = get(&rig, &signer, "k", &headers).await;
+        assert!(resp.status == 200 || resp.status == 206);
+        assert_eq!(round_trips(&rig) - before, 1, "{range:?}");
+    }
     // Range headers the lookup cannot read are judged as they always
     // were, by the one parser of ranges.
     for (range, status, code) in [
