@@ -3406,8 +3406,11 @@ impl Rig {
             self.deliver(&mut queue).await;
             // A wake-up that came before its time was sent on: at its
             // time it is the job.
+            // Within a day of the stage's start, and no later: a release
+            // that keeps failing ends the loop and fails the test below.
+            let end = b.clock.now().plus_secs(DAY);
             while let Some(t) = queue.iter().map(|(t, _)| *t).min() {
-                if wait != DAY || t > b.clock.now().plus_secs(DAY) {
+                if wait != DAY || t > end {
                     break;
                 }
                 b.clock.set(t);

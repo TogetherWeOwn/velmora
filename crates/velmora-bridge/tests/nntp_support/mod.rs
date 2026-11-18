@@ -486,6 +486,11 @@ impl MemCatalog {
     ) -> Guard<()> {
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
+            // As the SQL guard: a copy that is still pinned.
+            let state = e.job.extent.safety_state;
+            if !matches!(state, SafetyState::Held | SafetyState::Releasing) {
+                return false;
+            }
             // As the SQL guard: under the light check, the escalations
             // that had not ended when the extent was stored.
             let stored = e.job.extent.created_at;
