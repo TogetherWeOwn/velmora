@@ -432,12 +432,13 @@ impl Bench {
 /// [`fingerprint`] draws. `run.mjs` refuses to time a module that
 /// answers anything else, so a fast path that changes one output byte
 /// cannot be measured as a saving.
-pub const FINGERPRINT: u32 = 0xba54_7e36;
+pub const FINGERPRINT: u32 = 0x9698_af48;
 
 /// A digest over every byte the hot paths produce for one fixed extent:
 /// the sealed ciphertext and its hashes, each rendered article, the
-/// ciphertext read back through `BODY` in several chunkings, and the
-/// opened plaintext. Panics if the fast yEnc encoder and the reference
+/// ciphertext read back through `BODY` in several chunkings, the opened
+/// plaintext, and what the decoder answers to a few thousand hostile
+/// articles. Panics if the fast yEnc encoder and the reference
 /// encoder (`encode_body`, byte at a time) ever differ, or if SHA-256
 /// misses its known answer.
 pub fn fingerprint() -> u32 {
@@ -485,6 +486,75 @@ pub fn fingerprint() -> u32 {
             all.extend_from_slice(&fast);
         }
     }
+    // The decoder on hostile input: lines dense in `=` (an escape at the
+    // end of a line, at every lane offset), destinations shorter and
+    // longer than the declared size. The answer (bytes written or the
+    // refusal) and the whole destination, including what lies past the
+    // decoded bytes, go into the digest, so every build must agree on
+    // them with the native one.
+    let mut rng = FixedRng(5);
+    let mut roll = move || {
+        let mut b = [0u8; 4];
+        rng.fill_bytes(&mut b).unwrap();
+        u32::from_le_bytes(b) as usize
+    };
+    let (mut accepted, mut refused) = (0, 0);
+    for _ in 0..3000 {
+        let mut body = Vec::new();
+        let mut decoded = 0usize;
+        for _ in 0..roll() % 5 {
+            let len = roll() % 150;
+            let line_at = body.len();
+            let mut i = 0;
+            while i < len {
+                let r = roll();
+                let b = match r % 9 {
+                    0 | 1 => b'=',
+                    2 => b'}',
+                    _ => match (r >> 8) as u8 {
+                        b'\n' | b'\r' => b'x',
+                        b => b,
+                    },
+                };
+                // No `=y` at the start of a line: that is a keyword line.
+                body.push(if i == 1 && b == b'y' { b'z' } else { b });
+                i += 1;
+            }
+            // What the line decodes to when it is well formed: an escape
+            // pair is one byte.
+            let mut at = line_at;
+            while at < body.len() {
+                at += if body[at] == b'=' { 2 } else { 1 };
+                decoded += 1;
+            }
+            body.extend_from_slice(b"\r\n");
+        }
+        // Half declare the true size, so that accepted parts occur too.
+        let declared = match roll() % 2 {
+            0 => decoded,
+            _ => decoded.saturating_sub(roll() % 40),
+        };
+        let dst_len = (declared + 16).saturating_sub(roll() % 33);
+        let mut article = format!("=ybegin line=128 size={declared} name=t\r\n").into_bytes();
+        article.extend_from_slice(&body);
+        article.extend_from_slice(b"=yend\r\n");
+        let mut dst = vec![0xA5u8; dst_len];
+        match velmora::yenc::decode_part_to("<m@x>", &article, &mut dst) {
+            Ok(part) => {
+                accepted += 1;
+                all.extend_from_slice(&(part.written as u64).to_be_bytes());
+            }
+            Err(err) => {
+                refused += 1;
+                all.extend_from_slice(err.to_string().as_bytes());
+            }
+        }
+        all.extend_from_slice(&dst);
+    }
+    assert!(
+        accepted > 200 && refused > 200,
+        "{accepted} accepted, {refused} refused"
+    );
     for chunk in [1, 7, 4096, 65536] {
         let cipher = bench.cold_fetch(chunk);
         assert!(cipher == bench.cipher(), "read back differs");

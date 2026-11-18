@@ -42,8 +42,12 @@ mod simd {
 
     /// Bits of the lane bytes that are the `=` escape marker (decode side).
     /// (SSE2 is part of the x86_64 baseline, so no runtime detection.)
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn escape_bits(input: *const u8) -> u32 {
+    pub(super) unsafe fn escape_bits(input: *const u8) -> u32 {
         // SAFETY: caller guarantees 16 readable bytes at `input`; unaligned
         // loads are used throughout so no alignment requirement.
         unsafe {
@@ -55,8 +59,12 @@ mod simd {
 
     /// Copy 16 bytes applying the yEnc `-42` transform. Only valid for
     /// lanes where [`escape_bits`] returned zero.
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn sub42_copy16(input: *const u8, output: *mut u8) {
+    pub(super) unsafe fn sub42_copy16(input: *const u8, output: *mut u8) {
         // SAFETY: same contract as `escape_bits`, plus 16 writable bytes.
         unsafe {
             let v = _mm_loadu_si128(input as *const __m128i);
@@ -67,8 +75,12 @@ mod simd {
 
     /// Bits of the lane bytes whose `+42` value must be escaped when
     /// encoding: NUL, LF, CR and `=`.
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn critical_bits(input: *const u8) -> u32 {
+    pub(super) unsafe fn critical_bits(input: *const u8) -> u32 {
         // SAFETY: caller guarantees 16 readable bytes at `input`.
         unsafe {
             let v = _mm_add_epi8(_mm_loadu_si128(input as *const __m128i), _mm_set1_epi8(42));
@@ -88,8 +100,12 @@ mod simd {
 
     /// Copy 16 bytes applying the yEnc `+42` transform. The caller uses
     /// only the output bytes that come before the first critical byte.
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn add42_copy16(input: *const u8, output: *mut u8) {
+    pub(super) unsafe fn add42_copy16(input: *const u8, output: *mut u8) {
         // SAFETY: 16 readable bytes at `input`, 16 writable at `output`.
         unsafe {
             let v = _mm_loadu_si128(input as *const __m128i);
@@ -107,8 +123,12 @@ mod simd {
     pub(super) const LANES: bool = true;
 
     /// Bits of the lane bytes that are the `=` escape marker (decode side).
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn escape_bits(input: *const u8) -> u32 {
+    pub(super) unsafe fn escape_bits(input: *const u8) -> u32 {
         // SAFETY: caller guarantees 16 readable bytes at `input`.
         unsafe {
             let v = v128_load(input as *const v128);
@@ -118,8 +138,12 @@ mod simd {
 
     /// Copy 16 bytes applying the yEnc `-42` transform. Only valid for
     /// lanes where [`escape_bits`] returned zero.
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn sub42_copy16(input: *const u8, output: *mut u8) {
+    pub(super) unsafe fn sub42_copy16(input: *const u8, output: *mut u8) {
         // SAFETY: same contract as `escape_bits`, plus 16 writable bytes.
         unsafe {
             let v = v128_load(input as *const v128);
@@ -129,8 +153,12 @@ mod simd {
 
     /// Bits of the lane bytes whose `+42` value must be escaped when
     /// encoding: NUL, LF, CR and `=`.
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn critical_bits(input: *const u8) -> u32 {
+    pub(super) unsafe fn critical_bits(input: *const u8) -> u32 {
         // SAFETY: caller guarantees 16 readable bytes at `input`.
         unsafe {
             let v = i8x16_add(v128_load(input as *const v128), i8x16_splat(42));
@@ -150,8 +178,12 @@ mod simd {
 
     /// Copy 16 bytes applying the yEnc `+42` transform. The caller uses
     /// only the output bytes that come before the first critical byte.
+    ///
+    /// # Safety
+    /// Every pointer must have 16 bytes behind it: readable at `input`,
+    /// writable at `output`. No alignment is needed.
     #[inline(always)]
-    pub(super) fn add42_copy16(input: *const u8, output: *mut u8) {
+    pub(super) unsafe fn add42_copy16(input: *const u8, output: *mut u8) {
         // SAFETY: 16 readable bytes at `input`, 16 writable at `output`.
         unsafe {
             let v = v128_load(input as *const v128);
@@ -169,19 +201,19 @@ mod simd {
 mod simd {
     pub(super) const LANES: bool = false;
 
-    pub(super) fn escape_bits(_input: *const u8) -> u32 {
+    pub(super) unsafe fn escape_bits(_input: *const u8) -> u32 {
         unreachable!("no vector lanes on this target")
     }
 
-    pub(super) fn sub42_copy16(_input: *const u8, _output: *mut u8) {
+    pub(super) unsafe fn sub42_copy16(_input: *const u8, _output: *mut u8) {
         unreachable!("no vector lanes on this target")
     }
 
-    pub(super) fn critical_bits(_input: *const u8) -> u32 {
+    pub(super) unsafe fn critical_bits(_input: *const u8) -> u32 {
         unreachable!("no vector lanes on this target")
     }
 
-    pub(super) fn add42_copy16(_input: *const u8, _output: *mut u8) {
+    pub(super) unsafe fn add42_copy16(_input: *const u8, _output: *mut u8) {
         unreachable!("no vector lanes on this target")
     }
 }
@@ -395,8 +427,10 @@ fn encode_block(data: &[u8], dst: &mut [u8], column: &mut usize) -> usize {
             // SAFETY: the loop bounds guarantee 16 readable bytes at `i`
             // and 16 writable bytes at `o`; both functions need exactly
             // that and use unaligned access.
-            let bits = simd::critical_bits(input) & ((1u32 << take) - 1);
-            simd::add42_copy16(input, dst.as_mut_ptr().wrapping_add(o));
+            let bits = unsafe {
+                simd::add42_copy16(input, dst.as_mut_ptr().wrapping_add(o));
+                simd::critical_bits(input)
+            } & ((1u32 << take) - 1);
             let clean = if bits == 0 {
                 take
             } else {
@@ -802,13 +836,12 @@ fn decode_line_into(line: &[u8], dst: &mut [u8]) -> std::result::Result<usize, &
     let mut o = 0usize;
     if simd::LANES {
         while i + 16 <= line.len() && o + 16 <= dst.len() {
-            // SAFETY: loop bounds guarantee 16 readable bytes at `i` and 16
-            // writable bytes at `o`; `escape_bits`/`sub42_copy16` require
-            // exactly that (unaligned access is used inside).
             let input = line.as_ptr().wrapping_add(i);
-            let bits = simd::escape_bits(input);
+            // SAFETY: the loop bounds guarantee 16 readable bytes at `i`.
+            let bits = unsafe { simd::escape_bits(input) };
             if bits == 0 {
-                simd::sub42_copy16(input, dst.as_mut_ptr().wrapping_add(o));
+                // SAFETY: as above, and 16 writable bytes at `o`.
+                unsafe { simd::sub42_copy16(input, dst.as_mut_ptr().wrapping_add(o)) };
                 i += 16;
                 o += 16;
                 continue;

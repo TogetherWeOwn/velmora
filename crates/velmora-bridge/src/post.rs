@@ -545,9 +545,11 @@ fn render_article(row: &ArticleRow, total: u32, file_size: u64, payload: &[u8]) 
     };
     // Headers, blank line and yEnc body go into one buffer; the bytes are
     // the ones `encode_segment` + `assemble_article` give.
+    // The hint covers the usual output plus the encoder's working room for
+    // its last block, so the buffer is not moved near the end.
     Ok(assemble_article_with(
         &row.headers,
-        payload.len() + payload.len() / 16 + 512,
+        payload.len() + payload.len() / 16 + 10 * 1024,
         |out| encode_segment_vec(out, &params, payload),
     )?)
 }

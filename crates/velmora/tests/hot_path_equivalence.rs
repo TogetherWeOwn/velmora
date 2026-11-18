@@ -376,6 +376,10 @@ fn decoder_matches_the_byte_model_on_hostile_lines() {
                 // Lines before the bad one are in place; nothing lands
                 // past the end of what the bad line managed to decode.
                 assert!(dst[..model.len()] == model[..], "round {round}");
+                assert!(
+                    dst[model.len()..].iter().all(|&b| b == 0xA5),
+                    "round {round}: wrote past the decoded bytes"
+                );
                 refused += 1;
             }
             (Err(reason), Ok(_)) => panic!("round {round}: accepted, model says {reason}"),
