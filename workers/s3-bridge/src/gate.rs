@@ -300,8 +300,8 @@ impl DurableObject for PermitGate {
             end(1008, "gate: bad request");
             return Ok(());
         };
-        // A request the gate could not answer gets a reply with no
-        // answers: the caller ends the session, and its slots with it.
+        // A request the gate could not answer is told so: the session
+        // and what is held on it stand, and the caller asks again.
         let id = request.id;
         let reply = match gate
             .handle(Some(session.id), request, WorkerClock.now())
@@ -441,6 +441,11 @@ impl DoSession {
     /// up on are passed over.
     async fn reply(&self, id: u64) -> Result<GateReply> {
         core::future::poll_fn(|cx| {
+            // Closed from this end: what was held on it is free, and
+            // a reply that still arrives says nothing that holds.
+            if self.closed.get() {
+                return Poll::Ready(Err(failed("session ended")));
+            }
             let mut inbox = self.inbox.borrow_mut();
             while let Some(raw) = inbox.replies.pop_front() {
                 match serde_json::from_str::<GateReply>(&raw) {

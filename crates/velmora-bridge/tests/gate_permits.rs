@@ -2155,6 +2155,55 @@ async fn an_abandoned_holder_leaves_no_session_open() {
     assert!(take(&c, &w, &p, JOB, "job-1").await.is_some());
 }
 
+/// A permit forgotten while another call of its holder is on its way
+/// ends the session under that call. The call is answered as on no
+/// session: what it asked for is taken on a new one, never counted on
+/// from the one that ended.
+#[tokio::test]
+async fn a_call_that_crosses_a_forgotten_session_asks_again() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    w.stall.set(true);
+    let mut more = Box::pin(c.acquire_permit(&p, JOB, "job-1", w.now()));
+    for _ in 0..4 {
+        assert!(step(more.as_mut()).is_pending());
+    }
+    c.forget_permit(&a);
+    assert_eq!(w.sessions(name), 0);
+    w.stall.set(false);
+    let mut got = None;
+    for _ in 0..8 {
+        if let core::task::Poll::Ready(permit) = step(more.as_mut()) {
+            got = permit.unwrap();
+            break;
+        }
+    }
+    let got = got.expect("a slot on a new session");
+    assert_eq!((w.sessions(name), w.held(name, "p").await), (1, 1));
+    assert!(c.renew_permit(&got, w.now()).await.unwrap());
+    c.release_permit(&got).await.unwrap();
+    assert_eq!((w.sessions(name), w.held(name, "p").await), (0, 0));
+}
+
+/// Names that are not ASCII are counted at their stored size, and
+/// their providers are served like any other.
+#[tokio::test]
+async fn a_provider_with_a_name_beyond_ascii_gets_its_slots() {
+    let w = World::new();
+    let p = provider("n\u{e9}v\u{e9}-\u{65e5}\u{672c}", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    assert!(c.renew_permit(&a, w.now()).await.unwrap());
+    c.release_permit(&a).await.unwrap();
+}
+
 /// A deploy is waited out whether or not a session is still listed at
 /// the first start under the new code: the sessions that are listed do
 /// not show that nothing else was held.

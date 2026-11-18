@@ -937,13 +937,34 @@ UPDATE provider_permits SET holder = NULL, lease_until = 0, pool = NULL
 
 ### Cost
 
-Per 16 MiB extent the gate saves about 18 rows written to the
-catalogue and costs a handful of Durable Object requests. An object is
-billed for the time it is in memory, and it stays there while one of
-its permits is live: one object that never sleeps is about 332,000 GB-s
-a month. A paid plan includes 400,000 GB-s; above that, each object
-that is busy all month costs about $4.15. With `PERMIT_GATES = "one"`
-and one shard there is one object, inside the allowance however busy.
+Measured on a throwaway deployment (three accounts capped at two or
+three connections, four gate objects, 11 extents of 16 MiB per mode):
+
+| per 16 MiB extent              | `PERMITS=d1` | `PERMITS=do` |
+| ------------------------------ | ------------ | ------------ |
+| rows written to the catalogue  | 55.8         | 49.2         |
+| of those, slot rows            | about 6      | 0            |
+| billed requests to the gates   | 0            | about 13     |
+| rows written by the gates      | 0            | about 1.3    |
+| gate duration, GB-s            | 0            | 0.12         |
+
+- A job opens one session with each gate it takes a slot at: one
+  billed request each, about two per job. Renewals and the release
+  are messages on it, billed at a twentieth of a request. An extent is
+  about five job runs (the post, its retries and the checks).
+- A permit writes nothing. A gate writes its record once per
+  10 minutes of use and twice after a deploy (once more for each
+  further account or pool it serves), whatever the load.
+- A gate is in memory only while it answers: its sessions keep the
+  permits while it sleeps. An idle deployment asks each gate once per
+  cron run and writes nothing.
+- The time a job takes to get its slots was 47 ms at the median
+  against 354 ms with slot rows; the first job after a start of a
+  gate that has to ask the catalogue for its rows took 3.1 s.
+
+At the list prices of late 2026 that is about $3.2 per TB posted in
+gate mode against $3.3 with slot rows: the gate does not cost more,
+and it takes the slot rows out of the catalogue's write path.
 
 ## The route
 

@@ -62,7 +62,8 @@
 //!   what jobs could never hold (the slot and the address kept back
 //!   for reads) while the jobs' wait still runs. Every first start of
 //!   new code also forgets which slot rows the gate had seized and
-//!   asks the catalogue again: two writes per deploy.
+//!   asks the catalogue again: two writes per deploy, and one more
+//!   for every further account or pool the gate serves.
 //!
 //! A start of the same code waits for nothing: its sessions are its
 //! slots. What that leaves open is a reset that cuts sessions without a
@@ -411,8 +412,10 @@ pub struct GateReply {
     #[serde(default)]
     pub unowned: bool,
     /// The gate could not answer this request (its storage or the
-    /// catalogue failed) and answered none of it. The session and what
-    /// is held on it are as they were: the caller may ask again.
+    /// catalogue failed). No slot it asked for was handed out; what
+    /// it gave back before the failure is given back, and a renewal
+    /// before it stands. The session is open and nothing else that is
+    /// held on it has changed: the caller may ask again.
     #[serde(default)]
     pub failed: bool,
 }
@@ -1178,10 +1181,15 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 seen: now.0,
                 held: i.core.of_session(session, now.0),
             };
-            // The host's limit is on the stored form: one byte a
-            // character only if all of it is ASCII.
-            let fits = serde_json::to_string(&state)
-                .is_ok_and(|s| s.is_ascii() && s.len() <= SESSION_STATE_MAX);
+            // The host's limit is on the stored form, which may take
+            // two bytes for each unit of a text that is not all ASCII.
+            let fits = serde_json::to_string(&state).is_ok_and(|s| {
+                let stored = match s.is_ascii() {
+                    true => s.len(),
+                    false => 2 * s.encode_utf16().count(),
+                };
+                stored <= SESSION_STATE_MAX
+            });
             if !fits {
                 i.core.release(&permit, session);
                 return Ok(None);
@@ -1762,6 +1770,13 @@ impl<T: GateTransport> GateClient<T> {
         }
     }
 
+    /// `session` is still the session of the link `key`.
+    fn is_open(&self, key: &(String, String), session: &Rc<T::Session>) -> bool {
+        let links = self.links.borrow();
+        let now = links.get(key).and_then(|link| link.session.as_ref());
+        now.is_some_and(|now| Rc::ptr_eq(now, session))
+    }
+
     /// The session that holds `permit`, if this caller knows one.
     fn link_of(&self, permit: &Permit) -> Option<(String, String)> {
         let gate = self.gate_of_slot(&permit.provider, permit.slot).ok()?;
@@ -1830,7 +1845,10 @@ impl<T: GateTransport> GateClient<T> {
                 // the session and its slots stand, and the caller
                 // asks again when it next would.
                 Ok(reply) if reply.failed => return Err(refused()),
-                Ok(reply) if reply.answers.len() == ops.len() => {
+                // Not if the session was ended meanwhile (its last
+                // permit was forgotten): the gate has freed what was
+                // on it, this answer's slots too.
+                Ok(reply) if reply.answers.len() == ops.len() && self.is_open(&key, &session) => {
                     self.heard(gate, &reply);
                     answers = Some(reply.answers);
                 }
