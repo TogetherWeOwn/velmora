@@ -1,0 +1,10 @@
+{
+  "name": "velmora-alerts",
+  "private": true,
+  "type": "module",
+  "description": "Emails the operator when velmora needs attention, as a Cloudflare Worker.",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": { "node": ">=22.13" }
+}

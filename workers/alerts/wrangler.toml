@@ -1,0 +1,55 @@
+name = "velmora-alerts"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+# The account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),
+# never from this file. Ids and addresses below are placeholders: deploy
+# from a copy with the real values (see README.md).
+#
+# Secrets (wrangler secret put, value on stdin):
+#   ALERT_EMAIL_TO   the operator's address; a verified Email Routing
+#                    destination address of this account
+#   INGEST_TOKEN     bearer token for POST /v1/alert
+#   HEARTBEAT_URL    optional: a dead-man URL pinged after every check run
+
+[vars]
+# Sender: any address on a zone of this account with Email Routing enabled.
+ALERT_FROM = "alerts@<zone with email routing>"
+# Optional thresholds (seconds unless named otherwise); defaults in src/checks.js:
+#   POST_STALL_SECS (1800), VERIFY_BACKLOG_ALERT_SECS (43200),
+#   PROVIDER_COOLDOWN_ALERT_SECS (900), DLQ_ALERT_MIN (1 message an hour),
+#   EXPORT_MAX_AGE_SECS (93600), DAILY_EMAIL_CAP (30 alert emails a day)
+
+[[send_email]]
+name = "ALERT_EMAIL"
+
+# Own state: dedupe, rate limits, digest. Apply migrations/ to it.
+[[d1_databases]]
+binding = "STATE"
+database_name = "velmora-alerts"
+database_id = "<from wrangler d1 create velmora-alerts>"
+migrations_dir = "migrations"
+
+# The S3 Worker's catalogue, read only (a few rows per check; see
+# src/catalog.js). Leave it out and the catalogue checks do not run.
+[[d1_databases]]
+binding = "CATALOG"
+database_name = "velmora-catalog"
+database_id = "<the S3 Worker's catalogue id>"
+
+# The catalogue export bucket, listed once an hour. Optional.
+[[r2_buckets]]
+binding = "EXPORTS"
+bucket_name = "velmora-catalog-export"
+
+# The S3 Worker's dead-letter queue. Nothing else consumes it.
+[[queues.consumers]]
+queue = "velmora-dlq"
+max_batch_size = 100
+max_batch_timeout = 30
+max_retries = 3
+
+[triggers]
+# Checks every 5 minutes; the digest daily at 07:30 UTC (DIGEST_CRON).
+crons = ["*/5 * * * *", "30 7 * * *"]
