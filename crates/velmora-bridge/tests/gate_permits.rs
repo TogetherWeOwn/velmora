@@ -108,6 +108,9 @@ struct World {
     down: Cell<bool>,
     /// Requests to a gate do not arrive while this is set.
     stall: Cell<bool>,
+    /// Replies on a session do not arrive while this is set; the gate
+    /// has answered.
+    late: Cell<bool>,
 }
 
 impl World {
@@ -125,6 +128,7 @@ impl World {
             posts: Cell::new(0),
             ops: Cell::new(0),
             down: Cell::new(false),
+            late: Cell::new(false),
             stall: Cell::new(false),
         })
     }
@@ -355,6 +359,13 @@ impl GateSession for Line {
             .await
             .unwrap_or(GateReply::failed(id));
         self.attach(&gate);
+        // A reply that was sent is read even if the session ended
+        // while it was on its way.
+        core::future::poll_fn(|_| match self.world.late.get() {
+            true => core::task::Poll::Pending,
+            false => core::task::Poll::Ready(()),
+        })
+        .await;
         Ok(on_the_wire(&reply))
     }
 
@@ -2168,14 +2179,17 @@ async fn a_call_that_crosses_a_forgotten_session_asks_again() {
     c.seed_permits(&providers).await.unwrap();
     let name = "permits:all:0";
     let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
-    w.stall.set(true);
+    // The gate hands out a second slot on the session; its answer is
+    // on its way when the session ends.
+    w.late.set(true);
     let mut more = Box::pin(c.acquire_permit(&p, JOB, "job-1", w.now()));
     for _ in 0..4 {
         assert!(step(more.as_mut()).is_pending());
     }
+    assert_eq!(w.msgs.get(), 1, "asked on the open session");
     c.forget_permit(&a);
     assert_eq!(w.sessions(name), 0);
-    w.stall.set(false);
+    w.late.set(false);
     let mut got = None;
     for _ in 0..8 {
         if let core::task::Poll::Ready(permit) = step(more.as_mut()) {
