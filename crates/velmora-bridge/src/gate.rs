@@ -410,6 +410,24 @@ pub struct GateReply {
     /// the rollout step is due ([`PermitGate::sweep`]).
     #[serde(default)]
     pub unowned: bool,
+    /// The gate could not answer this request (its storage or the
+    /// catalogue failed) and answered none of it. The session and what
+    /// is held on it are as they were: the caller may ask again.
+    #[serde(default)]
+    pub failed: bool,
+}
+
+impl GateReply {
+    /// The reply to a request the gate could not answer.
+    pub fn failed(id: u64) -> Self {
+        GateReply {
+            id,
+            answers: Vec::new(),
+            load: Vec::new(),
+            unowned: false,
+            failed: true,
+        }
+    }
 }
 
 /// What a gate holds on one provider.
@@ -439,6 +457,16 @@ pub struct Held {
     until: i64,
     /// The session it was taken on.
     session: u64,
+}
+
+impl Held {
+    /// This is the slot of `p`, taken on `session`.
+    fn is(&self, p: &GatePermit, session: u64) -> bool {
+        self.session == session
+            && self.provider == p.provider
+            && self.slot == p.slot
+            && self.token == p.token
+    }
 }
 
 /// A session and the slots taken on it: what the host keeps with the
@@ -647,24 +675,23 @@ impl Core {
         }
     }
 
-    /// The class of a slot that `p` still holds at `now`.
-    fn class_of(&self, p: &GatePermit, now: i64) -> Option<bool> {
+    /// The class of a slot that `p` still holds on `session` at `now`.
+    fn class_of(&self, p: &GatePermit, session: u64, now: i64) -> Option<bool> {
         self.held
             .iter()
-            .find(|h| h.provider == p.provider && h.slot == p.slot && h.token == p.token)
+            .find(|h| h.is(p, session))
             .filter(|h| h.until >= now)
             .map(|h| h.background)
     }
 
-    /// Extends a slot that is still held under this token by the
-    /// lifetime of its class. `false`: the caller owns nothing.
-    pub fn renew(&mut self, p: &GatePermit, now: UnixMs) -> bool {
+    /// Extends a slot that is still held under this token, on the
+    /// session it was taken on, by the lifetime of its class. `false`:
+    /// the caller owns nothing. A slot lives and ends with its session,
+    /// and what the host keeps for a session is written when that
+    /// session asks: a permit shown on another session is not held.
+    pub fn renew(&mut self, p: &GatePermit, session: u64, now: UnixMs) -> bool {
         self.prune(now.0);
-        match self
-            .held
-            .iter_mut()
-            .find(|h| h.provider == p.provider && h.slot == p.slot && h.token == p.token)
-        {
+        match self.held.iter_mut().find(|h| h.is(p, session)) {
             Some(h) => {
                 // Never earlier: a renewal that was held up does not
                 // undo one that came after it.
@@ -675,10 +702,9 @@ impl Core {
         }
     }
 
-    /// Frees the slot if this token still owns it.
-    pub fn release(&mut self, p: &GatePermit) {
-        self.held
-            .retain(|h| !(h.provider == p.provider && h.slot == p.slot && h.token == p.token));
+    /// Frees the slot if this token still owns it on `session`.
+    pub fn release(&mut self, p: &GatePermit, session: u64) {
+        self.held.retain(|h| !h.is(p, session));
     }
 
     pub fn load(&mut self, now: UnixMs) -> Vec<GateLoad> {
@@ -881,9 +907,10 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             // Slots from before cannot be renewed, so each class is
             // gone one lifetime after the start at the latest, and at
             // its horizon if that is sooner.
-            let wait = |until: i64, background: bool| match sessions.is_empty()
-                && until + SKEW_MS > now.0
-            {
+            // Sessions that are still listed do not show that nothing
+            // else was held: an attachment the host could not read, or
+            // a session that is ending, is not among them.
+            let wait = |until: i64, background: bool| match until + SKEW_MS > now.0 {
                 true => until.min(now.0 + ttl_ms(background)) + SKEW_MS,
                 false => 0,
             };
@@ -1151,21 +1178,24 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                 seen: now.0,
                 held: i.core.of_session(session, now.0),
             };
-            let fits = serde_json::to_string(&state).is_ok_and(|s| s.len() <= SESSION_STATE_MAX);
+            // The host's limit is on the stored form: one byte a
+            // character only if all of it is ASCII.
+            let fits = serde_json::to_string(&state)
+                .is_ok_and(|s| s.is_ascii() && s.len() <= SESSION_STATE_MAX);
             if !fits {
-                i.core.release(&permit);
+                i.core.release(&permit, session);
                 return Ok(None);
             }
             Ok(Some(permit))
         }))
     }
 
-    async fn renew(&self, permits: &[GatePermit], now: UnixMs) -> Result<Vec<bool>> {
+    async fn renew(&self, permits: &[GatePermit], session: u64, now: UnixMs) -> Result<Vec<bool>> {
         for background in [true, false] {
             let any = self.with(|i| {
                 permits
                     .iter()
-                    .any(|p| i.core.class_of(p, now.0) == Some(background))
+                    .any(|p| i.core.class_of(p, session, now.0) == Some(background))
             });
             if any {
                 self.cover(background, now.0 + ttl_ms(background)).await?;
@@ -1175,14 +1205,15 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
             permits
                 .iter()
                 .map(|p| {
-                    let covered = i.core.class_of(p, now.0).is_some_and(|background| {
+                    let class = i.core.class_of(p, session, now.0);
+                    let covered = class.is_some_and(|background| {
                         let horizon = match background {
                             true => i.saved.jobs_until.min(i.record.jobs_until),
                             false => i.saved.reads_until.min(i.record.reads_until),
                         };
                         horizon >= now.0 + ttl_ms(background)
                     });
-                    covered && i.core.renew(p, now)
+                    covered && i.core.renew(p, session, now)
                 })
                 .collect()
         }))
@@ -1270,15 +1301,16 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         let answers = self
             .answer(session, &request.ops, now, &mut taken, &mut unowned)
             .await;
-        if answers.is_err() {
+        if let (Err(_), Some(session)) = (&answers, session) {
             // The caller learns of none of them.
-            self.with(|i| taken.iter().for_each(|p| i.core.release(p)));
+            self.with(|i| taken.iter().for_each(|p| i.core.release(p, session)));
         }
         Ok(GateReply {
             id: request.id,
             answers: answers?,
             load: self.with(|i| i.core.load(now)),
             unowned,
+            failed: false,
         })
     }
 
@@ -1311,9 +1343,15 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
                     taken.extend(permit.clone());
                     GateAnswer::Acquired(permit)
                 }
-                GateOp::Renew { permits } => GateAnswer::Renewed(self.renew(permits, now).await?),
+                // Nothing is held on no session.
+                GateOp::Renew { permits } => GateAnswer::Renewed(match session {
+                    Some(session) => self.renew(permits, session, now).await?,
+                    None => vec![false; permits.len()],
+                }),
                 GateOp::Release { permits } => {
-                    self.with(|i| permits.iter().for_each(|p| i.core.release(p)));
+                    if let Some(session) = session {
+                        self.with(|i| permits.iter().for_each(|p| i.core.release(p, session)));
+                    }
                     GateAnswer::Released
                 }
                 GateOp::Load => GateAnswer::Load(self.with(|i| i.core.load(now))),
@@ -1479,6 +1517,11 @@ pub trait PermitGate {
     ) -> LocalBoxFuture<'a, Result<Option<Permit>>>;
     fn renew<'a>(&'a self, permits: &'a [Permit]) -> LocalBoxFuture<'a, Result<Vec<bool>>>;
     fn release<'a>(&'a self, permit: &'a Permit) -> LocalBoxFuture<'a, Result<()>>;
+    /// The holder of `permit` is gone without having released it (its
+    /// job was abandoned). Nothing is awaited: the session is closed
+    /// if this was the last slot on it, and the gate frees what was
+    /// held on a session that closes; otherwise the slot expires.
+    fn forget(&self, permit: &Permit);
     /// What every gate holds, asked now: a request per gate.
     fn load(&self) -> LocalBoxFuture<'_, Result<Vec<GateLoad>>>;
     /// What the gates last said they hold, in replies to this caller no
@@ -1623,6 +1666,10 @@ fn sum_load(parts: Vec<GateLoad>) -> Vec<GateLoad> {
 
 fn unexpected() -> BridgeError {
     BridgeError::Sql("gate: unexpected answer".into())
+}
+
+fn refused() -> BridgeError {
+    BridgeError::Sql("gate: request not answered".into())
 }
 
 impl<T: GateTransport> GateClient<T> {
@@ -1779,6 +1826,10 @@ impl<T: GateTransport> GateClient<T> {
         let mut answers = None;
         if let Some(session) = open {
             match session.call(self.request(gate, ops.clone())).await {
+                // The gate answered none of it and changed nothing:
+                // the session and its slots stand, and the caller
+                // asks again when it next would.
+                Ok(reply) if reply.failed => return Err(refused()),
                 Ok(reply) if reply.answers.len() == ops.len() => {
                     self.heard(gate, &reply);
                     answers = Some(reply.answers);
@@ -1801,7 +1852,7 @@ impl<T: GateTransport> GateClient<T> {
                 if !asked.is_empty() {
                     let n = asked.len();
                     let (session, reply) = self.transport.open(self.request(gate, asked)).await?;
-                    if reply.answers.len() != n {
+                    if reply.failed || reply.answers.len() != n {
                         session.close();
                         return Err(unexpected());
                     }
@@ -1853,7 +1904,13 @@ impl<T: GateTransport> GateClient<T> {
                 if let Some(session) = link.session.take() {
                     session.close();
                 }
-                links.remove(&key);
+                // Not while another call waits for its turn on it: a
+                // call that came after would find no link, make one
+                // with a turn of its own and run beside the waiter.
+                // The last of them removes it.
+                if Rc::strong_count(&link.turn) <= 2 {
+                    links.remove(&key);
+                }
             }
         }
         Ok(answers)
@@ -2013,6 +2070,29 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
                 _ => Err(unexpected()),
             }
         })
+    }
+
+    fn forget(&self, permit: &Permit) {
+        let Some(key) = self.link_of(permit) else {
+            return;
+        };
+        let Ok(mut links) = self.links.try_borrow_mut() else {
+            return;
+        };
+        let Some(link) = links.get_mut(&key) else {
+            return;
+        };
+        link.tokens.remove(&permit.token);
+        if link.tokens.is_empty() {
+            // A call still under way on it fails and is answered as
+            // on no session; the link is that call's to remove.
+            if let Some(session) = link.session.take() {
+                session.close();
+            }
+            if Rc::strong_count(&link.turn) <= 1 {
+                links.remove(&key);
+            }
+        }
     }
 
     fn load(&self) -> LocalBoxFuture<'_, Result<Vec<GateLoad>>> {

@@ -835,8 +835,9 @@ A deploy can cut every socket. The object then knows no holder, while
 Workers may still hold connections under permits of the old version.
 So:
 
-- The first start under a new version that finds no open socket, and
-  that is within the stored horizon of the old permits, waits until
+- The first start under a new version that is within the stored
+  horizon of the old permits (whether or not a socket is still listed
+  as open) waits until
   every one of them has run out: up to 125 s for jobs and 40 s for
   reads (the lease lengths plus 5 s), counted from the first request
   after the deploy (the cron's, at the latest). During the jobs' wait
@@ -852,7 +853,9 @@ So:
 Not covered: an object that is reset without a deploy (it crashed, its
 machine was lost) while holders are connected through it. Their sockets
 are cut, their permits are free at once, and each of them goes on
-until its next renewal fails: up to 20 s for a job, 5 s for a read. In
+until its next renewal fails. A job renews every 20 s and before every
+call to the provider, and a call may run for 80 s: up to about 100 s
+for a job, 25 s for a read. In
 that time the account can be asked for more connections than
 `max_conns`; the provider refuses the extra ones and the job that was
 refused is retried. Closing this would take two stored rows for every

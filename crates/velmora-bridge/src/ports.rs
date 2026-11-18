@@ -1140,6 +1140,10 @@ pub trait Catalog {
     ) -> Result<Option<Permit>>;
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool>;
     async fn release_permit(&self, p: &Permit) -> Result<()>;
+    /// The holder of `p` is gone without releasing it: whatever is
+    /// kept open for it on this side is dropped, with nothing awaited.
+    /// The slot itself frees when its permit expires, or sooner.
+    fn forget_permit(&self, _p: &Permit) {}
 
     // provider pool
     /// Held slots, slots ever handed out and health, per provider that

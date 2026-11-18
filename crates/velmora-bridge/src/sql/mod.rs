@@ -799,6 +799,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
             None => permits::release_permit(self, p).await,
         }
     }
+    fn forget_permit(&self, p: &Permit) {
+        if let Some(gate) = self.active_gate() {
+            gate.forget(p);
+        }
+    }
 
     // provider pool
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {

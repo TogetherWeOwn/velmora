@@ -353,12 +353,7 @@ impl GateSession for Line {
         let reply = gate
             .handle(Some(self.id), request, self.world.now())
             .await
-            .unwrap_or(GateReply {
-                id,
-                answers: Vec::new(),
-                load: Vec::new(),
-                unowned: false,
-            });
+            .unwrap_or(GateReply::failed(id));
         self.attach(&gate);
         Ok(on_the_wire(&reply))
     }
@@ -518,13 +513,13 @@ async fn memory_and_slot_rows_decide_alike() {
                 5..=6 if !held.is_empty() => {
                     let (a, b) = &held[rng.next(held.len() as u64) as usize];
                     let x = rows.renew_permit(a, UnixMs(now)).await.unwrap();
-                    let y = core.renew(b, UnixMs(now));
+                    let y = core.renew(b, 1, UnixMs(now));
                     assert_eq!(x, y, "seed {seed} step {step}: renew {}", a.provider);
                 }
                 7 if !held.is_empty() => {
                     let (a, b) = held.swap_remove(rng.next(held.len() as u64) as usize);
                     rows.release_permit(&a).await.unwrap();
-                    core.release(&b);
+                    core.release(&b, 1);
                 }
                 _ => now += rng.next(30_000) as i64,
             }
@@ -714,7 +709,7 @@ fn tokens_of_a_later_start_are_higher() {
             .acquire(&p, &[], true, ("h", 1), UnixMs(T0), Warm::Done)
             .unwrap();
         last = permit.token;
-        first.release(&permit);
+        first.release(&permit, 1);
     }
     let mut second = Core::new(UnixMs(T0 + 1));
     let permit = second
@@ -885,10 +880,15 @@ async fn nothing_is_promised_past_the_stored_horizon() {
     }
     assert_eq!(renewed, HORIZON_STEP_MS / 20_000);
     w.pass(20_000);
-    // The slot is not extended. The holder hears that it holds nothing
-    // and its session ends, so the place is free.
-    assert!(!c.renew_permit(&permit, w.now()).await.unwrap());
+    // The slot is not extended, and the holder hears that the gate
+    // could not answer. Its session stands with what is held on it:
+    // one request that failed frees nothing behind a holder's back.
+    assert!(c.renew_permit(&permit, w.now()).await.is_err());
+    assert_eq!(w.sessions("permits:all:0"), 1);
+    assert_eq!(w.held("permits:all:0", "p").await, 1);
     store.fail.set(false);
+    assert!(c.renew_permit(&permit, w.now()).await.unwrap());
+    c.release_permit(&permit).await.unwrap();
     assert_eq!(w.sessions("permits:all:0"), 0);
     assert_eq!(w.held("permits:all:0", "p").await, 0);
 }
@@ -1792,10 +1792,10 @@ fn a_late_renewal_does_not_shorten_a_permit() {
     let permit = core
         .acquire(&p, &[], true, ("job", 1), now, Warm::Done)
         .unwrap();
-    assert!(core.renew(&permit, UnixMs(T0 + 60_000)));
-    assert!(core.renew(&permit, UnixMs(T0 + 30_000)));
+    assert!(core.renew(&permit, 1, UnixMs(T0 + 60_000)));
+    assert!(core.renew(&permit, 1, UnixMs(T0 + 30_000)));
     // Still held where the later renewal put it.
-    assert!(core.renew(&permit, UnixMs(T0 + 60_000 + JOB_MS)));
+    assert!(core.renew(&permit, 1, UnixMs(T0 + 60_000 + JOB_MS)));
 }
 
 /// A caller dropped before its question was sent is not asked for: the
@@ -2008,6 +2008,176 @@ async fn a_refused_holder_leaves_no_session_open() {
     assert_eq!(w.sessions("permits:all:0"), 0);
     assert!(take(&c, &w, &p, JOB, "job-2").await.is_some());
     assert_eq!(w.sessions("permits:all:0"), 1);
+}
+
+/// A permit is held on the session it was taken on and nowhere else:
+/// shown on another session, or on none, it is neither renewed nor
+/// freed.
+#[tokio::test]
+async fn a_permit_is_held_only_on_its_own_session() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    take(&c, &w, &p, JOB, "job-2").await.unwrap();
+    let ids: Vec<u64> = w.sockets.borrow()[name].keys().copied().collect();
+    assert_eq!(ids.len(), 2);
+    let ask = |session: Option<u64>, op: GateOp| {
+        let w = w.clone();
+        async move {
+            let request = GateRequest {
+                id: 1,
+                gate: name.into(),
+                ops: vec![op],
+            };
+            let reply = w.gate(name).await.handle(session, request, w.now()).await;
+            reply.unwrap().answers.remove(0)
+        }
+    };
+    let permits = vec![GatePermit::from(&a)];
+    let renew = || GateOp::Renew {
+        permits: permits.clone(),
+    };
+    let release = || GateOp::Release {
+        permits: permits.clone(),
+    };
+    let mut own = Vec::new();
+    for id in &ids {
+        if ask(Some(*id), renew()).await == GateAnswer::Renewed(vec![true]) {
+            own.push(*id);
+        }
+    }
+    assert_eq!(own.len(), 1, "renewed on its own session only");
+    assert_eq!(ask(None, renew()).await, GateAnswer::Renewed(vec![false]));
+    let other = ids.iter().find(|id| **id != own[0]).unwrap();
+    ask(Some(*other), release()).await;
+    ask(None, release()).await;
+    assert_eq!(w.held(name, "p").await, 2, "freed by nobody else");
+    ask(Some(own[0]), release()).await;
+    assert_eq!(w.held(name, "p").await, 1);
+}
+
+fn step<F: Future>(f: core::pin::Pin<&mut F>) -> core::task::Poll<F::Output> {
+    let waker = futures_util::task::noop_waker();
+    f.poll(&mut core::task::Context::from_waker(&waker))
+}
+
+/// Calls of one holder that cross the end of its session do not run
+/// beside each other: the one that waited and the one that came after
+/// share one session, and none is left open that nobody knows.
+#[tokio::test]
+async fn calls_that_cross_the_end_of_a_session_share_the_next() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    let first = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    w.opens.set(0);
+
+    // The release is on its way and holds the turn.
+    w.stall.set(true);
+    let mut release = Box::pin(c.release_permit(&first));
+    for _ in 0..4 {
+        assert!(step(release.as_mut()).is_pending());
+    }
+    // A second call waits for its turn.
+    let mut one = Box::pin(c.acquire_permit(&p, JOB, "job-1", w.now()));
+    for _ in 0..4 {
+        assert!(step(one.as_mut()).is_pending());
+    }
+    // The release arrives and ends the session; the waiter opens the
+    // next one, and that is on its way when a third call comes.
+    w.stall.set(false);
+    assert!(step(release.as_mut()).is_ready());
+    assert_eq!(w.sessions(name), 0);
+    w.stall.set(true);
+    assert!(step(one.as_mut()).is_pending());
+    let mut two = Box::pin(c.acquire_permit(&p, JOB, "job-1", w.now()));
+    for _ in 0..4 {
+        assert!(step(two.as_mut()).is_pending());
+        assert!(step(one.as_mut()).is_pending());
+    }
+    w.stall.set(false);
+    let mut done = Vec::new();
+    for _ in 0..8 {
+        if let core::task::Poll::Ready(permit) = step(one.as_mut()) {
+            done.push(permit.unwrap().unwrap());
+            break;
+        }
+    }
+    for _ in 0..8 {
+        if let core::task::Poll::Ready(permit) = step(two.as_mut()) {
+            done.push(permit.unwrap().unwrap());
+            break;
+        }
+    }
+    assert_eq!(done.len(), 2);
+    assert_eq!((w.sessions(name), w.opens.get()), (1, 1), "one session");
+    assert_eq!(w.held(name, "p").await, 2);
+    // Both are known to their holder: giving them back ends it.
+    for permit in &done {
+        assert!(c.renew_permit(permit, w.now()).await.unwrap());
+    }
+    for permit in &done {
+        c.release_permit(permit).await.unwrap();
+    }
+    assert_eq!((w.sessions(name), w.held(name, "p").await), (0, 0));
+}
+
+/// A holder that is gone without giving its slots back (a job that was
+/// abandoned) leaves no session open: it ends with the last permit
+/// that is forgotten, and the gate frees what was held on it.
+#[tokio::test]
+async fn an_abandoned_holder_leaves_no_session_open() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    let b = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    let (calls, _) = (w.calls.get(), c.forget_permit(&a));
+    assert_eq!(w.sessions(name), 1, "another slot is still in use on it");
+    assert!(c.renew_permit(&b, w.now()).await.unwrap());
+    let calls = calls + 1;
+    c.forget_permit(&b);
+    assert_eq!(w.calls.get(), calls, "nothing is asked");
+    assert_eq!(w.sessions(name), 0);
+    assert_eq!(w.held(name, "p").await, 0);
+    // Forgotten twice, or after its release, is nothing.
+    c.forget_permit(&b);
+    assert!(take(&c, &w, &p, JOB, "job-1").await.is_some());
+}
+
+/// A deploy is waited out whether or not a session is still listed at
+/// the first start under the new code: the sessions that are listed do
+/// not show that nothing else was held.
+#[tokio::test]
+async fn a_deploy_is_waited_out_with_a_session_still_listed() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let name = "permits:all:0";
+    let kept = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    // New code; this session's connection was not cut.
+    w.boot.set(w.boot.get() + 1);
+    w.hibernate();
+    w.pass(1);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_none());
+    assert!(c.renew_permit(&kept, w.now()).await.unwrap(), "it holds on");
+    assert_eq!(w.held(name, "p").await, 1);
+    w.pass(20_000);
+    assert!(c.renew_permit(&kept, w.now()).await.unwrap());
+    w.pass(JOB_MS + SKEW_MS - 20_000);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_some());
 }
 
 /// The slots of one session fit with its connection: a session is

@@ -308,12 +308,7 @@ impl DurableObject for PermitGate {
             .await
         {
             Ok(reply) => reply,
-            Err(_) => GateReply {
-                id,
-                answers: Vec::new(),
-                load: Vec::new(),
-                unowned: false,
-            },
+            Err(_) => GateReply::failed(id),
         };
         let sent = attach(&ws, &gate.session(session.id, WorkerClock.now()))
             && serde_json::to_string(&reply).is_ok_and(|raw| ws.send_with_str(&raw).is_ok());
@@ -495,6 +490,13 @@ impl Drop for DoSession {
         let _ = socket.remove_event_listener_with_callback("message", message);
         let _ = socket.remove_event_listener_with_callback("close", end);
         let _ = socket.remove_event_listener_with_callback("error", end);
+        // A session nobody holds any more holds no slot: the gate
+        // frees what was taken on it when it closes. From another
+        // invocation the close is refused, and the socket has ended
+        // with the invocation that opened it.
+        if !self.closed.replace(true) {
+            let _ = self.ws.close(Some(1000), Some("dropped"));
+        }
     }
 }
 

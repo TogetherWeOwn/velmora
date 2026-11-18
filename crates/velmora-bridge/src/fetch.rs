@@ -50,6 +50,18 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// The time the permit's expiry counts from: the one it was taken
     /// with, or its last renewal that succeeded.
     held_from: UnixMs,
+    /// The slot was given back ([`Self::finish`]).
+    freed: bool,
+}
+
+impl<C: Catalog, N: NntpConnector, T: Clock> Drop for ProviderSession<'_, C, N, T> {
+    /// A session dropped before it was closed (its job was abandoned)
+    /// leaves nothing open towards the catalogue for its permit.
+    fn drop(&mut self) {
+        if !self.freed {
+            self.catalog.forget_permit(&self.permit);
+        }
+    }
 }
 
 /// The permit holder of a job run. One claim of an outbox row is one
@@ -184,6 +196,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             // its permit is short and the connect is not.
             kept: (class == PermitClass::Background).then_some((asked, false)),
             held_from: asked,
+            freed: false,
         }))
     }
 
@@ -421,7 +434,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             session.quit().await;
         }
         // A failed release is safe: the permit expires on its own.
-        let _ = self.catalog.release_permit(&self.permit).await;
+        self.freed = self.catalog.release_permit(&self.permit).await.is_ok();
         self.health
     }
 }
