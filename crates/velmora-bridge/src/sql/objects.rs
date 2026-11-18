@@ -265,8 +265,9 @@ const PLACED_EXTENT_COLS: &str =
 /// references from the first on, and the end of that run is found by
 /// halving `(lo, hi)`: `lo` is -1 or a `seq` the condition holds for,
 /// `hi` is one past the last `seq` or a `seq` it does not hold for. Each
-/// step is one seek of the primary key, about 17 for 131,072 references,
-/// where walking the key backwards read every reference behind the range.
+/// step seeks the primary key twice, once for each bound it sets: about
+/// 17 steps and 34 seeks for 131,072 references, where walking the key
+/// backwards read every reference behind the range.
 ///
 /// Writers number references from 0 without a gap, but nothing in the
 /// schema says so. A step therefore reads the first reference at or
