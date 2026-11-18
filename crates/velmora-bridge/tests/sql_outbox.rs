@@ -3393,3 +3393,386 @@ async fn pack_plans_drops_stray_rows_and_passes_what_it_cannot_pack() {
     assert!(velmora_bridge::plan::same_plan(&packed_c, &rows_c));
     assert!(packed_c.iter().all(|x| x.state == ArticleState::Posted));
 }
+
+// ---------------------------------------------------------------------------
+// The light check (`VERIFY_MODE=light`)
+// ---------------------------------------------------------------------------
+
+impl Fx {
+    /// A row of `kind` over the extent's two articles, `ok` of them good.
+    async fn check(
+        &self,
+        l: &Lease,
+        backbone: &str,
+        at: UnixMs,
+        kind: VerifyKind,
+        (ok, result): (u32, VerifyResult),
+    ) -> bool {
+        let v = VerificationRow {
+            extent_id: l.extent.clone(),
+            backbone: backbone.into(),
+            provider_id: format!("p-{backbone}"),
+            verified_at: at,
+            plan_rev: 1,
+            articles_ok: ok,
+            articles_total: 2,
+            result,
+            kind,
+        };
+        self.cat.record_verification(l, &v).await.unwrap()
+    }
+
+    /// `kind` and `mode` of every row of an extent, oldest first.
+    async fn kinds(&self, o: &Obj) -> Vec<(String, String)> {
+        let rows = self
+            .cat
+            .sql
+            .0
+            .query(
+                "SELECT kind, COALESCE(mode, 'NULL') FROM verifications WHERE extent_id = ?1 \
+                 ORDER BY verified_at, backbone",
+                &[text(o.extent.as_str())],
+            )
+            .await
+            .unwrap();
+        let cell = |v: &SqlValue| match v {
+            SqlValue::Text(t) => t.clone(),
+            other => panic!("not text: {other:?}"),
+        };
+        rows.iter().map(|r| (cell(&r[0]), cell(&r[1]))).collect()
+    }
+}
+
+/// The four kinds are two values of `kind` and the `mode` column: a
+/// Worker from before the column reads a sampled read as the full read
+/// it is and a size pass as the presence check it also is.
+#[tokio::test]
+async fn the_mode_column_tells_the_kinds_apart() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let kinds = [
+        VerifyKind::Body,
+        VerifyKind::Stat,
+        VerifyKind::Size,
+        VerifyKind::Sampled,
+    ];
+    for (i, kind) in kinds.into_iter().enumerate() {
+        let (name, at) = (format!("bb-{i}"), T0.plus_ms(i as i64));
+        assert!(fx.pass(&l, &name, at, kind).await);
+    }
+    let stored = fx.kinds(&o).await;
+    let want = [
+        ("body", "NULL"),
+        ("stat", "NULL"),
+        ("stat", "size"),
+        ("body", "sampled"),
+    ];
+    let want: Vec<_> = want
+        .iter()
+        .map(|(k, m)| (k.to_string(), m.to_string()))
+        .collect();
+    assert_eq!(stored, want);
+    // Read back as written.
+    let status = fx.cat.backbone_status(&o.extent).await.unwrap();
+    let read: Vec<VerifyKind> = status.iter().map(|s| s.kind).collect();
+    assert_eq!(read, kinds);
+    // Only a full read moves the extent's last read.
+    assert_eq!(
+        fx.extent(&o, "last_verified_at").await,
+        T0.plus_ms(3).0.to_string()
+    );
+    // The full checks on record: the plain one and the sampled one.
+    let full = fx.cat.body_checks(&o.extent).await.unwrap();
+    let full: Vec<_> = full
+        .iter()
+        .map(|b| (&*b.backbone, b.kind, b.counts))
+        .collect();
+    assert_eq!(
+        full,
+        [
+            ("bb-0", VerifyKind::Body, true),
+            ("bb-3", VerifyKind::Sampled, true)
+        ]
+    );
+    // No other mode exists, and a mode a later version adds is read as
+    // what `kind` says.
+    let bad = fx
+        .cat
+        .sql
+        .exec("UPDATE verifications SET mode = 'head'", &[]);
+    assert!(bad.await.is_err());
+    assert_eq!(
+        VerifyKind::from_columns("stat", Some("later")),
+        Some(VerifyKind::Stat)
+    );
+    assert_eq!(
+        VerifyKind::from_columns("body", Some("later")),
+        Some(VerifyKind::Body)
+    );
+    assert_eq!(VerifyKind::from_columns("head", None), None);
+
+    // Two results in one millisecond: kind and mode are those of the
+    // row kept.
+    assert!(
+        fx.pass(&l, "bb-2", T0.plus_ms(2), VerifyKind::Sampled)
+            .await
+    );
+    assert_eq!(fx.kinds(&o).await[2], ("body".into(), "sampled".into()));
+    // A full read is not replaced by a presence check of that instant.
+    assert!(fx.pass(&l, "bb-2", T0.plus_ms(2), VerifyKind::Size).await);
+    assert_eq!(fx.kinds(&o).await[2], ("body".into(), "sampled".into()));
+    assert!(fx.pass(&l, "bb-1", T0.plus_ms(1), VerifyKind::Size).await);
+    assert_eq!(fx.kinds(&o).await[1], ("stat".into(), "size".into()));
+}
+
+/// The light guard: passes of any kind on enough backbones that count,
+/// recorded under this claim, release an extent that was never read in
+/// full. The guard of `body` refuses the same rows.
+#[tokio::test]
+async fn the_light_guard_releases_without_a_full_check() {
+    let fx = Fx::new().await;
+    let (o, r) = fx.at_release("k").await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    let at = T0.plus_ms(2);
+    let before = fx.dump().await;
+    // One backbone is not two.
+    let light = fx.cat.begin_release_light(&r, 2, &counting, "[]", at);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert!(fx.pass(&r, "bb-c", T0.plus_ms(1), VerifyKind::Stat).await);
+    // Nor is a backbone that does not count a second one.
+    let light = fx.cat.begin_release_light(&r, 2, &counting, "[]", at);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_ne!(fx.dump().await, before);
+
+    // No backbone was read in full: `body` refuses.
+    let body = fx.cat.begin_release(&r, 2, &counting, "[]", at);
+    assert_eq!(body.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // Zero backbones never release.
+    let light = fx.cat.begin_release_light(&r, 0, &counting, "[]", at);
+    assert!(matches!(light.await, Err(BridgeError::Invalid(_))));
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[\"light\"]", at);
+    assert_eq!(light.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "[\"light\"]");
+}
+
+/// The light guard keeps the rest of the release guard: the lease, the
+/// evidence from this claim, and the latest row of each backbone.
+#[tokio::test]
+async fn the_light_guard_keeps_the_lease_and_the_fresh_evidence() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    // Passes from verify, before the release claim.
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Size).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Size).await);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let begin = |lease: &Lease, at: UnixMs| {
+        let (cat, counting, lease) = (&fx.cat, &counting, lease.clone());
+        async move {
+            cat.begin_release_light(&lease, 2, counting, "[]", at)
+                .await
+                .unwrap()
+        }
+    };
+    // Nothing recorded under this claim.
+    assert_eq!(begin(&r, later.plus_ms(1)).await, Guard::Lost);
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat)
+            .await
+    );
+    assert!(
+        fx.pass(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat)
+            .await
+    );
+    // A lease that is not this one, and one that has run out.
+    let mut stale = r.clone();
+    stale.token -= 1;
+    assert_eq!(begin(&stale, later.plus_ms(2)).await, Guard::Lost);
+    let expired = later.plus_ms(LEASE_MS + 1);
+    assert_eq!(begin(&r, expired).await, Guard::Lost);
+    // A newer failure on one backbone cancels its pass.
+    let missing = (1, VerifyResult::Missing);
+    assert!(
+        fx.check(&r, "bb-b", later.plus_ms(3), VerifyKind::Stat, missing)
+            .await
+    );
+    assert_eq!(begin(&r, later.plus_ms(4)).await, Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert!(
+        fx.pass(&r, "bb-b", later.plus_ms(5), VerifyKind::Stat)
+            .await
+    );
+    assert_eq!(begin(&r, later.plus_ms(6)).await, Guard::Applied(()));
+}
+
+/// A size that did not fit is a failed check of the bytes: the backbone
+/// holds no copy for either guard, whatever it answers afterwards, until
+/// a full read of it passes.
+#[tokio::test]
+async fn a_wrong_size_holds_the_backbone_until_it_is_read_in_full() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    let wrong = (1, VerifyResult::Corrupt);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Size).await);
+    assert!(fx.check(&l, "bb-b", T0, VerifyKind::Size, wrong).await);
+    let checks = fx.cat.body_checks(&o.extent).await.unwrap();
+    let checks: Vec<_> = checks
+        .iter()
+        .map(|b| (&*b.backbone, b.kind, b.result, b.counts))
+        .collect();
+    assert_eq!(
+        checks,
+        [("bb-b", VerifyKind::Size, VerifyResult::Corrupt, false)]
+    );
+    // A later size that fits is not a read of the bytes.
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
+    assert_eq!(fx.cat.body_checks(&o.extent).await.unwrap().len(), 1);
+
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    let at = later.plus_ms(2);
+    let light = fx.cat.begin_release_light(&r, 2, &counting, "[]", at);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // The other backbone alone is one copy.
+    let light = fx.cat.begin_release_light(&r, 1, &counting, "[]", at);
+    assert_eq!(light.await.unwrap(), Guard::Applied(()));
+
+    // A second extent: the same, then read in full.
+    let o = fx.publish(&fx.bucket, "k2").await;
+    let l = fx.posted(&o, 2, T0).await;
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Size).await);
+    assert!(fx.check(&l, "bb-b", T0, VerifyKind::Size, wrong).await);
+    assert!(fx.pass(&l, "bb-b", T0.plus_ms(1), VerifyKind::Body).await);
+    let checks = fx.cat.body_checks(&o.extent).await.unwrap();
+    let checks: Vec<_> = checks
+        .iter()
+        .map(|b| (&*b.backbone, b.kind, b.counts))
+        .collect();
+    assert_eq!(checks, [("bb-b", VerifyKind::Body, true)]);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    // Both guards: the full read of `bb-b` is also the full check.
+    let body = fx.cat.begin_release(&r, 2, &counting, "[]", at);
+    assert_eq!(body.await.unwrap(), Guard::Applied(()));
+}
+
+/// A failed full read holds its backbone under the light guard as under
+/// the other one, and a sampled read is a full read to both.
+#[tokio::test]
+async fn the_light_guard_refuses_a_backbone_whose_full_read_failed() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 2, T0).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    let corrupt = (1, VerifyResult::Corrupt);
+    assert!(fx.check(&l, "bb-a", T0, VerifyKind::Sampled, corrupt).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Stat).await);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        assert!(
+            fx.pass(&r, backbone, later.plus_ms(1), VerifyKind::Stat)
+                .await
+        );
+    }
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2));
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    // Read in full again, as a sampled read: it holds a copy, and that
+    // read is the full check on record for the guard of `body` too.
+    assert!(
+        fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Sampled)
+            .await
+    );
+    let body = fx
+        .cat
+        .begin_release(&r, 2, &counting, "[]", later.plus_ms(4));
+    assert_eq!(body.await.unwrap(), Guard::Applied(()));
+}
+
+/// The backbones read in full for a while: one row per backbone, the
+/// later end wins, and a row whose time is over is not listed.
+#[tokio::test]
+async fn verify_escalations_keep_the_later_end() {
+    let fx = Fx::new().await;
+    let raise = |backbone: &str, from: UnixMs, secs: u32, result| VerifyEscalation {
+        backbone: backbone.to_string(),
+        until: from.plus_secs(secs),
+        raised_at: from,
+        extent_id: ExtentId::mint([7; 13]),
+        result,
+    };
+    assert_eq!(fx.cat.verify_escalations(T0).await.unwrap(), []);
+    let first = raise("bb-b", T0, 3_600, VerifyResult::Corrupt);
+    fx.cat.escalate_verify(&first).await.unwrap();
+    let other = raise("bb-a", T0, 600, VerifyResult::Missing);
+    fx.cat.escalate_verify(&other).await.unwrap();
+    assert_eq!(
+        fx.cat.verify_escalations(T0).await.unwrap(),
+        [other.clone(), first.clone()]
+    );
+    // An earlier end changes nothing.
+    let shorter = raise("bb-b", T0.plus_ms(1), 60, VerifyResult::Missing);
+    fx.cat.escalate_verify(&shorter).await.unwrap();
+    assert_eq!(
+        fx.cat.verify_escalations(T0).await.unwrap(),
+        [other, first.clone()]
+    );
+    // A later one replaces the row.
+    let longer = raise("bb-b", T0.plus_secs(1_800), 3_600, VerifyResult::Missing);
+    fx.cat.escalate_verify(&longer).await.unwrap();
+    // The first backbone's time is over; the end itself is not inside.
+    let now = T0.plus_secs(600);
+    let until = longer.until;
+    assert_eq!(fx.cat.verify_escalations(now).await.unwrap(), [longer]);
+    assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), []);
+    let rows = fx.count("SELECT COUNT(*) FROM verify_escalations").await;
+    assert_eq!(rows, 2);
+}

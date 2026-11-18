@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use base64::Engine as _;
 
 use crate::ports::Kek;
-use crate::types::{KekBytes, ProviderConfig, Secret};
+use crate::types::{KekBytes, ProviderConfig, Secret, SizeCommand};
 
 /// Real-data gate. While `false`, `create_bucket` refuses
 /// `disposable = false` and `GC_MODE=full` is rejected. Open since the
@@ -203,6 +203,9 @@ pub struct BridgeConfig {
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
     pub verify_delay_secs: u32,
+    /// How the verify stage checks an extent (`VERIFY_MODE` and its
+    /// companions).
+    pub verify: VerifyConfig,
     /// NNTP sockets one post job opens at most, over all its providers.
     pub post_sockets: u32,
     /// Connections one invocation reads cold extents over
@@ -255,6 +258,137 @@ fn required(get: &impl Fn(&str) -> Option<String>, name: &str) -> Result<String,
         Some(v) if !v.trim().is_empty() => Ok(v),
         _ => Err(ConfigError::Missing(name.to_string())),
     }
+}
+
+/// How the verify stage checks an extent (`VERIFY_MODE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Every extent is read in full (`BODY`) on one backbone.
+    #[default]
+    Body,
+    /// Presence and stored size of every article on every backbone, and
+    /// a full read of a sample of the extents ([`crate::verify`]).
+    Light,
+}
+
+/// Default of `VERIFY_SAMPLE_PERCENT`, in parts per million: 2 %.
+pub const DEFAULT_VERIFY_SAMPLE_PPM: u32 = 20_000;
+/// The smallest sample outside development: 1 %.
+pub const MIN_VERIFY_SAMPLE_PPM: u32 = 10_000;
+/// Default of `VERIFY_ESCALATE_SECS`: a day.
+pub const DEFAULT_VERIFY_ESCALATE_SECS: u32 = 86_400;
+
+/// The switches of the verify stage.
+///
+/// Rollout: every value is read by the job that runs, so Workers with
+/// different values may run side by side. An extent verified under
+/// `light` and released by a Worker under `body` is not released: it goes
+/// back to verify and is read in full. One verified under `body` is
+/// released by either.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyConfig {
+    pub mode: VerifyMode,
+    /// Extents read in full under `light`, in parts per million
+    /// (`VERIFY_SAMPLE_PERCENT`, a decimal number of percent).
+    pub sample_ppm: u32,
+    /// How long a backbone is read in full for every extent after a full
+    /// read of it failed under `light` (`VERIFY_ESCALATE_SECS`).
+    pub escalate_secs: u32,
+    /// The size command of each provider that has one
+    /// (`VERIFY_SIZE_COMMANDS`, a JSON object of provider id to `hdr`,
+    /// `over` or `head`). A provider without an entry is only
+    /// asked with `STAT`.
+    pub size_commands: Vec<(String, SizeCommand)>,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        VerifyConfig {
+            mode: VerifyMode::Body,
+            sample_ppm: DEFAULT_VERIFY_SAMPLE_PPM,
+            escalate_secs: DEFAULT_VERIFY_ESCALATE_SECS,
+            size_commands: Vec::new(),
+        }
+    }
+}
+
+impl VerifyConfig {
+    /// The size command of provider `id`, if it has one.
+    pub fn size_command(&self, id: &str) -> Option<SizeCommand> {
+        self.size_commands
+            .iter()
+            .find(|(p, _)| p == id)
+            .map(|(_, c)| *c)
+    }
+
+    fn from_env(
+        get: &impl Fn(&str) -> Option<String>,
+        providers: &[ProviderConfig],
+        dev: bool,
+    ) -> Result<Self, ConfigError> {
+        let mode = match get("VERIFY_MODE").as_deref().map(str::trim) {
+            None | Some("") | Some("body") => VerifyMode::Body,
+            Some("light") => VerifyMode::Light,
+            Some(_) => return Err(ConfigError::Invalid("VERIFY_MODE".into())),
+        };
+        let sample_ppm = match get("VERIFY_SAMPLE_PERCENT").as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_VERIFY_SAMPLE_PPM,
+            Some(v) => percent_ppm(v)
+                .ok_or_else(|| ConfigError::Invalid("VERIFY_SAMPLE_PERCENT".into()))?,
+        };
+        if sample_ppm < MIN_VERIFY_SAMPLE_PPM && !dev {
+            return Err(ConfigError::Refused(
+                "VERIFY_SAMPLE_PERCENT below 1 outside dev",
+            ));
+        }
+        let escalate_secs = number_or(
+            get,
+            "VERIFY_ESCALATE_SECS",
+            DEFAULT_VERIFY_ESCALATE_SECS,
+            (60, 30 * 86_400),
+        )?;
+        let invalid = || ConfigError::Invalid("VERIFY_SIZE_COMMANDS".into());
+        let size_commands = match get("VERIFY_SIZE_COMMANDS").as_deref().map(str::trim) {
+            None | Some("") => Vec::new(),
+            Some(json) => {
+                let map: BTreeMap<String, String> =
+                    serde_json::from_str(json).map_err(|_| invalid())?;
+                let mut out = Vec::with_capacity(map.len());
+                for (id, command) in map {
+                    // A name that is no provider is a typo: the provider
+                    // meant would silently stay on `STAT`.
+                    if !providers.iter().any(|p| p.id == id) {
+                        return Err(invalid());
+                    }
+                    out.push((id, SizeCommand::parse(&command).ok_or_else(invalid)?));
+                }
+                out
+            }
+        };
+        Ok(VerifyConfig {
+            mode,
+            sample_ppm,
+            escalate_secs,
+            size_commands,
+        })
+    }
+}
+
+/// A decimal number of percent, `0` to `100` with up to four decimals,
+/// in parts per million.
+fn percent_ppm(v: &str) -> Option<u32> {
+    let (whole, frac) = v.split_once('.').unwrap_or((v, ""));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || whole.len() > 3 || frac.len() > 4 || (!frac.is_empty() && !digits(frac)) {
+        return None;
+    }
+    if v.contains('.') && frac.is_empty() {
+        return None;
+    }
+    let whole: u32 = whole.parse().ok()?;
+    let frac: u32 = format!("{frac:0<4}").parse().ok()?;
+    let ppm = whole.checked_mul(10_000)?.checked_add(frac)?;
+    (ppm <= 1_000_000).then_some(ppm)
 }
 
 /// An optional number in `min..=max`; unset or empty = `default`.
@@ -658,6 +792,7 @@ impl BridgeConfig {
             *pool = pool.trim().to_lowercase();
         }
         validate_providers(&providers, dev, required_backbones)?;
+        let verify = VerifyConfig::from_env(&get, &providers, dev)?;
 
         let admin_token = required(&get, "ADMIN_TOKEN")?;
         if admin_token.len() < MIN_ADMIN_TOKEN_LEN {
@@ -678,6 +813,7 @@ impl BridgeConfig {
             required_backbones,
             safety_min_age_secs,
             verify_delay_secs,
+            verify,
             post_sockets,
             cold_sockets,
             propagation_grace_secs,

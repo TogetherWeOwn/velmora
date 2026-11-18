@@ -96,7 +96,7 @@ use crate::types::{
     IntentFence, IntentStats, JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload,
     OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig, ProviderFault,
     ProviderLoad, Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow,
-    VerificationRow, WriteId,
+    VerificationRow, VerifyEscalation, WriteId,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -526,7 +526,23 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(self, l, required, counting, evidence_json, now).await
+        outbox::begin_release(self, l, required, counting, evidence_json, now, true).await
+    }
+    async fn begin_release_light(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        now: UnixMs,
+    ) -> Result<Guard<()>> {
+        outbox::begin_release(self, l, required, counting, evidence_json, now, false).await
+    }
+    async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {
+        outbox::escalate_verify(self, e).await
+    }
+    async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>> {
+        outbox::verify_escalations(self, now).await
     }
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await

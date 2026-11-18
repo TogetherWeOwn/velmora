@@ -173,6 +173,7 @@ impl Fx {
             get_fanout_bytes: None,
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
+            verify: Default::default(),
             providers,
             admin_token: Secret::new(TOKEN.to_string()),
         };

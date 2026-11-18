@@ -24,6 +24,35 @@ REQUIRED_BACKBONES = "2"
 # still hold it when the release job reads them again.
 SAFETY_MIN_AGE_SECS = "86400"
 VERIFY_DELAY_SECS = "120"
+# How the verify stage checks an extent: body | light.
+# body: every article is read in full (BODY) on one backbone that counts
+# and asked for (STAT) on the others.
+# light: every article is asked for (STAT) on every backbone that counts,
+# and its size as the provider reports it is held against the size of the
+# article that was posted; a sample of the extents is read in full as
+# under body. The sample is drawn from the extent id under a key derived
+# from the active KEK, so a retry draws the same answer. A full read that
+# fails on a backbone that still lists the article puts that backbone
+# under full reads for every extent for VERIFY_ESCALATE_SECS, logs an
+# alert, and shows in the cron report as `verify_escalated`.
+# Both ways keep REQUIRED_BACKBONES, SAFETY_MIN_AGE_SECS and the STAT of
+# every article at release. The value is read by the job that runs, so
+# Workers of both values may run side by side: an extent verified under
+# body is released by either, one verified under light is read in full
+# before a Worker under body releases it.
+# Companions of light, all optional:
+#   VERIFY_SAMPLE_PERCENT  extents read in full, default 2; below 1 is
+#                          refused outside dev.
+#   VERIFY_ESCALATE_SECS   default 86400, from 60 to 2592000.
+#   VERIFY_SIZE_COMMANDS   a JSON object of provider id to hdr | over |
+#                          head: the command that returns the size of an
+#                          article by message-id on that provider (HDR
+#                          :bytes, OVER, or HEAD and its Bytes or
+#                          X-Received-Bytes header). A provider without
+#                          an entry, or an article whose answer carries
+#                          no size, is checked with STAT alone, and the
+#                          verification row says which it was.
+# Without VERIFY_MODE the stage runs as body.
 # One group per article, drawn at random. Each was posted to from every
 # posting account and read back by message-id on every account.
 NEWSGROUPS = "alt.binaries.boneless,alt.binaries.misc,alt.binaries.multimedia,alt.binaries.test"

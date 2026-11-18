@@ -198,6 +198,12 @@ impl NntpSession for CountedSession {
         end(&self.slow);
         found
     }
+    async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
+        begin(&self.slow, "size");
+        let found = NntpSession::size(self.client(), message_id, how).await;
+        end(&self.slow);
+        found
+    }
     async fn quit(mut self) {
         if let Some(client) = self.inner.take() {
             NntpSession::quit(client).await;
@@ -342,6 +348,8 @@ pub struct MemCatalog {
     pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
     /// `provider_failed` calls so far (strikes reported).
     pub failures_reported: Cell<u32>,
+    /// The backbones read in full for a while, as `verify_escalations`.
+    pub escalations: RefCell<Vec<VerifyEscalation>>,
 }
 
 impl MemCatalog {
@@ -419,21 +427,82 @@ impl MemCatalog {
         Self::latest_rows(e, |_| true)
     }
 
-    /// As the SQL catalogue: per backbone, the latest `BODY` row, pass
+    /// As the SQL catalogue: per backbone, the latest full read, pass
     /// or failure. `counts` only where it is a complete pass and no
     /// later check of that backbone failed; a later `STAT` pass does not
-    /// hide it.
+    /// hide it. Then the latest size check that found a wrong size, where
+    /// no full read came after it (never `counts`).
     fn body_checks(e: &Entry) -> Vec<BackboneStatus> {
-        let deciding =
-            |v: &VerificationRow| v.kind == VerifyKind::Body || v.result != VerifyResult::Ok;
+        let deciding = |v: &VerificationRow| v.kind.is_full() || v.result != VerifyResult::Ok;
         let on_record = Self::latest_rows(e, deciding);
-        let mut rows = Self::latest_rows(e, |v| v.kind == VerifyKind::Body);
+        let mut rows = Self::latest_rows(e, |v| v.kind.is_full());
         for row in &mut rows {
             row.counts &= on_record
                 .iter()
-                .any(|s| s.backbone == row.backbone && s.kind == VerifyKind::Body && s.counts);
+                .any(|s| s.backbone == row.backbone && s.kind.is_full() && s.counts);
         }
+        let wrong_size =
+            |v: &VerificationRow| v.kind == VerifyKind::Size && v.result == VerifyResult::Corrupt;
+        for mut size in Self::latest_rows(e, wrong_size) {
+            let read_since = |b: &BackboneStatus| {
+                b.backbone == size.backbone && b.verified_at > size.verified_at
+            };
+            if !rows.iter().any(read_since) {
+                size.counts = false;
+                rows.push(size);
+            }
+        }
+        rows.sort_by(|a, b| (&a.backbone, a.verified_at).cmp(&(&b.backbone, b.verified_at)));
         rows
+    }
+
+    /// The release guard, with the full check on record asked for or not.
+    fn release(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        need_full: bool,
+    ) -> Guard<()> {
+        let applied = self.fenced(l, |e| {
+            // As the SQL guard: only rows recorded under this claim.
+            let claimed = e.outbox.claimed_at;
+            let statuses = Self::statuses(e);
+            // A fresh pass is the full check only where a full read
+            // is on record, and counts for nothing where the last check
+            // of the bytes failed.
+            let checks = Self::body_checks(e);
+            let failed = |s: &BackboneStatus| {
+                checks.iter().any(|b| {
+                    b.backbone == s.backbone
+                        && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+                })
+            };
+            let full = |s: &BackboneStatus| {
+                checks
+                    .iter()
+                    .any(|b| b.backbone == s.backbone && b.kind.is_full() && b.counts)
+            };
+            let passes = statuses
+                .iter()
+                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
+                .map(|s| match full(s) {
+                    true => (s.backbone.as_str(), VerifyKind::Body),
+                    false => (s.backbone.as_str(), VerifyKind::Stat),
+                });
+            if !velmora_bridge::verify::release_rule(passes, counting, required, need_full) {
+                return false;
+            }
+            e.job.extent.safety_state = SafetyState::Releasing;
+            e.job.extent.release_evidence = Some(evidence_json.to_string());
+            true
+        });
+        if applied == Some(true) {
+            Guard::Applied(())
+        } else {
+            Guard::Lost
+        }
     }
 
     /// The latest row per backbone for the current plan among `rows`.
@@ -646,7 +715,7 @@ impl Catalog for MemCatalog {
                 return false;
             }
             e.verifications.push(v.clone());
-            if v.result == VerifyResult::Ok && v.kind == VerifyKind::Body {
+            if v.result == VerifyResult::Ok && v.kind.is_full() {
                 e.job.extent.last_verified_at = Some(v.verified_at);
             }
             true
@@ -676,40 +745,33 @@ impl Catalog for MemCatalog {
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
-        let applied = self.fenced(l, |e| {
-            // As the SQL guard: only rows recorded under this claim.
-            let claimed = e.outbox.claimed_at;
-            let statuses = Self::statuses(e);
-            // A fresh pass is the full check only where a `BODY` pass
-            // is on record.
-            // is on record, and counts for nothing where the last full
-            // read failed.
-            let checks = Self::body_checks(e);
-            let last = |s: &BackboneStatus| checks.iter().find(|b| b.backbone == s.backbone);
-            let failed = |s: &BackboneStatus| {
-                last(s).is_some_and(|b| {
-                    b.result != VerifyResult::Ok || b.articles_ok != b.articles_total
-                })
-            };
-            let passes = statuses
-                .iter()
-                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
-                .map(|s| match last(s).is_some_and(|b| b.counts) {
-                    true => (s.backbone.as_str(), VerifyKind::Body),
-                    false => (s.backbone.as_str(), VerifyKind::Stat),
-                });
-            if !velmora_bridge::verify::releasable(passes, counting, required) {
-                return false;
-            }
-            e.job.extent.safety_state = SafetyState::Releasing;
-            e.job.extent.release_evidence = Some(evidence_json.to_string());
-            true
-        });
-        Ok(if applied == Some(true) {
-            Guard::Applied(())
-        } else {
-            Guard::Lost
-        })
+        Ok(self.release(l, required, counting, evidence_json, true))
+    }
+
+    async fn begin_release_light(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        _: UnixMs,
+    ) -> Result<Guard<()>> {
+        Ok(self.release(l, required, counting, evidence_json, false))
+    }
+
+    async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {
+        let mut all = self.escalations.borrow_mut();
+        match all.iter_mut().find(|o| o.backbone == e.backbone) {
+            Some(old) if e.until > old.until => *old = e.clone(),
+            Some(_) => {}
+            None => all.push(e.clone()),
+        }
+        Ok(())
+    }
+
+    async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>> {
+        let all = self.escalations.borrow();
+        Ok(all.iter().filter(|e| e.until > now).cloned().collect())
     }
 
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
@@ -1534,6 +1596,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         get_fanout_bytes: None,
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
+        verify: Default::default(),
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
     };

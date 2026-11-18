@@ -1118,11 +1118,9 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     let paused = bridge.cfg.release_paused().is_some();
     let on_usenet = |x: &crate::types::ExtentStatus| {
         !paused
-            && x.backbones.iter().any(|b| {
-                b.counts
-                    && b.kind == crate::types::VerifyKind::Body
-                    && configured.contains(&label(&b.backbone))
-            })
+            && x.backbones
+                .iter()
+                .any(|b| b.counts && b.kind.is_full() && configured.contains(&label(&b.backbone)))
     };
 
     let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);

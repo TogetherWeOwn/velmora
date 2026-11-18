@@ -20,8 +20,8 @@ use crate::types::{
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
     OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig,
-    ProviderFault, ProviderLoad, Resend, SafetyState, UnixMs, UploadId, UploadListQuery,
-    UploadPartRow, UploadRow, VerificationRow, WriteId,
+    ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs, UploadId,
+    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -202,6 +202,18 @@ pub enum BodyOutcome {
     Missing,
 }
 
+/// Result of one size command ([`NntpSession::size`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeOutcome {
+    /// `430`; the session stays usable.
+    Missing,
+    /// The provider has the article. `Some` = the size in bytes it
+    /// reported for it; `None` = it reported none (the command is not
+    /// supported, or the article has no such header), so nothing more
+    /// than a `STAT` is known.
+    Present(Option<u64>),
+}
+
 /// One authenticated NNTP session. Blanket impl for
 /// `velmora::nntp::NntpClient<T: Transport>` lands with the poster lane.
 ///
@@ -216,6 +228,16 @@ pub trait NntpSession {
     ) -> Result<velmora::nntp::PostOutcome>;
     /// `false` = 430.
     async fn stat(&mut self, message_id: &str) -> Result<bool>;
+    /// Asks whether the article is there and for the size the provider
+    /// reports for it, with `how`. A session that has no such command
+    /// asks with `STAT`: present, size unknown.
+    async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
+        let _ = how;
+        Ok(match self.stat(message_id).await? {
+            true => SizeOutcome::Present(None),
+            false => SizeOutcome::Missing,
+        })
+    }
     /// One `body_to`; appends to `out`.
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome>;
     async fn quit(self);
@@ -890,6 +912,27 @@ pub trait Catalog {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>>;
+    /// [`Catalog::begin_release`] under the light check
+    /// (`VERIFY_MODE=light`) for an extent that is not in the sample and
+    /// has no backbone under full reads: the same guard without the
+    /// full check on record. `required` backbones with a complete pass
+    /// under this claim are still needed, and none counts on a backbone
+    /// whose last check of the bytes failed.
+    async fn begin_release_light(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        now: UnixMs,
+    ) -> Result<Guard<()>>;
+    /// Notes that a full read of a sampled extent failed on `backbone`:
+    /// until `until` every extent is read in full there. An earlier end
+    /// never replaces a later one.
+    async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()>;
+    /// The backbones read in full for every extent at `now`
+    /// ([`Catalog::escalate_verify`]).
+    async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>>;
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third

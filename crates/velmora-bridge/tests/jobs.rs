@@ -288,6 +288,7 @@ impl Fx {
             get_fanout_bytes: None,
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
+            verify: Default::default(),
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         };
@@ -1167,6 +1168,37 @@ async fn dispatch_is_bounded() {
     assert_eq!(stats.dead, 1);
 }
 
+/// The cron report names the backbones that are read in full for every
+/// extent after a failed sample read, under the light check only, and
+/// only those that count toward a release.
+#[tokio::test]
+async fn dispatch_reports_the_backbones_under_full_reads() {
+    use velmora_bridge::config::VerifyMode;
+    let mut fx = Fx::new().await;
+    let now = fx.clock.now();
+    for (backbone, secs) in [("bb0", 3_600), ("gone", 3_600), ("bb0", 60)] {
+        let raised = VerifyEscalation {
+            backbone: backbone.to_string(),
+            until: now.plus_secs(secs),
+            raised_at: now,
+            extent_id: ExtentId::mint([9; 13]),
+            result: VerifyResult::Corrupt,
+        };
+        fx.bridge.catalog.escalate_verify(&raised).await.unwrap();
+    }
+    // Under `body` every extent is read in full anyway.
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!(report.verify_escalated, Vec::<String>::new());
+
+    fx.bridge.cfg.verify.mode = VerifyMode::Light;
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!(report.verify_escalated, ["bb0"]);
+    // When the period is over the report is empty again.
+    fx.clock.advance_secs(3_601);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!(report.verify_escalated, Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn dispatch_does_no_blob_or_nntp_io() {
     let fx = Fx::new().await;
@@ -1201,6 +1233,7 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             pack_failed: false,
             resend_post_secs: RESEND_SECS,
             resend_verify_secs: RESEND_SECS,
+            verify_escalated: Vec::new(),
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

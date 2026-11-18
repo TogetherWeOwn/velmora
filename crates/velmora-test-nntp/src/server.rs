@@ -124,6 +124,10 @@ struct Spool {
     /// The whole reply line of a login over the connection cap, when a
     /// test sets one; it overrides `limit_482`.
     limit_reply: Option<String>,
+    /// While set, the server reports a size for every article: a
+    /// `Bytes:` header in `HEAD`, and `HDR :bytes`. The value is the
+    /// stored length plus this difference.
+    reported_size: Option<i64>,
 }
 
 struct Shared {
@@ -155,6 +159,7 @@ impl Shared {
             body_gone: false,
             limit_482: false,
             limit_reply: None,
+            reported_size: None,
         };
         Self {
             config,
@@ -336,6 +341,17 @@ impl TestNntpServer {
     /// serves them (a provider whose `STAT` lags right after a `POST`).
     pub async fn set_stat_lag(&self, lag: bool) {
         self.shared.spool.lock().await.stat_lag = lag;
+    }
+
+    /// While `Some(d)`, the server reports a size for every article it
+    /// has: a `Bytes:` header at the end of a `HEAD`, and an answer to
+    /// `HDR :bytes <message-id>`. The size is the stored length plus
+    /// `d`, so `Some(0)` is a provider that reports what it stores and
+    /// any other value one whose stored article is not what was posted.
+    /// While `None` (the default) `HEAD` has no such header and `HDR` is
+    /// an unknown command.
+    pub async fn set_reported_size(&self, difference: Option<i64>) {
+        self.shared.spool.lock().await.reported_size = difference;
     }
 
     /// While set, `BODY` answers `430` for posted articles although `STAT`
@@ -693,9 +709,19 @@ async fn handle_connection(
                     _ => &article.raw,
                 };
                 let header_line = format!("{code} {} {}\r\n", article.number, article.message_id);
+                // A `HEAD` that reports the size: a `Bytes:` header after
+                // the stored ones, in place of the empty line.
+                let sized_head: Vec<u8>;
+                let mut payload = payload;
                 // Runtime hooks: a lagging STAT and a one-shot mid-body drop.
                 {
                     let mut spool = shared.spool.lock().await;
+                    if let (Some(d), "HEAD") = (spool.reported_size, cmd.as_str()) {
+                        let size = (article.raw.len() as i64).saturating_add(d).max(0);
+                        let stored = payload.strip_suffix(b"\r\n").unwrap_or(payload);
+                        sized_head = [stored, format!("Bytes: {size}\r\n").as_bytes()].concat();
+                        payload = &sized_head;
+                    }
                     if cmd.as_str() == "STAT" && spool.drop_stats > 0 {
                         spool.drop_stats -= 1;
                         break;
@@ -798,6 +824,26 @@ async fn handle_connection(
                         let _ = writer.write_all(b"441 Posting failed\r\n").await;
                     }
                 }
+            }
+            "HDR" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                // Only `HDR :bytes <message-id>`, and only while a test
+                // has switched the reported size on.
+                let reported = shared.spool.lock().await.reported_size;
+                let (field, id) = arg.split_once(' ').unwrap_or((arg.as_str(), ""));
+                let Some(d) = reported.filter(|_| field.eq_ignore_ascii_case(":bytes")) else {
+                    let _ = writer.write_all(b"500 Unknown command\r\n").await;
+                    continue;
+                };
+                let Some(article) = find_visible_by_id(&shared, &normalize_id(id)).await else {
+                    let _ = writer.write_all(b"430 No such article\r\n").await;
+                    continue;
+                };
+                let size = (article.raw.len() as i64).saturating_add(d).max(0);
+                let answer = format!("225 Header information follows\r\n0 {size}\r\n.\r\n");
+                let _ = writer.write_all(answer.as_bytes()).await;
             }
             "QUIT" => {
                 let _ = writer.write_all(b"205 Bye\r\n").await;

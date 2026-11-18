@@ -165,6 +165,24 @@ pub fn log_cold_reads(to: fn(&str)) {
     COLD_READS.with(|log| log.set(Some(to)));
 }
 
+thread_local! {
+    static ALERTS: std::cell::Cell<Option<fn(&str)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sends one line to `to` for each event an operator has to see: a
+/// failed full read of a sampled extent, for one. No key, bucket,
+/// message-id or host.
+pub fn log_alerts(to: fn(&str)) {
+    ALERTS.with(|log| log.set(Some(to)));
+}
+
+/// Hands the line to the log set with [`log_alerts`], if any.
+pub(crate) fn alert(line: impl FnOnce() -> String) {
+    if let Some(to) = ALERTS.with(std::cell::Cell::get) {
+        to(&line());
+    }
+}
+
 /// Hands the line to the log set with [`log_cold_reads`], if any.
 pub(crate) fn cold_read(line: impl FnOnce() -> String) {
     if let Some(to) = COLD_READS.with(std::cell::Cell::get) {

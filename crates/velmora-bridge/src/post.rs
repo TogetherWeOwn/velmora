@@ -48,14 +48,111 @@ use crate::plan::{draw, pack_seeded, StoredPlan};
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
-    NntpSession, Permit, PermitClass, LEASE_SECS, MAX_QUEUE_DELAY_SECS, NNTP_CALL_SECS,
-    PERMIT_SECS,
+    NntpSession, Permit, PermitClass, SizeOutcome, LEASE_SECS, MAX_QUEUE_DELAY_SECS,
+    NNTP_CALL_SECS, PERMIT_SECS,
 };
 use crate::recovery::write_stored_plan;
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
-    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, UnixMs, JOB_VERSION,
+    JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs, JOB_VERSION,
 };
+
+/// Asks a provider whether it has an article and for the size it reports
+/// for it ([`SizeCommand`]), in one command.
+///
+/// - `430`: [`SizeOutcome::Missing`].
+/// - The command's own `2xx`: the article is there. The size is taken
+///   only from an answer that is about this article: a `HEAD` whose
+///   reply line names the message-id, an `OVER` line whose message-id
+///   field is the one asked for, an `HDR` answer of exactly one line.
+///   An answer without a size that can be read is `Present(None)`.
+/// - Any other reply (the provider does not know the command, or wants a
+///   group first): the article is asked for with `STAT`, so the answer
+///   is `Present(None)` or `Missing`, or the session's own error.
+///
+/// An `Err` leaves the session in an unknown state: drop it.
+pub async fn stored_size<T: Transport>(
+    client: &mut NntpClient<T>,
+    message_id: &str,
+    how: SizeCommand,
+) -> Result<SizeOutcome> {
+    let plain = |c: char| c == '<' || c == '>' || c.is_whitespace() || c.is_control();
+    if message_id.is_empty() || message_id.chars().any(plain) {
+        return Err(BridgeError::Invalid("message-id"));
+    }
+    let (command, expect) = match how {
+        SizeCommand::Hdr => (format!("HDR :bytes <{message_id}>"), 225),
+        SizeCommand::Over => (format!("OVER <{message_id}>"), 224),
+        SizeCommand::Head => (format!("HEAD <{message_id}>"), 221),
+    };
+    let reply = client.raw_command(&command).await?;
+    if reply.code == 430 {
+        return Ok(SizeOutcome::Missing);
+    }
+    if reply.code != expect {
+        return Ok(match NntpSession::stat(client, message_id).await? {
+            true => SizeOutcome::Present(None),
+            false => SizeOutcome::Missing,
+        });
+    }
+    let mut block = Vec::new();
+    client.raw_dot_block(&mut block).await?;
+    let named = format!("<{message_id}>");
+    if how == SizeCommand::Head && !reply.text.split_whitespace().any(|w| w == named) {
+        // Not an answer about this article.
+        return Err(velmora::Error::Malformed("HEAD reply names another article".into()).into());
+    }
+    Ok(SizeOutcome::Present(reported_size(&block, &named, how)))
+}
+
+/// The size in the data block of a size command's answer, if it has one.
+/// `named` is the message-id in angle brackets.
+fn reported_size(block: &[u8], named: &str, how: SizeCommand) -> Option<u64> {
+    let text = core::str::from_utf8(block).ok()?;
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let number = |v: &str| {
+        let v = v.trim();
+        (!v.is_empty() && v.len() <= 15 && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse::<u64>().ok())
+            .flatten()
+    };
+    match how {
+        SizeCommand::Hdr => {
+            let mut lines = lines.filter(|l| !l.is_empty());
+            let (line, more) = (lines.next()?, lines.next());
+            let mut words = line.split_whitespace();
+            let (_, value, rest) = (words.next()?, words.next()?, words.next());
+            match (more, rest) {
+                (None, None) => number(value),
+                _ => None,
+            }
+        }
+        SizeCommand::Over => {
+            let fields: Vec<&str> = lines.next()?.split('\t').collect();
+            match fields.get(4).map(|f| f.trim()) == Some(named) {
+                true => number(fields.get(6)?),
+                false => None,
+            }
+        }
+        SizeCommand::Head => {
+            // The headers end at the first empty line. `Bytes:` is the
+            // provider's own count; `X-Received-Bytes:` came with the
+            // article.
+            let (mut own, mut carried) = (None, None);
+            for line in lines.by_ref().take_while(|l| !l.is_empty()) {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case("bytes") {
+                    own = own.or(Some(number(value)));
+                } else if name.eq_ignore_ascii_case("x-received-bytes") {
+                    carried = carried.or(Some(number(value)));
+                }
+            }
+            own.or(carried).flatten()
+        }
+    }
+}
 
 impl<T: Transport> NntpSession for NntpClient<T> {
     async fn post(&mut self, message_id: &str, article: &[u8]) -> Result<PostOutcome> {
@@ -68,6 +165,10 @@ impl<T: Transport> NntpSession for NntpClient<T> {
             Err(velmora::Error::ArticleNotFound(_)) => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
+        stored_size(self, message_id, how).await
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
@@ -1598,5 +1699,66 @@ async fn post_one<'a, C: Catalog, N: NntpConnector, T: Clock>(
             }) => return Err(Stop::fail(FailClass::DupUnconfirmed)),
             other => return Err(other.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NAMED: &str = "<a1@example.invalid>";
+
+    #[test]
+    fn head_takes_the_providers_own_size_first() {
+        let head = |block: &str| reported_size(block.as_bytes(), NAMED, SizeCommand::Head);
+        assert_eq!(head("Subject: x\r\nBytes: 744918\r\n"), Some(744_918));
+        assert_eq!(head("subject: x\nbytes:12\n"), Some(12));
+        // The size that came with the article, where the provider adds
+        // none of its own.
+        assert_eq!(head("X-Received-Bytes: 1883\r\nPath: a!b\r\n"), Some(1_883));
+        assert_eq!(
+            head("X-Received-Bytes: 1883\r\nBytes: 1900\r\n"),
+            Some(1_900)
+        );
+        // The first header of a name counts; one that is no number is no
+        // size, and the other name does not stand in for it.
+        assert_eq!(head("Bytes: 7\r\nBytes: 9\r\n"), Some(7));
+        assert_eq!(head("Bytes: many\r\nX-Received-Bytes: 5\r\n"), None);
+        assert_eq!(head("Bytes: -5\r\n"), None);
+        assert_eq!(head("Bytes: 1e3\r\n"), None);
+        assert_eq!(head("Bytes: 9999999999999999\r\n"), None);
+        assert_eq!(head("Subject: Bytes: 5\r\n"), None);
+        assert_eq!(head(""), None);
+        // Nothing after the header block is read.
+        assert_eq!(head("Subject: x\r\n\r\nBytes: 5\r\n"), None);
+        assert_eq!(reported_size(&[0xff, 0xfe], NAMED, SizeCommand::Head), None);
+    }
+
+    #[test]
+    fn hdr_takes_one_line_with_one_value() {
+        let hdr = |block: &str| reported_size(block.as_bytes(), NAMED, SizeCommand::Hdr);
+        assert_eq!(hdr("0 744918\r\n"), Some(744_918));
+        assert_eq!(hdr("3000234 12\r\n"), Some(12));
+        assert_eq!(hdr(""), None);
+        assert_eq!(hdr("0\r\n"), None);
+        assert_eq!(hdr("0 12 13\r\n"), None);
+        assert_eq!(hdr("0 twelve\r\n"), None);
+        // Two lines are not an answer about one article.
+        assert_eq!(hdr("1 12\r\n2 13\r\n"), None);
+    }
+
+    #[test]
+    fn over_takes_the_size_of_the_article_asked_for() {
+        let over = |block: &str| reported_size(block.as_bytes(), NAMED, SizeCommand::Over);
+        let line = |id: &str, bytes: &str| {
+            format!("0\tsubject\tfrom\tdate\t{id}\t\t{bytes}\t17\tXref: x\r\n")
+        };
+        assert_eq!(over(&line(NAMED, "744918")), Some(744_918));
+        // The line of another article says nothing about this one.
+        assert_eq!(over(&line("<other@example.invalid>", "744918")), None);
+        assert_eq!(over(&line(NAMED, "")), None);
+        assert_eq!(over(&line(NAMED, "big")), None);
+        assert_eq!(over("0\tsubject\r\n"), None);
+        assert_eq!(over(""), None);
     }
 }

@@ -55,10 +55,66 @@
 //!   provider of that backbone, under its stored message-id, while the
 //!   safety copy exists; the backbone is then read again.
 //! - A corrupt article is recorded at once.
+//!
+//! # The light check (`VERIFY_MODE=light`)
+//!
+//! An operator decision, taken because the full read of every extent is
+//! what bounds the verify stage. Under `light`, verify reads no `BODY`
+//! for most extents:
+//! - Every backbone that counts is asked for every article, with the
+//!   size command of its provider where it has one
+//!   (`VERIFY_SIZE_COMMANDS`, [`crate::types::SizeCommand`]) and with
+//!   `STAT` where it has none. A size command says that the article is
+//!   there and what size the provider reports for it; that size has to
+//!   be one the posted article can have ([`crate::fetch::size_bounds`]).
+//!   A pass where every article had a size that fits is recorded as
+//!   `size`; one where a size was missing is recorded as the `stat` pass
+//!   it is; a size that does not fit is recorded as `corrupt`.
+//! - A sample of the extents is read in full on one backbone, as above
+//!   (`sampled`). Which extents, and on which backbone, follows from the
+//!   extent id and a key derived from the active KEK ([`in_sample`]), so
+//!   a retry and the release job come to the same answer and a provider
+//!   cannot tell which articles will be read. The rate is
+//!   `VERIFY_SAMPLE_PERCENT`.
+//! - A backbone whose last check of the bytes failed (a full read, or a
+//!   size that did not fit) is read in full, as under `body`, and holds
+//!   no copy until that read passes.
+//! - A full read under `light` that finds an article corrupt, or missing
+//!   where `STAT` says it is there, raises the sample to every extent
+//!   for that backbone for `VERIFY_ESCALATE_SECS`
+//!   ([`Catalog::escalate_verify`]): the provider answered for bytes it
+//!   does not serve. The cron report names such backbones.
+//!
+//! The release under `light`:
+//! - The lease, the minimum age, the `STAT` of every article on every
+//!   backbone in the release job, and `REQUIRED_BACKBONES` distinct
+//!   backbones that hold every article are as under `body`.
+//! - An extent in the sample needs the full check on record, as under
+//!   `body`. So does every extent while a backbone that counts is under
+//!   full reads, and that backbone holds a copy only with its own full
+//!   check on record.
+//! - An extent outside the sample is released without a full check
+//!   ([`Catalog::begin_release_light`]). What this gives up: for such an
+//!   extent no byte was read back from any provider. A provider that
+//!   answers for articles whose bytes it does not serve is found by the
+//!   sample, not for each extent.
+//!
+//! The two modes side by side (a rollout, a rollback): each job follows
+//! the mode of the Worker it runs in. A full check recorded under either
+//! mode counts under both. An extent verified under `light` and released
+//! under `body` has no full check on record, so it goes back to verify
+//! and is read in full.
 
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use serde::Serialize;
+use sha2::Sha256;
+use zeroize::Zeroizing;
 
-use crate::fetch::{job_holder, read_articles, stat_articles, ProviderSession, ReadTally};
+use crate::config::VerifyMode;
+use crate::fetch::{
+    job_holder, read_articles, size_articles, stat_articles, ProviderSession, ReadTally,
+};
 use crate::pool::Pool;
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, Lease, NntpConnector, PermitClass,
@@ -66,9 +122,9 @@ use crate::ports::{
 };
 use crate::post::{settle, settle_at, Stop};
 use crate::types::{
-    ArticleRow, ArticleState, BackboneStatus, ExtentRow, FailClass, GenerationState, Job,
-    JobExtent, JobOutcome, OutboxStage, ProviderConfig, SafetyState, UnixMs, VerificationRow,
-    VerifyKind, VerifyResult, JOB_VERSION,
+    ArticleRow, ArticleState, BackboneStatus, ExtentId, ExtentRow, FailClass, GenerationState, Job,
+    JobExtent, JobOutcome, KekBytes, OutboxStage, ProviderConfig, SafetyState, SizeCommand, UnixMs,
+    VerificationRow, VerifyEscalation, VerifyKind, VerifyResult, JOB_VERSION,
 };
 
 /// Waits before a backbone with missing articles is read again. After the
@@ -94,6 +150,66 @@ struct Evidence<'a> {
     ok: u32,
     total: u32,
     plan_rev: u32,
+    /// For a `size` entry: the command the size was asked with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_command: Option<SizeCommand>,
+}
+
+const SAMPLE_KEY_INFO: &[u8] = b"velmora/verify-sample/v1";
+/// The sample is drawn in parts per million.
+const SAMPLE_SCALE: u64 = 1_000_000;
+
+/// The draw of an extent for the sample of the light check:
+/// HMAC-SHA256 of its id under a key derived from `kek` (HKDF-SHA256).
+/// It depends on nothing else, so every job comes to the same answer for
+/// an extent while the active KEK is the same. Without the key the
+/// sample cannot be told from the ids.
+fn sample_draw(kek: &KekBytes, extent: &ExtentId) -> [u8; 32] {
+    let mut key = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(None, kek.expose())
+        .expand(SAMPLE_KEY_INFO, key.as_mut())
+        .expect("HKDF-SHA256 output of 32 bytes");
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&key[..])
+        .expect("HMAC-SHA256 takes a key of any length");
+    mac.update(extent.as_str().as_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+fn draw_word(draw: &[u8; 32], at: usize) -> u64 {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&draw[at..at + 8]);
+    u64::from_be_bytes(word)
+}
+
+/// Whether `extent` is in the sample that the light check reads in full,
+/// at a rate of `ppm` parts per million.
+pub fn in_sample(kek: &KekBytes, extent: &ExtentId, ppm: u32) -> bool {
+    draw_word(&sample_draw(kek, extent), 0) % SAMPLE_SCALE < u64::from(ppm)
+}
+
+/// Which of `backbones` backbones (an index below it) a sampled extent
+/// is read in full on. It is drawn too, so every backbone is sampled.
+pub fn sample_backbone(kek: &KekBytes, extent: &ExtentId, backbones: usize) -> usize {
+    let count = u64::try_from(backbones.max(1)).unwrap_or(u64::MAX);
+    // Below `backbones`, so it fits a `usize`.
+    (draw_word(&sample_draw(kek, extent), 8) % count) as usize
+}
+
+/// What the light check asks for one extent.
+struct Light {
+    /// The extent is in the sample.
+    sampled: bool,
+    /// Index of the backbone a sampled extent is read in full on.
+    sample_index: usize,
+    /// The backbones that count and are read in full for every extent.
+    escalated: Vec<String>,
+}
+
+impl Light {
+    /// Whether a release of this extent needs the full check on record.
+    fn need_full(&self) -> bool {
+        self.sampled || !self.escalated.is_empty()
+    }
 }
 
 /// A backbone label as it is compared and recorded: trimmed, lower case.
@@ -152,6 +268,19 @@ pub fn releasable<'a>(
     counting: &[String],
     required: u32,
 ) -> bool {
+    release_rule(passes, counting, required, true)
+}
+
+/// [`releasable`], with the full check asked for or not. `need_full` is
+/// false only under the light check, for an extent outside the sample:
+/// then `required` distinct backbones that count, each with a pass of
+/// any kind, are enough.
+pub fn release_rule<'a>(
+    passes: impl IntoIterator<Item = (&'a str, VerifyKind)>,
+    counting: &[String],
+    required: u32,
+    need_full: bool,
+) -> bool {
     let mut holding: Vec<String> = Vec::new();
     let mut full = false;
     for (backbone, kind) in passes {
@@ -159,12 +288,12 @@ pub fn releasable<'a>(
         if !counting.contains(&name) {
             continue;
         }
-        full |= kind == VerifyKind::Body;
+        full |= kind.is_full();
         if !holding.contains(&name) {
             holding.push(name);
         }
     }
-    required > 0 && full && holding.len() >= required as usize
+    required > 0 && (full || !need_full) && holding.len() >= required as usize
 }
 
 fn result_of(tally: &ReadTally) -> VerifyResult {
@@ -238,9 +367,52 @@ where
             .plus_secs(self.cfg.safety_min_age_secs)
     }
 
+    /// What the light check asks for `extent`; `None` under
+    /// `VERIFY_MODE=body`. `labels` are the backbones that count.
+    async fn light(&self, extent: &ExtentRow, labels: &[String]) -> Staged<Option<Light>> {
+        if self.cfg.verify.mode != VerifyMode::Light {
+            return Ok(None);
+        }
+        let (_, kek) = self.kek.active();
+        let raised = self.catalog.verify_escalations(self.clock.now()).await?;
+        let escalated = raised
+            .into_iter()
+            .map(|e| label(&e.backbone))
+            .filter(|name| labels.contains(name))
+            .collect();
+        Ok(Some(Light {
+            sampled: in_sample(kek, &extent.id, self.cfg.verify.sample_ppm),
+            sample_index: sample_backbone(kek, &extent.id, labels.len()),
+            escalated,
+        }))
+    }
+
+    /// Whether a group of providers has a size command at all.
+    fn has_size_command(&self, providers: &[&ProviderConfig]) -> bool {
+        let known = |p: &&ProviderConfig| self.cfg.verify.size_command(&p.id).is_some();
+        providers.iter().any(known)
+    }
+
+    /// The kind a pass that was asked for as `asked` is recorded as. A
+    /// size pass is one only if every article that is there had a size:
+    /// one that fits, or one that does not (then the result is
+    /// `corrupt`). Without a size it is the `STAT` pass it was.
+    fn recorded_kind(asked: VerifyKind, tally: &ReadTally) -> VerifyKind {
+        match asked {
+            VerifyKind::Size if tally.corrupt.is_empty() => {
+                match tally.ok > 0 && tally.sized == tally.ok {
+                    true => VerifyKind::Size,
+                    false => VerifyKind::Stat,
+                }
+            }
+            asked => asked,
+        }
+    }
+
     /// Checks every article on one backbone, with `BODY` and the payload
-    /// hash or with `STAT` (`kind`), through its first provider in pool
-    /// order with a free slot. Providers that still retain the
+    /// hash, with the provider's size command, or with `STAT` (`kind`),
+    /// through its first provider in pool order with a free slot. A
+    /// provider without a size command answers a size pass with `STAT`. Providers that still retain the
     /// oldest article are preferred; when none does, the others answer,
     /// because a result needs a read.
     async fn read_backbone<'p>(
@@ -283,10 +455,14 @@ where
                 continue;
             };
             let tally = match kind {
-                VerifyKind::Body => {
+                VerifyKind::Body | VerifyKind::Sampled => {
                     read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
                 }
                 VerifyKind::Stat => stat_articles(&mut session, Some(lease), &rows).await,
+                VerifyKind::Size => match self.cfg.verify.size_command(&provider.id) {
+                    Some(how) => size_articles(&mut session, Some(lease), &rows, how).await,
+                    None => stat_articles(&mut session, Some(lease), &rows).await,
+                },
             };
             session.close().await;
             match tally {
@@ -446,8 +622,60 @@ where
         Ok(Some(wait.min(left.max(1))))
     }
 
-    /// Whether the last `BODY` read of `backbone` for the current plan is
-    /// on record as a failure.
+    /// A full read under the light check failed on `backbone`: decides
+    /// whether the provider answered for bytes it does not serve, and if
+    /// so raises the sample to every extent there for a while.
+    ///
+    /// A corrupt article is that at once. A missing one is that only if
+    /// the backbone says with `STAT` that it has it: an article that is
+    /// simply not there is found by every check, the light one too.
+    async fn sample_failed(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+        plan: &[ArticleRow],
+        providers: &[&ProviderConfig],
+        backbone: &str,
+        tally: &ReadTally,
+    ) -> Staged<()> {
+        let mut result = VerifyResult::Corrupt;
+        if tally.corrupt.is_empty() {
+            let gone: Vec<ArticleRow> = plan
+                .iter()
+                .filter(|a| tally.missing.contains(&a.idx))
+                .cloned()
+                .collect();
+            let (_, stat) = self
+                .read_backbone(lease, &gone, providers, VerifyKind::Stat)
+                .await?;
+            if stat.ok == 0 {
+                return Ok(());
+            }
+            result = VerifyResult::Missing;
+        }
+        let now = self.clock.now();
+        let raised = VerifyEscalation {
+            backbone: backbone.to_string(),
+            until: now.plus_secs(self.cfg.verify.escalate_secs),
+            raised_at: now,
+            extent_id: extent.id.clone(),
+            result,
+        };
+        self.catalog.escalate_verify(&raised).await?;
+        crate::trace::alert(|| {
+            format!(
+                "verify: full read of a sampled extent failed ({}) on backbone {backbone}; \
+                 every extent is read in full there for {} s",
+                result.as_str(),
+                self.cfg.verify.escalate_secs
+            )
+        });
+        Ok(())
+    }
+
+    /// Whether the last check of the bytes of `backbone` for the current
+    /// plan is on record as a failure: a full read, or a size that did
+    /// not fit ([`Catalog::body_checks`]).
     async fn full_read_failed(&self, extent: &ExtentRow, backbone: &str) -> Staged<bool> {
         let checks = self.catalog.body_checks(&extent.id).await?;
         Ok(checks.iter().any(|b| {
@@ -471,6 +699,8 @@ where
         let groups = release_backbones(&self.cfg.providers);
         let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
         let first = (lease.cursor / CURSOR_STEPS) as usize;
+        let light = self.light(extent, &labels).await?;
+        let need_full = light.as_ref().is_none_or(Light::need_full);
 
         for (index, (name, providers)) in groups.iter().enumerate().skip(first) {
             // The retries used count for the backbone the row names;
@@ -484,12 +714,25 @@ where
             // release takes no `STAT` answer from it until it has passed
             // one, so `STAT` here would send the extent round for ever.
             let mut kind = VerifyKind::Body;
-            if index > 0 {
+            if let Some(light) = &light {
+                // The light check: a full read only where the last check
+                // of the bytes failed, where the backbone is under full
+                // reads, and for the sample; the size or `STAT` else.
+                kind = if self.full_read_failed(extent, name).await? {
+                    VerifyKind::Body
+                } else if light.escalated.contains(name)
+                    || (light.sampled && index == light.sample_index)
+                {
+                    VerifyKind::Sampled
+                } else if self.has_size_command(providers) {
+                    VerifyKind::Size
+                } else {
+                    VerifyKind::Stat
+                };
+            } else if index > 0 {
                 let status = self.catalog.backbone_status(&extent.id).await?;
                 let full = |s: &BackboneStatus| {
-                    s.counts
-                        && s.kind == VerifyKind::Body
-                        && labels[..index].contains(&label(&s.backbone))
+                    s.counts && s.kind.is_full() && labels[..index].contains(&label(&s.backbone))
                 };
                 if status.iter().any(full) && !self.full_read_failed(extent, name).await? {
                     kind = VerifyKind::Stat;
@@ -517,7 +760,14 @@ where
                 }
                 *reached = stored;
             }
-            self.record(lease, extent, provider, &tally, kind).await?;
+            let kind = Self::recorded_kind(kind, &tally);
+            let row = self.record(lease, extent, provider, &tally, kind).await?;
+            if light.is_some() && kind.is_full() && row.result != VerifyResult::Ok {
+                // Recorded first: the failure stands whatever comes of
+                // this.
+                self.sample_failed(lease, extent, &plan, providers, name, &tally)
+                    .await?;
+            }
             // The next backbone is read by this job, under the same
             // claim. Its resume point is stored only if the job stops
             // before the round is over.
@@ -541,7 +791,7 @@ where
             .filter(|s| s.counts)
             .map(|s| (s.backbone.as_str(), s.kind));
         let now = self.clock.now();
-        if releasable(passes, &labels, self.cfg.required_backbones) {
+        if release_rule(passes, &labels, self.cfg.required_backbones, need_full) {
             // Read again: a repost by this job stamped its articles after
             // the plan was loaded. The release job reads the plan itself
             // and is the gate; this only keeps the due time right.
@@ -563,7 +813,7 @@ where
         if status.iter().any(|s| !s.counts) || status.len() < groups.len() || status.is_empty() {
             return self.round_failed(lease, FailClass::MissingPending).await;
         }
-        if !status.iter().any(|s| s.kind == VerifyKind::Body) {
+        if need_full && !status.iter().any(|s| s.kind.is_full()) {
             // Passes, but none of them the full check: read again.
             return self.round_failed(lease, FailClass::Internal).await;
         }
@@ -630,14 +880,32 @@ where
         // A backbone whose last full read failed holds no copy, whatever
         // it answers to `STAT`, until verify reads it in full again.
         let (full, failed): (Vec<_>, Vec<_>) = checks.into_iter().partition(|b| b.counts);
-        let failed: Vec<String> = failed
+        let mut failed: Vec<String> = failed
             .iter()
             .filter(|b| b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
             .map(|b| label(&b.backbone))
             .collect();
-        if full.is_empty() {
+        // The light check asks for the full check only for the sample
+        // and while a backbone is under full reads; `body` always does.
+        let light = self.light(extent, &labels).await?;
+        let need_full = light.as_ref().is_none_or(Light::need_full);
+        if need_full && full.is_empty() {
             return self.back_to_verify(lease, now, 0).await;
         }
+        // A backbone under full reads holds a copy only with its own
+        // full check on record.
+        for name in light.iter().flat_map(|l| &l.escalated) {
+            let read = full.iter().any(|b| label(&b.backbone) == *name);
+            if !read && !failed.contains(name) {
+                failed.push(name.clone());
+            }
+        }
+        // What verify recorded last for each backbone, for the evidence:
+        // read before this job's own rows hide it.
+        let mut verified = self.catalog.backbone_status(&extent.id).await?;
+        verified.retain(|s| {
+            s.counts && s.kind == VerifyKind::Size && labels.contains(&label(&s.backbone))
+        });
         // Presence: only what this job finds now counts. Every backbone
         // that counts is asked with `STAT`, and no `BODY` is read: one
         // that lacks the extent does not hold the release up while enough
@@ -665,7 +933,7 @@ where
                     true => (p.backbone.as_str(), VerifyKind::Body),
                     false => (p.backbone.as_str(), VerifyKind::Stat),
                 });
-        if !releasable(passes, &labels, required) {
+        if !release_rule(passes, &labels, required, need_full) {
             if read.iter().all(holds) {
                 return Err(Stop::Fail(FailClass::Internal, Some(REVERIFY_SECS)));
             }
@@ -694,6 +962,12 @@ where
             let name = label(&b.backbone);
             rows.iter().any(|r| r.backbone == name)
         });
+        // Then the size passes verify recorded on those backbones, each
+        // with the command its provider was asked with.
+        let on_record = on_record.chain(verified.iter().filter(|s| {
+            let name = label(&s.backbone);
+            rows.iter().any(|r| r.backbone == name)
+        }));
         let on_record = on_record.map(|b| Evidence {
             backbone: &b.backbone,
             provider: &b.provider_id,
@@ -702,6 +976,10 @@ where
             ok: b.articles_ok,
             total: b.articles_total,
             plan_rev: b.plan_rev,
+            size_command: match b.kind {
+                VerifyKind::Size => self.cfg.verify.size_command(&b.provider_id),
+                _ => None,
+            },
         });
         let evidence: Vec<Evidence<'_>> = rows
             .iter()
@@ -713,16 +991,26 @@ where
                 ok: r.articles_ok,
                 total: r.articles_total,
                 plan_rev: r.plan_rev,
+                size_command: None,
             })
             .chain(on_record)
             .collect();
         let evidence =
             serde_json::to_string(&evidence).map_err(|_| Stop::fail(FailClass::Internal))?;
-        match self
-            .catalog
-            .begin_release(lease, required, &labels, &evidence, self.clock.now())
-            .await?
-        {
+        let at = self.clock.now();
+        let begun = match need_full {
+            true => {
+                self.catalog
+                    .begin_release(lease, required, &labels, &evidence, at)
+                    .await?
+            }
+            false => {
+                self.catalog
+                    .begin_release_light(lease, required, &labels, &evidence, at)
+                    .await?
+            }
+        };
+        match begun {
             Guard::Applied(()) => self.finish_release(lease, extent).await,
             // The lease is gone or a newer result cancelled a pass. If the
             // lease still holds, the job comes back and reads again.

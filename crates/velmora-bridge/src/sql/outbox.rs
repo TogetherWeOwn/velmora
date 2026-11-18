@@ -17,7 +17,8 @@ use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, LEASE_SECS};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, BridgeError, Bucket, BucketId, DueRow, ExtentId,
     ExtentRow, ExtentState, FailClass, GenerationId, GenerationState, JobExtent, OutboxStage,
-    OutboxStats, Resend, Result, SafetyState, UnixMs, VerificationRow, VerifyKind, VerifyResult,
+    OutboxStats, Resend, Result, SafetyState, UnixMs, VerificationRow, VerifyEscalation,
+    VerifyKind, VerifyResult,
 };
 
 /// Lease length. Jobs renew on a timer and before each read article.
@@ -84,17 +85,21 @@ macro_rules! counts {
     };
 }
 
-/// Whether the last full read of the backbone of row `v` failed: its
-/// latest `body` row for the current plan of extent `e` is not a complete
-/// pass. A `STAT` answer says nothing about bytes that were read and
-/// found missing or wrong, so such a backbone holds no copy until it is
-/// read in full again.
+/// Whether the last check of the bytes on the backbone of row `v`
+/// failed, for the current plan of extent `e`: a full read (`body` row)
+/// that is not a complete pass, or a size check that found an article of
+/// the wrong size (`mode = 'size'`, `corrupt`), with no full read after
+/// it. A `STAT` answer, or a later size that fits, says nothing about
+/// bytes that were found missing or wrong, so such a backbone holds no
+/// copy until it is read in full again.
 macro_rules! body_failed {
     () => {
         "EXISTS (SELECT 1 FROM verifications f \
            WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
-             AND f.plan_rev = e.plan_rev AND f.kind = 'body' \
-             AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total) \
+             AND f.plan_rev = e.plan_rev \
+             AND ((f.kind = 'body' \
+                   AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total)) \
+               OR (f.mode = 'size' AND f.result = 'corrupt')) \
              AND NOT EXISTS (SELECT 1 FROM verifications g \
                WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
                  AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
@@ -727,7 +732,8 @@ pub(super) async fn record_verification<S: Sql>(
         SqlValue::Int(i64::from(v.articles_ok)),
         SqlValue::Int(i64::from(v.articles_total)),
         text(v.result.as_str()),
-        text(v.kind.as_str()),
+        text(v.kind.column()),
+        v.kind.mode_column().map_or(SqlValue::Null, text),
     ];
     let stmts = vec![
         (held_guard!(), lease_params(l, [])?),
@@ -740,15 +746,15 @@ pub(super) async fn record_verification<S: Sql>(
             // `body` pass says all the `stat` pass would. The tally of a
             // `STAT` goes to `articles_present` (see `tally!`).
             "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
-               plan_rev, articles_ok, articles_present, articles_total, result, kind) \
+               plan_rev, articles_ok, articles_present, articles_total, result, kind, mode) \
              VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
-               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9) \
+               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9, ?10) \
              ON CONFLICT(extent_id, backbone, verified_at) DO UPDATE SET \
                provider_id = excluded.provider_id, plan_rev = excluded.plan_rev, \
                articles_ok = excluded.articles_ok, \
                articles_present = excluded.articles_present, \
                articles_total = excluded.articles_total, \
-               result = excluded.result, kind = excluded.kind \
+               result = excluded.result, kind = excluded.kind, mode = excluded.mode \
              WHERE verifications.result = 'ok' \
                AND NOT (verifications.kind = 'body' AND excluded.kind = 'stat' \
                  AND excluded.result = 'ok')",
@@ -766,11 +772,18 @@ pub(super) async fn record_verification<S: Sql>(
                 SqlValue::Int(i64::from(v.articles_ok)),
                 SqlValue::Int(i64::from(v.articles_total)),
                 SqlValue::Int(i64::from(v.plan_rev)),
-                text(v.kind.as_str()),
+                text(v.kind.column()),
             ],
         ),
     ];
     fenced_batch(c, stmts).await
+}
+
+/// Reads the columns `kind`, `mode` of a verification row.
+pub(super) fn kind_of(r: &mut Cols) -> Result<VerifyKind> {
+    let (kind, mode) = (r.text()?, r.opt_text()?);
+    VerifyKind::from_columns(&kind, mode.as_deref())
+        .ok_or_else(|| BridgeError::Sql("unknown verification kind".into()))
 }
 
 /// Latest row per backbone for the extent's current plan. `counts` is true
@@ -785,7 +798,7 @@ pub(super) async fn backbone_status<S: Sql>(
     let sql = concat!(
         "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, ",
         tally!(),
-        ", v.articles_total, v.result, v.kind, ",
+        ", v.articles_total, v.result, v.kind, v.mode, ",
         counts!(),
         " FROM verifications v JOIN extents e ON e.id = v.extent_id \
          WHERE v.extent_id = ?1 AND ",
@@ -804,31 +817,38 @@ pub(super) async fn backbone_status<S: Sql>(
             articles_ok: r.num()?,
             articles_total: r.num()?,
             result: r.parsed(VerifyResult::parse)?,
-            kind: r.parsed(VerifyKind::parse)?,
+            kind: kind_of(&mut r)?,
             counts: r.num::<i64>()? != 0,
         });
     }
     Ok(out)
 }
 
-/// The last full read per backbone: its latest `body` row for the current
-/// plan, pass or failure. `counts` is true where that row is the full
-/// check on record ([`body_on_record`]).
+/// The last check of the bytes per backbone, for the current plan:
+/// - its latest `body` row, pass or failure. `counts` is true where that
+///   row is the full check on record ([`body_on_record`]);
+/// - its latest size check that found an article of the wrong size, if
+///   no full read came after it (kind `Size`, never `counts`).
+///
+/// A row here that is not a complete pass means the backbone holds no
+/// copy until it is read in full again ([`body_failed`]).
 pub(super) async fn body_checks<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<Vec<BackboneStatus>> {
     let sql = concat!(
         "SELECT b.backbone, b.provider_id, b.verified_at, b.plan_rev, b.articles_ok, \
-           b.articles_total, b.result, (",
+           b.articles_total, b.result, b.kind, b.mode, (b.kind = 'body' AND ",
         body_on_record!(),
         ") FROM verifications b JOIN extents e ON e.id = b.extent_id \
-         WHERE b.extent_id = ?1 AND b.plan_rev = e.plan_rev AND b.kind = 'body' \
+         WHERE b.extent_id = ?1 AND b.plan_rev = e.plan_rev \
+           AND (b.kind = 'body' OR (b.mode = 'size' AND b.result = 'corrupt')) \
            AND NOT EXISTS (SELECT 1 FROM verifications g \
              WHERE g.extent_id = b.extent_id AND g.backbone = b.backbone \
-               AND g.plan_rev = b.plan_rev AND g.kind = 'body' \
-               AND g.verified_at > b.verified_at) \
-         ORDER BY b.backbone"
+               AND g.plan_rev = b.plan_rev AND g.verified_at > b.verified_at \
+               AND (g.kind = 'body' OR (b.kind <> 'body' AND g.mode = 'size' \
+                 AND g.result = 'corrupt'))) \
+         ORDER BY b.backbone, b.verified_at"
     );
     let rows = c.sql.query(sql, &[text(extent.as_str())]).await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -842,7 +862,7 @@ pub(super) async fn body_checks<S: Sql>(
             articles_ok: r.num()?,
             articles_total: r.num()?,
             result: r.parsed(VerifyResult::parse)?,
-            kind: VerifyKind::Body,
+            kind: kind_of(&mut r)?,
             counts: r.num::<i64>()? != 0,
         });
     }
@@ -865,6 +885,10 @@ pub(super) async fn body_checks<S: Sql>(
 /// for every article. A pass on a backbone outside `counting` is not
 /// looked at. The lease must also be unexpired: an expired lease may
 /// be taken over at any moment. Anything else is `Lost`.
+///
+/// With `need_full` false (the light check, for an extent outside the
+/// sample) the second point is left out: the first one, the lease and
+/// the rest of the guard are the same.
 pub(super) async fn begin_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -872,6 +896,7 @@ pub(super) async fn begin_release<S: Sql>(
     counting: &[String],
     evidence_json: &str,
     now: UnixMs,
+    need_full: bool,
 ) -> Result<Guard<()>> {
     if l.stage != OutboxStage::Release || required == 0 {
         return Err(BridgeError::Invalid(
@@ -892,20 +917,25 @@ pub(super) async fn begin_release<S: Sql>(
               WHERE ",
         fresh_pass!(),
         ") < ?5 \
-         OR NOT EXISTS (SELECT 1 FROM verifications v JOIN extents e ON e.id = v.extent_id \
-              WHERE ",
+         OR (?8 = 1 AND NOT EXISTS (SELECT 1 FROM verifications v \
+              JOIN extents e ON e.id = v.extent_id WHERE ",
         fresh_pass!(),
         " AND EXISTS (SELECT 1 FROM verifications b \
                 WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
         body_on_record!(),
-        "))"
+        ")))"
     );
     let stmts = vec![
         (
             guard,
             lease_params(
                 l,
-                [SqlValue::Int(i64::from(required)), ms(now), text(&labels)],
+                [
+                    SqlValue::Int(i64::from(required)),
+                    ms(now),
+                    text(&labels),
+                    SqlValue::Int(i64::from(need_full)),
+                ],
             )?,
         ),
         (
@@ -915,6 +945,54 @@ pub(super) async fn begin_release<S: Sql>(
         ),
     ];
     super::uploads::guarded(c, stmts).await
+}
+
+/// See [`crate::ports::Catalog::escalate_verify`].
+pub(super) async fn escalate_verify<S: Sql>(c: &SqlCatalog<S>, e: &VerifyEscalation) -> Result<()> {
+    let stmt = (
+        "INSERT INTO verify_escalations(backbone, until, raised_at, extent_id, result) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(backbone) DO UPDATE SET until = excluded.until, \
+           raised_at = excluded.raised_at, extent_id = excluded.extent_id, \
+           result = excluded.result \
+         WHERE excluded.until > verify_escalations.until",
+        vec![
+            text(&e.backbone),
+            ms(e.until),
+            ms(e.raised_at),
+            text(e.extent_id.as_str()),
+            text(e.result.as_str()),
+        ],
+    );
+    c.sql.batch(vec![stmt]).await?;
+    Ok(())
+}
+
+/// See [`crate::ports::Catalog::verify_escalations`].
+pub(super) async fn verify_escalations<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+) -> Result<Vec<VerifyEscalation>> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT backbone, until, raised_at, extent_id, result FROM verify_escalations \
+             WHERE until > ?1 ORDER BY backbone",
+            &[ms(now)],
+        )
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut r = Cols::new(row);
+        out.push(VerifyEscalation {
+            backbone: r.text()?,
+            until: UnixMs(r.num()?),
+            raised_at: UnixMs(r.num()?),
+            extent_id: ExtentId::new(r.text()?),
+            result: r.parsed(VerifyResult::parse)?,
+        });
+    }
+    Ok(out)
 }
 
 /// `releasing` → `released`, row done. The safety copy stays in R2: from
