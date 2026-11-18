@@ -7,7 +7,7 @@ mod nntp_support;
 use nntp_support::*;
 use velmora_bridge::config::{VerifyConfig, VerifyMode};
 use velmora_bridge::fetch::size_bounds;
-use velmora_bridge::post::stored_size;
+use velmora_bridge::post::{stored_size, stored_sizes};
 use velmora_bridge::verify::{in_sample, sample_backbone, MISSING_BACKOFF_SECS, REVERIFY_SECS};
 use velmora_bridge::*;
 
@@ -753,6 +753,60 @@ async fn the_default_is_the_full_read_of_every_extent() {
         rig.checks(&s),
         [ok("bb0", VerifyKind::Body), ok("bb1", VerifyKind::Stat)]
     );
+    // And nothing is asked for together, at verify or at release.
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.state(&s), SafetyState::Released);
+    assert!(!events().contains(&"ask_many"));
+}
+
+/// Under the light check the articles of an extent are asked for in one
+/// call per provider, at verify and at release, and a call that breaks
+/// costs nothing but the round trip: its articles are asked one by one.
+#[tokio::test]
+async fn the_light_check_asks_for_an_extent_together() {
+    let rig = light_rig(0, &[("p0", SizeCommand::Head)]).await;
+    rig.servers[0].set_reported_size(Some(0)).await;
+    let together = || events().iter().filter(|e| **e == "ask_many").count();
+    let (s, plan) = rig.on_two(41).await;
+    let n = plan.len();
+
+    assert_eq!(rig.logged(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(rig.calls(), (0, n, n));
+    assert_eq!(together(), 2);
+    assert_eq!(
+        rig.checks(&s),
+        [ok("bb0", VerifyKind::Size), ok("bb1", VerifyKind::Stat)]
+    );
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.state(&s), SafetyState::Released);
+    assert_eq!(together(), 4);
+
+    // The connection of the second backbone closes on the first `STAT`
+    // of the call: every article is then asked on its own, on a new
+    // connection, and the answer is the same.
+    let (s, plan) = rig.on_two(42).await;
+    let n = plan.len();
+    rig.servers[1].drop_next_stats(1).await;
+    assert_eq!(rig.logged(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(together(), 6);
+    // The `STAT`s of the call that broke, and one for each article.
+    assert_eq!(rig.calls(), (0, 2 * n, n));
+    assert_eq!(
+        rig.checks(&s),
+        [ok("bb0", VerifyKind::Size), ok("bb1", VerifyKind::Stat)]
+    );
+
+    // An article missing in the middle of a call is missing, and the
+    // others are not.
+    let (s, plan) = rig.on_two(43).await;
+    rig.servers[1].hide(&plan[1].message_id).await;
+    let wait = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(wait, MISSING_BACKOFF_SECS[0]);
+    assert_eq!(rig.checks(&s), [ok("bb0", VerifyKind::Size)]);
+    assert_eq!(rig.stage(&s), OutboxStage::Verify);
+    assert_eq!(rig.state(&s), SafetyState::Held);
 }
 
 fn extent_id(n: u32) -> ExtentId {
@@ -908,11 +962,52 @@ async fn size_commands_against_a_server() {
     // The session is still in step after every answer.
     assert!(NntpSession::stat(&mut client, id).await.unwrap());
 
+    // Asked for together, the answers are those of one by one, in
+    // order, whatever the command and whatever the server has on offer.
+    let ids = [id, "gone@example.invalid", id, plan[1].message_id.as_str()];
+    for setting in 0..4 {
+        rig.server()
+            .set_reported_size((setting > 0).then_some(0))
+            .await;
+        rig.server().set_size_carried(setting == 2).await;
+        rig.server().set_over_empty(setting == 3).await;
+        for how in [None, Some(SizeCommand::Head), Some(SizeCommand::Hdr)]
+            .into_iter()
+            .chain([Some(SizeCommand::Over)])
+        {
+            let mut one_by_one = Vec::new();
+            for id in ids {
+                one_by_one.push(match how {
+                    Some(how) => stored_size(&mut client, id, how).await.unwrap(),
+                    None => match NntpSession::stat(&mut client, id).await.unwrap() {
+                        true => SizeOutcome::Present(None),
+                        false => SizeOutcome::Missing,
+                    },
+                });
+            }
+            let together = stored_sizes(&mut client, &ids, how).await.unwrap();
+            assert_eq!(together, one_by_one, "{setting} {how:?}");
+            assert_eq!(together[1], SizeOutcome::Missing);
+            assert_ne!(together[0], SizeOutcome::Missing);
+        }
+    }
+    assert!(stored_sizes(&mut client, &[], None)
+        .await
+        .unwrap()
+        .is_empty());
+    // The session is still in step.
+    assert!(NntpSession::stat(&mut client, id).await.unwrap());
+
     // A message-id that could carry a second command is refused before
-    // anything is sent.
+    // anything is sent, alone or among others.
     for bad in ["", "a b@x", "a>\r\nQUIT", "<a@x>"] {
         let refused = stored_size(&mut client, bad, SizeCommand::Head).await;
         assert!(refused.is_err(), "{bad:?}");
+        for how in [None, Some(SizeCommand::Head)] {
+            let refused = stored_sizes(&mut client, &[id, bad], how).await;
+            assert!(refused.is_err(), "{bad:?}");
+        }
     }
+    assert!(NntpSession::stat(&mut client, id).await.unwrap());
     client.quit().await;
 }

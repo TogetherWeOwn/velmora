@@ -76,45 +76,94 @@ pub async fn stored_size<T: Transport>(
     message_id: &str,
     how: SizeCommand,
 ) -> Result<SizeOutcome> {
+    let mut sizes = stored_sizes(client, &[message_id], Some(how)).await?;
+    sizes.pop().ok_or(BridgeError::Invalid("message-id"))
+}
+
+/// [`stored_size`] (or `STAT`, when `how` is `None`) for each of
+/// `message_ids`, in that order, with the commands written ahead of
+/// their replies: one round trip for all of them instead of one each.
+/// The answers are those of the commands sent one by one. The few that
+/// need a `STAT` after their own answer are asked again once every reply
+/// has been read.
+///
+/// An `Err` leaves the session in an unknown state, with replies that
+/// may still be on their way: drop it. No answer of the call counts.
+pub async fn stored_sizes<T: Transport>(
+    client: &mut NntpClient<T>,
+    message_ids: &[&str],
+    how: Option<SizeCommand>,
+) -> Result<Vec<SizeOutcome>> {
     let plain = |c: char| c == '<' || c == '>' || c.is_whitespace() || c.is_control();
-    if message_id.is_empty() || message_id.chars().any(plain) {
-        return Err(BridgeError::Invalid("message-id"));
+    // Before anything is written: a refused id must not leave commands
+    // with unread replies behind it.
+    for id in message_ids {
+        if id.is_empty() || id.chars().any(plain) {
+            return Err(BridgeError::Invalid("message-id"));
+        }
     }
-    let (command, expect) = match how {
-        SizeCommand::Hdr => (format!("HDR :bytes <{message_id}>"), 225),
-        SizeCommand::Over => (format!("OVER <{message_id}>"), 224),
-        SizeCommand::Head => (format!("HEAD <{message_id}>"), 221),
+    let Some(how) = how else {
+        let found = client.stat_many(message_ids).await?;
+        return Ok(found
+            .into_iter()
+            .map(|there| match there {
+                true => SizeOutcome::Present(None),
+                false => SizeOutcome::Missing,
+            })
+            .collect());
     };
-    let reply = client.raw_command(&command).await?;
-    if reply.code == 430 {
-        return Ok(SizeOutcome::Missing);
+    let (verb, expect) = match how {
+        SizeCommand::Hdr => ("HDR :bytes", 225),
+        SizeCommand::Over => ("OVER", 224),
+        SizeCommand::Head => ("HEAD", 221),
+    };
+    for id in message_ids {
+        client.raw_send(&format!("{verb} <{id}>")).await?;
     }
-    if reply.code != expect {
-        return Ok(match NntpSession::stat(client, message_id).await? {
-            true => SizeOutcome::Present(None),
-            false => SizeOutcome::Missing,
+    // `None` = to be asked with `STAT`.
+    let mut out: Vec<Option<SizeOutcome>> = Vec::with_capacity(message_ids.len());
+    let mut block = Vec::new();
+    for id in message_ids {
+        let reply = client.raw_reply().await?;
+        if reply.code == 430 {
+            out.push(Some(SizeOutcome::Missing));
+            continue;
+        }
+        if reply.code != expect {
+            out.push(None);
+            continue;
+        }
+        block.clear();
+        client.raw_dot_block(&mut block).await?;
+        let named = format!("<{id}>");
+        if how == SizeCommand::Head && !reply.text.split_whitespace().any(|w| w == named) {
+            // Not an answer about this article.
+            return Err(
+                velmora::Error::Malformed("HEAD reply names another article".into()).into(),
+            );
+        }
+        out.push(match reported_size(&block, &named, how) {
+            Some(Reported::Own(size)) => Some(SizeOutcome::Present(Some(size))),
+            Some(Reported::Carried(size)) => Some(SizeOutcome::Carried(size)),
+            // The headers of the article asked for: it is there.
+            None if how == SizeCommand::Head => Some(SizeOutcome::Present(None)),
+            // An `HDR` or `OVER` answer that cannot be tied to the
+            // article (no line, more than one, another message-id) does
+            // not say the article is there either: `STAT` does.
+            None => None,
         });
     }
-    let mut block = Vec::new();
-    client.raw_dot_block(&mut block).await?;
-    let named = format!("<{message_id}>");
-    if how == SizeCommand::Head && !reply.text.split_whitespace().any(|w| w == named) {
-        // Not an answer about this article.
-        return Err(velmora::Error::Malformed("HEAD reply names another article".into()).into());
+    let mut sizes = Vec::with_capacity(out.len());
+    for (id, answer) in message_ids.iter().zip(out) {
+        sizes.push(match answer {
+            Some(answer) => answer,
+            None => match NntpSession::stat(client, id).await? {
+                true => SizeOutcome::Present(None),
+                false => SizeOutcome::Missing,
+            },
+        });
     }
-    Ok(match reported_size(&block, &named, how) {
-        Some(Reported::Own(size)) => SizeOutcome::Present(Some(size)),
-        Some(Reported::Carried(size)) => SizeOutcome::Carried(size),
-        // The headers of the article asked for: it is there.
-        None if how == SizeCommand::Head => SizeOutcome::Present(None),
-        // An `HDR` or `OVER` answer that cannot be tied to the article
-        // (no line, more than one, another message-id) does not say the
-        // article is there either: `STAT` does.
-        None => match NntpSession::stat(client, message_id).await? {
-            true => SizeOutcome::Present(None),
-            false => SizeOutcome::Missing,
-        },
-    })
+    Ok(sizes)
 }
 
 /// A size in a provider's answer, and whose count it is.
@@ -193,6 +242,14 @@ impl<T: Transport> NntpSession for NntpClient<T> {
 
     async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
         stored_size(self, message_id, how).await
+    }
+
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        stored_sizes(self, message_ids, how).await
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {

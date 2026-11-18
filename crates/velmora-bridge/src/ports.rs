@@ -243,10 +243,39 @@ pub trait NntpSession {
             false => SizeOutcome::Missing,
         })
     }
+    /// The answers of [`stat`](Self::stat) (`how` is `None`: present
+    /// without a size, or missing) or of [`size`](Self::size) for each
+    /// of `message_ids`, in that order. A session may write the commands
+    /// ahead of their replies; the answers are the same as one by one.
+    /// It is one call: no more than [`ASK_MANY`] articles. After an
+    /// `Err` no answer counts and the session is dropped.
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        let mut out = Vec::with_capacity(message_ids.len());
+        for id in message_ids {
+            out.push(match how {
+                Some(how) => self.size(id, how).await?,
+                None => match self.stat(id).await? {
+                    true => SizeOutcome::Present(None),
+                    false => SizeOutcome::Missing,
+                },
+            });
+        }
+        Ok(out)
+    }
     /// One `body_to`; appends to `out`.
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome>;
     async fn quit(self);
 }
+
+/// Most articles in one [`NntpSession::ask_many`]: the articles of a
+/// whole extent of the largest size, so its check is one round trip per
+/// provider. The commands of that many are a few kilobytes, the answers
+/// (a header block each at most) well under a megabyte.
+pub const ASK_MANY: usize = 32;
 
 /// The longest one `connect`, `post`, `stat`, `body` or `quit` may take, whatever its
 /// per-operation timeouts add up to: a connector gives the call up with

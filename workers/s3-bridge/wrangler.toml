@@ -55,6 +55,9 @@ VERIFY_DELAY_SECS = "120"
 #                          presence. A provider without an entry, or an
 #                          answer without a size, is checked with STAT
 #                          alone. The verification row says which it was.
+# Under light the articles of an extent are asked for together on each
+# provider (the commands written ahead of their replies): a round trip
+# for an extent instead of one per article, at verify and at release.
 # A raised backbone is read in full for every extent stored before the
 # period ends, whenever its job runs, and counts at release only with
 # that full read on record.

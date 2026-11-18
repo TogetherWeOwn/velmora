@@ -204,6 +204,19 @@ impl NntpSession for CountedSession {
         end(&self.slow);
         found
     }
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        note_event("ask_many");
+        // Counted as the calls they stand for.
+        for _ in message_ids {
+            begin(&self.slow, if how.is_some() { "size" } else { "stat" });
+            end(&self.slow);
+        }
+        NntpSession::ask_many(self.client(), message_ids, how).await
+    }
     async fn quit(mut self) {
         if let Some(client) = self.inner.take() {
             NntpSession::quit(client).await;

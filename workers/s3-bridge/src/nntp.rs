@@ -137,6 +137,15 @@ impl NntpSession for WorkerSession {
         within_call(self.1.call_secs(), call).await
     }
 
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        let call = velmora_bridge::post::stored_sizes(&mut self.0, message_ids, how);
+        within_call(self.1.call_secs(), call).await
+    }
+
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {
         within_call(self.1.call_secs(), async {
             match self.0.body_to(message_id, out).await {

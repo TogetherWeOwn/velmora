@@ -113,7 +113,7 @@ use zeroize::Zeroizing;
 
 use crate::config::VerifyMode;
 use crate::fetch::{
-    job_holder, read_articles, size_articles, stat_articles, ProviderSession, ReadTally,
+    ask_articles_together, job_holder, read_articles, stat_articles, ProviderSession, ReadTally,
 };
 use crate::pool::Pool;
 use crate::ports::{
@@ -428,6 +428,7 @@ where
     ) -> Staged<(&'p ProviderConfig, ReadTally)> {
         let holder = job_holder(lease);
         let rows: Vec<&ArticleRow> = plan.iter().collect();
+        let together = self.cfg.verify.mode == VerifyMode::Light;
         let now = self.clock.now();
         let oldest = plan.iter().filter_map(|a| a.posted_at).min();
         let (mut fresh, expired): (Vec<_>, Vec<_>) = providers
@@ -462,11 +463,16 @@ where
                 VerifyKind::Body | VerifyKind::Sampled => {
                     read_articles(&mut session, Some(lease), &rows, |_, _| {}).await
                 }
+                // Under the light check the articles of an extent are
+                // asked for together; under `body` one by one, as before.
+                VerifyKind::Stat if together => {
+                    ask_articles_together(&mut session, Some(lease), &rows, None).await
+                }
                 VerifyKind::Stat => stat_articles(&mut session, Some(lease), &rows).await,
-                VerifyKind::Size => match self.cfg.verify.size_command(&provider.id) {
-                    Some(how) => size_articles(&mut session, Some(lease), &rows, how).await,
-                    None => stat_articles(&mut session, Some(lease), &rows).await,
-                },
+                VerifyKind::Size => {
+                    let how = self.cfg.verify.size_command(&provider.id);
+                    ask_articles_together(&mut session, Some(lease), &rows, how).await
+                }
             };
             session.close().await;
             match tally {
