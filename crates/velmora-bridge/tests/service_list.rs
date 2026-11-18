@@ -509,7 +509,7 @@ async fn list_objects_v1_needs_a_grant() {
     rig.bucket("bkt-hidden", true).await;
     rig.call(&signer, Method::Get, "/bkt-hidden", &[], &[], b"")
         .await
-        .expect_error(403, "AccessDenied");
+        .expect_error(404, "NoSuchBucket");
     rig.call(
         &signer,
         Method::Get,
@@ -544,4 +544,307 @@ async fn restic_listing_query_is_served() {
     .await;
     resp.expect(200);
     assert_eq!(resp.values("Key"), ["repo%2Fkeys%2Fk1"]);
+}
+
+/// Seeds `folders` sub-folders of `per` keys each straight into the
+/// catalogue: every key is a copy of the generation row and the live
+/// pointer of `template`, an object that was really put.
+fn seed_folders<N: NntpConnector + 'static>(
+    rig: &Rig<N>,
+    bucket: &Bucket,
+    template: &str,
+    folders: u32,
+    per: u32,
+) {
+    rig.bridge.catalog.sql.with_conn(|c| {
+        let cols: Vec<String> = c
+            .prepare("SELECT name FROM pragma_table_info('generations')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
+        let select: Vec<&str> = cols
+            .iter()
+            .map(|col| match col.as_str() {
+                "id" => "?1",
+                "key" => "?2",
+                other => other,
+            })
+            .collect();
+        let clone = format!(
+            "INSERT INTO generations ({}) SELECT {} FROM generations \
+             WHERE bucket_id = ?3 AND key = ?4",
+            cols.join(", "),
+            select.join(", ")
+        );
+        let bucket = bucket.id.as_str();
+        c.execute_batch("BEGIN").unwrap();
+        for f in 0..folders {
+            for k in 0..per {
+                let key = format!("photos/album-{f:04}/img-{k:05}.jpg");
+                let id = format!("g_{:013x}{f:08x}{k:08x}", 1);
+                c.execute(&clone, [&id, &key, bucket, template]).unwrap();
+                c.execute(
+                    "INSERT INTO objects (bucket_id, key, generation_id) VALUES (?1, ?2, ?3)",
+                    [bucket, &key, &id],
+                )
+                .unwrap();
+            }
+        }
+        c.execute_batch("COMMIT").unwrap();
+    });
+}
+
+/// The cost of opening a folder with 150 sub-folders (what rclone, a
+/// file browser and the console do): catalogue round trips, rows
+/// returned and SQLite VM steps for one delimiter page. Prints the
+/// numbers; the bounds keep the page from going back to a query per
+/// sub-folder.
+#[tokio::test(flavor = "current_thread")]
+async fn a_folder_of_150_subfolders_is_one_catalogue_query() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "template", b"abc")
+        .await
+        .expect(200);
+    seed_folders(&rig, &bucket, "template", 150, 200);
+    let sql = &rig.bridge.catalog.sql;
+
+    sql.reset_read_stats();
+    let p = page(
+        &list(
+            &rig,
+            &signer,
+            BUCKET,
+            &[("prefix", "photos/"), ("delimiter", "/")],
+        )
+        .await,
+    );
+    let cost = sql.read_stats();
+    assert_eq!(p.prefixes.len(), 150);
+    assert!(p.keys.is_empty() && !p.truncated);
+
+    // What authentication alone costs, to tell the listing's share.
+    sql.reset_read_stats();
+    rig.head(&signer, BUCKET, "photos/none").await.expect(404);
+    let auth = sql.read_stats();
+    println!(
+        "LIST 150 sub-folders x 200 keys: {} queries, {} rows returned, {} vm steps \
+         (of which a HEAD of a missing key, auth included: {} queries, {} rows, {} vm steps)",
+        cost.queries, cost.rows, cost.vm_steps, auth.queries, auth.rows, auth.vm_steps
+    );
+    let listing = cost.queries - (auth.queries - 1);
+    assert_eq!(listing, 1, "catalogue queries for the page itself");
+    assert!(cost.rows < 200, "rows returned: {}", cost.rows);
+    // The work does not grow with the 30 000 keys under the sub-folders:
+    // walking them takes several VM steps a key.
+    assert!(cost.vm_steps < 30_000, "vm steps: {}", cost.vm_steps);
+}
+
+/// What S3 lists for `keys` (sorted): one page of at most `max` entries
+/// after another, each a pair of keys and common prefixes. A group is
+/// one entry, at the place of its first key past `after`; `after` equal
+/// to a group skips that group.
+fn model(
+    keys: &[String],
+    prefix: &str,
+    delimiter: &str,
+    after: &str,
+    max: usize,
+) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut entries: Vec<(bool, String)> = Vec::new();
+    for key in keys {
+        if !key.starts_with(prefix) || key.as_str() <= after {
+            continue;
+        }
+        let group = (!delimiter.is_empty())
+            .then(|| key[prefix.len()..].find(delimiter))
+            .flatten()
+            .map(|at| key[..prefix.len() + at + delimiter.len()].to_string());
+        match group {
+            Some(group) if group == after => {}
+            Some(group) => {
+                if entries.last() != Some(&(true, group.clone())) {
+                    entries.push((true, group));
+                }
+            }
+            None => entries.push((false, key.clone())),
+        }
+    }
+    let mut pages: Vec<(Vec<String>, Vec<String>)> = entries
+        .chunks(max)
+        .map(|chunk| {
+            let pick = |folded: bool| {
+                chunk
+                    .iter()
+                    .filter(|(f, _)| *f == folded)
+                    .map(|(_, name)| name.clone())
+                    .collect::<Vec<_>>()
+            };
+            (pick(false), pick(true))
+        })
+        .collect();
+    if pages.is_empty() {
+        pages.push((Vec::new(), Vec::new()));
+    }
+    pages
+}
+
+/// Every page of every listing equals the model: prefixes, multi-byte
+/// and multi-character delimiters, a start inside, at and past a group,
+/// and page sizes that end a page on a key, on a group and in the
+/// middle of one. The catalogue hands the service one row per group, so
+/// this is what holds that scan to the listing a full scan gives.
+#[tokio::test(flavor = "current_thread")]
+async fn every_page_matches_a_full_scan() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let mut keys: Vec<String> = [
+        "a",
+        "a-",
+        "a--b",
+        "a--b--c",
+        "a--c",
+        "a/",
+        "a/1",
+        "a/2",
+        "a/b/1",
+        "a/b/2",
+        "a/b/c/3",
+        "a/c",
+        "a/é/1",
+        "a/é/2",
+        "a0",
+        "ab/1",
+        "b",
+        "b/",
+        "b//1",
+        "b//2",
+        "b/1",
+        "c/1",
+        "c/2",
+        "d",
+        "zz/1",
+        "zz/2/3",
+        "é",
+        "é/1",
+        "日本/1",
+        "日本/2",
+        "日本語",
+    ]
+    .iter()
+    .map(|k| k.to_string())
+    .collect();
+    keys.sort();
+    put_all(&rig, &signer, &keys).await;
+
+    let mut listings = 0;
+    for delimiter in ["", "/", "--", "é", "a", "//", "\u{10FFFF}"] {
+        for prefix in ["", "a", "a/", "a/b/", "a--", "b/", "zz", "日", "nothing"] {
+            for after in ["", "a/", "a/1", "a/b", "a/b/", "a--", "b", "b//", "é/", "~"] {
+                for max in [1, 2, 3, 1000] {
+                    let max_keys = max.to_string();
+                    let mut q = vec![("prefix", prefix), ("max-keys", max_keys.as_str())];
+                    if !delimiter.is_empty() {
+                        q.push(("delimiter", delimiter));
+                    }
+                    if !after.is_empty() {
+                        q.push(("start-after", after));
+                    }
+                    let got: Vec<_> = all_pages(&rig, &signer, &q)
+                        .await
+                        .into_iter()
+                        .map(|p| {
+                            assert_eq!(p.key_count, p.keys.len() + p.prefixes.len());
+                            (p.keys, p.prefixes)
+                        })
+                        .collect();
+                    assert_eq!(
+                        got,
+                        model(&keys, prefix, delimiter, after, max),
+                        "delimiter {delimiter:?} prefix {prefix:?} start-after {after:?} \
+                         max-keys {max}"
+                    );
+                    listings += 1;
+                }
+
+                // ListObjects (V1) reads the same range with `marker`.
+                let mut q = vec![("prefix", prefix)];
+                if !delimiter.is_empty() {
+                    q.push(("delimiter", delimiter));
+                }
+                if !after.is_empty() {
+                    q.push(("marker", after));
+                }
+                let resp = rig
+                    .call(&signer, Method::Get, &format!("/{BUCKET}"), &q, &[], b"")
+                    .await;
+                resp.expect(200);
+                let text = resp.text();
+                let prefixes: Vec<String> = text
+                    .split("<CommonPrefixes><Prefix>")
+                    .skip(1)
+                    .map(|rest| rest.split("</Prefix>").next().unwrap().to_string())
+                    .collect();
+                assert_eq!(
+                    vec![(resp.values("Key"), prefixes)],
+                    model(&keys, prefix, delimiter, after, 1000),
+                    "V1 delimiter {delimiter:?} prefix {prefix:?} marker {after:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(listings, 7 * 9 * 10 * 4);
+}
+
+/// A page costs what it returns, not what its groups hold: one catalogue
+/// query per page whatever `max-keys` is, and rows in step with it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_page_reads_in_step_with_max_keys() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "template", b"abc")
+        .await
+        .expect(200);
+    seed_folders(&rig, &bucket, "template", 150, 20);
+    let sql = &rig.bridge.catalog.sql;
+
+    sql.reset_read_stats();
+    rig.head(&signer, BUCKET, "photos/none").await.expect(404);
+    let auth = sql.read_stats().queries - 1;
+
+    let mut seen = Vec::new();
+    let mut token: Option<String> = None;
+    for (max, pages) in [(1, 1), (50, 3), (60, 2)] {
+        for _ in 0..pages {
+            let max_keys = max.to_string();
+            let mut q = vec![
+                ("prefix", "photos/"),
+                ("delimiter", "/"),
+                ("max-keys", max_keys.as_str()),
+            ];
+            if let Some(t) = &token {
+                q.push(("continuation-token", t));
+            }
+            sql.reset_read_stats();
+            let p = page(&list(&rig, &signer, BUCKET, &q).await);
+            let cost = sql.read_stats();
+            assert_eq!(cost.queries - auth, 1, "max-keys {max}");
+            assert!(cost.rows <= max + 1 + 3, "max-keys {max}: {}", cost.rows);
+            assert!(p.keys.is_empty());
+            seen.extend(p.prefixes);
+            // A token is bound to its page size: start each size afresh.
+            token = p.token;
+        }
+        if max == 1 {
+            assert_eq!(seen, ["photos/album-0000/"]);
+        } else {
+            let all: Vec<String> = (0..150).map(|f| format!("photos/album-{f:04}/")).collect();
+            assert_eq!(seen[..], all[..seen.len()]);
+            assert_eq!(seen.len(), if max == 50 { 150 } else { 120 });
+        }
+        seen.clear();
+        token = None;
+    }
 }

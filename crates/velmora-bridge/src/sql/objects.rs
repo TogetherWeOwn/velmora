@@ -986,6 +986,119 @@ pub(super) async fn list<S: Sql>(
     Ok(page)
 }
 
+/// See [`crate::ports::Catalog::list_heads`]. With a delimiter this is
+/// one statement, a skip-scan: each step of the recursion seeks the next
+/// key on the primary key of `objects` (one row), and after a key that
+/// holds the delimiter past the prefix it seeks to the successor of that
+/// key's group. `q.max_keys` heads cost about three rows each (the seek,
+/// the object, its generation), however many keys the groups hold.
+pub(super) async fn list_heads<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    q: &ListQuery,
+) -> Result<Vec<ListEntry>> {
+    if q.max_keys == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = q.max_keys.min(LIST_BATCH_MAX + 1);
+    let upper = successor(&q.prefix);
+    // One lower bound: inclusive at `from`, or exclusive at `after`.
+    let mut from = q.prefix.clone();
+    if let Some(done) = &q.skip_prefix {
+        match successor(done) {
+            Some(s) => from = from.max(s),
+            None => return Ok(Vec::new()),
+        }
+    }
+    let after = q.after.clone().unwrap_or_default();
+    let (bound, op) = if after >= from {
+        (after, ">")
+    } else {
+        (from, ">=")
+    };
+    // The successor of a group is its head up to the delimiter, then the
+    // successor of the delimiter. A delimiter that has none (all
+    // U+10FFFF) is listed row by row: the caller folds either way.
+    let group = q
+        .delimiter
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .and_then(|d| Some((d, successor(d)?)));
+
+    let mut params = vec![
+        text(bucket.as_str()),
+        text(&bound),
+        SqlValue::Int(i64::from(limit)),
+    ];
+    let sql = match &group {
+        None => {
+            params.extend(upper.as_deref().map(text));
+            format!(
+                "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
+                 JOIN generations g \
+                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                 WHERE o.bucket_id = ?1 AND o.key {op} ?2 {} ORDER BY o.key LIMIT ?3",
+                if upper.is_some() {
+                    "AND o.key < ?4"
+                } else {
+                    ""
+                }
+            )
+        }
+        Some((delimiter, next)) => {
+            // `CROSS JOIN` fixes the join order (SQLite never reorders
+            // it): each head looks its object up. Left to choose, the
+            // planner walks every object of the bucket and probes the
+            // heads, which reads the groups this scan just stepped over.
+            // `substr` and `instr` count characters, as this does. The
+            // generation is joined `LEFT`: a head without one (which the
+            // foreign key rules out) fails the row decode below, where an
+            // inner join would end the listing early without a word.
+            let prefix_chars = i64::try_from(q.prefix.chars().count())
+                .map_err(|_| BridgeError::Invalid("list prefix length"))?;
+            params.extend([SqlValue::Int(prefix_chars), text(delimiter), text(next)]);
+            params.extend(upper.as_deref().map(text));
+            let below = if upper.is_some() {
+                "AND o.key < ?7"
+            } else {
+                ""
+            };
+            format!(
+                "WITH RECURSIVE scan(n, key) AS ( \
+                   SELECT 1, (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                              AND o.key {op} ?2 {below} ORDER BY o.key LIMIT 1) \
+                   UNION ALL \
+                   SELECT n + 1, CASE WHEN instr(substr(key, ?4 + 1), ?5) > 0 \
+                     THEN (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                           AND o.key >= substr(scan.key, 1, \
+                                 ?4 + instr(substr(scan.key, ?4 + 1), ?5) - 1) || ?6 \
+                           {below} ORDER BY o.key LIMIT 1) \
+                     ELSE (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                           AND o.key > scan.key {below} ORDER BY o.key LIMIT 1) END \
+                   FROM scan WHERE key IS NOT NULL AND n < ?3 \
+                 ) \
+                 SELECT s.key, g.size, g.etag, g.created_at FROM scan s \
+                 CROSS JOIN objects o ON o.bucket_id = ?1 AND o.key = s.key \
+                 LEFT JOIN generations g \
+                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                 ORDER BY s.n"
+            )
+        }
+    };
+    let rows = c.sql.query(&sql, &params).await?;
+    let mut heads = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut cols = Cols::new(row);
+        heads.push(ListEntry {
+            key: cols.text()?,
+            size: cols.num()?,
+            etag: cols.text()?,
+            last_modified: cols.ms()?,
+        });
+    }
+    Ok(heads)
+}
+
 // ---------------------------------------------------------------------------
 // Admin
 // ---------------------------------------------------------------------------

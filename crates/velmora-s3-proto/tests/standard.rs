@@ -160,6 +160,7 @@ fn single_value_headers_keep_literal_commas() {
             "x-amz-date",
             "x-amz-content-sha256",
             "x-amz-security-token",
+            "x-amz-user-agent",
             "x-amz-copy-source",
             "x-amz-copy-source-if-modified-since",
             "x-amz-copy-source-if-unmodified-since",
@@ -222,7 +223,7 @@ fn storage_class_and_read_plan_are_standard() {
     assert_eq!(storage_class(None), Ok("STANDARD"));
     assert_eq!(
         storage_class(Some("GLACIER")),
-        Err(ErrorCode::InvalidRequest)
+        Err(ErrorCode::InvalidStorageClass)
     );
     let m = ObjectMetadata::new("g".into(), 10, "\"e\"".into(), NOW, vec![], None).unwrap();
     // No availability gate: a GET plans a body straight away.
@@ -274,17 +275,25 @@ fn upload_metadata_from_headers_keeps_persistent_fields_only() {
             ("x-amz-meta-name", "a\t b   c"),
         ]
     );
-    for (k, v) in [
-        ("x-amz-storage-class", "GLACIER"),
-        ("x-amz-acl", "public-read"),
-        ("x-amz-checksum-algorithm", "XXHASH64"),
+    for (k, v, code) in [
+        (
+            "x-amz-storage-class",
+            "GLACIER",
+            ErrorCode::InvalidStorageClass,
+        ),
+        (
+            "x-amz-acl",
+            "public-read",
+            ErrorCode::AccessControlListNotSupported,
+        ),
+        (
+            "x-amz-checksum-algorithm",
+            "XXHASH64",
+            ErrorCode::InvalidRequest,
+        ),
     ] {
         let h = Headers::new(&[("host", HOST), (k, v)], &policy()).unwrap();
-        assert_eq!(
-            UploadMetadata::from_headers(&h).unwrap_err(),
-            ErrorCode::InvalidRequest,
-            "{k}"
-        );
+        assert_eq!(UploadMetadata::from_headers(&h).unwrap_err(), code, "{k}");
     }
 }
 
@@ -1037,4 +1046,209 @@ fn v1_marker_skips_a_group_only_when_it_is_the_group() {
     );
     let xml = page(&rows, "&delimiter=%2F&start-after=a%2F", 1000, 1);
     assert!(!xml.contains("<CommonPrefixes>"), "{xml}");
+}
+
+// ---- Region aliases and named header refusals ----
+
+fn policy_for(region: &str, aliases: &[&str]) -> Policy {
+    Policy::new(
+        HOST.into(),
+        region.into(),
+        Limits {
+            target_bytes: 8192,
+            control_xml_bytes: 4096,
+            header_bytes: 16384,
+            header_count: 64,
+            query_pairs: 64,
+            upload_bytes: 1024,
+            clock_skew_seconds: 900,
+            presign_seconds: 60,
+        },
+    )
+    .unwrap()
+    .with_region_aliases(aliases)
+    .unwrap()
+}
+
+#[test]
+fn a_scope_region_is_the_configured_one_or_an_alias() {
+    let t = Target::parse("/bucket/key", &policy()).unwrap();
+    // `sign` signs for us-east-1.
+    let all = sign("GET", &t, &[], "host;x-amz-content-sha256;x-amz-date");
+    let run = |policy: &Policy, all: &[(String, String)]| {
+        let pairs: Vec<_> = all.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let h = Headers::new(&pairs, policy).unwrap();
+        verify("GET", &t, &h, true, NOW, policy, &Auth).map(|v| v.principal.to_string())
+    };
+    assert_eq!(run(&policy_for("us-east-1", &[]), &all).unwrap(), "p");
+    assert_eq!(policy_for("auto", &["us-east-1"]).region(), "auto");
+    assert_eq!(
+        run(&policy_for("auto", &["us-east-1", "eu-central-1"]), &all).unwrap(),
+        "p"
+    );
+    // Not configured and not an alias: refused for the region, whatever
+    // the key or the signature.
+    for policy in [policy_for("auto", &[]), policy_for("auto", &["eu-west-1"])] {
+        assert_eq!(
+            run(&policy, &all).unwrap_err(),
+            ErrorCode::AuthorizationHeaderMalformed
+        );
+        let forged: Vec<_> = all
+            .iter()
+            .map(|(k, v)| (k.clone(), v.replace("AKIDEXAMPLE", "AKIDNOBODY")))
+            .collect();
+        assert_eq!(
+            run(&policy, &forged).unwrap_err(),
+            ErrorCode::AuthorizationHeaderMalformed
+        );
+    }
+    // The alias names the scope the signature is checked with: a scope
+    // rewritten to another accepted region no longer matches it.
+    let moved: Vec<_> = all
+        .iter()
+        .map(|(k, v)| (k.clone(), v.replace("/us-east-1/", "/auto/")))
+        .collect();
+    assert_eq!(
+        run(&policy_for("auto", &["us-east-1"]), &moved).unwrap_err(),
+        ErrorCode::SignatureDoesNotMatch
+    );
+    // Only the region is told apart: another service or terminator is
+    // the refusal it always was.
+    for (from, to) in [("/s3/", "/sts/"), ("aws4_request,", "aws4,")] {
+        let other: Vec<_> = all
+            .iter()
+            .map(|(k, v)| (k.clone(), v.replace(from, to)))
+            .collect();
+        let err = run(&policy_for("auto", &["us-east-1"]), &other).unwrap_err();
+        assert_ne!(err, ErrorCode::AuthorizationHeaderMalformed, "{to}");
+    }
+
+    // A presigned URL is refused with the query-parameter code.
+    let presigned = Target::parse(
+        "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=00",
+        &policy(),
+    )
+    .unwrap();
+    let policy = policy_for("auto", &[]);
+    let h = Headers::new(&[("host", HOST)], &policy).unwrap();
+    assert_eq!(
+        verify("GET", &presigned, &h, true, NOW, &policy, &Auth).unwrap_err(),
+        ErrorCode::AuthorizationQueryParametersError
+    );
+
+    // An alias is a plain region name.
+    for bad in [&[""][..], &["us east"], &["a/b"], &["é"]] {
+        assert!(policy_for("auto", &[]).with_region_aliases(bad).is_err());
+    }
+    assert_eq!(ErrorCode::AuthorizationHeaderMalformed.status(), 400);
+    assert_eq!(ErrorCode::AuthorizationQueryParametersError.status(), 400);
+}
+
+#[test]
+fn a_refused_header_is_named() {
+    let check = |name: &str, value: &str| {
+        Headers::new(&[("host", HOST), (name, value)], &policy())
+            .unwrap()
+            .check_features()
+            .map_err(|r| (r.code, r.header))
+    };
+    for (name, value) in [
+        ("x-amz-user-agent", "aws-sdk-js/3.600.0"),
+        ("x-amz-acl", "private"),
+        ("x-amz-acl", "bucket-owner-full-control"),
+        ("x-amz-server-side-encryption", "AES256"),
+        ("x-amz-request-payer", "requester"),
+        ("x-amz-mp-object-size", "0"),
+        ("x-amz-mp-object-size", "5497558138880"),
+        ("x-amz-sdk-checksum-algorithm", "CRC32"),
+        ("x-amz-storage-class", "INTELLIGENT_TIERING"),
+        ("x-amz-bucket-object-lock-enabled", "false"),
+        ("x-amz-meta-anything", "x"),
+    ] {
+        assert_eq!(check(name, value), Ok(()), "{name}: {value}");
+    }
+    for (name, value, code) in [
+        (
+            "x-amz-acl",
+            "public-read",
+            ErrorCode::AccessControlListNotSupported,
+        ),
+        (
+            "x-amz-acl",
+            "Private",
+            ErrorCode::AccessControlListNotSupported,
+        ),
+        ("x-amz-acl", "", ErrorCode::AccessControlListNotSupported),
+        (
+            "x-amz-grant-full-control",
+            "id=a",
+            ErrorCode::AccessControlListNotSupported,
+        ),
+        (
+            "x-amz-server-side-encryption",
+            "aws:kms",
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "x-amz-server-side-encryption",
+            "aes256",
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "x-amz-request-payer",
+            "Requester",
+            ErrorCode::InvalidArgument,
+        ),
+        ("x-amz-mp-object-size", "-1", ErrorCode::InvalidArgument),
+        ("x-amz-mp-object-size", "1e3", ErrorCode::InvalidArgument),
+        (
+            "x-amz-storage-class",
+            "GLACIER",
+            ErrorCode::InvalidStorageClass,
+        ),
+        (
+            "x-amz-sdk-checksum-algorithm",
+            "XXHASH64",
+            ErrorCode::InvalidRequest,
+        ),
+        ("x-amz-checksum-mode", "DISABLED", ErrorCode::InvalidRequest),
+        (
+            "x-amz-bucket-object-lock-enabled",
+            "true",
+            ErrorCode::NotImplemented,
+        ),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "k",
+            ErrorCode::NotImplemented,
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key",
+            "k",
+            ErrorCode::NotImplemented,
+        ),
+        ("x-amz-tagging", "a=b", ErrorCode::NotImplemented),
+        (
+            "x-amz-object-lock-legal-hold",
+            "ON",
+            ErrorCode::NotImplemented,
+        ),
+        (
+            "x-amz-expected-bucket-owner",
+            "1",
+            ErrorCode::NotImplemented,
+        ),
+        ("x-amz-security-token", "t", ErrorCode::NotImplemented),
+        ("x-amz-user-agent-2", "x", ErrorCode::NotImplemented),
+    ] {
+        assert_eq!(
+            check(name, value),
+            Err((code, name.to_string())),
+            "{name}: {value}"
+        );
+    }
+    assert_eq!(IGNORED_HEADERS, ["x-amz-user-agent"]);
+    assert_eq!(ErrorCode::NotImplemented.status(), 501);
+    assert_eq!(ErrorCode::InvalidStorageClass.status(), 400);
+    assert_eq!(ErrorCode::AccessControlListNotSupported.status(), 400);
 }

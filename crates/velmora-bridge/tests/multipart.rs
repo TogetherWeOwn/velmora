@@ -971,6 +971,15 @@ async fn upload_id_cross_bucket_is_nosuchupload() {
         complete_req(ALPHA_KEY, "beta", KEY, &beta_id, &[(1, &etag)], &[]),
         abort_req(ALPHA_KEY, "beta", KEY, &beta_id),
         create_req(ALPHA_KEY, "beta", KEY, &[]),
+    ] {
+        let target = req.target.clone();
+        assert_eq!(
+            rig.send(req).await.outcome(),
+            "404 NoSuchBucket",
+            "{target}"
+        );
+    }
+    for req in [
         part_req(RO_KEY, "alpha", KEY, &id, 2, &bytes),
         abort_req(RO_KEY, "alpha", KEY, &id),
         create_req(RO_KEY, "alpha", KEY, &[]),

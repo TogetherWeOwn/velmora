@@ -1,7 +1,8 @@
 //! ListObjectsV2, ListObjects (V1) and ListBuckets.
 //!
-//! The catalogue returns raw rows in key order; the protocol crate folds
-//! common prefixes and renders the page. Continuation tokens are tagged
+//! The catalogue returns rows in key order, one per group when the
+//! listing has a delimiter; the protocol crate folds common prefixes and
+//! renders the page. Continuation tokens are tagged
 //! with a key derived from the active KEK, so a token is only good for
 //! the listing that issued it.
 
@@ -16,10 +17,8 @@ use crate::crypto::list_token_key;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{ListQuery, S3Request, S3Response};
 
-/// Rows asked of the catalogue per query.
-const BATCH: u32 = 1000;
-/// Catalogue queries one page may spend. A listing that needs more ends
-/// as a valid truncated page.
+/// Catalogue queries one page may spend. One is the rule; a listing
+/// that needs more than these ends as a valid truncated page.
 const QUERY_BUDGET: u32 = 200;
 /// Domain label of the token-tag key handed to the protocol crate.
 const TOKEN_LABEL: &[u8] = b"velmora/list-objects-v2/token-key/v1";
@@ -112,24 +111,29 @@ async fn objects<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
     let mut queries = 0;
     while page.wants_more() && queries < QUERY_BUDGET {
         queries += 1;
+        // Only what the page still takes is asked for: with a delimiter
+        // the catalogue returns one row per group, so this is one query
+        // per page but for the rare row the page ignores.
+        let wanted = page.wanted();
         let rows = bridge
             .catalog
-            .list(
+            .list_heads(
                 &bucket.id,
                 &ListQuery {
                     prefix: page.prefix().to_owned(),
-                    delimiter: None,
+                    delimiter: page.delimiter().map(str::to_owned),
                     after: page.after().map(str::to_owned),
                     skip_prefix: page.skip_prefix().map(str::to_owned),
-                    max_keys: BATCH,
+                    max_keys: wanted,
                 },
             )
             .await
             .map_err(|_| internal())?;
-        let more_rows = rows.next.is_some();
-        let mut consumed_all = true;
-        let mut entries = rows.entries.into_iter().peekable();
-        while let Some(e) = entries.next() {
+        let complete = u32::try_from(rows.len()).is_ok_and(|n| n >= wanted);
+        for e in rows {
+            if !page.wants_more() {
+                break;
+            }
             page.push(ObjectEntry {
                 key: e.key,
                 size: e.size,
@@ -137,15 +141,8 @@ async fn objects<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                 last_modified_ms: e.last_modified.0,
             })
             .map_err(s3_error)?;
-            let Some(next) = entries.peek() else { break };
-            // Stop at a full page, and after a common prefix whose other
-            // keys follow: the next query seeks past them.
-            if !page.wants_more() || page.skip_prefix().is_some_and(|p| next.key.starts_with(p)) {
-                consumed_all = false;
-                break;
-            }
         }
-        if consumed_all && !more_rows {
+        if !complete {
             exhausted = true;
             break;
         }

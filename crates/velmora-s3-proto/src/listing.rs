@@ -171,7 +171,8 @@ enum Entry {
 /// One ListObjectsV2 page, or a V1 page from [`ListObjectsV2::parse_v1`].
 /// The caller loops: query rows with
 /// `key starts_with prefix() AND key > after()` in ascending key order, `push`
-/// each while `wants_more()`, then `finish(exhausted)`, where `exhausted` means
+/// each while `wants_more()` (rows under `skip_prefix()` may be left out: they
+/// would be ignored), then `finish(exhausted)`, where `exhausted` means
 /// the scan reached the end of the prefix range (false = the caller's query
 /// budget ran out, which yields a valid truncated page).
 #[derive(Clone, Debug)]
@@ -290,6 +291,18 @@ impl ListObjectsV2 {
     /// False once the page holds `max-keys` entries plus one lookahead.
     pub fn wants_more(&self) -> bool {
         self.max_keys > 0 && self.entries.len() <= self.max_keys as usize
+    }
+
+    /// Rows the page can still take: what is missing to `max-keys`
+    /// entries plus the one lookahead. A caller that seeks past each
+    /// group needs no more rows than this, since every row it then
+    /// feeds becomes an entry (but for the one group a marker names).
+    pub fn wanted(&self) -> u32 {
+        (self.max_keys + 1).saturating_sub(self.entries.len() as u32)
+    }
+    /// The delimiter the page folds at; None = no folding.
+    pub fn delimiter(&self) -> Option<&str> {
+        (!self.scope.delimiter.is_empty()).then_some(self.scope.delimiter.as_str())
     }
 
     pub fn push(&mut self, row: ObjectEntry) -> Result<()> {

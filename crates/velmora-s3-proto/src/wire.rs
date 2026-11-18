@@ -6,7 +6,9 @@
 // CRC32C/CRC64NVME/SHA1 checksum headers and the aws-chunked headers are accepted;
 // the SDK's `x-id` operation hint is accepted as a query parameter;
 // `x-amz-bucket-object-lock-enabled: false` is accepted (Object Lock is not offered);
-// the ListObjects V1 `marker` and the V2 `fetch-owner` query keys are accepted.
+// the ListObjects V1 `marker` and the V2 `fetch-owner` query keys are accepted;
+// `Headers::validate_features` is replaced by `Headers::check_features`, which names
+// the header it refuses and accepts the no-op headers listed there.
 
 use super::{ErrorCode, Policy, Result};
 
@@ -295,66 +297,151 @@ impl Headers {
     }
 
     pub(crate) fn validate_features(&self) -> Result<()> {
+        self.check_features().map_err(|refusal| refusal.code)
+    }
+
+    /// The header policy, with the header a refusal is about. Three
+    /// classes of `x-amz-*` header:
+    ///
+    /// * understood and acted on (dates, checksums, copy source, ...);
+    /// * accepted and ignored, because the service already does what the
+    ///   header asks or the header asks for nothing
+    ///   ([`IGNORED_HEADERS`] and the values named below);
+    /// * everything else, refused by name: `NotImplemented` for a header
+    ///   that is not offered, a specific code for a value that is not.
+    ///
+    /// Nothing here reads a secret, so the answer may be given before the
+    /// signature is checked. An ignored header is still canonical-request
+    /// input when the client signed it, and like every `x-amz-*` header
+    /// it must be signed (`verify`).
+    pub fn check_features(&self) -> std::result::Result<(), HeaderRefusal> {
+        let refuse = |code, header: &str| {
+            Err(HeaderRefusal {
+                code,
+                header: header.to_owned(),
+            })
+        };
         if let (Some(wire), Some(sdk)) = (
             self.get("x-amz-checksum-algorithm"),
             self.get("x-amz-sdk-checksum-algorithm"),
         ) {
             if wire != sdk {
-                return Err(ErrorCode::InvalidRequest);
+                return refuse(ErrorCode::InvalidRequest, "x-amz-sdk-checksum-algorithm");
             }
         }
         for (k, v) in self.iter() {
-            if matches!(
-                k,
-                "x-amz-checksum-algorithm" | "x-amz-sdk-checksum-algorithm"
-            ) && super::ChecksumAlgorithm::from_name(v).is_none()
-            {
-                return Err(ErrorCode::InvalidRequest);
+            if !k.starts_with("x-amz-") || k.starts_with("x-amz-meta-") {
+                continue;
             }
-            if k.starts_with("x-amz-")
-                && !k.starts_with("x-amz-meta-")
-                && !matches!(
-                    k,
-                    "x-amz-date"
-                        | "x-amz-content-sha256"
-                        | "x-amz-storage-class"
-                        | "x-amz-checksum-sha256"
-                        | "x-amz-checksum-crc32"
-                        | "x-amz-checksum-crc32c"
-                        | "x-amz-checksum-crc64nvme"
-                        | "x-amz-checksum-sha1"
-                        | "x-amz-checksum-type"
-                        | "x-amz-decoded-content-length"
-                        | "x-amz-trailer"
-                        | "x-amz-sdk-checksum-algorithm"
-                        | "x-amz-checksum-algorithm"
-                        | "x-amz-checksum-mode"
-                        | "x-amz-copy-source"
-                        | "x-amz-copy-source-range"
-                        | "x-amz-metadata-directive"
-                        | "x-amz-copy-source-if-match"
-                        | "x-amz-copy-source-if-none-match"
-                        | "x-amz-copy-source-if-modified-since"
-                        | "x-amz-copy-source-if-unmodified-since"
-                        | "x-amz-bucket-object-lock-enabled"
-                )
-            {
-                return Err(ErrorCode::InvalidRequest);
-            }
-            // rclone sends `false` on CreateBucket. Object Lock is not
-            // offered, so asking for it is refused, never ignored.
-            if k == "x-amz-bucket-object-lock-enabled" && !v.eq_ignore_ascii_case("false") {
-                return Err(ErrorCode::NotImplemented);
-            }
-            if k == "x-amz-storage-class" {
-                super::storage_class(Some(v))?;
-            }
-            if k == "x-amz-checksum-mode" && v != "ENABLED" {
-                return Err(ErrorCode::InvalidRequest);
+            match k {
+                "x-amz-checksum-algorithm" | "x-amz-sdk-checksum-algorithm" => {
+                    if super::ChecksumAlgorithm::from_name(v).is_none() {
+                        return refuse(ErrorCode::InvalidRequest, k);
+                    }
+                }
+                // rclone sends `false` on CreateBucket. Object Lock is not
+                // offered, so asking for it is refused, never ignored.
+                "x-amz-bucket-object-lock-enabled" => {
+                    if !v.eq_ignore_ascii_case("false") {
+                        return refuse(ErrorCode::NotImplemented, k);
+                    }
+                }
+                "x-amz-storage-class" => {
+                    if super::storage_class(Some(v)).is_err() {
+                        return refuse(ErrorCode::InvalidStorageClass, k);
+                    }
+                }
+                "x-amz-checksum-mode" => {
+                    if v != "ENABLED" {
+                        return refuse(ErrorCode::InvalidRequest, k);
+                    }
+                }
+                // Every object is private to the keys granted on its
+                // bucket, which is what these two canned ACLs ask for.
+                // Any other ACL would grant access this service cannot
+                // give, so it is refused as S3 refuses an ACL on a bucket
+                // with ACLs disabled.
+                "x-amz-acl" => {
+                    if !matches!(v, "private" | "bucket-owner-full-control") {
+                        return refuse(ErrorCode::AccessControlListNotSupported, k);
+                    }
+                }
+                // A no-op: every object is encrypted before it is stored,
+                // with keys this service manages, whether or not the
+                // client asks. `AES256` (SSE-S3) asks for exactly that.
+                // `aws:kms` and customer keys name key management that is
+                // not offered and are refused.
+                "x-amz-server-side-encryption" => {
+                    if v != "AES256" {
+                        return refuse(ErrorCode::InvalidArgument, k);
+                    }
+                }
+                // No bucket is requester-pays, where S3 ignores the header.
+                "x-amz-request-payer" => {
+                    if v != "requester" {
+                        return refuse(ErrorCode::InvalidArgument, k);
+                    }
+                }
+                // The size a multipart upload will have, as newer SDKs
+                // declare it. Each part and the completed object are
+                // validated on their own; the declaration is not used.
+                "x-amz-mp-object-size" => {
+                    if super::decimal(v).is_err() {
+                        return refuse(ErrorCode::InvalidArgument, k);
+                    }
+                }
+                _ if UNDERSTOOD_HEADERS.contains(&k) || IGNORED_HEADERS.contains(&k) => {}
+                _ if k.starts_with("x-amz-grant-") => {
+                    return refuse(ErrorCode::AccessControlListNotSupported, k);
+                }
+                // Object lock, tagging, session tokens, customer keys,
+                // redirects, bucket-owner checks, and whatever comes next:
+                // each means something to the client that this service
+                // would not do.
+                _ => return refuse(ErrorCode::NotImplemented, k),
             }
         }
         Ok(())
     }
+}
+
+/// `x-amz-*` headers some handler or the verifier acts on, beyond those
+/// [`Headers::check_features`] holds to a value.
+const UNDERSTOOD_HEADERS: [&str; 17] = [
+    "x-amz-date",
+    "x-amz-content-sha256",
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-type",
+    "x-amz-decoded-content-length",
+    "x-amz-trailer",
+    "x-amz-copy-source",
+    "x-amz-copy-source-range",
+    "x-amz-metadata-directive",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+];
+
+/// `x-amz-*` headers accepted whatever their value, and ignored: they
+/// describe the client and ask the service for nothing.
+pub const IGNORED_HEADERS: [&str; 1] = [
+    // The browser builds of the AWS SDK for JavaScript send (and sign)
+    // their user agent here, where `User-Agent` cannot be set.
+    "x-amz-user-agent",
+];
+
+/// A request header the service will not act on: the S3 error code and
+/// the lowercase name of the header, so the answer can name it. The
+/// name is request data: escape it before it is rendered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderRefusal {
+    pub code: ErrorCode,
+    pub header: String,
 }
 
 pub fn canonical_request(

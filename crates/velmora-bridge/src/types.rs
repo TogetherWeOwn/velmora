@@ -1625,18 +1625,114 @@ pub struct S3Response {
     pub body: RespBody,
 }
 
+/// Text as XML character data. Whatever XML 1.0 cannot carry becomes
+/// U+FFFD.
+fn xml_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\u{fffe}' | '\u{ffff}' => out.push('\u{fffd}'),
+            c if c >= ' ' => out.push(c),
+            _ => out.push('\u{fffd}'),
+        }
+    }
+    out
+}
+
+/// What an S3 XML error document starts with ([`S3Response::error`]).
+const ERROR_OPEN: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>";
+const ERROR_CLOSE: &str = "</Error>";
+
+/// The ID a request is logged under, if it is fit to be sent back: 1 to
+/// 64 ASCII letters, digits, `.`, `_` or `-`, which is also what the log
+/// line prints. Anything else is no ID (it would not match a log line,
+/// and it is request data that must not reach a header or a document).
+pub fn safe_request_id(id: &str) -> Option<&str> {
+    (!id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+    .then_some(id)
+}
+
 impl S3Response {
     /// S3 XML error document. `code` and `message` must be static text,
     /// never request data.
     pub fn error(status: u16, code: &str, message: &str) -> S3Response {
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>{message}</Message></Error>"
+        S3Response::error_with(status, code, message, &[])
+    }
+
+    /// [`S3Response::error`] with more elements, as S3 adds them to some
+    /// errors (`<Header>`, `<Region>`, `<ArgumentName>`). `code` and the
+    /// element names must be static text. The message and the element
+    /// values may hold request data: they are escaped here.
+    pub fn error_with(
+        status: u16,
+        code: &str,
+        message: &str,
+        fields: &[(&str, &str)],
+    ) -> S3Response {
+        let mut body = format!(
+            "{ERROR_OPEN}{code}</Code><Message>{}</Message>",
+            xml_text(message)
         );
+        for (name, value) in fields {
+            body.push_str(&format!("<{name}>{}</{name}>", xml_text(value)));
+        }
+        body.push_str(ERROR_CLOSE);
         S3Response {
             status,
             headers: vec![("content-type".to_string(), "application/xml".to_string())],
             body: RespBody::Bytes(body.into_bytes()),
         }
+    }
+
+    /// The response as it leaves the service: with `x-amz-request-id`
+    /// and `x-amz-id-2`, and, when it is an error document, with
+    /// `<RequestId>` and `<HostId>` in it. `id` is the ID the request is
+    /// logged under; one that is not [`safe_request_id`] adds nothing.
+    ///
+    /// Only an error status with an XML body that [`S3Response::error`]
+    /// built is rewritten. An object body is never touched: no object is
+    /// served with an error status.
+    pub fn with_request_id(mut self, id: &str) -> S3Response {
+        let Some(id) = safe_request_id(id) else {
+            return self;
+        };
+        self.headers.retain(|(n, _)| {
+            !n.eq_ignore_ascii_case("x-amz-request-id") && !n.eq_ignore_ascii_case("x-amz-id-2")
+        });
+        self.headers
+            .push(("x-amz-request-id".to_string(), id.to_string()));
+        self.headers
+            .push(("x-amz-id-2".to_string(), id.to_string()));
+        let xml = self.headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("content-type") && v.eq_ignore_ascii_case("application/xml")
+        });
+        if let (true, true, RespBody::Bytes(body)) = (self.status >= 400, xml, &mut self.body) {
+            if body.starts_with(ERROR_OPEN.as_bytes())
+                && body.ends_with(ERROR_CLOSE.as_bytes())
+                && !body
+                    .windows(b"<RequestId>".len())
+                    .any(|w| w == b"<RequestId>")
+            {
+                body.truncate(body.len() - ERROR_CLOSE.len());
+                body.extend_from_slice(
+                    format!("<RequestId>{id}</RequestId><HostId>{id}</HostId>{ERROR_CLOSE}")
+                        .as_bytes(),
+                );
+                // A length set for the shorter document no longer holds.
+                self.headers
+                    .retain(|(n, _)| !n.eq_ignore_ascii_case("content-length"));
+            }
+        }
+        self
     }
 
     /// `501 NotImplemented`.

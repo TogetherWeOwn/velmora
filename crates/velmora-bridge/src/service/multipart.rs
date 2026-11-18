@@ -32,6 +32,7 @@
 //! then list no part checksums in Complete), and Complete refuses a
 //! client-supplied object checksum or a `COMPOSITE` type with `501`.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -60,8 +61,8 @@ use crate::ports::{
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
-    check_precondition, discard_refused, discard_unless_present, hold_precondition, precondition,
-    restore_gate, writes_refused,
+    auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
+    hold_precondition, host_refused, precondition, restore_gate, writes_refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
@@ -186,6 +187,7 @@ fn message(code: ErrorCode) -> &'static str {
             "At least one of the pre-conditions you specified did not hold."
         }
         ErrorCode::NoSuchKey => "The specified key does not exist.",
+        ErrorCode::NoSuchBucket => "The specified bucket does not exist.",
         _ => "The request is not valid.",
     }
 }
@@ -297,6 +299,7 @@ fn policy(cfg: &BridgeConfig) -> Outcome<Policy> {
             presign_seconds: 604_800,
         },
     )
+    .and_then(|policy| policy.with_region_aliases(&REGION_ALIASES))
     .map_err(|_| Fail::Internal)
 }
 
@@ -330,6 +333,12 @@ struct OneKey {
     /// Name of the bucket this key holds an `rw` grant on (the addressed
     /// one, or none).
     writable_bucket: Option<String>,
+    /// The key holds a grant on the addressed bucket, of either kind.
+    granted: bool,
+    /// Set when `authorize` refused a bucket this key has no grant on.
+    /// The verifier asks `authorize` only once the signature has
+    /// verified, so this is only ever set for an authenticated caller.
+    no_bucket: Cell<bool>,
 }
 
 struct KeyMaterial {
@@ -349,8 +358,13 @@ impl Authority for OneKey {
 
     /// Every multipart call mutates, so it needs `rw` on the bucket.
     fn authorize(&self, principal: &str, _method: &str, target: &Target) -> bool {
-        self.key.as_ref().is_some_and(|k| k.principal == principal)
-            && self.writable_bucket.as_deref() == Some(target.bucket.as_str())
+        if !self.key.as_ref().is_some_and(|k| k.principal == principal) {
+            return false;
+        }
+        if !self.granted {
+            self.no_bucket.set(true);
+        }
+        self.writable_bucket.as_deref() == Some(target.bucket.as_str())
     }
 }
 
@@ -405,6 +419,13 @@ where
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy)?;
+    // The named refusals of `common::authenticate`, in the same order.
+    if let Some(resp) = host_refused(&headers, &bridge.cfg) {
+        return Err(resp.into());
+    }
+    headers
+        .check_features()
+        .map_err(|refusal| header_refused(&refusal))?;
 
     let mut authority = OneKey::default();
     let mut bucket = None;
@@ -423,6 +444,7 @@ where
                 Some(b) => bridge.catalog.grant(&akid, &b.id).await?,
                 None => None,
             };
+            authority.granted = perm.is_some();
             authority.writable_bucket = (perm == Some(Perm::Rw)).then(|| target.bucket.clone());
             authority.key = Some(KeyMaterial {
                 access_key_id: row.access_key_id,
@@ -440,9 +462,18 @@ where
         bridge.clock.now().secs().0,
         &policy,
         &authority,
-    )?;
+    )
+    .map_err(|code| {
+        if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
+            // As `common::authenticate`: the signature verified, and to
+            // this key no bucket of this name exists.
+            Fail::S3(ErrorCode::NoSuchBucket)
+        } else {
+            Fail::Response(auth_refused(code, &policy, &headers, &target))
+        }
+    })?;
     // `authorize` passed, so the bucket exists and the grant is `rw`.
-    let bucket = bucket.ok_or(ErrorCode::AccessDenied)?;
+    let bucket = bucket.ok_or(ErrorCode::NoSuchBucket)?;
     // A replay that was started and did not end: see `restore_gate`.
     if bridge.catalog.restore_pending().await? {
         return Err(ErrorCode::SlowDown.into());

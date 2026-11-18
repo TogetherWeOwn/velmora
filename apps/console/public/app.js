@@ -414,10 +414,10 @@ function lifecycle(st) {
   // Stages: post → verify → release → done (or dead / cancelled).
   if (xs.some((x) => x.stage === "dead")) return ["failed: a job is dead", "warn"];
   if (xs.every((x) => x.safety_state === "released" || x.safety_state === "deleted")) {
-    return ["released (Usenet + cache)", "good"];
+    return ["stored (archived + cached)", "good"];
   }
-  if (xs.some((x) => x.stage === "post")) return ["posting", "warn"];
-  if (xs.some((x) => x.stage === "verify")) return ["posted, verifying", "warn"];
+  if (xs.some((x) => x.stage === "post")) return ["archiving", "warn"];
+  if (xs.some((x) => x.stage === "verify")) return ["archived, verifying", "warn"];
   if (xs.some((x) => x.stage === "release" || x.safety_state === "releasing")) return ["verified, releasing", "good"];
   return ["verified, safety copy held", "good"];
 }
@@ -918,7 +918,7 @@ $("status-btn").addEventListener("click", async () => {
     el(
       "table",
       { class: "mini" },
-      el("thead", {}, el("tr", {}, ...["provider", "backbone", "enabled", "healthy", "connections", "cooling"].map((h) => el("th", {}, h)))),
+      el("thead", {}, el("tr", {}, ...["archive", "network", "enabled", "healthy", "connections", "cooling"].map((h) => el("th", {}, h)))),
       el(
         "tbody",
         {},

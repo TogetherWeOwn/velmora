@@ -182,7 +182,12 @@ fn error_class(e: FanoutError) -> &'static str {
 /// that cannot be read is an error response, not a `200` that breaks.
 /// The rest is piped under `waitUntil`, in order; a failure aborts the
 /// stream.
-pub async fn respond(env: &Env, ctx: &Context, resp: S3Response) -> (u16, Response) {
+pub async fn respond(
+    env: &Env,
+    ctx: &Context,
+    resp: S3Response,
+    request_id: &str,
+) -> (u16, Response) {
     let (status, headers) = (resp.status, resp.headers);
     let fan = match resp.body {
         RespBody::Fanout(fan) => fan,
@@ -195,7 +200,13 @@ pub async fn respond(env: &Env, ctx: &Context, resp: S3Response) -> (u16, Respon
             return (status, crate::http::to_response(resp));
         }
     };
-    let refuse = |resp: S3Response| (resp.status, crate::http::to_response(resp));
+    // `resp` came with its request ID; a refusal made here gets it too.
+    let refuse = |resp: S3Response| {
+        (
+            resp.status,
+            crate::http::to_response(resp.with_request_id(request_id)),
+        )
+    };
     let Some((pipe, readable)) = SelfPipe::new(env, fan.len()) else {
         console_error!("fanout: no service binding or stream");
         return refuse(IngressError::Internal.response());

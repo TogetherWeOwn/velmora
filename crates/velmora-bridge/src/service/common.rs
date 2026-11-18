@@ -2,12 +2,13 @@
 //! authentication, error rendering, the mutation gates and the stored
 //! metadata encoding.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use velmora_s3_proto::mutation::UploadMetadata;
 use velmora_s3_proto::{
-    verify, Authority, ChecksumAlgorithm, Credential, ErrorCode, Headers, Limits, Policy,
-    StoredChecksum, Target, VerifiedRequest,
+    verify, Authority, ChecksumAlgorithm, Credential, ErrorCode, HeaderRefusal, Headers, Limits,
+    Policy, StoredChecksum, Target, VerifiedRequest,
 };
 use zeroize::Zeroizing;
 
@@ -31,6 +32,11 @@ const QUERY_PAIRS: usize = 32;
 const CONTROL_XML_BYTES: usize = 1024 * 1024;
 const CLOCK_SKEW_SECS: u32 = 900;
 const PRESIGN_SECS: u32 = 604_800;
+/// Regions a credential scope may name besides the configured one. Most
+/// clients sign for `us-east-1` unless told otherwise, and `auto` is
+/// what S3-compatible endpoints without regions document. The region is
+/// only a name here: one endpoint, no per-region data.
+pub(super) const REGION_ALIASES: [&str; 2] = ["us-east-1", "auto"];
 
 /// Headers that make a mutation conditional. A request that carries one
 /// is either held to it by the batch that commits ([`conditional_gate`])
@@ -73,6 +79,14 @@ pub(super) fn s3_error(code: ErrorCode) -> S3Response {
         ErrorCode::InternalError => "We encountered an internal error. Please try again.",
         ErrorCode::InvalidAccessKeyId => {
             "The AWS Access Key Id you provided does not exist in our records."
+        }
+        ErrorCode::InvalidStorageClass => "The storage class you specified is not valid.",
+        ErrorCode::AccessControlListNotSupported => "The bucket does not allow ACLs.",
+        ErrorCode::AuthorizationHeaderMalformed => {
+            "The authorization header is malformed; the region is wrong."
+        }
+        ErrorCode::AuthorizationQueryParametersError => {
+            "Error parsing the X-Amz-Credential parameter; the region is wrong."
         }
         _ => "The request is not valid.",
     };
@@ -151,7 +165,122 @@ pub(super) fn policy_with(
             presign_seconds: PRESIGN_SECS,
         },
     )
+    .and_then(|policy| policy.with_region_aliases(&REGION_ALIASES))
     .map_err(|_| internal())
+}
+
+/// The answer to a header the service will not act on. It names the
+/// header (in the message and, as S3 does for `NotImplemented`, in
+/// `<Header>`), never its value.
+pub(super) fn header_refused(refusal: &HeaderRefusal) -> S3Response {
+    let header = refusal.header.as_str();
+    let message = match refusal.code {
+        ErrorCode::NotImplemented => {
+            format!("The header '{header}' implies functionality that is not implemented.")
+        }
+        ErrorCode::InvalidStorageClass => {
+            format!("The storage class you specified in '{header}' is not offered. Use STANDARD.")
+        }
+        ErrorCode::AccessControlListNotSupported => format!(
+            "The header '{header}' asks for an ACL that is not supported. Objects are always \
+             private; send 'private' or omit the header."
+        ),
+        ErrorCode::InvalidArgument if header == "x-amz-server-side-encryption" => format!(
+            "The encryption method specified in '{header}' is not supported. Objects are \
+             always encrypted at rest; send 'AES256' or omit the header."
+        ),
+        _ => format!("The value of the header '{header}' is not valid."),
+    };
+    let element = match refusal.code {
+        ErrorCode::InvalidArgument => "ArgumentName",
+        _ => "Header",
+    };
+    S3Response::error_with(
+        refusal.code.status(),
+        &format!("{:?}", refusal.code),
+        &message,
+        &[(element, header)],
+    )
+}
+
+/// The answer to a `Host` that is not the configured endpoint, or
+/// `None` when it is. The verifier refuses such a request whatever its
+/// signature (a request is only good for the endpoint it was signed
+/// for); this says why, before any key is looked up. The usual cause is
+/// virtual-hosted-style addressing (`<bucket>.<endpoint>`), so that case
+/// is named. The configured endpoint itself is not disclosed.
+pub(super) fn host_refused(headers: &Headers, cfg: &BridgeConfig) -> Option<S3Response> {
+    let host = headers.get("host")?;
+    if host.eq_ignore_ascii_case(&cfg.s3_host) {
+        return None;
+    }
+    let suffix = format!(".{}", cfg.s3_host.to_ascii_lowercase());
+    let message = if host.to_ascii_lowercase().ends_with(&suffix) {
+        "Virtual-hosted-style requests are not supported. Use path-style addressing: \
+         the bucket goes in the path, not in the host name."
+    } else {
+        "The Host header does not name this endpoint. Use the endpoint host name you were \
+         given, with path-style addressing."
+    };
+    Some(S3Response::error_with(
+        400,
+        "InvalidRequest",
+        message,
+        &[("Header", "host")],
+    ))
+}
+
+/// The region a credential scope names, when it is fit to be sent back
+/// in an error (ASCII letters, digits and `-`, at most 32).
+fn claimed_region(headers: &Headers, target: &Target) -> Option<String> {
+    let credential = match headers.get("authorization") {
+        Some(value) => value
+            .split_once("Credential=")
+            .map(|(_, rest)| rest.split(',').next().unwrap_or_default().to_owned())?,
+        None => target
+            .query()
+            .iter()
+            .find(|(k, _)| k == b"X-Amz-Credential")
+            .and_then(|(_, v)| String::from_utf8(v.clone()).ok())?,
+    };
+    let region = credential.split('/').nth(2)?;
+    (!region.is_empty()
+        && region.len() <= 32
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    .then(|| region.to_owned())
+}
+
+/// The answer to a request the verifier refused. A scope for a region
+/// this endpoint does not answer for is told which region to use, in
+/// the words S3 uses; the configured region is no secret (HeadBucket
+/// and GetBucketLocation report it).
+pub(super) fn auth_refused(
+    code: ErrorCode,
+    policy: &Policy,
+    headers: &Headers,
+    target: &Target,
+) -> S3Response {
+    let expected = policy.region();
+    let named = claimed_region(headers, target)
+        .map(|r| format!("the region '{r}' is wrong; "))
+        .unwrap_or_default();
+    let message = match code {
+        ErrorCode::AuthorizationHeaderMalformed => {
+            format!("The authorization header is malformed; {named}expecting '{expected}'")
+        }
+        ErrorCode::AuthorizationQueryParametersError => {
+            format!("Error parsing the X-Amz-Credential parameter; {named}expecting '{expected}'")
+        }
+        _ => return s3_error(code),
+    };
+    S3Response::error_with(
+        code.status(),
+        &format!("{code:?}"),
+        &message,
+        &[("Region", expected)],
+    )
 }
 
 /// A request whose signature verified and whose key is granted the
@@ -178,12 +307,16 @@ impl Authed {
 /// The one credential this request names, with what it may do to the
 /// addressed bucket. An unknown, disabled or revoked key has no secret
 /// (`InvalidAccessKeyId`, whatever the bucket); a missing bucket or grant
-/// has no permission (`AccessDenied`).
+/// has no permission.
 struct OneKey {
     akid: String,
     principal: String,
     secret: Option<Zeroizing<Vec<u8>>>,
     perm: Option<Perm>,
+    /// Set when `authorize` refused a bucket this key has no grant on.
+    /// The verifier asks `authorize` only once the signature has
+    /// verified, so this is only ever set for an authenticated caller.
+    no_bucket: Cell<bool>,
 }
 
 impl Authority for OneKey {
@@ -206,7 +339,10 @@ impl Authority for OneKey {
         match self.perm {
             Some(Perm::Rw) => true,
             Some(Perm::Ro) => matches!(method, "GET" | "HEAD"),
-            None => false,
+            None => {
+                self.no_bucket.set(true);
+                false
+            }
         }
     }
 }
@@ -240,8 +376,16 @@ pub(super) fn edge_header(name: &str) -> bool {
 
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A key with no usable row is
-/// `InvalidAccessKeyId` for every bucket; a missing bucket and a missing
-/// grant are indistinguishable (`AccessDenied`).
+/// `InvalidAccessKeyId` for every bucket.
+///
+/// A bucket that does not exist and one the key holds no grant on are
+/// indistinguishable, to everyone: a caller that did not authenticate
+/// gets the authentication error and learns nothing of the bucket, and
+/// one that did gets `NoSuchBucket` for both (S3 checks in that order
+/// too: signature, then bucket, then permission). To a key, a bucket it
+/// has no grant on does not exist, so no key can probe for the names of
+/// buckets that are not its own. A key that holds a grant too weak for
+/// the operation (read-only, on a write) is `AccessDenied`.
 pub(super) async fn authenticate<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
@@ -263,12 +407,21 @@ where
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).map_err(s3_error)?;
+    // Refusals that name their cause. Neither reads anything but the
+    // request itself and the configuration.
+    if let Some(resp) = host_refused(&headers, &bridge.cfg) {
+        return Err(resp);
+    }
+    headers
+        .check_features()
+        .map_err(|refusal| header_refused(&refusal))?;
 
     let mut authority = OneKey {
         akid: claimed_key(&headers, &target).unwrap_or_default(),
         principal: String::new(),
         secret: None,
         perm: None,
+        no_bucket: Cell::new(false),
     };
     let mut bucket = None;
     if !authority.akid.is_empty() {
@@ -330,9 +483,17 @@ where
         &policy,
         &authority,
     )
-    .map_err(s3_error)?;
+    .map_err(|code| {
+        if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
+            // The signature verified; the key has no grant on a bucket
+            // of this name, whether or not one exists.
+            s3_error(ErrorCode::NoSuchBucket)
+        } else {
+            auth_refused(code, &policy, &headers, &target)
+        }
+    })?;
     if !target.bucket.is_empty() && bucket.is_none() {
-        return Err(s3_error(ErrorCode::AccessDenied));
+        return Err(s3_error(ErrorCode::NoSuchBucket));
     }
     Ok(Authed {
         policy,

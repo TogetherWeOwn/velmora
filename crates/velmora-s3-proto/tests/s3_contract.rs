@@ -449,8 +449,34 @@ fn unknown_integrity_encryption_tokens_and_policy_fields_fail_closed() {
     );
     assert_eq!(storage_class(None), Ok("STANDARD"));
     assert_eq!(storage_class(Some("STANDARD")), Ok("STANDARD"));
-    for class in ["standard", "GLACIER", "DEEP_ARCHIVE", "STANDARD_IA", ""] {
-        assert_eq!(storage_class(Some(class)), Err(ErrorCode::InvalidRequest));
+    // Classes whose reads are synchronous at S3 are accepted and stored
+    // (and reported) as STANDARD; a class that would need a restore before
+    // a read, or an unknown one, is refused by name.
+    for class in [
+        "STANDARD_IA",
+        "ONEZONE_IA",
+        "INTELLIGENT_TIERING",
+        "GLACIER_IR",
+        "REDUCED_REDUNDANCY",
+    ] {
+        assert_eq!(storage_class(Some(class)), Ok("STANDARD"), "{class}");
+    }
+    for class in [
+        "standard",
+        "GLACIER",
+        "DEEP_ARCHIVE",
+        "OUTPOSTS",
+        "SNOW",
+        "EXPRESS_ONEZONE",
+        "standard_ia",
+        " STANDARD",
+        "",
+    ] {
+        assert_eq!(
+            storage_class(Some(class)),
+            Err(ErrorCode::InvalidStorageClass),
+            "{class}"
+        );
     }
 }
 
