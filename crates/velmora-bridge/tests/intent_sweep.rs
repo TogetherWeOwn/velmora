@@ -286,7 +286,7 @@ async fn a_request_that_stops_at_any_call_leaves_nothing_broken() {
             let answered = ran.done().map(|r| r.status);
             if !reached {
                 assert_eq!(answered, Some(200));
-                assert!(n > 20, "the request made {n} calls");
+                assert!(n > 18, "the request made {n} calls");
                 break;
             }
             settles(s, answered, &format!("{trip:?} at call {n}")).await;

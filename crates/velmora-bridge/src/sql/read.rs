@@ -20,11 +20,12 @@ use super::auth::bucket_row;
 use super::objects::{
     extent_cols, generation_row, text, Cols, GENERATION_COLS, GENERATION_WIDTH, PLACED_EXTENT_COLS,
 };
+use super::replay::RESTORE_PENDING;
 use super::SqlCatalog;
 use crate::ports::{Row, Sql, SqlValue};
 use crate::types::{
-    AccessKeyRow, BridgeError, BucketId, GenerationId, KeyStatus, Perm, PinnedRead, ReadExtent,
-    ReadLookup, ReadQuery, ReadWindow, Result,
+    AccessKeyRow, AuthLookup, BridgeError, BucketId, GenerationId, KeyStatus, Perm, PinnedRead,
+    ReadExtent, ReadLookup, ReadQuery, ReadWindow, Result,
 };
 
 /// Columns after the letter: an extent with its read stamp and the
@@ -51,6 +52,41 @@ fn pad(used: usize) -> String {
 const GRANTED: &str = "EXISTS (SELECT 1 FROM grants gr \
        JOIN access_keys k ON k.access_key_id = gr.access_key_id \
      WHERE gr.access_key_id = ?1 AND gr.bucket_id = b.id AND k.status = 'active')";
+
+/// Who asks and for which bucket, as three arms: the key `?1` while it
+/// is active (`k`), the bucket named `?2` (`b`), and the grant of that
+/// key on that bucket (`p`).
+fn caller_arms() -> String {
+    format!(
+        "SELECT 'k', access_key_id, principal, secret_wrapped, kek_version, status, \
+           created_at{} \
+         FROM access_keys WHERE access_key_id = ?1 AND status = 'active' \
+         UNION ALL \
+         SELECT 'b', id, name, owner, bdk_wrapped, kek_version, disposable, created_at{} \
+         FROM buckets WHERE name = ?2 \
+         UNION ALL \
+         SELECT 'p', gr.perm{} FROM grants gr \
+           JOIN access_keys k ON k.access_key_id = gr.access_key_id \
+           JOIN buckets b ON b.id = gr.bucket_id \
+         WHERE gr.access_key_id = ?1 AND b.name = ?2 AND k.status = 'active'",
+        pad(6),
+        pad(BUCKET_WIDTH),
+        pad(1),
+    )
+}
+
+/// `?1` key id, `?2` bucket name. The `r` arm counts what
+/// `replay::restore_pending` counts.
+fn auth_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| {
+        format!(
+            "{} UNION ALL SELECT 'r', {RESTORE_PENDING}{}",
+            caller_arms(),
+            pad(1),
+        )
+    })
+}
 
 /// The extents arm: those of generation `g` that hold plaintext
 /// `[{start}, {end})`, as `objects::extents_in` finds them.
@@ -91,24 +127,12 @@ fn lookup_sql() -> &'static str {
             end,
         );
         format!(
-            "SELECT 'k', access_key_id, principal, secret_wrapped, kek_version, status, \
-               created_at{} \
-             FROM access_keys WHERE access_key_id = ?1 AND status = 'active' \
-             UNION ALL \
-             SELECT 'b', id, name, owner, bdk_wrapped, kek_version, disposable, created_at{} \
-             FROM buckets WHERE name = ?2 \
-             UNION ALL \
-             SELECT 'p', gr.perm{} FROM grants gr \
-               JOIN access_keys k ON k.access_key_id = gr.access_key_id \
-               JOIN buckets b ON b.id = gr.bucket_id \
-             WHERE gr.access_key_id = ?1 AND b.name = ?2 AND k.status = 'active' \
+            "{} \
              UNION ALL \
              SELECT 'g', {GENERATION_COLS}{} FROM {live} WHERE b.name = ?2 AND {GRANTED} \
              UNION ALL \
              {extents}",
-            pad(6),
-            pad(BUCKET_WIDTH),
-            pad(1),
+            caller_arms(),
             pad(GENERATION_WIDTH),
         )
     })
@@ -189,6 +213,41 @@ fn once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
     }
 }
 
+fn key_row(row: Row) -> Result<AccessKeyRow> {
+    let mut r = Cols::new(row);
+    Ok(AccessKeyRow {
+        access_key_id: r.text()?,
+        principal: r.text()?,
+        secret_wrapped: r.blob()?,
+        kek_version: r.num()?,
+        status: r.parsed(KeyStatus::parse)?,
+        created_at: r.ms()?,
+    })
+}
+
+pub(super) async fn auth_lookup<S: Sql>(
+    c: &SqlCatalog<S>,
+    akid: &str,
+    bucket: &str,
+) -> Result<AuthLookup> {
+    let rows = c.sql.query(auth_sql(), &[text(akid), text(bucket)]).await?;
+    let mut out = AuthLookup::default();
+    let mut pending = None;
+    for row in rows {
+        let (letter, row) = arm(row)?;
+        match letter.as_str() {
+            "k" => once(&mut out.key, key_row(row)?)?,
+            "b" => once(&mut out.bucket, bucket_row(row)?)?,
+            "p" => once(&mut out.perm, Cols::new(row).parsed(Perm::parse)?)?,
+            "r" => once(&mut pending, Cols::new(row).num::<i64>()?)?,
+            _ => return Err(bad("unknown row letter")),
+        }
+    }
+    // The arm has no condition: a result without it is not a whole one.
+    out.restore_pending = pending.ok_or_else(|| bad("no restore state"))? != 0;
+    Ok(out)
+}
+
 pub(super) async fn read_lookup<S: Sql>(
     c: &SqlCatalog<S>,
     q: &ReadQuery<'_>,
@@ -222,23 +281,9 @@ pub(super) async fn read_lookup<S: Sql>(
     for row in rows {
         let (letter, row) = arm(row)?;
         match letter.as_str() {
-            "k" => {
-                let mut r = Cols::new(row);
-                let key = AccessKeyRow {
-                    access_key_id: r.text()?,
-                    principal: r.text()?,
-                    secret_wrapped: r.blob()?,
-                    kek_version: r.num()?,
-                    status: r.parsed(KeyStatus::parse)?,
-                    created_at: r.ms()?,
-                };
-                once(&mut out.key, key)?;
-            }
+            "k" => once(&mut out.key, key_row(row)?)?,
             "b" => once(&mut out.bucket, bucket_row(row)?)?,
-            "p" => {
-                let perm = Cols::new(row).parsed(Perm::parse)?;
-                once(&mut out.perm, perm)?;
-            }
+            "p" => once(&mut out.perm, Cols::new(row).parsed(Perm::parse)?)?,
             "g" => once(&mut out.generation, generation_row(row)?)?,
             "e" => {
                 // Judged below, once the generation row is there.

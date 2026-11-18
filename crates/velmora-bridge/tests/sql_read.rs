@@ -1,6 +1,7 @@
-//! The one-statement lookups of a read (`Catalog::read_lookup`,
-//! `Catalog::pinned_read`) answer what the single reads they stand for
-//! answer, for every key, bucket, object and window.
+//! The one-statement lookups (`Catalog::auth_lookup`,
+//! `Catalog::read_lookup`, `Catalog::pinned_read`) answer what the
+//! single reads they stand for answer, for every key, bucket, object
+//! and window.
 
 mod service_support;
 
@@ -171,4 +172,59 @@ async fn a_compound_select_has_no_more_terms_than_d1_takes() {
         most as usize
     );
     assert!(sql.query(&terms(most + 1), &[]).await.is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_statement_answers_who_asks_as_the_single_reads_do() {
+    let rig = rig_with(NoNntp, config(Vec::new()));
+    let (bucket, _) = rig.standard("bkt-one").await;
+    let other = rig.bucket("bkt-two", true).await;
+    rig.key("AKIDTESTKEY000000002", secret(), KeyStatus::Disabled)
+        .await;
+    rig.grant("AKIDTESTKEY000000002", &bucket, Perm::Rw).await;
+    rig.key("AKIDTESTKEY000000003", secret(), KeyStatus::Active)
+        .await;
+    rig.grant("AKIDTESTKEY000000003", &other, Perm::Ro).await;
+    let catalog = &rig.bridge.catalog;
+
+    for replaying in [false, true] {
+        if replaying {
+            let now = rig.now();
+            let _ = catalog.restore_begin(UnixMs(0), now).await.unwrap();
+        }
+        let mut seen = Vec::new();
+        for akid in [
+            AKID,
+            "AKIDTESTKEY000000002",
+            "AKIDTESTKEY000000003",
+            "AKIDTESTKEY00000NONE",
+            "",
+            "' OR 1=1 --",
+        ] {
+            for name in ["bkt-one", "bkt-two", "bkt-none", ""] {
+                let before = catalog.sql.trips.get();
+                let one = catalog.auth_lookup(akid, name).await.unwrap();
+                assert_eq!(catalog.sql.trips.get() - before, 1, "{akid} {name}");
+                let parts = auth_lookup_by_parts(catalog, akid, name).await.unwrap();
+                assert!(one.key == parts.key, "{akid} {name}");
+                assert_eq!(one.bucket, parts.bucket, "{akid} {name}");
+                assert_eq!(one.perm, parts.perm, "{akid} {name}");
+                assert_eq!(one.restore_pending, parts.restore_pending);
+                assert_eq!(one.restore_pending, replaying);
+                assert!(one.key.iter().all(|k| k.status == KeyStatus::Active));
+                seen.push((one.key.is_some(), one.bucket.is_some(), one.perm));
+            }
+        }
+        // The rows that tell callers apart are all there.
+        assert_eq!(seen[0], (true, true, Some(Perm::Rw)));
+        assert_eq!(seen[1], (true, true, None));
+        assert_eq!(seen[2], (true, false, None));
+        assert_eq!(seen[3], (true, false, None));
+        // A disabled key has no row and no grant, whatever it was given.
+        assert_eq!(seen[4], (false, true, None));
+        assert_eq!(seen[8], (true, true, None));
+        assert_eq!(seen[9], (true, true, Some(Perm::Ro)));
+        assert_eq!(seen[12], (false, true, None));
+        assert_eq!(seen[20], (false, true, None));
+    }
 }

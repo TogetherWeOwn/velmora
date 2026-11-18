@@ -297,6 +297,11 @@ pub(super) struct Authed {
     pub verified: VerifiedRequest,
     /// The addressed bucket; `None` only for the service root.
     pub bucket: Option<Bucket>,
+    /// The grant of the key on `bucket`.
+    pub perm: Option<Perm>,
+    /// Whether writes are refused ([`Catalog::restore_pending`]), as
+    /// read with the key. `None`: not read with it.
+    pub restore_pending: Option<bool>,
 }
 
 impl Authed {
@@ -306,6 +311,34 @@ impl Authed {
             (Some(bucket), Some(key)) if !key.is_empty() => Ok((bucket, key)),
             _ => Err(s3_error(ErrorCode::InvalidRequest)),
         }
+    }
+}
+
+/// Why a request was not authenticated. Each caller answers it in its
+/// own words.
+pub(super) enum Refused {
+    Code(ErrorCode),
+    /// A refusal that names its cause, already rendered: a `Host` that
+    /// is not this endpoint, a header the service will not act on, a
+    /// credential scope for another region.
+    Response(S3Response),
+    /// The catalogue or the key store failed.
+    Internal,
+}
+
+impl Refused {
+    pub(super) fn response(self) -> S3Response {
+        match self {
+            Self::Code(code) => s3_error(code),
+            Self::Response(resp) => resp,
+            Self::Internal => internal(),
+        }
+    }
+}
+
+impl From<ErrorCode> for Refused {
+    fn from(code: ErrorCode) -> Self {
+        Self::Code(code)
     }
 }
 
@@ -381,48 +414,46 @@ pub(super) fn edge_header(name: &str) -> bool {
 
 /// The request line and headers of a request, validated, and the key
 /// id it claims (empty: none).
-struct Parsed {
-    policy: Policy,
-    target: Target,
-    headers: Headers,
-    akid: String,
+pub(super) struct Parsed {
+    pub policy: Policy,
+    pub target: Target,
+    pub headers: Headers,
+    /// The key that is looked up. The verifier reads the credential
+    /// strictly and takes the key only under the id it reads itself.
+    pub akid: String,
 }
 
-fn parse<C, B, N, J, K, T>(
-    bridge: &Bridge<C, B, N, J, K, T>,
+/// Validates the request line and the headers under `policy`, and
+/// refuses what can be named from the request and the configuration
+/// alone: a `Host` that is not this endpoint, a header the service will
+/// not act on.
+pub(super) fn parse(
     req: &S3Request,
-) -> Result<Parsed, S3Response>
-where
-    C: Catalog,
-    B: BlobStore,
-    N: NntpConnector,
-    J: JobSink,
-    K: Kek,
-    T: Clock,
-{
-    let policy = policy(&bridge.cfg)?;
-    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
+    policy: Policy,
+    cfg: &BridgeConfig,
+) -> Result<Parsed, Refused> {
+    let target = Target::parse(&req.raw_target, &policy);
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
         .filter(|(n, _)| !edge_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
-    let headers = Headers::new(&fields, &policy).map_err(s3_error);
+    let headers = Headers::new(&fields, &policy);
     // Refusals that name their cause. Neither reads anything but the
     // request itself and the configuration. The host comes before the
     // path is judged: on a virtual-hosted request the first segment is a
     // key, and "not a bucket name" would name the wrong mistake.
     if let Ok(headers) = &headers {
-        if let Some(resp) = host_refused(headers, &bridge.cfg) {
-            return Err(resp);
+        if let Some(resp) = host_refused(headers, cfg) {
+            return Err(Refused::Response(resp));
         }
     }
     let target = target?;
     let headers = headers?;
     headers
         .check_features()
-        .map_err(|refusal| header_refused(&refusal))?;
+        .map_err(|refusal| Refused::Response(header_refused(&refusal)))?;
     let akid = claimed_key(&headers, &target).unwrap_or_default();
     Ok(Parsed {
         policy,
@@ -437,7 +468,7 @@ where
 async fn usable_key<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     row: Option<AccessKeyRow>,
-) -> Result<Option<AccessKeyRow>, S3Response>
+) -> Result<Option<AccessKeyRow>, Refused>
 where
     C: Catalog,
     B: BlobStore,
@@ -456,11 +487,19 @@ where
         Some(row) if bridge.cfg.maintenance == Maintenance::Restore => {
             let revoked = revocation_recorded(&bridge.safety, &row.access_key_id)
                 .await
-                .map_err(|_| internal())?;
+                .map_err(|_| Refused::Internal)?;
             Ok((!revoked).then_some(row))
         }
         other => Ok(other),
     }
+}
+
+/// What the catalogue holds on who asks.
+struct Caller {
+    row: Option<AccessKeyRow>,
+    bucket: Option<Bucket>,
+    perm: Option<Perm>,
+    restore_pending: Option<bool>,
 }
 
 /// Verifies the signature of a parsed request against the key row found
@@ -471,10 +510,8 @@ fn finish<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
     parsed: Parsed,
-    row: Option<AccessKeyRow>,
-    bucket: Option<Bucket>,
-    perm: Option<Perm>,
-) -> Result<Authed, S3Response>
+    caller: Caller,
+) -> Result<Authed, Refused>
 where
     C: Catalog,
     B: BlobStore,
@@ -497,20 +534,20 @@ where
         no_bucket: Cell::new(false),
     };
     let mut found = None;
-    if let Some(row) = row {
+    if let Some(row) = caller.row {
         let secret = unwrap_secret(
             &bridge.kek,
             row.kek_version,
             &row.access_key_id,
             &row.secret_wrapped,
         )
-        .map_err(|_| internal())?;
+        .map_err(|_| Refused::Internal)?;
         authority.principal = row.principal;
         authority.secret = Some(secret);
-        if bucket.is_some() {
-            authority.perm = perm;
+        if caller.bucket.is_some() {
+            authority.perm = caller.perm;
         }
-        found = bucket;
+        found = caller.bucket;
     }
 
     // Transport was checked at ingress; plain HTTP never reaches a handler
@@ -528,13 +565,13 @@ where
         if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
             // The signature verified; the key has no grant on a bucket
             // of this name, whether or not one exists.
-            s3_error(ErrorCode::NoSuchBucket)
+            Refused::Code(ErrorCode::NoSuchBucket)
         } else {
-            auth_refused(code, &policy, &headers, &target)
+            Refused::Response(auth_refused(code, &policy, &headers, &target))
         }
     })?;
     if !target.bucket.is_empty() && found.is_none() {
-        return Err(s3_error(ErrorCode::NoSuchBucket));
+        return Err(ErrorCode::NoSuchBucket.into());
     }
     Ok(Authed {
         policy,
@@ -542,6 +579,8 @@ where
         headers,
         verified,
         bucket: found,
+        perm: authority.perm,
+        restore_pending: caller.restore_pending,
     })
 }
 
@@ -569,17 +608,20 @@ where
     K: Kek,
     T: Clock,
 {
-    let parsed = parse(bridge, req)?;
-    by_single_reads(bridge, req, parsed).await
+    let parsed = parse(req, policy(&bridge.cfg)?, &bridge.cfg).map_err(Refused::response)?;
+    authenticate_parsed(bridge, req, parsed)
+        .await
+        .map_err(Refused::response)
 }
 
-/// [`authenticate`] after the parse: the key, the bucket and the grant,
-/// each asked for on its own.
-async fn by_single_reads<C, B, N, J, K, T>(
+/// [`authenticate`] after the parse. The key `parsed.akid`, the bucket
+/// and the grant come from the catalogue in one round trip
+/// ([`Catalog::auth_lookup`]); a request that names no key asks nothing.
+pub(super) async fn authenticate_parsed<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
     parsed: Parsed,
-) -> Result<Authed, S3Response>
+) -> Result<Authed, Refused>
 where
     C: Catalog,
     B: BlobStore,
@@ -588,32 +630,26 @@ where
     K: Kek,
     T: Clock,
 {
-    let (mut row, mut bucket, mut perm) = (None, None, None);
+    let mut caller = Caller {
+        row: None,
+        bucket: None,
+        perm: None,
+        restore_pending: None,
+    };
     if !parsed.akid.is_empty() {
         let found = bridge
             .catalog
-            .access_key(&parsed.akid)
+            .auth_lookup(&parsed.akid, &parsed.target.bucket)
             .await
-            .map_err(|_| internal())?;
-        row = usable_key(bridge, found).await?;
-        if row.is_some() {
-            if !parsed.target.bucket.is_empty() {
-                bucket = bridge
-                    .catalog
-                    .bucket_by_name(&parsed.target.bucket)
-                    .await
-                    .map_err(|_| internal())?;
-            }
-            if let Some(b) = &bucket {
-                perm = bridge
-                    .catalog
-                    .grant(&parsed.akid, &b.id)
-                    .await
-                    .map_err(|_| internal())?;
-            }
-        }
+            .map_err(|_| Refused::Internal)?;
+        caller = Caller {
+            row: usable_key(bridge, found.key).await?,
+            bucket: found.bucket,
+            perm: found.perm,
+            restore_pending: Some(found.restore_pending),
+        };
     }
-    finish(bridge, req, parsed, row, bucket, perm)
+    finish(bridge, req, parsed, caller)
 }
 
 /// What [`authenticate_read`] found beside the authorization: the live
@@ -648,13 +684,16 @@ where
     K: Kek,
     T: Clock,
 {
-    let parsed = parse(bridge, req)?;
+    let parsed = parse(req, policy(&bridge.cfg)?, &bridge.cfg).map_err(Refused::response)?;
     let key = match parsed.target.key.as_deref() {
         Some(key) if !key.is_empty() => key,
         _ => "",
     };
     if parsed.akid.is_empty() || parsed.target.bucket.is_empty() || key.is_empty() {
-        return Ok((by_single_reads(bridge, req, parsed).await?, None));
+        let authed = authenticate_parsed(bridge, req, parsed)
+            .await
+            .map_err(Refused::response)?;
+        return Ok((authed, None));
     }
     let lookup = bridge
         .catalog
@@ -667,8 +706,15 @@ where
         })
         .await
         .map_err(|_| internal())?;
-    let row = usable_key(bridge, lookup.key).await?;
-    let authed = finish(bridge, req, parsed, row, lookup.bucket, lookup.perm)?;
+    let caller = Caller {
+        row: usable_key(bridge, lookup.key)
+            .await
+            .map_err(Refused::response)?,
+        bucket: lookup.bucket,
+        perm: lookup.perm,
+        restore_pending: None,
+    };
+    let authed = finish(bridge, req, parsed, caller).map_err(Refused::response)?;
     Ok((
         authed,
         Some(Found {

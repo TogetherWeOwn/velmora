@@ -643,15 +643,16 @@ pub(super) async fn stamp_rolled_back<S: Sql>(
     Ok(changed == 1)
 }
 
+/// Not zero while a replay is to be run or a rollback is recorded: the
+/// replays that did not end, plus the rollback stamp if it is set.
+pub(super) const RESTORE_PENDING: &str =
+    "(SELECT COUNT(*) FROM restore_state WHERE state <> 'complete') \
+     + (SELECT COUNT(*) FROM rollback_stamp WHERE id = 1 AND rolled_back_at IS NOT NULL)";
+
 pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
     let rows = c
         .sql
-        .query(
-            "SELECT (SELECT COUNT(*) FROM restore_state WHERE state <> 'complete') \
-                  + (SELECT COUNT(*) FROM rollback_stamp \
-                     WHERE id = 1 AND rolled_back_at IS NOT NULL)",
-            &[],
-        )
+        .query(&format!("SELECT {RESTORE_PENDING}"), &[])
         .await?;
     match rows.first().map(Vec::as_slice) {
         Some([SqlValue::Int(n)]) => Ok(*n != 0),
