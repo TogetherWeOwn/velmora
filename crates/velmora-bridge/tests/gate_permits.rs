@@ -2187,6 +2187,7 @@ async fn a_call_that_crosses_a_forgotten_session_asks_again() {
         assert!(step(more.as_mut()).is_pending());
     }
     assert_eq!(w.msgs.get(), 1, "asked on the open session");
+    assert_eq!(w.held(name, "p").await, 2, "and granted on it");
     c.forget_permit(&a);
     assert_eq!(w.sessions(name), 0);
     w.late.set(false);
