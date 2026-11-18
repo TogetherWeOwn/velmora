@@ -199,7 +199,9 @@ service = "velmora-s3"
 # named permits:<unit>:<shard>. Optional vars: PERMIT_SHARDS (1 to 64,
 # default 1) divides each account over that many objects; PERMIT_GATES
 # (account | one, default account) = "one" puts every account behind the
-# same objects, which is the least Durable Object duration.
+# same objects. A job holds one hibernating WebSocket per gate while it
+# has slots: slots live in memory and with the socket, not in storage,
+# and the object bills no duration between two messages.
 [[durable_objects.bindings]]
 name = "PERMIT_GATE"
 class_name = "PermitGate"
@@ -207,6 +209,12 @@ class_name = "PermitGate"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PermitGate"]
+
+# The id of the deployed version: a gate that starts under new code with
+# no session left waits out the slots of the old (one stored row per
+# deploy and gate).
+[version_metadata]
+binding = "CF_VERSION_METADATA"
 
 [[d1_databases]]
 binding = "CATALOG"
@@ -431,6 +439,9 @@ service = "velmora-s3-dev"
 [[env.dev.durable_objects.bindings]]
 name = "PERMIT_GATE"
 class_name = "PermitGate"
+
+[env.dev.version_metadata]
+binding = "CF_VERSION_METADATA"
 
 [[env.dev.d1_databases]]
 binding = "CATALOG"

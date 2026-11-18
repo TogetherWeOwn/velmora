@@ -777,11 +777,16 @@ handing permits out. `PERMITS` chooses where they are kept:
 - `d1` (default, also when unset): slot rows in the catalogue
   (`provider_permits`). Every acquire, renew and release writes a row.
 - `do`: in the memory of a Durable Object (`PermitGate`, binding
-  `PERMIT_GATE`). An acquire, a renew and a release are requests to the
-  object and write nothing. Calls a job makes at the same moment travel
-  in one request. The object stores one small record: written when a
-  busy period starts, again every 10 minutes while permits are live,
-  and cleared 2 seconds after the last permit is gone.
+  `PERMIT_GATE`). A holder (a job, a cold read) opens one WebSocket to
+  each object it needs; its first acquire travels with the opening,
+  and every renewal, further acquire and release is a message on it.
+  Calls a job makes at the same moment travel together. Nothing is
+  written for a permit: the permits of a session are kept with its
+  socket, the object leaves memory between two messages and finds them
+  again when the next one comes. When the socket ends (the job is
+  done, its invocation ended or failed) its permits are free at once.
+  The object stores one small record: written at the first start after
+  a deploy, and every 10 minutes while permits of a class are live.
 
 There is one object per provider account, named
 `permits:account.<id>:0`. Accounts that share `pool_max_conns` have one
@@ -822,24 +827,43 @@ write.
 
 ### Restarts
 
-The object loses its memory when it is evicted, when its host moves it
-and at every deploy. It then knows no holder, while Workers may still
-hold connections under permits of its last life. So:
+The object leaves memory about ten seconds after its last message and
+comes back at the next one with every open socket and the permits kept
+with it. That is not a restart, costs nothing and makes nobody wait.
 
-- An object that starts without a stored record was idle; it hands out
-  at once.
-- One that starts with a record waits until every permit of its last
-  life has run out: up to 125 s for jobs and 40 s for reads (the lease
-  lengths plus 5 s), counted from the first request after the start.
-  During the jobs' wait a read may use only the connection and the
-  address that are kept back for reads.
-- Permits from before a start are neither renewed nor released by the
-  new object. A job that cannot renew stops and is retried by the
+A deploy can cut every socket. The object then knows no holder, while
+Workers may still hold connections under permits of the old version.
+So:
+
+- The first start under a new version that finds no open socket, and
+  that is within the stored horizon of the old permits, waits until
+  every one of them has run out: up to 125 s for jobs and 40 s for
+  reads (the lease lengths plus 5 s), counted from the first request
+  after the deploy (the cron's, at the latest). During the jobs' wait
+  a read may use only the connection and the address that are kept
+  back for reads. The wait is stored with the version, so later starts
+  neither forget it nor begin it again.
+- A start with no horizon ahead (nothing was handed out for more than
+  10 minutes) hands out at once.
+- Permits from before the deploy are neither renewed nor released by
+  the new object. A job that cannot renew stops and is retried by the
   queue, as it does when a slot row is lost.
 
-Every start logs one line, `permit gate started: jobs_until=…
-reads_until=… seized=…`. Many of them in an hour without a deploy mean
-the object does not stay in memory between requests.
+Not covered: an object that is reset without a deploy (it crashed, its
+machine was lost) while holders are connected through it. Their sockets
+are cut, their permits are free at once, and each of them goes on
+until its next renewal fails: up to 20 s for a job, 5 s for a read. In
+that time the account can be asked for more connections than
+`max_conns`; the provider refuses the extra ones and the job that was
+refused is retried. Closing this would take two stored rows for every
+busy period of every object.
+
+The version comes from the `CF_VERSION_METADATA` binding; without it
+the object answers every request with an error.
+
+Every time the object comes into memory it logs one line, `permit gate
+started: sessions=… jobs_until=… reads_until=… warm_until=… seized=…`.
+`warm_until` in the future is the wait after a deploy.
 
 ### Turning it on, and back
 
@@ -857,8 +881,9 @@ together, when its last gate has retired. With several shards the
 address and pool limits are shared out among the gates, so the account
 is either all the gates' or all the catalogue's, never part of each.
 
-A gate does not rely on what it stored about the rows: at every start,
-and whenever it is put back in charge, it asks the catalogue.
+A gate that comes into memory takes what it stored about the rows; the
+cron (every 5 minutes) and every return to charge ask the catalogue
+again. Do not edit `do-gate:` rows by hand while `PERMITS` is `do`.
 
 1. Deploy a version that knows `PERMITS`, with `PERMITS = "d1"`. The
    deploy adds the object class (a migration). Nothing calls it.

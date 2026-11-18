@@ -161,6 +161,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
             catalog,
             GateClient::new(
                 DoTransport::new(namespace),
+                || WorkerClock.now(),
                 permits,
                 sharding,
                 shards,

@@ -113,6 +113,17 @@ const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
 /// deletes it.
 pub(crate) struct GuardRefused(());
 
+/// Puts what the gates hold in place of what the slot rows say.
+fn overlay(load: &mut [ProviderLoad], held: &[crate::gate::GateLoad]) {
+    for l in load {
+        let g = held.iter().find(|g| g.provider == l.provider_id);
+        l.held = g.map_or(0, |g| g.held);
+        l.holders = g.map_or(0, |g| g.holders);
+        l.background_holders = g.map_or(0, |g| g.background_holders);
+        l.uses = g.map_or(0, |g| g.uses);
+    }
+}
+
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
     pub sql: S,
@@ -753,12 +764,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
             Some(gate) => gate.acquire(p, class, holder).await?,
             None => permits::acquire_permit(self, p, class, holder, now).await?,
         };
-        // Nothing free may mean the other side still owns the slots
-        // after a change of `PERMITS`: the rollout step runs now, not
-        // at the next sweep. At most once per [`NUDGE_EVERY_MS`], and a
-        // failure of it is not a failure of the acquire.
+        // After a change of `PERMITS` the other side may still own the
+        // slots: the rollout step runs now, not at the next sweep. A
+        // gate says so itself when it is not in charge; the slot rows
+        // cannot, so there nothing free is taken for it. At most once
+        // per [`NUDGE_EVERY_MS`], and a failure of it is not a failure
+        // of the acquire.
         if let (None, Some(gate)) = (&permit, self.gate.as_deref()) {
-            if (now.0 - self.nudged.get()).abs() >= permits::NUDGE_EVERY_MS {
+            let due = match gate.active() {
+                true => gate.unowned(),
+                false => true,
+            };
+            if due && (now.0 - self.nudged.get()).abs() >= permits::NUDGE_EVERY_MS {
                 self.nudged.set(now.0);
                 let _ = permits::sweep_gates(self, Some(gate)).await;
             }
@@ -788,15 +805,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         let mut load = health::provider_load(self, now).await?;
         if let Some(gate) = self.active_gate() {
             // The slot rows are the gate's as a whole; what is in use
-            // is what the gate has handed out.
-            let held = gate.load().await?;
-            for l in &mut load {
-                let g = held.iter().find(|g| g.provider == l.provider_id);
-                l.held = g.map_or(0, |g| g.held);
-                l.holders = g.map_or(0, |g| g.holders);
-                l.background_holders = g.map_or(0, |g| g.background_holders);
-                l.uses = g.map_or(0, |g| g.uses);
-            }
+            // is what the gates have handed out, as they last told
+            // this caller: the order of providers is a preference, and
+            // not worth a request to every gate.
+            overlay(&mut load, &gate.hint(now));
+        }
+        Ok(load)
+    }
+    async fn provider_status(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        let mut load = health::provider_load(self, now).await?;
+        if let Some(gate) = self.active_gate() {
+            overlay(&mut load, &gate.load().await?);
         }
         Ok(load)
     }

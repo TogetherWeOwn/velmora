@@ -77,14 +77,32 @@ impl GateStore for Store {
     }
 }
 
-/// The gates of a deployment: their storage, their memory (lost on
-/// [`World::restart`]) and the clock they read.
+/// What the runtime keeps of a gate's open sessions while the object
+/// is out of memory: per session, what was attached to its connection.
+type Sockets = BTreeMap<String, BTreeMap<u64, SessionState>>;
+
+/// The most the runtime keeps with one connection, in bytes.
+const ATTACHMENT_MAX: usize = 16_384;
+
+/// The gates of a deployment: their storage, their open sessions, their
+/// memory (lost on [`World::hibernate`], [`World::restart`] and
+/// [`World::crash`]) and the clock they read.
 struct World {
     db: Db,
     now: Cell<i64>,
     stores: RefCell<BTreeMap<String, Store>>,
     gates: RefCell<BTreeMap<String, Rc<Gate<Db, Store>>>>,
+    sockets: RefCell<Sockets>,
+    /// The version of the code the gates run.
+    boot: Cell<u32>,
+    /// Every round trip to a gate: `opens + msgs + posts`.
     calls: Cell<u32>,
+    /// Sessions opened: each is one billed request.
+    opens: Cell<u32>,
+    /// Messages on open sessions: each is billed as 1/20 request.
+    msgs: Cell<u32>,
+    /// Requests without a session: each is one billed request.
+    posts: Cell<u32>,
     ops: Cell<u32>,
     /// No gate can be reached.
     down: Cell<bool>,
@@ -99,7 +117,12 @@ impl World {
             now: Cell::new(T0),
             stores: RefCell::default(),
             gates: RefCell::default(),
+            sockets: RefCell::default(),
+            boot: Cell::new(1),
             calls: Cell::new(0),
+            opens: Cell::new(0),
+            msgs: Cell::new(0),
+            posts: Cell::new(0),
             ops: Cell::new(0),
             down: Cell::new(false),
             stall: Cell::new(false),
@@ -122,27 +145,54 @@ impl World {
             .clone()
     }
 
-    fn gate(&self, name: &str) -> Rc<Gate<Db, Store>> {
+    /// The gate in memory, as the host brings it there for an event:
+    /// with the sessions whose connections are still open.
+    async fn gate(&self, name: &str) -> Rc<Gate<Db, Store>> {
         let store = self.store(name);
-        self.gates
+        let gate = self
+            .gates
             .borrow_mut()
             .entry(name.to_string())
-            .or_insert_with(|| Rc::new(Gate::new(self.db.clone(), store)))
-            .clone()
+            .or_insert_with(|| {
+                Rc::new(Gate::new(
+                    self.db.clone(),
+                    store,
+                    format!("v{}", self.boot.get()),
+                ))
+            })
+            .clone();
+        if !gate.started() {
+            let open = self.sockets.borrow().get(name).cloned().unwrap_or_default();
+            let sessions = open.into_values().collect();
+            // A start that fails is tried again at the next event.
+            let _ = gate.resume(sessions, self.now()).await;
+        }
+        gate
     }
 
-    /// The object loses its memory: a deploy, or a move.
-    fn restart(&self) {
+    /// The objects leave memory between two events. Their sessions stay
+    /// open.
+    fn hibernate(&self) {
         self.gates.borrow_mut().clear();
     }
 
-    /// Lets every gate do its housekeeping, as the host does while
-    /// [`Gate::next_wake`] names a time.
-    async fn tick(&self) {
-        let gates: Vec<_> = self.gates.borrow().values().cloned().collect();
-        for gate in gates {
-            gate.tick(self.now()).await;
-        }
+    /// New code that cuts every session: the objects lose their memory
+    /// and their connections, and start as another version.
+    fn restart(&self) {
+        self.boot.set(self.boot.get() + 1);
+        self.crash();
+    }
+
+    /// The objects are reset without a deploy: memory and connections
+    /// are gone, the version is the same.
+    fn crash(&self) {
+        self.gates.borrow_mut().clear();
+        self.sockets.borrow_mut().clear();
+    }
+
+    /// Sessions open at the gate `name`.
+    fn sessions(&self, name: &str) -> usize {
+        self.sockets.borrow().get(name).map_or(0, BTreeMap::len)
     }
 
     /// A catalogue as a Worker of `mode` has it.
@@ -163,7 +213,11 @@ impl World {
         shards: u32,
         providers: &[ProviderConfig],
     ) -> SqlCatalog<Db> {
-        let client = GateClient::new(Wire(self.clone()), mode, sharding, shards, providers);
+        let clock = {
+            let w = self.clone();
+            move || w.now()
+        };
+        let client = GateClient::new(Wire(self.clone()), clock, mode, sharding, shards, providers);
         SqlCatalog::with_gate(self.db.clone(), client.into_gate())
     }
 
@@ -202,8 +256,11 @@ impl World {
     async fn load(&self, gate: &str) -> Vec<GateLoad> {
         let reply = self
             .gate(gate)
+            .await
             .handle(
+                None,
                 GateRequest {
+                    id: 0,
                     gate: gate.into(),
                     ops: vec![GateOp::Load],
                 },
@@ -230,8 +287,9 @@ impl World {
 
 struct Wire(Rc<World>);
 
-impl GateTransport for Wire {
-    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+impl Wire {
+    /// A request on its way: it may not arrive, or find no gate.
+    async fn arrive(&self, request: &GateRequest) -> Result<GateRequest> {
         core::future::poll_fn(|_| match self.0.stall.get() {
             true => core::task::Poll::Pending,
             false => core::task::Poll::Ready(()),
@@ -243,11 +301,115 @@ impl GateTransport for Wire {
         self.0.calls.set(self.0.calls.get() + 1);
         self.0.ops.set(self.0.ops.get() + request.ops.len() as u32);
         // As on the wire: the request and the reply are JSON.
-        let request: GateRequest =
-            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
-        let gate = self.0.gate(&request.gate);
-        let reply = gate.handle(request, self.0.now()).await?;
-        Ok(serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap())
+        Ok(serde_json::from_str(&serde_json::to_string(request).unwrap()).unwrap())
+    }
+}
+
+fn on_the_wire(reply: &GateReply) -> GateReply {
+    serde_json::from_str(&serde_json::to_string(reply).unwrap()).unwrap()
+}
+
+/// The caller's end of a session.
+struct Line {
+    world: Rc<World>,
+    gate: String,
+    id: u64,
+}
+
+impl Line {
+    /// The session is kept with its connection, as the host does before
+    /// a reply leaves.
+    fn attach(&self, gate: &Gate<Db, Store>) {
+        let state = gate.session(self.id, self.world.now());
+        let size = serde_json::to_string(&state).unwrap().len();
+        assert!(size <= ATTACHMENT_MAX, "{size} bytes with one connection");
+        self.world
+            .sockets
+            .borrow_mut()
+            .entry(self.gate.clone())
+            .or_default()
+            .insert(self.id, state);
+    }
+
+    fn open(&self) -> bool {
+        self.world
+            .sockets
+            .borrow()
+            .get(&self.gate)
+            .is_some_and(|s| s.contains_key(&self.id))
+    }
+}
+
+impl GateSession for Line {
+    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        let request = Wire(self.world.clone()).arrive(&request).await?;
+        if !self.open() {
+            return Err(BridgeError::Sql("gate: session ended".into()));
+        }
+        self.world.msgs.set(self.world.msgs.get() + 1);
+        let gate = self.world.gate(&self.gate).await;
+        let id = request.id;
+        // The host answers a request the gate failed at with no answers.
+        let reply = gate
+            .handle(Some(self.id), request, self.world.now())
+            .await
+            .unwrap_or(GateReply {
+                id,
+                answers: Vec::new(),
+                load: Vec::new(),
+                unowned: false,
+            });
+        self.attach(&gate);
+        Ok(on_the_wire(&reply))
+    }
+
+    fn close(&self) {
+        let was_open = self
+            .world
+            .sockets
+            .borrow_mut()
+            .get_mut(&self.gate)
+            .is_some_and(|s| s.remove(&self.id).is_some());
+        // An object in memory hears of the end at once; one that is not
+        // starts without the session.
+        let gate = self.world.gates.borrow().get(&self.gate).cloned();
+        if let (true, Some(gate)) = (was_open, gate) {
+            gate.close(self.id);
+        }
+    }
+}
+
+impl GateTransport for Wire {
+    type Session = Line;
+
+    async fn open(&self, request: GateRequest) -> Result<(Line, GateReply)> {
+        let request = self.arrive(&request).await?;
+        self.0.opens.set(self.0.opens.get() + 1);
+        let gate = self.0.gate(&request.gate).await;
+        let now = self.0.now();
+        let line = Line {
+            world: self.0.clone(),
+            gate: request.gate.clone(),
+            id: gate.open(now).await?,
+        };
+        match gate.handle(Some(line.id), request, now).await {
+            Ok(reply) => {
+                line.attach(&gate);
+                Ok((line, on_the_wire(&reply)))
+            }
+            Err(e) => {
+                gate.close(line.id);
+                Err(e)
+            }
+        }
+    }
+
+    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        let request = self.arrive(&request).await?;
+        self.0.posts.set(self.0.posts.get() + 1);
+        let gate = self.0.gate(&request.gate).await;
+        let reply = gate.handle(None, request, self.0.now()).await?;
+        Ok(on_the_wire(&reply))
     }
 }
 
@@ -335,7 +497,7 @@ async fn memory_and_slot_rows_decide_alike() {
                         &GateProvider::from(p),
                         &[],
                         class == JOB,
-                        &holder,
+                        (&holder, 1),
                         UnixMs(now),
                         Warm::Done,
                     );
@@ -397,7 +559,8 @@ async fn load_is_what_the_gate_handed_out() {
 // Losing the memory
 // ---------------------------------------------------------------------------
 
-/// A gate that was idle when it lost its memory waits for nothing.
+/// New code that starts after the horizon of the old slots has passed
+/// waits for nothing.
 #[tokio::test]
 async fn a_start_after_idle_hands_out_at_once() {
     let w = World::new();
@@ -405,19 +568,108 @@ async fn a_start_after_idle_hands_out_at_once() {
     let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
     let a = take(&c, &w, &providers[0], JOB, "job-1").await.unwrap();
     c.release_permit(&a).await.unwrap();
-    // Nothing held: after the linger the horizon is cleared.
-    let gate = w.gate("permits:all:0");
-    assert!(gate.next_wake(w.now()).is_some());
-    w.pass(LINGER_MS);
-    w.tick().await;
     let record = w.store("permits:all:0").record.borrow().clone().unwrap();
-    assert_eq!((record.jobs_until, record.reads_until), (0, 0));
-    assert_eq!(gate.next_wake(w.now()), None, "nothing keeps it in memory");
+    w.pass(record.jobs_until + SKEW_MS - w.now.get());
 
     w.restart();
     w.pass(1);
     assert!(take(&c, &w, &providers[0], JOB, "job-2").await.is_some());
     assert!(take(&c, &w, &providers[0], READ, "read-2").await.is_some());
+}
+
+/// The object leaves memory between two messages of its sessions and
+/// comes back with every slot as it was: the holders renew and free
+/// them, nobody else gets them, and nothing waits. Nothing is written
+/// for it.
+#[tokio::test]
+async fn slots_outlive_the_memory_with_their_sessions() {
+    let w = World::new();
+    let p = with_ips(provider("p", 3), 2);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let a = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    let b = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    let r = take(&c, &w, &p, READ, "read-1").await.unwrap();
+    let store = w.store("permits:all:0");
+    let saves = store.saves.get();
+
+    for _ in 0..5 {
+        w.hibernate();
+        w.pass(15_000);
+        assert_eq!(w.held("permits:all:0", "p").await, 3);
+        assert!(take(&c, &w, &p, JOB, "job-2").await.is_none(), "full");
+        w.hibernate();
+        assert!(c.renew_permit(&a, w.now()).await.unwrap());
+        assert!(c.renew_permit(&b, w.now()).await.unwrap());
+        assert!(c.renew_permit(&r, w.now()).await.unwrap());
+    }
+    assert_eq!(store.saves.get(), saves, "no write for any of it");
+
+    // Freed at an object that has just come back: the place is free.
+    w.hibernate();
+    c.release_permit(&a).await.unwrap();
+    let next = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    assert_eq!(next.slot, a.slot);
+    assert!(next.token > r.token.max(b.token), "tokens never repeat");
+    // A slot not renewed ends on time, in or out of memory.
+    w.hibernate();
+    w.pass(READ_MS + 1);
+    assert!(!c.renew_permit(&r, w.now()).await.unwrap());
+}
+
+/// The end of a session frees its slots at once, whether the object is
+/// in memory or not: a holder whose invocation ended holds nothing.
+#[tokio::test]
+async fn the_end_of_a_session_frees_its_slots() {
+    let w = World::new();
+    let p = provider("p", 4);
+    let providers = [p.clone()];
+    for asleep in [false, true] {
+        let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+        take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        take(&c, &w, &p, JOB, "job-2").await.unwrap();
+        assert_eq!(w.sessions("permits:all:0"), 2);
+        if asleep {
+            w.hibernate();
+        }
+        // The invocation of job-1 ends: the runtime closes its socket.
+        let ended: Vec<u64> = w.sockets.borrow()["permits:all:0"]
+            .iter()
+            .filter(|(_, s)| s.held.len() == 2)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(ended.len(), 1);
+        Line {
+            world: w.clone(),
+            gate: "permits:all:0".into(),
+            id: ended[0],
+        }
+        .close();
+        assert_eq!(w.held("permits:all:0", "p").await, 1);
+        assert!(take(&c, &w, &p, JOB, "job-3").await.is_some());
+        w.restart();
+        assert_eq!(w.held("permits:all:0", "p").await, 0);
+        w.pass(JOB_MS + SKEW_MS + 1);
+    }
+}
+
+/// What this design leaves open, pinned so that a change to it is
+/// seen: a reset that is not a deploy cuts the sessions and the gate
+/// starts with nothing to wait for. A holder from before learns at its
+/// next renewal that it holds nothing.
+#[tokio::test]
+async fn a_reset_without_a_deploy_is_not_waited_out() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    let old = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    w.crash();
+    w.pass(1);
+    let other = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    assert!(take(&other, &w, &p, JOB, "job-2").await.is_some());
+    assert!(!c.renew_permit(&old, w.now()).await.unwrap());
 }
 
 /// A permit from before a restart is worth nothing at the new object:
@@ -434,6 +686,8 @@ async fn an_old_permit_neither_renews_nor_frees_after_a_restart() {
     w.restart();
     w.pass(1);
     assert!(!c.renew_permit(&old, w.now()).await.unwrap());
+    // The wait counts from the first request the new object sees.
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
     w.pass(JOB_MS + SKEW_MS);
     let new = take(&c, &w, &providers[0], JOB, "job-2").await.unwrap();
     assert_eq!(new.slot, 0, "the same slot number");
@@ -457,14 +711,14 @@ fn tokens_of_a_later_start_are_higher() {
     let mut last = 0;
     for _ in 0..100_000 {
         let permit = first
-            .acquire(&p, &[], true, "h", UnixMs(T0), Warm::Done)
+            .acquire(&p, &[], true, ("h", 1), UnixMs(T0), Warm::Done)
             .unwrap();
         last = permit.token;
         first.release(&permit);
     }
     let mut second = Core::new(UnixMs(T0 + 1));
     let permit = second
-        .acquire(&p, &[], true, "h", UnixMs(T0 + 1), Warm::Done)
+        .acquire(&p, &[], true, ("h", 1), UnixMs(T0 + 1), Warm::Done)
         .unwrap();
     assert!(permit.token > last);
 }
@@ -631,29 +885,31 @@ async fn nothing_is_promised_past_the_stored_horizon() {
     }
     assert_eq!(renewed, HORIZON_STEP_MS / 20_000);
     w.pass(20_000);
-    assert!(c.renew_permit(&permit, w.now()).await.is_err());
-    // The slot is not extended: it ends where the last renewal put it.
-    store.fail.set(false);
-    w.pass(JOB_MS - 20_000 + 1);
+    // The slot is not extended. The holder hears that it holds nothing
+    // and its session ends, so the place is free.
     assert!(!c.renew_permit(&permit, w.now()).await.unwrap());
+    store.fail.set(false);
+    assert_eq!(w.sessions("permits:all:0"), 0);
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
 }
 
-/// The cost in storage: one write when a class first takes a slot, one
-/// per [`HORIZON_STEP_MS`] while slots stay in use, one when all is
-/// quiet again. Never one per permit.
+/// The cost in storage: one write when a class first takes a slot and
+/// one per [`HORIZON_STEP_MS`] while slots stay in use. Never one per
+/// permit, none when all is quiet again, none for leaving memory.
 #[tokio::test]
-async fn storage_is_written_per_busy_period_not_per_permit() {
+async fn storage_is_written_per_horizon_step_not_per_permit() {
     let w = World::new();
     let providers = [provider("p", 8), provider("q", 8)];
     let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
     c.seed_permits(&providers).await.unwrap();
     let store = w.store("permits:all:0");
     let seized = store.saves.get();
-    assert!(seized <= 1, "the seizure is one write");
+    assert!(seized <= 2, "one write for the start, one for the seizure");
     w.db.0.meter_writes().unwrap();
 
     // 30 minutes of jobs: 6 slots taken, renewed every 20 s, given
-    // back and taken again every minute.
+    // back and taken again every minute. The object leaves memory
+    // between any two requests.
     let (mut permits, mut cycles) = (Vec::new(), 0);
     for second in (0..1800).step_by(20) {
         if second % 60 == 0 {
@@ -666,10 +922,11 @@ async fn storage_is_written_per_busy_period_not_per_permit() {
                 cycles += 1;
             }
         }
+        w.hibernate();
         let held = c.renew_permit(&permits[0], w.now()).await.unwrap();
         assert!(held);
         w.pass(20_000);
-        w.tick().await;
+        w.hibernate();
     }
     assert_eq!(cycles, 180);
     let busy = store.saves.get() - seized;
@@ -678,9 +935,10 @@ async fn storage_is_written_per_busy_period_not_per_permit() {
     for permit in permits.drain(..) {
         c.release_permit(&permit).await.unwrap();
     }
-    w.pass(LINGER_MS);
-    w.tick().await;
-    assert_eq!(store.saves.get() - seized, busy + 1, "one write to clear");
+    w.pass(HORIZON_STEP_MS * 3);
+    w.hibernate();
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
+    assert_eq!(store.saves.get() - seized, busy, "nothing to clear");
     assert_eq!(
         w.db.0.writes().billed(),
         0,
@@ -688,27 +946,64 @@ async fn storage_is_written_per_busy_period_not_per_permit() {
     );
 }
 
-/// A horizon being cleared while a request arrives: the slot is handed
-/// out only with its horizon back in storage.
+/// New code is one write per gate: the first start under it, and only
+/// that one. Starts of the same code (the object left memory) write
+/// nothing and ask the catalogue nothing.
 #[tokio::test]
-async fn a_slot_taken_after_the_clear_is_covered_again() {
+async fn a_deploy_is_one_write_and_a_start_is_none() {
     let w = World::new();
-    let providers = [provider("p", 2)];
+    let providers = [provider("p", 4)];
     let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
-    let a = take(&c, &w, &providers[0], READ, "read-1").await.unwrap();
-    c.release_permit(&a).await.unwrap();
-    w.pass(LINGER_MS);
-    w.tick().await;
-    let b = take(&c, &w, &providers[0], READ, "read-2").await.unwrap();
-    let stored = w.store("permits:all:0").record.borrow().clone().unwrap();
-    assert!(stored.reads_until >= w.now.get() + READ_MS);
-    // And a tick with a live slot clears nothing.
-    w.pass(LINGER_MS * 3);
-    w.tick().await;
-    let stored = w.store("permits:all:0").record.borrow().clone().unwrap();
-    assert!(stored.reads_until >= w.now.get() + READ_MS - LINGER_MS * 3);
-    assert!(w.gate("permits:all:0").next_wake(w.now()).is_some());
-    c.release_permit(&b).await.unwrap();
+    c.seed_permits(&providers).await.unwrap();
+    let a = take(&c, &w, &providers[0], JOB, "job-1").await.unwrap();
+    let store = w.store("permits:all:0");
+    let saves = store.saves.get();
+    w.db.0.meter_writes().unwrap();
+
+    for _ in 0..10 {
+        w.hibernate();
+        w.pass(10_000);
+        assert!(c.renew_permit(&a, w.now()).await.unwrap());
+    }
+    assert_eq!(store.saves.get(), saves);
+
+    w.restart();
+    assert!(!c.renew_permit(&a, w.now()).await.unwrap());
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
+    assert_eq!(store.saves.get(), saves + 1, "the wait is stored");
+    for _ in 0..10 {
+        w.hibernate();
+        w.pass(1000);
+        assert!(take(&c, &w, &providers[0], JOB, "job-2").await.is_none());
+    }
+    assert_eq!(store.saves.get(), saves + 1);
+    // The wait is not forgotten with the memory, nor begun again.
+    w.pass(JOB_MS + SKEW_MS - 10_000);
+    w.hibernate();
+    assert!(take(&c, &w, &providers[0], JOB, "job-2").await.is_some());
+    assert_eq!(w.db.0.writes().billed(), 0, "no catalogue row");
+}
+
+/// A second deploy during the wait of the first does not cut the wait
+/// short. It begins one of its own: what the first handed out in
+/// between is not known to it.
+#[tokio::test]
+async fn a_deploy_during_the_wait_does_not_cut_it_short() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    w.restart();
+    assert_eq!(w.held("permits:all:0", "p").await, 0);
+    w.pass(JOB_MS / 2);
+    w.restart();
+    w.pass(JOB_MS / 2 - 1);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_none());
+    w.pass(SKEW_MS + 2);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_none());
+    w.pass(JOB_MS);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -865,7 +1160,9 @@ async fn both_sides_together_never_exceed_the_limits() {
                 10 if rng.next(40) == 0 => w.restart(),
                 _ => {
                     w.pass(rng.next(20_000) as i64);
-                    w.tick().await;
+                    if rng.next(3) == 0 {
+                        w.hibernate();
+                    }
                 }
             }
             for p in &providers {
@@ -960,7 +1257,6 @@ async fn an_acquire_that_finds_nothing_moves_the_rollout_on() {
     let permit = take(&new, &w, &p, READ, "new-read").await.unwrap();
     new.release_permit(&permit).await.unwrap();
     w.pass(READ_MS + SKEW_MS);
-    w.tick().await;
 
     let back = w.catalog(PermitMode::Catalog, GateSharding::One, &providers);
     assert!(take(&back, &w, &p, READ, "back-read").await.is_none());
@@ -1092,7 +1388,9 @@ async fn storm(kinds: &[(PermitMode, u32)], seed: u64) -> Vec<u32> {
             10 if rng.next(40) == 0 => w.restart(),
             _ => {
                 w.pass(rng.next(20_000) as i64);
-                w.tick().await;
+                if rng.next(3) == 0 {
+                    w.hibernate();
+                }
             }
         }
         let at = format!("kinds {kinds:?} seed {seed} step {step}");
@@ -1332,8 +1630,8 @@ async fn the_gates_of_an_account_free_its_rows_together() {
 }
 
 /// The rows are cleared by hand while the gate is not in memory, and
-/// catalogue callers take them. A gate that starts again does not rely
-/// on what it stored: it asks the catalogue and waits.
+/// catalogue callers take them. The gate does not rely for long on what
+/// it stored: the periodic step asks the catalogue every time.
 #[tokio::test]
 async fn a_gate_does_not_trust_what_it_stored_about_the_rows() {
     let w = World::new();
@@ -1357,6 +1655,8 @@ async fn a_gate_does_not_trust_what_it_stored_about_the_rows() {
     assert!(take(&old, &w, &p, JOB, "old-job").await.is_some());
     assert!(take(&old, &w, &p, READ, "old-read").await.is_some());
 
+    // The periodic step asks the catalogue, whatever the gate stored.
+    new.seed_permits(&providers).await.unwrap();
     for _ in 0..3 {
         assert!(take(&new, &w, &p, JOB, "new-job").await.is_none());
         assert!(take(&new, &w, &p, READ, "new-read").await.is_none());
@@ -1387,30 +1687,29 @@ async fn a_gate_back_in_charge_asks_the_catalogue_again() {
     assert!(take(&new, &w, &p, READ, "new-read").await.is_none());
 }
 
-/// The save that clears the horizon fails: the next look tries again,
-/// and only then may the object leave memory.
+/// The write of a start under new code fails: nothing is handed out,
+/// and the next request tries the start again.
 #[tokio::test]
-async fn a_clear_that_failed_is_tried_again() {
+async fn a_start_that_cannot_store_its_wait_hands_out_nothing() {
     let w = World::new();
     let p = provider("p", 2);
     let providers = [p.clone()];
     let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
     let store = w.store("permits:all:0");
-    let job = take(&c, &w, &p, JOB, "job").await.unwrap();
-    c.release_permit(&job).await.unwrap();
-    let gate = w.gate("permits:all:0");
+    take(&c, &w, &p, JOB, "job").await.unwrap();
 
+    w.restart();
     store.fail.set(true);
-    w.pass(LINGER_MS + 1);
-    w.tick().await;
-    assert!(store.record.borrow().as_ref().unwrap().jobs_until > 0);
-    assert!(gate.next_wake(w.now()).is_some(), "not done yet");
+    w.pass(JOB_MS + SKEW_MS + 1);
+    assert!(c.acquire_permit(&p, JOB, "job-2", w.now()).await.is_err());
+    assert_eq!(store.record.borrow().as_ref().unwrap().boot, "v1");
 
     store.fail.set(false);
-    w.pass(1000);
-    w.tick().await;
-    assert_eq!(store.record.borrow().as_ref().unwrap().jobs_until, 0);
-    assert!(gate.next_wake(w.now()).is_none(), "may leave memory");
+    // The wait counts from the start that could be stored.
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_none());
+    assert_eq!(store.record.borrow().as_ref().unwrap().boot, "v2");
+    w.pass(JOB_MS + SKEW_MS + 1);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_some());
 }
 
 /// In slot-rows mode a gate that cannot be reached does not stop the
@@ -1449,12 +1748,15 @@ async fn a_request_that_fails_keeps_no_slot() {
         background: true,
         holder: "job".into(),
     };
-    let gate = w.gate("permits:all:0");
+    let gate = w.gate("permits:all:0").await;
     let ask = GateRequest {
+        id: 1,
         gate: "permits:all:0".into(),
         ops: vec![acquire(whole.clone()), acquire(whole.clone().part(2, 2))],
     };
-    assert!(gate.handle(ask, w.now()).await.is_err());
+    let session = gate.open(w.now()).await.unwrap();
+    assert!(gate.handle(Some(session), ask, w.now()).await.is_err());
+    assert!(gate.session(session, w.now()).held.is_empty());
     assert_eq!(w.held("permits:all:0", "p").await, 0);
 }
 
@@ -1465,7 +1767,9 @@ fn a_late_renewal_does_not_shorten_a_permit() {
     let p = GateProvider::from(&provider("p", 2));
     let mut core = Core::new(UnixMs(T0));
     let now = UnixMs(T0);
-    let permit = core.acquire(&p, &[], true, "job", now, Warm::Done).unwrap();
+    let permit = core
+        .acquire(&p, &[], true, ("job", 1), now, Warm::Done)
+        .unwrap();
     assert!(core.renew(&permit, UnixMs(T0 + 60_000)));
     assert!(core.renew(&permit, UnixMs(T0 + 30_000)));
     // Still held where the later renewal put it.
@@ -1501,6 +1805,7 @@ async fn a_part_outside_the_division_is_refused() {
     let w = World::new();
     let p = GateProvider::from(&provider("p", 2)).part(2, 2);
     let ask = GateRequest {
+        id: 1,
         gate: "permits:account.p:2".into(),
         ops: vec![GateOp::Acquire {
             provider: p,
@@ -1509,8 +1814,9 @@ async fn a_part_outside_the_division_is_refused() {
             holder: "job".into(),
         }],
     };
-    let gate = w.gate("permits:account.p:2");
-    assert!(gate.handle(ask, w.now()).await.is_err());
+    let gate = w.gate("permits:account.p:2").await;
+    let session = gate.open(w.now()).await.unwrap();
+    assert!(gate.handle(Some(session), ask, w.now()).await.is_err());
     assert_eq!(w.rows_of_gates("p").await, 0);
 }
 
@@ -1588,6 +1894,120 @@ async fn each_gate_is_asked_once() {
     assert_eq!(w.calls.get(), 2, "the account's gate and the pool's");
     assert_eq!(c.renew_all_permits(&permits).await, vec![true; 6]);
     assert_eq!(w.calls.get(), 4);
+}
+
+/// What a job costs at its gates, from its first slot to its last: one
+/// billed request per gate (the opening of its session), a message for
+/// everything after, no stored row and no catalogue row. A message is
+/// billed as a twentieth of a request.
+#[tokio::test]
+async fn a_job_is_one_request_per_gate_and_no_row() {
+    for (sharding, shards, gates) in [
+        (GateSharding::One, 1, 1),
+        (GateSharding::Account, 1, 2),
+        (GateSharding::Account, 2, 2),
+    ] {
+        let w = World::new();
+        let providers = [provider("p", 8), provider("q", 8)];
+        let c = w.catalog_of(PermitMode::Gate, sharding, shards, &providers);
+        // The gates of an account take it over in two periodic steps:
+        // each needs the others to have taken their part.
+        c.seed_permits(&providers).await.unwrap();
+        w.pass(SEIZE_EVERY_MS);
+        c.seed_permits(&providers).await.unwrap();
+        // An earlier run of the job: the horizon of this step is stored.
+        let first = take(&c, &w, &providers[0], JOB, "job-1").await.unwrap();
+        let other = take(&c, &w, &providers[1], JOB, "job-1").await.unwrap();
+        c.release_permit(&first).await.unwrap();
+        c.release_permit(&other).await.unwrap();
+        w.pass(1000);
+        let saves = || -> u32 { w.stores.borrow().values().map(|s| s.saves.get()).sum() };
+        let saved = saves();
+        w.db.0.meter_writes().unwrap();
+        for counter in [&w.calls, &w.opens, &w.msgs, &w.posts] {
+            counter.set(0);
+        }
+
+        // Two sockets, one per account, held for 100 s.
+        let now = w.now();
+        let order = c.provider_load(now).await.unwrap();
+        assert_eq!(order.len(), 2);
+        let permits: Vec<Permit> = join_all(providers.iter().map(|p| {
+            let c = &c;
+            async move { c.acquire_permit(p, JOB, "job-1", now).await }
+        }))
+        .await
+        .into_iter()
+        .map(|p| p.unwrap().unwrap())
+        .collect();
+        let lease = no_lease();
+        for _ in 0..5 {
+            w.hibernate();
+            w.pass(20_000);
+            let (_, held) = c.renew_all(&lease, &permits, w.now()).await.unwrap();
+            assert_eq!(held, vec![true; 2]);
+        }
+        w.hibernate();
+        join_all(permits.iter().map(|p| c.release_permit(p))).await;
+
+        let at = format!("{sharding:?} x{shards}");
+        assert_eq!(w.opens.get(), gates, "{at}: one session per gate");
+        assert_eq!(w.posts.get(), 0, "{at}: nothing asked without a session");
+        // Five renewals and the release, per gate.
+        assert_eq!(w.msgs.get(), gates * 6, "{at}");
+        assert_eq!(saves(), saved, "{at}: no stored row");
+        assert_eq!(w.db.0.writes().billed(), 0, "{at}: no catalogue row");
+        let open: usize = w.sockets.borrow().values().map(BTreeMap::len).sum();
+        assert_eq!(open, 0, "{at}: the sessions ended with the job");
+    }
+}
+
+/// A holder that finds every slot taken is left without a session (an
+/// open socket can keep its invocation from ending), and the gate in
+/// charge is not asked to take over: one request for each time it asks.
+#[tokio::test]
+async fn a_refused_holder_leaves_no_session_open() {
+    let w = World::new();
+    let p = provider("p", 2);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let held = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    for counter in [&w.opens, &w.msgs, &w.posts] {
+        counter.set(0);
+    }
+    for _ in 0..3 {
+        assert!(take(&c, &w, &p, JOB, "job-2").await.is_none());
+        assert_eq!(w.sessions("permits:all:0"), 1, "only the holder's");
+        w.pass(5000);
+    }
+    assert_eq!((w.opens.get(), w.msgs.get(), w.posts.get()), (3, 0, 0));
+    c.release_permit(&held).await.unwrap();
+    assert_eq!(w.sessions("permits:all:0"), 0);
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_some());
+    assert_eq!(w.sessions("permits:all:0"), 1);
+}
+
+/// The slots of one session fit with its connection: a session is
+/// refused a slot before what must be kept for it grows too large.
+#[tokio::test]
+async fn a_session_holds_no_more_than_fits_with_its_connection() {
+    let w = World::new();
+    let p = provider("p", 2000);
+    let providers = [p.clone()];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    let mut taken = 0;
+    while take(&c, &w, &p, JOB, "job-1").await.is_some() {
+        taken += 1;
+    }
+    assert!((64..1999).contains(&taken), "{taken} slots on one session");
+    let kept = serde_json::to_string(&w.sockets.borrow()["permits:all:0"])
+        .unwrap()
+        .len();
+    assert!(kept <= SESSION_STATE_MAX + 64, "{kept} bytes");
+    // Another holder has a session of its own.
+    assert!(take(&c, &w, &p, JOB, "job-2").await.is_some());
 }
 
 trait RenewPermits {
@@ -1709,11 +2129,14 @@ async fn the_slot_rows_mode_asks_no_gate() {
 #[tokio::test]
 async fn a_gate_asked_under_another_name_refuses() {
     let w = World::new();
-    let gate = w.gate("permits:all:0");
+    let gate = w.gate("permits:all:0").await;
     let ask = |name: &str| GateRequest {
+        id: 1,
         gate: name.into(),
         ops: vec![GateOp::Load],
     };
-    gate.handle(ask("permits:all:0"), w.now()).await.unwrap();
-    assert!(gate.handle(ask("other"), w.now()).await.is_err());
+    gate.handle(None, ask("permits:all:0"), w.now())
+        .await
+        .unwrap();
+    assert!(gate.handle(None, ask("other"), w.now()).await.is_err());
 }
