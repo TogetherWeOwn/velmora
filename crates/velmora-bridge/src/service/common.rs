@@ -19,8 +19,8 @@ use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnecto
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
-    Bucket, BucketId, GenerationId, GenerationRow, KeyStatus, Perm, Precondition,
-    PreconditionError, RespBody, S3Request, S3Response,
+    AccessKeyRow, Bucket, BucketId, GenerationId, GenerationRow, KeyStatus, Perm, Precondition,
+    PreconditionError, ReadExtent, ReadQuery, ReadWindow, RespBody, S3Request, S3Response,
 };
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -379,22 +379,19 @@ pub(super) fn edge_header(name: &str) -> bool {
         || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
 }
 
-/// Authenticates and authorizes from the request line and headers only.
-/// The body is never touched. A key with no usable row is
-/// `InvalidAccessKeyId` for every bucket.
-///
-/// A bucket that does not exist and one the key holds no grant on are
-/// indistinguishable, to everyone: a caller that did not authenticate
-/// gets the authentication error and learns nothing of the bucket, and
-/// one that did gets `NoSuchBucket` for both (S3 checks in that order
-/// too: signature, then bucket, then permission). To a key, a bucket it
-/// has no grant on does not exist, so no key can probe for the names of
-/// buckets that are not its own. A key that holds a grant too weak for
-/// the operation (read-only, on a write) is `AccessDenied`.
-pub(super) async fn authenticate<C, B, N, J, K, T>(
+/// The request line and headers of a request, validated, and the key
+/// id it claims (empty: none).
+struct Parsed {
+    policy: Policy,
+    target: Target,
+    headers: Headers,
+    akid: String,
+}
+
+fn parse<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
-) -> Result<Authed, S3Response>
+) -> Result<Parsed, S3Response>
 where
     C: Catalog,
     B: BlobStore,
@@ -426,61 +423,94 @@ where
     headers
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;
+    let akid = claimed_key(&headers, &target).unwrap_or_default();
+    Ok(Parsed {
+        policy,
+        target,
+        headers,
+        akid,
+    })
+}
 
+/// The key row a request may be verified against: an active one that is
+/// not recorded as revoked.
+async fn usable_key<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    row: Option<AccessKeyRow>,
+) -> Result<Option<AccessKeyRow>, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let row = row.filter(|row| row.status == KeyStatus::Active);
+    // Under maintenance the catalogue may be a restored copy that
+    // still holds a key revoked after it was taken, until the first
+    // replay step deletes it; reads are served meanwhile. Its
+    // revocation record is the authority then (one head per request,
+    // in this mode only). Multipart refuses every request earlier.
+    match row {
+        Some(row) if bridge.cfg.maintenance == Maintenance::Restore => {
+            let revoked = revocation_recorded(&bridge.safety, &row.access_key_id)
+                .await
+                .map_err(|_| internal())?;
+            Ok((!revoked).then_some(row))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Verifies the signature of a parsed request against the key row found
+/// for it and judges the operation by `perm`, the grant of that key on
+/// `bucket`. Without a row nothing else counts: the bucket and the
+/// grant of a key that is not usable are not looked at.
+fn finish<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    parsed: Parsed,
+    row: Option<AccessKeyRow>,
+    bucket: Option<Bucket>,
+    perm: Option<Perm>,
+) -> Result<Authed, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let Parsed {
+        policy,
+        target,
+        headers,
+        akid,
+    } = parsed;
     let mut authority = OneKey {
-        akid: claimed_key(&headers, &target).unwrap_or_default(),
+        akid,
         principal: String::new(),
         secret: None,
         perm: None,
         no_bucket: Cell::new(false),
     };
-    let mut bucket = None;
-    if !authority.akid.is_empty() {
-        let row = bridge
-            .catalog
-            .access_key(&authority.akid)
-            .await
-            .map_err(|_| internal())?
-            .filter(|row| row.status == KeyStatus::Active);
-        // Under maintenance the catalogue may be a restored copy that
-        // still holds a key revoked after it was taken, until the first
-        // replay step deletes it; reads are served meanwhile. Its
-        // revocation record is the authority then (one head per request,
-        // in this mode only). Multipart refuses every request earlier.
-        let row = match row {
-            Some(row) if bridge.cfg.maintenance == Maintenance::Restore => {
-                let revoked = revocation_recorded(&bridge.safety, &row.access_key_id)
-                    .await
-                    .map_err(|_| internal())?;
-                (!revoked).then_some(row)
-            }
-            other => other,
-        };
-        if let Some(row) = row {
-            let secret = unwrap_secret(
-                &bridge.kek,
-                row.kek_version,
-                &row.access_key_id,
-                &row.secret_wrapped,
-            )
-            .map_err(|_| internal())?;
-            authority.principal = row.principal;
-            authority.secret = Some(secret);
-            if !target.bucket.is_empty() {
-                bucket = bridge
-                    .catalog
-                    .bucket_by_name(&target.bucket)
-                    .await
-                    .map_err(|_| internal())?;
-            }
-            if let Some(b) = &bucket {
-                authority.perm = bridge
-                    .catalog
-                    .grant(&authority.akid, &b.id)
-                    .await
-                    .map_err(|_| internal())?;
-            }
+    let mut found = None;
+    if let Some(row) = row {
+        let secret = unwrap_secret(
+            &bridge.kek,
+            row.kek_version,
+            &row.access_key_id,
+            &row.secret_wrapped,
+        )
+        .map_err(|_| internal())?;
+        authority.principal = row.principal;
+        authority.secret = Some(secret);
+        if bucket.is_some() {
+            authority.perm = perm;
         }
+        found = bucket;
     }
 
     // Transport was checked at ingress; plain HTTP never reaches a handler
@@ -503,7 +533,7 @@ where
             auth_refused(code, &policy, &headers, &target)
         }
     })?;
-    if !target.bucket.is_empty() && bucket.is_none() {
+    if !target.bucket.is_empty() && found.is_none() {
         return Err(s3_error(ErrorCode::NoSuchBucket));
     }
     Ok(Authed {
@@ -511,8 +541,141 @@ where
         target,
         headers,
         verified,
-        bucket,
+        bucket: found,
     })
+}
+
+/// Authenticates and authorizes from the request line and headers only.
+/// The body is never touched. A key with no usable row is
+/// `InvalidAccessKeyId` for every bucket.
+///
+/// A bucket that does not exist and one the key holds no grant on are
+/// indistinguishable, to everyone: a caller that did not authenticate
+/// gets the authentication error and learns nothing of the bucket, and
+/// one that did gets `NoSuchBucket` for both (S3 checks in that order
+/// too: signature, then bucket, then permission). To a key, a bucket it
+/// has no grant on does not exist, so no key can probe for the names of
+/// buckets that are not its own. A key that holds a grant too weak for
+/// the operation (read-only, on a write) is `AccessDenied`.
+pub(super) async fn authenticate<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+) -> Result<Authed, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let parsed = parse(bridge, req)?;
+    by_single_reads(bridge, req, parsed).await
+}
+
+/// [`authenticate`] after the parse: the key, the bucket and the grant,
+/// each asked for on its own.
+async fn by_single_reads<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    parsed: Parsed,
+) -> Result<Authed, S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let (mut row, mut bucket, mut perm) = (None, None, None);
+    if !parsed.akid.is_empty() {
+        let found = bridge
+            .catalog
+            .access_key(&parsed.akid)
+            .await
+            .map_err(|_| internal())?;
+        row = usable_key(bridge, found).await?;
+        if row.is_some() {
+            if !parsed.target.bucket.is_empty() {
+                bucket = bridge
+                    .catalog
+                    .bucket_by_name(&parsed.target.bucket)
+                    .await
+                    .map_err(|_| internal())?;
+            }
+            if let Some(b) = &bucket {
+                perm = bridge
+                    .catalog
+                    .grant(&parsed.akid, &b.id)
+                    .await
+                    .map_err(|_| internal())?;
+            }
+        }
+    }
+    finish(bridge, req, parsed, row, bucket, perm)
+}
+
+/// What [`authenticate_read`] found beside the authorization: the live
+/// generation of the addressed key and the extents the catalogue chose
+/// for the window that was asked for.
+pub(super) struct Found {
+    pub generation: Option<GenerationRow>,
+    pub extents: Vec<ReadExtent>,
+}
+
+/// [`authenticate`] for a GET or HEAD of an object, with the object
+/// looked up in the same round trip to the catalogue
+/// ([`Catalog::read_lookup`]). The request is judged exactly as
+/// [`authenticate`] judges it, on the same rows; what was found of the
+/// object is only handed out with an authorization.
+///
+/// `window` names the plaintext the request is expected to read, from
+/// its validated headers; extents come back for a window of at most
+/// `max_len` bytes. `None` beside the authorization: the request does
+/// not address an object, and nothing was looked up for it.
+pub(super) async fn authenticate_read<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    req: &S3Request,
+    window: impl FnOnce(&Headers) -> ReadWindow,
+    max_len: u64,
+) -> Result<(Authed, Option<Found>), S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let parsed = parse(bridge, req)?;
+    let key = match parsed.target.key.as_deref() {
+        Some(key) if !key.is_empty() => key,
+        _ => "",
+    };
+    if parsed.akid.is_empty() || parsed.target.bucket.is_empty() || key.is_empty() {
+        return Ok((by_single_reads(bridge, req, parsed).await?, None));
+    }
+    let lookup = bridge
+        .catalog
+        .read_lookup(&ReadQuery {
+            akid: &parsed.akid,
+            bucket: &parsed.target.bucket,
+            key,
+            window: window(&parsed.headers),
+            max_len,
+        })
+        .await
+        .map_err(|_| internal())?;
+    let row = usable_key(bridge, lookup.key).await?;
+    let authed = finish(bridge, req, parsed, row, lookup.bucket, lookup.perm)?;
+    Ok((
+        authed,
+        Some(Found {
+            generation: lookup.generation,
+            extents: lookup.extents,
+        }),
+    ))
 }
 
 /// The condition a write request names, if any. Understood are

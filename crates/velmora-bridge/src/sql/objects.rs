@@ -127,11 +127,11 @@ impl Cols {
 }
 
 /// How many columns [`GENERATION_COLS`] selects.
-const GENERATION_WIDTH: usize = 12;
-const GENERATION_COLS: &str = "g.id, g.bucket_id, g.key, g.state, g.size, g.etag, \
+pub(super) const GENERATION_WIDTH: usize = 12;
+pub(super) const GENERATION_COLS: &str = "g.id, g.bucket_id, g.key, g.state, g.size, g.etag, \
      g.checksum_json, g.content_json, g.user_meta_json, g.extent_count, g.created_at, g.retired_at";
 
-fn generation_row(row: Row) -> Result<GenerationRow> {
+pub(super) fn generation_row(row: Row) -> Result<GenerationRow> {
     let mut c = Cols::new(row);
     Ok(GenerationRow {
         id: GenerationId::new(c.text()?),
@@ -159,7 +159,11 @@ pub(super) const EXTENT_COLS: &str =
 
 /// One extent row: the `extents` columns in schema order.
 pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
-    let mut c = Cols::new(row);
+    extent_cols(&mut Cols::new(row))
+}
+
+/// The next [`EXTENT_COLS`] columns of a row.
+pub(super) fn extent_cols(c: &mut Cols) -> Result<ExtentRow> {
     Ok(ExtentRow {
         id: ExtentId::new(c.text()?),
         bucket_id: BucketId::new(c.text()?),
@@ -237,7 +241,7 @@ pub(super) async fn generation_by_id<S: Sql>(
 /// The select list of an extent as a generation references it: `seq` and
 /// `plain_offset` come from the reference, not from the generation the
 /// extent was first written for.
-const PLACED_EXTENT_COLS: &str =
+pub(super) const PLACED_EXTENT_COLS: &str =
     "e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
      e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
      e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \

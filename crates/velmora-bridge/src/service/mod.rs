@@ -10,6 +10,7 @@ mod bucket;
 mod common;
 mod copy;
 mod delete;
+mod flow;
 mod get;
 pub use get::{INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS};
 mod list;

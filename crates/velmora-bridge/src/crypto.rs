@@ -675,59 +675,103 @@ pub fn open_range(
     plain_off: u64,
     dst: &mut [u8],
 ) -> Result<usize> {
-    let outcome = open_range_inner(bdk, bucket, extent, src_base, src, plain_off, dst);
-    if outcome.is_err() {
-        dst.zeroize();
-    }
-    outcome
-}
-
-fn open_range_inner(
-    bdk: &DataKey,
-    bucket: &BucketId,
-    extent: &ExtentRow,
-    src_base: u64,
-    src: &[u8],
-    plain_off: u64,
-    dst: &mut [u8],
-) -> Result<usize> {
-    if extent.bucket_id != *bucket {
-        return Err(ERR_EXTENT_BUCKET);
-    }
-    if media::ciphertext_size(extent.plain_size) != Some(extent.cipher_size) {
-        return Err(ERR_EXTENT_RECORD);
-    }
-    let header_bytes = <[u8; HEADER_SIZE as usize]>::try_from(extent.media_header.as_slice())
-        .map_err(|_| ERR_EXTENT_RECORD)?;
-    let wrapped = extent.wrapped_file_key.as_deref().ok_or(ERR_SHREDDED)?;
-
-    let file_key = unwrap_file_key(bdk, bucket, &extent.id, wrapped)?;
-    let verified = VerifiedHeader::verify_record(
-        &profile(),
-        extent.key_mode,
-        &file_key,
-        &Header::from_bytes(&header_bytes),
-    )
-    .map_err(|_| ERR_AUTH)?;
-
-    // Whatever part of the stream header was fetched must match the record.
-    if src_base < HEADER_SIZE {
-        let from = src_base as usize;
-        let n = src.len().min(header_bytes.len() - from);
-        if !bool::from(src[..n].ct_eq(&header_bytes[from..from + n])) {
-            return Err(ERR_AUTH);
+    match ExtentOpener::new(bdk, bucket, extent) {
+        Ok(opener) => opener.open(src_base, src, plain_off, dst),
+        Err(e) => {
+            dst.zeroize();
+            Err(e)
         }
     }
+}
 
-    let reader = verified.reader(extent.plain_size).map_err(|_| ERR_AUTH)?;
-    let source = OffsetBuf {
-        base: src_base,
-        bytes: src,
-    };
-    reader
-        .read_at(&source, dst, plain_off)
-        .map_err(|e| match e {
-            velmora::Error::Io(_) => ERR_SPAN,
-            _ => ERR_AUTH,
+/// One extent whose record verified against its bucket and file key,
+/// ready to open ranges of its ciphertext: [`open_range`] in two steps,
+/// for a reader that opens the extent a few chunks at a time as its
+/// ciphertext arrives. Every call authenticates the chunks it releases,
+/// each under its own index and, for the last one, the final flag that
+/// the catalogued plaintext size gives it: a chunk that was moved,
+/// swapped, cut or changed fails, whatever was opened before.
+pub struct ExtentOpener {
+    verified: VerifiedHeader,
+    header: [u8; HEADER_SIZE as usize],
+    plain_size: u64,
+}
+
+impl fmt::Debug for ExtentOpener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtentOpener")
+            .field("plain_size", &self.plain_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExtentOpener {
+    /// Checks the row against `bucket`, unwraps its file key and verifies
+    /// the catalogued header with it.
+    pub fn new(bdk: &DataKey, bucket: &BucketId, extent: &ExtentRow) -> Result<Self> {
+        if extent.bucket_id != *bucket {
+            return Err(ERR_EXTENT_BUCKET);
+        }
+        if media::ciphertext_size(extent.plain_size) != Some(extent.cipher_size) {
+            return Err(ERR_EXTENT_RECORD);
+        }
+        let header = <[u8; HEADER_SIZE as usize]>::try_from(extent.media_header.as_slice())
+            .map_err(|_| ERR_EXTENT_RECORD)?;
+        let wrapped = extent.wrapped_file_key.as_deref().ok_or(ERR_SHREDDED)?;
+
+        let file_key = unwrap_file_key(bdk, bucket, &extent.id, wrapped)?;
+        let verified = VerifiedHeader::verify_record(
+            &profile(),
+            extent.key_mode,
+            &file_key,
+            &Header::from_bytes(&header),
+        )
+        .map_err(|_| ERR_AUTH)?;
+        Ok(ExtentOpener {
+            verified,
+            header,
+            plain_size: extent.plain_size,
         })
+    }
+
+    /// As [`open_range`], for the extent this was made from.
+    pub fn open(&self, src_base: u64, src: &[u8], plain_off: u64, dst: &mut [u8]) -> Result<usize> {
+        let outcome = self.open_inner(src_base, src, plain_off, dst);
+        if outcome.is_err() {
+            dst.zeroize();
+        }
+        outcome
+    }
+
+    fn open_inner(
+        &self,
+        src_base: u64,
+        src: &[u8],
+        plain_off: u64,
+        dst: &mut [u8],
+    ) -> Result<usize> {
+        // Whatever part of the stream header was fetched must match the record.
+        if src_base < HEADER_SIZE {
+            let from = src_base as usize;
+            let n = src.len().min(self.header.len() - from);
+            if !bool::from(src[..n].ct_eq(&self.header[from..from + n])) {
+                return Err(ERR_AUTH);
+            }
+        }
+
+        let reader = self
+            .verified
+            .reader(self.plain_size)
+            .map_err(|_| ERR_AUTH)?;
+        let source = OffsetBuf {
+            base: src_base,
+            bytes: src,
+        };
+        reader
+            .read_at(&source, dst, plain_off)
+            .map_err(|e| match e {
+                velmora::Error::Io(_) => ERR_SPAN,
+                _ => ERR_AUTH,
+            })
+    }
 }

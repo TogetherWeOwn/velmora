@@ -1,0 +1,154 @@
+//! The one-statement lookups of a read (`Catalog::read_lookup`,
+//! `Catalog::pinned_read`) answer what the single reads they stand for
+//! answer, for every key, bucket, object and window.
+
+mod service_support;
+
+use service_support::*;
+use velmora::media::PLAIN_CHUNK_SIZE;
+use velmora_bridge::*;
+
+const CHUNK: u64 = PLAIN_CHUNK_SIZE;
+
+fn rows(extents: &[ReadExtent]) -> Vec<&ExtentRow> {
+    extents.iter().map(|e| &e.row).collect()
+}
+
+async fn same(rig: &Rig, q: &ReadQuery<'_>) -> ReadLookup {
+    let catalog = &rig.bridge.catalog;
+    let before = catalog.sql.trips.get();
+    let one = catalog.read_lookup(q).await.unwrap();
+    assert_eq!(catalog.sql.trips.get() - before, 1, "{q:?}");
+    let parts = read_lookup_by_parts(catalog, q).await.unwrap();
+    assert!(one.key == parts.key, "{q:?}");
+    assert_eq!(one.bucket, parts.bucket, "{q:?}");
+    assert_eq!(one.perm, parts.perm, "{q:?}");
+    assert_eq!(one.generation, parts.generation, "{q:?}");
+    assert_eq!(rows(&one.extents), rows(&parts.extents), "{q:?}");
+    one
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_statement_answers_what_the_single_reads_answer() {
+    let mut cfg = config(Vec::new());
+    cfg.max_extent_bytes = 2 * CHUNK;
+    cfg.slice_bytes = 2 * CHUNK;
+    let rig = rig_with(NoNntp, cfg);
+    let (bucket, signer) = rig.standard("bkt-one").await;
+    let other = rig.bucket("bkt-two", true).await;
+    rig.key("AKIDTESTKEY000000002", secret(), KeyStatus::Disabled)
+        .await;
+    rig.grant("AKIDTESTKEY000000002", &bucket, Perm::Rw).await;
+    rig.key("AKIDTESTKEY000000003", secret(), KeyStatus::Active)
+        .await;
+    rig.grant("AKIDTESTKEY000000003", &other, Perm::Ro).await;
+
+    let size = 7 * CHUNK + 4321;
+    let body = pattern(21, size as usize);
+    rig.put(&signer, "bkt-one", "big", &body).await.expect(200);
+    rig.put(&signer, "bkt-one", "small", b"x").await.expect(200);
+    rig.put(&signer, "bkt-one", "empty", b"").await.expect(200);
+
+    let edges = [
+        0,
+        1,
+        CHUNK,
+        2 * CHUNK - 1,
+        2 * CHUNK,
+        2 * CHUNK + 1,
+        6 * CHUNK,
+        size - 1,
+        size,
+        size + 1,
+        u64::MAX,
+    ];
+    let mut windows = vec![ReadWindow::Nothing];
+    for start in edges {
+        for end in edges {
+            windows.push(ReadWindow::Span { start, end });
+        }
+        windows.push(ReadWindow::Tail { len: start });
+    }
+    let mut with_extents = 0;
+    for akid in [
+        AKID,
+        "AKIDTESTKEY000000002",
+        "AKIDTESTKEY000000003",
+        "AKIDUNKNOWN",
+        "",
+    ] {
+        for name in ["bkt-one", "bkt-two", "bkt-none", ""] {
+            for key in ["big", "small", "empty", "absent", ""] {
+                for window in &windows {
+                    for max_len in [0, 1, 2 * CHUNK, size - 1, size, u64::MAX] {
+                        let q = ReadQuery {
+                            akid,
+                            bucket: name,
+                            key,
+                            window: *window,
+                            max_len,
+                        };
+                        let found = same(&rig, &q).await;
+                        let granted = akid == AKID && name == "bkt-one";
+                        assert!(granted || found.generation.is_none(), "{q:?}");
+                        assert!(granted || found.extents.is_empty(), "{q:?}");
+                        with_extents += usize::from(!found.extents.is_empty());
+                    }
+                }
+            }
+        }
+    }
+    assert!(with_extents > 100, "{with_extents}");
+
+    // A whole read of the object: every extent, in order, each with
+    // what is known of its last read.
+    let q = ReadQuery {
+        akid: AKID,
+        bucket: "bkt-one",
+        key: "big",
+        window: ReadWindow::Span {
+            start: 0,
+            end: u64::MAX,
+        },
+        max_len: u64::MAX,
+    };
+    let found = same(&rig, &q).await;
+    let (generation, extents) = rig.live(&bucket, "big").await.unwrap();
+    assert_eq!(found.generation.as_ref(), Some(&generation));
+    assert_eq!(rows(&found.extents), extents.iter().collect::<Vec<_>>());
+    assert_eq!(extents.len(), 4);
+
+    // The read pinned to a generation.
+    let catalog = &rig.bridge.catalog;
+    for start in edges {
+        for end in edges {
+            if start > i64::MAX as u64 || end > i64::MAX as u64 {
+                continue;
+            }
+            let before = catalog.sql.trips.get();
+            let one = catalog
+                .pinned_read(&bucket.id, &generation.id, start, end)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(catalog.sql.trips.get() - before, 1);
+            let parts = pinned_read_by_parts(catalog, &bucket.id, &generation.id, start, end)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(one.bucket, parts.bucket);
+            assert_eq!(one.generation, parts.generation);
+            assert_eq!(rows(&one.extents), rows(&parts.extents), "{start} {end}");
+        }
+    }
+    // A generation is found only in its own bucket.
+    let none = catalog
+        .pinned_read(&other.id, &generation.id, 0, size)
+        .await
+        .unwrap();
+    assert!(none.is_none());
+    let none = pinned_read_by_parts(catalog, &other.id, &generation.id, 0, size)
+        .await
+        .unwrap();
+    assert!(none.is_none());
+}
