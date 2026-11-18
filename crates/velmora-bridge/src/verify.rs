@@ -150,7 +150,11 @@ struct Evidence<'a> {
     ok: u32,
     total: u32,
     plan_rev: u32,
-    /// For a `size` entry: the command the size was asked with.
+    /// For a `size` entry: the size command set for its provider
+    /// (`VERIFY_SIZE_COMMANDS`) when the release ran. The verification
+    /// row does not keep the command: after a change of that setting
+    /// between an extent's verify and its release, this names the new
+    /// one. Nothing decides on it.
     #[serde(skip_serializing_if = "Option::is_none")]
     size_command: Option<SizeCommand>,
 }
@@ -637,8 +641,9 @@ where
     /// so raises the sample to every extent there for a while.
     ///
     /// A corrupt article is that at once. A missing one is that only if
-    /// the backbone says with `STAT` that it has it: an article that is
-    /// simply not there is found by every check, the light one too.
+    /// the same provider (`providers`) says with `STAT` that it has it:
+    /// an article that is simply not there is found by every check, the
+    /// light one too.
     async fn sample_failed(
         &self,
         lease: &Lease,
@@ -775,7 +780,9 @@ where
             if light.is_some() && kind.is_full() && row.result != VerifyResult::Ok {
                 // Recorded first: the failure stands whatever comes of
                 // this.
-                self.sample_failed(lease, extent, &plan, providers, name, &tally)
+                // Asked of the provider that failed the read: another
+                // provider of the backbone may answer differently.
+                self.sample_failed(lease, extent, &plan, &[provider], name, &tally)
                     .await?;
             }
             // The next backbone is read by this job, under the same
