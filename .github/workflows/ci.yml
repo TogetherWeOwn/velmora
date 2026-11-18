@@ -841,7 +841,8 @@ jobs:
   # (workers/alerts). Both values live in the `production` environment:
   # vars.ALERTS_INGEST_URL and secrets.ALERTS_INGEST_TOKEN; without them
   # this job only writes a warning. It never fails the run itself. The
-  # token reaches curl on stdin, never argv.
+  # token reaches curl on stdin, never argv, and curl's own messages (which
+  # would name the host) stay out of the public log.
   deploy-alert:
     name: deploy alert
     needs: [deploy-build, deploy]
@@ -870,8 +871,8 @@ jobs:
             title: "Production deploy failed",
             detail: ("Commit \($sha): deploy build \($b), deploy \($d). A failed or cancelled deploy rolls back to the version before it (see the run). Run: \($run)")}')
           if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \
-            | curl -fsS --max-time 30 -H @- -H 'Content-Type: application/json' \
-                --data "$body" "${ALERTS_INGEST_URL%/}/v1/alert" >/dev/null; then
+            | curl -fs --max-time 30 -H @- -H 'Content-Type: application/json' \
+                --data "$body" "${ALERTS_INGEST_URL%/}/v1/alert" >/dev/null 2>&1; then
             echo "deploy alert sent"
           else
             echo "::warning::deploy alert could not be delivered"

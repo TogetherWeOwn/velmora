@@ -21,7 +21,21 @@ export const DEFAULTS = Object.freeze({
   DLQ_ALERT_MIN: 1,
   // The newest catalogue export manifest is older than this.
   EXPORT_MAX_AGE_SECS: 26 * 3600,
+  // A row with this many attempts in its stage counts as failing.
+  FAILING_ATTEMPTS: 3,
 });
+
+/** Which reading each check needs (a failed reading leaves its keys as they were). */
+export function readingOf(key) {
+  if (key === "posting-stalled") return "post head";
+  if (key === "verify-backlog") return "verify head";
+  if (key === "post-failing") return "post attempts";
+  if (key === "verify-failing") return "verify attempts";
+  if (key === "outbox-dead") return "dead rows";
+  if (key.startsWith("provider-cooldown:")) return "provider health";
+  if (key === "catalog-export-stale") return "export list";
+  return null;
+}
 
 /** Reads a positive integer var, falling back to the default. */
 export function setting(env, name) {
@@ -81,6 +95,25 @@ export function evaluate(snap, env = {}) {
         "No post job is finishing. Check provider health and the post queues in /_admin/status.",
       forMs: stallMs,
     });
+  }
+
+  // Failing: the stall and backlog checks above see a head that moves, and
+  // a failed or deferred job moves it too. So also: at least half of the
+  // soonest rows of a stage (3 or more rows) have FAILING_ATTEMPTS or more.
+  const failAt = setting(env, "FAILING_ATTEMPTS");
+  for (const stage of ["post", "verify"]) {
+    const a = snap.attempts?.[stage] ?? [];
+    const bad = a.filter((n) => n >= failAt).length;
+    if (a.length >= 3 && bad * 2 >= a.length) {
+      out.push({
+        key: `${stage}-failing`,
+        title: stage === "post" ? "Posting keeps failing" : "Verifying keeps failing",
+        detail:
+          `${bad} of the ${a.length} soonest ${stage} rows have ${failAt} or more attempts: ` +
+          `${stage} jobs run but do not succeed. Check provider health and last_error in /_admin/status.`,
+        forMs: stallMs,
+      });
+    }
   }
 
   const verifyMax = setting(env, "VERIFY_BACKLOG_ALERT_SECS") * 1000;

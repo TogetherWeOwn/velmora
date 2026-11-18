@@ -19,7 +19,7 @@ ALERT_FROM = "alerts@<zone with email routing>"
 # Optional thresholds (seconds unless named otherwise); defaults in src/checks.js:
 #   POST_STALL_SECS (1800), VERIFY_BACKLOG_ALERT_SECS (43200),
 #   PROVIDER_COOLDOWN_ALERT_SECS (900), DLQ_ALERT_MIN (1 message an hour),
-#   EXPORT_MAX_AGE_SECS (93600), DAILY_EMAIL_CAP (30 alert emails a day)
+#   EXPORT_MAX_AGE_SECS (93600), FAILING_ATTEMPTS (3), DAILY_EMAIL_CAP (30 alert emails a day)
 
 [[send_email]]
 name = "ALERT_EMAIL"

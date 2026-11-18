@@ -39,13 +39,16 @@ export async function observe(db, a, now) {
     .first();
 }
 
-/** Marks cron keys that did not hold in this tick as resolved. */
-export async function resolveCron(db, activeKeys, now) {
+/**
+ * Marks cron keys that did not hold in this tick as resolved, except those
+ * for which `keep(key)` is true (their reading failed this tick).
+ */
+export async function resolveCron(db, activeKeys, now, keep = () => false) {
   const rows = (
     await db.prepare("SELECT key FROM alerts WHERE source = 'cron' AND active = 1").all()
   ).results;
   const held = new Set(activeKeys);
-  const gone = rows.map((r) => r.key).filter((k) => !held.has(k));
+  const gone = rows.map((r) => r.key).filter((k) => !held.has(k) && !keep(k));
   for (const k of gone) {
     await db
       .prepare("UPDATE alerts SET active = 0, resolved_at = ?2, seen_unsent = 0 WHERE key = ?1")
@@ -53,6 +56,18 @@ export async function resolveCron(db, activeKeys, now) {
       .run();
   }
   return gone;
+}
+
+/** Event alerts (host, ci) reported again after their last email: retried by the tick. */
+export async function unsentEvents(db) {
+  return (
+    await db
+      .prepare(
+        "SELECT key, source, severity, title, detail, active_since, last_seen_at, last_sent_at, seen_unsent, sent_in_run " +
+          "FROM alerts WHERE source <> 'cron' AND active = 1 AND severity = 'page' AND seen_unsent > 0",
+      )
+      .all()
+  ).results ?? [];
 }
 
 /** Resolves event alerts not reported for EVENT_TTL. */

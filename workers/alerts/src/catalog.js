@@ -5,7 +5,8 @@
 //   - the oldest due row of a stage: outbox_due (stage, next_at), 1 row;
 //   - dead rows: outbox_due, at most DEAD_CAP rows (normally none);
 //   - provider_health: one row per provider that ever failed (a few).
-// Measured against production: 0 to 4 rows read per statement.
+//   - the attempts of the 20 soonest rows of a stage: outbox_due, 20 rows.
+// Measured against production: 0 to 20 rows read per statement.
 
 export const DEAD_CAP = 1000;
 
@@ -15,6 +16,10 @@ export const SQL = Object.freeze({
     "ORDER BY next_at LIMIT 1",
   dead: `SELECT count(*) AS n FROM (SELECT 1 FROM outbox WHERE stage = 'dead' LIMIT ${DEAD_CAP})`,
   providers: "SELECT provider_id, cooldown_until, last_failure_reason FROM provider_health",
+  // The attempts of the 20 soonest rows of a stage, due or not: a row that
+  // fails is put back with a later next_at, so when every attempt fails
+  // the soonest rows carry high counts too. Healthy production: 0 or 1.
+  attempts: "SELECT attempts FROM outbox WHERE stage = ?1 ORDER BY next_at LIMIT 20",
 });
 
 // Export manifests: d1/<database>/<restore point ms>.manifest.json, written
@@ -50,13 +55,29 @@ export async function newestExport(bucket, now, prefix = EXPORT_PREFIX) {
  * opts.checkExport: list the export bucket this tick (hourly is enough).
  */
 export async function readSnapshot(env, now, opts = {}) {
-  const snap = { now, postHead: null, verifyHead: null, releaseHead: null, deadRows: 0, providers: [], errors: [] };
+  const snap = {
+    now,
+    postHead: null,
+    verifyHead: null,
+    releaseHead: null,
+    deadRows: 0,
+    providers: [],
+    attempts: { post: [], verify: [] },
+    errors: [],
+  };
   const db = env.CATALOG;
   if (db) {
     const tries = [
       ["post head", async () => (snap.postHead = await head(db, "post", now))],
       ["verify head", async () => (snap.verifyHead = await head(db, "verify", now))],
       ["release head", async () => (snap.releaseHead = await head(db, "release", now))],
+      ...["post", "verify"].map((stage) => [
+        `${stage} attempts`,
+        async () => {
+          const r = await db.prepare(SQL.attempts).bind(stage).all();
+          snap.attempts[stage] = (r.results ?? []).map((x) => Number(x.attempts));
+        },
+      ]),
       ["dead rows", async () => (snap.deadRows = Number((await db.prepare(SQL.dead).first())?.n ?? 0))],
       [
         "provider health",

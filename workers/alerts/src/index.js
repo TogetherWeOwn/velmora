@@ -11,12 +11,15 @@
 // It is its own Worker so that a broken S3 Worker cannot silence it, and so
 // that changing it never redeploys the S3 Worker.
 
-import { evaluate, figures } from "./checks.js";
+import { evaluate, figures, readingOf } from "./checks.js";
 import { readSnapshot } from "./catalog.js";
 import * as store from "./store.js";
 import { alertMessage, digestMessage, send } from "./email.js";
 
 const KEY_RE = /^[a-z0-9][a-z0-9._:-]{0,99}$/;
+const MAX_BODY = 16 * 1024;
+// Control characters (CR, LF ...) never reach a subject line.
+const oneLine = (s) => String(s).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
 const SOURCES = new Set(["host", "ci"]);
 
 function dailyCap(env) {
@@ -24,17 +27,46 @@ function dailyCap(env) {
   return Number.isFinite(n) && n > 0 ? n : 30;
 }
 
-/** Emails the alert row if its claim succeeds. Returns true when sent. */
+/**
+ * Emails the alert row if its claim succeeds: "sent", "failed" (the claim
+ * is given back, the next tick retries) or "held" (not due, or capped).
+ */
 export async function maybeSend(env, row, now, forMs) {
   const claim = await store.claimSend(env.STATE, row, now, { forMs, dailyCap: dailyCap(env) });
-  if (!claim) return false;
+  if (!claim) return "held";
   try {
     await send(env, alertMessage(claim, now, store.reminderGap(Number(row.sent_in_run ?? 0) + 1)));
-    return true;
+    return "sent";
   } catch (e) {
     await store.unclaimSend(env.STATE, claim, now);
-    console.error(`alert email failed for ${row.key}: ${e?.code ?? ""} ${String(e?.message ?? e).slice(0, 200)}`);
-    return false;
+    // The code only: a provider message may name the recipient.
+    console.error(`alert email failed for ${row.key}: ${e?.code ?? e?.name ?? "error"}`);
+    return "failed";
+  }
+}
+
+/**
+ * Once the daily cap is reached, one email (outside the cap) says so, at
+ * most once a day, so that a new problem is not muted without a word.
+ */
+async function capNotice(env, now) {
+  const db = env.STATE;
+  const cap = dailyCap(env);
+  if ((await store.sentSince(db, now - store.DAY)) < cap) return "held";
+  const last = await store.getMeta(db, "cap_notice_at");
+  if (last && now - last < store.DAY) return "held";
+  try {
+    await send(env, {
+      subject: "[velmora] Alert email cap reached",
+      text:
+        `${cap} alert emails went out in the last 24 h, the daily cap. Further alerts are not emailed ` +
+        "until the count drops; they still appear in the daily digest. Something is badly wrong, or an alert is too noisy.",
+    });
+    await store.setMeta(db, "cap_notice_at", now);
+    return "sent";
+  } catch (e) {
+    console.error(`cap notice failed: ${e?.code ?? e?.name ?? "error"}`);
+    return "failed";
   }
 }
 
@@ -69,16 +101,25 @@ export async function tick(env, now) {
   }
 
   const conds = evaluate(snap, env);
-  let sent = 0;
+  const results = [];
   for (const c of conds) {
     const row = await store.observe(db, { ...c, source: "cron", severity: "page" }, now);
-    if (await maybeSend(env, row, now, c.forMs)) sent++;
+    results.push(await maybeSend(env, row, now, c.forMs));
   }
-  // A reading that failed hides its condition; nothing is cleared then.
-  if (snap.errors.length === 0) await store.resolveCron(db, conds.map((c) => c.key), now);
+  // Reports that came in while their key waited out its hour.
+  for (const row of await store.unsentEvents(db)) results.push(await maybeSend(env, row, now, 0));
+  results.push(await capNotice(env, now));
+  // A reading that failed hides its condition: its keys are not cleared.
+  const failed = new Set(snap.errors.map((e) => e.split(":")[0]));
+  await store.resolveCron(db, conds.map((c) => c.key), now, (k) => failed.has(readingOf(k)));
   await store.expireEvents(db, now);
   await store.prune(db, now);
-  return { conditions: conds.map((c) => c.key), sent, snap };
+  return {
+    conditions: conds.map((c) => c.key),
+    sent: results.filter((r) => r === "sent").length,
+    sendFailures: results.filter((r) => r === "failed").length,
+    snap,
+  };
 }
 
 export async function digest(env, now) {
@@ -106,12 +147,15 @@ const json = (status, body) =>
 /** POST /v1/alert: { key, title, detail?, severity?: "page"|"info", source: "host"|"ci" }. */
 export async function ingest(request, env, now) {
   const auth = request.headers.get("authorization") ?? "";
+  if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) return json(413, { error: "body too large" });
   if (!env.INGEST_TOKEN || !timingSafeEqual(auth, `Bearer ${env.INGEST_TOKEN}`)) {
     return json(401, { error: "unauthorized" });
   }
   let b;
   try {
-    b = await request.json();
+    const raw = await request.text();
+    if (raw.length > MAX_BODY) return json(413, { error: "body too large" });
+    b = JSON.parse(raw);
   } catch {
     return json(400, { error: "body must be JSON" });
   }
@@ -127,12 +171,12 @@ export async function ingest(request, env, now) {
       key: `${source}:${key}`,
       source,
       severity,
-      title: b.title.slice(0, 200),
+      title: oneLine(b.title).slice(0, 200),
       detail: String(b.detail ?? "").slice(0, 4000),
     },
     now,
   );
-  const sent = severity === "page" ? await maybeSend(env, row, now, 0) : false;
+  const sent = severity === "page" ? (await maybeSend(env, row, now, 0)) === "sent" : false;
   return json(200, { key: row.key, emailed: sent });
 }
 
@@ -146,15 +190,18 @@ export default {
 
   async scheduled(event, env, ctx) {
     const now = event.scheduledTime ?? Date.now();
-    if (event.cron === (env.DIGEST_CRON ?? "30 7 * * *")) {
-      await digest(env, now);
-      return;
-    }
+    // The heartbeat reports failure when the run threw or an email could
+    // not be sent, so a broken email path is seen from outside.
     let ok = false;
     try {
+      if (event.cron === (env.DIGEST_CRON ?? "30 7 * * *")) {
+        await digest(env, now);
+        ok = true;
+        return;
+      }
       const r = await tick(env, now);
-      ok = true;
-      console.log(`alerts tick: holding=${r.conditions.join(",") || "none"} emailed=${r.sent}`);
+      ok = r.sendFailures === 0;
+      console.log(`alerts tick: holding=${r.conditions.join(",") || "none"} emailed=${r.sent} failed=${r.sendFailures}`);
     } finally {
       ctx.waitUntil(heartbeat(env, ok));
     }

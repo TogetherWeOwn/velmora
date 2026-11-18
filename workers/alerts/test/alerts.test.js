@@ -262,18 +262,85 @@ test("tick: a failed email is retried on the next tick", async () => {
   assert.equal(e.ALERT_EMAIL.sent.length, 1);
 });
 
-test("tick: a failed reading clears nothing and alerts after 15 min", async () => {
+test("tick: a failed reading keeps only its own keys, and alerts after 15 min", async () => {
   const e = env();
   outbox(e.CATALOG, "d", "dead", T0);
+  e.CATALOG.db.prepare("INSERT INTO provider_health(provider_id, cooldown_until) VALUES ('p1', ?)").run(T0 + 9 * HOUR);
   await tick(e, T0);
   e.CATALOG.db.exec("DROP TABLE provider_health");
   e.CATALOG.db.exec("DELETE FROM outbox");
-  let r = await tick(e, T0 + 5 * MIN);
+  const r = await tick(e, T0 + 5 * MIN);
   assert.deepEqual(r.conditions, ["check-error"]);
-  const dead = await e.STATE.prepare("SELECT active FROM alerts WHERE key = 'outbox-dead'").first();
-  assert.equal(dead.active, 1, "not cleared while a reading fails");
+  const get = async (k) => (await e.STATE.prepare("SELECT active FROM alerts WHERE key = ?1").bind(k).first()).active;
+  assert.equal(await get("provider-cooldown:p1"), 1, "its reading failed: kept");
+  assert.equal(await get("outbox-dead"), 0, "its reading worked: cleared");
   await tick(e, T0 + 20 * MIN);
   assert.ok(e.ALERT_EMAIL.sent.some((m) => m.subject === "[velmora] Alert checks could not read"));
+});
+
+test("failing: most of the soonest rows with 3+ attempts, held 30 min", async () => {
+  const base = { now: T0, deadRows: 0, dlqLastHour: 0, providers: [], errors: [] };
+  assert.deepEqual(evaluate({ ...base, attempts: { post: [0, 1, 0, 4], verify: [] } }), []);
+  assert.deepEqual(evaluate({ ...base, attempts: { post: [5, 5], verify: [] } }), [], "too few rows");
+  const c = evaluate({ ...base, attempts: { post: [3, 7, 0, 4], verify: [9, 9, 9] } });
+  assert.deepEqual(c.map((x) => x.key), ["post-failing", "verify-failing"]);
+  assert.equal(c[0].forMs, 30 * MIN);
+  // End to end: post rows that fail cleanly move their next_at every time.
+  const e = env();
+  for (let i = 0; i < 5; i++) {
+    e.CATALOG.db
+      .prepare("INSERT INTO outbox(extent_id, generation_id, stage, next_at, attempts, updated_at) VALUES (?, 'g', 'post', ?, 6, 0)")
+      .run(`x${i}`, T0 + (i + 1) * MIN);
+  }
+  for (let t = 0; t <= 30; t += 5) await tick(e, T0 + t * MIN);
+  assert.ok(e.ALERT_EMAIL.sent.some((m) => m.subject === "[velmora] Posting keeps failing"));
+});
+
+test("a second event report inside the hour is emailed once the hour is up", async () => {
+  const e = env();
+  const a = { source: "ci", key: "deploy-failed", title: "Production deploy failed", detail: "commit a" };
+  await ingest(req(a), e, T0);
+  await ingest(req({ ...a, detail: "commit b" }), e, T0 + 10 * MIN);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1);
+  await tick(e, T0 + 30 * MIN);
+  assert.equal(e.ALERT_EMAIL.sent.length, 1, "still inside the hour");
+  await tick(e, T0 + 61 * MIN);
+  assert.equal(e.ALERT_EMAIL.sent.length, 2);
+  assert.match(e.ALERT_EMAIL.sent[1].text, /commit b/);
+  await tick(e, T0 + 66 * MIN);
+  assert.equal(e.ALERT_EMAIL.sent.length, 2, "nothing new to send");
+});
+
+test("cap reached: one notice a day", async () => {
+  const e = env({ DAILY_EMAIL_CAP: "2" });
+  for (const k of ["a", "b", "c"]) await ingest(req({ source: "host", key: k, title: k }), e, T0);
+  assert.equal(e.ALERT_EMAIL.sent.length, 2);
+  await tick(e, T0 + MIN);
+  await tick(e, T0 + 6 * MIN);
+  const notices = e.ALERT_EMAIL.sent.filter((m) => m.subject === "[velmora] Alert email cap reached");
+  assert.equal(notices.length, 1);
+});
+
+test("heartbeat reports failure when an email cannot be sent", async () => {
+  const e = env({ HEARTBEAT_URL: "https://hb.example.invalid/x" });
+  outbox(e.CATALOG, "d", "dead", T0);
+  e.ALERT_EMAIL.fail = "E_RECIPIENT_NOT_ALLOWED";
+  const pinged = [];
+  const realFetch = globalThis.fetch;
+  const realErr = console.error;
+  globalThis.fetch = async (u) => (pinged.push(String(u)), new Response(""));
+  const logged = [];
+  console.error = (m) => logged.push(m);
+  try {
+    const waits = [];
+    await worker.scheduled({ cron: "*/5 * * * *", scheduledTime: T0 }, e, { waitUntil: (p) => waits.push(p) });
+    await Promise.all(waits);
+  } finally {
+    globalThis.fetch = realFetch;
+    console.error = realErr;
+  }
+  assert.deepEqual(pinged, ["https://hb.example.invalid/x/fail"]);
+  assert.ok(logged.every((m) => !m.includes("@")), "no address in logs");
 });
 
 function req(body, token = "test-ingest-token") {
@@ -297,6 +364,11 @@ test("ingest: auth, validation, dedupe", async () => {
   r = await (await ingest(req({ ...a, key: "x", severity: "info" }), e, T0)).json();
   assert.equal(r.emailed, false, "info goes to the digest");
   assert.equal(e.ALERT_EMAIL.sent.length, 1);
+  const big = await ingest(req({ ...a, key: "big", detail: "x".repeat(20_000) }), e, T0);
+  assert.equal(big.status, 413);
+  r = await (await ingest(req({ ...a, key: "crlf", title: "a\r\nBcc: x" }), e, T0)).json();
+  const row = await e.STATE.prepare("SELECT title FROM alerts WHERE key = 'host:crlf'").first();
+  assert.equal(row.title, "a Bcc: x");
   const none = env({ INGEST_TOKEN: undefined });
   assert.equal((await ingest(req(a), none, T0)).status, 401, "no token configured: closed");
 });

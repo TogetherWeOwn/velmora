@@ -7,12 +7,13 @@ and changing it never redeploys the S3 Worker.
 ## What it watches
 
 Every 5 minutes it takes a few index-only readings of the S3 Worker's
-catalogue. Each statement reads 0 to 4 rows (measured), and nothing is
+catalogue. Each statement reads at most 20 rows (measured), and nothing is
 ever written there. Each condition below emails when it holds:
 
 | Key | Holds when | Emails after |
 |---|---|---|
 | `posting-stalled` | the oldest due post row has been due 30 min and has not changed since the last tick (a post job's every outcome moves it, and the dispatcher sends the oldest first) | 30 min more |
+| `post-failing`, `verify-failing` | at least half of the 20 soonest rows of the stage (3 rows or more) have `FAILING_ATTEMPTS` (3) or more attempts: jobs run and fail, which moves the head and hides it from the two checks around this one | 30 min |
 | `verify-backlog` | the oldest due verify row has waited over `VERIFY_BACKLOG_ALERT_SECS` (12 h) | at once |
 | `dlq` | at least `DLQ_ALERT_MIN` (1) messages reached the dead-letter queue in the last hour | at once |
 | `outbox-dead` | outbox rows are in stage `dead` | at once |
@@ -38,8 +39,10 @@ It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
 - **Per key:** one email, then reminders while it keeps holding, after
   1 h, 2 h, 4 h, and so on, up to once a day. A key never emails twice
   within an hour.
-- **Cap:** at most `DAILY_EMAIL_CAP` (30) alert emails in 24 h. Past the
-  cap, alerts still show in the digest.
+- **Cap:** at most `DAILY_EMAIL_CAP` (30) alert emails in 24 h. Reaching
+  it sends one notice; past the cap, alerts still show in the digest.
+- **Reports inside the hour:** a key reported again inside its hour is
+  emailed by the first tick after the hour.
 - **Daily digest** at 07:30 UTC: what holds, what cleared, the notices,
   dead-letter counts and the current figures. It arrives every day, so
   if it stops, alerting itself is down.
@@ -49,7 +52,7 @@ It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
   dispatcher sends it again, so acknowledging loses no work.
 - **Failed send:** the claim is given back and the next tick retries.
 - **Outside monitor (optional):** set `HEARTBEAT_URL`, and every check run
-  pings it (`<url>/fail` if the run threw). If the pings stop, the outside
+  pings it (`<url>/fail` if the run threw or an email could not be sent). If the pings stop, the outside
   monitor emails you.
 
 ## Cost
