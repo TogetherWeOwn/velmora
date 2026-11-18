@@ -35,11 +35,11 @@ use std::collections::VecDeque;
 use futures_util::future::{join, join_all, poll_fn};
 use futures_util::lock::Mutex;
 use sha2::{Digest, Sha256};
-use velmora::article::{assemble_article, OBFUSCATED_YENC_NAME_LEN};
+use velmora::article::{assemble_article_with, OBFUSCATED_YENC_NAME_LEN};
 use velmora::nntp::{is_retryable_post_error, NntpClient, PostOutcome, MAX_POST_ATTEMPTS};
 use velmora::rng::{uniform_below, SystemRng};
 use velmora::transport::Transport;
-use velmora::yenc::{encode_segment, SegmentParams};
+use velmora::yenc::{encode_segment_vec, SegmentParams};
 
 use crate::articles::article_spans;
 use crate::fetch::{forgiven, job_holder, report_health, Health, ProviderSession};
@@ -543,9 +543,31 @@ fn render_article(row: &ArticleRow, total: u32, file_size: u64, payload: &[u8]) 
             file_size,
         },
     };
-    let mut body = Vec::with_capacity(payload.len() + payload.len() / 16 + 512);
-    encode_segment(&mut body, &params, payload)?;
-    Ok(assemble_article(&row.headers, &body)?)
+    // Headers, blank line and yEnc body go into one buffer; the bytes are
+    // the ones `encode_segment` + `assemble_article` give.
+    Ok(assemble_article_with(
+        &row.headers,
+        payload.len() + payload.len() / 16 + 512,
+        |out| encode_segment_vec(out, &params, payload),
+    )?)
+}
+
+/// [`sha256`] for the CPU benchmark (`velmora-cpu-bench`). Not an API.
+#[doc(hidden)]
+pub fn bench_sha256(bytes: &[u8]) -> [u8; 32] {
+    sha256(bytes)
+}
+
+/// [`render_article`] for the CPU benchmark (`velmora-cpu-bench`), which
+/// times the code the post stage runs. Not an API.
+#[doc(hidden)]
+pub fn bench_render_article(
+    row: &ArticleRow,
+    total: u32,
+    file_size: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    render_article(row, total, file_size, payload)
 }
 
 impl<C, B, N, J, K, T> Bridge<C, B, N, J, K, T>

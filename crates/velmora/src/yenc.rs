@@ -26,33 +26,74 @@ pub const LINE_LENGTH: usize = 128;
 // SIMD lane helpers
 // ---------------------------------------------------------------------------
 
-/// 16-byte lane primitives. Every platform provides the same two functions;
-/// SIMD targets implement them with vector intrinsics, the rest fall through
-/// to scalar code (which the caller would have run anyway).
+/// 16-byte lane primitives. Every platform provides the same items; SIMD
+/// targets implement them with vector intrinsics. Targets without SIMD set
+/// `LANES` to false and the callers run their scalar loops only.
+///
+/// The `*_bits` functions return one bit per lane byte (bit `n` for byte
+/// `n`), so the caller knows where the first special byte sits and can copy
+/// everything before it in one vector store.
 #[cfg(target_arch = "x86_64")]
 mod simd {
-    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
-    /// True when the 16 bytes at `input` contain no `=` escape byte.
+    /// Whether this target has vector lanes at all.
+    pub(super) const LANES: bool = true;
+
+    /// Bits of the lane bytes that are the `=` escape marker (decode side).
     /// (SSE2 is part of the x86_64 baseline, so no runtime detection.)
-    pub(super) fn lane_is_clean(input: *const u8) -> bool {
+    #[inline(always)]
+    pub(super) fn escape_bits(input: *const u8) -> u32 {
         // SAFETY: caller guarantees 16 readable bytes at `input`; unaligned
         // loads are used throughout so no alignment requirement.
         unsafe {
             let v = _mm_loadu_si128(input as *const __m128i);
             let eq = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'=' as i8));
-            _mm_movemask_epi8(eq) == 0
+            _mm_movemask_epi8(eq) as u32
         }
     }
 
-    /// Copy 16 bytes applying the yEnc `-42` transform. Only valid for lanes
-    /// where [`lane_is_clean`] returned true.
+    /// Copy 16 bytes applying the yEnc `-42` transform. Only valid for
+    /// lanes where [`escape_bits`] returned zero.
+    #[inline(always)]
     pub(super) fn sub42_copy16(input: *const u8, output: *mut u8) {
-        // SAFETY: same contract as `lane_is_clean`, plus 16 writable bytes.
+        // SAFETY: same contract as `escape_bits`, plus 16 writable bytes.
         unsafe {
             let v = _mm_loadu_si128(input as *const __m128i);
             let r = _mm_sub_epi8(v, _mm_set1_epi8(42));
+            _mm_storeu_si128(output as *mut __m128i, r);
+        }
+    }
+
+    /// Bits of the lane bytes whose `+42` value must be escaped when
+    /// encoding: NUL, LF, CR and `=`.
+    #[inline(always)]
+    pub(super) fn critical_bits(input: *const u8) -> u32 {
+        // SAFETY: caller guarantees 16 readable bytes at `input`.
+        unsafe {
+            let v = _mm_add_epi8(_mm_loadu_si128(input as *const __m128i), _mm_set1_epi8(42));
+            let hit = _mm_or_si128(
+                _mm_or_si128(
+                    _mm_cmpeq_epi8(v, _mm_setzero_si128()),
+                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8)),
+                ),
+                _mm_or_si128(
+                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\r' as i8)),
+                    _mm_cmpeq_epi8(v, _mm_set1_epi8(b'=' as i8)),
+                ),
+            );
+            _mm_movemask_epi8(hit) as u32
+        }
+    }
+
+    /// Copy 16 bytes applying the yEnc `+42` transform. The caller uses
+    /// only the output bytes that come before the first critical byte.
+    #[inline(always)]
+    pub(super) fn add42_copy16(input: *const u8, output: *mut u8) {
+        // SAFETY: 16 readable bytes at `input`, 16 writable at `output`.
+        unsafe {
+            let v = _mm_loadu_si128(input as *const __m128i);
+            let r = _mm_add_epi8(v, _mm_set1_epi8(42));
             _mm_storeu_si128(output as *mut __m128i, r);
         }
     }
@@ -62,39 +103,86 @@ mod simd {
 mod simd {
     use core::arch::wasm32::*;
 
-    /// True when the 16 bytes at `input` contain no `=` escape byte.
-    pub(super) fn lane_is_clean(input: *const u8) -> bool {
+    /// Whether this target has vector lanes at all.
+    pub(super) const LANES: bool = true;
+
+    /// Bits of the lane bytes that are the `=` escape marker (decode side).
+    #[inline(always)]
+    pub(super) fn escape_bits(input: *const u8) -> u32 {
         // SAFETY: caller guarantees 16 readable bytes at `input`.
         unsafe {
             let v = v128_load(input as *const v128);
-            i8x16_bitmask(i8x16_eq(v, i8x16_splat(b'=' as i8))) == 0
+            i8x16_bitmask(i8x16_eq(v, i8x16_splat(b'=' as i8))) as u32
         }
     }
 
-    /// Copy 16 bytes applying the yEnc `-42` transform. Only valid for lanes
-    /// where [`lane_is_clean`] returned true.
+    /// Copy 16 bytes applying the yEnc `-42` transform. Only valid for
+    /// lanes where [`escape_bits`] returned zero.
+    #[inline(always)]
     pub(super) fn sub42_copy16(input: *const u8, output: *mut u8) {
-        // SAFETY: same contract as `lane_is_clean`, plus 16 writable bytes.
+        // SAFETY: same contract as `escape_bits`, plus 16 writable bytes.
         unsafe {
             let v = v128_load(input as *const v128);
             v128_store(output as *mut v128, i8x16_sub(v, i8x16_splat(42)));
         }
     }
+
+    /// Bits of the lane bytes whose `+42` value must be escaped when
+    /// encoding: NUL, LF, CR and `=`.
+    #[inline(always)]
+    pub(super) fn critical_bits(input: *const u8) -> u32 {
+        // SAFETY: caller guarantees 16 readable bytes at `input`.
+        unsafe {
+            let v = i8x16_add(v128_load(input as *const v128), i8x16_splat(42));
+            let hit = v128_or(
+                v128_or(
+                    i8x16_eq(v, i8x16_splat(0)),
+                    i8x16_eq(v, i8x16_splat(b'\n' as i8)),
+                ),
+                v128_or(
+                    i8x16_eq(v, i8x16_splat(b'\r' as i8)),
+                    i8x16_eq(v, i8x16_splat(b'=' as i8)),
+                ),
+            );
+            i8x16_bitmask(hit) as u32
+        }
+    }
+
+    /// Copy 16 bytes applying the yEnc `+42` transform. The caller uses
+    /// only the output bytes that come before the first critical byte.
+    #[inline(always)]
+    pub(super) fn add42_copy16(input: *const u8, output: *mut u8) {
+        // SAFETY: 16 readable bytes at `input`, 16 writable at `output`.
+        unsafe {
+            let v = v128_load(input as *const v128);
+            v128_store(output as *mut v128, i8x16_add(v, i8x16_splat(42)));
+        }
+    }
 }
 
-/// Scalar fallback: never claims a clean lane, so decoding always takes the
-/// byte loop below. (LLVM still autovectorises parts of it.)
+/// Scalar fallback: no vector lanes, so the callers never reach these and
+/// run their byte loops only. (LLVM still autovectorises parts of them.)
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "wasm32", target_feature = "simd128")
 )))]
 mod simd {
-    pub(super) fn lane_is_clean(_input: *const u8) -> bool {
-        false
+    pub(super) const LANES: bool = false;
+
+    pub(super) fn escape_bits(_input: *const u8) -> u32 {
+        unreachable!("no vector lanes on this target")
     }
 
     pub(super) fn sub42_copy16(_input: *const u8, _output: *mut u8) {
-        unreachable!("lane_is_clean is always false on this target")
+        unreachable!("no vector lanes on this target")
+    }
+
+    pub(super) fn critical_bits(_input: *const u8) -> u32 {
+        unreachable!("no vector lanes on this target")
+    }
+
+    pub(super) fn add42_copy16(_input: *const u8, _output: *mut u8) {
+        unreachable!("no vector lanes on this target")
     }
 }
 
@@ -256,12 +344,119 @@ pub fn encode_body(w: &mut impl io::Write, data: &[u8]) -> Result<u32> {
     Ok(hash.finalize())
 }
 
-/// Writes one complete yEnc article segment: the `=ybegin` header (plus
-/// `=ypart` for multi-part), the streamed encoded body, and the `=yend`
-/// footer carrying the segment CRC32 (`crc32=` single-part, `pcrc32=`
-/// multi-part). For multi-part segments `data.len()` must equal the
-/// `[begin,end]` range length.
-pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) -> Result<()> {
+/// Input bytes handled per output reservation in [`encode_body_vec`].
+const ENCODE_BLOCK: usize = 4096;
+
+/// Most output bytes `len` input bytes can encode to, whatever column the
+/// block starts at: two columns per byte, a CRLF per line of at least
+/// `LINE_LENGTH - 1` columns, and one vector store of slack.
+const fn encoded_bound(len: usize) -> usize {
+    2 * len + 2 * (2 * len / (LINE_LENGTH - 1) + 3) + 32
+}
+
+/// [`encode_body`] straight into a `Vec`, appending to `out`. The output is
+/// byte-identical to [`encode_body`] (which stays as the reference and the
+/// streaming form); this one runs 16 bytes at a time on SIMD targets and
+/// writes without a per-line `write_all`.
+///
+/// Returns the CRC32 of `data`.
+pub fn encode_body_vec(out: &mut Vec<u8>, data: &[u8]) -> u32 {
+    let mut hash = crc32fast::Hasher::new();
+    hash.update(data);
+
+    let mut column = 0usize;
+    for block in data.chunks(ENCODE_BLOCK) {
+        let start = out.len();
+        out.resize(start + encoded_bound(block.len()), 0);
+        let written = encode_block(block, &mut out[start..], &mut column);
+        out.truncate(start + written);
+    }
+    if column > 0 {
+        out.extend_from_slice(b"\r\n");
+    }
+    hash.finalize()
+}
+
+/// Encodes `data` into `dst` continuing a line at `*column`, and returns the
+/// bytes written. `dst` must hold at least `encoded_bound(data.len())`
+/// bytes; every write outside the vector store is bounds-checked, and the
+/// vector store is taken only with 16 writable bytes left.
+fn encode_block(data: &[u8], dst: &mut [u8], column: &mut usize) -> usize {
+    let mut col = *column;
+    let mut i = 0usize;
+    let mut o = 0usize;
+    if simd::LANES {
+        // Each round takes the clean bytes at the head of a 16-byte lane,
+        // capped at the room left on the line, then the one critical byte
+        // that stopped it (if any). `col < LINE_LENGTH` holds on entry.
+        while i + 16 <= data.len() && o + 24 <= dst.len() {
+            let take = (LINE_LENGTH - col).min(16);
+            let input = data.as_ptr().wrapping_add(i);
+            // SAFETY: the loop bounds guarantee 16 readable bytes at `i`
+            // and 16 writable bytes at `o`; both functions need exactly
+            // that and use unaligned access.
+            let bits = simd::critical_bits(input) & ((1u32 << take) - 1);
+            simd::add42_copy16(input, dst.as_mut_ptr().wrapping_add(o));
+            let clean = if bits == 0 {
+                take
+            } else {
+                bits.trailing_zeros() as usize
+            };
+            i += clean;
+            o += clean;
+            col += clean;
+            if bits != 0 {
+                // `clean < take`, so the line still has room for a column.
+                if col >= LINE_LENGTH - 1 {
+                    // Never strand `=` at end of line.
+                    dst[o] = b'\r';
+                    dst[o + 1] = b'\n';
+                    o += 2;
+                    col = 0;
+                }
+                dst[o] = b'=';
+                dst[o + 1] = data[i].wrapping_add(42).wrapping_add(64);
+                i += 1;
+                o += 2;
+                col += 2;
+            }
+            if col >= LINE_LENGTH {
+                dst[o] = b'\r';
+                dst[o + 1] = b'\n';
+                o += 2;
+                col = 0;
+            }
+        }
+    }
+    for &b in &data[i..] {
+        let mut value = b.wrapping_add(42);
+        if value == 0 || value == b'\n' || value == b'\r' || value == b'=' {
+            if col >= LINE_LENGTH - 1 {
+                dst[o] = b'\r';
+                dst[o + 1] = b'\n';
+                o += 2;
+                col = 0;
+            }
+            dst[o] = b'=';
+            o += 1;
+            col += 1;
+            value = value.wrapping_add(64);
+        }
+        dst[o] = value;
+        o += 1;
+        col += 1;
+        if col >= LINE_LENGTH {
+            dst[o] = b'\r';
+            dst[o + 1] = b'\n';
+            o += 2;
+            col = 0;
+        }
+    }
+    *column = col;
+    o
+}
+
+fn check_segment(p: &SegmentParams, data: &[u8]) -> Result<()> {
     p.validate()?;
     if p.multipart() && data.len() as u64 != p.end - p.begin + 1 {
         return Err(Error::Malformed(format!(
@@ -274,36 +469,61 @@ pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) ->
             p.end - p.begin + 1
         )));
     }
+    Ok(())
+}
 
+fn write_segment_head(w: &mut impl io::Write, p: &SegmentParams, len: usize) -> io::Result<()> {
     if p.multipart() {
         write!(
             w,
             "=ybegin part={} total={} line={} size={} name={}\r\n",
             p.part, p.total, LINE_LENGTH, p.file_size, p.name
         )?;
-        write!(w, "=ypart begin={} end={}\r\n", p.begin, p.end)?;
+        write!(w, "=ypart begin={} end={}\r\n", p.begin, p.end)
     } else {
         write!(
             w,
             "=ybegin line={} size={} name={}\r\n",
-            LINE_LENGTH,
-            data.len(),
-            p.name
-        )?;
+            LINE_LENGTH, len, p.name
+        )
     }
+}
 
-    let crc = encode_body(w, data)?;
-
+fn write_segment_tail(
+    w: &mut impl io::Write,
+    p: &SegmentParams,
+    len: usize,
+    crc: u32,
+) -> io::Result<()> {
     if p.multipart() {
-        write!(
-            w,
-            "=yend size={} part={} pcrc32={crc:08x}\r\n",
-            data.len(),
-            p.part
-        )?;
+        write!(w, "=yend size={} part={} pcrc32={crc:08x}\r\n", len, p.part)
     } else {
-        write!(w, "=yend size={} crc32={crc:08x}\r\n", data.len())?;
+        write!(w, "=yend size={len} crc32={crc:08x}\r\n")
     }
+}
+
+/// Writes one complete yEnc article segment: the `=ybegin` header (plus
+/// `=ypart` for multi-part), the streamed encoded body, and the `=yend`
+/// footer carrying the segment CRC32 (`crc32=` single-part, `pcrc32=`
+/// multi-part). For multi-part segments `data.len()` must equal the
+/// `[begin,end]` range length.
+pub fn encode_segment(w: &mut impl io::Write, p: &SegmentParams, data: &[u8]) -> Result<()> {
+    check_segment(p, data)?;
+    write_segment_head(w, p, data.len())?;
+    let crc = encode_body(w, data)?;
+    write_segment_tail(w, p, data.len(), crc)?;
+    Ok(())
+}
+
+/// [`encode_segment`] appending to a `Vec`, with the body encoded by
+/// [`encode_body_vec`]. The appended bytes are identical to what
+/// [`encode_segment`] writes; nothing is appended when the parameters are
+/// refused.
+pub fn encode_segment_vec(out: &mut Vec<u8>, p: &SegmentParams, data: &[u8]) -> Result<()> {
+    check_segment(p, data)?;
+    write_segment_head(out, p, data.len())?;
+    let crc = encode_body_vec(out, data);
+    write_segment_tail(out, p, data.len(), crc)?;
     Ok(())
 }
 
@@ -406,7 +626,6 @@ pub fn decode_part_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Resul
         ));
     }
 
-    let mut hash = crc32fast::Hasher::new();
     let mut written = 0usize;
     let trailer: &[u8];
     let (mut ypart_begin, mut ypart_end) = (0i64, 0i64);
@@ -450,15 +669,10 @@ pub fn decode_part_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Resul
             continue;
         }
         body_started = true;
-        let before = written;
         match decode_line_into(content, &mut dst[written..]) {
-            Ok(n) => {
-                hash.update(&dst[written..written + n]);
-                written += n;
-            }
+            Ok(n) => written += n,
             Err(reason) => return Err(malformed(message_id, reason)),
         }
-        let _ = before;
         if !terminated {
             return Err(malformed(message_id, "missing =yend line"));
         }
@@ -546,7 +760,9 @@ pub fn decode_part_to(message_id: &str, article: &[u8], dst: &mut [u8]) -> Resul
     if let Some(crc_text) = crc_text {
         match u32::from_str_radix(crc_text, 16) {
             Ok(want) => {
-                let got = hash.finalize();
+                // One pass over the decoded bytes (the same CRC32 a
+                // per-line update gives, without a call per line).
+                let got = crc32fast::hash(&dst[..written]);
                 if want != got {
                     return Err(Error::CrcMismatch {
                         message_id: message_id.to_string(),
@@ -577,22 +793,45 @@ fn malformed(message_id: &str, reason: &str) -> Error {
 }
 
 /// Decodes one raw body line (no line terminator) into `dst`, returning the
-/// decoded length. Clean 16-byte lanes go through SIMD; the first lane
-/// containing `=` — and everything after it — takes the scalar escape loop.
+/// decoded length. On SIMD targets each round takes the bytes at the head
+/// of a 16-byte lane that come before an `=`, then that one escape pair,
+/// and goes back to lanes; the scalar loop finishes the last partial lane
+/// (and is the whole decoder on targets without SIMD).
 fn decode_line_into(line: &[u8], dst: &mut [u8]) -> std::result::Result<usize, &'static str> {
     let mut i = 0usize;
     let mut o = 0usize;
-    while i + 16 <= line.len() && o + 16 <= dst.len() {
-        // SAFETY: loop bounds guarantee 16 readable bytes at `i` and 16
-        // writable bytes at `o`; `lane_is_clean`/`sub42_copy16` require exactly
-        // that (unaligned access is used inside).
-        let input = line.as_ptr().wrapping_add(i);
-        if simd::lane_is_clean(input) {
-            simd::sub42_copy16(input, dst.as_mut_ptr().wrapping_add(o));
-            i += 16;
-            o += 16;
-        } else {
-            break;
+    if simd::LANES {
+        while i + 16 <= line.len() && o + 16 <= dst.len() {
+            // SAFETY: loop bounds guarantee 16 readable bytes at `i` and 16
+            // writable bytes at `o`; `escape_bits`/`sub42_copy16` require
+            // exactly that (unaligned access is used inside).
+            let input = line.as_ptr().wrapping_add(i);
+            let bits = simd::escape_bits(input);
+            if bits == 0 {
+                simd::sub42_copy16(input, dst.as_mut_ptr().wrapping_add(o));
+                i += 16;
+                o += 16;
+                continue;
+            }
+            // Copy the bytes before the first `=` one by one (a vector
+            // store here would write past the decoded bytes, and `dst` may
+            // be a window of a buffer other articles fill), then take the
+            // escape pair with the same checks as the scalar loop below.
+            let clean = bits.trailing_zeros() as usize;
+            for (to, from) in dst[o..o + clean].iter_mut().zip(&line[i..i + clean]) {
+                *to = from.wrapping_sub(42);
+            }
+            i += clean + 1;
+            o += clean;
+            if i >= line.len() {
+                return Err("yenc escape at end of line");
+            }
+            if o >= dst.len() {
+                return Err("decoded article exceeds destination");
+            }
+            dst[o] = line[i].wrapping_sub(64).wrapping_sub(42);
+            i += 1;
+            o += 1;
         }
     }
     while i < line.len() {
@@ -621,7 +860,7 @@ fn split_lines(mut rest: &[u8]) -> impl Iterator<Item = (&[u8], bool)> + '_ {
         if rest.is_empty() {
             return None;
         }
-        match rest.iter().position(|&b| b == b'\n') {
+        match memchr::memchr(b'\n', rest) {
             Some(pos) => {
                 let mut line = &rest[..pos];
                 rest = &rest[pos + 1..];
