@@ -374,7 +374,11 @@ where
             return Ok(None);
         }
         let (_, kek) = self.kek.active();
-        let raised = self.catalog.verify_escalations(self.clock.now()).await?;
+        // Every escalation that had not ended when the extent was
+        // stored, not only those that run now: an extent that waited
+        // through one (a backlog, a release that came late) is read in
+        // full all the same.
+        let raised = self.catalog.verify_escalations(extent.created_at).await?;
         let escalated = raised
             .into_iter()
             .map(|e| label(&e.backbone))
@@ -903,6 +907,21 @@ where
         // What verify recorded last for each backbone, for the evidence:
         // read before this job's own rows hide it.
         let mut verified = self.catalog.backbone_status(&extent.id).await?;
+        if light.is_some() {
+            // Under the light check a backbone holds a copy only if
+            // verify's last word on it was a complete pass: an answer to
+            // `STAT` here does not stand in for a size check that failed
+            // or was never made (a backbone that lacked the extent at
+            // verify and has it now).
+            for name in &labels {
+                let passed = verified
+                    .iter()
+                    .any(|s| s.counts && label(&s.backbone) == *name);
+                if !passed && !failed.contains(name) {
+                    failed.push(name.clone());
+                }
+            }
+        }
         verified.retain(|s| {
             s.counts && s.kind == VerifyKind::Size && labels.contains(&label(&s.backbone))
         });
@@ -998,15 +1017,15 @@ where
         let evidence =
             serde_json::to_string(&evidence).map_err(|_| Stop::fail(FailClass::Internal))?;
         let at = self.clock.now();
-        let begun = match need_full {
-            true => {
+        let begun = match light {
+            None => {
                 self.catalog
                     .begin_release(lease, required, &labels, &evidence, at)
                     .await?
             }
-            false => {
+            Some(_) => {
                 self.catalog
-                    .begin_release_light(lease, required, &labels, &evidence, at)
+                    .begin_release_light(lease, required, &labels, &evidence, at, need_full)
                     .await?
             }
         };

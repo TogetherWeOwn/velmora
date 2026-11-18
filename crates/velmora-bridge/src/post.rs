@@ -102,12 +102,33 @@ pub async fn stored_size<T: Transport>(
         // Not an answer about this article.
         return Err(velmora::Error::Malformed("HEAD reply names another article".into()).into());
     }
-    Ok(SizeOutcome::Present(reported_size(&block, &named, how)))
+    Ok(match reported_size(&block, &named, how) {
+        Some(Reported::Own(size)) => SizeOutcome::Present(Some(size)),
+        Some(Reported::Carried(size)) => SizeOutcome::Carried(size),
+        // The headers of the article asked for: it is there.
+        None if how == SizeCommand::Head => SizeOutcome::Present(None),
+        // An `HDR` or `OVER` answer that cannot be tied to the article
+        // (no line, more than one, another message-id) does not say the
+        // article is there either: `STAT` does.
+        None => match NntpSession::stat(client, message_id).await? {
+            true => SizeOutcome::Present(None),
+            false => SizeOutcome::Missing,
+        },
+    })
+}
+
+/// A size in a provider's answer, and whose count it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reported {
+    /// The provider's own count of the article it stores.
+    Own(u64),
+    /// A count that came with the article (`X-Received-Bytes:`).
+    Carried(u64),
 }
 
 /// The size in the data block of a size command's answer, if it has one.
 /// `named` is the message-id in angle brackets.
-fn reported_size(block: &[u8], named: &str, how: SizeCommand) -> Option<u64> {
+fn reported_size(block: &[u8], named: &str, how: SizeCommand) -> Option<Reported> {
     let text = core::str::from_utf8(block).ok()?;
     let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     let number = |v: &str| {
@@ -123,14 +144,14 @@ fn reported_size(block: &[u8], named: &str, how: SizeCommand) -> Option<u64> {
             let mut words = line.split_whitespace();
             let (_, value, rest) = (words.next()?, words.next()?, words.next());
             match (more, rest) {
-                (None, None) => number(value),
+                (None, None) => number(value).map(Reported::Own),
                 _ => None,
             }
         }
         SizeCommand::Over => {
             let fields: Vec<&str> = lines.next()?.split('\t').collect();
             match fields.get(4).map(|f| f.trim()) == Some(named) {
-                true => number(fields.get(6)?),
+                true => number(fields.get(6)?).map(Reported::Own),
                 false => None,
             }
         }
@@ -149,7 +170,10 @@ fn reported_size(block: &[u8], named: &str, how: SizeCommand) -> Option<u64> {
                     carried = carried.or(Some(number(value)));
                 }
             }
-            own.or(carried).flatten()
+            match own {
+                Some(own) => own.map(Reported::Own),
+                None => carried.flatten().map(Reported::Carried),
+            }
         }
     }
 }
@@ -1711,18 +1735,24 @@ mod tests {
     #[test]
     fn head_takes_the_providers_own_size_first() {
         let head = |block: &str| reported_size(block.as_bytes(), NAMED, SizeCommand::Head);
-        assert_eq!(head("Subject: x\r\nBytes: 744918\r\n"), Some(744_918));
-        assert_eq!(head("subject: x\nbytes:12\n"), Some(12));
+        assert_eq!(
+            head("Subject: x\r\nBytes: 744918\r\n"),
+            Some(Reported::Own(744_918))
+        );
+        assert_eq!(head("subject: x\nbytes:12\n"), Some(Reported::Own(12)));
         // The size that came with the article, where the provider adds
-        // none of its own.
-        assert_eq!(head("X-Received-Bytes: 1883\r\nPath: a!b\r\n"), Some(1_883));
+        // none of its own: told apart, it is no count of what is stored.
+        assert_eq!(
+            head("X-Received-Bytes: 1883\r\nPath: a!b\r\n"),
+            Some(Reported::Carried(1_883))
+        );
         assert_eq!(
             head("X-Received-Bytes: 1883\r\nBytes: 1900\r\n"),
-            Some(1_900)
+            Some(Reported::Own(1_900))
         );
         // The first header of a name counts; one that is no number is no
         // size, and the other name does not stand in for it.
-        assert_eq!(head("Bytes: 7\r\nBytes: 9\r\n"), Some(7));
+        assert_eq!(head("Bytes: 7\r\nBytes: 9\r\n"), Some(Reported::Own(7)));
         assert_eq!(head("Bytes: many\r\nX-Received-Bytes: 5\r\n"), None);
         assert_eq!(head("Bytes: -5\r\n"), None);
         assert_eq!(head("Bytes: 1e3\r\n"), None);
@@ -1737,8 +1767,8 @@ mod tests {
     #[test]
     fn hdr_takes_one_line_with_one_value() {
         let hdr = |block: &str| reported_size(block.as_bytes(), NAMED, SizeCommand::Hdr);
-        assert_eq!(hdr("0 744918\r\n"), Some(744_918));
-        assert_eq!(hdr("3000234 12\r\n"), Some(12));
+        assert_eq!(hdr("0 744918\r\n"), Some(Reported::Own(744_918)));
+        assert_eq!(hdr("3000234 12\r\n"), Some(Reported::Own(12)));
         assert_eq!(hdr(""), None);
         assert_eq!(hdr("0\r\n"), None);
         assert_eq!(hdr("0 12 13\r\n"), None);
@@ -1753,7 +1783,7 @@ mod tests {
         let line = |id: &str, bytes: &str| {
             format!("0\tsubject\tfrom\tdate\t{id}\t\t{bytes}\t17\tXref: x\r\n")
         };
-        assert_eq!(over(&line(NAMED, "744918")), Some(744_918));
+        assert_eq!(over(&line(NAMED, "744918")), Some(Reported::Own(744_918)));
         // The line of another article says nothing about this one.
         assert_eq!(over(&line("<other@example.invalid>", "744918")), None);
         assert_eq!(over(&line(NAMED, "")), None);

@@ -464,8 +464,20 @@ impl MemCatalog {
         counting: &[String],
         evidence_json: &str,
         need_full: bool,
+        light: bool,
     ) -> Guard<()> {
+        let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
+            // As the SQL guard: under the light check, the escalations
+            // that had not ended when the extent was stored.
+            let stored = e.job.extent.created_at;
+            let escalated = |backbone: &str| {
+                light
+                    && raised
+                        .iter()
+                        .any(|r| r.backbone == backbone && r.until > stored)
+            };
+            let need_full = need_full || counting.iter().any(|name| escalated(name));
             // As the SQL guard: only rows recorded under this claim.
             let claimed = e.outbox.claimed_at;
             let statuses = Self::statuses(e);
@@ -487,6 +499,7 @@ impl MemCatalog {
             let passes = statuses
                 .iter()
                 .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
+                .filter(|s| !escalated(&s.backbone) || full(s))
                 .map(|s| match full(s) {
                     true => (s.backbone.as_str(), VerifyKind::Body),
                     false => (s.backbone.as_str(), VerifyKind::Stat),
@@ -745,7 +758,7 @@ impl Catalog for MemCatalog {
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, true))
+        Ok(self.release(l, required, counting, evidence_json, true, false))
     }
 
     async fn begin_release_light(
@@ -755,8 +768,9 @@ impl Catalog for MemCatalog {
         counting: &[String],
         evidence_json: &str,
         _: UnixMs,
+        need_full: bool,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, false))
+        Ok(self.release(l, required, counting, evidence_json, need_full, true))
     }
 
     async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {

@@ -886,9 +886,18 @@ pub(super) async fn body_checks<S: Sql>(
 /// looked at. The lease must also be unexpired: an expired lease may
 /// be taken over at any moment. Anything else is `Lost`.
 ///
-/// With `need_full` false (the light check, for an extent outside the
-/// sample) the second point is left out: the first one, the lease and
-/// the rest of the guard are the same.
+/// `light` is `None` for the guard above, and `Some(need_full)` for the
+/// light check. With `Some(false)` (an extent outside the sample) the
+/// second point is left out: the first one, the lease and the rest of
+/// the guard are the same.
+///
+/// Under the light check the escalations count too (`verify_escalations`,
+/// those that had not ended when the extent was stored): a pass on a
+/// backbone under full reads counts only with the full check on record
+/// for that backbone, and with any backbone of `counting` under full
+/// reads the second point holds whatever `need_full` says. They are
+/// read in the guard, so one raised after the job read them is not
+/// missed.
 pub(super) async fn begin_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -896,8 +905,10 @@ pub(super) async fn begin_release<S: Sql>(
     counting: &[String],
     evidence_json: &str,
     now: UnixMs,
-    need_full: bool,
+    light: Option<bool>,
 ) -> Result<Guard<()>> {
+    let need_full = light.unwrap_or(true);
+    let light = light.is_some();
     if l.stage != OutboxStage::Release || required == 0 {
         return Err(BridgeError::Invalid(
             "release needs a release lease and at least one required backbone",
@@ -916,8 +927,18 @@ pub(super) async fn begin_release<S: Sql>(
          OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
               WHERE ",
         fresh_pass!(),
-        ") < ?5 \
-         OR (?8 = 1 AND NOT EXISTS (SELECT 1 FROM verifications v \
+        " AND NOT (?9 = 1 \
+                AND EXISTS (SELECT 1 FROM verify_escalations z \
+                  WHERE z.backbone = v.backbone AND z.until > e.created_at) \
+                AND NOT EXISTS (SELECT 1 FROM verifications b \
+                  WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
+        body_on_record!(),
+        "))) < ?5 \
+         OR ((?8 = 1 OR (?9 = 1 AND EXISTS (SELECT 1 FROM verify_escalations z \
+                JOIN extents o ON o.id = ?1 \
+                WHERE z.until > o.created_at \
+                  AND z.backbone IN (SELECT value FROM json_each(?7))))) \
+             AND NOT EXISTS (SELECT 1 FROM verifications v \
               JOIN extents e ON e.id = v.extent_id WHERE ",
         fresh_pass!(),
         " AND EXISTS (SELECT 1 FROM verifications b \
@@ -935,6 +956,7 @@ pub(super) async fn begin_release<S: Sql>(
                     ms(now),
                     text(&labels),
                     SqlValue::Int(i64::from(need_full)),
+                    SqlValue::Int(i64::from(light)),
                 ],
             )?,
         ),

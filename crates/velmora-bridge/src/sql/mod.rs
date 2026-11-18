@@ -526,7 +526,7 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(self, l, required, counting, evidence_json, now, true).await
+        outbox::begin_release(self, l, required, counting, evidence_json, now, None).await
     }
     async fn begin_release_light(
         &self,
@@ -535,8 +535,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         counting: &[String],
         evidence_json: &str,
         now: UnixMs,
+        need_full: bool,
     ) -> Result<Guard<()>> {
-        outbox::begin_release(self, l, required, counting, evidence_json, now, false).await
+        outbox::begin_release(
+            self,
+            l,
+            required,
+            counting,
+            evidence_json,
+            now,
+            Some(need_full),
+        )
+        .await
     }
     async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {
         outbox::escalate_verify(self, e).await

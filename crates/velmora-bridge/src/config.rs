@@ -291,8 +291,9 @@ pub struct VerifyConfig {
     /// Extents read in full under `light`, in parts per million
     /// (`VERIFY_SAMPLE_PERCENT`, a decimal number of percent).
     pub sample_ppm: u32,
-    /// How long a backbone is read in full for every extent after a full
-    /// read of it failed under `light` (`VERIFY_ESCALATE_SECS`).
+    /// How long a backbone is read in full after a full read of it
+    /// failed under `light` (`VERIFY_ESCALATE_SECS`): for every extent
+    /// stored before the period ends, whenever its job runs.
     pub escalate_secs: u32,
     /// The size command of each provider that has one
     /// (`VERIFY_SIZE_COMMANDS`, a JSON object of provider id to `hdr`,

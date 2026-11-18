@@ -3538,11 +3538,15 @@ async fn the_light_guard_releases_without_a_full_check() {
     let at = T0.plus_ms(2);
     let before = fx.dump().await;
     // One backbone is not two.
-    let light = fx.cat.begin_release_light(&r, 2, &counting, "[]", at);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert!(fx.pass(&r, "bb-c", T0.plus_ms(1), VerifyKind::Stat).await);
     // Nor is a backbone that does not count a second one.
-    let light = fx.cat.begin_release_light(&r, 2, &counting, "[]", at);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
@@ -3553,13 +3557,15 @@ async fn the_light_guard_releases_without_a_full_check() {
     assert_eq!(body.await.unwrap(), Guard::Lost);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
     // Zero backbones never release.
-    let light = fx.cat.begin_release_light(&r, 0, &counting, "[]", at);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 0, &counting, "[]", at, false);
     assert!(matches!(light.await, Err(BridgeError::Invalid(_))));
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
 
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[\"light\"]", at);
+        .begin_release_light(&r, 2, &counting, "[\"light\"]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
     assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
     assert_eq!(fx.extent(&o, "release_evidence").await, "[\"light\"]");
@@ -3586,7 +3592,7 @@ async fn the_light_guard_keeps_the_lease_and_the_fresh_evidence() {
     let begin = |lease: &Lease, at: UnixMs| {
         let (cat, counting, lease) = (&fx.cat, &counting, lease.clone());
         async move {
-            cat.begin_release_light(&lease, 2, counting, "[]", at)
+            cat.begin_release_light(&lease, 2, counting, "[]", at, false)
                 .await
                 .unwrap()
         }
@@ -3661,11 +3667,15 @@ async fn a_wrong_size_holds_the_backbone_until_it_is_read_in_full() {
         );
     }
     let at = later.plus_ms(2);
-    let light = fx.cat.begin_release_light(&r, 2, &counting, "[]", at);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
     // The other backbone alone is one copy.
-    let light = fx.cat.begin_release_light(&r, 1, &counting, "[]", at);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 1, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
 
     // A second extent: the same, then read in full.
@@ -3723,7 +3733,7 @@ async fn the_light_guard_refuses_a_backbone_whose_full_read_failed() {
     }
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2));
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2), false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     // Read in full again, as a sampled read: it holds a copy, and that
     // read is the full check on record for the guard of `body` too.
@@ -3735,6 +3745,78 @@ async fn the_light_guard_refuses_a_backbone_whose_full_read_failed() {
         .cat
         .begin_release(&r, 2, &counting, "[]", later.plus_ms(4));
     assert_eq!(body.await.unwrap(), Guard::Applied(()));
+}
+
+/// The light guard reads the escalations itself: one raised after the
+/// job read them (while it asked the providers) still holds the extent.
+/// A backbone under full reads counts only with its own full read.
+#[tokio::test]
+async fn the_light_guard_reads_the_escalations_itself() {
+    let fx = Fx::new().await;
+    let (o, r) = fx.at_release("k").await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    let stored = UnixMs(fx.extent(&o, "created_at").await.parse().unwrap());
+    let raise = |backbone: &str, until: UnixMs| VerifyEscalation {
+        backbone: backbone.to_string(),
+        until,
+        raised_at: stored,
+        extent_id: ExtentId::mint([7; 13]),
+        result: VerifyResult::Corrupt,
+    };
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
+    // It ends after the extent was stored, so the extent is under it,
+    // whether or not it still runs when the release does.
+    let raised = raise("bb-b", stored.plus_ms(1));
+    fx.cat.escalate_verify(&raised).await.unwrap();
+    let late = T0.plus_secs(7 * 86_400);
+    for at in [T0.plus_ms(2), late] {
+        let light = fx
+            .cat
+            .begin_release_light(&r, 2, &counting, "[]", at, false);
+        assert_eq!(light.await.unwrap(), Guard::Lost);
+    }
+    // The full read of another backbone does not stand in for it.
+    assert!(
+        fx.pass(&r, "bb-a", T0.plus_ms(3), VerifyKind::Sampled)
+            .await
+    );
+    for need_full in [false, true] {
+        let light = fx
+            .cat
+            .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(4), need_full);
+        assert_eq!(light.await.unwrap(), Guard::Lost);
+    }
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    // Its own full read does.
+    assert!(
+        fx.pass(&r, "bb-b", T0.plus_ms(3), VerifyKind::Sampled)
+            .await
+    );
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(4), false);
+    assert_eq!(light.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+
+    // One that had ended when the extent was stored, and one on a
+    // backbone that does not count, say nothing.
+    let fx = Fx::new().await;
+    let (o, r) = fx.at_release("k").await;
+    let stored = UnixMs(fx.extent(&o, "created_at").await.parse().unwrap());
+    fx.cat
+        .escalate_verify(&raise("bb-b", stored))
+        .await
+        .unwrap();
+    let far = raise("bb-c", stored.plus_secs(86_400));
+    fx.cat.escalate_verify(&far).await.unwrap();
+    assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
+    assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
+    let light = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
+    assert_eq!(light.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
 }
 
 /// The backbones read in full for a while: one row per backbone, the

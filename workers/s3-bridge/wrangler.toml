@@ -47,11 +47,17 @@ VERIFY_DELAY_SECS = "120"
 #   VERIFY_SIZE_COMMANDS   a JSON object of provider id to hdr | over |
 #                          head: the command that returns the size of an
 #                          article by message-id on that provider (HDR
-#                          :bytes, OVER, or HEAD and its Bytes or
-#                          X-Received-Bytes header). A provider without
-#                          an entry, or an article whose answer carries
-#                          no size, is checked with STAT alone, and the
-#                          verification row says which it was.
+#                          :bytes, OVER, or HEAD and its Bytes header).
+#                          Only a size the provider counted itself is
+#                          recorded as a size check. A size that came
+#                          with the article (X-Received-Bytes under
+#                          HEAD) must fit too, but a pass is recorded as
+#                          presence. A provider without an entry, or an
+#                          answer without a size, is checked with STAT
+#                          alone. The verification row says which it was.
+# A raised backbone is read in full for every extent stored before the
+# period ends, whenever its job runs, and counts at release only with
+# that full read on record.
 # Without VERIFY_MODE the stage runs as body.
 # One group per article, drawn at random. Each was posted to from every
 # posting account and read back by message-id on every account.

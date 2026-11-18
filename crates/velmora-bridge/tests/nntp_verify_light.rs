@@ -327,6 +327,48 @@ async fn an_article_missing_on_one_backbone_blocks_the_release() {
     assert_eq!(rig.state(&late), SafetyState::Held);
 }
 
+/// With three backbones that count, one that lacked the extent when
+/// verify ran does not count at the release because it answers `STAT`
+/// then: it was never checked. The extent goes back to verify.
+#[tokio::test]
+async fn a_backbone_verify_did_not_pass_does_not_count_at_release() {
+    let spec = |backbone, post| Spec {
+        backbone,
+        post,
+        max_conns: 2,
+    };
+    let mut rig = rig(&[spec("bb0", true), spec("bb1", false), spec("bb2", false)]).await;
+    rig.bridge.cfg.required_backbones = 2;
+    rig.bridge.cfg.propagation_grace_secs = 0;
+    rig.bridge.cfg.verify = VerifyConfig {
+        mode: VerifyMode::Light,
+        sample_ppm: 0,
+        escalate_secs: ESCALATE_SECS,
+        size_commands: Vec::new(),
+    };
+    let (s, plan) = rig.on_two(20).await;
+    let mut outcome = rig.run(&s, OutboxStage::Verify).await;
+    while outcome != JobOutcome::Ack {
+        rig.wait_until_due(&s);
+        outcome = rig.run(&s, OutboxStage::Verify).await;
+    }
+    assert_eq!(rig.stage(&s), OutboxStage::Release);
+    let on_record = rig.checks(&s);
+    assert_eq!(
+        on_record.last().unwrap(),
+        &row("bb2", VerifyKind::Stat, VerifyResult::Missing)
+    );
+
+    // The third backbone gets the extent; the second loses an article.
+    rig.propagate(&s, 0, 2).await;
+    rig.servers[1].hide(&plan[1].message_id).await;
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.logged(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.stage(&s), OutboxStage::Verify);
+    assert_eq!(rig.state(&s), SafetyState::Held);
+    assert!(rig.bridge.safety.contains(&s.extent.safety_key()));
+}
+
 /// One backbone is not two under the light check either.
 #[tokio::test]
 async fn one_backbone_releases_nothing_under_the_light_check() {
@@ -446,10 +488,22 @@ async fn a_corrupt_sample_raises_the_backbone_to_full_reads() {
     assert_eq!(rig.state(&s), SafetyState::Released);
     assert!(rig.evidence(&s).contains(&entry(name, "sampled", None)));
 
-    // When the period is over, extents outside the sample are not read
-    // again.
+    // An extent stored before the period ended is read in full there
+    // even when its job runs after it: a backlog does not let it by.
     rig.bridge.clock.advance_secs(ESCALATE_SECS);
+    let (late, plan) = rig.on_two(14).await;
+    assert_eq!(
+        rig.logged(&late, OutboxStage::Verify).await,
+        JobOutcome::Ack
+    );
+    assert_eq!(rig.calls().0, plan.len());
+    assert_eq!(rig.checks(&late), want);
+
+    // Extents stored after the period are not read in full again.
     let (after, _) = rig.on_two(12).await;
+    let now = rig.bridge.clock.now();
+    let catalog = &rig.bridge.catalog;
+    catalog.edit(&after.extent, |e| e.job.extent.created_at = now);
     assert_eq!(
         rig.logged(&after, OutboxStage::Verify).await,
         JobOutcome::Ack
@@ -542,7 +596,9 @@ async fn an_escalation_reaches_extents_that_wait_for_their_release() {
     rig.bridge.catalog.escalate_verify(&shorter).await.unwrap();
     assert_eq!(*rig.bridge.catalog.escalations.borrow(), [raised]);
 
-    rig.bridge.clock.advance_secs(1);
+    // The release comes late, after the period is over: the extent was
+    // stored before its end, so it is still held to it.
+    rig.bridge.clock.advance_secs(ESCALATE_SECS + 60);
     assert_eq!(rig.logged(&s, OutboxStage::Release).await, JobOutcome::Ack);
     // Nothing was asked: there is no full check on record.
     assert_eq!(rig.calls(), (0, 0, 0));
@@ -823,7 +879,7 @@ async fn size_commands_against_a_server() {
 
     rig.server().set_reported_size(Some(0)).await;
     let mut sizes = Vec::new();
-    for how in [SizeCommand::Head, SizeCommand::Hdr] {
+    for how in commands {
         match stored_size(&mut client, id, how).await.unwrap() {
             SizeOutcome::Present(Some(size)) => sizes.push(size),
             other => panic!("{how:?}: {other:?}"),
@@ -831,8 +887,24 @@ async fn size_commands_against_a_server() {
         let gone = stored_size(&mut client, "gone@example.invalid", how).await;
         assert_eq!(gone.unwrap(), SizeOutcome::Missing, "{how:?}");
     }
-    assert_eq!(sizes[0], sizes[1]);
+    assert_eq!(sizes, [sizes[0]; 3]);
     assert!(least <= sizes[0] && sizes[0] <= most, "{sizes:?}");
+
+    // A size that came with the article is told apart from the
+    // provider's own count.
+    rig.server().set_size_carried(true).await;
+    let carried = stored_size(&mut client, id, SizeCommand::Head).await;
+    assert_eq!(carried.unwrap(), SizeOutcome::Carried(sizes[0]));
+    rig.server().set_size_carried(false).await;
+
+    // An `OVER` answer with no line for the article says nothing, not
+    // even that the article is there: `STAT` is asked.
+    rig.server().set_over_empty(true).await;
+    let found = stored_size(&mut client, id, SizeCommand::Over).await;
+    assert_eq!(found.unwrap(), SizeOutcome::Present(None));
+    let gone = stored_size(&mut client, "gone@example.invalid", SizeCommand::Over).await;
+    assert_eq!(gone.unwrap(), SizeOutcome::Missing);
+    rig.server().set_over_empty(false).await;
     // The session is still in step after every answer.
     assert!(NntpSession::stat(&mut client, id).await.unwrap());
 

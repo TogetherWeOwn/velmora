@@ -128,6 +128,10 @@ struct Spool {
     /// `Bytes:` header in `HEAD`, and `HDR :bytes`. The value is the
     /// stored length plus this difference.
     reported_size: Option<i64>,
+    /// The `HEAD` size header is `X-Received-Bytes:` and not `Bytes:`.
+    size_carried: bool,
+    /// `OVER <message-id>` answers `224` with no line.
+    over_empty: bool,
 }
 
 struct Shared {
@@ -160,6 +164,8 @@ impl Shared {
             limit_482: false,
             limit_reply: None,
             reported_size: None,
+            size_carried: false,
+            over_empty: false,
         };
         Self {
             config,
@@ -350,6 +356,18 @@ impl TestNntpServer {
     /// any other value one whose stored article is not what was posted.
     /// While `None` (the default) `HEAD` has no such header and `HDR` is
     /// an unknown command.
+    /// Whether the size in `HEAD` is given as `X-Received-Bytes:`, the
+    /// header that travels with an article, and not as `Bytes:`.
+    pub async fn set_size_carried(&self, on: bool) {
+        self.shared.spool.lock().await.size_carried = on;
+    }
+
+    /// Whether `OVER <message-id>` answers `224` with an empty block,
+    /// whatever it holds.
+    pub async fn set_over_empty(&self, on: bool) {
+        self.shared.spool.lock().await.over_empty = on;
+    }
+
     pub async fn set_reported_size(&self, difference: Option<i64>) {
         self.shared.spool.lock().await.reported_size = difference;
     }
@@ -719,7 +737,11 @@ async fn handle_connection(
                     if let (Some(d), "HEAD") = (spool.reported_size, cmd.as_str()) {
                         let size = (article.raw.len() as i64).saturating_add(d).max(0);
                         let stored = payload.strip_suffix(b"\r\n").unwrap_or(payload);
-                        sized_head = [stored, format!("Bytes: {size}\r\n").as_bytes()].concat();
+                        let name = match spool.size_carried {
+                            true => "X-Received-Bytes",
+                            false => "Bytes",
+                        };
+                        sized_head = [stored, format!("{name}: {size}\r\n").as_bytes()].concat();
                         payload = &sized_head;
                     }
                     if cmd.as_str() == "STAT" && spool.drop_stats > 0 {
@@ -843,6 +865,37 @@ async fn handle_connection(
                 };
                 let size = (article.raw.len() as i64).saturating_add(d).max(0);
                 let answer = format!("225 Header information follows\r\n0 {size}\r\n.\r\n");
+                let _ = writer.write_all(answer.as_bytes()).await;
+            }
+            "OVER" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                // Only `OVER <message-id>`, and only while a test has
+                // switched the reported size on.
+                let (reported, empty) = {
+                    let spool = shared.spool.lock().await;
+                    (spool.reported_size, spool.over_empty)
+                };
+                let Some(d) = reported.filter(|_| arg.starts_with('<')) else {
+                    let _ = writer.write_all(b"500 Unknown command\r\n").await;
+                    continue;
+                };
+                if empty {
+                    let _ = writer
+                        .write_all(b"224 Overview information follows\r\n.\r\n")
+                        .await;
+                    continue;
+                }
+                let Some(article) = find_visible_by_id(&shared, &normalize_id(&arg)).await else {
+                    let _ = writer.write_all(b"430 No such article\r\n").await;
+                    continue;
+                };
+                let size = (article.raw.len() as i64).saturating_add(d).max(0);
+                let answer = format!(
+                    "224 Overview information follows\r\n0\tsubject\tfrom\tdate\t{}\t\t{size}\t1\r\n.\r\n",
+                    article.message_id
+                );
                 let _ = writer.write_all(answer.as_bytes()).await;
             }
             "QUIT" => {

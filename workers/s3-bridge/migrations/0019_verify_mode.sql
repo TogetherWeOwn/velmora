@@ -6,8 +6,9 @@
 --   'sampled' = a full read (`kind = 'body'`) made because the extent
 --               fell in the sample, or because its backbone is read in
 --               full for a while after a failed read;
---   'size'    = presence and the reported size of every article
---               (`kind = 'stat'`).
+--   'size'    = presence and the size of every article as the
+--               provider counted it (`kind = 'stat'`). A size that came
+--               with the article is checked too, but leaves `mode` NULL.
 -- `kind` keeps its two values, so a Worker from before this column
 -- reads a 'sampled' row as the full read it is and a 'size' row as the
 -- presence check it also is, and its own inserts leave `mode` NULL: it
@@ -19,9 +20,10 @@ ALTER TABLE verifications ADD COLUMN mode TEXT
 
 -- A backbone that is read in full for every extent until `until`,
 -- because a full read of a sampled extent failed there. One row per
--- backbone (its label, trimmed and lower case); a row whose `until` is
--- over says nothing. `extent_id` and `result` name the read that raised
--- it last.
+-- backbone (its label, trimmed and lower case). It covers every extent
+-- stored before `until` (`extents.created_at`), whenever that extent is
+-- verified or released; it says nothing about an extent stored later.
+-- `extent_id` and `result` name the read that raised it last.
 CREATE TABLE verify_escalations (
   backbone   TEXT PRIMARY KEY,
   until      INTEGER NOT NULL,

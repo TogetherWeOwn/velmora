@@ -212,6 +212,11 @@ pub enum SizeOutcome {
     /// supported, or the article has no such header), so nothing more
     /// than a `STAT` is known.
     Present(Option<u64>),
+    /// The provider has the article, and its answer carries a size that
+    /// is not the provider's own count: a header written where the
+    /// article was first received, which travels with it. It says what
+    /// arrived there, not what this provider stores.
+    Carried(u64),
 }
 
 /// One authenticated NNTP session. Blanket impl for
@@ -913,11 +918,17 @@ pub trait Catalog {
         now: UnixMs,
     ) -> Result<Guard<()>>;
     /// [`Catalog::begin_release`] under the light check
-    /// (`VERIFY_MODE=light`) for an extent that is not in the sample and
-    /// has no backbone under full reads: the same guard without the
-    /// full check on record. `required` backbones with a complete pass
-    /// under this claim are still needed, and none counts on a backbone
-    /// whose last check of the bytes failed.
+    /// (`VERIFY_MODE=light`). `required` backbones with a complete pass
+    /// under this claim are needed, and none counts on a backbone whose
+    /// last check of the bytes failed. With `need_full` false (an extent
+    /// outside the sample) the full check on record is not asked for.
+    ///
+    /// The guard reads the escalations itself
+    /// ([`Catalog::verify_escalations`] at the time the extent was
+    /// stored), so one raised while the job asked the providers holds:
+    /// a backbone under full reads counts only with its own full check
+    /// on record, and with any counting backbone under full reads the
+    /// full check is asked for whatever `need_full` says.
     async fn begin_release_light(
         &self,
         l: &Lease,
@@ -925,14 +936,17 @@ pub trait Catalog {
         counting: &[String],
         evidence_json: &str,
         now: UnixMs,
+        need_full: bool,
     ) -> Result<Guard<()>>;
     /// Notes that a full read of a sampled extent failed on `backbone`:
     /// until `until` every extent is read in full there. An earlier end
     /// never replaces a later one.
     async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()>;
-    /// The backbones read in full for every extent at `now`
-    /// ([`Catalog::escalate_verify`]).
-    async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>>;
+    /// The escalations that have not ended at `at`
+    /// ([`Catalog::escalate_verify`]). An extent is read in full on the
+    /// backbones of those that had not ended when it was stored (`at` =
+    /// its `created_at`), whenever its job runs.
+    async fn verify_escalations(&self, at: UnixMs) -> Result<Vec<VerifyEscalation>>;
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third

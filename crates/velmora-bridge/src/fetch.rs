@@ -495,6 +495,7 @@ enum Got {
     Body(BodyOutcome),
     Present,
     Size(Option<u64>),
+    Carried(u64),
 }
 
 /// The sizes, in bytes, a provider may report for the stored article of
@@ -587,6 +588,7 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
                     }),
                     Ask::Size(how) => s.size(&row.message_id, how).await.map(|o| match o {
                         SizeOutcome::Present(size) => Got::Size(size),
+                        SizeOutcome::Carried(size) => Got::Carried(size),
                         SizeOutcome::Missing => Got::Body(BodyOutcome::Missing),
                     }),
                 },
@@ -607,6 +609,16 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
                         let (least, most) = size_bounds(row);
                         match (least..=most).contains(&size) {
                             true => Checked::Sized,
+                            false => Checked::Corrupt,
+                        }
+                    }
+                    // A size that came with the article: one that cannot
+                    // be the article that was posted is a failure, one
+                    // that can says nothing of what is stored here.
+                    Got::Carried(size) => {
+                        let (least, most) = size_bounds(row);
+                        match (least..=most).contains(&size) {
+                            true => Checked::Present,
                             false => Checked::Corrupt,
                         }
                     }
