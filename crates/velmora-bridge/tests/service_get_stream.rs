@@ -175,6 +175,35 @@ async fn a_body_leaves_in_blocks_as_its_ciphertext_arrives() {
     }
 }
 
+/// A body that leaves in blocks holds a window of the budget, and each
+/// block takes its part of that window with it: a budget with room for
+/// the window and little more serves the whole body. Without room for
+/// the window nothing is sent, and the answer is a clean refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_in_blocks_needs_no_more_of_the_budget_than_its_window() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let body = pattern(11, 8 << 20);
+    rig.put(&signer, BUCKET, "k", &body).await.expect(200);
+    rig.bridge.safety.inner.stream_in(20_000);
+    let all = rig.bridge.cfg.inflight_budget_bytes;
+
+    let window = (4 << 20) + 100_000;
+    let others = rig.bridge.budget.try_charge(all - window).unwrap();
+    let (blocks, whole) = items(&rig, &signer, "k").await;
+    assert!(whole, "{} bytes arrived", blocks.concat().len());
+    assert!(blocks.concat() == body);
+    assert!(blocks.len() > 8, "{}", blocks.len());
+    assert!(rig.bridge.budget.peak() <= all);
+    assert_eq!(rig.bridge.budget.in_use(), all - window);
+    drop(others);
+
+    let _others = rig.bridge.budget.try_charge(all - (1 << 20)).unwrap();
+    let resp = get(&rig, &signer, "k", &[]).await;
+    resp.expect_error(503, "SlowDown");
+    assert_eq!(rig.bridge.budget.in_use(), all - (1 << 20));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn range_edges_of_a_body_that_arrives_in_chunks() {
     let rig = small_extents();

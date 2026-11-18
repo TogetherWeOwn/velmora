@@ -820,6 +820,9 @@ async fn relay<C, B, N, J, K, T>(
             len: whole.len - flowed.sent,
         };
         let piece = &rest;
+        // What the stores answered counts for the first try only: a
+        // piece that was taken back is in the cache by the next.
+        let mut absent = flowed.absent;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -828,7 +831,8 @@ async fn relay<C, B, N, J, K, T>(
                 out.wanted().await;
             }
             cold.mid = at > 0 || flowed.sent > 0;
-            let item = cold.piece(&bucket, piece, flowed.absent).await;
+            let item = cold.piece(&bucket, piece, absent).await;
+            absent = false;
             let failed = item.is_err();
             // Before the last item and before an error: the reader of
             // the body may never ask again after either, and the last
@@ -1372,9 +1376,11 @@ where
     /// at the first failure.
     ///
     /// Held meanwhile: a window of the budget for the ciphertext that
-    /// is being put together and opened, taken once and never waited
-    /// for (without room there is no flow), and the plaintext of the
-    /// block that waits for the reader, charged to it.
+    /// is being put together and opened and for the plaintext of the
+    /// block that is made from it. It is not waited for before the
+    /// first block (without room there is no flow). A block goes to the
+    /// reader with its part of the window; what the window lacks for
+    /// the next one is charged then, and waited for.
     async fn flow(
         &mut self,
         bucket: &Bucket,
@@ -1472,9 +1478,17 @@ where
                 };
                 let short = need.saturating_sub(window.bytes());
                 if short > 0 {
-                    match room.try_charge(short) {
-                        Some(more) => window.absorb(more),
-                        None => break,
+                    let more = match room.try_charge(short) {
+                        Some(more) => Some(more),
+                        // The status line is out. These few bytes are
+                        // waited for: what is left of the piece in one
+                        // would need far more room than they do.
+                        None if done.sent > 0 => self.wait(room.charge(short)).await.ok(),
+                        None => None,
+                    };
+                    match (more, work.as_mut()) {
+                        (Some(more), Some(window)) => window.absorb(more),
+                        _ => break,
                     }
                 }
                 let Ok(size) = usize::try_from(n) else {
@@ -1488,15 +1502,16 @@ where
                 }
                 buf.drain(..sealed);
                 base += sealed as u64;
-                if complete {
-                    // Nothing more is read for this piece: what waits
-                    // for the reader is its plaintext alone. Nothing
-                    // can run between this release and the charge.
-                    work = None;
-                }
-                let Some(held) = room.try_charge(n) else {
+                // The plaintext goes to the reader with its part of
+                // the window, which counted it already.
+                let Some(held) = work.as_mut().map(|window| window.split(n)) else {
                     break;
                 };
+                if complete {
+                    // Nothing more is read for this piece: what waits
+                    // for the reader is its plaintext alone.
+                    work = None;
+                }
                 let item: Item = Ok((plain, held));
                 let sending = async {
                     match patience {

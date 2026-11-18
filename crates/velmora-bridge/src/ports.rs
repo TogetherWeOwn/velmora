@@ -153,7 +153,9 @@ pub trait BlobStore {
     /// end a body short. Dropping the call or the body ends the read.
     ///
     /// A store without such a read answers with the whole span as one
-    /// item.
+    /// item. That span is in memory before its reader has charged the
+    /// byte budget for more than a window of it: a store that serves
+    /// GETs has a read of its own.
     async fn open(&self, key: &str, span: ByteSpan) -> Result<Option<BlobBody>> {
         let bytes = self.get(key, Some(span)).await?;
         Ok(bytes.map(|bytes| stream::once(async move { Ok(bytes) }).boxed_local()))
