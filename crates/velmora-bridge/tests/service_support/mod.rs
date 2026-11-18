@@ -455,6 +455,12 @@ impl Sql for FailSql {
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
+        // D1 counts in doubles: its adapter refuses an integer it cannot
+        // hold exactly, and so does this one.
+        let exact = |v: &SqlValue| !matches!(v, SqlValue::Int(i) if i.unsigned_abs() >= 1 << 53);
+        if !params.iter().all(exact) {
+            return Err(BridgeError::Sql("integer outside the exact range".into()));
+        }
         self.trip
             .guard(sql_down, self.inner.query(sql, params))
             .await

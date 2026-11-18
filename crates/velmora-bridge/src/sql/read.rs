@@ -33,6 +33,11 @@ const WIDTH: usize = 24;
 /// Columns of a bucket row.
 const BUCKET_WIDTH: usize = 7;
 
+/// The largest offset a statement is given: the largest integer a
+/// database driver that counts in doubles (D1) takes as a parameter.
+/// No object is that long.
+const MAX_OFFSET: u64 = (1 << 53) - 1;
+
 fn bad(what: &'static str) -> BridgeError {
     BridgeError::Sql(format!("read lookup: {what}"))
 }
@@ -188,13 +193,12 @@ pub(super) async fn read_lookup<S: Sql>(
     c: &SqlCatalog<S>,
     q: &ReadQuery<'_>,
 ) -> Result<ReadLookup> {
-    // An offset past what the database counts in is past the end of any
-    // object.
-    let cap = |v: u64| SqlValue::Int(i64::try_from(v).unwrap_or(i64::MAX));
+    // An offset past `MAX_OFFSET` is past the end of any object.
+    let cap = |v: u64| SqlValue::Int(v.min(MAX_OFFSET) as i64);
     let (from, to, tail, wanted) = match q.window {
         ReadWindow::Nothing => (SqlValue::Int(0), SqlValue::Int(0), 0, 0),
         ReadWindow::Span { start, end } => (cap(start), cap(end), 0, 1),
-        ReadWindow::Tail { len } => (cap(len), SqlValue::Int(i64::MAX), 1, 1),
+        ReadWindow::Tail { len } => (cap(len), cap(u64::MAX), 1, 1),
     };
     let rows = c
         .sql
