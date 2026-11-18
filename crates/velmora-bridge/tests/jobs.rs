@@ -17,7 +17,8 @@ use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, wrap_bdk, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::{
-    DISPATCH_BATCH, DISPATCH_BATCHES, DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS, RESEND_SECS,
+    resend_secs, DISPATCH_BATCH, DISPATCH_BATCHES, DISPATCH_LIMIT, GC_BATCH, MAX_ATTEMPTS,
+    QUEUE_RETENTION_MAX_SECS, RESEND_MAX_SECS, RESEND_SECS, RESEND_SLACK_SECS,
 };
 use velmora_bridge::recovery::{
     article_key, read_article_plan, write_article_plan, Layout, Unpublished,
@@ -1198,6 +1199,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             mark_failed: false,
             plans_packed: 0,
             pack_failed: false,
+            resend_post_secs: RESEND_SECS,
+            resend_verify_secs: RESEND_SECS,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -2048,6 +2051,340 @@ async fn dispatch_sends_a_due_row_once() {
     }
     assert_eq!(fx.dump().await, before);
     assert_eq!(fx.tick().await.0, []);
+}
+
+// ---------------------------------------------------------------------------
+// The resend wait follows what the queues hold
+// ---------------------------------------------------------------------------
+
+/// What the post queues hold, for the dispatcher runs that follow.
+fn post_backlog(fx: &Fx, post: Oldest) {
+    fx.bridge.jobs.set_backlog(Backlog {
+        post,
+        verify: Oldest::Unknown,
+    });
+}
+
+/// Counts every outbox row written from now on, whatever the write
+/// changes ([`outbox_writes`]).
+async fn count_outbox_writes(fx: &Fx) {
+    for sql in [
+        "CREATE TABLE outbox_writes (n INTEGER NOT NULL)",
+        "INSERT INTO outbox_writes VALUES (0)",
+        "CREATE TRIGGER outbox_written AFTER UPDATE ON outbox \
+         BEGIN UPDATE outbox_writes SET n = n + 1; END",
+    ] {
+        fx.sql.exec(sql, &[]).await.unwrap();
+    }
+}
+
+async fn outbox_writes(fx: &Fx) -> usize {
+    fx.count("SELECT n FROM outbox_writes").await
+}
+
+/// The dispatcher run of a Worker from before the wait followed the
+/// queues: every marked row is due again after [`RESEND_SECS`].
+async fn old_tick(fx: &Fx) -> Vec<Job> {
+    let now = fx.clock.now();
+    let fixed = Resend::after(RESEND_SECS);
+    let catalog = &fx.bridge.catalog;
+    let due = catalog.due(now, fixed, DISPATCH_LIMIT).await.unwrap();
+    let ids: Vec<ExtentId> = due.iter().map(|row| row.extent_id.clone()).collect();
+    catalog.mark_sent(&ids, now).await.unwrap();
+    due.into_iter()
+        .map(|row| Job::Extent {
+            v: JOB_VERSION,
+            extent: row.extent_id,
+            generation: row.generation_id,
+            stage: row.stage,
+        })
+        .collect()
+}
+
+#[test]
+fn the_resend_wait_is_the_age_of_the_oldest_message_within_its_bounds() {
+    let now = T0;
+    let ago = |secs: u32| Oldest::At(now.plus_ms(-i64::from(secs) * 1000));
+    // Nothing waits, or the queues do not say: as before.
+    assert_eq!(resend_secs(now, Oldest::Unknown), RESEND_SECS);
+    assert_eq!(resend_secs(now, Oldest::Empty), RESEND_SECS);
+    // A queue that keeps up changes nothing.
+    assert_eq!(resend_secs(now, ago(0)), RESEND_SECS);
+    assert_eq!(
+        resend_secs(now, ago(RESEND_SECS - RESEND_SLACK_SECS)),
+        RESEND_SECS
+    );
+    // Behind: the age of its oldest message and the slack.
+    assert_eq!(
+        resend_secs(now, ago(RESEND_SECS - RESEND_SLACK_SECS + 1)),
+        RESEND_SECS + 1
+    );
+    assert_eq!(
+        resend_secs(now, ago(7 * 3600)),
+        7 * 3600 + RESEND_SLACK_SECS
+    );
+    // A part of a second counts as a whole one: never sent early.
+    let part = Oldest::At(now.plus_ms(-7_200_001));
+    assert_eq!(resend_secs(now, part), 7201 + RESEND_SLACK_SECS);
+    // Never over the bound, whatever a queue names.
+    assert_eq!(
+        resend_secs(now, ago(RESEND_MAX_SECS - RESEND_SLACK_SECS)),
+        RESEND_MAX_SECS
+    );
+    assert_eq!(resend_secs(now, ago(3 * DAY_SECS)), RESEND_MAX_SECS);
+    assert_eq!(
+        resend_secs(now, ago(QUEUE_RETENTION_MAX_SECS)),
+        RESEND_MAX_SECS
+    );
+    // A time no message in a queue can have is not believed: seconds
+    // read as milliseconds, the epoch, a stale value.
+    assert_eq!(
+        resend_secs(now, ago(QUEUE_RETENTION_MAX_SECS + 1)),
+        RESEND_SECS
+    );
+    assert_eq!(resend_secs(now, ago(30 * DAY_SECS)), RESEND_SECS);
+    let in_secs = UnixMs(now.0 / 1000);
+    for at in [UnixMs(0), UnixMs(1), in_secs, UnixMs(i64::MIN), UnixMs(-1)] {
+        assert_eq!(resend_secs(now, Oldest::At(at)), RESEND_SECS, "{at:?}");
+    }
+    // A time ahead of this clock is no age.
+    for at in [now.plus_ms(1), now.plus_secs(DAY_SECS), UnixMs(i64::MAX)] {
+        assert_eq!(resend_secs(now, Oldest::At(at)), RESEND_SECS, "{at:?}");
+    }
+    let far = resend_secs(UnixMs(i64::MAX), Oldest::At(UnixMs(i64::MIN)));
+    assert_eq!(far, RESEND_SECS);
+    const { assert!(RESEND_SLACK_SECS >= 2 * TICK_SECS) };
+    const { assert!(RESEND_SECS < RESEND_MAX_SECS) };
+}
+
+/// A queue that is hours behind gets no second message for a row that
+/// waits in it, and the runs that leave the row alone write nothing for
+/// it. When its job is delivered at last, it does its work.
+#[tokio::test]
+async fn a_slow_queue_gets_no_second_message() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let a = fx.put(&bucket, "a", b"tiny").await;
+    let b = fx.put(&bucket, "b", b"tiny").await;
+    // The post queues hold messages from two hours before these rows.
+    let oldest = T0.plus_ms(-7_200_000);
+    post_backlog(&fx, Oldest::At(oldest));
+    let (jobs, _) = fx.tick().await;
+    assert_eq!(jobs, [a.job(OutboxStage::Post), b.job(OutboxStage::Post)]);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!(report.resend_post_secs, 7200 + RESEND_SLACK_SECS);
+    assert_eq!(report.resend_verify_secs, RESEND_SECS);
+    let outbox = fx.dump().await;
+
+    // The queue does not move for most of a day. Every five minutes a
+    // run: none sends, and none writes an outbox row, not even with
+    // the values the row has.
+    count_outbox_writes(&fx).await;
+    let mut at = TICK_SECS;
+    while at < RESEND_MAX_SECS {
+        fx.clock.set(T0.plus_secs(at));
+        assert_eq!(fx.tick().await.0, [], "sent again after {at} s");
+        at += TICK_SECS;
+    }
+    assert_eq!(outbox_writes(&fx).await, 0);
+    fx.clock.set(T0.plus_secs(RESEND_MAX_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    assert_eq!(outbox_writes(&fx).await, 0);
+    assert_eq!(fx.dump().await, outbox);
+    assert_eq!(fx.outbox(&a, "sent_at").await, T0.0.to_string());
+    // At the bound the rows are sent again, and a send still writes one
+    // row per row sent: its mark.
+    fx.clock.set(T0.plus_secs(RESEND_MAX_SECS));
+    assert_eq!(fx.tick().await.0.len(), 2);
+    assert_eq!(outbox_writes(&fx).await, 2);
+
+    // The jobs are delivered at last: each posts its extent, once.
+    for o in [&a, &b] {
+        fx.bridge
+            .jobs
+            .send(&o.job(OutboxStage::Post), 0)
+            .await
+            .unwrap();
+    }
+    fx.pump().await;
+    for o in [&a, &b] {
+        assert_eq!(fx.outbox(o, "stage").await, "done");
+    }
+    assert_eq!(fx.server.posted_count().await, 2, "one article each, once");
+}
+
+/// A message that was lost is sent again as soon as every message left
+/// in its queues is from after the row's mark, and at the latest
+/// [`RESEND_MAX_SECS`] after the mark when the queues never get there.
+#[tokio::test]
+async fn a_lost_message_is_sent_again_within_the_bound() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    let post = o.job(OutboxStage::Post);
+    let slack_ms = i64::from(RESEND_SLACK_SECS) * 1000;
+    let at = |secs: u32| T0.plus_secs(secs);
+
+    // Sent at T0 behind three hours of other messages, and lost.
+    post_backlog(&fx, Oldest::At(T0.plus_ms(-3 * 3_600_000)));
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+
+    // Two hours on the queue has worked its way to the messages of the
+    // row's own run: its message may be the next one.
+    fx.clock.set(at(7200));
+    post_backlog(&fx, Oldest::At(T0));
+    assert_eq!(fx.tick().await.0, []);
+    post_backlog(&fx, Oldest::At(T0.plus_ms(slack_ms - 1)));
+    assert_eq!(fx.tick().await.0, []);
+    // Every message left is from after the mark and the slack: the
+    // row's message is gone. One run later it is sent again.
+    post_backlog(&fx, Oldest::At(T0.plus_ms(slack_ms)));
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+    assert_eq!(fx.outbox(&o, "sent_at").await, at(7200).0.to_string());
+    assert_eq!(fx.tick().await.0, []);
+
+    // Lost again, and the queues never get past the mark (they stand
+    // still, or keep a message that is older for another reason): the
+    // row waits the longest wait, to the millisecond, and no longer.
+    post_backlog(&fx, Oldest::At(T0.plus_ms(-3 * 3_600_000)));
+    fx.clock.set(at(7200 + RESEND_MAX_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(at(7200 + RESEND_MAX_SECS));
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+
+    // Lost a third time, from queues that are empty now: nothing can
+    // be waiting, and the resend timeout is all the row waits.
+    let third = fx.clock.now();
+    post_backlog(&fx, Oldest::Empty);
+    fx.clock.set(third.plus_secs(RESEND_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(third.plus_secs(RESEND_SECS));
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+
+    // This one arrives, and so does a late copy.
+    for _ in 0..2 {
+        fx.bridge.jobs.send(&post, 0).await.unwrap();
+    }
+    fx.pump().await;
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.server.posted_count().await, 1);
+}
+
+/// The wait of one kind of queue does not hold back the rows of the
+/// other: verify rows whose queues keep up are sent again at the resend
+/// timeout while the post queues are behind.
+#[tokio::test]
+async fn each_kind_of_queue_has_its_own_wait() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let posting = fx.put(&bucket, "posting", b"tiny").await;
+    let verifying = fx.put(&bucket, "verifying", b"tiny").await;
+    // One extent is posted; its hand-over to verify is lost.
+    fx.bridge.jobs.drop_next(1);
+    let posted = fx.bridge.run_job(&verifying.job(OutboxStage::Post)).await;
+    assert_eq!(posted, JobOutcome::Ack);
+    assert_eq!(fx.outbox(&verifying, "stage").await, "verify");
+    let due = UnixMs(fx.outbox(&verifying, "next_at").await.parse().unwrap());
+    fx.clock.set(due);
+    fx.bridge.jobs.set_backlog(Backlog {
+        post: Oldest::At(due.plus_ms(-5 * 3_600_000)),
+        verify: Oldest::At(due.plus_ms(-1000)),
+    });
+    let (jobs, _) = fx.tick().await;
+    let verify = verifying.job(OutboxStage::Verify);
+    assert_eq!(jobs, [posting.job(OutboxStage::Post), verify.clone()]);
+
+    // Both messages are lost. The verify queues keep up.
+    fx.clock.set(due.plus_secs(RESEND_SECS).plus_ms(-1));
+    assert_eq!(fx.tick().await.0, []);
+    fx.clock.set(due.plus_secs(RESEND_SECS));
+    fx.bridge.jobs.set_backlog(Backlog {
+        post: Oldest::At(due.plus_ms(-5 * 3_600_000)),
+        verify: Oldest::At(due.plus_secs(RESEND_SECS).plus_ms(-1000)),
+    });
+    assert_eq!(fx.tick().await.0, [verify]);
+}
+
+/// Old and new Workers side by side, and a Worker whose queues do not
+/// say what they hold. An old dispatcher run sends a waiting row again
+/// after the resend timeout, as it always did, and marks it; a run that
+/// cannot ask the queues does the same. Neither keeps a new run from
+/// its work, no run leaves a row waiting past the bound, and every copy
+/// of the job finds the work done once.
+#[tokio::test]
+async fn old_and_new_dispatchers_share_the_mark() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch", true).await;
+    let o = fx.put(&bucket, "k", b"tiny").await;
+    let post = o.job(OutboxStage::Post);
+    let at = |secs: u32| T0.plus_secs(secs);
+    let behind = Oldest::At(T0.plus_ms(-2 * 3_600_000));
+    let mut copies = 0;
+
+    // A new run sends the row into queues that are two hours behind.
+    post_backlog(&fx, behind);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+    copies += 1;
+    // An old run leaves the fresh mark alone, like a new one.
+    fx.clock.set(at(TICK_SECS));
+    assert_eq!(old_tick(&fx).await, []);
+
+    // At the resend timeout a new run still waits; an old one sends a
+    // duplicate and marks the row with its own time.
+    fx.clock.set(at(RESEND_SECS));
+    assert_eq!(fx.tick().await.0, []);
+    assert_eq!(old_tick(&fx).await, std::slice::from_ref(&post));
+    copies += 1;
+    assert_eq!(
+        fx.outbox(&o, "sent_at").await,
+        at(RESEND_SECS).0.to_string()
+    );
+    // The new runs read that mark like their own.
+    fx.clock.set(at(2 * RESEND_SECS - 1));
+    assert_eq!(fx.tick().await.0, []);
+
+    // A new Worker that cannot ask its queues (a restarted isolate
+    // whose calls fail, a runtime without the metrics) falls back to
+    // the resend timeout.
+    fx.clock.set(at(2 * RESEND_SECS));
+    post_backlog(&fx, Oldest::Unknown);
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+    copies += 1;
+    // The queues answer again: the row is left alone again.
+    post_backlog(&fx, behind);
+    fx.clock.set(at(3 * RESEND_SECS));
+    assert_eq!(fx.tick().await.0, []);
+    // An old run at the same moment sends, and a new run right after
+    // it sees the old run's mark.
+    assert_eq!(old_tick(&fx).await, std::slice::from_ref(&post));
+    copies += 1;
+    assert_eq!(fx.tick().await.0, []);
+
+    // A job claims the row and dies: whichever Worker runs next sends
+    // the row as soon as the lease is over, whatever the queues hold.
+    let died_at = fx.clock.now();
+    let catalog = &fx.bridge.catalog;
+    let claim = catalog.claim(&o.extent, &o.generation, OutboxStage::Post, "w", died_at);
+    assert!(claim.await.unwrap().is_some());
+    assert_eq!(fx.outbox(&o, "sent_at").await, "NULL");
+    fx.clock.set(died_at.plus_secs(LEASE_SECS));
+    assert_eq!(fx.tick().await.0, []);
+    assert_eq!(old_tick(&fx).await, []);
+    fx.clock.set(died_at.plus_secs(LEASE_SECS + 1));
+    assert_eq!(fx.tick().await.0, std::slice::from_ref(&post));
+    copies += 1;
+
+    // All five copies are delivered: the extent is posted once.
+    assert_eq!(copies, 5);
+    for _ in 0..copies {
+        fx.bridge.jobs.send(&post, 0).await.unwrap();
+    }
+    fx.pump().await;
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.server.posted_count().await, 1);
+    assert_eq!(fx.tick().await.0, []);
+    assert_eq!(old_tick(&fx).await, []);
 }
 
 /// A job that holds a newer lease on the row is not disturbed by the

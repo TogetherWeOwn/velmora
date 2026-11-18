@@ -428,6 +428,14 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             if report.pack_failed {
                 console_error!("dispatch: packing article plans failed");
             }
+            let resend_secs = velmora_bridge::jobs::RESEND_SECS;
+            if report.resend_post_secs > resend_secs || report.resend_verify_secs > resend_secs {
+                console_log!(
+                    "dispatch: queues behind; a sent row is left alone for {} s (post), {} s (verify)",
+                    report.resend_post_secs,
+                    report.resend_verify_secs
+                );
+            }
         }
         Err(e) => console_error!("dispatch failed: {}", error_class(&e)),
     }

@@ -8,7 +8,9 @@
 //! - `dispatch` sends a message for every due row that no job holds,
 //!   which covers lost messages, expired retries and restarts. It marks
 //!   each row it sent and leaves a marked row alone for [`RESEND_SECS`],
-//!   so a row waiting in a queue is not sent again on every run. It
+//!   and for longer while its queues still hold messages from before
+//!   the mark ([`resend_secs`]), so a row waiting in a queue is not
+//!   sent again. It
 //!   reads the catalogue, writes that mark and sends to the queue; it
 //!   never claims a lease, opens a socket, touches a blob store (but for
 //!   the rollback stamp) or runs crypto.
@@ -33,7 +35,7 @@ use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
-    GenerationId, Job, JobOutcome, OutboxStage, Result, JOB_VERSION,
+    GenerationId, Job, JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
 };
 use crate::verify::release_labels;
 
@@ -50,7 +52,8 @@ pub const DISPATCH_BATCHES: u32 = 20;
 /// and per batch one catalogue write (the marks) and one queue call per
 /// bound queue: with the most queues a deployment may bind (8 of each
 /// kind, and the one of the jobs without an extent) that is at most
-/// 3 + 20 + 20 * 17 = 363 calls, beside the two dozen of the rest of
+/// 3 + 20 + 20 * 17 = 363 calls, and one more per queue of an extent's
+/// jobs to ask what it holds (16), beside the two dozen of the rest of
 /// the run. The platform allows 1,000.
 pub const DISPATCH_LIMIT: u32 = DISPATCH_BATCH * DISPATCH_BATCHES;
 /// How long the dispatcher leaves a row alone after it sent a job for
@@ -60,9 +63,65 @@ pub const DISPATCH_LIMIT: u32 = DISPATCH_BATCH * DISPATCH_BATCHES;
 /// be waiting in its queue; sending another on every run would only add
 /// duplicates, each one a queue delivery and a claim that finds nothing.
 /// A message that was really lost (dropped after its retries, say) costs
-/// its row this long. Nothing but time is at stake: the outbox row
+/// its row this long, or longer while its queues are behind
+/// ([`resend_secs`]). Nothing but time is at stake: the outbox row
 /// stays, and a release that is late only keeps its safety copy longer.
 pub const RESEND_SECS: u32 = 3600;
+/// The longest the dispatcher leaves a sent row alone, whatever its
+/// queues hold: a job whose message was lost is sent again within this
+/// time and one dispatcher run.
+///
+/// A queue that is more than this behind gets a second message for a
+/// row that waits in it, at most one per row in this time.
+pub const RESEND_MAX_SECS: u32 = 86_400;
+/// How much older than the oldest message in its queues a mark must be
+/// before its message counts as gone.
+///
+/// A mark carries the time its dispatcher run began, and the message
+/// the time the queue took it, later in that run: a run lasts well
+/// under this, so a message still in a queue is never newer than its
+/// row's mark by this much. It also covers a clock of the queues that
+/// is not this one, and a message that was delivered and whose job has
+/// not claimed its row yet.
+pub const RESEND_SLACK_SECS: u32 = 600;
+
+/// The oldest a message in a queue can be: the longest a queue keeps
+/// one (14 days). A queue that names an older time for its oldest
+/// message is not believed.
+pub const QUEUE_RETENTION_MAX_SECS: u32 = 14 * 86_400;
+
+/// How long the dispatcher leaves a sent row alone at `now`, given the
+/// oldest message its queues still hold.
+///
+/// A queue hands its messages out oldest first, near enough. While it
+/// holds one from before a row's mark (less [`RESEND_SLACK_SECS`]), the
+/// row's own message may wait behind it, and sending another would only
+/// make the queue longer. Once every message left is from after the
+/// mark and the row is still unclaimed, its message is gone. So the
+/// wait is the age of the oldest message plus the slack, never under
+/// [`RESEND_SECS`] and never over [`RESEND_MAX_SECS`].
+///
+/// The oldest message may be one that waits out a delay or a retry and
+/// holds nothing up. Then the wait is longer than it had to be, within
+/// the same bound.
+///
+/// An empty queue, one that does not say, and one that names a time no
+/// message of its can have (older than [`QUEUE_RETENTION_MAX_SECS`])
+/// give [`RESEND_SECS`]: as before there was anything to ask.
+pub fn resend_secs(now: UnixMs, oldest: Oldest) -> u32 {
+    let Oldest::At(at) = oldest else {
+        return RESEND_SECS;
+    };
+    // Rounded up, and a time ahead of `now` is no age at all.
+    let age_secs = now.0.saturating_sub(at.0).max(0).saturating_add(999) / 1000;
+    if age_secs > i64::from(QUEUE_RETENTION_MAX_SECS) {
+        return RESEND_SECS;
+    }
+    let wait = age_secs.saturating_add(i64::from(RESEND_SLACK_SECS));
+    u32::try_from(wait)
+        .unwrap_or(RESEND_MAX_SECS)
+        .clamp(RESEND_SECS, RESEND_MAX_SECS)
+}
 /// Held extents one dispatcher run checks for the re-drive.
 pub const REDRIVE_LIMIT: u32 = 500;
 /// Extents with article rows one dispatcher run looks at to pack their
@@ -428,7 +487,7 @@ where
     /// The dispatcher's hot-tier check: at most one total per
     /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap.
     /// `GC_MODE` does not gate it: eviction removes no data.
-    async fn evict_check(&self, now: crate::types::UnixMs) -> Result<bool> {
+    async fn evict_check(&self, now: UnixMs) -> Result<bool> {
         let every_ms = i64::from(EVICT_CHECK_SECS) * 1000;
         if !self.catalog.hot_check_due(now, every_ms).await? {
             return Ok(false);
@@ -524,8 +583,19 @@ where
         // unrecorded. A mark that fails ends nothing: its batch is sent
         // again by the next run, and a duplicate job only finds its row
         // claimed.
+        //
+        // How long a mark counts as fresh depends on what the queues
+        // still hold: a row is not sent again while its message can be
+        // waiting behind older ones.
         let mut send_failed = None;
-        let due = self.catalog.due(now, RESEND_SECS, DISPATCH_LIMIT).await?;
+        let backlog = self.jobs.backlog().await;
+        let resend = Resend {
+            post_secs: resend_secs(now, backlog.post),
+            verify_secs: resend_secs(now, backlog.verify),
+        };
+        report.resend_post_secs = resend.post_secs;
+        report.resend_verify_secs = resend.verify_secs;
+        let due = self.catalog.due(now, resend, DISPATCH_LIMIT).await?;
         for rows in due.chunks(DISPATCH_BATCH as usize) {
             let jobs: Vec<Job> = rows
                 .iter()

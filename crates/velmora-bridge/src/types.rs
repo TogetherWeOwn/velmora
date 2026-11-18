@@ -1329,6 +1329,57 @@ pub struct DispatchReport {
     pub plans_packed: u32,
     /// Packing failed; the rest of the run went on without it.
     pub pack_failed: bool,
+    /// How long this run left a sent post row alone, in seconds: the
+    /// resend timeout, or longer while the post queues still held
+    /// messages from before the row's mark. 0: the run did not get as
+    /// far as the send.
+    pub resend_post_secs: u32,
+    /// The same for a sent verify or release row and the verify queues.
+    pub resend_verify_secs: u32,
+}
+
+/// The oldest message that waits in the queues of one kind, as far as
+/// the queues say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Oldest {
+    /// Not known: a queue of the kind did not say, or what it said
+    /// could not be used.
+    #[default]
+    Unknown,
+    /// No queue of the kind holds a message.
+    Empty,
+    /// When the oldest message still in a queue of the kind was sent.
+    At(UnixMs),
+}
+
+/// What waits in the queues the dispatcher sends an extent's jobs to
+/// (`JobSink::backlog`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Backlog {
+    /// The queues of the post jobs.
+    pub post: Oldest,
+    /// The queues of the verify and release jobs.
+    pub verify: Oldest,
+}
+
+/// How long the dispatcher leaves a row alone after it sent a job for
+/// it (`Catalog::due`), by the kind of queue the job went to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resend {
+    /// Seconds for a row in `post`.
+    pub post_secs: u32,
+    /// Seconds for a row in `verify` or `release`.
+    pub verify_secs: u32,
+}
+
+impl Resend {
+    /// The same wait for every stage.
+    pub fn after(secs: u32) -> Self {
+        Resend {
+            post_secs: secs,
+            verify_secs: secs,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

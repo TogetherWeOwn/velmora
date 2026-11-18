@@ -14,8 +14,16 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use velmora_bridge::{BridgeError, Job, JobSink, OutboxStage, Result, MAX_QUEUE_DELAY_SECS};
-use worker::{MessageBuilder, Queue, QueueContentType};
+use std::time::Duration;
+
+use futures_util::future::{join_all, select, Either};
+use velmora_bridge::{
+    Backlog, BridgeError, Job, JobSink, Oldest, OutboxStage, Result, UnixMs, MAX_QUEUE_DELAY_SECS,
+};
+use worker::js_sys::{Function, Promise, Reflect};
+use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::wasm_bindgen_futures::JsFuture;
+use worker::{console_error, MessageBuilder, Queue, QueueContentType};
 
 /// Queues' `sendBatch` limit.
 const MAX_BATCH: usize = 100;
@@ -274,7 +282,105 @@ fn send_err(_: worker::Error) -> BridgeError {
     BridgeError::Queue("send failed".into())
 }
 
+/// Longest wait for one queue to say what it holds. A queue that takes
+/// longer is not known, and the dispatcher goes on.
+const METRICS_TIMEOUT_MS: u64 = 5_000;
+
+/// What one queue says it holds, from two values of its metrics: the
+/// number of messages it can deliver now and the time the oldest was
+/// sent, in ms.
+///
+/// The queues were seen to leave a message that waits out a delay out
+/// of the count while they name its time. A job the dispatcher sends
+/// has no delay, and the queues that take them always hold delayed
+/// messages of other kinds (a wake-up waits up to twelve hours). So a
+/// count of zero is an empty queue for the dispatcher, whatever time is
+/// named: nothing it sent can be waiting there. With messages to
+/// deliver, the time is that of the oldest message, delayed or not;
+/// without a time that can be one, the queue is not known.
+fn oldest_of(count: Option<f64>, oldest_ms: Option<f64>) -> Oldest {
+    match (count, oldest_ms) {
+        (Some(0.0), _) => Oldest::Empty,
+        // Under 2^53: an exact integer.
+        (Some(n), Some(ms))
+            if n.is_finite() && n > 0.0 && (1.0..9_007_199_254_740_992.0).contains(&ms) =>
+        {
+            Oldest::At(UnixMs(ms as i64))
+        }
+        _ => Oldest::Unknown,
+    }
+}
+
+/// The oldest message in the queues of one kind. One queue that is not
+/// known makes the kind unknown: the message of a row may be in it.
+fn oldest_in(queues: impl IntoIterator<Item = Oldest>) -> Oldest {
+    let mut oldest = Oldest::Empty;
+    for queue in queues {
+        oldest = match (oldest, queue) {
+            (_, Oldest::Unknown) => return Oldest::Unknown,
+            (kept, Oldest::Empty) => kept,
+            (Oldest::At(a), Oldest::At(b)) => Oldest::At(a.min(b)),
+            (_, at) => at,
+        };
+    }
+    oldest
+}
+
+/// The realtime metrics of one queue (`metrics()` of the binding).
+/// `None` for a runtime without them, a call that failed and an answer
+/// in another shape.
+async fn metrics(queue: &Queue) -> Option<(Option<f64>, Option<f64>)> {
+    let binding: &JsValue = queue.as_ref();
+    let call = Reflect::get(binding, &JsValue::from_str("metrics")).ok()?;
+    let call: Function = call.dyn_into().ok()?;
+    let promise: Promise = call.call0(binding).ok()?.dyn_into().ok()?;
+    let answer = JsFuture::from(promise).await.ok()?;
+    let field = |name: &str| Reflect::get(&answer, &JsValue::from_str(name)).ok();
+    let count = field("backlogCount").and_then(|v| v.as_f64());
+    // A `Date`, whose value is the time in ms; absent for a queue that
+    // holds nothing. Anything else is a time that cannot be one.
+    let oldest_ms = field("oldestMessageTimestamp")
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .map(|v| {
+            let date = || v.dyn_ref::<worker::js_sys::Date>().map(|d| d.get_time());
+            v.as_f64().or_else(date).unwrap_or(f64::NAN)
+        });
+    Some((count, oldest_ms))
+}
+
+/// What one queue holds, or unknown after [`METRICS_TIMEOUT_MS`].
+async fn oldest_of_queue(queue: &Queue) -> Oldest {
+    let asked = Box::pin(metrics(queue));
+    let limit = Box::pin(worker::Delay::from(Duration::from_millis(
+        METRICS_TIMEOUT_MS,
+    )));
+    match select(asked, limit).await {
+        Either::Left((Some((count, oldest_ms)), _)) => oldest_of(count, oldest_ms),
+        _ => Oldest::Unknown,
+    }
+}
+
 impl JobSink for QueueSink {
+    /// One metrics call per post and verify queue, all at once. A kind
+    /// that is not known is said in the log, by its name alone.
+    async fn backlog(&self) -> Backlog {
+        let (post, verify) = futures_util::future::join(
+            join_all(self.post.iter().map(oldest_of_queue)),
+            join_all(self.verify.iter().map(oldest_of_queue)),
+        )
+        .await;
+        let backlog = Backlog {
+            post: oldest_in(post),
+            verify: oldest_in(verify),
+        };
+        for (kind, oldest) in [("post", backlog.post), ("verify", backlog.verify)] {
+            if oldest == Oldest::Unknown {
+                console_error!("dispatch: what the {kind} queues hold is not known");
+            }
+        }
+        backlog
+    }
+
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
         check_delay(delay_secs)?;
         if self.drop_notify.take() {
@@ -352,6 +458,62 @@ mod tests {
             lane(&wake_job(OutboxStage::Release), many),
             Lane::Verify(_)
         ));
+    }
+
+    /// A queue is empty, holds messages from a known time on, or is not
+    /// known; a count without a time, and garbage, are not known.
+    #[test]
+    fn a_queue_says_what_it_holds_or_is_not_known() {
+        const SENT: f64 = 1_762_992_000_123.0;
+        let at = Oldest::At(UnixMs(1_762_992_000_123));
+        assert_eq!(oldest_of(Some(3.0), Some(SENT)), at);
+        // Nothing to deliver: empty, also when messages that wait out
+        // a delay are named by their time, or the time is none.
+        for oldest_ms in [None, Some(SENT), Some(0.0), Some(f64::NAN)] {
+            assert_eq!(oldest_of(Some(0.0), oldest_ms), Oldest::Empty);
+        }
+        for (count, oldest_ms) in [
+            (None, None),
+            (None, Some(SENT)),
+            (Some(3.0), None),
+            (Some(-1.0), None),
+            (Some(-1.0), Some(SENT)),
+            (Some(f64::NAN), None),
+            (Some(f64::NAN), Some(SENT)),
+            (Some(f64::INFINITY), Some(SENT)),
+            // A queue that names the epoch for its oldest message, or
+            // a time that is none.
+            (Some(3.0), Some(0.0)),
+            (Some(3.0), Some(-1.0)),
+            (Some(3.0), Some(f64::NAN)),
+            (Some(3.0), Some(f64::INFINITY)),
+            (Some(3.0), Some(1e300)),
+        ] {
+            assert_eq!(
+                oldest_of(count, oldest_ms),
+                Oldest::Unknown,
+                "{count:?} {oldest_ms:?}"
+            );
+        }
+    }
+
+    /// The oldest message of a kind is the oldest of its queues, and
+    /// one queue that is not known makes the kind unknown.
+    #[test]
+    fn a_kind_is_as_old_as_its_oldest_queue() {
+        let at = |ms| Oldest::At(UnixMs(ms));
+        assert_eq!(oldest_in([]), Oldest::Empty);
+        assert_eq!(oldest_in([Oldest::Empty, Oldest::Empty]), Oldest::Empty);
+        assert_eq!(oldest_in([Oldest::Empty, at(7), Oldest::Empty]), at(7));
+        assert_eq!(oldest_in([at(9), at(7), at(8)]), at(7));
+        for unknown in [
+            vec![Oldest::Unknown],
+            vec![at(7), Oldest::Unknown],
+            vec![Oldest::Unknown, at(7)],
+            vec![Oldest::Empty, Oldest::Unknown, Oldest::Empty],
+        ] {
+            assert_eq!(oldest_in(unknown.clone()), Oldest::Unknown, "{unknown:?}");
+        }
     }
 
     #[test]

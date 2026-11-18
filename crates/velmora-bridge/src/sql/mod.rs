@@ -88,6 +88,7 @@ use crate::ports::{
 };
 use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
+use crate::types::Resend;
 use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId,
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
@@ -530,8 +531,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
         outbox::finish_release(self, l, now).await
     }
-    async fn due(&self, now: UnixMs, resend_secs: u32, limit: u32) -> Result<Vec<DueRow>> {
-        outbox::due(self, now, resend_secs, limit).await
+    async fn due(&self, now: UnixMs, resend: Resend, limit: u32) -> Result<Vec<DueRow>> {
+        outbox::due(self, now, resend, limit).await
     }
     async fn mark_sent(&self, extents: &[ExtentId], now: UnixMs) -> Result<u64> {
         outbox::mark_sent(self, extents, now).await

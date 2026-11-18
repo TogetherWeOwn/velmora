@@ -15,13 +15,13 @@ use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 pub use crate::types::Result;
 use crate::types::{
-    AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Bucket, BucketId, ByteSpan,
-    CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
+    AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Backlog, Bucket, BucketId,
+    ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
     OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig,
-    ProviderFault, ProviderLoad, SafetyState, UnixMs, UploadId, UploadListQuery, UploadPartRow,
-    UploadRow, VerificationRow, WriteId,
+    ProviderFault, ProviderLoad, Resend, SafetyState, UnixMs, UploadId, UploadListQuery,
+    UploadPartRow, UploadRow, VerificationRow, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -259,6 +259,13 @@ pub trait JobSink {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()>;
     /// Dispatcher only; at most 100 jobs.
     async fn send_many(&self, jobs: &[Job]) -> Result<()>;
+    /// Dispatcher only: the oldest message that still waits in the
+    /// queues of each kind. Never an error: what is not known is
+    /// [`Oldest::Unknown`], which is also the answer of a sink that
+    /// cannot tell. It sends nothing.
+    async fn backlog(&self) -> Backlog {
+        Backlog::default()
+    }
 }
 
 pub trait Clock {
@@ -889,10 +896,11 @@ pub trait Catalog {
     /// of `limit` to itself, so these are not always the oldest `limit`
     /// rows of all stages: a stage with fewer due rows than its share
     /// gets all of them listed. A row marked by
-    /// [`Self::mark_sent`] is left out until `resend_secs` after the
-    /// mark, unless a job claimed it since (a claim clears the mark) or
-    /// it was given a due time later than the mark.
-    async fn due(&self, now: UnixMs, resend_secs: u32, limit: u32) -> Result<Vec<DueRow>>;
+    /// [`Self::mark_sent`] is left out until the seconds `resend` has
+    /// for its stage after the mark, unless a job claimed it since (a
+    /// claim clears the mark) or it was given a due time later than the
+    /// mark.
+    async fn due(&self, now: UnixMs, resend: Resend, limit: u32) -> Result<Vec<DueRow>>;
     /// The dispatcher has sent a job for each of `extents`: marks the
     /// ones that are still due and held by no job, and returns how many.
     /// The mark is a hint for [`Self::due`] alone; it gates no claim.

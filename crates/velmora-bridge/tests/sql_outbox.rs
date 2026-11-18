@@ -442,14 +442,17 @@ async fn next_at_backoff_is_respected() {
     assert!(fx.claim(&o, OutboxStage::Post, early).await.is_none());
     assert!(fx
         .cat
-        .due(early, RESEND_SECS, 100)
+        .due(early, Resend::after(RESEND_SECS), 100)
         .await
         .unwrap()
         .is_empty());
     assert_eq!(fx.outbox(&o, "attempts").await, "1");
 
     assert_eq!(
-        fx.cat.due(retry_at, RESEND_SECS, 100).await.unwrap(),
+        fx.cat
+            .due(retry_at, Resend::after(RESEND_SECS), 100)
+            .await
+            .unwrap(),
         vec![DueRow {
             extent_id: o.extent.clone(),
             generation_id: o.generation.clone(),
@@ -630,7 +633,11 @@ async fn cancellation_beats_stale_completion() {
     for stage in OutboxStage::ALL {
         assert!(fx.claim(&o, *stage, late).await.is_none());
     }
-    let due = fx.cat.due(late, RESEND_SECS, 100).await.unwrap();
+    let due = fx
+        .cat
+        .due(late, Resend::after(RESEND_SECS), 100)
+        .await
+        .unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].extent_id, newer.extent);
 }
@@ -1044,7 +1051,7 @@ async fn release_needs_fresh_evidence() {
     );
     assert!(fx
         .cat
-        .due(done_at.plus_ms(HOUR_MS), RESEND_SECS, 100)
+        .due(done_at.plus_ms(HOUR_MS), Resend::after(RESEND_SECS), 100)
         .await
         .unwrap()
         .is_empty());
@@ -1681,21 +1688,42 @@ async fn dispatcher_reads_are_bounded_and_bury_only_exhausted_rows() {
     for i in 0..5 {
         objs.push(fx.publish(&fx.bucket, &format!("k{i}")).await);
     }
-    assert_eq!(fx.cat.due(T0, RESEND_SECS, 100).await.unwrap().len(), 5);
-    assert_eq!(fx.cat.due(T0, RESEND_SECS, 2).await.unwrap().len(), 2);
+    assert_eq!(
+        fx.cat
+            .due(T0, Resend::after(RESEND_SECS), 100)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        fx.cat
+            .due(T0, Resend::after(RESEND_SECS), 2)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(fx
         .cat
-        .due(T0.plus_ms(-1), RESEND_SECS, 100)
+        .due(T0.plus_ms(-1), Resend::after(RESEND_SECS), 100)
         .await
         .unwrap()
         .is_empty());
 
     // Leased rows are not re-sent until the lease expires.
     let held = fx.claim(&objs[0], OutboxStage::Post, T0).await.unwrap();
-    assert_eq!(fx.cat.due(T0, RESEND_SECS, 100).await.unwrap().len(), 4);
     assert_eq!(
         fx.cat
-            .due(T0.plus_ms(LEASE_MS + 1), RESEND_SECS, 100)
+            .due(T0, Resend::after(RESEND_SECS), 100)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        fx.cat
+            .due(T0.plus_ms(LEASE_MS + 1), Resend::after(RESEND_SECS), 100)
             .await
             .unwrap()
             .len(),
@@ -1731,7 +1759,7 @@ async fn dispatcher_reads_are_bounded_and_bury_only_exhausted_rows() {
     assert!(fx.claim(&objs[1], OutboxStage::Post, T0).await.is_none());
     assert_eq!(
         fx.cat
-            .due(T0.plus_ms(LEASE_MS + 1), RESEND_SECS, 100)
+            .due(T0.plus_ms(LEASE_MS + 1), Resend::after(RESEND_SECS), 100)
             .await
             .unwrap()
             .len(),
@@ -2272,7 +2300,7 @@ async fn redrive_requeues_underverified_done_extents() {
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     assert!(fx
         .cat
-        .due(later, RESEND_SECS, 100)
+        .due(later, Resend::after(RESEND_SECS), 100)
         .await
         .unwrap()
         .is_empty());
@@ -2286,7 +2314,14 @@ async fn redrive_requeues_underverified_done_extents() {
     assert_eq!(fx.outbox(&o, "cursor").await, "0");
     assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
     assert_eq!(fx.outbox(&o, "next_at").await, later.0.to_string());
-    assert_eq!(fx.cat.due(later, RESEND_SECS, 100).await.unwrap().len(), 1);
+    assert_eq!(
+        fx.cat
+            .due(later, Resend::after(RESEND_SECS), 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     // Moved once: the row is no longer `done`.
     assert_eq!(fx.redrive(&["bb2"], 1, 100, later).await, 0);
 
@@ -2559,7 +2594,11 @@ const RESEND_MS: i64 = RESEND_SECS as i64 * 1000;
 
 impl Fx {
     async fn due_ids(&self, now: UnixMs) -> Vec<ExtentId> {
-        let rows = self.cat.due(now, RESEND_SECS, 100).await.unwrap();
+        let rows = self
+            .cat
+            .due(now, Resend::after(RESEND_SECS), 100)
+            .await
+            .unwrap();
         rows.into_iter().map(|r| r.extent_id).collect()
     }
 
@@ -2613,6 +2652,45 @@ async fn a_marked_row_is_not_due_again_until_the_resend_timeout() {
 
     // The mark gates no claim.
     assert!(fx.claim(&a, OutboxStage::Post, T0).await.is_some());
+}
+
+/// Each stage is left alone for the wait of its kind of queue: `post`
+/// for one, `verify` and `release` for the other.
+#[tokio::test]
+async fn the_resend_wait_is_per_kind_of_queue() {
+    let fx = Fx::new().await;
+    let post = fx.publish(&fx.bucket, "post").await;
+    let verify = fx.publish(&fx.bucket, "verify").await;
+    let release = fx.publish(&fx.bucket, "release").await;
+    for (o, stage) in [(&verify, "verify"), (&release, "release")] {
+        let sql = "UPDATE outbox SET stage = ?2 WHERE extent_id = ?1";
+        let params = [
+            SqlValue::Text(o.extent.as_str().into()),
+            SqlValue::Text(stage.into()),
+        ];
+        assert_eq!(fx.cat.sql.0.exec(sql, &params).await.unwrap(), 1);
+    }
+    assert_eq!(fx.mark(&[&post, &verify, &release], T0).await, 3);
+    let due = |now: UnixMs, post_secs: u32, verify_secs: u32| {
+        let resend = Resend {
+            post_secs,
+            verify_secs,
+        };
+        let cat = &fx.cat;
+        async move {
+            let rows = cat.due(now, resend, 100).await.unwrap();
+            let mut stages: Vec<&str> = rows.iter().map(|r| r.stage.as_str()).collect();
+            stages.sort_unstable();
+            stages
+        }
+    };
+    let now = T0.plus_ms(2 * RESEND_MS);
+    assert_eq!(due(now, 7200, 7201).await, ["post"]);
+    assert_eq!(due(now, 7201, 7200).await, ["release", "verify"]);
+    assert_eq!(due(now, 7201, 7201).await, [""; 0]);
+    assert_eq!(due(now, 7200, 7200).await.len(), 3);
+    // The mark gates no claim, however long the wait.
+    assert!(fx.claim(&post, OutboxStage::Post, now).await.is_some());
 }
 
 #[tokio::test]
@@ -2709,7 +2787,10 @@ async fn every_stage_gets_its_share_of_a_dispatcher_run() {
     let due = |limit: u32| {
         let cat = &fx.cat;
         async move {
-            let rows = cat.due(T0, RESEND_SECS, limit).await.unwrap();
+            let rows = cat
+                .due(T0, Resend::after(RESEND_SECS), limit)
+                .await
+                .unwrap();
             rows.into_iter().map(|r| r.extent_id).collect::<Vec<_>>()
         }
     };

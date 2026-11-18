@@ -538,6 +538,7 @@ pub struct FakeJobs {
     dropped: Cell<u32>,
     calls: Cell<u32>,
     fail_after: Cell<Option<u32>>,
+    backlog: Cell<crate::types::Backlog>,
 }
 
 /// `send_many` bound (Queues `sendBatch`).
@@ -546,6 +547,11 @@ pub const MAX_SEND_MANY: usize = 100;
 impl FakeJobs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// What [`JobSink::backlog`] answers from now on. Unknown until set.
+    pub fn set_backlog(&self, backlog: crate::types::Backlog) {
+        self.backlog.set(backlog);
     }
 
     pub fn drop_next(&self, n: u32) {
@@ -622,6 +628,10 @@ impl JobSink for FakeJobs {
             self.record(job, 0);
         }
         Ok(())
+    }
+
+    async fn backlog(&self) -> crate::types::Backlog {
+        self.backlog.get()
     }
 }
 

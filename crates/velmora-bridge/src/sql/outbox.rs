@@ -17,7 +17,7 @@ use crate::ports::{Guard, Lease, Permit, Sql, SqlValue, LEASE_SECS};
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, BridgeError, Bucket, BucketId, DueRow, ExtentId,
     ExtentRow, ExtentState, FailClass, GenerationId, GenerationState, JobExtent, OutboxStage,
-    OutboxStats, Result, SafetyState, UnixMs, VerificationRow, VerifyKind, VerifyResult,
+    OutboxStats, Resend, Result, SafetyState, UnixMs, VerificationRow, VerifyKind, VerifyResult,
 };
 
 /// Lease length. Jobs renew on a timer and before each read article.
@@ -963,9 +963,10 @@ const DUE_STAGES: [&str; 3] = ["post", "verify", "release"];
 
 /// Due rows no job holds, oldest first, without the ones the dispatcher
 /// has sent a job for and that job may still be on its way: a row with a
-/// mark (`sent_at`) is left out until `resend_secs` after the mark. A
-/// claim clears the mark, and a due time later than the mark outdates
-/// it, so a row that a job gave back or moved on is listed at once.
+/// mark (`sent_at`) is left out until the seconds `resend` has for its
+/// stage after the mark. A claim clears the mark, and a due time later
+/// than the mark outdates it, so a row that a job gave back or moved on
+/// is listed at once.
 ///
 /// At most `limit` rows. Each stage has a third of them to itself, its
 /// oldest rows; what a stage does not use goes to the oldest rows left
@@ -977,11 +978,11 @@ const DUE_STAGES: [&str; 3] = ["post", "verify", "release"];
 /// rowid breaks a tie), with no sort: a statement stops at `limit` rows
 /// it lists. The marks and the leases are not in the index, so it also
 /// reads the due rows it passes over on the way, which are at most the
-/// rows marked within `resend_secs` and the ones a job holds.
+/// rows marked within that time and the ones a job holds.
 pub(super) async fn due<S: Sql>(
     c: &SqlCatalog<S>,
     now: UnixMs,
-    resend_secs: u32,
+    resend: Resend,
     limit: u32,
 ) -> Result<Vec<DueRow>> {
     let limit_rows = limit as usize;
@@ -990,6 +991,10 @@ pub(super) async fn due<S: Sql>(
     let mut kept: Vec<(i64, usize, DueRow)> = Vec::new();
     let mut spare: Vec<(i64, usize, DueRow)> = Vec::new();
     for stage in DUE_STAGES {
+        let resend_secs = match stage {
+            "post" => resend.post_secs,
+            _ => resend.verify_secs,
+        };
         let rows = c
             .sql
             .query(
