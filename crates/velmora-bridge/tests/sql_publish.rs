@@ -1553,22 +1553,38 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
         fx.generation(&fx.bucket, "a", T0.plus_ms(3), &sizes),
         placed(&ids, &sizes),
     );
+    // One article each, and one extent of many: its plan alone is more
+    // than an answer may carry.
+    const MANY: usize = 5;
+    const MANY_BYTES: u64 = 40_000_000;
     let mut plan_bytes = 0;
-    for id in &ids {
+    let mut many_bytes = 0;
+    for (i, id) in ids.iter().enumerate() {
+        let cipher_size = if i == MANY { MANY_BYTES } else { 164 };
         let (plan, _) = velmora_bridge::plan::plan_seeded(
             &mut velmora::rng::SystemRng,
             T0.0 / 1000,
             &["alt.binaries.test"],
             id,
-            164,
+            cipher_size,
             |span| Some([span.start as u8; 32]),
         )
         .unwrap();
-        plan_bytes = plan.len();
-        let set = "UPDATE extents SET safety_state = 'deleted', plan = ?2 WHERE id = ?1";
-        let bound = [text(id.as_str()), SqlValue::Blob(plan)];
+        if i == MANY {
+            many_bytes = plan.len();
+        } else {
+            plan_bytes = plan.len();
+        }
+        let set = "UPDATE extents SET safety_state = 'deleted', plan = ?2, cipher_size = ?3 \
+                   WHERE id = ?1";
+        let bound = [
+            text(id.as_str()),
+            SqlValue::Blob(plan),
+            SqlValue::Int(cipher_size as i64),
+        ];
         assert_eq!(fx.run(set, &bound).await, 1);
     }
+    assert!(many_bytes > plan_bytes * 10, "{many_bytes} {plan_bytes}");
     // Ten plans to an answer, and more than 500 extents to a value of
     // placements.
     fx.sql().limits.set(Some(SqlLimits {
@@ -1600,16 +1616,18 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
     let before = fx.dump().await;
     let published = fx.replay(&g).await;
     assert_eq!(asked(&fx, SIZES), [500, 20]);
-    let runs = asked(&fx, PLANS);
-    assert_eq!(runs.len(), 52);
-    assert!(runs.iter().all(|n| *n == 10), "{runs:?}");
-    assert_ne!(published, ReplayPublish::Damaged);
+    // The five before the large plan, the large plan alone, the other
+    // 494 of the first value, and the 20 of the second.
+    let mut expected = vec![5, 1];
+    expected.extend([10; 49]);
+    expected.extend([4, 10, 10]);
+    assert_eq!(asked(&fx, PLANS), expected);
 
     // The same record with the plan of its last extent damaged, in a
     // catalogue as it was before: found in the last run.
-    let fx2 = Fx::new(false).await;
-    drop((fx, before, published));
-    let fx = fx2;
+    assert_eq!(published, ReplayPublish::Published);
+    assert_ne!(fx.dump().await, before);
+    let fx = Fx::new(false).await;
     let r = fx.recorded().await;
     assert_eq!(fx.replay(&r.first).await, ReplayPublish::Published);
     let ids = fx.replayed(&sizes).await;
@@ -1617,20 +1635,13 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
         fx.generation(&fx.bucket, "a", T0.plus_ms(3), &sizes),
         placed(&ids, &sizes),
     );
-    let huge = vec![0u8; plan_bytes * 25];
-    for (id, plan) in [(&ids[3], &huge), (&ids[519], &vec![0u8])] {
-        let set = "UPDATE extents SET safety_state = 'deleted', plan = ?2 WHERE id = ?1";
-        let bound = [text(id.as_str()), SqlValue::Blob(plan.clone())];
-        assert_eq!(fx.run(set, &bound).await, 1);
-    }
+    let set = "UPDATE extents SET safety_state = 'deleted', plan = x'00' WHERE id = ?1";
+    assert_eq!(fx.run(set, &[text(ids[519].as_str())]).await, 1);
     fx.sql().limits.set(Some(SqlLimits {
         set_rows: 600,
         result_bytes: plan_bytes * 10,
         ..SqlLimits::D1
     }));
-    // Only the damaged last one first.
-    let whole = "UPDATE extents SET safety_state = 'held', plan = NULL WHERE id = ?1";
-    assert_eq!(fx.run(whole, &[text(ids[3].as_str())]).await, 1);
     let before = fx.dump().await;
     assert_eq!(fx.replay(&g).await, ReplayPublish::Damaged);
     assert_eq!(fx.dump().await, before);
