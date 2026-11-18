@@ -477,6 +477,20 @@ fn nothing_lost_rebuilds_nothing() {
     assert_eq!(s.attempt(&[]), Ok(Vec::new()));
     // No parity is needed for that.
     assert_eq!(reconstruct(&present(&s.data), &[]), Ok(Vec::new()));
+    // The limit on parity shards per call holds all the same.
+    let too_many = vec![
+        ParityShard {
+            row: 0,
+            bytes: &s.parity[0]
+        };
+        MAX_PARITY_SHARDS + 1
+    ];
+    assert_eq!(
+        reconstruct(&present(&s.data), &too_many),
+        Err(RsError::TooManyParityShards {
+            count: MAX_PARITY_SHARDS + 1
+        })
+    );
 }
 
 #[test]

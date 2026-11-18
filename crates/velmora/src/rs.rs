@@ -355,7 +355,7 @@ fn invert(mut a: Vec<u16>, n: usize) -> Option<Vec<u16>> {
 ///
 /// Returns the rebuilt shards in the order of their index in `data`, each
 /// cut to its stated length. With nothing lost the result is empty and
-/// `parity` is not looked at.
+/// only the number of `parity` entries is checked, not their content.
 ///
 /// Errors, always without bytes: see [`RsError`]. In particular more losses
 /// than parity shards is [`RsError::TooManyLosses`].
@@ -384,10 +384,10 @@ pub fn reconstruct(
             }
         }
     }
+    check_parity_count(parity.len())?;
     if lost.is_empty() {
         return Ok(Vec::new());
     }
-    check_parity_count(parity.len())?;
     let t = lost.len();
     if parity.len() < t {
         return Err(RsError::TooManyLosses {
