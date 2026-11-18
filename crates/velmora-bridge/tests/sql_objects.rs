@@ -2325,13 +2325,18 @@ async fn extents_in_matches_the_statement_it_replaced() {
     let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
     let counts = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 257];
     for (n, count) in counts.into_iter().enumerate() {
-        let sizes: Vec<u64> = (0..count)
+        // Extents of no bytes share their offset with the one after.
+        let mut sizes: Vec<u64> = (0..count)
             .map(|_| match rng.below(8) {
                 0 => 1,
                 1 => 1 + rng.below(3),
+                2 | 3 => 0,
                 _ => 1 + rng.below(5_000),
             })
             .collect();
+        if sizes.iter().sum::<u64>() == 0 {
+            sizes[0] = 1;
+        }
         let g = fx.uneven(&b.id, &format!("k{n}"), &sizes).await;
         let size = g.size;
 
@@ -2350,7 +2355,7 @@ async fn extents_in_matches_the_statement_it_replaced() {
         let mut border = 0;
         for s in &sizes {
             border += s;
-            for at in [border.saturating_sub(2), border - 1, border] {
+            for at in [border.saturating_sub(2), border.saturating_sub(1), border] {
                 // One byte at and next to the border, a range across
                 // it, and the suffix that begins there.
                 ranges.push((at, at + 1));
@@ -2378,6 +2383,15 @@ async fn extents_in_matches_the_statement_it_replaced() {
         }
     }
 
+    // Runs of empty extents at the start, in the middle and at the end.
+    let sizes = [0, 0, 3, 0, 0, 5, 0, 0];
+    let g = fx.uneven(&b.id, "zeros", &sizes).await;
+    for start in 0..10 {
+        for end in start..11 {
+            fx.same_run(&g, &sizes, start, end).await;
+        }
+    }
+
     // An empty object is one extent of no bytes; an unknown generation
     // has no rows.
     let empty = fx.uneven(&b.id, "empty", &[0]).await;
@@ -2387,6 +2401,49 @@ async fn extents_in_matches_the_statement_it_replaced() {
     let unknown = GenerationId::mint(T0, [0xEE; 8]);
     assert!(fx.cat.extents_in(&unknown, 0, 10).await.unwrap().is_empty());
     assert!(fx.by_walk(&unknown, 0, 10).is_empty());
+}
+
+/// Writers number the references of a generation from 0 without a gap,
+/// and nothing in the schema holds them to it. Where numbers are missing
+/// the bisection still returns what the walk returned: a missing number
+/// stands for the next reference that exists.
+#[tokio::test(flavor = "current_thread")]
+async fn extents_in_matches_the_walk_where_numbers_are_missing() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+    for (n, count) in [2u64, 5, 16, 33, 100].into_iter().enumerate() {
+        let sizes = vec![5u64; count as usize];
+        let g = fx.uneven(&b.id, &format!("k{n}"), &sizes).await;
+        // Drop about a third of the references, in runs, at either end
+        // and in the middle; always keep one.
+        let mut gone = vec![];
+        for seq in 0..count {
+            if rng.below(3) == 0 && gone.len() as u64 + 1 < count {
+                gone.push(seq);
+            }
+        }
+        fx.cat.sql.db.with_conn(|c| {
+            for seq in &gone {
+                let n = c
+                    .execute(
+                        "DELETE FROM generation_extents WHERE generation_id = ?1 AND seq = ?2",
+                        rusqlite::params![g.id.as_str(), *seq as i64],
+                    )
+                    .unwrap();
+                assert_eq!(n, 1);
+            }
+        });
+        let size = g.size;
+        for start in 0..size + 2 {
+            for end in [start, start + 1, start + 7, size, size + 3] {
+                let got = fx.cat.extents_in(&g.id, start, end).await.unwrap();
+                let seqs: Vec<u32> = got.iter().map(|e| e.seq.unwrap()).collect();
+                let walked = fx.by_walk(&g.id, start, end);
+                assert_eq!(seqs, walked, "{start}..{end} of {count} without {gone:?}");
+            }
+        }
+    }
 }
 
 /// A range read reaches `generation_extents` through its primary key

@@ -259,6 +259,64 @@ async fn copy_of_a_source_above_the_single_record_limit_is_refused() {
     .expect_error(412, "PreconditionFailed");
 }
 
+/// The source of a copy is read twice, its generation and then its
+/// rows, and the key can be overwritten in between. The conditions on
+/// the source are then judged on what was loaded, not on what was seen
+/// first.
+#[tokio::test(flavor = "current_thread")]
+async fn copy_judges_its_conditions_on_the_source_it_loaded() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "src", &pattern(4, 9_000))
+        .await
+        .expect(200);
+    rig.put(&signer, BUCKET, "other", &pattern(5, 7_000))
+        .await
+        .expect(200);
+    let (first, _) = rig.live(&bucket, "src").await.unwrap();
+    let (other, _) = rig.live(&bucket, "other").await.unwrap();
+    assert_ne!(first.etag, other.etag);
+
+    let from = source("src");
+    let copy = |to: &'static str| {
+        let (rig, signer, from, etag) = (&rig, &signer, from.as_str(), first.etag.as_str());
+        async move {
+            let h = [
+                ("x-amz-copy-source", from),
+                ("x-amz-copy-source-if-match", etag),
+            ];
+            call(rig, signer, Method::Put, to, &h).await
+        }
+    };
+    copy("before").await.expect(200);
+
+    // Between the two reads the key gets the generation of `other`.
+    *rig.bridge.catalog.sql.before_matching.borrow_mut() = Some((
+        "FROM objects o JOIN generations g",
+        1,
+        "UPDATE objects SET generation_id = \
+           (SELECT generation_id FROM objects WHERE key = 'other') WHERE key = 'src'"
+            .into(),
+    ));
+    copy("during").await.expect_error(412, "PreconditionFailed");
+    assert!(rig.bridge.catalog.sql.before_matching.borrow().is_none());
+    assert!(rig.live(&bucket, "during").await.is_none());
+    let (now, _) = rig.live(&bucket, "src").await.unwrap();
+    assert_eq!(now.id, other.id);
+
+    // And when it is deleted in between, there is no source.
+    *rig.bridge.catalog.sql.before_matching.borrow_mut() = Some((
+        "FROM objects o JOIN generations g",
+        1,
+        "DELETE FROM objects WHERE key = 'src'".into(),
+    ));
+    let h = [("x-amz-copy-source", from.as_str())];
+    call(&rig, &signer, Method::Put, "gone", &h)
+        .await
+        .expect_error(404, "NoSuchKey");
+    assert!(rig.bridge.catalog.sql.before_matching.borrow().is_none());
+}
+
 /// UploadPartCopy reads the extents of its range and no others, so it
 /// is the way to copy a source too large for CopyObject.
 #[tokio::test(flavor = "current_thread")]

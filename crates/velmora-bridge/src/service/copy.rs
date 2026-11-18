@@ -151,7 +151,9 @@ fn source_too_large() -> S3Response {
 /// [`SINGLE_RECORD_EXTENTS`] extents is refused, and it is refused on
 /// its generation row, before any extent row is read. The key can get
 /// another generation between the two reads, so what was loaded is
-/// judged again.
+/// judged again, on its conditions and on its count; only in that
+/// window are the rows of a source above the limit read before it is
+/// refused.
 async fn source_object<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     headers: &Headers,

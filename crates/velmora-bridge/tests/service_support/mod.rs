@@ -378,6 +378,10 @@ pub struct FailSql {
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
     pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+    /// Runs the given SQL once, just before a read whose text contains
+    /// the string, after letting the given number of such reads through:
+    /// what another request commits between two reads of this one.
+    pub before_matching: RefCell<Option<(&'static str, u32, String)>>,
     /// Fails this many batches, the next ones: a commit that does not
     /// go through while single statements still do.
     pub fail_batches: Cell<u32>,
@@ -423,6 +427,23 @@ impl FailSql {
         }
     }
 
+    /// Commits what was set to happen before this read, if it is the one.
+    fn interleave(&self, sql: &str) {
+        let mut rule = self.before_matching.borrow_mut();
+        let due = match rule.as_mut() {
+            Some((text, pass, _)) if sql.contains(*text) => {
+                let due = *pass == 0;
+                *pass = pass.saturating_sub(1);
+                due
+            }
+            _ => false,
+        };
+        if due {
+            let (_, _, other) = rule.take().unwrap();
+            self.inner.with_conn(|c| c.execute_batch(&other).unwrap());
+        }
+    }
+
     /// Whether this statement is one of those answered "overloaded".
     fn over_budget(&self) -> Result<()> {
         match self.overloaded.get() {
@@ -448,6 +469,7 @@ impl Sql for FailSql {
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
+        self.interleave(sql);
         self.trip
             .guard(sql_down, self.inner.query(sql, params))
             .await
@@ -578,6 +600,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_publish: Cell::new(None),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
+                before_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),
                 overloaded: Cell::new(0),
             }),

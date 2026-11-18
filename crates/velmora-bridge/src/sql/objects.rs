@@ -264,9 +264,15 @@ const PLACED_EXTENT_COLS: &str =
 /// Offsets rise with `seq`, so the condition holds for a run of
 /// references from the first on, and the end of that run is found by
 /// halving `(lo, hi)`: `lo` is -1 or a `seq` the condition holds for,
-/// `hi` is the count or a `seq` it does not hold for. Each step is one
-/// seek of the primary key, about 17 for 131,072 references, where
-/// walking the key backwards read every reference behind the range.
+/// `hi` is one past the last `seq` or a `seq` it does not hold for. Each
+/// step is one seek of the primary key, about 17 for 131,072 references,
+/// where walking the key backwards read every reference behind the range.
+///
+/// Writers number references from 0 without a gap, but nothing in the
+/// schema says so. A step therefore reads the first reference at or
+/// after the middle rather than the one exactly there: the condition
+/// still holds for a run from the first `seq` on, and a `seq` that has
+/// no reference stands for the next one that has.
 macro_rules! bisect {
     ($name:literal, $cmp:literal, $at:literal) => {
         concat!(
@@ -275,13 +281,15 @@ macro_rules! bisect {
                 WHERE generation_id = ?1), 0) \
               UNION ALL \
               SELECT CASE WHEN (SELECT plain_offset FROM generation_extents \
-                                 WHERE generation_id = ?1 AND seq = (b.lo + b.hi) / 2) ",
+                                 WHERE generation_id = ?1 AND seq >= (b.lo + b.hi) / 2 \
+                                 ORDER BY seq LIMIT 1) ",
             $cmp,
             " ",
             $at,
             " THEN (b.lo + b.hi) / 2 ELSE b.lo END, \
                      CASE WHEN (SELECT plain_offset FROM generation_extents \
-                                 WHERE generation_id = ?1 AND seq = (b.lo + b.hi) / 2) ",
+                                 WHERE generation_id = ?1 AND seq >= (b.lo + b.hi) / 2 \
+                                 ORDER BY seq LIMIT 1) ",
             $cmp,
             " ",
             $at,

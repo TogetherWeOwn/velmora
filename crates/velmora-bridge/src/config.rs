@@ -41,6 +41,8 @@ pub const MAX_WRITE_SLICES: u64 = 16;
 /// Most extents one recovery record names in a single document. A
 /// CopyObject writes such a record for all the extents of its source, so
 /// a source of more is refused (`service/copy.rs`); it is copied in parts.
+/// While [`MAX_OBJECT_EXTENTS_LIMIT`] is the same number no object is
+/// larger, and the refusal is there for when that limit is raised.
 pub const SINGLE_RECORD_EXTENTS: u32 = 10_000;
 
 /// Most extents one object may be made of, and `MAX_OBJECT_EXTENTS`
