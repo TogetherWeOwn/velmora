@@ -944,12 +944,15 @@ three connections, four gate objects, 11 extents of 16 MiB per mode):
 | ------------------------------ | ------------ | ------------ |
 | rows written to the catalogue  | 55.8         | 49.2         |
 | of those, slot rows            | about 6      | 0            |
-| billed requests to the gates   | 0            | about 13     |
+| billed requests to the gates   | 0            | 13 to 31     |
 | rows written by the gates      | 0            | about 1.3    |
 | gate duration, GB-s            | 0            | 0.12         |
 
 - A job opens one session with each gate it takes a slot at: one
-  billed request each, about two per job. Renewals and the release
+  billed request each, about two per job. The gates were entered 31
+  times per extent; 13 is that count with a message as a twentieth
+  and the end of a session as nothing, which is how they are priced
+  as far as the price list says. Renewals and the release
   are messages on it, billed at a twentieth of a request. An extent is
   about five job runs (the post, its retries and the checks).
 - A permit writes nothing. A gate writes its record once per
@@ -962,9 +965,9 @@ three connections, four gate objects, 11 extents of 16 MiB per mode):
   against 354 ms with slot rows; the first job after a start of a
   gate that has to ask the catalogue for its rows took 3.1 s.
 
-At the list prices of late 2026 that is about $3.2 per TB posted in
-gate mode against $3.3 with slot rows: the gate does not cost more,
-and it takes the slot rows out of the catalogue's write path.
+At the list prices of late 2026 that is $3.2 to $3.4 per TB posted in
+gate mode against $3.3 with slot rows: about the same bill, with the
+slot rows out of the catalogue's write path.
 
 ## The route
 
