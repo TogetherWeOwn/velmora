@@ -8,11 +8,13 @@
 
 use futures_util::future::{join_all, select, Either};
 use velmora::rng::{FillRandom, SystemRng};
+use velmora::rs::{reconstruct, DataShard, ParityShard};
 use velmora::transport::is_article_limit_error;
 use velmora::yenc::decode_part_to;
 
 use crate::articles::article_spans;
-use crate::ingress::Sleeper;
+use crate::ingress::{ByteBudget, Sleeper};
+use crate::plan::StoredPlan;
 use crate::pool::Pool;
 use crate::ports::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
@@ -874,6 +876,11 @@ pub enum ColdFetch {
     Interrupted,
     /// No provider could supply every article intact.
     Unavailable,
+    /// `extent-unrecoverable`: articles are lost on every provider and
+    /// the extent's parity cannot make up for them (more are lost than
+    /// parity articles can be read intact, or the parity addendum cannot
+    /// be read). Nothing of the extent is returned.
+    Unrecoverable,
 }
 
 /// Bytes one socket of a cold read holds beside the extent it fills: the
@@ -914,6 +921,20 @@ pub fn cold_fetch_bytes(cipher_size: u64, sockets: u32) -> u64 {
         .min(cold_step_bytes(cipher_size, sockets))
 }
 
+/// What rebuilding `lost` data articles of an extent charges to the byte
+/// budget, on top of what the read of the extent holds: its `parity`
+/// parity articles of `shard_len` bytes each as they are read, the
+/// rebuilt articles, and the working memory of the codec
+/// ([`velmora::rs`]: `lost + 2` shards and two small matrices).
+pub fn cold_rebuild_bytes(shard_len: u64, parity: u64, lost: u64) -> u64 {
+    let shards = parity
+        .saturating_add(lost.saturating_mul(2))
+        .saturating_add(2);
+    shards
+        .saturating_mul(shard_len)
+        .saturating_add(lost.saturating_mul(lost).saturating_mul(4))
+}
+
 /// Times one provider may answer `430` for one article within one cold
 /// read before the article is asked of the next: the second ask comes
 /// after the provider's other articles (a fresh article can be invisible
@@ -940,6 +961,13 @@ pub struct ColdStats {
     /// Articles a provider did not have or had with other bytes, which
     /// were then asked of another.
     pub refetched: u32,
+    /// Data articles no provider had intact, which were rebuilt from the
+    /// extent's parity articles and found equal to their planned SHA-256.
+    /// Each is an article that wants posting again.
+    pub rebuilt: u32,
+    /// Extents that lost more than their parity could rebuild
+    /// (`extent-unrecoverable`).
+    pub unrecoverable: u32,
 }
 
 impl ColdStats {
@@ -964,6 +992,14 @@ impl core::fmt::Display for ColdStats {
         for (id, articles, bytes) in &self.share {
             write!(f, " {id}={articles}/{bytes}")?;
         }
+        // Only when it happened: a read that lost nothing logs the line
+        // it always did.
+        if self.rebuilt > 0 {
+            write!(f, " rebuilt={}", self.rebuilt)?;
+        }
+        if self.unrecoverable > 0 {
+            write!(f, " extent-unrecoverable={}", self.unrecoverable)?;
+        }
         Ok(())
     }
 }
@@ -972,6 +1008,10 @@ impl core::fmt::Display for ColdStats {
 /// borrowed only between awaits.
 struct Board {
     cipher: Vec<u8>,
+    /// The `cipher_offset` of the first byte of `cipher`: 0 for the data
+    /// articles, the size of the ciphertext for the parity articles,
+    /// whose payloads are addressed past it.
+    base: u64,
     /// Per article: its bytes are in `cipher` and matched their SHA-256.
     have: Vec<bool>,
     /// Per article: a socket is reading it now.
@@ -988,6 +1028,21 @@ struct Board {
 }
 
 impl Board {
+    /// A board for `articles` articles that fill `bytes` bytes from the
+    /// offset `base`, read from `providers` providers.
+    fn new(bytes: usize, base: u64, articles: usize, providers: usize) -> Self {
+        Board {
+            cipher: vec![0u8; bytes],
+            base,
+            have: vec![false; articles],
+            taken: vec![false; articles],
+            asks: vec![0u8; articles * providers],
+            providers,
+            turn: 0,
+            waiting: Vec::new(),
+        }
+    }
+
     /// Whether any socket is reading an article now. Until none is, the
     /// pass goes on, and every socket in it stays logged in.
     fn reading(&self) -> bool {
@@ -1036,6 +1091,71 @@ enum Out {
     Broken,
 }
 
+/// The data articles of an extent and which of them were read.
+#[derive(Clone, Copy)]
+struct Lost<'p> {
+    /// The plan as the catalogue holds it, with its parity addendum.
+    stored: &'p StoredPlan,
+    /// Per data article: its verified bytes are in the ciphertext.
+    have: &'p [bool],
+}
+
+/// What the passes over one extent know of the providers they read from.
+struct Desk<'a> {
+    /// The providers that may be asked, best first.
+    order: Vec<&'a ProviderConfig>,
+    /// Per provider of `order`: why it gets no more work.
+    out: Vec<Option<Out>>,
+    /// Per provider: it gave no further slot.
+    full: Vec<bool>,
+    /// Per provider: it answered for every article it was asked for.
+    asked: Vec<bool>,
+    /// Per provider: sessions that broke off in this read.
+    breaks: Vec<u32>,
+}
+
+impl Desk<'_> {
+    /// How a read ends that could not get every article of `rows`
+    /// (`have`): whether a provider that may hold what is lacking could
+    /// not be asked, and why.
+    fn short(
+        &self,
+        pool: &Pool<'_>,
+        readers: &[&ProviderConfig],
+        rows: &[ArticleRow],
+        have: &[bool],
+        now: UnixMs,
+    ) -> ColdFetch {
+        // A cooling provider that retains a missing article and was
+        // not asked may hold what the others lack: retry later.
+        let lacks = |p: &ProviderConfig| {
+            rows.iter()
+                .zip(have)
+                .any(|(a, have)| !have && p.retains(a.posted_at, now))
+        };
+        let was_asked = |p: &ProviderConfig| {
+            self.order
+                .iter()
+                .position(|o| o.id == p.id)
+                .is_some_and(|i| self.asked[i] && self.out[i].is_none())
+        };
+        let waiting: Vec<&ProviderConfig> = readers
+            .iter()
+            .copied()
+            .filter(|p| !was_asked(p) && lacks(p))
+            .collect();
+        let interrupted =
+            self.out.contains(&Some(Out::Broken)) || pool.cooling_until(&waiting).is_some();
+        if interrupted {
+            ColdFetch::Interrupted
+        } else if self.out.contains(&Some(Out::Busy)) {
+            ColdFetch::Busy
+        } else {
+            ColdFetch::Unavailable
+        }
+    }
+}
+
 /// Reads extents from Usenet over several connections at once.
 ///
 /// One reader belongs to one invocation: every slot it takes carries one
@@ -1058,6 +1178,9 @@ pub(crate) struct ColdReader<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// Slow connections that may still be replaced ([`SLOW_REPLACEMENTS`]).
     replacements: u32,
     stats: std::rc::Rc<core::cell::RefCell<ColdStats>>,
+    /// The byte budget a rebuild from parity is charged to
+    /// ([`cold_rebuild_bytes`]).
+    room: ByteBudget,
 }
 
 impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
@@ -1213,52 +1336,19 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         }
     }
 
-    /// Reads one extent: every article with one `BODY`, each on whichever
-    /// socket is free, decoded into its place and compared with the
-    /// SHA-256 of its plan row; then the whole ciphertext against the
-    /// extent's digest. Nothing is returned that did not pass both.
-    ///
-    /// An article goes to the best tier of `read` providers that retains
-    /// it. One that a provider does not have, or has with other bytes, is
-    /// asked of the next provider; one whose connection broke goes back
-    /// to the other sockets, and the broken session reconnects (through
-    /// the next proxy, if the provider has several) while its reconnects
-    /// last ([`MAX_READ_RECONNECTS`]). A provider is not asked for an
-    /// article older than its retention, and a provider in a cooldown is
-    /// not asked at all. An article past every reader's stated retention
-    /// is asked of every reader before the read gives up.
-    pub(crate) async fn fetch(&mut self, extent: &ExtentRow) -> Result<ColdFetch> {
-        let plan = self.catalog.articles(&extent.id).await?;
-        let size =
-            usize::try_from(extent.cipher_size).map_err(|_| BridgeError::Invalid("extent size"))?;
-        let spans = article_spans(extent.cipher_size);
-        let planned = plan.len() == spans.len()
-            && (0u32..).zip(&plan).zip(&spans).all(|((idx, row), span)| {
-                row.idx == idx && row.cipher_offset == span.start && row.cipher_len == span.len
-            });
-        if plan.is_empty() || !planned {
-            return Ok(ColdFetch::Unavailable);
-        }
-
-        let now = self.clock.now();
-        let pool = Pool::load(self.catalog, self.providers, now).await?;
-        let readers: Vec<&'a ProviderConfig> = self.providers.iter().filter(|p| p.read).collect();
-        let mut order = pool.order(readers.clone(), PermitClass::Read);
-        if order.is_empty() {
-            // Every reader is cooling: a read is worth one attempt on the
-            // provider that is due back first, unless that one refused
-            // the login. A refused account answers no read: it is asked
-            // again when its cooldown ends, not on every read.
-            order.extend(pool.soonest_cooling(&readers));
-        }
-        // A session on a provider that is no longer in the order (it is
-        // cooling now) is not used.
-        let (kept, gone): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
-            .into_iter()
-            .partition(|s| order.iter().any(|p| p.id == s.provider.id));
-        self.sessions = kept;
-        ProviderSession::close_all(gone).await;
-
+    /// Reads the articles of `rows` that `chosen` allows onto `board`,
+    /// over the sessions of the reader, until every one of them is there
+    /// or no provider of the desk can be asked for what is lacking. What
+    /// the providers did is noted on `desk`.
+    async fn read_rows(
+        &mut self,
+        desk: &mut Desk<'a>,
+        readers: &[&'a ProviderConfig],
+        now: UnixMs,
+        plan: &[ArticleRow],
+        chosen: &[bool],
+        board: &core::cell::RefCell<Board>,
+    ) -> Result<()> {
         // An article past every reader's stated retention may still be
         // there: a second phase asks for those before giving up.
         let orphan = |a: &ArticleRow| {
@@ -1266,28 +1356,24 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 .iter()
                 .any(|p| p.enabled && p.retains(a.posted_at, now))
         };
-        let board = core::cell::RefCell::new(Board {
-            cipher: vec![0u8; size],
-            have: vec![false; plan.len()],
-            taken: vec![false; plan.len()],
-            asks: vec![0u8; plan.len() * order.len()],
-            providers: order.len(),
-            turn: 0,
-            waiting: Vec::new(),
-        });
-        let mut out: Vec<Option<Out>> = vec![None; order.len()];
-        let mut full = vec![false; order.len()];
-        // Providers that answered for every article they were asked for.
-        let mut asked = vec![false; order.len()];
+        let Desk {
+            order,
+            out,
+            full,
+            asked,
+            breaks,
+        } = desk;
+        let order = &*order;
         let stats = std::rc::Rc::clone(&self.stats);
         let stats = &*stats;
-        // Sessions of a provider that broke off in this read.
-        let mut breaks = vec![0u32; order.len()];
         let mut failure = None;
         'phases: for expired in [false, true] {
-            let wanted = |provider: usize, article: usize| match expired {
-                false => order[provider].retains(plan[article].posted_at, now),
-                true => orphan(&plan[article]),
+            let wanted = |provider: usize, article: usize| {
+                chosen[article]
+                    && match expired {
+                        false => order[provider].retains(plan[article].posted_at, now),
+                        true => orphan(&plan[article]),
+                    }
             };
             loop {
                 let work: Vec<usize> = (0..order.len())
@@ -1324,7 +1410,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     });
                 self.sessions = kept;
                 ProviderSession::close_all(other).await;
-                if let Err(e) = self.staff(&order, &work, &mut out, &mut full).await {
+                if let Err(e) = self.staff(order, &work, out, full).await {
                     failure = Some(e);
                     break 'phases;
                 }
@@ -1352,7 +1438,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 self.sessions = kept;
                 ProviderSession::close_all(other).await;
                 let ended = join_all(self.sessions.iter_mut().map(|session| {
-                    let (board, plan, wanted, out) = (&board, &plan, &wanted, &out);
+                    let (plan, wanted, out) = (plan, &wanted, &*out);
                     let provider = index(session);
                     async move {
                         let Some(provider) = provider.filter(|&i| out[i].is_none()) else {
@@ -1428,37 +1514,235 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 ProviderSession::close_all(slow).await;
             }
         }
-        if let Some(e) = failure {
-            return Err(e);
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        let Board { cipher, have, .. } = board.into_inner();
-        if have.contains(&false) {
-            // A cooling provider that retains a missing article and was
-            // not asked may hold what the others lack: retry later.
-            let lacks = |p: &ProviderConfig| {
-                plan.iter()
-                    .any(|a| !have[a.idx as usize] && p.retains(a.posted_at, now))
-            };
-            let was_asked = |p: &ProviderConfig| {
-                order
-                    .iter()
-                    .position(|o| o.id == p.id)
-                    .is_some_and(|i| asked[i] && out[i].is_none())
-            };
-            let waiting: Vec<&ProviderConfig> = readers
-                .iter()
-                .copied()
-                .filter(|p| !was_asked(p) && lacks(p))
-                .collect();
-            let interrupted =
-                out.contains(&Some(Out::Broken)) || pool.cooling_until(&waiting).is_some();
-            return Ok(if interrupted {
-                ColdFetch::Interrupted
-            } else if out.contains(&Some(Out::Busy)) {
-                ColdFetch::Busy
-            } else {
-                ColdFetch::Unavailable
+    }
+
+    /// Rebuilds the data articles of `extent` that no provider had intact
+    /// (`lost`) into their places in `cipher`, from the extent's parity
+    /// articles. `None` = every lost article is in its place and equal to
+    /// the SHA-256 of its plan row; otherwise how the read ends, with
+    /// `cipher` as it was.
+    ///
+    /// The parity articles are read like the data articles: each with one
+    /// `BODY` from the providers of the desk, accepted only when it is
+    /// exactly the payload the addendum names (length and SHA-256). As
+    /// many are asked for as articles are lost, and another for each
+    /// that no provider has intact, while the addendum has more. The
+    /// codec is given verified shards only, and cannot tell a wrong one
+    /// ([`velmora::rs`]); what it rebuilds is used only once every
+    /// rebuilt article matches its own planned SHA-256.
+    ///
+    /// Nothing is written and nothing is posted here. The count of
+    /// rebuilt articles is kept ([`ColdStats::rebuilt`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn rebuild(
+        &mut self,
+        extent: &ExtentRow,
+        lost: Lost<'_>,
+        cipher: &mut [u8],
+        desk: &mut Desk<'a>,
+        pool: &Pool<'_>,
+        readers: &[&'a ProviderConfig],
+        now: UnixMs,
+    ) -> Result<Option<ColdFetch>> {
+        let Lost { stored, have } = lost;
+        let plan = &stored.rows[..];
+        let unrecoverable = |stats: &core::cell::RefCell<ColdStats>| {
+            stats.borrow_mut().unrecoverable += 1;
+            Ok(Some(ColdFetch::Unrecoverable))
+        };
+        let parity = match stored.parity_plan(&extent.id, extent.cipher_size) {
+            // No parity: the read ends as it always did.
+            Ok(None) => return Ok(Some(ColdFetch::Unavailable)),
+            Ok(Some(parity)) => parity,
+            Err(_) => return unrecoverable(&self.stats),
+        };
+        let gaps: Vec<usize> = (0..plan.len()).filter(|&a| !have[a]).collect();
+        let (m, t) = (parity.articles.len(), gaps.len());
+        let len = parity.shard_len as usize;
+        // The payloads are addressed past the ciphertext, one shard
+        // after the other: the board below relies on it.
+        let laid_out = parity.rows.len() == m
+            && (0u64..).zip(&parity.articles).all(|(slot, a)| {
+                a.cipher_len == u64::from(parity.shard_len)
+                    && a.cipher_offset == extent.cipher_size + slot * u64::from(parity.shard_len)
             });
+        if !laid_out || t > m {
+            return unrecoverable(&self.stats);
+        }
+        // The rebuild is held beside the extent. Without room for it the
+        // read is tried again later, like one that got no connection.
+        let need = cold_rebuild_bytes(u64::from(parity.shard_len), m as u64, t as u64);
+        let Some(_room) = self.room.try_charge(need) else {
+            return Ok(Some(ColdFetch::Busy));
+        };
+        let board =
+            core::cell::RefCell::new(Board::new(m * len, extent.cipher_size, m, desk.order.len()));
+        let mut chosen = vec![false; m];
+        loop {
+            let got = board.borrow().have.iter().filter(|have| **have).count();
+            let more: Vec<usize> = (0..m)
+                .filter(|&slot| !chosen[slot])
+                .take(t.saturating_sub(got))
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            for slot in more {
+                chosen[slot] = true;
+            }
+            self.read_rows(desk, readers, now, &parity.articles, &chosen, &board)
+                .await?;
+        }
+        let Board {
+            cipher: shards,
+            have: got,
+            ..
+        } = board.into_inner();
+        let usable: Vec<usize> = (0..m).filter(|&slot| got[slot]).take(t).collect();
+        if usable.len() < t {
+            // A provider that could not be asked may have the rest.
+            return match desk.short(pool, readers, &parity.articles, &got, now) {
+                ColdFetch::Unavailable => unrecoverable(&self.stats),
+                end => Ok(Some(end)),
+            };
+        }
+        let rebuilt = {
+            // Every shard passed in was compared with its SHA-256 when it
+            // was read: the present data articles with their plan rows,
+            // the parity articles with the addendum.
+            let data: Vec<DataShard<'_>> = plan
+                .iter()
+                .zip(have)
+                .map(|(row, have)| match have {
+                    true => {
+                        let start = row.cipher_offset as usize;
+                        DataShard::Present(&cipher[start..start + row.cipher_len as usize])
+                    }
+                    false => DataShard::Lost {
+                        len: row.cipher_len as usize,
+                    },
+                })
+                .collect();
+            let parity: Vec<ParityShard<'_>> = usable
+                .iter()
+                .map(|&slot| ParityShard {
+                    row: parity.rows[slot],
+                    bytes: &shards[slot * len..(slot + 1) * len],
+                })
+                .collect();
+            reconstruct(&data, &parity)
+        };
+        let Ok(rebuilt) = rebuilt else {
+            return unrecoverable(&self.stats);
+        };
+        // Nothing of a rebuild is used unless all of it is what the plan
+        // says: one article that differs means the stripe is not the one
+        // the parity was made of.
+        let whole = rebuilt.len() == t
+            && gaps.iter().zip(&rebuilt).all(|(&a, bytes)| {
+                bytes.len() as u64 == plan[a].cipher_len && sha256(bytes) == plan[a].payload_sha256
+            });
+        if !whole {
+            return unrecoverable(&self.stats);
+        }
+        for (&a, bytes) in gaps.iter().zip(&rebuilt) {
+            let start = plan[a].cipher_offset as usize;
+            cipher[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+        self.stats.borrow_mut().rebuilt += t as u32;
+        Ok(None)
+    }
+
+    /// Reads one extent: every article with one `BODY`, each on whichever
+    /// socket is free, decoded into its place and compared with the
+    /// SHA-256 of its plan row; then the whole ciphertext against the
+    /// extent's digest. Nothing is returned that did not pass both.
+    ///
+    /// An article goes to the best tier of `read` providers that retains
+    /// it. One that a provider does not have, or has with other bytes, is
+    /// asked of the next provider; one whose connection broke goes back
+    /// to the other sockets, and the broken session reconnects (through
+    /// the next proxy, if the provider has several) while its reconnects
+    /// last ([`MAX_READ_RECONNECTS`]). A provider is not asked for an
+    /// article older than its retention, and a provider in a cooldown is
+    /// not asked at all. An article past every reader's stated retention
+    /// is asked of every reader before the read gives up.
+    ///
+    /// Articles that every provider was asked for and none had intact
+    /// are rebuilt from the extent's parity articles, when it has any
+    /// ([`Self::rebuild`]); an extent that lost none reads no parity.
+    pub(crate) async fn fetch(&mut self, extent: &ExtentRow) -> Result<ColdFetch> {
+        // The plan and the parity addendum beside it come with one
+        // read of the catalogue. The addendum is looked at only when an
+        // article is lost.
+        let stored = self.catalog.stored_plan(&extent.id).await?;
+        let plan = &stored.rows[..];
+        let size =
+            usize::try_from(extent.cipher_size).map_err(|_| BridgeError::Invalid("extent size"))?;
+        let spans = article_spans(extent.cipher_size);
+        let planned = plan.len() == spans.len()
+            && (0u32..).zip(plan).zip(&spans).all(|((idx, row), span)| {
+                row.idx == idx && row.cipher_offset == span.start && row.cipher_len == span.len
+            });
+        if plan.is_empty() || !planned {
+            return Ok(ColdFetch::Unavailable);
+        }
+
+        let now = self.clock.now();
+        let pool = Pool::load(self.catalog, self.providers, now).await?;
+        let readers: Vec<&'a ProviderConfig> = self.providers.iter().filter(|p| p.read).collect();
+        let mut order = pool.order(readers.clone(), PermitClass::Read);
+        if order.is_empty() {
+            // Every reader is cooling: a read is worth one attempt on the
+            // provider that is due back first, unless that one refused
+            // the login. A refused account answers no read: it is asked
+            // again when its cooldown ends, not on every read.
+            order.extend(pool.soonest_cooling(&readers));
+        }
+        // A session on a provider that is no longer in the order (it is
+        // cooling now) is not used.
+        let (kept, gone): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
+            .into_iter()
+            .partition(|s| order.iter().any(|p| p.id == s.provider.id));
+        self.sessions = kept;
+        ProviderSession::close_all(gone).await;
+
+        let mut desk = Desk {
+            out: vec![None; order.len()],
+            full: vec![false; order.len()],
+            asked: vec![false; order.len()],
+            breaks: vec![0; order.len()],
+            order,
+        };
+        let board = core::cell::RefCell::new(Board::new(size, 0, plan.len(), desk.order.len()));
+        let all = vec![true; plan.len()];
+        // On the heap too: a body nests many futures above this one.
+        Box::pin(self.read_rows(&mut desk, &readers, now, plan, &all, &board)).await?;
+        let Board {
+            mut cipher, have, ..
+        } = board.into_inner();
+        if have.contains(&false) {
+            let end = desk.short(&pool, &readers, plan, &have, now);
+            if end != ColdFetch::Unavailable {
+                return Ok(end);
+            }
+            // Every provider that may be asked answered, and articles
+            // are lost: the extent's parity, if it has any, is read now.
+            let lost = Lost {
+                stored: &stored,
+                have: &have,
+            };
+            // On the heap: the rebuild is rare, and what it holds across
+            // its awaits is not carried by every read that never needs it.
+            let rebuild = self.rebuild(extent, lost, &mut cipher, &mut desk, &pool, &readers, now);
+            let rebuilt = Box::pin(rebuild).await?;
+            if let Some(end) = rebuilt {
+                return Ok(end);
+            }
         }
         if sha256(&cipher) != extent.cipher_sha256 {
             return Ok(ColdFetch::Unavailable);
@@ -1611,7 +1895,7 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
         match read? {
             Checked::Wire => {
                 // Spans were checked against the plan by the caller.
-                let start = row.cipher_offset as usize;
+                let start = (row.cipher_offset - b.base) as usize;
                 let len = row.cipher_len as usize;
                 // Another socket may have supplied it meanwhile only if
                 // it was not taken, and it was: the place is this one's.
@@ -1668,6 +1952,7 @@ where
             sessions: Vec::new(),
             replacements: SLOW_REPLACEMENTS,
             stats: Default::default(),
+            room: self.budget.for_request(),
         })
     }
 
@@ -1771,6 +2056,36 @@ mod tests {
     /// What the drill showed: most connections take 150 to 200 ms for an
     /// article and one or two take over three seconds. Those are named,
     /// and nobody else.
+    /// A full extent that lost as many articles as it has parity: the
+    /// rebuild fits the request budget beside the read of the extent.
+    #[test]
+    fn a_rebuild_is_charged_its_parity_its_articles_and_the_codec() {
+        let shard = velmora::article::ARTICLE_ZERO_PAYLOAD_BYTES;
+        // 4 parity shards read, 4 rebuilt, 4 + 2 of working memory.
+        let need = cold_rebuild_bytes(shard, 4, 4);
+        assert_eq!(need, 14 * shard + 64);
+        assert_eq!(cold_rebuild_bytes(shard, 1, 1), 5 * shard + 4);
+        // Beside what a GET holds while it reads the extent over eight
+        // sockets, under a budget of 48 MiB.
+        let extent = 24 * shard;
+        assert!(cold_step_bytes(extent, 8) + need <= 48 * 1024 * 1024);
+        assert_eq!(cold_rebuild_bytes(u64::MAX, 4, 4), u64::MAX);
+    }
+
+    /// The log line of a read that rebuilt nothing is what it was.
+    #[test]
+    fn a_rebuild_is_named_in_the_log_line_only_when_there_was_one() {
+        let mut stats = ColdStats::default();
+        let plain = stats.to_string();
+        assert!(!plain.contains("rebuilt") && !plain.contains("unrecoverable"));
+        stats.rebuilt = 3;
+        stats.unrecoverable = 1;
+        assert_eq!(
+            stats.to_string(),
+            format!("{plain} rebuilt=3 extent-unrecoverable=1")
+        );
+    }
+
     #[test]
     fn a_connection_far_slower_than_the_middle_one_is_a_straggler() {
         let ended = paced(&[150, 3_300, 200, 180, 3_400, 160, 170, 190]);

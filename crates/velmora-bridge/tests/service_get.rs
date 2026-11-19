@@ -2475,3 +2475,280 @@ async fn largest_extent_fits_the_smallest_allowed_budget_cold() {
     assert!(resp.body == body);
     assert_eq!(cold.rig.bridge.budget.in_use(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Cold reads that rebuild lost articles from the extent's parity
+// ---------------------------------------------------------------------------
+
+/// 24 data articles and 4 parity articles.
+const FULL_EXTENT: usize = 16 * 1024 * 1024;
+
+/// A cold-read rig that plans parity for what it posts.
+async fn parity_cold() -> Cold {
+    let mut cold = cold_rig().await;
+    let bridge = Rc::get_mut(&mut cold.rig.bridge).expect("the rig alone holds the bridge");
+    bridge.cfg.packed_plans = true;
+    bridge.cfg.parity = true;
+    // Every `BODY` is noted, with no time passing.
+    bridge.nntp.slow(&bridge.clock, 0);
+    cold
+}
+
+/// The data articles of the extent, then its parity articles.
+async fn stripe(cold: &Cold, extent: &ExtentRow) -> (Vec<ArticleRow>, Vec<ArticleRow>) {
+    let stored = cold
+        .rig
+        .bridge
+        .catalog
+        .stored_plan(&extent.id)
+        .await
+        .unwrap();
+    let parity = stored
+        .parity_plan(&extent.id, extent.cipher_size)
+        .unwrap()
+        .expect("the extent has parity");
+    (stored.rows, parity.articles)
+}
+
+impl Cold {
+    /// The provider no longer has these articles.
+    async fn lose<'a>(&self, rows: impl IntoIterator<Item = &'a ArticleRow>) {
+        for row in rows {
+            self.server.hide(&format!("<{}>", row.message_id)).await;
+        }
+    }
+
+    /// The provider has `row` again.
+    async fn restore(&self, row: &ArticleRow) {
+        self.server.unhide(&format!("<{}>", row.message_id)).await;
+    }
+
+    /// The provider now holds, under the message-id of `row`, a
+    /// well-formed article of the right length with other bytes.
+    async fn damage(&self, extent: &ExtentRow, rows: &[ArticleRow], row: &ArticleRow) {
+        let end = (row.cipher_offset + row.cipher_len).max(extent.cipher_size);
+        let other = vec![0x5au8; end as usize];
+        let article = nntp_support::render(rows, row, &other, true);
+        self.server.hide(&format!("<{}>", row.message_id)).await;
+        let addr = self.server.addr();
+        let cfg = nntp_support::nntp_config(&addr.ip().to_string(), addr.port(), USER, PASS);
+        let mut client = nntp_support::dial(&cfg).await.unwrap();
+        client
+            .post_article(&row.message_id, &article)
+            .await
+            .unwrap();
+        client.quit().await;
+    }
+
+    /// `BODY` commands sent so far.
+    fn bodies(&self) -> usize {
+        let calls = self.rig.bridge.nntp.calls();
+        calls.iter().filter(|call| call.0 == "body").count()
+    }
+
+    /// A GET of the whole object with nothing in the cache.
+    async fn cold_get(&self, key: &str, extent: &ExtentRow) -> Resp {
+        evict(&self.rig, extent).await;
+        get(&self.rig, &self.signer, key, &[]).await
+    }
+
+    /// The GET failed, served nothing of `body` and cached nothing.
+    fn nothing_served(&self, resp: &Resp, body: &[u8]) {
+        resp.expect_error(503, "ServiceUnavailable");
+        assert!(!resp.body.windows(32).any(|w| w == &body[..32]));
+        assert!(self.rig.bridge.cache.keys().is_empty(), "nothing is cached");
+        assert_eq!(self.rig.bridge.nntp.live(), 0);
+        assert_eq!(self.rig.bridge.budget.in_use(), 0);
+    }
+}
+
+/// A full extent with one, two, three and four of its data articles gone
+/// from the provider reads back bit for bit, and the rebuilt extent is
+/// cached. With five gone nothing is served and nothing is cached.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_read_rebuilds_up_to_as_many_lost_articles_as_the_extent_has_parity() {
+    let cold = parity_cold().await;
+    let body = pattern(41, FULL_EXTENT);
+    let extent = cold.put_and_post("full.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    assert_eq!((data.len(), parity.len()), (24, 4));
+
+    // The first article, the last (shorter than a shard), and others.
+    for lost in [23usize, 0, 7, 16] {
+        cold.lose([&data[lost]]).await;
+        let resp = cold.cold_get("full.bin", &extent).await;
+        resp.expect(200);
+        assert_eq!(sha256(&resp.body), sha256(&body));
+        assert!(cached(&cold.rig, &extent));
+        assert_eq!(cold.rig.bridge.budget.in_use(), 0);
+    }
+
+    cold.lose([&data[11]]).await;
+    let resp = cold.cold_get("full.bin", &extent).await;
+    cold.nothing_served(&resp, &body);
+
+    // With one of the five back, the same request succeeds.
+    cold.restore(&data[0]).await;
+    let resp = cold.cold_get("full.bin", &extent).await;
+    resp.expect(200);
+    assert_eq!(sha256(&resp.body), sha256(&body));
+}
+
+/// Parity is read only for an extent that lost an article: a read that
+/// finds every data article sends one `BODY` each and no other, and one
+/// that lost a single article reads a single parity article.
+#[tokio::test(flavor = "current_thread")]
+async fn parity_is_read_only_when_an_article_is_lost() {
+    let cold = parity_cold().await;
+    let body = pattern(43, 6_500_000);
+    let extent = cold.put_and_post("ten.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    assert_eq!((data.len(), parity.len()), (10, 2));
+
+    let before = cold.bodies();
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+    assert_eq!(cold.bodies() - before, data.len());
+
+    // The lost article is asked for twice, then one parity article.
+    cold.lose([&data[4]]).await;
+    let before = cold.bodies();
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+    assert_eq!(cold.bodies() - before, data.len() + 1 + 1);
+}
+
+/// An article the provider holds with other bytes is a lost article: it
+/// is rebuilt, and the bytes the provider sent are not served.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_read_rebuilds_an_article_that_fails_its_hash() {
+    let cold = parity_cold().await;
+    let body = pattern(47, 6_500_000);
+    let extent = cold.put_and_post("ten.bin", &body).await;
+    let (data, _) = stripe(&cold, &extent).await;
+    cold.damage(&extent, &data, &data[3]).await;
+    cold.lose([&data[8]]).await;
+
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+    assert!(cached(&cold.rig, &extent));
+}
+
+/// A parity article that fails its hash is not given to the codec: the
+/// next one is read in its place. When no other is left, nothing is
+/// served.
+#[tokio::test(flavor = "current_thread")]
+async fn a_parity_article_that_fails_its_hash_is_not_used() {
+    let cold = parity_cold().await;
+    let body = pattern(53, 6_500_000);
+    let extent = cold.put_and_post("ten.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    cold.lose([&data[2]]).await;
+    let all = [data.clone(), parity.clone()].concat();
+    cold.damage(&extent, &all, &parity[0]).await;
+
+    // A rebuild from the damaged article would not match the plan.
+    let before = cold.bodies();
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+    // Ten data articles, the lost one once more, and both parity
+    // articles.
+    assert_eq!(cold.bodies() - before, data.len() + 1 + 2);
+
+    // The other parity article is gone as well: within the margin by
+    // count, but only one of the two shards needed is intact.
+    cold.lose([&parity[1]]).await;
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    cold.nothing_served(&resp, &body);
+
+    // Two data articles lost and one parity article left: not enough.
+    cold.restore(&parity[1]).await;
+    cold.lose([&parity[0], &data[9]]).await;
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    cold.nothing_served(&resp, &body);
+}
+
+/// A lost data article and a lost parity article, within what the parity
+/// left can rebuild.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_read_rebuilds_with_a_parity_article_lost_too() {
+    let cold = parity_cold().await;
+    let body = pattern(59, 6_500_000);
+    let extent = cold.put_and_post("ten.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    cold.lose([&data[0], &parity[0]]).await;
+
+    let resp = cold.cold_get("ten.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+}
+
+/// A small extent has one parity article: its one lost article is
+/// rebuilt, for a ranged GET that needs it as for a whole one; two lost
+/// articles are not.
+#[tokio::test(flavor = "current_thread")]
+async fn a_small_extent_is_rebuilt_from_its_one_parity_article() {
+    let cold = parity_cold().await;
+    let body = pattern(61, 1_500_000);
+    let extent = cold.put_and_post("small.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    assert_eq!((data.len(), parity.len()), (3, 1));
+    cold.lose([&data[1]]).await;
+
+    evict(&cold.rig, &extent).await;
+    let resp = get_range(&cold.rig, &cold.signer, "small.bin", "bytes=900000-900099").await;
+    assert_eq!(resp.expect(206).body, body[900_000..900_100]);
+    let resp = cold.cold_get("small.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+
+    cold.lose([&data[2]]).await;
+    let resp = cold.cold_get("small.bin", &extent).await;
+    cold.nothing_served(&resp, &body);
+}
+
+/// An extent of a single article.
+#[tokio::test(flavor = "current_thread")]
+async fn an_extent_of_one_article_is_rebuilt_from_its_parity_article() {
+    let cold = parity_cold().await;
+    let body = pattern(67, 40_000);
+    let extent = cold.put_and_post("one.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    assert_eq!((data.len(), parity.len()), (1, 1));
+    cold.lose([&data[0]]).await;
+
+    let resp = cold.cold_get("one.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+}
+
+/// An addendum that cannot be read rebuilds nothing: the read of an
+/// extent that lost an article fails, and the read of one that lost
+/// none is not touched by it.
+#[tokio::test(flavor = "current_thread")]
+async fn an_addendum_that_cannot_be_read_rebuilds_nothing() {
+    let cold = parity_cold().await;
+    let body = pattern(71, 1_500_000);
+    let extent = cold.put_and_post("small.bin", &body).await;
+    let (data, _) = stripe(&cold, &extent).await;
+    let changed = cold.rig.bridge.catalog.sql.with_conn(|c| {
+        c.execute(
+            "UPDATE extents SET parity = x'0100' WHERE id = ?1",
+            [extent.id.as_str()],
+        )
+        .unwrap()
+    });
+    assert_eq!(changed, 1);
+
+    let resp = cold.cold_get("small.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+
+    cold.lose([&data[1]]).await;
+    let resp = cold.cold_get("small.bin", &extent).await;
+    cold.nothing_served(&resp, &body);
+}

@@ -1299,6 +1299,12 @@ where
                 // again after a wait, on new connections, a few times.
                 Ok(ColdFetch::Interrupted) if interrupted < INTERRUPTED_RETRIES => interrupted += 1,
                 Ok(ColdFetch::Interrupted) => return Err(ReadFail::Busy),
+                // An extent that lost more than its parity rebuilds is
+                // as unavailable as one without parity.
+                Ok(ColdFetch::Unrecoverable) => {
+                    crate::trace::cold_read(|| "extent-unrecoverable".to_owned());
+                    return Err(ReadFail::Unavailable);
+                }
                 Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
                 Err(_) => return Err(ReadFail::Internal),
             }
