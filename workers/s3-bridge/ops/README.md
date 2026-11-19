@@ -969,11 +969,14 @@ statement that also moved a counter reports two.
 Read routes, all `GET` and served without a table scan:
 
 - `/_admin/ops-snapshot[?hours=N]`: the totals, the age of the oldest
-  due outbox row per stage, the hourly figures (the last 48 hours that had an event unless
-  `hours` says another number, at most 168; each names its hour) and the state of the recount.
-  The hourly figures count outbox rows leaving a stage in that hour,
-  as seen: a restore replay that closes a row counts as a verify, and
-  a row written late is counted in the hour it was written.
+  due outbox row per stage, the hourly figures (the last 48 hours that
+  had an event unless `hours` says another number, at most 168; each
+  names its hour) and the state of the recount.
+  Posts, verifies and releases count outbox rows leaving that stage
+  in the hour, and dead counts rows given up; failures count errors
+  recorded, retries in the same stage included. All are as seen: a
+  restore replay that closes a row counts as a verify, and a row
+  written late is counted in the hour it was written.
 - `/_admin/usage/buckets[?after=&limit=]`: objects and bytes per
   bucket, in pages; `next_after` is the cursor. `seeded: false` says
   that the counters are off and the figures are stale or missing.
