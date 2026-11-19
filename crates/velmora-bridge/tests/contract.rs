@@ -754,6 +754,31 @@ fn config_rejects_invalid_and_unsafe_values() {
         }
     );
     assert_eq!(cfg.publish_chunk_rows, Some(100));
+    // Nor one whose largest object is published in more than 128
+    // values: 10,000 extents in values of 78 rows are 129.
+    refused(&[("PUBLISH_CHUNK_ROWS", "78")]);
+    refused(&[("PUBLISH_CHUNK_ROWS", "1")]);
+    assert_eq!(
+        with(&[("PUBLISH_CHUNK_ROWS", "79")])
+            .unwrap()
+            .publish_chunk_rows,
+        Some(79)
+    );
+    assert_eq!(
+        with(&[("PUBLISH_CHUNK_ROWS", "1"), ("MAX_OBJECT_EXTENTS", "128")])
+            .unwrap()
+            .publish_chunk_rows,
+        Some(1)
+    );
+    refused(&[
+        ("PUBLISH_CHUNK_ROWS", "1023"),
+        ("MAX_OBJECT_EXTENTS", "131072"),
+    ]);
+    assert!(with(&[
+        ("PUBLISH_CHUNK_ROWS", "1024"),
+        ("MAX_OBJECT_EXTENTS", "131072")
+    ])
+    .is_ok());
     // No limit is taken whose largest object is a record of more
     // segments than a head names: 192 segments of 64 are 12,288. The
     // limit of an object in one document is no such record.

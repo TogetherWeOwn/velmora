@@ -79,6 +79,11 @@ pub const DEFAULT_MAX_OBJECT_EXTENTS: u32 = crate::recovery::SINGLE_RECORD_EXTEN
 /// 29.6 MiB (23.5 MiB at 65,536); see `ops/README.md`, "Large objects".
 pub const COMPLETE_CHARGE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Most values (`PUBLISH_CHUNK_ROWS` rows each) the publication of one
+/// object is cut into. A restore asks the catalogue twice a value in
+/// one call, far below the 1,000 queries a call may make.
+pub const MAX_PUBLISH_CHUNKS: u32 = 128;
+
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
 
@@ -570,6 +575,17 @@ impl BridgeConfig {
             return Err(ConfigError::Refused(
                 "MAX_OBJECT_EXTENTS in segments of RECORD_SEGMENT_EXTENTS is more than one record holds",
             ));
+        }
+        // The publication of the largest object is a bounded number of
+        // values, in the one batch of a Complete and in the checks of a
+        // restore, which ask the catalogue once or twice a value. With
+        // the built-in rows a value every limit passes (6 values).
+        if let Some(rows) = publish_chunk_rows {
+            if max_object_extents.div_ceil(rows) > MAX_PUBLISH_CHUNKS {
+                return Err(ConfigError::Refused(
+                    "MAX_OBJECT_EXTENTS in values of PUBLISH_CHUNK_ROWS is more than one publication takes",
+                ));
+            }
         }
         // Once an object may have more extents than one document holds
         // (the large-object limit), an upload of every part number in

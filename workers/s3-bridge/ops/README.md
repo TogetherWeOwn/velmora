@@ -742,7 +742,11 @@ extents or fewer is recorded in one document, byte for byte as before.
 **Shipped: off.** `MAX_OBJECT_EXTENTS` is not set, so the limit is
 10 000 and no segmented record is written. This build alone changes
 nothing: the limit is raised by a setting, and only after a drill of
-the segmented path on a deployment of its own has passed.
+the segmented path on a deployment of its own has passed. Raise it only
+on a build in which DeleteObject, a conditional write and UploadPartCopy
+read no extent rows they do not need, and CopyObject refuses a source
+above 10 000 extents: without that, those calls load every extent row
+of a large object in one result.
 
 | Setting | Shipped | The build takes | What it bounds |
 |---|---|---|---|
@@ -766,6 +770,11 @@ the segmented path on a deployment of its own has passed.
   of 100 664 300 bytes (1 004 bytes of chunk framing and trailer; over
   HTTP/1.1 another 971 bytes of transfer chunking): 4 MiB under the
   edge limit of 104 857 600.
+  The 1 MiB between `MAX_PUT_BYTES` and the edge limit is for that
+  framing. A client that signs every chunk adds about 89 bytes a chunk:
+  1 MiB covers chunks of 16 KiB at 99 MiB and of 32 KiB at 199 MiB
+  A client with smaller signed chunks uses a smaller part, or the edge
+  refuses the body with 413 before the Worker runs.
 - **CompleteMultipartUpload of an upload above 10 000 extents** reads
   the extents a run of 256 part numbers at a time, stores the segments
   as it goes, then the head, then publishes in one transaction. It
@@ -773,10 +782,11 @@ the segmented path on a deployment of its own has passed.
   with a newline every 5 s in between; a failure after the headers is
   an `<Error>` document in that `200`, as S3 itself answers this call.
   aws-cli, boto3 and rclone read it. When the client goes away the work
-  goes on for at most 30 s more. Work that is cut there has published
-  nothing (its segments, and perhaps its head, stay as they are): send
-  the request again. The same request after a publication is answered
-  from the receipt.
+  goes on for at most 30 s more. Work that is cut there has either
+  published the object or left it unpublished (with its segments, and
+  perhaps its head, as they are); a missing answer says neither. Send
+  the request again: after a publication it is answered from the
+  receipt, otherwise it publishes.
   Refusals that need no work (unknown upload, a part that does not
   match, too many extents, a condition that does not hold) keep their
   status code.
@@ -808,11 +818,16 @@ the segmented path on a deployment of its own has passed.
 segments and smaller publish values, so that a drill covers it with a
 small object. They only take values at or below the built-in ones. The
 Worker refuses to start when `MAX_OBJECT_EXTENTS` in segments of
-`RECORD_SEGMENT_EXTENTS` would be more than 192 segments. Production
+`RECORD_SEGMENT_EXTENTS` would be more than 192 segments, or in values
+of `PUBLISH_CHUNK_ROWS` more than 128 values (a restore asks the
+catalogue twice a value in one call): a drill sets a small
+`MAX_OBJECT_EXTENTS` with them. Production
 and dev set none of them, and a contract test holds them to that.
 
 **Rollback.** Once one segmented record exists (a key under `m/seg/` in
-`SAFETY`), never roll back to a version older than the first one that
+`SAFETY`, or under `m/x/<tenant>/seg/` with `RECORD_LAYOUT = tenant`;
+a live generation above `RECORD_SEGMENT_AFTER` extents has one), never
+roll back to a version older than the first one that
 reads segmented records in the replay, the recovery copy and the intent
 sweep. An older version cannot read a head: its replay stops at it, and
 its sweep finds no record for a sliced write and removes the slices a
