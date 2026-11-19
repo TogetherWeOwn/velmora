@@ -1,9 +1,11 @@
 //! Goldens for the tenant seams: what goes on a queue and what is named
 //! in a bucket is, byte for byte, what it was before the seams.
 //!
-//! Every literal in this file was taken from the build before the
-//! seams and this file was committed against that build, unchanged
-//! since. A change that makes one of these tests fail has changed a
+//! Every literal in this file holds on the build before the seams. The
+//! file calls nothing the seams changed, so the same file runs on both
+//! builds: it was first committed against the earlier one, and the
+//! names of the sliced path, added after, were checked against that
+//! same build. A change that makes one of these tests fail has changed a
 //! wire format or a stored name. That is never a part of a code-only
 //! change: a queue message of another shape is dropped by the Worker
 //! version next to it during a deploy and after a rollback, and a
