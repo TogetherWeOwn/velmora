@@ -202,7 +202,15 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
 /// none, and when the one it has is not an addendum of that plan: such
 /// an extent is restored without parity, and the replay goes on.
 fn parity_of(x: &ReplayExtent, packed: &[u8]) -> (SqlValue, SqlValue) {
-    let read = x.parity.as_deref().and_then(|addendum| {
+    addendum_of(x, packed, x.parity.as_deref())
+}
+
+/// `addendum` and the number of its articles as the values of
+/// `extents.parity` and `parity_count` beside the packed plan `packed`
+/// of the extent of `x`; NULL both for none and for one that is not an
+/// addendum of that plan.
+fn addendum_of(x: &ReplayExtent, packed: &[u8], addendum: Option<&[u8]>) -> (SqlValue, SqlValue) {
+    let read = addendum.and_then(|addendum| {
         let parity = crate::parity::expand(&x.row.id, x.row.cipher_size, packed, addendum).ok()?;
         Some((addendum, i64::try_from(parity.articles.len()).ok()?))
     });
@@ -217,6 +225,9 @@ struct Unreadable {
     extent: ExtentId,
     /// The stored value.
     stored: Vec<u8>,
+    /// The parity addendum on the row, beside the plan that does not
+    /// read.
+    parity: Option<Vec<u8>>,
     /// The plan of the extent's record, to put in its place. `None` =
     /// the record has no plan that this row can hold.
     plan: Option<Vec<u8>>,
@@ -240,7 +251,7 @@ async fn unreadable_plans<S: Sql>(
             .sql
             .query(
                 &format!(
-                    "SELECT id, cipher_size, plan FROM extents \
+                    "SELECT id, cipher_size, plan, parity FROM extents \
                      WHERE id IN ({marks}) AND plan IS NOT NULL"
                 ),
                 &chunk
@@ -254,6 +265,7 @@ async fn unreadable_plans<S: Sql>(
             let id = ExtentId::new(r.text()?);
             let cipher_size: u64 = r.num()?;
             let stored = r.blob()?;
+            let parity = r.opt_blob()?;
             if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
                 continue;
             }
@@ -275,6 +287,7 @@ async fn unreadable_plans<S: Sql>(
             out.push(Unreadable {
                 extent: id,
                 stored,
+                parity,
                 plan,
             });
         }
@@ -302,12 +315,17 @@ pub(super) async fn replay_extents<S: Sql>(
             // Keyed on the very value that was read: a plan that
             // changed since is another plan, and is left alone. The
             // record's addendum, when it is one of this plan, goes in
-            // with it; an addendum the row has is kept otherwise.
-            let (parity, parity_count) = parity_of(x, plan);
+            // with it; failing that the row keeps the addendum it has,
+            // when that is one of this plan. Any other addendum is of
+            // another plan and goes: the extent has no parity.
+            let from_record = addendum_of(x, plan, x.parity.as_deref());
+            let (parity, parity_count) = match from_record {
+                (SqlValue::Null, _) => addendum_of(x, plan, u.parity.as_deref()),
+                found => found,
+            };
             stmts.push((
                 "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
-                   parity = COALESCE(?6, parity), \
-                   parity_count = COALESCE(?7, parity_count) \
+                   parity = ?6, parity_count = ?7 \
                  WHERE id = ?1 AND plan = ?5",
                 vec![
                     text(x.row.id.as_str()),

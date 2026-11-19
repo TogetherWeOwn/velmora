@@ -4338,6 +4338,99 @@ async fn a_parity_addendum_is_stored_with_its_plan_and_posted_with_it() {
     assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
 }
 
+/// `drop_articles_meta` takes the addendum with the packed plan it is
+/// beside.
+#[tokio::test]
+async fn gc_drops_the_parity_addendum_with_its_plan() {
+    let fx = Fx::new().await;
+    // `old` is planned before its key is written again.
+    let old = fx.two_articles("k").await;
+    let post = fx.claim(&old, OutboxStage::Post, T0).await.unwrap();
+    let (blob, _) = fx.seeded(&old, 1);
+    let addendum = fx.addendum(&old, &blob, 7);
+    let stored = fx
+        .cat
+        .plan_packed(&post, TWO_ARTICLES, &blob, Some(&addendum))
+        .await
+        .unwrap();
+    assert!(stored.is_some());
+    assert_eq!(fx.extent(&old, "parity_count").await, "1");
+    fx.run(
+        "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, 'drop_articles_meta', 0)",
+        &[text(old.extent.as_str())],
+    )
+    .await;
+    let _live = fx.publish(&fx.bucket, "k").await;
+    let day = T0.plus_ms(24 * HOUR_MS);
+    let rows = gc_rows(&fx, day, true).await;
+    let of = |r: &&GcRow| r.extent_id == old.extent && r.action == GcAction::DropArticlesMeta;
+    let drop = rows.iter().find(of).cloned().unwrap();
+    assert_eq!(fx.cat.gc_begin(&drop, day).await.unwrap(), GcStep::Done);
+    assert_eq!(fx.extent(&old, "plan IS NULL").await, "1");
+    assert_eq!(fx.extent(&old, "parity IS NULL").await, "1");
+    assert_eq!(fx.extent(&old, "parity_count").await, "NULL");
+    assert!(fx.cat.articles(&old.extent).await.unwrap().is_empty());
+}
+
+/// A replay that replaces a packed plan that cannot be read leaves no
+/// addendum of another plan beside the new one: the record's addendum
+/// goes in when it is one of the new plan, else the row's own when that
+/// is one, else none.
+#[tokio::test]
+async fn a_replay_keeps_no_addendum_of_another_plan() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let keys = ["stale", "own", "record"];
+    let mut replay = Vec::new();
+    let mut made = Vec::new();
+    for key in keys {
+        let o = fx.two_articles(key).await;
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let (blob, rows) = fx.seeded(&o, 1);
+        let addendum = fx.addendum(&o, &blob, 7);
+        // On the row: a plan that does not read, and an addendum of
+        // another plan ("stale", "record") or of the record's ("own").
+        let on_row = match key {
+            "own" => fx.addendum(&o, &blob, 8),
+            _ => fx.addendum(&o, &fx.seeded(&o, 2).0, 8),
+        };
+        let set_plan = "UPDATE extents SET plan = x'ffffff', article_count = 2, parity = ?2, \
+                        parity_count = 1 WHERE id = ?1";
+        let params = [text(o.extent.as_str()), SqlValue::Blob(on_row.clone())];
+        assert_eq!(fx.run(set_plan, &params).await, 1);
+        replay.push(ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: Some(blob.clone()),
+            plan: Some(rows),
+            parity: (key == "record").then(|| addendum.clone()),
+            safety_present: true,
+        });
+        made.push((o, blob, addendum, on_row));
+    }
+    let stranded = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(9))
+        .await
+        .unwrap();
+    assert!(stranded.is_empty(), "{stranded:?}");
+    for ((o, blob, addendum, on_row), key) in made.iter().zip(keys) {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        assert_eq!(stored.packed.as_deref(), Some(&blob[..]), "{key}");
+        let want = match key {
+            "stale" => None,
+            "own" => Some(&on_row[..]),
+            _ => Some(&addendum[..]),
+        };
+        assert_eq!(stored.parity.as_deref(), want, "{key}");
+        let count = fx.extent(o, "parity_count").await;
+        assert_eq!(count, want.map_or("NULL", |_| "1"), "{key}");
+        // What is left expands beside the plan, or there is none.
+        let parity = stored.parity_plan(&o.extent, TWO_ARTICLES).unwrap();
+        assert_eq!(parity.is_some(), want.is_some(), "{key}");
+    }
+}
+
 fn hex_upper(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }

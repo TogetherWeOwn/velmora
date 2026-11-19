@@ -58,6 +58,7 @@ const ERR_PLAN: BridgeError = BridgeError::Invalid("packed article plan");
 /// stream per article, so an article's identifiers do not depend on how
 /// many bytes the articles before it drew.
 pub(crate) struct SeedRng {
+    label: &'static [u8; 23],
     seed: [u8; SEED_LEN],
     idx: u32,
     block: u32,
@@ -69,7 +70,14 @@ const STREAM_LABEL: &[u8; 23] = b"velmora article plan v1";
 
 impl SeedRng {
     pub(crate) fn new(seed: &[u8; SEED_LEN], idx: u32) -> Self {
+        Self::labelled(STREAM_LABEL, seed, idx)
+    }
+
+    /// A stream under another label than the data plan's: whatever the
+    /// seed and `idx`, it is not a stream of [`SeedRng::new`].
+    pub(crate) fn labelled(label: &'static [u8; 23], seed: &[u8; SEED_LEN], idx: u32) -> Self {
         SeedRng {
+            label,
             seed: *seed,
             idx,
             block: 0,
@@ -79,11 +87,11 @@ impl SeedRng {
     }
 }
 
-/// `HMAC-SHA256(seed, STREAM_LABEL || idx || block)` (RFC 2104), as two
+/// `HMAC-SHA256(seed, label || idx || block)` (RFC 2104), as two
 /// plain SHA-256 calls: the key is shorter than a hash block and the
 /// message is short and of one length, so both hashes are over a small
 /// buffer on the stack.
-fn stream_block(seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
+fn labelled_block(label: &[u8; 23], seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
     const BLOCK: usize = 64;
     const LABEL: usize = STREAM_LABEL.len();
     let mut inner = [0x36u8; BLOCK + LABEL + 8];
@@ -92,18 +100,24 @@ fn stream_block(seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
         inner[at] ^= k;
         outer[at] ^= k;
     }
-    inner[BLOCK..BLOCK + LABEL].copy_from_slice(STREAM_LABEL);
+    inner[BLOCK..BLOCK + LABEL].copy_from_slice(label);
     inner[BLOCK + LABEL..BLOCK + LABEL + 4].copy_from_slice(&idx.to_be_bytes());
     inner[BLOCK + LABEL + 4..].copy_from_slice(&block.to_be_bytes());
     outer[BLOCK..].copy_from_slice(&sha256(&inner));
     sha256(&outer)
 }
 
+/// A block of the data plan's stream.
+#[cfg(test)]
+fn stream_block(seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
+    labelled_block(STREAM_LABEL, seed, idx, block)
+}
+
 impl FillRandom for SeedRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) -> velmora::Result<()> {
         for byte in dest {
             if self.used == self.buf.len() {
-                self.buf = stream_block(&self.seed, self.idx, self.block);
+                self.buf = labelled_block(self.label, &self.seed, self.idx, self.block);
                 self.block = self.block.checked_add(1).ok_or_else(|| {
                     velmora::Error::Malformed("article plan stream is exhausted".into())
                 })?;

@@ -669,6 +669,11 @@ impl BridgeConfig {
             Some("on") => true,
             Some(_) => return Err(ConfigError::Invalid("PARITY".into())),
         };
+        // The addendum is stored beside a packed plan only: with plans
+        // of rows the switch would be on and no extent would get parity.
+        if parity && !packed_plans {
+            return Err(ConfigError::Refused("PARITY without PACKED_PLANS"));
+        }
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
             Some("tenant") => crate::recovery::Layout::default_tenant(),

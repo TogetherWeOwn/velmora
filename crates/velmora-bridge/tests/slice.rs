@@ -3157,6 +3157,182 @@ async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
     expect_bytes(s, "GET w/one.bin body", &body, &r.body);
 }
 
+/// The post job with parity, on the SQL catalogue. The addendum is on the
+/// extent's row before an article is sent, the plan is recorded as posted
+/// by one write, made after the data articles and the parity articles
+/// are all on the provider, and no article row is written.
+#[tokio::test(flavor = "current_thread")]
+async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
+    let rig = Rig::with_vars(&[("PACKED_PLANS", "on"), ("PARITY", "on")]).await;
+    let s = "parity setup";
+    rig.setup_buckets_and_key(s).await;
+    let body = test_bytes(41, 2 * MIB);
+    expect_status(
+        s,
+        "PUT y/one.bin",
+        200,
+        &rig.put("/slice/y/one.bin", &body).await,
+    );
+    let sent = rig.bridge.jobs.take();
+    expect_eq(s, "jobs after the upload", 1, sent.len());
+    let job = &sent[0].job;
+    let stamped = "SELECT COUNT(*) FROM extents WHERE posted_at IS NOT NULL";
+    let id: String = rig
+        .bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.query_row("SELECT id FROM extents", [], |r| r.get(0)))
+        .expect("the extent");
+    let id = ExtentId::new(id);
+
+    // The write that records the plan as posted fails: what the job had
+    // done when it came to it is all there is.
+    let s = "parity, before the plan is recorded";
+    rig.bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch(
+            "CREATE TRIGGER the_job_dies BEFORE UPDATE OF posted_at ON extents \
+             BEGIN SELECT RAISE(ABORT, 'the job dies here'); END;",
+        )
+        .expect("create trigger");
+    });
+    let outcome = rig.bridge.run_job(job).await;
+    expect(
+        s,
+        "the post job did not finish",
+        matches!(outcome, JobOutcome::Retry { .. }),
+        format!("{outcome:?}"),
+    );
+    expect_eq(
+        s,
+        "(data articles, parity articles) planned",
+        (3, 1),
+        (
+            rig.sql_count("SELECT article_count FROM extents"),
+            rig.sql_count("SELECT parity_count FROM extents"),
+        ),
+    );
+    expect_eq(
+        s,
+        "articles on the provider: the data and the parity",
+        4,
+        rig.server.posted_ids().await.len(),
+    );
+    expect_eq(
+        s,
+        "(article rows, plans recorded as posted)",
+        (0, 0),
+        (
+            rig.sql_count("SELECT COUNT(*) FROM articles"),
+            rig.sql_count(stamped),
+        ),
+    );
+    let plan = rig
+        .bridge
+        .catalog
+        .stored_plan(&id)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::stored_plan", "Ok", e));
+    expect(s, "the plan is packed", plan.packed.is_some(), "rows");
+    expect_eq(s, "data articles of the plan", 3, plan.rows.len());
+    let size = rig.sql_count("SELECT cipher_size FROM extents") as u64;
+    let parity = match plan.parity_plan(&id, size) {
+        Ok(Some(parity)) => parity,
+        other => fail(s, "the stored plan has its addendum", "Some", other.is_ok()),
+    };
+    expect_eq(
+        s,
+        "parity articles of the addendum",
+        1,
+        parity.articles.len(),
+    );
+    expect_eq(
+        s,
+        "(idx, state) of the parity article",
+        (3, ArticleState::Planned),
+        (parity.articles[0].idx, parity.articles[0].state),
+    );
+    let on_provider = rig.server.posted_ids().await;
+    expect(
+        s,
+        "the parity article is on the provider",
+        on_provider
+            .iter()
+            .any(|i| bare(i) == parity.articles[0].message_id),
+        &parity.articles[0].message_id,
+    );
+
+    // The next job finds every article and sends none: the plan is
+    // recorded, the parity articles with it.
+    let s = "parity, the next job";
+    rig.bridge.catalog.sql.with_conn(|c| {
+        c.execute_batch("DROP TRIGGER the_job_dies")
+            .expect("drop trigger");
+    });
+    rig.server.set_posting_allowed(false).await;
+    rig.bridge.clock.advance_secs(3600);
+    let outcome = rig.bridge.run_job(job).await;
+    expect(
+        s,
+        "the job is done",
+        outcome == JobOutcome::Ack,
+        format!("{outcome:?}"),
+    );
+    expect_eq(
+        s,
+        "(article rows, plans recorded as posted)",
+        (0, 1),
+        (
+            rig.sql_count("SELECT COUNT(*) FROM articles"),
+            rig.sql_count(stamped),
+        ),
+    );
+    let plan = rig
+        .bridge
+        .catalog
+        .stored_plan(&id)
+        .await
+        .unwrap_or_else(|e| fail(s, "Catalog::stored_plan", "Ok", e));
+    let posted = match plan.parity_plan(&id, size) {
+        Ok(Some(parity)) => parity,
+        other => fail(s, "the stored plan has its addendum", "Some", other.is_ok()),
+    };
+    expect(
+        s,
+        "the addendum did not change",
+        posted.articles[0].message_id == parity.articles[0].message_id,
+        &posted.articles[0].message_id,
+    );
+    expect_eq(
+        s,
+        "state of the parity article",
+        ArticleState::Posted,
+        posted.articles[0].state,
+    );
+
+    // The rest of the pipeline, and the object from Usenet alone.
+    let s = "parity, read-back";
+    rig.server.set_posting_allowed(true).await;
+    rig.pump(s).await;
+    expect_eq(
+        s,
+        "articles on the provider",
+        4,
+        rig.server.posted_ids().await.len(),
+    );
+    expect_eq(
+        s,
+        "article rows",
+        0,
+        rig.sql_count("SELECT COUNT(*) FROM articles"),
+    );
+    for key in rig.bridge.cache.keys() {
+        rig.bridge.cache.delete(&key).await.expect("cache delete");
+    }
+    let r = rig.get("/slice/y/one.bin").await;
+    expect_status(s, "GET y/one.bin", 200, &r);
+    expect_bytes(s, "GET y/one.bin body", &body, &r.body);
+}
+
 /// What D1 bills, in rows written, for an object over its whole life:
 /// upload, post, verification on two backbones, a day's wait and the
 /// release. Objects of one and of three 16 MiB extents give the cost of an

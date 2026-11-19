@@ -831,13 +831,17 @@ where
         let parity = plan
             .parity_plan(&extent.id, extent.cipher_size)
             .map_err(|_| Stop::fail(FailClass::Corrupt))?;
+        // The shards this job built a moment ago, when the stored
+        // addendum is the one it built from them. Any others are dropped
+        // before the shards are computed again, so the job never holds
+        // two sets: its memory charge counts one encode.
+        let mine = mine
+            .filter(|mine| plan.parity.as_deref() == Some(&mine.addendum[..]))
+            .map(|mine| mine.shards);
         let (parity, shards) = match (parity, mine) {
             (None, _) => (Vec::new(), Vec::new()),
-            // The addendum this job built from these shards a moment ago.
-            (Some(parity), Some(mine)) if plan.parity.as_deref() == Some(&mine.addendum) => {
-                (parity.articles, mine.shards)
-            }
-            (Some(parity), _) => {
+            (Some(parity), Some(shards)) => (parity.articles, shards),
+            (Some(parity), None) => {
                 let shards = stored_shards(&cipher, &parity).ok_or(corrupt)?;
                 (parity.articles, shards)
             }

@@ -773,6 +773,19 @@ fn config_rejects_invalid_and_unsafe_values() {
         tuned.insert("PARITY".into(), value.into());
         assert_eq!(load(&tuned).unwrap().parity, on, "PARITY={value:?}");
     }
+    // Parity is stored beside a packed plan: on without packed plans it
+    // would give no extent parity, so it is refused.
+    for packed in ["off", ""] {
+        let mut tuned = prod.clone();
+        tuned.insert("PARITY".into(), "on".into());
+        tuned.insert("PACKED_PLANS".into(), packed.into());
+        assert_eq!(
+            load(&tuned).unwrap_err(),
+            ConfigError::Refused("PARITY without PACKED_PLANS")
+        );
+        tuned.insert("PARITY".into(), "off".into());
+        assert!(!load(&tuned).unwrap().packed_plans);
+    }
     // The limits of the slice settings themselves are accepted, and the
     // default slice is never above one extent.
     for (put, slice, sweep) in [

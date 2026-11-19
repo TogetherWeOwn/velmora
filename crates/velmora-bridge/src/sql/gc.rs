@@ -149,9 +149,11 @@ pub(super) async fn gc_begin<S: Sql>(
                     ident(),
                 ),
                 (apply, vec![text(row.extent_id.as_str())]),
-                // The article metadata of a packed plan is the plan.
+                // The article metadata of a packed plan is the plan, and
+                // the parity addendum beside it.
                 (
-                    "UPDATE extents SET plan = NULL WHERE id = ?1 AND ?2 = 'drop_articles_meta'",
+                    "UPDATE extents SET plan = NULL, parity = NULL, parity_count = NULL \
+                     WHERE id = ?1 AND ?2 = 'drop_articles_meta'",
                     vec![text(row.extent_id.as_str()), text(row.action.as_str())],
                 ),
                 close,

@@ -157,7 +157,7 @@ RECOVERY_COPY = "off"
 #     and from then on never roll back past that one (see "Rollback floor" in ops/README.md).
 #   PARITY (off): off | on. On: the plan of a new extent gets a parity addendum (extents.parity, migration 0022) and its
 #     parity articles are posted with its data articles: one per six data articles, at least one. Only with
-#     PACKED_PLANS on. An addendum that is stored is posted and read whatever the switch says. A Worker from before
+#     PACKED_PLANS on: on without it, the Worker refuses its configuration. An addendum that is stored is posted and read whatever the switch says. A Worker from before
 #     this switch ignores an addendum: it reads every plan as before, and an extent it posts or releases is left
 #     without its parity articles. Not set here: production posts no parity yet.
 

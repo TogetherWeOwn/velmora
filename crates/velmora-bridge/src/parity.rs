@@ -8,9 +8,9 @@
 //! rebuilt from the rest. The addendum says where the parity articles
 //! are: per parity article its row number in the code and the SHA-256 of
 //! its payload, plus a 16-byte random seed, the posting clock and the
-//! newsgroup list its identifiers are derived from, exactly as a seeded
+//! newsgroup list its identifiers are derived from, the way a seeded
 //! plan derives those of a data article ([`SeedRng`], keyed by the row
-//! number).
+//! number), from a stream under a label of its own.
 //!
 //! The data plan is not changed by it, byte for byte. A reader takes the
 //! stripe from the addendum, never from [`parity_count`]: the number of
@@ -97,6 +97,13 @@ pub struct ParityPlan {
     pub articles: Vec<ArticleRow>,
 }
 
+/// The label of the keyed stream the identifiers of a parity article are
+/// drawn from: block `n` of parity row `row` is
+/// `HMAC-SHA256(seed, "velmora parity plan, v1" || row || n)`. It is not
+/// the label of the data plan's stream, so no parity article shares a
+/// stream with a data article, whatever the two seeds are.
+const STREAM_LABEL: &[u8; 23] = b"velmora parity plan, v1";
+
 /// The identifiers of the parity articles `rows` (row number and payload
 /// hash each) of the stripe (`k`, `len`) of `extent`.
 fn derive(
@@ -110,7 +117,7 @@ fn derive(
 ) -> Result<Vec<ArticleRow>> {
     let mut out = Vec::with_capacity(rows.len());
     for ((slot, idx), (row, hash)) in (0u64..).zip(u32::from(k)..).zip(rows) {
-        let mut rng = SeedRng::new(seed, u32::from(*row));
+        let mut rng = SeedRng::labelled(STREAM_LABEL, seed, u32::from(*row));
         let meta = obfuscate_article(&mut rng, planned_secs, groups).map_err(|_| ERR_PARITY)?;
         let headers = render_obfuscated_headers(&meta).map_err(|_| ERR_PARITY)?;
         let cipher_offset = slot
@@ -453,14 +460,32 @@ mod tests {
         );
     }
 
-    const PINNED_ADDENDUM: &str = "010000010003000b00e06465666768696a6b6c6d6e6f70717273000000006b49d200696f6fcf0ffe79346e0b89105d33c9ce0111616c742e62696e61726965732e7465737402000096a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc70001b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2";
+    /// A parity article draws from a stream of its own: with the seed
+    /// and the number of a data article, its identifiers are still not
+    /// that article's.
+    #[test]
+    fn a_parity_stream_is_not_a_data_stream() {
+        use velmora::rng::FillRandom;
+        let seed = [7u8; SEED_LEN];
+        for at in [0u32, 1, 3, 65_535] {
+            let (mut data, mut parity) = ([0u8; 96], [0u8; 96]);
+            SeedRng::new(&seed, at).fill_bytes(&mut data).unwrap();
+            SeedRng::labelled(STREAM_LABEL, &seed, at)
+                .fill_bytes(&mut parity)
+                .unwrap();
+            assert_ne!(data, parity);
+            assert!(data.chunks(32).all(|d| parity.chunks(32).all(|p| p != d)));
+        }
+    }
+
+    const PINNED_ADDENDUM: &str = "010000010003000b00e06465666768696a6b6c6d6e6f70717273000000006b49d200a81bb8c9390606d319dd1b9e3795e7ac0111616c742e62696e61726965732e7465737402000096a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc70001b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2";
     const PINNED_MESSAGE_IDS: [&str; 2] = [
-        "tiwmail08p63eulnl3v8sr4tkex0z51g@dwgssjtf.gxu",
-        "gjcipfe0b9db5v4fsud0pk5a0o21u7k2@g2txe8cx.xkj",
+        "3zxw84wh9oqblc256wgrr14ehv31gwm5@5wf59alx.fqs",
+        "3t7efr1yi2rjz3rhwntshdfi9dvevp7x@kzrng8wz.5fx",
     ];
     const PINNED_HEADERS_SHA256: &str =
-        "47e41c0bd8909ea111eb018cbf6b19fa9ac31ee235f2db61a551a6dffbec0948";
-    const PINNED_YENC_NAME: &str = "mxt6rlpbtrpk";
+        "e9c6cf139d38069d59caf03c7a2e4afcf2aa9d360005147dd586550f2e58ca81";
+    const PINNED_YENC_NAME: &str = "kcii56b6rc40";
 
     /// The size of an addendum: 50 bytes, the newsgroup list, and 34
     /// bytes per parity article.
