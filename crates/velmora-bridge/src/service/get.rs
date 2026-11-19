@@ -823,6 +823,7 @@ async fn relay<C, B, N, J, K, T>(
         // What the stores answered counts for the first try only: a
         // piece that was taken back is in the cache by the next.
         let mut absent = flowed.absent;
+        let mut retried = false;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -831,8 +832,15 @@ async fn relay<C, B, N, J, K, T>(
                 out.wanted().await;
             }
             cold.mid = at > 0 || flowed.sent > 0;
+            if retried {
+                // A piece taken back while the reader asked: the cache
+                // write of the extent may still run, and the cache is
+                // asked first.
+                cold.settle().await;
+            }
             let item = cold.piece(&bucket, piece, absent).await;
             absent = false;
+            retried = true;
             let failed = item.is_err();
             // Before the last item and before an error: the reader of
             // the body may never ask again after either, and the last
@@ -1295,7 +1303,8 @@ where
     /// If it does not, the copy and the charge are given up, all of it
     /// is waited for with nothing held, and the store is asked again:
     /// two reads that each held a part and waited for the rest would
-    /// wait for each other.
+    /// wait for each other. (The one exception, bounded in time, is the
+    /// top-up of a block in [`Self::flow`] once a block is out.)
     async fn warm(&mut self, bucket: &Bucket, piece: &Piece, span: ByteSpan) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
@@ -1480,9 +1489,14 @@ where
                 if short > 0 {
                     let more = match room.try_charge(short) {
                         Some(more) => Some(more),
-                        // The status line is out. These few bytes are
-                        // waited for: what is left of the piece in one
-                        // would need far more room than they do.
+                        // A block of this piece is out. These few bytes
+                        // are waited for: what is left of the piece in
+                        // one would need far more room than they do.
+                        // The one wait for room with room held (see
+                        // `warm`): bounded by `CHARGE_WAIT_MS`, after
+                        // which the window is dropped and the body ends
+                        // short. A later piece, which has sent nothing
+                        // of its own yet, does not wait here.
                         None if done.sent > 0 => self.wait(room.charge(short)).await.ok(),
                         None => None,
                     };
@@ -1625,7 +1639,7 @@ where
                     // may have taken it. Then the extent is given up
                     // and read again under a charge for all of it, taken
                     // with nothing held: a read never waits for room
-                    // while it holds some.
+                    // while it holds some (but see `flow`).
                     let short = need.saturating_sub(work.bytes());
                     if short > 0 {
                         match room.try_charge(short) {

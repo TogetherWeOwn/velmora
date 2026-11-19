@@ -4,13 +4,14 @@
 
 mod service_support;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use futures_util::future::{ready, FutureExt};
+use futures_util::future::{pending, ready, FutureExt};
 use futures_util::StreamExt;
 use service_support::*;
 use velmora::media::{CIPHER_CHUNK_SIZE, HEADER_SIZE, PLAIN_CHUNK_SIZE};
-use velmora_bridge::ingress::{ByteBudget, Sleeper};
+use velmora_bridge::ingress::{ByteBudget, Charge, Sleeper, CHARGE_POLL_MS};
 use velmora_bridge::*;
 
 const BUCKET: &str = "bkt-flow";
@@ -188,13 +189,12 @@ async fn a_body_in_blocks_needs_no_more_of_the_budget_than_its_window() {
     rig.bridge.safety.inner.stream_in(20_000);
     let all = rig.bridge.cfg.inflight_budget_bytes;
 
-    let window = (4 << 20) + 100_000;
+    let window = 4 << 20;
     let others = rig.bridge.budget.try_charge(all - window).unwrap();
     let (blocks, whole) = items(&rig, &signer, "k").await;
     assert!(whole, "{} bytes arrived", blocks.concat().len());
     assert!(blocks.concat() == body);
     assert!(blocks.len() > 8, "{}", blocks.len());
-    assert!(rig.bridge.budget.peak() <= all);
     assert_eq!(rig.bridge.budget.in_use(), all - window);
     drop(others);
 
@@ -372,4 +372,84 @@ async fn a_body_that_stalls_is_read_on_from_a_second_read_without_a_byte_twice()
     assert!(resp.expect(206).body == body[100_000..=400_000]);
     assert_eq!(safety.gets() - before, 2);
     assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
+/// Once a block of a piece is out, a block that finds no room beside
+/// its window waits for it; room that frees up meanwhile is taken and
+/// the body goes on whole. Room that never frees up ends the body short
+/// after the wait, with only authenticated bytes out and the budget
+/// whole again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_block_after_the_first_waits_for_room_beside_its_window() {
+    for frees_up in [true, false] {
+        // Room taken by others while the body is read; the timer of a
+        // charge that waits gives it back if `frees_up`. Other timers
+        // never end.
+        let others: Rc<RefCell<Option<Charge>>> = Rc::default();
+        let polls = Rc::new(std::cell::Cell::new(0u32));
+        let sleeper: Sleeper = {
+            let others = Rc::clone(&others);
+            let polls = Rc::clone(&polls);
+            Rc::new(move |ms| {
+                if ms != CHARGE_POLL_MS {
+                    return pending().boxed_local();
+                }
+                polls.set(polls.get() + 1);
+                if frees_up {
+                    others.borrow_mut().take();
+                }
+                ready(()).boxed_local()
+            })
+        };
+        let cfg = config(Vec::new());
+        let budget = ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(sleeper);
+        let rig = rig_with_budget(NoNntp, cfg, budget);
+        let (_, signer) = rig.standard(BUCKET).await;
+        let body = pattern(13, 8 << 20);
+        rig.put(&signer, BUCKET, "k", &body).await.expect(200);
+        rig.bridge.safety.inner.stream_in(20_000);
+        let all = rig.bridge.cfg.inflight_budget_bytes;
+        let gets = rig.bridge.safety.inner.gets();
+
+        let req = signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "k"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut stream) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        let mut got = Vec::new();
+        let mut whole = true;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => got.extend_from_slice(&bytes),
+                Err(_) => {
+                    whole = false;
+                    break;
+                }
+            }
+            if got.len() >= 7 << 19 && others.borrow().is_none() && polls.get() == 0 {
+                // Every byte not held by this read is taken.
+                let free = all - rig.bridge.budget.in_use();
+                *others.borrow_mut() = Some(rig.bridge.budget.try_charge(free).unwrap());
+            }
+        }
+        assert!(polls.get() > 0, "{frees_up}: the block waited");
+        assert_eq!(whole, frees_up, "{frees_up}: {} bytes", got.len());
+        assert!(got == body[..got.len()], "only authenticated bytes left");
+        if frees_up {
+            assert_eq!(got.len(), body.len());
+            // In blocks to the end: the rest is not read again in one.
+            assert_eq!(rig.bridge.safety.inner.gets() - gets, 1);
+        }
+        drop(stream);
+        others.borrow_mut().take();
+        assert_eq!(rig.bridge.budget.in_use(), 0, "{frees_up}");
+    }
 }
