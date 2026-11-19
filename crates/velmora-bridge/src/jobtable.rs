@@ -108,6 +108,8 @@ struct Inner<'a, T> {
     next_id: Cell<u64>,
     slots: RefCell<Vec<Slot<'a, T>>>,
     reaped: Cell<u64>,
+    /// Of `reaped`, how many [`JobTable::unreported`] has given out.
+    reported: Cell<u64>,
 }
 
 impl<'a, T> Inner<'a, T> {
@@ -147,6 +149,7 @@ impl<'a, T> JobTable<'a, T> {
                 next_id: Cell::new(0),
                 slots: RefCell::new(Vec::new()),
                 reaped: Cell::new(0),
+                reported: Cell::new(0),
             }),
         }
     }
@@ -229,6 +232,13 @@ impl<'a, T> JobTable<'a, T> {
     /// Jobs dropped by [`Self::reap`] since the isolate began.
     pub fn reaped(&self) -> u64 {
         self.inner.reaped.get()
+    }
+
+    /// Jobs dropped since this was last asked, whoever dropped them:
+    /// for the one place that logs them. Each is given out once.
+    pub fn unreported(&self) -> u64 {
+        let reaped = self.inner.reaped.get();
+        reaped.saturating_sub(self.inner.reported.replace(reaped))
     }
 }
 
@@ -413,6 +423,8 @@ mod tests {
         );
         assert_eq!((table.len(), budget.in_use()), (0, 0));
         assert_eq!(table.reaped(), 3);
+        // Each dropped job is reported once, to whoever asks first.
+        assert_eq!((table.unreported(), table.unreported()), (3, 0));
         assert!(budget.try_charge_job(22 * MIB).is_some());
     }
 

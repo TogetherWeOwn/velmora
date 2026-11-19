@@ -1637,7 +1637,7 @@ where
         Ok(charge) => charge,
         Err(e) => {
             bridge.reap_work();
-            bridge.budget.try_charge(bytes).ok_or(e)?
+            bridge.budget.try_charge_ahead(bytes).ok_or(e)?
         }
     };
     let work = {

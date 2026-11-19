@@ -796,8 +796,11 @@ on a build in which:
   marked it for 60 s; a Complete that found no room after its wait
   does the same once more before it answers 503. That gives the 32 MiB
   back and logs
-  `work table: abandoned work dropped: ... budget_in_use_before=...
-  budget_in_use=...`. Work that is cut has either
+  `work table: abandoned work dropped: ... dropped_now=...
+  budget_in_use_before=... budget_in_use=...`. What a Complete dropped
+  after its wait is logged by the next request or queue batch of the
+  isolate, with `dropped_now=0` and two equal budget numbers. Work that
+  is cut has either
   published the object or left it unpublished (with its segments, and
   perhaps its head, as they are); a missing answer says neither. Send
   the request again: after a publication it is answered from the
@@ -815,13 +818,15 @@ on a build in which:
   another do not keep a Complete out for good, a job that would keep a
   waiting Complete out waits itself (it gives its lease back unspent
   when it has waited 20 s, as for any full budget) until the Complete
-  has its charge or gives up; the jobs that run finish first. A job is
-  held back only when the jobs are what keeps that Complete out: not
-  one that leaves room beside it, not while requests keep it out
-  (another such Complete runs, or bodies are being read), and not the
-  repost of a verify job that runs already. Nothing changes while no
-  Complete waits. A Complete whose request was stopped while it waited
-  holds the others back for 2 s, once.
+  has its charge or gives up; the jobs that run finish first. Not held
+  back: a job that leaves room beside that Complete, any job while
+  another such Complete runs (that one keeps it out, for as long as its
+  work takes), and the repost of a verify job that runs already. While
+  bodies are being read the jobs do wait: bodies pass in seconds, and
+  jobs let in meanwhile would hold the room when the bodies are done.
+  Nothing changes while no Complete waits. A Complete whose request was
+  stopped while it waited holds the others back for 2 s, once, whatever
+  the other requests do.
   The budget was not raised instead: a Complete and two such post jobs
   hold about 74 MiB, above the 72 MiB that the isolate is sized for, and
   a request budget of 64 MiB would let two 16 MiB bodies in at once on

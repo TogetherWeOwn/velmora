@@ -248,11 +248,14 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
 fn log_budget(bridge: &env::WorkerBridge) {
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
     let before = bridge.budget.in_use();
-    let dropped = bridge.reap_work();
+    let now_dropped = bridge.reap_work();
+    // With what a Complete dropped after its wait, since the last line.
+    let dropped = bridge.works.unreported();
     if dropped > 0 {
         console_error!(
             "work table: abandoned work dropped: isolate={} dropped={dropped} \
-             budget_in_use_before={before} budget_in_use={} running_work={} dropped_total={}",
+             dropped_now={now_dropped} budget_in_use_before={before} budget_in_use={} \
+             running_work={} dropped_total={}",
             env::isolate(),
             bridge.budget.in_use(),
             bridge.works.len(),
