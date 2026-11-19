@@ -779,6 +779,11 @@ pub trait Catalog {
     /// including the delimiter) may be left out. The caller folds: it
     /// gets the first key of every group and never needs the rest. Fewer
     /// than `q.max_keys` rows means the range is exhausted.
+    ///
+    /// One call reads one batch: `q.max_keys` above 1,001 (a full S3
+    /// page of 1,000 plus the one row that shows whether it is
+    /// truncated) is refused with `Invalid`. A caller that wants more
+    /// rows pages, as both listing versions do.
     async fn list_heads(&self, bucket: &BucketId, q: &ListQuery) -> Result<Vec<ListEntry>>;
     /// Admin view.
     async fn object_status(&self, bucket: &BucketId, key: &str) -> Result<Option<ObjectStatus>>;
