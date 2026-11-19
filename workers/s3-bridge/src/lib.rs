@@ -15,6 +15,7 @@ mod env;
 mod fanout;
 mod http;
 mod jobs;
+mod metrics;
 mod nntp;
 mod queues;
 mod r2;
@@ -105,11 +106,33 @@ async fn handle_detached(
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // What a GET read from Usenet, one line per run of cold extents.
-    velmora_bridge::trace::log_cold_reads(|line| console_log!("cold read: {line}"));
+    velmora_bridge::trace::log_cold_reads(|line| {
+        console_log!("cold read: {line}");
+        // A cache miss, counted as it happens: see `velmora_bridge::metrics`.
+        metrics::write(&velmora_bridge::metrics::cold_read_point());
+    });
+    metrics::bind(&env);
     if let Ok(bridge) = env::bridge(&env) {
         log_budget(&bridge);
     }
+    let started = worker::Date::now().as_millis();
     let method = req.inner().method();
+    let colo = req.cf().map(|cf| cf.colo()).unwrap_or_default();
+    let length = |headers: &worker::Headers| {
+        headers
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let bytes_in = length(req.headers());
+    // A sub-request of a large GET is this Worker calling itself: the
+    // GET it belongs to is the request that is counted.
+    let internal = req
+        .headers()
+        .has(velmora_bridge::fanout::TOKEN_HEADER)
+        .unwrap_or(false);
     // Every answer for an admin route carries `no-store`, the early
     // refusals below too.
     let admin = ingress::is_admin_url(&req.inner().url());
@@ -172,6 +195,21 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     );
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
+    }
+    if !internal {
+        let sample = bridge.cfg.metrics_sample;
+        if let Some(weight) = velmora_bridge::metrics::weight(status, sample, &request_id) {
+            let seen = velmora_bridge::metrics::Request {
+                method: &method,
+                admin,
+                status,
+                latency_ms: worker::Date::now().as_millis().saturating_sub(started),
+                bytes_in,
+                bytes_out: length(out.headers()),
+                colo: &colo,
+            };
+            metrics::write(&velmora_bridge::metrics::request_point(&seen, weight));
+        }
     }
     Ok(out)
 }
@@ -449,6 +487,16 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             }
             if report.pack_failed {
                 console_error!("dispatch: packing article plans failed");
+            }
+            if report.recount_failed {
+                console_error!("dispatch: the usage recount step failed");
+            }
+            match report.recount_drift {
+                Some(0) => console_log!("dispatch: usage recount ended, no drift"),
+                Some(n) => console_error!(
+                    "alert: usage counters differ from the tables in {n} figures; see /_admin/ops-snapshot"
+                ),
+                None => {}
             }
             let resend_secs = velmora_bridge::jobs::RESEND_SECS;
             if report.resend_post_secs > resend_secs || report.resend_verify_secs > resend_secs {

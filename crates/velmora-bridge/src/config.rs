@@ -251,7 +251,22 @@ pub struct BridgeConfig {
     pub dev_trust_http: bool,
     pub providers: Vec<ProviderConfig>,
     pub admin_token: Secret,
+    /// A second admin token that may only read (`ADMIN_READ_TOKEN`):
+    /// `GET` on the routes of [`crate::ingress::ADMIN_READ_ROUTES`]. What
+    /// a dashboard holds. `None` = only `ADMIN_TOKEN` is accepted.
+    pub admin_read_token: Option<Secret>,
+    /// The only host `/_admin` answers on (`ADMIN_HOST`). Meant to be a
+    /// name no public route of the Worker has, so that the admin routes
+    /// are reached through a service binding alone. `None` = on every
+    /// host the Worker serves.
+    pub admin_host: Option<String>,
+    /// One request in this many is written to the metrics dataset
+    /// (`METRICS_SAMPLE`, default 10); every one that ended in a 5xx is.
+    pub metrics_sample: u32,
 }
+
+/// `METRICS_SAMPLE` when unset: one request in ten.
+pub const DEFAULT_METRICS_SAMPLE: u32 = 10;
 
 fn required(get: &impl Fn(&str) -> Option<String>, name: &str) -> Result<String, ConfigError> {
     match get(name) {
@@ -800,6 +815,36 @@ impl BridgeConfig {
             return Err(ConfigError::Invalid("ADMIN_TOKEN".into()));
         }
 
+        // Optional, and held to the same length as the main token. The
+        // same value twice would make the read token a write token.
+        let admin_read_token = match get("ADMIN_READ_TOKEN") {
+            None => None,
+            Some(t) if t.is_empty() => None,
+            Some(t) if t.len() < MIN_ADMIN_TOKEN_LEN || t == admin_token => {
+                return Err(ConfigError::Invalid("ADMIN_READ_TOKEN".into()));
+            }
+            Some(t) => Some(Secret::new(t)),
+        };
+        let admin_host = match get("ADMIN_HOST").as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(h)
+                if h.len() <= 253
+                    && h.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
+                    }) =>
+            {
+                Some(h.to_string())
+            }
+            Some(_) => return Err(ConfigError::Invalid("ADMIN_HOST".into())),
+        };
+        let metrics_sample = match get("METRICS_SAMPLE").as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_METRICS_SAMPLE,
+            Some(v) => match v.parse::<u32>() {
+                Ok(n @ 1..=10_000) => n,
+                _ => return Err(ConfigError::Invalid("METRICS_SAMPLE".into())),
+            },
+        };
+
         Ok(BridgeConfig {
             environment,
             s3_host,
@@ -831,6 +876,9 @@ impl BridgeConfig {
             dev_trust_http,
             providers,
             admin_token: Secret::new(admin_token),
+            admin_read_token,
+            admin_host,
+            metrics_sample,
         })
     }
 

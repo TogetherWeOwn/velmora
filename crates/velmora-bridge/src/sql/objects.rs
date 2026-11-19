@@ -1227,5 +1227,7 @@ pub(super) async fn set_safety_state<S: Sql>(
             ],
         )
         .await?;
-    Ok(changed == 1)
+    // At least one: a usage-counter trigger adds its own row to the
+    // count, and only when the extent's row was changed.
+    Ok(changed >= 1)
 }

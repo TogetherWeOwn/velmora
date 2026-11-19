@@ -922,6 +922,69 @@ range from Usenet at 1.3 MiB/s, and one such GET lost its provider
 connection in the second sub-range and broke after 1,152 MiB; a
 connection lost now is opened again.
 
+## Usage counters and metrics
+
+The catalogue keeps running totals so that the status and dashboard
+routes read a handful of rows instead of counting tables: extents by
+state, outbox rows by stage, bytes not yet released and bytes pinned,
+live objects and bytes per bucket, posts, verifies and releases per
+hour, and the failed and dead counts. Triggers (migration 0022) change
+a total in the same statement as the row it counts, so a batch that
+fails leaves both as they were.
+
+The migration creates empty tables and reads nothing. The counters are
+off until the first recount has gone over every row, and a Worker from
+before the migration runs on the new schema unchanged.
+
+Switching them on (once, after the migration):
+
+1. `POST /_admin/usage/recount` (admin bearer). It starts a recount and
+   does a few bounded steps; no statement reads more than a few
+   thousand rows. Optional: `steps` (default 4, at most 16) and `chunk`
+   (rows per step, at most 4000).
+2. The cron continues it, five steps per run. `GET /_admin/ops-snapshot`
+   shows `recount` while it runs and `seeded: true` when it has ended.
+   Calling the route again also continues it.
+3. From then on the cron recounts once a week and compares. A
+   difference is logged as `alert: usage counters differ from the
+   tables` and kept in `last_recount`; the counters are replaced only
+   by `POST /_admin/usage/recount?adopt=1`. `restart=1` abandons a
+   recount that is running and begins again.
+
+Rows written: with packed plans, 52 per extent and 23 per object with
+the counters on, against 46 and 21 with them off (measured on the local
+rig; `rows_written_per_extent` in the slice tests prints both).
+
+Before rolling back to a Worker older than this one, send
+`POST /_admin/usage/off`: it switches the triggers off, and the totals
+are rebuilt by a recount when the newer Worker returns. An older Worker
+compares the number of rows a statement changed with one, and a
+statement that also moved a counter reports two.
+
+Read routes, all `GET` and served without a table scan:
+
+- `/_admin/ops-snapshot[?hours=N]`: the totals, the age of the oldest
+  due outbox row per stage, the hourly figures (default 48 hours, at
+  most 168) and the state of the recount.
+- `/_admin/usage/buckets[?after=&limit=]`: objects and bytes per
+  bucket, in pages; `next_after` is the cursor.
+- `/_admin/cost`: the JSON at `ops/cost/latest.json` in the cache
+  bucket, as the cost job left it (404 when there is none).
+
+`ADMIN_READ_TOKEN` (a secret, at least 32 characters, different from
+`ADMIN_TOKEN`) opens these three and `/_admin/status`, with `GET` only;
+it opens nothing that changes state. `ADMIN_HOST`, when set, is the
+only host name on which `/_admin/` answers at all; on any other host
+the routes answer 404.
+
+Request metrics go to the Analytics Engine dataset bound as `METRICS`:
+one request in `METRICS_SAMPLE` (default 10) and every 5xx. A point has
+the method, the status class, `s3` or `admin`, and the colo as text,
+and the status, latency in ms, request bytes, response bytes and the
+sampling weight as numbers; sum the weight to estimate request counts.
+A read from Usenet (a cache miss) is a point of kind `cold`, never
+sampled. No bucket, key, query, header or request id is written.
+
 ## KEK
 
 The escrow file holds one `VELMORA_KEK_<version>=<base64 of 32 bytes>` line

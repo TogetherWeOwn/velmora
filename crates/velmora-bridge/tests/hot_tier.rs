@@ -1583,6 +1583,9 @@ async fn the_migration_applies_to_a_catalogue_with_extents() {
         }
     });
     db.apply(MIGRATION_0004).unwrap();
+    // The usage counters arrive unarmed: the figures below are still read
+    // from the tables.
+    db.apply(MIGRATION_0022).unwrap();
 
     let new_columns: Vec<(i64, i64, Option<i64>, i64)> = db.with_conn(|c| {
         let mut stmt = c

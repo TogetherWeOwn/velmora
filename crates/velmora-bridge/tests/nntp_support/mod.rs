@@ -838,6 +838,40 @@ impl Catalog for MemCatalog {
 
     // The hot tier is tested on the SQL catalogue; here nothing is ever
     // evictable.
+    async fn usage_counters(&self) -> Result<velmora_bridge::types::UsageCounters> {
+        unused()
+    }
+    async fn usage_snapshot(&self, _: u32) -> Result<velmora_bridge::types::UsageSnapshot> {
+        unused()
+    }
+    async fn usage_buckets(
+        &self,
+        _: &str,
+        _: u32,
+    ) -> Result<Vec<velmora_bridge::types::BucketUsage>> {
+        unused()
+    }
+    async fn usage_recount_start(&self, _: UnixMs, _: bool, _: bool) -> Result<bool> {
+        unused()
+    }
+    async fn usage_recount_step(
+        &self,
+        _: u32,
+        _: UnixMs,
+    ) -> Result<velmora_bridge::types::RecountStep> {
+        unused()
+    }
+    async fn usage_recounts(
+        &self,
+    ) -> Result<(
+        velmora_bridge::types::RecountState,
+        Option<velmora_bridge::types::UsageRecount>,
+    )> {
+        unused()
+    }
+    async fn usage_off(&self) -> Result<()> {
+        unused()
+    }
     async fn hot_stats(&self) -> Result<HotStats> {
         Ok(HotStats::default())
     }
@@ -1653,6 +1687,9 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         verify: Default::default(),
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
+        admin_read_token: None,
+        admin_host: None,
+        metrics_sample: 10,
     };
     let bridge = Bridge {
         catalog: MemCatalog::default(),

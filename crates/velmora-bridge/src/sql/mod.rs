@@ -78,6 +78,7 @@ mod publish;
 mod recovery;
 mod replay;
 mod uploads;
+pub mod usage;
 
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 
@@ -97,6 +98,9 @@ use crate::types::{
     OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig, ProviderFault,
     ProviderLoad, Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow,
     VerificationRow, VerifyEscalation, WriteId,
+};
+use crate::types::{
+    BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
 };
 
 /// `meta` key the guard self-test writes inside its failing batch.
@@ -747,6 +751,29 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn pack_plans(&self, limit: u32) -> Result<PackReport> {
         outbox::pack_plans(self, limit).await
+    }
+
+    // usage counters
+    async fn usage_counters(&self) -> Result<UsageCounters> {
+        usage::counters(self).await
+    }
+    async fn usage_snapshot(&self, hours: u32) -> Result<UsageSnapshot> {
+        usage::snapshot(self, hours).await
+    }
+    async fn usage_buckets(&self, after: &str, limit: u32) -> Result<Vec<BucketUsage>> {
+        usage::buckets(self, after, limit).await
+    }
+    async fn usage_recount_start(&self, now: UnixMs, adopt: bool, restart: bool) -> Result<bool> {
+        usage::recount_start(self, now, adopt, restart).await
+    }
+    async fn usage_recount_step(&self, chunk: u32, now: UnixMs) -> Result<RecountStep> {
+        usage::recount_step(self, chunk, now).await
+    }
+    async fn usage_recounts(&self) -> Result<(RecountState, Option<UsageRecount>)> {
+        usage::recounts(self).await
+    }
+    async fn usage_off(&self) -> Result<()> {
+        usage::off(self).await
     }
 
     // hot tier

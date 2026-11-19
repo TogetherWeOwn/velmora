@@ -541,6 +541,9 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         verify: Default::default(),
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
+        admin_read_token: None,
+        admin_host: None,
+        metrics_sample: 10,
     }
 }
 

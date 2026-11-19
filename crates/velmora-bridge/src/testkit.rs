@@ -97,6 +97,13 @@ pub const MIGRATION_0018: &str =
 /// `verify_escalations`).
 pub const MIGRATION_0019: &str =
     include_str!("../../../workers/s3-bridge/migrations/0019_verify_mode.sql");
+/// Usage counters: the tables and the triggers that move them.
+pub const MIGRATION_0022: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0022_usage_counters.sql");
+
+/// Switches the usage counters on over an empty catalogue: zero is the
+/// right count of nothing, so no recount is needed first.
+pub const ARM_USAGE: &str = "UPDATE usage_global SET all_x = 1, all_o = 1, all_g = 1 WHERE id = 1";
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -238,8 +245,18 @@ impl RusqliteSql {
         }
     }
 
-    /// In-memory database with every migration applied, in order.
+    /// In-memory database with every migration applied, in order, and
+    /// the usage counters switched on: every test then runs with the
+    /// counter triggers writing, as production does once it is counted.
     pub fn with_schema() -> Result<Self> {
+        let db = Self::with_schema_unarmed()?;
+        db.apply(ARM_USAGE)?;
+        Ok(db)
+    }
+
+    /// As [`Self::with_schema`], with the usage counters as the migration
+    /// leaves them: off, until a recount has run.
+    pub fn with_schema_unarmed() -> Result<Self> {
         let db = Self::open_in_memory()?;
         db.apply(MIGRATION_0001)?;
         db.apply(MIGRATION_0002)?;
@@ -260,6 +277,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0017)?;
         db.apply(MIGRATION_0018)?;
         db.apply(MIGRATION_0019)?;
+        db.apply(MIGRATION_0022)?;
         Ok(db)
     }
 

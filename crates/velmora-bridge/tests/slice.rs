@@ -3162,7 +3162,7 @@ async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
 /// `(rows per extent, rows per object, bytes kept per extent)`: the bytes
 /// are what the catalogue holds for a released extent (`dbstat`, without
 /// the free space of its pages).
-async fn rows_written(packed_plans: &str) -> (u64, u64, i64) {
+async fn rows_written(packed_plans: &str, counters: bool) -> (u64, u64, i64) {
     const DAY: u32 = 86_400;
     const EXTENT: usize = 16 * MIB;
     let rig = Rig::with_backbones(
@@ -3177,8 +3177,13 @@ async fn rows_written(packed_plans: &str) -> (u64, u64, i64) {
     )
     .await;
     let s = "rows written";
-    rig.setup_buckets_and_key(s).await;
     let sql = &rig.bridge.catalog.sql;
+    if !counters {
+        // The usage counters as the migration leaves them: off.
+        sql.apply("UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0")
+            .expect("counters off");
+    }
+    rig.setup_buckets_and_key(s).await;
 
     let cases = [("multipart x1", 1usize), ("multipart x3", 3)];
     let mut totals = Vec::new();
@@ -3261,11 +3266,16 @@ async fn rows_written(packed_plans: &str) -> (u64, u64, i64) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn rows_written_per_extent() {
-    let rows = rows_written("off").await;
-    let packed = rows_written("on").await;
+    let rows = rows_written("off", true).await;
+    let packed = rows_written("on", true).await;
+    let uncounted = rows_written("on", false).await;
     println!(
         "rows written per extent: {} as rows, {} packed",
         rows.0, packed.0
+    );
+    println!(
+        "usage counters, packed: {} -> {} rows per extent, {} -> {} per object",
+        uncounted.0, packed.0, uncounted.1, packed.1
     );
     // A packed plan costs two writes however many articles it has: the
     // plan and the stamp. As rows, every article is three (the row, its
@@ -3278,11 +3288,30 @@ async fn rows_written_per_extent() {
     // A verify job reads every backbone under one claim, and a job
     // that makes its calls within 20 s of its claim renews nothing.
     assert!(
-        packed.0 <= 46,
+        uncounted.0 <= 46,
         "rows written per packed extent: {}",
+        uncounted.0
+    );
+    assert!(
+        uncounted.1 <= 21,
+        "rows written per object: {}",
+        uncounted.1
+    );
+    // The usage counters, once switched on, add one row per counted
+    // change. An extent has six: its row and its outbox row are written,
+    // the outbox row moves through three stages, and the safety copy is
+    // released. An object measured two more here: the bound is what this
+    // run wrote, and a regression guard rather than a derivation.
+    assert!(
+        packed.0 <= uncounted.0 + 6,
+        "rows written per packed extent, counted: {}",
         packed.0
     );
-    assert!(packed.1 <= 21, "rows written per object: {}", packed.1);
+    assert!(
+        packed.1 <= uncounted.1 + 2,
+        "rows written per object, counted: {}",
+        packed.1
+    );
     // What a 16 MiB extent keeps in the catalogue for good: 0.15 GB per
     // TB is 2,516 bytes an extent. A third of it is the record of its
     // checks, one row per backbone and check.

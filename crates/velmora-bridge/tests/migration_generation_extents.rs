@@ -13,7 +13,7 @@ use velmora_bridge::testkit::{
     RusqliteSql, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
     MIGRATION_0006, MIGRATION_0007, MIGRATION_0008, MIGRATION_0009, MIGRATION_0010, MIGRATION_0011,
     MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0015, MIGRATION_0016, MIGRATION_0017,
-    MIGRATION_0018, MIGRATION_0019,
+    MIGRATION_0018, MIGRATION_0019, MIGRATION_0022,
 };
 use velmora_bridge::*;
 
@@ -196,6 +196,7 @@ async fn backfill_gives_existing_objects_the_reads_they_had() {
         MIGRATION_0016,
         MIGRATION_0018,
         MIGRATION_0019,
+        MIGRATION_0022,
     ] {
         old.apply(migration).unwrap();
     }

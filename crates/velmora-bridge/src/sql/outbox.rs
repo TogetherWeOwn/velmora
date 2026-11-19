@@ -1204,14 +1204,18 @@ pub(super) async fn bury_exhausted<S: Sql>(
     max_attempts: u32,
     now: UnixMs,
 ) -> Result<u64> {
-    c.sql
-        .exec(
+    // Counted by the rows returned, not by the rows changed: a
+    // usage-counter trigger adds to the latter.
+    let buried = c
+        .sql
+        .query(
             "UPDATE outbox SET stage = 'dead', updated_at = ?2 \
              WHERE stage IN ('post', 'verify', 'release') AND attempts > ?1 \
-               AND (lease_until IS NULL OR lease_until < ?2)",
+               AND (lease_until IS NULL OR lease_until < ?2) RETURNING 1",
             &[SqlValue::Int(i64::from(max_attempts)), ms(now)],
         )
-        .await
+        .await?;
+    Ok(buried.len() as u64)
 }
 
 /// Sends `done` extents that a release could not be decided for back to
@@ -1269,11 +1273,12 @@ pub(super) async fn redrive_underverified<S: Sql>(
         latest!(),
         " AND ",
         counts!(),
-        ") < ?3)"
+        ") < ?3) RETURNING 1"
     );
+    // Counted by the rows returned: see `bury_exhausted`.
     let moved = c
         .sql
-        .exec(
+        .query(
             sql,
             &[
                 ms(now),
@@ -1286,7 +1291,7 @@ pub(super) async fn redrive_underverified<S: Sql>(
         .await?;
     // A short window was the end of the index: start over next time.
     set_redrive_cursor(c, if full { &last } else { "" }).await?;
-    Ok(moved)
+    Ok(moved.len() as u64)
 }
 
 /// Re-arms cancelled obligations of extents that a live generation
@@ -1339,16 +1344,18 @@ pub(super) async fn revive_referenced<S: Sql>(
         // `+stage`: the window is found by rowid. Through the stage
         // index the statement would visit every cancelled row there is.
         " WHERE rowid > ?2 AND rowid <= ?3 AND +stage = 'cancelled' AND ",
-        live_ref!("outbox.extent_id")
+        live_ref!("outbox.extent_id"),
+        " RETURNING 1"
     );
+    // Counted by the rows returned: see `bury_exhausted`.
     let revived = c
         .sql
-        .exec(sql, &[ms(now), SqlValue::Int(after), SqlValue::Int(last)])
+        .query(sql, &[ms(now), SqlValue::Int(after), SqlValue::Int(last)])
         .await?;
     // A short window was the end of the table: start over next time.
     let next = if full { last } else { 0 };
     set_scan_cursor(c, "revive", &next.to_string()).await?;
-    Ok(revived)
+    Ok(revived.len() as u64)
 }
 
 /// Extents per write of [`pack_plans`] (two statements each).
@@ -1488,14 +1495,27 @@ pub(super) async fn record_dispatch<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> R
 }
 
 pub(super) async fn outbox_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<OutboxStats> {
-    let rows = c
-        .sql
-        .query("SELECT stage, COUNT(*) FROM outbox GROUP BY stage", &[])
-        .await?;
-    let mut counted = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut r = Cols::new(row);
-        counted.push((r.parsed(OutboxStage::parse)?, r.num::<u64>()?));
+    // From the usage counters once they are switched on: one row read.
+    // Until then the table is counted, as it was before the counters.
+    let usage = super::usage::counters(c).await?;
+    let mut counted = Vec::with_capacity(OutboxStage::ALL.len());
+    if usage.seeded {
+        for &stage in OutboxStage::ALL {
+            // A stage without rows is left out, as a count of the
+            // table leaves it out.
+            if let Ok(n @ 1..) = u64::try_from(usage.outbox(stage)) {
+                counted.push((stage, n));
+            }
+        }
+    } else {
+        let rows = c
+            .sql
+            .query("SELECT stage, COUNT(*) FROM outbox GROUP BY stage", &[])
+            .await?;
+        for row in rows {
+            let mut r = Cols::new(row);
+            counted.push((r.parsed(OutboxStage::parse)?, r.num::<u64>()?));
+        }
     }
     let by_stage: Vec<_> = OutboxStage::ALL
         .iter()
