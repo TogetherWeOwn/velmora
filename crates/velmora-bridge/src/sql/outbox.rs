@@ -110,18 +110,28 @@ macro_rules! counts {
 /// it. A `STAT` answer, or a later size that fits, says nothing about
 /// bytes that were found missing or wrong, so such a backbone holds no
 /// copy until it is read in full again.
+///
+/// A full read of fewer articles than the plan has ([`total`]) is not a
+/// complete pass either, whatever it found: a version from before
+/// parity reads the data articles alone, and such a read says nothing
+/// of a parity article that an earlier read found missing or wrong.
 macro_rules! body_failed {
     () => {
-        "EXISTS (SELECT 1 FROM verifications f \
-           WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
-             AND f.plan_rev = e.plan_rev \
-             AND ((f.kind = 'body' \
-                   AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total)) \
-               OR (f.mode = 'size' AND f.result = 'corrupt')) \
-             AND NOT EXISTS (SELECT 1 FROM verifications g \
-               WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
-                 AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
-                 AND g.verified_at > f.verified_at))"
+        concat!(
+            "EXISTS (SELECT 1 FROM verifications f \
+               WHERE f.extent_id = v.extent_id AND f.backbone = v.backbone \
+                 AND f.plan_rev = e.plan_rev \
+                 AND ((f.kind = 'body' \
+                       AND (f.result <> 'ok' OR f.articles_ok <> f.articles_total \
+                         OR f.articles_total <> COALESCE(",
+            total!(),
+            ", -1))) \
+                   OR (f.mode = 'size' AND f.result = 'corrupt')) \
+                 AND NOT EXISTS (SELECT 1 FROM verifications g \
+                   WHERE g.extent_id = f.extent_id AND g.backbone = f.backbone \
+                     AND g.plan_rev = f.plan_rev AND g.kind = 'body' \
+                     AND g.verified_at > f.verified_at))"
+        )
     };
 }
 
