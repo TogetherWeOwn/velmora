@@ -136,7 +136,7 @@ pub async fn stored_sizes<T: Transport>(
         block.clear();
         client.raw_dot_block(&mut block).await?;
         let named = format!("<{id}>");
-        if how == SizeCommand::Head && !reply.text.split_whitespace().any(|w| w == named) {
+        if how == SizeCommand::Head && !head_names(&reply.text, &named) {
             // Not an answer about this article.
             return Err(
                 velmora::Error::Malformed("HEAD reply names another article".into()).into(),
@@ -185,6 +185,13 @@ enum Reported {
     Own(u64),
     /// A count that came with the article (`X-Received-Bytes:`).
     Carried(u64),
+}
+
+/// Whether the text of a `221` reply (`n <message-id> ...`) names the
+/// article `named`: in its second field, where `STAT` is read too. The
+/// same id further on in the line is free text.
+fn head_names(text: &str, named: &str) -> bool {
+    text.split_whitespace().nth(1) == Some(named)
 }
 
 /// The size in the data block of a size command's answer, if it has one.
@@ -1804,6 +1811,19 @@ mod tests {
     use super::*;
 
     const NAMED: &str = "<a1@example.invalid>";
+
+    #[test]
+    fn a_head_reply_names_its_article_in_the_second_field() {
+        assert!(head_names(&format!("0 {NAMED}"), NAMED));
+        assert!(head_names(&format!("7 {NAMED} article"), NAMED));
+        // Another article, with the one asked for in the free text.
+        assert!(!head_names(
+            &format!("7 <b2@example.invalid> {NAMED}"),
+            NAMED
+        ));
+        assert!(!head_names(NAMED, NAMED));
+        assert!(!head_names("", NAMED));
+    }
 
     #[test]
     fn head_takes_the_providers_own_size_first() {

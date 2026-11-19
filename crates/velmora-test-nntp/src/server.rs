@@ -351,13 +351,6 @@ impl TestNntpServer {
         self.shared.spool.lock().await.stat_lag = lag;
     }
 
-    /// While `Some(d)`, the server reports a size for every article it
-    /// has: a `Bytes:` header at the end of a `HEAD`, and an answer to
-    /// `HDR :bytes <message-id>`. The size is the stored length plus
-    /// `d`, so `Some(0)` is a provider that reports what it stores and
-    /// any other value one whose stored article is not what was posted.
-    /// While `None` (the default) `HEAD` has no such header and `HDR` is
-    /// an unknown command.
     /// Whether the size in `HEAD` is given as `X-Received-Bytes:`, the
     /// header that travels with an article, and not as `Bytes:`.
     pub async fn set_size_carried(&self, on: bool) {
@@ -370,6 +363,13 @@ impl TestNntpServer {
         self.shared.spool.lock().await.over_empty = on;
     }
 
+    /// While `Some(d)`, the server reports a size for every article it
+    /// has: a `Bytes:` header at the end of a `HEAD`, and an answer to
+    /// `HDR :bytes <message-id>`. The size is the stored length plus
+    /// `d`, so `Some(0)` is a provider that reports what it stores and
+    /// any other value one whose stored article is not what was posted.
+    /// While `None` (the default) `HEAD` has no such header and `HDR` is
+    /// an unknown command.
     pub async fn set_reported_size(&self, difference: Option<i64>) {
         self.shared.spool.lock().await.reported_size = difference;
     }

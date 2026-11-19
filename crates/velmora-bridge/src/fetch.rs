@@ -519,7 +519,10 @@ enum Got {
 ///   servers on the way add (`Path`, `Xref` and the like).
 ///
 /// `least` counts no header at all, so a provider that reports the size
-/// of the body alone passes too. An article cut short by more than the
+/// of the body alone passes too. It does count a line end as 2 bytes: a
+/// provider that counts it as 1 reports less than `least` for a whole
+/// article, which is recorded as corrupt and releases nothing. Such a
+/// provider is not given a size command. An article cut short by more than the
 /// slack (about 0.1 % of a full article plus its headers) is below
 /// `least`; one that is another, larger article is above `most`.
 pub fn size_bounds(row: &ArticleRow) -> (u64, u64) {

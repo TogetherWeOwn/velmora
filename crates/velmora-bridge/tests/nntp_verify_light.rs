@@ -113,6 +113,22 @@ impl Rig {
             .advance_secs((ahead_ms as u32).div_ceil(1000));
     }
 
+    /// Runs verify, each time the row is due, until a job is done. A
+    /// verify that never gets there fails the test.
+    async fn verify_until_ack(&self, s: &Seeded) -> JobOutcome {
+        let mut outcome = self.run(s, OutboxStage::Verify).await;
+        for _ in 0..32 {
+            if outcome == JobOutcome::Ack {
+                return outcome;
+            }
+            self.wait_until_due(s);
+            outcome = self.run(s, OutboxStage::Verify).await;
+        }
+        let row = self.bridge.catalog.outbox(&s.extent);
+        assert_eq!(outcome, JobOutcome::Ack, "stage {:?}", row.stage);
+        outcome
+    }
+
     /// The backbone index a sampled extent is read in full on.
     fn sample_index(&self, s: &Seeded) -> usize {
         sample_backbone(self.bridge.kek.active().1, &s.extent, 2)
@@ -347,11 +363,7 @@ async fn a_backbone_verify_did_not_pass_does_not_count_at_release() {
         size_commands: Vec::new(),
     };
     let (s, plan) = rig.on_two(20).await;
-    let mut outcome = rig.run(&s, OutboxStage::Verify).await;
-    while outcome != JobOutcome::Ack {
-        rig.wait_until_due(&s);
-        outcome = rig.run(&s, OutboxStage::Verify).await;
-    }
+    rig.verify_until_ack(&s).await;
     assert_eq!(rig.stage(&s), OutboxStage::Release);
     let on_record = rig.checks(&s);
     assert_eq!(
@@ -415,11 +427,7 @@ async fn raise(rig: &Rig, backbone: &str) -> VerifyEscalation {
 async fn the_release_records_nothing_for_a_backbone_verify_did_not_pass() {
     let rig = three_backbone_rig([("bb0", true), ("bb1", false), ("bb2", false)]).await;
     let (s, _) = rig.on_two(21).await;
-    let mut outcome = rig.run(&s, OutboxStage::Verify).await;
-    while outcome != JobOutcome::Ack {
-        rig.wait_until_due(&s);
-        outcome = rig.run(&s, OutboxStage::Verify).await;
-    }
+    rig.verify_until_ack(&s).await;
     assert_eq!(rig.stage(&s), OutboxStage::Release);
     let missing = row("bb2", VerifyKind::Stat, VerifyResult::Missing);
     assert_eq!(rig.checks(&s).last().unwrap(), &missing);
@@ -1446,7 +1454,9 @@ async fn size_commands_against_a_server() {
         .await
         .unwrap()
         .is_empty());
-    // The session is still in step.
+    // The session is still in step: a reply left unread would answer
+    // the next command.
+    assert!(!NntpSession::stat(&mut client, "absent@x").await.unwrap());
     assert!(NntpSession::stat(&mut client, id).await.unwrap());
 
     // A message-id that could carry a second command is refused before
@@ -1459,6 +1469,7 @@ async fn size_commands_against_a_server() {
             assert!(refused.is_err(), "{bad:?}");
         }
     }
+    assert!(!NntpSession::stat(&mut client, "absent@x").await.unwrap());
     assert!(NntpSession::stat(&mut client, id).await.unwrap());
     client.quit().await;
 }
