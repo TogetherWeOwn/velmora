@@ -233,7 +233,10 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
         }
     );
     let (b, j) = (Rc::clone(bridge), job.clone());
-    match jobs::run(now, post, async move { b.run_job(&j).await }).await {
+    // The message names no tenant: every job is of tenant 0, and here is
+    // where it is said.
+    let scope = velmora_bridge::TenantScope::tenant_zero();
+    match jobs::run(now, post, async move { b.run_job(&scope, &j).await }).await {
         Some(outcome) => outcome,
         // `jobs::run` has logged it.
         None => JobOutcome::Retry {

@@ -29,6 +29,7 @@ pub mod replay;
 pub mod service;
 pub mod sql;
 pub mod stamp;
+pub mod tenant;
 pub mod trace;
 pub mod types;
 pub mod verify;
@@ -40,4 +41,5 @@ pub mod testkit;
 
 pub use config::{BridgeConfig, KekRing, REAL_DATA_READY};
 pub use ports::*;
+pub use tenant::TenantScope;
 pub use types::*;

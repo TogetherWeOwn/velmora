@@ -61,6 +61,7 @@ use velmora::rng::SystemRng;
 use crate::crypto::{open_manifest, seal_manifest};
 use crate::plan::StoredPlan;
 use crate::ports::{BlobMeta, BlobStore, Catalog, Kek};
+use crate::tenant::TenantScope;
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, Bucket, BucketId, ExtentId, ExtentRow,
     ExtentState, GenerationId, GenerationRow, GenerationState, Result, SafetyState, UnixMs,
@@ -134,17 +135,21 @@ impl Layout {
         })
     }
 
-    /// The layout of [`DEFAULT_TENANT`].
-    pub fn default_tenant() -> Layout {
+    /// The tenant layout of the tenant of `scope`.
+    pub fn of(scope: &TenantScope) -> Layout {
         Layout {
-            root: format!("{TENANT_DIR}{DEFAULT_TENANT}/"),
+            root: format!("{TENANT_DIR}{}/", scope.tenant_id()),
         }
     }
 
-    /// Every layout a record can be in, in the order readers look: the
-    /// flat one first.
-    pub fn all() -> [Layout; 2] {
-        [Layout::flat(), Layout::default_tenant()]
+    /// Every layout a record of the tenant of `scope` can be in, in the
+    /// order readers look: the flat one first.
+    ///
+    /// The flat layout is of tenant 0 only: it has no tenant in its
+    /// names. So is this function, while tenant 0 is the only tenant a
+    /// scope can be made for.
+    pub fn all(scope: &TenantScope) -> [Layout; 2] {
+        [Layout::flat(), Layout::of(scope)]
     }
 
     /// The directory: every name of the layout starts with it.
@@ -246,11 +251,11 @@ pub fn record_name(key: &str) -> Option<RecordName<'_>> {
 }
 
 /// The name of the article plan of the same extent in the other layout
-/// of the two that [`Layout::all`] names; `None` when `key` is no
-/// article plan of one of them.
-pub fn other_plan_key(key: &str) -> Option<String> {
+/// of the two that [`Layout::all`] names for `scope`; `None` when `key`
+/// is no article plan of one of them.
+pub fn other_plan_key(scope: &TenantScope, key: &str) -> Option<String> {
     let name = record_name(key).filter(|n| n.kind == RecordKind::ArticlePlan)?;
-    let [flat, tenant] = Layout::all();
+    let [flat, tenant] = Layout::all(scope);
     let other = if name.layout == flat {
         tenant
     } else if name.layout == tenant {
@@ -1110,9 +1115,13 @@ fn names(name: &str, kind: RecordKind, id: &str) -> bool {
 }
 
 /// Whether a generation record of `id` is stored, under the name of any
-/// layout.
-pub async fn generation_recorded<B: BlobStore>(safety: &B, id: &GenerationId) -> Result<bool> {
-    for layout in Layout::all() {
+/// layout of `scope`.
+pub async fn generation_recorded<B: BlobStore>(
+    safety: &B,
+    scope: &TenantScope,
+    id: &GenerationId,
+) -> Result<bool> {
+    for layout in Layout::all(scope) {
         if safety.head(&layout.generation_key(id)).await?.is_some() {
             return Ok(true);
         }
@@ -1172,11 +1181,12 @@ pub struct PlanRead {
 pub async fn read_article_plan<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
+    scope: &TenantScope,
     extent: &ExtentId,
     first: &Layout,
 ) -> Result<PlanRead> {
     let mut found = PlanRead::default();
-    let others = Layout::all().into_iter().filter(|l| l != first);
+    let others = Layout::all(scope).into_iter().filter(|l| l != first);
     for layout in std::iter::once(first.clone()).chain(others) {
         let name = layout.article_key(extent);
         match read::<B, K, ArticleManifest>(safety, kek, &name).await {
