@@ -659,6 +659,29 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
         ),
         [again.posts, again.verifies]
     );
+    // The same through the other two places that file an hour: a
+    // second off (hour 3, with its releases), then a recorded failure
+    // of a later hour that files hour 3 again, with a failure in it.
+    catalog.usage_off().await.unwrap();
+    assert_eq!(hourly_sum(db), again);
+    db.apply(ARM_USAGE).unwrap();
+    let fail = |at: i64| {
+        let sql = format!(
+            "UPDATE outbox SET last_error = 'e', attempts = attempts + 1, updated_at = {at} \
+              WHERE extent_id = (SELECT MIN(extent_id) FROM outbox)"
+        );
+        db.apply(&sql).unwrap();
+    };
+    fail(10_800_001);
+    fail(14_400_000);
+    assert_eq!(
+        row(
+            db,
+            "SELECT releases, failures FROM usage_hours WHERE hour = 3",
+            2
+        ),
+        [again.releases, 1]
+    );
     catalog.usage_off().await.unwrap();
     assert!(!catalog.usage_counters().await.unwrap().seeded);
     assert!(!catalog.usage_recounts().await.unwrap().0.running);
