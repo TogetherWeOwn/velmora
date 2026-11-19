@@ -170,7 +170,24 @@ pub const BUCKET_TOTALS: &str = "SELECT COALESCE(SUM(live_objects), 0), \
    COALESCE(SUM(live_bytes), 0), COUNT(*) FROM usage_buckets WHERE kind = 1";
 
 pub(super) async fn snapshot<S: Sql>(c: &SqlCatalog<S>, hours: u32) -> Result<UsageSnapshot> {
-    let counters = counters(c).await?;
+    let mut counters = counters(c).await?;
+    // The hour under way, with what is already filed for it: counters
+    // switched off and on again within an hour filed its first part.
+    // One statement, so no event is in both or in neither.
+    let current = c
+        .sql
+        .query(
+            "SELECT g.hour, g.h_posts + COALESCE(h.posts, 0), \
+                    g.h_verifies + COALESCE(h.verifies, 0), \
+                    g.h_releases + COALESCE(h.releases, 0), \
+                    g.h_dead + COALESCE(h.dead, 0), \
+                    g.h_failures + COALESCE(h.failures, 0) \
+               FROM usage_global g LEFT JOIN usage_hours h ON h.hour = g.hour \
+              WHERE g.id = 1",
+            &[],
+        )
+        .await?;
+    counters.current = hour(&mut Cols::new(first(current)?))?;
     let mut totals = Cols::new(first(c.sql.query(BUCKET_TOTALS, &[]).await?)?);
     let (live_objects, live_bytes, buckets_counted) = (totals.num()?, totals.num()?, totals.num()?);
     let mut oldest = Cols::new(first(c.sql.query(OLDEST, &[]).await?)?);
@@ -181,8 +198,9 @@ pub(super) async fn snapshot<S: Sql>(c: &SqlCatalog<S>, hours: u32) -> Result<Us
         .query(
             "SELECT hour, posts, verifies, releases, dead, failures \
                FROM usage_hours WHERE hour <> ?2 ORDER BY hour DESC LIMIT ?1",
-            // Not the hour `counters` holds as current: one filed
-            // between the two reads would be there twice.
+            // Not the current hour: what is filed for it is in the
+            // current figures above, and one filed between the two
+            // reads would be there twice.
             &[
                 SqlValue::Int(i64::from(hours)),
                 SqlValue::Int(counters.current.hour),

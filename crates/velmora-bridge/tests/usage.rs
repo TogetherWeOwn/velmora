@@ -646,6 +646,15 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
     db.apply(ARM_USAGE).unwrap();
     db.apply("UPDATE outbox SET stage = 'release', updated_at = 7200001 WHERE stage = 'verify'")
         .unwrap();
+    // The snapshot shows that hour whole while it is under way: what
+    // the off filed and what came after, once.
+    let snap = catalog.usage_snapshot(48).await.unwrap();
+    assert_eq!(
+        (snap.counters.current.hour, snap.counters.current.posts),
+        (2, counted.posts)
+    );
+    assert!(snap.counters.current.verifies > 0);
+    assert!(snap.hours.iter().all(|h| h.hour != 2));
     db.apply("UPDATE outbox SET stage = 'done', updated_at = 10800000 WHERE stage = 'release'")
         .unwrap();
     let again = hourly_sum(db);
