@@ -85,7 +85,8 @@ CREATE TABLE usage_global (
 INSERT INTO usage_global (id) VALUES (1), (2);
 
 -- Completed hours, one row each, written when the first event of a later
--- hour arrives.
+-- hour arrives. An hour filed twice (the counters were switched off and
+-- on again within it) is added to, so none of its events are lost.
 CREATE TABLE usage_hours (
   hour           INTEGER PRIMARY KEY,          -- UnixMs / 3600000
   posts          INTEGER NOT NULL,
@@ -186,10 +187,14 @@ END;
 CREATE TRIGGER usage_outbox_stage AFTER UPDATE OF stage ON outbox
 WHEN NEW.stage <> OLD.stage
 BEGIN
-  INSERT OR IGNORE INTO usage_hours (hour, posts, verifies, releases, dead, failures)
+  INSERT INTO usage_hours (hour, posts, verifies, releases, dead, failures)
     SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures FROM usage_global
      WHERE id = 1 AND all_o = 1 AND hour > 0 AND NEW.updated_at / 3600000 > hour
-       AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0;
+       AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0
+    ON CONFLICT (hour) DO UPDATE SET
+       posts = posts + excluded.posts, verifies = verifies + excluded.verifies,
+       releases = releases + excluded.releases, dead = dead + excluded.dead,
+       failures = failures + excluded.failures;
   UPDATE usage_global SET
     ob_post = ob_post + (NEW.stage = 'post') - (OLD.stage = 'post'),
     ob_verify = ob_verify + (NEW.stage = 'verify') - (OLD.stage = 'verify'),
@@ -219,10 +224,14 @@ END;
 CREATE TRIGGER usage_outbox_failure AFTER UPDATE OF last_error ON outbox
 WHEN NEW.last_error IS NOT NULL AND NEW.stage = OLD.stage
 BEGIN
-  INSERT OR IGNORE INTO usage_hours (hour, posts, verifies, releases, dead, failures)
+  INSERT INTO usage_hours (hour, posts, verifies, releases, dead, failures)
     SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures FROM usage_global
      WHERE id = 1 AND all_o = 1 AND hour > 0 AND NEW.updated_at / 3600000 > hour
-       AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0;
+       AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0
+    ON CONFLICT (hour) DO UPDATE SET
+       posts = posts + excluded.posts, verifies = verifies + excluded.verifies,
+       releases = releases + excluded.releases, dead = dead + excluded.dead,
+       failures = failures + excluded.failures;
   UPDATE usage_global SET
     failures_total = failures_total + 1,
     h_posts = CASE WHEN NEW.updated_at / 3600000 > hour THEN 0 ELSE h_posts END,

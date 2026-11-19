@@ -973,9 +973,10 @@ to the triggers, from `wrangler d1 execute`:
 ```sql
 UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0,
        cur_x = '', cur_o = '', cur_g = '', pass = 0;
-``` An older Worker
-compares the number of rows a statement changed with one, and a
-statement that also moved a counter reports two.
+```
+
+An older Worker compares the number of rows a statement changed with
+one, and a statement that also moved a counter reports two.
 
 Read routes, all `GET` and served without a table scan:
 

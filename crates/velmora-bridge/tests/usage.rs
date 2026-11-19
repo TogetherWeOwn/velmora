@@ -641,6 +641,25 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
     // The hour that was under way is filed, not lost.
     assert_eq!(hourly_sum(db), counted);
     assert!(counted.posts > 0);
+    // Counting that goes on within that same hour adds to the filed
+    // hour when it is filed again.
+    db.apply(ARM_USAGE).unwrap();
+    db.apply("UPDATE outbox SET stage = 'release', updated_at = 7200001 WHERE stage = 'verify'")
+        .unwrap();
+    db.apply("UPDATE outbox SET stage = 'done', updated_at = 10800000 WHERE stage = 'release'")
+        .unwrap();
+    let again = hourly_sum(db);
+    assert_eq!(again.posts, counted.posts);
+    assert!(again.verifies > 0 && again.releases > 0);
+    assert_eq!(
+        row(
+            db,
+            "SELECT posts, verifies FROM usage_hours WHERE hour = 2",
+            2
+        ),
+        [again.posts, again.verifies]
+    );
+    catalog.usage_off().await.unwrap();
     assert!(!catalog.usage_counters().await.unwrap().seeded);
     assert!(!catalog.usage_recounts().await.unwrap().0.running);
     // The weekly recount starts only while the counters are on: one

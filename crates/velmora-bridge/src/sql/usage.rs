@@ -595,11 +595,15 @@ pub(super) async fn off<S: Sql>(c: &SqlCatalog<S>) -> Result<()> {
             // next recount, and do not span the time in between. The
             // hour under way is filed first, so its events are kept.
             (
-                "INSERT OR IGNORE INTO usage_hours \
+                "INSERT INTO usage_hours \
                    (hour, posts, verifies, releases, dead, failures) \
                  SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
                    FROM usage_global WHERE id = 1 AND hour > 0 \
-                    AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0",
+                    AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0 \
+                 ON CONFLICT (hour) DO UPDATE SET \
+                   posts = posts + excluded.posts, verifies = verifies + excluded.verifies, \
+                   releases = releases + excluded.releases, dead = dead + excluded.dead, \
+                   failures = failures + excluded.failures",
                 vec![],
             ),
             (
