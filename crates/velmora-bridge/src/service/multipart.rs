@@ -1337,7 +1337,7 @@ where
             if declared.parse::<u64>().ok() != Some(publication.size) {
                 let message = format!(
                     "The x-amz-mp-object-size header declares {declared} bytes, but the \
-                     listed parts hold {} bytes. Nothing was published; the upload stays open.",
+                     listed parts hold {} bytes. This request published nothing.",
                     publication.size
                 );
                 return Err(S3Response::error_with(
