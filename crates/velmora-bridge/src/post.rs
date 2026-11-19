@@ -1288,7 +1288,9 @@ where
     /// parity articles of it (their `idx` follows the data articles').
     /// A parity article is posted again from its shard, computed again
     /// from the safety copy; every shard must be the one the addendum
-    /// describes, or the job fails and nothing is sent.
+    /// describes. If one is not, no parity article is sent and the job
+    /// fails, after the data articles among `missing` were posted: they
+    /// do not depend on the addendum.
     ///
     /// `Ok(false)` = it cannot be done now (no provider that posts, no
     /// intact safety copy, or the providers refused): the caller carries
@@ -1302,9 +1304,44 @@ where
         providers: &[&ProviderConfig],
         parity: Option<&ParityPlan>,
     ) -> core::result::Result<bool, Stop> {
+        let mut other_shards = false;
+        let done = self
+            .repost_from_copy(
+                lease,
+                extent,
+                plan,
+                missing,
+                providers,
+                parity,
+                &mut other_shards,
+            )
+            .await;
+        match (other_shards, done) {
+            // The data articles are dealt with; the addendum is not
+            // one of this ciphertext.
+            (true, Ok(_)) => Err(Stop::fail(FailClass::Corrupt)),
+            (_, done) => done,
+        }
+    }
+
+    /// [`Self::repost`]. `other_shards` is set when the shards of the
+    /// safety copy are not the ones the addendum describes: then only
+    /// the data articles are posted.
+    #[allow(clippy::too_many_arguments)] // `repost` and its one flag
+    async fn repost_from_copy(
+        &self,
+        lease: &Lease,
+        extent: &ExtentRow,
+        plan: &[ArticleRow],
+        missing: &[u32],
+        providers: &[&ProviderConfig],
+        parity: Option<&ParityPlan>,
+        other_shards: &mut bool,
+    ) -> core::result::Result<bool, Stop> {
         if providers.is_empty() || extent.safety_state != SafetyState::Held {
             return Ok(false);
         }
+        let data = plan.len();
         // The parity plan counts only when one of its articles is asked
         // for: the shards are computed for nothing else.
         let parity = parity.filter(|p| p.articles.iter().any(|a| missing.contains(&a.idx)));
@@ -1341,8 +1378,12 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Ok(false);
         }
-        let shards = match parity {
-            Some(parity) => stored_shards(&cipher, parity).ok_or(Stop::fail(FailClass::Corrupt))?,
+        let shards = match parity.map(|parity| stored_shards(&cipher, parity)) {
+            Some(Some(shards)) => shards,
+            Some(None) => {
+                *other_shards = true;
+                Vec::new()
+            }
             None => Vec::new(),
         };
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
@@ -1355,7 +1396,11 @@ where
         }
         let todo: Vec<usize> = (0..plan.len())
             .filter(|at| missing.contains(&plan[*at].idx))
+            .filter(|at| *at < data || !*other_shards)
             .collect();
+        if todo.is_empty() {
+            return Ok(false);
+        }
         let holder = job_holder(lease);
         let probing = pool.refusing(&order);
         let (sessions, _) = self

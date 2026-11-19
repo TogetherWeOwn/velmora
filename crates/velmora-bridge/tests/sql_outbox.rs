@@ -4821,3 +4821,136 @@ async fn parity_costs_no_row_at_verify_and_release() {
     assert_eq!(texts[0], texts[1]);
     assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
 }
+
+/// A `done` extent with parity whose passes left the parity articles
+/// out counts on no backbone: it goes back to verify.
+#[tokio::test]
+async fn redrive_requeues_an_extent_verified_without_its_parity() {
+    let fx = Fx::new().await;
+    let mut made = Vec::new();
+    for (key, n) in [("whole", 3), ("data", 2)] {
+        let (o, l) = fx.posted_packed(key, true).await;
+        fx.pass_of(&l, "bb1", T0, VerifyKind::Body, n).await;
+        fx.pass_of(&l, "bb2", T0, VerifyKind::Stat, n).await;
+        assert!(fx.cat.advance(&l, OutboxStage::Done, T0, T0).await.unwrap());
+        made.push(o);
+    }
+    let later = T0.plus_ms(HOUR_MS);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 100, later).await, 1);
+    assert_eq!(fx.outbox(&made[0], "stage").await, "done");
+    assert_eq!(fx.outbox(&made[1], "stage").await, "verify");
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 100, later).await, 0);
+}
+
+/// A replay puts the addendum of the record back where the one on the
+/// row cannot be read beside its plan, or is not the one the row
+/// counts, and drops the passes on record with it. Where the record has
+/// none that reads, the row stays as it is: its jobs fail, and it is
+/// never taken for an extent without parity.
+#[tokio::test]
+async fn a_replay_restores_an_addendum_that_cannot_be_read() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let keys = [
+        "sound",
+        "damaged",
+        "miscounted",
+        "gone",
+        "no record",
+        "bad record",
+    ];
+    let mut replay = Vec::new();
+    let mut made = Vec::new();
+    for key in keys {
+        let (o, l) = fx.posted_packed(key, true).await;
+        fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let (blob, addendum) = (stored.packed.unwrap(), stored.parity.unwrap());
+        let mut cut = addendum.clone();
+        cut.truncate(40);
+        let id = text(o.extent.as_str());
+        let changed = match key {
+            "sound" => 1,
+            "miscounted" => {
+                let sql = "UPDATE extents SET parity_count = 5 WHERE id = ?1";
+                fx.run(sql, &[id]).await
+            }
+            "gone" => {
+                let sql = "UPDATE extents SET parity = NULL WHERE id = ?1";
+                fx.run(sql, &[id]).await
+            }
+            _ => {
+                let sql = "UPDATE extents SET parity = ?2 WHERE id = ?1";
+                fx.run(sql, &[id, SqlValue::Blob(cut.clone())]).await
+            }
+        };
+        assert_eq!(changed, 1);
+        replay.push(ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: Some(blob),
+            plan: Some(stored.rows),
+            parity: match key {
+                "no record" => None,
+                "bad record" => Some(cut),
+                _ => Some(addendum.clone()),
+            },
+            safety_present: true,
+        });
+        made.push((o, addendum));
+    }
+    for (o, _) in &made[1..] {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        let read = stored.parity_plan(&o.extent, TWO_ARTICLES);
+        let count = fx.extent(o, "parity_count").await;
+        assert!(read.is_err() || count != "1" || stored.parity.is_none());
+    }
+    let left = async |o: &Obj| {
+        (
+            fx.extent(o, "hex(parity)").await,
+            fx.extent(o, "parity_count").await,
+        )
+    };
+    let unrestored = [left(&made[4].0).await, left(&made[5].0).await];
+
+    let stranded = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(9))
+        .await
+        .unwrap();
+    assert!(stranded.is_empty(), "{stranded:?}");
+    let passes = async |o: &Obj| {
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let rows = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        rows.unwrap()[0][0].clone()
+    };
+    for ((o, addendum), key) in made.iter().zip(keys) {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        match key {
+            "no record" | "bad record" => {
+                // As it was, and no job takes it.
+                assert!(stored.parity_plan(&o.extent, TWO_ARTICLES).is_err());
+                assert!(unrestored.contains(&left(o).await), "{key}");
+                assert_eq!(passes(o).await, SqlValue::Int(1), "{key}");
+            }
+            _ => {
+                assert_eq!(stored.parity.as_deref(), Some(&addendum[..]), "{key}");
+                assert_eq!(fx.extent(o, "parity_count").await, "1", "{key}");
+                let parity = stored.parity_plan(&o.extent, TWO_ARTICLES).unwrap();
+                assert_eq!(parity.unwrap().articles.len(), 1, "{key}");
+                // A sound row is not written, and keeps its passes.
+                let kept = i64::from(key == "sound");
+                assert_eq!(passes(o).await, SqlValue::Int(kept), "{key}");
+            }
+        }
+        assert_eq!(fx.extent(o, "posted_at IS NOT NULL").await, "1", "{key}");
+    }
+    // Again: nothing changes.
+    let before = fx.dump().await;
+    fx.cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(fx.dump().await, before);
+}
