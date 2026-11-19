@@ -405,7 +405,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         uploads::complete_upload(self, t, revision, digest, c, condition, record).await
     }
     async fn upload_extents(&self, t: &UploadTarget<'_>, limit: u32) -> Result<Vec<PartExtent>> {
-        recovery::upload_extents(self, t, limit).await
+        recovery::upload_extents(self, t, None, limit).await
+    }
+    async fn upload_extents_between(
+        &self,
+        t: &UploadTarget<'_>,
+        first: u16,
+        last: u16,
+        limit: u32,
+    ) -> Result<Vec<PartExtent>> {
+        recovery::upload_extents(self, t, Some((first, last)), limit).await
     }
     async fn upload_extents_held(
         &self,

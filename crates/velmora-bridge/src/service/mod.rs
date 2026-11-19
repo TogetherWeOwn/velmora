@@ -14,6 +14,7 @@ mod get;
 pub use get::{INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS};
 mod list;
 mod multipart;
+pub use multipart::MAX_PARTS;
 mod multipart_list;
 mod put;
 mod slices;

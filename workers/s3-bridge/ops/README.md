@@ -605,8 +605,9 @@ PutObject, and of a part, is the MD5 of its body. A part made by
 UploadPartCopy stays at `MAX_EXTENT_BYTES`.
 
 **How large an object can be.** One object is made of at most
-`MAX_OBJECT_EXTENTS` extents (10 000, the most this build takes): one
-recovery record names them all, and one request publishes them.
+`MAX_OBJECT_EXTENTS` extents (10 000 as shipped; the build takes up to
+131 072, see "Large objects" below): one recovery record names them
+all, and one request publishes them.
 CompleteMultipartUpload counts the extents of every part the upload
 holds, listed or not, and answers 400 `EntityTooLarge` above the limit.
 The upload stays open.
@@ -619,10 +620,11 @@ The upload stays open.
 
 A part above 16 MiB saves requests, not extents: 95 MiB is one request
 for twelve extents. For the largest objects use parts of 16 MiB. An
-object above 156 GiB does not fit this build.
+object above 156 GiB does not fit the shipped limit.
 
 - A request body above 100 MiB is refused before the Worker runs, so
-  99 MiB is the most `MAX_PUT_BYTES` takes. That limit counts the bytes
+  99 MiB is what `MAX_PUT_BYTES` is set to (the build takes up to
+  199 MiB, for a plan whose edge takes 200 MiB). That limit counts the bytes
   on the wire: a body sent in signed chunks carries 89 bytes of framing
   per chunk. With chunks of 8 KiB, the smallest S3 allows, a body above
   about 98.9 MiB is over it and is refused there; chunks of 16 KiB or
@@ -726,6 +728,87 @@ Going back to a Worker version from before this table needs nothing
 else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
+
+## Large objects
+
+An object of more than 10 000 extents has a recovery record in parts
+(a segmented record): segments of 4 096 extents under `m/seg/<set>/`,
+stored first, and a head under the name of the record, stored last.
+Only the head is the record. Segments without a head are named by
+nothing and are read by nothing; they are left by a Complete that
+failed or lost a race, and no job removes them. An object of 10 000
+extents or fewer is recorded in one document, byte for byte as before.
+
+**Shipped: off.** `MAX_OBJECT_EXTENTS` is not set, so the limit is
+10 000 and no segmented record is written. The limit is raised by a
+setting, after the drills of the large-object plan have passed, not by
+this build alone.
+
+| Setting | Shipped | The build takes | What it bounds |
+|---|---|---|---|
+| `MAX_OBJECT_EXTENTS` | 10 000 (not set) | 1 to 131 072 | extents of one object |
+| `MAX_PUT_BYTES` | 99 MiB | up to 199 MiB | one request body; set it to the edge limit of the plan less 1 MiB |
+| `SLICE_BYTES` | 8 MiB (not set) | 16 slices a body at most | extents per part |
+
+- With `MAX_OBJECT_EXTENTS` above 10 000 the Worker refuses to start
+  unless an upload of 10 000 parts of `MAX_PUT_BYTES` fits the limit:
+  `ceil(MAX_PUT_BYTES / SLICE_BYTES) x 10 000` must not be more. At
+  99 MiB in slices of 8 MiB that is 130 000 extents, so 131 072 passes.
+  A client can then use every part number at its largest part and never
+  meets the extent limit: 10 000 parts of 96 MiB are 937 GiB.
+- A plan with a higher edge limit is a change of settings only. With an
+  edge of 200 MiB: `MAX_PUT_BYTES = 208666624` (199 MiB) and
+  `SLICE_BYTES = 16777216` (13 slices a part, 130 000 extents). The
+  Worker refuses to start with 199 MiB in slices of 8 MiB (25 slices).
+- **Client settings for a large object:** aws-cli and boto3
+  `multipart_chunksize = 96MB`; rclone `--s3-chunk-size 96M`. A part of
+  96 MiB from aws-cli 2.31 with its default checksum settings is a body
+  of 100 664 300 bytes (1 004 bytes of chunk framing and trailer; over
+  HTTP/1.1 another 971 bytes of transfer chunking): 4 MiB under the
+  edge limit of 104 857 600.
+- **CompleteMultipartUpload of an upload above 10 000 extents** reads
+  the extents a run of 256 part numbers at a time, stores the segments
+  as it goes, then the head, then publishes in one transaction. It
+  answers `200` at once and the document follows when the work is done,
+  with a newline every 5 s in between; a failure after the headers is
+  an `<Error>` document in that `200`, as S3 itself answers this call.
+  aws-cli, boto3 and rclone read it. The work goes on when the client
+  goes away; the same request again is answered from the receipt.
+  Refusals that need no work (unknown upload, a part that does not
+  match, too many extents, a condition that does not hold) keep their
+  status code.
+- One such Complete is charged 24 MiB of `INFLIGHT_BUDGET_BYTES` while
+  it runs; without room it answers 503 `SlowDown`. With
+  `MAX_OBJECT_EXTENTS` above 10 000 the Worker refuses to start with a
+  budget below that.
+- An UploadPart or an abort that arrives while the extents are read
+  wins: no head is stored, nothing is published, and the answer is the
+  one the upload then deserves (`InvalidPart`, `NoSuchUpload`, or a new
+  attempt on the upload as it is).
+- Complete sends one batch of at most 100 queue messages. The outbox
+  rows are written for every extent in the publish transaction, and the
+  dispatcher sends the rest.
+- A head names at most 192 segments. With the built-in segment size
+  that is far above the limit (131 072 extents are 32 segments).
+
+**Drill settings.** `RECORD_SEGMENT_AFTER` (1 to 10 000),
+`RECORD_SEGMENT_EXTENTS` (1 to 4 096) and `PUBLISH_CHUNK_ROWS`
+(1 to 25 000) make the segmented path start earlier, with smaller
+segments and smaller publish values, so that a drill covers it with a
+small object. They only take values at or below the built-in ones. The
+Worker refuses to start when `MAX_OBJECT_EXTENTS` in segments of
+`RECORD_SEGMENT_EXTENTS` would be more than 192 segments. Production
+and dev set none of them, and a contract test holds them to that.
+
+**Rollback.** Once one segmented record exists (a key under `m/seg/` in
+`SAFETY`), never roll back to a version older than the first one that
+reads segmented records in the replay, the recovery copy and the intent
+sweep. An older version cannot read a head: its replay stops at it, and
+its sweep finds no record for a sliced write and removes the slices a
+day later. Setting `MAX_OBJECT_EXTENTS` back to 10 000 stops new
+segmented records and does not lower this floor: the ones written stay.
+With the limit at 10 000 from the start there is no such record and no
+new floor.
 
 ## Packed article plans
 

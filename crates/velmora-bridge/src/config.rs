@@ -23,12 +23,31 @@ pub const REAL_DATA_READY: bool = true;
 /// bodies land.
 pub const MAX_EXTENT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
-/// Largest PutObject body `MAX_PUT_BYTES` may allow. The edge refuses a
-/// request of 100 MiB before the Worker runs; the last MiB is left for
-/// the framing of a chunked body. It is enough for signed chunks of
-/// 16 KiB or more; with signed chunks of 8 KiB, the smallest S3 allows,
-/// the edge refuses a body above about 98.9 MiB.
-pub const MAX_PUT_BYTES_LIMIT: u64 = 99 * 1024 * 1024;
+/// Largest body `MAX_PUT_BYTES` may allow: of a PutObject and of an
+/// UploadPart. It is the ceiling of the setting, not what a deployment
+/// has: the edge of the account's plan refuses a larger request before
+/// the Worker runs, so `MAX_PUT_BYTES` is set to what that edge lets
+/// through less [`EDGE_FRAMING_BYTES`] ([`edge_put_bytes`]): 99 MiB
+/// under an edge limit of 100 MiB, 199 MiB under one of 200 MiB. A plan
+/// with a higher edge limit is then a change of settings
+/// (`MAX_PUT_BYTES`, and `SLICE_BYTES` so that a body stays within
+/// [`MAX_WRITE_SLICES`]), not of code. A value above what the edge
+/// lets through is harmless: the edge answers first.
+pub const MAX_PUT_BYTES_LIMIT: u64 = 199 * 1024 * 1024;
+
+/// What is left of an edge body limit for the framing of a chunked
+/// body. It is enough for signed chunks of 16 KiB or more; with signed
+/// chunks of 8 KiB, the smallest S3 allows, the edge of 100 MiB refuses
+/// a body above about 98.9 MiB. The unsigned 1 MiB chunks and the
+/// checksum trailer of a current aws-cli take 1,004 bytes around a part
+/// of 96 MiB.
+pub const EDGE_FRAMING_BYTES: u64 = 1024 * 1024;
+
+/// The `MAX_PUT_BYTES` of a deployment behind an edge that refuses a
+/// request body of `edge_limit` bytes or more.
+pub const fn edge_put_bytes(edge_limit: u64) -> u64 {
+    edge_limit.saturating_sub(EDGE_FRAMING_BYTES)
+}
 
 /// `SLICE_BYTES` when the variable is absent: 8 MiB, or one extent when
 /// that is smaller.
@@ -38,12 +57,26 @@ pub const DEFAULT_SLICE_BYTES: u64 = 8 * 1024 * 1024;
 /// catalogue batches, and one generation holds them.
 pub const MAX_WRITE_SLICES: u64 = 16;
 
-/// Most extents one object may be made of, and `MAX_OBJECT_EXTENTS`
-/// when the variable is absent. One recovery record names them all and
-/// one catalogue batch publishes them, so CompleteMultipartUpload
-/// refuses an upload that holds more, in listed parts or not, and
-/// UploadPart refuses a part of several extents that would take it there.
-pub const MAX_OBJECT_EXTENTS_LIMIT: u32 = 10_000;
+/// Most extents `MAX_OBJECT_EXTENTS` may allow one object. Up to
+/// [`DEFAULT_MAX_OBJECT_EXTENTS`] one recovery record names them all;
+/// above, the record is segmented
+/// ([`crate::recovery::SegmentWriter`]). One catalogue batch publishes
+/// them either way. CompleteMultipartUpload refuses an upload that
+/// holds more than the setting, in listed parts or not, and UploadPart
+/// refuses a part of several extents that would take it there.
+/// 131,072 extents of 8 MiB are 1 TiB.
+pub const MAX_OBJECT_EXTENTS_LIMIT: u32 = 131_072;
+
+/// `MAX_OBJECT_EXTENTS` when the variable is absent: what one
+/// recovery record in one document holds.
+pub const DEFAULT_MAX_OBJECT_EXTENTS: u32 = crate::recovery::SINGLE_RECORD_EXTENTS;
+
+/// What a CompleteMultipartUpload of more extents than one document
+/// holds is charged against `INFLIGHT_BUDGET_BYTES` while it reads and
+/// publishes them: a fixed sum for the largest object there is
+/// ([`MAX_OBJECT_EXTENTS_LIMIT`]), from the measurement in workerd
+/// (see `ops/README.md`, "Large objects").
+pub const COMPLETE_CHARGE_BYTES: u64 = 24 * 1024 * 1024;
 
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;
@@ -181,6 +214,15 @@ pub struct BridgeConfig {
     pub slice_bytes: u64,
     /// Most extents CompleteMultipartUpload publishes as one object.
     pub max_object_extents: u32,
+    /// Where a generation record is segmented
+    /// ([`crate::recovery::Cut`]). The built-in figures, unless a
+    /// drill set smaller ones (`RECORD_SEGMENT_AFTER`,
+    /// `RECORD_SEGMENT_EXTENTS`).
+    pub record_cut: crate::recovery::Cut,
+    /// Most rows one value of a set-based publish describes
+    /// (`PUBLISH_CHUNK_ROWS`): `None` = what the database adapter
+    /// says. A drill sets a smaller figure, never a larger one.
+    pub publish_chunk_rows: Option<u32>,
     /// Delete the safety blobs of sliced writes that were never
     /// published. Off: their `write_intents` rows stay and can be swept
     /// later.
@@ -490,12 +532,63 @@ impl BridgeConfig {
             return Err(ConfigError::Invalid(cause.into()));
         }
         let max_object_extents = match optional_u64(&get, "MAX_OBJECT_EXTENTS")? {
-            None => MAX_OBJECT_EXTENTS_LIMIT,
+            None => DEFAULT_MAX_OBJECT_EXTENTS,
             Some(n) => u32::try_from(n)
                 .ok()
                 .filter(|n| (1..=MAX_OBJECT_EXTENTS_LIMIT).contains(n))
                 .ok_or_else(|| ConfigError::Invalid("MAX_OBJECT_EXTENTS".into()))?,
         };
+        // Drill settings. Each may only be smaller than the built-in
+        // figure, so nothing written under them is larger than what the
+        // readers and the database were measured with.
+        let below = |name: &str, built_in: u32| -> Result<Option<u32>, ConfigError> {
+            match optional_u64(&get, name)? {
+                None => Ok(None),
+                Some(n) => u32::try_from(n)
+                    .ok()
+                    .filter(|n| (1..=built_in).contains(n))
+                    .map(Some)
+                    .ok_or_else(|| ConfigError::Invalid(name.into())),
+            }
+        };
+        let built_in = crate::recovery::Cut::BUILT_IN;
+        let record_cut = crate::recovery::Cut {
+            after: below("RECORD_SEGMENT_AFTER", built_in.after)?.unwrap_or(built_in.after),
+            per: below("RECORD_SEGMENT_EXTENTS", built_in.per)?.unwrap_or(built_in.per),
+        };
+        let publish_chunk_rows = below(
+            "PUBLISH_CHUNK_ROWS",
+            u32::try_from(crate::ports::SqlLimits::D1.set_rows).unwrap_or(u32::MAX),
+        )?;
+        // The largest object the limit allows is one whose record a
+        // head may name: no reader takes a head of more segments. With
+        // the built-in segment size every limit passes; a smaller
+        // segment size needs a smaller limit.
+        if max_object_extents > record_cut.after && !record_cut.fits(u64::from(max_object_extents))
+        {
+            return Err(ConfigError::Refused(
+                "MAX_OBJECT_EXTENTS in segments of RECORD_SEGMENT_EXTENTS is more than one record holds",
+            ));
+        }
+        // Once an object may have more extents than one document holds
+        // (the large-object limit), an upload of every part number in
+        // bodies of the largest size has to fit it: otherwise a client
+        // that follows the limits it is told finds out at Complete.
+        // Derived from the three settings, so a plan with larger bodies
+        // is checked by the same rule.
+        let part_extents = if max_put_bytes > max_extent_bytes {
+            max_put_bytes.div_ceil(slice_bytes)
+        } else {
+            1
+        };
+        if max_object_extents > DEFAULT_MAX_OBJECT_EXTENTS
+            && part_extents.saturating_mul(u64::from(crate::service::MAX_PARTS))
+                > u64::from(max_object_extents)
+        {
+            return Err(ConfigError::Refused(
+                "MAX_OBJECT_EXTENTS is less than 10000 parts of MAX_PUT_BYTES in slices of SLICE_BYTES",
+            ));
+        }
         let intent_sweep = match get("INTENT_SWEEP").as_deref().map(str::trim) {
             None | Some("") | Some("off") => false,
             Some("on") => true,
@@ -555,6 +648,10 @@ impl BridgeConfig {
         let inflight_budget_bytes: u64 = number(&get, "INFLIGHT_BUDGET_BYTES")?;
         // Plaintext and ciphertext of one maximal body must fit.
         if inflight_budget_bytes < max_extent_bytes.saturating_mul(2) {
+            return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
+        }
+        // A Complete of a segmented record is charged a fixed sum.
+        if max_object_extents > record_cut.after && inflight_budget_bytes < COMPLETE_CHARGE_BYTES {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }
         // Only as many sockets as the budget has room for: what a cold
@@ -672,6 +769,8 @@ impl BridgeConfig {
             max_put_bytes,
             slice_bytes,
             max_object_extents,
+            record_cut,
+            publish_chunk_rows,
             intent_sweep,
             packed_plans,
             records,

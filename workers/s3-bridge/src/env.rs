@@ -139,7 +139,10 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     set_abandon(abandon);
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
     Ok(Bridge {
-        catalog: SqlCatalog::new(D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)),
+        catalog: SqlCatalog::new(
+            D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)
+                .with_set_rows(cfg.publish_chunk_rows),
+        ),
         safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)
             .with_tombstone_delay(tombstone_delay),
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),

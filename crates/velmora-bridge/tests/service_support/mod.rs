@@ -518,6 +518,8 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
+        record_cut: velmora_bridge::recovery::Cut::BUILT_IN,
+        publish_chunk_rows: None,
         intent_sweep: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,

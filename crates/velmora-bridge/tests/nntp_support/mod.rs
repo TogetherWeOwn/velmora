@@ -1153,6 +1153,15 @@ impl Catalog for MemCatalog {
     async fn upload_extents(&self, _: &UploadTarget<'_>, _: u32) -> Result<Vec<PartExtent>> {
         unused()
     }
+    async fn upload_extents_between(
+        &self,
+        _: &UploadTarget<'_>,
+        _: u16,
+        _: u16,
+        _: u32,
+    ) -> Result<Vec<PartExtent>> {
+        unused()
+    }
     async fn replay_probe(&self, _: &GenerationRow) -> Result<velmora_bridge::replay::ReplayProbe> {
         unused()
     }
@@ -1512,6 +1521,8 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         max_put_bytes: 16 * 1024 * 1024,
         slice_bytes: 8 * 1024 * 1024,
         max_object_extents: 10_000,
+        record_cut: velmora_bridge::recovery::Cut::BUILT_IN,
+        publish_chunk_rows: None,
         intent_sweep: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,

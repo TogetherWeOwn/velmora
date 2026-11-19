@@ -51,9 +51,13 @@ POST_SOCKETS = "6"
 # within the 48 MiB above. See "A GET above GET_FANOUT_BYTES" in
 # ops/README.md for what was measured.
 COLD_SOCKETS = "8"
-# The largest body of a PutObject or an UploadPart: 99 MiB, the most this
-# build takes. A request body above 100 MiB is refused before it reaches
-# the Worker, and the margin is for chunked framing. A body above
+# The largest body of a PutObject or an UploadPart: 99 MiB. A request
+# body above 100 MiB is refused before it reaches the Worker (the edge
+# limit of the account's plan), and the margin is for chunked framing: a
+# part of 96 MiB from a current aws-cli is 1,004 bytes larger on the
+# wire. The build takes up to 199 MiB, for a plan whose edge takes
+# 200 MiB: then set this and SLICE_BYTES (16 MiB, so that a body stays
+# within 16 slices), nothing else. A body above
 # MAX_EXTENT_BYTES is stored as slices of SLICE_BYTES, one in memory at a
 # time. Without the variable the limit is MAX_EXTENT_BYTES. A part made
 # by UploadPartCopy stays at MAX_EXTENT_BYTES.
@@ -90,9 +94,12 @@ INTENT_SWEEP = "off"
 RECOVERY_COPY = "off"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
-#   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
-#     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB that is 78 GiB in parts above
-#     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES.
+#   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 131072. CompleteMultipartUpload, and an UploadPart
+#     above MAX_EXTENT_BYTES, answer 400 EntityTooLarge for an upload that would hold more. With slices of 8 MiB, 10000 is 78 GiB in parts above
+#     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES. Above 10000 the recovery record of an object is
+#     written in segments, which a Worker from before the segmented readers does not read: see ops/README.md, "Large objects",
+#     before raising it, and for the rollback floor after. Above 10000 it must also hold 10000 parts of MAX_PUT_BYTES in
+#     slices of SLICE_BYTES (99 MiB in 8 MiB: 130000), and INFLIGHT_BUDGET_BYTES must be at least 24 MiB.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.
