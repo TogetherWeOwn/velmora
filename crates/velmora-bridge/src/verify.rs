@@ -834,6 +834,24 @@ where
         // not count toward a release, are not looked at.
         let mut status = self.catalog.backbone_status(&extent.id).await?;
         status.retain(|s| labels.contains(&label(&s.backbone)));
+        if light.is_some() {
+            // Under the light check a backbone that was read in full
+            // before is asked for presence in a later round, and that
+            // row is its latest. The full read on record still stands,
+            // as it does for the release: a pass now on a backbone with
+            // a complete full read of this plan is the full check.
+            let checks = self.catalog.body_checks(&extent.id).await?;
+            let read = |s: &BackboneStatus| {
+                let on = |b: &&BackboneStatus| label(&b.backbone) == label(&s.backbone);
+                let mut of_plan = checks.iter().filter(|b| b.plan_rev == extent.plan_rev);
+                of_plan.any(|b| b.counts && on(&b))
+            };
+            for s in status.iter_mut().filter(|s| s.counts && !s.kind.is_full()) {
+                if read(s) {
+                    s.kind = VerifyKind::Body;
+                }
+            }
+        }
         let passes = status
             .iter()
             .filter(|s| s.counts)

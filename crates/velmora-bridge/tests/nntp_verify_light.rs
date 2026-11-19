@@ -457,7 +457,29 @@ async fn another_backbone_is_read_in_full_when_the_one_named_lacks_the_extent() 
     assert!(!rows.contains(&ok("bb1", VerifyKind::Sampled)));
     assert_eq!(rig.calls().0, 2 * plan.len());
 
+    // An article is gone for a moment when the release asks: back to
+    // verify. The full read on record still stands there, though the
+    // latest row of its backbone is now a presence pass.
+    rig.servers[1].hide(&plan[0].message_id).await;
     rig.bridge.clock.advance_secs(1);
+    assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
+    assert_eq!(rig.stage(&s), OutboxStage::Verify);
+    rig.servers[1].unhide(&plan[0].message_id).await;
+    for _ in 0..12 {
+        rig.wait_until_due(&s);
+        rig.logged(&s, OutboxStage::Verify).await;
+        if rig.stage(&s) == OutboxStage::Release {
+            break;
+        }
+    }
+    assert_eq!(rig.stage(&s), OutboxStage::Release);
+    let rows = rig.checks(&s);
+    let full = |r: &&(String, VerifyKind, VerifyResult)| r.0 == "bb0" && r.1.is_full();
+    assert_eq!(rows.iter().filter(full).count(), 1);
+    let last = rows.iter().rev().find(|r| r.0 == "bb0").unwrap();
+    assert_eq!(last, &ok("bb0", VerifyKind::Stat));
+
+    rig.wait_until_due(&s);
     assert_eq!(rig.run(&s, OutboxStage::Release).await, JobOutcome::Ack);
     assert_eq!(rig.state(&s), SafetyState::Released);
     let evidence = rig.evidence(&s);
