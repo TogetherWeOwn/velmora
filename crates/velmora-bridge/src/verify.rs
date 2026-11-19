@@ -834,7 +834,8 @@ where
         // not count toward a release, are not looked at.
         let mut status = self.catalog.backbone_status(&extent.id).await?;
         status.retain(|s| labels.contains(&label(&s.backbone)));
-        if light.is_some() {
+        let full_now = status.iter().any(|s| s.counts && s.kind.is_full());
+        if light.is_some() && need_full && !full_now {
             // Under the light check a backbone that was read in full
             // before is asked for presence in a later round, and that
             // row is its latest. The full read on record still stands,
