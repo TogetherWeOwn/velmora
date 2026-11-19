@@ -2,6 +2,7 @@
 # Regression test for the history scan's git log options.
 #
 # Usage: gitleaks-log-opts-test.sh <gitleaks-binary> <config> <log-opts>
+# Needs git and jq.
 #
 # Builds a throwaway repository with two known bypasses of a plain
 # `--log-opts=HEAD` history scan and asserts that <log-opts> catches both:
@@ -43,14 +44,25 @@ new_repo() {
   printf '%s\n' "$dir"
 }
 
-# scan <repo> <log-opts>: prints the gitleaks exit code (0 clean, 1 leak).
+# scan <repo> <log-opts> <file>: prints "<exit code> <n>", where n counts
+# github-pat findings in <file> at the repo's HEAD commit. Exit code 1 alone
+# is not proof: gitleaks also exits 1 on a scan error.
 scan() {
-  local rc=0
+  local rc=0 report="$work/report.json" head
+  rm -f "$report"
+  head="$(git -C "$1" rev-parse HEAD)"
   "$gitleaks_bin" git "$1" --redact --no-banner --log-level error \
     --exit-code 1 --log-opts="$2" --ignore-gitleaks-allow \
     --config "$config" \
-    --gitleaks-ignore-path "$work/empty-ignore" >/dev/null 2>&1 || rc=$?
-  printf '%s\n' "$rc"
+    --gitleaks-ignore-path "$work/empty-ignore" \
+    --report-format json --report-path "$report" >/dev/null 2>&1 || rc=$?
+  local n=0
+  if [ -s "$report" ]; then
+    n="$(jq --arg f "$3" --arg c "$head" \
+      '[.[] | select(.RuleID == "github-pat" and .File == $f and .Commit == $c)] | length' \
+      "$report")"
+  fi
+  printf '%s %s\n' "$rc" "$n"
 }
 : > "$work/empty-ignore"
 
@@ -93,20 +105,20 @@ done
 
 fail=0
 check() {
-  local name="$1" repo="$2" got
-  got="$(scan "$repo" HEAD)"
-  if [ "$got" != 0 ]; then
-    echo "FAIL $name: --log-opts=HEAD exited $got, expected 0 (the bypass no longer reproduces; test is not proving anything)"
+  local name="$1" repo="$2" file="$3" got
+  got="$(scan "$repo" HEAD "$file")"
+  if [ "$got" != "0 0" ]; then
+    echo "FAIL $name: --log-opts=HEAD gave '$got' (exit, findings), expected '0 0' (the bypass no longer reproduces; test is not proving anything)"
     fail=1
   fi
-  got="$(scan "$repo" "$log_opts")"
-  if [ "$got" = 1 ]; then
+  got="$(scan "$repo" "$log_opts" "$file")"
+  if [ "$got" = "1 1" ]; then
     echo "ok   $name: caught with --log-opts=\"$log_opts\""
   else
-    echo "FAIL $name: --log-opts=\"$log_opts\" exited $got, expected 1 (secret missed)"
+    echo "FAIL $name: --log-opts=\"$log_opts\" gave '$got' (exit, findings), expected '1 1' (secret missed)"
     fail=1
   fi
 }
-check "-diff attribute" "$r1"
-check "merge-conflict resolution" "$r2"
+check "-diff attribute" "$r1" creds.env
+check "merge-conflict resolution" "$r2" conf
 exit "$fail"
