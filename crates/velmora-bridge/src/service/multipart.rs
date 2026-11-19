@@ -1305,7 +1305,9 @@ where
             UploadState::Completed => {
                 // A retry of the Complete that won: answer from the
                 // receipt and publish nothing, so a later overwrite of the
-                // key is never rolled back.
+                // key is never rolled back. A declared size is not
+                // checked again: the same part list was held to it when
+                // it won, and a replay publishes nothing to guard.
                 if upload.complete_digest != Some(digest) {
                     return Err(ErrorCode::NoSuchUpload.into());
                 }
@@ -1333,7 +1335,18 @@ where
         // published. The header is checked as a decimal before this.
         if let Some(declared) = a.headers.get("x-amz-mp-object-size") {
             if declared.parse::<u64>().ok() != Some(publication.size) {
-                return Err(ErrorCode::InvalidRequest.into());
+                let message = format!(
+                    "The x-amz-mp-object-size header declares {declared} bytes, but the \
+                     listed parts hold {} bytes. Nothing was published; the upload stays open.",
+                    publication.size
+                );
+                return Err(S3Response::error_with(
+                    400,
+                    "InvalidRequest",
+                    &message,
+                    &[("Header", "x-amz-mp-object-size")],
+                )
+                .into());
             }
         }
         // One record names every extent of the object and one batch

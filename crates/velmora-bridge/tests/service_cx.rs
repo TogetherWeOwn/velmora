@@ -435,6 +435,24 @@ async fn a_wrong_host_is_told_so() {
         resp.expect_error(400, "InvalidRequest");
         assert!(resp.message().starts_with("Virtual-hosted-style requests"));
     }
+    // A one-segment key or the root, which route to no operation, gets
+    // the same answer about the host rather than a bare 501.
+    type Call<'a> = (Method, &'a str, &'a [(&'a str, &'a str)]);
+    let calls: &[Call<'_>] = &[
+        (Method::Post, "/big.bin", &[("uploads", "")]),
+        (Method::Delete, "/big.bin", &[("uploadId", "u")]),
+        (Method::Get, "/", &[("uploads", "")]),
+    ];
+    for (method, target, query) in calls {
+        let mut req = signer.sign(rig.now(), method.clone(), target, query, &[], vec![]);
+        req.set_header("host", &format!("{BUCKET}.{HOST}"));
+        let resp = rig.send(req).await;
+        resp.expect_error(400, "InvalidRequest");
+        assert!(resp.message().starts_with("Virtual-hosted-style requests"));
+        // With the right host the same call is an operation not offered.
+        let req = signer.sign(rig.now(), method.clone(), target, query, &[], vec![]);
+        rig.send(req).await.expect_error(501, "NotImplemented");
+    }
     // With the right host the path is what is refused.
     let req = signer.sign(
         rig.now(),
@@ -594,6 +612,16 @@ async fn every_answer_carries_the_request_id() {
         assert!(!text.contains("RequestId"), "{bad:?}");
     }
     assert_eq!(safe_request_id("Ab0._-"), Some("Ab0._-"));
+    // The ID a request without a ray ID is given is always one that is
+    // kept, at the extremes of its inputs as well.
+    for (now, random) in [
+        (0, 0),
+        (1_763_500_000_000, 0xdead_beef),
+        (u64::MAX, u32::MAX),
+    ] {
+        let id = local_request_id(now, random);
+        assert_eq!(safe_request_id(&id), Some(id.as_str()), "{id}");
+    }
 
     // The same holds for an answer of the service itself.
     let rig = rig();
@@ -677,6 +705,15 @@ async fn multipart_calls_answer_the_same_way() {
         .await;
     wrong.expect(400);
     assert_eq!(field(&wrong, "Code").as_deref(), Some("InvalidRequest"));
+    assert_eq!(
+        field(&wrong, "Header").as_deref(),
+        Some("x-amz-mp-object-size")
+    );
+    let message = field(&wrong, "Message").unwrap();
+    assert!(
+        message.contains("999") && message.contains(" 7 bytes"),
+        "{message}"
+    );
     rig.head(&signer, BUCKET, "big").await.expect(404);
     rig.call(
         &east,

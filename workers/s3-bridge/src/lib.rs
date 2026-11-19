@@ -125,10 +125,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .filter(|ray| !ray.is_empty())
         .unwrap_or_else(|| {
             use worker::js_sys::{Date, Math};
-            format!(
-                "{:011x}{:08x}-local",
+            velmora_bridge::local_request_id(
                 Date::now() as u64,
-                (Math::random() * 4_294_967_296.0) as u32
+                (Math::random() * 4_294_967_296.0) as u32,
             )
         });
     let early = |resp: S3Response| {

@@ -210,7 +210,12 @@ pub(super) fn header_refused(refusal: &HeaderRefusal) -> S3Response {
 /// virtual-hosted-style addressing (`<bucket>.<endpoint>`), so that case
 /// is named. The configured endpoint itself is not disclosed.
 pub(super) fn host_refused(headers: &Headers, cfg: &BridgeConfig) -> Option<S3Response> {
-    let host = headers.get("host")?;
+    host_value_refused(headers.get("host")?, cfg)
+}
+
+/// [`host_refused`] for a `Host` value read off the raw request, as on a
+/// route that parses no headers.
+pub(super) fn host_value_refused(host: &str, cfg: &BridgeConfig) -> Option<S3Response> {
     if host.eq_ignore_ascii_case(&cfg.s3_host) {
         return None;
     }

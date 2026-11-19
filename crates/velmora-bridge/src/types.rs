@@ -1661,6 +1661,13 @@ pub fn safe_request_id(id: &str) -> Option<&str> {
     .then_some(id)
 }
 
+/// The ID of a request that came with no ray ID (a service binding):
+/// the time in milliseconds and 32 random bits, in hex, then `-local`.
+/// Always a [`safe_request_id`], so it reaches the header and the log.
+pub fn local_request_id(now_ms: u64, random: u32) -> String {
+    format!("{now_ms:011x}{random:08x}-local")
+}
+
 impl S3Response {
     /// S3 XML error document. `code` and `message` must be static text,
     /// never request data.
