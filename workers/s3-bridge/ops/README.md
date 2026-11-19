@@ -824,10 +824,13 @@ on a build in which:
   work takes), and the repost of a verify job that runs already. While
   bodies are being read the jobs do wait: bodies pass in seconds, and
   jobs let in meanwhile would hold the room when the bodies are done.
-  The price: while the bodies never leave 32 MiB free (two or more
-  part uploads at once, or one body of more than 8 MiB and at most
-  `MAX_EXTENT_BYTES` that is read slowly; a longer body is charged two
-  slices, 16 MiB at the default `SLICE_BYTES`, and leaves that room),
+  The price: while the bodies never leave 32 MiB free, which is while
+  their charges come to more than 16 MiB together (a body of at most
+  `MAX_EXTENT_BYTES` is charged twice its length, a longer one two
+  slices, 16 MiB at the default `SLICE_BYTES`; so one body of more
+  than 8 MiB and at most `MAX_EXTENT_BYTES` that is read slowly does
+  it, and so do two longer bodies at once, but one longer body alone
+  or a few small ones leave the room),
   no post, verify or release job starts, whatever its size (also one
   that would fit beside the Complete; only the repost of a verify job
   that runs already goes on), until the Complete has its charge or
