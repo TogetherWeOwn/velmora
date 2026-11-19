@@ -2485,7 +2485,12 @@ const FULL_EXTENT: usize = 16 * 1024 * 1024;
 
 /// A cold-read rig that plans parity for what it posts.
 async fn parity_cold() -> Cold {
-    let mut cold = cold_rig().await;
+    parity_cold_with(None).await
+}
+
+/// The same, whose byte budget polls with `sleeper`.
+async fn parity_cold_with(sleeper: Option<Sleeper>) -> Cold {
+    let mut cold = cold_rig_with(2, sleeper).await;
     let bridge = Rc::get_mut(&mut cold.rig.bridge).expect("the rig alone holds the bridge");
     bridge.cfg.packed_plans = true;
     bridge.cfg.parity = true;
@@ -2751,4 +2756,123 @@ async fn an_addendum_that_cannot_be_read_rebuilds_nothing() {
     cold.lose([&data[1]]).await;
     let resp = cold.cold_get("small.bin", &extent).await;
     cold.nothing_served(&resp, &body);
+}
+
+/// A rebuild is a read: it posts nothing, and the GET writes to the
+/// catalogue what a cold GET of an extent that lost nothing writes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rebuild_posts_nothing_and_writes_nothing_more() {
+    let cold = parity_cold().await;
+    let body = pattern(73, 1_500_000);
+    let extent = cold.put_and_post("small.bin", &body).await;
+    let (data, _) = stripe(&cold, &extent).await;
+    let sql = &cold.rig.bridge.catalog.sql.inner;
+    sql.meter_writes().unwrap();
+    let posts = |cold: &Cold| {
+        let calls = cold.rig.bridge.nntp.calls();
+        calls.iter().filter(|call| call.0 == "post").count()
+    };
+
+    let before = sql.writes();
+    cold.cold_get("small.bin", &extent).await.expect(200);
+    let plain = sql.writes().since(&before);
+
+    cold.lose([&data[2]]).await;
+    let (posted, held) = (posts(&cold), cold.server.posted_count().await);
+    let before = sql.writes();
+    let resp = cold.cold_get("small.bin", &extent).await;
+    resp.expect(200);
+    assert!(resp.body == body);
+    let rebuilt = sql.writes().since(&before);
+
+    assert_eq!(rebuilt.writing_statements, plain.writing_statements);
+    assert_eq!(rebuilt.billed(), plain.billed());
+    assert_eq!(posts(&cold), posted);
+    assert_eq!(cold.server.posted_count().await, held);
+}
+
+/// A read whose rebuild found no room waits until there is room for the
+/// extent and for the rebuild together, and holds nothing meanwhile. It
+/// is not made again as soon as the extent alone fits: that read would
+/// be refused its rebuild again, every time.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_refused_its_rebuild_waits_for_room_for_both() {
+    let polls = Rc::new(Cell::new(0u32));
+    let weak: Rc<RefCell<Weak<TestBridge<TcpConnector>>>> = Rc::new(RefCell::new(Weak::new()));
+    let taken: Rc<RefCell<Option<Charge>>> = Rc::default();
+    let sleeper: Sleeper = {
+        let (polls, weak, taken) = (polls.clone(), weak.clone(), taken.clone());
+        Rc::new(move |ms| {
+            if is_watch(ms) {
+                return Box::pin(std::future::pending());
+            }
+            let bridge = weak.borrow().upgrade().expect("rig is alive");
+            let held = taken.borrow().as_ref().map_or(0, Charge::bytes);
+            assert_eq!(bridge.budget.in_use(), held, "a waiting read holds budget");
+            bridge.clock.advance_ms(i64::from(ms));
+            polls.set(polls.get() + 1);
+            // Room is made after a few looks.
+            if polls.get() == 3 {
+                taken.borrow_mut().take();
+            }
+            Box::pin(async {})
+        })
+    };
+    let cold = parity_cold_with(Some(sleeper)).await;
+    *weak.borrow_mut() = Rc::downgrade(&cold.rig.bridge);
+    let body = pattern(79, 1_500_000);
+    let extent = cold.put_and_post("small.bin", &body).await;
+    let (data, parity) = stripe(&cold, &extent).await;
+    cold.lose([&data[1]]).await;
+    evict(&cold.rig, &extent).await;
+
+    // Room for the read of the extent, one byte short of the rebuild.
+    let budget = &cold.rig.bridge.budget;
+    let step = velmora_bridge::fetch::cold_step_bytes(
+        extent.cipher_size,
+        cold.rig.bridge.cfg.cold_sockets,
+    );
+    let rebuild = velmora_bridge::fetch::cold_rebuild_bytes(parity[0].cipher_len, 1);
+    *taken.borrow_mut() = budget.try_charge(budget.capacity() - step - rebuild + 1);
+    assert!(taken.borrow().is_some());
+
+    let before = cold.bodies();
+    let resp = get(&cold.rig, &cold.signer, "small.bin", &[]).await;
+
+    resp.expect(200);
+    assert!(resp.body == body);
+    assert!(polls.get() >= 3, "it looked {} times", polls.get());
+    // Two reads of the extent: the one that was refused its rebuild
+    // (three articles, the lost one asked for twice), and the one that
+    // rebuilt (the same and one parity article).
+    assert_eq!(cold.bodies() - before, 4 + 5);
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(cold.rig.bridge.nntp.live(), 0);
+}
+
+thread_local! {
+    static COLD_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The log line of an extent that cannot be rebuilt names the extent.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unrecoverable_extent_is_named_in_the_log() {
+    velmora_bridge::trace::log_cold_reads(|line| {
+        COLD_LINES.with(|lines| lines.borrow_mut().push(line.to_owned()));
+    });
+    let cold = parity_cold().await;
+    let body = pattern(83, 1_500_000);
+    let extent = cold.put_and_post("small.bin", &body).await;
+    let (data, _) = stripe(&cold, &extent).await;
+    cold.lose([&data[0], &data[1]]).await;
+
+    let resp = cold.cold_get("small.bin", &extent).await;
+
+    cold.nothing_served(&resp, &body);
+    let lines = COLD_LINES.with(|lines| lines.borrow().clone());
+    let named = format!("extent-unrecoverable extent={}", extent.id);
+    assert_eq!(lines.iter().filter(|line| **line == named).count(), 1);
+    assert!(lines
+        .iter()
+        .any(|line| line.contains(" extent-unrecoverable=1 ")));
 }

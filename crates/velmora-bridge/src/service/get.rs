@@ -1237,13 +1237,30 @@ where
         let mut slept = 0u32;
         let mut attempt = 0u64;
         let mut interrupted = 0u32;
+        // Room for a rebuild from the extent's parity, taken for the
+        // next try after a read that found none for it. Without it a
+        // read that lost articles would be made again in full as soon
+        // as the extent alone fits, and refused its rebuild again.
+        let mut spare: Option<Charge> = None;
         loop {
             let reader = match &mut self.reader {
                 Some(reader) => reader,
-                none => none.insert(bridge.cold_reader().map_err(|_| ReadFail::Internal)?),
+                // A rebuild from parity is charged to this request.
+                none => none.insert(
+                    bridge
+                        .cold_reader()
+                        .map_err(|_| ReadFail::Internal)?
+                        .charged_to(Rc::clone(&room)),
+                ),
             };
+            if let Some(spare) = spare.take() {
+                reader.fund(spare);
+            }
             let fetched = Spent::time(&bridge.clock, &self.spent.read, reader.fetch(extent));
             let read = beside(&mut self.put, fetched).await;
+            // What a rebuild lacked, if the read ended for that: the
+            // next try waits for room for the read and for these.
+            let rebuild = reader.settle();
             match read {
                 Ok(ColdFetch::Filled(cipher)) => {
                     // One cache write at a time.
@@ -1302,7 +1319,9 @@ where
                 // An extent that lost more than its parity rebuilds is
                 // as unavailable as one without parity.
                 Ok(ColdFetch::Unrecoverable) => {
-                    crate::trace::cold_read(|| "extent-unrecoverable".to_owned());
+                    crate::trace::cold_read(|| {
+                        format!("extent-unrecoverable extent={}", extent.id)
+                    });
                     return Err(ReadFail::Unavailable);
                 }
                 Ok(ColdFetch::Unavailable) => return Err(ReadFail::Unavailable),
@@ -1312,6 +1331,9 @@ where
             self.hang_up().await;
             drop(work);
             let sleep = bridge.budget.sleeper().ok_or(ReadFail::Busy)?;
+            // With a rebuild to come, room for both: the two are held
+            // together.
+            let both = need.saturating_add(rebuild);
             loop {
                 if bridge.clock.now() >= deadline || slept >= COLD_WAIT_MS {
                     return Err(ReadFail::Busy);
@@ -1323,7 +1345,7 @@ where
                 slept = slept.saturating_add(ms);
                 // Until there is room for the read, which is released
                 // again here: what follows takes what it needs.
-                if room.try_charge_in_turn(need).is_some() {
+                if room.try_charge_in_turn(both).is_some() {
                     break;
                 }
                 let now = bridge.clock.now();
@@ -1332,7 +1354,7 @@ where
                     return Err(ReadFail::Busy);
                 };
                 let listed = async {
-                    let listed = core::pin::pin!(room.charge_in_turn(need));
+                    let listed = core::pin::pin!(room.charge_in_turn(both));
                     match select(listed, sleep(left)).await {
                         Either::Left((found, _)) => Some(found.is_ok()),
                         Either::Right(_) => None,
@@ -1354,8 +1376,13 @@ where
             if bridge.clock.now() >= deadline {
                 return Err(ReadFail::Busy);
             }
-            // Not in the cache: read it, under a charge taken as above.
+            // Not in the cache: read it, under a charge taken as above,
+            // and with the room for its rebuild in hand if that is free
+            // still. If it is not, the rebuild asks for it itself.
             work = self.step(need, lean).await?;
+            if rebuild > 0 {
+                spare = room.try_charge(rebuild);
+            }
         }
     }
 }

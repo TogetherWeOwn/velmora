@@ -160,7 +160,9 @@ thread_local! {
 /// Sends one line to `to` each time a read ends its connections to
 /// Usenet: extents read, connections opened and broken, articles and
 /// bytes per provider id, and the milliseconds spent reading and writing
-/// to the cache. No key, bucket, message-id or host.
+/// to the cache. No key, bucket, message-id or host. An extent that
+/// lost more than its parity rebuilds gets a line of its own, with its
+/// id.
 pub fn log_cold_reads(to: fn(&str)) {
     COLD_READS.with(|log| log.set(Some(to)));
 }
