@@ -83,7 +83,9 @@ git -C "$r2" add conf
 git -C "$r2" commit -q --no-edit
 # Neither parent holds the token: only the resolution adds it.
 for parent in HEAD^1 HEAD^2; do
-  if git -C "$r2" log -p "$parent" | grep -qF "$fake_token"; then
+  # Capture first: `git log | grep -q` can lose to SIGPIPE under pipefail.
+  parent_log="$(git -C "$r2" log -p "$parent")"
+  if grep -qF "$fake_token" <<<"$parent_log"; then
     echo "setup error: token reachable from $parent" >&2
     exit 2
   fi
