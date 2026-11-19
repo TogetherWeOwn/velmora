@@ -1258,9 +1258,13 @@ pub(super) async fn redrive_underverified<S: Sql>(
 ) -> Result<u64> {
     let labels =
         serde_json::to_string(backbones).map_err(|_| BridgeError::Invalid("backbone labels"))?;
-    // One run looks at a window of `limit` held extents, read from the
-    // partial index alone, and the next run starts after it: the cost
-    // of a run does not grow with the number of held extents.
+    // One run looks at a window of `limit` pinned extents (held or
+    // releasing), read from the partial index alone, and the next run
+    // starts after it: the cost of a run does not grow with the number
+    // of pinned extents. The window counts releasing ones too, so a
+    // backlog of them is stepped over a window at a time rather than
+    // read whole in search of `limit` held ones; the update below takes
+    // the held ones of the window.
     let after = c
         .sql
         .query("SELECT v FROM scan_cursors WHERE k = 'redrive'", &[])
@@ -1273,10 +1277,10 @@ pub(super) async fn redrive_underverified<S: Sql>(
     let window = c
         .sql
         .query(
-            // The first condition is the index's own `WHERE`, word for
-            // word: the planner takes a partial index only then.
+            // The condition is the index's own `WHERE`, word for word:
+            // the planner takes a partial index only then.
             "SELECT id FROM extents INDEXED BY extents_safety \
-              WHERE safety_state IN ('held', 'releasing') AND safety_state = 'held' \
+              WHERE safety_state IN ('held', 'releasing') \
                 AND id > ?1 ORDER BY id LIMIT ?2",
             &[text(&after), SqlValue::Int(i64::from(limit))],
         )

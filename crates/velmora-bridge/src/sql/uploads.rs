@@ -536,11 +536,14 @@ pub(super) async fn abort_upload<S: Sql>(
 /// the extents first published in it. Every adopted extent has its
 /// reference by the time this is read, so these are the rows of
 /// `extents WHERE generation_id = ?1`, each found by its primary key.
-/// `CROSS JOIN` and the unary `+` fix that order.
+/// `CROSS JOIN` and the unary `+` fix that order. The trigger copies
+/// `seq` into the reference; `+e.seq = ge.seq` holds that, so the walk
+/// in `ge.seq` order is the extents' order, read from the primary key of
+/// `generation_extents` with no sort.
 macro_rules! adopted {
     () => {
         "generation_extents ge CROSS JOIN extents e ON e.id = ge.extent_id \
-          WHERE ge.generation_id = ?1 AND +e.generation_id = ?1"
+          WHERE ge.generation_id = ?1 AND +e.generation_id = ?1 AND +e.seq = ge.seq"
     };
 }
 
@@ -660,7 +663,7 @@ pub(super) async fn complete_upload<S: Sql>(
             adopted!(),
             ") <> ?3 \
                OR EXISTS (SELECT 1 FROM (SELECT e.plain_offset AS plain_offset, \
-                    SUM(e.plain_size) OVER (ORDER BY e.seq \
+                    SUM(e.plain_size) OVER (ORDER BY ge.seq \
                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected FROM ",
             adopted!(),
             ") WHERE plain_offset <> COALESCE(expected, 0))"

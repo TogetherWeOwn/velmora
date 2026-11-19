@@ -1607,6 +1607,11 @@ async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone(
                 !step.starts_with("SCAN extents") && !step.starts_with("SCAN e"),
                 "{sql}\n{step}"
             );
+            // The offsets check walks the references in `seq` order
+            // from their primary key: no sort.
+            if sql.contains(" OVER (") {
+                assert!(!step.contains("TEMP B-TREE"), "{sql}\n{step}");
+            }
         }
     }
 }

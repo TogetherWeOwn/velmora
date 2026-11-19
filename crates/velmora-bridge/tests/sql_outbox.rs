@@ -4093,6 +4093,38 @@ async fn a_bury_below_the_index_limit_still_buries_every_row_over_it() {
 /// (`extents_held` and `extents_pinned` dropped): the window of held
 /// extents is read from `extents_safety` alone, in id order, and both
 /// do what they did.
+/// A window counts the releasing extents as well as the held ones, so a
+/// run reads at most `limit` entries of the pinned set however many
+/// releasing extents follow the cursor, and the next run starts after
+/// them.
+#[tokio::test(flavor = "current_thread")]
+async fn redrive_window_steps_over_releasing_extents() {
+    let fx = Fx::new().await;
+    let mut objs = Vec::new();
+    for i in 0..5 {
+        objs.push(fx.done_on_one_backbone(&format!("k{i}")).await);
+    }
+    objs.sort_by(|a, b| a.extent.as_str().cmp(b.extent.as_str()));
+    for o in &objs[..3] {
+        fx.run(
+            "UPDATE extents SET safety_state = 'releasing' WHERE id = ?1",
+            &[text(o.extent.as_str())],
+        )
+        .await;
+    }
+    let later = T0.plus_ms(HOUR_MS);
+    // Windows of two: [r, r], [r, h], [h] (short: the cursor resets).
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 0);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 1);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 1);
+    for o in &objs[..3] {
+        assert_eq!(fx.outbox(o, "stage").await, "done");
+    }
+    for o in &objs[3..] {
+        assert_eq!(fx.outbox(o, "stage").await, "verify");
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn redrive_and_bury_run_from_the_indexes_that_remain() {
     let fx = Fx::new().await;

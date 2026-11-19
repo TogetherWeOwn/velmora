@@ -582,7 +582,9 @@ pub struct Pressure {
     /// Request charges that found no room at once and slept.
     pub request_waits: u64,
     /// The time request charges slept for room, in milliseconds,
-    /// whether they were served, refused or dropped in the end.
+    /// whether they were served, refused or dropped in the end. Counted
+    /// in whole polls of [`CHARGE_POLL_MS`] as each one ends: a poll cut
+    /// short because its charge was dropped is not counted.
     pub request_wait_ms: u64,
     /// Request charges that waited [`CHARGE_WAIT_MS`] and were refused
     /// (`SlowDown`).
