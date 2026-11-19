@@ -73,11 +73,13 @@ struct Obj {
 
 impl Fx {
     async fn new() -> Fx {
+        Fx::on(RusqliteSql::with_schema().unwrap()).await
+    }
+
+    /// The fixture on the database `db`, which has its schema.
+    async fn on(db: RusqliteSql) -> Fx {
         let fx = Fx {
-            cat: SqlCatalog::new(Probe(
-                RusqliteSql::with_schema().unwrap(),
-                RefCell::new(Vec::new()),
-            )),
+            cat: SqlCatalog::new(Probe(db, RefCell::new(Vec::new()))),
             seed: Cell::new(1),
             bucket: BucketId::mint([0xb1; 8]),
             real_bucket: BucketId::mint([0xb2; 8]),
@@ -2902,10 +2904,10 @@ async fn a_packed_plan_is_stored_once_and_posted_as_a_whole() {
 
     // Refused before a write: not this extent's size, or not a plan.
     let before = fx.dump().await;
-    assert!(fx.cat.plan_packed(&post, 1064, &blob).await.is_err());
+    assert!(fx.cat.plan_packed(&post, 1064, &blob, None).await.is_err());
     assert!(fx
         .cat
-        .plan_packed(&post, TWO_ARTICLES, &blob[..9])
+        .plan_packed(&post, TWO_ARTICLES, &blob[..9], None)
         .await
         .is_err());
     assert_eq!(fx.dump().await, before);
@@ -2916,7 +2918,7 @@ async fn a_packed_plan_is_stored_once_and_posted_as_a_whole() {
     };
     let none = fx
         .cat
-        .plan_packed(&stale, TWO_ARTICLES, &blob)
+        .plan_packed(&stale, TWO_ARTICLES, &blob, None)
         .await
         .unwrap();
     assert_eq!(none, None);
@@ -2925,7 +2927,7 @@ async fn a_packed_plan_is_stored_once_and_posted_as_a_whole() {
 
     let stored = fx
         .cat
-        .plan_packed(&post, TWO_ARTICLES, &blob)
+        .plan_packed(&post, TWO_ARTICLES, &blob, None)
         .await
         .unwrap()
         .unwrap();
@@ -2939,7 +2941,7 @@ async fn a_packed_plan_is_stored_once_and_posted_as_a_whole() {
     assert_ne!(other, blob);
     let again = fx
         .cat
-        .plan_packed(&post, TWO_ARTICLES, &other)
+        .plan_packed(&post, TWO_ARTICLES, &other, None)
         .await
         .unwrap()
         .unwrap();
@@ -3148,7 +3150,11 @@ impl Fx {
             |_| Some([7; 32]),
         )
         .unwrap();
-        let stored = self.cat.plan_packed(&lease, 1064, &blob).await.unwrap();
+        let stored = self
+            .cat
+            .plan_packed(&lease, 1064, &blob, None)
+            .await
+            .unwrap();
         assert!(stored.is_some());
         self.run(
             "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, 'drop_articles_meta', 0)",
@@ -3238,24 +3244,28 @@ async fn a_replay_replaces_only_a_packed_plan_that_cannot_be_read() {
             row: extents[0].1.clone(),
             packed: Some(pack_explicit(&extents[0].0.extent, 1064, &other).unwrap()),
             plan: Some(other),
+            parity: None,
             safety_present: true,
         },
         ReplayExtent {
             row: extents[1].1.clone(),
             plan: Some(extents[1].2.clone()),
             packed: Some(extents[1].3.clone()),
+            parity: None,
             safety_present: true,
         },
         ReplayExtent {
             row: extents[2].1.clone(),
             plan: Some(extents[2].2.clone()),
             packed: None,
+            parity: None,
             safety_present: true,
         },
         ReplayExtent {
             row: extents[3].1.clone(),
             plan: None,
             packed: None,
+            parity: None,
             safety_present: true,
         },
     ];
@@ -4168,4 +4178,370 @@ async fn redrive_and_bury_run_from_the_indexes_that_remain() {
     .await;
     assert_eq!(fx.cat.bury_exhausted(50, later).await.unwrap(), 1);
     assert_eq!(fx.outbox(&objs[0], "stage").await, "dead");
+}
+
+// ---------------------------------------------------------------------------
+// Parity addendum
+// ---------------------------------------------------------------------------
+
+impl Fx {
+    /// A new addendum beside the packed plan `plan` of the object's
+    /// extent: one parity article, whose shard has the digest `hash`.
+    fn addendum(&self, o: &Obj, plan: &[u8], hash: u8) -> Vec<u8> {
+        let rows: Vec<(u16, [u8; 32])> = velmora_bridge::parity::new_rows(2)
+            .into_iter()
+            .map(|row| (row, [hash; 32]))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        velmora_bridge::parity::build(
+            &mut velmora::rng::SystemRng,
+            T0.0 / 1000,
+            &["alt.binaries.test"],
+            &o.extent,
+            TWO_ARTICLES,
+            plan,
+            &rows,
+        )
+        .unwrap()
+    }
+
+    /// How many statements the catalogue has run.
+    fn statements(&self) -> usize {
+        self.cat.sql.1.borrow().len()
+    }
+}
+
+/// The addendum goes on the extent's row with the plan, in the one
+/// statement that stores the plan, and the first one stands. The plan is
+/// then posted only with its parity articles.
+#[tokio::test]
+async fn a_parity_addendum_is_stored_with_its_plan_and_posted_with_it() {
+    let fx = Fx::new().await;
+    let o = fx.two_articles("k").await;
+    let post = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
+    let (blob, rows) = fx.seeded(&o, 1);
+    let addendum = fx.addendum(&o, &blob, 7);
+
+    // Refused before a write: an addendum of another plan, or cut short.
+    let (other, _) = fx.seeded(&o, 2);
+    let before = fx.dump().await;
+    for bad in [&fx.addendum(&o, &other, 7)[..], &addendum[..40], &[]] {
+        let refused = fx
+            .cat
+            .plan_packed(&post, TWO_ARTICLES, &blob, Some(bad))
+            .await;
+        assert!(
+            matches!(refused, Err(BridgeError::Invalid(_))),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.extent(&o, "plan IS NULL").await, "1");
+
+    let at = fx.statements();
+    let stored = fx
+        .cat
+        .plan_packed(&post, TWO_ARTICLES, &blob, Some(&addendum))
+        .await
+        .unwrap()
+        .unwrap();
+    // One statement wrote both; the other reads the plan back.
+    let ran = fx.cat.sql.1.borrow()[at..].to_vec();
+    let writes: Vec<_> = ran
+        .iter()
+        .filter(|(sql, _)| sql.contains("UPDATE"))
+        .collect();
+    assert_eq!(writes.len(), 1, "{ran:?}");
+    assert!(writes[0].0.contains("plan = ?3") && writes[0].0.contains("parity = ?5"));
+    assert_eq!(stored.packed.as_deref(), Some(&blob[..]));
+    assert_eq!(stored.parity.as_deref(), Some(&addendum[..]));
+    assert_eq!(stored.rows, rows);
+    assert_eq!(fx.extent(&o, "hex(parity)").await, hex_upper(&addendum));
+    assert_eq!(fx.extent(&o, "parity_count").await, "1");
+    assert_eq!(fx.extent(&o, "article_count").await, "2");
+    assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
+    // Readers of the data articles see the data articles.
+    assert_eq!(fx.cat.articles(&o.extent).await.unwrap(), rows);
+    assert_eq!(fx.cat.stored_plan(&o.extent).await.unwrap(), stored);
+    let job = fx
+        .cat
+        .job_extent(&o.extent, &o.generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (job.extent.article_count, job.parity_count),
+        (Some(2), Some(1))
+    );
+    let parity = stored
+        .parity_plan(&o.extent, TWO_ARTICLES)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parity.articles.len(), 1);
+    assert_eq!(parity.articles[0].idx, 2);
+    assert_eq!(parity.articles[0].cipher_offset, TWO_ARTICLES);
+    assert_eq!(parity.articles[0].payload_sha256, [7; 32]);
+    assert_eq!(parity.articles[0].state, ArticleState::Planned);
+
+    // The first plan stands with its addendum: against another
+    // addendum, against none, and against another plan with its own.
+    let late = fx.addendum(&o, &blob, 8);
+    assert_ne!(late, addendum);
+    let other_addendum = fx.addendum(&o, &other, 7);
+    for (plan, with) in [
+        (&blob, Some(&late[..])),
+        (&blob, None),
+        (&other, Some(&other_addendum[..])),
+    ] {
+        let again = fx
+            .cat
+            .plan_packed(&post, TWO_ARTICLES, plan, with)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, stored);
+    }
+    assert_eq!(fx.extent(&o, "hex(parity)").await, hex_upper(&addendum));
+
+    // The data articles alone are not the whole plan.
+    let before = fx.dump().await;
+    for part in [
+        &[(0, "p1"), (1, "p1")][..],
+        &[(0, "p1"), (2, "p2")],
+        &[(0, "p1"), (1, "p1"), (3, "p2")],
+        &[(0, "p1"), (1, "p1"), (1, "p2")],
+    ] {
+        let refused = fx.cat.mark_posted_many(&post, part, T0.plus_secs(1)).await;
+        assert!(
+            matches!(refused, Err(BridgeError::Invalid(_))),
+            "{part:?} {refused:?}"
+        );
+    }
+    assert_eq!(fx.dump().await, before);
+    assert_eq!(fx.extent(&o, "posted_at").await, "NULL");
+    let t = T0.plus_secs(5);
+    let all = [(2, "p2"), (0, "p1"), (1, "p1")];
+    assert!(fx.cat.mark_posted_many(&post, &all, t).await.unwrap());
+    assert_eq!(fx.extent(&o, "posted_at").await, t.0.to_string());
+    // The parity articles have the state and the stamps of the plan.
+    let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+    let parity = stored
+        .parity_plan(&o.extent, TWO_ARTICLES)
+        .unwrap()
+        .unwrap();
+    let a = &parity.articles[0];
+    assert_eq!((a.state, a.posted_at), (ArticleState::Posted, Some(t)));
+    // A repost of the parity article stamps the plan like any other.
+    let r = T0.plus_secs(20);
+    assert!(fx.cat.mark_reposted_many(&post, &[2], r).await.unwrap());
+    assert_eq!(fx.extent(&o, "reposted_at").await, r.0.to_string());
+    assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// Without an addendum the two columns stay NULL and the plan is posted
+/// as before. With one, the same statements run and the same number of
+/// rows is written: parity costs no row and no statement.
+#[tokio::test]
+async fn parity_writes_no_more_rows_and_no_more_statements() {
+    let fx = Fx::new().await;
+    let plain = fx.two_articles("plain").await;
+    let with = fx.two_articles("with").await;
+    fx.cat.sql.0.meter_writes().unwrap();
+    let mut cost = Vec::new();
+    let mut texts = Vec::new();
+    // Two providers took articles of each plan.
+    for (o, parity) in [(&plain, false), (&with, true)] {
+        let post = fx.claim(o, OutboxStage::Post, T0).await.unwrap();
+        let (blob, _) = fx.seeded(o, 1);
+        let addendum = parity.then(|| fx.addendum(o, &blob, 7));
+        let all: &[(u32, &str)] = match parity {
+            true => &[(0, "p1"), (1, "p1"), (2, "p2")],
+            false => &[(0, "p1"), (1, "p2")],
+        };
+        let (rows, at) = (fx.cat.sql.0.writes(), fx.statements());
+        fx.cat
+            .plan_packed(&post, TWO_ARTICLES, &blob, addendum.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fx
+            .cat
+            .mark_posted_many(&post, all, T0.plus_secs(1))
+            .await
+            .unwrap());
+        let wrote = fx.cat.sql.0.writes().since(&rows);
+        cost.push((wrote.billed(), wrote.writing_statements));
+        let ran = &fx.cat.sql.1.borrow()[at..];
+        texts.push(ran.iter().map(|(sql, _)| sql.clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(cost[0], cost[1], "{cost:?}");
+    assert!(cost[0].0 > 0);
+    assert_eq!(texts[0], texts[1]);
+    assert_eq!(fx.extent(&plain, "parity IS NULL").await, "1");
+    assert_eq!(fx.extent(&plain, "parity_count").await, "NULL");
+    assert_eq!(fx.extent(&plain, "article_count").await, "2");
+    assert_eq!(fx.extent(&with, "parity_count").await, "1");
+    assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
+    let job = fx
+        .cat
+        .job_extent(&plain.extent, &plain.generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.parity_count, None);
+    let stored = fx.cat.stored_plan(&plain.extent).await.unwrap();
+    assert_eq!(stored.parity, None);
+    assert_eq!(
+        stored.parity_plan(&plain.extent, TWO_ARTICLES).unwrap(),
+        None
+    );
+}
+
+/// A replay restores the addendum of the record with the packed plan it
+/// is beside, and only there: one that does not read, or that comes with
+/// a plan of rows, is left out, and the plan is restored without it.
+#[tokio::test]
+async fn a_replay_restores_an_addendum_only_beside_its_packed_plan() {
+    use velmora_bridge::replay::ReplayExtent;
+    let fx = Fx::new().await;
+    let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
+    let mut replay = Vec::new();
+    let mut made = Vec::new();
+    for key in ["whole", "cut", "other", "rows", "unreadable"] {
+        let o = fx.two_articles(key).await;
+        let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
+        let (blob, rows) = fx.seeded(&o, 1);
+        let addendum = fx.addendum(&o, &blob, 7);
+        let parity = match key {
+            "cut" => addendum[..addendum.len() - 1].to_vec(),
+            "other" => fx.addendum(&o, &fx.seeded(&o, 2).0, 7),
+            _ => addendum.clone(),
+        };
+        if key == "unreadable" {
+            let set_plan = "UPDATE extents SET plan = x'ffffff', article_count = 2 WHERE id = ?1";
+            assert_eq!(fx.run(set_plan, &[text(o.extent.as_str())]).await, 1);
+        }
+        replay.push(ReplayExtent {
+            row: extent_rows.remove(0),
+            packed: (key != "rows").then(|| blob.clone()),
+            plan: Some(rows),
+            parity: Some(parity),
+            safety_present: true,
+        });
+        made.push((o, blob, addendum));
+    }
+    let stranded = fx
+        .cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(9))
+        .await
+        .unwrap();
+    assert!(stranded.is_empty(), "{stranded:?}");
+    for ((o, blob, addendum), key) in
+        made.iter()
+            .zip(["whole", "cut", "other", "rows", "unreadable"])
+    {
+        let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
+        assert_eq!(stored.rows.len(), 2, "{key}");
+        match key {
+            "whole" | "unreadable" => {
+                assert_eq!(stored.packed.as_deref(), Some(&blob[..]), "{key}");
+                assert_eq!(stored.parity.as_deref(), Some(&addendum[..]), "{key}");
+                assert_eq!(fx.extent(o, "parity_count").await, "1", "{key}");
+                let parity = stored.parity_plan(&o.extent, TWO_ARTICLES).unwrap();
+                assert_eq!(parity.unwrap().articles.len(), 1, "{key}");
+            }
+            _ => {
+                assert_eq!(stored.packed.is_some(), key != "rows", "{key}");
+                assert_eq!(stored.parity, None, "{key}");
+                assert_eq!(fx.extent(o, "parity IS NULL").await, "1", "{key}");
+                assert_eq!(fx.extent(o, "parity_count").await, "NULL", "{key}");
+            }
+        }
+    }
+    // Again: nothing changes.
+    let before = fx.dump().await;
+    fx.cat
+        .replay_extents(&bucket, &replay, T0.plus_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(fx.dump().await, before);
+}
+
+/// The migration runs on a catalogue that has plans, and leaves each as
+/// it is: no parity, read and posted as before.
+#[tokio::test]
+async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
+    use velmora_bridge::testkit::*;
+    let db = RusqliteSql::open_in_memory().unwrap();
+    for script in [
+        MIGRATION_0001,
+        MIGRATION_0002,
+        MIGRATION_0003,
+        MIGRATION_0004,
+        MIGRATION_0005,
+        MIGRATION_0006,
+        MIGRATION_0007,
+        MIGRATION_0008,
+        MIGRATION_0009,
+        MIGRATION_0010,
+        MIGRATION_0011,
+        MIGRATION_0012,
+        MIGRATION_0013,
+        MIGRATION_0014,
+        MIGRATION_0015,
+        MIGRATION_0016,
+        MIGRATION_0017,
+        MIGRATION_0018,
+    ] {
+        db.apply(script).unwrap();
+    }
+    let fx = Fx::on(db).await;
+    // A packed plan, and two extents without a plan.
+    let packed = fx.two_articles("packed").await;
+    let rows = fx.publish(&fx.bucket, "rows").await;
+    let _bare = fx.publish(&fx.bucket, "bare").await;
+    let (blob, planned) = fx.seeded(&packed, 1);
+    let set_plan = "UPDATE extents SET plan = ?2, article_count = 2, plan_rev = 1 WHERE id = ?1";
+    let params = [text(packed.extent.as_str()), SqlValue::Blob(blob.clone())];
+    assert_eq!(fx.run(set_plan, &params).await, 1);
+    let columns = "id, state, cipher_size, article_count, plan_rev, hex(plan), posted_at";
+    let extents = format!("SELECT {columns} FROM extents ORDER BY id");
+    let before = fx.cat.sql.0.query(&extents, &[]).await.unwrap();
+    assert_eq!(before.len(), 3);
+
+    fx.cat.sql.0.apply(MIGRATION_0022).unwrap();
+
+    assert_eq!(fx.cat.sql.0.query(&extents, &[]).await.unwrap(), before);
+    let with = "SELECT COUNT(*) FROM extents WHERE parity IS NOT NULL OR parity_count IS NOT NULL";
+    assert_eq!(fx.count(with).await, 0);
+    let stored = fx.cat.stored_plan(&packed.extent).await.unwrap();
+    assert_eq!(stored.packed.as_deref(), Some(&blob[..]));
+    assert_eq!((&stored.rows, &stored.parity), (&planned, &None));
+    // A plan of rows is stored and read as before.
+    let lease = fx.claim(&rows, OutboxStage::Post, T0).await.unwrap();
+    let one = fx.whole(&rows, "rows");
+    fx.cat.plan_articles(&lease, &one).await.unwrap().unwrap();
+    let stored = fx.cat.stored_plan(&rows.extent).await.unwrap();
+    assert_eq!((stored.packed, stored.parity), (None, None));
+    assert_eq!(stored.rows.len(), 1);
+    // The plan is posted by its data articles, as before.
+    let post = fx.claim(&packed, OutboxStage::Post, T0).await.unwrap();
+    let job = fx
+        .cat
+        .job_extent(&packed.extent, &packed.generation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (job.extent.article_count, job.parity_count),
+        (Some(2), None)
+    );
+    let all = [(0, "p1"), (1, "p1")];
+    let t = T0.plus_secs(1);
+    assert!(fx.cat.mark_posted_many(&post, &all, t).await.unwrap());
+    assert_eq!(fx.extent(&packed, "posted_at").await, t.0.to_string());
 }

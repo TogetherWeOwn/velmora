@@ -192,6 +192,14 @@ pub struct BridgeConfig {
     /// switch goes on only once no older version can come back, and a
     /// rollback after that is to a version that knows it, with it off.
     pub packed_plans: bool,
+    /// Give the plan of a new extent a parity addendum (`PARITY`,
+    /// [`crate::parity`]) and post its parity articles with the data
+    /// articles. Only a plan that is stored packed gets one. The switch
+    /// says nothing about an addendum that is stored: that one is always
+    /// posted and read. A Worker from before the switch ignores an
+    /// addendum, so a rollback past it posts and releases extents
+    /// without their parity.
+    pub parity: bool,
     /// The layout of new recovery records (`RECORD_LAYOUT`,
     /// [`crate::recovery::Layout`]): `flat`, or `tenant` for the
     /// directory of the tenant. It names what is written only. Every
@@ -656,6 +664,11 @@ impl BridgeConfig {
             Some("on") => true,
             Some(_) => return Err(ConfigError::Invalid("PACKED_PLANS".into())),
         };
+        let parity = match get("PARITY").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("PARITY".into())),
+        };
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
             Some("tenant") => crate::recovery::Layout::default_tenant(),
@@ -855,6 +868,7 @@ impl BridgeConfig {
             max_object_extents,
             intent_sweep,
             packed_plans,
+            parity,
             records,
             required_backbones,
             safety_min_age_secs,

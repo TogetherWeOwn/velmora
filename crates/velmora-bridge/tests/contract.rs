@@ -287,6 +287,8 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.maintenance, Maintenance::Off);
     assert!(cfg.server_side_copy);
     assert!(cfg.packed_plans);
+    // No parity until it is turned on.
+    assert!(!cfg.parity);
     // A GET above 1 GiB is served in sub-ranges of 1 GiB.
     assert_eq!(cfg.get_fanout_bytes, Some(1 << 30));
     assert!(!cfg.dev_trust_http);
@@ -754,6 +756,9 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
+        ("PARITY", "1"),
+        ("PARITY", "ON"),
+        ("PARITY", "true"),
     ] {
         assert_eq!(set(&prod, name, bad), invalid(name), "{name}={bad}");
     }
@@ -762,6 +767,12 @@ fn config_rejects_invalid_and_unsafe_values() {
     tuned.insert("PROPAGATION_GRACE_SECS".into(), "0".into());
     let cfg = load(&tuned).unwrap();
     assert_eq!((cfg.post_sockets, cfg.propagation_grace_secs), (8, 0));
+    // The parity switch: absent, blank and `off` are off.
+    for (value, on) in [("", false), ("  ", false), ("off", false), (" on ", true)] {
+        let mut tuned = prod.clone();
+        tuned.insert("PARITY".into(), value.into());
+        assert_eq!(load(&tuned).unwrap().parity, on, "PARITY={value:?}");
+    }
     // The limits of the slice settings themselves are accepted, and the
     // default slice is never above one extent.
     for (put, slice, sweep) in [

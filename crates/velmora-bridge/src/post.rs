@@ -43,7 +43,8 @@ use velmora::yenc::{encode_segment, SegmentParams};
 
 use crate::articles::article_spans;
 use crate::fetch::{forgiven, job_holder, report_health, Health, ProviderSession};
-use crate::jobs::JOB_OVERHEAD_BYTES;
+use crate::jobs::{parity_job_bytes, JOB_OVERHEAD_BYTES};
+use crate::parity::{self, ParityPlan};
 use crate::plan::{draw, pack_seeded, StoredPlan};
 use crate::pool::Pool;
 use crate::ports::{
@@ -444,11 +445,69 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-/// The slice of `cipher` an article row describes, if it is in bounds.
-fn payload_of<'a>(cipher: &'a [u8], row: &ArticleRow) -> Option<&'a [u8]> {
+/// The payload an article row describes, if it is in bounds: a slice of
+/// `cipher` for a data article. A parity article is addressed past the
+/// ciphertext, one shard length per article
+/// ([`ParityPlan::articles`]): its payload is that shard of `parity`,
+/// which holds the shards in the order of the addendum.
+fn payload_of<'a>(cipher: &'a [u8], parity: &'a [Vec<u8>], row: &ArticleRow) -> Option<&'a [u8]> {
     let start = usize::try_from(row.cipher_offset).ok()?;
     let len = usize::try_from(row.cipher_len).ok()?;
-    cipher.get(start..start.checked_add(len)?)
+    match start.checked_sub(cipher.len()) {
+        Some(past) if !parity.is_empty() => {
+            if len == 0 || past % len != 0 {
+                return None;
+            }
+            let shard = parity.get(past / len)?;
+            (shard.len() == len).then_some(shard.as_slice())
+        }
+        _ => cipher.get(start..start.checked_add(len)?),
+    }
+}
+
+/// The parity shards `rows` of the ciphertext of an extent: the stripe
+/// is its articles, one data shard each.
+fn parity_shards(cipher: &[u8], rows: &[u16]) -> Option<Vec<Vec<u8>>> {
+    let data: Option<Vec<&[u8]>> = article_spans(cipher.len() as u64)
+        .iter()
+        .map(|span| {
+            let start = usize::try_from(span.start).ok()?;
+            let end = usize::try_from(span.end()).ok()?;
+            cipher.get(start..end)
+        })
+        .collect();
+    velmora::rs::encode(&data?, rows).ok()
+}
+
+/// The parity shards of a stored addendum, computed again from the
+/// ciphertext. `None` = one of them is not the shard the addendum
+/// describes (its length, its SHA-256): the addendum is not of this
+/// ciphertext, and nothing of it may be posted.
+fn stored_shards(cipher: &[u8], parity: &ParityPlan) -> Option<Vec<Vec<u8>>> {
+    let shards = parity_shards(cipher, &parity.rows)?;
+    let same = shards.len() == parity.articles.len()
+        && shards.iter().zip(&parity.articles).all(|(shard, a)| {
+            shard.len() as u64 == a.cipher_len && sha256(shard) == a.payload_sha256
+        });
+    same.then_some(shards)
+}
+
+/// The addendum a job drew for a new plan, and the shards it describes.
+struct DrawnParity {
+    addendum: Vec<u8>,
+    shards: Vec<Vec<u8>>,
+}
+
+/// What a post job holds once its extent is loaded.
+struct Loaded {
+    /// The verified ciphertext.
+    cipher: Vec<u8>,
+    /// The stored plan: the data articles, then the parity articles.
+    plan: Vec<ArticleRow>,
+    /// The parity shards, in the order of the parity articles.
+    parity: Vec<Vec<u8>>,
+    /// This job drew the plan, so no article of it was ever sent.
+    drawn: bool,
 }
 
 /// Renders the complete article for a stored row. Everything on the wire
@@ -501,17 +560,14 @@ where
     /// Runs the post stage for a claimed extent: plan, POST every planned
     /// article, then hand over to the verify stage.
     pub async fn post_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.post_extent(lease, &job.extent).await {
+        match self.post_extent(lease, job).await {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
     }
 
-    async fn post_extent(
-        &self,
-        lease: &Lease,
-        extent: &ExtentRow,
-    ) -> core::result::Result<(), Stop> {
+    async fn post_extent(&self, lease: &Lease, job: &JobExtent) -> core::result::Result<(), Stop> {
+        let extent = &job.extent;
         // A job that comes back to an extent it has posted already (a
         // crash before the stage moved on, a revived obligation) needs no
         // provider: it only writes the recovery record again.
@@ -537,13 +593,23 @@ where
         };
         // The articles left to post are known before the extent is read:
         // every one of a new plan, the planned ones of a stored plan.
+        // The parity articles of a plan are posted with it.
         let todo = match stored.rows.is_empty() {
-            true => article_spans(extent.cipher_size).len(),
-            false => stored
-                .rows
-                .iter()
-                .filter(|a| a.state == ArticleState::Planned)
-                .count(),
+            true => {
+                let data = article_spans(extent.cipher_size).len();
+                match self.cfg.packed_plans && self.cfg.parity {
+                    true => data + parity::parity_count(data),
+                    false => data,
+                }
+            }
+            false => {
+                let planned = |a: &&ArticleRow| a.state == ArticleState::Planned;
+                let data = stored.rows.iter().filter(planned).count();
+                match data {
+                    0 => 0,
+                    _ => data + job.parity_count.unwrap_or(0) as usize,
+                }
+            }
         };
         let asked = self.clock.now();
         let (mut held, _) = self
@@ -586,14 +652,14 @@ where
             self.load_planned(lease, extent, stored),
         )
         .await;
-        let (cipher, mut plan, drawn) = match loaded {
+        let mut loaded = match loaded {
             Ok(loaded) => loaded,
             Err(stop) => {
                 close_all(held).await;
                 return Err(stop);
             }
         };
-        if plan.iter().any(|a| a.state == ArticleState::Planned) {
+        if loaded.plan.iter().any(|a| a.state == ArticleState::Planned) {
             let started = self.clock.now();
             let opened = Opened {
                 sessions: held,
@@ -602,9 +668,7 @@ where
                 probing,
             };
             let posted = self
-                .post_with_failover(
-                    lease, extent, &mut plan, &cipher, &order, cooling, opened, drawn,
-                )
+                .post_with_failover(lease, extent, &mut loaded, &order, cooling, opened)
                 .await;
             let post_ms = self.clock.now().0 - started.0;
             crate::trace::note(&lease.extent, |t| t.post_ms = post_ms);
@@ -739,14 +803,19 @@ where
     }
 
     /// The verified ciphertext of the extent and its stored article plan,
-    /// with the recovery record of the plan written. The flag: this job
-    /// drew the plan, so no article of it was ever sent.
+    /// with the recovery record of the plan written.
+    ///
+    /// A plan with a parity addendum comes with its parity shards. They
+    /// are computed from the ciphertext here, also for an addendum that
+    /// was stored before this job (a retry, a lost race), and each must
+    /// be the shard the stored addendum describes: one that is not fails
+    /// the job before anything is posted.
     async fn load_planned(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
         stored: StoredPlan,
-    ) -> core::result::Result<(Vec<u8>, Vec<ArticleRow>, bool), Stop> {
+    ) -> core::result::Result<Loaded, Stop> {
         let started = self.clock.now();
         let cipher = self
             .safety
@@ -757,7 +826,22 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Err(Stop::fail(FailClass::Corrupt));
         }
-        let (plan, drawn) = self.stored_plan(lease, extent, &cipher, stored).await?;
+        let (plan, drawn, mine) = self.stored_plan(lease, extent, &cipher, stored).await?;
+        let corrupt = Stop::fail(FailClass::Corrupt);
+        let parity = plan
+            .parity_plan(&extent.id, extent.cipher_size)
+            .map_err(|_| Stop::fail(FailClass::Corrupt))?;
+        let (parity, shards) = match (parity, mine) {
+            (None, _) => (Vec::new(), Vec::new()),
+            // The addendum this job built from these shards a moment ago.
+            (Some(parity), Some(mine)) if plan.parity.as_deref() == Some(&mine.addendum) => {
+                (parity.articles, mine.shards)
+            }
+            (Some(parity), _) => {
+                let shards = stored_shards(&cipher, &parity).ok_or(corrupt)?;
+                (parity.articles, shards)
+            }
+        };
         // The message-ids exist nowhere but the catalogue until this
         // record is stored: without it, a lost catalogue could not find
         // the extent on Usenet. Nothing is posted before it is durable.
@@ -766,7 +850,45 @@ where
             .map_err(|_| Stop::fail(FailClass::BlobError))?;
         let load_ms = self.clock.now().0 - started.0;
         crate::trace::note(&lease.extent, |t| t.load_ms = load_ms);
-        Ok((cipher, plan.rows, drawn))
+        let mut rows = plan.rows;
+        rows.extend(parity);
+        Ok(Loaded {
+            cipher,
+            plan: rows,
+            parity: shards,
+            drawn,
+        })
+    }
+
+    /// The parity addendum of a new plan (`packed`) of the extent: the
+    /// parity shards of its ciphertext, each with its SHA-256, under
+    /// identifiers from a fresh seed.
+    fn draw_parity(
+        &self,
+        extent: &ExtentRow,
+        cipher: &[u8],
+        packed: &[u8],
+        groups: &[&str],
+        now_secs: i64,
+    ) -> Option<DrawnParity> {
+        let rows = parity::new_rows(article_spans(extent.cipher_size).len());
+        let shards = parity_shards(cipher, &rows)?;
+        let hashed: Vec<(u16, [u8; 32])> = rows
+            .iter()
+            .zip(&shards)
+            .map(|(row, shard)| (*row, sha256(shard)))
+            .collect();
+        let addendum = parity::build(
+            &mut SystemRng,
+            now_secs,
+            groups,
+            &extent.id,
+            extent.cipher_size,
+            packed,
+            &hashed,
+        )
+        .ok()?;
+        Some(DrawnParity { addendum, shards })
     }
 
     /// The authoritative stored plan, created first when the extent has
@@ -781,16 +903,22 @@ where
     /// The flag: the stored plan is the one this job drew just now. Any
     /// other plan was there before this job, and a run before it may
     /// have sent articles of it that the catalogue does not know of.
+    ///
+    /// With the parity switch on, a new packed plan is stored with its
+    /// parity addendum, in the same write. The addendum this job built
+    /// is returned with its shards; it is the stored one only if this
+    /// job's plan won.
     async fn stored_plan(
         &self,
         lease: &Lease,
         extent: &ExtentRow,
         cipher: &[u8],
         stored: StoredPlan,
-    ) -> core::result::Result<(StoredPlan, bool), Stop> {
+    ) -> core::result::Result<(StoredPlan, bool, Option<DrawnParity>), Stop> {
         let spans = article_spans(extent.cipher_size);
         let mut plan = stored;
         let mut drawn = false;
+        let mut mine = None;
         if plan.rows.is_empty() {
             let groups: Vec<&str> = self.cfg.newsgroups.iter().map(String::as_str).collect();
             let now_secs = self.clock.now().secs().0;
@@ -816,11 +944,22 @@ where
                 false => None,
             };
             plan = match packed {
-                Some(packed) => self
-                    .catalog
-                    .plan_packed(lease, extent.cipher_size, &packed)
-                    .await?
-                    .ok_or(Stop::Fenced)?,
+                Some(packed) => {
+                    // Parity is stored beside a packed plan only. An
+                    // extent whose parity cannot be built is not posted
+                    // without it: the job fails instead.
+                    if self.cfg.parity {
+                        let parity = self
+                            .draw_parity(extent, cipher, &packed, &groups, now_secs)
+                            .ok_or(Stop::fail(FailClass::Internal))?;
+                        mine = Some(parity);
+                    }
+                    let addendum = mine.as_ref().map(|m| m.addendum.as_slice());
+                    self.catalog
+                        .plan_packed(lease, extent.cipher_size, &packed, addendum)
+                        .await?
+                        .ok_or(Stop::Fenced)?
+                }
                 None => StoredPlan {
                     rows: self
                         .catalog
@@ -828,6 +967,7 @@ where
                         .await?
                         .ok_or(Stop::Fenced)?,
                     packed: None,
+                    parity: None,
                 },
             };
             drawn = plan.rows.first().map(|a| &a.message_id) == rows.first().map(|a| &a.message_id);
@@ -843,7 +983,7 @@ where
         if !matches {
             return Err(Stop::fail(FailClass::Internal));
         }
-        Ok((plan, drawn))
+        Ok((plan, drawn, mine))
     }
 
     /// Posts the planned articles, priority tier by priority tier. The
@@ -869,18 +1009,22 @@ where
     /// `order` is the posting providers in pool order and `first` the
     /// sessions the job already holds on its first tier: they are the
     /// first round.
-    #[allow(clippy::too_many_arguments)]
     async fn post_with_failover<'a>(
         &'a self,
         lease: &Lease,
         extent: &ExtentRow,
-        plan: &mut [ArticleRow],
-        cipher: &[u8],
+        loaded: &mut Loaded,
         order: &[&'a ProviderConfig],
         cooling: Option<UnixMs>,
         first: Opened<'a, C, N, T>,
-        drawn: bool,
     ) -> core::result::Result<(), Stop> {
+        let Loaded {
+            cipher,
+            plan,
+            parity,
+            drawn,
+        } = loaded;
+        let (cipher, parity, drawn) = (cipher.as_slice(), parity.as_slice(), *drawn);
         let holder = job_holder(lease);
         let probing = first.probing.clone();
         let mut first = Some(first);
@@ -948,6 +1092,7 @@ where
                 // asked again in this job, the rest of the tier is.
                 untried.retain(|p| !sessions.iter().any(|s| s.provider.id == p.id));
                 let round = Round::new(&self.catalog, &self.clock, lease, extent, cipher, plan)
+                    .parity(parity)
                     .kept_at(kept_at);
                 let ended = round
                     .run(
@@ -1004,7 +1149,7 @@ where
     }
 
     /// Records the whole plan as posted: every article this job posted,
-    /// in one fenced write. Until here the catalogue has every one of
+    /// data and parity, in one fenced write. Until here the catalogue has every one of
     /// them as planned, so a job that dies before this write posts the
     /// plan again, under the same message-ids, and the providers answer
     /// that they have it.
@@ -1135,6 +1280,12 @@ where
     /// anything is sent, so a job that dies after a POST leaves it
     /// behind, and again as each article is accepted.
     ///
+    /// `parity` is the extent's parity plan, when `missing` may name
+    /// parity articles of it (their `idx` follows the data articles').
+    /// A parity article is posted again from its shard, computed again
+    /// from the safety copy; every shard must be the one the addendum
+    /// describes, or the job fails and nothing is sent.
+    ///
     /// `Ok(false)` = it cannot be done now (no provider that posts, no
     /// intact safety copy, or the providers refused): the caller carries
     /// on as if there were no repost.
@@ -1145,10 +1296,25 @@ where
         plan: &[ArticleRow],
         missing: &[u32],
         providers: &[&ProviderConfig],
+        parity: Option<&ParityPlan>,
     ) -> core::result::Result<bool, Stop> {
         if providers.is_empty() || extent.safety_state != SafetyState::Held {
             return Ok(false);
         }
+        // The parity plan counts only when one of its articles is asked
+        // for: the shards are computed for nothing else.
+        let parity = parity.filter(|p| p.articles.iter().any(|a| missing.contains(&a.idx)));
+        let with_parity: Vec<ArticleRow>;
+        let plan = match parity {
+            Some(parity) => {
+                with_parity = [plan, &parity.articles].concat();
+                &with_parity[..]
+            }
+            None => plan,
+        };
+        let shard_bytes = parity.map_or(0, |p| {
+            parity_job_bytes(extent.cipher_size, p.articles.len())
+        });
         // Unlike the rest of its stage, a repost holds the whole extent. A
         // repost larger than the budget still has to run, alone: next to
         // what its own stage already holds.
@@ -1159,6 +1325,7 @@ where
         let bytes = extent
             .cipher_size
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
+            .saturating_add(shard_bytes)
             .min(room);
         let Ok(_charge) = self.budget.charge_job(bytes).await else {
             return Err(Stop::NoPermit);
@@ -1170,6 +1337,10 @@ where
         if cipher.len() as u64 != extent.cipher_size || sha256(&cipher) != extent.cipher_sha256 {
             return Ok(false);
         }
+        let shards = match parity {
+            Some(parity) => stored_shards(&cipher, parity).ok_or(Stop::fail(FailClass::Corrupt))?,
+            None => Vec::new(),
+        };
         let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
         let order = pool.order(providers.to_vec(), PermitClass::Background);
         if order.is_empty() {
@@ -1203,7 +1374,8 @@ where
                 Err(_) => Stop::Catalog,
             });
         }
-        let round = Round::new(&self.catalog, &self.clock, lease, extent, &cipher, plan);
+        let round =
+            Round::new(&self.catalog, &self.clock, lease, extent, &cipher, plan).parity(&shards);
         // `true`: each article is looked up before it is sent.
         let todo = todo.into_iter().map(|at| (at, true));
         let ended = round.run(sessions, todo, Record::Reposted).await;
@@ -1212,6 +1384,46 @@ where
             Some(stop @ (Stop::Fenced | Stop::Catalog | Stop::NoPermit)) => Err(stop),
             Some(_) => Ok(false),
         }
+    }
+
+    /// Posts the articles `missing` of a posted extent once more, to
+    /// every provider that posts: its data articles and, by their
+    /// `idx`, the parity articles of its addendum. `Err` = the job
+    /// stopped, with the failure class when it failed. For tests of the
+    /// repost alone. Never compiled into the Worker.
+    #[cfg(feature = "testkit")]
+    pub async fn repost_run(
+        &self,
+        lease: &Lease,
+        job: &JobExtent,
+        missing: &[u32],
+    ) -> core::result::Result<bool, Option<FailClass>> {
+        let extent = &job.extent;
+        let run = async {
+            let stored = self.catalog.stored_plan(&extent.id).await?;
+            let parity = stored
+                .parity_plan(&extent.id, extent.cipher_size)
+                .map_err(|_| Stop::fail(FailClass::Corrupt))?;
+            let posters: Vec<&ProviderConfig> = self
+                .cfg
+                .providers
+                .iter()
+                .filter(|p| p.post && p.enabled)
+                .collect();
+            self.repost(
+                lease,
+                extent,
+                &stored.rows,
+                missing,
+                &posters,
+                parity.as_ref(),
+            )
+            .await
+        };
+        run.await.map_err(|stop| match stop {
+            Stop::Fail(class, _) => Some(class),
+            _ => None,
+        })
     }
 }
 
@@ -1277,7 +1489,8 @@ impl Fatal {
 }
 
 /// One socket of a round.
-struct Socket {
+struct Socket<'a> {
+    provider: &'a str,
     /// `None` = the permit is lost or given back.
     permit: Option<Permit>,
     /// The socket was logged in at some time since the job opened it.
@@ -1298,7 +1511,7 @@ struct RoundState<'a> {
     /// The time of the last renewal that confirmed the lease.
     kept_at: Option<UnixMs>,
     fatal: Option<Fatal>,
-    sockets: Vec<Socket>,
+    sockets: Vec<Socket<'a>>,
     /// Providers whose verdict another of their sockets would only repeat.
     closed: Vec<&'a str>,
     /// Per plan position: the provider that accepted the article.
@@ -1342,6 +1555,8 @@ pub(crate) struct Round<'a, C: Catalog, T: Clock> {
     lease: &'a Lease,
     extent: &'a ExtentRow,
     cipher: &'a [u8],
+    /// The parity shards of the plan's parity articles, in their order.
+    parity: &'a [Vec<u8>],
     plan: &'a [ArticleRow],
     /// How accepted articles are recorded.
     record: Cell<Record>,
@@ -1365,6 +1580,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             lease,
             extent,
             cipher,
+            parity: &[],
             plan,
             record: Cell::new(Record::Posted),
             tick: Mutex::new(()),
@@ -1381,6 +1597,19 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 marked: vec![false; plan.len()],
             }),
         }
+    }
+
+    /// The plan ends with parity articles: `shards` holds their
+    /// payloads, in the same order.
+    pub(crate) fn parity(mut self, shards: &'a [Vec<u8>]) -> Self {
+        self.parity = shards;
+        self
+    }
+
+    /// Whether the article at plan position `at` is a data article: its
+    /// payload is in the ciphertext, not past it.
+    fn is_data(&self, at: usize) -> bool {
+        self.plan[at].cipher_offset < self.extent.cipher_size
     }
 
     /// Counts a renewal at `at` that confirmed the lease and the permit of
@@ -1415,6 +1644,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                     providers.push(provider);
                 }
                 state.sockets.push(Socket {
+                    provider,
                     permit: Some(session.permit().clone()),
                     logged_in: session.connected(),
                 });
@@ -1549,7 +1779,13 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 }
             }
         };
-        self.state.borrow_mut().sockets[slot].permit = None;
+        {
+            let mut state = self.state.borrow_mut();
+            state.sockets[slot].permit = None;
+            // A socket that held back for this provider (`take`) has to
+            // look again.
+            state.idle.drain(..).for_each(Waker::wake);
+        }
         let health = session.finish().await;
         (provider, stop, health)
     }
@@ -1557,23 +1793,63 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
     /// The next article for a socket of `provider`. With an empty queue
     /// it waits while another socket is still posting, because that
     /// article may come back; `None` = nothing is left for this socket.
+    ///
+    /// Data articles go first. A parity article is left to the provider
+    /// that took the fewest data articles of the round, so that one
+    /// provider losing its articles does not take the data and the
+    /// parity with it: a socket of a provider that took more holds back
+    /// while the other has a socket in the round. That is a preference
+    /// only. A provider counts while one of its sockets still holds its
+    /// slot and the provider is not closed; when its last socket is gone
+    /// the sockets that held back take the parity themselves. The
+    /// provider with the fewest never holds back, and each of its
+    /// sockets is posting or about to take, so the round always goes on.
     async fn take(&self, provider: &str) -> Option<usize> {
         poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
             if state.fatal.is_some() || state.closed.contains(&provider) {
                 return Poll::Ready(None);
             }
-            if let Some(next) = state.queue.pop_front() {
+            let data = state.queue.iter().position(|at| self.is_data(*at));
+            if let Some(next) = data.and_then(|at| state.queue.remove(at)) {
                 state.in_flight += 1;
                 return Poll::Ready(Some(next));
             }
-            if state.in_flight == 0 {
+            if !state.queue.is_empty() && !self.holds_back(&state, provider) {
+                if let Some(next) = state.queue.pop_front() {
+                    state.in_flight += 1;
+                    return Poll::Ready(Some(next));
+                }
+            }
+            if state.queue.is_empty() && state.in_flight == 0 {
                 return Poll::Ready(None);
             }
             state.idle.push(cx.waker().clone());
             Poll::Pending
         })
         .await
+    }
+
+    /// Whether a socket of `provider` leaves a parity article to another
+    /// provider: one with a socket in the round that took fewer data
+    /// articles of it. Only a first post is placed; a repost goes to
+    /// the providers that miss the article.
+    fn holds_back(&self, state: &RoundState<'a>, provider: &str) -> bool {
+        if !matches!(self.record.get(), Record::Posted) {
+            return false;
+        }
+        let took = |provider: &str| {
+            (0..self.plan.len())
+                .filter(|at| self.is_data(*at) && state.accepted[*at] == Some(provider))
+                .count()
+        };
+        let mine = took(provider);
+        state.sockets.iter().any(|socket| {
+            socket.permit.is_some()
+                && socket.provider != provider
+                && !state.closed.contains(&socket.provider)
+                && took(socket.provider) < mine
+        })
     }
 
     async fn post_at<N: NntpConnector>(
@@ -1583,9 +1859,12 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         at: usize,
     ) -> core::result::Result<(), Stop> {
         let row = &self.plan[at];
-        let total = u32::try_from(self.plan.len()).map_err(|_| Stop::fail(FailClass::Internal))?;
+        // The articles of the extent's ciphertext: parity is not a part
+        // of it.
+        let data = (0..self.plan.len()).filter(|at| self.is_data(*at)).count();
+        let total = u32::try_from(data).map_err(|_| Stop::fail(FailClass::Internal))?;
         self.keep(slot, session).await?;
-        let payload = payload_of(self.cipher, row)
+        let payload = payload_of(self.cipher, self.parity, row)
             .filter(|p| sha256(p) == row.payload_sha256)
             .ok_or(Stop::fail(FailClass::Internal))?;
         let article = render_article(row, total, self.extent.cipher_size, payload)
@@ -1656,6 +1935,9 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                         // A socket that ended meanwhile stays ended.
                         if !held {
                             state.sockets[slot].permit = None;
+                            // A socket that held back for its provider
+                            // (`take`) has to look again.
+                            state.idle.drain(..).for_each(Waker::wake);
                         }
                     }
                     state.kept_at = Some(now);

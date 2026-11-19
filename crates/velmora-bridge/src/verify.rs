@@ -634,7 +634,10 @@ where
                 .iter()
                 .filter(|p| p.post && p.enabled && label(&p.backbone) == backbone)
                 .collect();
-            if self.repost(lease, extent, plan, missing, &posters).await? {
+            if self
+                .repost(lease, extent, plan, missing, &posters, None)
+                .await?
+            {
                 self.cursor(lease, cursor - retries + REPOSTED).await?;
                 return Ok(Some(self.cfg.verify_delay_secs.max(1)));
             }

@@ -629,6 +629,13 @@ pub struct ArticleManifest {
     /// reader from before this field skips it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_b64")]
     pub packed: Option<Vec<u8>>,
+    /// The parity addendum of the plan ([`crate::parity`]), when it has
+    /// one: where the extent's parity articles are. `articles` holds the
+    /// data articles only. A replay gives the catalogue the addendum
+    /// back with the packed plan it is beside, after it has checked it
+    /// against that plan. A reader from before this field skips it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_b64")]
+    pub parity: Option<Vec<u8>>,
 }
 
 fn digest<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
@@ -754,13 +761,15 @@ impl GenerationManifest {
 impl ArticleManifest {
     /// The record of a plan with its packed form, when it has a seeded
     /// one. The other packed form holds what `articles` holds, and is
-    /// made from it again.
+    /// made from it again. The parity addendum of a packed plan goes
+    /// with either form: it holds beside both.
     pub fn of(extent: &ExtentRow, plan: &StoredPlan) -> Self {
         let packed = plan.packed.as_ref();
         ArticleManifest {
             packed: packed
                 .filter(|p| crate::plan::seed_of(p).is_some())
                 .cloned(),
+            parity: packed.and(plan.parity.clone()),
             ..Self::new(extent, &plan.rows)
         }
     }
@@ -773,6 +782,7 @@ impl ArticleManifest {
             // been read before the plan was stored.
             plan_rev: extent.plan_rev.max(1),
             packed: None,
+            parity: None,
             articles: plan
                 .iter()
                 .map(|a| ArticleRecord {
@@ -1076,13 +1086,14 @@ pub async fn write_article_plan<B: BlobStore, K: Kek>(
         &StoredPlan {
             rows: plan.to_vec(),
             packed: None,
+            parity: None,
         },
     )
     .await
 }
 
 /// [`write_article_plan`] for a plan as the catalogue holds it: the
-/// record also carries its seeded packed form.
+/// record also carries its seeded packed form and its parity addendum.
 pub async fn write_stored_plan<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,

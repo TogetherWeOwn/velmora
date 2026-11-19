@@ -133,18 +133,25 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
         // The packed plan goes on the extent's row, and no article row
         // is written. An extent that has a plan keeps it, as with rows;
         // one that lost its plan (the count is all that is left of it)
-        // gets it back.
-        (Some(plan), Some(packed)) => out.push((
-            "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
-             WHERE id = ?1 AND plan IS NULL \
-               AND NOT EXISTS (SELECT 1 FROM articles WHERE extent_id = ?1)",
-            vec![
-                id(),
-                SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
-                SqlValue::Int(i64::from(e.plan_rev)),
-                SqlValue::Blob(packed.clone()),
-            ],
-        )),
+        // gets it back. Its parity addendum goes with it, by the same
+        // statement, and never without it.
+        (Some(plan), Some(packed)) => {
+            let (parity, parity_count) = parity_of(x, packed);
+            out.push((
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
+                   parity = ?5, parity_count = ?6 \
+                 WHERE id = ?1 AND plan IS NULL \
+                   AND NOT EXISTS (SELECT 1 FROM articles WHERE extent_id = ?1)",
+                vec![
+                    id(),
+                    SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
+                    SqlValue::Int(i64::from(e.plan_rev)),
+                    SqlValue::Blob(packed.clone()),
+                    parity,
+                    parity_count,
+                ],
+            ))
+        }
         (Some(plan), None) => {
             for a in plan {
                 out.push(article_insert(a)?);
@@ -187,6 +194,22 @@ fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()
         ));
     }
     Ok(())
+}
+
+/// The parity addendum of the record of `x` and the number of its
+/// articles, as the values of `extents.parity` and `parity_count`
+/// beside the packed plan `packed`. Both are NULL when the record has
+/// none, and when the one it has is not an addendum of that plan: such
+/// an extent is restored without parity, and the replay goes on.
+fn parity_of(x: &ReplayExtent, packed: &[u8]) -> (SqlValue, SqlValue) {
+    let read = x.parity.as_deref().and_then(|addendum| {
+        let parity = crate::parity::expand(&x.row.id, x.row.cipher_size, packed, addendum).ok()?;
+        Some((addendum, i64::try_from(parity.articles.len()).ok()?))
+    });
+    match read {
+        Some((addendum, count)) => (SqlValue::Blob(addendum.to_vec()), SqlValue::Int(count)),
+        None => (SqlValue::Null, SqlValue::Null),
+    }
 }
 
 /// A packed plan in the catalogue that cannot be read.
@@ -277,9 +300,14 @@ pub(super) async fn replay_extents<S: Sql>(
         for u in unreadable.iter().filter(|u| u.extent == x.row.id) {
             let Some(plan) = &u.plan else { continue };
             // Keyed on the very value that was read: a plan that
-            // changed since is another plan, and is left alone.
+            // changed since is another plan, and is left alone. The
+            // record's addendum, when it is one of this plan, goes in
+            // with it; an addendum the row has is kept otherwise.
+            let (parity, parity_count) = parity_of(x, plan);
             stmts.push((
-                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4 \
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
+                   parity = COALESCE(?6, parity), \
+                   parity_count = COALESCE(?7, parity_count) \
                  WHERE id = ?1 AND plan = ?5",
                 vec![
                     text(x.row.id.as_str()),
@@ -287,6 +315,8 @@ pub(super) async fn replay_extents<S: Sql>(
                     SqlValue::Int(i64::from(x.row.plan_rev)),
                     SqlValue::Blob(plan.clone()),
                     SqlValue::Blob(u.stored.clone()),
+                    parity,
+                    parity_count,
                 ],
             ));
         }

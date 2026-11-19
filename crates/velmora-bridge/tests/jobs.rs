@@ -274,6 +274,7 @@ impl Fx {
             intent_sweep: false,
             records: velmora_bridge::recovery::Layout::flat(),
             packed_plans: false,
+            parity: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
             verify_delay_secs: VERIFY_DELAY_SECS,

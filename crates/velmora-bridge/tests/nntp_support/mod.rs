@@ -280,6 +280,16 @@ pub struct Entry {
     pub job: JobExtent,
     pub outbox: OutboxRow,
     pub articles: Vec<ArticleRow>,
+    /// The packed form of the plan in `articles`, kept only for a plan
+    /// that was stored with a parity addendum: the addendum is read
+    /// beside it.
+    pub packed: Option<Vec<u8>>,
+    /// The parity addendum of the plan, as it was stored.
+    pub parity: Option<Vec<u8>>,
+    /// Per parity article that is marked posted, by `idx`: the provider.
+    pub parity_posted: BTreeMap<u32, String>,
+    /// The `idx` of every parity article stamped as posted again.
+    pub parity_reposted: Vec<u32>,
     pub verifications: Vec<VerificationRow>,
 }
 
@@ -388,6 +398,10 @@ impl MemCatalog {
                 job,
                 outbox,
                 articles: Vec::new(),
+                packed: None,
+                parity: None,
+                parity_posted: BTreeMap::new(),
+                parity_reposted: Vec::new(),
                 verifications: Vec::new(),
             },
         );
@@ -683,11 +697,49 @@ impl Catalog for MemCatalog {
         l: &Lease,
         cipher_size: u64,
         plan: &[u8],
+        parity: Option<&[u8]>,
     ) -> Result<Option<velmora_bridge::plan::StoredPlan>> {
-        // This catalogue keeps every plan as rows.
+        // This catalogue keeps every plan as rows. A plan with a parity
+        // addendum keeps its packed form too, and the addendum beside
+        // it: both are stored with the rows or not at all.
         let rows = velmora_bridge::plan::expand(&l.extent, cipher_size, plan, None, None)?;
-        let rows = self.plan_articles(l, &rows).await?;
-        Ok(rows.map(|rows| velmora_bridge::plan::StoredPlan { rows, packed: None }))
+        let count = match parity {
+            Some(addendum) => {
+                let parity =
+                    velmora_bridge::parity::expand(&l.extent, cipher_size, plan, addendum)?;
+                Some(parity.articles.len() as u32)
+            }
+            None => None,
+        };
+        note_event("plan");
+        let stored = self.fenced(l, |e| {
+            if e.articles.is_empty() {
+                e.articles = rows.to_vec();
+                e.job.extent.article_count = Some(rows.len() as u32);
+                e.job.extent.plan_rev = 1;
+                if let Some(addendum) = parity {
+                    e.packed = Some(plan.to_vec());
+                    e.parity = Some(addendum.to_vec());
+                    e.job.parity_count = count;
+                }
+            }
+        });
+        match stored {
+            Some(()) => self.stored_plan(&l.extent).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn stored_plan(&self, extent: &ExtentId) -> Result<velmora_bridge::plan::StoredPlan> {
+        let entries = self.entries.borrow();
+        Ok(match entries.get(extent) {
+            Some(e) => velmora_bridge::plan::StoredPlan {
+                rows: e.articles.clone(),
+                packed: e.packed.clone(),
+                parity: e.parity.clone(),
+            },
+            None => Default::default(),
+        })
     }
 
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>> {
@@ -1030,8 +1082,11 @@ impl Catalog for MemCatalog {
         // All or nothing, like the fenced SQL batch.
         let written = self.fenced(l, |e| {
             for idx in idxs {
-                let a = &mut e.articles[*idx as usize];
-                a.reposted_at = a.reposted_at.max(Some(now));
+                // A parity article has no row: its `idx` is past them.
+                match e.articles.get_mut(*idx as usize) {
+                    Some(a) => a.reposted_at = a.reposted_at.max(Some(now)),
+                    None => e.parity_reposted.push(*idx),
+                }
             }
         });
         Ok(written.is_some())
@@ -1058,17 +1113,39 @@ impl Catalog for MemCatalog {
             self.fault.set(None);
             self.edit(&l.extent, steal);
         }
-        // All or nothing, like the fenced SQL batch.
-        let written = self
-            .fenced(l, |e| {
-                for (idx, provider) in posted {
-                    let a = &mut e.articles[*idx as usize];
-                    a.state = ArticleState::Posted;
-                    a.provider_id = Some(provider.to_string());
-                    a.posted_at = Some(now);
+        // All or nothing, like the fenced SQL batch. A plan with a
+        // parity addendum is marked only as a whole, parity articles
+        // included, as a packed plan is in the real catalogue.
+        let written = self.fenced(l, |e| {
+            let whole = e.articles.len() + e.job.parity_count.unwrap_or(0) as usize;
+            let listed: std::collections::BTreeSet<u32> = posted
+                .iter()
+                .map(|(idx, _)| *idx)
+                .filter(|idx| (*idx as usize) < whole)
+                .collect();
+            if e.parity.is_some() && listed.len() != whole {
+                return false;
+            }
+            for (idx, provider) in posted {
+                match e.articles.get_mut(*idx as usize) {
+                    Some(a) => {
+                        a.state = ArticleState::Posted;
+                        a.provider_id = Some(provider.to_string());
+                        a.posted_at = Some(now);
+                    }
+                    None => {
+                        e.parity_posted.insert(*idx, provider.to_string());
+                    }
                 }
-            })
-            .is_some();
+            }
+            true
+        });
+        if written == Some(false) {
+            return Err(BridgeError::Invalid(
+                "a packed plan is marked posted only as a whole",
+            ));
+        }
+        let written = written.is_some();
         match fault {
             Some(Fault::StealLeaseAfter(i)) if has(i) => {
                 self.fault.set(None);
@@ -1665,6 +1742,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         intent_sweep: false,
         records: velmora_bridge::recovery::Layout::flat(),
         packed_plans: false,
+        parity: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         verify_delay_secs: 30,
@@ -1847,6 +1925,7 @@ impl Rig {
                 extent,
                 bucket,
                 generation_state: GenerationState::Live,
+                parity_count: None,
             },
             generation.clone(),
         );

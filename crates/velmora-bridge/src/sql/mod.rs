@@ -486,8 +486,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         l: &Lease,
         cipher_size: u64,
         plan: &[u8],
+        parity: Option<&[u8]>,
     ) -> Result<Option<StoredPlan>> {
-        outbox::plan_packed(self, l, cipher_size, plan).await
+        outbox::plan_packed(self, l, cipher_size, plan, parity).await
     }
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>> {
         Ok(outbox::stored_plan(self, extent).await?.rows)

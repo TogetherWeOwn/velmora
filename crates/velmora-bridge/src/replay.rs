@@ -97,6 +97,11 @@ pub struct ReplayExtent {
     /// is to hold it that way: it is then stored on the extent's row,
     /// and no article row is written.
     pub packed: Option<Vec<u8>>,
+    /// The parity addendum of the plan record, as the record holds it.
+    /// It goes on the extent's row only with `packed`, and only when it
+    /// is an addendum of that plan ([`crate::parity::expand`]): any
+    /// other is left out, and the extent has no parity.
+    pub parity: Option<Vec<u8>>,
     /// Whether the pinned copy exists.
     pub safety_present: bool,
 }
@@ -410,6 +415,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 let mut unopened = read.unreadable;
                 let record = read.record;
                 let mut packed = None;
+                let mut parity = None;
                 let plan = match record {
                     Some(record) => match record.rows(state) {
                         Ok(rows) => {
@@ -421,6 +427,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                                     &rows,
                                     record.packed.as_deref(),
                                 );
+                                parity = record.parity.filter(|_| packed.is_some());
                             }
                             Some(rows)
                         }
@@ -443,6 +450,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     row,
                     plan,
                     packed,
+                    parity,
                     safety_present,
                 });
             }

@@ -165,6 +165,21 @@ pub fn job_bytes(stage: OutboxStage, cipher_size: u64, post_sockets: u32) -> u64
     }
 }
 
+/// What a job that holds the parity shards of an extent charges on top:
+/// the `parity` shards themselves, and what the codec works in while it
+/// computes them (as many again, and two more). Each is as long as the
+/// extent's longest article. Nothing for an extent without parity.
+pub fn parity_job_bytes(cipher_size: u64, parity: usize) -> u64 {
+    let shard = match (parity, crate::parity::stripe_of(cipher_size)) {
+        (0, _) | (_, None) => return 0,
+        (_, Some((_, shard))) => u64::from(shard),
+    };
+    (parity as u64)
+        .saturating_mul(2)
+        .saturating_add(2)
+        .saturating_mul(shard)
+}
+
 /// Where a drain stops: 90 % of the cap, so that a tier sitting at the
 /// cap is not evicted a little on every run.
 pub fn low_watermark(cap: u64) -> u64 {
@@ -313,6 +328,19 @@ where
             Err(e) => return settle(&self.catalog, &self.clock, lease, e.into()).await,
         };
         let bytes = job_bytes(stage, row.extent.cipher_size, self.cfg.post_sockets);
+        // A post job computes the parity shards of its extent and holds
+        // them next to it: those of the stored plan, or of the plan it
+        // is about to draw.
+        let parity = match (stage, row.parity_count, row.extent.article_count) {
+            (OutboxStage::Post, Some(parity), _) => parity as usize,
+            (OutboxStage::Post, None, None) if self.cfg.packed_plans && self.cfg.parity => {
+                crate::parity::parity_count(
+                    crate::articles::article_spans(row.extent.cipher_size).len(),
+                )
+            }
+            _ => 0,
+        };
+        let bytes = bytes.saturating_add(parity_job_bytes(row.extent.cipher_size, parity));
         // A job larger than the whole budget still has to run: alone.
         let bytes = bytes.min(self.budget.job_capacity());
         let waited_from = self.clock.now();
