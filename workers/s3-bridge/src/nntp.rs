@@ -41,7 +41,7 @@ use velmora_bridge::hosts::{
 };
 use velmora_bridge::{
     BodyOutcome, BridgeError, NntpConnector, NntpSession, Permit, PermitClass, ProviderConfig,
-    ProxyConfig, Result, UnixMs, QUIT_SECS,
+    ProxyConfig, Result, SizeCommand, SizeOutcome, UnixMs, QUIT_SECS,
 };
 
 /// Largest article the bridge reads or posts (velmora articles are about
@@ -130,6 +130,20 @@ impl NntpSession for WorkerSession {
             }
         })
         .await
+    }
+
+    async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
+        let call = velmora_bridge::post::stored_size(&mut self.0, message_id, how);
+        within_call(self.1.call_secs(), call).await
+    }
+
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        let call = velmora_bridge::post::stored_sizes(&mut self.0, message_ids, how);
+        within_call(self.1.call_secs(), call).await
     }
 
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome> {

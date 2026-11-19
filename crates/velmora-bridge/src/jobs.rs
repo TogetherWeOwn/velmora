@@ -563,6 +563,17 @@ where
         let labels = release_labels(&self.cfg.providers);
         let required = self.cfg.required_backbones;
         report.release_paused = self.cfg.release_paused().is_some();
+        if self.cfg.verify.mode == crate::config::VerifyMode::Light {
+            // Read fresh: the report is how an operator learns of it.
+            // A failed read here leaves the list empty, not the run.
+            if let Ok(raised) = self.catalog.verify_escalations(now).await {
+                report.verify_escalated = raised
+                    .into_iter()
+                    .map(|e| crate::verify::label(&e.backbone))
+                    .filter(|name| labels.contains(name))
+                    .collect();
+            }
+        }
         if !report.release_paused {
             // The re-drive is an extra: its failure must not keep the
             // due rows below from being sent.

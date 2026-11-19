@@ -198,6 +198,25 @@ impl NntpSession for CountedSession {
         end(&self.slow);
         found
     }
+    async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
+        begin(&self.slow, "size");
+        let found = NntpSession::size(self.client(), message_id, how).await;
+        end(&self.slow);
+        found
+    }
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        note_event("ask_many");
+        // Counted as the calls they stand for.
+        for _ in message_ids {
+            begin(&self.slow, if how.is_some() { "size" } else { "stat" });
+            end(&self.slow);
+        }
+        NntpSession::ask_many(self.client(), message_ids, how).await
+    }
     async fn quit(mut self) {
         if let Some(client) = self.inner.take() {
             NntpSession::quit(client).await;
@@ -342,6 +361,12 @@ pub struct MemCatalog {
     pub slow_next_renewal: RefCell<Option<(FixedClock, i64)>>,
     /// `provider_failed` calls so far (strikes reported).
     pub failures_reported: Cell<u32>,
+    /// The backbones read in full for a while, as `verify_escalations`.
+    pub escalations: RefCell<Vec<VerifyEscalation>>,
+    /// Extent, backbone and plan of each raise, as `verify_raises`.
+    pub raises: RefCell<Vec<(ExtentId, String, u32)>>,
+    /// The next this many `escalate_verify` calls fail and store nothing.
+    pub fail_escalations: Cell<u32>,
 }
 
 impl MemCatalog {
@@ -419,21 +444,95 @@ impl MemCatalog {
         Self::latest_rows(e, |_| true)
     }
 
-    /// As the SQL catalogue: per backbone, the latest `BODY` row, pass
+    /// As the SQL catalogue: per backbone, the latest full read, pass
     /// or failure. `counts` only where it is a complete pass and no
     /// later check of that backbone failed; a later `STAT` pass does not
-    /// hide it.
+    /// hide it. Then the latest size check that found a wrong size, where
+    /// no full read came after it (never `counts`).
     fn body_checks(e: &Entry) -> Vec<BackboneStatus> {
-        let deciding =
-            |v: &VerificationRow| v.kind == VerifyKind::Body || v.result != VerifyResult::Ok;
+        let deciding = |v: &VerificationRow| v.kind.is_full() || v.result != VerifyResult::Ok;
         let on_record = Self::latest_rows(e, deciding);
-        let mut rows = Self::latest_rows(e, |v| v.kind == VerifyKind::Body);
+        let mut rows = Self::latest_rows(e, |v| v.kind.is_full());
         for row in &mut rows {
             row.counts &= on_record
                 .iter()
-                .any(|s| s.backbone == row.backbone && s.kind == VerifyKind::Body && s.counts);
+                .any(|s| s.backbone == row.backbone && s.kind.is_full() && s.counts);
         }
+        let wrong_size =
+            |v: &VerificationRow| v.kind == VerifyKind::Size && v.result == VerifyResult::Corrupt;
+        for mut size in Self::latest_rows(e, wrong_size) {
+            let read_since = |b: &BackboneStatus| {
+                b.backbone == size.backbone && b.verified_at > size.verified_at
+            };
+            if !rows.iter().any(read_since) {
+                size.counts = false;
+                rows.push(size);
+            }
+        }
+        rows.sort_by(|a, b| (&a.backbone, a.verified_at).cmp(&(&b.backbone, b.verified_at)));
         rows
+    }
+
+    /// The release guard, with the full check on record asked for or not.
+    fn release(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        need_full: bool,
+        light: bool,
+    ) -> Guard<()> {
+        let raised = self.escalations.borrow().clone();
+        let applied = self.fenced(l, |e| {
+            // As the SQL guard: under the light check, the escalations
+            // that had not ended when the extent was stored.
+            let stored = e.job.extent.created_at;
+            let escalated = |backbone: &str| {
+                light
+                    && raised
+                        .iter()
+                        .any(|r| r.backbone == backbone && r.until > stored)
+            };
+            let need_full = need_full || counting.iter().any(|name| escalated(name));
+            // As the SQL guard: only rows recorded under this claim.
+            let claimed = e.outbox.claimed_at;
+            let statuses = Self::statuses(e);
+            // A fresh pass is the full check only where a full read
+            // is on record, and counts for nothing where the last check
+            // of the bytes failed.
+            let checks = Self::body_checks(e);
+            let failed = |s: &BackboneStatus| {
+                checks.iter().any(|b| {
+                    b.backbone == s.backbone
+                        && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+                })
+            };
+            let full = |s: &BackboneStatus| {
+                checks
+                    .iter()
+                    .any(|b| b.backbone == s.backbone && b.kind.is_full() && b.counts)
+            };
+            let passes = statuses
+                .iter()
+                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
+                .filter(|s| !escalated(&s.backbone) || full(s))
+                .map(|s| match full(s) {
+                    true => (s.backbone.as_str(), VerifyKind::Body),
+                    false => (s.backbone.as_str(), VerifyKind::Stat),
+                });
+            if !velmora_bridge::verify::release_rule(passes, counting, required, need_full) {
+                return false;
+            }
+            e.job.extent.safety_state = SafetyState::Releasing;
+            e.job.extent.release_evidence = Some(evidence_json.to_string());
+            true
+        });
+        if applied == Some(true) {
+            Guard::Applied(())
+        } else {
+            Guard::Lost
+        }
     }
 
     /// The latest row per backbone for the current plan among `rows`.
@@ -646,7 +745,7 @@ impl Catalog for MemCatalog {
                 return false;
             }
             e.verifications.push(v.clone());
-            if v.result == VerifyResult::Ok && v.kind == VerifyKind::Body {
+            if v.result == VerifyResult::Ok && v.kind.is_full() {
                 e.job.extent.last_verified_at = Some(v.verified_at);
             }
             true
@@ -676,40 +775,54 @@ impl Catalog for MemCatalog {
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
-        let applied = self.fenced(l, |e| {
-            // As the SQL guard: only rows recorded under this claim.
-            let claimed = e.outbox.claimed_at;
-            let statuses = Self::statuses(e);
-            // A fresh pass is the full check only where a `BODY` pass
-            // is on record.
-            // is on record, and counts for nothing where the last full
-            // read failed.
-            let checks = Self::body_checks(e);
-            let last = |s: &BackboneStatus| checks.iter().find(|b| b.backbone == s.backbone);
-            let failed = |s: &BackboneStatus| {
-                last(s).is_some_and(|b| {
-                    b.result != VerifyResult::Ok || b.articles_ok != b.articles_total
-                })
-            };
-            let passes = statuses
-                .iter()
-                .filter(|s| s.counts && s.verified_at >= claimed && !failed(s))
-                .map(|s| match last(s).is_some_and(|b| b.counts) {
-                    true => (s.backbone.as_str(), VerifyKind::Body),
-                    false => (s.backbone.as_str(), VerifyKind::Stat),
-                });
-            if !velmora_bridge::verify::releasable(passes, counting, required) {
-                return false;
-            }
-            e.job.extent.safety_state = SafetyState::Releasing;
-            e.job.extent.release_evidence = Some(evidence_json.to_string());
-            true
-        });
-        Ok(if applied == Some(true) {
-            Guard::Applied(())
-        } else {
-            Guard::Lost
-        })
+        Ok(self.release(l, required, counting, evidence_json, true, false))
+    }
+
+    async fn begin_release_light(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        _: UnixMs,
+        need_full: bool,
+    ) -> Result<Guard<()>> {
+        Ok(self.release(l, required, counting, evidence_json, need_full, true))
+    }
+
+    async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {
+        if self.fail_escalations.get() > 0 {
+            self.fail_escalations.set(self.fail_escalations.get() - 1);
+            return Err(BridgeError::Sql("injected escalate_verify failure".into()));
+        }
+        let key = (e.extent_id.clone(), e.backbone.clone(), plan_rev);
+        let mut raises = self.raises.borrow_mut();
+        if raises.contains(&key) {
+            return Ok(());
+        }
+        raises.push(key);
+        let mut all = self.escalations.borrow_mut();
+        match all.iter_mut().find(|o| o.backbone == e.backbone) {
+            Some(old) if e.until > old.until => *old = e.clone(),
+            Some(_) => {}
+            None => all.push(e.clone()),
+        }
+        Ok(())
+    }
+
+    async fn verify_raised(
+        &self,
+        extent: &ExtentId,
+        backbone: &str,
+        plan_rev: u32,
+    ) -> Result<bool> {
+        let key = (extent.clone(), backbone.to_string(), plan_rev);
+        Ok(self.raises.borrow().contains(&key))
+    }
+
+    async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>> {
+        let all = self.escalations.borrow();
+        Ok(all.iter().filter(|e| e.until > now).cloned().collect())
     }
 
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
@@ -1534,6 +1647,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         get_fanout_bytes: None,
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
+        verify: Default::default(),
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
     };

@@ -541,6 +541,18 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // The verify mode: absent or blank is the full read of every
+        // extent, the stage as it was before the switch existed.
+        if name == "VERIFY_MODE" {
+            for _ in 0..2 {
+                assert_eq!(
+                    load(&vars).unwrap().verify.mode,
+                    velmora_bridge::config::VerifyMode::Body
+                );
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // Packed plans: absent or blank is off, the way a catalogue was
         // before the switch existed.
         if name == "PACKED_PLANS" {
@@ -579,6 +591,111 @@ fn missing_secret_fails_closed() {
             load(&vars).unwrap_err(),
             ConfigError::Missing(name.clone()),
             "blank {name}"
+        );
+    }
+}
+
+/// The light check: `body` unless asked for, and every value of it
+/// checked when the Worker starts.
+#[test]
+fn verify_mode_is_body_unless_light_is_asked_for() {
+    use velmora_bridge::config::{VerifyConfig, VerifyMode};
+    let (prod, dev) = wrangler_vars();
+    let prod = with_secrets(prod, &prod_providers());
+    let dev = with_secrets(dev, PROVIDER_PLAIN);
+    let with = |base: &BTreeMap<String, String>, pairs: &[(&str, &str)]| {
+        let mut m = base.clone();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.to_string());
+        }
+        load(&m).map(|c| c.verify)
+    };
+    let invalid = |k: &str| Err(ConfigError::Invalid(k.to_string()));
+
+    // Nothing set: the full read of every extent.
+    let unset = with(&prod, &[]).unwrap();
+    assert_eq!(unset, VerifyConfig::default());
+    assert_eq!(unset.mode, VerifyMode::Body);
+    assert_eq!((unset.sample_ppm, unset.escalate_secs), (20_000, 86_400));
+    assert_eq!(with(&prod, &[("VERIFY_MODE", "body")]).unwrap(), unset);
+    assert_eq!(with(&prod, &[("VERIFY_MODE", "")]).unwrap(), unset);
+
+    let light = with(
+        &prod,
+        &[
+            ("VERIFY_MODE", "light"),
+            ("VERIFY_SAMPLE_PERCENT", "1.5"),
+            ("VERIFY_ESCALATE_SECS", "3600"),
+            ("VERIFY_SIZE_COMMANDS", r#"{"p2":"head","p1":"hdr"}"#),
+        ],
+    )
+    .unwrap();
+    assert_eq!(light.mode, VerifyMode::Light);
+    assert_eq!((light.sample_ppm, light.escalate_secs), (15_000, 3_600));
+    assert_eq!(light.size_command("p1"), Some(SizeCommand::Hdr));
+    assert_eq!(light.size_command("p2"), Some(SizeCommand::Head));
+    assert_eq!(light.size_command("p3"), None);
+    let over = with(&prod, &[("VERIFY_SIZE_COMMANDS", r#"{"p1":"over"}"#)]).unwrap();
+    assert_eq!(over.size_command("p1"), Some(SizeCommand::Over));
+    assert_eq!(over.size_command("p2"), None);
+
+    // No mode but the two.
+    for mode in ["Light", "stat", "off", "sampled"] {
+        assert_eq!(
+            with(&prod, &[("VERIFY_MODE", mode)]),
+            invalid("VERIFY_MODE")
+        );
+    }
+    // The sample: a number of percent, at most 100.
+    for (percent, ppm) in [
+        ("2", 20_000),
+        ("100", 1_000_000),
+        ("1", 10_000),
+        ("2.0625", 20_625),
+    ] {
+        let got = with(&prod, &[("VERIFY_SAMPLE_PERCENT", percent)]).unwrap();
+        assert_eq!(got.sample_ppm, ppm, "{percent}");
+    }
+    for percent in [
+        "101", "-1", "2%", "1.", ".5", "1.00001", "two", "1e2", "1000",
+    ] {
+        assert_eq!(
+            with(&prod, &[("VERIFY_SAMPLE_PERCENT", percent)]),
+            invalid("VERIFY_SAMPLE_PERCENT"),
+            "{percent}"
+        );
+    }
+    // Less than 1 % is a test setting.
+    for percent in ["0", "0.5", "0.9999"] {
+        assert!(matches!(
+            with(&prod, &[("VERIFY_SAMPLE_PERCENT", percent)]),
+            Err(ConfigError::Refused(_))
+        ));
+    }
+    let none = with(&dev, &[("VERIFY_SAMPLE_PERCENT", "0")]).unwrap();
+    assert_eq!(none.sample_ppm, 0);
+    // The period of full reads after a failed sample.
+    for secs in ["59", "0", "2592001", "day"] {
+        assert_eq!(
+            with(&prod, &[("VERIFY_ESCALATE_SECS", secs)]),
+            invalid("VERIFY_ESCALATE_SECS"),
+            "{secs}"
+        );
+    }
+    // The size commands: known providers, known commands. A typo would
+    // leave the provider on `STAT` without a word.
+    for json in [
+        r#"{"p9":"head"}"#,
+        r#"{"p1":"xhdr"}"#,
+        r#"{"p1":"HEAD"}"#,
+        r#"{"p1":1}"#,
+        r#"["p1"]"#,
+        "head",
+    ] {
+        assert_eq!(
+            with(&prod, &[("VERIFY_SIZE_COMMANDS", json)]),
+            invalid("VERIFY_SIZE_COMMANDS"),
+            "{json}"
         );
     }
 }
@@ -1047,6 +1164,8 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "upload_parts",
             "uploads",
             "verifications",
+            "verify_escalations",
+            "verify_raises",
             "write_intents",
         ]
     );
@@ -1071,6 +1190,10 @@ async fn ddl_applies_cleanly_with_fixed_times() {
          vec![text("x_1"), i(0), text("m1@example.invalid"), text("alt.binaries.test"), blob(200), i(0), i(69), blob(32), text(ArticleState::Posted.as_str()), text("p1"), t.clone()]),
         ("INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
          vec![text("x_1"), text("bb1"), text("p1"), t.clone(), i(1), i(1), i(1), text(VerifyResult::Ok.as_str())]),
+        ("INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         vec![text("x_1"), text("bb2"), text("p2"), t.clone(), i(1), i(1), i(1), text(VerifyResult::Ok.as_str()), text(VerifyKind::Size.column()), text(VerifyKind::Size.mode_column().unwrap())]),
+        ("INSERT INTO verify_escalations(backbone,until,raised_at,extent_id,result) VALUES (?1,?2,?3,?4,?5)",
+         vec![text("bb1"), SqlValue::Int(T0.plus_secs(86_400).0), t.clone(), text("x_1"), text(VerifyResult::Corrupt.as_str())]),
         ("INSERT INTO outbox(extent_id,generation_id,stage,attempts,next_at,lease_token,lease_owner,lease_until,cursor,last_error,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
          vec![text("x_1"), text("g_1"), text(OutboxStage::Post.as_str()), i(0), t.clone(), i(0), SqlValue::Null, SqlValue::Null, i(0), SqlValue::Null, t.clone()]),
         ("INSERT INTO uploads(id,bucket_id,key,content_json,user_meta_json,state,revision,completed_generation_id,complete_digest,result_etag,initiated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",

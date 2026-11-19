@@ -166,6 +166,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
 #[event(queue)]
 async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) -> Result<()> {
+    // What an operator has to see of a job: a failed full read of a
+    // sampled extent, for one.
+    velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
@@ -421,6 +424,13 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
                 if let Some(warning) = bridge.cfg.release_paused() {
                     console_error!("dispatch: {warning}");
                 }
+            }
+            if !report.verify_escalated.is_empty() {
+                console_error!(
+                    "dispatch: a full read of a sampled extent failed; every extent is read in \
+                     full on: {}",
+                    report.verify_escalated.join(", ")
+                );
             }
             if report.sweep_failed {
                 console_error!("dispatch: the sweep of unpublished writes was not sent");

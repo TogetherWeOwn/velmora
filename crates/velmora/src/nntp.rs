@@ -661,6 +661,48 @@ impl<T: Transport> NntpClient<T> {
         Ok(out)
     }
 
+    /// Pipelined `STAT`: whether the server has each article, in the
+    /// order asked, with up to `max_pipelined` commands written ahead of
+    /// their replies. `430` is `false`. Every `223` envelope is
+    /// correlated with its article as in [`NntpClient::stat`]. On any
+    /// error after the first byte is written the client becomes
+    /// unusable, as after a failed [`NntpClient::fetch_many`]; an
+    /// argument refused before that writes nothing.
+    pub async fn stat_many(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
+        for id in message_ids {
+            validate_argument(id)?;
+        }
+        let result = self.stat_many_inner(message_ids).await;
+        if result.is_err() {
+            self.transport.invalidate();
+        }
+        result
+    }
+
+    async fn stat_many_inner(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(message_ids.len());
+        for chunk in message_ids.chunks(self.max_pipelined()) {
+            for id in chunk {
+                self.transport
+                    .write_line(format!("STAT <{id}>").as_bytes())
+                    .await
+                    .map_err(Error::Io)?;
+            }
+            for id in chunk {
+                let reply = self.read_reply().await?;
+                match reply.code {
+                    223 => {
+                        parse_envelope(&reply.text, id)?;
+                        out.push(true);
+                    }
+                    430 => out.push(false),
+                    _ => return Err(self.classify(&reply, id)),
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn max_pipelined(&self) -> usize {
         // `connect` rejects 0; this is defence in depth.
         self.max_pipelined.max(1)
@@ -843,6 +885,23 @@ impl<T: Transport> NntpClient<T> {
     /// commands this client does not model, e.g. `DATE`, `CAPABILITIES`).
     pub async fn raw_command(&mut self, cmd: &str) -> Result<Reply> {
         self.command(cmd).await
+    }
+
+    /// Writes a raw command without reading its reply, so that several
+    /// can be written ahead of their replies. Every command written this
+    /// way owes one [`NntpClient::raw_reply`], in order; after an error
+    /// from either, drop the client.
+    pub async fn raw_send(&mut self, cmd: &str) -> Result<()> {
+        self.transport
+            .write_line(cmd.as_bytes())
+            .await
+            .map_err(Error::Io)
+    }
+
+    /// Reads the reply to the oldest [`NntpClient::raw_send`] not yet
+    /// answered.
+    pub async fn raw_reply(&mut self) -> Result<Reply> {
+        self.read_reply().await
     }
 
     /// Reads the dot-block following a `2xx` reply to [`NntpClient::raw_command`].

@@ -16,11 +16,13 @@ use crate::ingress::Sleeper;
 use crate::pool::Pool;
 use crate::ports::{
     BlobMeta, BlobStore, BodyOutcome, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
-    NntpSession, Permit, PermitClass, QUIT_SECS, READ_PERMIT_SECS, READ_SLACK_SECS,
+    NntpSession, Permit, PermitClass, SizeOutcome, ASK_MANY, QUIT_SECS, READ_PERMIT_SECS,
+    READ_SLACK_SECS,
 };
 use crate::post::{sha256, Stop, KEEP_EVERY_MS};
 use crate::types::{
-    ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, ProviderFault, Result, UnixMs,
+    ArticleRow, BridgeError, ExtentRow, FailClass, ProviderConfig, ProviderFault, Result,
+    SizeCommand, UnixMs,
 };
 
 /// One provider connection slot and the session opened under it.
@@ -453,8 +455,13 @@ pub(crate) struct ReadTally {
     pub(crate) ok: u32,
     /// Still `430` after the in-pass retry.
     pub(crate) missing: Vec<u32>,
-    /// Present, but not the planned bytes.
+    /// Present, but not the planned bytes; in a size pass
+    /// ([`ask_articles_together`]), present with a size no posted article of
+    /// that plan can have.
     pub(crate) corrupt: Vec<u32>,
+    /// In a size pass: the articles of `ok` whose reported size fits.
+    /// The others of `ok` are only known to be present.
+    pub(crate) sized: u32,
 }
 
 enum Checked {
@@ -464,6 +471,8 @@ enum Checked {
     Present,
     /// A `BODY` is in the caller's buffer, not yet decoded or checked.
     Wire,
+    /// The provider has the article and reports a size that fits it.
+    Sized,
     Missing,
     Corrupt,
 }
@@ -477,6 +486,56 @@ enum Ask {
     Stat,
     /// `BODY`, left in the caller's buffer for it to decode and check.
     Wire,
+    /// Presence and the size the provider reports, compared with
+    /// [`size_bounds`].
+    Size(SizeCommand),
+}
+
+/// What one command found, before it is checked.
+enum Got {
+    Body(BodyOutcome),
+    Present,
+    Size(Option<u64>),
+    Carried(u64),
+}
+
+/// The sizes, in bytes, a provider may report for the stored article of
+/// `row`: `(least, most)`, both inclusive.
+///
+/// What is compared. The catalogue keeps the length of an article's
+/// payload (`cipher_len`, ciphertext) and its header block, not the
+/// length of its yEnc text, so the reported size is held against the
+/// range that text can have:
+/// - the payload itself, `cipher_len` bytes;
+/// - one more byte for every escaped byte. yEnc escapes 4 of the 256
+///   byte values everywhere, and ciphertext is uniform, so their number
+///   is `cipher_len / 64` give or take a few standard deviations: 8 are
+///   allowed each way (`8 * sqrt(cipher_len / 64) + 8`). An encoder may
+///   also escape a dot, a tab or a space at the edge of a line: up to 2
+///   more per line are allowed upward;
+/// - a line end (2 bytes) for each line of at most 128 characters;
+/// - upward only: the `=ybegin` and `=yend` lines (256 bytes), the
+///   header block that was posted, and 8192 bytes for the headers the
+///   servers on the way add (`Path`, `Xref` and the like).
+///
+/// `least` counts no header at all, so a provider that reports the size
+/// of the body alone passes too. It does count a line end as 2 bytes: a
+/// provider that counts it as 1 reports less than `least` for a whole
+/// article, which is recorded as corrupt and releases nothing. Such a
+/// provider is not given a size command. An article cut short by more than the
+/// slack (about 0.1 % of a full article plus its headers) is below
+/// `least`; one that is another, larger article is above `most`.
+pub fn size_bounds(row: &ArticleRow) -> (u64, u64) {
+    let n = row.cipher_len;
+    let escapes = n / 64;
+    let spread = 8 * escapes.isqrt() + 8;
+    let least_lines = n / 129;
+    let least = n + escapes.saturating_sub(spread) + 2 * least_lines;
+    let most_text = n + escapes + spread;
+    let most_lines = most_text / 127 + 1;
+    let headers = u64::try_from(row.headers.len()).unwrap_or(u64::MAX);
+    let most = (most_text + 4 * most_lines + 256 + 8192).saturating_add(headers);
+    (least, most)
 }
 
 /// Decodes a `BODY` reply and accepts it only if it is exactly the planned
@@ -526,12 +585,16 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
         let result = match connected {
             Ok(()) => match session.session().await {
                 Ok(s) => match ask {
-                    Ask::Body | Ask::Wire => s.body(&row.message_id, wire).await.map(Some),
-                    Ask::Stat => match s.stat(&row.message_id).await {
-                        Ok(true) => Ok(None),
-                        Ok(false) => Ok(Some(BodyOutcome::Missing)),
-                        Err(e) => Err(e),
-                    },
+                    Ask::Body | Ask::Wire => s.body(&row.message_id, wire).await.map(Got::Body),
+                    Ask::Stat => s.stat(&row.message_id).await.map(|there| match there {
+                        true => Got::Present,
+                        false => Got::Body(BodyOutcome::Missing),
+                    }),
+                    Ask::Size(how) => s.size(&row.message_id, how).await.map(|o| match o {
+                        SizeOutcome::Present(size) => Got::Size(size),
+                        SizeOutcome::Carried(size) => Got::Carried(size),
+                        SizeOutcome::Missing => Got::Body(BodyOutcome::Missing),
+                    }),
                 },
                 Err(Stop::Session(e)) => Err(e),
                 Err(stop) => return Err(stop),
@@ -542,10 +605,12 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
             Ok(found) => {
                 session.note_ok();
                 return Ok(match found {
-                    Some(BodyOutcome::Found) if ask == Ask::Wire => Checked::Wire,
-                    Some(BodyOutcome::Found) => check_payload(row, wire),
-                    Some(BodyOutcome::Missing) => Checked::Missing,
-                    None => Checked::Present,
+                    Got::Body(BodyOutcome::Found) if ask == Ask::Wire => Checked::Wire,
+                    Got::Body(BodyOutcome::Found) => check_payload(row, wire),
+                    Got::Body(BodyOutcome::Missing) => Checked::Missing,
+                    Got::Present => Checked::Present,
+                    Got::Size(size) => check_size(row, SizeOutcome::Present(size)),
+                    Got::Carried(size) => check_size(row, SizeOutcome::Carried(size)),
                 });
             }
             Err(e) => e,
@@ -567,6 +632,24 @@ async fn read_one<C: Catalog, N: NntpConnector, T: Clock>(
     }
 }
 
+/// What a provider's answer about the article of `row` comes to.
+fn check_size(row: &ArticleRow, answer: SizeOutcome) -> Checked {
+    let fits = |size: u64| {
+        let (least, most) = size_bounds(row);
+        (least..=most).contains(&size)
+    };
+    match answer {
+        SizeOutcome::Missing => Checked::Missing,
+        SizeOutcome::Present(None) => Checked::Present,
+        SizeOutcome::Present(Some(size)) if fits(size) => Checked::Sized,
+        // A size that came with the article: one that cannot be the
+        // article that was posted is a failure, one that can says
+        // nothing of what is stored here.
+        SizeOutcome::Carried(size) if fits(size) => Checked::Present,
+        SizeOutcome::Present(Some(_)) | SizeOutcome::Carried(_) => Checked::Corrupt,
+    }
+}
+
 /// Reads `rows` one `BODY` at a time on `session` and hands every verified
 /// payload to `sink`. Unverified bytes never reach the sink.
 ///
@@ -580,7 +663,7 @@ pub(crate) async fn read_articles<C: Catalog, N: NntpConnector, T: Clock>(
     rows: &[&ArticleRow],
     sink: impl FnMut(&ArticleRow, Vec<u8>),
 ) -> core::result::Result<ReadTally, Stop> {
-    ask_articles(session, lease, rows, Ask::Body, sink).await
+    ask_articles(session, lease, rows, Ask::Body, false, sink).await
 }
 
 /// Asks the provider with `STAT` whether it has each of `rows`: no article
@@ -596,7 +679,36 @@ pub(crate) async fn stat_articles<C: Catalog, N: NntpConnector, T: Clock>(
     lease: Option<&Lease>,
     rows: &[&ArticleRow],
 ) -> core::result::Result<ReadTally, Stop> {
-    ask_articles(session, lease, rows, Ask::Stat, |_, _| {}).await
+    ask_articles(session, lease, rows, Ask::Stat, false, |_, _| {}).await
+}
+
+/// Asks the provider whether it has each of `rows`, with `STAT` (`how`
+/// is `None`, as [`stat_articles`]) or with its size command `how`,
+/// which also gives the size it reports: no article is read.
+/// `ReadTally::ok` counts the articles it has, `sized` those of them
+/// whose reported size fits ([`size_bounds`]), and `corrupt` those with
+/// a size that does not. The retry of a `430` and the lease are as in
+/// [`read_articles`].
+///
+/// The commands of up to [`ASK_MANY`] articles are written ahead of
+/// their replies ([`NntpSession::ask_many`]): a round trip for an extent
+/// instead of one per article.
+///
+/// This is not a check of the bytes: only [`read_articles`] proves an
+/// article can be read back.
+///
+/// The lease and the slot are renewed before every such call. A call
+/// that fails counts for nothing: the session is dropped, and its
+/// articles and those after them are asked one by one, as in
+/// [`stat_articles`], with the reconnects and the errors of that way.
+pub(crate) async fn ask_articles_together<C: Catalog, N: NntpConnector, T: Clock>(
+    session: &mut ProviderSession<'_, C, N, T>,
+    lease: Option<&Lease>,
+    rows: &[&ArticleRow],
+    how: Option<SizeCommand>,
+) -> core::result::Result<ReadTally, Stop> {
+    let ask = how.map_or(Ask::Stat, Ask::Size);
+    ask_articles(session, lease, rows, ask, true, |_, _| {}).await
 }
 
 async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
@@ -604,15 +716,43 @@ async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
     lease: Option<&Lease>,
     rows: &[&ArticleRow],
     ask: Ask,
+    together: bool,
     mut sink: impl FnMut(&ArticleRow, Vec<u8>),
 ) -> core::result::Result<ReadTally, Stop> {
     let mut tally = ReadTally::default();
     let mut wire = Vec::new();
     let mut reconnects = 0;
     let mut retry: Vec<&ArticleRow> = Vec::new();
+    // The articles the calls for several did not answer for.
+    let mut first = rows;
+    let how = match ask {
+        Ask::Stat => Some(None),
+        Ask::Size(how) => Some(Some(how)),
+        Ask::Body | Ask::Wire => None,
+    };
+    if let (true, Some(how)) = (together, how) {
+        while !first.is_empty() {
+            let (now, later) = first.split_at(first.len().min(ASK_MANY));
+            let Some(answers) = ask_together(session, lease, now, how).await? else {
+                break;
+            };
+            for (row, answer) in now.iter().zip(answers) {
+                match check_size(row, answer) {
+                    Checked::Sized => {
+                        tally.ok += 1;
+                        tally.sized += 1;
+                    }
+                    Checked::Corrupt => tally.corrupt.push(row.idx),
+                    Checked::Missing => retry.push(row),
+                    Checked::Present | Checked::Wire | Checked::Good(_) => tally.ok += 1,
+                }
+            }
+            first = later;
+        }
+    }
     for pass in 0..2 {
         let todo = if pass == 0 {
-            rows.to_vec()
+            first.to_vec()
         } else {
             core::mem::take(&mut retry)
         };
@@ -624,6 +764,10 @@ async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
                     sink(row, payload);
                 }
                 Checked::Present | Checked::Wire => tally.ok += 1,
+                Checked::Sized => {
+                    tally.ok += 1;
+                    tally.sized += 1;
+                }
                 Checked::Corrupt => tally.corrupt.push(row.idx),
                 Checked::Missing if pass == 0 => retry.push(row),
                 Checked::Missing => tally.missing.push(row.idx),
@@ -631,6 +775,62 @@ async fn ask_articles<C: Catalog, N: NntpConnector, T: Clock>(
         }
     }
     Ok(tally)
+}
+
+/// One [`NntpSession::ask_many`] for `rows` (at most [`ASK_MANY`]):
+/// their answers in order, or `None` when the call counts for nothing
+/// and the rows are to be asked one by one. The session connects first
+/// if it has to, renewed before and after as in [`read_one`]; a session
+/// that failed is dropped with its strike.
+async fn ask_together<C: Catalog, N: NntpConnector, T: Clock>(
+    session: &mut ProviderSession<'_, C, N, T>,
+    lease: Option<&Lease>,
+    rows: &[&ArticleRow],
+    how: Option<SizeCommand>,
+) -> core::result::Result<Option<Vec<SizeOutcome>>, Stop> {
+    session.keep(lease).await?;
+    let fresh = !session.connected();
+    match session.session().await {
+        Ok(_) => {}
+        // Its strike is noted. The one-by-one way connects again and
+        // counts its reconnects.
+        Err(Stop::Session(_)) => {
+            session.discard();
+            return Ok(None);
+        }
+        Err(stop) => return Err(stop),
+    }
+    if fresh {
+        session.keep(lease).await?;
+    }
+    let ids: Vec<&str> = rows.iter().map(|r| r.message_id.as_str()).collect();
+    let answers = match session.session().await {
+        Ok(s) => s.ask_many(&ids, how).await,
+        Err(Stop::Session(_)) => {
+            session.discard();
+            return Ok(None);
+        }
+        Err(stop) => return Err(stop),
+    };
+    match answers {
+        Ok(answers) if answers.len() == rows.len() => {
+            session.note_ok();
+            Ok(Some(answers))
+        }
+        Ok(_) => {
+            session.discard();
+            Ok(None)
+        }
+        Err(e @ BridgeError::Nntp(_)) => {
+            session.note_err(&e);
+            session.discard();
+            Ok(None)
+        }
+        Err(other) => {
+            session.discard();
+            Err(other.into())
+        }
+    }
 }
 
 /// Longest a cold read keeps retrying while every provider slot it could
@@ -1440,7 +1640,7 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
                 }
             }
             // Not asked for.
-            Checked::Good(_) | Checked::Present => b.asks[slot] = MISSING_ASKS,
+            Checked::Good(_) | Checked::Present | Checked::Sized => b.asks[slot] = MISSING_ASKS,
         }
     }
 }

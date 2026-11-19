@@ -93,6 +93,10 @@ pub const MIGRATION_0017: &str =
 /// (`upload_part_extents`).
 pub const MIGRATION_0018: &str =
     include_str!("../../../workers/s3-bridge/migrations/0018_upload_part_extents.sql");
+/// The light check of the verify stage (`verifications.mode`,
+/// `verify_escalations`).
+pub const MIGRATION_0019: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0019_verify_mode.sql");
 
 // ---------------------------------------------------------------------------
 // RusqliteSql
@@ -232,6 +236,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0016)?;
         db.apply(MIGRATION_0017)?;
         db.apply(MIGRATION_0018)?;
+        db.apply(MIGRATION_0019)?;
         Ok(db)
     }
 

@@ -20,8 +20,8 @@ use crate::types::{
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
     OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig,
-    ProviderFault, ProviderLoad, Resend, SafetyState, UnixMs, UploadId, UploadListQuery,
-    UploadPartRow, UploadRow, VerificationRow, WriteId,
+    ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs, UploadId,
+    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation, WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -202,6 +202,23 @@ pub enum BodyOutcome {
     Missing,
 }
 
+/// Result of one size command ([`NntpSession::size`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeOutcome {
+    /// `430`; the session stays usable.
+    Missing,
+    /// The provider has the article. `Some` = the size in bytes it
+    /// reported for it; `None` = it reported none (the command is not
+    /// supported, or the article has no such header), so nothing more
+    /// than a `STAT` is known.
+    Present(Option<u64>),
+    /// The provider has the article, and its answer carries a size that
+    /// is not the provider's own count: a header written where the
+    /// article was first received, which travels with it. It says what
+    /// arrived there, not what this provider stores.
+    Carried(u64),
+}
+
 /// One authenticated NNTP session. Blanket impl for
 /// `velmora::nntp::NntpClient<T: Transport>` lands with the poster lane.
 ///
@@ -216,10 +233,52 @@ pub trait NntpSession {
     ) -> Result<velmora::nntp::PostOutcome>;
     /// `false` = 430.
     async fn stat(&mut self, message_id: &str) -> Result<bool>;
+    /// Asks whether the article is there and for the size the provider
+    /// reports for it, with `how`. A session that has no such command
+    /// asks with `STAT`: present, size unknown.
+    async fn size(&mut self, message_id: &str, how: SizeCommand) -> Result<SizeOutcome> {
+        let _ = how;
+        Ok(match self.stat(message_id).await? {
+            true => SizeOutcome::Present(None),
+            false => SizeOutcome::Missing,
+        })
+    }
+    /// The answers of [`stat`](Self::stat) (`how` is `None`: present
+    /// without a size, or missing) or of [`size`](Self::size) for each
+    /// of `message_ids`, in that order. A session may write the commands
+    /// ahead of their replies; the answers are the same as one by one.
+    /// It is one call: no more than [`ASK_MANY`] articles. After an
+    /// `Err` no answer counts and the session is dropped.
+    async fn ask_many(
+        &mut self,
+        message_ids: &[&str],
+        how: Option<SizeCommand>,
+    ) -> Result<Vec<SizeOutcome>> {
+        let mut out = Vec::with_capacity(message_ids.len());
+        for id in message_ids {
+            out.push(match how {
+                Some(how) => self.size(id, how).await?,
+                None => match self.stat(id).await? {
+                    true => SizeOutcome::Present(None),
+                    false => SizeOutcome::Missing,
+                },
+            });
+        }
+        Ok(out)
+    }
     /// One `body_to`; appends to `out`.
     async fn body(&mut self, message_id: &str, out: &mut Vec<u8>) -> Result<BodyOutcome>;
     async fn quit(self);
 }
+
+/// Most articles in one [`NntpSession::ask_many`]: the articles of a
+/// whole extent of the largest size, so its check is one call per
+/// provider. A size command writes all of them ahead of their replies;
+/// `STAT` writes them in the client's groups (16 at a time), so a full
+/// call of `STAT` is two round trips. The commands of that many are a
+/// few kilobytes, the answers (a header block each at most) well under
+/// a megabyte.
+pub const ASK_MANY: usize = 32;
 
 /// The longest one `connect`, `post`, `stat`, `body` or `quit` may take, whatever its
 /// per-operation timeouts add up to: a connector gives the call up with
@@ -890,6 +949,43 @@ pub trait Catalog {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>>;
+    /// [`Catalog::begin_release`] under the light check
+    /// (`VERIFY_MODE=light`). `required` backbones with a complete pass
+    /// under this claim are needed, and none counts on a backbone whose
+    /// last check of the bytes failed. With `need_full` false (an extent
+    /// outside the sample) the full check on record is not asked for.
+    ///
+    /// The guard reads the escalations itself
+    /// ([`Catalog::verify_escalations`] at the time the extent was
+    /// stored), so one raised while the job asked the providers holds:
+    /// a backbone under full reads counts only with its own full check
+    /// on record, and with any counting backbone under full reads the
+    /// full check is asked for whatever `need_full` says.
+    async fn begin_release_light(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        now: UnixMs,
+        need_full: bool,
+    ) -> Result<Guard<()>>;
+    /// Notes that a full read of a sampled extent failed on `backbone`:
+    /// until `until` every extent is read in full there. An earlier end
+    /// never replaces a later one. An extent raises a backbone once for
+    /// a plan (`plan_rev`): that it did is stored with the escalation,
+    /// both or neither, and a second call for the same three changes
+    /// nothing.
+    async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()>;
+    /// Whether `extent` has raised `backbone` for `plan_rev`
+    /// ([`Catalog::escalate_verify`]).
+    async fn verify_raised(&self, extent: &ExtentId, backbone: &str, plan_rev: u32)
+        -> Result<bool>;
+    /// The escalations that have not ended at `at`
+    /// ([`Catalog::escalate_verify`]). An extent is read in full on the
+    /// backbones of those that had not ended when it was stored (`at` =
+    /// its `created_at`), whenever its job runs.
+    async fn verify_escalations(&self, at: UnixMs) -> Result<Vec<VerifyEscalation>>;
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third

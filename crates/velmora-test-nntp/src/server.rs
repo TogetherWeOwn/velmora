@@ -118,12 +118,21 @@ struct Spool {
     /// While true, `BODY` answers `430` for articles in the `POST` spool
     /// although `STAT` finds them.
     body_gone: bool,
+    late_bodies: usize,
     /// While true, a login over the connection cap is answered `482`
     /// instead of `502`.
     limit_482: bool,
     /// The whole reply line of a login over the connection cap, when a
     /// test sets one; it overrides `limit_482`.
     limit_reply: Option<String>,
+    /// While set, the server reports a size for every article: a
+    /// `Bytes:` header in `HEAD`, and `HDR :bytes`. The value is the
+    /// stored length plus this difference.
+    reported_size: Option<i64>,
+    /// The `HEAD` size header is `X-Received-Bytes:` and not `Bytes:`.
+    size_carried: bool,
+    /// `OVER <message-id>` answers `224` with no line.
+    over_empty: bool,
 }
 
 struct Shared {
@@ -153,8 +162,12 @@ impl Shared {
             drop_stats: 0,
             stat_lag: false,
             body_gone: false,
+            late_bodies: 0,
             limit_482: false,
             limit_reply: None,
+            reported_size: None,
+            size_carried: false,
+            over_empty: false,
         };
         Self {
             config,
@@ -336,6 +349,36 @@ impl TestNntpServer {
     /// serves them (a provider whose `STAT` lags right after a `POST`).
     pub async fn set_stat_lag(&self, lag: bool) {
         self.shared.spool.lock().await.stat_lag = lag;
+    }
+
+    /// Whether the size in `HEAD` is given as `X-Received-Bytes:`, the
+    /// header that travels with an article, and not as `Bytes:`.
+    pub async fn set_size_carried(&self, on: bool) {
+        self.shared.spool.lock().await.size_carried = on;
+    }
+
+    /// Whether `OVER <message-id>` answers `224` with an empty block,
+    /// whatever it holds.
+    pub async fn set_over_empty(&self, on: bool) {
+        self.shared.spool.lock().await.over_empty = on;
+    }
+
+    /// While `Some(d)`, the server reports a size for every article it
+    /// has: a `Bytes:` header at the end of a `HEAD`, and an answer to
+    /// `HDR :bytes <message-id>`. The size is the stored length plus
+    /// `d`, so `Some(0)` is a provider that reports what it stores and
+    /// any other value one whose stored article is not what was posted.
+    /// While `None` (the default) `HEAD` has no such header and `HDR` is
+    /// an unknown command.
+    pub async fn set_reported_size(&self, difference: Option<i64>) {
+        self.shared.spool.lock().await.reported_size = difference;
+    }
+
+    /// The next `n` `BODY` commands answer `430`, and everything after
+    /// them is served: an article that arrives just after it was asked
+    /// for.
+    pub async fn late_for_next_bodies(&self, n: usize) {
+        self.shared.spool.lock().await.late_bodies = n;
     }
 
     /// While set, `BODY` answers `430` for posted articles although `STAT`
@@ -693,9 +736,23 @@ async fn handle_connection(
                     _ => &article.raw,
                 };
                 let header_line = format!("{code} {} {}\r\n", article.number, article.message_id);
+                // A `HEAD` that reports the size: a `Bytes:` header after
+                // the stored ones, in place of the empty line.
+                let sized_head: Vec<u8>;
+                let mut payload = payload;
                 // Runtime hooks: a lagging STAT and a one-shot mid-body drop.
                 {
                     let mut spool = shared.spool.lock().await;
+                    if let (Some(d), "HEAD") = (spool.reported_size, cmd.as_str()) {
+                        let size = (article.raw.len() as i64).saturating_add(d).max(0);
+                        let stored = payload.strip_suffix(b"\r\n").unwrap_or(payload);
+                        let name = match spool.size_carried {
+                            true => "X-Received-Bytes",
+                            false => "Bytes",
+                        };
+                        sized_head = [stored, format!("{name}: {size}\r\n").as_bytes()].concat();
+                        payload = &sized_head;
+                    }
                     if cmd.as_str() == "STAT" && spool.drop_stats > 0 {
                         spool.drop_stats -= 1;
                         break;
@@ -707,6 +764,12 @@ async fn handle_connection(
                             .iter()
                             .any(|a| a.message_id == article.message_id)
                     {
+                        drop(spool);
+                        let _ = writer.write_all(b"430 No such article\r\n").await;
+                        continue;
+                    }
+                    if cmd.as_str() == "BODY" && spool.late_bodies > 0 {
+                        spool.late_bodies -= 1;
                         drop(spool);
                         let _ = writer.write_all(b"430 No such article\r\n").await;
                         continue;
@@ -798,6 +861,57 @@ async fn handle_connection(
                         let _ = writer.write_all(b"441 Posting failed\r\n").await;
                     }
                 }
+            }
+            "HDR" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                // Only `HDR :bytes <message-id>`, and only while a test
+                // has switched the reported size on.
+                let reported = shared.spool.lock().await.reported_size;
+                let (field, id) = arg.split_once(' ').unwrap_or((arg.as_str(), ""));
+                let Some(d) = reported.filter(|_| field.eq_ignore_ascii_case(":bytes")) else {
+                    let _ = writer.write_all(b"500 Unknown command\r\n").await;
+                    continue;
+                };
+                let Some(article) = find_visible_by_id(&shared, &normalize_id(id)).await else {
+                    let _ = writer.write_all(b"430 No such article\r\n").await;
+                    continue;
+                };
+                let size = (article.raw.len() as i64).saturating_add(d).max(0);
+                let answer = format!("225 Header information follows\r\n0 {size}\r\n.\r\n");
+                let _ = writer.write_all(answer.as_bytes()).await;
+            }
+            "OVER" => {
+                if !check_auth(&shared.config, &authed, &mut writer).await {
+                    continue;
+                }
+                // Only `OVER <message-id>`, and only while a test has
+                // switched the reported size on.
+                let (reported, empty) = {
+                    let spool = shared.spool.lock().await;
+                    (spool.reported_size, spool.over_empty)
+                };
+                let Some(d) = reported.filter(|_| arg.starts_with('<')) else {
+                    let _ = writer.write_all(b"500 Unknown command\r\n").await;
+                    continue;
+                };
+                if empty {
+                    let _ = writer
+                        .write_all(b"224 Overview information follows\r\n.\r\n")
+                        .await;
+                    continue;
+                }
+                let Some(article) = find_visible_by_id(&shared, &normalize_id(&arg)).await else {
+                    let _ = writer.write_all(b"430 No such article\r\n").await;
+                    continue;
+                };
+                let size = (article.raw.len() as i64).saturating_add(d).max(0);
+                let answer = format!(
+                    "224 Overview information follows\r\n0\tsubject\tfrom\tdate\t{}\t\t{size}\t1\r\n.\r\n",
+                    article.message_id
+                );
+                let _ = writer.write_all(answer.as_bytes()).await;
             }
             "QUIT" => {
                 let _ = writer.write_all(b"205 Bye\r\n").await;

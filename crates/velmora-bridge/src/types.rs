@@ -305,13 +305,99 @@ db_enum!(
     VerifyResult { Ok => "ok", Missing => "missing", Corrupt => "corrupt", Error => "error" }
 );
 db_enum!(
-    /// `verifications.kind`: how the articles were checked. `Body` = every
-    /// article was read and its payload hash compared; `Stat` = the
-    /// provider only said that it has them. A `Stat` pass is never the
-    /// full check: a provider can answer `STAT` for an article whose
-    /// `BODY` it no longer serves.
-    VerifyKind { Body => "body", Stat => "stat" }
+    /// How a verification row checked the articles.
+    ///
+    /// - `Body`: every article was read and its payload hash compared.
+    /// - `Sampled`: the same full read, made because the extent fell in
+    ///   the sample of the light check (`VERIFY_MODE=light`) or because
+    ///   its backbone is read in full for a while after a failed read.
+    /// - `Stat`: the provider only said that it has the articles.
+    /// - `Size`: the provider has every article and the size it stores
+    ///   for each is the size of the article that was posted
+    ///   ([`crate::verify::size_bounds`]).
+    ///
+    /// A `Stat` pass is never a check of the bytes: a provider can answer
+    /// `STAT` for an article whose `BODY` it no longer serves. A `Size`
+    /// pass says that the provider stores articles of the right length,
+    /// not that their bytes were read.
+    ///
+    /// In the catalogue the `kind` column keeps its two values: `Body`
+    /// and `Sampled` are `body` rows, `Stat` and `Size` are `stat` rows,
+    /// and the `mode` column tells them apart
+    /// ([`VerifyKind::column`], [`VerifyKind::mode_column`]). So a Worker
+    /// from before the light check reads every row as what it also is.
+    VerifyKind { Body => "body", Stat => "stat", Size => "size", Sampled => "sampled" }
 );
+
+impl VerifyKind {
+    /// Whether every article was read and its payload hash compared.
+    pub fn is_full(self) -> bool {
+        matches!(self, VerifyKind::Body | VerifyKind::Sampled)
+    }
+
+    /// The value of `verifications.kind`.
+    pub fn column(self) -> &'static str {
+        match self.is_full() {
+            true => "body",
+            false => "stat",
+        }
+    }
+
+    /// The value of `verifications.mode`; `None` = a row as from before
+    /// the column.
+    pub fn mode_column(self) -> Option<&'static str> {
+        match self {
+            VerifyKind::Body | VerifyKind::Stat => None,
+            VerifyKind::Size => Some("size"),
+            VerifyKind::Sampled => Some("sampled"),
+        }
+    }
+
+    /// From the two columns. A `mode` this code does not know (a row of
+    /// a later version) leaves what `kind` says, which every version
+    /// wrote the same way.
+    pub fn from_columns(kind: &str, mode: Option<&str>) -> Option<Self> {
+        match (kind, mode) {
+            ("body", Some("sampled")) => Some(VerifyKind::Sampled),
+            ("body", _) => Some(VerifyKind::Body),
+            ("stat", Some("size")) => Some(VerifyKind::Size),
+            ("stat", _) => Some(VerifyKind::Stat),
+            _ => None,
+        }
+    }
+}
+
+/// A backbone that is read in full for every extent for a while
+/// (`verify_escalations`): a full read of a sampled extent failed there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyEscalation {
+    /// The label as it is compared: trimmed, lower case.
+    pub backbone: String,
+    pub until: UnixMs,
+    pub raised_at: UnixMs,
+    /// The extent whose read failed, and how.
+    pub extent_id: ExtentId,
+    pub result: VerifyResult,
+}
+
+db_enum!(
+    /// The command that asks a provider for the size it stores for one
+    /// article, by message-id (`VERIFY_SIZE_COMMANDS`). Each one also
+    /// says whether the article is there, so it replaces the `STAT`.
+    ///
+    /// - `Hdr`: `HDR :bytes <message-id>` (RFC 3977).
+    /// - `Over`: `OVER <message-id>`, the bytes field of the overview
+    ///   line, taken only if the line names the message-id asked for.
+    /// - `Head`: `HEAD <message-id>` and its `Bytes:` header, or else its
+    ///   `X-Received-Bytes:` header. The second one is written by the
+    ///   server that took the post and travels with the article, so it
+    ///   says what was posted, not what this provider stores.
+    ///
+    /// `XHDR` and `XOVER` are not offered: asked by message-id, one
+    /// provider answered them for another article.
+    SizeCommand { Hdr => "hdr", Over => "over", Head => "head" }
+);
+
 db_enum!(
     /// `uploads.state`.
     UploadState { Open => "open", Completed => "completed", Aborted => "aborted" }
@@ -1325,6 +1411,10 @@ pub struct DispatchReport {
     /// Fewer backbones count toward a release than `REQUIRED_BACKBONES`:
     /// nothing is released until the provider list is put right.
     pub release_paused: bool,
+    /// The backbones that are read in full for every extent just now,
+    /// because a full read of a sampled extent failed there
+    /// (`VERIFY_MODE=light`). Empty is the normal state.
+    pub verify_escalated: Vec<String>,
     /// Plans that were rows in `articles` and are packed now.
     pub plans_packed: u32,
     /// Packing failed; the rest of the run went on without it.
