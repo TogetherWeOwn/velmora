@@ -128,11 +128,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     };
     let bytes_in = length(req.headers());
     // A sub-request of a large GET is this Worker calling itself: the
-    // GET it belongs to is the request that is counted.
-    let internal = req
-        .headers()
-        .has(velmora_bridge::fanout::TOKEN_HEADER)
-        .unwrap_or(false);
+    // GET it belongs to is the request that is counted. Set below, and
+    // only for a request whose token verifies: the header alone, which
+    // any client can send, changes nothing.
+    let internal = std::cell::Cell::new(false);
     // Every answer for an admin route carries `no-store`, the early
     // refusals below too.
     let admin = ingress::is_admin_url(&req.inner().url());
@@ -164,7 +163,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // large GET gets none unless it failed: a 5xx is never left out,
     // whatever headers the request carried.
     let count = |status: u16, sample: u32, bytes_out: u64| {
-        if internal && status < 500 {
+        if internal.get() && status < 500 {
             return;
         }
         // A request without a ray id (one through a service binding)
@@ -179,7 +178,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             let seen = velmora_bridge::metrics::Request {
                 method: &method,
                 admin,
-                sub: internal,
+                sub: internal.get(),
                 status,
                 latency_ms: worker::Date::now().as_millis().saturating_sub(started),
                 bytes_in,
@@ -210,6 +209,14 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
     };
     let target = incoming.req.raw_target.clone();
+    internal.set(
+        velmora_bridge::fanout::admit(
+            &bridge.kek,
+            &incoming.req,
+            velmora_bridge::ports::Clock::now(&bridge.clock),
+        )
+        .is_ok(),
+    );
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
         let resp = handle_detached(&ctx, Rc::clone(&bridge), req).await;
         // A deferred document: buffered when it is done soon, else

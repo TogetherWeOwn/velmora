@@ -590,6 +590,25 @@ pub(super) async fn off<S: Sql>(c: &SqlCatalog<S>) -> Result<()> {
                    cur_x = '', cur_o = '', cur_g = '', pass = 0, adopt = 0",
                 vec![],
             ),
+            // The event totals and the hour under way count "since the
+            // counters were switched on": they start again with the
+            // next recount, and do not span the time in between. The
+            // hour under way is filed first, so its events are kept.
+            (
+                "INSERT OR IGNORE INTO usage_hours \
+                   (hour, posts, verifies, releases, dead, failures) \
+                 SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
+                   FROM usage_global WHERE id = 1 AND hour > 0 \
+                    AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0",
+                vec![],
+            ),
+            (
+                "UPDATE usage_global SET posts_total = 0, verifies_total = 0, \
+                   releases_total = 0, dead_total = 0, failures_total = 0, \
+                   hour = 0, h_posts = 0, h_verifies = 0, h_releases = 0, \
+                   h_dead = 0, h_failures = 0 WHERE id = 1",
+                vec![],
+            ),
             ("DELETE FROM usage_buckets WHERE kind = 2", vec![]),
         ])
         .await?;

@@ -166,7 +166,8 @@ fn totals(db: &RusqliteSql) -> Totals {
     }
 }
 
-/// The filed hours and the hour under way add up to the totals.
+/// The filed hours and the hour under way add up to every event
+/// counted, an `off` in between or not.
 fn hourly_sum(db: &RusqliteSql) -> Totals {
     let t = row(
         db,
@@ -200,6 +201,8 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut now = T0;
     let mut model = Totals::default();
+    // The same since the counters were last switched off.
+    let mut since = Totals::default();
     let mut ended = 0;
     // Ids are drawn from a small space, so that a new row lands before
     // the recount's cursor as often as after it.
@@ -266,10 +269,15 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
                 if let (true, 1, Some(old)) = (on, n, old.as_deref()) {
                     if old != new {
                         model.posts += i64::from(old == "post" && new == "verify");
+                        since.posts += i64::from(old == "post" && new == "verify");
                         model.verifies +=
                             i64::from(old == "verify" && matches!(new, "release" | "done"));
+                        since.verifies +=
+                            i64::from(old == "verify" && matches!(new, "release" | "done"));
                         model.releases += i64::from(old == "release" && new == "done");
+                        since.releases += i64::from(old == "release" && new == "done");
                         model.dead += i64::from(new == "dead");
+                        since.dead += i64::from(new == "dead");
                     }
                 }
             }
@@ -286,6 +294,7 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
                     .unwrap();
                 if on && n == 1 {
                     model.failures += 1;
+                    since.failures += 1;
                 }
             }
             67..=69 => {
@@ -380,13 +389,14 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
             _ => {
                 if rng.below(4) == 0 {
                     catalog.usage_off().await.unwrap();
+                    since = Totals::default();
                 }
             }
         }
         if armed(db) {
             assert_exact(db, &at);
         }
-        assert_eq!(totals(db), model, "totals, {at}");
+        assert_eq!(totals(db), since, "totals, {at}");
         assert_eq!(hourly_sum(db), model, "hours, {at}");
     }
 
@@ -617,8 +627,20 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
         [0]
     );
 
-    // Off: no trigger writes again, and the recount is gone.
+    // Off: no trigger writes again, and the recount is gone. The event
+    // totals and the hour under way start again from zero.
+    let events = "SELECT posts_total + verifies_total + releases_total + dead_total \
+                  + failures_total + hour + h_posts + h_verifies + h_releases + h_dead \
+                  + h_failures FROM usage_global WHERE id = 1";
+    db.apply("UPDATE outbox SET stage = 'verify', updated_at = 7200000 WHERE stage = 'post'")
+        .unwrap();
+    assert!(row(db, events, 1)[0] > 0);
+    let counted = hourly_sum(db);
     catalog.usage_off().await.unwrap();
+    assert_eq!(row(db, events, 1), [0]);
+    // The hour that was under way is filed, not lost.
+    assert_eq!(hourly_sum(db), counted);
+    assert!(counted.posts > 0);
     assert!(!catalog.usage_counters().await.unwrap().seeded);
     assert!(!catalog.usage_recounts().await.unwrap().0.running);
     // The weekly recount starts only while the counters are on: one

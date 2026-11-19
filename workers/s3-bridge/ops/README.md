@@ -962,7 +962,18 @@ serves, and before rolling back to one, send `POST /_admin/usage/off`,
 also while a recount is still running (a recount counts changes to the
 rows it has passed before the counters are on). It switches the
 triggers off and drops a running recount, and the totals are rebuilt
-by a recount when the newer Worker returns. An older Worker
+by a recount when the newer Worker returns. The route also files the
+hour under way and sets the event totals to zero, so they count from
+the next recount on.
+
+The route is refused in maintenance and while a restore is replayed,
+which is when a rollback may be needed. This statement does the same
+to the triggers, from `wrangler d1 execute`:
+
+```sql
+UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0,
+       cur_x = '', cur_o = '', cur_g = '', pass = 0;
+``` An older Worker
 compares the number of rows a statement changed with one, and a
 statement that also moved a counter reports two.
 
@@ -993,7 +1004,10 @@ bucket with the admin token (`PUT` and `DELETE` of `/<bucket>`) stays
 on the S3 host names.
 
 Request metrics go to the Analytics Engine dataset bound as `METRICS`:
-one request in `METRICS_SAMPLE` (default 10) and every 5xx. A point has
+one request in `METRICS_SAMPLE` (default 10) and every 5xx the Worker
+answers itself. A request the runtime ends (an exception, error 1101,
+or a limit) gets no point: those are in the Worker's own invocation
+figures, not here. A point has
 the method, the status class, `s3` or `admin` (or `sub`: a failed
 sub-request of a large GET), and the colo as text,
 and the status, latency in ms, request bytes, response bytes and the
