@@ -110,7 +110,8 @@ export function evaluate(snap, env = {}) {
         title: stage === "post" ? "Posting keeps failing" : "Verifying keeps failing",
         detail:
           `${bad} of the ${a.length} soonest ${stage} rows have ${failAt} or more attempts: ` +
-          `${stage} jobs run but do not succeed. Check provider health and last_error in /_admin/status.`,
+          `${stage} jobs run but do not succeed. Check provider health in /_admin/status, and the ` +
+          "rows' last_error in the outbox.",
         forMs: stallMs,
       });
     }
@@ -161,7 +162,9 @@ export function evaluate(snap, env = {}) {
           `Provider ${p.id} is skipped (cooling) until ${new Date(p.coolingUntil).toISOString()}` +
           (p.reason ? `; last failure: ${p.reason}` : "") +
           ".",
-        forMs: coolMs,
+        // A cooldown with coolMs or more still to run alerts at once;
+        // a shorter one alerts once it has held coolMs.
+        forMs: p.coolingUntil - now >= coolMs ? 0 : coolMs,
       });
     }
   }
@@ -197,13 +200,15 @@ export function evaluate(snap, env = {}) {
 /** One-line figures for the daily digest. */
 export function figures(snap) {
   const now = snap.now;
+  const failed = new Set((snap.errors ?? []).map((e) => e.split(":")[0]));
+  const na = (reading, text) => (failed.has(reading) ? "could not read" : text);
   const age = (h) => (h ? ageText(now - h.nextAt) : "none due");
   const lines = [
-    `oldest due post row: ${age(snap.postHead)}`,
-    `oldest due verify row: ${age(snap.verifyHead)}`,
-    `oldest due release row: ${age(snap.releaseHead)}`,
-    `dead outbox rows: ${snap.deadRows ?? "n/a"}`,
-    `providers cooling: ${(snap.providers ?? []).filter((p) => p.coolingUntil > now).map((p) => p.id).join(", ") || "none"}`,
+    `oldest due post row: ${na("post head", age(snap.postHead))}`,
+    `oldest due verify row: ${na("verify head", age(snap.verifyHead))}`,
+    `oldest due release row: ${na("release head", age(snap.releaseHead))}`,
+    `dead outbox rows: ${na("dead rows", snap.deadRows)}`,
+    `providers cooling: ${na("provider health", (snap.providers ?? []).filter((p) => p.coolingUntil > now).map((p) => p.id).join(", ") || "none")}`,
   ];
   if (snap.exportNewestAt !== undefined) {
     lines.push(

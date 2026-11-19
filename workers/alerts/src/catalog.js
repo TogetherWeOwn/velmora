@@ -19,11 +19,15 @@ export const SQL = Object.freeze({
   // The attempts of the 20 soonest rows of a stage, due or not: a row that
   // fails is put back with a later next_at, so when every attempt fails
   // the soonest rows carry high counts too. Healthy production: 0 or 1.
-  attempts: "SELECT attempts FROM outbox WHERE stage = ?1 ORDER BY next_at LIMIT 20",
+  // Ordered along outbox_due; reads the 20 table rows (attempts and
+  // last_error are not in the index).
+  attempts: "SELECT attempts, last_error FROM outbox WHERE stage = ?1 ORDER BY next_at LIMIT 20",
 });
 
-// Export manifests: d1/<database>/<restore point ms>.manifest.json, written
-// last by the export (no manifest = incomplete export).
+// Complete exports: d1/<database>/<restore point ms>.sql (one object, as
+// workers/s3-bridge/ops/catalog-export.sh writes it) or
+// d1/<database>/<restore point ms>.manifest.json (a split export, whose
+// manifest is written last; its parts alone are an incomplete export).
 export const EXPORT_PREFIX = "d1/velmora-catalog/";
 
 async function head(db, stage, now) {
@@ -31,7 +35,7 @@ async function head(db, stage, now) {
   return r ? { id: String(r.extent_id), nextAt: Number(r.next_at) } : null;
 }
 
-/** Newest manifest time (ms) among the recent ones; null when none. */
+/** Newest complete export time (ms) among the recent ones; null when none. */
 export async function newestExport(bucket, now, prefix = EXPORT_PREFIX) {
   // Keys sort by their 13-digit ms, so listing from three days back reads
   // a few keys, however many exports have piled up before that.
@@ -41,7 +45,7 @@ export async function newestExport(bucket, now, prefix = EXPORT_PREFIX) {
   do {
     const page = await bucket.list({ prefix, startAfter, cursor, limit: 1000 });
     for (const o of page.objects) {
-      const m = /^(\d{13})\.manifest\.json$/.exec(o.key.slice(prefix.length));
+      const m = /^(\d{13})\.(?:manifest\.json|sql)$/.exec(o.key.slice(prefix.length));
       if (m) newest = Math.max(newest ?? 0, Number(m[1]));
     }
     cursor = page.truncated ? page.cursor : undefined;
@@ -75,7 +79,12 @@ export async function readSnapshot(env, now, opts = {}) {
         `${stage} attempts`,
         async () => {
           const r = await db.prepare(SQL.attempts).bind(stage).all();
-          snap.attempts[stage] = (r.results ?? []).map((x) => Number(x.attempts));
+          // A verify that finds articles not yet propagated is put back as
+          // a failure (missing-pending) and counts an attempt: that is a
+          // scheduled wait, not a failing job.
+          snap.attempts[stage] = (r.results ?? []).map((x) =>
+            x.last_error === "missing-pending" ? 0 : Number(x.attempts),
+          );
         },
       ]),
       ["dead rows", async () => (snap.deadRows = Number((await db.prepare(SQL.dead).first())?.n ?? 0))],

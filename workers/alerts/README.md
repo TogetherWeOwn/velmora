@@ -28,6 +28,9 @@ It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
   deployments;
 - CI: the `deploy-alert` job when the production deploy fails.
 
+A reporter is any script that can POST JSON with the token. The
+operator host's own feeder is private to that host, as are its paths.
+
 ```json
 { "source": "host", "key": "run48", "title": "...", "detail": "...", "severity": "page" }
 ```
@@ -39,8 +42,10 @@ It also takes reports on `POST /v1/alert` (bearer `INGEST_TOKEN`) from:
 - **Per key:** one email, then reminders while it keeps holding, after
   1 h, 2 h, 4 h, and so on, up to once a day. A key never emails twice
   within an hour.
-- **Cap:** at most `DAILY_EMAIL_CAP` (30) alert emails in 24 h. Reaching
-  it sends one notice; past the cap, alerts still show in the digest.
+- **Cap:** at most `DAILY_EMAIL_CAP` (30) alert emails in 24 h, a soft
+  limit (sends racing at the limit can pass it by one or two). When it
+  holds an email back, one notice says so; held alerts still show in the
+  digest.
 - **Reports inside the hour:** a key reported again inside its hour is
   emailed by the first tick after the hour.
 - **Daily digest** at 07:30 UTC: what holds, what cleared, the notices,

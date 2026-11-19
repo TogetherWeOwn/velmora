@@ -26,7 +26,13 @@ export function alertMessage(claim, now, nextGapMs) {
 export function digestMessage(d, figures, now) {
   const L = [];
   const n = d.active.filter((a) => a.severity === "page").length;
-  L.push(n === 0 ? "Nothing is wrong right now." : `${n} problem(s) holding right now:`);
+  const unread = d.readErrors ?? [];
+  if (unread.length > 0) {
+    L.push("Some checks could not read the catalogue, so this digest is incomplete:");
+    for (const e of unread) L.push(`- ${e}`);
+    L.push("");
+  }
+  L.push(n === 0 ? "Nothing is wrong that the checks could see." : `${n} problem(s) holding right now:`);
   for (const a of d.active.filter((x) => x.severity === "page")) {
     L.push(`- ${a.title} (since ${fmt(a.active_since)}): ${a.detail}`);
   }
@@ -50,7 +56,12 @@ export function digestMessage(d, figures, now) {
   }
   L.push("");
   L.push(`Generated ${fmt(now)}. This digest arrives every day; if it stops, alerting is down.`);
-  const subject = n === 0 ? "[velmora] Daily digest: all clear" : `[velmora] Daily digest: ${n} problem(s)`;
+  const subject =
+    n > 0
+      ? `[velmora] Daily digest: ${n} problem(s)`
+      : unread.length > 0
+        ? "[velmora] Daily digest: checks could not read"
+        : "[velmora] Daily digest: all clear";
   return { subject, text: L.join("\n") };
 }
 

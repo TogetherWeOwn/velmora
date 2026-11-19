@@ -75,7 +75,8 @@ export async function expireEvents(db, now) {
   await db
     .prepare(
       "UPDATE alerts SET active = 0, resolved_at = ?1, seen_unsent = 0 " +
-        "WHERE source <> 'cron' AND active = 1 AND last_seen_at < ?2",
+        "WHERE source <> 'cron' AND active = 1 AND last_seen_at < ?2 " +
+        "  AND (seen_unsent = 0 OR severity <> 'page')",  // never drop a report not yet emailed
     )
     .bind(now, now - EVENT_TTL)
     .run();
@@ -109,19 +110,26 @@ export function reminderGap(sentInRun) {
 export async function claimSend(db, row, now, { forMs = 0, dailyCap = 30 } = {}) {
   if (row.severity !== "page") return null;
   if (now - Number(row.active_since) < forMs) return null;
-  if ((await sentSince(db, now - DAY)) >= dailyCap) return null;
+  if ((await sentSince(db, now - DAY)) >= dailyCap) {
+    await setMeta(db, "cap_hit_at", now);
+    return null;
+  }
+  // A report (host, ci) is a new event each time: one an hour, no backoff.
+  const gap = row.source === "cron" ? reminderGap(Number(row.sent_in_run ?? 0)) : HOUR;
   const claimed = await db
     .prepare(
       "UPDATE alerts SET last_sent_at = ?2, seen_unsent = 0 " +
         "  , sent_in_run = sent_in_run + 1 " +
         "WHERE key = ?1 AND active = 1 AND (last_sent_at IS NULL OR last_sent_at <= ?3) " +
-        "RETURNING key, last_sent_at",
+        "RETURNING key, source, title, detail, active_since",
     )
-    .bind(row.key, now, now - reminderGap(Number(row.sent_in_run ?? 0)))
+    .bind(row.key, now, now - gap)
     .first();
   if (!claimed) return null;
   await db.prepare("INSERT INTO sends(at, key, kind) VALUES (?1, ?2, 'alert')").bind(now, row.key).run();
-  return { ...row, covered: Number(row.seen_unsent), prevSentAt: row.last_sent_at ?? null };
+  // The email carries what the row says now (a report may have replaced
+  // the detail after `row` was read), not the older copy.
+  return { ...row, ...claimed, covered: Number(row.seen_unsent), prevSentAt: row.last_sent_at ?? null };
 }
 
 /** Gives a claim back after the email could not be sent. */
@@ -134,10 +142,10 @@ export async function unclaimSend(db, claim, now) {
   await db.prepare("DELETE FROM sends WHERE key = ?1 AND at = ?2 AND kind = 'alert'").bind(claim.key, now).run();
 }
 
-export async function recordDlq(db, queue, count, sample, now) {
+export async function recordDlq(db, queue, count, sample, now, msgId = null) {
   await db
-    .prepare("INSERT INTO dlq(at, queue, count, sample) VALUES (?1, ?2, ?3, ?4)")
-    .bind(now, queue, count, sample)
+    .prepare("INSERT INTO dlq(at, queue, count, sample, msg_id) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(msg_id) DO NOTHING")
+    .bind(now, queue, count, sample, msgId)
     .run();
 }
 

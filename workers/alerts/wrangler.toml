@@ -48,7 +48,10 @@ bucket_name = "velmora-catalog-export"
 queue = "velmora-dlq"
 max_batch_size = 100
 max_batch_timeout = 30
-max_retries = 3
+# A batch is acknowledged only after it is recorded. While the state
+# database is down the batch is retried, every 5 minutes for about 8 h.
+max_retries = 100
+retry_delay = 300
 
 [triggers]
 # Checks every 5 minutes; the digest daily at 07:30 UTC (DIGEST_CRON).

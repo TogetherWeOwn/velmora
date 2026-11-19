@@ -869,7 +869,10 @@ jobs:
           body=$(jq -n --arg sha "$GITHUB_SHA" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" '{
             source: "ci", key: "deploy-failed",
             title: "Production deploy failed",
-            detail: ("Commit \($sha): deploy build \($b), deploy \($d). A failed or cancelled deploy rolls back to the version before it (see the run). Run: \($run)")}')
+            detail: ("Commit \($sha): deploy build \($b), deploy \($d). "
+              + (if $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
+                 else "The deploy job rolls back to the version before it when it can; whether it did, or asks for a manual check, is in the run'"'"'s \"Roll back to the recorded version\" step." end)
+              + " Run: \($run)")}')
           if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \
             | curl -fs --max-time 30 -H @- -H 'Content-Type: application/json' \
                 --data "$body" "${ALERTS_INGEST_URL%/}/v1/alert" >/dev/null 2>&1; then

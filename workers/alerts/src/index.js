@@ -52,14 +52,16 @@ export async function maybeSend(env, row, now, forMs) {
 async function capNotice(env, now) {
   const db = env.STATE;
   const cap = dailyCap(env);
-  if ((await store.sentSince(db, now - store.DAY)) < cap) return "held";
+  // The cap held an email since the last notice (claimSend marks it).
+  const hit = await store.getMeta(db, "cap_hit_at");
   const last = await store.getMeta(db, "cap_notice_at");
+  if (!hit || (last && hit <= last)) return "held";
   if (last && now - last < store.DAY) return "held";
   try {
     await send(env, {
       subject: "[velmora] Alert email cap reached",
       text:
-        `${cap} alert emails went out in the last 24 h, the daily cap. Further alerts are not emailed ` +
+        `${cap} alert emails went out within 24 h, the daily cap, and at least one more was held back. Further alerts are not emailed ` +
         "until the count drops; they still appear in the daily digest. Something is badly wrong, or an alert is too noisy.",
     });
     await store.setMeta(db, "cap_notice_at", now);
@@ -126,6 +128,7 @@ export async function digest(env, now) {
   const db = env.STATE;
   const snap = await readSnapshot(env, now, { checkExport: true });
   const d = await store.digestData(db, now);
+  d.readErrors = snap.errors;
   const msg = digestMessage(d, env.CATALOG ? figures(snap) : [], now);
   await send(env, msg);
   await db.prepare("INSERT INTO sends(at, key, kind) VALUES (?1, 'digest', 'digest')").bind(now).run();
@@ -201,6 +204,17 @@ export default {
       }
       const r = await tick(env, now);
       ok = r.sendFailures === 0;
+      // A digest that failed is sent again by the next tick (and until it
+      // goes, the heartbeat keeps reporting failure).
+      const lastDigest = await store.getMeta(env.STATE, "last_digest");
+      if (lastDigest && now - lastDigest > 25 * store.HOUR) {
+        try {
+          await digest(env, now);
+        } catch (e) {
+          console.error(`digest retry failed: ${e?.code ?? e?.name ?? "error"}`);
+          ok = false;
+        }
+      }
       console.log(`alerts tick: holding=${r.conditions.join(",") || "none"} emailed=${r.sent} failed=${r.sendFailures}`);
     } finally {
       ctx.waitUntil(heartbeat(env, ok));
@@ -219,7 +233,7 @@ export default {
     } catch {
       sample = "(unreadable body)";
     }
-    await store.recordDlq(env.STATE, batch.queue, batch.messages.length, sample, now);
+    await store.recordDlq(env.STATE, batch.queue, batch.messages.length, sample, now, batch.messages[0]?.id ?? null);
     batch.ackAll();
   },
 };

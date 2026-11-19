@@ -196,12 +196,18 @@ test("daily cap, info severity, and giving a claim back", async () => {
   assert.ok(await store.claimSend(db, again, T0 + MIN), "retried on the next tick");
 });
 
-test("event alerts expire after two hours without a report", async () => {
+test("event alerts expire after two hours without a report, never before their email", async () => {
   const db = new FakeD1().applyDir(MIG);
-  await store.observe(db, { key: "host:a", source: "host", title: "t", detail: "d" }, T0);
-  await store.expireEvents(db, T0 + HOUR);
-  assert.equal((await db.prepare("SELECT active FROM alerts").first()).active, 1);
+  const row = await store.observe(db, { key: "host:a", source: "host", title: "t", detail: "d" }, T0);
   await store.expireEvents(db, T0 + 3 * HOUR);
+  assert.equal((await db.prepare("SELECT active FROM alerts").first()).active, 1, "not emailed yet: kept");
+  assert.ok(await store.claimSend(db, row, T0 + 3 * HOUR));
+  await store.observe(db, { key: "host:a", source: "host", title: "t", detail: "d" }, T0 + 3 * HOUR);
+  await store.claimSend(db, row, T0 + 3 * HOUR); // held: inside the hour; seen_unsent stays 1
+  await db.prepare("UPDATE alerts SET seen_unsent = 0").run(); // as if its email went out
+  await store.expireEvents(db, T0 + 4 * HOUR);
+  assert.equal((await db.prepare("SELECT active FROM alerts").first()).active, 1, "reported an hour ago");
+  await store.expireEvents(db, T0 + 6 * HOUR);
   assert.equal((await db.prepare("SELECT active FROM alerts").first()).active, 0);
 });
 
@@ -413,4 +419,113 @@ test("scheduled routes the digest cron and pings the heartbeat", async () => {
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// ---- regressions from review ----
+
+test("an export written as one .sql object counts; split parts alone do not", async () => {
+  const p = "d1/velmora-catalog/";
+  assert.equal(await newestExport(new FakeBucket([`${p}${T0 - 2 * HOUR}.sql`]), T0), T0 - 2 * HOUR);
+  assert.equal(await newestExport(new FakeBucket([`${p}${T0 - 2 * HOUR}.sql.zst.part-000`]), T0), null);
+});
+
+test("a verify waiting for propagation (missing-pending) is not a failing job", async () => {
+  const e = env();
+  for (let i = 0; i < 5; i++) {
+    e.CATALOG.db
+      .prepare("INSERT INTO outbox(extent_id, generation_id, stage, next_at, attempts, last_error, updated_at) VALUES (?, 'g', 'verify', ?, 4, ?, 0)")
+      .run(`v${i}`, T0 + MIN, i < 3 ? "missing-pending" : "provider");
+  }
+  const s = await readSnapshot(e, T0);
+  assert.deepEqual(s.attempts.verify, [0, 0, 0, 4, 4]);
+  assert.equal(evaluate(s).some((c) => c.key === "verify-failing"), false);
+  const plan = e.CATALOG.db.prepare(`EXPLAIN QUERY PLAN ${SQL.attempts}`).all("verify");
+  assert.match(plan.map((r) => r.detail).join(" "), /INDEX outbox_due/, "ordered along the index, no sort");
+  assert.doesNotMatch(plan.map((r) => r.detail).join(" "), /TEMP B-TREE/);
+});
+
+test("a cooldown with 15 min or more left alerts at once", () => {
+  const base = { now: T0, deadRows: 0, dlqLastHour: 0, errors: [] };
+  const long = evaluate({ ...base, providers: [{ id: "p1", coolingUntil: T0 + 16 * MIN }] });
+  assert.equal(long[0].forMs, 0);
+  const short = evaluate({ ...base, providers: [{ id: "p1", coolingUntil: T0 + 13 * MIN }] });
+  assert.equal(short[0].forMs, 15 * MIN);
+});
+
+test("the email carries the newest report, even if it came after the row was read", async () => {
+  const db = new FakeD1().applyDir(MIG);
+  const a = { key: "ci:deploy-failed", source: "ci", severity: "page", title: "t", detail: "commit a" };
+  const stale = await store.observe(db, a, T0);
+  await store.observe(db, { ...a, detail: "commit b" }, T0 + MIN);
+  const c = await store.claimSend(db, stale, T0 + MIN);
+  assert.equal(c.detail, "commit b");
+});
+
+test("reports email once an hour without backoff", async () => {
+  const db = new FakeD1().applyDir(MIG);
+  const a = { key: "ci:deploy-failed", source: "ci", severity: "page", title: "t", detail: "d" };
+  for (let h = 0; h < 5; h++) {
+    const row = await store.observe(db, a, T0 + h * HOUR);
+    assert.ok(await store.claimSend(db, row, T0 + h * HOUR), `hour ${h}`);
+  }
+});
+
+test("cap notice: sent when the cap held an email, even if the count dropped before the tick", async () => {
+  const e = env({ DAILY_EMAIL_CAP: "1" });
+  await ingest(req({ source: "host", key: "a", title: "a" }), e, T0);
+  await ingest(req({ source: "host", key: "b", title: "b" }), e, T0 + MIN); // held by the cap
+  await tick(e, T0 + store.DAY + 2 * MIN); // the first send has aged out of the window
+  assert.ok(e.ALERT_EMAIL.sent.some((m) => m.subject === "[velmora] Alert email cap reached"));
+});
+
+test("a redelivered dead-letter batch counts once", async () => {
+  const e = env();
+  const batch = { queue: "velmora-dlq", messages: [{ id: "m1", body: "x" }, { id: "m2", body: "y" }], ackAll() {} };
+  await worker.queue(batch, e);
+  await worker.queue(batch, e);
+  assert.equal(await store.dlqSince(e.STATE, 0), 2);
+});
+
+test("digest: failed readings are said, not shown as all clear", async () => {
+  const e = env();
+  e.CATALOG.db.exec("DROP TABLE outbox");
+  await digest(e, T0);
+  const m = e.ALERT_EMAIL.sent[0];
+  assert.equal(m.subject, "[velmora] Daily digest: checks could not read");
+  assert.match(m.text, /oldest due verify row: could not read/);
+});
+
+test("a failed digest is sent again by a later tick, and the heartbeat fails until then", async () => {
+  const e = env({ HEARTBEAT_URL: "https://hb.example.invalid/x" });
+  const pinged = [];
+  const realFetch = globalThis.fetch;
+  const realErr = console.error;
+  globalThis.fetch = async (u) => (pinged.push(String(u)), new Response(""));
+  console.error = () => {};
+  const run = async (cron, t) => {
+    const waits = [];
+    try {
+      await worker.scheduled({ cron, scheduledTime: t }, e, { waitUntil: (p) => waits.push(p) });
+    } catch {
+      // the failed digest run throws
+    }
+    await Promise.all(waits);
+  };
+  try {
+    await run("30 7 * * *", T0); // first digest works
+    e.ALERT_EMAIL.fail = "E_DELIVERY_FAILED";
+    await run("30 7 * * *", T0 + store.DAY);
+    await run("*/5 * * * *", T0 + store.DAY + 2 * HOUR);
+    e.ALERT_EMAIL.fail = null;
+    await run("*/5 * * * *", T0 + store.DAY + 2 * HOUR + 5 * MIN);
+  } finally {
+    globalThis.fetch = realFetch;
+    console.error = realErr;
+  }
+  assert.deepEqual(pinged.slice(1), [
+    "https://hb.example.invalid/x/fail",
+    "https://hb.example.invalid/x/fail",
+    "https://hb.example.invalid/x",
+  ]);
+  assert.equal(e.ALERT_EMAIL.sent.filter((m) => /Daily digest/.test(m.subject)).length, 2);
 });
