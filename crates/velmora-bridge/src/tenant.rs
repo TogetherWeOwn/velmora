@@ -20,7 +20,9 @@
 //! - the queue consumer, once for each message;
 //! - the configuration, for the record layout `tenant`;
 //! - the replay and the recovery copy, which go through the records of
-//!   the whole store.
+//!   the whole store;
+//! - the directory of a store with one tenant
+//!   ([`crate::directory::SingleTenant`]), which nothing asks yet.
 //!
 //! A source test (`tests/tenant_seams.rs`) holds that list. The request
 //! path and the catalogue's own delete lists still name blobs without a
