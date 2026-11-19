@@ -20,8 +20,8 @@ use velmora_bridge::config::COMPLETE_CHARGE_BYTES;
 use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::keepalive::{Deferred, KEEPALIVE_BYTE, XML_DECLARATION};
 use velmora_bridge::recovery::{
-    read_segment, read_stored_generation, set_id, Cut, GenerationHead, GenerationManifest,
-    SegmentWriter, StoredGeneration, MAX_SEGMENTS,
+    read_segment, read_stored_generation, set_id, write_generation, Cut, GenerationHead,
+    GenerationManifest, SegmentWriter, StoredGeneration, MAX_SEGMENTS, SINGLE_RECORD_EXTENTS,
 };
 use velmora_bridge::*;
 
@@ -286,23 +286,29 @@ async fn an_object_within_one_document_is_recorded_and_answered_as_before() {
 async fn the_production_cut_asks_nothing_more_of_the_catalogue() {
     // With the limit one document holds, a Complete makes the calls it
     // made before segments existed: the upload is not counted first.
+    // The figures are those of the build before the writer of
+    // segments, counted there for the same two requests: a part of one
+    // extent, and one stored in three slices (with its stamp).
+    const BEFORE: [(usize, u64); 2] = [(100, 11), (3 * SLICE_HALF, 15)];
     let mut plain = seg_config();
     plain.record_cut = Cut::BUILT_IN;
     plain.max_object_extents = 10_000;
     let mut counted = plain.clone();
     counted.max_object_extents = 131_072;
-    let mut calls = Vec::new();
-    for cfg in [plain, counted] {
-        let s = scene_with(cfg).await;
-        let listed = [s.part(1, &body(1, 3 * SLICE_HALF)).await];
-        let before = s.rig.trip().calls();
-        let resp = s.complete_raw(&listed).await;
-        assert!(matches!(resp.body, RespBody::Bytes(_)));
-        assert_eq!(resp.status, 200);
-        calls.push(s.rig.trip().calls() - before);
-        assert!(s.segments().is_empty());
+    for (len, calls_before) in BEFORE {
+        // A limit above one document costs one count, and nothing else.
+        for (cfg, more) in [(plain.clone(), 0), (counted.clone(), 1)] {
+            let s = scene_with(cfg).await;
+            let listed = [s.part(1, &body(1, len)).await];
+            let before = s.rig.trip().calls();
+            let resp = s.complete_raw(&listed).await;
+            assert!(matches!(resp.body, RespBody::Bytes(_)));
+            assert_eq!(resp.status, 200);
+            let calls = s.rig.trip().calls() - before;
+            assert_eq!(calls, calls_before + more, "{len} bytes");
+            assert!(s.segments().is_empty());
+        }
     }
-    assert_eq!(calls[1], calls[0] + 1, "one count, and only above the cut");
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +530,230 @@ async fn a_record_of_more_segments_than_a_head_names_is_never_begun() {
     assert_eq!(writer.extents(), MAX_SEGMENTS as u32);
     assert_eq!(s.segments().len(), MAX_SEGMENTS, "nothing more was stored");
     assert!(records(&s.rig).is_empty());
+}
+
+/// A generation and one of its extent rows, made for `s`'s bucket by a
+/// Complete elsewhere: what the writers are handed.
+async fn a_generation_for(s: &Scene) -> (GenerationRow, ExtentRow) {
+    let small = scene().await;
+    let one = [small.part(1, &body(1, PART)).await];
+    assert!(!failed(&small.complete(&one).await));
+    let (mut generation, rows) = small.rig.live(&small.bucket, KEY).await.unwrap();
+    generation.bucket_id = s.bucket.id.clone();
+    let mut row = rows[0].clone();
+    row.bucket_id = s.bucket.id.clone();
+    (generation, row)
+}
+
+/// `row` as extent `seq` of a generation of such rows.
+fn nth(row: &ExtentRow, seq: u32) -> ExtentRow {
+    let mut row = row.clone();
+    row.seq = Some(seq);
+    row.plain_offset = Some(u64::from(seq) * row.plain_size);
+    row
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_writer_stores_a_head_only_for_the_extents_the_generation_counts() {
+    let s = scene().await;
+    let (generation, row) = a_generation_for(&s).await;
+    let b = &s.rig.bridge;
+    let writer = |tag: u8| {
+        SegmentWriter::new(
+            &b.safety,
+            &b.kek,
+            &b.cfg.records,
+            &s.bucket,
+            set_id(s.rig.now(), [tag; 8]),
+            4,
+        )
+        .unwrap()
+    };
+    const PUSHED: u32 = 5;
+    let exact = |g: &mut GenerationRow| {
+        g.extent_count = PUSHED;
+        g.size = u64::from(PUSHED) * row.plain_size;
+    };
+
+    // One extent more or fewer than were pushed, or another size.
+    type Change = fn(&mut GenerationRow);
+    let wrong: [Change; 4] = [
+        |g| g.extent_count += 1,
+        |g| g.extent_count -= 1,
+        |g| g.size += 1,
+        |g| g.size -= 1,
+    ];
+    for (tag, change) in wrong.into_iter().enumerate() {
+        let mut w = writer(tag as u8);
+        for seq in 0..PUSHED {
+            w.push(&nth(&row, seq)).await.unwrap();
+        }
+        let mut g = generation.clone();
+        exact(&mut g);
+        change(&mut g);
+        assert!(w.finish(&b.catalog, &g).await.is_err(), "{tag}");
+        assert!(records(&s.rig).is_empty(), "{tag}: no head");
+    }
+
+    // An extent that leaves a gap, in `seq` or in the bytes, is not
+    // taken, and neither is one pushed twice.
+    let mut w = writer(9);
+    w.push(&nth(&row, 0)).await.unwrap();
+    assert!(w.push(&nth(&row, 2)).await.is_err());
+    assert!(w.push(&nth(&row, 0)).await.is_err());
+    let mut shifted = nth(&row, 1);
+    shifted.plain_offset = Some(row.plain_size + 1);
+    assert!(w.push(&shifted).await.is_err());
+    let mut skipped = nth(&row, 1);
+    skipped.seq = Some(2);
+    assert!(w.push(&skipped).await.is_err());
+    assert_eq!(w.extents(), 1);
+
+    // A writer whose segment was not stored takes no more and stores
+    // no head: the extents of that segment are gone from it.
+    let mut w = writer(10);
+    for seq in 0..3 {
+        w.push(&nth(&row, seq)).await.unwrap();
+    }
+    *b.safety.fail_put_prefix.borrow_mut() = Some("m/seg/".into());
+    assert!(w.push(&nth(&row, 3)).await.is_err());
+    *b.safety.fail_put_prefix.borrow_mut() = None;
+    assert!(w.push(&nth(&row, 4)).await.is_err());
+    let mut g = generation.clone();
+    g.extent_count = 4;
+    g.size = 4 * row.plain_size;
+    assert!(w.finish(&b.catalog, &g).await.is_err());
+    assert!(records(&s.rig).is_empty());
+
+    // The same extents, counted as they are, get their head.
+    let mut w = writer(11);
+    for seq in 0..PUSHED {
+        w.push(&nth(&row, seq)).await.unwrap();
+    }
+    let mut g = generation.clone();
+    exact(&mut g);
+    w.finish(&b.catalog, &g).await.unwrap();
+    let heads = s.heads().await;
+    assert_eq!((heads.len(), heads[0].1), (1, PUSHED as usize));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_in_one_document_is_refused_above_what_it_holds() {
+    let s = scene().await;
+    let (mut generation, row) = a_generation_for(&s).await;
+    let b = &s.rig.bridge;
+    let most = SINGLE_RECORD_EXTENTS;
+    let rows: Vec<ExtentRow> = (0..=most).map(|seq| nth(&row, seq)).collect();
+    generation.extent_count = most + 1;
+    generation.size = u64::from(most + 1) * row.plain_size;
+    let before = b.safety.puts.borrow().len();
+    let refused = write_generation(
+        &b.catalog,
+        &b.safety,
+        &b.kek,
+        &b.cfg.records,
+        &s.bucket,
+        &generation,
+        &rows,
+    )
+    .await;
+    assert!(refused.is_err());
+    assert_eq!(b.safety.puts.borrow().len(), before, "nothing was stored");
+    assert!(records(&s.rig).is_empty());
+
+    // What one document holds is taken.
+    generation.extent_count = most;
+    generation.size = u64::from(most) * row.plain_size;
+    let recorded = write_generation(
+        &b.catalog,
+        &b.safety,
+        &b.kek,
+        &b.cfg.records,
+        &s.bucket,
+        &generation,
+        &rows[..most as usize],
+    )
+    .await;
+    assert!(recorded.is_ok());
+    assert_eq!(records(&s.rig).len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sliced_parts_without_their_stamp_get_no_head() {
+    let s = scene().await;
+    // Parts that were stored and answered `503`: the stamp was not
+    // raised. The client takes them from ListParts.
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = Some("rs/".into());
+    let mut listed = Vec::new();
+    let mut whole = Vec::new();
+    for n in 1..=2u16 {
+        let bytes = body(n as u8, PART);
+        s.send_part(n, &bytes).await.expect_error(503, "SlowDown");
+        listed.push((n, md5_etag(&bytes)));
+        whole.extend(bytes);
+    }
+    assert!(stamps(&s.rig).is_empty());
+
+    // 20 extents: a record in segments. Without the stamp there is no
+    // head and nothing is published; the client is told to come back.
+    let resp = s.complete(&listed).await;
+    expect_error_document(&resp, "SlowDown");
+    assert!(records(&s.rig).is_empty(), "no head before the stamp");
+    assert_eq!(s.rig.count("generations"), 0);
+    assert_eq!(s.rig.bridge.budget.in_use(), 0);
+
+    *s.rig.bridge.safety.fail_put_prefix.borrow_mut() = None;
+    let resp = s.complete(&listed).await;
+    assert!(!failed(&resp), "{}", resp.text());
+    assert_eq!(stamps(&s.rig).len(), 1);
+    assert!(s.read().await.body == whole);
+    let heads = s.heads().await;
+    assert_eq!((heads.len(), heads[0].1), (1, 20));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_upload_that_outgrows_one_document_during_a_complete_is_told_to_come_back() {
+    // 8 extents: counted as one document. A part that comes in at any
+    // call of the Complete makes it 9. The request holds no charge for
+    // a record in segments, so it either publishes what it read in one
+    // document or is told to come back; it is never refused as too
+    // large, and never writes a segment.
+    let bytes = body(1, 8 * SLICE_HALF);
+    let total = {
+        let s = scene().await;
+        let listed = [s.part(1, &bytes).await];
+        let before = s.rig.trip().calls();
+        s.complete(&listed).await.expect(200);
+        s.rig.trip().calls() - before
+    };
+    let (mut published, mut sent_back) = (0, 0);
+    for skip in 0..total {
+        let s = scene().await;
+        let listed = [s.part(1, &bytes).await];
+        let ran = run_until(&s.rig, s.complete(&listed), skip, Trip::Stall).await;
+        let running = ran.stalled();
+        s.rig.trip().disarm();
+        s.part(2, &body(2, 100)).await;
+        let resp = resume(&s.rig, running).await;
+        let what = format!("call {skip}: {} {}", resp.status, resp.text());
+        if resp.status == 200 {
+            assert!(!failed(&resp), "{what}");
+            published += 1;
+        } else {
+            resp.expect_error(503, "SlowDown");
+            assert_eq!(s.rig.count("generations"), 0, "{what}");
+            sent_back += 1;
+            // The next request counts 9 extents and is answered as a
+            // Complete of a record in segments is.
+            let resp = s.complete_raw(&listed).await;
+            assert!(matches!(resp.body, RespBody::Deferred(_)), "{what}");
+            assert!(!failed(&Resp::collect(resp).await), "{what}");
+        }
+        assert!(s.segments().is_empty(), "{what}");
+        assert!(s.read().await.body == bytes, "{what}");
+        assert_eq!(s.rig.bridge.budget.in_use(), 0, "{what}");
+    }
+    assert!(published > 0 && sent_back > 0, "{published} {sent_back}");
 }
 
 #[tokio::test(flavor = "current_thread")]

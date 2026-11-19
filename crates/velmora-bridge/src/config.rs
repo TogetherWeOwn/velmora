@@ -74,9 +74,10 @@ pub const DEFAULT_MAX_OBJECT_EXTENTS: u32 = crate::recovery::SINGLE_RECORD_EXTEN
 /// What a CompleteMultipartUpload of more extents than one document
 /// holds is charged against `INFLIGHT_BUDGET_BYTES` while it reads and
 /// publishes them: a fixed sum for the largest object there is
-/// ([`MAX_OBJECT_EXTENTS_LIMIT`]), from the measurement in workerd
-/// (see `ops/README.md`, "Large objects").
-pub const COMPLETE_CHARGE_BYTES: u64 = 24 * 1024 * 1024;
+/// ([`MAX_OBJECT_EXTENTS_LIMIT`]). Measured in workerd, one such
+/// Complete of 131,072 extents grew the memory of the isolate by
+/// 29.6 MiB (23.5 MiB at 65,536); see `ops/README.md`, "Large objects".
+pub const COMPLETE_CHARGE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Upper bound for `max_conns` of one provider.
 pub const MAX_CONNS_LIMIT: u32 = 64;

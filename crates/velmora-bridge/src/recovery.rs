@@ -1278,6 +1278,9 @@ pub struct SegmentWriter<'a, B, K> {
     /// `seq` and offset of the next extent.
     seq: u32,
     offset: u64,
+    /// A segment was not stored: its extents are gone from the writer,
+    /// which takes no more and stores no head.
+    failed: bool,
 }
 
 impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
@@ -1306,6 +1309,7 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
             entries: Vec::new(),
             seq: 0,
             offset: 0,
+            failed: false,
         })
     }
 
@@ -1320,6 +1324,9 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
     /// would begin segment [`MAX_SEGMENTS`]` + 1`, before it is stored.
     pub async fn push(&mut self, extent: &ExtentRow) -> Result<()> {
         let record = ExtentRecord::of(extent)?;
+        if self.failed {
+            return Err(ERR_RECORD);
+        }
         if record.seq != self.seq || record.plain_offset != self.offset || !record.has_digests() {
             return Err(ERR_RECORD);
         }
@@ -1361,6 +1368,7 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
         let plain = serde_json::to_vec(&segment).map_err(|_| ERR_RECORD)?;
         drop(segment);
         let name = self.layout.segment_key(&self.set, index);
+        self.failed = true;
         let sha = write_plain(
             self.safety,
             self.kek,
@@ -1370,6 +1378,7 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
             &plain,
         )
         .await?;
+        self.failed = false;
         entry.sha256 = sha.to_vec();
         self.entries.push(entry);
         Ok(())
@@ -1384,7 +1393,8 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
         catalog: &C,
         generation: &GenerationRow,
     ) -> Result<Recorded> {
-        if generation.bucket_id != self.bucket.id
+        if self.failed
+            || generation.bucket_id != self.bucket.id
             || generation.extent_count != self.seq
             || generation.size != self.offset
             || self.seq == 0

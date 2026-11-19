@@ -99,7 +99,7 @@ RECOVERY_COPY = "off"
 #     MAX_EXTENT_BYTES, and 156 GiB in parts of exactly MAX_EXTENT_BYTES. Above 10000 the recovery record of an object is
 #     written in segments, which a Worker from before the segmented readers does not read: see ops/README.md, "Large objects",
 #     before raising it, and for the rollback floor after. Above 10000 it must also hold 10000 parts of MAX_PUT_BYTES in
-#     slices of SLICE_BYTES (99 MiB in 8 MiB: 130000), and INFLIGHT_BUDGET_BYTES must be at least 24 MiB.
+#     slices of SLICE_BYTES (99 MiB in 8 MiB: 130000), and INFLIGHT_BUDGET_BYTES must be at least 32 MiB.
 #   MAX_PUT_BYTES (MAX_EXTENT_BYTES): see above. INTENT_SWEEP (off): see above.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.

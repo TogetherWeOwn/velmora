@@ -740,9 +740,9 @@ failed or lost a race, and no job removes them. An object of 10 000
 extents or fewer is recorded in one document, byte for byte as before.
 
 **Shipped: off.** `MAX_OBJECT_EXTENTS` is not set, so the limit is
-10 000 and no segmented record is written. The limit is raised by a
-setting, after the drills of the large-object plan have passed, not by
-this build alone.
+10 000 and no segmented record is written. This build alone changes
+nothing: the limit is raised by a setting, and only after a drill of
+the segmented path on a deployment of its own has passed.
 
 | Setting | Shipped | The build takes | What it bounds |
 |---|---|---|---|
@@ -772,15 +772,23 @@ this build alone.
   answers `200` at once and the document follows when the work is done,
   with a newline every 5 s in between; a failure after the headers is
   an `<Error>` document in that `200`, as S3 itself answers this call.
-  aws-cli, boto3 and rclone read it. The work goes on when the client
-  goes away; the same request again is answered from the receipt.
+  aws-cli, boto3 and rclone read it. When the client goes away the work
+  goes on for at most 30 s more. Work that is cut there has published
+  nothing (its segments, and perhaps its head, stay as they are): send
+  the request again. The same request after a publication is answered
+  from the receipt.
   Refusals that need no work (unknown upload, a part that does not
   match, too many extents, a condition that does not hold) keep their
   status code.
-- One such Complete is charged 24 MiB of `INFLIGHT_BUDGET_BYTES` while
+- One such Complete is charged 32 MiB of `INFLIGHT_BUDGET_BYTES` while
   it runs; without room it answers 503 `SlowDown`. With
   `MAX_OBJECT_EXTENTS` above 10 000 the Worker refuses to start with a
-  budget below that.
+  budget below that. With the budget of 48 MiB one isolate runs one such
+  Complete at a time. Measured in a local workerd (wasm memory of the
+  isolate, 1.6 MiB before): 31.1 MiB at the end of a Complete of
+  131 072 extents (29.6 MiB more), 25.1 MiB at 65 536 (23.5 MiB more);
+  6.8 s and 3.2 s, 43 and 27 catalogue reads, 34 and 18 record puts,
+  one publish batch, one queue batch.
 - An UploadPart or an abort that arrives while the extents are read
   wins: no head is stored, nothing is published, and the answer is the
   one the upload then deserves (`InvalidPart`, `NoSuchUpload`, or a new
