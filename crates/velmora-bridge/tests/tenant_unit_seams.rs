@@ -89,3 +89,18 @@ async fn a_directory_can_say_that_it_does_not_know_a_key() {
     }
     assert_eq!(Empty.route("VKIA0000000000000000").await.unwrap(), None);
 }
+
+/// A directory that could not be read answers with an error, and the
+/// error is not "no such key": a caller can tell the two apart, and
+/// only the second says that no tenant has the key.
+#[tokio::test(flavor = "current_thread")]
+async fn a_directory_that_fails_does_not_say_no_such_key() {
+    struct Down;
+    impl Directory for Down {
+        async fn route(&self, _access_key_id: &str) -> Result<Option<TenantScope>> {
+            Err(BridgeError::Sql("the directory could not be read".into()))
+        }
+    }
+    let answer = Down.route("VKIA0000000000000000").await;
+    assert!(matches!(answer, Err(BridgeError::Sql(_))), "{answer:?}");
+}

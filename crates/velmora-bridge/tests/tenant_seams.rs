@@ -274,8 +274,10 @@ fn the_reserved_names_are_used_by_nothing() {
 }
 
 /// The catalogue id is read from the configuration in one place, the
-/// accessor of the bridge, and in the one listed place of the request
-/// path. A bridge of a unit will answer there with the id of its unit.
+/// accessor of the bridge. The request path asks the accessor too: the
+/// end of a restore makes the stamp row under the id the stamp is then
+/// asked with. A bridge of a unit will answer there with the id of its
+/// unit.
 /// The scope has no part in it: the id is not made from a tenant.
 #[test]
 fn the_catalogue_id_is_read_in_one_place() {
@@ -300,8 +302,6 @@ fn the_catalogue_id_is_read_in_one_place() {
         &[
             // `Bridge::catalogue_id`.
             ("bridge/stamp.rs", 1),
-            // The end of a restore: a request is not scoped yet.
-            ("bridge/service/admin.rs", 1),
         ],
     );
     assert_eq!(found.get("bridge/stamp.rs"), Some(&1));
@@ -314,6 +314,14 @@ fn the_catalogue_id_is_read_in_one_place() {
     // The stamp is the one user of the id in the library, and it asks
     // the accessor every time.
     assert_eq!(all["bridge/stamp.rs"].matches(".catalogue_id()").count(), 9);
+    // The end of a restore makes or levels the stamp row: it asks the
+    // accessor, as the stamp does that is read under that row after.
+    assert_eq!(
+        all["bridge/service/admin.rs"]
+            .matches("bridge.catalogue_id()")
+            .count(),
+        1
+    );
     assert!(!all[TENANT].contains("catalogue_id"));
     assert!(!all["bridge/directory.rs"].contains("catalogue_id"));
 }

@@ -16,8 +16,20 @@
 //! tenant's catalogue decides those, as it does today.
 //!
 //! An answer of "no such key" (`Ok(None)`) is not a failure of the
-//! directory (`Err`). A caller refuses the request on either and never
-//! guesses a tenant.
+//! directory (`Err`), and a caller treats the two differently:
+//!
+//! - On `Ok(None)` the directory was read and no tenant has the key.
+//!   The caller refuses the request and never guesses a tenant.
+//! - On `Err` the directory could not be read, and that says nothing
+//!   about the key. The caller must not take it for "no such key". It
+//!   may do one thing: ask the catalogue of tenant 0 whether it holds
+//!   the key, and go on as a request of tenant 0 if it does. In every
+//!   other case it refuses, with an answer that says the service is
+//!   unavailable and not that the key is unknown.
+//!
+//! The way through tenant 0 is for a failed read only, never for an
+//! answer of "no such key": a store whose directory is down still
+//! serves the tenant whose catalogue it can reach without one.
 
 use crate::tenant::TenantScope;
 use crate::types::Result;
