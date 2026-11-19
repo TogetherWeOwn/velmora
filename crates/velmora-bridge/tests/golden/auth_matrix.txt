@@ -334,3 +334,192 @@ UnknownMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your reques
 UnknownMaintenance | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UnknownMaintenance | CompleteMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RoMaintenance | ListBuckets | 200 |  |  | retry-after -
+RoMaintenance | HeadBucket | 200 |  |  | retry-after -
+RoMaintenance | GetBucketLocation | 200 |  |  | retry-after -
+RoMaintenance | ListObjectsV2 | 200 |  |  | retry-after -
+RoMaintenance | ListMultipartUploads | 200 |  |  | retry-after -
+RoMaintenance | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | GetObject | 404 | NoSuchKey | The specified key does not exist. | retry-after -
+RoMaintenance | GetObject range | 404 | NoSuchKey | The specified key does not exist. | retry-after -
+RoMaintenance | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
+RoMaintenance | HeadObject | 404 |  |  | retry-after -
+RoMaintenance | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RoMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RoMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RoMaintenance | ListParts | 404 | NoSuchUpload | The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed. | retry-after -
+RoMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RoMaintenance | CompleteMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UngrantedMaintenance | ListBuckets | 200 |  |  | retry-after -
+UngrantedMaintenance | HeadBucket | 403 |  |  | retry-after -
+UngrantedMaintenance | GetBucketLocation | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | ListObjectsV2 | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | ListMultipartUploads | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | GetObject | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | HeadObject | 403 |  |  | retry-after -
+UngrantedMaintenance | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UngrantedMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UngrantedMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UngrantedMaintenance | ListParts | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UngrantedMaintenance | CompleteMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RevokedMaintenance | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | HeadBucket | 403 |  |  | retry-after -
+RevokedMaintenance | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | ListObjectsV2 | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | ListMultipartUploads | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | CreateBucket | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | DeleteBucket | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | GetObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | GetObject range | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | HeadObject | 403 |  |  | retry-after -
+RevokedMaintenance | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RevokedMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RevokedMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RevokedMaintenance | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RevokedMaintenance | CompleteMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+PresignedRw | ListBuckets | 200 |  |  | retry-after -
+PresignedRw | HeadBucket | 200 |  |  | retry-after -
+PresignedRw | GetBucketLocation | 200 |  |  | retry-after -
+PresignedRw | ListObjectsV2 | 200 |  |  | retry-after -
+PresignedRw | ListMultipartUploads | 200 |  |  | retry-after -
+PresignedRw | CreateBucket | 409 | BucketAlreadyOwnedByYou | The bucket you tried to create already exists, and you own it. | retry-after -
+PresignedRw | DeleteBucket | 409 | BucketNotEmpty | The bucket you tried to delete is not empty, or has held data: a bucket that ever stored an object or opened a multipart upload is kept. | retry-after -
+PresignedRw | GetObject | 200 |  |  | retry-after -
+PresignedRw | GetObject range | 200 |  |  | retry-after -
+PresignedRw | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
+PresignedRw | HeadObject | 200 |  |  | retry-after -
+PresignedRw | PutObject | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | CopyObject | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | DeleteObject | 204 |  |  | retry-after -
+PresignedRw | DeleteObjects | 400 | InvalidRequest | Missing required header for this request: Content-MD5. | retry-after -
+PresignedRw | CreateMultipartUpload | 200 |  |  | retry-after -
+PresignedRw | UploadPart | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | UploadPartCopy | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | ListParts | 200 |  |  | retry-after -
+PresignedRw | AbortMultipartUpload | 204 |  |  | retry-after -
+PresignedRw | CompleteMultipartUpload | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRo | ListBuckets | 200 |  |  | retry-after -
+PresignedRo | HeadBucket | 200 |  |  | retry-after -
+PresignedRo | GetBucketLocation | 200 |  |  | retry-after -
+PresignedRo | ListObjectsV2 | 200 |  |  | retry-after -
+PresignedRo | ListMultipartUploads | 200 |  |  | retry-after -
+PresignedRo | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | GetObject | 200 |  |  | retry-after -
+PresignedRo | GetObject range | 200 |  |  | retry-after -
+PresignedRo | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
+PresignedRo | HeadObject | 200 |  |  | retry-after -
+PresignedRo | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | ListParts | 200 |  |  | retry-after -
+PresignedRo | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | CompleteMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+PresignedUnknown | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | HeadBucket | 403 |  |  | retry-after -
+PresignedUnknown | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | ListObjectsV2 | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | ListMultipartUploads | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | CreateBucket | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | DeleteBucket | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | GetObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | GetObject range | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | HeadObject | 403 |  |  | retry-after -
+PresignedUnknown | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedUnknown | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedUnknown | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedUnknown | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedUnknown | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedWrongSecret | ListBuckets | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | HeadBucket | 403 |  |  | retry-after -
+PresignedWrongSecret | GetBucketLocation | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | ListObjectsV2 | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | ListMultipartUploads | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | CreateBucket | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | DeleteBucket | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | GetObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | GetObject range | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | GetObject absent | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | HeadObject | 403 |  |  | retry-after -
+PresignedWrongSecret | PutObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | CopyObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | DeleteObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | DeleteObjects | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | CreateMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | UploadPart | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | UploadPartCopy | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | ListParts | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | AbortMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | CompleteMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+CatalogueFails | ListBuckets | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | HeadBucket | 500 |  |  | retry-after -
+CatalogueFails | GetBucketLocation | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | ListObjectsV2 | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | ListMultipartUploads | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | CreateBucket | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | DeleteBucket | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | GetObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | GetObject range | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | GetObject absent | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | HeadObject | 500 |  |  | retry-after -
+CatalogueFails | PutObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | CopyObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | DeleteObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | DeleteObjects | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | ListParts | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | CompleteMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | ListBuckets | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | HeadBucket | 500 |  |  | retry-after -
+LostKek | GetBucketLocation | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | ListObjectsV2 | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | ListMultipartUploads | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | CreateBucket | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | DeleteBucket | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | GetObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | GetObject range | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | GetObject absent | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | HeadObject | 500 |  |  | retry-after -
+LostKek | PutObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | CopyObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | DeleteObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | DeleteObjects | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | ListParts | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | CompleteMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -

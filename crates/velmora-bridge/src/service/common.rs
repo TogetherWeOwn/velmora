@@ -300,7 +300,7 @@ pub(super) struct Authed {
     /// The grant of the key on `bucket`.
     pub perm: Option<Perm>,
     /// Whether writes are refused ([`Catalog::restore_pending`]), as
-    /// read with the key. `None`: not read with it.
+    /// read with the key. `None`: not asked for.
     pub restore_pending: Option<bool>,
 }
 
@@ -609,7 +609,7 @@ where
     T: Clock,
 {
     let parsed = parse(req, policy(&bridge.cfg)?, &bridge.cfg).map_err(Refused::response)?;
-    authenticate_parsed(bridge, req, parsed)
+    authenticate_parsed(bridge, req, parsed, false)
         .await
         .map_err(Refused::response)
 }
@@ -617,10 +617,13 @@ where
 /// [`authenticate`] after the parse. The key `parsed.akid`, the bucket
 /// and the grant come from the catalogue in one round trip
 /// ([`Catalog::auth_lookup`]); a request that names no key asks nothing.
+/// With `gate`, whether writes are refused is read in that round trip
+/// too, and the request then fails if that cannot be read.
 pub(super) async fn authenticate_parsed<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     req: &S3Request,
     parsed: Parsed,
+    gate: bool,
 ) -> Result<Authed, Refused>
 where
     C: Catalog,
@@ -639,14 +642,14 @@ where
     if !parsed.akid.is_empty() {
         let found = bridge
             .catalog
-            .auth_lookup(&parsed.akid, &parsed.target.bucket)
+            .auth_lookup(&parsed.akid, &parsed.target.bucket, gate)
             .await
             .map_err(|_| Refused::Internal)?;
         caller = Caller {
             row: usable_key(bridge, found.key).await?,
             bucket: found.bucket,
             perm: found.perm,
-            restore_pending: Some(found.restore_pending),
+            restore_pending: found.restore_pending,
         };
     }
     finish(bridge, req, parsed, caller)
@@ -690,7 +693,7 @@ where
         _ => "",
     };
     if parsed.akid.is_empty() || parsed.target.bucket.is_empty() || key.is_empty() {
-        let authed = authenticate_parsed(bridge, req, parsed)
+        let authed = authenticate_parsed(bridge, req, parsed, false)
             .await
             .map_err(Refused::response)?;
         return Ok((authed, None));

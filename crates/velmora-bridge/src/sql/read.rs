@@ -40,7 +40,7 @@ const BUCKET_WIDTH: usize = 7;
 const MAX_OFFSET: u64 = (1 << 53) - 1;
 
 fn bad(what: &'static str) -> BridgeError {
-    BridgeError::Sql(format!("read lookup: {what}"))
+    BridgeError::Sql(format!("lookup: {what}"))
 }
 
 /// `, NULL` for each column an arm of `used` columns leaves empty.
@@ -75,9 +75,16 @@ fn caller_arms() -> String {
     )
 }
 
-/// `?1` key id, `?2` bucket name. The `r` arm counts what
-/// `replay::restore_pending` counts.
+/// `?1` key id, `?2` bucket name.
 fn auth_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(caller_arms)
+}
+
+/// [`auth_sql`] with an `r` arm that counts what
+/// `replay::restore_pending` counts. A statement of its own: a request
+/// that does not write is answered without the tables of a replay.
+fn gated_auth_sql() -> &'static str {
     static SQL: OnceLock<String> = OnceLock::new();
     SQL.get_or_init(|| {
         format!(
@@ -229,8 +236,13 @@ pub(super) async fn auth_lookup<S: Sql>(
     c: &SqlCatalog<S>,
     akid: &str,
     bucket: &str,
+    gate: bool,
 ) -> Result<AuthLookup> {
-    let rows = c.sql.query(auth_sql(), &[text(akid), text(bucket)]).await?;
+    let sql = match gate {
+        true => gated_auth_sql(),
+        false => auth_sql(),
+    };
+    let rows = c.sql.query(sql, &[text(akid), text(bucket)]).await?;
     let mut out = AuthLookup::default();
     let mut pending = None;
     for row in rows {
@@ -239,12 +251,15 @@ pub(super) async fn auth_lookup<S: Sql>(
             "k" => once(&mut out.key, key_row(row)?)?,
             "b" => once(&mut out.bucket, bucket_row(row)?)?,
             "p" => once(&mut out.perm, Cols::new(row).parsed(Perm::parse)?)?,
-            "r" => once(&mut pending, Cols::new(row).num::<i64>()?)?,
+            "r" if gate => once(&mut pending, Cols::new(row).num::<i64>()?)?,
             _ => return Err(bad("unknown row letter")),
         }
     }
     // The arm has no condition: a result without it is not a whole one.
-    out.restore_pending = pending.ok_or_else(|| bad("no restore state"))? != 0;
+    if gate && pending.is_none() {
+        return Err(bad("no restore state"));
+    }
+    out.restore_pending = pending.map(|n| n != 0);
     Ok(out)
 }
 

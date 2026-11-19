@@ -549,6 +549,7 @@ pub async fn auth_lookup_by_parts<C: Catalog + ?Sized>(
     c: &C,
     akid: &str,
     bucket: &str,
+    gate: bool,
 ) -> Result<AuthLookup> {
     let mut out = AuthLookup {
         key: c
@@ -557,7 +558,10 @@ pub async fn auth_lookup_by_parts<C: Catalog + ?Sized>(
             .filter(|key| key.status == KeyStatus::Active),
         bucket: c.bucket_by_name(bucket).await?,
         perm: None,
-        restore_pending: c.restore_pending().await?,
+        restore_pending: match gate {
+            true => Some(c.restore_pending().await?),
+            false => None,
+        },
     };
     if let (Some(_), Some(bucket)) = (&out.key, &out.bucket) {
         out.perm = c.grant(akid, &bucket.id).await?;
@@ -680,11 +684,11 @@ pub trait Catalog {
 
     /// What authenticating a request needs, in one round trip where
     /// the adapter can: the key `akid` while it is active, the bucket
-    /// named `bucket`, the grant of the one on the other, and whether
-    /// writes are refused ([`Catalog::restore_pending`]). The default
-    /// asks one after the other.
-    async fn auth_lookup(&self, akid: &str, bucket: &str) -> Result<AuthLookup> {
-        auth_lookup_by_parts(self, akid, bucket).await
+    /// named `bucket`, the grant of the one on the other, and with
+    /// `gate` whether writes are refused ([`Catalog::restore_pending`]).
+    /// The default asks one after the other.
+    async fn auth_lookup(&self, akid: &str, bucket: &str, gate: bool) -> Result<AuthLookup> {
+        auth_lookup_by_parts(self, akid, bucket, gate).await
     }
 
     // objects

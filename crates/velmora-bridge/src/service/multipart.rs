@@ -374,7 +374,7 @@ where
     // The key, the bucket, the grant and the state of a replay, in one
     // round trip to the catalogue. Unknown and disabled keys look the
     // same: no credential.
-    let authed = authenticate_parsed(bridge, req, parsed).await?;
+    let authed = authenticate_parsed(bridge, req, parsed, true).await?;
     // Every multipart call mutates, so it needs `rw` on the bucket.
     if authed.perm != Some(Perm::Rw) {
         return Err(ErrorCode::AccessDenied.into());
@@ -390,11 +390,8 @@ where
     } = authed;
     let bucket = bucket.ok_or(ErrorCode::NoSuchBucket)?;
     // A replay that was started and did not end: see `restore_gate`.
-    let replaying = match restore_pending {
-        Some(pending) => pending,
-        None => bridge.catalog.restore_pending().await?,
-    };
-    if replaying {
+    // Read with the key. Without an answer nothing is written.
+    if restore_pending.ok_or(Fail::Internal)? {
         return Err(ErrorCode::SlowDown.into());
     }
     let key = target

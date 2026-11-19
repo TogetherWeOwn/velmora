@@ -186,11 +186,26 @@ async fn one_statement_answers_who_asks_as_the_single_reads_do() {
         .await;
     rig.grant("AKIDTESTKEY000000003", &other, Perm::Ro).await;
     let catalog = &rig.bridge.catalog;
+    let script = |text: &str| catalog.sql.with_conn(|c| c.execute_batch(text).unwrap());
 
-    for replaying in [false, true] {
-        if replaying {
-            let now = rig.now();
-            let _ = catalog.restore_begin(UnixMs(0), now).await.unwrap();
+    // What makes writes refused: a replay that did not end, and a
+    // recorded rollback. A replay that ended does not.
+    for (state, refused) in [
+        ("", false),
+        ("begin", true),
+        ("UPDATE restore_state SET state = 'complete';", false),
+        (
+            "INSERT OR REPLACE INTO rollback_stamp VALUES (1, 0, 'c', 1);",
+            true,
+        ),
+        ("UPDATE rollback_stamp SET rolled_back_at = NULL;", false),
+    ] {
+        match state {
+            "begin" => {
+                let now = rig.now();
+                let _ = catalog.restore_begin(UnixMs(0), now).await.unwrap();
+            }
+            text => script(text),
         }
         let mut seen = Vec::new();
         for akid in [
@@ -202,17 +217,24 @@ async fn one_statement_answers_who_asks_as_the_single_reads_do() {
             "' OR 1=1 --",
         ] {
             for name in ["bkt-one", "bkt-two", "bkt-none", ""] {
-                let before = catalog.sql.trips.get();
-                let one = catalog.auth_lookup(akid, name).await.unwrap();
-                assert_eq!(catalog.sql.trips.get() - before, 1, "{akid} {name}");
-                let parts = auth_lookup_by_parts(catalog, akid, name).await.unwrap();
-                assert!(one.key == parts.key, "{akid} {name}");
-                assert_eq!(one.bucket, parts.bucket, "{akid} {name}");
-                assert_eq!(one.perm, parts.perm, "{akid} {name}");
-                assert_eq!(one.restore_pending, parts.restore_pending);
-                assert_eq!(one.restore_pending, replaying);
-                assert!(one.key.iter().all(|k| k.status == KeyStatus::Active));
-                seen.push((one.key.is_some(), one.bucket.is_some(), one.perm));
+                for gate in [false, true] {
+                    let what = format!("{akid} {name} {gate} {state}");
+                    let before = catalog.sql.trips.get();
+                    let one = catalog.auth_lookup(akid, name, gate).await.unwrap();
+                    assert_eq!(catalog.sql.trips.get() - before, 1, "{what}");
+                    let parts = auth_lookup_by_parts(catalog, akid, name, gate)
+                        .await
+                        .unwrap();
+                    assert!(one.key == parts.key, "{what}");
+                    assert_eq!(one.bucket, parts.bucket, "{what}");
+                    assert_eq!(one.perm, parts.perm, "{what}");
+                    assert_eq!(one.restore_pending, parts.restore_pending, "{what}");
+                    assert_eq!(one.restore_pending, gate.then_some(refused), "{what}");
+                    assert!(one.key.iter().all(|k| k.status == KeyStatus::Active));
+                    if gate {
+                        seen.push((one.key.is_some(), one.bucket.is_some(), one.perm));
+                    }
+                }
             }
         }
         // The rows that tell callers apart are all there.
@@ -227,4 +249,10 @@ async fn one_statement_answers_who_asks_as_the_single_reads_do() {
         assert_eq!(seen[12], (false, true, None));
         assert_eq!(seen[20], (false, true, None));
     }
+
+    // Who asks is answered without the tables of a replay, unless the
+    // answer is to say whether writes are refused.
+    *catalog.sql.fail_matching.borrow_mut() = Some(("FROM restore_state", 0));
+    assert!(catalog.auth_lookup(AKID, "bkt-one", false).await.is_ok());
+    assert!(catalog.auth_lookup(AKID, "bkt-one", true).await.is_err());
 }

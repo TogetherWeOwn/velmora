@@ -875,8 +875,8 @@ pub enum ReadWindow {
 
 /// What authenticating a request takes from the catalogue
 /// (`Catalog::auth_lookup`), read at one moment: what `access_key`,
-/// `bucket_by_name`, `grant` and `restore_pending` answer one after the
-/// other.
+/// `bucket_by_name`, `grant` and, when asked for, `restore_pending`
+/// answer one after the other.
 ///
 /// `bucket` is the bucket of that name whoever asks; the caller uses it
 /// only for a key that authenticated.
@@ -888,8 +888,8 @@ pub struct AuthLookup {
     /// The key's permission on the bucket; `None` for a disabled key.
     pub perm: Option<Perm>,
     /// A replay of the recovery records is to be run, or a rollback is
-    /// recorded: writes are refused.
-    pub restore_pending: bool,
+    /// recorded: writes are refused. `None`: not asked for.
+    pub restore_pending: Option<bool>,
 }
 
 /// What one GET or HEAD asks the catalogue (`Catalog::read_lookup`).

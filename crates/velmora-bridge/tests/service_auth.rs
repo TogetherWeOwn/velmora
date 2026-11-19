@@ -10,8 +10,11 @@
 mod service_support;
 
 use base64::Engine;
+use hmac::{Hmac, KeyInit, Mac};
 use service_support::*;
+use sha2::Sha256;
 use velmora_bridge::config::Maintenance;
+use velmora_bridge::recovery::write_key_revocation;
 use velmora_bridge::*;
 
 const BUCKET: &str = "bkt-auth";
@@ -53,9 +56,30 @@ enum Case {
     RwMaintenance,
     /// An unknown key under `MAINTENANCE=restore`.
     UnknownMaintenance,
+    /// The `ro` key under `MAINTENANCE=restore`.
+    RoMaintenance,
+    /// The key without a grant under `MAINTENANCE=restore`.
+    UngrantedMaintenance,
+    /// The `rw` key under `MAINTENANCE=restore`, with its row and its
+    /// grant still in the catalogue and a record of its revocation in
+    /// the safety store.
+    RevokedMaintenance,
+    /// The `rw` key, the request presigned (query only, no headers
+    /// beside `host`, no body).
+    PresignedRw,
+    /// The `ro` key, presigned.
+    PresignedRo,
+    /// An unknown key, presigned.
+    PresignedUnknown,
+    /// The `rw` key, presigned with another secret.
+    PresignedWrongSecret,
+    /// The `rw` key while the catalogue fails to read a key.
+    CatalogueFails,
+    /// The `rw` key, its secret wrapped under a KEK the service lacks.
+    LostKek,
 }
 
-const CASES: [Case; 16] = [
+const CASES: [Case; 25] = [
     Case::Rw,
     Case::Ro,
     Case::Unknown,
@@ -72,6 +96,15 @@ const CASES: [Case; 16] = [
     Case::RoReplaying,
     Case::RwMaintenance,
     Case::UnknownMaintenance,
+    Case::RoMaintenance,
+    Case::UngrantedMaintenance,
+    Case::RevokedMaintenance,
+    Case::PresignedRw,
+    Case::PresignedRo,
+    Case::PresignedUnknown,
+    Case::PresignedWrongSecret,
+    Case::CatalogueFails,
+    Case::LostKek,
 ];
 
 struct Op {
@@ -155,6 +188,80 @@ fn ops(bucket: &str, one: &str, two: &str, etag: &str) -> Vec<Op> {
     ]
 }
 
+impl Case {
+    fn maintenance(self) -> bool {
+        matches!(
+            self,
+            Case::RwMaintenance
+                | Case::UnknownMaintenance
+                | Case::RoMaintenance
+                | Case::UngrantedMaintenance
+                | Case::RevokedMaintenance
+        )
+    }
+
+    fn presigned(self) -> bool {
+        matches!(
+            self,
+            Case::PresignedRw
+                | Case::PresignedRo
+                | Case::PresignedUnknown
+                | Case::PresignedWrongSecret
+        )
+    }
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// A presigned request: the signature in the query, `host` the only
+/// signed header, the payload unsigned.
+fn presign(
+    signer: &Signer,
+    now: UnixMs,
+    method: Method,
+    raw_path: &str,
+    query: &[(&str, &str)],
+) -> Req {
+    let (stamp, scope, key) = signer.scope(now);
+    let credential = format!("{}/{scope}", signer.akid);
+    let mut q: Vec<(String, String)> = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", credential.as_str()),
+        ("X-Amz-Date", stamp.as_str()),
+        ("X-Amz-Expires", "3600"),
+        ("X-Amz-SignedHeaders", "host"),
+    ]
+    .iter()
+    .chain(query)
+    .map(|(k, v)| (uri_encode(k, false), uri_encode(v, false)))
+    .collect();
+    q.sort();
+    let query = q
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical = format!(
+        "{}\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD",
+        method.as_str()
+    );
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+        hex(&sha256(canonical.as_bytes()))
+    );
+    let signature = hex(&hmac(&key, to_sign.as_bytes()));
+    Req {
+        method,
+        target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
+        headers: vec![("host".to_string(), HOST.to_string())],
+        body: Vec::new(),
+    }
+}
+
 struct Ran {
     line: String,
     trips: u64,
@@ -163,7 +270,7 @@ struct Ran {
 /// Runs every operation as `case`, on a rig of its own.
 async fn run(case: Case) -> Vec<Ran> {
     let mut cfg = config(Vec::new());
-    if matches!(case, Case::RwMaintenance | Case::UnknownMaintenance) {
+    if case.maintenance() {
         cfg.maintenance = Maintenance::Restore;
     }
     let maintenance = cfg.maintenance;
@@ -234,6 +341,26 @@ async fn run(case: Case) -> Vec<Ran> {
             .await
             .unwrap();
     }
+    match case {
+        Case::RevokedMaintenance => {
+            write_key_revocation(&rig.bridge.safety, &rig.bridge.kek, &rw.akid, rig.now())
+                .await
+                .unwrap();
+        }
+        Case::LostKek => rig.bridge.catalog.sql.with_conn(|c| {
+            c.execute_batch(&format!(
+                "UPDATE access_keys SET kek_version = 99 WHERE access_key_id = '{}';",
+                rw.akid
+            ))
+            .unwrap();
+        }),
+        // From here on: nothing before this may fail.
+        Case::CatalogueFails => {
+            *rig.bridge.catalog.sql.fail_matching.borrow_mut() =
+                Some(("FROM access_keys WHERE access_key_id", 0));
+        }
+        _ => {}
+    }
 
     let (signer, name) = match case {
         Case::Rw
@@ -242,14 +369,18 @@ async fn run(case: Case) -> Vec<Ran> {
         | Case::CredentialInSignature
         | Case::Anonymous
         | Case::RwReplaying
-        | Case::RwMaintenance => (&rw, BUCKET),
-        Case::Ro | Case::RoReplaying => (&ro, BUCKET),
-        Case::Unknown | Case::UnknownMaintenance => (&unknown, BUCKET),
+        | Case::RwMaintenance
+        | Case::RevokedMaintenance
+        | Case::PresignedRw
+        | Case::CatalogueFails
+        | Case::LostKek => (&rw, BUCKET),
+        Case::Ro | Case::RoReplaying | Case::RoMaintenance | Case::PresignedRo => (&ro, BUCKET),
+        Case::Unknown | Case::UnknownMaintenance | Case::PresignedUnknown => (&unknown, BUCKET),
         Case::Disabled => (&disabled, BUCKET),
-        Case::Ungranted => (&ungranted, BUCKET),
+        Case::Ungranted | Case::UngrantedMaintenance => (&ungranted, BUCKET),
         Case::AbsentBucket => (&rw, "bkt-absent"),
         Case::UnknownAbsentBucket => (&unknown, "bkt-absent"),
-        Case::WrongSecret => (&wrong, BUCKET),
+        Case::WrongSecret | Case::PresignedWrongSecret => (&wrong, BUCKET),
     };
     let mut out = Vec::new();
     // Upload ids and ETags are drawn at random; the table names them.
@@ -262,21 +393,23 @@ async fn run(case: Case) -> Vec<Ran> {
         };
         let query: Vec<(&str, &str)> = op.query.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let headers: Vec<(&str, &str)> = op.headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let mut req = signer.sign(
-            rig.now(),
-            op.method,
-            &target,
-            &query,
-            &headers,
-            op.body.clone(),
-        );
+        let mut req = match case.presigned() {
+            true => presign(signer, rig.now(), op.method, &target, &query),
+            false => signer.sign(
+                rig.now(),
+                op.method,
+                &target,
+                &query,
+                &headers,
+                op.body.clone(),
+            ),
+        };
         let signed = req
             .headers
             .iter()
             .find(|(n, _)| n == "authorization")
-            .unwrap()
-            .1
-            .clone();
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
         match case {
             Case::Tampered => {
                 let (head, _) = signed.rsplit_once("Signature=").unwrap();
@@ -350,6 +483,20 @@ async fn every_operation_answers_every_caller_as_recorded() {
         "WrongAlgorithm | UploadPart | 403 | AccessDenied",
         "RwReplaying | UploadPart | 503",
         "RwMaintenance | CreateMultipartUpload | 503",
+        "RwMaintenance | GetObject | 404",
+        "RevokedMaintenance | GetObject | 403 | InvalidAccessKeyId",
+        "RevokedMaintenance | ListObjectsV2 | 403 | InvalidAccessKeyId",
+        "RoMaintenance | ListObjectsV2 | 200",
+        "UngrantedMaintenance | ListObjectsV2 | 403 | AccessDenied",
+        "PresignedRw | GetObject | 200",
+        "PresignedRw | CreateMultipartUpload | 200",
+        "PresignedRo | CreateMultipartUpload | 403 | AccessDenied",
+        "PresignedUnknown | UploadPart | 403 | InvalidAccessKeyId",
+        "PresignedWrongSecret | UploadPart | 403 | SignatureDoesNotMatch",
+        "CatalogueFails | GetObject | 500 | InternalError",
+        "CatalogueFails | UploadPart | 500 | InternalError",
+        "LostKek | GetObject | 500 | InternalError",
+        "LostKek | UploadPart | 500 | InternalError",
     ] {
         assert!(table.contains(needle), "{needle}");
     }

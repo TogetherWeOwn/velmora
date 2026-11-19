@@ -199,8 +199,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Vec<ExtentRow>> {
         objects::extents_in(self, generation, start, end).await
     }
-    async fn auth_lookup(&self, akid: &str, bucket: &str) -> Result<AuthLookup> {
-        read::auth_lookup(self, akid, bucket).await
+    async fn auth_lookup(&self, akid: &str, bucket: &str, gate: bool) -> Result<AuthLookup> {
+        read::auth_lookup(self, akid, bucket, gate).await
     }
     async fn read_lookup(&self, q: &ReadQuery<'_>) -> Result<ReadLookup> {
         read::read_lookup(self, q).await
