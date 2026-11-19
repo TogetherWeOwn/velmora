@@ -84,6 +84,13 @@ macro_rules! total {
 /// Whether that row is a complete pass of its kind for the current plan:
 /// of every article of it, the parity articles included ([`total`]). A
 /// pass that left them out is not one.
+///
+/// A pass is bound to the plan revision and to this number, not to the
+/// addendum itself. That holds because the addendum of a plan never
+/// changes once it is stored. Code that writes another addendum on an
+/// extent that has one must delete the extent's `verifications` in the
+/// same batch (or bind the passes to the revision of the addendum):
+/// otherwise a pass over other parity articles would count for these.
 macro_rules! counts {
     () => {
         concat!(
@@ -586,6 +593,13 @@ pub(super) async fn plan_packed<S: Sql>(
     let stmts: Vec<Stmt> = vec![
         (held_guard!(), lease_params(l, [])?),
         (
+            // The addendum is written once, with the plan, on an extent
+            // that has neither (`article_count IS NULL`), so no pass on
+            // record can be of another addendum. A statement that
+            // rewrites the addendum of an extent must delete that
+            // extent's `verifications` in the same batch: a pass is
+            // bound to `plan_rev` and the article total only
+            // (`counts!`).
             "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3, \
                parity = ?5, parity_count = ?6 \
              WHERE id = ?1 AND article_count IS NULL AND cipher_size = ?4",

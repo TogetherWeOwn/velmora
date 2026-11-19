@@ -233,8 +233,31 @@ struct Unreadable {
     plan: Option<Vec<u8>>,
 }
 
+/// A parity addendum in the catalogue that cannot be read beside its
+/// packed plan, which can, and the addendum of the extent's record to
+/// put in its place.
+struct LostAddendum {
+    extent: ExtentId,
+    /// The stored plan, `extents.parity` and `extents.parity_count`, as
+    /// they were read.
+    plan: Vec<u8>,
+    stored: SqlValue,
+    stored_count: SqlValue,
+    /// The record's addendum and the number of its articles.
+    parity: SqlValue,
+    parity_count: SqlValue,
+}
+
 /// The extents of `extents` whose packed plan in the catalogue cannot be
-/// read (a damaged value, the plan of another extent).
+/// read (a damaged value, the plan of another extent), and those whose
+/// plan can be read but whose parity addendum cannot, or is not the one
+/// the row counts, where the record has the addendum of that plan.
+///
+/// An addendum that cannot be read fails every job that verifies or
+/// releases the extent, so the record is the only way back for it too.
+/// Where the record has none that is an addendum of the stored plan,
+/// the row is left as it is: its jobs keep failing, and the extent is
+/// never taken for one without parity.
 ///
 /// A plan the catalogue has is kept, in whatever form, as long as it
 /// can be read. One that cannot is no plan: every reader of the extent
@@ -243,15 +266,16 @@ struct Unreadable {
 async fn unreadable_plans<S: Sql>(
     c: &SqlCatalog<S>,
     extents: &[ReplayExtent],
-) -> Result<Vec<Unreadable>> {
+) -> Result<(Vec<Unreadable>, Vec<LostAddendum>)> {
     let mut out = Vec::new();
+    let mut addenda = Vec::new();
     for chunk in extents.chunks(LOST_CHUNK) {
         let marks = vec!["?"; chunk.len()].join(",");
         let rows = c
             .sql
             .query(
                 &format!(
-                    "SELECT id, cipher_size, plan, parity FROM extents \
+                    "SELECT id, cipher_size, plan, parity, parity_count FROM extents \
                      WHERE id IN ({marks}) AND plan IS NOT NULL"
                 ),
                 &chunk
@@ -266,12 +290,39 @@ async fn unreadable_plans<S: Sql>(
             let cipher_size: u64 = r.num()?;
             let stored = r.blob()?;
             let parity = r.opt_blob()?;
-            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
-                continue;
-            }
+            let parity_count: Option<i64> = r.opt_num()?;
             let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
                 continue;
             };
+            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_ok() {
+                // The plan reads. Its addendum has to read beside it,
+                // and be the one the row counts.
+                let on_row = match &parity {
+                    Some(parity) => SqlValue::Blob(parity.clone()),
+                    None => SqlValue::Null,
+                };
+                let count = parity_count.map_or(SqlValue::Null, SqlValue::Int);
+                let reads = addendum_of(x, &stored, parity.as_deref());
+                let sound = match (&on_row, &count) {
+                    (SqlValue::Null, SqlValue::Null) => true,
+                    _ => reads == (on_row.clone(), count.clone()),
+                };
+                if sound {
+                    continue;
+                }
+                let (from_record, record_count) = addendum_of(x, &stored, x.parity.as_deref());
+                if from_record != SqlValue::Null {
+                    addenda.push(LostAddendum {
+                        extent: id,
+                        plan: stored,
+                        stored: on_row,
+                        stored_count: count,
+                        parity: from_record,
+                        parity_count: record_count,
+                    });
+                }
+                continue;
+            }
             // The record's plan in the form the replay stores it in,
             // and the explicit form when it stores rows: beside a plan
             // value, rows are not read.
@@ -292,7 +343,7 @@ async fn unreadable_plans<S: Sql>(
             });
         }
     }
-    Ok(out)
+    Ok((out, addenda))
 }
 
 /// Step 1. Returns the extents whose packed plan cannot be read and
@@ -303,7 +354,7 @@ pub(super) async fn replay_extents<S: Sql>(
     extents: &[ReplayExtent],
     now: UnixMs,
 ) -> Result<Vec<ExtentId>> {
-    let unreadable = unreadable_plans(c, extents).await?;
+    let (unreadable, addenda) = unreadable_plans(c, extents).await?;
     let mut stmts: Vec<Stmt> = Vec::new();
     for x in extents {
         if stmts.is_empty() {
@@ -336,6 +387,31 @@ pub(super) async fn replay_extents<S: Sql>(
                     parity,
                     parity_count,
                 ],
+            ));
+        }
+        for a in addenda.iter().filter(|a| a.extent == x.row.id) {
+            // Keyed on the very values that were read. A pass on record
+            // is bound to the plan revision and the number of articles,
+            // not to the addendum: whoever writes another addendum on
+            // an extent drops its passes in the same batch, so that
+            // none of them speaks for parity articles it never saw.
+            let read = || {
+                vec![
+                    text(a.extent.as_str()),
+                    SqlValue::Blob(a.plan.clone()),
+                    a.stored.clone(),
+                    a.stored_count.clone(),
+                ]
+            };
+            stmts.push((
+                "DELETE FROM verifications WHERE extent_id = ?1                    AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2                      AND parity IS ?3 AND parity_count IS ?4)",
+                read(),
+            ));
+            let mut params = read();
+            params.extend([a.parity.clone(), a.parity_count.clone()]);
+            stmts.push((
+                "UPDATE extents SET parity = ?5, parity_count = ?6                  WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND parity_count IS ?4",
+                params,
             ));
         }
         if stmts.len() >= BATCH_STATEMENTS {

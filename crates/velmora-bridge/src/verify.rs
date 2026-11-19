@@ -1091,6 +1091,9 @@ where
         match extent.safety_state {
             SafetyState::Held => {}
             // A job died between the release decision and its last step.
+            // The plan is not read again: the decision was taken on
+            // every article of it, parity included, under the guard of
+            // the catalogue, and this step only completes it.
             SafetyState::Releasing => return self.finish_release(lease, extent).await,
             SafetyState::Released | SafetyState::Deleted => {
                 return self.advance(lease, OutboxStage::Done, now).await;

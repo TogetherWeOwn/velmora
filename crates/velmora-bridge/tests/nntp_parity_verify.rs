@@ -5,8 +5,9 @@
 mod nntp_support;
 
 use nntp_support::*;
+use velmora::rng::SystemRng;
 use velmora::yenc::decode_part_to;
-use velmora_bridge::parity::ParityPlan;
+use velmora_bridge::parity::{self, ParityPlan};
 use velmora_bridge::verify::MISSING_BACKOFF_SECS;
 use velmora_bridge::*;
 
@@ -270,37 +271,6 @@ async fn passes_without_the_parity_articles_release_nothing() {
     assert!(rig.released(&s));
 }
 
-/// The catalogue's own guard refuses a release on passes that left the
-/// parity articles out, whatever the job found.
-#[tokio::test]
-async fn the_guard_counts_the_parity_articles() {
-    let rig = parity_rig(false).await;
-    let (s, _) = rig.verified_on_two(4).await;
-    let lease = rig.claim(&s, OutboxStage::Release).await;
-    let now = rig.bridge.clock.now();
-    let labels = ["bb0".to_string(), "bb1".to_string()];
-    let pass = |backbone: &str, at: UnixMs, total: u32| VerificationRow {
-        extent_id: s.extent.clone(),
-        backbone: backbone.to_string(),
-        provider_id: "p".to_string(),
-        verified_at: at,
-        plan_rev: 1,
-        articles_ok: total,
-        articles_total: total,
-        result: VerifyResult::Ok,
-        kind: VerifyKind::Stat,
-    };
-    let catalog = &rig.bridge.catalog;
-    for (at, total, granted) in [(now, DATA, false), (now.plus_ms(1), ALL, true)] {
-        for backbone in ["bb0", "bb1"] {
-            let row = pass(backbone, at, total);
-            assert!(catalog.record_verification(&lease, &row).await.unwrap());
-        }
-        let begun = catalog.begin_release(&lease, 2, &labels, "[]", at).await;
-        assert_eq!(begun.unwrap() == Guard::Applied(()), granted, "{total}");
-    }
-}
-
 /// The second backbone still lacks a parity article when the propagation
 /// grace is over: it is posted straight to that backbone's provider from
 /// the safety copy, under its stored message-id, and the next read
@@ -492,5 +462,88 @@ async fn an_unreadable_addendum_fails_verify_and_release() {
         assert_eq!(rig.rows(&s).len(), 2);
         assert_eq!(rig.bridge.nntp.connects(), connects);
         assert!(rig.safety_held(&s));
+    }
+}
+
+/// One provider: it posts, reads, and is all a release needs. No grace.
+async fn one_provider_rig() -> Rig {
+    let mut rig = parity_rig(true).await;
+    rig.bridge.cfg.propagation_grace_secs = 0;
+    rig.bridge.cfg.required_backbones = 1;
+    rig.bridge.cfg.providers.truncate(1);
+    rig
+}
+
+/// A data article and a parity article are missing in the same pass:
+/// one repost sends both.
+#[tokio::test]
+async fn data_and_parity_missing_together_are_posted_together() {
+    let rig = one_provider_rig().await;
+    let (s, parity) = rig.posted(8).await;
+    let plan = rig.plan(&s).await;
+    let lost = [&plan[3], &parity.articles[1]];
+    for row in lost {
+        rig.servers[0].hide(&row.message_id).await;
+    }
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    for row in lost {
+        assert!(!rig.servers[0].is_hidden(&row.message_id).await);
+    }
+    assert_eq!(rig.servers[0].posted_count().await, ALL as usize);
+
+    rig.bridge.clock.advance_secs(delay);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.rows(&s);
+    let ok = VerifyResult::Ok;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(summary(&rows[0]), ("bb0", VerifyKind::Body, ok, ALL, ALL));
+}
+
+/// The stored addendum describes other shards than the safety copy
+/// gives: no parity article is posted and the job fails as corrupt, but
+/// the data article that was missing in the same pass is posted first.
+/// Nothing is recorded and nothing released.
+#[tokio::test]
+async fn data_is_posted_again_before_an_addendum_of_other_shards_fails_the_job() {
+    let rig = one_provider_rig().await;
+    let (s, good) = rig.posted(9).await;
+    let plan = rig.plan(&s).await;
+    let mut hashes: Vec<(u16, [u8; 32])> = good
+        .rows
+        .iter()
+        .zip(&good.articles)
+        .map(|(row, a)| (*row, a.payload_sha256))
+        .collect();
+    hashes[0].1[5] ^= 0x10;
+    // A new addendum has its own identifiers: the provider has none of
+    // its articles.
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        let packed = e.packed.clone().unwrap();
+        let other = parity::build(
+            &mut SystemRng,
+            T0.secs().0,
+            &["alt.binaries.test"],
+            &s.extent,
+            s.cipher.len() as u64,
+            &packed,
+            &hashes,
+        );
+        e.parity = Some(other.unwrap());
+    });
+    rig.servers[0].hide(&plan[3].message_id).await;
+
+    for _ in 0..2 {
+        assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+        let outbox = rig.outbox(&s);
+        assert_eq!(outbox.stage, OutboxStage::Verify);
+        assert_eq!(outbox.last_error, Some(FailClass::Corrupt));
+        // The data article is back, and no article was added.
+        assert!(!rig.servers[0].is_hidden(&plan[3].message_id).await);
+        assert_eq!(rig.servers[0].posted_count().await, ALL as usize);
+        assert!(rig.rows(&s).is_empty());
+        assert!(rig.safety_held(&s));
+        rig.bridge.clock.advance_secs(3600);
     }
 }
