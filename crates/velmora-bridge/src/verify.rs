@@ -73,8 +73,11 @@
 //! - A sample of the extents is read in full on one backbone, as above
 //!   (`sampled`). Which extents, and on which backbone, follows from the
 //!   extent id and a key derived from the active KEK ([`in_sample`]), so
-//!   a retry and the release job come to the same answer and a provider
-//!   cannot tell which articles will be read. The rate is
+//!   a retry and the release job come to the same answer for as long as
+//!   the active KEK is the same one, and a provider cannot tell which
+//!   articles will be read. A new active KEK draws the sample anew: an
+//!   extent that waits then may be read in full on another backbone, or
+//!   on none if a full read of it is on record. The rate is
 //!   `VERIFY_SAMPLE_PERCENT`.
 //! - A backbone whose last check of the bytes failed (a full read, or a
 //!   size that did not fit) is read in full, as under `body`, and holds
@@ -650,6 +653,12 @@ where
     /// the same provider (`providers`) says with `STAT` that it has it:
     /// an article that is simply not there is found by every check, the
     /// light one too.
+    ///
+    /// An extent raises a backbone once: while the row of that backbone
+    /// is the one it wrote, ended or not, a job of it that fails a read
+    /// there again leaves the end where it is. Its bytes are as bad as
+    /// they were; what another extent finds there is what is news.
+    /// ([`Catalog::escalate_verify`] holds to this on its own.)
     async fn sample_failed(
         &self,
         lease: &Lease,
@@ -675,6 +684,14 @@ where
             result = VerifyResult::Missing;
         }
         let now = self.clock.now();
+        // Every row, the ended ones too: one per backbone at most.
+        let rows = self.catalog.verify_escalations(UnixMs(0)).await?;
+        if rows
+            .iter()
+            .any(|e| e.backbone == backbone && e.extent_id == extent.id)
+        {
+            return Ok(());
+        }
         let raised = VerifyEscalation {
             backbone: backbone.to_string(),
             until: now.plus_secs(self.cfg.verify.escalate_secs),
@@ -704,6 +721,27 @@ where
                 && label(&b.backbone) == backbone
                 && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
         }))
+    }
+
+    /// What the last full read of `backbone` for the current plan came
+    /// to, if it failed. That failure has had its say on the backbone
+    /// ([`Self::sample_failed`]): the same extent failing the same way
+    /// again says nothing new about it.
+    async fn failed_full_read(
+        &self,
+        extent: &ExtentRow,
+        backbone: &str,
+    ) -> Staged<Option<VerifyResult>> {
+        let checks = self.catalog.body_checks(&extent.id).await?;
+        Ok(checks
+            .iter()
+            .find(|b| {
+                b.plan_rev == extent.plan_rev
+                    && label(&b.backbone) == backbone
+                    && b.kind.is_full()
+                    && b.result != VerifyResult::Ok
+            })
+            .map(|b| b.result))
     }
 
     /// Whether a backbone the light check does not name for `extent` is
@@ -784,8 +822,31 @@ where
                     kind = VerifyKind::Stat;
                 }
             }
+            // Under the light check a full read that fails may raise the
+            // backbone to full reads. Not for a failure this extent has
+            // on record there already: a corrupt one raised it then, and
+            // a missing one was held against `STAT` then. Only a read
+            // that now finds bad bytes where it found none is news.
+            let watched = light.is_some() && kind.is_full();
+            let before = match watched {
+                true => self.failed_full_read(extent, name).await?,
+                false => None,
+            };
+            let news = |now: VerifyResult| {
+                watched && before != Some(VerifyResult::Corrupt) && before != Some(now)
+            };
+            let mut asked = false;
             let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
             if result_of(&tally) == VerifyResult::Missing {
+                if news(VerifyResult::Missing) {
+                    // Before the waits for a missing article, which may
+                    // take hours: a provider that says with `STAT` it has
+                    // what it does not serve is answering for other
+                    // extents all that time.
+                    self.sample_failed(lease, extent, &plan, &[provider], name, &tally)
+                        .await?;
+                    asked = true;
+                }
                 // What this stores is the resume point of this backbone.
                 let stored = reached.take();
                 let wait = self
@@ -808,7 +869,7 @@ where
             }
             let kind = Self::recorded_kind(kind, &tally);
             let row = self.record(lease, extent, provider, &tally, kind).await?;
-            if light.is_some() && kind.is_full() && row.result != VerifyResult::Ok {
+            if row.result != VerifyResult::Ok && news(row.result) && !asked {
                 // Recorded first: the failure stands whatever comes of
                 // this.
                 // Asked of the provider that failed the read: another

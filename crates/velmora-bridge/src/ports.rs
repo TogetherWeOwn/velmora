@@ -972,7 +972,8 @@ pub trait Catalog {
     ) -> Result<Guard<()>>;
     /// Notes that a full read of a sampled extent failed on `backbone`:
     /// until `until` every extent is read in full there. An earlier end
-    /// never replaces a later one.
+    /// never replaces a later one, and the extent whose row it is
+    /// does not move the end, ended or not: it has been counted.
     async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()>;
     /// The escalations that have not ended at `at`
     /// ([`Catalog::escalate_verify`]). An extent is read in full on the

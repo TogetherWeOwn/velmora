@@ -3870,41 +3870,58 @@ async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
 }
 
 /// The backbones read in full for a while: one row per backbone, the
-/// later end wins, and a row whose time is over is not listed.
+/// later end wins unless it comes from the extent whose row it is,
+/// and a row whose time is over is not listed.
 #[tokio::test]
 async fn verify_escalations_keep_the_later_end() {
     let fx = Fx::new().await;
-    let raise = |backbone: &str, from: UnixMs, secs: u32, result| VerifyEscalation {
+    let raise = |backbone: &str, extent: u8, from: UnixMs, secs: u32, result| VerifyEscalation {
         backbone: backbone.to_string(),
         until: from.plus_secs(secs),
         raised_at: from,
-        extent_id: ExtentId::mint([7; 13]),
+        extent_id: ExtentId::mint([extent; 13]),
         result,
     };
     assert_eq!(fx.cat.verify_escalations(T0).await.unwrap(), []);
-    let first = raise("bb-b", T0, 3_600, VerifyResult::Corrupt);
+    let first = raise("bb-b", 7, T0, 3_600, VerifyResult::Corrupt);
     fx.cat.escalate_verify(&first).await.unwrap();
-    let other = raise("bb-a", T0, 600, VerifyResult::Missing);
+    let other = raise("bb-a", 7, T0, 600, VerifyResult::Missing);
     fx.cat.escalate_verify(&other).await.unwrap();
     assert_eq!(
         fx.cat.verify_escalations(T0).await.unwrap(),
         [other.clone(), first.clone()]
     );
     // An earlier end changes nothing.
-    let shorter = raise("bb-b", T0.plus_ms(1), 60, VerifyResult::Missing);
+    let shorter = raise("bb-b", 8, T0.plus_ms(1), 60, VerifyResult::Missing);
     fx.cat.escalate_verify(&shorter).await.unwrap();
+    assert_eq!(
+        fx.cat.verify_escalations(T0).await.unwrap(),
+        [other.clone(), first.clone()]
+    );
+    // So does a later one from the extent that raised the backbone:
+    // the same failure found again is not a reason to read everything
+    // in full for longer.
+    let again = raise("bb-b", 7, T0.plus_secs(1_800), 3_600, VerifyResult::Corrupt);
+    fx.cat.escalate_verify(&again).await.unwrap();
     assert_eq!(
         fx.cat.verify_escalations(T0).await.unwrap(),
         [other, first.clone()]
     );
-    // A later one replaces the row.
-    let longer = raise("bb-b", T0.plus_secs(1_800), 3_600, VerifyResult::Missing);
+    // A later one from another extent replaces the row.
+    let longer = raise("bb-b", 8, T0.plus_secs(1_800), 3_600, VerifyResult::Missing);
     fx.cat.escalate_verify(&longer).await.unwrap();
     // The first backbone's time is over; the end itself is not inside.
     let now = T0.plus_secs(600);
     let until = longer.until;
     assert_eq!(fx.cat.verify_escalations(now).await.unwrap(), [longer]);
     assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), []);
+    // Nor once the escalation has ended: only another extent does.
+    let same = raise("bb-b", 8, until, 60, VerifyResult::Corrupt);
+    fx.cat.escalate_verify(&same).await.unwrap();
+    assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), []);
+    let renewed = raise("bb-b", 9, until, 60, VerifyResult::Corrupt);
+    fx.cat.escalate_verify(&renewed).await.unwrap();
+    assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), [renewed]);
     let rows = fx.count("SELECT COUNT(*) FROM verify_escalations").await;
     assert_eq!(rows, 2);
 }

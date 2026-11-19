@@ -789,7 +789,7 @@ impl Catalog for MemCatalog {
     async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {
         let mut all = self.escalations.borrow_mut();
         match all.iter_mut().find(|o| o.backbone == e.backbone) {
-            Some(old) if e.until > old.until => *old = e.clone(),
+            Some(old) if e.until > old.until && e.extent_id != old.extent_id => *old = e.clone(),
             Some(_) => {}
             None => all.push(e.clone()),
         }

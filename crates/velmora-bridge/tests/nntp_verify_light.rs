@@ -403,9 +403,10 @@ async fn raise(rig: &Rig, backbone: &str) -> VerifyEscalation {
     raised
 }
 
-/// The release records nothing for a backbone verify did not pass: its
+/// The release records no pass for a backbone verify did not pass: its
 /// answer to `STAT` now must not become the last word on it, or a
-/// release that is tried again would count it.
+/// release that is tried again would count it. A failure found by the
+/// release is recorded all the same.
 #[tokio::test]
 async fn the_release_records_nothing_for_a_backbone_verify_did_not_pass() {
     let rig = three_backbone_rig([("bb0", true), ("bb1", false), ("bb2", false)]).await;
@@ -516,20 +517,23 @@ async fn a_failed_full_read_is_held_against_the_stat_of_the_same_provider() {
         }
         rig.wait_until_due(&s);
     }
-    let (backbone, provider) = missing(&rig).expect("a missing row");
+    let (backbone, _) = missing(&rig).expect("a missing row");
     assert_eq!(backbone, "bb1");
     let now = rig.bridge.catalog.escalations.borrow().clone();
-    match provider.as_str() {
-        // Nothing was raised by this read: the row is the one from
-        // before, though the other provider answers `STAT` for it.
-        "p1" => assert_eq!(now, [raised]),
-        // Raised by this read, though the other provider says with
-        // `STAT` that the article is not there.
-        "p2" => assert_eq!(
+    // Each read that finds the article missing is held against `STAT`
+    // at once, before the waits, so what counts is which providers were
+    // read in any of the rounds.
+    match rig.bridge.nntp.connects_to("p2") {
+        // Only the first provider was read and nothing was raised: the
+        // row is the one from before, though the other provider answers
+        // `STAT` for the article.
+        0 => assert_eq!(now, [raised]),
+        // The second was read and raised the backbone, though the other
+        // provider says with `STAT` that the article is not there.
+        _ => assert_eq!(
             (&now[0].extent_id, now[0].result),
             (&s.extent, VerifyResult::Missing)
         ),
-        other => panic!("read by {other}"),
     }
 }
 
@@ -651,6 +655,17 @@ async fn a_corrupt_sample_raises_the_backbone_to_full_reads() {
     }
     names.sort();
     assert_eq!(names, ["bb0", "bb1"]);
+    // An extent raises a backbone once. Its bytes were bad when posted
+    // and stay bad: every later round fails the same reads, during the
+    // escalations and after them, and moves neither end.
+    let raised = rig.bridge.catalog.escalations.borrow().clone();
+    for _ in 0..6 {
+        rig.bridge.clock.advance_secs(ESCALATE_SECS / 4);
+        rig.wait_until_due(&bad);
+        assert_ne!(rig.run(&bad, OutboxStage::Verify).await, JobOutcome::Ack);
+        assert_eq!(*rig.bridge.catalog.escalations.borrow(), raised);
+    }
+    assert_eq!(rig.state(&bad), SafetyState::Held);
     // The rest follows the one that was drawn, from its first read.
     *rig.bridge.catalog.escalations.borrow_mut() = vec![expected];
 
@@ -706,24 +721,38 @@ async fn a_sample_that_cannot_be_read_where_stat_passes_escalates() {
     let name = ["bb0", "bb1"][drawn];
     rig.servers[drawn].set_body_gone(true).await;
 
-    // The waits for a missing article come first, as under `body`.
+    // The backbone is raised by the first read that finds this, before
+    // the waits for a missing article: they take hours, and all that
+    // time the provider would answer `STAT` for other extents.
+    let now = rig.bridge.clock.now();
+    let expected = VerifyEscalation {
+        backbone: name.to_string(),
+        until: now.plus_secs(ESCALATE_SECS),
+        raised_at: now,
+        extent_id: s.extent.clone(),
+        result: VerifyResult::Missing,
+    };
+    let want = vec![expected];
+    // The waits themselves are those of `body`, and the reads that come
+    // after them find nothing new: the end stays where it was put.
     for wait in MISSING_BACKOFF_SECS {
         assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), wait);
-        assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+        assert_eq!(*rig.bridge.catalog.escalations.borrow(), want);
+        // Not recorded yet: the backbone is read again after the wait.
+        assert!(rig.checks(&s).iter().all(|r| r.0 != name));
         rig.bridge.clock.advance_secs(wait);
     }
-    let now = rig.bridge.clock.now();
     assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
     assert!(rig
         .checks(&s)
         .contains(&row(name, VerifyKind::Sampled, VerifyResult::Missing)));
-    let raised = rig.bridge.catalog.escalations.borrow().clone();
-    assert_eq!(raised.len(), 1);
-    assert_eq!(
-        (raised[0].backbone.as_str(), raised[0].result),
-        (name, VerifyResult::Missing)
-    );
-    assert_eq!(raised[0].until, now.plus_secs(ESCALATE_SECS));
+    assert_eq!(*rig.bridge.catalog.escalations.borrow(), want);
+    // Nor does a read after the escalation has ended raise it again:
+    // this extent has had its say on the backbone.
+    rig.bridge.clock.advance_secs(ESCALATE_SECS);
+    rig.wait_until_due(&s);
+    assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert_eq!(*rig.bridge.catalog.escalations.borrow(), want);
     assert_eq!(rig.state(&s), SafetyState::Held);
     assert_eq!(rig.stage(&s), OutboxStage::Verify);
 }

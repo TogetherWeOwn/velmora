@@ -977,7 +977,8 @@ pub(super) async fn escalate_verify<S: Sql>(c: &SqlCatalog<S>, e: &VerifyEscalat
          ON CONFLICT(backbone) DO UPDATE SET until = excluded.until, \
            raised_at = excluded.raised_at, extent_id = excluded.extent_id, \
            result = excluded.result \
-         WHERE excluded.until > verify_escalations.until",
+         WHERE excluded.until > verify_escalations.until \
+           AND excluded.extent_id <> verify_escalations.extent_id",
         vec![
             text(&e.backbone),
             ms(e.until),
