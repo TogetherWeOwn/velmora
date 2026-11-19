@@ -1,2 +1,4 @@
 # Test vectors are byte-exact fixtures: never convert line endings.
 crates/velmora/testdata/** -text
+# Golden record plaintexts are byte-exact fixtures.
+crates/velmora-bridge/tests/golden/** -text

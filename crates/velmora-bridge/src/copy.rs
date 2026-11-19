@@ -49,6 +49,21 @@
 //!   on after the plans that are over there ([`SWEEP_KEY`]). The last
 //!   pass in which the record is fresh sends it as it is; its other
 //!   plans are copied by the walk when it comes to them.
+//! - **A segmented generation record is sent after its segments.** Its
+//!   head stands where a record of one document stands, and names the
+//!   segments that hold its extents ([`GenerationHead`]). The job that
+//!   sends the head first reads every segment, one at a time, and makes
+//!   each equal over there. The head is sent only when every segment
+//!   is stored, opens under its own name and is the one the head names;
+//!   otherwise the record is counted (`source_unreadable`) and its head
+//!   is not sent. This holds in the sweep and in the walk, and in the
+//!   sweep the head also waits for its article plans, as a record of
+//!   one document does. A segment is also a key under `m/` like any
+//!   other, and is sent as one when a pass comes to it, whether or not
+//!   its head or the plans it names are over there: a reader comes to
+//!   a segment only through its head, so a segment without one says
+//!   nothing. The order that is kept is the head's: after its plans in
+//!   the sweep, and after its segments always.
 //! - **Nothing is ever deleted over there.** "Absent in the safety
 //!   bucket" cannot be told from "the safety bucket was lost", which is
 //!   the event the copy exists for. A copy without a source is counted
@@ -120,11 +135,14 @@ use crate::config::Maintenance;
 use crate::crypto::open_manifest;
 use crate::ports::{BlobEntry, BlobMeta, BlobStore, Clock, JobSink, Kek};
 use crate::recovery::{
-    article_key, other_plan_key, plan_keys, record_name, start_after, Layout, RecordKind,
-    RECORD_PREFIX, TENANT_DIR, TENANT_KEY_PREFIX,
+    article_key, other_plan_key, plan_keys, read_segment, record_name, record_version,
+    segment_plan_keys, start_after, GenerationHead, Layout, RecordKind, RECORD_PREFIX,
+    SEGMENTED_VERSION, TENANT_DIR, TENANT_KEY_PREFIX,
 };
 use crate::remote::{md5_hex, HttpSend, RemoteError, S3Remote, MAX_KEY_BYTES};
-use crate::types::{BucketId, ExtentId, Job, JobOutcome, OutboxStage, Result, UnixMs, JOB_VERSION};
+use crate::types::{
+    BridgeError, BucketId, ExtentId, Job, JobOutcome, OutboxStage, Result, UnixMs, JOB_VERSION,
+};
 
 /// A pass starts on the cron run that falls in the first
 /// [`START_WINDOW_MS`] of each interval of this length.
@@ -200,6 +218,12 @@ pub const JOB_PAGES: u32 = 40;
 pub const JOB_MS: i64 = 20_000;
 /// Copies under way at once.
 pub const CONCURRENCY: usize = 6;
+/// Most segments of a generation record that is copied. A job looks at
+/// every segment of a record before it sends the head, so they all
+/// have to fit into one job, also beside the other records of its
+/// chunk. A record with more is counted as failed in every pass that
+/// comes to it.
+pub const HEAD_SEGMENTS: usize = JOB_COPIES - CONCURRENCY;
 /// Source keys read per page.
 pub const PAGE: u32 = 1000;
 /// A job that failed is retried while its pass is younger than this.
@@ -674,12 +698,30 @@ enum Copied {
 /// A record to copy, after the first look at it.
 enum Read {
     Is(Copied),
-    /// A fresh generation record: its bytes, and the keys of the
-    /// article plans it names.
+    /// A generation record that something is sent before: its bytes,
+    /// and what it names.
     Generation {
         bytes: Vec<u8>,
-        plans: Vec<String>,
+        named: Named,
     },
+}
+
+/// What a generation record names that is sent before it.
+enum Named {
+    /// A fresh record of one document: the keys of its article plans.
+    Plans(Vec<String>),
+    /// A segmented record: its head.
+    Segments(Box<GenerationHead>),
+}
+
+impl Named {
+    /// How many extents the record has.
+    fn extents(&self) -> usize {
+        match self {
+            Named::Plans(keys) => keys.len(),
+            Named::Segments(head) => head.extent_count() as usize,
+        }
+    }
 }
 
 /// What became of the article plan of a fresh generation record.
@@ -1456,8 +1498,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             });
         let read: Vec<(usize, Read)> = stream::iter(work)
             .map(|(i, entry, copy)| async move {
-                if plans && generation(&entry.key) {
-                    (i, self.read_generation(&entry.key, copy).await)
+                if generation(&entry.key) {
+                    (i, self.read_generation(&entry.key, copy, plans).await)
                 } else {
                     (i, Read::Is(self.copy_one(&entry.key, copy).await))
                 }
@@ -1466,7 +1508,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             .collect()
             .await;
         let mut result: Vec<Option<Copied>> = vec![None; chunk.len()];
-        let mut generations: BTreeMap<usize, (Vec<u8>, Vec<String>)> = BTreeMap::new();
+        let mut generations: BTreeMap<usize, (Vec<u8>, Named)> = BTreeMap::new();
         let (mut asked, mut down) = (0, 0);
         for (i, read) in read {
             match read {
@@ -1475,13 +1517,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     down += usize::from(copied == Copied::Down);
                     result[i] = Some(copied);
                 }
-                Read::Generation { bytes, plans } => {
-                    generations.insert(i, (bytes, plans));
+                Read::Generation { bytes, named } => {
+                    generations.insert(i, (bytes, named));
                 }
             }
         }
         let mut outage = all_down(asked, down);
-        if !generations.is_empty() {
+        if plans && !generations.is_empty() {
             self.load_known(known, span).await;
         }
 
@@ -1489,31 +1531,76 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let mut ready: Vec<usize> = Vec::new();
         // Requests in a row, group after group, that got no answer.
         let mut silent = 0;
-        for (i, (_, keys)) in &generations {
+        for (i, (bytes, named)) in &generations {
             let key = &chunk[*i].entry.key;
+            if outage && !plans {
+                // Not looked at, and the walk does not pass it.
+                finished = *i;
+                break;
+            }
             if outage {
                 // Not looked at: the job comes again, or the next pass.
                 result[*i] = Some(Copied::Held);
                 continue;
             }
+            let of = named.extents();
+            let layout = record_name(key).map_or_else(Layout::flat, |n| n.layout);
             // How many of its plans are over there: what an earlier job
             // of this pass counted, or an earlier pass. A count for
-            // another record, or one that leaves no plan to look at, is
-            // not believed.
-            let believed = |n: u32| Some(n as usize).filter(|n| *n < keys.len());
+            // another record is not believed, and neither is one that
+            // leaves no plan to look at, unless segments are still to
+            // be sent after the plans.
+            let whole = matches!(named, Named::Segments(_));
+            let believed = |n: u32| Some(n as usize).filter(|n| *n < of || (whole && *n == of));
             let counted = believed(place.plans).filter(|_| place.generation == *key);
             let saved = known.plans.get(key).copied().and_then(believed);
-            let mut n = counted.max(saved).unwrap_or(0);
+            // The walk sends a record as it is.
+            let mut n = if plans {
+                counted.max(saved).unwrap_or(0)
+            } else {
+                of
+            };
             // A plan of the record is not over there.
             let mut stopped = false;
-            while n < keys.len() && !stopped {
+            // The plan keys of one segment, and which.
+            let mut held: Option<(usize, Vec<String>)> = None;
+            // A segment could not be read.
+            let mut unread: Option<Copied> = None;
+            while n < of && !stopped {
                 let room = JOB_COPIES.saturating_sub(budget.copies);
                 if room == 0 || self.spent(budget.started) {
                     break;
                 }
-                let take = CONCURRENCY.min(room).min(keys.len() - n);
+                // The plans to look at: of a segmented record, those of
+                // the one segment that holds the next extent.
+                let rest: &[String] = match named {
+                    Named::Plans(keys) => &keys[n..],
+                    Named::Segments(head) => {
+                        let Some(at) = head.segment_of(n as u32) else {
+                            unread = Some(Copied::Unreadable);
+                            break;
+                        };
+                        if held.as_ref().map(|(index, _)| *index) != Some(at) {
+                            // One segment at a time.
+                            held = None;
+                            match self.segment_plans(head, &layout, at).await {
+                                Ok(keys) => held = Some((at, keys)),
+                                Err(copied) => {
+                                    unread = Some(copied);
+                                    break;
+                                }
+                            }
+                        }
+                        let first = head.segments[at].seq as usize;
+                        match &held {
+                            Some((_, keys)) => &keys[n - first..],
+                            None => &[],
+                        }
+                    }
+                };
+                let take = CONCURRENCY.min(room).min(rest.len());
                 budget.copies += take;
-                let looked: Vec<Plan> = stream::iter(&keys[n..n + take])
+                let looked: Vec<Plan> = stream::iter(&rest[..take])
                     .map(|key| self.plan(key))
                     .buffered(CONCURRENCY)
                     .collect()
@@ -1553,17 +1640,56 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 outage = silent >= OUTAGE_MIN;
             }
-            known.keep(key, n, keys.len());
-            if n == keys.len() || (stopped && !outage && *key <= span.last) {
+            drop(held);
+            if let Some(copied) = unread {
+                // Its head is not sent: finished for this pass.
+                result[*i] = Some(copied);
+                continue;
+            }
+            known.keep(key, n, of);
+            let more = if n == of || (stopped && !outage && *key <= span.last) {
                 // All its plans are over there, or it is fresh for the
                 // last time: the walk would send it as it is.
-                ready.push(*i);
+                match named {
+                    Named::Plans(_) => {
+                        ready.push(*i);
+                        false
+                    }
+                    Named::Segments(head) => {
+                        match self
+                            .send_segmented(key, bytes, head, &layout, budget, counts)
+                            .await
+                        {
+                            Some(copied) => {
+                                if copied == Copied::Done {
+                                    known.forget(key);
+                                }
+                                if copied == Copied::Down {
+                                    silent += 1;
+                                } else if asked_store(copied) {
+                                    silent = 0;
+                                }
+                                outage = silent >= OUTAGE_MIN;
+                                result[*i] = Some(copied);
+                                false
+                            }
+                            // Its segments did not fit into the job.
+                            None => true,
+                        }
+                    }
+                }
             } else if stopped {
                 // Held back: finished for this pass.
                 result[*i] = Some(Copied::Held);
+                false
             } else {
-                place.generation = key.clone();
-                place.plans = n as u32;
+                true
+            };
+            if more {
+                if plans {
+                    place.generation = key.clone();
+                    place.plans = n as u32;
+                }
                 finished = *i;
                 break;
             }
@@ -1647,8 +1773,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         Ok(range)
     }
 
-    /// Reads a fresh generation record that is to be copied.
-    async fn read_generation(&self, key: &str, copy: Option<&Listed>) -> Read {
+    /// Reads a generation record that is to be copied. A segmented one
+    /// comes back with its head, in the sweep and in the walk; one of a
+    /// single document with the plans it names when they go first
+    /// (`plans`: the sweep), and is sent as it is otherwise.
+    async fn read_generation(&self, key: &str, copy: Option<&Listed>, plans: bool) -> Read {
         let bytes = match self.safety.get(key, None).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Read::Is(Copied::Gone),
@@ -1657,17 +1786,117 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let Ok(plain) = open_manifest(self.kek, key, &bytes) else {
             return Read::Is(Copied::Unreadable);
         };
+        // The listing may name another digest than the MD5 of the bytes;
+        // an equal copy is not sent again.
         if equal(copy, bytes.len() as u64, &md5_hex(&bytes)) {
             return Read::Is(Copied::Same);
+        }
+        if record_version(&plain) == Some(SEGMENTED_VERSION) {
+            // A head that does not say which segments it has is never
+            // sent: nothing could be sent before it.
+            return match GenerationHead::parse(key, &plain) {
+                Ok(head) => Read::Generation {
+                    bytes,
+                    named: Named::Segments(Box::new(head)),
+                },
+                Err(_) => Read::Is(Copied::Unreadable),
+            };
+        }
+        if !plans {
+            return Read::Is(self.send(key, &bytes).await);
         }
         // Without the extents it names, its plans cannot be sent first.
         // As the layout of the record names them; [`Copier::plan`]
         // looks under the other name too.
         let layout = record_name(key).map_or_else(Layout::flat, |n| n.layout);
         match plan_keys(&plain, &layout) {
-            Some(plans) => Read::Generation { bytes, plans },
+            Some(plans) => Read::Generation {
+                bytes,
+                named: Named::Plans(plans),
+            },
             None => Read::Is(Copied::Unreadable),
         }
+    }
+
+    /// The keys of the article plans that segment `index` of `head`
+    /// names, in the order of its extents. `Err` = what became of the
+    /// record instead: its segment could not be asked for (`Failed`),
+    /// or is not stored or not the one the head names (`Unreadable`).
+    async fn segment_plans(
+        &self,
+        head: &GenerationHead,
+        layout: &Layout,
+        index: usize,
+    ) -> std::result::Result<Vec<String>, Copied> {
+        match read_segment(self.safety, self.kek, layout, head, index).await {
+            Ok(extents) => segment_plan_keys(&extents, layout).ok_or(Copied::Unreadable),
+            Err(BridgeError::Blob(_)) => Err(Copied::Failed),
+            Err(_) => Err(Copied::Unreadable),
+        }
+    }
+
+    /// Makes every segment of `head` equal over there, in order and
+    /// one at a time, and then sends the head, `bytes`, to `key`. The
+    /// head is sent only if every segment is stored and is the one the
+    /// head names ([`GenerationHead::open_segment`]), and is equal
+    /// over there; whatever an earlier job did, this one looks at them
+    /// all again. A segment that is sent is counted as copied.
+    ///
+    /// `None` = a bound of the job was reached; the next job begins
+    /// again and finds the segments that were sent equal. A job sends
+    /// at least one segment whatever the time, so the record is
+    /// finished after as many jobs as it has segments at the most.
+    async fn send_segmented(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        head: &GenerationHead,
+        layout: &Layout,
+        budget: &mut Budget,
+        counts: &mut CopyCounts,
+    ) -> Option<Copied> {
+        let segments = head.segments.len();
+        if segments > HEAD_SEGMENTS {
+            return Some(Copied::Failed);
+        }
+        if JOB_COPIES.saturating_sub(budget.copies) < segments {
+            return None;
+        }
+        budget.copies += segments;
+        let mut sent = 0;
+        for index in 0..segments {
+            let name = head.segment_key(layout, index);
+            let sealed = match self.safety.get(&name, None).await {
+                Ok(Some(sealed)) => sealed,
+                Ok(None) => return Some(Copied::Unreadable),
+                Err(_) => return Some(Copied::Failed),
+            };
+            if head.open_segment(self.kek, layout, index, &sealed).is_err() {
+                return Some(Copied::Unreadable);
+            }
+            match self.remote.head(self.clock, &name).await {
+                Ok(copy) if equal(copy.as_ref(), sealed.len() as u64, &md5_hex(&sealed)) => {
+                    continue
+                }
+                Ok(_) => {}
+                Err(RemoteError::Refused(_) | RemoteError::Unsignable) => {
+                    return Some(Copied::Refused)
+                }
+                Err(RemoteError::Unavailable) => return Some(Copied::Down),
+                Err(_) => return Some(Copied::Failed),
+            }
+            if sent > 0 && self.spent(budget.started) {
+                return None;
+            }
+            match self.send(&name, &sealed).await {
+                Copied::Done => {
+                    sent += 1;
+                    counts.copied += 1;
+                }
+                other => return Some(other),
+            }
+        }
+        Some(self.send(key, bytes).await)
     }
 
     /// Makes the article plan at `key` equal over there, or the plan of

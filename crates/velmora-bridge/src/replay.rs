@@ -16,6 +16,15 @@
 //! extents spans several calls; it is published by the call that
 //! finishes its last extent.
 //!
+//! A segmented record ([`GenerationHead`]) is replayed the same way,
+//! with its extents read from its segments: a call reads the head and
+//! the segment its cursor is in. Before the first extent of such a
+//! record is restored, and again in the call that publishes it, every
+//! segment is read, one at a time, and held to the head. A record with
+//! a segment that is missing, does not open or is not the one its head
+//! names is unreadable as a whole: its names are reported, and nothing
+//! of it is published.
+//!
 //! What a replay cannot bring back: access keys and grants (re-issue them
 //! through the admin API), uploads that were in progress, and an extent
 //! with neither a pinned copy nor an article plan record. A generation
@@ -33,11 +42,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{
-    read_article_plan, read_generation, read_tombstone, record_name, start_after,
-    GenerationManifest, Layout, GENERATION_PREFIX, TOMBSTONE_PREFIX,
+    read_article_plan, read_segment, read_stored_generation, read_tombstone, record_name,
+    start_after, ExtentRecord, GenerationHead, Layout, StoredGeneration, GENERATION_PREFIX,
+    TOMBSTONE_PREFIX,
 };
 use crate::types::{
-    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
+    ArticleRow, ArticleState, BridgeError, BucketId, ExtentPlacement, ExtentRow, GenerationId,
+    Result, UnixMs,
 };
 
 /// How much one call does. The default keeps a call far below a Worker
@@ -309,35 +320,38 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         let mut budget = limits.extents;
         for listed in &names {
             let flat = &listed.flat;
-            // The first name of the id that opens: a name that does not
-            // must not hide a record of the same id that does.
-            let mut opened = None;
+            // The first name of the id that can be read: a name that
+            // cannot must not hide a record of the same id that can.
             for (name, layout) in listed.names() {
-                match read_generation(&self.safety, &self.kek, name).await {
-                    Ok(Some(m)) => {
-                        opened = Some((m, layout));
+                let record = match read_stored_generation(&self.safety, &self.kek, name).await {
+                    Ok(Some(record)) => record,
+                    // Removed by an operator since the listing.
+                    Ok(None) => continue,
+                    Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+                    Err(_) => {
+                        report.unreadable.push(name.clone());
+                        continue;
+                    }
+                };
+                match self
+                    .replay_manifest(&record, layout, &mut cursor, &mut budget, report)
+                    .await?
+                {
+                    Replayed::Done => {
+                        report.manifests += 1;
                         break;
                     }
-                    // Removed by an operator since the listing.
-                    Ok(None) => {}
-                    Err(crate::types::BridgeError::Blob(e)) => {
-                        return Err(crate::types::BridgeError::Blob(e))
+                    // Out of budget inside this record.
+                    Replayed::More => return Ok(Some(cursor)),
+                    Replayed::Unreadable(segment) => {
+                        for unread in [segment, name.clone()] {
+                            if !report.unreadable.contains(&unread) {
+                                report.unreadable.push(unread);
+                            }
+                        }
                     }
-                    Err(_) => report.unreadable.push(name.clone()),
                 }
             }
-            let Some((manifest, layout)) = opened else {
-                cursor = finished(cursor, flat);
-                continue;
-            };
-            if !self
-                .replay_manifest(&manifest, layout, &mut cursor, &mut budget, report)
-                .await?
-            {
-                // Out of budget inside this record.
-                return Ok(Some(cursor));
-            }
-            report.manifests += 1;
             cursor = finished(cursor, flat);
         }
         if names.len() as u64 == u64::from(limits.records) {
@@ -350,24 +364,52 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         }))
     }
 
-    /// `false` = the extent budget ran out; `cursor` says where.
+    /// Reads every segment of `head`, one at a time, and holds each to
+    /// the head. `Ok(Err(name))` = the segment stored at `name` is
+    /// missing or is not the one the head names: the record is
+    /// unreadable. `Ok(Ok(placements))` = where the generation has each
+    /// of its extents, when `placed`; empty otherwise.
+    async fn read_segments(
+        &self,
+        head: &GenerationHead,
+        layout: &Layout,
+        placed: bool,
+    ) -> Result<std::result::Result<Vec<ExtentPlacement>, String>> {
+        let mut placements = Vec::new();
+        if placed {
+            placements.reserve_exact(head.extent_count() as usize);
+        }
+        for index in 0..head.segments.len() {
+            match read_segment(&self.safety, &self.kek, layout, head, index).await {
+                Ok(extents) if placed => placements.extend(extents.iter().map(placement)),
+                Ok(_) => {}
+                Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+                Err(_) => return Ok(Err(head.segment_key(layout, index))),
+            }
+        }
+        Ok(Ok(placements))
+    }
+
     async fn replay_manifest(
         &self,
-        m: &GenerationManifest,
-        // The layout the record is stored in: where the article plans
-        // of its extents are looked for first.
+        record: &StoredGeneration,
+        // The layout the record is stored in: where its segments are,
+        // and where the article plans of its extents are looked for
+        // first.
         layout: &Layout,
         cursor: &mut ReplayCursor,
         budget: &mut usize,
         report: &mut ReplayReport,
-    ) -> Result<bool> {
-        let generation = m.generation()?;
+    ) -> Result<Replayed> {
+        let (generation, bucket) = match record {
+            StoredGeneration::Single(m) => (m.generation()?, m.bucket()),
+            StoredGeneration::Segmented(head) => (head.generation(), head.bucket()),
+        };
         let probe = self.catalog.replay_probe(&generation).await?;
         if probe == ReplayProbe::Superseded {
             report.superseded += 1;
-            return Ok(true);
+            return Ok(Replayed::Done);
         }
-        let bucket = m.bucket();
         // A bucket made again under the same name since the export has
         // another id and another data key. Nothing of the record can go
         // into it, and its rows cannot go in beside it: the name is
@@ -378,19 +420,57 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 if report.other_bucket.len() < OTHER_BUCKET_LISTED {
                     report.other_bucket.push(generation.id.as_str().to_owned());
                 }
-                return Ok(true);
+                return Ok(Replayed::Done);
             }
         }
         let now = self.clock.now();
+        let total = generation.extent_count as usize;
         let mut at = cursor.extent as usize;
-        while at < m.extents.len() {
-            if *budget == 0 {
-                return Ok(false);
+        if let StoredGeneration::Segmented(head) = record {
+            // Before the first row of the record is written: a record
+            // that cannot be read leaves nothing behind.
+            if at == 0 {
+                if let Err(segment) = self.read_segments(head, layout, false).await? {
+                    return Ok(Replayed::Unreadable(segment));
+                }
             }
-            let end = m.extents.len().min(at + *budget);
+        }
+        // The segment the cursor is in: its index and its extents.
+        let mut held: Option<(usize, Vec<ExtentRecord>)> = None;
+        while at < total {
+            if *budget == 0 {
+                return Ok(Replayed::More);
+            }
+            // The run of extents the cursor is in, and the `seq` of its
+            // first: the whole record, or one segment of it.
+            let (first, run): (usize, &[ExtentRecord]) = match record {
+                StoredGeneration::Single(m) => (0, &m.extents),
+                StoredGeneration::Segmented(head) => {
+                    let seq = u32::try_from(at).unwrap_or(u32::MAX);
+                    let Some(index) = head.segment_of(seq) else {
+                        return Err(BridgeError::Invalid("recovery record is malformed"));
+                    };
+                    if held.as_ref().is_none_or(|(i, _)| *i != index) {
+                        drop(held.take());
+                        match read_segment(&self.safety, &self.kek, layout, head, index).await {
+                            Ok(extents) => held = Some((index, extents)),
+                            Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+                            Err(_) => {
+                                return Ok(Replayed::Unreadable(head.segment_key(layout, index)))
+                            }
+                        }
+                    }
+                    let extents = held.as_ref().map_or(&[][..], |(_, e)| e);
+                    (head.segments[index].seq as usize, extents)
+                }
+            };
+            let end = total.min(at + *budget).min(first + run.len());
             let mut chunk = Vec::with_capacity(end - at);
             for index in at..end {
-                let mut row = m.extent(index)?;
+                let mut row = match record {
+                    StoredGeneration::Single(m) => m.extent(index),
+                    StoredGeneration::Segmented(head) => head.extent(&run[index - first]),
+                }?;
                 let safety_present = self.safety.head(&row.id.safety_key()).await?.is_some();
                 // A plan in an existing catalogue row is kept; this one
                 // fills the gap when the row or its plan is missing.
@@ -466,15 +546,20 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         match probe {
             ReplayProbe::Present => report.present += 1,
             _ => {
-                let placements: Vec<ExtentPlacement> = m
-                    .extents
-                    .iter()
-                    .map(|e| ExtentPlacement {
-                        extent_id: crate::types::ExtentId::new(e.id.clone()),
-                        seq: e.seq,
-                        plain_offset: e.plain_offset,
-                    })
-                    .collect();
+                // The segment of the last extents is not held twice.
+                drop(held);
+                let placements: Vec<ExtentPlacement> = match record {
+                    StoredGeneration::Single(m) => m.extents.iter().map(placement).collect(),
+                    // Every segment again, whatever the calls before
+                    // this one read: what is published is what the head
+                    // names, all of it, as it is stored now.
+                    StoredGeneration::Segmented(head) => {
+                        match self.read_segments(head, layout, true).await? {
+                            Ok(placements) => placements,
+                            Err(segment) => return Ok(Replayed::Unreadable(segment)),
+                        }
+                    }
+                };
                 match self
                     .catalog
                     .replay_publish(&generation, &placements, now)
@@ -514,7 +599,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 }
             }
         }
-        Ok(true)
+        Ok(Replayed::Done)
     }
 
     async fn replay_tombstones(
@@ -659,6 +744,26 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         report.damaged_total = total;
         report.damaged = ids.iter().map(|id| id.as_str().to_owned()).collect();
         Ok(None)
+    }
+}
+
+/// What a call made of one generation record.
+enum Replayed {
+    /// Nothing is left to do for it.
+    Done,
+    /// The extent budget ran out; the cursor says where.
+    More,
+    /// It is segmented, and the segment stored at this name is missing
+    /// or is not the one its head names. Nothing of it was published.
+    Unreadable(String),
+}
+
+/// Where a generation has the extent of a record.
+fn placement(e: &ExtentRecord) -> ExtentPlacement {
+    ExtentPlacement {
+        extent_id: crate::types::ExtentId::new(e.id.clone()),
+        seq: e.seq,
+        plain_offset: e.plain_offset,
     }
 }
 
