@@ -760,11 +760,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn usage_snapshot(&self, hours: u32) -> Result<UsageSnapshot> {
         usage::snapshot(self, hours).await
     }
-    async fn usage_buckets(&self, after: &str, limit: u32) -> Result<Vec<BucketUsage>> {
+    async fn usage_buckets(&self, after: &str, limit: u32) -> Result<(bool, Vec<BucketUsage>)> {
         usage::buckets(self, after, limit).await
     }
-    async fn usage_recount_start(&self, now: UnixMs, adopt: bool, restart: bool) -> Result<bool> {
-        usage::recount_start(self, now, adopt, restart).await
+    async fn usage_recount_start(
+        &self,
+        now: UnixMs,
+        adopt: bool,
+        restart: bool,
+        only_on: bool,
+    ) -> Result<bool> {
+        usage::recount_start(self, now, adopt, restart, only_on).await
     }
     async fn usage_recount_step(&self, chunk: u32, now: UnixMs) -> Result<RecountStep> {
         usage::recount_step(self, chunk, now).await

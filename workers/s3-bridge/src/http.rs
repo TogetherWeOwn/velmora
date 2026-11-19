@@ -30,6 +30,13 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     let https = ingress::is_https(&url);
     let method = Method::parse(&req.inner().method());
     let mut headers: Vec<(String, String)> = req.headers().entries().collect();
+    // A request through a service binding may have no `Host` header:
+    // the host of its URL is the one it was sent to.
+    if !headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")) {
+        if let Some(host) = ingress::url_authority(&url) {
+            headers.push(("host".to_string(), host.to_string()));
+        }
+    }
     ingress::restore_accept_encoding(&mut headers, client_accept_encoding(&req).as_deref());
     let declared_len = ingress::declared_length(&headers).unwrap_or(None);
     let body = if req.inner().body().is_some() {

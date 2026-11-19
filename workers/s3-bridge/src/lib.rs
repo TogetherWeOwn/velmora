@@ -160,11 +160,40 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
         http::to_response(resp.with_request_id(&request_id))
     };
+    // The point of this request, if it gets one. A sub-request of a
+    // large GET gets none unless it failed: a 5xx is never left out,
+    // whatever headers the request carried.
+    let count = |status: u16, sample: u32, bytes_out: u64| {
+        if internal && status < 500 {
+            return;
+        }
+        // A request without a ray id (one through a service binding)
+        // is drawn by its place in this isolate's count instead.
+        let drawn = if request_id.is_empty() {
+            format!("n{}", metrics::next())
+        } else {
+            request_id.clone()
+        };
+        if let Some(weight) = velmora_bridge::metrics::weight(status, sample, &drawn) {
+            let seen = velmora_bridge::metrics::Request {
+                method: &method,
+                admin,
+                status,
+                latency_ms: worker::Date::now().as_millis().saturating_sub(started),
+                bytes_in,
+                bytes_out,
+                colo: &colo,
+            };
+            metrics::write(&velmora_bridge::metrics::request_point(&seen, weight));
+        }
+    };
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
             console_error!("config refused: {class}");
-            return Ok(early(ingress::IngressError::Internal.response()));
+            let resp = ingress::IngressError::Internal.response();
+            count(resp.status, 1, 0);
+            return Ok(early(resp));
         }
     };
     let incoming = match http::to_s3_request(req) {
@@ -174,6 +203,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "{}",
                 ingress::log_line(&method, "-", e.status(), &request_id)
             );
+            count(e.status(), bridge.cfg.metrics_sample, 0);
             return Ok(early(e.response()));
         }
     };
@@ -196,21 +226,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
-    if !internal {
-        let sample = bridge.cfg.metrics_sample;
-        if let Some(weight) = velmora_bridge::metrics::weight(status, sample, &request_id) {
-            let seen = velmora_bridge::metrics::Request {
-                method: &method,
-                admin,
-                status,
-                latency_ms: worker::Date::now().as_millis().saturating_sub(started),
-                bytes_in,
-                bytes_out: length(out.headers()),
-                colo: &colo,
-            };
-            metrics::write(&velmora_bridge::metrics::request_point(&seen, weight));
-        }
-    }
+    count(status, bridge.cfg.metrics_sample, length(out.headers()));
     Ok(out)
 }
 

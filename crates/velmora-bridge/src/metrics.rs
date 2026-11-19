@@ -12,8 +12,11 @@
 //! Whether a GET was served from the cache is not known when its
 //! headers are sent: the body finds that out extent by extent. A read
 //! from Usenet is therefore a point of its own ([`cold_read_point`]),
-//! never sampled. Cache misses are those points; hits are the sampled
-//! GETs less the misses.
+//! never sampled. It counts a run of reads from Usenet, not a GET: one
+//! GET can have several (each sub-range of a large GET, a reader that
+//! was idle and came back), and a copy reads too. The points say how
+//! much is read from Usenet over time; they are not a hit rate, and are
+//! not to be taken from the GET count.
 
 use sha2::{Digest, Sha256};
 

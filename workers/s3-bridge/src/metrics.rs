@@ -19,6 +19,19 @@ thread_local! {
     static DATASET: RefCell<Option<AnalyticsEngineDataset>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    static SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A number no other request of this isolate got: what a request
+/// without an id of its own is sampled by.
+pub fn next() -> u64 {
+    SEEN.with(|n| {
+        n.set(n.get().wrapping_add(1));
+        n.get()
+    })
+}
+
 /// Looks the binding up, once per request: it costs no I/O.
 pub fn bind(env: &Env) {
     let dataset = env.analytics_engine(BINDING).ok();

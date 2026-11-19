@@ -438,6 +438,18 @@ pub fn is_admin_target(raw_target: &str) -> bool {
     )
 }
 
+/// The host and port of a full request URL, as a `Host` header has
+/// them. A request that came through a service binding may carry no
+/// `Host` header; its URL names the host it was sent to.
+pub fn url_authority(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (!authority.is_empty()).then_some(authority)
+}
+
 /// [`is_admin_target`] of a full request URL. A URL whose target cannot
 /// be read counts as an admin one, so its refusal is not cached either.
 pub fn is_admin_url(url: &str) -> bool {

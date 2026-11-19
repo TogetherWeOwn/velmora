@@ -848,10 +848,10 @@ impl Catalog for MemCatalog {
         &self,
         _: &str,
         _: u32,
-    ) -> Result<Vec<velmora_bridge::types::BucketUsage>> {
+    ) -> Result<(bool, Vec<velmora_bridge::types::BucketUsage>)> {
         unused()
     }
-    async fn usage_recount_start(&self, _: UnixMs, _: bool, _: bool) -> Result<bool> {
+    async fn usage_recount_start(&self, _: UnixMs, _: bool, _: bool, _: bool) -> Result<bool> {
         unused()
     }
     async fn usage_recount_step(

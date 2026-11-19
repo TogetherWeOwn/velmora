@@ -125,12 +125,22 @@ async fn recount_state<S: Sql>(c: &SqlCatalog<S>) -> Result<RecountState> {
 }
 
 async fn last_recount<S: Sql>(c: &SqlCatalog<S>) -> Result<Option<UsageRecount>> {
+    recount_record(c, None).await
+}
+
+/// The last recount, or with `started_at` the last one that began then:
+/// the record of one pass, whatever has ended since.
+async fn recount_record<S: Sql>(
+    c: &SqlCatalog<S>,
+    started_at: Option<UnixMs>,
+) -> Result<Option<UsageRecount>> {
     let rows = c
         .sql
         .query(
             "SELECT started_at, finished_at, rows, adopted, drift, detail \
-               FROM usage_recounts ORDER BY id DESC LIMIT 1",
-            &[],
+               FROM usage_recounts WHERE ?1 IS NULL OR started_at = ?1 \
+              ORDER BY id DESC LIMIT 1",
+            &[started_at.map_or(SqlValue::Null, ms)],
         )
         .await?;
     let Some(row) = rows.into_iter().next() else {
@@ -153,7 +163,8 @@ pub const OLDEST: &str = "SELECT \
    (SELECT MIN(next_at) FROM outbox WHERE stage = 'verify'), \
    (SELECT MIN(next_at) FROM outbox WHERE stage = 'release')";
 
-/// One row per bucket that ever had a live object: the bucket count,
+/// One row per bucket with a counted object (a bucket emptied since
+/// keeps a row of zeros until a recount is adopted): the bucket count,
 /// not the object count, bounds this read.
 pub const BUCKET_TOTALS: &str = "SELECT COALESCE(SUM(live_objects), 0), \
    COALESCE(SUM(live_bytes), 0), COUNT(*) FROM usage_buckets WHERE kind = 1";
@@ -169,8 +180,13 @@ pub(super) async fn snapshot<S: Sql>(c: &SqlCatalog<S>, hours: u32) -> Result<Us
         .sql
         .query(
             "SELECT hour, posts, verifies, releases, dead, failures \
-               FROM usage_hours ORDER BY hour DESC LIMIT ?1",
-            &[SqlValue::Int(i64::from(hours))],
+               FROM usage_hours WHERE hour <> ?2 ORDER BY hour DESC LIMIT ?1",
+            // Not the hour `counters` holds as current: one filed
+            // between the two reads would be there twice.
+            &[
+                SqlValue::Int(i64::from(hours)),
+                SqlValue::Int(counters.current.hour),
+            ],
         )
         .await?;
     let mut filed = Vec::with_capacity(rows.len());
@@ -202,27 +218,40 @@ pub(super) async fn buckets<S: Sql>(
     c: &SqlCatalog<S>,
     after: &str,
     limit: u32,
-) -> Result<Vec<BucketUsage>> {
+) -> Result<(bool, Vec<BucketUsage>)> {
+    // One statement, so the page and the answer to "are the counters
+    // on" are of the same moment. Its first row is there for an empty
+    // page too, with no bucket in it.
     let rows = c
         .sql
         .query(
-            "SELECT u.bucket_id, b.name, u.live_objects, u.live_bytes \
-               FROM usage_buckets u JOIN buckets b ON b.id = u.bucket_id \
-              WHERE u.kind = 1 AND u.bucket_id > ?1 ORDER BY u.bucket_id LIMIT ?2",
+            "SELECT g.ok, p.bucket_id, p.name, p.live_objects, p.live_bytes \
+               FROM (SELECT (all_x = 1 AND all_o = 1 AND all_g = 1) AS ok \
+                       FROM usage_global WHERE id = 1) g \
+               LEFT JOIN (SELECT u.bucket_id, b.name, u.live_objects, u.live_bytes \
+                            FROM usage_buckets u JOIN buckets b ON b.id = u.bucket_id \
+                           WHERE u.kind = 1 AND u.bucket_id > ?1 \
+                           ORDER BY u.bucket_id LIMIT ?2) p ON 1 = 1 \
+              ORDER BY p.bucket_id",
             &[text(after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
+    let mut seeded = false;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
+        seeded = r.num::<i64>()? != 0;
+        let Some(bucket_id) = r.opt_text()? else {
+            continue;
+        };
         out.push(BucketUsage {
-            bucket_id: r.text()?,
+            bucket_id,
             name: r.text()?,
             live_objects: r.num()?,
             live_bytes: r.num()?,
         });
     }
-    Ok(out)
+    Ok((seeded, out))
 }
 
 // ---------------------------------------------------------------------------
@@ -230,22 +259,28 @@ pub(super) async fn buckets<S: Sql>(
 // ---------------------------------------------------------------------------
 
 /// Starts a recount. `false` when one is running and `restart` is not
-/// set. With `adopt` its figures replace the live counters at the end;
+/// set, and with `only_on` when the counters are off: that is checked
+/// in the statement that starts it, so a start cannot follow an `off`
+/// it did not see. With `adopt` its figures replace the live counters at the end;
 /// the first recount does that anyway.
 pub(super) async fn recount_start<S: Sql>(
     c: &SqlCatalog<S>,
     now: UnixMs,
     adopt: bool,
     restart: bool,
+    only_on: bool,
 ) -> Result<bool> {
     let restart = SqlValue::Int(i64::from(restart));
+    let only_on = SqlValue::Int(i64::from(only_on));
     let changed = c
         .sql
         .batch(vec![
             (
                 "DELETE FROM usage_buckets WHERE kind = 2 AND EXISTS \
-                   (SELECT 1 FROM usage_global WHERE id = 2 AND (pass = 0 OR ?1 = 1))",
-                vec![restart.clone()],
+                   (SELECT 1 FROM usage_global WHERE id = 2 AND (pass = 0 OR ?1 = 1)) \
+                   AND (?2 = 0 OR EXISTS (SELECT 1 FROM usage_global \
+                         WHERE id = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1))",
+                vec![restart.clone(), only_on.clone()],
             ),
             (
                 "UPDATE usage_global SET \
@@ -255,8 +290,10 @@ pub(super) async fn recount_start<S: Sql>(
                    ob_post = 0, ob_verify = 0, ob_release = 0, ob_done = 0, \
                    ob_cancelled = 0, ob_dead = 0, \
                    pass = 1, started_at = ?2, rows_seen = 0, adopt = ?3 \
-                 WHERE id = 2 AND (pass = 0 OR ?1 = 1)",
-                vec![restart, ms(now), SqlValue::Int(i64::from(adopt))],
+                 WHERE id = 2 AND (pass = 0 OR ?1 = 1) \
+                   AND (?4 = 0 OR EXISTS (SELECT 1 FROM usage_global \
+                         WHERE id = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1))",
+                vec![restart, ms(now), SqlValue::Int(i64::from(adopt)), only_on],
             ),
         ])
         .await?;
@@ -522,7 +559,7 @@ pub(super) async fn recount_step<S: Sql>(
             let changed = c.sql.batch(finish_stmts(now)).await?;
             // Ended by this call, not by another that ran beside it.
             if changed.last().copied().unwrap_or(0) == 1 {
-                step.finished = last_recount(c).await?;
+                step.finished = recount_record(c, Some(state.started_at)).await?;
             }
             return Ok(step);
         }

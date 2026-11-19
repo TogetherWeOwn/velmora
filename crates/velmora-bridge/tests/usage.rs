@@ -329,7 +329,10 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
                         ("INSERT INTO tx_guard (ok) VALUES (0)", vec![]),
                     ])
                     .await;
-                assert!(failed.is_err(), "{at}");
+                assert!(
+                    matches!(failed, Err(velmora_bridge::types::BridgeError::GuardFailed)),
+                    "{at}: {failed:?}"
+                );
                 assert_eq!(
                     before,
                     (levels(db, 1), levels(db, 2), bucket_counters(db)),
@@ -351,7 +354,7 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
             93..=94 => {
                 let (adopt, restart) = (rng.below(3) == 0, rng.below(4) == 0);
                 catalog
-                    .usage_recount_start(UnixMs(now), adopt, restart)
+                    .usage_recount_start(UnixMs(now), adopt, restart, false)
                     .await
                     .unwrap();
             }
@@ -391,7 +394,7 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
     // ends with the counters on and exact.
     let was_on = armed(db);
     assert!(catalog
-        .usage_recount_start(UnixMs(now), false, true)
+        .usage_recount_start(UnixMs(now), false, true, false)
         .await
         .unwrap());
     let done = loop {
@@ -456,12 +459,12 @@ async fn the_first_recount_switches_the_counters_on_in_bounded_steps() {
     assert!(idle.idle && idle.rows == 0 && idle.finished.is_none());
 
     assert!(catalog
-        .usage_recount_start(UnixMs(T0), false, false)
+        .usage_recount_start(UnixMs(T0), false, false, false)
         .await
         .unwrap());
     // A second start does not begin again.
     assert!(!catalog
-        .usage_recount_start(UnixMs(T0 + 1), false, false)
+        .usage_recount_start(UnixMs(T0 + 1), false, false, false)
         .await
         .unwrap());
 
@@ -555,7 +558,7 @@ async fn a_recount_reports_a_difference_and_replaces_only_when_asked() {
         let catalog = &catalog;
         async move {
             assert!(catalog
-                .usage_recount_start(UnixMs(T0), adopt, false)
+                .usage_recount_start(UnixMs(T0), adopt, false, false)
                 .await
                 .unwrap());
             loop {
@@ -590,7 +593,7 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
     let catalog = SqlCatalog::new(db);
     let db = &catalog.sql;
     assert!(catalog
-        .usage_recount_start(UnixMs(T0), false, false)
+        .usage_recount_start(UnixMs(T0), false, false, false)
         .await
         .unwrap());
     for _ in 0..8 {
@@ -600,7 +603,7 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
     assert_eq!((state.table, state.rows_seen), ("generations", 26));
 
     assert!(catalog
-        .usage_recount_start(UnixMs(T0 + 9), true, true)
+        .usage_recount_start(UnixMs(T0 + 9), true, true, false)
         .await
         .unwrap());
     let (state, _) = catalog.usage_recounts().await.unwrap();
@@ -617,6 +620,18 @@ async fn a_restart_drops_the_recount_under_way_and_off_stops_the_counters() {
     // Off: no trigger writes again, and the recount is gone.
     catalog.usage_off().await.unwrap();
     assert!(!catalog.usage_counters().await.unwrap().seeded);
+    assert!(!catalog.usage_recounts().await.unwrap().0.running);
+    // The weekly recount starts only while the counters are on: one
+    // that read "on" before the off does not start, and cannot switch
+    // them back on.
+    assert!(!catalog
+        .usage_recount_start(UnixMs(T0 + 10), false, false, true)
+        .await
+        .unwrap());
+    assert!(!catalog
+        .usage_recount_start(UnixMs(T0 + 10), false, true, true)
+        .await
+        .unwrap());
     assert!(!catalog.usage_recounts().await.unwrap().0.running);
     let frozen = (levels(db, 1), bucket_counters(db));
     db.meter_writes().unwrap();
@@ -657,7 +672,7 @@ async fn a_step_counts_no_more_than_the_largest_chunk() {
     });
     let catalog = SqlCatalog::new(db);
     catalog
-        .usage_recount_start(UnixMs(T0), false, false)
+        .usage_recount_start(UnixMs(T0), false, false, false)
         .await
         .unwrap();
     let out = catalog

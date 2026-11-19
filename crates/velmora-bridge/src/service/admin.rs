@@ -496,7 +496,8 @@ async fn ops_snapshot<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
 }
 
 /// `GET /_admin/usage/buckets[?after=ID][&limit=N]`: live objects and
-/// bytes per bucket, a page in bucket-id order.
+/// bytes per bucket, a page in bucket-id order. `seeded: false` says
+/// that the counters are off and the figures are stale or missing.
 async fn usage_buckets<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     raw_target: &str,
@@ -511,7 +512,7 @@ async fn usage_buckets<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
     {
         return Err(fail(400, "InvalidArgument", "after is not a bucket id."));
     }
-    let page = bridge
+    let (seeded, page) = bridge
         .catalog
         .usage_buckets(after, limit)
         .await
@@ -519,7 +520,9 @@ async fn usage_buckets<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
     let next = (page.len() as u64 == u64::from(limit))
         .then(|| page.last().map(|b| b.bucket_id.clone()))
         .flatten();
-    Ok(ok(&json!({ "buckets": page, "next_after": next })))
+    Ok(ok(
+        &json!({ "seeded": seeded, "buckets": page, "next_after": next }),
+    ))
 }
 
 /// `GET /_admin/cost`: the cost meter's last report, as it was written.
@@ -537,16 +540,19 @@ async fn cost<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T:
     if size > MAX_COST_REPORT {
         return Err(fail(502, "BadCostReport", "The cost report is too large."));
     }
+    // Exactly the bytes the HEAD saw, and so no more than the limit: a
+    // report replaced by a larger one since is cut short and fails as
+    // JSON below, without being held whole.
+    let span = crate::types::ByteSpan {
+        start: 0,
+        len: size,
+    };
     let bytes = bridge
         .cache
-        .get(COST_REPORT_KEY, None)
+        .get(COST_REPORT_KEY, Some(span))
         .await
         .or_internal()?
         .ok_or_else(none)?;
-    // Checked again: the report may have been replaced since the HEAD.
-    if bytes.len() as u64 > MAX_COST_REPORT {
-        return Err(fail(502, "BadCostReport", "The cost report is too large."));
-    }
     let report: Value = serde_json::from_slice(&bytes)
         .map_err(|_| fail(502, "BadCostReport", "The cost report is not JSON."))?;
     Ok(ok(&report))
@@ -566,7 +572,12 @@ async fn usage_recount<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
     let now = bridge.clock.now();
     let started = bridge
         .catalog
-        .usage_recount_start(now, flag(raw_target, "adopt"), flag(raw_target, "restart"))
+        .usage_recount_start(
+            now,
+            flag(raw_target, "adopt"),
+            flag(raw_target, "restart"),
+            false,
+        )
         .await
         .or_internal()?;
     let mut rows = 0u64;

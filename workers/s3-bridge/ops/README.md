@@ -949,28 +949,34 @@ Switching them on (once, after the migration):
    difference is logged as `alert: usage counters differ from the
    tables` and kept in `last_recount`; the counters are replaced only
    by `POST /_admin/usage/recount?adopt=1`. `restart=1` abandons a
-   recount that is running and begins again.
+   recount that is running and begins again; while a comparison is
+   running, `adopt=1` alone only continues it, so send
+   `restart=1&adopt=1` to replace the counters.
 
 Rows written: with packed plans, 52 per extent and 23 per object with
 the counters on, against 46 and 21 with them off (measured on the local
 rig; `rows_written_per_extent` in the slice tests prints both).
 
-Before rolling back to a Worker older than this one, send
-`POST /_admin/usage/off`: it switches the triggers off, and the totals
-are rebuilt by a recount when the newer Worker returns. An older Worker
+Start the first recount only when no Worker older than this one still
+serves, and before rolling back to one, send `POST /_admin/usage/off`,
+also while a recount is still running (a recount counts changes to the
+rows it has passed before the counters are on). It switches the
+triggers off and drops a running recount, and the totals are rebuilt
+by a recount when the newer Worker returns. An older Worker
 compares the number of rows a statement changed with one, and a
 statement that also moved a counter reports two.
 
 Read routes, all `GET` and served without a table scan:
 
 - `/_admin/ops-snapshot[?hours=N]`: the totals, the age of the oldest
-  due outbox row per stage, the hourly figures (default 48 hours, at
-  most 168) and the state of the recount.
+  due outbox row per stage, the hourly figures (the last 48 hours that had an event unless
+  `hours` says another number, at most 168; each names its hour) and the state of the recount.
   The hourly figures count outbox rows leaving a stage in that hour,
   as seen: a restore replay that closes a row counts as a verify, and
   a row written late is counted in the hour it was written.
 - `/_admin/usage/buckets[?after=&limit=]`: objects and bytes per
-  bucket, in pages; `next_after` is the cursor.
+  bucket, in pages; `next_after` is the cursor. `seeded: false` says
+  that the counters are off and the figures are stale or missing.
 - `/_admin/cost`: the JSON at `ops/cost/latest.json` in the cache
   bucket, as the cost job left it (404 when there is none).
 
@@ -978,7 +984,8 @@ Read routes, all `GET` and served without a table scan:
 `ADMIN_TOKEN`) opens these three and `/_admin/status`, with `GET` only;
 it opens nothing that changes state. `ADMIN_HOST`, when set, is the
 only host name on which `/_admin/` answers at all; on any other host
-the routes answer 404. It covers `/_admin/` only: creating and deleting a
+the routes answer 404. A caller through a service binding is held
+to it as well: the host name in the URL it fetches is the one checked. It covers `/_admin/` only: creating and deleting a
 bucket with the admin token (`PUT` and `DELETE` of `/<bucket>`) stays
 on the S3 host names.
 
@@ -987,8 +994,10 @@ one request in `METRICS_SAMPLE` (default 10) and every 5xx. A point has
 the method, the status class, `s3` or `admin`, and the colo as text,
 and the status, latency in ms, request bytes, response bytes and the
 sampling weight as numbers; sum the weight to estimate request counts.
-A read from Usenet (a cache miss) is a point of kind `cold`, never
-sampled. No bucket, key, query, header or request id is written.
+A run of reads from Usenet (cache misses) is a point of kind `cold`,
+never sampled. One GET can have several such runs and a copy reads
+too, so these points show how much is read from Usenet over time; they
+are not a hit rate and are not to be subtracted from the GET count. No bucket, key, query, header or request id is written.
 
 ## KEK
 

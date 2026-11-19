@@ -1860,7 +1860,9 @@ pub struct RecountState {
 pub struct RecountStep {
     /// No recount is running; nothing was done.
     pub idle: bool,
-    /// Table rows this step counted.
+    /// Table rows counted while this step ran: this step's, and those
+    /// of a step that ran beside it. A progress figure; the record of
+    /// the recount has the exact total.
     pub rows: u64,
     /// The recount ended with this step.
     pub finished: Option<UsageRecount>,
@@ -1873,13 +1875,15 @@ pub struct UsageSnapshot {
     /// Live objects and their plaintext bytes, over all buckets.
     pub live_objects: i64,
     pub live_bytes: i64,
-    /// Buckets that have, or had, a live object.
+    /// Bucket rows in the counters: buckets with a live object, and
+    /// those emptied since the last adopted recount.
     pub buckets_counted: u64,
     /// The earliest `next_at` of the rows waiting in each stage.
     pub oldest_post: Option<UnixMs>,
     pub oldest_verify: Option<UnixMs>,
     pub oldest_release: Option<UnixMs>,
-    /// Completed hours, newest first.
+    /// Completed hours that had an event, newest first: `hour` says
+    /// which, and an hour without events has no entry.
     pub hours: Vec<UsageHour>,
     pub recount: RecountState,
     pub last_recount: Option<UsageRecount>,

@@ -1693,8 +1693,11 @@ async fn ops_snapshot_reads_the_counters() {
 
     // Nothing of an object is in the snapshot: no key, no bucket name.
     let text = fx.get("/ops-snapshot").await.text();
-    for secret in ["waiting", "scratch", TOKEN] {
-        assert!(!text.contains(secret), "{secret} in {text}");
+    for (i, private) in ["waiting", "scratch", TOKEN].iter().enumerate() {
+        assert!(
+            !text.contains(private),
+            "private text {i} is in the snapshot"
+        );
     }
     assert_eq!(fx.get("/ops-snapshot?hours=x").await.status, 400);
 }
@@ -1712,6 +1715,13 @@ async fn usage_buckets_pages_in_id_order() {
 
     let all = fx.get("/usage/buckets").await.json();
     assert_eq!(all["next_after"], Value::Null);
+    assert_eq!(all["seeded"], true);
+    // A page past the last bucket is empty, and still says so.
+    let past = fx.get("/usage/buckets?after=zzzz").await.json();
+    assert_eq!(
+        (&past["seeded"], &past["buckets"]),
+        (&json!(true), &json!([]))
+    );
     let listed = all["buckets"].as_array().unwrap();
     assert_eq!(listed.len(), 3);
     for (row, id) in listed.iter().zip(&ids) {
@@ -1792,6 +1802,10 @@ async fn recount_runs_in_steps_and_off_switches_the_counters_off() {
     assert_eq!(status["outbox"], json!({ "post": 5 }));
     assert_eq!(fx.get("/ops-snapshot").await.json()["seeded"], false);
     fx.put(&bucket, "while-off", b"z").await;
+    // The bucket figures are marked as stale while the counters are off.
+    let stale = fx.get("/usage/buckets").await.json();
+    assert_eq!(stale["seeded"], false);
+    assert_eq!(stale["buckets"][0]["live_objects"], 5);
 
     // One request, one bounded step: 2 of the 6 extents.
     let r = fx.post("/usage/recount?steps=1&chunk=2").await.json();

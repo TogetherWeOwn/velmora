@@ -1202,16 +1202,24 @@ pub trait Catalog {
     /// The catalogue-wide counters: one row read.
     async fn usage_counters(&self) -> Result<UsageCounters>;
     /// The counters, the oldest waiting row of each stage, the last
-    /// `hours` completed hours and the state of the recount. No read
+    /// `hours` completed hours that had an event and the state of the recount. No read
     /// here grows with the tables.
     async fn usage_snapshot(&self, hours: u32) -> Result<UsageSnapshot>;
-    /// Live objects per bucket, in bucket-id order after `after`.
-    async fn usage_buckets(&self, after: &str, limit: u32) -> Result<Vec<BucketUsage>>;
+    /// Live objects per bucket, in bucket-id order after `after`, and
+    /// whether the counters were on when the page was read: the figures
+    /// of counters that are off are stale.
+    async fn usage_buckets(&self, after: &str, limit: u32) -> Result<(bool, Vec<BucketUsage>)>;
     /// Starts a recount of the counters from the tables. `false` when
     /// one is running and `restart` is not set. The first recount
     /// switches the counters on; a later one replaces them only with
     /// `adopt`, and records what differed either way.
-    async fn usage_recount_start(&self, now: UnixMs, adopt: bool, restart: bool) -> Result<bool>;
+    async fn usage_recount_start(
+        &self,
+        now: UnixMs,
+        adopt: bool,
+        restart: bool,
+        only_on: bool,
+    ) -> Result<bool>;
     /// One bounded step of the running recount: at most `chunk` table
     /// rows, or its end.
     async fn usage_recount_step(&self, chunk: u32, now: UnixMs) -> Result<RecountStep>;

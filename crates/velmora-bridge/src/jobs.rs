@@ -687,9 +687,13 @@ where
             // Only a catalogue whose counters a recount switched on has
             // a last one: nothing is started before the operator's.
             let due = last.is_some_and(|l| now.0 - l.finished_at.0 >= RECOUNT_EVERY_MS);
+            // Started only while the counters are on, which the
+            // statement that starts it checks: not after an `off`.
             if !due
-                || !self.catalog.usage_counters().await?.seeded
-                || !self.catalog.usage_recount_start(now, false, false).await?
+                || !self
+                    .catalog
+                    .usage_recount_start(now, false, false, true)
+                    .await?
             {
                 return Ok(());
             }

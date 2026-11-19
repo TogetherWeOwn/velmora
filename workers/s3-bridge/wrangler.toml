@@ -178,7 +178,7 @@ GET_FANOUT_BYTES = "1073741824"
 
 # Request metrics: one request in METRICS_SAMPLE (default 10) and every
 # 5xx is a data point with method, status, latency, bytes and colo; a
-# read from Usenet (a cache miss) is a point of its own. No bucket, key,
+# run of reads from Usenet (cache misses) is a point of its own. No bucket, key,
 # query, header or request id is written. Without this binding the
 # Worker writes none. See "Usage counters and metrics" in ops/README.md.
 [[analytics_engine_datasets]]
