@@ -113,10 +113,13 @@ const RECORD_VERSION: u32 = 1;
 /// Format version of a segmented generation record: of its head and of
 /// each of its segments.
 pub const SEGMENTED_VERSION: u32 = 2;
-/// Most segments one head names. A head says how many it has; this
-/// bounds what a reader holds of one, and the index in a segment name
-/// has room for it.
-pub const MAX_SEGMENTS: usize = 8192;
+/// Most segments one head names: a head with more is malformed, and a
+/// writer never makes one. Every reader has to get through all the
+/// segments of a head in one go (the recovery copy before it sends the
+/// head, a replay before it publishes), so this is what one job of each
+/// can read, and the one bound for them all. At 4,096 extents to a
+/// segment it is 786,432 extents.
+pub const MAX_SEGMENTS: usize = 192;
 
 const ERR_RECORD: BridgeError = BridgeError::Invalid("recovery record is malformed");
 const ERR_VERSION: BridgeError = BridgeError::Invalid("recovery record version is unknown");

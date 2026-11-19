@@ -16,9 +16,9 @@ use velmora::rng::SystemRng;
 use velmora_bridge::config::{ConfigError, Maintenance};
 use velmora_bridge::copy::{
     pass_due, plan_hint, Copier, CopyCounts, StepError, BEGAN_KEY, DOWN_KEY, FRESH_MS,
-    HEAD_SEGMENTS, HINT_PAUSE_MS, HINT_RETRY_MS, HINT_RETRY_SECS, JOB_COPIES, MIN_AGE_MS,
-    PASS_INTERVAL_MS, RETRY_WINDOW_MS, STORE_KEY, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS,
-    SWEEP_RETRY_MS, SWEPT_KEY, WALKED_KEY, WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
+    HINT_PAUSE_MS, HINT_RETRY_MS, HINT_RETRY_SECS, JOB_COPIES, MIN_AGE_MS, PASS_INTERVAL_MS,
+    RETRY_WINDOW_MS, STORE_KEY, SWEEP_KEY, SWEEP_MS, SWEEP_RECORDS, SWEEP_RETRY_MS, SWEPT_KEY,
+    WALKED_KEY, WALK_INTERVAL_MS, WALK_KEY, WALK_SOON_MS, WANT_KEY,
 };
 use velmora_bridge::crypto::seal_manifest;
 use velmora_bridge::remote::{
@@ -4868,6 +4868,7 @@ async fn the_cursors_of_a_pass_keep_their_names() {
 use segmented_support::Sealed;
 use velmora_bridge::recovery::{
     record_name, BucketRecord, ExtentRecord, GenerationManifest, GenerationRecord, Layout,
+    MAX_SEGMENTS,
 };
 
 /// A record of `extents` extents of 10 bytes for the generation `id`;
@@ -5228,22 +5229,87 @@ async fn a_segmented_record_with_more_plans_than_a_job_takes_several() {
     }
 }
 
-/// A head with more segments than one job can look at is not copied:
-/// it is counted as failed in every pass, and holds nothing back.
+/// A head with the most segments there are is sent, in the sweep and
+/// in the walk; one with more is no head, and holds nothing back.
 #[tokio::test(flavor = "current_thread")]
-async fn a_head_with_more_segments_than_a_job_takes_is_counted_as_failed() {
-    let w = World::new();
-    let key = generation(OLD, "_a");
-    w.segmented(&key, HEAD_SEGMENTS + 1, 1, false).await;
-    let most = generation(OLD, "_b");
-    let sealed = w.segmented(&most, HEAD_SEGMENTS, 1, false).await;
-    let counts = w.pass().await;
-    assert_eq!(counts.failed, 1, "{counts:?}");
-    assert!(w.e2.get(&key).is_none());
-    assert_eq!(w.e2.get(&most), Some(sealed.head_sealed.clone()));
-    // The segments of both went over, as keys of their own or before
-    // the head that fits.
-    assert_eq!(w.e2.puts(), 2 * HEAD_SEGMENTS + 2);
+async fn a_head_with_the_most_segments_is_sent_and_one_with_more_is_none() {
+    for age in [600_000, OLD] {
+        let w = World::new();
+        let key = generation(age, "_a");
+        let fresh = age != OLD;
+        w.segmented(&key, MAX_SEGMENTS + 1, 1, fresh).await;
+        let most = generation(age, "_b");
+        let sealed = w.segmented(&most, MAX_SEGMENTS, 1, fresh).await;
+        let counts = w.pass().await;
+        assert_eq!(counts.source_unreadable, 1, "{counts:?}");
+        assert_eq!(counts.failed, 0, "{counts:?}");
+        assert!(w.e2.get(&key).is_none());
+        assert_eq!(puts_of(w.e2, &key), 0);
+        assert_eq!(w.e2.get(&most), Some(sealed.head_sealed.clone()));
+        assert_eq!(puts_of(w.e2, &most), 1);
+        for (name, bytes) in &sealed.segments {
+            assert_eq!(w.e2.get(name).as_ref(), Some(bytes));
+            assert!(put_at(w.e2, name) < put_at(w.e2, &most), "{name}");
+        }
+    }
+}
+
+/// A head the job comes to with too little room left for its segments
+/// is left to the next job, which sends it: after some plans that were
+/// still to look at, and after a group of plans looked at again for a
+/// record that is fresh for the last time.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_that_does_not_fit_into_the_rest_of_a_job_is_sent_by_the_next() {
+    // Fresh with every plan written, and fresh for the last time with
+    // one plan that is not.
+    for (age, lost) in [(600_000, false), (FRESH_MS - 60_000, true)] {
+        let case = format!("age {age}");
+        let w = World::new();
+        let key = generation(age, "_a");
+        // 192 segments, and 192 plans of which 70 are still to send:
+        // the job that sends those has no room for the segments.
+        let sealed = w.segmented(&key, MAX_SEGMENTS, 1, true).await;
+        let plans: Vec<String> = sealed
+            .plain
+            .iter()
+            .flat_map(|s| &s.extents)
+            .map(|e| format!("m/art/{}", e.id))
+            .collect();
+        for plan in &plans[..MAX_SEGMENTS - 70] {
+            w.e2.set(plan, &w.safety.stored(plan).unwrap().bytes);
+        }
+        if lost {
+            assert!(w.safety.lose(&plans[MAX_SEGMENTS - 1]));
+        }
+        let mut jobs = 0;
+        let mut head_job = None;
+        let mut cursor = Some(String::new());
+        let pass = w.clock.now();
+        while let Some(at) = cursor {
+            jobs += 1;
+            assert!(jobs < 50, "{case}: the pass does not end");
+            let step = w.copier().step(pass, &at).await.unwrap();
+            assert_eq!(step.counts.failed, 0, "{case}");
+            if head_job.is_none() && w.e2.get(&key).is_some() {
+                head_job = Some(jobs);
+            }
+            cursor = step.next;
+        }
+        assert!(head_job.is_some_and(|job| job > 1), "{case}: {head_job:?}");
+        // The head once, after every segment. A segment may go twice:
+        // the pass also comes to it as a key of its own, and sends it
+        // again when it listed the store before the head's job did.
+        assert_eq!(w.e2.get(&key), Some(sealed.head_sealed.clone()), "{case}");
+        assert_eq!(puts_of(w.e2, &key), 1, "{case}");
+        for (name, bytes) in &sealed.segments {
+            assert_eq!(w.e2.get(name).as_ref(), Some(bytes), "{case}");
+            assert!(put_at(w.e2, name) < put_at(w.e2, &key), "{case}: {name}");
+            assert!(puts_of(w.e2, name) <= 2, "{case}: {name}");
+        }
+        for plan in &plans {
+            assert!(puts_of(w.e2, plan) <= 1, "{case}: {plan}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

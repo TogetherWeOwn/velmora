@@ -10,13 +10,15 @@ mod service_support;
 use segmented_support::*;
 use service_support::*;
 use sha2::{Digest, Sha256};
-use velmora_bridge::crypto::open_manifest;
+use velmora::rng::SystemRng;
+use velmora_bridge::crypto::{open_manifest, seal_manifest};
 use velmora_bridge::recovery::{
     read_generation, read_stored_generation, BucketRecord, ExtentRecord, GenerationHead,
     GenerationManifest, GenerationRecord, Layout, Segment, SegmentEntry, StoredGeneration,
     MAX_SEGMENTS, SEGMENTED_VERSION,
 };
 use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::testkit::TestKek;
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
@@ -283,6 +285,25 @@ fn golden(name: &str, bytes: &[u8]) {
 /// before format 2 existed, and the plaintexts of a head and of a
 /// segment are the ones checked in. (The sealed bytes have a random
 /// nonce; what is sealed is what a format is.)
+/// The file `name` of sealed bytes opens under the test key and the
+/// record name `record` to `plain`. With `VELMORA_WRITE_GOLDEN` set,
+/// seals `plain` and writes the file.
+fn sealed_golden(name: &str, record: &str, plain: &[u8]) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    let kek = TestKek::new();
+    if std::env::var_os("VELMORA_WRITE_GOLDEN").is_some() {
+        let sealed = seal_manifest(&kek, record, plain, &mut SystemRng).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+    }
+    let sealed = std::fs::read(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let opened = open_manifest(&kek, record, &sealed).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    assert_eq!(&opened[..], plain, "{name}");
+    // Under another name it does not open.
+    assert!(open_manifest(&kek, &format!("{record}0"), &sealed).is_err());
+}
+
 #[test]
 fn the_bytes_of_both_formats_are_the_ones_checked_in() {
     let m = golden_manifest();
@@ -300,8 +321,25 @@ fn the_bytes_of_both_formats_are_the_ones_checked_in() {
         &serde_json::to_vec(&segments[1]).unwrap(),
     );
 
-    // What is checked in reads back as the same record.
+    // What the writer makes of the rows of that object is the record
+    // that is checked in.
+    let rows: Vec<ExtentRow> = (0..m.extents.len()).map(|i| m.extent(i).unwrap()).collect();
+    let made = GenerationManifest::new(&m.bucket(), &m.generation().unwrap(), &rows).unwrap();
+    golden("generation-v1.json", &serde_json::to_vec(&made).unwrap());
+
+    // Sealed once under the test key, each under its own name: they
+    // still open, and to the bytes above.
     let name = format!("m/{}", m.generation.id);
+    let plain = serde_json::to_vec(&m).unwrap();
+    sealed_golden("generation-v1.sealed", &name, &plain);
+    sealed_golden("generation-v2-head.sealed", &name, &head_plain);
+    sealed_golden(
+        "generation-v2-segment-1.sealed",
+        &Layout::flat().segment_key(set, 1),
+        &serde_json::to_vec(&segments[1]).unwrap(),
+    );
+
+    // What is checked in reads back as the same record.
     assert_eq!(GenerationHead::parse(&name, &head_plain).unwrap(), head);
     assert_eq!(head.extent_count(), 5);
     assert_eq!(
@@ -759,40 +797,198 @@ async fn a_truncated_or_inconsistent_head_is_unreadable() {
     );
 }
 
-/// A segment that goes missing while a replay is under way: the calls
-/// before it wrote rows of the generation, and still nothing is
-/// published.
-#[tokio::test(flavor = "current_thread")]
-async fn a_segment_lost_during_a_replay_publishes_nothing() {
-    let layout = Layout::flat();
-    let (rig, bucket, _, _) = world(&layout).await;
-    let sealed = segment(&rig, &bucket, &layout, 64).await;
-    wipe(&rig);
-    let limits = ReplayLimits {
-        records: 1,
-        extents: 10,
-    };
+/// Replays until the cursor is `at` extents or more into `big`, with
+/// `limits`, and returns the cursor.
+async fn replay_into(rig: &Rig, limits: ReplayLimits, at: u32) -> ReplayCursor {
     let mut cursor = ReplayCursor::start(UnixMs(0));
-    // Into the first segment of `big`.
-    while cursor.extent == 0 {
+    for _ in 0..1000 {
+        if cursor.extent >= at {
+            return cursor;
+        }
         let step = rig.bridge.replay_step_within(cursor, limits).await.unwrap();
         cursor = step.next.expect("the replay goes on");
     }
-    assert!(cursor.extent > 0 && cursor.extent < 64, "{cursor:?}");
-    assert!(rig.bridge.safety.inner.lose(&sealed.segments[2].0));
+    panic!("the replay does not come to extent {at}");
+}
+
+/// Replays from `cursor` to the end, and returns what was unreadable.
+async fn replay_from(rig: &Rig, limits: ReplayLimits, cursor: ReplayCursor) -> Vec<String> {
     let mut unreadable = Vec::new();
     let mut next = Some(cursor);
+    let mut calls = 0;
     while let Some(at) = next {
+        calls += 1;
+        assert!(calls < 1000, "the replay does not end");
         let mut step = rig.bridge.replay_step_within(at, limits).await.unwrap();
         next = step.next.take();
         unreadable.extend(step.unreadable);
     }
-    assert!(unreadable.contains(&sealed.head_key), "{unreadable:?}");
-    assert!(unreadable.contains(&sealed.segments[2].0), "{unreadable:?}");
-    assert_eq!(rig.count("objects"), 2);
-    let signer = reissue_key(&rig).await;
-    get(&rig, &signer, "big").await.expect(404);
-    assert_eq!(get(&rig, &signer, "after").await.expect(200).body, b"after");
+    unreadable
+}
+
+/// A segment that goes missing or is exchanged while a replay is under
+/// way: the calls before it wrote rows of the generation, and still
+/// nothing is published. Every segment is read again to publish, so
+/// this holds for a segment the replay is long past.
+#[tokio::test(flavor = "current_thread")]
+async fn a_segment_lost_during_a_replay_publishes_nothing() {
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 10,
+    };
+    // Where the cursor is when it happens, which segment, and whether
+    // the segment is lost or exchanged.
+    for (at, which, exchanged) in [
+        (1, 2, false),
+        // The cursor is in the last segment: no call reads segment 0
+        // again for its extents.
+        (140, 0, false),
+        (140, 0, true),
+        (140, 1, true),
+    ] {
+        let case = format!("at {at}: segment {which}, exchanged {exchanged}");
+        let layout = Layout::flat();
+        let (rig, bucket, _, _) = world(&layout).await;
+        let sealed = segment(&rig, &bucket, &layout, 64).await;
+        wipe(&rig);
+        let cursor = replay_into(&rig, limits, at).await;
+        assert!((cursor.extent as usize) < EXTENTS, "{case}: {cursor:?}");
+        let name = &sealed.segments[which].0;
+        assert!(rig.bridge.safety.inner.lose(name));
+        if exchanged {
+            // Another segment that opens under this name and says what
+            // the lost one said: sealed again, it is not the one the
+            // head names.
+            let (_, other) = seal_segment(&rig.bridge.kek, &layout, &sealed.plain[which]);
+            assert_ne!(other, sealed.segments[which].1);
+            store(&rig, &bucket, name, other).await;
+        }
+        let unreadable = replay_from(&rig, limits, cursor).await;
+        assert!(
+            unreadable.contains(&sealed.head_key),
+            "{case}: {unreadable:?}"
+        );
+        assert!(unreadable.contains(name), "{case}: {unreadable:?}");
+        assert_eq!(rig.count("objects"), 2, "{case}");
+        assert_eq!(rig.count("generations"), 2, "{case}");
+        assert_eq!(rig.count("generation_extents"), 2, "{case}");
+        // What the calls before wrote is left: extents of no
+        // generation, as an upload that was not completed leaves them.
+        let left = rig.count("extents");
+        assert!(left > 2 && left <= 2 + EXTENTS as i64, "{case}: {left}");
+        let signer = reissue_key(&rig).await;
+        get(&rig, &signer, "big").await.expect(404);
+        assert_eq!(get(&rig, &signer, "after").await.expect(200).body, b"after");
+    }
+}
+
+/// A record stored under a name of each layout, the first of which
+/// loses a segment while a replay is under way: the other is replayed
+/// from its first extent, whatever the cursor had counted in the first,
+/// and is published whole. The first is not read again by the calls
+/// that follow.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_under_two_names_is_replayed_from_the_one_that_reads() {
+    for extents in [10, 50, 100] {
+        let limits = ReplayLimits {
+            records: 1,
+            extents,
+        };
+        let flat = Layout::flat();
+        let tenant = Layout::default_tenant();
+        let (rig, bucket, _, body) = world(&flat).await;
+        let (name, m) = record_of(&rig, &bucket, "big", &flat).await;
+        let first = segment_from(&rig, &bucket, &flat, &name, &m, 64).await;
+        // The same record under the tenant name, in other segments.
+        let twin = tenant.of_flat(&name);
+        let second = segment_from(&rig, &bucket, &tenant, &twin, &m, 50).await;
+        wipe(&rig);
+        let cursor = replay_into(&rig, limits, 1).await;
+        assert_eq!(cursor.name, name, "{cursor:?}");
+        // Not the segment the cursor is in.
+        let lost = if cursor.extent < 128 { 2 } else { 0 };
+        assert!(rig.bridge.safety.inner.lose(&first.segments[lost].0));
+        // Up to the call that gives the first name up.
+        let mut cursor = cursor;
+        let mut unreadable = Vec::new();
+        while cursor.name == name {
+            let step = rig.bridge.replay_step_within(cursor, limits).await.unwrap();
+            unreadable.extend(step.unreadable);
+            cursor = step.next.expect("the replay goes on");
+        }
+        // The count is of the other name now, and from its start.
+        assert_eq!(cursor.name, twin, "{cursor:?}");
+        assert!(cursor.extent as usize <= extents, "{cursor:?}");
+        unreadable.extend(replay_from(&rig, limits, cursor).await);
+        assert!(unreadable.contains(&first.head_key), "{unreadable:?}");
+        assert_eq!(
+            unreadable.iter().filter(|n| **n == first.head_key).count(),
+            1,
+            "{unreadable:?}"
+        );
+        assert!(!unreadable.contains(&second.head_key), "{unreadable:?}");
+        assert_eq!(rig.count("objects"), 3);
+        assert_eq!(rig.count("extents"), 2 + EXTENTS as i64);
+        let signer = reissue_key(&rig).await;
+        assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
+    }
+}
+
+/// A head is the record its name promises and names a set by an id of
+/// the alphabet of a set id, and of nothing else: the set id goes into
+/// the names of the segments.
+#[test]
+fn a_head_of_another_name_or_with_a_set_id_that_is_none_is_refused() {
+    let m = golden_manifest();
+    let set = "s_0000018bcfe568050123456789abcdef";
+    let segments = split(&m, set, 2);
+    let digests = vec![vec![0xd0; 32]; segments.len()];
+    let head = head_of(&m, set, &segments, &digests);
+    let name = format!("m/{}", m.generation.id);
+    let parse = |name: &str, head: &GenerationHead| {
+        GenerationHead::parse(name, &serde_json::to_vec(head).unwrap())
+    };
+    parse(&name, &head).unwrap();
+    let tenant = Layout::default_tenant().of_flat(&name);
+    parse(&tenant, &head).unwrap();
+
+    // The name of another generation, of a tombstone, of a plan.
+    let mut other = name.clone();
+    other.pop();
+    other.push('0');
+    assert_ne!(other, name);
+    for wrong in [
+        other,
+        format!("m/del/{}", m.generation.id),
+        format!("m/art/{}", m.generation.id),
+        format!("m/seg/{set}/00000"),
+    ] {
+        let err = parse(&wrong, &head).expect_err(&wrong);
+        assert_eq!(invalid(err), "recovery record is malformed", "{wrong}");
+    }
+
+    for set in [
+        "",
+        "s_",
+        "s_A",
+        "x_0000018bcfe56805",
+        "../s_1",
+        "s_1/../../g_1",
+        "s_1/",
+        "s_ 1",
+        "s_0000018bcfe568050123456789abcdef\n",
+        // 65 characters after the prefix.
+        &format!("s_{}", "0".repeat(65)),
+    ] {
+        let mut forged = head.clone();
+        forged.set = set.to_string();
+        let err = parse(&name, &forged).expect_err(set);
+        assert_eq!(invalid(err), "recovery record is malformed", "{set:?}");
+    }
+    // The longest id there is.
+    let mut longest = head.clone();
+    longest.set = format!("s_{}", "0".repeat(64));
+    parse(&name, &longest).unwrap();
 }
 
 /// A version this build does not know is refused as unknown: 3 by this

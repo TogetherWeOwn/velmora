@@ -351,8 +351,10 @@ generation, tombstone and article plan records:
 | `tenant` | `m/x/<tenant>/<id>` | `m/x/<tenant>/del/<id>` | `m/x/<tenant>/art/<extent>` |
 
 Every write belongs to tenant `t_0000000000000000` today. The names
-under `m/x/<tenant>/seg/` are reserved for records that hold a part of
-an article plan. Any other value of the variable refuses to start.
+under `m/seg/` and `m/x/<tenant>/seg/` are the segments of a segmented
+generation record: each holds a run of the extents of one object, and
+is read only through the generation record that names it. No build
+writes them yet. Any other value of the variable refuses to start.
 
 - A record is never renamed, moved or rewritten: it is sealed under its
   whole name and would not open under another. Changing the setting

@@ -136,8 +136,8 @@ use crate::crypto::open_manifest;
 use crate::ports::{BlobEntry, BlobMeta, BlobStore, Clock, JobSink, Kek};
 use crate::recovery::{
     article_key, other_plan_key, plan_keys, read_segment, record_name, record_version,
-    segment_plan_keys, start_after, GenerationHead, Layout, RecordKind, RECORD_PREFIX,
-    SEGMENTED_VERSION, TENANT_DIR, TENANT_KEY_PREFIX,
+    segment_plan_keys, start_after, GenerationHead, Layout, RecordKind, MAX_SEGMENTS,
+    RECORD_PREFIX, SEGMENTED_VERSION, TENANT_DIR, TENANT_KEY_PREFIX,
 };
 use crate::remote::{md5_hex, HttpSend, RemoteError, S3Remote, MAX_KEY_BYTES};
 use crate::types::{
@@ -218,12 +218,14 @@ pub const JOB_PAGES: u32 = 40;
 pub const JOB_MS: i64 = 20_000;
 /// Copies under way at once.
 pub const CONCURRENCY: usize = 6;
-/// Most segments of a generation record that is copied. A job looks at
-/// every segment of a record before it sends the head, so they all
-/// have to fit into one job, also beside the other records of its
-/// chunk. A record with more is counted as failed in every pass that
-/// comes to it.
-pub const HEAD_SEGMENTS: usize = JOB_COPIES - CONCURRENCY;
+/// Segments a job has room for whenever a head is the first record it
+/// comes to. A job looks at every segment of a record before it sends
+/// the head, so they all have to fit into one job, beside the other
+/// records of its chunk and one group of article plans looked at again.
+/// No head has more ([`MAX_SEGMENTS`]): one that does not fit into the
+/// rest of a job is left to the next, and fits there.
+pub const HEAD_SEGMENTS: usize = JOB_COPIES - 2 * CONCURRENCY;
+const _: () = assert!(MAX_SEGMENTS <= HEAD_SEGMENTS);
 /// Source keys read per page.
 pub const PAGE: u32 = 1000;
 /// A job that failed is retried while its pass is younger than this.
@@ -552,7 +554,7 @@ fn fresh(prefix: &str, pass: UnixMs) -> String {
 /// | up to the fresh tombstones (`m/art/`, older `m/del/`) | walk: `Low` |
 /// | fresh `m/del/g_` | sweep: `Tombstones` |
 /// | older `m/g_` | walk: `High` |
-/// | fresh `m/g_`, and on up to `m/x/` (`m/rk/` and every other family) | sweep: `Generations` |
+/// | fresh `m/g_`, and on up to `m/x/` (`m/rk/`, `m/seg/` and every other family) | sweep: `Generations` |
 /// | `m/x/` up to the fresh tombstones of `T` (`T art/`, older `T del/`) | walk: `TenantLow` |
 /// | fresh `T del/g_` | sweep: `TenantTombstones` |
 /// | older `T g_` | walk: `TenantHigh` |
@@ -560,7 +562,9 @@ fn fresh(prefix: &str, pass: UnixMs) -> String {
 /// | everything after `T g_` | walk: `Tail` |
 ///
 /// Every key under `m/` is in one part of the walk or of the sweep, in
-/// every pass, wherever the fresh records begin.
+/// every pass, wherever the fresh records begin. The segments of the
+/// flat layout (`m/seg/`) are in the sweep, so every pass lists them
+/// all; those of the tenant layout are in the `Tail` of the walk.
 fn span(phase: Phase, pass: UnixMs) -> Span {
     let layout = phase.layout();
     let until = match phase {
@@ -1855,10 +1859,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         budget: &mut Budget,
         counts: &mut CopyCounts,
     ) -> Option<Copied> {
+        // At most `MAX_SEGMENTS`, which a job that starts at this head
+        // has room for (`HEAD_SEGMENTS`).
         let segments = head.segments.len();
-        if segments > HEAD_SEGMENTS {
-            return Some(Copied::Failed);
-        }
         if JOB_COPIES.saturating_sub(budget.copies) < segments {
             return None;
         }
