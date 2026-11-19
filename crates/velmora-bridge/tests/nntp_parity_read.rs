@@ -393,3 +393,24 @@ async fn a_rebuilt_article_that_is_not_the_planned_one_is_not_used() {
     assert_eq!(verified(&stats), 3);
     assert_eq!(rig.bridge.budget.in_use(), 0);
 }
+
+/// The preferred provider gives fewer connections than the reader asks
+/// for, and lacks a data article; the provider of the next tier is asked
+/// for it and lacks it too, and has no parity for it. The connections
+/// of the preferred provider were ended for that, so its slots are free:
+/// the parity article is read from it and the article rebuilt.
+#[tokio::test]
+async fn parity_is_read_from_a_provider_whose_slots_a_tier_switch_freed() {
+    let mut st = posted(12, THREE, 2).await;
+    // More sockets than `p0` has slots, and `p1` only asked after it.
+    st.rig.bridge.cfg.cold_sockets = 4;
+    st.rig.bridge.cfg.providers[1].priority = 1;
+    st.rig.servers[0].hide(&st.data[1].message_id).await;
+    st.rig.servers[1].hide(&st.data[1].message_id).await;
+    st.rig.servers[1].hide(&st.parity[0].message_id).await;
+
+    let (read, stats) = st.read().await;
+
+    assert!(read == ColdFetch::Filled(st.s.cipher.clone()), "{stats:?}");
+    assert_eq!((stats.rebuilt, stats.unrecoverable), (1, 0));
+}

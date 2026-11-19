@@ -24,8 +24,8 @@ use super::common::{
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
 use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{
-    cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
-    COLD_WAIT_MS,
+    cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_rebuild_most, cold_step_bytes, ColdFetch,
+    ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
@@ -809,13 +809,18 @@ where
 {
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
     // A cold extent comes back whole and needs twice its size while it
-    // does. Beside the pieces already held that can be more than the
+    // does, and more if articles of it are lost and rebuilt from its
+    // parity. Beside the pieces already held that can be more than the
     // budget has, however long the read waits. Such an extent is read
     // once on its own first: that leaves it in the cache, and the read
     // below then needs room for its piece only.
     let mut held = 0u64;
     for piece in &todo {
-        let cold = cold_read_bytes(piece.extent.cipher_size, bridge.cfg.cold_sockets);
+        let (size, sockets) = (piece.extent.cipher_size, bridge.cfg.cold_sockets);
+        // Whether the extent has parity, and lost anything, is not
+        // known before it is read: the most a rebuild of it may hold.
+        let rebuilt = cold_step_bytes(size, sockets).saturating_add(cold_rebuild_most(size));
+        let cold = cold_read_bytes(size, sockets).max(rebuilt);
         if held > 0 && held.saturating_add(cold) > bridge.budget.capacity() {
             drop(
                 read_piece(bridge, bucket, piece)

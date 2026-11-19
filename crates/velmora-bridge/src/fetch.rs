@@ -933,6 +933,20 @@ pub fn cold_rebuild_bytes(shard_len: u64, lost: u64) -> u64 {
         .saturating_add(lost.saturating_mul(lost).saturating_mul(4))
 }
 
+/// The most [`cold_rebuild_bytes`] is for an extent of `cipher_size`
+/// bytes: as many articles lost as a new extent of that size gets
+/// parity articles ([`crate::parity::parity_count`]). Nothing for a size
+/// that has no stripe.
+pub fn cold_rebuild_most(cipher_size: u64) -> u64 {
+    match crate::parity::stripe_of(cipher_size) {
+        Some((k, shard)) => {
+            let most = crate::parity::parity_count(usize::from(k)) as u64;
+            cold_rebuild_bytes(u64::from(shard), most)
+        }
+        None => 0,
+    }
+}
+
 /// Times one provider may answer `430` for one article within one cold
 /// read before the article is asked of the next: the second ask comes
 /// after the provider's other articles (a fresh article can be invisible
@@ -1438,6 +1452,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                             && index(s).is_some_and(|i| out[i].is_none())
                     });
                 self.sessions = kept;
+                // The slots of a session that is ended are free again:
+                // its provider is not full, and is given sessions anew
+                // when its tier has work once more (the parity articles
+                // of an extent, after a lower tier was asked for a data
+                // article).
+                for i in other.iter().filter_map(index) {
+                    full[i] = false;
+                }
                 ProviderSession::close_all(other).await;
                 if let Err(e) = self.staff(order, &work, out, full).await {
                     failure = Some(e);

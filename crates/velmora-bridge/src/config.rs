@@ -741,12 +741,9 @@ impl BridgeConfig {
         // beside the extent, at most as many articles as the largest
         // extent has parity. Without room for both, such a read would
         // be refused every time.
-        let rebuild = match crate::parity::stripe_of(cipher) {
-            Some((k, shard)) if parity => {
-                let most = crate::parity::parity_count(usize::from(k)) as u64;
-                crate::fetch::cold_rebuild_bytes(u64::from(shard), most)
-            }
-            _ => 0,
+        let rebuild = match parity {
+            true => crate::fetch::cold_rebuild_most(cipher),
+            false => 0,
         };
         let fits = |sockets: &u32| {
             let step = crate::fetch::cold_step_bytes(cipher, *sockets);
