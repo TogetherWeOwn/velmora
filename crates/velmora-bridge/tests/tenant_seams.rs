@@ -110,6 +110,8 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // The recovery copy: the tenant phases, and the other name
             // of a plan.
             ("bridge/copy.rs", 2),
+            // The directory of a store with one tenant.
+            ("bridge/directory.rs", 1),
             // The replay: the listing, and the plans of an extent.
             ("bridge/replay.rs", 3),
             // The queue consumer.
@@ -269,6 +271,68 @@ fn the_reserved_names_are_used_by_nothing() {
         let files: Vec<&String> = found.keys().filter(|f| *f != TENANT).collect();
         assert!(files.is_empty(), "{name}: {files:?}");
     }
+}
+
+/// The catalogue id is read from the configuration in one place, the
+/// accessor of the bridge, and in the one listed place of the request
+/// path. A bridge of a unit will answer there with the id of its unit.
+/// The scope has no part in it: the id is not made from a tenant.
+#[test]
+fn the_catalogue_id_is_read_in_one_place() {
+    let all = all();
+    // Any reading of the field, whatever the variable before it; a
+    // call of the accessor is not one.
+    let found: BTreeMap<String, usize> = all
+        .iter()
+        .map(|(file, text)| {
+            let n = text
+                .split(".catalogue_id")
+                .skip(1)
+                .filter(|rest| !rest.starts_with('('))
+                .count();
+            (file.clone(), n)
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    within(
+        "`.catalogue_id`",
+        &found,
+        &[
+            // `Bridge::catalogue_id`.
+            ("bridge/stamp.rs", 1),
+            // The end of a restore: a request is not scoped yet.
+            ("bridge/service/admin.rs", 1),
+        ],
+    );
+    assert_eq!(found.get("bridge/stamp.rs"), Some(&1));
+    assert_eq!(
+        all["bridge/stamp.rs"]
+            .matches("pub fn catalogue_id(&self) -> &str")
+            .count(),
+        1
+    );
+    // The stamp is the one user of the id in the library, and it asks
+    // the accessor every time.
+    assert_eq!(all["bridge/stamp.rs"].matches(".catalogue_id()").count(), 9);
+    assert!(!all[TENANT].contains("catalogue_id"));
+    assert!(!all["bridge/directory.rs"].contains("catalogue_id"));
+}
+
+/// The directory is a port and one adapter, and nothing asks it yet: no
+/// request and no job is routed by it.
+#[test]
+fn the_directory_is_asked_by_nothing() {
+    let all = all();
+    const DIRECTORY: &str = "bridge/directory.rs";
+    for name in ["Directory", "SingleTenant", "directory::", ".route("] {
+        let found = uses(&all, name);
+        let files: Vec<&String> = found.keys().filter(|f| *f != DIRECTORY).collect();
+        assert!(files.is_empty(), "{name}: {files:?}");
+    }
+    // One method, and one adapter.
+    let directory = &all[DIRECTORY];
+    assert_eq!(directory.matches("fn ").count(), 2);
+    assert_eq!(directory.matches("impl Directory for ").count(), 1);
 }
 
 /// The reader of this test is not fooled by its own helper.
