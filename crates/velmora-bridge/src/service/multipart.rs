@@ -1368,11 +1368,14 @@ struct Placed<'a, B, K> {
 /// numbers at a time, and from the extent that makes the object larger
 /// than one document holds, the rows go into segments as they come, so
 /// what is held is one run of rows, one segment and the placements.
+/// Only a request that holds the charge of that work (`charged`) stores
+/// segments; another is answered `503 SlowDown` before the first.
 async fn gather<'a, C, B, N, J, K, T>(
     bridge: &'a Bridge<C, B, N, J, K, T>,
     c: &'a Completion,
     publication: &Publication,
     held: u64,
+    charged: bool,
 ) -> Outcome<Option<Placed<'a, B, K>>>
 where
     C: Catalog,
@@ -1452,6 +1455,15 @@ where
         }
         waiting.extend(rows);
         if writer.is_none() && seq > cut.after {
+            if !charged {
+                // The request began on an upload within one document,
+                // so it holds no charge and its answer is not kept
+                // alive. A listed part was since stored again with the
+                // same ETag in more extents (the slice size changed
+                // between the two versions that took them). Sent again,
+                // the Complete is counted as what it is.
+                return Err(ErrorCode::SlowDown.into());
+            }
             writer = Some(SegmentWriter::new(
                 &bridge.safety,
                 &bridge.kek,
@@ -1560,7 +1572,7 @@ where
         Look::Open(opened) => *opened,
     };
     if first.held <= u64::from(bridge.cfg.record_cut.after) {
-        return publish(bridge, &completion, first).await;
+        return publish(bridge, &completion, first, false).await;
     }
     // A segmented record: the extents are read and stored a run at a
     // time, which can outlast a client's read timeout. So the answer is
@@ -1577,7 +1589,7 @@ where
         let bridge = Rc::clone(bridge);
         async move {
             let _charge = charge;
-            document(respond(publish(&bridge, &completion, first).await))
+            document(respond(publish(&bridge, &completion, first, true).await))
         }
     };
     // Work that was dropped: the upload is published or it is not, and
@@ -1593,13 +1605,16 @@ where
 /// Records and publishes the upload, from `first` on: up to
 /// [`COMPLETE_ATTEMPTS`] attempts, each on the upload as it reads it.
 /// A request that began on an upload within one document holds no
-/// charge, also when the upload has grown past it by a later attempt:
-/// the parts it lists are the ones it began with (their ETags), so its
-/// record is still one document.
+/// charge (`charged` is false), also when the upload has grown past it
+/// by a later attempt: the parts it lists are the ones it began with
+/// (their ETags), so its record is one document as long as each is
+/// stored in the extents it had. [`gather`] refuses the one case that
+/// is left.
 async fn publish<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     c: &Completion,
     first: Opened,
+    charged: bool,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -1626,7 +1641,7 @@ where
                 Look::Open(opened) => *opened,
             },
         };
-        let Some(placed) = gather(bridge, c, &publication, held).await? else {
+        let Some(placed) = gather(bridge, c, &publication, held, charged).await? else {
             // An UploadPart replaced a listed part after the upload was
             // read. The batch would lose its guard: take the same path.
             lost_at = Some(upload.revision);

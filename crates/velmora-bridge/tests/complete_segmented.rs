@@ -771,6 +771,86 @@ async fn an_upload_that_outgrows_one_document_during_a_complete_is_published_in_
     }
 }
 
+/// Stores part 1 again as a later version would: the same bytes and
+/// ETag, in new extents, one more of them (the last is in two). The
+/// new ones are named outside what an id is minted as.
+fn store_again_in_one_more_extent(rig: &Rig) {
+    sql(
+        rig,
+        "CREATE TEMP TABLE again AS SELECT * FROM extents WHERE id IN
+           (SELECT extent_id FROM upload_parts UNION SELECT extent_id FROM upload_part_extents);
+         UPDATE again SET id = 'x_zz' || substr(id, 5);
+         INSERT INTO extents SELECT * FROM again;
+         UPDATE upload_parts SET extent_id = 'x_zz' || substr(extent_id, 5);
+         UPDATE upload_part_extents SET extent_id = 'x_zz' || substr(extent_id, 5);
+         DELETE FROM again WHERE id NOT IN
+           (SELECT extent_id FROM upload_part_extents WHERE piece = 7);
+         UPDATE again SET id = 'x_yy' || substr(id, 5), plain_size = plain_size / 2;
+         UPDATE extents SET plain_size = plain_size / 2 WHERE id IN
+           (SELECT extent_id FROM upload_part_extents WHERE piece = 7);
+         INSERT INTO extents SELECT * FROM again;
+         INSERT INTO upload_part_extents (upload_id, part_number, piece, extent_id)
+           SELECT upload_id, part_number, 8, 'x_yy' || substr(extent_id, 5)
+             FROM upload_part_extents WHERE piece = 7;
+         UPDATE uploads SET revision = revision + 1;
+         DROP TABLE again;",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_charged_complete_stores_segments() {
+    // 8 extents: counted as one document, so the request holds no
+    // charge. At any call of it the listed part is stored again with
+    // the same ETag in 9 extents (a version with a smaller slice took
+    // the client's retry), and the next attempt of the Complete accepts
+    // it by its ETag. Its record would be segments: the request is told
+    // to come back, and the one sent again is charged for them.
+    let bytes = body(1, 8 * SLICE_HALF);
+    let total = {
+        let s = scene().await;
+        let listed = [s.part(1, &bytes).await];
+        let before = s.rig.trip().calls();
+        s.complete(&listed).await.expect(200);
+        s.rig.trip().calls() - before
+    };
+    let charge = velmora_bridge::config::COMPLETE_CHARGE_BYTES;
+    let mut sent_back = 0;
+    for skip in 0..total {
+        let s = scene().await;
+        let listed = [s.part(1, &bytes).await];
+        assert!(s.rig.bridge.budget.peak() < charge);
+        let ran = run_until(&s.rig, s.complete(&listed), skip, Trip::Stall).await;
+        let running = ran.stalled();
+        s.rig.trip().disarm();
+        store_again_in_one_more_extent(&s.rig);
+        let resp = resume(&s.rig, running).await;
+        let what = format!("call {skip}: {} {}", resp.status, resp.text());
+        if s.rig.bridge.budget.peak() < charge {
+            // Not charged: nothing of a segmented record is stored.
+            assert!(s.segments().is_empty(), "{what}");
+            if records(&s.rig).is_empty() {
+                assert_eq!(resp.status, 503, "{what}");
+                assert!(resp.text().contains("SlowDown"), "{what}");
+                assert_eq!(s.rig.count("generations"), 0, "{what}");
+                sent_back += 1;
+                let resp = s.complete(&listed).await;
+                assert!(!failed(&resp), "{what}: {}", resp.text());
+                assert!(s.rig.bridge.budget.peak() >= charge, "{what}");
+            } else {
+                // The part came after the record of the 8 was stored.
+                assert!(!failed(&resp), "{what}");
+                continue;
+            }
+        } else {
+            assert!(!failed(&resp), "{what}");
+        }
+        let heads = s.heads().await;
+        assert_eq!((heads.len(), heads[0].1), (1, 9), "{what}");
+        assert_eq!(s.rig.bridge.budget.in_use(), 0, "{what}");
+    }
+    assert!(sent_back > 0, "no attempt met the part stored again");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn without_room_for_its_charge_a_complete_is_told_to_come_back() {
     let cfg = seg_config();

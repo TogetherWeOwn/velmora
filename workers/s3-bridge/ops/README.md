@@ -825,12 +825,16 @@ catalogue twice a value in one call): a drill sets a small
 `MAX_OBJECT_EXTENTS` with them. Production
 and dev set none of them, and a contract test holds them to that.
 
-**Rollback.** Once one segmented record exists (a key under `m/seg/` in
-`SAFETY`, or under `m/x/<tenant>/seg/` with `RECORD_LAYOUT = tenant`;
-a live generation above `RECORD_SEGMENT_AFTER` extents has one), never
-roll back to a version older than the first one that
-reads segmented records in the replay, the recovery copy and the intent
-sweep. An older version cannot read a head: its replay stops at it, and
+**Rollback.** Once one segmented record exists, never roll back to a
+version older than the first one that reads segmented records in the
+replay, the recovery copy and the intent sweep. The check is on the
+stored records: list `SAFETY` for one key under `m/seg/`, and under
+`m/x/<tenant>/seg/` for each tenant with `RECORD_LAYOUT = tenant`
+(`wrangler r2 object` has no listing; use an S3 client on the bucket
+with `--prefix` and `--max-keys 1`). The extent count of a generation in
+the catalogue does not answer it: only a multipart Complete writes
+segments, so under a drill setting a sliced PutObject above
+`RECORD_SEGMENT_AFTER` extents has its record in one document. An older version cannot read a head: its replay stops at it, and
 its sweep finds no record for a sliced write and removes the slices a
 day later. Setting `MAX_OBJECT_EXTENTS` back to 10 000 stops new
 segmented records and does not lower this floor: the ones written stay.
