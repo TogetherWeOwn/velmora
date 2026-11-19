@@ -4151,6 +4151,9 @@ async fn redrive_and_bury_run_from_the_indexes_that_remain() {
     for step in all.lines() {
         assert!(!step.starts_with("SCAN e"), "{all}");
         assert!(!step.contains("TEMP B-TREE"), "{all}");
+        // `outbox_due` would walk every `done` row: the outbox rows are
+        // found by key from the window.
+        assert!(!step.contains("outbox_due"), "{all}");
     }
     assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
     assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 1);

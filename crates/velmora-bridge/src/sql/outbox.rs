@@ -1295,11 +1295,15 @@ pub(super) async fn redrive_underverified<S: Sql>(
         "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
            last_error = NULL, updated_at = ?1, ",
         unlease!(),
-        " WHERE stage = 'done' AND extent_id IN ( \
+        // Driven from the window of the index, each outbox row found by
+        // its key: `CROSS JOIN` fixes the order and the unary `+` keeps
+        // the planner off `outbox_due`, which would walk every `done`
+        // row (every extent ever posted) once per run.
+        " WHERE +stage = 'done' AND extent_id IN ( \
            SELECT e.id FROM extents e INDEXED BY extents_safety \
-             JOIN outbox o ON o.extent_id = e.id \
+             CROSS JOIN outbox o ON o.extent_id = e.id \
             WHERE e.safety_state IN ('held', 'releasing') AND e.safety_state = 'held' \
-              AND e.id > ?4 AND e.id <= ?5 AND o.stage = 'done' AND ",
+              AND e.id > ?4 AND e.id <= ?5 AND +o.stage = 'done' AND ",
         live_ref!("e.id"),
         " AND (SELECT COUNT(*) FROM verifications v \
                     WHERE v.extent_id = e.id \
