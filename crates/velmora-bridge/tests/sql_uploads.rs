@@ -8,7 +8,7 @@
 //! bound parameters (the D1 limit) and can make a batch fail after all of
 //! its statements ran.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
@@ -22,6 +22,8 @@ struct Probe {
     db: RusqliteSql,
     /// When set, every batch ends with a failing `tx_guard` insert.
     lose_guard: Cell<bool>,
+    /// The statements of every batch, as they were sent.
+    batched: RefCell<Vec<(&'static str, Vec<SqlValue>)>>,
 }
 
 fn check_params(params: &[SqlValue]) {
@@ -39,6 +41,7 @@ impl Sql for Probe {
     }
     async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         stmts.iter().for_each(|(_, p)| check_params(p));
+        self.batched.borrow_mut().extend(stmts.iter().cloned());
         if self.lose_guard.get() {
             stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
         }
@@ -63,6 +66,7 @@ impl Fx {
             cat: SqlCatalog::new(Probe {
                 db: RusqliteSql::with_schema().unwrap(),
                 lose_guard: Cell::new(false),
+                batched: RefCell::new(Vec::new()),
             }),
             seed: Cell::new(1),
             bucket: BucketId::mint([0xb1; 8]),
@@ -1534,4 +1538,75 @@ async fn complete_adopts_a_sliced_part_whole_and_in_order() {
     want.sort();
     assert_eq!(fx.gc_extents().await, want);
     fx.assert_no_live_extent_is_gc_bound().await;
+}
+
+// ---------------------------------------------------------------------------
+// Complete without the index on the generation of an extent
+// ---------------------------------------------------------------------------
+
+/// Complete finds the extents of its upload through the parts and the
+/// generation's own rows, each by its primary key: on the schema the
+/// next release leaves (no index on `extents.generation_id`) it adopts
+/// plain and sliced parts as before, and no statement of it reads the
+/// extents table through.
+#[tokio::test]
+async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone() {
+    let fx = Fx::new().await;
+    fx.cat
+        .sql
+        .db
+        .apply(velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES)
+        .unwrap();
+    let id = fx.create(&fx.bucket, KEY).await;
+    let t = target(&fx.bucket, KEY, &id);
+    let (s, _) = fx.sliced(&t, 1, &[100, 100, 100]).await;
+    let (d, _) = fx.part(&t, 2, 100).await;
+    let (_unlisted, _) = fx.part(&t, 3, 50).await;
+    let (upload, _) = fx.read(&t).await;
+    let listed = [(&s[0], 100), (&s[1], 100), (&s[2], 100), (&d, 100)];
+    let c = fx.commit(&fx.bucket, KEY, &listed);
+    fx.cat.sql.batched.borrow_mut().clear();
+    assert_eq!(
+        fx.cat
+            .publish_upload(&t, upload.revision, &DIGEST, &c)
+            .await
+            .unwrap(),
+        Guard::Applied(())
+    );
+    let adopted = fx
+        .texts(
+            "SELECT extent_id FROM generation_extents WHERE generation_id = ?1 ORDER BY seq",
+            &[text(c.generation.id.as_str())],
+        )
+        .await;
+    let want: Vec<String> = listed.iter().map(|(x, _)| x.as_str().to_string()).collect();
+    assert_eq!(adopted, want);
+    let queued = fx
+        .texts(
+            "SELECT extent_id FROM outbox WHERE generation_id = ?1 ORDER BY extent_id",
+            &[text(c.generation.id.as_str())],
+        )
+        .await;
+    assert_eq!(queued.len(), 4);
+
+    let ran = std::mem::take(&mut *fx.cat.sql.batched.borrow_mut());
+    assert!(ran.len() > 5, "the batch of a Complete");
+    for (sql, params) in ran {
+        let plan = fx
+            .cat
+            .sql
+            .db
+            .query(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .await
+            .unwrap();
+        for row in plan {
+            let SqlValue::Text(step) = &row[3] else {
+                panic!("unexpected {row:?}")
+            };
+            assert!(
+                !step.starts_with("SCAN extents") && !step.starts_with("SCAN e"),
+                "{sql}\n{step}"
+            );
+        }
+    }
 }

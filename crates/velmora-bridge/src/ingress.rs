@@ -563,11 +563,47 @@ struct BudgetState {
     peak: Cell<u64>,
     /// Charges that waited the full time and found no room.
     refused: Cell<u64>,
+    /// What waiting for room has cost so far.
+    pressure: Cell<Pressure>,
     /// The number the next charge that waits is given.
     next_wait: Cell<u64>,
     /// The charges that wait for room now: the lowest number came
     /// first.
     waiting: RefCell<Vec<Listed>>,
+}
+
+/// What the shared budget has cost the work of one isolate since it
+/// began: counts and milliseconds, read by [`ByteBudget::pressure`].
+/// Requests and background jobs are counted apart, because the budget
+/// is one for both and the question is which of them waits for the
+/// other. Nothing here changes what a charge does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pressure {
+    /// Request charges that found no room at once and slept.
+    pub request_waits: u64,
+    /// The time request charges slept for room, in milliseconds,
+    /// whether they were served, refused or dropped in the end.
+    pub request_wait_ms: u64,
+    /// Request charges that waited [`CHARGE_WAIT_MS`] and were refused
+    /// (`SlowDown`).
+    pub request_refused: u64,
+    /// As `request_waits`, for background jobs.
+    pub job_waits: u64,
+    /// As `request_wait_ms`, for background jobs.
+    pub job_wait_ms: u64,
+    /// As `request_refused`, for background jobs.
+    pub job_refused: u64,
+    /// Charges above the whole limit of their kind, refused at once.
+    pub too_large: u64,
+}
+
+impl BudgetState {
+    /// Adds to the pressure counters.
+    fn press(&self, f: impl FnOnce(&mut Pressure)) {
+        let mut p = self.pressure.get();
+        f(&mut p);
+        self.pressure.set(p);
+    }
 }
 
 /// A charge that waits for room, as the others see it.
@@ -681,6 +717,7 @@ impl ByteBudget {
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
                 refused: Cell::new(0),
+                pressure: Cell::new(Pressure::default()),
                 next_wait: Cell::new(0),
                 waiting: RefCell::new(Vec::new()),
             }),
@@ -703,6 +740,7 @@ impl ByteBudget {
                 jobs: Cell::new(0),
                 peak: Cell::new(0),
                 refused: Cell::new(0),
+                pressure: Cell::new(Pressure::default()),
                 next_wait: Cell::new(0),
                 waiting: RefCell::new(Vec::new()),
             }),
@@ -783,6 +821,12 @@ impl ByteBudget {
     /// longer runs.
     pub fn refused(&self) -> u64 {
         self.state.refused.get()
+    }
+
+    /// What waiting for room has cost the requests and the jobs of
+    /// this isolate since it began.
+    pub fn pressure(&self) -> Pressure {
+        self.state.pressure.get()
     }
 
     /// Charges that wait for room now.
@@ -886,6 +930,8 @@ impl ByteBudget {
             self.state.capacity
         };
         if bytes > limit {
+            let s = &self.state;
+            s.press(|p| p.too_large = p.too_large.saturating_add(1));
             return Err(IngressError::SlowDown);
         }
         let mut waited = 0u32;
@@ -911,9 +957,25 @@ impl ByteBudget {
             if waited >= CHARGE_WAIT_MS {
                 let s = &self.state;
                 s.refused.set(s.refused.get().saturating_add(1));
+                s.press(|p| {
+                    let n = if job {
+                        &mut p.job_refused
+                    } else {
+                        &mut p.request_refused
+                    };
+                    *n = n.saturating_add(1);
+                });
                 return Err(IngressError::SlowDown);
             }
             if waiting.is_none() {
+                self.state.press(|p| {
+                    let n = if job {
+                        &mut p.job_waits
+                    } else {
+                        &mut p.request_waits
+                    };
+                    *n = n.saturating_add(1);
+                });
                 let number = self.state.next_wait.get();
                 self.state.next_wait.set(number.wrapping_add(1));
                 let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
@@ -929,6 +991,14 @@ impl ByteBudget {
             }
             sleep(CHARGE_POLL_MS).await;
             waited = waited.saturating_add(CHARGE_POLL_MS);
+            self.state.press(|p| {
+                let ms = if job {
+                    &mut p.job_wait_ms
+                } else {
+                    &mut p.request_wait_ms
+                };
+                *ms = ms.saturating_add(u64::from(CHARGE_POLL_MS));
+            });
         }
     }
 

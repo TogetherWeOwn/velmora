@@ -1231,3 +1231,81 @@ fn an_empty_budget_takes_no_charge() {
     assert!(jobs_only.try_charge(1).is_none());
     assert!(jobs_only.try_charge_job(1).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// The budget counts what waiting for room costs
+// ---------------------------------------------------------------------------
+
+/// A budget whose sleeps return at once and drop `held` at the
+/// `release_at`-th sleep (never, for 0).
+fn budget_that_frees(
+    capacity: u64,
+    held: &std::rc::Rc<std::cell::RefCell<Option<Charge>>>,
+    release_at: u32,
+) -> ByteBudget {
+    let (held, slept) = (
+        std::rc::Rc::clone(held),
+        std::rc::Rc::new(std::cell::Cell::new(0u32)),
+    );
+    let sleeper: Sleeper = std::rc::Rc::new(move |_ms| {
+        slept.set(slept.get() + 1);
+        if slept.get() == release_at {
+            held.borrow_mut().take();
+        }
+        Box::pin(async {})
+    });
+    ByteBudget::new(capacity).with_sleeper(sleeper)
+}
+
+#[tokio::test]
+async fn the_budget_counts_waits_and_refusals_of_requests_and_jobs_apart() {
+    use velmora_bridge::ingress::Pressure;
+    let poll = u64::from(CHARGE_POLL_MS);
+    let full_wait = u64::from(CHARGE_WAIT_MS);
+
+    // Room at once: nothing is counted.
+    let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let budget = budget_that_frees(10, &held, 3);
+    let first = budget.charge(4).await.unwrap();
+    assert_eq!(budget.pressure(), Pressure::default());
+
+    // A request that waits three sleeps for a job to end, and is served.
+    *held.borrow_mut() = Some(budget.try_charge_job(6).unwrap());
+    let served = budget.charge(6).await.unwrap();
+    assert_eq!(
+        budget.pressure(),
+        Pressure {
+            request_waits: 1,
+            request_wait_ms: 3 * poll,
+            ..Pressure::default()
+        }
+    );
+
+    // A job that waits the full time behind the requests, and is refused.
+    assert_eq!(
+        budget.charge_job(1).await.unwrap_err(),
+        IngressError::SlowDown
+    );
+    // And a request likewise.
+    assert_eq!(budget.charge(1).await.unwrap_err(), IngressError::SlowDown);
+    // More than the whole budget is refused without a wait.
+    assert_eq!(budget.charge(11).await.unwrap_err(), IngressError::SlowDown);
+    assert_eq!(
+        budget.pressure(),
+        Pressure {
+            request_waits: 2,
+            request_wait_ms: 3 * poll + full_wait,
+            request_refused: 1,
+            job_waits: 1,
+            job_wait_ms: full_wait,
+            job_refused: 1,
+            too_large: 1,
+        }
+    );
+    // The total that was counted before says the same.
+    assert_eq!(budget.refused(), 2);
+    // Counting changed nothing of what is held.
+    assert_eq!(budget.in_use(), 10);
+    drop((first, served));
+    assert_eq!(budget.in_use(), 0);
+}

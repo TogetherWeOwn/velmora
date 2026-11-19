@@ -3943,3 +3943,194 @@ async fn verify_escalations_keep_the_later_end() {
     let rows = fx.count("SELECT COUNT(*) FROM verify_escalations").await;
     assert_eq!(rows, 2);
 }
+
+// ---------------------------------------------------------------------------
+// The bury reads the exhausted rows, not the queue
+// ---------------------------------------------------------------------------
+
+/// The bury as it was before the `outbox_exhausted` index: the text the
+/// previous release runs, kept here to measure against.
+const BURY_BEFORE_THE_INDEX: &str = "UPDATE outbox SET stage = 'dead', updated_at = ?2 \
+     WHERE stage IN ('post', 'verify', 'release') AND attempts > ?1 \
+       AND (lease_until IS NULL OR lease_until < ?2)";
+
+/// A queue of `waiting` rows at a working stage with attempts to spare,
+/// plus six rows around the limit: three to bury (one per working
+/// stage), one leased, one finished, and one exactly at the limit.
+fn queue_of(waiting: u32) -> RusqliteSql {
+    let db = RusqliteSql::with_schema().unwrap();
+    db.with_conn(|c| {
+        // The rows stand alone: no extent behind them is needed to
+        // measure a statement that touches the outbox only.
+        c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        c.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1) \
+             INSERT INTO outbox(extent_id, generation_id, stage, attempts, next_at, updated_at) \
+             SELECT printf('x_%08d', i), 'g', \
+                    CASE i % 3 WHEN 0 THEN 'post' WHEN 1 THEN 'verify' ELSE 'release' END, \
+                    i % 50, i, 0 FROM n",
+            rusqlite::params![waiting],
+        )
+        .unwrap();
+        c.execute_batch(
+            "INSERT INTO outbox(extent_id, generation_id, stage, attempts, next_at, updated_at, \
+                                lease_until) VALUES \
+               ('y_post', 'g', 'post', 51, 0, 0, NULL), \
+               ('y_verify', 'g', 'verify', 60, 0, 0, NULL), \
+               ('y_release', 'g', 'release', 99, 0, 0, 5), \
+               ('y_leased', 'g', 'post', 99, 0, 0, 2000000000000), \
+               ('y_done', 'g', 'done', 99, 0, 0, NULL), \
+               ('y_at_limit', 'g', 'post', 50, 0, 0, NULL);",
+        )
+        .unwrap();
+    });
+    db
+}
+
+/// Runs a bury and returns (rows moved to `dead`, VM steps it took, its plan).
+fn bury_cost(db: &RusqliteSql, sql: &str) -> (usize, i32, String) {
+    db.with_conn(|c| {
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(rusqlite::params![50, 1000], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|detail| detail.unwrap())
+            .collect();
+        let mut stmt = c.prepare(sql).unwrap();
+        let moved = stmt.execute(rusqlite::params![50, 1000]).unwrap();
+        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        (moved, steps, plan.join("\n"))
+    })
+}
+
+#[test]
+fn a_bury_reads_the_exhausted_rows_and_not_the_queue() {
+    let (small, large) = (queue_of(300), queue_of(30_000));
+    let (moved_small, steps_small, plan) = bury_cost(&small, velmora_bridge::sql::BURY_EXHAUSTED);
+    let (moved_large, steps_large, plan_large) =
+        bury_cost(&large, velmora_bridge::sql::BURY_EXHAUSTED);
+    assert_eq!(plan, "SCAN outbox USING INDEX outbox_exhausted");
+    assert_eq!(plan_large, plan);
+    assert_eq!((moved_small, moved_large), (3, 3));
+    // A hundred times the queue, and not one step more.
+    assert_eq!(steps_small, steps_large);
+    // The index holds the rows out of attempts at a working stage and
+    // nothing else: four entries before the bury (the leased one stays),
+    // one after, whatever waits.
+    for db in [&small, &large] {
+        let left: i64 = db.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM outbox INDEXED BY outbox_exhausted \
+                 WHERE attempts > 50 AND stage IN ('post', 'verify', 'release')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(left, 1);
+    }
+
+    // What it replaces walked the queue: its cost grows with the rows waiting.
+    let (old_small, old_large) = (queue_of(300), queue_of(30_000));
+    let (moved, before_small, _) = bury_cost(&old_small, BURY_BEFORE_THE_INDEX);
+    let (_, before_large, _) = bury_cost(&old_large, BURY_BEFORE_THE_INDEX);
+    assert_eq!(moved, 3);
+    assert!(
+        before_large > 50 * before_small,
+        "{before_small} {before_large}"
+    );
+    assert!(
+        before_large > 100 * steps_large,
+        "{before_large} {steps_large}"
+    );
+}
+
+#[test]
+fn the_bury_and_its_index_spell_the_same_limit() {
+    // A partial index answers a statement only when both spell the
+    // condition alike. (That the jobs' limit is not below the index's
+    // is checked where the statement is written, when it is compiled.)
+    let spelled = format!(
+        "attempts > {} AND stage IN ('post', 'verify', 'release')",
+        velmora_bridge::sql::EXHAUSTED_INDEX_ATTEMPTS
+    );
+    assert!(velmora_bridge::sql::BURY_EXHAUSTED.contains(&spelled));
+    assert!(velmora_bridge::testkit::MIGRATION_0021.contains(&spelled));
+}
+
+#[tokio::test]
+async fn a_bury_below_the_index_limit_still_buries_every_row_over_it() {
+    let fx = Fx::new().await;
+    let a = fx.publish(&fx.bucket, "a").await;
+    let b = fx.publish(&fx.bucket, "b").await;
+    fx.run(
+        "UPDATE outbox SET attempts = 7 WHERE extent_id = ?1",
+        &[text(a.extent.as_str())],
+    )
+    .await;
+    fx.run(
+        "UPDATE outbox SET attempts = 5 WHERE extent_id = ?1",
+        &[text(b.extent.as_str())],
+    )
+    .await;
+    assert_eq!(fx.cat.bury_exhausted(5, T0).await.unwrap(), 1);
+    assert_eq!(fx.outbox(&a, "stage").await, "dead");
+    assert_eq!(fx.outbox(&b, "stage").await, "post");
+    // And a limit above the index's leaves the rows between the two.
+    let c = fx.publish(&fx.bucket, "c").await;
+    fx.run(
+        "UPDATE outbox SET attempts = 60 WHERE extent_id = ?1",
+        &[text(c.extent.as_str())],
+    )
+    .await;
+    assert_eq!(fx.cat.bury_exhausted(60, T0).await.unwrap(), 0);
+    assert_eq!(fx.cat.bury_exhausted(59, T0).await.unwrap(), 1);
+    assert_eq!(fx.outbox(&c, "stage").await, "dead");
+}
+
+/// The re-drive and the bury on the schema the next release leaves
+/// (`extents_held` and `extents_pinned` dropped): the window of held
+/// extents is read from `extents_safety` alone, in id order, and both
+/// do what they did.
+#[tokio::test(flavor = "current_thread")]
+async fn redrive_and_bury_run_from_the_indexes_that_remain() {
+    let fx = Fx::new().await;
+    fx.cat
+        .sql
+        .0
+        .apply(velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES)
+        .unwrap();
+    let mut objs = Vec::new();
+    for i in 0..5 {
+        objs.push(fx.done_on_one_backbone(&format!("k{i}")).await);
+    }
+    let later = T0.plus_ms(HOUR_MS);
+    let plans = fx
+        .plans_of(async {
+            assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
+        })
+        .await;
+    let all = plans.join("\n");
+    assert!(
+        all.contains("SEARCH extents USING COVERING INDEX extents_safety (id>?)"),
+        "{all}"
+    );
+    for step in all.lines() {
+        assert!(!step.starts_with("SCAN e"), "{all}");
+        assert!(!step.contains("TEMP B-TREE"), "{all}");
+    }
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 2);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 1);
+    assert_eq!(fx.redrive(&["bb1", "bb2"], 2, 2, later).await, 0);
+    for o in &objs {
+        assert_eq!(fx.outbox(o, "stage").await, "verify");
+    }
+    fx.run(
+        "UPDATE outbox SET attempts = 51 WHERE extent_id = ?1",
+        &[text(objs[0].extent.as_str())],
+    )
+    .await;
+    assert_eq!(fx.cat.bury_exhausted(50, later).await.unwrap(), 1);
+    assert_eq!(fx.outbox(&objs[0], "stage").await, "dead");
+}

@@ -100,6 +100,14 @@ pub const MIGRATION_0019: &str =
 /// Usage counters: the tables and the triggers that move them.
 pub const MIGRATION_0020: &str =
     include_str!("../../../workers/s3-bridge/migrations/0020_usage_counters.sql");
+/// Indexes for periodic ingest work: the exhausted outbox rows, and one
+/// index of the pinned set in place of two.
+pub const MIGRATION_0021: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0021_ingest_indexes.sql");
+/// Not a migration yet: the drops that follow [`MIGRATION_0021`] in the
+/// next release. [`RusqliteSql::with_contracted_schema`] applies them.
+pub const NEXT_DROP_SUPERSEDED_INDEXES: &str =
+    include_str!("../../../workers/s3-bridge/migrations-next/0022_drop_superseded_indexes.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -278,6 +286,15 @@ impl RusqliteSql {
         db.apply(MIGRATION_0018)?;
         db.apply(MIGRATION_0019)?;
         db.apply(MIGRATION_0020)?;
+        db.apply(MIGRATION_0021)?;
+        Ok(db)
+    }
+
+    /// [`Self::with_schema`] after the next release's index drops: the
+    /// schema the code must already run on.
+    pub fn with_contracted_schema() -> Result<Self> {
+        let db = Self::with_schema()?;
+        db.apply(NEXT_DROP_SUPERSEDED_INDEXES)?;
         Ok(db)
     }
 
