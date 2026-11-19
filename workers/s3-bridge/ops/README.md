@@ -966,6 +966,9 @@ Read routes, all `GET` and served without a table scan:
 - `/_admin/ops-snapshot[?hours=N]`: the totals, the age of the oldest
   due outbox row per stage, the hourly figures (default 48 hours, at
   most 168) and the state of the recount.
+  The hourly figures count outbox rows leaving a stage in that hour,
+  as seen: a restore replay that closes a row counts as a verify, and
+  a row written late is counted in the hour it was written.
 - `/_admin/usage/buckets[?after=&limit=]`: objects and bytes per
   bucket, in pages; `next_after` is the cursor.
 - `/_admin/cost`: the JSON at `ops/cost/latest.json` in the cache
@@ -975,7 +978,9 @@ Read routes, all `GET` and served without a table scan:
 `ADMIN_TOKEN`) opens these three and `/_admin/status`, with `GET` only;
 it opens nothing that changes state. `ADMIN_HOST`, when set, is the
 only host name on which `/_admin/` answers at all; on any other host
-the routes answer 404.
+the routes answer 404. It covers `/_admin/` only: creating and deleting a
+bucket with the admin token (`PUT` and `DELETE` of `/<bucket>`) stays
+on the S3 host names.
 
 Request metrics go to the Analytics Engine dataset bound as `METRICS`:
 one request in `METRICS_SAMPLE` (default 10) and every 5xx. A point has
