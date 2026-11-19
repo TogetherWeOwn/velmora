@@ -817,10 +817,14 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     }
 }
 
-/// Segments one call of a replay reads: every segment of two records,
-/// or of one record twice (before its first row, and to publish it).
-/// Each is one read of the blob store, and a call has a bounded number
-/// of those.
+/// The most segments one call of a replay reads: twice the most a head
+/// names. Each is one read of the blob store, and a call has a bounded
+/// number of those.
+///
+/// This bounds a call, not a restore. Over the calls of a restore a
+/// segment of an unpublished record is read three times (before the
+/// first row, for its extents, and to publish), and once more for each
+/// call that stops inside it, which the next call reads again.
 pub const SEGMENT_READS: usize = 2 * MAX_SEGMENTS;
 
 /// Whether a call that has read `reads` segments may read every segment
@@ -891,8 +895,9 @@ fn finished(cursor: ReplayCursor, flat: &str) -> ReplayCursor {
 mod segment_reads {
     use super::*;
 
-    /// A call reads the segments of a record twice, or of two records,
-    /// and no more; a call that has read none takes any head.
+    /// A call reads no more than [`SEGMENT_READS`] segments, however
+    /// they fall over the passes of a record or over several records;
+    /// a call that has read none takes any head.
     #[test]
     fn a_call_reads_a_bounded_number_of_segments() {
         let mut reads = 0;
