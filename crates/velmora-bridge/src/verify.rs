@@ -731,30 +731,6 @@ where
         Ok(named.all(|(_, name)| failed(name)))
     }
 
-    /// Whether the last full read of a backbone the light check names
-    /// for `extent` found the current plan corrupt.
-    async fn corrupt_where_named(
-        &self,
-        extent: &ExtentRow,
-        labels: &[String],
-        light: &Light,
-    ) -> Staged<bool> {
-        let checks = self.catalog.body_checks(&extent.id).await?;
-        let named = |b: &BackboneStatus| {
-            let name = label(&b.backbone);
-            labels
-                .iter()
-                .position(|l| *l == name)
-                .is_some_and(|i| light.names(i, &name))
-        };
-        Ok(checks.iter().any(|b| {
-            b.plan_rev == extent.plan_rev
-                && b.kind.is_full()
-                && b.result == VerifyResult::Corrupt
-                && named(b)
-        }))
-    }
-
     /// `reached` is the resume point the job has got to and the row does
     /// not say yet: `Some` once a backbone has its result and until a
     /// write stores a resume point or the reads are over. The caller
@@ -832,23 +808,17 @@ where
             }
             let kind = Self::recorded_kind(kind, &tally);
             let row = self.record(lease, extent, provider, &tally, kind).await?;
-            if let Some(light) = &light {
+            if light.is_some() && kind.is_full() && row.result != VerifyResult::Ok {
                 // Recorded first: the failure stands whatever comes of
                 // this.
-                let mut raise = kind.is_full() && row.result != VerifyResult::Ok;
-                if raise && !tally.corrupt.is_empty() && !light.names(index, name) {
-                    // A backbone read in place of a named one that found
-                    // the plan corrupt: the same bytes bad here were bad
-                    // when they were posted, which says nothing about
-                    // this backbone.
-                    raise = !self.corrupt_where_named(extent, &labels, light).await?;
-                }
-                if raise {
-                    // Asked of the provider that failed the read: another
-                    // provider of the backbone may answer differently.
-                    self.sample_failed(lease, extent, &plan, &[provider], name, &tally)
-                        .await?;
-                }
+                // Asked of the provider that failed the read: another
+                // provider of the backbone may answer differently.
+                // A backbone read in place of a named one is raised like
+                // any other: the rows do not say which articles failed,
+                // so bytes that were bad when posted cannot be told from
+                // damage of its own.
+                self.sample_failed(lease, extent, &plan, &[provider], name, &tally)
+                    .await?;
             }
             // The next backbone is read by this job, under the same
             // claim. Its resume point is stored only if the job stops
