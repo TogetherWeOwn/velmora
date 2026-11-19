@@ -17,8 +17,11 @@
 -- can run on this schema.
 -- Additive only.
 
-ALTER TABLE verifications ADD COLUMN mode TEXT
-  CHECK (mode IS NULL OR mode IN ('size','sampled'));
+-- No CHECK on the column: adding one makes SQLite test it against every
+-- row the table has, and this must not read the table. The Worker
+-- writes only NULL, 'size' or 'sampled', and reads a value it does not
+-- know as what `kind` says.
+ALTER TABLE verifications ADD COLUMN mode TEXT;
 
 -- A backbone that is read in full for every extent until `until`,
 -- because a full read of a sampled extent failed there. One row per
@@ -32,4 +35,16 @@ CREATE TABLE verify_escalations (
   raised_at  INTEGER NOT NULL,
   extent_id  TEXT NOT NULL,
   result     TEXT NOT NULL CHECK (result IN ('missing','corrupt','error'))
+) WITHOUT ROWID;
+
+-- An extent has raised a backbone for a plan: it does so once. Written
+-- with the row above, in one batch. A failed read of the same plan found
+-- again by a retry says nothing new about the backbone; a new plan of
+-- the extent (`plan_rev`) or another extent does.
+CREATE TABLE verify_raises (
+  extent_id  TEXT NOT NULL,
+  backbone   TEXT NOT NULL,
+  plan_rev   INTEGER NOT NULL,
+  raised_at  INTEGER NOT NULL,
+  PRIMARY KEY (extent_id, backbone, plan_rev)
 ) WITHOUT ROWID;

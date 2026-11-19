@@ -399,7 +399,11 @@ async fn raise(rig: &Rig, backbone: &str) -> VerifyEscalation {
         extent_id: ExtentId::mint([0xee; 13]),
         result: VerifyResult::Corrupt,
     };
-    rig.bridge.catalog.escalate_verify(&raised).await.unwrap();
+    rig.bridge
+        .catalog
+        .escalate_verify(&raised, 1)
+        .await
+        .unwrap();
     raised
 }
 
@@ -757,6 +761,159 @@ async fn a_sample_that_cannot_be_read_where_stat_passes_escalates() {
     assert_eq!(rig.stage(&s), OutboxStage::Verify);
 }
 
+/// An article that arrives between the read and the `STAT` is not a
+/// provider answering for bytes it lacks: it is read once more before
+/// the backbone is raised, and that read gets it.
+#[tokio::test]
+async fn an_article_that_arrives_after_the_read_does_not_escalate() {
+    let rig = light_rig(ALL, &[]).await;
+    let (s, plan) = rig.on_two(16).await;
+    let drawn = rig.sample_index(&s);
+    // A read asks twice for an article it does not get: both times
+    // in vain here.
+    rig.servers[drawn]
+        .late_for_next_bodies(2 * plan.len())
+        .await;
+
+    let wait = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(wait, MISSING_BACKOFF_SECS[0]);
+    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+    assert!(rig.bridge.catalog.raises.borrow().is_empty());
+    rig.bridge.clock.advance_secs(wait);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+}
+
+/// Two extents that find the same backbone listing what it does not
+/// serve each raise it once. Their retries, which come in turns before
+/// either failure is on record, do not move the end.
+#[tokio::test]
+async fn two_extents_in_turns_raise_a_backbone_once_each() {
+    let rig = light_rig(ALL, &[]).await;
+    // Of three extents two are read in full on the same backbone.
+    let mut seeded = Vec::new();
+    for n in [30, 31, 32] {
+        seeded.push(rig.on_two(n).await.0);
+    }
+    let on = |i: usize| -> Vec<&Seeded> {
+        let drawn = |s: &&Seeded| rig.sample_index(s) == i;
+        seeded.iter().filter(drawn).collect()
+    };
+    let (drawn, pair) = match on(0) {
+        pair if pair.len() >= 2 => (0, pair),
+        _ => (1, on(1)),
+    };
+    let (a, b) = (pair[0], pair[1]);
+    rig.servers[drawn].set_body_gone(true).await;
+
+    assert_ne!(rig.run(a, OutboxStage::Verify).await, JobOutcome::Ack);
+    rig.bridge.clock.advance_secs(10);
+    let now = rig.bridge.clock.now();
+    assert_ne!(rig.run(b, OutboxStage::Verify).await, JobOutcome::Ack);
+    let want = vec![VerifyEscalation {
+        backbone: ["bb0", "bb1"][drawn].to_string(),
+        until: now.plus_secs(ESCALATE_SECS),
+        raised_at: now,
+        extent_id: b.extent.clone(),
+        result: VerifyResult::Missing,
+    }];
+    assert_eq!(*rig.bridge.catalog.escalations.borrow(), want);
+    for _ in 0..3 {
+        for s in [a, b] {
+            rig.wait_until_due(s);
+            assert_ne!(rig.run(s, OutboxStage::Verify).await, JobOutcome::Ack);
+            assert_eq!(*rig.bridge.catalog.escalations.borrow(), want);
+        }
+    }
+    assert_eq!(rig.bridge.catalog.raises.borrow().len(), 2);
+}
+
+/// That an extent has raised a backbone is stored with the escalation
+/// and nowhere else. A raise that was not stored is made by the next
+/// job, though the failed read is on record by then.
+#[tokio::test]
+async fn a_raise_that_was_not_stored_is_made_by_the_next_job() {
+    let rig = light_rig(ALL, &[]).await;
+    let bad = rig.seed(17, &marked_plaintext(PLAIN_LEN)).await;
+    rig.post_with_planted_article(&bad, 1).await;
+    rig.propagate(&bad, 0, 1).await;
+    let drawn = rig.sample_index(&bad);
+    let name = ["bb0", "bb1"][drawn];
+    rig.bridge.catalog.fail_escalations.set(1);
+
+    assert_ne!(rig.run(&bad, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert!(rig
+        .checks(&bad)
+        .contains(&row(name, VerifyKind::Sampled, VerifyResult::Corrupt)));
+    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+
+    // The job that could not store it keeps its claim until that ends.
+    let held = rig.bridge.catalog.outbox(&bad.extent).lease_until;
+    let ahead_ms = held.expect("a claim").0 - rig.bridge.clock.now().0;
+    rig.bridge.clock.advance_secs(ahead_ms as u32 / 1000 + 1);
+    assert_ne!(rig.run(&bad, OutboxStage::Verify).await, JobOutcome::Ack);
+    let raised = rig.bridge.catalog.escalations.borrow().clone();
+    assert!(raised
+        .iter()
+        .any(|e| e.backbone == name && e.result == VerifyResult::Corrupt));
+}
+
+/// A full read that failed under `body` was never held against the
+/// backbone. Under `light` the next read of it is.
+#[tokio::test]
+async fn a_failure_on_record_from_the_body_mode_raises_under_light() {
+    let mut rig = light_rig(0, &[]).await;
+    rig.bridge.cfg.verify.mode = VerifyMode::Body;
+    let bad = rig.seed(18, &marked_plaintext(PLAIN_LEN)).await;
+    rig.post_with_planted_article(&bad, 1).await;
+    rig.propagate(&bad, 0, 1).await;
+    assert_ne!(rig.run(&bad, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert!(rig
+        .checks(&bad)
+        .contains(&row("bb0", VerifyKind::Body, VerifyResult::Corrupt)));
+    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+
+    rig.bridge.cfg.verify.mode = VerifyMode::Light;
+    rig.wait_until_due(&bad);
+    assert_ne!(rig.run(&bad, OutboxStage::Verify).await, JobOutcome::Ack);
+    let raised = rig.bridge.catalog.escalations.borrow().clone();
+    assert!(raised
+        .iter()
+        .any(|e| e.backbone == "bb0" && e.extent_id == bad.extent));
+}
+
+/// An article that was not there for `STAT` either is on record as
+/// missing and raised nothing. If the provider lists it later and still
+/// does not serve it, that read raises the backbone.
+#[tokio::test]
+async fn a_missing_article_on_record_does_not_clear_a_later_lie() {
+    let rig = light_rig(ALL, &[]).await;
+    let (s, plan) = rig.on_two(19).await;
+    let drawn = rig.sample_index(&s);
+    let name = ["bb0", "bb1"][drawn];
+    rig.servers[drawn].hide(&plan[0].message_id).await;
+    for wait in MISSING_BACKOFF_SECS {
+        assert_eq!(retry_delay(&rig.run(&s, OutboxStage::Verify).await), wait);
+        rig.bridge.clock.advance_secs(wait);
+    }
+    assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert!(rig
+        .checks(&s)
+        .contains(&row(name, VerifyKind::Sampled, VerifyResult::Missing)));
+    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+
+    rig.servers[drawn].unhide(&plan[0].message_id).await;
+    rig.servers[drawn].set_body_gone(true).await;
+    rig.wait_until_due(&s);
+    assert_ne!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let raised = rig.bridge.catalog.escalations.borrow().clone();
+    assert_eq!(raised.len(), 1);
+    assert_eq!(
+        (raised[0].backbone.as_str(), raised[0].result),
+        (name, VerifyResult::Missing)
+    );
+}
+
 /// An article that is simply not there is not a provider answering for
 /// bytes it lacks: every check finds it, so the sample is not raised.
 #[tokio::test]
@@ -796,13 +953,21 @@ async fn an_escalation_reaches_extents_that_wait_for_their_release() {
         extent_id: ExtentId::mint([0xee; 13]),
         result: VerifyResult::Corrupt,
     };
-    rig.bridge.catalog.escalate_verify(&raised).await.unwrap();
+    rig.bridge
+        .catalog
+        .escalate_verify(&raised, 1)
+        .await
+        .unwrap();
     // An earlier end does not shorten it.
     let shorter = VerifyEscalation {
         until: now.plus_secs(60),
         ..raised.clone()
     };
-    rig.bridge.catalog.escalate_verify(&shorter).await.unwrap();
+    rig.bridge
+        .catalog
+        .escalate_verify(&shorter, 1)
+        .await
+        .unwrap();
     assert_eq!(*rig.bridge.catalog.escalations.borrow(), [raised]);
 
     // The release comes late, after the period is over: the extent was
@@ -850,7 +1015,11 @@ async fn a_backbone_under_full_reads_needs_its_own_full_read() {
         extent_id: ExtentId::mint([0xee; 13]),
         result: VerifyResult::Corrupt,
     };
-    rig.bridge.catalog.escalate_verify(&raised).await.unwrap();
+    rig.bridge
+        .catalog
+        .escalate_verify(&raised, 1)
+        .await
+        .unwrap();
     rig.bridge.clock.advance_secs(1);
     rig.run(&s, OutboxStage::Release).await;
     assert_eq!(rig.state(&s), SafetyState::Held);

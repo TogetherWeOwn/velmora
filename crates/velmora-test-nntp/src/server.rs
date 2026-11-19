@@ -118,6 +118,7 @@ struct Spool {
     /// While true, `BODY` answers `430` for articles in the `POST` spool
     /// although `STAT` finds them.
     body_gone: bool,
+    late_bodies: usize,
     /// While true, a login over the connection cap is answered `482`
     /// instead of `502`.
     limit_482: bool,
@@ -161,6 +162,7 @@ impl Shared {
             drop_stats: 0,
             stat_lag: false,
             body_gone: false,
+            late_bodies: 0,
             limit_482: false,
             limit_reply: None,
             reported_size: None,
@@ -370,6 +372,13 @@ impl TestNntpServer {
 
     pub async fn set_reported_size(&self, difference: Option<i64>) {
         self.shared.spool.lock().await.reported_size = difference;
+    }
+
+    /// The next `n` `BODY` commands answer `430`, and everything after
+    /// them is served: an article that arrives just after it was asked
+    /// for.
+    pub async fn late_for_next_bodies(&self, n: usize) {
+        self.shared.spool.lock().await.late_bodies = n;
     }
 
     /// While set, `BODY` answers `430` for posted articles although `STAT`
@@ -755,6 +764,12 @@ async fn handle_connection(
                             .iter()
                             .any(|a| a.message_id == article.message_id)
                     {
+                        drop(spool);
+                        let _ = writer.write_all(b"430 No such article\r\n").await;
+                        continue;
+                    }
+                    if cmd.as_str() == "BODY" && spool.late_bodies > 0 {
+                        spool.late_bodies -= 1;
                         drop(spool);
                         let _ = writer.write_all(b"430 No such article\r\n").await;
                         continue;

@@ -548,8 +548,16 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         )
         .await
     }
-    async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {
-        outbox::escalate_verify(self, e).await
+    async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {
+        outbox::escalate_verify(self, e, plan_rev).await
+    }
+    async fn verify_raised(
+        &self,
+        extent: &ExtentId,
+        backbone: &str,
+        plan_rev: u32,
+    ) -> Result<bool> {
+        outbox::verify_raised(self, extent, backbone, plan_rev).await
     }
     async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>> {
         outbox::verify_escalations(self, now).await

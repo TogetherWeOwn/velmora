@@ -1184,7 +1184,7 @@ async fn dispatch_reports_the_backbones_under_full_reads() {
             extent_id: ExtentId::mint([9; 13]),
             result: VerifyResult::Corrupt,
         };
-        fx.bridge.catalog.escalate_verify(&raised).await.unwrap();
+        fx.bridge.catalog.escalate_verify(&raised, 1).await.unwrap();
     }
     // Under `body` every extent is read in full anyway.
     let report = fx.bridge.dispatch().await.unwrap();

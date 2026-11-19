@@ -970,25 +970,59 @@ pub(super) async fn begin_release<S: Sql>(
 }
 
 /// See [`crate::ports::Catalog::escalate_verify`].
-pub(super) async fn escalate_verify<S: Sql>(c: &SqlCatalog<S>, e: &VerifyEscalation) -> Result<()> {
-    let stmt = (
+pub(super) async fn escalate_verify<S: Sql>(
+    c: &SqlCatalog<S>,
+    e: &VerifyEscalation,
+    plan_rev: u32,
+) -> Result<()> {
+    // One batch: the escalation only where this extent has not raised
+    // the backbone for this plan, then the note that it has.
+    let raise = (
         "INSERT INTO verify_escalations(backbone, until, raised_at, extent_id, result) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
+         SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (SELECT 1 FROM verify_raises \
+           WHERE extent_id = ?4 AND backbone = ?1 AND plan_rev = ?6) \
          ON CONFLICT(backbone) DO UPDATE SET until = excluded.until, \
            raised_at = excluded.raised_at, extent_id = excluded.extent_id, \
            result = excluded.result \
-         WHERE excluded.until > verify_escalations.until \
-           AND excluded.extent_id <> verify_escalations.extent_id",
+         WHERE excluded.until > verify_escalations.until",
         vec![
             text(&e.backbone),
             ms(e.until),
             ms(e.raised_at),
             text(e.extent_id.as_str()),
             text(e.result.as_str()),
+            int(plan_rev)?,
         ],
     );
-    c.sql.batch(vec![stmt]).await?;
+    let note = (
+        "INSERT OR IGNORE INTO verify_raises(extent_id, backbone, plan_rev, raised_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        vec![
+            text(e.extent_id.as_str()),
+            text(&e.backbone),
+            int(plan_rev)?,
+            ms(e.raised_at),
+        ],
+    );
+    c.sql.batch(vec![raise, note]).await?;
     Ok(())
+}
+
+/// See [`crate::ports::Catalog::verify_raised`].
+pub(super) async fn verify_raised<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    backbone: &str,
+    plan_rev: u32,
+) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            "SELECT 1 FROM verify_raises WHERE extent_id = ?1 AND backbone = ?2 AND plan_rev = ?3",
+            &[text(extent.as_str()), text(backbone), int(plan_rev)?],
+        )
+        .await?;
+    Ok(!rows.is_empty())
 }
 
 /// See [`crate::ports::Catalog::verify_escalations`].

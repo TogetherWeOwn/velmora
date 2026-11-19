@@ -83,10 +83,14 @@
 //!   size that did not fit) is read in full, as under `body`, and holds
 //!   no copy until that read passes.
 //! - A full read under `light` that finds an article corrupt, or missing
-//!   where `STAT` says it is there, raises the sample to every extent
-//!   for that backbone for `VERIFY_ESCALATE_SECS`
-//!   ([`Catalog::escalate_verify`]): the provider answered for bytes it
-//!   does not serve. The cron report names such backbones.
+//!   where `STAT` says it is there and a second read still does not get
+//!   it, raises the sample to every extent for that backbone for
+//!   `VERIFY_ESCALATE_SECS` ([`Catalog::escalate_verify`]): the provider
+//!   answered for bytes it does not serve. A missing article is held
+//!   against `STAT` by the read that finds it, before the waits for a
+//!   missing article. An extent raises a backbone once for a plan: the
+//!   same failure found again by its retries does not move the end,
+//!   another extent's does. The cron report names such backbones.
 //!
 //! The release under `light`:
 //! - The lease, the minimum age, the `STAT` of every article on every
@@ -650,15 +654,17 @@ where
     /// so raises the sample to every extent there for a while.
     ///
     /// A corrupt article is that at once. A missing one is that only if
-    /// the same provider (`providers`) says with `STAT` that it has it:
-    /// an article that is simply not there is found by every check, the
-    /// light one too.
+    /// the same provider (`providers`) says with `STAT` that it has it
+    /// and then still does not serve it: an article that is simply not
+    /// there is found by every check, the light one too, and one that
+    /// arrived between the read and the `STAT` is read the second time.
     ///
-    /// An extent raises a backbone once: while the row of that backbone
-    /// is the one it wrote, ended or not, a job of it that fails a read
-    /// there again leaves the end where it is. Its bytes are as bad as
-    /// they were; what another extent finds there is what is news.
-    /// ([`Catalog::escalate_verify`] holds to this on its own.)
+    /// An extent raises a backbone once for a plan
+    /// ([`Catalog::verify_raised`]): its bytes are as bad on a retry as
+    /// they were, and what another extent finds there is what is news.
+    /// That is stored with the escalation and nowhere else, so a raise
+    /// that was not stored is made by the next job that fails the read,
+    /// whatever the record of the reads says by then.
     async fn sample_failed(
         &self,
         lease: &Lease,
@@ -668,30 +674,39 @@ where
         backbone: &str,
         tally: &ReadTally,
     ) -> Staged<()> {
+        let raised = self
+            .catalog
+            .verify_raised(&extent.id, backbone, extent.plan_rev);
+        if raised.await? {
+            return Ok(());
+        }
         let mut result = VerifyResult::Corrupt;
         if tally.corrupt.is_empty() {
-            let gone: Vec<ArticleRow> = plan
-                .iter()
-                .filter(|a| tally.missing.contains(&a.idx))
-                .cloned()
-                .collect();
+            let rows = |of: &[u32], keep: bool| -> Vec<ArticleRow> {
+                let pick = |a: &&ArticleRow| of.contains(&a.idx) == keep;
+                plan.iter().filter(pick).cloned().collect()
+            };
+            let gone = rows(&tally.missing, true);
             let (_, stat) = self
                 .read_backbone(lease, &gone, providers, VerifyKind::Stat)
                 .await?;
-            if stat.ok == 0 {
+            // Those the provider says it has, read once more.
+            let listed: Vec<ArticleRow> = gone
+                .into_iter()
+                .filter(|a| !stat.missing.contains(&a.idx))
+                .collect();
+            if listed.is_empty() {
                 return Ok(());
             }
-            result = VerifyResult::Missing;
+            let (_, again) = self
+                .read_backbone(lease, &listed, providers, VerifyKind::Body)
+                .await?;
+            result = result_of(&again);
+            if result == VerifyResult::Ok {
+                return Ok(());
+            }
         }
         let now = self.clock.now();
-        // Every row, the ended ones too: one per backbone at most.
-        let rows = self.catalog.verify_escalations(UnixMs(0)).await?;
-        if rows
-            .iter()
-            .any(|e| e.backbone == backbone && e.extent_id == extent.id)
-        {
-            return Ok(());
-        }
         let raised = VerifyEscalation {
             backbone: backbone.to_string(),
             until: now.plus_secs(self.cfg.verify.escalate_secs),
@@ -699,7 +714,9 @@ where
             extent_id: extent.id.clone(),
             result,
         };
-        self.catalog.escalate_verify(&raised).await?;
+        self.catalog
+            .escalate_verify(&raised, extent.plan_rev)
+            .await?;
         crate::trace::alert(|| {
             format!(
                 "verify: full read of a sampled extent failed ({}) on backbone {backbone}; \
@@ -721,27 +738,6 @@ where
                 && label(&b.backbone) == backbone
                 && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
         }))
-    }
-
-    /// What the last full read of `backbone` for the current plan came
-    /// to, if it failed. That failure has had its say on the backbone
-    /// ([`Self::sample_failed`]): the same extent failing the same way
-    /// again says nothing new about it.
-    async fn failed_full_read(
-        &self,
-        extent: &ExtentRow,
-        backbone: &str,
-    ) -> Staged<Option<VerifyResult>> {
-        let checks = self.catalog.body_checks(&extent.id).await?;
-        Ok(checks
-            .iter()
-            .find(|b| {
-                b.plan_rev == extent.plan_rev
-                    && label(&b.backbone) == backbone
-                    && b.kind.is_full()
-                    && b.result != VerifyResult::Ok
-            })
-            .map(|b| b.result))
     }
 
     /// Whether a backbone the light check does not name for `extent` is
@@ -823,22 +819,13 @@ where
                 }
             }
             // Under the light check a full read that fails may raise the
-            // backbone to full reads. Not for a failure this extent has
-            // on record there already: a corrupt one raised it then, and
-            // a missing one was held against `STAT` then. Only a read
-            // that now finds bad bytes where it found none is news.
+            // backbone to full reads, once for this extent and plan
+            // ([`Self::sample_failed`]).
             let watched = light.is_some() && kind.is_full();
-            let before = match watched {
-                true => self.failed_full_read(extent, name).await?,
-                false => None,
-            };
-            let news = |now: VerifyResult| {
-                watched && before != Some(VerifyResult::Corrupt) && before != Some(now)
-            };
             let mut asked = false;
             let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
             if result_of(&tally) == VerifyResult::Missing {
-                if news(VerifyResult::Missing) {
+                if watched {
                     // Before the waits for a missing article, which may
                     // take hours: a provider that says with `STAT` it has
                     // what it does not serve is answering for other
@@ -869,9 +856,10 @@ where
             }
             let kind = Self::recorded_kind(kind, &tally);
             let row = self.record(lease, extent, provider, &tally, kind).await?;
-            if row.result != VerifyResult::Ok && news(row.result) && !asked {
+            if watched && !asked && row.result != VerifyResult::Ok {
                 // Recorded first: the failure stands whatever comes of
-                // this.
+                // this. A raise that is not stored is made by the next
+                // job that fails this read.
                 // Asked of the provider that failed the read: another
                 // provider of the backbone may answer differently.
                 // A backbone read in place of a named one is raised like

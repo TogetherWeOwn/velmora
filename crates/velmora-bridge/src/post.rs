@@ -210,8 +210,12 @@ fn reported_size(block: &[u8], named: &str, how: SizeCommand) -> Option<Reported
             }
         }
         SizeCommand::Over => {
-            let fields: Vec<&str> = lines.next()?.split('\t').collect();
-            match fields.get(4).map(|f| f.trim()) == Some(named) {
+            // One line, as for `HDR`: two are not an answer about one
+            // article.
+            let mut lines = lines.filter(|l| !l.is_empty());
+            let (line, more) = (lines.next()?, lines.next());
+            let fields: Vec<&str> = line.split('\t').collect();
+            match more.is_none() && fields.get(4).map(|f| f.trim()) == Some(named) {
                 true => number(fields.get(6)?).map(Reported::Own),
                 false => None,
             }
@@ -1859,5 +1863,8 @@ mod tests {
         assert_eq!(over(&line(NAMED, "big")), None);
         assert_eq!(over("0\tsubject\r\n"), None);
         assert_eq!(over(""), None);
+        // Two lines are not an answer about one article.
+        let two = line(NAMED, "744918") + &line("<other@example.invalid>", "12");
+        assert_eq!(over(&two), None);
     }
 }

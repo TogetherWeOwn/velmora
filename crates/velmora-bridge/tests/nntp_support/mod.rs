@@ -363,6 +363,10 @@ pub struct MemCatalog {
     pub failures_reported: Cell<u32>,
     /// The backbones read in full for a while, as `verify_escalations`.
     pub escalations: RefCell<Vec<VerifyEscalation>>,
+    /// Extent, backbone and plan of each raise, as `verify_raises`.
+    pub raises: RefCell<Vec<(ExtentId, String, u32)>>,
+    /// The next this many `escalate_verify` calls fail and store nothing.
+    pub fail_escalations: Cell<u32>,
 }
 
 impl MemCatalog {
@@ -786,14 +790,34 @@ impl Catalog for MemCatalog {
         Ok(self.release(l, required, counting, evidence_json, need_full, true))
     }
 
-    async fn escalate_verify(&self, e: &VerifyEscalation) -> Result<()> {
+    async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {
+        if self.fail_escalations.get() > 0 {
+            self.fail_escalations.set(self.fail_escalations.get() - 1);
+            return Err(BridgeError::Sql("injected escalate_verify failure".into()));
+        }
+        let key = (e.extent_id.clone(), e.backbone.clone(), plan_rev);
+        let mut raises = self.raises.borrow_mut();
+        if raises.contains(&key) {
+            return Ok(());
+        }
+        raises.push(key);
         let mut all = self.escalations.borrow_mut();
         match all.iter_mut().find(|o| o.backbone == e.backbone) {
-            Some(old) if e.until > old.until && e.extent_id != old.extent_id => *old = e.clone(),
+            Some(old) if e.until > old.until => *old = e.clone(),
             Some(_) => {}
             None => all.push(e.clone()),
         }
         Ok(())
+    }
+
+    async fn verify_raised(
+        &self,
+        extent: &ExtentId,
+        backbone: &str,
+        plan_rev: u32,
+    ) -> Result<bool> {
+        let key = (extent.clone(), backbone.to_string(), plan_rev);
+        Ok(self.raises.borrow().contains(&key))
     }
 
     async fn verify_escalations(&self, now: UnixMs) -> Result<Vec<VerifyEscalation>> {

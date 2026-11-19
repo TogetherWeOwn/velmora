@@ -1165,6 +1165,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "uploads",
             "verifications",
             "verify_escalations",
+            "verify_raises",
             "write_intents",
         ]
     );

@@ -3495,13 +3495,9 @@ async fn the_mode_column_tells_the_kinds_apart() {
             ("bb-3", VerifyKind::Sampled, true)
         ]
     );
-    // No other mode exists, and a mode a later version adds is read as
-    // what `kind` says.
-    let bad = fx
-        .cat
-        .sql
-        .exec("UPDATE verifications SET mode = 'head'", &[]);
-    assert!(bad.await.is_err());
+    // The column has no CHECK (adding one would read every row of the
+    // table): a mode this version does not know is read as what `kind`
+    // says.
     assert_eq!(
         VerifyKind::from_columns("stat", Some("later")),
         Some(VerifyKind::Stat)
@@ -3768,7 +3764,7 @@ async fn the_light_guard_reads_the_escalations_itself() {
     // It ends after the extent was stored, so the extent is under it,
     // whether or not it still runs when the release does.
     let raised = raise("bb-b", stored.plus_ms(1));
-    fx.cat.escalate_verify(&raised).await.unwrap();
+    fx.cat.escalate_verify(&raised, 1).await.unwrap();
     let late = T0.plus_secs(7 * 86_400);
     for at in [T0.plus_ms(2), late] {
         let light = fx
@@ -3805,11 +3801,11 @@ async fn the_light_guard_reads_the_escalations_itself() {
     let (o, r) = fx.at_release("k").await;
     let stored = UnixMs(fx.extent(&o, "created_at").await.parse().unwrap());
     fx.cat
-        .escalate_verify(&raise("bb-b", stored))
+        .escalate_verify(&raise("bb-b", stored), 1)
         .await
         .unwrap();
     let far = raise("bb-c", stored.plus_secs(86_400));
-    fx.cat.escalate_verify(&far).await.unwrap();
+    fx.cat.escalate_verify(&far, 1).await.unwrap();
     assert!(fx.pass(&r, "bb-a", T0.plus_ms(1), VerifyKind::Stat).await);
     assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
     let light = fx
@@ -3840,7 +3836,7 @@ async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
         extent_id: ExtentId::mint([7; 13]),
         result: VerifyResult::Corrupt,
     };
-    fx.cat.escalate_verify(&raised).await.unwrap();
+    fx.cat.escalate_verify(&raised, 1).await.unwrap();
     let light = fx
         .cat
         .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
@@ -3870,8 +3866,8 @@ async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
 }
 
 /// The backbones read in full for a while: one row per backbone, the
-/// later end wins unless it comes from the extent whose row it is,
-/// and a row whose time is over is not listed.
+/// later end wins, and a row whose time is over is not listed. An
+/// extent raises a backbone once for a plan.
 #[tokio::test]
 async fn verify_escalations_keep_the_later_end() {
     let fx = Fx::new().await;
@@ -3882,46 +3878,66 @@ async fn verify_escalations_keep_the_later_end() {
         extent_id: ExtentId::mint([extent; 13]),
         result,
     };
+    let raised = |extent: u8, backbone: &'static str, plan_rev: u32| {
+        let id = ExtentId::mint([extent; 13]);
+        let cat = &fx.cat;
+        async move { cat.verify_raised(&id, backbone, plan_rev).await.unwrap() }
+    };
     assert_eq!(fx.cat.verify_escalations(T0).await.unwrap(), []);
+    assert!(!raised(7, "bb-b", 1).await);
     let first = raise("bb-b", 7, T0, 3_600, VerifyResult::Corrupt);
-    fx.cat.escalate_verify(&first).await.unwrap();
+    fx.cat.escalate_verify(&first, 1).await.unwrap();
+    assert!(raised(7, "bb-b", 1).await);
+    assert!(!raised(7, "bb-a", 1).await);
+    assert!(!raised(7, "bb-b", 2).await);
     let other = raise("bb-a", 7, T0, 600, VerifyResult::Missing);
-    fx.cat.escalate_verify(&other).await.unwrap();
+    fx.cat.escalate_verify(&other, 1).await.unwrap();
     assert_eq!(
         fx.cat.verify_escalations(T0).await.unwrap(),
         [other.clone(), first.clone()]
     );
-    // An earlier end changes nothing.
+    // An earlier end changes nothing, though the extent has raised.
     let shorter = raise("bb-b", 8, T0.plus_ms(1), 60, VerifyResult::Missing);
-    fx.cat.escalate_verify(&shorter).await.unwrap();
+    fx.cat.escalate_verify(&shorter, 1).await.unwrap();
+    assert!(raised(8, "bb-b", 1).await);
     assert_eq!(
         fx.cat.verify_escalations(T0).await.unwrap(),
         [other.clone(), first.clone()]
     );
-    // So does a later one from the extent that raised the backbone:
-    // the same failure found again is not a reason to read everything
-    // in full for longer.
-    let again = raise("bb-b", 7, T0.plus_secs(1_800), 3_600, VerifyResult::Corrupt);
-    fx.cat.escalate_verify(&again).await.unwrap();
+    // Nor does a later one from an extent that has raised the backbone
+    // for this plan, whoever wrote the row last: the same failure found
+    // again is not a reason to read everything in full for longer.
+    for extent in [7, 8] {
+        let again = raise(
+            "bb-b",
+            extent,
+            T0.plus_secs(1_800),
+            3_600,
+            VerifyResult::Corrupt,
+        );
+        fx.cat.escalate_verify(&again, 1).await.unwrap();
+    }
     assert_eq!(
         fx.cat.verify_escalations(T0).await.unwrap(),
         [other, first.clone()]
     );
     // A later one from another extent replaces the row.
-    let longer = raise("bb-b", 8, T0.plus_secs(1_800), 3_600, VerifyResult::Missing);
-    fx.cat.escalate_verify(&longer).await.unwrap();
+    let longer = raise("bb-b", 9, T0.plus_secs(1_800), 3_600, VerifyResult::Missing);
+    fx.cat.escalate_verify(&longer, 1).await.unwrap();
     // The first backbone's time is over; the end itself is not inside.
     let now = T0.plus_secs(600);
     let until = longer.until;
     assert_eq!(fx.cat.verify_escalations(now).await.unwrap(), [longer]);
     assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), []);
-    // Nor once the escalation has ended: only another extent does.
-    let same = raise("bb-b", 8, until, 60, VerifyResult::Corrupt);
-    fx.cat.escalate_verify(&same).await.unwrap();
+    // Nor once the escalation has ended. A new plan of the extent is
+    // new bytes, and raises it again.
+    let same = raise("bb-b", 9, until, 60, VerifyResult::Corrupt);
+    fx.cat.escalate_verify(&same, 1).await.unwrap();
     assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), []);
-    let renewed = raise("bb-b", 9, until, 60, VerifyResult::Corrupt);
-    fx.cat.escalate_verify(&renewed).await.unwrap();
-    assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), [renewed]);
+    fx.cat.escalate_verify(&same, 2).await.unwrap();
+    assert_eq!(fx.cat.verify_escalations(until).await.unwrap(), [same]);
+    let notes = fx.count("SELECT COUNT(*) FROM verify_raises").await;
+    assert_eq!(notes, 5);
     let rows = fx.count("SELECT COUNT(*) FROM verify_escalations").await;
     assert_eq!(rows, 2);
 }
