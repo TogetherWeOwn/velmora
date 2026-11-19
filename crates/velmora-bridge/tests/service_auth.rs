@@ -77,9 +77,33 @@ enum Case {
     CatalogueFails,
     /// The `rw` key, its secret wrapped under a KEK the service lacks.
     LostKek,
+    /// An unknown key while a replay is pending.
+    UnknownReplaying,
+    /// The disabled key while a replay is pending.
+    DisabledReplaying,
+    /// The key without a grant while a replay is pending.
+    UngrantedReplaying,
+    /// The `rw` key's id with another secret while a replay is pending.
+    WrongSecretReplaying,
+    /// The `rw` key, presigned, while a replay is pending.
+    PresignedRwReplaying,
+    /// The `rw` key while a rollback is recorded.
+    RwRolledBack,
+    /// The `ro` key while a rollback is recorded.
+    RoRolledBack,
+    /// An unknown key while a rollback is recorded.
+    UnknownRolledBack,
+    /// The disabled key, presigned.
+    PresignedDisabled,
+    /// The key without a grant, presigned.
+    PresignedUngranted,
+    /// An unknown key while the state of a replay cannot be read.
+    UnknownReplayUnreadable,
+    /// The `ro` key while the state of a replay cannot be read.
+    RoReplayUnreadable,
 }
 
-const CASES: [Case; 25] = [
+const CASES: [Case; 37] = [
     Case::Rw,
     Case::Ro,
     Case::Unknown,
@@ -105,6 +129,18 @@ const CASES: [Case; 25] = [
     Case::PresignedWrongSecret,
     Case::CatalogueFails,
     Case::LostKek,
+    Case::UnknownReplaying,
+    Case::DisabledReplaying,
+    Case::UngrantedReplaying,
+    Case::WrongSecretReplaying,
+    Case::PresignedRwReplaying,
+    Case::RwRolledBack,
+    Case::RoRolledBack,
+    Case::UnknownRolledBack,
+    Case::PresignedDisabled,
+    Case::PresignedUngranted,
+    Case::UnknownReplayUnreadable,
+    Case::RoReplayUnreadable,
 ];
 
 struct Op {
@@ -207,6 +243,22 @@ impl Case {
                 | Case::PresignedRo
                 | Case::PresignedUnknown
                 | Case::PresignedWrongSecret
+                | Case::PresignedRwReplaying
+                | Case::PresignedDisabled
+                | Case::PresignedUngranted
+        )
+    }
+
+    fn replaying(self) -> bool {
+        matches!(
+            self,
+            Case::RwReplaying
+                | Case::RoReplaying
+                | Case::UnknownReplaying
+                | Case::DisabledReplaying
+                | Case::UngrantedReplaying
+                | Case::WrongSecretReplaying
+                | Case::PresignedRwReplaying
         )
     }
 }
@@ -332,7 +384,7 @@ async fn run(case: Case) -> Vec<Ran> {
         two = ids.pop().unwrap();
         one = ids.pop().unwrap();
     }
-    if matches!(case, Case::RwReplaying | Case::RoReplaying) {
+    if case.replaying() {
         let now = rig.now();
         let _ = rig
             .bridge
@@ -354,7 +406,16 @@ async fn run(case: Case) -> Vec<Ran> {
             ))
             .unwrap();
         }),
+        Case::RwRolledBack | Case::RoRolledBack | Case::UnknownRolledBack => {
+            rig.bridge.catalog.sql.with_conn(|c| {
+                c.execute_batch("INSERT OR REPLACE INTO rollback_stamp VALUES (1, 0, 'c', 1);")
+                    .unwrap();
+            })
+        }
         // From here on: nothing before this may fail.
+        Case::UnknownReplayUnreadable | Case::RoReplayUnreadable => {
+            *rig.bridge.catalog.sql.fail_matching.borrow_mut() = Some(("FROM restore_state", 0));
+        }
         Case::CatalogueFails => {
             *rig.bridge.catalog.sql.fail_matching.borrow_mut() =
                 Some(("FROM access_keys WHERE access_key_id", 0));
@@ -373,14 +434,31 @@ async fn run(case: Case) -> Vec<Ran> {
         | Case::RevokedMaintenance
         | Case::PresignedRw
         | Case::CatalogueFails
-        | Case::LostKek => (&rw, BUCKET),
-        Case::Ro | Case::RoReplaying | Case::RoMaintenance | Case::PresignedRo => (&ro, BUCKET),
-        Case::Unknown | Case::UnknownMaintenance | Case::PresignedUnknown => (&unknown, BUCKET),
-        Case::Disabled => (&disabled, BUCKET),
-        Case::Ungranted | Case::UngrantedMaintenance => (&ungranted, BUCKET),
+        | Case::LostKek
+        | Case::PresignedRwReplaying
+        | Case::RwRolledBack => (&rw, BUCKET),
+        Case::Ro
+        | Case::RoReplaying
+        | Case::RoMaintenance
+        | Case::PresignedRo
+        | Case::RoRolledBack
+        | Case::RoReplayUnreadable => (&ro, BUCKET),
+        Case::Unknown
+        | Case::UnknownMaintenance
+        | Case::PresignedUnknown
+        | Case::UnknownReplaying
+        | Case::UnknownRolledBack
+        | Case::UnknownReplayUnreadable => (&unknown, BUCKET),
+        Case::Disabled | Case::DisabledReplaying | Case::PresignedDisabled => (&disabled, BUCKET),
+        Case::Ungranted
+        | Case::UngrantedMaintenance
+        | Case::UngrantedReplaying
+        | Case::PresignedUngranted => (&ungranted, BUCKET),
         Case::AbsentBucket => (&rw, "bkt-absent"),
         Case::UnknownAbsentBucket => (&unknown, "bkt-absent"),
-        Case::WrongSecret | Case::PresignedWrongSecret => (&wrong, BUCKET),
+        Case::WrongSecret | Case::PresignedWrongSecret | Case::WrongSecretReplaying => {
+            (&wrong, BUCKET)
+        }
     };
     let mut out = Vec::new();
     // Upload ids and ETags are drawn at random; the table names them.
@@ -497,6 +575,17 @@ async fn every_operation_answers_every_caller_as_recorded() {
         "CatalogueFails | UploadPart | 500 | InternalError",
         "LostKek | GetObject | 500 | InternalError",
         "LostKek | UploadPart | 500 | InternalError",
+        // A refusal comes before the state of a replay is told.
+        "UnknownReplaying | UploadPart | 403 | InvalidAccessKeyId",
+        "DisabledReplaying | CreateMultipartUpload | 403 | InvalidAccessKeyId",
+        "WrongSecretReplaying | UploadPart | 403 | SignatureDoesNotMatch",
+        "UnknownRolledBack | CreateMultipartUpload | 403 | InvalidAccessKeyId",
+        "PresignedRwReplaying | UploadPart | 503 | SlowDown",
+        "RwRolledBack | CompleteMultipartUpload | 503 | SlowDown",
+        // The state of a replay is read with the key: a multipart call
+        // that cannot read it fails, whoever asks, and writes nothing.
+        "UnknownReplayUnreadable | UploadPart | 500 | InternalError",
+        "RoReplayUnreadable | CreateMultipartUpload | 500 | InternalError",
     ] {
         assert!(table.contains(needle), "{needle}");
     }
