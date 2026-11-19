@@ -793,7 +793,9 @@ on a build in which:
   not dropped by the runtime, so what it holds would stay held: the
   isolate keeps such work in a table, the work marks it every 5 s, and
   each request and each queue batch first drops the work that has not
-  marked it for 60 s. That gives the 32 MiB back and logs
+  marked it for 60 s; a Complete that found no room after its wait
+  does the same once more before it answers 503. That gives the 32 MiB
+  back and logs
   `work table: abandoned work dropped: ... budget_in_use_before=...
   budget_in_use=...`. Work that is cut has either
   published the object or left it unpublished (with its segments, and
@@ -813,10 +815,13 @@ on a build in which:
   another do not keep a Complete out for good, a job that would keep a
   waiting Complete out waits itself (it gives its lease back unspent
   when it has waited 20 s, as for any full budget) until the Complete
-  has its charge or gives up; the jobs that run finish first. A job
-  that leaves room beside the Complete is not held back, and nothing
-  changes while no Complete waits. A Complete whose request was stopped
-  while it waited holds the jobs back for 2 s, once.
+  has its charge or gives up; the jobs that run finish first. A job is
+  held back only when the jobs are what keeps that Complete out: not
+  one that leaves room beside it, not while requests keep it out
+  (another such Complete runs, or bodies are being read), and not the
+  repost of a verify job that runs already. Nothing changes while no
+  Complete waits. A Complete whose request was stopped while it waited
+  holds the others back for 2 s, once.
   The budget was not raised instead: a Complete and two such post jobs
   hold about 74 MiB, above the 72 MiB that the isolate is sized for, and
   a request budget of 64 MiB would let two 16 MiB bodies in at once on
@@ -867,10 +872,14 @@ charge back:
 3. Wait 60 s (the runtime stops the invocation about 30 s after the
    client left) and then 60 s more for the mark to go quiet. Send any
    request: the tail shows `work table: abandoned work dropped` with
-   `budget_in_use_before=33554432` and `budget_in_use=0`, and the
+   `dropped=1` and a `budget_in_use` that is 33 554 432 below
+   `budget_in_use_before` (33554432 and 0 when nothing else is charged
+   on the isolate: keep the drill Worker idle otherwise), and the
    `memory:` line of that request shows `budget_in_use=0` (plus what
-   the request itself holds). All of it has to come from one isolate:
-   compare `isolate=` in the lines.
+   the request itself holds). A queue batch or a cron pass that
+   reaches the isolate first drops the work and logs the line before
+   your request does: look for the line, not for the request. All of
+   it has to come from one isolate: compare `isolate=` in the lines.
 4. Control: the same Complete with a client that stays (no
    `--max-time`). It answers after about 90 s with the result document,
    the object reads back, no `abandoned work` line appears, and

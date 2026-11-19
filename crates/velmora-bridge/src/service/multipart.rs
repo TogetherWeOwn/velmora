@@ -1629,11 +1629,17 @@ where
     // with whitespace (`crate::keepalive`), and a failure from here on
     // is an `<Error>` document in it, as S3 itself answers a Complete.
     // The memory of the work is charged as one fixed sum; without room
-    // for it the client is told to come back.
-    let charge = bridge
-        .budget
-        .charge_ahead(crate::config::COMPLETE_CHARGE_BYTES)
-        .await?;
+    // for it the client is told to come back. What may hold the room
+    // is the work of an invocation that ended while this one waited:
+    // nothing else may have come to drop it, so look once more.
+    let bytes = crate::config::COMPLETE_CHARGE_BYTES;
+    let charge = match bridge.budget.charge_ahead(bytes).await {
+        Ok(charge) => charge,
+        Err(e) => {
+            bridge.reap_work();
+            bridge.budget.try_charge(bytes).ok_or(e)?
+        }
+    };
     let work = {
         let bridge = Rc::clone(bridge);
         async move {

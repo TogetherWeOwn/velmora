@@ -1028,6 +1028,37 @@ async fn the_charge_of_a_cancelled_invocation_is_given_back() {
     assert!(s.rig.bridge.works.is_empty());
 }
 
+/// A Complete sent again that waits for room while the work of the
+/// invocation that was cut becomes droppable is not refused for it:
+/// nothing else may come to the isolate to drop that work.
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_that_waited_drops_the_work_of_a_cancelled_invocation() {
+    use futures_util::FutureExt;
+    let s = scene_with_timers().await;
+    let (listed, whole) = three_parts(&s).await;
+    let mut answer = deferred(s.complete_raw(&listed).await);
+    let work = answer.take_work().expect("the work is there once");
+    let running = step_to(&s.rig, work, |rig| keys_under(rig, "m/seg/").len() == 1)
+        .await
+        .stalled();
+    std::mem::forget(running);
+    s.rig.trip().disarm();
+
+    // Sent again a moment too early: nothing to drop on the way in.
+    s.rig.bridge.clock.advance_ms(JOB_QUIET_MS - 1);
+    let mut again = Box::pin(s.complete(&listed));
+    assert!(again.as_mut().now_or_never().is_none(), "no room");
+    assert_eq!(s.rig.bridge.works.reaped(), 0);
+    assert_eq!(s.rig.bridge.budget.waiting(), 1);
+    s.rig.bridge.clock.advance_ms(1);
+    let resp = again.await;
+    assert!(!failed(&resp), "{}", resp.text());
+    assert_eq!(s.rig.bridge.works.reaped(), 1);
+    assert!(s.read().await.body == whole);
+    assert_eq!(s.rig.bridge.budget.in_use(), 0);
+    assert!(s.rig.bridge.works.is_empty());
+}
+
 /// At the shipped budget a Complete has room only while the jobs hold
 /// 24 MiB or less, and post jobs of 22 MiB come one after another. The
 /// jobs let a Complete that waits go first: the next job waits for it.
