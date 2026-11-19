@@ -3185,6 +3185,50 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
         .expect("the extent");
     let id = ExtentId::new(id);
 
+    // The provider takes no article: the addendum is stored, and in the
+    // extent's recovery record, with nothing sent.
+    let s = "parity, before the first POST";
+    let planned = "SELECT COUNT(*) FROM extents WHERE parity IS NOT NULL";
+    expect_eq(s, "addenda before the job", 0, rig.sql_count(planned));
+    rig.server.set_posting_allowed(false).await;
+    let outcome = rig.bridge.run_job(job).await;
+    expect(
+        s,
+        "the post job did not finish",
+        matches!(outcome, JobOutcome::Retry { .. }),
+        format!("{outcome:?}"),
+    );
+    expect_eq(
+        s,
+        "articles on the provider",
+        0,
+        rig.server.posted_ids().await.len(),
+    );
+    expect_eq(
+        s,
+        "(addenda, parity articles planned, plans recorded as posted)",
+        (1, 1, 0),
+        (
+            rig.sql_count(planned),
+            rig.sql_count("SELECT parity_count FROM extents"),
+            rig.sql_count(stamped),
+        ),
+    );
+    let first: Vec<u8> = rig
+        .bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.query_row("SELECT parity FROM extents", [], |r| r.get(0)))
+        .expect("the addendum");
+    expect(
+        s,
+        "the recovery record of the plan is written",
+        rig.bridge.safety.contains(&format!("m/art/{id}")),
+        &id,
+    );
+    rig.server.set_posting_allowed(true).await;
+    rig.bridge.clock.advance_secs(3600);
+
     // The write that records the plan as posted fails: what the job had
     // done when it came to it is all there is.
     let s = "parity, before the plan is recorded";
@@ -3244,6 +3288,18 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
         "parity articles of the addendum",
         1,
         parity.articles.len(),
+    );
+    let then: Vec<u8> = rig
+        .bridge
+        .catalog
+        .sql
+        .with_conn(|c| c.query_row("SELECT parity FROM extents", [], |r| r.get(0)))
+        .expect("the addendum");
+    expect(
+        s,
+        "the addendum is the one stored before the first POST",
+        first == then,
+        then.len(),
     );
     expect_eq(
         s,

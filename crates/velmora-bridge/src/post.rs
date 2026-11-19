@@ -1510,6 +1510,8 @@ struct RoundState<'a> {
     unknown: Vec<bool>,
     /// Articles a socket is posting right now.
     in_flight: usize,
+    /// How many of them are data articles.
+    data_in_flight: usize,
     /// Sockets waiting for an article that may come back to the queue.
     idle: Vec<Waker>,
     /// The time of the last renewal that confirmed the lease.
@@ -1592,6 +1594,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
                 queue: VecDeque::new(),
                 unknown: vec![false; plan.len()],
                 in_flight: 0,
+                data_in_flight: 0,
                 idle: Vec::new(),
                 kept_at: None,
                 fatal: None,
@@ -1743,6 +1746,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             let posted = self.post_at(slot, &mut session, at).await;
             let mut state = self.state.borrow_mut();
             state.in_flight -= 1;
+            state.data_in_flight -= usize::from(self.is_data(at));
             // Whatever happened, a waiting socket has to look again.
             state.idle.drain(..).for_each(Waker::wake);
             match posted {
@@ -1802,8 +1806,12 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
     /// that took the fewest data articles of the round, so that one
     /// provider losing its articles does not take the data and the
     /// parity with it: a socket of a provider that took more holds back
-    /// while the other has a socket in the round. That is a preference
-    /// only. A provider counts while one of its sockets still holds its
+    /// while the other has a socket in the round. No socket takes one
+    /// while a data article is still being posted: which provider took
+    /// fewer is known when each data article has its provider, and the
+    /// socket that posts the last one wakes the others when it is done
+    /// (an article that fails goes back to the queue, and data goes
+    /// first). That is a preference only. A provider counts while one of its sockets still holds its
     /// slot and the provider is not closed; when its last socket is gone
     /// the sockets that held back take the parity themselves. The
     /// provider with the fewest never holds back, and each of its
@@ -1817,6 +1825,7 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
             let data = state.queue.iter().position(|at| self.is_data(*at));
             if let Some(next) = data.and_then(|at| state.queue.remove(at)) {
                 state.in_flight += 1;
+                state.data_in_flight += 1;
                 return Poll::Ready(Some(next));
             }
             if !state.queue.is_empty() && !self.holds_back(&state, provider) {
@@ -1834,13 +1843,18 @@ impl<'a, C: Catalog, T: Clock> Round<'a, C, T> {
         .await
     }
 
-    /// Whether a socket of `provider` leaves a parity article to another
-    /// provider: one with a socket in the round that took fewer data
-    /// articles of it. Only a first post is placed; a repost goes to
+    /// Whether a socket of `provider` leaves a parity article for now:
+    /// to the socket that is posting a data article, until it is done,
+    /// and then to another provider, one with a socket in the round
+    /// that took fewer data articles of it. Only a first post is placed; a repost goes to
     /// the providers that miss the article.
     fn holds_back(&self, state: &RoundState<'a>, provider: &str) -> bool {
         if !matches!(self.record.get(), Record::Posted) {
             return false;
+        }
+        // Not before every data article has its provider.
+        if state.data_in_flight > 0 {
+            return true;
         }
         let took = |provider: &str| {
             (0..self.plan.len())

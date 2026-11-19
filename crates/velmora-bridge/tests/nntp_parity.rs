@@ -4,6 +4,7 @@
 
 mod nntp_support;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -488,6 +489,64 @@ async fn parity_goes_to_the_provider_with_fewer_data_articles() {
     all.extend(stored(&rig, 1).await);
     assert_eq!(all, id_set(plan.iter().chain(&parity.articles)));
     assert_eq!(all.len(), 28);
+}
+
+/// A data article is still in flight when the queue runs out of data:
+/// no parity article is sent until it has ended, since the provider
+/// that takes it is not yet counted. The parity is then with a provider
+/// that has no more of the extent's data articles than the other.
+#[tokio::test]
+async fn parity_waits_for_the_data_articles_in_flight() {
+    let rig = parity_rig(&[spec("bb0", 4), spec("bb1", 2)]).await;
+    let s = rig.seed(1, &marked_plaintext(5 * 700_000)).await;
+    // The plan first, so that the parity articles are known.
+    rig.servers[0].set_posting_allowed(false).await;
+    rig.servers[1].set_posting_allowed(false).await;
+    assert_ne!(rig.run_post(&s).await, JobOutcome::Ack);
+    rig.servers[0].set_posting_allowed(true).await;
+    rig.servers[1].set_posting_allowed(true).await;
+    let parity_ids = id_set(&parity_of(&rig, &s).await.articles);
+    let data_ids = id_set(&rig.plan(&s).await);
+    assert_eq!(data_ids.len(), 5);
+    rig.bridge.clock.advance_secs(3600);
+
+    // The first POST to be answered, a data article, stays in flight.
+    let release = rig.bridge.nntp.park_next_post();
+    let early = Cell::new(true);
+    let lease = rig.claim(&s, OutboxStage::Post).await;
+    let job = rig.job(&s).await;
+    let post = rig.bridge.post_stage(&lease, &job);
+    let hold = async {
+        let held = async || {
+            let mut all = stored(&rig, 0).await;
+            all.extend(stored(&rig, 1).await);
+            all
+        };
+        // Every data article is with a provider, the parked one too.
+        while !held().await.is_superset(&data_ids) {
+            tokio::task::yield_now().await;
+        }
+        // Time enough for an idle socket to send a parity article.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        early.set(held().await.intersection(&parity_ids).next().is_some());
+        release.set(true);
+    };
+    let both = async { tokio::join!(post, hold).0 };
+    let outcome = tokio::time::timeout(Duration::from_secs(120), both).await;
+    assert_eq!(outcome.expect("the job ends"), JobOutcome::Ack);
+    assert!(
+        !early.get(),
+        "parity was sent with a data article in flight"
+    );
+
+    let data = data_by(&rig.plan(&s).await);
+    let took = |p: &str| data.get(p).copied().unwrap_or(0);
+    let by = parity_posted(&rig, &s);
+    assert_eq!(by.len(), 1);
+    for provider in by.values() {
+        let other = if provider == "p0" { "p1" } else { "p0" };
+        assert!(took(provider) <= took(other), "{data:?} {by:?}");
+    }
 }
 
 /// The preferred provider stops taking posts in the middle of the
