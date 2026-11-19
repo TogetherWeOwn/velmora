@@ -210,12 +210,24 @@ fn run_to_completion(conn: &Connection, sql: &str, params: &[SqlValue]) -> Resul
     Ok(conn.total_changes().saturating_sub(before))
 }
 
+/// Most terms D1 takes in one compound SELECT, measured on workerd.
+pub const D1_MAX_COMPOUND_SELECT: i32 = 5;
+
 impl RusqliteSql {
     /// Empty in-memory database with foreign keys on.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(map_err)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(map_err)?;
+        // D1 (workerd) refuses a compound SELECT of more than five
+        // terms ("too many terms in compound SELECT"); SQLite's own
+        // default is 500, so a sixth `UNION ALL` arm would pass here
+        // and fail every call on D1.
+        conn.set_limit(
+            rusqlite::limits::Limit::SQLITE_LIMIT_COMPOUND_SELECT,
+            D1_MAX_COMPOUND_SELECT,
+        )
+        .map_err(map_err)?;
         Ok(RusqliteSql {
             conn: RefCell::new(conn),
             meter: RefCell::new(None),

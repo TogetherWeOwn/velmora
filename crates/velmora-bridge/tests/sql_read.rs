@@ -152,3 +152,23 @@ async fn one_statement_answers_what_the_single_reads_answer() {
         .unwrap();
     assert!(none.is_none());
 }
+
+/// The test database refuses what D1 refuses: a compound SELECT of more
+/// than five terms. The read lookup is five arms, so a sixth would fail
+/// here as it would fail every GET on D1.
+#[tokio::test(flavor = "current_thread")]
+async fn a_compound_select_has_no_more_terms_than_d1_takes() {
+    let sql = velmora_bridge::testkit::RusqliteSql::open_in_memory().unwrap();
+    let terms = |n: i32| {
+        (0..n)
+            .map(|i| format!("SELECT {i}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+    };
+    let most = velmora_bridge::testkit::D1_MAX_COMPOUND_SELECT;
+    assert_eq!(
+        sql.query(&terms(most), &[]).await.unwrap().len(),
+        most as usize
+    );
+    assert!(sql.query(&terms(most + 1), &[]).await.is_err());
+}
