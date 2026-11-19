@@ -773,7 +773,8 @@ async fn an_article_that_arrives_after_the_read_does_not_escalate() {
     let (s, plan) = rig.on_two(16).await;
     let drawn = rig.sample_index(&s);
     let name = ["bb0", "bb1"][drawn];
-    let posted: Vec<_> = plan.iter().map(|a| a.posted_at).collect();
+    // A repost stamps `reposted_at`.
+    let posted: Vec<_> = plan.iter().map(|a| (a.posted_at, a.reposted_at)).collect();
     rig.bridge.clock.advance_secs(1);
     // A read asks twice for an article it does not get: both times
     // in vain here.
@@ -785,7 +786,8 @@ async fn an_article_that_arrives_after_the_read_does_not_escalate() {
     assert!(rig.checks(&s).contains(&ok(name, VerifyKind::Sampled)));
     assert!(rig.bridge.catalog.escalations.borrow().is_empty());
     assert!(rig.bridge.catalog.raises.borrow().is_empty());
-    let after: Vec<_> = rig.plan(&s).await.iter().map(|a| a.posted_at).collect();
+    let after = rig.plan(&s).await;
+    let after: Vec<_> = after.iter().map(|a| (a.posted_at, a.reposted_at)).collect();
     assert_eq!(after, posted);
     assert_eq!(rig.stage(&s), OutboxStage::Release);
 }
