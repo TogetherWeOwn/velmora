@@ -634,13 +634,21 @@ async fn a_corrupt_sample_raises_the_backbone_to_full_reads() {
         extent_id: bad.extent.clone(),
         result: VerifyResult::Corrupt,
     };
-    assert!(raised.contains(&expected));
-    // The other backbone has a copy of the same corrupt article. Where
-    // it came after the failed read it was read in full to stand in for
-    // it, and was raised too. The rest follows the one that was drawn.
-    assert!(raised.len() <= 2);
-    let all = &rig.bridge.catalog.escalations;
-    all.borrow_mut().retain(|e| e.backbone == name);
+    // The other backbone has a copy of the same corrupt article and is
+    // read in full to stand in for the one drawn, in this round or the
+    // next: bytes that were bad when posted do not raise it.
+    assert_eq!(raised, core::slice::from_ref(&expected));
+    rig.wait_until_due(&bad);
+    rig.run(&bad, OutboxStage::Verify).await;
+    let other = ["bb1", "bb0"][drawn];
+    let rows = rig.checks(&bad);
+    assert!(rows.iter().any(|r| r.0 == other && r.1.is_full()));
+    let raised = rig.bridge.catalog.escalations.borrow().clone();
+    assert_eq!(raised.len(), 1);
+    assert_eq!(raised[0].backbone, name);
+    // Raised again by the second read of the backbone drawn: the rest
+    // counts from its first.
+    rig.bridge.catalog.escalations.borrow_mut()[0] = expected;
 
     // From here on nothing is in the sample by its id.
     rig.bridge.cfg.verify.sample_ppm = 0;
