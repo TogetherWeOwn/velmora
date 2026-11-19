@@ -1,5 +1,7 @@
-//! Test support: the only writer of segmented generation records
-//! (format 2). Production code reads them and does not write them.
+//! Test support: a writer of segmented generation records (format 2)
+//! for the tests of the readers, apart from the production writer
+//! (`recovery::SegmentWriter`), so that a reader is not only tested
+//! against the code it ships with.
 //!
 //! A record is made from a format-1 record: the same bucket, the same
 //! generation, the same extents, cut into segments of a size the test

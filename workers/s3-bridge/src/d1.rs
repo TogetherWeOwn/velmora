@@ -18,7 +18,7 @@
 //! SQL text, parameter or database message.
 
 use velmora_bridge::{
-    is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlValue, MAX_SQL_PARAMS,
+    is_tx_guard_violation, BridgeError, Result, Row, Sql, SqlLimits, SqlValue, MAX_SQL_PARAMS,
 };
 use worker::js_sys::{self, Array, ArrayBuffer, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
@@ -35,6 +35,7 @@ const MAX_SAFE_INT: i64 = (1 << 53) - 1;
 /// database passes 4 GiB.
 pub struct D1Sql {
     db: D1Sys,
+    limits: SqlLimits,
 }
 
 impl D1Sql {
@@ -42,7 +43,18 @@ impl D1Sql {
         let raw: &JsValue = db.as_ref();
         D1Sql {
             db: raw.clone().unchecked_into(),
+            limits: SqlLimits::D1,
         }
+    }
+
+    /// Fewer rows to one value of a set-based publish than D1 was
+    /// measured with (`PUBLISH_CHUNK_ROWS`, a drill setting). Never
+    /// more.
+    pub fn with_set_rows(mut self, rows: Option<u32>) -> Self {
+        if let Some(rows) = rows.and_then(|r| usize::try_from(r).ok()) {
+            self.limits.set_rows = rows.clamp(1, SqlLimits::D1.set_rows);
+        }
+        self
     }
 
     fn statement(&self, sql: &str, params: &[SqlValue]) -> Result<D1PreparedStatement> {
@@ -58,6 +70,10 @@ impl D1Sql {
 }
 
 impl Sql for D1Sql {
+    fn limits(&self) -> SqlLimits {
+        self.limits
+    }
+
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         let rows = settle(self.statement(sql, params)?.raw()).await?;
         let rows = rows.dyn_into::<Array>().map_err(|_| decode_err())?;

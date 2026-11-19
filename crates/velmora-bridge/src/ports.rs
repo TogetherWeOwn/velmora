@@ -763,6 +763,16 @@ pub trait Catalog {
     /// The extent rows of the upload's current parts, ordered by part
     /// number and, within a part, in body order; at most `limit` of them.
     async fn upload_extents(&self, t: &UploadTarget<'_>, limit: u32) -> Result<Vec<PartExtent>>;
+    /// The same rows of the parts numbered `first..=last` alone, at
+    /// most `limit` of them: how a Complete of more extents than one
+    /// read should bring reads them, a run of part numbers at a time.
+    async fn upload_extents_between(
+        &self,
+        t: &UploadTarget<'_>,
+        first: u16,
+        last: u16,
+        limit: u32,
+    ) -> Result<Vec<PartExtent>>;
     /// How many extents the upload holds under part numbers other than
     /// `except`. A count without a guard: Complete decides for real.
     async fn upload_extents_held(&self, upload: &UploadId, except: u16) -> Result<u64>;
@@ -1156,6 +1166,10 @@ pub struct Bridge<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek
     pub clock: T,
     /// Per-isolate in-flight bytes (DESIGN §A.2).
     pub budget: ByteBudget,
+    /// The deferred work of requests that holds a charge, where a later
+    /// invocation can drop what a cancelled one left
+    /// ([`Bridge::tabled`](crate::service), [`Bridge::reap_work`]).
+    pub works: crate::jobtable::WorkTable,
     /// Validated configuration.
     pub cfg: BridgeConfig,
 }

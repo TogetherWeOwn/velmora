@@ -1015,10 +1015,37 @@ async fn a_charge_in_turn_is_not_held_back_by_one_it_does_not_keep_out() {
     assert_eq!((served.bytes(), budget.in_use()), (80, 80));
 }
 
-/// A charge that is listed as waiting but is not polled any more holds
-/// a charge in turn back for `TURN_WAIT_MS` and no longer.
+/// A charge that is listed as waiting and is polled holds a charge in
+/// turn back for `TURN_WAIT_MS` and no longer.
 #[tokio::test]
 async fn a_charge_in_turn_waits_no_longer_than_its_turn() {
+    let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
+    let calls = Rc::new(Cell::new(0u32));
+    let c = calls.clone();
+    let request = budget.for_request().with_sleeper(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        Box::pin(tokio::task::yield_now())
+    }));
+    let held = request.try_charge(50).unwrap();
+    let waiter = async {
+        // Refused in the end: the 50 never go.
+        assert!(budget.charge(70).await.is_err());
+    };
+    let turn = async {
+        tokio::task::yield_now().await;
+        let charge = request.charge_in_turn(40).await.unwrap();
+        assert_eq!(calls.get(), ingress::TURN_WAIT_MS / ingress::CHARGE_POLL_MS);
+        charge
+    };
+    let ((), charge) = futures_util::future::join(waiter, turn).await;
+    drop((held, charge));
+}
+
+/// A charge that is listed as waiting but is not polled any more (its
+/// invocation was cut) holds a charge in turn back for `WAIT_QUIET_MS`,
+/// and holds none back after that: not for the life of the isolate.
+#[tokio::test]
+async fn a_charge_that_is_not_polled_holds_a_charge_in_turn_back_only_briefly() {
     use futures_util::FutureExt;
     // The first sleep never ends, the others end at once.
     let calls = Rc::new(Cell::new(0u32));
@@ -1036,13 +1063,500 @@ async fn a_charge_in_turn_waits_no_longer_than_its_turn() {
     let mut stale = Box::pin(budget.charge(70));
     assert!(stale.as_mut().now_or_never().is_none());
     let before = calls.get();
+    assert!(request.try_charge_in_turn(40).is_none(), "it may be alive");
     let charge = request.charge_in_turn(40).await.unwrap();
     assert_eq!(
         calls.get() - before,
-        ingress::TURN_WAIT_MS / ingress::CHARGE_POLL_MS
+        ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS
     );
     assert_eq!(charge.bytes(), 40);
+    drop(charge);
+    assert!(request.try_charge_in_turn(40).is_some(), "known to be gone");
+    assert_eq!(
+        calls.get() - before,
+        ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS
+    );
     drop((held, stale));
+}
+
+/// The watch on a charge that is not polled goes on through the rounds
+/// in which others keep that charge out: requests that come and go do
+/// not start it again, and it is found out in `WAIT_QUIET_MS`, not at
+/// the end of the turn.
+#[tokio::test]
+async fn a_charge_that_is_not_polled_is_found_out_while_others_come_and_go() {
+    use futures_util::FutureExt;
+    let quiet_rounds = ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let plain = ByteBudget::new(100);
+    // Another request holds 40 in 5 rounds of every 20: the charge of
+    // 70 that waits has no room beside it then, whoever else is there.
+    let other: Rc<RefCell<Option<Charge>>> = Rc::new(RefCell::new(None));
+    let calls = Rc::new(Cell::new(0u32));
+    let (o, c, p) = (other.clone(), calls.clone(), plain.for_request());
+    let request = plain.for_request().with_sleeper(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        o.borrow_mut().take();
+        if c.get() % 20 >= 15 {
+            *o.borrow_mut() = Some(p.try_charge(40).unwrap());
+        }
+        Box::pin(async {})
+    }));
+    let held = request.try_charge(50).unwrap();
+    let cut = plain
+        .for_request()
+        .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())));
+    let mut stale = Box::pin(cut.charge(70));
+    assert!(stale.as_mut().now_or_never().is_none());
+    let charge = request.charge_in_turn(40).await.unwrap();
+    assert_eq!(calls.get(), quiet_rounds);
+    drop((charge, held, stale));
+}
+
+/// Two charges that are not polled, in front by turns as another
+/// request comes and goes, are found out one after the other: the watch
+/// stays on the first until it is quiet, whoever is seen meanwhile.
+#[tokio::test]
+async fn two_charges_that_are_not_polled_are_found_out_one_after_the_other() {
+    use futures_util::FutureExt;
+    let quiet_rounds = ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let plain = ByteBudget::new(100);
+    // Another request holds 35 in every second round: the charge of 70
+    // has no room beside it then, the one of 55 has.
+    let other: Rc<RefCell<Option<Charge>>> = Rc::new(RefCell::new(None));
+    let calls = Rc::new(Cell::new(0u32));
+    let (o, c, p) = (other.clone(), calls.clone(), plain.for_request());
+    let request = plain.for_request().with_sleeper(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        o.borrow_mut().take();
+        if c.get() % 2 == 1 {
+            *o.borrow_mut() = Some(p.try_charge(35).unwrap());
+        }
+        Box::pin(async {})
+    }));
+    let held = request.try_charge(30).unwrap();
+    let cut = || {
+        plain
+            .for_request()
+            .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())))
+    };
+    let (first, second) = (cut(), cut());
+    let mut stale = (Box::pin(first.charge(70)), Box::pin(second.charge(55)));
+    *other.borrow_mut() = Some(plain.try_charge(70).unwrap());
+    assert!(stale.0.as_mut().now_or_never().is_none());
+    assert!(stale.1.as_mut().now_or_never().is_none());
+    other.borrow_mut().take();
+    let charge = request.charge_in_turn(40).await.unwrap();
+    assert_eq!(calls.get(), 2 * quiet_rounds);
+    drop((charge, held, stale));
+}
+
+/// A charge that is polled is waited for behind one that is not: the
+/// charge in turn that found the first one quiet looks at the next.
+#[tokio::test]
+async fn a_charge_behind_a_quiet_one_holds_a_charge_in_turn_back() {
+    use futures_util::FutureExt;
+    let budget = ByteBudget::new(100).with_sleeper(turn_sleeper());
+    let request = budget.for_request();
+    let held = request.try_charge(50).unwrap();
+    let cut = budget
+        .for_request()
+        .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())));
+    let mut stale = Box::pin(cut.charge(70));
+    assert!(stale.as_mut().now_or_never().is_none());
+    // Past the time a quiet one is given, within the turn.
+    let rounds = (ingress::WAIT_QUIET_MS + ingress::TURN_WAIT_MS) / 2 / ingress::CHARGE_POLL_MS;
+    let waiter = async {
+        assert!(budget.charge(70).await.is_err());
+    };
+    let turn = async {
+        tokio::task::yield_now().await;
+        let charge = futures_util::future::select(
+            Box::pin(request.charge_in_turn(40)),
+            Box::pin(async {
+                for _ in 0..rounds {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        )
+        .await;
+        assert!(
+            matches!(charge, futures_util::future::Either::Right(_)),
+            "served in front of a charge that waits"
+        );
+    };
+    futures_util::future::join(waiter, turn).await;
+    drop((held, stale));
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// The shipped budget: 48 MiB for requests, 72 MiB for jobs.
+fn shipped_budget(sleeper: Sleeper) -> ByteBudget {
+    ByteBudget::new(48 * MIB)
+        .with_job_capacity(72 * MIB)
+        .with_sleeper(sleeper)
+}
+
+/// A charge that goes ahead of the jobs (the 32 MiB of a Complete with
+/// a segmented record) is served once the running jobs leave room for
+/// it: a job that asks meanwhile, and that would keep it out, waits
+/// until it is served. Without that, post jobs of 22 MiB that come one
+/// after another never leave less than 44 MiB charged, and the Complete
+/// is refused every time. A plain charge of a request is not waited
+/// for: the jobs do as before.
+#[tokio::test]
+async fn a_job_charge_yields_to_a_waiting_charge_ahead() {
+    use futures_util::FutureExt;
+    let budget = shipped_budget(turn_sleeper());
+    let running = RefCell::new(vec![
+        budget.try_charge_job(22 * MIB).unwrap(),
+        budget.try_charge_job(22 * MIB).unwrap(),
+    ]);
+    // A plain charge that waits holds no job back.
+    let mut plain = Box::pin(budget.charge(32 * MIB));
+    assert!(plain.as_mut().now_or_never().is_none());
+    let third = budget.charge_job(22 * MIB).now_or_never();
+    assert!(
+        third.is_some_and(|c| c.is_ok()),
+        "a job beside a plain wait"
+    );
+    drop(plain);
+    assert_eq!(budget.jobs_in_use(), 44 * MIB);
+
+    let order = RefCell::new(Vec::new());
+    let complete = async {
+        let charge = budget.charge_ahead(32 * MIB).await.unwrap();
+        order.borrow_mut().push("complete");
+        charge
+    };
+    let job = async {
+        // The Complete is waiting by now.
+        tokio::task::yield_now().await;
+        let charge = budget.charge_job(22 * MIB).await;
+        order.borrow_mut().push("job");
+        charge
+    };
+    let jobs_end = async {
+        for _ in 0..5 {
+            assert!(order.borrow().is_empty(), "22 MiB more fit all along");
+            assert_eq!(budget.jobs_in_use(), 44 * MIB, "the job waits");
+            tokio::task::yield_now().await;
+        }
+        running.borrow_mut().pop();
+        // The job that waited does not fit beside the Complete: it is
+        // served when the Complete is done.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*order.borrow(), ["complete"]);
+    };
+    let complete = async {
+        let charge = complete.await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(charge);
+    };
+    let ((), job, ()) = futures_util::future::join3(complete, job, jobs_end).await;
+    assert_eq!(*order.borrow(), ["complete", "job"]);
+    assert_eq!(job.unwrap().bytes(), 22 * MIB);
+}
+
+/// A job is held back only by a charge ahead that it would keep out:
+/// one that fits beside the charge that waits is served at once.
+#[tokio::test]
+async fn a_job_charge_that_leaves_room_for_the_charge_ahead_does_not_wait() {
+    use futures_util::FutureExt;
+    let budget = shipped_budget(turn_sleeper());
+    let running = budget.try_charge_job(40 * MIB).unwrap();
+    let mut complete = Box::pin(budget.charge_ahead(32 * MIB));
+    assert!(complete.as_mut().now_or_never().is_none());
+    // 32 MiB of a request weigh 48 MiB of the 72: 24 MiB are left for
+    // jobs. 40 MiB are charged; 2 MiB more keep the Complete out as the
+    // 40 do, and are held back all the same.
+    assert!(budget.charge_job(2 * MIB).now_or_never().is_none());
+    drop(running);
+    assert!(budget.charge_job(25 * MIB).now_or_never().is_none());
+    let small = budget.charge_job(24 * MIB).now_or_never();
+    assert!(small.is_some_and(|c| c.is_ok()), "24 MiB leave room");
+    assert!(complete.as_mut().now_or_never().is_some_and(|c| c.is_ok()));
+    // Nobody waits now: a job takes what is free.
+    assert!(budget.charge_job(70 * MIB).now_or_never().is_some());
+}
+
+/// A job that runs already and charges more (a repost within a verify
+/// job) is not held back: what it holds may be the very thing that
+/// keeps the charge ahead out, and it gives that back only when it is
+/// done. It still has to fit.
+#[tokio::test]
+async fn a_running_job_that_charges_more_does_not_wait_for_a_charge_ahead() {
+    use futures_util::FutureExt;
+    let budget = ByteBudget::new(32 * MIB).with_sleeper(turn_sleeper());
+    let running = budget.try_charge_job(2 * MIB).unwrap();
+    let mut complete = Box::pin(budget.charge_ahead(32 * MIB));
+    assert!(complete.as_mut().now_or_never().is_none());
+    assert!(budget.charge_job(11 * MIB).now_or_never().is_none());
+    let more = budget.charge_job_more(11 * MIB).now_or_never();
+    assert!(more.is_some_and(|c| c.is_ok()), "served at once");
+    assert!(budget.charge_job_more(31 * MIB).now_or_never().is_none());
+    drop(running);
+    assert!(complete.as_mut().now_or_never().is_some_and(|c| c.is_ok()));
+}
+
+/// While another charge ahead runs and keeps the waiting one out
+/// (another Complete), no job gives it room by waiting, and that one
+/// runs for as long as its work takes: a job that fits is served. The
+/// charge that a Complete takes after its wait and the reap counts the
+/// same.
+#[tokio::test]
+async fn a_charge_ahead_that_another_one_keeps_out_holds_no_job_back() {
+    use futures_util::FutureExt;
+    for fallback in [false, true] {
+        let budget = shipped_budget(turn_sleeper());
+        let other = match fallback {
+            true => budget.try_charge_ahead(32 * MIB).unwrap(),
+            false => budget
+                .charge_ahead(32 * MIB)
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+        };
+        let mut complete = Box::pin(budget.charge_ahead(32 * MIB));
+        assert!(complete.as_mut().now_or_never().is_none());
+        let nothing = budget.charge_job(0).now_or_never();
+        assert!(nothing.is_some_and(|c| c.is_ok()));
+        let job = budget.charge_job(22 * MIB).now_or_never();
+        let job = job.expect("served at once").unwrap();
+        // The other one is done: there is room beside that job, and the
+        // next job waits for the one that waits.
+        drop(other);
+        assert!(budget.charge_job(3 * MIB).now_or_never().is_none());
+        assert!(complete.as_mut().now_or_never().is_some_and(|c| c.is_ok()));
+        drop(job);
+    }
+}
+
+/// Two charges ahead that became one (`Charge::absorb`) still count as
+/// running until that one is dropped, and not after.
+#[tokio::test]
+async fn a_charge_ahead_that_was_absorbed_counts_until_it_is_dropped() {
+    use futures_util::FutureExt;
+    let budget = shipped_budget(turn_sleeper());
+    let mut other = budget.try_charge_ahead(8 * MIB).unwrap();
+    other.absorb(budget.try_charge_ahead(24 * MIB).unwrap());
+    let mut complete = Box::pin(budget.charge_ahead(32 * MIB));
+    assert!(complete.as_mut().now_or_never().is_none());
+    assert!(budget.charge_job(22 * MIB).now_or_never().is_some());
+    drop(other);
+    // A body of the same size is not a charge ahead: see below.
+    let body = budget.try_charge(32 * MIB).unwrap();
+    assert!(budget.charge_job(22 * MIB).now_or_never().is_none());
+    drop((body, complete));
+}
+
+/// While a body is being read and keeps the charge ahead out, the jobs
+/// wait all the same: a body is done in seconds, and a job that was let
+/// in meanwhile would hold the room then. With three part uploads and a
+/// backlog of post jobs, a Complete would otherwise be refused again
+/// and again.
+#[tokio::test]
+async fn a_job_charge_yields_to_a_charge_ahead_that_a_body_keeps_out() {
+    use futures_util::FutureExt;
+    let budget = shipped_budget(turn_sleeper());
+    let body = budget.try_charge(20 * MIB).unwrap();
+    let mut complete = Box::pin(budget.charge_ahead(32 * MIB));
+    assert!(complete.as_mut().now_or_never().is_none());
+    // It would fit: 20 MiB of 48 and 22 MiB of 72.
+    let mut job = Box::pin(budget.charge_job(22 * MIB));
+    assert!(job.as_mut().now_or_never().is_none(), "the job went first");
+    // The body is done: the room is the Complete's.
+    drop(body);
+    assert!(complete.as_mut().now_or_never().is_some_and(|c| c.is_ok()));
+    assert!(job.as_mut().now_or_never().is_some_and(|c| c.is_ok()));
+}
+
+/// A charge ahead whose request was stopped is found out in
+/// `WAIT_QUIET_MS` whatever the other requests do: another charge
+/// ahead that comes and goes, so that the stopped one holds the job
+/// back in one round and not in the next, does not start the watch
+/// again. Here: a job of 22 MiB runs, the requests hold a body of 8 MiB
+/// for 1.5 s and a running Complete's 32 MiB for 0.5 s in turn, and a
+/// post job of 22 MiB asks.
+#[tokio::test]
+async fn a_charge_ahead_that_is_not_polled_is_found_out_under_changing_requests() {
+    use futures_util::FutureExt;
+    let quiet_rounds = ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let plain = shipped_budget(turn_sleeper());
+    let others: Rc<RefCell<Option<Charge>>> = Rc::new(RefCell::new(None));
+    let calls = Rc::new(Cell::new(0u32));
+    let (o, c, p) = (others.clone(), calls.clone(), plain.for_request());
+    let budget = plain.for_request().with_sleeper(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        o.borrow_mut().take();
+        *o.borrow_mut() = Some(match c.get() % 20 < 15 {
+            true => p.try_charge(8 * MIB).unwrap(),
+            false => p.try_charge_ahead(32 * MIB).unwrap(),
+        });
+        Box::pin(async {})
+    }));
+    let running = budget.try_charge_job(22 * MIB).unwrap();
+    *others.borrow_mut() = Some(plain.try_charge(8 * MIB).unwrap());
+    let cut = budget
+        .for_request()
+        .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())));
+    let mut stale = Box::pin(cut.charge_ahead(32 * MIB));
+    assert!(stale.as_mut().now_or_never().is_none());
+    let job = budget.charge_job(22 * MIB).await.unwrap();
+    assert_eq!(calls.get(), quiet_rounds);
+    drop((job, running, stale));
+}
+
+/// A charge ahead whose request was stopped (its invocation was cut:
+/// nothing polls it and nothing drops it) holds a job back for
+/// `WAIT_QUIET_MS` and no longer, and holds no later job back at all.
+/// One that is polled again is waited for again.
+#[tokio::test]
+async fn a_charge_ahead_that_is_not_polled_holds_jobs_back_only_briefly() {
+    use futures_util::FutureExt;
+    let calls = Rc::new(Cell::new(0u32));
+    let c = calls.clone();
+    let budget = shipped_budget(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        Box::pin(async {})
+    }));
+    let running = budget.try_charge_job(44 * MIB).unwrap();
+    // Polled once, then left: it stays listed. Its own sleeps are
+    // counted apart.
+    let own = Rc::new(Cell::new(0u32));
+    let o = own.clone();
+    let cut = budget.for_request().with_sleeper(Rc::new(move |_| {
+        o.set(o.get() + 1);
+        Box::pin(std::future::pending())
+    }));
+    let mut stale = Box::pin(cut.charge_ahead(32 * MIB));
+    assert!(stale.as_mut().now_or_never().is_none());
+    assert_eq!(own.get(), 1);
+
+    let job = budget.charge_job(22 * MIB).await.unwrap();
+    assert_eq!(
+        calls.get(),
+        ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS
+    );
+    drop(job);
+    // The next job does not wait at all.
+    let job = budget.charge_job(22 * MIB).await.unwrap();
+    assert_eq!(
+        calls.get(),
+        ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS
+    );
+    drop((job, running, stale));
+}
+
+/// A charge ahead that was quiet and is polled again is waited for
+/// again.
+#[tokio::test]
+async fn a_quiet_charge_ahead_that_is_polled_again_is_waited_for_again() {
+    use futures_util::FutureExt;
+    let quiet_rounds = ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let calls = Rc::new(Cell::new(0u32));
+    let c = calls.clone();
+    let budget = shipped_budget(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        Box::pin(async {})
+    }));
+    let running = budget.try_charge_job(44 * MIB).unwrap();
+    // Its sleep ends when the gate is open, and shuts the gate.
+    let gate = Rc::new(Cell::new(false));
+    let g = gate.clone();
+    let slow = budget.for_request().with_sleeper(Rc::new(move |_| {
+        let g = g.clone();
+        Box::pin(std::future::poll_fn(move |_| match g.replace(false) {
+            true => std::task::Poll::Ready(()),
+            false => std::task::Poll::Pending,
+        }))
+    }));
+    let mut complete = Box::pin(slow.charge_ahead(32 * MIB));
+    assert!(complete.as_mut().now_or_never().is_none());
+    drop(budget.charge_job(22 * MIB).await.unwrap());
+    assert_eq!(calls.get(), quiet_rounds);
+    drop(budget.charge_job(22 * MIB).await.unwrap());
+    assert_eq!(calls.get(), quiet_rounds, "quiet: not waited for");
+
+    gate.set(true);
+    assert!(complete.as_mut().now_or_never().is_none());
+    drop(budget.charge_job(22 * MIB).await.unwrap());
+    assert_eq!(calls.get(), 2 * quiet_rounds, "polled: waited for again");
+    drop((running, complete));
+}
+
+/// A charge ahead that is polled is waited for behind one that is not:
+/// the job that found the first one quiet looks at the next.
+#[tokio::test]
+async fn a_charge_ahead_behind_a_quiet_one_is_waited_for() {
+    use futures_util::FutureExt;
+    let budget = shipped_budget(turn_sleeper());
+    let running = budget.try_charge_job(44 * MIB).unwrap();
+    let cut = budget
+        .for_request()
+        .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())));
+    let mut stale = Box::pin(cut.charge_ahead(32 * MIB));
+    assert!(stale.as_mut().now_or_never().is_none());
+    let rounds = 3 * ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let complete = async {
+        assert!(budget.charge_ahead(32 * MIB).await.is_err());
+    };
+    let job = async {
+        tokio::task::yield_now().await;
+        let charge = futures_util::future::select(
+            Box::pin(budget.charge_job(22 * MIB)),
+            Box::pin(async {
+                for _ in 0..rounds {
+                    tokio::task::yield_now().await;
+                }
+            }),
+        )
+        .await;
+        assert!(
+            matches!(charge, futures_util::future::Either::Right(_)),
+            "served beside a Complete that waits"
+        );
+    };
+    futures_util::future::join(complete, job).await;
+    drop((running, stale));
+}
+
+/// A charge ahead that is polled all along is waited for as long as it
+/// waits: longer than the time a quiet one is given.
+#[tokio::test]
+async fn a_charge_ahead_that_is_polled_is_waited_for() {
+    let budget = shipped_budget(turn_sleeper());
+    let running = budget.try_charge_job(44 * MIB).unwrap();
+    let rounds = 3 * ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let complete = async {
+        // Refused in the end: the 44 MiB never go.
+        assert!(budget.charge_ahead(32 * MIB).await.is_err());
+    };
+    let job = async {
+        tokio::task::yield_now().await;
+        let seen = Cell::new(0u32);
+        let charge = futures_util::future::select(
+            Box::pin(budget.charge_job(22 * MIB)),
+            Box::pin(async {
+                for _ in 0..rounds {
+                    seen.set(seen.get() + 1);
+                    tokio::task::yield_now().await;
+                }
+            }),
+        )
+        .await;
+        assert!(
+            matches!(charge, futures_util::future::Either::Right(_)),
+            "served after {} rounds beside a Complete that waits",
+            seen.get()
+        );
+    };
+    futures_util::future::join(complete, job).await;
+    drop(running);
 }
 
 /// A charge that gave up waiting, or was dropped while it waited, holds

@@ -946,7 +946,9 @@ where
         }
         // Unlike the rest of its stage, a repost holds the whole extent. A
         // repost larger than the budget still has to run, alone: next to
-        // what its own stage already holds.
+        // what its own stage already holds. It runs already, so it does
+        // not let a waiting Complete go first: its stage's charge may be
+        // what keeps that Complete out.
         let room = self
             .budget
             .job_capacity()
@@ -955,7 +957,7 @@ where
             .cipher_size
             .saturating_add(u64::from(self.cfg.post_sockets) * POST_SOCKET_BYTES)
             .min(room);
-        let Ok(_charge) = self.budget.charge_job(bytes).await else {
+        let Ok(_charge) = self.budget.charge_job_more(bytes).await else {
             return Err(Stop::NoPermit);
         };
         let cipher = match self.safety.get(&extent.id.safety_key(), None).await {

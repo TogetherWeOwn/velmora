@@ -14,6 +14,7 @@ mod get;
 pub use get::{INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS};
 mod list;
 mod multipart;
+pub use multipart::MAX_PARTS;
 mod multipart_list;
 mod put;
 mod slices;
@@ -240,11 +241,23 @@ where
     K: Kek,
     T: Clock,
 {
+    /// Drops the deferred work of invocations that are gone, with the
+    /// charge it holds, and says how many: work that its invocation has
+    /// not marked for [`JOB_QUIET_MS`](crate::jobtable::JOB_QUIET_MS).
+    /// The runtime ends an invocation at most 30 s after its client
+    /// left, and what ran under it is then neither polled nor dropped
+    /// (see [`crate::jobtable`]).
+    pub fn reap_work(&self) -> usize {
+        self.works
+            .reap_quiet(self.clock.now(), crate::jobtable::JOB_QUIET_MS)
+    }
+
     /// Entry point for every fetch: S3 and `/_admin`.
     pub async fn handle(self: Rc<Self>, req: S3Request) -> S3Response
     where
         Self: 'static,
     {
+        self.reap_work();
         let target = req.raw_target.clone();
         // A sub-range of a large GET, asked for by another invocation of
         // this Worker. It is told apart by its target alone and admitted

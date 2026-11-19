@@ -14,9 +14,9 @@ use std::rc::Rc;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use velmora_bridge::config::{
-    BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance, DEFAULT_COLD_SOCKETS,
-    DEFAULT_HOT_CAP_BYTES, DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES, MAX_EXTENT_BYTES_LIMIT,
-    MAX_PUT_BYTES_LIMIT,
+    edge_put_bytes, BridgeConfig, ConfigError, Environment, GcMode, KekRing, Maintenance,
+    DEFAULT_COLD_SOCKETS, DEFAULT_HOT_CAP_BYTES, DEFAULT_POST_SOCKETS, DEFAULT_SLICE_BYTES,
+    MAX_EXTENT_BYTES_LIMIT, MAX_OBJECT_EXTENTS_LIMIT, MAX_PUT_BYTES_LIMIT,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::jobs::RESEND_SECS;
@@ -262,7 +262,7 @@ fn config_loads_from_documented_vars() {
         ConfigError::Invalid("S3_HOST".into())
     );
 
-    let cfg = load(&with_secrets(prod, &prod_providers())).unwrap();
+    let cfg = load(&with_secrets(prod.clone(), &prod_providers())).unwrap();
     assert_eq!(cfg.environment, Environment::Prod);
     assert_eq!(cfg.s3_host, PROD_HOST_FIXTURE);
     assert_eq!(cfg.required_backbones, 2);
@@ -297,13 +297,30 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.propagation_grace_secs, 21_600);
     // A PutObject body may be 99 MiB, stored in slices of 8 MiB. The
     // sweep of writes that were never published ships off in production.
+    // That is what the edge of 100 MiB lets through, less the framing;
+    // the build takes more, for a plan with a higher edge limit.
     assert_eq!(cfg.max_put_bytes, 99 * 1024 * 1024);
-    assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
+    assert_eq!(cfg.max_put_bytes, edge_put_bytes(100 * 1024 * 1024));
+    assert_eq!(MAX_PUT_BYTES_LIMIT, edge_put_bytes(200 * 1024 * 1024));
     assert_eq!(cfg.slice_bytes, DEFAULT_SLICE_BYTES);
     assert!(!cfg.intent_sweep);
-    // One object holds at most 10 000 extents unless the variable says
-    // fewer.
+    // One object holds at most 10 000 extents: what one recovery
+    // record in one document names. Production does not set the
+    // variable, and none of the drill settings: its records are cut
+    // where the build says, and its publish values hold what D1 was
+    // measured with.
     assert_eq!(cfg.max_object_extents, 10_000);
+    assert_eq!(cfg.record_cut, recovery::Cut::BUILT_IN);
+    assert_eq!(cfg.publish_chunk_rows, None);
+    for name in [
+        "MAX_OBJECT_EXTENTS",
+        "RECORD_SEGMENT_AFTER",
+        "RECORD_SEGMENT_EXTENTS",
+        "PUBLISH_CHUNK_ROWS",
+    ] {
+        assert!(!prod.contains_key(name), "{name} is set in production");
+        assert!(!dev.contains_key(name), "{name} is set in dev");
+    }
 
     // The dev environment is complete on its own (envs do not inherit vars).
     let cfg = load(&with_secrets(dev.clone(), PROVIDER_PLAIN)).unwrap();
@@ -316,7 +333,7 @@ fn config_loads_from_documented_vars() {
     assert!(cfg.server_side_copy);
     assert_eq!(
         (cfg.max_put_bytes, cfg.slice_bytes, cfg.intent_sweep),
-        (MAX_PUT_BYTES_LIMIT, DEFAULT_SLICE_BYTES, true)
+        (99 * 1024 * 1024, DEFAULT_SLICE_BYTES, true)
     );
     // Dev sets no job budget: jobs and requests share the one limit.
     assert_eq!(cfg.job_budget_bytes, cfg.inflight_budget_bytes);
@@ -522,7 +539,7 @@ fn missing_secret_fails_closed() {
                     assert_eq!(cfg.max_put_bytes, cfg.max_extent_bytes);
                     assert!(!cfg.intent_sweep);
                 } else {
-                    assert_eq!(cfg.max_put_bytes, MAX_PUT_BYTES_LIMIT);
+                    assert_eq!(cfg.max_put_bytes, 99 * 1024 * 1024);
                     assert!(!cfg.intent_sweep);
                 }
                 vars.insert(name.clone(), "  ".into());
@@ -621,9 +638,11 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("COLD_SOCKETS", "9"),
         ("PROPAGATION_GRACE_SECS", "-1"),
         ("PROPAGATION_GRACE_SECS", "6h"),
-        // Below one extent, above what the edge lets through, not a number.
+        // Below one extent, more than 16 slices of 8 MiB (17), above
+        // what the build takes, not a number.
         ("MAX_PUT_BYTES", "16777215"),
-        ("MAX_PUT_BYTES", "103809025"),
+        ("MAX_PUT_BYTES", "134217729"),
+        ("MAX_PUT_BYTES", "208666625"),
         ("MAX_PUT_BYTES", "99MiB"),
         // No slice, a slice above one extent, more than 16 slices in
         // the largest body (99 MiB in slices of 6 MiB are 17).
@@ -632,8 +651,16 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("SLICE_BYTES", "6291456"),
         ("SLICE_BYTES", "8m"),
         ("MAX_OBJECT_EXTENTS", "0"),
-        ("MAX_OBJECT_EXTENTS", "10001"),
+        ("MAX_OBJECT_EXTENTS", "131073"),
         ("MAX_OBJECT_EXTENTS", "10k"),
+        // A drill setting is never larger than what the build has.
+        ("RECORD_SEGMENT_AFTER", "0"),
+        ("RECORD_SEGMENT_AFTER", "10001"),
+        ("RECORD_SEGMENT_EXTENTS", "0"),
+        ("RECORD_SEGMENT_EXTENTS", "4097"),
+        ("PUBLISH_CHUNK_ROWS", "0"),
+        ("PUBLISH_CHUNK_ROWS", "25001"),
+        ("PUBLISH_CHUNK_ROWS", "many"),
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
@@ -661,11 +688,129 @@ fn config_rejects_invalid_and_unsafe_values() {
         assert_eq!(cfg.slice_bytes.to_string(), slice);
         assert_eq!(cfg.intent_sweep, sweep.trim() == "on");
     }
-    for n in ["1", "10000"] {
+    // 1 to 131,072 extents: 130,000 are 10,000 parts of 99 MiB in
+    // slices of 8 MiB.
+    for n in ["1", "10000", "130000", "131072"] {
         let mut capped = prod.clone();
         capped.insert("MAX_OBJECT_EXTENTS".into(), n.into());
         assert_eq!(load(&capped).unwrap().max_object_extents.to_string(), n);
     }
+    let with = |pairs: &[(&str, &str)]| {
+        let mut vars = prod.clone();
+        for (name, value) in pairs {
+            vars.insert(name.to_string(), value.to_string());
+        }
+        load(&vars)
+    };
+    let refused = |pairs: &[(&str, &str)]| {
+        assert!(
+            matches!(with(pairs), Err(ConfigError::Refused(_))),
+            "{pairs:?}"
+        );
+    };
+    // Above what one document holds, the limit has to take an upload
+    // of every part number in the largest bodies: 13 slices a part.
+    refused(&[("MAX_OBJECT_EXTENTS", "10001")]);
+    refused(&[("MAX_OBJECT_EXTENTS", "129999")]);
+    // 15 slices a part are 150,000 extents: more than any limit.
+    refused(&[("MAX_OBJECT_EXTENTS", "131072"), ("SLICE_BYTES", "7340032")]);
+    // The same rule for a plan whose edge takes 200 MiB: 199 MiB in
+    // slices of 16 MiB are 13 a part, in slices of 8 MiB 25 (no body
+    // has more than 16), in slices of 15 MiB 14 (140,000 extents).
+    let business = [("MAX_PUT_BYTES", "208666624"), ("SLICE_BYTES", "16777216")];
+    let cfg = with(&business).unwrap();
+    assert_eq!(
+        (cfg.max_put_bytes, cfg.max_object_extents),
+        (MAX_PUT_BYTES_LIMIT, 10_000)
+    );
+    let cfg = with(&[business[0], business[1], ("MAX_OBJECT_EXTENTS", "131072")]).unwrap();
+    assert_eq!(cfg.max_object_extents, MAX_OBJECT_EXTENTS_LIMIT);
+    assert_eq!(
+        with(&[business[0]]).unwrap_err(),
+        invalid("MAX_PUT_BYTES"),
+        "25 slices"
+    );
+    refused(&[
+        business[0],
+        ("SLICE_BYTES", "15728640"),
+        ("MAX_OBJECT_EXTENTS", "131072"),
+    ]);
+    // The same two settings at today's 99 MiB.
+    let cfg = with(&[("MAX_OBJECT_EXTENTS", "131072")]).unwrap();
+    assert_eq!(cfg.max_put_bytes, 99 * 1024 * 1024);
+
+    // Drill settings: smaller figures are taken.
+    let drill = [
+        ("RECORD_SEGMENT_AFTER", "128"),
+        ("RECORD_SEGMENT_EXTENTS", "64"),
+        ("PUBLISH_CHUNK_ROWS", "100"),
+    ];
+    let cfg = with(&drill).unwrap();
+    assert_eq!(
+        cfg.record_cut,
+        recovery::Cut {
+            after: 128,
+            per: 64
+        }
+    );
+    assert_eq!(cfg.publish_chunk_rows, Some(100));
+    // Nor one whose largest object is published in more than 128
+    // values: 10,000 extents in values of 78 rows are 129.
+    refused(&[("PUBLISH_CHUNK_ROWS", "78")]);
+    refused(&[("PUBLISH_CHUNK_ROWS", "1")]);
+    assert_eq!(
+        with(&[("PUBLISH_CHUNK_ROWS", "79")])
+            .unwrap()
+            .publish_chunk_rows,
+        Some(79)
+    );
+    assert_eq!(
+        with(&[("PUBLISH_CHUNK_ROWS", "1"), ("MAX_OBJECT_EXTENTS", "128")])
+            .unwrap()
+            .publish_chunk_rows,
+        Some(1)
+    );
+    refused(&[
+        ("PUBLISH_CHUNK_ROWS", "1023"),
+        ("MAX_OBJECT_EXTENTS", "131072"),
+    ]);
+    assert!(with(&[
+        ("PUBLISH_CHUNK_ROWS", "1024"),
+        ("MAX_OBJECT_EXTENTS", "131072")
+    ])
+    .is_ok());
+    // No limit is taken whose largest object is a record of more
+    // segments than a head names: 192 segments of 64 are 12,288. The
+    // limit of an object in one document is no such record.
+    refused(&[drill[0], drill[1], ("MAX_OBJECT_EXTENTS", "12289")]);
+    refused(&[drill[0], ("RECORD_SEGMENT_EXTENTS", "1")]);
+    with(&[("RECORD_SEGMENT_EXTENTS", "1")]).unwrap();
+    with(&[
+        ("RECORD_SEGMENT_AFTER", "9999"),
+        ("RECORD_SEGMENT_EXTENTS", "53"),
+    ])
+    .unwrap();
+    refused(&[
+        ("RECORD_SEGMENT_AFTER", "9999"),
+        ("RECORD_SEGMENT_EXTENTS", "52"),
+    ]);
+    // With an object that large, a Complete must have room for what it
+    // is charged: 32 MiB.
+    let budget = |bytes: &'static str| {
+        with(&[
+            drill[0],
+            ("MAX_EXTENT_BYTES", "4194304"),
+            ("MAX_PUT_BYTES", ""),
+            ("JOB_BUDGET_BYTES", ""),
+            ("INFLIGHT_BUDGET_BYTES", bytes),
+        ])
+    };
+    assert_eq!(
+        budget("33554431").unwrap_err(),
+        invalid("INFLIGHT_BUDGET_BYTES")
+    );
+    assert_eq!(budget("33554432").unwrap().inflight_budget_bytes, 32 << 20);
+    assert_eq!(config::COMPLETE_CHARGE_BYTES, 32 << 20);
     let mut small = prod.clone();
     small.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
     small.remove("MAX_PUT_BYTES");
@@ -1476,6 +1621,7 @@ async fn contract_compiles_against_fakes() {
         jobs,
         kek,
         clock,
+        works: Default::default(),
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });

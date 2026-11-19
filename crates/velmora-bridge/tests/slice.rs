@@ -636,6 +636,7 @@ impl Rig {
             jobs: FakeJobs::new(),
             kek: TestKek::new(),
             clock: FixedClock::new(T0),
+            works: Default::default(),
             budget: ByteBudget::new(cfg.inflight_budget_bytes),
             cfg,
         });

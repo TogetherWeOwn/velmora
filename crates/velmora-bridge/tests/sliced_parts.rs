@@ -769,6 +769,135 @@ async fn an_upload_never_holds_more_extents_than_one_object_may_have() {
 }
 
 // ---------------------------------------------------------------------------
+// A part of 96 MiB as aws-cli frames it
+// ---------------------------------------------------------------------------
+
+/// CRC-64/NVME of `data`, base64: the value of
+/// `x-amz-checksum-crc64nvme`.
+fn crc64nvme_b64(data: &[u8]) -> String {
+    use base64::Engine as _;
+    let mut table = [0u64; 256];
+    for (i, t) in table.iter_mut().enumerate() {
+        let mut c = i as u64;
+        for _ in 0..8 {
+            c = if c & 1 == 1 {
+                (c >> 1) ^ 0x9A6C_9329_AC4B_C9B5
+            } else {
+                c >> 1
+            };
+        }
+        *t = c;
+    }
+    let mut c = !0u64;
+    for b in data {
+        c = table[((c ^ u64::from(*b)) & 0xff) as usize] ^ (c >> 8);
+    }
+    base64::engine::general_purpose::STANDARD.encode((!c).to_be_bytes())
+}
+
+/// What the edge of the account's plan lets through: it refuses a
+/// request body of 100 MiB or more before the Worker runs.
+const EDGE_LIMIT: usize = 100 * MIB;
+/// `multipart_chunksize = 96MB` of aws-cli and boto3.
+const PART_96M: usize = 96 * MIB;
+/// The body aws-cli 2.31 sends for such a part with its default
+/// settings, measured on the wire: 96 chunks of 1 MiB with a size line
+/// of 8 bytes and a line end each (960 bytes), the last chunk (3), the
+/// trailer `x-amz-checksum-crc64nvme` with its 12 characters (39), and
+/// the empty line (2). 1,004 bytes more than the part.
+const AWS_CLI_BODY_96M: usize = 100_664_300;
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_part_of_96_mib_as_aws_cli_frames_it_is_under_the_edge_limit() {
+    use velmora_bridge::config::{edge_put_bytes, EDGE_FRAMING_BYTES};
+
+    // The deployed limits: bodies up to 99 MiB decoded.
+    let rig = big_rig();
+    assert_eq!(
+        rig.bridge.cfg.max_put_bytes,
+        edge_put_bytes(EDGE_LIMIT as u64)
+    );
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let id = create(&rig, &signer, KEY).await;
+
+    // The request of aws-cli: unsigned chunks of 1 MiB and a CRC-64
+    // trailer, sent with `Transfer-Encoding: chunked` and no
+    // `Content-Length`.
+    let bytes = body(5, PART_96M);
+    let checksum = crc64nvme_b64(&bytes);
+    assert_eq!(checksum.len(), 12);
+    let decoded = PART_96M.to_string();
+    let (mut req, _) = signer.sign_as(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[("partNumber", "1"), ("uploadId", &id)],
+        &[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", &decoded),
+            ("x-amz-trailer", "x-amz-checksum-crc64nvme"),
+            ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+        ],
+        Vec::new(),
+        Some(UNSIGNED_TRAILER),
+    );
+    req.set_header("transfer-encoding", "chunked");
+    req.body = unsigned_chunks(&bytes, MIB, &format!("x-amz-checksum-crc64nvme:{checksum}"));
+
+    // The framing is what was measured, and the whole body is under the
+    // edge limit with 4,193,300 bytes to spare.
+    let framed = req.body.len();
+    assert_eq!(framed, AWS_CLI_BODY_96M);
+    assert_eq!(framed - PART_96M, 1_004);
+    assert!(framed < EDGE_LIMIT);
+    assert_eq!(EDGE_LIMIT - framed, 4_193_300);
+    // HTTP/1.1 chunked transfer adds 971 bytes on the wire in the
+    // capture; twice that is still far inside what the limit of the
+    // setting leaves for framing.
+    assert!(((framed - PART_96M) as u64) * 2 + 971 < EDGE_FRAMING_BYTES);
+
+    // The Worker takes it, as it arrives: in pieces, without a length.
+    let sent = send_in_pieces(&rig, req, 256 * 1024 + 7).await;
+    assert_eq!(sent.status, 200, "{}", sent.text());
+    assert_eq!(sent.header("etag"), Some(md5_etag(&bytes).as_str()));
+    // Twelve slices of 8 MiB, two of them in memory at a time.
+    assert_eq!(staged(&rig).len(), 12);
+    assert_eq!(rig.bridge.budget.peak(), 2 * SLICE_8M as u64);
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+
+    // A trailer that is not the checksum of the body is refused, and
+    // nothing of that part is kept.
+    let (mut bad, _) = signer.sign_as(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[("partNumber", "2"), ("uploadId", &id)],
+        &[
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", &decoded),
+            ("x-amz-trailer", "x-amz-checksum-crc64nvme"),
+            ("x-amz-sdk-checksum-algorithm", "CRC64NVME"),
+        ],
+        Vec::new(),
+        Some(UNSIGNED_TRAILER),
+    );
+    bad.set_header("transfer-encoding", "chunked");
+    bad.body = unsigned_chunks(&bytes, MIB, "x-amz-checksum-crc64nvme:AAAAAAAAAAA=");
+    assert_eq!(bad.body.len(), AWS_CLI_BODY_96M);
+    let refused = send_in_pieces(&rig, bad, MIB).await;
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    assert_eq!(staged(&rig).len(), 12);
+
+    // And the object is the part.
+    complete(&rig, &signer, &id, &[md5_etag(&bytes)])
+        .await
+        .expect(200);
+    let (generation, rows) = rig.live(&bucket, KEY).await.unwrap();
+    assert_eq!((generation.size, rows.len()), (PART_96M as u64, 12));
+    assert!(get(&rig, &signer, KEY).await.body == bytes);
+}
+
+// ---------------------------------------------------------------------------
 // Requests that fail, stop, or lose their upload
 // ---------------------------------------------------------------------------
 

@@ -23,7 +23,8 @@
 //!
 //! A generation record has one of two formats. **Format 1**
 //! ([`GenerationManifest`]) is one document with every extent, and it
-//! is what every write stores. **Format 2** is for an object of more
+//! is what every write of at most [`SINGLE_RECORD_EXTENTS`] extents
+//! stores. **Format 2** is for an object of more
 //! extents than one document should hold: the extents are cut into
 //! [`Segment`]s in `seq` order, each sealed under its own name, and a
 //! [`GenerationHead`] stands where the format-1 record stands. The head
@@ -33,7 +34,11 @@
 //! the head and believes a segment only if it is the one the head
 //! names ([`GenerationHead::open_segment`]); a record with a segment
 //! that is missing, does not open or does not match is unreadable as a
-//! whole. This version reads format 2 and does not write it.
+//! whole. The one writer of format 2 is [`SegmentWriter`], which
+//! CompleteMultipartUpload uses for an upload of more extents than a
+//! format-1 record takes. A segment is no record of a write: nothing
+//! replays it without the head that names it, so segments stored for a
+//! head that was never stored are garbage, and nothing else.
 //!
 //! Generation and tombstone ids start with their mint time, so the blob
 //! keys of one layout list in time order and a replay can start at a restore point.
@@ -54,8 +59,9 @@
 //! Two rules are held by types, not by care at the call sites:
 //!
 //! - **Record before commit.** The catalogue publishes a generation
-//!   only against a [`Recorded`], and only [`write_generation`] makes
-//!   one, after the record is stored.
+//!   only against a [`Recorded`], and only [`write_generation`] and
+//!   [`SegmentWriter::finish`] make one, after the record is stored
+//!   (of a segmented record: every segment, then the head).
 //! - **No delete removes a record.** [`BlobStore::delete`] refuses every
 //!   key under `m/`, in the store adapter itself. The one way to remove
 //!   a record is [`discard_generation`], and it takes an
@@ -124,12 +130,57 @@ pub const SEGMENTED_VERSION: u32 = 2;
 /// extent of the record), and nothing here bounds the extents of one
 /// segment (the writer does).
 pub const MAX_SEGMENTS: usize = 192;
+/// Most extents a format-1 record holds. A generation of more is
+/// written segmented, and [`write_generation`] refuses it.
+pub const SINGLE_RECORD_EXTENTS: u32 = 10_000;
+/// Extents of one segment of a segmented record, the last one of a
+/// record apart.
+pub const SEGMENT_EXTENTS: u32 = 4_096;
+
+/// Where a generation record is cut. [`Cut::BUILT_IN`] is what a
+/// deployment has; a drill may set smaller figures (`RECORD_SEGMENT_AFTER`,
+/// `RECORD_SEGMENT_EXTENTS`), never larger ones, so nothing it writes is
+/// larger than what every reader was measured with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    /// A record of more extents than this is segmented.
+    pub after: u32,
+    /// Extents of one segment.
+    pub per: u32,
+}
+
+impl Cut {
+    pub const BUILT_IN: Cut = Cut {
+        after: SINGLE_RECORD_EXTENTS,
+        per: SEGMENT_EXTENTS,
+    };
+
+    /// How many segments a record of `extents` extents has when it is
+    /// segmented.
+    pub fn segments(&self, extents: u64) -> u64 {
+        extents.div_ceil(u64::from(self.per.max(1)))
+    }
+
+    /// Whether a segmented record of `extents` extents is one a head
+    /// may name: at most [`MAX_SEGMENTS`] segments.
+    pub fn fits(&self, extents: u64) -> bool {
+        self.segments(extents) <= MAX_SEGMENTS as u64
+    }
+}
 
 const ERR_RECORD: BridgeError = BridgeError::Invalid("recovery record is malformed");
 const ERR_VERSION: BridgeError = BridgeError::Invalid("recovery record version is unknown");
 const ERR_SEGMENT: BridgeError = BridgeError::Invalid("recovery record segment is missing");
 const ERR_SEGMENT_OTHER: BridgeError =
     BridgeError::Invalid("recovery record segment is not the one its head names");
+const ERR_TOO_MANY: BridgeError =
+    BridgeError::Invalid("recovery record would hold more extents than its format takes");
+
+/// A set id minted at `now`: `s_`, 13 hex digits of the time and 16 of
+/// `rand`.
+pub fn set_id(now: UnixMs, rand: [u8; 8]) -> String {
+    format!("s_{:013x}{:016x}", now.0.max(0), u64::from_be_bytes(rand))
+}
 
 /// The id of a set of segments as a segment name takes it: `s_`, then
 /// 1 to 64 lowercase ASCII letters and digits. It starts with its mint
@@ -755,23 +806,7 @@ impl GenerationManifest {
     pub fn new(bucket: &Bucket, generation: &GenerationRow, extents: &[ExtentRow]) -> Result<Self> {
         let extents = extents
             .iter()
-            .map(|e| {
-                Ok(ExtentRecord {
-                    id: e.id.as_str().to_owned(),
-                    seq: e.seq.ok_or(ERR_RECORD)?,
-                    plain_offset: e.plain_offset.ok_or(ERR_RECORD)?,
-                    plain_size: e.plain_size,
-                    cipher_size: e.cipher_size,
-                    media_header: e.media_header.clone(),
-                    key_mode: e.key_mode,
-                    // An extent without its key cannot be read back.
-                    wrapped_file_key: e.wrapped_file_key.clone().ok_or(ERR_RECORD)?,
-                    plain_md5: e.plain_md5.to_vec(),
-                    plain_sha256: e.plain_sha256.to_vec(),
-                    cipher_sha256: e.cipher_sha256.to_vec(),
-                    created_at: e.created_at.0,
-                })
-            })
+            .map(ExtentRecord::of)
             .collect::<Result<Vec<_>>>()?;
         if generation.bucket_id != bucket.id
             || usize::try_from(generation.extent_count).ok() != Some(extents.len())
@@ -780,25 +815,8 @@ impl GenerationManifest {
         }
         Ok(GenerationManifest {
             v: RECORD_VERSION,
-            bucket: BucketRecord {
-                id: bucket.id.as_str().to_owned(),
-                name: bucket.name.clone(),
-                owner: bucket.owner.clone(),
-                bdk_wrapped: bucket.bdk_wrapped.clone(),
-                kek_version: bucket.kek_version,
-                disposable: bucket.disposable,
-                created_at: bucket.created_at.0,
-            },
-            generation: GenerationRecord {
-                id: generation.id.as_str().to_owned(),
-                key: generation.key.clone(),
-                size: generation.size,
-                etag: generation.etag.clone(),
-                checksum_json: generation.checksum_json.clone(),
-                content_json: generation.content_json.clone(),
-                user_meta_json: generation.user_meta_json.clone(),
-                created_at: generation.created_at.0,
-            },
+            bucket: BucketRecord::of(bucket),
+            generation: GenerationRecord::of(generation),
             extents,
         })
     }
@@ -824,6 +842,18 @@ impl GenerationManifest {
 }
 
 impl BucketRecord {
+    fn of(bucket: &Bucket) -> Self {
+        BucketRecord {
+            id: bucket.id.as_str().to_owned(),
+            name: bucket.name.clone(),
+            owner: bucket.owner.clone(),
+            bdk_wrapped: bucket.bdk_wrapped.clone(),
+            kek_version: bucket.kek_version,
+            disposable: bucket.disposable,
+            created_at: bucket.created_at.0,
+        }
+    }
+
     fn row(&self) -> Bucket {
         Bucket {
             id: BucketId::new(self.id.clone()),
@@ -838,6 +868,19 @@ impl BucketRecord {
 }
 
 impl GenerationRecord {
+    fn of(generation: &GenerationRow) -> Self {
+        GenerationRecord {
+            id: generation.id.as_str().to_owned(),
+            key: generation.key.clone(),
+            size: generation.size,
+            etag: generation.etag.clone(),
+            checksum_json: generation.checksum_json.clone(),
+            content_json: generation.content_json.clone(),
+            user_meta_json: generation.user_meta_json.clone(),
+            created_at: generation.created_at.0,
+        }
+    }
+
     /// The generation of `count` extents as it was published: live.
     fn row(&self, bucket: &BucketRecord, count: u32) -> GenerationRow {
         GenerationRow {
@@ -858,6 +901,26 @@ impl GenerationRecord {
 }
 
 impl ExtentRecord {
+    /// `e` as a record lists it. Its `seq` and `plain_offset` are its
+    /// place in the generation the record is of.
+    fn of(e: &ExtentRow) -> Result<Self> {
+        Ok(ExtentRecord {
+            id: e.id.as_str().to_owned(),
+            seq: e.seq.ok_or(ERR_RECORD)?,
+            plain_offset: e.plain_offset.ok_or(ERR_RECORD)?,
+            plain_size: e.plain_size,
+            cipher_size: e.cipher_size,
+            media_header: e.media_header.clone(),
+            key_mode: e.key_mode,
+            // An extent without its key cannot be read back.
+            wrapped_file_key: e.wrapped_file_key.clone().ok_or(ERR_RECORD)?,
+            plain_md5: e.plain_md5.to_vec(),
+            plain_sha256: e.plain_sha256.to_vec(),
+            cipher_sha256: e.cipher_sha256.to_vec(),
+            created_at: e.created_at.0,
+        })
+    }
+
     /// Whether its digests have the lengths [`Self::row`] takes.
     fn has_digests(&self) -> bool {
         digest::<16>(&self.plain_md5).is_ok()
@@ -1105,14 +1168,30 @@ async fn write<B: BlobStore, K: Kek, R: Serialize>(
     record: &R,
 ) -> Result<()> {
     let plain = serde_json::to_vec(record).map_err(|_| ERR_RECORD)?;
-    let sealed = seal_manifest(kek, name, &plain, &mut SystemRng)?;
+    write_plain(safety, kek, name, bucket, subject, &plain)
+        .await
+        .map(|_| ())
+}
+
+/// Seals `plain` and stores it at `name`. Returns the SHA-256 of what
+/// was stored.
+async fn write_plain<B: BlobStore, K: Kek>(
+    safety: &B,
+    kek: &K,
+    name: &str,
+    bucket: &BucketId,
+    subject: &str,
+    plain: &[u8],
+) -> Result<[u8; 32]> {
+    let sealed = seal_manifest(kek, name, plain, &mut SystemRng)?;
     let sha: [u8; 32] = Sha256::digest(&sealed).into();
     let meta = BlobMeta {
         bucket,
         extent: &ExtentId::new(subject),
         cipher_sha256: &sha,
     };
-    safety.put(name, sealed, &meta).await
+    safety.put(name, sealed, &meta).await?;
+    Ok(sha)
 }
 
 /// `None` = no record at `name`. A record that does not open or parse is
@@ -1136,8 +1215,11 @@ async fn read<B: BlobStore, K: Kek, R: for<'de> Deserialize<'de>>(
 }
 
 /// Writes the generation record (`m/<generation_id>` in the flat
-/// layout), after it raised the floor of the key to the id, and returns
-/// the proof of it, without which the catalogue publishes nothing.
+/// layout) in one document, after it raised the floor of the key to the
+/// id, and returns the proof of it, without which the catalogue
+/// publishes nothing. Refuses more than [`SINGLE_RECORD_EXTENTS`]
+/// extents before anything is written: that is a record for
+/// [`SegmentWriter`].
 pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
     catalog: &C,
     safety: &B,
@@ -1147,6 +1229,9 @@ pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
     generation: &GenerationRow,
     extents: &[ExtentRow],
 ) -> Result<Recorded> {
+    if extents.len() > SINGLE_RECORD_EXTENTS as usize {
+        return Err(ERR_TOO_MANY);
+    }
     let record = GenerationManifest::new(bucket, generation, extents)?;
     catalog
         .raise_floor(&bucket.id, &generation.key, &generation.id, true)
@@ -1165,6 +1250,190 @@ pub async fn write_generation<C: Catalog, B: BlobStore, K: Kek>(
         generation: generation.id.clone(),
         key: name,
     })
+}
+
+/// The writer of a segmented generation record (format 2).
+///
+/// The extents are pushed in `seq` order; every [`Cut::per`] of them
+/// are sealed and stored as one segment, so the writer holds the
+/// extents of one segment at a time. [`SegmentWriter::finish`] stores
+/// the head, and only then is there a record: until then nothing
+/// stored here is replayed, whatever became of the request. So the
+/// segments may be stored before the id of the generation is minted,
+/// and the floor of the key is raised only for the head.
+///
+/// A writer that fails is dropped. Its segments stay as garbage under
+/// a set id no head names; a new try takes a new set id, so it never
+/// stores another segment under a name a head could already point at.
+pub struct SegmentWriter<'a, B, K> {
+    safety: &'a B,
+    kek: &'a K,
+    layout: &'a Layout,
+    bucket: &'a Bucket,
+    set: String,
+    per: usize,
+    /// The extents of the segment that is not stored yet.
+    open: Vec<ExtentRecord>,
+    entries: Vec<SegmentEntry>,
+    /// `seq` and offset of the next extent.
+    seq: u32,
+    offset: u64,
+    /// A segment was not stored: its extents are gone from the writer,
+    /// which takes no more and stores no head.
+    failed: bool,
+}
+
+impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
+    /// A writer of the segments of `set` ([`set_id`]), of `per` extents
+    /// each.
+    pub fn new(
+        safety: &'a B,
+        kek: &'a K,
+        layout: &'a Layout,
+        bucket: &'a Bucket,
+        set: String,
+        per: u32,
+    ) -> Result<Self> {
+        let per = usize::try_from(per).map_err(|_| ERR_RECORD)?;
+        if !valid_set_id(&set) || per == 0 {
+            return Err(ERR_RECORD);
+        }
+        Ok(SegmentWriter {
+            safety,
+            kek,
+            layout,
+            bucket,
+            set,
+            per,
+            open: Vec::new(),
+            entries: Vec::new(),
+            seq: 0,
+            offset: 0,
+            failed: false,
+        })
+    }
+
+    /// How many extents were pushed.
+    pub fn extents(&self) -> u32 {
+        self.seq
+    }
+
+    /// The next extent of the generation: its `seq` and `plain_offset`
+    /// are where the one before ends. Stores a segment when this fills
+    /// one. An extent that leaves a gap is refused, and so is one that
+    /// would begin segment [`MAX_SEGMENTS`]` + 1`, before it is stored.
+    pub async fn push(&mut self, extent: &ExtentRow) -> Result<()> {
+        let record = ExtentRecord::of(extent)?;
+        if self.failed {
+            return Err(ERR_RECORD);
+        }
+        if record.seq != self.seq || record.plain_offset != self.offset || !record.has_digests() {
+            return Err(ERR_RECORD);
+        }
+        if self.open.is_empty() && self.entries.len() >= MAX_SEGMENTS {
+            return Err(ERR_TOO_MANY);
+        }
+        self.seq = self.seq.checked_add(1).ok_or(ERR_RECORD)?;
+        self.offset = self
+            .offset
+            .checked_add(record.plain_size)
+            .ok_or(ERR_RECORD)?;
+        self.open.push(record);
+        if self.open.len() == self.per {
+            self.store().await?;
+        }
+        Ok(())
+    }
+
+    /// Seals and stores the open segment.
+    async fn store(&mut self) -> Result<()> {
+        let extents = std::mem::take(&mut self.open);
+        let (Some(first), Some(last)) = (extents.first(), extents.last()) else {
+            return Ok(());
+        };
+        // Until the segment is stored, its extents are in no segment.
+        self.failed = true;
+        let index = u32::try_from(self.entries.len()).map_err(|_| ERR_RECORD)?;
+        let mut entry = SegmentEntry {
+            seq: first.seq,
+            count: u32::try_from(extents.len()).map_err(|_| ERR_RECORD)?,
+            plain_offset: first.plain_offset,
+            plain_size: last.plain_offset + last.plain_size - first.plain_offset,
+            sha256: Vec::new(),
+        };
+        let segment = Segment {
+            v: SEGMENTED_VERSION,
+            set: self.set.clone(),
+            index,
+            extents,
+        };
+        let plain = serde_json::to_vec(&segment).map_err(|_| ERR_RECORD)?;
+        drop(segment);
+        let name = self.layout.segment_key(&self.set, index);
+        let sha = write_plain(
+            self.safety,
+            self.kek,
+            &name,
+            &self.bucket.id,
+            &self.set,
+            &plain,
+        )
+        .await?;
+        self.failed = false;
+        entry.sha256 = sha.to_vec();
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// Stores the last segment, raises the floor of the key to the id
+    /// of `generation` and stores the head. Returns the proof of the
+    /// record. `Err`, with no head stored, unless the extents pushed
+    /// are the ones `generation` counts, of its size together.
+    pub async fn finish<C: Catalog>(
+        mut self,
+        catalog: &C,
+        generation: &GenerationRow,
+    ) -> Result<Recorded> {
+        if self.failed
+            || generation.bucket_id != self.bucket.id
+            || generation.extent_count != self.seq
+            || generation.size != self.offset
+            || self.seq == 0
+        {
+            return Err(ERR_RECORD);
+        }
+        self.store().await?;
+        let head = GenerationHead {
+            v: SEGMENTED_VERSION,
+            bucket: BucketRecord::of(self.bucket),
+            generation: GenerationRecord::of(generation),
+            set: self.set,
+            segments: self.entries,
+        };
+        let name = self.layout.generation_key(&generation.id);
+        let plain = serde_json::to_vec(&head).map_err(|_| ERR_RECORD)?;
+        // What is stored is what every reader takes: the head is read
+        // back from its bytes before it becomes the record.
+        if GenerationHead::parse(&name, &plain)? != head {
+            return Err(ERR_RECORD);
+        }
+        catalog
+            .raise_floor(&self.bucket.id, &generation.key, &generation.id, true)
+            .await?;
+        write_plain(
+            self.safety,
+            self.kek,
+            &name,
+            &self.bucket.id,
+            generation.id.as_str(),
+            &plain,
+        )
+        .await?;
+        Ok(Recorded {
+            generation: generation.id.clone(),
+            key: name,
+        })
+    }
 }
 
 /// Writes the tombstone (`m/del/<id>` in the flat layout), after it

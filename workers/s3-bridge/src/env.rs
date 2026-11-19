@@ -24,7 +24,10 @@ use crate::e2::FetchHttp;
 use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
 use crate::nntp::WorkerConnector;
 use crate::queues::{binding_name, bound_queues, DropNotify, QueueSink, AUX_Q, DEV_DROP_NOTIFY_N};
-use crate::r2::{tombstone_delay_from_var, R2Blobs, DEV_TOMBSTONE_PUT_DELAY_MS};
+use crate::r2::{
+    segment_delay_from_var, tombstone_delay_from_var, R2Blobs, DEV_SEGMENT_PUT_DELAY_MS,
+    DEV_TOMBSTONE_PUT_DELAY_MS,
+};
 use velmora_bridge::remote::{RemoteConfig, S3Remote};
 
 /// Wall clock of the Workers runtime (advances on I/O only).
@@ -130,6 +133,8 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let drop_notify = DropNotify::from_var(cfg.is_dev(), get(DEV_DROP_NOTIFY_N).as_deref())?;
     let tombstone_delay =
         tombstone_delay_from_var(cfg.is_dev(), get(DEV_TOMBSTONE_PUT_DELAY_MS).as_deref())?;
+    let segment_delay =
+        segment_delay_from_var(cfg.is_dev(), get(DEV_SEGMENT_PUT_DELAY_MS).as_deref())?;
     let abandon = abandon_from_var(cfg.is_dev(), get(DEV_ABANDON_JOB_N).as_deref())?;
     let built_at = WorkerClock.now().0;
     if memory_log_from_var(cfg.is_dev(), get(DEV_MEMORY_LOG).as_deref())? {
@@ -139,9 +144,13 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     set_abandon(abandon);
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
     Ok(Bridge {
-        catalog: SqlCatalog::new(D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)),
+        catalog: SqlCatalog::new(
+            D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?)
+                .with_set_rows(cfg.publish_chunk_rows),
+        ),
         safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)
-            .with_tombstone_delay(tombstone_delay),
+            .with_tombstone_delay(tombstone_delay)
+            .with_segment_delay(segment_delay),
         cache: R2Blobs::new(env.bucket("CACHE").map_err(binding("CACHE"))?),
         nntp: WorkerConnector::new(),
         jobs: QueueSink::new(
@@ -153,6 +162,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         .map_err(|name| format!("missing binding {name}"))?,
         kek,
         clock: WorkerClock,
+        works: Default::default(),
         budget: ByteBudget::new(cfg.inflight_budget_bytes)
             .with_job_capacity(cfg.job_budget_bytes)
             .with_sleeper(sleeper())
@@ -236,6 +246,11 @@ mod tests {
         // Outside dev the value is never read.
         for raw in [None, Some("1500"), Some("garbage")] {
             assert_eq!(tombstone_delay_from_var(false, raw), Ok(0));
+            assert_eq!(segment_delay_from_var(false, raw), Ok(0));
         }
+        assert_eq!(segment_delay_from_var(true, Some("9000")), Ok(9000));
+        assert_eq!(segment_delay_from_var(true, None), Ok(0));
+        let err = segment_delay_from_var(true, Some("60001")).unwrap_err();
+        assert_eq!(err, "invalid DEV_SEGMENT_PUT_DELAY_MS");
     }
 }

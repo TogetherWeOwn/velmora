@@ -18,6 +18,10 @@
 //!   revision `R` and publishes their extents, in part order and body
 //!   order, in one guarded batch pinned to `R`. An upload that holds
 //!   more extents than one object may have is refused and stays open.
+//!   An upload of more extents than one recovery record holds in one
+//!   document is read a run of part numbers at a time and recorded in
+//!   segments ([`SegmentWriter`]); its answer is a `200` whose document
+//!   may follow its headers, as S3 answers a Complete.
 //!   The stored receipt makes a retry return the same ETag without
 //!   publishing again.
 //! - **Abort** closes the upload; its part extents go to garbage
@@ -33,8 +37,10 @@
 //! client-supplied object checksum or a `COMPOSITE` type with `501`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::rc::Rc;
 
+use futures_util::future::LocalBoxFuture;
 use sha2::{Digest, Sha256};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{
@@ -54,11 +60,12 @@ use crate::ingress::{
     UploadLengths, UploadReadError,
 };
 use crate::intents::WRITER_MAX_AGE_MS;
+use crate::keepalive::{Deferred, XML_DECLARATION};
 use crate::ports::{
     BlobMeta, BlobStore, Bridge, Catalog, Clock, Guard, JobSink, Kek, NntpConnector,
     PublishOutcome, UploadTarget,
 };
-use crate::recovery::{id_after, write_generation};
+use crate::recovery::{id_after, set_id, write_generation, Recorded, SegmentWriter, MAX_SEGMENTS};
 use crate::service::common::{
     check_precondition, discard_refused, discard_unless_present, hold_precondition, precondition,
     restore_gate, writes_refused,
@@ -66,9 +73,9 @@ use crate::service::common::{
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
     Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
-    JOB_VERSION,
+    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, Precondition,
+    RespBody, S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState,
+    WriteId, JOB_VERSION,
 };
 
 /// Smallest non-final part.
@@ -1101,11 +1108,18 @@ fn plan(listed: &[PartEvidence], stored: &[UploadPartRow]) -> Outcome<Publicatio
     Ok(Publication { parts, size, etag })
 }
 
-/// The extents of the listed parts as the generation will hold them: in
-/// part order and, within a part, in body order. `staged` is ordered by
-/// part number and piece. `None` when it does not hold exactly the parts
-/// that were listed: a part was replaced after the upload was read.
-fn place(parts: &[ListedPart], staged: Vec<PartExtent>) -> Option<Vec<ExtentRow>> {
+/// The extents of the listed `parts` as the generation will hold them:
+/// in part order and, within a part, in body order, the first of them
+/// at `seq` and `offset`, which are moved past the last. `staged` is
+/// ordered by part number and piece; what it holds of other parts is
+/// left out. `None` when it does not hold exactly the parts that were
+/// listed: a part was replaced after the upload was read.
+fn place(
+    parts: &[ListedPart],
+    staged: Vec<PartExtent>,
+    seq: &mut u32,
+    offset: &mut u64,
+) -> Option<Vec<ExtentRow>> {
     let mut by_part: HashMap<u16, Vec<ExtentRow>> = HashMap::new();
     for PartExtent {
         part_number,
@@ -1120,39 +1134,40 @@ fn place(parts: &[ListedPart], staged: Vec<PartExtent>) -> Option<Vec<ExtentRow>
         rows.push(extent);
     }
     let mut out = Vec::new();
-    let mut offset = 0u64;
     for part in parts {
         let rows = by_part.remove(&part.number)?;
         if rows.first().map(|e| &e.id) != Some(&part.first) {
             return None;
         }
-        let start = offset;
+        let start = *offset;
         for mut row in rows {
-            row.seq = Some(u32::try_from(out.len()).ok()?);
-            row.plain_offset = Some(offset);
-            offset = offset.checked_add(row.plain_size)?;
+            row.seq = Some(*seq);
+            row.plain_offset = Some(*offset);
+            *seq = seq.checked_add(1)?;
+            *offset = offset.checked_add(row.plain_size)?;
             out.push(row);
         }
-        if offset - start != part.size {
+        if *offset - start != part.size {
             return None;
         }
     }
     Some(out)
 }
 
-pub(super) async fn complete<
-    C: Catalog,
-    B: BlobStore,
-    N: NntpConnector,
-    J: JobSink,
-    K: Kek,
-    T: Clock,
->(
+pub(super) async fn complete<C, B, N, J, K, T>(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
     _bucket: &str,
     _key: &str,
-) -> S3Response {
+) -> S3Response
+where
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+{
     respond(complete_inner(bridge, req).await)
 }
 
@@ -1209,10 +1224,56 @@ fn complete_response(a: &Authed, etag: String, modified_ms: i64) -> Outcome<S3Re
     Ok(from_proto(result.complete_response(&a.target, &a.policy)?))
 }
 
-async fn complete_inner<C, B, N, J, K, T>(
+/// Part numbers one read of a paged Complete covers.
+const WINDOW_PARTS: u16 = 256;
+/// Most extent rows such a read brings: every part of the run in as many
+/// slices as one body may have.
+const WINDOW_ROWS: u32 = WINDOW_PARTS as u32 * crate::config::MAX_WRITE_SLICES as u32;
+
+/// What a Complete asks, once its body is read.
+struct Completion {
+    a: Authed,
+    condition: Option<Precondition>,
+    id: UploadId,
+    listed: Vec<PartEvidence>,
+    digest: [u8; 32],
+}
+
+impl Completion {
+    fn target(&self) -> UploadTarget<'_> {
+        UploadTarget {
+            bucket: &self.a.bucket.id,
+            key: &self.a.key,
+            id: &self.id,
+        }
+    }
+}
+
+/// An open upload as one attempt read it, with its listed parts checked.
+struct Opened {
+    upload: UploadRow,
+    publication: Publication,
+    /// How many extents the upload holds, listed or not. 0 when no
+    /// object of this deployment has a segmented record: then nothing
+    /// asks.
+    held: u64,
+}
+
+/// What an attempt found before it wrote anything.
+enum Look {
+    /// The request is answered: by the receipt of the Complete that won.
+    Answer(S3Response),
+    Open(Box<Opened>),
+}
+
+/// Reads the upload and checks the request against it. Writes nothing.
+/// `lost_at` is the revision of the attempt before, if its batch lost
+/// the guard.
+async fn look<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
-    req: S3Request,
-) -> Outcome<S3Response>
+    c: &Completion,
+    lost_at: Option<u64>,
+) -> Outcome<Look>
 where
     C: Catalog,
     B: BlobStore,
@@ -1220,6 +1281,300 @@ where
     J: JobSink,
     K: Kek,
     T: Clock,
+{
+    let (a, target) = (&c.a, c.target());
+    let Some((upload, parts)) = bridge.catalog.upload(&target).await? else {
+        return Err(ErrorCode::NoSuchUpload.into());
+    };
+    match upload.state {
+        UploadState::Open => {}
+        UploadState::Aborted => return Err(ErrorCode::NoSuchUpload.into()),
+        UploadState::Completed => {
+            // A retry of the Complete that won: answer from the
+            // receipt and publish nothing, so a later overwrite of the
+            // key is never rolled back.
+            if upload.complete_digest != Some(c.digest) {
+                return Err(ErrorCode::NoSuchUpload.into());
+            }
+            let etag = upload.result_etag.ok_or(Fail::Internal)?;
+            return complete_response(a, etag, bridge.clock.now().0).map(Look::Answer);
+        }
+    }
+    if lost_at == Some(upload.revision) {
+        // Nothing changed the upload, so the batch was not refused by
+        // a race: the catalogue would not adopt the listed parts.
+        return Err(ErrorCode::InvalidPart.into());
+    }
+    // A condition that does not hold now is answered before anything
+    // is written for this attempt, the floor of the key included.
+    if let Some(condition) = &c.condition {
+        if let Err(refusal) = check_precondition(bridge, &a.bucket.id, &a.key, condition).await {
+            return refused_unless_completed(bridge, &target, &c.digest, a, refusal)
+                .await
+                .map(Look::Answer);
+        }
+    }
+    let publication = plan(&c.listed, &parts)?;
+    drop(parts);
+    // An upload that holds more than an object may have, in listed
+    // parts or not, is refused before anything is recorded, and stays
+    // open: the client aborts it, or sends parts again in bodies of at
+    // most one extent until it holds fewer. With a limit no segmented
+    // record is under, the one read of the extents says so itself.
+    let (limit, cut) = (bridge.cfg.max_object_extents, bridge.cfg.record_cut);
+    let mut held = 0;
+    if limit > cut.after {
+        held = bridge.catalog.upload_extents_held(&c.id, 0).await?;
+        if held > u64::from(limit) {
+            return Err(too_many_extents(limit).into());
+        }
+        // No reader takes a head of more segments, so no segment of
+        // such a record is stored. A configuration that was checked
+        // never comes here.
+        if held > u64::from(cut.after) && !cut.fits(held) {
+            let most = u32::try_from(MAX_SEGMENTS)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(cut.per);
+            return Err(too_many_extents(most.min(limit)).into());
+        }
+    }
+    Ok(Look::Open(Box::new(Opened {
+        upload,
+        publication,
+        held,
+    })))
+}
+
+/// The record of one attempt, before it is stored as a whole.
+enum Draft<'a, B, K> {
+    /// Every extent, for a record in one document.
+    Single(Vec<ExtentRow>),
+    /// The segments are stored; the head is not.
+    Segmented(SegmentWriter<'a, B, K>),
+}
+
+/// The listed extents of one attempt, placed.
+struct Placed<'a, B, K> {
+    placements: Vec<ExtentPlacement>,
+    /// A part of several extents is among them.
+    sliced: bool,
+    draft: Draft<'a, B, K>,
+}
+
+/// Reads the extents of the listed parts and places them. `None` when
+/// the upload no longer holds the parts as they were listed: an
+/// UploadPart replaced one after the upload was read.
+///
+/// An upload of at most [`Cut::after`](crate::recovery::Cut) extents is
+/// read at once. A larger one is read a run of [`WINDOW_PARTS`] part
+/// numbers at a time, and from the extent that makes the object larger
+/// than one document holds, the rows go into segments as they come, so
+/// what is held is one run of rows, one segment and the placements.
+/// Only a request that holds the charge of that work (`charged`) stores
+/// segments; another is answered `503 SlowDown` before the first.
+async fn gather<'a, C, B, N, J, K, T>(
+    bridge: &'a Bridge<C, B, N, J, K, T>,
+    c: &'a Completion,
+    publication: &Publication,
+    held: u64,
+    charged: bool,
+) -> Outcome<Option<Placed<'a, B, K>>>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let target = c.target();
+    let (limit, cut) = (bridge.cfg.max_object_extents, bridge.cfg.record_cut);
+    let placement = |e: &ExtentRow| -> Outcome<ExtentPlacement> {
+        Ok(ExtentPlacement {
+            extent_id: e.id.clone(),
+            seq: e.seq.ok_or(Fail::Internal)?,
+            plain_offset: e.plain_offset.ok_or(Fail::Internal)?,
+        })
+    };
+    let (mut seq, mut offset) = (0u32, 0u64);
+    if held <= u64::from(cut.after) {
+        // One record in one document names every extent.
+        let most = limit.min(cut.after);
+        let staged = bridge
+            .catalog
+            .upload_extents(&target, most.saturating_add(1))
+            .await?;
+        if u32::try_from(staged.len()).map_or(true, |n| n > most) {
+            if most == limit {
+                return Err(too_many_extents(limit).into());
+            }
+            // The upload grew past one document since it was counted:
+            // an UploadPart came in between. The next attempt counts
+            // again.
+            return Ok(None);
+        }
+        let sliced = staged.iter().any(|p| p.piece > 0);
+        let Some(extents) = place(&publication.parts, staged, &mut seq, &mut offset) else {
+            return Ok(None);
+        };
+        let placements = extents.iter().map(placement).collect::<Outcome<Vec<_>>>()?;
+        return Ok(Some(Placed {
+            placements,
+            sliced,
+            draft: Draft::Single(extents),
+        }));
+    }
+
+    let mut placements: Vec<ExtentPlacement> = Vec::new();
+    let mut sliced = false;
+    // Rows wait here until there are more than one document holds.
+    let mut waiting: Vec<ExtentRow> = Vec::new();
+    let mut writer: Option<SegmentWriter<'a, B, K>> = None;
+    let mut parts = publication.parts.as_slice();
+    while let Some(first) = parts.first().map(|p| p.number) {
+        let last = first.saturating_add(WINDOW_PARTS - 1);
+        let run = parts.partition_point(|p| p.number <= last);
+        let (listed, rest) = parts.split_at(run);
+        parts = rest;
+        let staged = bridge
+            .catalog
+            .upload_extents_between(&target, first, last, WINDOW_ROWS + 1)
+            .await?;
+        if u32::try_from(staged.len()).map_or(true, |n| n > WINDOW_ROWS) {
+            // No part is stored in more slices than one body may have.
+            return Err(Fail::Internal);
+        }
+        sliced |= staged.iter().any(|p| p.piece > 0);
+        let Some(rows) = place(listed, staged, &mut seq, &mut offset) else {
+            return Ok(None);
+        };
+        if seq > limit {
+            // Only when parts were added since the count.
+            return Err(too_many_extents(limit).into());
+        }
+        for row in &rows {
+            placements.push(placement(row)?);
+        }
+        waiting.extend(rows);
+        if writer.is_none() && seq > cut.after {
+            if !charged {
+                // The request began on an upload within one document,
+                // so it holds no charge and its answer is not kept
+                // alive. A listed part was since stored again with the
+                // same ETag in more extents (the slice size changed
+                // between the two versions that took them). Sent again,
+                // the Complete is counted as what it is.
+                return Err(ErrorCode::SlowDown.into());
+            }
+            writer = Some(SegmentWriter::new(
+                &bridge.safety,
+                &bridge.kek,
+                &bridge.cfg.records,
+                &c.a.bucket,
+                set_id(bridge.clock.now(), random()?),
+                cut.per,
+            )?);
+        }
+        if let Some(writer) = writer.as_mut() {
+            for row in waiting.drain(..) {
+                writer.push(&row).await?;
+            }
+        }
+        // The host runs its timers here: the window after which the
+        // answer is streamed, and the keepalive of that stream. Calls
+        // that are answered at once, one after the other, may leave it
+        // no turn for them (measured in a local workerd: no timer ran
+        // while this loop read 131,072 extents).
+        if let Some(sleep) = bridge.budget.sleeper() {
+            sleep(0).await;
+        }
+    }
+    let draft = match writer {
+        Some(writer) => Draft::Segmented(writer),
+        // The listed parts are few enough for one document, whatever
+        // else the upload holds.
+        None => Draft::Single(waiting),
+    };
+    Ok(Some(Placed {
+        placements,
+        sliced,
+        draft,
+    }))
+}
+
+/// Runs `work`, which holds a charge, in the table of the isolate
+/// ([`Bridge::works`]), and marks it there every
+/// [`JOB_BEAT_MS`](crate::jobtable::JOB_BEAT_MS) on a timer of this
+/// invocation.
+///
+/// The work runs under the invocation's `waitUntil`, which the runtime
+/// ends at most 30 s after the client left. What ran under it is then
+/// neither polled again nor dropped, so in the frame of the invocation
+/// the charge would be held for as long as the isolate lives. In the
+/// table its mark goes stale instead, and the next request of the
+/// isolate drops it ([`Bridge::reap_work`]): the charge and the memory
+/// it stands for go together.
+///
+/// `gone` is the document when the work was dropped while this
+/// invocation still ran: its timer was a minute late, or the work did
+/// not end in [`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS).
+///
+/// A host without timers has nothing to mark with: its work runs in
+/// the frame of the invocation.
+fn tabled<C, B, N, J, K, T>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    work: impl Future<Output = Vec<u8>> + 'static,
+    gone: impl FnOnce() -> Vec<u8> + 'static,
+) -> LocalBoxFuture<'static, Vec<u8>>
+where
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+{
+    let Some(sleep) = bridge.budget.sleeper().cloned() else {
+        return Box::pin(work);
+    };
+    let started = bridge.clock.now();
+    let running = bridge.works.run(started, work);
+    let bridge = Rc::clone(bridge);
+    Box::pin(async move {
+        let beat = || sleep(crate::jobtable::JOB_BEAT_MS as u32);
+        match running.marked(started, || bridge.clock.now(), beat).await {
+            crate::jobtable::Ran::Done(doc) => doc,
+            _ => gone(),
+        }
+    })
+}
+
+/// The document of an answer, as a deferred body sends it after the
+/// XML declaration.
+fn document(resp: S3Response) -> Vec<u8> {
+    let body = match resp.body {
+        RespBody::Bytes(body) => body,
+        _ => Vec::new(),
+    };
+    let rest = body.strip_prefix(XML_DECLARATION).unwrap_or(&body);
+    let start = rest
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    rest[start..].to_vec()
+}
+
+async fn complete_inner<C, B, N, J, K, T>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    req: S3Request,
+) -> Outcome<S3Response>
+where
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
 {
     let a = authenticate(bridge, &req).await?;
     // Before the body is read or anything is published: `If-None-Match:
@@ -1235,11 +1590,6 @@ where
         return Err(ErrorCode::NotImplemented.into());
     }
     let id = upload_id(&a.target)?;
-    let target = UploadTarget {
-        bucket: &a.bucket.id,
-        key: &a.key,
-        id: &id,
-    };
     let max = MAX_COMPLETE_BODY_BYTES.min(bridge.cfg.max_extent_bytes);
     let body = read_verified_body(bridge, &a, req, max).await?;
     let listed = parse_complete(&body, &a.policy, MAX_PARTS, MultipartChecksum::None).map_err(
@@ -1256,62 +1606,108 @@ where
     )?;
     drop(body);
     let digest = receipt_digest(&listed);
+    let completion = Completion {
+        a,
+        condition,
+        id,
+        listed,
+        digest,
+    };
 
+    // Everything the request can be refused for without a write is
+    // answered here, with its status.
+    let first = match look(bridge, &completion, None).await? {
+        Look::Answer(resp) => return Ok(resp),
+        Look::Open(opened) => *opened,
+    };
+    if first.held <= u64::from(bridge.cfg.record_cut.after) {
+        return publish(bridge, &completion, first, false).await;
+    }
+    // A segmented record: the extents are read and stored a run at a
+    // time, which can outlast a client's read timeout. So the answer is
+    // a `200` whose document follows when the work is done, kept alive
+    // with whitespace (`crate::keepalive`), and a failure from here on
+    // is an `<Error>` document in it, as S3 itself answers a Complete.
+    // The memory of the work is charged as one fixed sum; without room
+    // for it the client is told to come back. What may hold the room
+    // is the work of an invocation that ended while this one waited:
+    // nothing else may have come to drop it, so look once more.
+    let bytes = crate::config::COMPLETE_CHARGE_BYTES;
+    let charge = match bridge.budget.charge_ahead(bytes).await {
+        Ok(charge) => charge,
+        Err(e) => {
+            bridge.reap_work();
+            bridge.budget.try_charge_ahead(bytes).ok_or(e)?
+        }
+    };
+    let work = {
+        let bridge = Rc::clone(bridge);
+        async move {
+            let _charge = charge;
+            document(respond(publish(&bridge, &completion, first, true).await))
+        }
+    };
+    // Work that was dropped: the upload is published or it is not, and
+    // a Complete sent again answers from the receipt or publishes.
+    let fallback = || document(s3_error(ErrorCode::InternalError));
+    let work = tabled(bridge, work, fallback);
+    Ok(S3Response {
+        status: 200,
+        headers: vec![("content-type".to_string(), "application/xml".to_string())],
+        body: RespBody::Deferred(Deferred::new(work, fallback)),
+    })
+}
+
+/// Records and publishes the upload, from `first` on: up to
+/// [`COMPLETE_ATTEMPTS`] attempts, each on the upload as it reads it.
+/// A request that began on an upload within one document holds no
+/// charge (`charged` is false), also when the upload has grown past it
+/// by a later attempt: the parts it lists are the ones it began with
+/// (their ETags), so its record is one document as long as each is
+/// stored in the extents it had. [`gather`] refuses the one case that
+/// is left.
+async fn publish<C, B, N, J, K, T>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    c: &Completion,
+    first: Opened,
+    charged: bool,
+) -> Outcome<S3Response>
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+{
+    let (a, target, digest) = (&c.a, c.target(), &c.digest);
+    let condition = c.condition.as_ref();
+    let mut first = Some(first);
     // Revision of the previous attempt, if its batch lost the guard.
     let mut lost_at: Option<u64> = None;
     for _ in 0..COMPLETE_ATTEMPTS {
-        let Some((upload, parts)) = bridge.catalog.upload(&target).await? else {
-            return Err(ErrorCode::NoSuchUpload.into());
+        let Opened {
+            upload,
+            publication,
+            held,
+        } = match first.take() {
+            Some(opened) => opened,
+            None => match look(bridge, c, lost_at).await? {
+                Look::Answer(resp) => return Ok(resp),
+                Look::Open(opened) => *opened,
+            },
         };
-        match upload.state {
-            UploadState::Open => {}
-            UploadState::Aborted => return Err(ErrorCode::NoSuchUpload.into()),
-            UploadState::Completed => {
-                // A retry of the Complete that won: answer from the
-                // receipt and publish nothing, so a later overwrite of the
-                // key is never rolled back.
-                if upload.complete_digest != Some(digest) {
-                    return Err(ErrorCode::NoSuchUpload.into());
-                }
-                let etag = upload.result_etag.ok_or(Fail::Internal)?;
-                return complete_response(&a, etag, bridge.clock.now().0);
-            }
-        }
-        if lost_at == Some(upload.revision) {
-            // Nothing changed the upload, so the batch was not refused by
-            // a race: the catalogue would not adopt the listed parts.
-            return Err(ErrorCode::InvalidPart.into());
-        }
-        // A condition that does not hold now is answered before anything
-        // is written for this attempt, the floor of the key included.
-        if let Some(condition) = &condition {
-            if let Err(refusal) = check_precondition(bridge, &a.bucket.id, &a.key, condition).await
-            {
-                return refused_unless_completed(bridge, &target, &digest, &a, refusal).await;
-            }
-        }
-        let publication = plan(&listed, &parts)?;
-        drop(parts);
-        // One record names every extent of the object and one batch
-        // publishes them. An upload that holds more than an object may
-        // have, in listed parts or not, is refused before either, and
-        // stays open: the client aborts it, or sends parts again in
-        // bodies of at most one extent until it holds fewer.
-        let limit = bridge.cfg.max_object_extents;
-        let staged = bridge
-            .catalog
-            .upload_extents(&target, limit.saturating_add(1))
-            .await?;
-        if u32::try_from(staged.len()).map_or(true, |n| n > limit) {
-            return Err(too_many_extents(limit).into());
-        }
-        let sliced = staged.iter().any(|p| p.piece > 0);
-        let Some(extents) = place(&publication.parts, staged) else {
+        let Some(placed) = gather(bridge, c, &publication, held, charged).await? else {
             // An UploadPart replaced a listed part after the upload was
             // read. The batch would lose its guard: take the same path.
             lost_at = Some(upload.revision);
             continue;
         };
+        let Placed {
+            placements,
+            sliced,
+            draft,
+        } = placed;
         // A part stored in slices may be here without its stamp: its
         // request answered `503`, or `500` after a commit it could not
         // confirm, and the client took the part from ListParts. Its write intents are in any catalogue saved while
@@ -1322,13 +1718,16 @@ where
             restore_gate(bridge).await?;
             return Err(ErrorCode::SlowDown.into());
         }
-        let mut placements = Vec::with_capacity(extents.len());
-        for e in &extents {
-            placements.push(ExtentPlacement {
-                extent_id: e.id.clone(),
-                seq: e.seq.ok_or(Fail::Internal)?,
-                plain_offset: e.plain_offset.ok_or(Fail::Internal)?,
-            });
+        if matches!(draft, Draft::Segmented(_)) {
+            // The read took many calls. An upload that moved in the
+            // meantime (a part came, or an abort) gets no head: the
+            // batch would refuse it. The next attempt answers from what
+            // the upload is by then.
+            match bridge.catalog.upload(&target).await? {
+                Some((now, _))
+                    if now.state == UploadState::Open && now.revision == upload.revision => {}
+                _ => continue,
+            }
         }
         let now = bridge.clock.now();
         // The id sorts after everything already on the key, so the order
@@ -1366,41 +1765,43 @@ where
             &a.bucket.id,
             &a.key,
             &commit.generation.id,
-            condition.as_ref(),
+            condition,
         )
         .await
         {
-            return refused_unless_completed(bridge, &target, &digest, &a, refusal).await;
+            return refused_unless_completed(bridge, &target, digest, a, refusal).await;
         }
-        let record = write_generation(
-            &bridge.catalog,
-            &bridge.safety,
-            &bridge.kek,
-            &bridge.cfg.records,
-            &a.bucket,
-            &commit.generation,
-            &extents,
-        )
-        .await?;
-        drop(extents);
+        let record: Recorded = match draft {
+            Draft::Single(extents) => {
+                write_generation(
+                    &bridge.catalog,
+                    &bridge.safety,
+                    &bridge.kek,
+                    &bridge.cfg.records,
+                    &a.bucket,
+                    &commit.generation,
+                    &extents,
+                )
+                .await?
+            }
+            // The last segment, then the head: only now is there a
+            // record of this attempt.
+            Draft::Segmented(writer) => writer.finish(&bridge.catalog, &commit.generation).await?,
+        };
         match bridge
             .catalog
-            .complete_upload(
-                &target,
-                upload.revision,
-                &digest,
-                &commit,
-                condition.as_ref(),
-                record,
-            )
+            .complete_upload(&target, upload.revision, digest, &commit, condition, record)
             .await?
         {
             PublishOutcome::Applied => {
-                // The outbox rows are the durable obligation; a lost
-                // notification is picked up by the dispatcher.
+                // The outbox rows are the durable obligation, written
+                // by the batch for every extent. One message batch
+                // starts the first of them; the dispatcher brings the
+                // rest, and whatever a lost notification leaves.
                 let jobs: Vec<Job> = commit
                     .placements
                     .iter()
+                    .take(JOB_BATCH)
                     .map(|p| Job::Extent {
                         v: JOB_VERSION,
                         extent: p.extent_id.clone(),
@@ -1408,24 +1809,24 @@ where
                         stage: OutboxStage::Post,
                     })
                     .collect();
-                for batch in jobs.chunks(JOB_BATCH) {
-                    let _ = bridge.jobs.send_many(batch).await;
-                }
-                return complete_response(&a, publication.etag, now.0);
+                let _ = bridge.jobs.send_many(&jobs).await;
+                return complete_response(a, publication.etag, now.0);
             }
             PublishOutcome::Refused(record) => {
                 // Nothing was published under this id, so its record
                 // must not publish it in a replay either. Best effort: a
                 // record left behind replays as a PUT that failed, and
                 // under everything that follows it on the key, which
-                // the floor raised for it holds to a later id.
+                // the floor raised for it holds to a later id. Of a
+                // segmented record the head is the record: its segments
+                // stay, and nothing reads them without it.
                 let discarded = discard_unless_present(bridge, &commit.generation, record).await;
                 // Refused as well when a replay started after this
                 // request passed the gate.
                 if bridge.catalog.restore_pending().await? {
                     return Err(ErrorCode::SlowDown.into());
                 }
-                if let Some(condition) = &condition {
+                if let Some(condition) = condition {
                     // A conditional Complete says `412` or `404` only
                     // when no record of it is left: with one, a replay
                     // could publish what the answer says was refused.
@@ -1441,8 +1842,7 @@ where
                     if let Err(refusal) =
                         check_precondition(bridge, &a.bucket.id, &a.key, condition).await
                     {
-                        return refused_unless_completed(bridge, &target, &digest, &a, refusal)
-                            .await;
+                        return refused_unless_completed(bridge, &target, digest, a, refusal).await;
                     }
                 }
                 // Otherwise refused for the id (the key took a newer one

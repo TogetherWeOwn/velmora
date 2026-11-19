@@ -2080,6 +2080,44 @@ async fn a_repost_larger_than_the_budget_still_runs() {
     assert_eq!(rig.bridge.budget.in_use(), 0);
 }
 
+/// A repost is a second charge of a job that runs already. It does not
+/// wait for a Complete that waits for room: the charge its own verify
+/// job holds is what keeps that Complete out, so the two would wait for
+/// each other until both give up.
+#[tokio::test]
+async fn a_repost_does_not_wait_for_a_complete_that_its_own_job_keeps_out() {
+    use futures_util::FutureExt;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    const MIB: u64 = 1024 * 1024;
+    let mut rig = two_posting_backbones().await;
+    let sleeps = Rc::new(Cell::new(0u32));
+    let counted = sleeps.clone();
+    rig.bridge.budget = ByteBudget::new(32 * MIB).with_sleeper(Rc::new(move |_| {
+        counted.set(counted.get() + 1);
+        Box::pin(async {})
+    }));
+    let (s, plan) = rig.waited_out_the_grace(38).await;
+    // What the dispatcher charges for a verify job.
+    let stage = rig.bridge.budget.try_charge_job(2 * MIB).unwrap();
+    // A Complete waits for its 32 MiB: only the 2 MiB keep it out.
+    let waiter = rig
+        .bridge
+        .budget
+        .for_request()
+        .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())));
+    let mut complete = Box::pin(waiter.charge_ahead(32 * MIB));
+    assert!(complete.as_mut().now_or_never().is_none());
+
+    let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+    assert_eq!(delay, rig.bridge.cfg.verify_delay_secs);
+    assert_eq!(rig.outbox(&s).cursor, SECOND_REPOSTED);
+    assert_eq!(rig.servers[1].posted_count().await, plan.len());
+    assert_eq!(sleeps.get(), 0, "the repost waited for room");
+    drop((stage, complete));
+    assert_eq!(rig.bridge.budget.in_use(), 0);
+}
+
 /// A verify run reads from a provider and reposts on it: one invocation,
 /// so one address. On an account that allows one address the repost goes
 /// through, and every slot of the run carries the same name.

@@ -605,8 +605,9 @@ PutObject, and of a part, is the MD5 of its body. A part made by
 UploadPartCopy stays at `MAX_EXTENT_BYTES`.
 
 **How large an object can be.** One object is made of at most
-`MAX_OBJECT_EXTENTS` extents (10 000, the most this build takes): one
-recovery record names them all, and one request publishes them.
+`MAX_OBJECT_EXTENTS` extents (10 000 as shipped; the build takes up to
+131 072, see "Large objects" below): one recovery record names them
+all, and one request publishes them.
 CompleteMultipartUpload counts the extents of every part the upload
 holds, listed or not, and answers 400 `EntityTooLarge` above the limit.
 The upload stays open.
@@ -619,10 +620,11 @@ The upload stays open.
 
 A part above 16 MiB saves requests, not extents: 95 MiB is one request
 for twelve extents. For the largest objects use parts of 16 MiB. An
-object above 156 GiB does not fit this build.
+object above 156 GiB does not fit the shipped limit.
 
 - A request body above 100 MiB is refused before the Worker runs, so
-  99 MiB is the most `MAX_PUT_BYTES` takes. That limit counts the bytes
+  99 MiB is what `MAX_PUT_BYTES` is set to (the build takes up to
+  199 MiB, for a plan whose edge takes 200 MiB). That limit counts the bytes
   on the wire: a body sent in signed chunks carries 89 bytes of framing
   per chunk. With chunks of 8 KiB, the smallest S3 allows, a body above
   about 98.9 MiB is over it and is refused there; chunks of 16 KiB or
@@ -726,6 +728,200 @@ Going back to a Worker version from before this table needs nothing
 else: the objects are ordinary generations, which it reads, posts,
 verifies and replays. It answers `EntityTooLarge` to a new PutObject
 above one extent.
+
+## Large objects
+
+An object of more than 10 000 extents has a recovery record in parts
+(a segmented record): segments of 4 096 extents under `m/seg/<set>/`,
+stored first, and a head under the name of the record, stored last.
+Only the head is the record. Segments without a head are named by
+nothing and are read by nothing; they are left by a Complete that
+failed or lost a race, and no job removes them. An object of 10 000
+extents or fewer is recorded in one document, byte for byte as before.
+
+**Shipped: off.** `MAX_OBJECT_EXTENTS` is not set, so the limit is
+10 000 and no segmented record is written. This build alone changes
+nothing: the limit is raised by a setting, and only after a drill of
+the segmented path on a deployment of its own has passed. Raise it only
+on a build in which:
+
+1. DeleteObject, a conditional write and UploadPartCopy read no extent
+   rows they do not need, and CopyObject refuses a source above 10 000
+   extents: without that, those calls load every extent row of a large
+   object in one result.
+2. The cut of a Complete by the runtime has been drilled on a deployed
+   Worker ("The cut drill" below) and the 32 MiB came back.
+3. The drill has measured a Complete beside running post jobs: how long
+   it waited for its charge and how many answered 503 (see the charge
+   below).
+
+| Setting | Shipped | The build takes | What it bounds |
+|---|---|---|---|
+| `MAX_OBJECT_EXTENTS` | 10 000 (not set) | 1 to 131 072 | extents of one object |
+| `MAX_PUT_BYTES` | 99 MiB | up to 199 MiB | one request body; set it to the edge limit of the plan less 1 MiB |
+| `SLICE_BYTES` | 8 MiB (not set) | 16 slices a body at most | extents per part |
+
+- With `MAX_OBJECT_EXTENTS` above 10 000 the Worker refuses to start
+  unless an upload of 10 000 parts of `MAX_PUT_BYTES` fits the limit:
+  `ceil(MAX_PUT_BYTES / SLICE_BYTES) x 10 000` must not be more. At
+  99 MiB in slices of 8 MiB that is 130 000 extents, so 131 072 passes.
+  A client can then use every part number at its largest part and never
+  meets the extent limit: 10 000 parts of 96 MiB are 937 GiB.
+- A plan with a higher edge limit is a change of settings only. With an
+  edge of 200 MiB: `MAX_PUT_BYTES = 208666624` (199 MiB) and
+  `SLICE_BYTES = 16777216` (13 slices a part, 130 000 extents). The
+  Worker refuses to start with 199 MiB in slices of 8 MiB (25 slices).
+- **Client settings for a large object:** aws-cli and boto3
+  `multipart_chunksize = 96MB`; rclone `--s3-chunk-size 96M`. A part of
+  96 MiB from aws-cli 2.31 with its default checksum settings is a body
+  of 100 664 300 bytes (1 004 bytes of chunk framing and trailer; over
+  HTTP/1.1 another 971 bytes of transfer chunking): 4 MiB under the
+  edge limit of 104 857 600.
+  The 1 MiB between `MAX_PUT_BYTES` and the edge limit is for that
+  framing. A client that signs every chunk adds about 89 bytes a chunk:
+  1 MiB covers chunks of 16 KiB at 99 MiB and of 32 KiB at 199 MiB
+  A client with smaller signed chunks uses a smaller part, or the edge
+  refuses the body with 413 before the Worker runs.
+- **CompleteMultipartUpload of an upload above 10 000 extents** reads
+  the extents a run of 256 part numbers at a time, stores the segments
+  as it goes, then the head, then publishes in one transaction. It
+  answers `200` at once and the document follows when the work is done,
+  with a newline every 5 s in between; a failure after the headers is
+  an `<Error>` document in that `200`, as S3 itself answers this call.
+  aws-cli, boto3 and rclone read it. When the client goes away the work
+  goes on for at most 30 s more. Work that is cut there is not run and
+  not dropped by the runtime, so what it holds would stay held: the
+  isolate keeps such work in a table, the work marks it every 5 s, and
+  each request and each queue batch first drops the work that has not
+  marked it for 60 s; a Complete that found no room after its wait
+  does the same once more before it answers 503. That gives the 32 MiB
+  back and logs
+  `work table: abandoned work dropped: ... dropped_now=...
+  budget_in_use_before=... budget_in_use=...`. What a Complete dropped
+  after its wait is logged by the next request or queue batch of the
+  isolate, with `dropped_now=0` and two equal budget numbers. Work that
+  is cut has either
+  published the object or left it unpublished (with its segments, and
+  perhaps its head, as they are); a missing answer says neither. Send
+  the request again: after a publication it is answered from the
+  receipt, otherwise it publishes.
+  Refusals that need no work (unknown upload, a part that does not
+  match, too many extents, a condition that does not hold) keep their
+  status code.
+- One such Complete is charged 32 MiB of `INFLIGHT_BUDGET_BYTES` while
+  it runs; without room it answers 503 `SlowDown`. With
+  `MAX_OBJECT_EXTENTS` above 10 000 the Worker refuses to start with a
+  budget below that. With the budget of 48 MiB one isolate runs one such
+  Complete at a time.
+  Beside it the jobs have 24 MiB of their 72 MiB: one post job of a
+  16 MiB extent (22 MiB), not two. So that jobs which come one after
+  another do not keep a Complete out for good, a job that would keep a
+  waiting Complete out waits itself (it gives its lease back unspent
+  when it has waited 20 s, as for any full budget) until the Complete
+  has its charge or gives up; the jobs that run finish first. Not held
+  back: a job that leaves room beside that Complete, any job while
+  another such Complete runs (that one keeps it out, for as long as its
+  work takes), and the repost of a verify job that runs already. While
+  bodies are being read the jobs do wait: bodies pass in seconds, and
+  jobs let in meanwhile would hold the room when the bodies are done.
+  The price: while the bodies never leave 32 MiB free, which is while
+  their charges come to more than 16 MiB together (a body of at most
+  `MAX_EXTENT_BYTES` is charged twice its length, a longer one two
+  slices, 16 MiB at the default `SLICE_BYTES`; so one body of more
+  than 8 MiB and at most `MAX_EXTENT_BYTES` that is read slowly does
+  it, and so do two longer bodies at once, but one longer body alone
+  or a few small ones leave the room),
+  no post, verify or release job starts, whatever its size (also one
+  that would fit beside the Complete; only the repost of a verify job
+  that runs already goes on), until the Complete has its charge or
+  answers 503, each time the client sends it. A job that has waited its
+  20 s through that gives its lease back and counts as a refusal in the
+  `budget saturated` line although the jobs hold little
+  (`jobs_in_use`). Such a Complete is refused by the bodies
+  alone, with or without jobs; the client sends it again.
+  Nothing changes while no Complete waits. A Complete whose request was
+  stopped while it waited holds the others back for 2 s, once, whatever
+  the other requests do.
+  The budget was not raised instead: a Complete and two such post jobs
+  hold about 74 MiB, above the 72 MiB that the isolate is sized for, and
+  a request budget of 64 MiB would let two 16 MiB bodies in at once on
+  every deployment (96 MiB at the weight of a request), whether or not
+  it stores large objects.
+  Measured in a local workerd (wasm memory of the
+  isolate, 1.6 MiB before): 31.1 MiB at the end of a Complete of
+  131 072 extents (29.6 MiB more), 25.1 MiB at 65 536 (23.5 MiB more);
+  6.8 s and 3.2 s, 43 and 27 catalogue reads, 34 and 18 record puts,
+  one publish batch, one queue batch.
+  In another run of the 131 072 (6.6 s) the headers of the answer left
+  after 2.1 s and the one publish batch took 2.6 s; in a local workerd
+  no timer runs during that batch, so a newline that falls due then is
+  late there.
+- An UploadPart or an abort that arrives while the extents are read
+  wins: no head is stored, nothing is published, and the answer is the
+  one the upload then deserves (`InvalidPart`, `NoSuchUpload`, or a new
+  attempt on the upload as it is).
+- Complete sends one batch of at most 100 queue messages. The outbox
+  rows are written for every extent in the publish transaction, and the
+  dispatcher sends the rest.
+- A head names at most 192 segments. With the built-in segment size
+  that is far above the limit (131 072 extents are 32 segments).
+
+**Drill settings.** `RECORD_SEGMENT_AFTER` (1 to 10 000),
+`RECORD_SEGMENT_EXTENTS` (1 to 4 096) and `PUBLISH_CHUNK_ROWS`
+(1 to 25 000) make the segmented path start earlier, with smaller
+segments and smaller publish values, so that a drill covers it with a
+small object. They only take values at or below the built-in ones. The
+Worker refuses to start when `MAX_OBJECT_EXTENTS` in segments of
+`RECORD_SEGMENT_EXTENTS` would be more than 192 segments, or in values
+of `PUBLISH_CHUNK_ROWS` more than 128 values (a restore asks the
+catalogue twice a value in one call): a drill sets a small
+`MAX_OBJECT_EXTENTS` with them. Production
+and dev set none of them, and a contract test holds them to that.
+
+**The cut drill.** On a drill Worker with `ENVIRONMENT=dev` (never
+production), to see that a Complete which the runtime cut gives its
+charge back:
+
+1. Set small `RECORD_SEGMENT_AFTER` and `RECORD_SEGMENT_EXTENTS`,
+   `DEV_MEMORY_LOG=on`, and `DEV_SEGMENT_PUT_DELAY_MS` so that the
+   segments of the drill object take about 90 s together (the delay is
+   at most 60 000 ms a put, and is ignored outside dev). Start
+   `wrangler tail`.
+2. Upload the parts, then send the Complete with `curl --max-time 5`:
+   the client leaves while the segments are stored.
+3. Wait 60 s (the runtime stops the invocation about 30 s after the
+   client left) and then 60 s more for the mark to go quiet. Send any
+   request: the tail shows `work table: abandoned work dropped` with
+   `dropped=1` and a `budget_in_use` that is 33 554 432 below
+   `budget_in_use_before` (33554432 and 0 when nothing else is charged
+   on the isolate: keep the drill Worker idle otherwise), and the
+   `memory:` line of that request shows `budget_in_use=0` (plus what
+   the request itself holds). A queue batch or a cron pass that
+   reaches the isolate first drops the work and logs the line before
+   your request does: look for the line, not for the request. All of
+   it has to come from one isolate: compare `isolate=` in the lines.
+4. Control: the same Complete with a client that stays (no
+   `--max-time`). It answers after about 90 s with the result document,
+   the object reads back, no `abandoned work` line appears, and
+   `budget_in_use` is 0 afterwards.
+5. Send the cut Complete again: it publishes or answers from the
+   receipt.
+
+**Rollback.** Once one segmented record exists, never roll back to a
+version older than the first one that reads segmented records in the
+replay, the recovery copy and the intent sweep. The check is on the
+stored records: list `SAFETY` for one key under `m/seg/`, and under
+`m/x/<tenant>/seg/` for each tenant with `RECORD_LAYOUT = tenant`
+(`wrangler r2 object` has no listing; use an S3 client on the bucket
+with `--prefix` and `--max-keys 1`). The extent count of a generation in
+the catalogue does not answer it: only a multipart Complete writes
+segments, so under a drill setting a sliced PutObject above
+`RECORD_SEGMENT_AFTER` extents has its record in one document. An older version cannot read a head: its replay stops at it, and
+its sweep finds no record for a sliced write and removes the slices a
+day later. Setting `MAX_OBJECT_EXTENTS` back to 10 000 stops new
+segmented records and does not lower this floor: the ones written stay.
+With the limit at 10 000 from the start there is no such record and no
+new floor.
 
 ## Packed article plans
 

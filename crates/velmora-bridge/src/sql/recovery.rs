@@ -106,35 +106,43 @@ fn delete_before(
 }
 
 /// Extent rows of the parts the upload holds now, by part number and,
-/// within a part, in body order.
+/// within a part, in body order: of every part, or of the parts
+/// numbered `first..=last` of `between`.
 pub(super) async fn upload_extents<S: Sql>(
     c: &SqlCatalog<S>,
     t: &UploadTarget<'_>,
+    between: Option<(u16, u16)>,
     limit: u32,
 ) -> Result<Vec<PartExtent>> {
+    // With a range both halves name the upload and the part numbers,
+    // so each is a range of its primary key.
+    let range = match between {
+        Some(_) => " AND part_number BETWEEN ?5 AND ?6",
+        None => "",
+    };
     let sql = format!(
         "SELECT p.part_number, p.piece, {EXTENT_COLS} FROM \
-           (SELECT part_number, 0 AS piece, extent_id FROM upload_parts WHERE upload_id = ?1 \
+           (SELECT part_number, 0 AS piece, extent_id FROM upload_parts \
+             WHERE upload_id = ?1{range} \
             UNION ALL \
             SELECT part_number, piece, extent_id FROM upload_part_extents \
-             WHERE upload_id = ?1) p \
+             WHERE upload_id = ?1{range}) p \
          JOIN extents ON extents.id = p.extent_id \
          WHERE extents.bucket_id = ?2 AND EXISTS \
            (SELECT 1 FROM uploads u WHERE u.id = ?1 AND u.bucket_id = ?2 AND u.key = ?3) \
          ORDER BY p.part_number, p.piece LIMIT ?4"
     );
-    let rows = c
-        .sql
-        .query(
-            &sql,
-            &[
-                text(t.id.as_str()),
-                text(t.bucket.as_str()),
-                text(t.key),
-                SqlValue::Int(i64::from(limit)),
-            ],
-        )
-        .await?;
+    let mut params = vec![
+        text(t.id.as_str()),
+        text(t.bucket.as_str()),
+        text(t.key),
+        SqlValue::Int(i64::from(limit)),
+    ];
+    if let Some((first, last)) = between {
+        params.push(SqlValue::Int(i64::from(first)));
+        params.push(SqlValue::Int(i64::from(last)));
+    }
+    let rows = c.sql.query(&sql, &params).await?;
     rows.into_iter()
         .map(|mut row| {
             if row.len() < 2 {
