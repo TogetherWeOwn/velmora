@@ -4743,3 +4743,183 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
     assert!(fx.cat.mark_posted_many(&post, &all, t).await.unwrap());
     assert_eq!(fx.extent(&packed, "posted_at").await, t.0.to_string());
 }
+
+impl Fx {
+    /// A `TWO_ARTICLES` extent whose packed plan is posted, with one
+    /// parity article when `parity`, claimed for verify at `T0`.
+    async fn posted_packed(&self, key: &str, parity: bool) -> (Obj, Lease) {
+        let o = self.two_articles(key).await;
+        let post = self.claim(&o, OutboxStage::Post, T0).await.unwrap();
+        let (blob, _) = self.seeded(&o, 1);
+        let addendum = parity.then(|| self.addendum(&o, &blob, 7));
+        let all: &[(u32, &str)] = match parity {
+            true => &[(0, "p1"), (1, "p1"), (2, "p1")],
+            false => &[(0, "p1"), (1, "p1")],
+        };
+        self.cat
+            .plan_packed(&post, TWO_ARTICLES, &blob, addendum.as_deref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(self.cat.mark_posted_many(&post, all, T0).await.unwrap());
+        assert!(self
+            .cat
+            .advance(&post, OutboxStage::Verify, T0, T0)
+            .await
+            .unwrap());
+        let l = self.claim(&o, OutboxStage::Verify, T0).await.unwrap();
+        (o, l)
+    }
+
+    /// A pass of `kind` that found `n` articles of `n`.
+    async fn pass_of(&self, l: &Lease, backbone: &str, at: UnixMs, kind: VerifyKind, n: u32) {
+        let v = VerificationRow {
+            extent_id: l.extent.clone(),
+            backbone: backbone.into(),
+            provider_id: format!("p-{backbone}"),
+            verified_at: at,
+            plan_rev: 1,
+            articles_ok: n,
+            articles_total: n,
+            result: VerifyResult::Ok,
+            kind,
+        };
+        assert!(self.cat.record_verification(l, &v).await.unwrap());
+    }
+}
+
+/// A plan with a parity addendum is its data articles and its parity
+/// articles. A pass over the data articles alone, as a version from
+/// before parity records it, is not a complete pass: it counts for no
+/// backbone, is no full check on record, and does not stamp the extent.
+#[tokio::test]
+async fn a_pass_without_the_parity_articles_is_not_a_complete_pass() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let verified = "SELECT COUNT(*) FROM extents WHERE last_verified_at IS NOT NULL";
+    let counts_for_the_object = || async {
+        let status = fx
+            .cat
+            .object_status(&fx.bucket, "k")
+            .await
+            .unwrap()
+            .unwrap();
+        let backbones = &status.extents[0].backbones;
+        backbones.iter().filter(|b| b.counts).count()
+    };
+
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 2).await;
+    assert!(fx.counting(&o).await.is_empty());
+    assert!(fx.cat.body_checks(&o.extent).await.unwrap()[0]
+        .counts
+        .eq(&false));
+    assert_eq!(fx.count(verified).await, 0);
+    assert_eq!(counts_for_the_object().await, 0);
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 2).await;
+    assert!(fx.counting(&o).await.is_empty());
+
+    fx.pass_of(&l, "bb-a", T0.plus_ms(1), VerifyKind::Body, 3)
+        .await;
+    assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
+    assert!(fx.cat.body_checks(&o.extent).await.unwrap()[0].counts);
+    assert_eq!(fx.count(verified).await, 1);
+    assert_eq!(counts_for_the_object().await, 1);
+    fx.pass_of(&l, "bb-b", T0.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
+}
+
+/// The guard of the release counts the parity articles: neither the full
+/// check on record nor a fresh pass is one when it left them out.
+#[tokio::test]
+async fn release_refuses_passes_without_the_parity_articles() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    // Verified by a version from before parity: the data articles only.
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 2).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Stat, 2).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    let lost = |at: UnixMs| {
+        let (cat, r, counting) = (&fx.cat, &r, &counting);
+        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
+    };
+
+    // Fresh passes over the data articles only.
+    fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, 2)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, 2)
+        .await;
+    assert!(lost(later.plus_ms(2)).await, "nothing counted the parity");
+    // Fresh passes over every article, on a full check of the data only.
+    fx.pass_of(&r, "bb-a", later.plus_ms(3), VerifyKind::Stat, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Stat, 3)
+        .await;
+    assert!(lost(later.plus_ms(4)).await, "no full check of the parity");
+    // The full check of every article, and one backbone asked for less.
+    fx.pass_of(&r, "bb-a", later.plus_ms(5), VerifyKind::Body, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(5), VerifyKind::Stat, 2)
+        .await;
+    assert!(lost(later.plus_ms(6)).await, "one backbone without parity");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+    assert_eq!(fx.extent(&o, "release_evidence").await, "NULL");
+
+    fx.pass_of(&r, "bb-b", later.plus_ms(7), VerifyKind::Stat, 3)
+        .await;
+    assert!(!lost(later.plus_ms(8)).await);
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+}
+
+/// Verify and release of a plan with parity run the same statements and
+/// write the same number of rows as of a plan without: a parity article
+/// costs no row.
+#[tokio::test]
+async fn parity_costs_no_row_at_verify_and_release() {
+    let fx = Fx::new().await;
+    let plain = fx.posted_packed("plain", false).await;
+    let with = fx.posted_packed("with", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.cat.sql.0.meter_writes().unwrap();
+    let mut cost = Vec::new();
+    let mut texts = Vec::new();
+    for ((o, l), n) in [(&plain, 2), (&with, 3)] {
+        let (rows, at) = (fx.cat.sql.0.writes(), fx.statements());
+        fx.pass_of(l, "bb-a", T0, VerifyKind::Body, n).await;
+        fx.pass_of(l, "bb-b", T0, VerifyKind::Stat, n).await;
+        fx.cat.backbone_status(&o.extent).await.unwrap();
+        fx.cat.body_checks(&o.extent).await.unwrap();
+        let later = T0.plus_ms(HOUR_MS);
+        assert!(fx
+            .cat
+            .advance(l, OutboxStage::Release, later, T0)
+            .await
+            .unwrap());
+        let r = fx.claim(o, OutboxStage::Release, later).await.unwrap();
+        fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, n)
+            .await;
+        fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, n)
+            .await;
+        let begun = fx
+            .cat
+            .begin_release(&r, 2, &counting, "[]", later.plus_ms(2));
+        assert_eq!(begun.await.unwrap(), Guard::Applied(()));
+        assert!(fx.cat.finish_release(&r, later.plus_ms(2)).await.unwrap());
+        assert_eq!(fx.extent(o, "safety_state").await, "released");
+        let wrote = fx.cat.sql.0.writes().since(&rows);
+        cost.push((wrote.billed(), wrote.writing_statements));
+        let ran = &fx.cat.sql.1.borrow()[at..];
+        texts.push(ran.iter().map(|(sql, _)| sql.clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(cost[0], cost[1], "{cost:?}");
+    assert!(cost[0].0 > 0);
+    assert_eq!(texts[0], texts[1]);
+    assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
+}

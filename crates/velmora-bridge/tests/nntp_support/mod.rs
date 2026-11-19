@@ -641,9 +641,14 @@ impl MemCatalog {
                 articles_total: v.articles_total,
                 result: v.result,
                 kind: v.kind,
+                // A complete pass is one of every article of the plan,
+                // the parity articles of its addendum included.
                 counts: v.result == VerifyResult::Ok
                     && v.articles_ok == v.articles_total
-                    && Some(v.articles_total) == extent.article_count,
+                    && Some(v.articles_total)
+                        == extent
+                            .article_count
+                            .map(|data| data + e.job.parity_count.unwrap_or(0)),
             })
             .collect()
     }
@@ -1177,8 +1182,9 @@ impl Catalog for MemCatalog {
                     None => e.parity_reposted.push(*idx),
                 }
             }
-            // Like the SQL: a packed plan has one stamp, on its extent, so
-            // a repost of any of its articles (parity too) stamps them all.
+            // A packed plan has one stamp for all its articles, on the
+            // extent's row: a repost of any of them is a repost of the
+            // plan, as in the real catalogue.
             if e.packed.is_some() && !idxs.is_empty() {
                 for a in &mut e.articles {
                     a.reposted_at = a.reposted_at.max(Some(now));
