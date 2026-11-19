@@ -5071,7 +5071,8 @@ async fn a_head_is_not_sent_when_a_segment_is_missing_or_wrong() {
                         w.raw(&name, bytes).await;
                     }
                     // A segment that opens under this name, and is the
-                    // one of another head.
+                    // one of another head. The head names its digest:
+                    // only what the segment says of itself is wrong.
                     _ => {
                         let mut segment = sealed.plain[at].clone();
                         if what == "other set" {
@@ -5080,7 +5081,12 @@ async fn a_head_is_not_sent_when_a_segment_is_missing_or_wrong() {
                             segment.index = 0;
                         }
                         let plain = serde_json::to_vec(&segment).unwrap();
-                        w.record(&name, &plain).await;
+                        let stored = w.record(&name, &plain).await;
+                        let mut head = sealed.head.clone();
+                        head.segments[at].sha256 = Sha256::digest(&stored).to_vec();
+                        let plain = serde_json::to_vec(&head).unwrap();
+                        velmora_bridge::recovery::GenerationHead::parse(&key, &plain).expect(what);
+                        w.record(&key, &plain).await;
                     }
                 }
                 let counts = w.pass().await;
@@ -5093,6 +5099,7 @@ async fn a_head_is_not_sent_when_a_segment_is_missing_or_wrong() {
                 // the record.
                 assert!(w.safety.lose(&name) || what == "missing");
                 w.raw(&name, good).await;
+                w.raw(&key, sealed.head_sealed.clone()).await;
                 w.clock.advance_ms(WALK_INTERVAL_MS + FRESH_MS);
                 let counts = w.pass().await;
                 assert_eq!(counts.source_unreadable, 0, "{case}: {counts:?}");

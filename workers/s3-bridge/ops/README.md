@@ -352,9 +352,11 @@ generation, tombstone and article plan records:
 
 Every write belongs to tenant `t_0000000000000000` today. The names
 under `m/seg/` and `m/x/<tenant>/seg/` are the segments of a segmented
-generation record: each holds a run of the extents of one object, and
-is read only through the generation record that names it. No build
-writes them yet. Any other value of the variable refuses to start.
+generation record: each holds a run of the extents of one object. A
+restore reads a segment only through the generation record that names
+it; the recovery copy also sends it to the remote store as a key of its
+own, like any other key under `m/`, and before the record that names
+it. No build writes them yet. Any other value of the variable refuses to start.
 
 - A record is never renamed, moved or rewritten: it is sealed under its
   whole name and would not open under another. Changing the setting

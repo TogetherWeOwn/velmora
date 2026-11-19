@@ -854,6 +854,13 @@ impl GenerationRecord {
 }
 
 impl ExtentRecord {
+    /// Whether its digests have the lengths [`Self::row`] takes.
+    fn has_digests(&self) -> bool {
+        digest::<16>(&self.plain_md5).is_ok()
+            && digest::<32>(&self.plain_sha256).is_ok()
+            && digest::<32>(&self.cipher_sha256).is_ok()
+    }
+
     /// The extent as a committed row of `generation` whose safety copy
     /// is held and that has no article plan yet.
     fn row(&self, bucket: &BucketRecord, generation: &GenerationRecord) -> Result<ExtentRow> {
@@ -978,7 +985,9 @@ impl GenerationHead {
         }
         let (mut seq, mut offset) = (entry.seq, entry.plain_offset);
         for e in &segment.extents {
-            if e.seq != seq || e.plain_offset != offset {
+            // Also what makes a row of every extent: a segment that
+            // opens is one the whole of which can be replayed.
+            if e.seq != seq || e.plain_offset != offset || !e.has_digests() {
                 return Err(ERR_SEGMENT_OTHER);
             }
             // The head was checked: its counts and sizes do not overflow.

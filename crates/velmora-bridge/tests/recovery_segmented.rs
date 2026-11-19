@@ -265,12 +265,18 @@ fn golden_manifest() -> GenerationManifest {
     }
 }
 
+/// Whether the vectors are written, not compared: only when
+/// `VELMORA_WRITE_GOLDEN` is exactly `1`.
+fn write_golden() -> bool {
+    std::env::var_os("VELMORA_WRITE_GOLDEN").is_some_and(|v| v == "1")
+}
+
 /// Compares with a file of `tests/golden/`. `VELMORA_WRITE_GOLDEN=1`
 /// writes the file instead: for a new vector, never to make a changed
 /// one pass.
 fn golden(name: &str, bytes: &[u8]) {
     let path = format!("{}/tests/golden/{name}", env!("CARGO_MANIFEST_DIR"));
-    if std::env::var_os("VELMORA_WRITE_GOLDEN").is_some() {
+    if write_golden() {
         std::fs::write(&path, bytes).unwrap();
     }
     let stored = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -281,19 +287,15 @@ fn golden(name: &str, bytes: &[u8]) {
     );
 }
 
-/// The plaintext of a format-1 record is, byte for byte, what it was
-/// before format 2 existed, and the plaintexts of a head and of a
-/// segment are the ones checked in. (The sealed bytes have a random
-/// nonce; what is sealed is what a format is.)
 /// The file `name` of sealed bytes opens under the test key and the
-/// record name `record` to `plain`. With `VELMORA_WRITE_GOLDEN` set,
-/// seals `plain` and writes the file.
-fn sealed_golden(name: &str, record: &str, plain: &[u8]) {
+/// record name `record` to `plain`. With `VELMORA_WRITE_GOLDEN=1`,
+/// seals `plain` and writes the file. Returns the sealed bytes.
+fn sealed_golden(name: &str, record: &str, plain: &[u8]) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(name);
     let kek = TestKek::new();
-    if std::env::var_os("VELMORA_WRITE_GOLDEN").is_some() {
+    if write_golden() {
         let sealed = seal_manifest(&kek, record, plain, &mut SystemRng).unwrap();
         std::fs::write(&path, sealed).unwrap();
     }
@@ -302,8 +304,13 @@ fn sealed_golden(name: &str, record: &str, plain: &[u8]) {
     assert_eq!(&opened[..], plain, "{name}");
     // Under another name it does not open.
     assert!(open_manifest(&kek, &format!("{record}0"), &sealed).is_err());
+    sealed
 }
 
+/// The plaintext of a format-1 record is, byte for byte, what it was
+/// before format 2 existed, and the plaintexts of a head and of a
+/// segment are the ones checked in. (The sealed bytes have a random
+/// nonce; what is sealed is what a format is.)
 #[test]
 fn the_bytes_of_both_formats_are_the_ones_checked_in() {
     let m = golden_manifest();
@@ -312,14 +319,22 @@ fn the_bytes_of_both_formats_are_the_ones_checked_in() {
     let set = "s_0000018bcfe568050123456789abcdef";
     let segments = split(&m, set, 2);
     assert_eq!(segments.len(), 3);
-    let digests: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0xd0 + i; 32]).collect();
+    let segment_plain = serde_json::to_vec(&segments[1]).unwrap();
+    golden("generation-v2-segment-1.json", &segment_plain);
+    // Sealed once under the test key, each under its own name: they
+    // still open, and to the bytes above.
+    let segment_sealed = sealed_golden(
+        "generation-v2-segment-1.sealed",
+        &Layout::flat().segment_key(set, 1),
+        &segment_plain,
+    );
+    // The head names the segment that is checked in by its digest; the
+    // two others are not stored.
+    let mut digests: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0xd0 + i; 32]).collect();
+    digests[1] = Sha256::digest(&segment_sealed).to_vec();
     let head = head_of(&m, set, &segments, &digests);
     let head_plain = serde_json::to_vec(&head).unwrap();
     golden("generation-v2-head.json", &head_plain);
-    golden(
-        "generation-v2-segment-1.json",
-        &serde_json::to_vec(&segments[1]).unwrap(),
-    );
 
     // What the writer makes of the rows of that object is the record
     // that is checked in.
@@ -327,17 +342,22 @@ fn the_bytes_of_both_formats_are_the_ones_checked_in() {
     let made = GenerationManifest::new(&m.bucket(), &m.generation().unwrap(), &rows).unwrap();
     golden("generation-v1.json", &serde_json::to_vec(&made).unwrap());
 
-    // Sealed once under the test key, each under its own name: they
-    // still open, and to the bytes above.
     let name = format!("m/{}", m.generation.id);
     let plain = serde_json::to_vec(&m).unwrap();
     sealed_golden("generation-v1.sealed", &name, &plain);
-    sealed_golden("generation-v2-head.sealed", &name, &head_plain);
-    sealed_golden(
-        "generation-v2-segment-1.sealed",
-        &Layout::flat().segment_key(set, 1),
-        &serde_json::to_vec(&segments[1]).unwrap(),
-    );
+    let head_sealed = sealed_golden("generation-v2-head.sealed", &name, &head_plain);
+
+    // The stored head opens the stored segment, and no other bytes.
+    let kek = TestKek::new();
+    let stored = GenerationHead::parse(&name, &open_manifest(&kek, &name, &head_sealed).unwrap());
+    let stored = stored.unwrap();
+    let opened = stored.open_segment(&kek, &Layout::flat(), 1, &segment_sealed);
+    assert!(opened.unwrap() == segments[1].extents);
+    let mut other = segment_sealed.clone();
+    other[0] ^= 1;
+    assert!(stored
+        .open_segment(&kek, &Layout::flat(), 1, &other)
+        .is_err());
 
     // What is checked in reads back as the same record.
     assert_eq!(GenerationHead::parse(&name, &head_plain).unwrap(), head);
@@ -382,6 +402,9 @@ async fn a_segmented_record_replays_to_what_the_single_record_replays_to() {
             (64, 1, 65),
             (64, 2, 7),
             (64, 50, 1000),
+            // More segments than a call reads after the first pass
+            // over them: the call stops before it publishes.
+            (1, 50, 1000),
             (4096, 1, 50),
             (1, 1, 3),
             (100, 1, 33),
@@ -549,7 +572,16 @@ fn forged(
 async fn a_segment_that_is_not_what_its_head_says_makes_the_record_unreadable() {
     type InSegments = fn(&mut Vec<Segment>);
     type InHead = fn(&mut Vec<SegmentEntry>);
-    let cases: [(&str, InSegments, InHead); 7] = [
+    let cases: [(&str, InSegments, InHead); 8] = [
+        // An extent with a digest of another length: no row can be
+        // made of it, in whatever segment it is.
+        (
+            "short extent digest",
+            |segments| {
+                segments[2].extents[5].plain_md5.pop();
+            },
+            |_| {},
+        ),
         // The head says 65 and 63 where the segments hold 64 and 64.
         (
             "wrong count",
@@ -932,6 +964,181 @@ async fn a_record_under_two_names_is_replayed_from_the_one_that_reads() {
         let signer = reissue_key(&rig).await;
         assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
     }
+}
+
+/// A record under two names, the first in segments and with a segment
+/// lost before the replay, the second in one part and with more extents
+/// than a call handles: the replay ends, and with the second published.
+#[tokio::test(flavor = "current_thread")]
+async fn a_single_record_behind_a_segmented_one_that_does_not_read_is_replayed() {
+    for lost in [0, 2] {
+        for limits in [
+            ReplayLimits::default(),
+            ReplayLimits {
+                records: 1,
+                extents: 7,
+            },
+        ] {
+            let flat = Layout::flat();
+            let (rig, bucket, _, body) = world(&flat).await;
+            let (name, m) = record_of(&rig, &bucket, "big", &flat).await;
+            let first = segment_from(&rig, &bucket, &flat, &name, &m, 64).await;
+            let twin = Layout::default_tenant().of_flat(&name);
+            let plain = serde_json::to_vec(&m).unwrap();
+            let sealed = seal_manifest(&rig.bridge.kek, &twin, &plain, &mut SystemRng).unwrap();
+            store(&rig, &bucket, &twin, sealed).await;
+            assert!(rig.bridge.safety.inner.lose(&first.segments[lost].0));
+            wipe(&rig);
+            // The first call that stops inside the record names the
+            // one it counts in.
+            let cursor = replay_into(&rig, limits, 1).await;
+            assert_eq!(cursor.name, twin, "lost {lost}: {cursor:?}");
+            let unreadable = replay_from(&rig, limits, cursor).await;
+            assert!(!unreadable.contains(&twin), "lost {lost}: {unreadable:?}");
+            assert_eq!(rig.count("objects"), 3, "lost {lost}");
+            assert_eq!(rig.count("extents"), 2 + EXTENTS as i64, "lost {lost}");
+            let signer = reissue_key(&rig).await;
+            assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
+        }
+    }
+}
+
+/// The name a cursor counts in gives no record any more, removed or no
+/// longer one that opens, while a replay is under way: the record under
+/// the other name is replayed from its first extent. For a count made
+/// in a segmented record, and for one made in a record in one part,
+/// which the cursor does not name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_count_is_not_carried_to_the_other_name_of_a_record() {
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 10,
+    };
+    for segmented in [true, false] {
+        for removed in [true, false] {
+            let case = format!("segmented {segmented}, removed {removed}");
+            let flat = Layout::flat();
+            let tenant = Layout::default_tenant();
+            let (rig, bucket, _, body) = world(&flat).await;
+            let (name, m) = record_of(&rig, &bucket, "big", &flat).await;
+            if segmented {
+                segment_from(&rig, &bucket, &flat, &name, &m, 64).await;
+            }
+            let twin = tenant.of_flat(&name);
+            let second = segment_from(&rig, &bucket, &tenant, &twin, &m, 50).await;
+            wipe(&rig);
+            let cursor = replay_into(&rig, limits, 30).await;
+            let owner = if segmented { name.as_str() } else { "" };
+            assert_eq!(cursor.name, owner, "{case}: {cursor:?}");
+            if removed {
+                assert!(rig.bridge.safety.inner.lose(&name), "{case}");
+            } else {
+                assert!(rig
+                    .bridge
+                    .safety
+                    .inner
+                    .corrupt(&name, |b| b.truncate(b.len() / 2)));
+            }
+            let step = rig.bridge.replay_step_within(cursor, limits).await.unwrap();
+            assert_eq!(step.unreadable.contains(&name), !removed, "{case}");
+            let cursor = step.next.expect("the replay goes on");
+            assert_eq!(cursor.name, twin, "{case}: {cursor:?}");
+            assert_eq!(cursor.extent, 10, "{case}: {cursor:?}");
+            let unreadable = replay_from(&rig, limits, cursor).await;
+            assert!(!unreadable.contains(&second.head_key), "{case}");
+            assert_eq!(rig.count("objects"), 3, "{case}");
+            let signer = reissue_key(&rig).await;
+            assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
+        }
+    }
+}
+
+/// A segmented record that is gone when the next call comes for it:
+/// the count the cursor had in it is not used in the record after it,
+/// and no name is left in the cursor when no record is after it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_count_in_a_record_that_is_gone_is_not_used_in_the_next() {
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 10,
+    };
+    for last in [false, true] {
+        let layout = Layout::flat();
+        let (rig, bucket, _, _) = world(&layout).await;
+        let sealed = segment(&rig, &bucket, &layout, 64).await;
+        if last {
+            let (after, _) = record_of(&rig, &bucket, "after", &layout).await;
+            assert!(rig.bridge.safety.inner.lose(&after));
+        }
+        wipe(&rig);
+        let cursor = replay_into(&rig, limits, 30).await;
+        assert_eq!(cursor.name, sealed.head_key);
+        assert!(rig.bridge.safety.inner.lose(&sealed.head_key));
+        let step = rig.bridge.replay_step_within(cursor, limits).await.unwrap();
+        let cursor = step.next.expect("the replay goes on");
+        assert_eq!((cursor.extent, cursor.name.as_str()), (0, ""), "{cursor:?}");
+        let unreadable = replay_from(&rig, limits, cursor).await;
+        assert_eq!(unreadable, Vec::<String>::new());
+        let signer = reissue_key(&rig).await;
+        get(&rig, &signer, "big").await.expect(404);
+        let after = get(&rig, &signer, "after").await;
+        if last {
+            after.expect(404);
+        } else {
+            assert_eq!(after.expect(200).body, b"after");
+        }
+    }
+}
+
+/// A call reads no more segments than twice the most a head names,
+/// whatever its limits: with two records of a segment for each extent
+/// it stops inside the second, at the segment that would be one more,
+/// and the calls after it publish both.
+#[tokio::test(flavor = "current_thread")]
+async fn a_call_stops_at_the_segments_it_may_read() {
+    use velmora_bridge::replay::SEGMENT_READS;
+    let limits = ReplayLimits {
+        records: 50,
+        extents: 10_000,
+    };
+    let layout = Layout::flat();
+    let (rig, bucket, signer, body) = world(&layout).await;
+    rig.bridge.clock.advance_ms(1000);
+    rig.put(&signer, BUCKET, "big too", &body).await.expect(200);
+    let (name, m) = record_of(&rig, &bucket, "big", &layout).await;
+    segment_from(&rig, &bucket, &layout, &name, &m, 1).await;
+    // Another set id: it is made of the time.
+    rig.bridge.clock.advance_ms(1);
+    let (second, m) = record_of(&rig, &bucket, "big too", &layout).await;
+    segment_from(&rig, &bucket, &layout, &second, &m, 1).await;
+    wipe(&rig);
+
+    // Each call: the record it stops in, and the extent.
+    let mut stops = Vec::new();
+    let mut next = Some(ReplayCursor::start(UnixMs(0)));
+    while let Some(at) = next {
+        assert!(stops.len() < 20, "{stops:?}");
+        let mut step = rig.bridge.replay_step_within(at, limits).await.unwrap();
+        assert_eq!(step.unreadable, Vec::<String>::new());
+        next = step.next.take();
+        if let Some(cursor) = next.as_ref().filter(|c| !c.name.is_empty()) {
+            stops.push((cursor.name.clone(), cursor.extent as usize));
+        }
+    }
+    // The first: read once to hold it to its head and once for its
+    // extents, it is not read a third time by the same call.
+    assert_eq!(stops[0], (name, EXTENTS), "{stops:?}");
+    // The second, by the call that read the first to publish it and
+    // the second to hold it to its head.
+    let left = SEGMENT_READS - 2 * EXTENTS;
+    assert!(left > 0 && left < EXTENTS);
+    assert_eq!(stops[1], (second, left), "{stops:?}");
+    // The third call ends it.
+    assert_eq!(stops.len(), 2, "{stops:?}");
+    assert_eq!(rig.count("objects"), 4);
+    let signer = reissue_key(&rig).await;
+    assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
+    assert_eq!(get(&rig, &signer, "big too").await.expect(200).body, body);
 }
 
 /// A head is the record its name promises and names a set by an id of

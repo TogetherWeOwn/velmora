@@ -328,15 +328,18 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         let mut reads = 0;
         for listed in &names {
             let flat = &listed.flat;
-            // The name the cursor counts extents in. The names before
-            // it were given up, and are not read again: a count made in
-            // one name is never used in another.
-            let owner = std::mem::take(&mut cursor.name);
-            let mut skip = listed.names().any(|(name, _)| *name == owner);
-            if !owner.is_empty() && !skip {
-                // That record is gone.
-                cursor.extent = 0;
-            }
+            // The name the cursor counts extents in: the one it holds,
+            // or, when it holds none, the first name of the id (a
+            // record in one part under its first name is not named).
+            // A count made in one name is never used in another, and
+            // the names before it were given up and are not read again.
+            let named = std::mem::take(&mut cursor.name);
+            let mut skip = listed.names().any(|(name, _)| *name == named);
+            let owner = if named.is_empty() {
+                listed.name.clone()
+            } else {
+                named.clone()
+            };
             // The first name of the id that can be read: a name that
             // cannot must not hide a record of the same id that can.
             for (name, layout) in listed.names() {
@@ -344,6 +347,13 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     continue;
                 }
                 skip = false;
+                // Another name than the one the count was made in, be
+                // it that the record of that name is gone, or that it
+                // does not open any more: this one starts at its first
+                // extent.
+                if *name != owner {
+                    cursor.extent = 0;
+                }
                 let record = match read_stored_generation(&self.safety, &self.kek, name).await {
                     Ok(Some(record)) => record,
                     // Removed by an operator since the listing.
@@ -354,7 +364,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         continue;
                     }
                 };
-                if matches!(record, StoredGeneration::Segmented(_)) {
+                let segmented = matches!(record, StoredGeneration::Segmented(_));
+                // A count the cursor did not name was made in a record
+                // in one part.
+                if segmented && named.is_empty() {
+                    cursor.extent = 0;
+                }
+                // The cursor names every record but the usual one: in
+                // one part, under the first name of its id.
+                if segmented || *name != listed.name {
                     cursor.name.clone_from(name);
                 }
                 let mut budget = (&mut budget, &mut reads);
@@ -389,6 +407,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         Ok(Some(ReplayCursor {
             phase: ReplayPhase::Tombstones,
             after: start_after(TOMBSTONE_PREFIX, UnixMs(cursor.since_ms)),
+            // A count in a record that is not listed any more is of
+            // nothing.
+            extent: 0,
+            name: String::new(),
             ..cursor
         }))
     }
@@ -492,7 +514,11 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     };
                     if held.as_ref().is_none_or(|(i, _)| *i != index) {
                         drop(held.take());
-                        **reads += 1;
+                        // The cursor is at the first extent of a
+                        // segment: the next call reads it.
+                        if !fits(reads, 1) {
+                            return Ok(Replayed::More);
+                        }
                         match read_segment(&self.safety, &self.kek, layout, head, index).await {
                             Ok(extents) => held = Some((index, extents)),
                             Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
