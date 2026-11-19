@@ -775,3 +775,24 @@ RoReplayUnreadable | UploadPartCopy | 500 | InternalError | We encountered an in
 RoReplayUnreadable | ListParts | 200 |  |  | retry-after -
 RoReplayUnreadable | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RoReplayUnreadable | CompleteMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | ListBuckets | 200 |  |  | retry-after -
+RwReplayUnreadable | HeadBucket | 200 |  |  | retry-after -
+RwReplayUnreadable | GetBucketLocation | 200 |  |  | retry-after -
+RwReplayUnreadable | ListObjectsV2 | 200 |  |  | retry-after -
+RwReplayUnreadable | ListMultipartUploads | 200 |  |  | retry-after -
+RwReplayUnreadable | CreateBucket | 409 | BucketAlreadyOwnedByYou | The bucket you tried to create already exists, and you own it. | retry-after -
+RwReplayUnreadable | DeleteBucket | 409 | BucketNotEmpty | The bucket you tried to delete is not empty, or has held data: a bucket that ever stored an object or opened a multipart upload is kept. | retry-after -
+RwReplayUnreadable | GetObject | 200 |  |  | retry-after -
+RwReplayUnreadable | GetObject range | 206 |  |  | retry-after -
+RwReplayUnreadable | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
+RwReplayUnreadable | HeadObject | 200 |  |  | retry-after -
+RwReplayUnreadable | PutObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | CopyObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | DeleteObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | DeleteObjects | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | ListParts | 200 |  |  | retry-after -
+RwReplayUnreadable | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | CompleteMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -

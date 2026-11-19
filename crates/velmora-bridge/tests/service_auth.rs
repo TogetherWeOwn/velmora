@@ -4,8 +4,11 @@
 //! trips to the catalogue.
 //!
 //! The table was recorded before the key, the bucket and the grant
-//! were read in one statement, and is not to change with how they are
-//! read. `UPDATE_GOLDEN=1` writes it anew.
+//! were read in one statement. Reading the state of a replay with the
+//! key changed one thing on purpose: a multipart call that cannot read
+//! that state answers 500 whoever asks (the `*ReplayUnreadable` rows).
+//! Nothing else is to change with how they are read. `UPDATE_GOLDEN=1`
+//! writes it anew.
 
 mod service_support;
 
@@ -101,9 +104,12 @@ enum Case {
     UnknownReplayUnreadable,
     /// The `ro` key while the state of a replay cannot be read.
     RoReplayUnreadable,
+    /// The `rw` key while the state of a replay cannot be read: the
+    /// one caller that could write, so the one that shows nothing is.
+    RwReplayUnreadable,
 }
 
-const CASES: [Case; 37] = [
+const CASES: [Case; 38] = [
     Case::Rw,
     Case::Ro,
     Case::Unknown,
@@ -141,6 +147,7 @@ const CASES: [Case; 37] = [
     Case::PresignedUngranted,
     Case::UnknownReplayUnreadable,
     Case::RoReplayUnreadable,
+    Case::RwReplayUnreadable,
 ];
 
 struct Op {
@@ -413,7 +420,7 @@ async fn run(case: Case) -> Vec<Ran> {
             })
         }
         // From here on: nothing before this may fail.
-        Case::UnknownReplayUnreadable | Case::RoReplayUnreadable => {
+        Case::UnknownReplayUnreadable | Case::RoReplayUnreadable | Case::RwReplayUnreadable => {
             *rig.bridge.catalog.sql.fail_matching.borrow_mut() = Some(("FROM restore_state", 0));
         }
         Case::CatalogueFails => {
@@ -436,7 +443,8 @@ async fn run(case: Case) -> Vec<Ran> {
         | Case::CatalogueFails
         | Case::LostKek
         | Case::PresignedRwReplaying
-        | Case::RwRolledBack => (&rw, BUCKET),
+        | Case::RwRolledBack
+        | Case::RwReplayUnreadable => (&rw, BUCKET),
         Case::Ro
         | Case::RoReplaying
         | Case::RoMaintenance
@@ -586,6 +594,17 @@ async fn every_operation_answers_every_caller_as_recorded() {
         // that cannot read it fails, whoever asks, and writes nothing.
         "UnknownReplayUnreadable | UploadPart | 500 | InternalError",
         "RoReplayUnreadable | CreateMultipartUpload | 500 | InternalError",
+        // The one caller that could write writes nothing while it
+        // cannot be read: every call that changes state fails.
+        "RwReplayUnreadable | PutObject | 500 | InternalError",
+        "RwReplayUnreadable | CopyObject | 500 | InternalError",
+        "RwReplayUnreadable | DeleteObject | 500 | InternalError",
+        "RwReplayUnreadable | DeleteObjects | 500 | InternalError",
+        "RwReplayUnreadable | CreateMultipartUpload | 500 | InternalError",
+        "RwReplayUnreadable | UploadPart | 500 | InternalError",
+        "RwReplayUnreadable | UploadPartCopy | 500 | InternalError",
+        "RwReplayUnreadable | AbortMultipartUpload | 500 | InternalError",
+        "RwReplayUnreadable | CompleteMultipartUpload | 500 | InternalError",
     ] {
         assert!(table.contains(needle), "{needle}");
     }
