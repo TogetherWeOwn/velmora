@@ -1351,6 +1351,8 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
         let (Some(first), Some(last)) = (extents.first(), extents.last()) else {
             return Ok(());
         };
+        // Until the segment is stored, its extents are in no segment.
+        self.failed = true;
         let index = u32::try_from(self.entries.len()).map_err(|_| ERR_RECORD)?;
         let mut entry = SegmentEntry {
             seq: first.seq,
@@ -1368,7 +1370,6 @@ impl<'a, B: BlobStore, K: Kek> SegmentWriter<'a, B, K> {
         let plain = serde_json::to_vec(&segment).map_err(|_| ERR_RECORD)?;
         drop(segment);
         let name = self.layout.segment_key(&self.set, index);
-        self.failed = true;
         let sha = write_plain(
             self.safety,
             self.kek,

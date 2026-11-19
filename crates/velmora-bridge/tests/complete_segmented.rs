@@ -575,13 +575,15 @@ async fn the_writer_stores_a_head_only_for_the_extents_the_generation_counts() {
         g.size = u64::from(PUSHED) * row.plain_size;
     };
 
-    // One extent more or fewer than were pushed, or another size.
+    // One extent more or fewer than were pushed, another size, or
+    // another bucket.
     type Change = fn(&mut GenerationRow);
-    let wrong: [Change; 4] = [
+    let wrong: [Change; 5] = [
         |g| g.extent_count += 1,
         |g| g.extent_count -= 1,
         |g| g.size += 1,
         |g| g.size -= 1,
+        |g| g.bucket_id = BucketId::mint([0; 8]),
     ];
     for (tag, change) in wrong.into_iter().enumerate() {
         let mut w = writer(tag as u8);
@@ -591,8 +593,11 @@ async fn the_writer_stores_a_head_only_for_the_extents_the_generation_counts() {
         let mut g = generation.clone();
         exact(&mut g);
         change(&mut g);
+        let puts = b.safety.puts.borrow().len();
         assert!(w.finish(&b.catalog, &g).await.is_err(), "{tag}");
         assert!(records(&s.rig).is_empty(), "{tag}: no head");
+        // Refused before the last segment is stored.
+        assert_eq!(b.safety.puts.borrow().len(), puts, "{tag}");
     }
 
     // An extent that leaves a gap, in `seq` or in the bytes, is not
@@ -622,6 +627,29 @@ async fn the_writer_stores_a_head_only_for_the_extents_the_generation_counts() {
     let mut g = generation.clone();
     g.extent_count = 4;
     g.size = 4 * row.plain_size;
+    assert!(w.finish(&b.catalog, &g).await.is_err());
+    assert!(records(&s.rig).is_empty());
+
+    // Also when the segment that was lost held no byte, and the size
+    // of the rest is the size of the generation.
+    let mut w = SegmentWriter::new(
+        &b.safety,
+        &b.kek,
+        &b.cfg.records,
+        &s.bucket,
+        set_id(s.rig.now(), [12; 8]),
+        1,
+    )
+    .unwrap();
+    w.push(&nth(&row, 0)).await.unwrap();
+    let mut empty = nth(&row, 1);
+    empty.plain_size = 0;
+    *b.safety.fail_put_prefix.borrow_mut() = Some("m/seg/".into());
+    assert!(w.push(&empty).await.is_err());
+    *b.safety.fail_put_prefix.borrow_mut() = None;
+    let mut g = generation.clone();
+    g.extent_count = 2;
+    g.size = row.plain_size;
     assert!(w.finish(&b.catalog, &g).await.is_err());
     assert!(records(&s.rig).is_empty());
 
@@ -712,12 +740,12 @@ async fn sliced_parts_without_their_stamp_get_no_head() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn an_upload_that_outgrows_one_document_during_a_complete_is_told_to_come_back() {
+async fn an_upload_that_outgrows_one_document_during_a_complete_is_published_in_one() {
     // 8 extents: counted as one document. A part that comes in at any
-    // call of the Complete makes it 9. The request holds no charge for
-    // a record in segments, so it either publishes what it read in one
-    // document or is told to come back; it is never refused as too
-    // large, and never writes a segment.
+    // call of the Complete makes the upload 9. The request lists the
+    // 8 it began with, so its record is one document whatever the
+    // upload holds by then: it is not refused as too large and it
+    // writes no segment.
     let bytes = body(1, 8 * SLICE_HALF);
     let total = {
         let s = scene().await;
@@ -726,7 +754,6 @@ async fn an_upload_that_outgrows_one_document_during_a_complete_is_told_to_come_
         s.complete(&listed).await.expect(200);
         s.rig.trip().calls() - before
     };
-    let (mut published, mut sent_back) = (0, 0);
     for skip in 0..total {
         let s = scene().await;
         let listed = [s.part(1, &bytes).await];
@@ -736,24 +763,12 @@ async fn an_upload_that_outgrows_one_document_during_a_complete_is_told_to_come_
         s.part(2, &body(2, 100)).await;
         let resp = resume(&s.rig, running).await;
         let what = format!("call {skip}: {} {}", resp.status, resp.text());
-        if resp.status == 200 {
-            assert!(!failed(&resp), "{what}");
-            published += 1;
-        } else {
-            resp.expect_error(503, "SlowDown");
-            assert_eq!(s.rig.count("generations"), 0, "{what}");
-            sent_back += 1;
-            // The next request counts 9 extents and is answered as a
-            // Complete of a record in segments is.
-            let resp = s.complete_raw(&listed).await;
-            assert!(matches!(resp.body, RespBody::Deferred(_)), "{what}");
-            assert!(!failed(&Resp::collect(resp).await), "{what}");
-        }
+        assert!(!failed(&resp), "{what}");
         assert!(s.segments().is_empty(), "{what}");
+        assert_eq!(records(&s.rig).len(), 1, "{what}");
         assert!(s.read().await.body == bytes, "{what}");
         assert_eq!(s.rig.bridge.budget.in_use(), 0, "{what}");
     }
-    assert!(published > 0 && sent_back > 0, "{published} {sent_back}");
 }
 
 #[tokio::test(flavor = "current_thread")]

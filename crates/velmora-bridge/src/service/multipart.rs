@@ -1469,8 +1469,8 @@ where
         // The host runs its timers here: the window after which the
         // answer is streamed, and the keepalive of that stream. Calls
         // that are answered at once, one after the other, may leave it
-        // no turn for them (measured in a local workerd: no timer for
-        // the 4.6 s of this loop at 131,072 extents).
+        // no turn for them (measured in a local workerd: no timer ran
+        // while this loop read 131,072 extents).
         if let Some(sleep) = bridge.budget.sleeper() {
             sleep(0).await;
         }
@@ -1560,7 +1560,7 @@ where
         Look::Open(opened) => *opened,
     };
     if first.held <= u64::from(bridge.cfg.record_cut.after) {
-        return publish(bridge, &completion, first, false).await;
+        return publish(bridge, &completion, first).await;
     }
     // A segmented record: the extents are read and stored a run at a
     // time, which can outlast a client's read timeout. So the answer is
@@ -1577,7 +1577,7 @@ where
         let bridge = Rc::clone(bridge);
         async move {
             let _charge = charge;
-            document(respond(publish(&bridge, &completion, first, true).await))
+            document(respond(publish(&bridge, &completion, first).await))
         }
     };
     // Work that was dropped: the upload is published or it is not, and
@@ -1592,15 +1592,14 @@ where
 
 /// Records and publishes the upload, from `first` on: up to
 /// [`COMPLETE_ATTEMPTS`] attempts, each on the upload as it reads it.
-/// `charged`: the request holds the charge of a record in segments.
-/// One that does not, and finds the upload grown past one document
-/// between two attempts, is told to come back: the next request is
-/// charged and answered as such a Complete is.
+/// A request that began on an upload within one document holds no
+/// charge, also when the upload has grown past it by a later attempt:
+/// the parts it lists are the ones it began with (their ETags), so its
+/// record is still one document.
 async fn publish<C, B, N, J, K, T>(
     bridge: &Bridge<C, B, N, J, K, T>,
     c: &Completion,
     first: Opened,
-    charged: bool,
 ) -> Outcome<S3Response>
 where
     C: Catalog,
@@ -1627,9 +1626,6 @@ where
                 Look::Open(opened) => *opened,
             },
         };
-        if !charged && held > u64::from(bridge.cfg.record_cut.after) {
-            return Err(ErrorCode::SlowDown.into());
-        }
         let Some(placed) = gather(bridge, c, &publication, held).await? else {
             // An UploadPart replaced a listed part after the upload was
             // read. The batch would lose its guard: take the same path.

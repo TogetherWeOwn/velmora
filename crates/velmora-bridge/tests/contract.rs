@@ -795,17 +795,22 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("RECORD_SEGMENT_EXTENTS", "52"),
     ]);
     // With an object that large, a Complete must have room for what it
-    // is charged.
-    assert_eq!(
+    // is charged: 32 MiB.
+    let budget = |bytes: &'static str| {
         with(&[
             drill[0],
             ("MAX_EXTENT_BYTES", "4194304"),
             ("MAX_PUT_BYTES", ""),
-            ("INFLIGHT_BUDGET_BYTES", "25165823")
+            ("JOB_BUDGET_BYTES", ""),
+            ("INFLIGHT_BUDGET_BYTES", bytes),
         ])
-        .unwrap_err(),
+    };
+    assert_eq!(
+        budget("33554431").unwrap_err(),
         invalid("INFLIGHT_BUDGET_BYTES")
     );
+    assert_eq!(budget("33554432").unwrap().inflight_budget_bytes, 32 << 20);
+    assert_eq!(config::COMPLETE_CHARGE_BYTES, 32 << 20);
     let mut small = prod.clone();
     small.insert("MAX_EXTENT_BYTES".into(), "4194304".into());
     small.remove("MAX_PUT_BYTES");
