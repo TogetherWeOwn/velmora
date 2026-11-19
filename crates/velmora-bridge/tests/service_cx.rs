@@ -633,6 +633,22 @@ async fn multipart_calls_answer_the_same_way() {
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
          </CompleteMultipartUpload>"
     );
+    // A declared size that is not the size of the listed parts is the
+    // client's sign that a part is missing: nothing is published, and the
+    // upload stays open.
+    let wrong = rig
+        .call(
+            &east,
+            Method::Post,
+            &object,
+            &[("uploadId", &id)],
+            &[("x-amz-mp-object-size", "999")],
+            xml.as_bytes(),
+        )
+        .await;
+    wrong.expect(400);
+    assert_eq!(field(&wrong, "Code").as_deref(), Some("InvalidRequest"));
+    rig.head(&signer, BUCKET, "big").await.expect(404);
     rig.call(
         &east,
         Method::Post,

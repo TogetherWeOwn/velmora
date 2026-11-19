@@ -1000,7 +1000,12 @@ pub(super) async fn list_heads<S: Sql>(
     if q.max_keys == 0 {
         return Ok(Vec::new());
     }
-    let limit = q.max_keys.min(LIST_BATCH_MAX + 1);
+    // "Fewer rows than asked for" must mean the range is exhausted, so
+    // a request for more than one statement returns is refused, not cut.
+    if q.max_keys > LIST_BATCH_MAX + 1 {
+        return Err(BridgeError::Invalid("list_heads: more than one batch"));
+    }
+    let limit = q.max_keys;
     let upper = successor(&q.prefix);
     // One lower bound: inclusive at `from`, or exclusive at `after`.
     let mut from = q.prefix.clone();

@@ -1323,6 +1323,14 @@ where
         }
         let publication = plan(&listed, &parts)?;
         drop(parts);
+        // The size the client says the object has is its guard against a
+        // part that went missing: an object of another size is not
+        // published. The header is checked as a decimal before this.
+        if let Some(declared) = a.headers.get("x-amz-mp-object-size") {
+            if declared.parse::<u64>().ok() != Some(publication.size) {
+                return Err(ErrorCode::InvalidRequest.into());
+            }
+        }
         // One record names every extent of the object and one batch
         // publishes them. An upload that holds more than an object may
         // have, in listed parts or not, is refused before either, and

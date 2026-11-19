@@ -383,8 +383,8 @@ impl Headers {
                     }
                 }
                 // The size a multipart upload will have, as newer SDKs
-                // declare it. Each part and the completed object are
-                // validated on their own; the declaration is not used.
+                // declare it. CompleteMultipartUpload holds the object
+                // to it; no other operation gives it a meaning.
                 "x-amz-mp-object-size" => {
                     if super::decimal(v).is_err() {
                         return refuse(ErrorCode::InvalidArgument, k);
