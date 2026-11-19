@@ -1059,6 +1059,39 @@ async fn a_complete_that_waited_drops_the_work_of_a_cancelled_invocation() {
     assert!(s.rig.bridge.works.is_empty());
 }
 
+/// A Complete that took its charge after that drop runs like any
+/// other: while it runs, the jobs do not wait for another Complete that
+/// it keeps out.
+#[tokio::test]
+async fn a_complete_that_took_its_charge_after_the_drop_holds_no_job_back() {
+    use futures_util::FutureExt;
+    let s = scene_with_timers().await;
+    let (listed, _) = three_parts(&s).await;
+    let mut answer = deferred(s.complete_raw(&listed).await);
+    let work = answer.take_work().expect("the work is there once");
+    let running = step_to(&s.rig, work, |rig| keys_under(rig, "m/seg/").len() == 1)
+        .await
+        .stalled();
+    std::mem::forget(running);
+    s.rig.trip().disarm();
+    s.rig.bridge.clock.advance_ms(JOB_QUIET_MS - 1);
+    let mut again = Box::pin(s.complete_raw(&listed));
+    assert!(again.as_mut().now_or_never().is_none(), "no room");
+    s.rig.bridge.clock.advance_ms(1);
+    // Its charge is held by its work, which has not run yet.
+    let mut second = deferred(again.await);
+    let held = second.take_work().expect("the work is there once");
+    let budget = &s.rig.bridge.budget;
+    let bytes = velmora_bridge::config::COMPLETE_CHARGE_BYTES;
+    assert_eq!(s.rig.bridge.works.reaped(), 1);
+    assert_eq!(budget.in_use(), bytes);
+    let mut third = Box::pin(budget.charge_ahead(bytes));
+    assert!(third.as_mut().now_or_never().is_none());
+    let job = budget.charge_job(budget.job_capacity() / 4).now_or_never();
+    assert!(job.is_some_and(|c| c.is_ok()), "the job waited");
+    drop((third, held));
+}
+
 /// At the shipped budget a Complete has room only while the jobs hold
 /// 24 MiB or less, and post jobs of 22 MiB come one after another. The
 /// jobs let a Complete that waits go first: the next job waits for it.

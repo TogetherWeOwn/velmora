@@ -1112,6 +1112,44 @@ async fn a_charge_that_is_not_polled_is_found_out_while_others_come_and_go() {
     drop((charge, held, stale));
 }
 
+/// Two charges that are not polled, in front by turns as another
+/// request comes and goes, are found out one after the other: the watch
+/// stays on the first until it is quiet, whoever is seen meanwhile.
+#[tokio::test]
+async fn two_charges_that_are_not_polled_are_found_out_one_after_the_other() {
+    use futures_util::FutureExt;
+    let quiet_rounds = ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
+    let plain = ByteBudget::new(100);
+    // Another request holds 35 in every second round: the charge of 70
+    // has no room beside it then, the one of 55 has.
+    let other: Rc<RefCell<Option<Charge>>> = Rc::new(RefCell::new(None));
+    let calls = Rc::new(Cell::new(0u32));
+    let (o, c, p) = (other.clone(), calls.clone(), plain.for_request());
+    let request = plain.for_request().with_sleeper(Rc::new(move |_| {
+        c.set(c.get() + 1);
+        o.borrow_mut().take();
+        if c.get() % 2 == 1 {
+            *o.borrow_mut() = Some(p.try_charge(35).unwrap());
+        }
+        Box::pin(async {})
+    }));
+    let held = request.try_charge(30).unwrap();
+    let cut = || {
+        plain
+            .for_request()
+            .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())))
+    };
+    let (first, second) = (cut(), cut());
+    let mut stale = (Box::pin(first.charge(70)), Box::pin(second.charge(55)));
+    *other.borrow_mut() = Some(plain.try_charge(70).unwrap());
+    assert!(stale.0.as_mut().now_or_never().is_none());
+    assert!(stale.1.as_mut().now_or_never().is_none());
+    other.borrow_mut().take();
+    let charge = request.charge_in_turn(40).await.unwrap();
+    assert_eq!(calls.get(), 2 * quiet_rounds);
+    drop((charge, held, stale));
+}
+
 /// A charge that is polled is waited for behind one that is not: the
 /// charge in turn that found the first one quiet looks at the next.
 #[tokio::test]
@@ -1338,28 +1376,31 @@ async fn a_job_charge_yields_to_a_charge_ahead_that_a_body_keeps_out() {
 }
 
 /// A charge ahead whose request was stopped is found out in
-/// `WAIT_QUIET_MS` whatever the other requests do: bodies that come and
-/// go, so that it is in front in one round and kept out by them in the
-/// next, do not start the watch again. Here: a job of 26 MiB runs, the
-/// requests hold 8 MiB for 1.5 s and 30 MiB for 0.5 s in turn, and a
+/// `WAIT_QUIET_MS` whatever the other requests do: another charge
+/// ahead that comes and goes, so that the stopped one holds the job
+/// back in one round and not in the next, does not start the watch
+/// again. Here: a job of 22 MiB runs, the requests hold a body of 8 MiB
+/// for 1.5 s and a running Complete's 32 MiB for 0.5 s in turn, and a
 /// post job of 22 MiB asks.
 #[tokio::test]
 async fn a_charge_ahead_that_is_not_polled_is_found_out_under_changing_requests() {
     use futures_util::FutureExt;
     let quiet_rounds = ingress::WAIT_QUIET_MS / ingress::CHARGE_POLL_MS;
     let plain = shipped_budget(turn_sleeper());
-    let bodies: Rc<RefCell<Option<Charge>>> = Rc::new(RefCell::new(None));
+    let others: Rc<RefCell<Option<Charge>>> = Rc::new(RefCell::new(None));
     let calls = Rc::new(Cell::new(0u32));
-    let (b, c, p) = (bodies.clone(), calls.clone(), plain.for_request());
+    let (o, c, p) = (others.clone(), calls.clone(), plain.for_request());
     let budget = plain.for_request().with_sleeper(Rc::new(move |_| {
         c.set(c.get() + 1);
-        b.borrow_mut().take();
-        let bytes = if c.get() % 20 < 15 { 8 } else { 30 };
-        *b.borrow_mut() = Some(p.try_charge(bytes * MIB).unwrap());
+        o.borrow_mut().take();
+        *o.borrow_mut() = Some(match c.get() % 20 < 15 {
+            true => p.try_charge(8 * MIB).unwrap(),
+            false => p.try_charge_ahead(32 * MIB).unwrap(),
+        });
         Box::pin(async {})
     }));
-    let running = budget.try_charge_job(26 * MIB).unwrap();
-    *bodies.borrow_mut() = Some(plain.try_charge(8 * MIB).unwrap());
+    let running = budget.try_charge_job(22 * MIB).unwrap();
+    *others.borrow_mut() = Some(plain.try_charge(8 * MIB).unwrap());
     let cut = budget
         .for_request()
         .with_sleeper(Rc::new(|_| Box::pin(std::future::pending())));

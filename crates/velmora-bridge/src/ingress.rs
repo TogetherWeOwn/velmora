@@ -804,7 +804,9 @@ impl ByteBudget {
 
     /// Charges that waited [`CHARGE_WAIT_MS`] and found no room, since
     /// the isolate began: each is a moment at which the budget had been
-    /// full for that long. A count that keeps rising while little is
+    /// full for that long, or at which a job had been held back that
+    /// long behind a charge ahead ([`Self::charge_ahead`]) that found
+    /// no room itself. A count that keeps rising while little is
     /// charged and released says that bytes are held by work that no
     /// longer runs.
     pub fn refused(&self) -> u64 {
