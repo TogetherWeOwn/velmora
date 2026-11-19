@@ -326,11 +326,21 @@ async fn admin(rig: &Rig, method: Method, target: &str) -> Resp {
 /// the stamp.
 /// Returns the shapes of the names in the safety bucket and in the
 /// cache bucket, each sorted.
+///
+/// A write intent is a row of the catalogue: it has no name in a store.
+/// What a sliced write leaves there besides its extents is the raise
+/// of the stamp it makes (`rs/main/...`), which is why the lists hold
+/// five of them. Nothing here writes to the cache store; the one name
+/// it gets is held by `tenant_cache_name.rs`.
 async fn names_written(records: Layout) -> (Vec<String>, Vec<String>) {
     let mut cfg = config(Vec::new());
     cfg.records = records;
     cfg.intent_sweep = true;
     cfg.slice_bytes = 4 * 1024 * 1024;
+    // Above this a write is cut in slices: the 6 MiB PUT and the 5 MiB
+    // part are two extents each, written by the sliced path under
+    // write intents.
+    cfg.max_extent_bytes = 4 * 1024 * 1024;
     let rig = rig_with(NoNntp, cfg);
     let (bucket, signer) = rig.standard(BUCKET).await;
 
@@ -434,6 +444,12 @@ async fn the_service_stores_the_same_names_with_the_layout_unset() {
             "m/del/<generation>",
             "m/rk/AKIDTESTKEY000000001",
             "rs/main/00000000000000000001",
+            "rs/main/00000000000000000002",
+            "rs/main/00000000000000000003",
+            "rs/main/00000000000000000004",
+            "rs/main/00000000000000000005",
+            "x/<extent>",
+            "x/<extent>",
             "x/<extent>",
             "x/<extent>",
             "x/<extent>",
@@ -459,6 +475,12 @@ async fn the_service_stores_the_same_names_with_the_tenant_layout() {
             "m/x/t_0000000000000000/art/<extent>",
             "m/x/t_0000000000000000/del/<generation>",
             "rs/main/00000000000000000001",
+            "rs/main/00000000000000000002",
+            "rs/main/00000000000000000003",
+            "rs/main/00000000000000000004",
+            "rs/main/00000000000000000005",
+            "x/<extent>",
+            "x/<extent>",
             "x/<extent>",
             "x/<extent>",
             "x/<extent>",
