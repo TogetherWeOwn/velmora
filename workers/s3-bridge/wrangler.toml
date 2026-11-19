@@ -62,6 +62,11 @@ VERIFY_DELAY_SECS = "120"
 # period ends, whenever its job runs, and counts at release only with
 # that full read on record.
 # Without VERIFY_MODE the stage runs as body.
+# The production deploy writes this line from the variable
+# VELMORA_VERIFY_MODE of its environment (unset: body). It is the only
+# place the production value is set: a var set outside the deploy is gone
+# after the next one.
+VERIFY_MODE = "body"
 # One group per article, drawn at random. Each was posted to from every
 # posting account and read back by message-id on every account.
 NEWSGROUPS = "alt.binaries.boneless,alt.binaries.misc,alt.binaries.multimedia,alt.binaries.test"

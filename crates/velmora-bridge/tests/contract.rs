@@ -541,6 +541,18 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // The verify mode: absent or blank is the full read of every
+        // extent, the stage as it was before the switch existed.
+        if name == "VERIFY_MODE" {
+            for _ in 0..2 {
+                assert_eq!(
+                    load(&vars).unwrap().verify.mode,
+                    velmora_bridge::config::VerifyMode::Body
+                );
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // Packed plans: absent or blank is off, the way a catalogue was
         // before the switch existed.
         if name == "PACKED_PLANS" {
