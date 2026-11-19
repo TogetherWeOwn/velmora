@@ -658,6 +658,9 @@ where
     /// and then still does not serve it: an article that is simply not
     /// there is found by every check, the light one too, and one that
     /// arrived between the read and the `STAT` is read the second time.
+    /// What that second read finds is the word on those articles, and
+    /// `tally` is brought up to it: one it read and checked is no longer
+    /// missing, one it found with other bytes is corrupt.
     ///
     /// An extent raises a backbone once for a plan
     /// ([`Catalog::verify_raised`]): its bytes are as bad on a retry as
@@ -672,7 +675,7 @@ where
         plan: &[ArticleRow],
         providers: &[&ProviderConfig],
         backbone: &str,
-        tally: &ReadTally,
+        tally: &mut ReadTally,
     ) -> Staged<()> {
         let raised = self
             .catalog
@@ -701,6 +704,16 @@ where
             let (_, again) = self
                 .read_backbone(lease, &listed, providers, VerifyKind::Body)
                 .await?;
+            for a in &listed {
+                if again.missing.contains(&a.idx) {
+                    continue;
+                }
+                tally.missing.retain(|idx| *idx != a.idx);
+                match again.corrupt.contains(&a.idx) {
+                    true => tally.corrupt.push(a.idx),
+                    false => tally.ok += 1,
+                }
+            }
             result = result_of(&again);
             if result == VerifyResult::Ok {
                 return Ok(());
@@ -823,17 +836,17 @@ where
             // ([`Self::sample_failed`]).
             let watched = light.is_some() && kind.is_full();
             let mut asked = false;
-            let (provider, tally) = self.read_backbone(lease, &plan, providers, kind).await?;
+            let (provider, mut tally) = self.read_backbone(lease, &plan, providers, kind).await?;
+            if watched && result_of(&tally) == VerifyResult::Missing {
+                // Before the waits for a missing article, which may take
+                // hours: a provider that says with `STAT` it has what it
+                // does not serve is answering for other extents all that
+                // time. An article this reads after all is not missing.
+                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally)
+                    .await?;
+                asked = true;
+            }
             if result_of(&tally) == VerifyResult::Missing {
-                if watched {
-                    // Before the waits for a missing article, which may
-                    // take hours: a provider that says with `STAT` it has
-                    // what it does not serve is answering for other
-                    // extents all that time.
-                    self.sample_failed(lease, extent, &plan, &[provider], name, &tally)
-                        .await?;
-                    asked = true;
-                }
                 // What this stores is the resume point of this backbone.
                 let stored = reached.take();
                 let wait = self
@@ -866,7 +879,7 @@ where
                 // any other: the rows do not say which articles failed,
                 // so bytes that were bad when posted cannot be told from
                 // damage of its own.
-                self.sample_failed(lease, extent, &plan, &[provider], name, &tally)
+                self.sample_failed(lease, extent, &plan, &[provider], name, &mut tally)
                     .await?;
             }
             // The next backbone is read by this job, under the same

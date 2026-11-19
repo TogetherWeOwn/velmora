@@ -763,25 +763,31 @@ async fn a_sample_that_cannot_be_read_where_stat_passes_escalates() {
 
 /// An article that arrives between the read and the `STAT` is not a
 /// provider answering for bytes it lacks: it is read once more before
-/// the backbone is raised, and that read gets it.
+/// the backbone is raised. That read gets it, and what it read counts:
+/// the backbone has passed, with no wait and no repost.
 #[tokio::test]
 async fn an_article_that_arrives_after_the_read_does_not_escalate() {
-    let rig = light_rig(ALL, &[]).await;
+    let mut rig = light_rig(ALL, &[]).await;
+    // After the grace a missing article would be posted again.
+    rig.bridge.cfg.propagation_grace_secs = 0;
     let (s, plan) = rig.on_two(16).await;
     let drawn = rig.sample_index(&s);
+    let name = ["bb0", "bb1"][drawn];
+    let posted: Vec<_> = plan.iter().map(|a| a.posted_at).collect();
+    rig.bridge.clock.advance_secs(1);
     // A read asks twice for an article it does not get: both times
     // in vain here.
     rig.servers[drawn]
         .late_for_next_bodies(2 * plan.len())
         .await;
 
-    let wait = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
-    assert_eq!(wait, MISSING_BACKOFF_SECS[0]);
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    assert!(rig.checks(&s).contains(&ok(name, VerifyKind::Sampled)));
     assert!(rig.bridge.catalog.escalations.borrow().is_empty());
     assert!(rig.bridge.catalog.raises.borrow().is_empty());
-    rig.bridge.clock.advance_secs(wait);
-    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
-    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+    let after: Vec<_> = rig.plan(&s).await.iter().map(|a| a.posted_at).collect();
+    assert_eq!(after, posted);
+    assert_eq!(rig.stage(&s), OutboxStage::Release);
 }
 
 /// Two extents that find the same backbone listing what it does not
