@@ -824,13 +824,15 @@ on a build in which:
   work takes), and the repost of a verify job that runs already. While
   bodies are being read the jobs do wait: bodies pass in seconds, and
   jobs let in meanwhile would hold the room when the bodies are done.
-  The price: while the bodies never leave 32 MiB free (three or more
-  part uploads at once, or one body that is read slowly beside
-  another), no job that would not fit beside the Complete starts until
-  the Complete has its charge or answers 503, each time the client
-  sends it, and such a job counts as a refusal in the `budget saturated`
-  line although little is charged. Such a Complete is refused by the
-  bodies alone, with or without jobs; the client sends it again.
+  The price: while the bodies never leave 32 MiB free (two or more
+  part uploads at once, or one body above 8 MiB that is read slowly),
+  no job starts, whatever its size (also one that would fit beside the
+  Complete; only the repost of a verify job that runs already goes on),
+  until the Complete has its charge or answers 503, each time the
+  client sends it. A job that has waited its 20 s through that gives
+  its lease back and counts as a refusal in the `budget saturated` line
+  although little is charged. Such a Complete is refused by the bodies
+  alone, with or without jobs; the client sends it again.
   Nothing changes while no Complete waits. A Complete whose request was
   stopped while it waited holds the others back for 2 s, once, whatever
   the other requests do.
