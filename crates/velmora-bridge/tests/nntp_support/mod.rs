@@ -581,10 +581,16 @@ impl MemCatalog {
             // is on record, and counts for nothing where the last check
             // of the bytes failed.
             let checks = Self::body_checks(e);
+            // A full read of fewer articles than the plan has (the data
+            // alone, as a version from before parity reads) failed too.
+            let total = e.job.extent.article_count;
+            let total = total.map(|data| data + e.job.parity_count.unwrap_or(0));
             let failed = |s: &BackboneStatus| {
                 checks.iter().any(|b| {
                     b.backbone == s.backbone
-                        && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+                        && (b.result != VerifyResult::Ok
+                            || b.articles_ok != b.articles_total
+                            || Some(b.articles_total) != total)
                 })
             };
             let full = |s: &BackboneStatus| {

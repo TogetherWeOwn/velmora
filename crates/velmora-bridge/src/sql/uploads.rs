@@ -63,6 +63,11 @@ impl Cols {
         self.0.next().ok_or_else(|| bad("missing column"))
     }
 
+    /// The next column as it is stored, of whatever type.
+    pub(super) fn value(&mut self) -> Result<SqlValue> {
+        self.next()
+    }
+
     pub(super) fn opt_text(&mut self) -> Result<Option<String>> {
         match self.next()? {
             SqlValue::Null => Ok(None),

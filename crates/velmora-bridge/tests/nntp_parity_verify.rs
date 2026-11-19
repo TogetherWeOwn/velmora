@@ -547,3 +547,36 @@ async fn data_is_posted_again_before_an_addendum_of_other_shards_fails_the_job()
         rig.bridge.clock.advance_secs(3600);
     }
 }
+
+/// A full read from before parity read the data articles only. It is
+/// not a full read of this plan: the backbone is read in full again,
+/// not asked with `STAT`.
+#[tokio::test]
+async fn a_full_read_of_the_data_alone_is_read_in_full_again() {
+    let rig = parity_rig(false).await;
+    let (s, parity) = rig.posted(10).await;
+    rig.propagate(&s, 0, 1).await;
+    for row in &parity.articles {
+        rig.propagate_one(row).await;
+    }
+    let plan_rev = rig.bridge.catalog.extent(&s.extent).plan_rev;
+    rig.bridge.catalog.edit(&s.extent, |e| {
+        e.verifications.push(VerificationRow {
+            extent_id: s.extent.clone(),
+            backbone: "bb1".into(),
+            provider_id: "old".into(),
+            verified_at: UnixMs(T0.0 - 1000),
+            plan_rev,
+            articles_ok: DATA,
+            articles_total: DATA,
+            result: VerifyResult::Ok,
+            kind: VerifyKind::Body,
+        });
+    });
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.rows(&s);
+    let last = rows.iter().rfind(|v| v.backbone == "bb1").unwrap();
+    let ok = VerifyResult::Ok;
+    assert_eq!(summary(last), ("bb1", VerifyKind::Body, ok, ALL, ALL));
+}

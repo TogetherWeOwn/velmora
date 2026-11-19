@@ -359,6 +359,15 @@ pub fn release_rule<'a>(
     required > 0 && (full || !need_full) && holding.len() >= required as usize
 }
 
+/// Whether the `BODY` row `b` is a full read that failed: it found an
+/// article missing or wrong, or it did not read all `total` articles of
+/// the plan. The second is a read from before parity, of the data
+/// articles alone: it says nothing of the parity articles, so it does
+/// not clear an earlier failure on one of them.
+fn read_failed(b: &BackboneStatus, total: u32) -> bool {
+    b.result != VerifyResult::Ok || b.articles_ok != b.articles_total || b.articles_total != total
+}
+
 fn result_of(tally: &ReadTally) -> VerifyResult {
     if !tally.corrupt.is_empty() {
         VerifyResult::Corrupt
@@ -863,13 +872,18 @@ where
 
     /// Whether the last check of the bytes of `backbone` for the current
     /// plan is on record as a failure: a full read, or a size that did
-    /// not fit ([`Catalog::body_checks`]).
-    async fn full_read_failed(&self, extent: &ExtentRow, backbone: &str) -> Staged<bool> {
+    /// not fit ([`Catalog::body_checks`]). A full read that was not one
+    /// of all `total` articles of the plan is a failure too (one from
+    /// before parity read the data alone).
+    async fn full_read_failed(
+        &self,
+        extent: &ExtentRow,
+        backbone: &str,
+        total: u32,
+    ) -> Staged<bool> {
         let checks = self.catalog.body_checks(&extent.id).await?;
         Ok(checks.iter().any(|b| {
-            b.plan_rev == extent.plan_rev
-                && label(&b.backbone) == backbone
-                && (b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+            b.plan_rev == extent.plan_rev && label(&b.backbone) == backbone && read_failed(b, total)
         }))
     }
 
@@ -932,7 +946,7 @@ where
                 // The light check: a full read only where the last check
                 // of the bytes failed, where the backbone is under full
                 // reads, and for the sample; the size or `STAT` else.
-                kind = if self.full_read_failed(extent, name).await? {
+                kind = if self.full_read_failed(extent, name, plan.total()).await? {
                     VerifyKind::Body
                 } else if light.names(index, name)
                     || (need_full && self.full_read_owed(extent, &labels, light).await?)
@@ -948,7 +962,9 @@ where
                 let full = |s: &BackboneStatus| {
                     s.counts && s.kind.is_full() && labels[..index].contains(&label(&s.backbone))
                 };
-                if status.iter().any(full) && !self.full_read_failed(extent, name).await? {
+                if status.iter().any(full)
+                    && !self.full_read_failed(extent, name, plan.total()).await?
+                {
                     kind = VerifyKind::Stat;
                 }
             }
@@ -1143,7 +1159,7 @@ where
         let (full, failed): (Vec<_>, Vec<_>) = checks.into_iter().partition(|b| b.counts);
         let mut failed: Vec<String> = failed
             .iter()
-            .filter(|b| b.result != VerifyResult::Ok || b.articles_ok != b.articles_total)
+            .filter(|b| read_failed(b, plan.total()))
             .map(|b| label(&b.backbone))
             .collect();
         // The light check asks for the full check only for the sample

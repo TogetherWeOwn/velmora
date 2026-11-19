@@ -290,7 +290,9 @@ async fn unreadable_plans<S: Sql>(
             let cipher_size: u64 = r.num()?;
             let stored = r.blob()?;
             let parity = r.opt_blob()?;
-            let parity_count: Option<i64> = r.opt_num()?;
+            // As it is stored: a count that is no number is damage of
+            // this row, and must not stop the replay of the others.
+            let count = r.value()?;
             let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
                 continue;
             };
@@ -301,7 +303,6 @@ async fn unreadable_plans<S: Sql>(
                     Some(parity) => SqlValue::Blob(parity.clone()),
                     None => SqlValue::Null,
                 };
-                let count = parity_count.map_or(SqlValue::Null, SqlValue::Int);
                 let reads = addendum_of(x, &stored, parity.as_deref());
                 let sound = match (&on_row, &count) {
                     (SqlValue::Null, SqlValue::Null) => true,
@@ -404,13 +405,16 @@ pub(super) async fn replay_extents<S: Sql>(
                 ]
             };
             stmts.push((
-                "DELETE FROM verifications WHERE extent_id = ?1                    AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2                      AND parity IS ?3 AND parity_count IS ?4)",
+                "DELETE FROM verifications WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS ?3 AND parity_count IS ?4)",
                 read(),
             ));
             let mut params = read();
             params.extend([a.parity.clone(), a.parity_count.clone()]);
             stmts.push((
-                "UPDATE extents SET parity = ?5, parity_count = ?6                  WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND parity_count IS ?4",
+                "UPDATE extents SET parity = ?5, parity_count = ?6 \
+                 WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND parity_count IS ?4",
                 params,
             ));
         }
