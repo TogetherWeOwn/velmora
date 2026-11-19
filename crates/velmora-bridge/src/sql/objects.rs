@@ -1161,7 +1161,8 @@ pub(super) async fn object_status<S: Sql>(
         .query(
             "SELECT v.extent_id, v.backbone, v.provider_id, v.verified_at, v.plan_rev, \
                CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END, \
-               v.articles_total, v.result, v.kind, v.mode, e.article_count \
+               v.articles_total, v.result, v.kind, v.mode, \
+               e.article_count + COALESCE(e.parity_count, 0) \
              FROM verifications v JOIN extents e ON e.id = v.extent_id \
              WHERE e.id IN (SELECT extent_id FROM generation_extents WHERE generation_id = ?1) \
                AND v.plan_rev = e.plan_rev AND v.verified_at = \
