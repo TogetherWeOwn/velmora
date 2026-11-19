@@ -65,6 +65,20 @@ fn uses(all: &BTreeMap<String, String>, what: &str) -> BTreeMap<String, usize> {
         .collect()
 }
 
+/// How often each file says `name` other than as `scope.<name>`.
+fn unscoped(all: &BTreeMap<String, String>, name: &str) -> BTreeMap<String, usize> {
+    all.iter()
+        .map(|(file, text)| {
+            let n = text
+                .match_indices(name)
+                .filter(|(at, _)| !text[..*at].ends_with("scope."))
+                .count();
+            (file.clone(), n)
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
 /// Every file of `found` is in `allowed`, at most as often as there.
 fn within(what: &str, found: &BTreeMap<String, usize>, allowed: &[(&str, usize)]) {
     for (file, n) in found {
@@ -84,11 +98,11 @@ const TENANT: &str = "bridge/tenant.rs";
 #[test]
 fn a_scope_is_made_only_at_the_listed_places() {
     let all = all();
-    let mut found = uses(&all, "tenant_zero(");
+    let mut found = uses(&all, "tenant_zero");
     // The definition, and its own tests.
     assert!(found.remove(TENANT).is_some());
     within(
-        "tenant_zero(",
+        "tenant_zero",
         &found,
         &[
             // The record layout `tenant` of the configuration.
@@ -135,6 +149,23 @@ fn the_scope_has_one_constructor() {
             assert!(!text.contains(bad), "{file}: {bad}");
         }
     }
+    // No constructor under another spelling, and no conversion: in the
+    // code of the module (its tests left out) the type is never made
+    // through `Self`, and the field is named three times: the struct,
+    // the one literal, and the parameter of `blob_key`.
+    let module = tenant
+        .split("#[cfg(test)]")
+        .next()
+        .expect("the module before its tests");
+    assert!(!module.contains("Self"), "a second way to make a scope");
+    assert_eq!(module.matches("tenant: ").count(), 3);
+    assert_eq!(module.matches("fn tenant_zero").count(), 1);
+    for (file, text) in &all {
+        assert!(
+            !text.contains(" for TenantScope"),
+            "{file}: an impl of a trait"
+        );
+    }
     // The field is private: no other file can write the literal.
     assert!(tenant.contains("pub struct TenantScope {\n    tenant: &'static str,\n}"));
     let literals = uses(&all, "TenantScope {");
@@ -162,21 +193,26 @@ fn the_id_of_tenant_zero_is_written_in_one_place() {
 #[test]
 fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
     let all = all();
-    let mut found = uses(&all, ".safety_key()");
-    for (file, n) in uses(&all, ".cache_key()") {
+    // Every way to say the two names counts, also a path to the
+    // function or a variable called like it: all but a call on a scope.
+    let mut found = unscoped(&all, "safety_key");
+    for (file, n) in unscoped(&all, "cache_key") {
         *found.entry(file).or_default() += n;
     }
     // The scope itself: for tenant 0 it answers with the old names.
     assert!(found.remove(TENANT).is_some());
     within(
-        ".safety_key() or .cache_key()",
+        "safety_key or cache_key, not of a scope,",
         &found,
         &[
+            // The two definitions.
+            ("bridge/types.rs", 2),
             // The request path: a request is not scoped yet.
             ("bridge/fetch.rs", 1),
             ("bridge/service/admin.rs", 3),
             ("bridge/service/get.rs", 2),
-            ("bridge/service/multipart.rs", 1),
+            // One call, and a variable of the name said twice.
+            ("bridge/service/multipart.rs", 3),
             ("bridge/service/put.rs", 1),
             ("bridge/service/slices.rs", 1),
             // The replay, which goes through the whole store.
@@ -194,6 +230,12 @@ fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
     ] {
         assert!(all.contains_key(job_path), "{job_path} is gone");
         assert!(!found.contains_key(job_path), "{job_path}");
+    }
+    // And no name of the two families is written out by hand.
+    for family in ["\"x/", "\"c/"] {
+        let found = uses(&all, family);
+        let files: Vec<&String> = found.keys().collect();
+        assert_eq!(files, ["bridge/tenant.rs", "bridge/types.rs"], "{family}");
     }
 }
 
