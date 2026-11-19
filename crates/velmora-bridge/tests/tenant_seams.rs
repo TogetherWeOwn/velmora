@@ -1,0 +1,237 @@
+//! The tenant seams, held by reading the source.
+//!
+//! [`velmora_bridge::tenant`] says where a tenant scope is made and
+//! which code still names a blob without one. These tests read the
+//! source of the library and of the Worker and hold both lists, so that
+//! a change that makes a scope somewhere new, or names a blob past the
+//! scope somewhere new, fails here and is looked at.
+//!
+//! Comment lines are not read: only code counts.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Every `.rs` file under `dir`, by its path from `root`.
+fn sources(root: &Path, dir: &Path, into: &mut BTreeMap<String, String>) {
+    for entry in fs::read_dir(dir).expect("a source directory") {
+        let path = entry.expect("a directory entry").path();
+        if path.is_dir() {
+            sources(root, &path, into);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let name = path
+                .strip_prefix(root)
+                .expect("a path under the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = fs::read_to_string(&path).expect("a source file");
+            into.insert(name, code(&text));
+        }
+    }
+}
+
+/// `text` without its comment lines.
+fn code(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The code of the library (`bridge/...`) and of the Worker
+/// (`worker/...`).
+fn all() -> BTreeMap<String, String> {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut found = BTreeMap::new();
+    for (name, dir) in [
+        ("bridge", here.join("src")),
+        ("worker", here.join("../../workers/s3-bridge/src")),
+    ] {
+        let mut files = BTreeMap::new();
+        sources(&dir, &dir, &mut files);
+        assert!(!files.is_empty(), "no source under {}", dir.display());
+        for (file, text) in files {
+            found.insert(format!("{name}/{file}"), text);
+        }
+    }
+    found
+}
+
+/// How often each file says `what`; files that never do are left out.
+fn uses(all: &BTreeMap<String, String>, what: &str) -> BTreeMap<String, usize> {
+    all.iter()
+        .map(|(file, text)| (file.clone(), text.matches(what).count()))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
+/// Every file of `found` is in `allowed`, at most as often as there.
+fn within(what: &str, found: &BTreeMap<String, usize>, allowed: &[(&str, usize)]) {
+    for (file, n) in found {
+        let most = allowed.iter().find(|(f, _)| f == file).map(|(_, n)| *n);
+        assert!(
+            most.is_some_and(|most| *n <= most),
+            "{file} says `{what}` {n} times, allowed: {most:?}. \
+             See the module documentation of `velmora_bridge::tenant`."
+        );
+    }
+}
+
+const TENANT: &str = "bridge/tenant.rs";
+
+/// A scope is made where work enters with no tenant on it, and nowhere
+/// else.
+#[test]
+fn a_scope_is_made_only_at_the_listed_places() {
+    let all = all();
+    let mut found = uses(&all, "tenant_zero(");
+    // The definition, and its own tests.
+    assert!(found.remove(TENANT).is_some());
+    within(
+        "tenant_zero(",
+        &found,
+        &[
+            // The record layout `tenant` of the configuration.
+            ("bridge/config.rs", 1),
+            // The recovery copy: the tenant phases, and the other name
+            // of a plan.
+            ("bridge/copy.rs", 2),
+            // The replay: the listing, and the plans of an extent.
+            ("bridge/replay.rs", 3),
+            // The queue consumer.
+            ("worker/lib.rs", 1),
+        ],
+    );
+    // The consumer does make one: the job path has its scope from it.
+    assert_eq!(found.get("worker/lib.rs"), Some(&1));
+}
+
+/// One constructor, no `Default`, nothing that reads one from bytes.
+#[test]
+fn the_scope_has_one_constructor() {
+    let all = all();
+    let tenant = &all[TENANT];
+    assert_eq!(tenant.matches("-> TenantScope").count(), 1);
+    assert_eq!(
+        tenant.matches("TenantScope {").count(),
+        4,
+        "the struct, its impl, the constructor and its one literal"
+    );
+    let derive = tenant
+        .lines()
+        .zip(tenant.lines().skip(1))
+        .find(|(_, next)| next.starts_with("pub struct TenantScope"))
+        .map(|(derive, _)| derive)
+        .expect("the derive of the scope");
+    assert_eq!(derive, "#[derive(Clone, Debug, PartialEq, Eq)]");
+    for (file, text) in &all {
+        for bad in [
+            "Default for TenantScope",
+            "Deserialize<'de> for TenantScope",
+            "From<&str> for TenantScope",
+            "From<String> for TenantScope",
+            "FromStr for TenantScope",
+        ] {
+            assert!(!text.contains(bad), "{file}: {bad}");
+        }
+    }
+    // The field is private: no other file can write the literal.
+    assert!(tenant.contains("pub struct TenantScope {\n    tenant: &'static str,\n}"));
+    let literals = uses(&all, "TenantScope {");
+    assert_eq!(literals.keys().collect::<Vec<_>>(), [TENANT]);
+}
+
+/// The id of tenant 0 is written once, and taken by name in the two
+/// modules that make names from it.
+#[test]
+fn the_id_of_tenant_zero_is_written_in_one_place() {
+    let all = all();
+    let mut literal = uses(&all, "t_0000000000000000");
+    // The tests of the scope say the names in full.
+    literal.remove(TENANT);
+    assert_eq!(literal.keys().collect::<Vec<_>>(), ["bridge/recovery.rs"]);
+    let named = uses(&all, "DEFAULT_TENANT");
+    assert_eq!(
+        named.keys().collect::<Vec<_>>(),
+        ["bridge/recovery.rs", TENANT]
+    );
+}
+
+/// The job path names no blob past its scope, and the places that still
+/// do are the listed ones.
+#[test]
+fn a_blob_is_named_without_a_scope_only_at_the_listed_places() {
+    let all = all();
+    let mut found = uses(&all, ".safety_key()");
+    for (file, n) in uses(&all, ".cache_key()") {
+        *found.entry(file).or_default() += n;
+    }
+    // The scope itself: for tenant 0 it answers with the old names.
+    assert!(found.remove(TENANT).is_some());
+    within(
+        ".safety_key() or .cache_key()",
+        &found,
+        &[
+            // The request path: a request is not scoped yet.
+            ("bridge/fetch.rs", 1),
+            ("bridge/service/admin.rs", 3),
+            ("bridge/service/get.rs", 2),
+            ("bridge/service/multipart.rs", 1),
+            ("bridge/service/put.rs", 1),
+            ("bridge/service/slices.rs", 1),
+            // The replay, which goes through the whole store.
+            ("bridge/replay.rs", 2),
+            // The delete list the catalogue makes for garbage
+            // collection: rows carry no tenant yet.
+            ("bridge/sql/gc.rs", 2),
+        ],
+    );
+    for job_path in [
+        "bridge/jobs.rs",
+        "bridge/post.rs",
+        "bridge/verify.rs",
+        "bridge/intents.rs",
+    ] {
+        assert!(all.contains_key(job_path), "{job_path} is gone");
+        assert!(!found.contains_key(job_path), "{job_path}");
+    }
+}
+
+/// The layouts are asked of a scope: the two functions that named
+/// tenant 0 themselves are gone.
+#[test]
+fn a_layout_of_a_tenant_comes_from_a_scope() {
+    let all = all();
+    assert!(uses(&all, "default_tenant(").is_empty());
+    assert!(uses(&all, "Layout::all()").is_empty());
+    assert_eq!(
+        all["bridge/recovery.rs"]
+            .matches("pub fn of(scope: &TenantScope)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        all["bridge/recovery.rs"]
+            .matches("pub fn all(scope: &TenantScope)")
+            .count(),
+        1
+    );
+}
+
+/// Nothing writes, reads or lists the reserved names.
+#[test]
+fn the_reserved_names_are_used_by_nothing() {
+    let all = all();
+    for name in ["BUCKET_CONFIG_DIR", "CATALOGUE_DUMP_PREFIX", "\"cb/"] {
+        let found = uses(&all, name);
+        let files: Vec<&String> = found.keys().filter(|f| *f != TENANT).collect();
+        assert!(files.is_empty(), "{name}: {files:?}");
+    }
+}
+
+/// The reader of this test is not fooled by its own helper.
+#[test]
+fn comment_lines_are_not_code() {
+    let text = "// tenant_zero(\nlet a = 1; // b\n    /// .safety_key()\nx.safety_key()";
+    assert_eq!(code(text), "let a = 1; // b\nx.safety_key()");
+}
