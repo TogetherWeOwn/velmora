@@ -518,7 +518,8 @@ impl Fx {
             }
             runs += 1;
             assert!(runs < 200, "the queue does not drain");
-            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&job).await {
+            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&TENANT_ZERO, &job).await
+            {
                 queue.push((self.clock.now().plus_secs(delay_secs), job));
             }
         }
@@ -610,7 +611,10 @@ async fn no_post_before_the_article_plan_record() {
     let o = fx.put(&bucket, "a/big.bin", &plaintext()).await;
     *fx.bridge.safety.no_put.borrow_mut() = Some("m/art/".to_string());
 
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
     assert_eq!(fx.server.posted_count().await, 0);
     assert_eq!(fx.outbox(&o, "stage").await, "post");
@@ -622,13 +626,16 @@ async fn no_post_before_the_article_plan_record() {
     *fx.bridge.safety.no_put.borrow_mut() = None;
     fx.make_due(&o).await;
     assert_eq!(
-        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.server.posted_count().await, 3);
     let record = read_article_plan(
         &fx.bridge.safety,
         &fx.bridge.kek,
+        &TENANT_ZERO,
         &o.extent,
         &Layout::flat(),
     )
@@ -665,6 +672,7 @@ async fn no_post_before_the_article_plan_record() {
     let broken = read_article_plan(
         &fx.bridge.safety,
         &fx.bridge.kek,
+        &TENANT_ZERO,
         &o.extent,
         &Layout::flat(),
     )
@@ -691,6 +699,7 @@ async fn no_post_before_the_article_plan_record() {
     let again = read_article_plan(
         &fx.bridge.safety,
         &fx.bridge.kek,
+        &TENANT_ZERO,
         &o.extent,
         &Layout::flat(),
     )
@@ -744,7 +753,10 @@ async fn provider_cooldown_on_the_sql_catalogue() {
 
     for run in 0..3 {
         fx.make_due(&o).await;
-        let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+        let outcome = fx
+            .bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+            .await;
         assert!(matches!(outcome, JobOutcome::Retry { .. }));
         if run < 2 {
             assert_eq!(fx.health("cooldown_until").await, "0");
@@ -760,7 +772,10 @@ async fn provider_cooldown_on_the_sql_catalogue() {
     let before = fx.uses().await;
     fx.clock.advance_secs(20);
     fx.make_due(&o).await;
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     assert_eq!(outcome, JobOutcome::Retry { delay_secs: 40 });
     assert_eq!(fx.outbox(&o, "attempts").await, "3");
     assert_eq!(fx.outbox(&o, "next_at").await, until.0.to_string());
@@ -805,7 +820,10 @@ async fn pool_limit_on_the_sql_catalogue() {
     let permit = catalog.acquire_permit(twin, PermitClass::Background, "other", fx.clock.now());
     let permit = permit.await.unwrap().expect("the pool's background slot");
 
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     assert!(matches!(outcome, JobOutcome::Retry { .. }));
     assert_eq!(fx.outbox(&o, "stage").await, "post");
     assert_eq!(fx.outbox(&o, "attempts").await, "0");
@@ -815,7 +833,10 @@ async fn pool_limit_on_the_sql_catalogue() {
 
     catalog.release_permit(&permit).await.unwrap();
     fx.make_due(&o).await;
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     assert_eq!(outcome, JobOutcome::Ack);
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
     assert_eq!(fx.server.posted_count().await, 3);
@@ -830,7 +851,10 @@ async fn duplicate_and_stale_jobs_are_noops() {
     let o = fx.put(&bucket, "k", &plaintext()).await;
     let post = o.job(OutboxStage::Post);
 
-    assert_eq!(fx.bridge.run_job(&post).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &post).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
     fx.bridge.jobs.take();
     let before = fx.dump().await;
@@ -873,7 +897,11 @@ async fn duplicate_and_stale_jobs_are_noops() {
         Job::Gc { v: JOB_VERSION + 1 },
     ];
     for job in &stale {
-        assert_eq!(fx.bridge.run_job(job).await, JobOutcome::Ack, "{job:?}");
+        assert_eq!(
+            fx.bridge.run_job(&TENANT_ZERO, job).await,
+            JobOutcome::Ack,
+            "{job:?}"
+        );
     }
     assert_eq!(
         fx.dump().await,
@@ -888,8 +916,11 @@ async fn duplicate_and_stale_jobs_are_noops() {
     fx.forbid_io.set(false);
     fx.clock.advance_secs(VERIFY_DELAY_SECS);
     let verify = o.job(OutboxStage::Verify);
-    let (a, b) =
-        futures_util::future::join(fx.bridge.run_job(&verify), fx.bridge.run_job(&verify)).await;
+    let (a, b) = futures_util::future::join(
+        fx.bridge.run_job(&TENANT_ZERO, &verify),
+        fx.bridge.run_job(&TENANT_ZERO, &verify),
+    )
+    .await;
     assert_eq!((a, b), (JobOutcome::Ack, JobOutcome::Ack));
     assert_eq!(fx.outbox(&o, "stage").await, "release");
     let verifications = "SELECT COUNT(*) FROM verifications";
@@ -906,7 +937,10 @@ async fn stale_lease_is_fenced() {
     // claims the row in that gap.
     *fx.bridge.nntp.target.borrow_mut() =
         Some((o.extent.clone(), o.generation.clone(), OutboxStage::Post));
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     assert_eq!(outcome, JobOutcome::Ack, "a fenced job stops and acks");
     let thief = fx.bridge.nntp.stolen.borrow_mut().take().expect("stolen");
 
@@ -936,7 +970,10 @@ async fn stale_lease_is_fenced() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fx.bridge.post_stage(&thief, &row).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.post_stage(&TENANT_ZERO, &thief, &row).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
     // Both workers used the one stored plan: no article exists twice.
     assert_eq!(fx.server.posted_count().await, 3);
@@ -949,7 +986,10 @@ async fn job_waits_for_memory_without_spending_an_attempt() {
     let o = fx.put(&bucket, "k", &plaintext()).await;
 
     let all = fx.bridge.budget.try_charge(BUDGET).expect("empty budget");
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     let JobOutcome::Retry { delay_secs } = outcome else {
         panic!("expected a retry, got {outcome:?}");
     };
@@ -962,7 +1002,9 @@ async fn job_waits_for_memory_without_spending_an_attempt() {
     drop(all);
     fx.clock.advance_secs(delay_secs);
     assert_eq!(
-        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
@@ -986,7 +1028,10 @@ async fn job_charges_against_the_job_limit() {
         .budget
         .try_charge_job(BUDGET / 2 * 3 - MIB)
         .unwrap();
-    let outcome = fx.bridge.run_job(&o.job(OutboxStage::Post)).await;
+    let outcome = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+        .await;
     let JobOutcome::Retry { delay_secs } = outcome else {
         panic!("expected a retry, got {outcome:?}");
     };
@@ -1006,7 +1051,9 @@ async fn job_charges_against_the_job_limit() {
     assert!(held > BUDGET);
     fx.clock.advance_secs(delay_secs);
     assert_eq!(
-        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
@@ -1024,11 +1071,15 @@ async fn restore_maintenance_stops_jobs_and_dispatch() {
 
     fx.forbid_io.set(true);
     assert_eq!(
-        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(
@@ -1091,7 +1142,9 @@ async fn dispatch_recovers_a_message_lost_between_stages() {
     // The post job's hand-over to verify is lost.
     fx.bridge.jobs.drop_next(1);
     assert_eq!(
-        fx.bridge.run_job(&o.job(OutboxStage::Post)).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Post))
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.bridge.jobs.dropped(), 1);
@@ -1288,7 +1341,9 @@ async fn gc_off_deletes_nothing() {
     // Even a GC message that does arrive does nothing.
     fx.forbid_io.set(true);
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.dump().await, before);
@@ -1311,7 +1366,9 @@ async fn gc_disposable_skips_real_buckets() {
     assert!(fx.bridge.dispatch().await.unwrap().gc_enqueued);
     fx.bridge.jobs.take();
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
 
@@ -1327,7 +1384,9 @@ async fn gc_disposable_skips_real_buckets() {
 
     // The real bucket's rows stay due, and stay untouched on every run.
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert!(fx.has_safety(&real_old) && fx.has_cache(&real_old));
@@ -1355,7 +1414,9 @@ async fn gc_job_caps_actions() {
     assert_eq!(blobs(&fx), 60);
 
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.scalar(done, &[]).await, GC_BATCH.to_string());
@@ -1366,7 +1427,9 @@ async fn gc_job_caps_actions() {
     assert_eq!(sent[0].job, Job::Gc { v: JOB_VERSION });
 
     assert_eq!(
-        fx.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        fx.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(fx.scalar(done, &[]).await, "60");
@@ -1398,7 +1461,7 @@ async fn gc_failing_row_does_not_block_the_batch() {
 
     let gc = Job::Gc { v: JOB_VERSION };
     assert!(matches!(
-        fx.bridge.run_job(&gc).await,
+        fx.bridge.run_job(&TENANT_ZERO, &gc).await,
         JobOutcome::Retry { .. }
     ));
     // Every other row was handled; the failing one is still due.
@@ -1410,7 +1473,7 @@ async fn gc_failing_row_does_not_block_the_batch() {
 
     // Once the store recovers, the retry finishes the row.
     *fx.bridge.cache.broken.borrow_mut() = None;
-    assert_eq!(fx.bridge.run_job(&gc).await, JobOutcome::Ack);
+    assert_eq!(fx.bridge.run_job(&TENANT_ZERO, &gc).await, JobOutcome::Ack);
     assert_eq!(fx.scalar(open, &[]).await, "0");
     assert!(!fx.has_cache(&old[0]));
 }
@@ -1729,7 +1792,8 @@ impl Fx {
             }
             runs += 1;
             assert!(runs < 2000, "the queue does not drain");
-            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&job).await {
+            if let JobOutcome::Retry { delay_secs } = self.bridge.run_job(&TENANT_ZERO, &job).await
+            {
                 queue.push((self.clock.now().plus_secs(delay_secs), job));
             }
         }
@@ -1834,7 +1898,10 @@ async fn release_wakes_itself_after_the_minimum_age() {
     // A millisecond before the minimum age is over nothing is released,
     // neither by a job that comes early nor by the dispatcher.
     for o in &objects {
-        let early = fx.bridge.run_job(&o.job(OutboxStage::Release)).await;
+        let early = fx
+            .bridge
+            .run_job(&TENANT_ZERO, &o.job(OutboxStage::Release))
+            .await;
         assert_eq!(early, JobOutcome::Ack);
     }
     assert_eq!(fx.tick().await.0, []);
@@ -1861,7 +1928,7 @@ async fn release_wakes_itself_after_the_minimum_age() {
             o.job(OutboxStage::Release),
             o.wake(OutboxStage::Release, due),
         ] {
-            assert_eq!(fx.bridge.run_job(&job).await, JobOutcome::Ack);
+            assert_eq!(fx.bridge.run_job(&TENANT_ZERO, &job).await, JobOutcome::Ack);
         }
     }
     assert_eq!(fx.dump().await, before);
@@ -1889,14 +1956,17 @@ async fn a_wake_up_cannot_release_early() {
 
     // It claims to be due already.
     let lying = o.wake(OutboxStage::Release, T0);
-    assert_eq!(fx.bridge.run_job(&lying).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &lying).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.dump().await, before);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
     assert!(fx.bridge.jobs.take().is_empty());
 
     // Far ahead: sent on with the longest delay a queue takes.
     let far = o.wake(OutboxStage::Release, T0.plus_secs(30 * DAY_SECS));
-    assert_eq!(fx.bridge.run_job(&far).await, JobOutcome::Ack);
+    assert_eq!(fx.bridge.run_job(&TENANT_ZERO, &far).await, JobOutcome::Ack);
     let sent = fx.bridge.jobs.take();
     assert_eq!(sent.len(), 1);
     assert_eq!(
@@ -1908,7 +1978,10 @@ async fn a_wake_up_cannot_release_early() {
     if let Job::Wake { v, .. } = &mut other {
         *v = JOB_VERSION + 1;
     }
-    assert_eq!(fx.bridge.run_job(&other).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &other).await,
+        JobOutcome::Ack
+    );
     assert!(fx.bridge.jobs.take().is_empty());
     assert_eq!(fx.dump().await, before);
 }
@@ -2023,7 +2096,10 @@ async fn dispatch_sends_a_due_row_once() {
 
     // One is posted, and its hand-over to verify is lost.
     fx.bridge.jobs.drop_next(1);
-    assert_eq!(fx.bridge.run_job(&post(&moved)).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &post(&moved)).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.outbox(&moved, "stage").await, "verify");
     // One is claimed by a job that dies.
     let claim = fx
@@ -2079,7 +2155,10 @@ async fn dispatch_sends_a_due_row_once() {
     let before = fx.dump().await;
     for o in [&moved, &crashed, &lost] {
         for stage in [OutboxStage::Post, OutboxStage::Verify, OutboxStage::Release] {
-            assert_eq!(fx.bridge.run_job(&o.job(stage)).await, JobOutcome::Ack);
+            assert_eq!(
+                fx.bridge.run_job(&TENANT_ZERO, &o.job(stage)).await,
+                JobOutcome::Ack
+            );
         }
     }
     assert_eq!(fx.dump().await, before);
@@ -2314,7 +2393,10 @@ async fn each_kind_of_queue_has_its_own_wait() {
     let verifying = fx.put(&bucket, "verifying", b"tiny").await;
     // One extent is posted; its hand-over to verify is lost.
     fx.bridge.jobs.drop_next(1);
-    let posted = fx.bridge.run_job(&verifying.job(OutboxStage::Post)).await;
+    let posted = fx
+        .bridge
+        .run_job(&TENANT_ZERO, &verifying.job(OutboxStage::Post))
+        .await;
     assert_eq!(posted, JobOutcome::Ack);
     assert_eq!(fx.outbox(&verifying, "stage").await, "verify");
     let due = UnixMs(fx.outbox(&verifying, "next_at").await.parse().unwrap());
@@ -2457,7 +2539,10 @@ async fn a_resent_release_job_is_fenced() {
     // again, and the second delivery takes the row over and releases.
     fx.clock.advance_secs(LEASE_SECS + 1);
     assert_eq!(fx.tick().await.0, std::slice::from_ref(&release));
-    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &release).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
     let evidence = fx.extent(&o, "release_evidence").await;
     let released_at = fx.extent(&o, "released_at").await;
@@ -2491,7 +2576,7 @@ async fn a_wake_up_that_cannot_be_sent_on_is_retried() {
     fx.bridge.jobs.fail_after(Some(0));
     for (ahead, delay_secs) in [(90, 90), (30 * DAY_SECS, MAX_QUEUE_DELAY_SECS)] {
         let wake = o.wake(OutboxStage::Release, T0.plus_secs(ahead));
-        let outcome = fx.bridge.run_job(&wake).await;
+        let outcome = fx.bridge.run_job(&TENANT_ZERO, &wake).await;
         assert_eq!(outcome, JobOutcome::Retry { delay_secs });
     }
     assert!(fx.bridge.jobs.take().is_empty());
@@ -2532,7 +2617,10 @@ async fn a_dispatcher_run_ahead_of_the_wake_up_costs_one_duplicate() {
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     // The dispatcher's job comes last and finds nothing to do.
     let before = fx.dump().await;
-    assert_eq!(fx.bridge.run_job(&release).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &release).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.dump().await, before);
     assert_eq!(fx.tick().await.0, []);
 }
@@ -2633,7 +2721,7 @@ async fn a_job_dropped_mid_flight_gives_its_bytes_back() {
     let o = fx.put(&bucket, "k", &plaintext()).await;
     let job = o.job(OutboxStage::Post);
 
-    let mut running = Box::pin(fx.bridge.run_job(&job));
+    let mut running = Box::pin(fx.bridge.run_job(&TENANT_ZERO, &job));
     poll_until_charged(&mut running, &fx.bridge.budget).await;
     assert!(fx.bridge.budget.in_use() >= o.plain.len() as u64);
     drop(running);
@@ -2667,7 +2755,7 @@ async fn an_abandoned_job_does_not_hold_the_budget_for_ever() {
     // The invocation begins its job, and is cancelled mid-flight.
     let table = JobTable::new();
     let began = fx.clock.now();
-    let mut abandoned = table.run(began, fx.bridge.run_job(&first_job));
+    let mut abandoned = table.run(began, fx.bridge.run_job(&TENANT_ZERO, &first_job));
     poll_until_charged(&mut abandoned, &fx.bridge.budget).await;
     std::mem::forget(abandoned);
     let held = fx.bridge.budget.in_use();
@@ -2677,7 +2765,7 @@ async fn an_abandoned_job_does_not_hold_the_budget_for_ever() {
     // off; no attempt is spent, no error is recorded, nothing is posted.
     for _ in 0..3 {
         let waited_from = fx.clock.now();
-        let outcome = fx.bridge.run_job(&second_job).await;
+        let outcome = fx.bridge.run_job(&TENANT_ZERO, &second_job).await;
         let JobOutcome::Retry { delay_secs } = outcome else {
             panic!("expected a job that is put off, got {outcome:?}");
         };
@@ -2704,14 +2792,23 @@ async fn an_abandoned_job_does_not_hold_the_budget_for_ever() {
         "an abandoned job still holds the isolate's budget"
     );
     assert_eq!((reaped, table.len(), table.reaped()), (1, 0, 1));
-    assert_eq!(fx.bridge.run_job(&second_job).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &second_job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.outbox(&second, "stage").await, "verify");
     assert_eq!(fx.bridge.budget.in_use(), 0);
 
     // The extent of the abandoned job is not lost: its lease runs out
     // and the next job for it posts it.
     fx.clock.advance_secs(3600);
-    assert_eq!(fx.bridge.run_job(&first_job).await, JobOutcome::Ack);
+    assert_eq!(
+        fx.bridge.run_job(&TENANT_ZERO, &first_job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(fx.outbox(&first, "stage").await, "verify");
     assert_eq!(fx.bridge.budget.in_use(), 0);
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
