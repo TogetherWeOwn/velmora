@@ -1466,6 +1466,14 @@ where
                 writer.push(&row).await?;
             }
         }
+        // The host runs its timers here: the window after which the
+        // answer is streamed, and the keepalive of that stream. Calls
+        // that are answered at once, one after the other, may leave it
+        // no turn for them (measured in a local workerd: no timer for
+        // the 4.6 s of this loop at 131,072 extents).
+        if let Some(sleep) = bridge.budget.sleeper() {
+            sleep(0).await;
+        }
     }
     let draft = match writer {
         Some(writer) => Draft::Segmented(writer),

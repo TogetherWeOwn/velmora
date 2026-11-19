@@ -789,6 +789,9 @@ the segmented path on a deployment of its own has passed.
   131 072 extents (29.6 MiB more), 25.1 MiB at 65 536 (23.5 MiB more);
   6.8 s and 3.2 s, 43 and 27 catalogue reads, 34 and 18 record puts,
   one publish batch, one queue batch.
+  The headers of the 131 072 answer left after 2.1 s. The one publish
+  batch took 2.8 s of it; in a local workerd no timer runs while it
+  does, so a newline that falls due then is late there.
 - An UploadPart or an abort that arrives while the extents are read
   wins: no head is stored, nothing is published, and the answer is the
   one the upload then deserves (`InvalidPart`, `NoSuchUpload`, or a new

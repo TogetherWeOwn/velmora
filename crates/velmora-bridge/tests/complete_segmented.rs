@@ -794,6 +794,46 @@ async fn without_room_for_its_charge_a_complete_is_told_to_come_back() {
     assert!(s.read().await.body == small);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn the_host_gets_a_turn_for_its_timers_after_each_run_of_parts() {
+    // The window after which the answer is streamed, and the keepalive
+    // of the stream, are timers of the host. The read gives it a turn
+    // after every run of part numbers.
+    let slept = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = Rc::clone(&slept);
+    let sleeper: Sleeper = Rc::new(move |ms| {
+        log.borrow_mut().push(ms);
+        Box::pin(tokio::task::yield_now())
+    });
+    let budget = ByteBudget::new(2 * COMPLETE_CHARGE_BYTES).with_sleeper(sleeper);
+    let rig = rig_with_budget(NoNntp, seg_config(), budget);
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let created = rig
+        .call(
+            &signer,
+            Method::Post,
+            &path(BUCKET, KEY),
+            &[("uploads", "")],
+            &[],
+            b"",
+        )
+        .await;
+    let id = created.values("UploadId").remove(0);
+    let s = Scene {
+        rig,
+        bucket,
+        signer,
+        id,
+    };
+    // Parts 1, 300 and 700: three runs of 256 part numbers.
+    let (listed, whole) = three_parts(&s).await;
+    slept.borrow_mut().clear();
+    let resp = s.complete(&listed).await;
+    assert!(!failed(&resp), "{}", resp.text());
+    assert_eq!(*slept.borrow(), [0, 0, 0]);
+    assert!(s.read().await.body == whole);
+}
+
 // ---------------------------------------------------------------------------
 // A failure once the answer has begun
 // ---------------------------------------------------------------------------
