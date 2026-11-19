@@ -35,7 +35,7 @@ export async function maybeSend(env, row, now, forMs) {
   const claim = await store.claimSend(env.STATE, row, now, { forMs, dailyCap: dailyCap(env) });
   if (!claim) return "held";
   try {
-    await send(env, alertMessage(claim, now, store.reminderGap(Number(row.sent_in_run ?? 0) + 1)));
+    await send(env, alertMessage(claim, now, store.gapFor(row, Number(row.sent_in_run ?? 0) + 1)));
     return "sent";
   } catch (e) {
     await store.unclaimSend(env.STATE, claim, now);
@@ -133,6 +133,7 @@ export async function digest(env, now) {
   await send(env, msg);
   await db.prepare("INSERT INTO sends(at, key, kind) VALUES (?1, 'digest', 'digest')").bind(now).run();
   await store.setMeta(db, "last_digest", now);
+  await store.setMeta(db, "digest_failed", false);
 }
 
 function timingSafeEqual(a, b) {
@@ -198,7 +199,12 @@ export default {
     let ok = false;
     try {
       if (event.cron === (env.DIGEST_CRON ?? "30 7 * * *")) {
-        await digest(env, now);
+        try {
+          await digest(env, now);
+        } catch (e) {
+          await store.setMeta(env.STATE, "digest_failed", true);
+          throw e;
+        }
         ok = true;
         return;
       }
@@ -207,7 +213,8 @@ export default {
       // A digest that failed is sent again by the next tick (and until it
       // goes, the heartbeat keeps reporting failure).
       const lastDigest = await store.getMeta(env.STATE, "last_digest");
-      if (lastDigest && now - lastDigest > 25 * store.HOUR) {
+      const digestFailed = await store.getMeta(env.STATE, "digest_failed");
+      if (digestFailed || (lastDigest && now - lastDigest > 25 * store.HOUR)) {
         try {
           await digest(env, now);
         } catch (e) {

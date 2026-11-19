@@ -102,6 +102,14 @@ export function reminderGap(sentInRun) {
 }
 
 /**
+ * The wait after the `sentInRun`-th email of a row: reminder backoff for
+ * cron conditions; one hour for reports (host, ci), each a new event.
+ */
+export function gapFor(row, sentInRun) {
+  return row.source === "cron" ? reminderGap(sentInRun) : HOUR;
+}
+
+/**
  * Claims the right to email for this key now: at most one email per key
  * per hour (less often while it keeps holding), and none past the daily cap. The claim is one conditional
  * UPDATE, so a cron tick and a report racing for the same key send once.
@@ -110,12 +118,13 @@ export function reminderGap(sentInRun) {
 export async function claimSend(db, row, now, { forMs = 0, dailyCap = 30 } = {}) {
   if (row.severity !== "page") return null;
   if (now - Number(row.active_since) < forMs) return null;
+  const gap = gapFor(row, Number(row.sent_in_run ?? 0));
+  // Not due for this key: nothing is held back, whatever the cap.
+  if (row.last_sent_at != null && Number(row.last_sent_at) > now - gap) return null;
   if ((await sentSince(db, now - DAY)) >= dailyCap) {
     await setMeta(db, "cap_hit_at", now);
     return null;
   }
-  // A report (host, ci) is a new event each time: one an hour, no backoff.
-  const gap = row.source === "cron" ? reminderGap(Number(row.sent_in_run ?? 0)) : HOUR;
   const claimed = await db
     .prepare(
       "UPDATE alerts SET last_sent_at = ?2, seen_unsent = 0 " +

@@ -515,9 +515,10 @@ test("a failed digest is sent again by a later tick, and the heartbeat fails unt
     await run("30 7 * * *", T0); // first digest works
     e.ALERT_EMAIL.fail = "E_DELIVERY_FAILED";
     await run("30 7 * * *", T0 + store.DAY);
-    await run("*/5 * * * *", T0 + store.DAY + 2 * HOUR);
+    await run("*/5 * * * *", T0 + store.DAY + 5 * MIN); // retried at once, fails again
     e.ALERT_EMAIL.fail = null;
-    await run("*/5 * * * *", T0 + store.DAY + 2 * HOUR + 5 * MIN);
+    await run("*/5 * * * *", T0 + store.DAY + 10 * MIN);
+    await run("*/5 * * * *", T0 + store.DAY + 15 * MIN); // sent: no more retries
   } finally {
     globalThis.fetch = realFetch;
     console.error = realErr;
@@ -526,6 +527,38 @@ test("a failed digest is sent again by a later tick, and the heartbeat fails unt
     "https://hb.example.invalid/x/fail",
     "https://hb.example.invalid/x/fail",
     "https://hb.example.invalid/x",
+    "https://hb.example.invalid/x",
   ]);
   assert.equal(e.ALERT_EMAIL.sent.filter((m) => /Daily digest/.test(m.subject)).length, 2);
+});
+
+test("a first digest that fails is retried by the next tick", async () => {
+  const e = env();
+  e.ALERT_EMAIL.fail = "E_DELIVERY_FAILED";
+  const realErr = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(worker.scheduled({ cron: "30 7 * * *", scheduledTime: T0 }, e, { waitUntil() {} }));
+    e.ALERT_EMAIL.fail = null;
+    await worker.scheduled({ cron: "*/5 * * * *", scheduledTime: T0 + 5 * MIN }, e, { waitUntil() {} });
+  } finally {
+    console.error = realErr;
+  }
+  assert.equal(e.ALERT_EMAIL.sent.filter((m) => /Daily digest/.test(m.subject)).length, 1);
+});
+
+test("at the cap, a condition not due for its own reminder holds nothing back", async () => {
+  const e = env({ DAILY_EMAIL_CAP: "1" });
+  outbox(e.CATALOG, "d", "dead", T0);
+  await tick(e, T0); // the one email of the day
+  await tick(e, T0 + 5 * MIN); // within the key's hour: not due, not held by the cap
+  assert.equal(await store.getMeta(e.STATE, "cap_hit_at"), null);
+  assert.equal(e.ALERT_EMAIL.sent.filter((m) => /cap reached/.test(m.subject)).length, 0);
+});
+
+test("a report's email states the one-hour wait", async () => {
+  const e = env();
+  const a = { source: "ci", key: "deploy-failed", title: "t" };
+  for (let h = 0; h < 3; h++) await ingest(req(a), e, T0 + h * HOUR);
+  assert.match(e.ALERT_EMAIL.sent[2].text, new RegExp(`not before ${new Date(T0 + 3 * HOUR).toISOString().replace(".000Z", "Z")}`));
 });
