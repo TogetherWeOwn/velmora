@@ -118,7 +118,9 @@ pub const SEGMENTED_VERSION: u32 = 2;
 /// segments of a head in one go (the recovery copy before it sends the
 /// head, a replay before it publishes), so this is what one job of each
 /// can read, and the one bound for them all. At 4,096 extents to a
-/// segment it is 786,432 extents.
+/// segment it is 786,432 extents. It bounds the reads, not the memory:
+/// a reader holds one segment at a time, and nothing here bounds the
+/// extents of one segment (the writer does).
 pub const MAX_SEGMENTS: usize = 192;
 
 const ERR_RECORD: BridgeError = BridgeError::Invalid("recovery record is malformed");

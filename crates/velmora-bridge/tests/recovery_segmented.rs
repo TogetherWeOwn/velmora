@@ -774,7 +774,7 @@ async fn a_truncated_or_inconsistent_head_is_unreadable() {
 
     // Heads whose entries do not tile the object, each sealed well.
     type Change = fn(&mut GenerationHead);
-    let cases: [(&str, Change); 9] = [
+    let cases: [(&str, Change); 10] = [
         ("no segment", |h| h.segments.clear()),
         ("last segment dropped", |h| {
             h.segments.pop();
@@ -784,6 +784,12 @@ async fn a_truncated_or_inconsistent_head_is_unreadable() {
         ("gap in seq", |h| h.segments[1].seq += 1),
         ("gap in offsets", |h| h.segments[2].plain_offset += 1),
         ("empty segment", |h| h.segments[1].count = 0),
+        ("empty segment between two", |h| {
+            let mut empty = h.segments[1].clone();
+            empty.count = 0;
+            empty.plain_size = 0;
+            h.segments.insert(1, empty);
+        }),
         ("short digest", |h| {
             h.segments[1].sha256.pop();
         }),
@@ -793,6 +799,13 @@ async fn a_truncated_or_inconsistent_head_is_unreadable() {
         let (rig, bucket, _, _) = world(&layout).await;
         let mut sealed = segment(&rig, &bucket, &layout, 64).await;
         change(&mut sealed.head);
+        // Refused by the head alone, whatever its segments say.
+        let plain = serde_json::to_vec(&sealed.head).unwrap();
+        assert_eq!(
+            invalid(GenerationHead::parse(&sealed.head_key, &plain).expect_err(what)),
+            "recovery record is malformed",
+            "{what}"
+        );
         sealed.reseal_head(&rig.bridge.kek);
         put_segmented(&rig, &bucket, &sealed).await;
         assert_refused(&rig, &sealed.head_key, None, what).await;
@@ -1006,17 +1019,17 @@ async fn a_single_record_behind_a_segmented_one_that_does_not_read_is_replayed()
 /// The name a cursor counts in gives no record any more, removed or no
 /// longer one that opens, while a replay is under way: the record under
 /// the other name is replayed from its first extent. For a count made
-/// in a segmented record, and for one made in a record in one part,
-/// which the cursor does not name.
+/// in a segmented record, for one made in a record in one part, and
+/// for the cursor of an older build, which did not name that one.
 #[tokio::test(flavor = "current_thread")]
 async fn a_count_is_not_carried_to_the_other_name_of_a_record() {
     let limits = ReplayLimits {
         records: 1,
         extents: 10,
     };
-    for segmented in [true, false] {
+    for (segmented, older) in [(true, false), (false, false), (false, true)] {
         for removed in [true, false] {
-            let case = format!("segmented {segmented}, removed {removed}");
+            let case = format!("segmented {segmented}, older {older}, removed {removed}");
             let flat = Layout::flat();
             let tenant = Layout::default_tenant();
             let (rig, bucket, _, body) = world(&flat).await;
@@ -1027,9 +1040,11 @@ async fn a_count_is_not_carried_to_the_other_name_of_a_record() {
             let twin = tenant.of_flat(&name);
             let second = segment_from(&rig, &bucket, &tenant, &twin, &m, 50).await;
             wipe(&rig);
-            let cursor = replay_into(&rig, limits, 30).await;
-            let owner = if segmented { name.as_str() } else { "" };
-            assert_eq!(cursor.name, owner, "{case}: {cursor:?}");
+            let mut cursor = replay_into(&rig, limits, 30).await;
+            assert_eq!(cursor.name, name, "{case}: {cursor:?}");
+            if older {
+                cursor.name.clear();
+            }
             if removed {
                 assert!(rig.bridge.safety.inner.lose(&name), "{case}");
             } else {
@@ -1053,28 +1068,34 @@ async fn a_count_is_not_carried_to_the_other_name_of_a_record() {
     }
 }
 
-/// A segmented record that is gone when the next call comes for it:
-/// the count the cursor had in it is not used in the record after it,
-/// and no name is left in the cursor when no record is after it.
+/// A record, segmented or in one part, that is gone when the next call
+/// comes for it: the count the cursor had in it is not used in the
+/// record after it, and no name is left in the cursor when no record
+/// is after it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_count_in_a_record_that_is_gone_is_not_used_in_the_next() {
     let limits = ReplayLimits {
         records: 1,
         extents: 10,
     };
-    for last in [false, true] {
+    for (segmented, last) in [(true, false), (true, true), (false, false), (false, true)] {
         let layout = Layout::flat();
         let (rig, bucket, _, _) = world(&layout).await;
-        let sealed = segment(&rig, &bucket, &layout, 64).await;
+        let gone = if segmented {
+            segment(&rig, &bucket, &layout, 64).await.head_key
+        } else {
+            record_of(&rig, &bucket, "big", &layout).await.0
+        };
         if last {
             let (after, _) = record_of(&rig, &bucket, "after", &layout).await;
             assert!(rig.bridge.safety.inner.lose(&after));
         }
         wipe(&rig);
         let cursor = replay_into(&rig, limits, 30).await;
-        assert_eq!(cursor.name, sealed.head_key);
-        assert!(rig.bridge.safety.inner.lose(&sealed.head_key));
+        assert_eq!(cursor.name, gone);
+        assert!(rig.bridge.safety.inner.lose(&gone));
         let step = rig.bridge.replay_step_within(cursor, limits).await.unwrap();
+        assert_eq!(step.unpublishable, Vec::<String>::new(), "{step:?}");
         let cursor = step.next.expect("the replay goes on");
         assert_eq!((cursor.extent, cursor.name.as_str()), (0, ""), "{cursor:?}");
         let unreadable = replay_from(&rig, limits, cursor).await;
@@ -1139,6 +1160,53 @@ async fn a_call_stops_at_the_segments_it_may_read() {
     let signer = reissue_key(&rig).await;
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
     assert_eq!(get(&rig, &signer, "big too").await.expect(200).body, body);
+}
+
+/// A record whose segments do not fit in what is left of a call is not
+/// begun by it: with three records of a segment for each extent, no
+/// call reads more segments than it may.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_that_does_not_fit_in_a_call_is_left_to_the_next() {
+    use velmora_bridge::replay::SEGMENT_READS;
+    let limits = ReplayLimits {
+        records: 50,
+        extents: 10_000,
+    };
+    let layout = Layout::flat();
+    let (rig, bucket, signer, body) = world(&layout).await;
+    let keys = ["big", "big too", "big three"];
+    for key in &keys[1..] {
+        rig.bridge.clock.advance_ms(1000);
+        rig.put(&signer, BUCKET, key, &body).await.expect(200);
+    }
+    for key in keys {
+        // Another set id: it is made of the time.
+        rig.bridge.clock.advance_ms(1);
+        let (name, m) = record_of(&rig, &bucket, key, &layout).await;
+        segment_from(&rig, &bucket, &layout, &name, &m, 1).await;
+    }
+    wipe(&rig);
+
+    let mut most = 0;
+    let mut next = Some(ReplayCursor::start(UnixMs(0)));
+    let mut calls = 0;
+    while let Some(at) = next {
+        calls += 1;
+        assert!(calls < 20);
+        let before = rig.bridge.safety.inner.gets_under("m/seg/");
+        let mut step = rig.bridge.replay_step_within(at, limits).await.unwrap();
+        assert_eq!(step.unreadable, Vec::<String>::new());
+        most = most.max(rig.bridge.safety.inner.gets_under("m/seg/") - before);
+        next = step.next.take();
+    }
+    // The second call reads all it may, and would begin the third
+    // record if the segments of that one were not counted first.
+    assert_eq!(most, SEGMENT_READS as u64);
+    assert_eq!(rig.count("objects"), 5);
+    let signer = reissue_key(&rig).await;
+    for key in keys {
+        assert_eq!(get(&rig, &signer, key).await.expect(200).body, body);
+    }
 }
 
 /// A head is the record its name promises and names a set by an id of

@@ -135,9 +135,11 @@ pub struct ReplayCursor {
     pub after: String,
     /// Extents already handled of the record after `after`.
     pub extent: u32,
-    /// The name the record `extent` counts in is stored under, when it
-    /// is a segmented record: a record of one id may be stored under a
-    /// name of each layout, and the count is of the one that was read.
+    /// The name the record `extent` counts in is stored under: a record
+    /// of one id may be stored under a name of each layout, and the
+    /// count is of the one that was read. Empty between two records,
+    /// and in a cursor of a build from before segmented records, whose
+    /// count is of a record in one part under the first name of its id.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// The replay this cursor belongs to, as the restore route recorded
@@ -329,10 +331,13 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         for listed in &names {
             let flat = &listed.flat;
             // The name the cursor counts extents in: the one it holds,
-            // or, when it holds none, the first name of the id (a
-            // record in one part under its first name is not named).
-            // A count made in one name is never used in another, and
-            // the names before it were given up and are not read again.
+            // or, when it holds none (a cursor of an older build, which
+            // counted in records in one part only), the first name of
+            // the id. A count made in one name is never used in
+            // another, and the names before it were given up and are
+            // not read again. A count without a name cannot be told
+            // from one made in a record that is gone since; every
+            // cursor this build makes inside a record names it.
             let named = std::mem::take(&mut cursor.name);
             let mut skip = listed.names().any(|(name, _)| *name == named);
             let owner = if named.is_empty() {
@@ -370,11 +375,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 if segmented && named.is_empty() {
                     cursor.extent = 0;
                 }
-                // The cursor names every record but the usual one: in
-                // one part, under the first name of its id.
-                if segmented || *name != listed.name {
-                    cursor.name.clone_from(name);
-                }
+                // The cursor names the record it is in, so that the
+                // count is not used in another when this one is gone
+                // by the next call.
+                cursor.name.clone_from(name);
                 let mut budget = (&mut budget, &mut reads);
                 match self
                     .replay_manifest(&record, layout, &mut cursor, &mut budget, report)
@@ -486,8 +490,9 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             // Before the first row of the record is written: a record
             // that cannot be read when the replay comes to it leaves
             // nothing behind. (One that loses a segment after that
-            // leaves extent rows of no generation, as an upload that
-            // was not completed does; they are swept like those.)
+            // leaves extent rows of no generation. Nothing reads them
+            // and no sweep removes them; a replay of the record, once
+            // it reads again, writes the same rows.)
             if at == 0 {
                 if **budget == 0 || !fits(reads, head.segments.len()) {
                     return Ok(Replayed::More);

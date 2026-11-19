@@ -368,8 +368,12 @@ it. No build writes them yet. Any other value of the variable refuses to start.
   the record that names it first, then in the other one, because a plan
   can be written after the setting changed and a copy shares the
   extents of its source).
-- The replay reads the two listings as one, in id order. Its cursor did
-  not change, so a replay can be continued across a deploy.
+- The replay reads the two listings as one, in id order. A cursor of
+  an older build is still read, so a replay can be continued across a
+  deploy. Not across a rollback to a build from before segmented
+  records: a cursor that stops inside a record carries the `name` of
+  that record, which such a build refuses. Start that replay again from
+  the beginning; a replay can be repeated.
 - The names stay under `m/`, so what is true of `m/` stays true of
   them: the store refuses to delete them, and the recovery copy sends
   them under the same names.
