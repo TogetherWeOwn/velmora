@@ -297,10 +297,35 @@ fn masked(answer: &Answer, supplied_names: &[&str]) -> String {
     // Longest first: a name inside another is not left half masked.
     let mut all: Vec<String> = supplied_names.iter().flat_map(|n| forms(n)).collect();
     all.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    all.dedup();
     for form in all {
-        text = text.replace(&form, "\u{1}");
+        text = without_supplied(&text, &form);
     }
     text
+}
+
+/// `text` without `form`, a text the request supplied, where it stands
+/// on its own: not where a letter or digit comes right before it. The
+/// answer gives a supplied name back whole, after a `>`, a `/`, a `"`
+/// or a space. Taken out anywhere, a short one (`group/`) would also
+/// take the end of a word of the service (`newsgroup/`), and with it
+/// the leak.
+fn without_supplied(text: &str, form: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(i) = text[at..].find(form) {
+        let start = at + i;
+        out.push_str(&text[at..start]);
+        if start > 0 && is_word(bytes[start - 1]) {
+            out.push_str(form);
+        } else {
+            out.push('\u{1}');
+        }
+        at = start + form.len();
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 async fn ask(
@@ -565,7 +590,7 @@ async fn answers() -> Answers {
     let stranger = Signer::new("AKIDNOSUCHKEY0000001", secret());
     let r = ask(&rig, &stranger, Method::Get, &at, &[], &[], b"").await;
     all.add("a key that is not there", r);
-    let forger = Signer::new(AKID, "not-the-secret-not-the-secret-not-the-se");
+    let forger = Signer::new(AKID, &format!("{}-other", secret()));
     let r = ask(&rig, &forger, Method::Get, &at, &[], &[], b"").await;
     all.add("a wrong signature", r);
     let mut unsigned = signer.sign(rig.now(), Method::Get, &at, &[], &[], Vec::new());
@@ -753,6 +778,13 @@ async fn a_word_of_the_service_is_found_next_to_a_supplied_name() {
     assert!(findings(&masked(&answer(&encoded), &supplied)).is_empty());
     let leak = format!("<Error><Key>{KEY}</Key><Message>The article is gone.</Message></Error>");
     assert!(!findings(&masked(&answer(&leak), &supplied)).is_empty());
+    // A supplied name that is the end of a word of the service does
+    // not hide that word.
+    let supplied_short = ["group/"];
+    let joined = "<Prefix>group/</Prefix><Message>newsgroup/alt.x</Message>";
+    assert!(!findings(&masked(&answer(joined), &supplied_short)).is_empty());
+    let own = "<Prefix>group/</Prefix><CommonPrefixes>a/group/</CommonPrefixes>";
+    assert!(findings(&masked(&answer(own), &supplied_short)).is_empty());
     let header = Answer {
         resp: Resp {
             headers: vec![("x-backbone".to_string(), "2".to_string())],
