@@ -774,8 +774,12 @@ async fn a_truncated_or_inconsistent_head_is_unreadable() {
 
     // Heads whose entries do not tile the object, each sealed well.
     type Change = fn(&mut GenerationHead);
-    let cases: [(&str, Change); 10] = [
+    let cases: [(&str, Change); 11] = [
         ("no segment", |h| h.segments.clear()),
+        ("no segment and no bytes", |h| {
+            h.segments.clear();
+            h.generation.size = 0;
+        }),
         ("last segment dropped", |h| {
             h.segments.pop();
         }),
