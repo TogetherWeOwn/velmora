@@ -790,6 +790,71 @@ async fn an_article_that_arrives_after_the_read_does_not_escalate() {
     assert_eq!(rig.stage(&s), OutboxStage::Release);
 }
 
+/// The second read may get only some of the round's articles: the rest
+/// came with the first. Together they are every article, read and
+/// checked.
+#[tokio::test]
+async fn the_two_reads_of_a_round_are_counted_together() {
+    let mut rig = light_rig(ALL, &[]).await;
+    rig.bridge.cfg.propagation_grace_secs = 0;
+    let (s, plan) = rig.on_two(20).await;
+    let drawn = rig.sample_index(&s);
+    let name = ["bb0", "bb1"][drawn];
+    rig.bridge.clock.advance_secs(1);
+    // One article is still missing after the read has asked twice.
+    rig.servers[drawn]
+        .late_for_next_bodies(plan.len() + 1)
+        .await;
+
+    assert_eq!(rig.run(&s, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.bridge.catalog.verifications(&s.extent);
+    let read = rows.iter().find(|r| r.backbone == name).expect("a row");
+    assert_eq!(
+        (
+            read.kind,
+            read.result,
+            read.articles_ok,
+            read.articles_total
+        ),
+        (VerifyKind::Sampled, VerifyResult::Ok, 3, 3)
+    );
+    assert!(rig.bridge.catalog.escalations.borrow().is_empty());
+}
+
+/// An article the second read gets with other bytes is corrupt, not
+/// read: the round fails, the backbone is raised, nothing is released.
+#[tokio::test]
+async fn a_late_article_with_other_bytes_is_corrupt() {
+    let mut rig = light_rig(ALL, &[]).await;
+    rig.bridge.cfg.propagation_grace_secs = 0;
+    let bad = rig.seed(21, &marked_plaintext(PLAIN_LEN)).await;
+    rig.post_with_planted_article(&bad, 1).await;
+    rig.propagate(&bad, 0, 1).await;
+    let drawn = rig.sample_index(&bad);
+    let name = ["bb0", "bb1"][drawn];
+    rig.bridge.clock.advance_secs(1);
+    rig.servers[drawn].late_for_next_bodies(2 * 3).await;
+
+    assert_ne!(rig.run(&bad, OutboxStage::Verify).await, JobOutcome::Ack);
+    let rows = rig.bridge.catalog.verifications(&bad.extent);
+    let read = rows.iter().find(|r| r.backbone == name).expect("a row");
+    assert_eq!(
+        (
+            read.kind,
+            read.result,
+            read.articles_ok,
+            read.articles_total
+        ),
+        (VerifyKind::Sampled, VerifyResult::Corrupt, 2, 3)
+    );
+    let raised = rig.bridge.catalog.escalations.borrow().clone();
+    assert!(raised
+        .iter()
+        .any(|e| e.backbone == name && e.result == VerifyResult::Corrupt));
+    assert_eq!(rig.state(&bad), SafetyState::Held);
+    assert_eq!(rig.stage(&bad), OutboxStage::Verify);
+}
+
 /// Two extents that find the same backbone listing what it does not
 /// serve each raise it once. Their retries, which come in turns before
 /// either failure is on record, do not move the end.
