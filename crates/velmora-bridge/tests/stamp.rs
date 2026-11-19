@@ -311,7 +311,9 @@ async fn a_rollback_closes_writes_and_stops_jobs_until_a_replay_ends() {
     delete(&rig, &signer, "a").await.expect_writes_refused();
     get(&rig, &signer, "a").await.expect(200);
     assert_eq!(
-        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        rig.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert!(refused(rig.bridge.raise_stamp().await));
@@ -948,17 +950,17 @@ async fn gc_and_eviction_check_the_stamp_before_they_delete() {
     let gc = Job::Gc { v: JOB_VERSION };
 
     rollback(&rig);
-    assert_eq!(bridge.run_job(&gc).await, JobOutcome::Ack);
+    assert_eq!(bridge.run_job(&TENANT_ZERO, &gc).await, JobOutcome::Ack);
     assert_eq!(row(&rig).await, behind(1));
     rollback(&rig);
-    assert_eq!(bridge.evict_batch(0).await.unwrap(), 0);
+    assert_eq!(bridge.evict_batch(&TENANT_ZERO, 0).await.unwrap(), 0);
     assert_eq!(row(&rig).await, behind(1));
 
     // A check that cannot be made: the job comes back later.
     rollback(&rig);
     bridge.safety.fail_list.set(true);
-    assert_ne!(bridge.run_job(&gc).await, JobOutcome::Ack);
-    assert!(bridge.evict_batch(0).await.is_err());
+    assert_ne!(bridge.run_job(&TENANT_ZERO, &gc).await, JobOutcome::Ack);
+    assert!(bridge.evict_batch(&TENANT_ZERO, 0).await.is_err());
     assert_eq!(row(&rig).await, level(1));
 }
 
@@ -985,10 +987,12 @@ async fn a_stamp_of_another_catalogue_id_is_not_used() {
     assert!(wrong_id(rig.bridge.dispatch().await.unwrap_err()));
     assert!(rig.bridge.jobs.inner.sent().is_empty());
     assert_ne!(
-        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        rig.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
-    assert!(rig.bridge.evict_batch(0).await.is_err());
+    assert!(rig.bridge.evict_batch(&TENANT_ZERO, 0).await.is_err());
     assert_eq!(stamps(&rig), [stamp_key("main", 1)]);
     let s = status(&rig).await;
     assert_eq!(s["catalogue_id_mismatch"], true);
@@ -1047,3 +1051,6 @@ async fn no_delete_removes_a_stamp_or_a_tenant_key() {
         assert!(rig.bridge.safety.contains(key), "{key}");
     }
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

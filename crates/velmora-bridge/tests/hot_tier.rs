@@ -222,7 +222,9 @@ impl Hot {
             }
             runs += 1;
             assert!(runs < 500, "the queue does not drain");
-            if let JobOutcome::Retry { delay_secs } = self.bridge().run_job(&job).await {
+            if let JobOutcome::Retry { delay_secs } =
+                self.bridge().run_job(&TENANT_ZERO, &job).await
+            {
                 queue.push((clock.now().plus_secs(delay_secs), job));
             }
         }
@@ -249,7 +251,10 @@ impl Hot {
 
     /// Runs one job and expects it to be acknowledged.
     async fn run(&self, job: &Job) {
-        assert_eq!(self.bridge().run_job(job).await, JobOutcome::Ack);
+        assert_eq!(
+            self.bridge().run_job(&TENANT_ZERO, job).await,
+            JobOutcome::Ack
+        );
     }
 
     /// Runs a later step of a drain as the step before it would have
@@ -697,7 +702,10 @@ async fn an_evicted_extent_is_read_cold_and_the_cache_refill_is_evictable() {
     let x = hot.released("cold").await;
     let cipher = x.cipher_size;
 
-    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), cipher);
+    assert_eq!(
+        hot.bridge().evict_batch(&TENANT_ZERO, 0).await.unwrap(),
+        cipher
+    );
     assert!(!hot.has_safety(&x) && !hot.has_cache(&x));
     assert_eq!(hot.evictable().await, 0);
 
@@ -716,7 +724,10 @@ async fn an_evicted_extent_is_read_cold_and_the_cache_refill_is_evictable() {
     assert_eq!(hot.bridge().nntp.connects(), connects + 1);
 
     // The refill is evictable at once, and the cycle repeats.
-    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), cipher);
+    assert_eq!(
+        hot.bridge().evict_batch(&TENANT_ZERO, 0).await.unwrap(),
+        cipher
+    );
     assert!(!hot.has_cache(&x));
     assert_eq!(hot.evictable().await, 0);
     hot.get_ok("cold").await;
@@ -754,7 +765,7 @@ async fn a_large_drain_runs_in_bounded_steps() {
         .fail_matching
         .replace(Some(("SUM(", 0)));
     assert!(matches!(
-        hot.bridge().run_job(&EVICT).await,
+        hot.bridge().run_job(&TENANT_ZERO, &EVICT).await,
         JobOutcome::Retry { .. }
     ));
     hot.run(&sent[0]).await;
@@ -1099,7 +1110,10 @@ async fn a_cache_fill_is_never_written_uncounted() {
     let cache = &hot.bridge().cache;
     cache.before_put.replace(Some(Box::new(move |_| {
         let cache_bytes = bridge.cfg.hot_cap_bytes + cipher as u64;
-        assert_eq!(at_once(bridge.evict_batch(0)).unwrap(), cache_bytes);
+        assert_eq!(
+            at_once(bridge.evict_batch(&TENANT_ZERO, 0)).unwrap(),
+            cache_bytes
+        );
     })));
     hot.get_ok("filled").await;
     assert!(cache.before_put.borrow().is_none());
@@ -1133,7 +1147,10 @@ async fn an_uncounted_cache_blob_is_evicted_or_counted_again() {
     hot.uncounted_fill(&both).await;
     assert_eq!(hot.num(&both, "hot_cache_bytes"), Some(0));
     assert_eq!(hot.evictable().await, cipher);
-    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), cipher);
+    assert_eq!(
+        hot.bridge().evict_batch(&TENANT_ZERO, 0).await.unwrap(),
+        cipher
+    );
     assert!(!hot.has_cache(&both) && !hot.has_safety(&both));
 
     // The other way round: a safety copy that is not counted, beside a
@@ -1149,7 +1166,10 @@ async fn an_uncounted_cache_blob_is_evicted_or_counted_again() {
     );
     assert!(hot.has_safety(&stray));
     assert_eq!(hot.evictable().await, cipher);
-    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), cipher);
+    assert_eq!(
+        hot.bridge().evict_batch(&TENANT_ZERO, 0).await.unwrap(),
+        cipher
+    );
     assert!(!hot.has_cache(&stray) && !hot.has_safety(&stray));
 
     // Alone, with nothing counted: no eviction lists the extent.
@@ -1229,7 +1249,7 @@ async fn a_failed_delete_is_retried_and_does_not_hold_up_the_rest() {
     let safety = &hot.bridge().safety;
 
     safety.fail_delete.replace(Some(xs[0].id.safety_key()));
-    let outcome = hot.bridge().run_job(&EVICT).await;
+    let outcome = hot.bridge().run_job(&TENANT_ZERO, &EVICT).await;
     assert!(matches!(outcome, JobOutcome::Retry { .. }), "{outcome:?}");
     // The extent whose delete failed is intact and still counted; the
     // ones behind it went.
@@ -1305,7 +1325,7 @@ async fn two_drains_at_once_do_not_evict_past_the_low_watermark() {
         .safety
         .before_delete
         .replace(Some(Box::new(move |_| {
-            let outcome = at_once(bridge.run_job(&EVICT));
+            let outcome = at_once(bridge.run_job(&TENANT_ZERO, &EVICT));
             assert_eq!(outcome, JobOutcome::Ack);
         })));
     hot.run(&EVICT).await;
@@ -1477,7 +1497,10 @@ async fn a_fill_racing_the_collection_of_its_cache_blob_stays_counted() {
     assert_eq!(hot.num(&x, "hot_safety_bytes"), Some(0));
     assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(cipher));
     catalog.hot_drain_set(1).await.unwrap();
-    assert_eq!(bridge.evict_batch(1).await.unwrap(), cipher as u64);
+    assert_eq!(
+        bridge.evict_batch(&TENANT_ZERO, 1).await.unwrap(),
+        cipher as u64
+    );
     assert!(!hot.has_cache(&x));
     assert_eq!(hot.stats().await, HotStats::default());
 }
@@ -1709,3 +1732,6 @@ async fn a_pinned_extent_is_never_granted_as_unpinned() {
     assert!(right.pinned);
     assert!(catalog.begin_evict(&right).await.unwrap());
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

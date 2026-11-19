@@ -236,7 +236,7 @@ async fn reads_skip_a_provider_past_its_retention() {
     let lease = rig.claim(&s, OutboxStage::Verify).await;
     let job = rig.job(&s).await;
     let before = (rig.uses(0).await, rig.uses(1).await);
-    rig.bridge.verify_stage(&lease, &job).await;
+    rig.bridge.verify_stage(&TENANT_ZERO, &lease, &job).await;
     assert_eq!(
         (rig.uses(0).await, rig.uses(1).await),
         (before.0, before.1 + 1)
@@ -1426,3 +1426,6 @@ async fn a_refusal_inside_the_round_is_no_strike_when_no_socket_ends_well() {
     assert_eq!((load.failures, load.fault, load.held), (0, None, 0));
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

@@ -389,7 +389,7 @@ pub async fn sweep_jobs(rig: &Rig) -> Vec<Job> {
 pub async fn sweep_tick(rig: &Rig) -> usize {
     let jobs = sweep_jobs(rig).await;
     for job in &jobs {
-        assert_eq!(rig.bridge.run_job(job).await, JobOutcome::Ack);
+        assert_eq!(rig.bridge.run_job(&TENANT_ZERO, job).await, JobOutcome::Ack);
     }
     jobs.len()
 }
@@ -566,5 +566,8 @@ pub fn start(rig: &Rig, req: Req) -> Running<'static, Resp> {
 /// A queue job, likewise.
 pub fn start_job(rig: &Rig, job: Job) -> Running<'static, JobOutcome> {
     let bridge = Rc::clone(&rig.bridge);
-    Box::pin(async move { bridge.run_job(&job).await })
+    Box::pin(async move { bridge.run_job(&TENANT_ZERO, &job).await })
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

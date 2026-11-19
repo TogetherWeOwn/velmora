@@ -305,7 +305,10 @@ async fn stale_lease_stops_before_any_post() {
     let job = rig.job(&s).await;
     let gets = rig.bridge.safety.gets();
 
-    assert_eq!(rig.bridge.post_stage(&stale, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &stale, &job).await,
+        JobOutcome::Ack
+    );
     assert!(rig.plan(&s).await.is_empty());
     assert_eq!(rig.server().posted_count().await, 0);
     assert_eq!(rig.bridge.nntp.connects(), 0);
@@ -318,7 +321,10 @@ async fn stale_lease_stops_before_any_post() {
     assert_eq!(outbox.stage, OutboxStage::Post);
 
     // The current holder is unaffected.
-    assert_eq!(rig.bridge.post_stage(&current, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &current, &job).await,
+        JobOutcome::Ack
+    );
     assert_eq!(rig.server().posted_count().await, 3);
 }
 
@@ -356,7 +362,10 @@ async fn lease_lost_mid_stage_stops_posting() {
     assert!(rig.bridge.jobs.sent().is_empty());
 
     let job = rig.job(&s).await;
-    assert_eq!(rig.bridge.post_stage(&thief, &job).await, JobOutcome::Ack);
+    assert_eq!(
+        rig.bridge.post_stage(&TENANT_ZERO, &thief, &job).await,
+        JobOutcome::Ack
+    );
     let done = rig.plan(&s).await;
     assert_eq!(ids(&done), ids(&plan));
     assert!(done.iter().all(|a| a.state == ArticleState::Posted));
@@ -613,3 +622,6 @@ async fn mismatched_safety_bytes_are_not_posted() {
     assert_eq!(rig.bridge.nntp.connects(), 1);
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

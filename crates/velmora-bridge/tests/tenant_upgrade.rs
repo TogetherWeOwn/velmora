@@ -138,14 +138,16 @@ async fn the_first_raise_gc_and_eviction_run_on_a_stamp_of_the_old_build() {
     assert_eq!(blobs(&rig), 2);
     rig.bridge.clock.advance_secs(30 * 24 * 3600);
     assert_eq!(
-        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        rig.bridge
+            .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+            .await,
         JobOutcome::Ack
     );
     assert_eq!(blobs(&rig), 1);
 
     // An eviction step.
-    assert_eq!(rig.bridge.evict_batch(0).await.unwrap(), 0);
-    assert!(rig.bridge.evict_batch(1).await.is_ok());
+    assert_eq!(rig.bridge.evict_batch(&TENANT_ZERO, 0).await.unwrap(), 0);
+    assert!(rig.bridge.evict_batch(&TENANT_ZERO, 1).await.is_ok());
 
     let s = status(&rig).await;
     assert_eq!(s["catalogue_id_mismatch"], false, "{s}");
@@ -168,15 +170,20 @@ async fn a_catalogue_id_made_from_the_tenant_would_be_refused_by_the_old_stamp()
         );
         assert!(wrong_id(rig.bridge.dispatch().await.unwrap_err()), "{id}");
         assert_ne!(
-            rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            rig.bridge
+                .run_job(&TENANT_ZERO, &Job::Gc { v: JOB_VERSION })
+                .await,
             JobOutcome::Ack,
             "{id}"
         );
         assert!(
-            wrong_id(rig.bridge.evict_batch(0).await.unwrap_err()),
+            wrong_id(rig.bridge.evict_batch(&TENANT_ZERO, 0).await.unwrap_err()),
             "{id}"
         );
         assert_eq!(status(&rig).await["catalogue_id_mismatch"], true, "{id}");
         assert_eq!(stamps(&rig), OLD_OBJECTS, "{id}");
     }
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();
