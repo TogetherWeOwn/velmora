@@ -1072,6 +1072,39 @@ async fn a_count_is_not_carried_to_the_other_name_of_a_record() {
     }
 }
 
+/// The cursor of an older build, which did not name a record in one
+/// part: the record is still there, and the replay goes on in it at
+/// the extent the cursor counts, in either layout.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cursor_without_a_name_goes_on_in_a_record_in_one_part() {
+    let limits = ReplayLimits {
+        records: 1,
+        extents: 10,
+    };
+    for layout in [Layout::flat(), Layout::default_tenant()] {
+        let (rig, bucket, _, body) = world(&layout).await;
+        let (name, _) = record_of(&rig, &bucket, "big", &layout).await;
+        wipe(&rig);
+        let mut cursor = replay_into(&rig, limits, 30).await;
+        assert_eq!((cursor.extent, &cursor.name), (30, &name), "{cursor:?}");
+        // As the older build wrote it, and as it comes over the wire.
+        cursor.name.clear();
+        let wire = serde_json::to_string(&cursor).unwrap();
+        assert!(!wire.contains("name"), "{wire}");
+        let cursor: ReplayCursor = serde_json::from_str(&wire).unwrap();
+        let rows = rig.count("extents");
+        let step = rig.bridge.replay_step_within(cursor, limits).await.unwrap();
+        assert_eq!(rig.count("extents"), rows + 10);
+        let cursor = step.next.expect("the replay goes on");
+        assert_eq!((cursor.extent, &cursor.name), (40, &name), "{cursor:?}");
+        let unreadable = replay_from(&rig, limits, cursor).await;
+        assert_eq!(unreadable, Vec::<String>::new());
+        assert_eq!(rig.count("objects"), 3);
+        let signer = reissue_key(&rig).await;
+        assert_eq!(get(&rig, &signer, "big").await.expect(200).body, body);
+    }
+}
+
 /// A record, segmented or in one part, that is gone when the next call
 /// comes for it: the count the cursor had in it is not used in the
 /// record after it, and no name is left in the cursor when no record
