@@ -411,18 +411,23 @@ where
         return Err(ErrorCode::SlowDown.into());
     }
     let policy = policy(&bridge.cfg)?;
-    let target = Target::parse(&req.raw_target, &policy)?;
+    let target = Target::parse(&req.raw_target, &policy);
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
         .filter(|(n, _)| !edge_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
-    let headers = Headers::new(&fields, &policy)?;
-    // The named refusals of `common::authenticate`, in the same order.
-    if let Some(resp) = host_refused(&headers, &bridge.cfg) {
-        return Err(resp.into());
+    let headers = Headers::new(&fields, &policy);
+    // The named refusals of `common::authenticate`, in the same order:
+    // the host before the path is judged.
+    if let Ok(headers) = &headers {
+        if let Some(resp) = host_refused(headers, &bridge.cfg) {
+            return Err(resp.into());
+        }
     }
+    let target = target?;
+    let headers = headers?;
     headers
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;

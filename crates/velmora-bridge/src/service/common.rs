@@ -399,19 +399,25 @@ where
     T: Clock,
 {
     let policy = policy(&bridge.cfg)?;
-    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error)?;
+    let target = Target::parse(&req.raw_target, &policy).map_err(s3_error);
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
         .filter(|(n, _)| !edge_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
-    let headers = Headers::new(&fields, &policy).map_err(s3_error)?;
+    let headers = Headers::new(&fields, &policy).map_err(s3_error);
     // Refusals that name their cause. Neither reads anything but the
-    // request itself and the configuration.
-    if let Some(resp) = host_refused(&headers, &bridge.cfg) {
-        return Err(resp);
+    // request itself and the configuration. The host comes before the
+    // path is judged: on a virtual-hosted request the first segment is a
+    // key, and "not a bucket name" would name the wrong mistake.
+    if let Ok(headers) = &headers {
+        if let Some(resp) = host_refused(headers, &bridge.cfg) {
+            return Err(resp);
+        }
     }
+    let target = target?;
+    let headers = headers?;
     headers
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;

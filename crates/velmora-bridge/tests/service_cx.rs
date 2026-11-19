@@ -277,7 +277,7 @@ async fn the_region_aliases_sign_as_well_as_the_configured_region() {
     // The alias is a name for the scope, not a way around the signature.
     let wrong = Signer {
         region: "us-east-1".to_string(),
-        secret: "another-secret-another-secret-another-00".to_string(),
+        secret: signer.secret.chars().rev().collect(),
         ..signer.clone()
     };
     rig.put(&wrong, BUCKET, "k", b"payload")
@@ -420,6 +420,35 @@ async fn a_wrong_host_is_told_so() {
     // Neither answer names the endpoint a caller should have used.
     assert!(!resp.text().contains(HOST));
 
+    // On a virtual-hosted request the first path segment is a key. One
+    // that could not be a bucket name still gets the answer about the
+    // host, for a multipart call as well.
+    for query in [&[][..], &[("uploads", "")][..]] {
+        let method = if query.is_empty() {
+            Method::Get
+        } else {
+            Method::Post
+        };
+        let mut req = signer.sign(rig.now(), method, "/Photos/image.jpg", query, &[], vec![]);
+        req.set_header("host", &format!("{BUCKET}.{HOST}"));
+        let resp = rig.send(req).await;
+        resp.expect_error(400, "InvalidRequest");
+        assert!(resp.message().starts_with("Virtual-hosted-style requests"));
+    }
+    // With the right host the path is what is refused.
+    let req = signer.sign(
+        rig.now(),
+        Method::Get,
+        "/Photos/image.jpg",
+        &[],
+        &[],
+        vec![],
+    );
+    let plain = rig.send(req).await;
+    plain.expect(400);
+    assert!(!plain.message().contains("Host"));
+    assert!(!plain.message().contains("hosted"));
+
     // The answer is the same for a request that names nothing real.
     let ghost = Signer::new("AKIDUNKNOWN000000000", secret());
     let mut req = ghost.sign(
@@ -458,7 +487,7 @@ async fn only_a_verified_caller_learns_that_a_bucket_is_missing() {
 
     // Not verified: the same answer whatever bucket is named.
     let forged = Signer {
-        secret: "another-secret-another-secret-another-00".to_string(),
+        secret: signer.secret.chars().rev().collect(),
         ..signer.clone()
     };
     let unknown = Signer::new("AKIDUNKNOWN000000000", secret());
@@ -712,7 +741,7 @@ async fn multipart_calls_answer_the_same_way() {
             .expect_error(404, "NoSuchBucket");
     }
     let forged = Signer {
-        secret: "another-secret-another-secret-another-00".to_string(),
+        secret: signer.secret.chars().rev().collect(),
         ..signer.clone()
     };
     let unknown = Signer::new("AKIDUNKNOWN000000000", secret());

@@ -115,12 +115,22 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let admin = ingress::is_admin_url(&req.inner().url());
     // The ray ID: what the request is logged under, and what every
     // answer carries as `x-amz-request-id` (`S3Response::with_request_id`).
+    // A request that did not come through the edge (a service binding)
+    // has no ray ID and is given an ID of its own.
     let request_id = req
         .headers()
         .get("cf-ray")
         .ok()
         .flatten()
-        .unwrap_or_default();
+        .filter(|ray| !ray.is_empty())
+        .unwrap_or_else(|| {
+            use worker::js_sys::{Date, Math};
+            format!(
+                "{:011x}{:08x}-local",
+                Date::now() as u64,
+                (Math::random() * 4_294_967_296.0) as u32
+            )
+        });
     let early = |resp: S3Response| {
         let mut resp = resp;
         if admin {
