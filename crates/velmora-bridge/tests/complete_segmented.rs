@@ -18,6 +18,7 @@ use intent_support::*;
 use service_support::*;
 use velmora_bridge::config::COMPLETE_CHARGE_BYTES;
 use velmora_bridge::ingress::{ByteBudget, Sleeper};
+use velmora_bridge::jobtable::{JOB_QUIET_MS, JOB_WAIT_MS};
 use velmora_bridge::keepalive::{Deferred, KEEPALIVE_BYTE, XML_DECLARATION};
 use velmora_bridge::recovery::{
     read_segment, read_stored_generation, set_id, write_generation, Cut, GenerationHead,
@@ -653,6 +654,31 @@ async fn the_writer_stores_a_head_only_for_the_extents_the_generation_counts() {
     assert!(w.finish(&b.catalog, &g).await.is_err());
     assert!(records(&s.rig).is_empty());
 
+    // Also when the put of that segment never ended and did not fail
+    // either: the push was dropped in the middle of it.
+    let mut w = SegmentWriter::new(
+        &b.safety,
+        &b.kek,
+        &b.cfg.records,
+        &s.bucket,
+        set_id(s.rig.now(), [13; 8]),
+        1,
+    )
+    .unwrap();
+    w.push(&nth(&row, 0)).await.unwrap();
+    let mut empty = nth(&row, 1);
+    empty.plain_size = 0;
+    let stalled = run_until(&s.rig, w.push(&empty), 0, Trip::Stall)
+        .await
+        .stalled();
+    drop(stalled);
+    s.rig.trip().disarm();
+    let mut g = generation.clone();
+    g.extent_count = 2;
+    g.size = row.plain_size;
+    assert!(w.finish(&b.catalog, &g).await.is_err());
+    assert!(records(&s.rig).is_empty());
+
     // The same extents, counted as they are, get their head.
     let mut w = writer(11);
     for seq in 0..PUSHED {
@@ -925,13 +951,175 @@ async fn the_host_gets_a_turn_for_its_timers_after_each_run_of_parts() {
     slept.borrow_mut().clear();
     let resp = s.complete(&listed).await;
     assert!(!failed(&resp), "{}", resp.text());
-    assert_eq!(*slept.borrow(), [0, 0, 0]);
+    // The other timers are the mark of the work and the keepalive.
+    let turns = slept.borrow().iter().filter(|ms| **ms == 0).count();
+    assert_eq!(turns, 3);
     assert!(s.read().await.body == whole);
 }
 
 // ---------------------------------------------------------------------------
 // A failure once the answer has begun
 // ---------------------------------------------------------------------------
+
+/// A scene whose host has timers.
+async fn scene_with_timers() -> Scene {
+    let cfg = seg_config();
+    let budget = ByteBudget::new(cfg.inflight_budget_bytes).with_sleeper(quick_ticks());
+    scene_with_budget(cfg, budget).await
+}
+
+async fn scene_with_budget(cfg: BridgeConfig, budget: ByteBudget) -> Scene {
+    let rig = rig_with_budget(NoNntp, cfg, budget);
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let created = rig
+        .call(
+            &signer,
+            Method::Post,
+            &path(BUCKET, KEY),
+            &[("uploads", "")],
+            &[],
+            b"",
+        )
+        .await;
+    let id = created.values("UploadId").remove(0);
+    Scene {
+        rig,
+        bucket,
+        signer,
+        id,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_charge_of_a_cancelled_invocation_is_given_back() {
+    // The runtime ends an invocation 30 s after its client left: the
+    // work is then neither polled again nor dropped. The charge it
+    // holds would stay for as long as the isolate lives.
+    let s = scene_with_timers().await;
+    let (listed, whole) = three_parts(&s).await;
+    let mut answer = deferred(s.complete_raw(&listed).await);
+    let work = answer.take_work().expect("the work is there once");
+    assert_eq!(s.rig.bridge.budget.in_use(), COMPLETE_CHARGE_BYTES);
+    let running = step_to(&s.rig, work, |rig| keys_under(rig, "m/seg/").len() == 1)
+        .await
+        .stalled();
+    std::mem::forget(running);
+    s.rig.trip().disarm();
+    assert_eq!(s.rig.bridge.budget.in_use(), COMPLETE_CHARGE_BYTES);
+
+    // A work that was marked less than a minute ago may be running.
+    s.rig.bridge.clock.advance_ms(JOB_QUIET_MS - 1);
+    assert_eq!(s.rig.bridge.reap_work(), 0);
+    assert_eq!(s.rig.bridge.budget.in_use(), COMPLETE_CHARGE_BYTES);
+
+    // The next request of the isolate after that drops it.
+    s.rig.bridge.clock.advance_ms(1);
+    assert_eq!(s.read().await.status, 404);
+    assert_eq!(s.rig.bridge.budget.in_use(), 0);
+    assert!(s.rig.bridge.works.is_empty());
+    assert_eq!(s.rig.bridge.works.reaped(), 1);
+    assert!(records(&s.rig).is_empty(), "no head");
+
+    // The upload is open, and the Complete sent again publishes it.
+    let resp = s.complete(&listed).await;
+    assert!(!failed(&resp), "{}", resp.text());
+    assert!(s.read().await.body == whole);
+    assert_eq!(s.rig.bridge.budget.in_use(), 0);
+    assert!(s.rig.bridge.works.is_empty());
+}
+
+/// At the shipped budget a Complete has room only while the jobs hold
+/// 24 MiB or less, and post jobs of 22 MiB come one after another. The
+/// jobs let a Complete that waits go first: the next job waits for it.
+#[tokio::test(flavor = "current_thread")]
+async fn the_jobs_let_a_complete_that_waits_go_first() {
+    use futures_util::FutureExt;
+    let m = MIB as u64;
+    let budget = ByteBudget::new(48 * m)
+        .with_job_capacity(72 * m)
+        .with_sleeper(quick_ticks());
+    let s = scene_with_budget(seg_config(), budget).await;
+    let (listed, whole) = three_parts(&s).await;
+    let budget = &s.rig.bridge.budget;
+    let two_jobs = budget.try_charge_job(44 * m).unwrap();
+    let mut complete = Box::pin(s.complete(&listed));
+    for _ in 0..40 {
+        assert!(complete.as_mut().now_or_never().is_none(), "no room yet");
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(budget.waiting(), 1);
+    // 22 MiB more fit beside the two jobs, and the next job waits.
+    assert!(budget.charge_job(22 * m).now_or_never().is_none());
+    assert_eq!(budget.jobs_in_use(), 44 * m);
+    drop(two_jobs);
+    let resp = complete.await;
+    assert!(!failed(&resp), "{}", resp.text());
+    assert!(s.read().await.body == whole);
+    assert_eq!((budget.in_use(), budget.refused()), (0, 0));
+}
+
+/// Polls `running` for `n` turns of the executor. Whether it is still
+/// pending.
+async fn turns(running: &mut Running<'_, ()>, n: usize) -> bool {
+    for _ in 0..n {
+        let turn = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(running.as_mut().poll(cx).is_pending())
+        });
+        if !turn.await {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_complete_that_does_not_end_is_given_up_by_its_own_invocation() {
+    let s = scene_with_timers().await;
+    let (listed, whole) = three_parts(&s).await;
+    let mut answer = deferred(s.complete_raw(&listed).await);
+    let work = answer.take_work().expect("the work is there once");
+    let mut running = step_to(&s.rig, work, |rig| keys_under(rig, "m/seg/").len() == 1)
+        .await
+        .stalled();
+    s.rig.bridge.clock.advance_ms(JOB_WAIT_MS);
+    assert!(!turns(&mut running, 64).await, "given up at its next mark");
+    s.rig.trip().disarm();
+    assert_eq!(s.rig.bridge.budget.in_use(), 0);
+    assert!(s.rig.bridge.works.is_empty());
+    let (doc, _) = read_stream(answer.into_stream(quick_ticks(), 5_000)).await;
+    assert!(doc.contains("<Code>InternalError</Code>"), "{doc}");
+    assert!(records(&s.rig).is_empty(), "no head");
+
+    let resp = s.complete(&listed).await;
+    assert!(!failed(&resp), "{}", resp.text());
+    assert!(s.read().await.body == whole);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_running_complete_is_marked_and_not_dropped() {
+    // Its invocation marks the work on a timer of its own, so however
+    // long it runs it is never taken for one that is gone.
+    let s = scene_with_timers().await;
+    let (listed, whole) = three_parts(&s).await;
+    let mut answer = deferred(s.complete_raw(&listed).await);
+    let work = answer.take_work().expect("the work is there once");
+    let mut running = step_to(&s.rig, work, |rig| keys_under(rig, "m/seg/").len() == 1)
+        .await
+        .stalled();
+    // Twelve minutes, stalled at a put: its timer goes on.
+    for _ in 0..24 {
+        s.rig.bridge.clock.advance_ms(JOB_QUIET_MS / 2);
+        assert!(turns(&mut running, 64).await, "stalled");
+        assert_eq!(s.rig.bridge.reap_work(), 0);
+    }
+    resume(&s.rig, running).await;
+    let (doc, _) = read_stream(answer.into_stream(quick_ticks(), 5_000)).await;
+    assert!(doc.contains("CompleteMultipartUploadResult"), "{doc}");
+    assert!(s.read().await.body == whole);
+    assert_eq!(s.rig.bridge.budget.in_use(), 0);
+    assert!(s.rig.bridge.works.is_empty());
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_failure_after_the_headers_is_an_error_document() {

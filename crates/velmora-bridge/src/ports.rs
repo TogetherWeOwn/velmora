@@ -1166,6 +1166,10 @@ pub struct Bridge<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek
     pub clock: T,
     /// Per-isolate in-flight bytes (DESIGN §A.2).
     pub budget: ByteBudget,
+    /// The deferred work of requests that holds a charge, where a later
+    /// invocation can drop what a cancelled one left
+    /// ([`Bridge::tabled`](crate::service), [`Bridge::reap_work`]).
+    pub works: crate::jobtable::WorkTable,
     /// Validated configuration.
     pub cfg: BridgeConfig,
 }

@@ -588,6 +588,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
             jobs: Jobs::default(),
             kek: TestKek::new(),
             clock: FixedClock::new(T0),
+            works: Default::default(),
             budget,
             cfg,
         }),

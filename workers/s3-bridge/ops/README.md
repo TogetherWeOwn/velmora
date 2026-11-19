@@ -743,10 +743,17 @@ extents or fewer is recorded in one document, byte for byte as before.
 10 000 and no segmented record is written. This build alone changes
 nothing: the limit is raised by a setting, and only after a drill of
 the segmented path on a deployment of its own has passed. Raise it only
-on a build in which DeleteObject, a conditional write and UploadPartCopy
-read no extent rows they do not need, and CopyObject refuses a source
-above 10 000 extents: without that, those calls load every extent row
-of a large object in one result.
+on a build in which:
+
+1. DeleteObject, a conditional write and UploadPartCopy read no extent
+   rows they do not need, and CopyObject refuses a source above 10 000
+   extents: without that, those calls load every extent row of a large
+   object in one result.
+2. The cut of a Complete by the runtime has been drilled on a deployed
+   Worker ("The cut drill" below) and the 32 MiB came back.
+3. The drill has measured a Complete beside running post jobs: how long
+   it waited for its charge and how many answered 503 (see the charge
+   below).
 
 | Setting | Shipped | The build takes | What it bounds |
 |---|---|---|---|
@@ -782,7 +789,13 @@ of a large object in one result.
   with a newline every 5 s in between; a failure after the headers is
   an `<Error>` document in that `200`, as S3 itself answers this call.
   aws-cli, boto3 and rclone read it. When the client goes away the work
-  goes on for at most 30 s more. Work that is cut there has either
+  goes on for at most 30 s more. Work that is cut there is not run and
+  not dropped by the runtime, so what it holds would stay held: the
+  isolate keeps such work in a table, the work marks it every 5 s, and
+  each request and each queue batch first drops the work that has not
+  marked it for 60 s. That gives the 32 MiB back and logs
+  `work table: abandoned work dropped: ... budget_in_use_before=...
+  budget_in_use=...`. Work that is cut has either
   published the object or left it unpublished (with its segments, and
   perhaps its head, as they are); a missing answer says neither. Send
   the request again: after a publication it is answered from the
@@ -794,7 +807,22 @@ of a large object in one result.
   it runs; without room it answers 503 `SlowDown`. With
   `MAX_OBJECT_EXTENTS` above 10 000 the Worker refuses to start with a
   budget below that. With the budget of 48 MiB one isolate runs one such
-  Complete at a time. Measured in a local workerd (wasm memory of the
+  Complete at a time.
+  Beside it the jobs have 24 MiB of their 72 MiB: one post job of a
+  16 MiB extent (22 MiB), not two. So that jobs which come one after
+  another do not keep a Complete out for good, a job that would keep a
+  waiting Complete out waits itself (it gives its lease back unspent
+  when it has waited 20 s, as for any full budget) until the Complete
+  has its charge or gives up; the jobs that run finish first. A job
+  that leaves room beside the Complete is not held back, and nothing
+  changes while no Complete waits. A Complete whose request was stopped
+  while it waited holds the jobs back for 2 s, once.
+  The budget was not raised instead: a Complete and two such post jobs
+  hold about 74 MiB, above the 72 MiB that the isolate is sized for, and
+  a request budget of 64 MiB would let two 16 MiB bodies in at once on
+  every deployment (96 MiB at the weight of a request), whether or not
+  it stores large objects.
+  Measured in a local workerd (wasm memory of the
   isolate, 1.6 MiB before): 31.1 MiB at the end of a Complete of
   131 072 extents (29.6 MiB more), 25.1 MiB at 65 536 (23.5 MiB more);
   6.8 s and 3.2 s, 43 and 27 catalogue reads, 34 and 18 record puts,
@@ -824,6 +852,31 @@ of `PUBLISH_CHUNK_ROWS` more than 128 values (a restore asks the
 catalogue twice a value in one call): a drill sets a small
 `MAX_OBJECT_EXTENTS` with them. Production
 and dev set none of them, and a contract test holds them to that.
+
+**The cut drill.** On a drill Worker with `ENVIRONMENT=dev` (never
+production), to see that a Complete which the runtime cut gives its
+charge back:
+
+1. Set small `RECORD_SEGMENT_AFTER` and `RECORD_SEGMENT_EXTENTS`,
+   `DEV_MEMORY_LOG=on`, and `DEV_SEGMENT_PUT_DELAY_MS` so that the
+   segments of the drill object take about 90 s together (the delay is
+   at most 60 000 ms a put, and is ignored outside dev). Start
+   `wrangler tail`.
+2. Upload the parts, then send the Complete with `curl --max-time 5`:
+   the client leaves while the segments are stored.
+3. Wait 60 s (the runtime stops the invocation about 30 s after the
+   client left) and then 60 s more for the mark to go quiet. Send any
+   request: the tail shows `work table: abandoned work dropped` with
+   `budget_in_use_before=33554432` and `budget_in_use=0`, and the
+   `memory:` line of that request shows `budget_in_use=0` (plus what
+   the request itself holds). All of it has to come from one isolate:
+   compare `isolate=` in the lines.
+4. Control: the same Complete with a client that stays (no
+   `--max-time`). It answers after about 90 s with the result document,
+   the object reads back, no `abandoned work` line appears, and
+   `budget_in_use` is 0 afterwards.
+5. Send the cut Complete again: it publishes or answers from the
+   receipt.
 
 **Rollback.** Once one segmented record exists, never roll back to a
 version older than the first one that reads segmented records in the

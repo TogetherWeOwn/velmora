@@ -318,6 +318,7 @@ impl Fx {
             jobs: FakeJobs::new(),
             kek: TestKek::new(),
             clock: SharedClock(Rc::clone(&clock)),
+            works: Default::default(),
             budget: ByteBudget::new(BUDGET),
             cfg,
         };

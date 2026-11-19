@@ -1621,6 +1621,7 @@ async fn contract_compiles_against_fakes() {
         jobs,
         kek,
         clock,
+        works: Default::default(),
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });

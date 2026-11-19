@@ -86,6 +86,13 @@ pub enum Ran<T> {
     },
 }
 
+/// The table of the work a request goes on with after its answer has
+/// begun (a deferred document), when that work holds a charge. A
+/// request has no limit of wall time while its client is there, so its
+/// work is dropped for being quiet ([`JobTable::reap_quiet`]) and never
+/// for its age.
+pub type WorkTable = JobTable<'static, Vec<u8>>;
+
 struct Slot<'a, T> {
     id: u64,
     started: UnixMs,

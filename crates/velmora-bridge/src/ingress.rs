@@ -52,6 +52,13 @@ pub const CHARGE_POLL_MS: u32 = 100;
 /// the others back no longer than this.
 pub const TURN_WAIT_MS: u32 = 5_000;
 
+/// How long a job charge lets a charge that goes ahead of the jobs
+/// ([`ByteBudget::charge_ahead`]) keep it waiting when that charge is
+/// not polled: its request was stopped and nothing took it off the list.
+/// One that is polled marks itself every [`CHARGE_POLL_MS`] and is
+/// waited for as long as it waits ([`CHARGE_WAIT_MS`] at most).
+pub const AHEAD_QUIET_MS: u32 = 2_000;
+
 /// Longest accepted `Content-Length` value (digits). `u64::MAX` has 20.
 const MAX_LENGTH_DIGITS: usize = 20;
 /// Largest accepted DeleteObjects body: 1000 keys of 1024 bytes, each
@@ -497,6 +504,14 @@ struct Listed {
     number: u64,
     requests: u64,
     jobs: u64,
+    /// Whether the jobs let this one go first
+    /// ([`ByteBudget::charge_ahead`]).
+    ahead: bool,
+    /// How often this one was polled while it waited.
+    mark: u64,
+    /// Set by a job that saw no new mark for [`AHEAD_QUIET_MS`]: no job
+    /// waits for this one until it is polled again.
+    quiet: bool,
 }
 
 /// One charge that waits for room, from its first wait until it is
@@ -551,6 +566,34 @@ impl BudgetState {
                 self.fits(requests, all_jobs)
                     && !self.fits(requests.saturating_add(own), all_jobs.saturating_add(jobs))
             })
+    }
+}
+
+impl BudgetState {
+    /// The charge ahead that a job charge of `bytes` would keep out, if
+    /// there is one, with its mark: one that has no room beside the jobs
+    /// that run and these bytes. A job that leaves room for every such
+    /// charge is not held back, and nobody is while none waits.
+    fn ahead_of(&self, bytes: u64) -> Option<(u64, u64)> {
+        let jobs = self.jobs.get().saturating_add(bytes);
+        self.waiting
+            .borrow()
+            .iter()
+            .filter(|w| w.ahead && !w.quiet)
+            .find(|w| !self.fits(self.requests.get().saturating_add(w.requests), jobs))
+            .map(|w| (w.number, w.mark))
+    }
+
+    /// Changes the listing of the charge that waits under `number`.
+    fn relist(&self, number: u64, change: impl FnOnce(&mut Listed)) {
+        if let Some(w) = self
+            .waiting
+            .borrow_mut()
+            .iter_mut()
+            .find(|w| w.number == number)
+        {
+            change(w);
+        }
     }
 }
 
@@ -778,7 +821,7 @@ impl ByteBudget {
     /// [`TURN_WAIT_MS`] at most, then this charge takes what is free
     /// like any other.
     pub async fn charge_in_turn(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, false, true).await
+        self.charge_as(bytes, false, true, false).await
     }
 
     /// Charges `bytes` for a request, waiting up to [`CHARGE_WAIT_MS`] for
@@ -786,13 +829,27 @@ impl ByteBudget {
     /// the whole capacity can never fit and fails at once. The caller has
     /// not read the body.
     pub async fn charge(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, false, false).await
+        self.charge_as(bytes, false, false, false).await
+    }
+
+    /// As [`Self::charge`], and the jobs let it go first: while it
+    /// waits, a job charge that would keep it out
+    /// ([`Self::charge_job`]) waits too, so the room the running jobs
+    /// give back is not taken by the next job. For a large fixed charge
+    /// of a request that is rare and that a client waits for (the
+    /// Complete of an upload with a segmented record): jobs that come
+    /// one after another would otherwise never leave room for it. A job
+    /// that leaves room beside it is not held back. One whose request
+    /// was stopped holds the jobs back for [`AHEAD_QUIET_MS`] at most.
+    pub async fn charge_ahead(&self, bytes: u64) -> Result<Charge, IngressError> {
+        self.charge_as(bytes, false, false, true).await
     }
 
     /// [`ByteBudget::charge`] for a background job: the same wait, against
-    /// the job limit.
+    /// the job limit, and after a charge that goes ahead of the jobs
+    /// ([`Self::charge_ahead`]) and that these bytes would keep out.
     pub async fn charge_job(&self, bytes: u64) -> Result<Charge, IngressError> {
-        self.charge_as(bytes, true, false).await
+        self.charge_as(bytes, true, false, false).await
     }
 
     async fn charge_as(
@@ -800,6 +857,7 @@ impl ByteBudget {
         bytes: u64,
         job: bool,
         in_turn: bool,
+        ahead: bool,
     ) -> Result<Charge, IngressError> {
         let limit = if job {
             self.state.job_capacity
@@ -813,7 +871,32 @@ impl ByteBudget {
         // Listed while this waits, so a charge that takes its turn sees
         // it; taken off the list when this returns or is dropped.
         let mut waiting: Option<Waiting> = None;
+        // The charge ahead that holds this job back, the mark it had
+        // when this job first saw it so, and the time since.
+        let mut watched: Option<(u64, u64, u32)> = None;
         loop {
+            // A job lets a charge ahead go first while that one is
+            // polled: one that shows no new mark for long enough was
+            // stopped, and is waited for by no job from then on.
+            let yields = job && {
+                let seen = self.state.ahead_of(bytes);
+                watched = match (seen, watched) {
+                    (Some((number, mark)), Some((n, m, since))) if (n, m) == (number, mark) => {
+                        Some((n, m, since.saturating_add(CHARGE_POLL_MS)))
+                    }
+                    (Some((number, mark)), _) => Some((number, mark, 0)),
+                    (None, _) => None,
+                };
+                match watched {
+                    Some((number, _, since)) if since >= AHEAD_QUIET_MS => {
+                        self.state.relist(number, |w| w.quiet = true);
+                        watched = None;
+                        // There may be another one behind it.
+                        continue;
+                    }
+                    held_back => held_back.is_some(),
+                }
+            };
             // Someone who waited before this one, and whom only its
             // request keeps out, is served first: for a bounded time.
             let behind = in_turn && waited < TURN_WAIT_MS && {
@@ -821,7 +904,7 @@ impl ByteBudget {
                 let (requests, jobs) = if job { (0, bytes) } else { (bytes, 0) };
                 self.state.in_the_way(requests, jobs, self.held(), mine)
             };
-            if !behind {
+            if !behind && !yields {
                 if let Some(c) = self.try_charge_as(bytes, job) {
                     return Ok(c);
                 }
@@ -842,6 +925,9 @@ impl ByteBudget {
                     number,
                     requests,
                     jobs,
+                    ahead,
+                    mark: 0,
+                    quiet: false,
                 });
                 waiting = Some(Waiting {
                     state: Rc::clone(&self.state),
@@ -850,6 +936,13 @@ impl ByteBudget {
             }
             sleep(CHARGE_POLL_MS).await;
             waited = waited.saturating_add(CHARGE_POLL_MS);
+            if let Some(w) = waiting.as_ref().filter(|_| ahead) {
+                // Polled again: the jobs see that this one is alive.
+                self.state.relist(w.number, |w| {
+                    w.mark = w.mark.wrapping_add(1);
+                    w.quiet = false;
+                });
+            }
         }
     }
 

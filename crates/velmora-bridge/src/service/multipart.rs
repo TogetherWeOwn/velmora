@@ -37,8 +37,10 @@
 //! client-supplied object checksum or a `COMPOSITE` type with `501`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::rc::Rc;
 
+use futures_util::future::LocalBoxFuture;
 use sha2::{Digest, Sha256};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{
@@ -1500,6 +1502,53 @@ where
     }))
 }
 
+/// Runs `work`, which holds a charge, in the table of the isolate
+/// ([`Bridge::works`]), and marks it there every
+/// [`JOB_BEAT_MS`](crate::jobtable::JOB_BEAT_MS) on a timer of this
+/// invocation.
+///
+/// The work runs under the invocation's `waitUntil`, which the runtime
+/// ends at most 30 s after the client left. What ran under it is then
+/// neither polled again nor dropped, so in the frame of the invocation
+/// the charge would be held for as long as the isolate lives. In the
+/// table its mark goes stale instead, and the next request of the
+/// isolate drops it ([`Bridge::reap_work`]): the charge and the memory
+/// it stands for go together.
+///
+/// `gone` is the document when the work was dropped while this
+/// invocation still ran: its timer was a minute late, or the work did
+/// not end in [`JOB_WAIT_MS`](crate::jobtable::JOB_WAIT_MS).
+///
+/// A host without timers has nothing to mark with: its work runs in
+/// the frame of the invocation.
+fn tabled<C, B, N, J, K, T>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    work: impl Future<Output = Vec<u8>> + 'static,
+    gone: impl FnOnce() -> Vec<u8> + 'static,
+) -> LocalBoxFuture<'static, Vec<u8>>
+where
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+{
+    let Some(sleep) = bridge.budget.sleeper().cloned() else {
+        return Box::pin(work);
+    };
+    let started = bridge.clock.now();
+    let running = bridge.works.run(started, work);
+    let bridge = Rc::clone(bridge);
+    Box::pin(async move {
+        let beat = || sleep(crate::jobtable::JOB_BEAT_MS as u32);
+        match running.marked(started, || bridge.clock.now(), beat).await {
+            crate::jobtable::Ran::Done(doc) => doc,
+            _ => gone(),
+        }
+    })
+}
+
 /// The document of an answer, as a deferred body sends it after the
 /// XML declaration.
 fn document(resp: S3Response) -> Vec<u8> {
@@ -1583,7 +1632,7 @@ where
     // for it the client is told to come back.
     let charge = bridge
         .budget
-        .charge(crate::config::COMPLETE_CHARGE_BYTES)
+        .charge_ahead(crate::config::COMPLETE_CHARGE_BYTES)
         .await?;
     let work = {
         let bridge = Rc::clone(bridge);
@@ -1595,6 +1644,7 @@ where
     // Work that was dropped: the upload is published or it is not, and
     // a Complete sent again answers from the receipt or publishes.
     let fallback = || document(s3_error(ErrorCode::InternalError));
+    let work = tabled(bridge, work, fallback);
     Ok(S3Response {
         status: 200,
         headers: vec![("content-type".to_string(), "application/xml".to_string())],

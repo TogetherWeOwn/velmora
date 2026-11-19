@@ -1556,6 +1556,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         jobs: FakeJobs::new(),
         kek: TestKek::new(),
         clock: FixedClock::new(T0),
+        works: Default::default(),
         budget: ByteBudget::new(48 * 1024 * 1024),
         cfg,
     };

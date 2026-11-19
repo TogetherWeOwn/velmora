@@ -667,7 +667,13 @@ impl BridgeConfig {
         if inflight_budget_bytes < max_extent_bytes.saturating_mul(2) {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }
-        // A Complete of a segmented record is charged a fixed sum.
+        // A Complete of a segmented record is charged a fixed sum. The
+        // rule is that it fits an idle isolate and no more: beside
+        // running jobs it gets its room because the jobs let it go
+        // first (`ByteBudget::charge_ahead`), not from a larger budget.
+        // Room for it beside two post jobs would be a request budget
+        // that also lets two maximal bodies in at once, on every
+        // deployment (`ops/README.md`, "Large objects").
         if max_object_extents > record_cut.after && inflight_budget_bytes < COMPLETE_CHARGE_BYTES {
             return Err(ConfigError::Invalid("INFLIGHT_BUDGET_BYTES".into()));
         }

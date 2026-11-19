@@ -65,6 +65,9 @@ struct Slot {
 /// is handed over, so dropping the body does not stop it. Once the client
 /// is gone the runtime gives `waitUntil` at most 30 s more: keys not done
 /// by then stay as they are, and a re-send of the request finishes them.
+/// Work that is cut there is neither polled again nor dropped; work that
+/// holds a charge therefore runs in the bridge's table, where the next
+/// invocation drops it (`log_budget`).
 async fn handle_detached(
     ctx: &Context,
     bridge: Rc<env::WorkerBridge>,
@@ -239,10 +242,23 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
     }
 }
 
-/// Drops the jobs of invocations that are gone, and says when the byte
-/// budget of this isolate stays full. Counts, sizes and times only.
+/// Drops the jobs and the deferred work of invocations that are gone,
+/// and says when the byte budget of this isolate stays full. Counts,
+/// sizes and times only.
 fn log_budget(bridge: &env::WorkerBridge) {
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
+    let before = bridge.budget.in_use();
+    let dropped = bridge.reap_work();
+    if dropped > 0 {
+        console_error!(
+            "work table: abandoned work dropped: isolate={} dropped={dropped} \
+             budget_in_use_before={before} budget_in_use={} running_work={} dropped_total={}",
+            env::isolate(),
+            bridge.budget.in_use(),
+            bridge.works.len(),
+            bridge.works.reaped(),
+        );
+    }
     if let Some(line) = jobs::reap(&bridge.budget, env::isolate(), now) {
         console_error!("{line}");
     }

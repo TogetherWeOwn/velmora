@@ -8,7 +8,11 @@
 //! Dev only: `DEV_TOMBSTONE_PUT_DELAY_MS` makes every put of a tombstone
 //! record to the safety store wait that long first (a slow store), so the
 //! local acceptance run can make a DeleteObjects outlast a client's read
-//! timeout. Outside `ENVIRONMENT=dev` the variable is ignored.
+//! timeout. `DEV_SEGMENT_PUT_DELAY_MS` does the same for every put of a
+//! segment of a generation record, so a drill can make a
+//! CompleteMultipartUpload outlast the time the runtime gives an
+//! invocation whose client has left. Outside `ENVIRONMENT=dev` the
+//! variables are ignored.
 
 use std::collections::HashMap;
 
@@ -30,7 +34,12 @@ pub struct R2Blobs {
     bucket: Bucket,
     /// Dev only: the wait before a tombstone put, in milliseconds.
     tombstone_delay_ms: u32,
+    /// Dev only: the wait before the put of a segment, in milliseconds.
+    segment_delay_ms: u32,
 }
+
+/// Name of the dev-only segment put delay variable.
+pub const DEV_SEGMENT_PUT_DELAY_MS: &str = "DEV_SEGMENT_PUT_DELAY_MS";
 
 /// Name of the dev-only tombstone put delay variable.
 pub const DEV_TOMBSTONE_PUT_DELAY_MS: &str = "DEV_TOMBSTONE_PUT_DELAY_MS";
@@ -42,6 +51,19 @@ const MAX_TOMBSTONE_DELAY_MS: u32 = 60_000;
 /// read (0). In dev, absent or empty is 0, and anything other than an
 /// integer up to [`MAX_TOMBSTONE_DELAY_MS`] is refused.
 pub fn tombstone_delay_from_var(dev: bool, raw: Option<&str>) -> std::result::Result<u32, String> {
+    put_delay_from_var(dev, raw, DEV_TOMBSTONE_PUT_DELAY_MS)
+}
+
+/// As [`tombstone_delay_from_var`], for [`DEV_SEGMENT_PUT_DELAY_MS`].
+pub fn segment_delay_from_var(dev: bool, raw: Option<&str>) -> std::result::Result<u32, String> {
+    put_delay_from_var(dev, raw, DEV_SEGMENT_PUT_DELAY_MS)
+}
+
+fn put_delay_from_var(
+    dev: bool,
+    raw: Option<&str>,
+    name: &str,
+) -> std::result::Result<u32, String> {
     if !dev {
         return Ok(0);
     }
@@ -51,7 +73,7 @@ pub fn tombstone_delay_from_var(dev: bool, raw: Option<&str>) -> std::result::Re
             .parse::<u32>()
             .ok()
             .filter(|ms| *ms <= MAX_TOMBSTONE_DELAY_MS)
-            .ok_or_else(|| format!("invalid {DEV_TOMBSTONE_PUT_DELAY_MS}")),
+            .ok_or_else(|| format!("invalid {name}")),
     }
 }
 
@@ -60,6 +82,7 @@ impl R2Blobs {
         R2Blobs {
             bucket,
             tombstone_delay_ms: 0,
+            segment_delay_ms: 0,
         }
     }
 
@@ -67,6 +90,23 @@ impl R2Blobs {
     pub fn with_tombstone_delay(mut self, ms: u32) -> Self {
         self.tombstone_delay_ms = ms;
         self
+    }
+
+    /// Dev only (see the module docs).
+    pub fn with_segment_delay(mut self, ms: u32) -> Self {
+        self.segment_delay_ms = ms;
+        self
+    }
+}
+
+/// Whether `key` names a segment of a generation record, in either
+/// layout: `m/seg/…` or `m/x/<tenant>/seg/…`.
+fn is_segment_key(key: &str) -> bool {
+    match key.strip_prefix("m/x/") {
+        Some(rest) => rest
+            .split_once('/')
+            .is_some_and(|(_, rest)| rest.starts_with("seg/")),
+        None => key.starts_with("m/seg/"),
     }
 }
 
@@ -115,6 +155,10 @@ impl BlobStore for R2Blobs {
             && record_name(key).is_some_and(|n| n.kind == RecordKind::Tombstone)
         {
             let wait = std::time::Duration::from_millis(u64::from(self.tombstone_delay_ms));
+            worker::Delay::from(wait).await;
+        }
+        if self.segment_delay_ms > 0 && is_segment_key(key) {
+            let wait = std::time::Duration::from_millis(u64::from(self.segment_delay_ms));
             worker::Delay::from(wait).await;
         }
         self.bucket
@@ -255,6 +299,23 @@ impl BlobStore for R2Blobs {
 mod tests {
     use super::*;
     use velmora_bridge::{BucketId, ExtentId};
+
+    #[test]
+    fn a_segment_key_is_told_in_both_layouts() {
+        for key in ["m/seg/s_1/0", "m/x/t_0000000000000000/seg/s_1/12"] {
+            assert!(is_segment_key(key), "{key}");
+        }
+        for key in [
+            "m/g_1",
+            "m/del/d_1",
+            "m/x/t_0000000000000000/g_1",
+            "m/x/seg/g_1",
+            "seg/s_1/0",
+            "x/seg/s_1/0",
+        ] {
+            assert!(!is_segment_key(key), "{key}");
+        }
+    }
 
     #[test]
     fn metadata_names_bucket_extent_and_digest() {
