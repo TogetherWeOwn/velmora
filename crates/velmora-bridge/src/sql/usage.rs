@@ -559,7 +559,12 @@ pub(super) async fn recount_step<S: Sql>(
             let changed = c.sql.batch(finish_stmts(now)).await?;
             // Ended by this call, not by another that ran beside it.
             if changed.last().copied().unwrap_or(0) == 1 {
-                step.finished = recount_record(c, Some(state.started_at)).await?;
+                // The record of the pass this step saw; after a restart
+                // in between there is none, and the last one is it.
+                step.finished = match recount_record(c, Some(state.started_at)).await? {
+                    Some(record) => Some(record),
+                    None => last_recount(c).await?,
+                };
             }
             return Ok(step);
         }

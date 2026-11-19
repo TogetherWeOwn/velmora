@@ -531,28 +531,32 @@ async fn cost<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T:
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<S3Response> {
     let none = || fail(404, "NoCostReport", "No cost report has been written.");
-    let size = bridge
-        .cache
-        .head(COST_REPORT_KEY)
-        .await
-        .or_internal()?
-        .ok_or_else(none)?;
-    if size > MAX_COST_REPORT {
-        return Err(fail(502, "BadCostReport", "The cost report is too large."));
-    }
-    // Exactly the bytes the HEAD saw, and so no more than the limit: a
-    // report replaced by a larger one since is cut short and fails as
-    // JSON below, without being held whole.
-    let span = crate::types::ByteSpan {
-        start: 0,
-        len: size,
+    // The range is exactly the bytes a HEAD saw, and so no more than
+    // the limit: a report replaced by a larger one since is cut short
+    // and fails as JSON below, without being held whole. A report
+    // replaced by a shorter one fails the read; that is tried again.
+    let mut tries = 0;
+    let bytes = loop {
+        tries += 1;
+        let size = bridge
+            .cache
+            .head(COST_REPORT_KEY)
+            .await
+            .or_internal()?
+            .ok_or_else(none)?;
+        if size > MAX_COST_REPORT {
+            return Err(fail(502, "BadCostReport", "The cost report is too large."));
+        }
+        let span = crate::types::ByteSpan {
+            start: 0,
+            len: size,
+        };
+        match bridge.cache.get(COST_REPORT_KEY, Some(span)).await {
+            Ok(bytes) => break bytes.ok_or_else(none)?,
+            Err(_) if tries < 2 => {}
+            Err(e) => return Err(e).or_internal(),
+        }
     };
-    let bytes = bridge
-        .cache
-        .get(COST_REPORT_KEY, Some(span))
-        .await
-        .or_internal()?
-        .ok_or_else(none)?;
     let report: Value = serde_json::from_slice(&bytes)
         .map_err(|_| fail(502, "BadCostReport", "The cost report is not JSON."))?;
     Ok(ok(&report))

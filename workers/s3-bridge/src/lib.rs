@@ -170,7 +170,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // A request without a ray id (one through a service binding)
         // is drawn by its place in this isolate's count instead.
         let drawn = if request_id.is_empty() {
-            format!("n{}", metrics::next())
+            // The start time too: every isolate counts from one.
+            format!("{started}n{}", metrics::next())
         } else {
             request_id.clone()
         };
@@ -178,6 +179,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             let seen = velmora_bridge::metrics::Request {
                 method: &method,
                 admin,
+                sub: internal,
                 status,
                 latency_ms: worker::Date::now().as_millis().saturating_sub(started),
                 bytes_in,

@@ -38,6 +38,9 @@ pub struct Request<'a> {
     pub method: &'a str,
     /// The request went to `/_admin`.
     pub admin: bool,
+    /// A sub-request of a large GET, which gets a point only when it
+    /// failed: it is told apart from the GET it belongs to.
+    pub sub: bool,
     pub status: u16,
     /// From the first byte of the request to the response headers.
     pub latency_ms: u64,
@@ -94,7 +97,8 @@ pub fn weight(status: u16, sample: u32, request_id: &str) -> Option<u32> {
 
 /// The point of one request.
 ///
-/// blobs: kind (`req`), method, status class, route (`s3` or `admin`),
+/// blobs: kind (`req`), method, status class, route (`s3`, `admin`, or `sub` for
+/// a failed sub-request of a large GET),
 /// colo. doubles: status, latency in ms, request bytes, response bytes,
 /// weight.
 pub fn request_point(r: &Request<'_>, weight: u32) -> Point {
@@ -104,7 +108,11 @@ pub fn request_point(r: &Request<'_>, weight: u32) -> Point {
             "req",
             method(r.method),
             class(r.status),
-            if r.admin { "admin" } else { "s3" },
+            match (r.sub, r.admin) {
+                (true, _) => "sub",
+                (false, true) => "admin",
+                (false, false) => "s3",
+            },
         ],
         colo: colo(r.colo),
         doubles: vec![
@@ -136,6 +144,7 @@ mod tests {
         Request {
             method,
             admin: false,
+            sub: false,
             status,
             latency_ms: 12,
             bytes_in: 3,
@@ -180,9 +189,12 @@ mod tests {
         assert_eq!(p.colo, "IAD");
         let admin = Request {
             admin: true,
+            sub: false,
             ..req("POST", 204, "EWR")
         };
         assert_eq!(request_point(&admin, 10).blobs[3], "admin");
+        let sub = Request { sub: true, ..admin };
+        assert_eq!(request_point(&sub, 1).blobs[3], "sub");
     }
 
     #[test]

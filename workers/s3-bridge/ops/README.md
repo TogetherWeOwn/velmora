@@ -994,7 +994,8 @@ on the S3 host names.
 
 Request metrics go to the Analytics Engine dataset bound as `METRICS`:
 one request in `METRICS_SAMPLE` (default 10) and every 5xx. A point has
-the method, the status class, `s3` or `admin`, and the colo as text,
+the method, the status class, `s3` or `admin` (or `sub`: a failed
+sub-request of a large GET), and the colo as text,
 and the status, latency in ms, request bytes, response bytes and the
 sampling weight as numbers; sum the weight to estimate request counts.
 A run of reads from Usenet (cache misses) is a point of kind `cold`,
