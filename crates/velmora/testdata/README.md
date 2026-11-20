@@ -117,3 +117,12 @@ ChaCha20-Poly1305) opens the payload under the unwrapped key.
 velmora's Random-mode writer reproduces rage's payload byte for byte (by
 length and SHA-256, and in full for the short ones) and that velmora's
 reader opens it.
+
+## rs-parity
+
+`rs-parity/vectors.py` is an independent model of the repair-parity code
+(`src/rs.rs`): standard-library Python, the field built from the
+polynomial, parity computed from the definition. It printed the fixed
+vectors in `tests/rs_parity.rs` (three tiny stripes in hex, and the
+SHA-256 of each parity shard of five stripes at the real article sizes).
+Run it with `python3 -I rs-parity/vectors.py` to reproduce them.

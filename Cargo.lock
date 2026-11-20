@@ -1565,6 +1565,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "velmora-parity-bench"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "velmora",
+]
+
+[[package]]
 name = "velmora-s3-bridge"
 version = "0.1.0"
 dependencies = [
