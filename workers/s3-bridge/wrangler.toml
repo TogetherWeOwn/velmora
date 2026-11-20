@@ -133,7 +133,7 @@ INTENT_SWEEP = "off"
 RECOVERY_COPY = "off"
 # d1 | do. Where provider connection permits come from. d1: slot rows of
 # the catalogue (provider_permits), a row write for every acquire,
-# renewal and release. do: the permit gate below holds them in memory
+# renewal and release. do: the permit gate (see below) holds them in memory
 # and the catalogue writes none. Both kinds of Worker can run against one
 # catalogue: a gate hands out nothing on an account until it holds every
 # slot row of it, and gives the rows back only once nothing it handed out
@@ -192,29 +192,18 @@ GET_FANOUT_BYTES = "1073741824"
 binding = "SELF"
 service = "velmora-s3"
 
-# The permit gate (src/gate.rs): provider permits in memory, for
-# PERMITS = "do". With PERMITS = "d1" it is called only to retire a
-# gate that still holds slot rows (after a change back). One object per
-# provider account (per pool, for accounts that share pool_max_conns),
-# named permits:<unit>:<shard>. Optional vars: PERMIT_SHARDS (1 to 64,
-# default 1) divides each account over that many objects; PERMIT_GATES
-# (account | one, default account) = "one" puts every account behind the
-# same objects. A job holds one hibernating WebSocket per gate while it
-# has slots: slots live in memory and with the socket, not in storage,
-# and the object bills no duration between two messages.
-[[durable_objects.bindings]]
-name = "PERMIT_GATE"
-class_name = "PermitGate"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["PermitGate"]
-
-# The id of the deployed version: a gate that starts under new code with
-# no session left waits out the slots of the old (one stored row per
-# deploy and gate).
-[version_metadata]
-binding = "CF_VERSION_METADATA"
+# The permit gate (src/gate.rs, class PermitGate) is not declared or
+# bound here yet, so this Worker takes its permits from the catalogue
+# (PERMITS = "d1" above; "do" without the binding refuses to start).
+# Declaring a Durable Object class is a deploy that can never be rolled
+# back past, so the class, its binding and PERMITS = "do" each come in a
+# deploy of their own, in this order (see "Shipping the gate" in
+# ops/README.md, which has the exact tables):
+#   2. `[exports.PermitGate]` alone (one-way; nothing can reach it).
+#   3. The `PERMIT_GATE` binding and `[version_metadata]` (reversible).
+#   4. PERMITS = "do" (reversible).
+# Never with the legacy `[[migrations]]` array: once a class is declared
+# by `exports`, Cloudflare refuses a deploy that goes back to it.
 
 [[d1_databases]]
 binding = "CATALOG"
@@ -435,6 +424,14 @@ vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "
 [[env.dev.services]]
 binding = "SELF"
 service = "velmora-s3-dev"
+
+# The permit gate, declared and bound in dev only (the CI end-to-end
+# run takes its permits from it with PERMITS = "do"). Production
+# declares the class later, in a deploy of its own (see the comment
+# above [[d1_databases]]).
+[env.dev.exports.PermitGate]
+type = "durable-object"
+storage = "sqlite"
 
 [[env.dev.durable_objects.bindings]]
 name = "PERMIT_GATE"

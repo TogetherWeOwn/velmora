@@ -2641,3 +2641,62 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
         assert_eq!(sent.len(), producers.len(), "{env}: a queue bound twice");
     }
 }
+
+/// The table headers of the shipped `wrangler.toml`, split into the
+/// production part (before the first `[env.*]` table) and the rest.
+fn wrangler_headers() -> (Vec<String>, Vec<String>) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let toml = std::fs::read_to_string(path).unwrap();
+    let headers: Vec<String> = toml
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('['))
+        .map(str::to_string)
+        .collect();
+    let env = headers
+        .iter()
+        .position(|h| h.starts_with("[env.") || h.starts_with("[[env."))
+        .unwrap_or(headers.len());
+    (headers[..env].to_vec(), headers[env..].to_vec())
+}
+
+/// A Durable Object class can never be rolled back past, so production
+/// declares and binds the permit gate in deploys of their own, after the
+/// code that knows `PERMITS` has run ("Shipping the gate" in
+/// ops/README.md). Until then the production tables hold no class, no
+/// Durable Object binding and `PERMITS = "d1"`. The pull requests that
+/// add the class (deploy 2) and its binding (deploy 3) change this test
+/// on purpose. The legacy `[[migrations]]` array is never used: once a
+/// class is declared by `exports`, a deploy that declares one by
+/// `[[migrations]]` is refused.
+#[test]
+fn production_declares_no_durable_object_class_yet() {
+    let (prod, rest) = wrangler_headers();
+    for header in &prod {
+        assert!(
+            !header.starts_with("[exports")
+                && !header.starts_with("[[durable_objects")
+                && !header.starts_with("[[migrations")
+                && header != "[version_metadata]",
+            "production table {header}: the gate ships in deploys of its own"
+        );
+    }
+    let (vars, dev) = wrangler_vars();
+    assert_eq!(vars.get("PERMITS").map(String::as_str), Some("d1"));
+    assert_eq!(dev.get("PERMITS").map(String::as_str), Some("d1"));
+    assert!(
+        !rest.iter().any(|h| h.contains("migrations]]")),
+        "a legacy [[migrations]] table"
+    );
+    // Dev (the end-to-end run with PERMITS = "do") declares and binds it.
+    for header in [
+        "[env.dev.exports.PermitGate]",
+        "[[env.dev.durable_objects.bindings]]",
+        "[env.dev.version_metadata]",
+    ] {
+        assert!(rest.iter().any(|h| h == header), "dev lacks {header}");
+    }
+}

@@ -890,8 +890,8 @@ what it stored about the rows. Its first start under a new version
 every return to charge ask the catalogue again. Do not edit `do-gate:`
 rows by hand while `PERMITS` is `do`.
 
-1. Deploy a version that knows `PERMITS`, with `PERMITS = "d1"`. The
-   deploy adds the object class (a migration). Nothing calls it.
+1. Ship the class and its binding with `PERMITS = "d1"`, in the three
+   deploys of "Shipping the gate" below. Nothing calls the gate yet.
 2. In a deploy of its own, set `PERMITS = "do"`. Do not change a
    provider's limits, pools or the provider list in that deploy, and do
    not split its traffic by percentage: both sides must agree on the
@@ -921,10 +921,10 @@ and an acquire that finds no free slot (at most every 30 s) read the
 slot rows once more, to find gates to retire, and a job closes its
 provider sessions before it frees their slots.
 
-A rollback to a version from before step 1 is not possible once step 1
-is deployed: Cloudflare refuses a rollback across a Durable Object
-migration. This includes the automatic rollback of the deploy that
-carries step 1; if that deploy fails, fix forward. Roll back to a
+A rollback to a version from before the class (deploy 2 below) is not
+possible once deploy 2 is live: Cloudflare refuses it. This includes
+the automatic rollback of deploy 2 itself; if that deploy fails, fix
+forward (below). Roll back to a
 version that does not know `PERMITS` only while `PERMITS` is `d1` and
 the query above shows no `do-gate:` or `do-gate-idle:` row; such rows
 never run out by themselves. To clear them by hand, only with no Worker
@@ -934,6 +934,72 @@ in `do` mode and after the longest permit has run out (125 s):
 UPDATE provider_permits SET holder = NULL, lease_until = 0, pool = NULL
  WHERE holder LIKE 'do-gate:%' OR holder LIKE 'do-gate-idle:%';
 ```
+
+### Shipping the gate
+
+A Worker version that declares a Durable Object class can never be
+rolled back past: Cloudflare refuses a rollback, a `versions deploy`
+and a traffic split to any version from before the class (code 100402
+for a class declared by `exports`; 10210 for the legacy `[[migrations]]`
+array). So the class goes out on its own, with the same code that has
+already run, and nothing that uses it comes in the same deploy. The
+shipped `wrangler.toml` declares the class for `env.dev` only; the
+production tables come in three later pull requests, each a deploy of
+its own, in this order:
+
+| # | change to the production tables | rollback |
+| - | ------------------------------- | -------- |
+| 1 | none: the code that knows `PERMITS`, with `PERMITS = "d1"` and no class or binding | as for any release |
+| 2 | `[exports.PermitGate]` alone | none past it, ever |
+| 3 | the `PERMIT_GATE` binding and `[version_metadata]` | to deploy 2 |
+| 4 | `PERMITS = "do"` (step 2 above) | `PERMITS = "d1"`, or to deploy 3 |
+
+Deploy 2 adds, at the top level of `wrangler.toml` (never with
+`[[migrations]]`: once a class is declared by `exports`, a deploy that
+declares it by `[[migrations]]` again is refused, code 100403):
+
+```toml
+[exports.PermitGate]
+type = "durable-object"
+storage = "sqlite"
+```
+
+Deploy 3 adds:
+
+```toml
+[[durable_objects.bindings]]
+name = "PERMIT_GATE"
+class_name = "PermitGate"
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+```
+
+Rules for deploy 2:
+
+- It goes out with `wrangler deploy` at 100 %, through the deploy job,
+  after deploy 1 has served normal traffic for about a day. A version
+  that adds a class cannot be uploaded with `versions upload` together
+  with its binding, and cannot share traffic with an older version.
+- It goes out last in the queue: every change waiting to ship goes
+  before it, so that no wanted version is left below the floor it sets.
+- If its smoke test fails, the deploy job's automatic rollback is
+  refused (code 100402) and the job fails at that step. The new version
+  keeps serving. Nothing is bound to the class and the code is the code
+  of deploy 1, so run the smoke test again; if it still fails, set
+  `MAINTENANCE` as needed and ship a fix forward. The class stays.
+
+After deploy 3 or 4 a fault is undone in the ordinary way: a rollback
+to the deploy 2 version (the job does it), or `PERMITS = "d1"` again.
+
+Never delete the class to undo it. An unused class with no object
+costs nothing. Removing it takes a version without the class in its
+code plus a `state = "deleted"` entry under `[exports.PermitGate]` in
+one deploy (a deletion is refused while the code still exports the
+class), and is a class change of its own, with no rollback. After a
+deletion, a rollback to a version that declares the class creates it
+again, empty, and a later rollback to the deleting version deletes it
+again with whatever it held. Never reuse the name of a deleted class.
 
 ### Cost
 
