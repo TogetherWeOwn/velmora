@@ -5,6 +5,9 @@
 
 <run dir> holds counts.json (tests/bench_counts.rs) and d1.json
 (bench/d1-replay.mjs). Writes <run dir>/results.json and results.md.
+D1 rows read and written are D1's own counts from the replay; the native
+meter's rows written are kept as d1_rows_written_native and compared with
+them (rows_written_check, a warning when they differ).
 
     python3 -I bench/report.py --compare <run dir A> <run dir B> [--out FILE]
 
@@ -68,12 +71,44 @@ def load(run):
         c = dict(c)
         r = d1["by_label"].get(label, {})
         c["d1_rows_read"] = r.get("d1_rows_read", 0)
-        c["d1_rows_written_replay"] = r.get("d1_rows_written_replay", 0)
+        # Rows written are D1's own count (the replay), which is what is
+        # reported and priced. The native meter (src/meter.rs) is a model
+        # of that count; where the two differ the model is wrong, and the
+        # report says so (rows_written_check).
+        c["d1_rows_written_native"] = c["d1_rows_written"]
+        c["d1_rows_written"] = r.get("d1_rows_written_replay", 0)
         c["r2_mib_in"] = c["r2_bytes_in"] / MIB
         c["r2_mib_out"] = c["r2_bytes_out"] / MIB
         c["wall_ms"] = c["wall_us"] / 1000
         labels[label] = c
     return counts, d1, labels
+
+
+def rows_written_check(labels):
+    """The native meter against D1's own count, label by label."""
+    differ = {
+        k: {"native": c["d1_rows_written_native"], "d1": c["d1_rows_written"]}
+        for k, c in sorted(labels.items())
+        if c["d1_rows_written_native"] != c["d1_rows_written"]
+    }
+    return {
+        "native": sum(c["d1_rows_written_native"] for c in labels.values()),
+        "d1": sum(c["d1_rows_written"] for c in labels.values()),
+        "labels": len(labels),
+        "labels_differing": differ,
+    }
+
+
+def check_line(chk):
+    if not chk["labels_differing"]:
+        return f"Rows-written check: the native meter equals D1's count on all {chk['labels']} labels ({chk['d1']:,} rows)."
+    worst = sorted(chk["labels_differing"].items(), key=lambda kv: -abs(kv[1]["native"] - kv[1]["d1"]))[:5]
+    return (
+        f"WARNING, rows-written check: the native meter gives {chk['native']:,} rows, D1 {chk['d1']:,} "
+        f"({len(chk['labels_differing'])} of {chk['labels']} labels differ; largest: "
+        + ", ".join(f"{k} {v['native']:,} vs {v['d1']:,}" for k, v in worst)
+        + "). The figures below are D1's; the native meter (src/meter.rs) miscounts a statement of this run."
+    )
 
 
 def per(c, n):
@@ -205,7 +240,7 @@ def model(counts, labels, prices, cpu):
     }
 
 
-def render(name, counts, d1, labels, m):
+def render(name, counts, d1, labels, m, chk):
     ops = sorted((k for k in labels if k.startswith("op:")))
     rows = [(k[3:] + f" (x{counts['calls'].get(k, 0)})", per(labels[k], counts["calls"].get(k, 1))) for k in ops]
     L = [f"# Local benchmark: {name}", ""]
@@ -213,6 +248,8 @@ def render(name, counts, d1, labels, m):
         "Layer 1 (native rig, fake NNTP, production `[vars]` with the overrides in tests/bench_counts.rs). "
         "Figures per call; D1 rows read and written are D1's own counters from the replay through local D1; "
         "native ms is the wall time of the native run (indicative only).",
+        "",
+        check_line(chk),
         "",
         "Variables: " + ", ".join(f"{k}={v}" for k, v in counts["vars"].items()),
         "",
@@ -260,9 +297,24 @@ def render(name, counts, d1, labels, m):
     return "\n".join(L) + "\n"
 
 
+def d1_written(r):
+    """Results written before rows written were taken from D1 hold the
+    native meter's figure under d1_rows_written and D1's under
+    d1_rows_written_replay: compare D1's. Their model totals stay priced
+    with the native figure; returns whether that is the case."""
+    old = False
+    for section in ("ops", "stages"):
+        for c in r[section].values():
+            if "d1_rows_written_native" not in c and "d1_rows_written_replay" in c:
+                old = old or c["d1_rows_written"] != c["d1_rows_written_replay"]
+                c["d1_rows_written"] = c["d1_rows_written_replay"]
+    return old
+
+
 def compare(a_dir, b_dir, out):
     ra = json.loads((Path(a_dir) / "results.json").read_text())
     rb = json.loads((Path(b_dir) / "results.json").read_text())
+    stale = [r["name"] for r in (ra, rb) if d1_written(r)]
     L = [f"| per call / per extent | {ra['name']} | {rb['name']} | change |", "|---|---:|---:|---:|"]
     keys = ["invocations", "d1_calls", "d1_rows_read", "d1_rows_written", "r2_class_a", "r2_class_b", "queue_messages", "nntp_asks", "nntp_bodies"]
     for section in ("ops", "stages"):
@@ -276,7 +328,13 @@ def compare(a_dir, b_dir, out):
                 L.append(f"| {label} {k} | {fmt(va)} | {fmt(vb)} | {ch} |")
     for k in ("usd_per_tb_ingested_total", "usd_per_tb_served_hot_total", "usd_per_tb_served_cold_total"):
         va, vb = ra["model"][k], rb["model"][k]
-        L.append(f"| model {k} | {va:.3f} | {vb:.3f} | {((vb - va) / va * 100 if va else 0):+.1f}% |")
+        ch = f"{(vb - va) / va * 100:+.1f}%" if va else ("" if va == vb else "new")
+        L.append(f"| model {k} | {va:.3f} | {vb:.3f} | {ch} |")
+    for name in stale:
+        L.append(
+            f"| note | | | the model totals of {name} price the native meter's rows written, "
+            "which differ from D1's in that run: run report.py on it again |"
+        )
     text = "\n".join(L) + "\n"
     if out:
         Path(out).write_text(text)
@@ -295,6 +353,7 @@ def main(argv):
     name = opts.get("--name", run.name)
     counts, d1, labels = load(run)
     m = model(counts, labels, prices, cpu)
+    chk = rows_written_check(labels)
     ops = {k[3:]: per(v, counts["calls"].get(k, 1)) for k, v in labels.items() if k.startswith("op:")}
     stages = {}
     for k, v in labels.items():
@@ -308,14 +367,17 @@ def main(argv):
         "vars": counts["vars"],
         "classes": counts["classes"],
         "replay": {"calls": d1["calls"], "disagreements": d1["disagreements"]},
+        "rows_written_check": chk,
         "ops": ops,
         "stages": stages,
         "model": m,
         "top_statements": d1["top_statements"][:20],
     }
     (run / "results.json").write_text(json.dumps(result, indent=1))
-    (run / "results.md").write_text(render(name, counts, d1, labels, m))
+    (run / "results.md").write_text(render(name, counts, d1, labels, m, chk))
     print(f"report: {run / 'results.md'}")
+    if chk["labels_differing"]:
+        print(check_line(chk), file=sys.stderr)
 
 
 if __name__ == "__main__":

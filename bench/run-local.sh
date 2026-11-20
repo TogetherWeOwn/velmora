@@ -15,8 +15,9 @@
 #
 # Nothing here touches the network except `npm ci` (pinned by
 # workers/s3-bridge/package-lock.json) on the first run. Scratch and build
-# output go under $BENCH_WORK (default /var/tmp/velmora-bench); the cargo
-# target directory of a --ref run is removed with its worktree.
+# output go under $BENCH_WORK (default /var/tmp/velmora-bench); a --ref run
+# has its own directory there (checkout and cargo target), removed at the
+# end, so runs of the same ref may overlap.
 set -euo pipefail
 umask 022
 
@@ -38,18 +39,24 @@ log() { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 mkdir -p "$WORK"
 
 SRC=$REPO
-CLEAN=()
-cleanup() { for c in "${CLEAN[@]}"; do eval "$c" || true; done; }
+RUN=''
+# A --ref run works in a directory of its own (checkout and cargo target),
+# removed at the end. Two runs of the same ref at the same time would
+# otherwise remove each other's checkout and build.
+cleanup() {
+  [[ -n $RUN ]] || return 0
+  git -C "$REPO" worktree remove --force "$RUN/src" 2>/dev/null || true
+  rm -rf "$RUN"
+}
 trap cleanup EXIT
 if [[ -n $REF ]]; then
   SHA=$(git -C "$REPO" rev-parse --short=7 "$REF^{commit}")
-  SRC=$WORK/src-$SHA
-  git -C "$REPO" worktree remove --force "$SRC" 2>/dev/null || rm -rf "$SRC"
-  git -C "$REPO" worktree add --detach "$SRC" "$SHA" >/dev/null 2>&1
-  CLEAN+=("git -C '$REPO' worktree remove --force '$SRC'")
+  RUN=$(mktemp -d "$WORK/run-$SHA.XXXXXX")
+  SRC=$RUN/src
+  git -C "$REPO" worktree add --detach "$SRC" "$SHA" >/dev/null \
+    || { log "FAILED: no checkout of $REF ($SHA) in $SRC"; exit 1; }
   cp "$REPO/crates/velmora-bridge/tests/bench_counts.rs" "$SRC/crates/velmora-bridge/tests/bench_counts.rs"
-  TARGET=$WORK/target-$SHA
-  CLEAN+=("rm -rf '$TARGET'")
+  TARGET=$RUN/target
 else
   SHA=$(git -C "$REPO" rev-parse --short=7 HEAD)
   [[ -z $(git -C "$REPO" status --porcelain --untracked-files=no) ]] || SHA="$SHA-dirty"
@@ -60,14 +67,22 @@ OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
 log "measuring $NAME ($SRC) into $OUT"
 
-# Pinned wrangler (local D1 runtime), installed once.
+# Pinned wrangler (local D1 runtime), installed once. One run installs at a
+# time: two `npm ci` in one directory leave it half written.
 NODE_DIR=$WORK/node
-if ! cmp -s "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/package-lock.json" 2>/dev/null \
-  || [[ ! -x $NODE_DIR/node_modules/.bin/wrangler ]]; then
-  log "installing the pinned wrangler into $NODE_DIR"
-  mkdir -p "$NODE_DIR"
-  cp "$REPO/workers/s3-bridge/package.json" "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/"
-  (cd "$NODE_DIR" && npm ci --no-audit --no-fund >/dev/null)
+install_wrangler() {
+  if ! cmp -s "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/package-lock.json" 2>/dev/null \
+    || [[ ! -x $NODE_DIR/node_modules/.bin/wrangler ]]; then
+    log "installing the pinned wrangler into $NODE_DIR"
+    mkdir -p "$NODE_DIR"
+    cp "$REPO/workers/s3-bridge/package.json" "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/"
+    (cd "$NODE_DIR" && npm ci --no-audit --no-fund >/dev/null)
+  fi
+}
+if command -v flock >/dev/null; then
+  (flock 9; install_wrangler) 9>"$WORK/node.lock"
+else
+  install_wrangler
 fi
 
 t=$(date +%s)
@@ -80,9 +95,10 @@ t=$(date +%s)
 log "native run done in $(($(date +%s) - t)) s"
 
 t=$(date +%s)
+D1_WORK=$(mktemp -d "$WORK/d1.XXXXXX")
 NODE_DIR=$NODE_DIR node "$HERE/d1-replay.mjs" "$OUT/d1-trace.jsonl" "$SRC/workers/s3-bridge/migrations" \
-  "$WORK/d1-$NAME" "$OUT/d1.json" 2>"$OUT/replay.log" || { cat "$OUT/replay.log" >&2; log "FAILED: the D1 replay"; exit 1; }
-rm -rf "$WORK/d1-$NAME"
+  "$D1_WORK" "$OUT/d1.json" 2>"$OUT/replay.log" || { rm -rf "$D1_WORK"; cat "$OUT/replay.log" >&2; log "FAILED: the D1 replay"; exit 1; }
+rm -rf "$D1_WORK"
 log "D1 replay done in $(($(date +%s) - t)) s: $(tail -n 1 "$OUT/replay.log")"
 gzip -f "$OUT/d1-trace.jsonl"
 
