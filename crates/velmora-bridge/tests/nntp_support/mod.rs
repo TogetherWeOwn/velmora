@@ -488,6 +488,10 @@ impl MemCatalog {
         let light = light.is_some();
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
+            // As the SQL guard: a lease that has not run out.
+            if e.outbox.lease_until.is_none_or(|until| until < now) {
+                return false;
+            }
             // As the SQL guard: a copy that is still pinned.
             let state = e.job.extent.safety_state;
             if !matches!(state, SafetyState::Held | SafetyState::Releasing) {

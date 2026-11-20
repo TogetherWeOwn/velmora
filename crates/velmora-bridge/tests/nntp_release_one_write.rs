@@ -273,9 +273,9 @@ async fn nothing_is_released_before_two_backbones_and_the_minimum_age() {
     }
 }
 
-/// A release that is refused writes nothing: the extent stays `held`,
-/// without evidence, under the light guard and under the guard of
-/// `body`.
+/// A release the job itself refuses (an article is gone when it asks)
+/// writes nothing: the extent stays `held`, without evidence, and goes
+/// back to verify, under `light` and under `body`.
 #[tokio::test]
 async fn a_refused_release_leaves_the_extent_as_it_was() {
     for check in CHECKS {
@@ -294,5 +294,63 @@ async fn a_refused_release_leaves_the_extent_as_it_was() {
         assert_eq!(after.safety_state, before.safety_state, "{check:?}");
         assert_eq!(after.release_evidence, None, "{check:?}");
         assert_eq!(rig.stage(&s), OutboxStage::Verify, "{check:?}");
+    }
+}
+
+/// A release the guard refuses writes nothing, under the light guard and
+/// under the guard of `body`: no pass recorded under this claim, then a
+/// lease that ran out. The same call in time is the one write.
+#[tokio::test]
+async fn a_release_the_guard_refuses_writes_nothing() {
+    for (n, check) in (31u8..).zip(CHECKS) {
+        let mut rig = rig_of(check).await;
+        rig.bridge.cfg.safety_min_age_secs = 0;
+        let (s, all) = rig.posted(n).await;
+        rig.copy_to_second(&all).await;
+        rig.verify_until_release(&s, "verify").await;
+        rig.wait_until_due(&s);
+        let lease = rig.claim(&s, OutboxStage::Release).await;
+        let catalog = &rig.bridge.catalog;
+        let counting = ["bb0".to_string(), "bb1".to_string()];
+        let release = |now: UnixMs| {
+            let (lease, counting) = (&lease, &counting);
+            async move {
+                let done = match check {
+                    Check::Body => catalog.release(lease, 2, counting, "[]", now).await,
+                    _ => {
+                        let need_full = check == Check::LightSampled;
+                        catalog
+                            .release_light(lease, 2, counting, "[]", now, need_full)
+                            .await
+                    }
+                };
+                done.unwrap()
+            }
+        };
+        let unchanged = |what: &str| {
+            assert!(rig.held(&s), "{check:?}: {what}");
+            assert_eq!(rig.stage(&s), OutboxStage::Release, "{check:?}: {what}");
+        };
+        let now = rig.bridge.clock.now();
+
+        // Every pass on record is older than this claim.
+        assert_eq!(release(now).await, Guard::Lost, "{check:?}");
+        unchanged("no pass under this claim");
+
+        // The passes count now; the lease has run out.
+        catalog.edit(&s.extent, |e| e.outbox.claimed_at = UnixMs(0));
+        let until = catalog.outbox(&s.extent).lease_until.expect("leased");
+        assert_eq!(release(UnixMs(until.0 + 1)).await, Guard::Lost, "{check:?}");
+        unchanged("the lease ran out");
+
+        // In time: released, with the evidence, and the row done.
+        assert_eq!(release(until).await, Guard::Applied(()), "{check:?}");
+        let extent = catalog.extent(&s.extent);
+        assert_eq!(extent.safety_state, SafetyState::Released, "{check:?}");
+        assert_eq!(extent.release_evidence.as_deref(), Some("[]"), "{check:?}");
+        assert_eq!(extent.released_at, Some(until), "{check:?}");
+        assert_eq!(rig.stage(&s), OutboxStage::Done, "{check:?}");
+        // A second release finds nothing to do.
+        assert_eq!(release(until).await, Guard::Lost, "{check:?}");
     }
 }
