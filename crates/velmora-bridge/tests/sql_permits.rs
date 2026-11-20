@@ -558,6 +558,12 @@ async fn providers_with_strikes_nothing_cleared_are_due_for_a_probe() {
     c.provider_failed("p4", ProviderFault::LoginRefused, T0)
         .await
         .unwrap();
+    // p6: three refused logins, a cooldown: the long quiet time still
+    // counts from the last strike, not from the cooldown's end.
+    for _ in 0..3 {
+        let refused = c.provider_failed("p6", ProviderFault::LoginRefused, T0);
+        refused.await.unwrap();
+    }
     c.seed_permits(&[provider("p5", 1)]).await.unwrap();
 
     assert!(due(&c, T0).await.is_empty());
@@ -574,8 +580,10 @@ async fn providers_with_strikes_nothing_cleared_are_due_for_a_probe() {
     );
     assert_eq!(
         due(&c, T0.plus_ms(LOGIN_REFUSED_QUIET_MS)).await,
-        ["p1", "p2", "p4"]
+        ["p1", "p2", "p4", "p6"]
     );
+    let p6 = c.provider_recovered("p6", T0.plus_ms(LOGIN_REFUSED_QUIET_MS));
+    p6.await.unwrap();
 
     // A cooling provider is not due, however long ago its last strike,
     // nor one whose cooldown ended within the quiet time: p2 fails at the

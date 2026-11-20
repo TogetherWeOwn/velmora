@@ -1657,13 +1657,11 @@ impl Catalog for MemCatalog {
             .borrow()
             .iter()
             .filter(|(_, h)| {
-                let since = match h.fault {
-                    Some(ProviderFault::LoginRefused) => login_quiet_since,
-                    _ => quiet_since,
+                let quiet = match h.fault {
+                    Some(ProviderFault::LoginRefused) => h.at <= login_quiet_since.0,
+                    _ => h.at.max(h.until) <= quiet_since.0,
                 };
-                (h.failures > 0 || h.cooldowns > 0)
-                    && h.until <= now.0
-                    && h.at.max(h.until) <= since.0
+                (h.failures > 0 || h.cooldowns > 0) && h.until <= now.0 && quiet
             })
             .map(|(id, _)| id.clone())
             .collect())

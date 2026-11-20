@@ -172,13 +172,17 @@ pub(super) async fn providers_to_probe<S: Sql>(
     // Quiet counts from the later of the last strike and the end of the
     // last cooldown: a probe never answers for real work right after a
     // cooldown, and so never clears a ladder of cooldowns real work built.
+    // After a refused login it counts from the strike: the login is what
+    // a probe tries, and that quiet time is never shorter than the
+    // cooldown the strike started.
     let rows = c
         .sql
         .query(
             "SELECT provider_id FROM provider_health \
              WHERE (failures > 0 OR cooldowns > 0) AND cooldown_until <= ?1 \
-               AND MAX(COALESCE(last_failure_at, 0), cooldown_until) <= CASE \
-                 WHEN last_failure_reason = ?4 THEN ?3 ELSE ?2 END \
+               AND CASE WHEN last_failure_reason = ?4 \
+                 THEN COALESCE(last_failure_at, 0) <= ?3 \
+                 ELSE MAX(COALESCE(last_failure_at, 0), cooldown_until) <= ?2 END \
              ORDER BY provider_id",
             &[
                 ms(now),
