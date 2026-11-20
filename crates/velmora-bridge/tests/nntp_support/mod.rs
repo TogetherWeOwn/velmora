@@ -473,7 +473,8 @@ impl MemCatalog {
         rows
     }
 
-    /// The release guard, with the full check on record asked for or not.
+    /// The release guard. `light`: as the SQL catalogue, `None` for the
+    /// guard of `body`, `Some(need_full)` for the light check.
     fn release_as(
         &self,
         l: &Lease,
@@ -481,9 +482,10 @@ impl MemCatalog {
         counting: &[String],
         evidence_json: &str,
         now: UnixMs,
-        need_full: bool,
-        light: bool,
+        light: Option<bool>,
     ) -> Guard<()> {
+        let need_full = light.unwrap_or(true);
+        let light = light.is_some();
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
             // As the SQL guard: a copy that is still pinned.
@@ -783,7 +785,7 @@ impl Catalog for MemCatalog {
         evidence_json: &str,
         now: UnixMs,
     ) -> Result<Guard<()>> {
-        Ok(self.release_as(l, required, counting, evidence_json, now, true, false))
+        Ok(self.release_as(l, required, counting, evidence_json, now, None))
     }
 
     async fn release_light(
@@ -795,7 +797,8 @@ impl Catalog for MemCatalog {
         now: UnixMs,
         need_full: bool,
     ) -> Result<Guard<()>> {
-        Ok(self.release_as(l, required, counting, evidence_json, now, need_full, true))
+        let light = Some(need_full);
+        Ok(self.release_as(l, required, counting, evidence_json, now, light))
     }
 
     async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {

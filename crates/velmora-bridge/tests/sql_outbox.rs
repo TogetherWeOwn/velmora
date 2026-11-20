@@ -3584,12 +3584,29 @@ async fn the_light_guard_releases_without_a_full_check() {
     assert!(matches!(light.await, Err(BridgeError::Invalid(_))));
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
 
+    // Every refusal above wrote nothing.
+    let before = fx.dump().await;
+    let light = fx.cat.release_light(&r, 3, &counting, "[]", at, false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, true);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before, "a refused release wrote something");
+
     let light = fx
         .cat
         .release_light(&r, 2, &counting, "[\"light\"]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
+    // One write: released with its evidence and the row done.
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
     assert_eq!(fx.extent(&o, "release_evidence").await, "[\"light\"]");
+    assert_eq!(fx.extent(&o, "released_at").await, at.0.to_string());
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    // Nothing is left to finish, and a second release is refused.
+    let before = fx.dump().await;
+    assert!(!fx.cat.finish_release(&r, at).await.unwrap());
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before);
 }
 
 /// The light guard keeps the rest of the release guard: the lease, the
