@@ -69,8 +69,8 @@ enum Case {
     /// grant still in the catalogue and a record of its revocation in
     /// the safety store.
     RevokedMaintenance,
-    /// The `rw` key, the request presigned (query only, no headers
-    /// beside `host`, no body).
+    /// The `rw` key, the request presigned: the signature in the
+    /// query, the headers of the operation signed, the payload not.
     PresignedRw,
     /// The `ro` key, presigned.
     PresignedRo,
@@ -326,23 +326,37 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// A presigned request: the signature in the query, `host` the only
-/// signed header, the payload unsigned.
+/// A presigned request: the signature in the query, `host` and the
+/// headers of the operation signed, the payload unsigned.
 fn presign(
     signer: &Signer,
     now: UnixMs,
     method: Method,
     raw_path: &str,
     query: &[(&str, &str)],
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
 ) -> Req {
     let (stamp, scope, key) = signer.scope(now);
     let credential = format!("{}/{scope}", signer.akid);
+    let mut signed: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned()))
+        .collect();
+    signed.push(("host".to_owned(), HOST.to_owned()));
+    signed.sort();
+    let names = signed
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String = signed.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let mut q: Vec<(String, String)> = [
         ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
         ("X-Amz-Credential", credential.as_str()),
         ("X-Amz-Date", stamp.as_str()),
         ("X-Amz-Expires", "3600"),
-        ("X-Amz-SignedHeaders", "host"),
+        ("X-Amz-SignedHeaders", names.as_str()),
     ]
     .iter()
     .chain(query)
@@ -355,7 +369,7 @@ fn presign(
         .collect::<Vec<_>>()
         .join("&");
     let canonical = format!(
-        "{}\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD",
+        "{}\n{raw_path}\n{query}\n{canonical_headers}\n{names}\nUNSIGNED-PAYLOAD",
         method.as_str()
     );
     let to_sign = format!(
@@ -363,11 +377,14 @@ fn presign(
         hex(&sha256(canonical.as_bytes()))
     );
     let signature = hex(&hmac(&key, to_sign.as_bytes()));
+    if method == Method::Put || !body.is_empty() {
+        signed.push(("content-length".to_owned(), body.len().to_string()));
+    }
     Req {
         method,
         target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
-        headers: vec![("host".to_string(), HOST.to_string())],
-        body: Vec::new(),
+        headers: signed,
+        body,
     }
 }
 
@@ -543,7 +560,16 @@ async fn run(case: Case) -> Vec<Ran> {
             headers.push(("x-amz-tagging", "a=b"));
         }
         let mut req = match case.presigned() {
-            true => presign(signer, rig.now(), op.method, &target, &query),
+            // A presigned upload is not chunked: the body goes as it is.
+            true => presign(
+                signer,
+                rig.now(),
+                op.method,
+                &target,
+                &query,
+                &headers,
+                op.body.clone(),
+            ),
             false if op.chunked => {
                 let decoded = op.body.len().to_string();
                 let mut headers = headers.clone();
@@ -684,6 +710,19 @@ async fn every_operation_answers_every_caller_as_recorded() {
         "UngrantedMaintenance | ListObjectsV2 | 404 | NoSuchBucket",
         "PresignedRw | GetObject | 200",
         "PresignedRw | CreateMultipartUpload | 200",
+        // A presigned write carries its body and is carried out.
+        "PresignedRw | PutObject | 200",
+        "PresignedRw | CopyObject | 200",
+        "PresignedRw | DeleteObjects | 200",
+        "PresignedRw | UploadPart | 200",
+        "PresignedRw | UploadPartCopy | 200",
+        "PresignedRw | CompleteMultipartUpload | 200",
+        "PresignedRw | GetObject range | 206",
+        "PresignedRo | PutObject | 403 | AccessDenied",
+        "PresignedRo | UploadPart | 403 | AccessDenied",
+        "PresignedUngranted | UploadPart | 404 | NoSuchBucket",
+        "PresignedDisabled | CompleteMultipartUpload | 403 | InvalidAccessKeyId",
+        "PresignedWrongSecret | CompleteMultipartUpload | 403 | SignatureDoesNotMatch",
         "PresignedRo | CreateMultipartUpload | 403 | AccessDenied",
         "PresignedUnknown | UploadPart | 403 | InvalidAccessKeyId",
         "PresignedWrongSecret | UploadPart | 403 | SignatureDoesNotMatch",
@@ -714,7 +753,10 @@ async fn every_operation_answers_every_caller_as_recorded() {
         "RwReplayUnreadable | AbortMultipartUpload | 500 | InternalError",
         "RwReplayUnreadable | CompleteMultipartUpload | 500 | InternalError",
     ] {
-        assert!(table.contains(needle), "{needle}");
+        assert!(
+            table.lines().any(|line| line.starts_with(needle)),
+            "{needle}"
+        );
     }
 }
 

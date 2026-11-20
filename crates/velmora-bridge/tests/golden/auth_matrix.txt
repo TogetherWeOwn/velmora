@@ -443,21 +443,21 @@ PresignedRw | ListMultipartUploads | 200 |  |  | retry-after -
 PresignedRw | CreateBucket | 409 | BucketAlreadyOwnedByYou | The bucket you tried to create already exists, and you own it. | retry-after -
 PresignedRw | DeleteBucket | 409 | BucketNotEmpty | The bucket you tried to delete is not empty, or has held data: a bucket that ever stored an object or opened a multipart upload is kept. | retry-after -
 PresignedRw | GetObject | 200 |  |  | retry-after -
-PresignedRw | GetObject range | 200 |  |  | retry-after -
+PresignedRw | GetObject range | 206 |  |  | retry-after -
 PresignedRw | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 PresignedRw | HeadObject | 200 |  |  | retry-after -
-PresignedRw | PutObject | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
-PresignedRw | PutObject chunked | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
-PresignedRw | CopyObject | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | PutObject | 200 |  |  | retry-after -
+PresignedRw | PutObject chunked | 200 |  |  | retry-after -
+PresignedRw | CopyObject | 200 |  |  | retry-after -
 PresignedRw | DeleteObject | 204 |  |  | retry-after -
-PresignedRw | DeleteObjects | 400 | InvalidRequest | Missing required header for this request: Content-MD5. | retry-after -
+PresignedRw | DeleteObjects | 200 |  |  | retry-after -
 PresignedRw | CreateMultipartUpload | 200 |  |  | retry-after -
-PresignedRw | UploadPart | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
-PresignedRw | UploadPart chunked | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
-PresignedRw | UploadPartCopy | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | UploadPart | 200 |  |  | retry-after -
+PresignedRw | UploadPart chunked | 200 |  |  | retry-after -
+PresignedRw | UploadPartCopy | 200 |  |  | retry-after -
 PresignedRw | ListParts | 200 |  |  | retry-after -
 PresignedRw | AbortMultipartUpload | 204 |  |  | retry-after -
-PresignedRw | CompleteMultipartUpload | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | CompleteMultipartUpload | 200 |  |  | retry-after -
 PresignedRo | ListBuckets | 200 |  |  | retry-after -
 PresignedRo | HeadBucket | 200 |  |  | retry-after -
 PresignedRo | GetBucketLocation | 200 |  |  | retry-after -
@@ -466,7 +466,7 @@ PresignedRo | ListMultipartUploads | 200 |  |  | retry-after -
 PresignedRo | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | GetObject | 200 |  |  | retry-after -
-PresignedRo | GetObject range | 200 |  |  | retry-after -
+PresignedRo | GetObject range | 206 |  |  | retry-after -
 PresignedRo | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 PresignedRo | HeadObject | 200 |  |  | retry-after -
 PresignedRo | PutObject | 403 | AccessDenied | Access Denied | retry-after -
@@ -673,7 +673,7 @@ PresignedRwReplaying | ListMultipartUploads | 200 |  |  | retry-after -
 PresignedRwReplaying | CreateBucket | 409 | BucketAlreadyOwnedByYou | The bucket you tried to create already exists, and you own it. | retry-after -
 PresignedRwReplaying | DeleteBucket | 409 | BucketNotEmpty | The bucket you tried to delete is not empty, or has held data: a bucket that ever stored an object or opened a multipart upload is kept. | retry-after -
 PresignedRwReplaying | GetObject | 200 |  |  | retry-after -
-PresignedRwReplaying | GetObject range | 200 |  |  | retry-after -
+PresignedRwReplaying | GetObject range | 206 |  |  | retry-after -
 PresignedRwReplaying | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 PresignedRwReplaying | HeadObject | 200 |  |  | retry-after -
 PresignedRwReplaying | PutObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
