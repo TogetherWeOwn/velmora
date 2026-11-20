@@ -5200,7 +5200,7 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
     let mut replay = Vec::new();
     let mut made = Vec::new();
-    for key in ["damaged", "fraction", "tiny", "sound"] {
+    for key in ["damaged", "fraction", "tiny", "huge", "sound"] {
         let (o, _) = fx.posted_packed(key, true).await;
         let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
@@ -5224,6 +5224,11 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let sql = "UPDATE extents SET parity_count = 5e-324 WHERE id = ?1";
     assert_eq!(fx.run(sql, &[text(made[2].extent.as_str())]).await, 1);
     assert_eq!(fx.extent(&made[2], "typeof(parity_count)").await, "real");
+    // A whole number that is no count, and that not every catalogue
+    // connection can carry as a number.
+    let sql = "UPDATE extents SET parity_count = 9007199254740993 WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[3].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[3], "typeof(parity_count)").await, "integer");
 
     let stranded = fx
         .cat
