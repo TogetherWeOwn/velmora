@@ -93,8 +93,8 @@ use crate::recovery::Recorded;
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 use crate::types::Resend;
 use crate::types::{
-    AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId,
-    CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
+    AccessKeyRow, AccessKeySummary, ArticleRow, AuthLookup, BackboneStatus, BridgeError, Bucket,
+    BucketId, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, JobExtent, ListEntry, ListPage, ListQuery, ObjectStatus, OpenUpload,
     OutboxStage, OutboxStats, PartExtent, Perm, PinnedRead, Precondition, ProviderConfig,
@@ -198,6 +198,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         end: u64,
     ) -> Result<Vec<ExtentRow>> {
         objects::extents_in(self, generation, start, end).await
+    }
+    async fn auth_lookup(&self, akid: &str, bucket: &str, gate: bool) -> Result<AuthLookup> {
+        read::auth_lookup(self, akid, bucket, gate).await
     }
     async fn read_lookup(&self, q: &ReadQuery<'_>) -> Result<ReadLookup> {
         read::read_lookup(self, q).await

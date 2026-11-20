@@ -32,7 +32,6 @@
 //! then list no part checksums in Complete), and Complete refuses a
 //! client-supplied object checksum or a `COMPOSITE` type with `501`.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -43,13 +42,11 @@ use velmora_s3_proto::mutation::{
     UploadMetadata,
 };
 use velmora_s3_proto::{
-    verify, Authority, ChecksumAlgorithm, Credential, ErrorCode, Headers, Limits, Policy, Target,
-    UploadValidator, VerifiedRequest,
+    ChecksumAlgorithm, ErrorCode, Headers, Limits, Policy, Target, UploadValidator, VerifiedRequest,
 };
-use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance};
-use crate::crypto::{seal_extent, unwrap_bdk, unwrap_secret};
+use crate::crypto::{seal_extent, unwrap_bdk};
 use crate::ingress::{
     body_is_empty, declared_length, read_upload, upload_lengths, Charge, IngressError,
     UploadLengths, UploadReadError,
@@ -61,15 +58,14 @@ use crate::ports::{
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
-    auth_refused, check_precondition, discard_refused, discard_unless_present, header_refused,
-    hold_precondition, host_refused, precondition, restore_gate, writes_refused, REGION_ALIASES,
+    self, authenticate_parsed, check_precondition, discard_refused, discard_unless_present,
+    hold_precondition, parse, precondition, restore_gate, writes_refused, Refused, REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
     Body, BridgeError, Bucket, CompleteUpload, ExtentId, ExtentPlacement, ExtentRow, ExtentState,
-    GenerationRow, GenerationState, Job, KeyStatus, OutboxStage, PartExtent, Perm, RespBody,
-    S3Request, S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId,
-    JOB_VERSION,
+    GenerationRow, GenerationState, Job, OutboxStage, PartExtent, Perm, RespBody, S3Request,
+    S3Response, SafetyState, UploadId, UploadPartRow, UploadRow, UploadState, WriteId, JOB_VERSION,
 };
 
 /// Smallest non-final part.
@@ -85,15 +81,6 @@ const COMPLETE_ATTEMPTS: u32 = 3;
 const KEY_MODE_RANDOM: u8 = 1;
 /// Queue messages of one `send_many`.
 const JOB_BATCH: usize = 100;
-
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
-fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
-}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -132,6 +119,16 @@ impl From<UploadReadError> for Fail {
         match e {
             UploadReadError::Ingress(e) => Fail::Ingress(e),
             UploadReadError::Proto(e) => Fail::S3(e),
+        }
+    }
+}
+
+impl From<Refused> for Fail {
+    fn from(e: Refused) -> Self {
+        match e {
+            Refused::Code(code) => Fail::S3(code),
+            Refused::Response(resp) => Fail::Response(resp),
+            Refused::Internal => Fail::Internal,
         }
     }
 }
@@ -325,52 +322,14 @@ fn query_one<'a>(target: &'a Target, name: &str) -> Outcome<Option<&'a str>> {
 // Authentication
 // ---------------------------------------------------------------------------
 
-/// The one access key a request named, if it is active, and whether it may
-/// write to the addressed bucket.
-#[derive(Default)]
-struct OneKey {
-    key: Option<KeyMaterial>,
-    /// Name of the bucket this key holds an `rw` grant on (the addressed
-    /// one, or none).
-    writable_bucket: Option<String>,
-    /// The key holds a grant on the addressed bucket, of either kind.
-    granted: bool,
-    /// Set when `authorize` refused a bucket this key has no grant on.
-    /// The verifier asks `authorize` only once the signature has
-    /// verified, so this is only ever set for an authenticated caller.
-    no_bucket: Cell<bool>,
-}
-
-struct KeyMaterial {
-    access_key_id: String,
-    principal: String,
-    secret: Zeroizing<Vec<u8>>,
-}
-
-impl Authority for OneKey {
-    fn credential(&self, access_key: &str) -> Option<Credential<'_>> {
-        let key = self.key.as_ref()?;
-        (key.access_key_id == access_key).then(|| Credential {
-            secret: &key.secret,
-            principal: &key.principal,
-        })
-    }
-
-    /// Every multipart call mutates, so it needs `rw` on the bucket.
-    fn authorize(&self, principal: &str, _method: &str, target: &Target) -> bool {
-        if !self.key.as_ref().is_some_and(|k| k.principal == principal) {
-            return false;
-        }
-        if !self.granted {
-            self.no_bucket.set(true);
-        }
-        self.writable_bucket.as_deref() == Some(target.bucket.as_str())
-    }
-}
-
 /// The access key id a request presents, before any verification:
 /// `Credential=<id>/…` of the `Authorization` header or the presigned
 /// `X-Amz-Credential`. `verify` parses the same fields strictly.
+///
+/// Stricter than the rule of the other operations (`common::parse`),
+/// and kept so that no answer of a multipart call changes: the two
+/// differ only in the error code of a request that is refused either
+/// way (a header with `Credential=` inside another field).
 fn presented_access_key(target: &Target, headers: &Headers) -> Option<String> {
     let credential = match headers.get("authorization") {
         Some(value) => value
@@ -410,77 +369,29 @@ where
     if bridge.cfg.maintenance == Maintenance::Restore {
         return Err(ErrorCode::SlowDown.into());
     }
-    let policy = policy(&bridge.cfg)?;
-    let target = Target::parse(&req.raw_target, &policy);
-    let fields: Vec<(&str, &str)> = req
-        .headers
-        .iter()
-        .filter(|(n, _)| !edge_header(n))
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
-    let headers = Headers::new(&fields, &policy);
-    // The named refusals of `common::authenticate`, in the same order:
-    // the host before the path is judged.
-    if let Ok(headers) = &headers {
-        if let Some(resp) = host_refused(headers, &bridge.cfg) {
-            return Err(resp.into());
-        }
+    let mut parsed = parse(req, policy(&bridge.cfg)?, &bridge.cfg)?;
+    parsed.akid = presented_access_key(&parsed.target, &parsed.headers).unwrap_or_default();
+    // The key, the bucket, the grant and the state of a replay, in one
+    // round trip to the catalogue. Unknown and disabled keys look the
+    // same: no credential.
+    let authed = authenticate_parsed(bridge, req, parsed, true).await?;
+    // Every multipart call mutates, so it needs `rw` on the bucket.
+    if authed.perm != Some(Perm::Rw) {
+        return Err(ErrorCode::AccessDenied.into());
     }
-    let target = target?;
-    let headers = headers?;
-    headers
-        .check_features()
-        .map_err(|refusal| header_refused(&refusal))?;
-
-    let mut authority = OneKey::default();
-    let mut bucket = None;
-    if let Some(akid) = presented_access_key(&target, &headers) {
-        // Unknown and disabled keys look the same: no credential.
-        let row = bridge.catalog.access_key(&akid).await?;
-        if let Some(row) = row.filter(|r| r.status == KeyStatus::Active) {
-            let secret = unwrap_secret(
-                &bridge.kek,
-                row.kek_version,
-                &row.access_key_id,
-                &row.secret_wrapped,
-            )?;
-            bucket = bridge.catalog.bucket_by_name(&target.bucket).await?;
-            let perm = match &bucket {
-                Some(b) => bridge.catalog.grant(&akid, &b.id).await?,
-                None => None,
-            };
-            authority.granted = perm.is_some();
-            authority.writable_bucket = (perm == Some(Perm::Rw)).then(|| target.bucket.clone());
-            authority.key = Some(KeyMaterial {
-                access_key_id: row.access_key_id,
-                principal: row.principal,
-                secret,
-            });
-        }
-    }
-    // Ingress refuses untrusted transport before any handler runs.
-    let verified = verify(
-        req.method.as_str(),
-        &target,
-        &headers,
-        true,
-        bridge.clock.now().secs().0,
-        &policy,
-        &authority,
-    )
-    .map_err(|code| {
-        if code == ErrorCode::AccessDenied && authority.no_bucket.get() {
-            // As `common::authenticate`: the signature verified, and to
-            // this key no bucket of this name exists.
-            Fail::S3(ErrorCode::NoSuchBucket)
-        } else {
-            Fail::Response(auth_refused(code, &policy, &headers, &target))
-        }
-    })?;
-    // `authorize` passed, so the bucket exists and the grant is `rw`.
+    let common::Authed {
+        policy,
+        target,
+        headers,
+        verified,
+        bucket,
+        restore_pending,
+        ..
+    } = authed;
     let bucket = bucket.ok_or(ErrorCode::NoSuchBucket)?;
     // A replay that was started and did not end: see `restore_gate`.
-    if bridge.catalog.restore_pending().await? {
+    // Read with the key. Without an answer nothing is written.
+    if restore_pending.ok_or(Fail::Internal)? {
         return Err(ErrorCode::SlowDown.into());
     }
     let key = target

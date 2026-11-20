@@ -17,14 +17,14 @@ use crate::recovery::{Recorded, Unpublished};
 use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, RestoreProgress};
 pub use crate::types::Result;
 use crate::types::{
-    AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Backlog, Bucket, BucketId,
-    ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
-    ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
-    IntentFence, IntentStats, Job, JobExtent, KekBytes, KeyStatus, ListEntry, ListPage, ListQuery,
-    ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, PinnedRead, Precondition,
-    ProviderConfig, ProviderFault, ProviderLoad, ReadExtent, ReadLookup, ReadQuery, ReadWindow,
-    Resend, SafetyState, SizeCommand, UnixMs, UploadId, UploadListQuery, UploadPartRow, UploadRow,
-    VerificationRow, VerifyEscalation, WriteId,
+    AccessKeyRow, AccessKeySummary, ArticleRow, AuthLookup, BackboneStatus, Backlog, Bucket,
+    BucketId, ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate,
+    ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow,
+    HotStats, IntentFence, IntentStats, Job, JobExtent, KekBytes, KeyStatus, ListEntry, ListPage,
+    ListQuery, ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, PinnedRead,
+    Precondition, ProviderConfig, ProviderFault, ProviderLoad, ReadExtent, ReadLookup, ReadQuery,
+    ReadWindow, Resend, SafetyState, SizeCommand, UnixMs, UploadId, UploadListQuery, UploadPartRow,
+    UploadRow, VerificationRow, VerifyEscalation, WriteId,
 };
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
@@ -543,6 +543,32 @@ pub struct KeyHead {
     pub unpublished: bool,
 }
 
+/// [`Catalog::auth_lookup`] from the single reads of `c`, one after the
+/// other: what every adapter must answer, however it asks.
+pub async fn auth_lookup_by_parts<C: Catalog + ?Sized>(
+    c: &C,
+    akid: &str,
+    bucket: &str,
+    gate: bool,
+) -> Result<AuthLookup> {
+    let mut out = AuthLookup {
+        key: c
+            .access_key(akid)
+            .await?
+            .filter(|key| key.status == KeyStatus::Active),
+        bucket: c.bucket_by_name(bucket).await?,
+        perm: None,
+        restore_pending: match gate {
+            true => Some(c.restore_pending().await?),
+            false => None,
+        },
+    };
+    if let (Some(_), Some(bucket)) = (&out.key, &out.bucket) {
+        out.perm = c.grant(akid, &bucket.id).await?;
+    }
+    Ok(out)
+}
+
 /// [`Catalog::read_lookup`] from the single reads of `c`, one after the
 /// other: what every adapter must answer, however it asks.
 pub async fn read_lookup_by_parts<C: Catalog + ?Sized>(
@@ -655,6 +681,15 @@ pub trait Catalog {
     /// lookup finds either the key with all its grants or nothing.
     /// Returns how many key rows went; unknown ids are no error.
     async fn delete_access_keys(&self, akids: &[String]) -> Result<u64>;
+
+    /// What authenticating a request needs, in one round trip where
+    /// the adapter can: the key `akid` while it is active, the bucket
+    /// named `bucket`, the grant of the one on the other, and with
+    /// `gate` whether writes are refused ([`Catalog::restore_pending`]).
+    /// The default asks one after the other.
+    async fn auth_lookup(&self, akid: &str, bucket: &str, gate: bool) -> Result<AuthLookup> {
+        auth_lookup_by_parts(self, akid, bucket, gate).await
+    }
 
     // objects
     async fn live_object(
