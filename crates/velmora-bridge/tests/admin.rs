@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use velmora::rng::SystemRng;
 use velmora_bridge::config::{Environment, GcMode, Maintenance};
 use velmora_bridge::crypto::{seal_extent, unwrap_bdk, unwrap_secret, wrap_bdk, DataKey};
-use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::fetch::{COLD_JITTER_MS, COLD_POLL_MS, COLD_WAIT_MS};
+use velmora_bridge::ingress::{ByteBudget, Sleeper};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::PublishUnrecorded;
 use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
@@ -111,6 +112,22 @@ impl Fx {
         maintenance: Maintenance,
         edit: impl FnOnce(&mut Vec<ProviderConfig>),
     ) -> Fx {
+        Fx::build(environment, maintenance, edit, None).await
+    }
+
+    /// The fixture with a host timer: `sleeper` is made with the
+    /// bridge's clock.
+    async fn with_sleeper(sleeper: impl FnOnce(FixedClock) -> Sleeper + 'static) -> Fx {
+        let sleeper: Box<dyn FnOnce(FixedClock) -> Sleeper> = Box::new(sleeper);
+        Fx::build(Environment::Dev, Maintenance::Off, |_| {}, Some(sleeper)).await
+    }
+
+    async fn build(
+        environment: Environment,
+        maintenance: Maintenance,
+        edit: impl FnOnce(&mut Vec<ProviderConfig>),
+        sleeper: Option<Box<dyn FnOnce(FixedClock) -> Sleeper>>,
+    ) -> Fx {
         let mut config = ServerConfig::for_test();
         config.articles = Vec::new();
         config.missing_ids.clear();
@@ -181,6 +198,11 @@ impl Fx {
             admin_host: None,
             metrics_sample: 10,
         };
+        let clock = FixedClock::new(T0);
+        let mut budget = ByteBudget::new(BUDGET);
+        if let Some(sleeper) = sleeper {
+            budget = budget.with_sleeper(sleeper(clock.clone()));
+        }
         let bridge = Bridge {
             catalog: SqlCatalog::new(RacingSql {
                 inner: RusqliteSql::with_schema().unwrap(),
@@ -191,8 +213,8 @@ impl Fx {
             nntp: TcpConnector::default(),
             jobs: FakeJobs::new(),
             kek: TestKek::new(),
-            clock: FixedClock::new(T0),
-            budget: ByteBudget::new(BUDGET),
+            clock,
+            budget,
             cfg,
         };
         Fx {
@@ -1136,6 +1158,7 @@ async fn object_status_evict_and_drill_after_release() {
             "size": plain.len(),
             "plaintext_sha256": hex(&sha256(&plain)),
             "match": true,
+            "retries": 0,
         })
     );
     assert!(
@@ -1164,6 +1187,167 @@ async fn object_status_evict_and_drill_after_release() {
 
     assert_eq!(fx.post("/drill/slice/missing").await.status, 404);
     assert_eq!(fx.post("/drill/nope/k").await.status, 404);
+}
+
+type Hook = Rc<dyn Fn(u32) -> futures_util::future::LocalBoxFuture<'static, ()>>;
+
+/// A sleeper for the drill's waits: each one moves the bridge's clock
+/// on by its length, counts in `polls`, checks that the drill holds no
+/// budget while it waits, and then runs `hook` with the poll's number.
+/// A longer sleep is a timer that watches over a call: it never fires.
+fn drill_sleeper(
+    polls: Rc<Cell<u32>>,
+    weak: Rc<RefCell<std::rc::Weak<TestBridge>>>,
+    hook: Hook,
+) -> impl FnOnce(FixedClock) -> Sleeper {
+    move |clock| {
+        Rc::new(move |ms| {
+            if ms > COLD_POLL_MS + COLD_JITTER_MS {
+                return Box::pin(std::future::pending());
+            }
+            assert!(ms >= COLD_POLL_MS, "{ms} ms");
+            let (polls, weak, hook, clock) =
+                (polls.clone(), weak.clone(), hook.clone(), clock.clone());
+            Box::pin(async move {
+                let bridge = weak.borrow().upgrade().expect("fixture is alive");
+                assert_eq!(bridge.budget.in_use(), 0, "a waiting drill holds budget");
+                polls.set(polls.get() + 1);
+                clock.advance_ms(i64::from(ms));
+                hook(polls.get()).await;
+            })
+        })
+    }
+}
+
+/// The fixture with [`drill_sleeper`].
+async fn drill_fx(
+    polls: &Rc<Cell<u32>>,
+    hook: impl FnOnce(Rc<RefCell<std::rc::Weak<TestBridge>>>) -> Hook,
+) -> Fx {
+    let weak: Rc<RefCell<std::rc::Weak<TestBridge>>> = Rc::default();
+    let fx = Fx::with_sleeper(drill_sleeper(
+        polls.clone(),
+        weak.clone(),
+        hook(weak.clone()),
+    ))
+    .await;
+    *weak.borrow_mut() = Rc::downgrade(&fx.bridge);
+    fx
+}
+
+/// A drill whose read a provider broke off is begun again after a short
+/// wait, as a cold read is: one bad moment of a provider or a proxy does
+/// not fail a read-back of a large object. One that keeps breaking off
+/// ends as `SlowDown` after the same number of tries as a cold read.
+#[tokio::test]
+async fn a_drill_reads_an_extent_again_after_a_broken_session() {
+    for heals in [true, false] {
+        let polls = Rc::new(Cell::new(0u32));
+        let fx = drill_fx(&polls, |_| Rc::new(|_| Box::pin(async {}))).await;
+        let bucket = fx.bucket("scratch").await;
+        let o = fx.put(&bucket, "k", &plaintext()).await;
+        fx.drive(&o, OutboxStage::Done).await;
+
+        // The first read breaks off on its first article, and on both of
+        // its reconnects: the provider is out of that pass.
+        let breaks = match heals {
+            true => 3,
+            false => usize::MAX,
+        };
+        fx.server.drop_next_bodies(breaks).await;
+        let cached = fx.bridge.cache.keys();
+        let r = fx.post("/drill/scratch/k").await;
+        match heals {
+            true => {
+                assert_eq!(r.status, 200, "{}", r.text());
+                let v = r.json();
+                assert_eq!((&v["match"], &v["retries"]), (&json!(true), &json!(1)));
+                assert_eq!(v["plaintext_sha256"], hex(&sha256(&o.plain)));
+                assert_eq!(polls.get(), 1);
+            }
+            false => {
+                assert_eq!(r.status, 503, "{}", r.text());
+                assert!(r.text().contains("SlowDown"));
+                assert_eq!(polls.get(), service::INTERRUPTED_RETRIES);
+            }
+        }
+        // Usenet only: nothing was written to the cache.
+        assert_eq!(fx.bridge.cache.keys(), cached);
+        assert_eq!(fx.bridge.nntp.live(), 0);
+        assert_eq!(fx.bridge.budget.in_use(), 0);
+        fx.server.drop_next_bodies(0).await;
+    }
+}
+
+/// While every slot of the providers is held, a drill waits for one, as
+/// a cold read does, holding no budget; it answers `SlowDown` once
+/// `COLD_WAIT_MS` has passed.
+#[tokio::test]
+async fn a_drill_waits_for_a_slot_then_slows_down() {
+    for frees in [true, false] {
+        let polls = Rc::new(Cell::new(0u32));
+        let held: Rc<RefCell<Vec<Permit>>> = Rc::default();
+        let fx = drill_fx(&polls, |weak| {
+            let held = held.clone();
+            Rc::new(move |poll| {
+                let (held, weak) = (held.clone(), weak.clone());
+                Box::pin(async move {
+                    // The other holder gives its slots back on the third
+                    // poll, or keeps them, renewed, for good.
+                    let bridge = weak.borrow().upgrade().expect("fixture is alive");
+                    let permits: Vec<Permit> = held.borrow().clone();
+                    for permit in &permits {
+                        if frees && poll == 3 {
+                            bridge.catalog.release_permit(permit).await.unwrap();
+                        } else {
+                            let now = bridge.clock.now();
+                            bridge.catalog.renew_permit(permit, now).await.unwrap();
+                        }
+                    }
+                })
+            })
+        })
+        .await;
+        let bucket = fx.bucket("scratch").await;
+        let o = fx.put(&bucket, "k", &plaintext()).await;
+        fx.drive(&o, OutboxStage::Done).await;
+        let p = fx.bridge.cfg.providers[0].clone();
+        let now = fx.bridge.clock.now();
+        while let Some(permit) = fx
+            .bridge
+            .catalog
+            .acquire_permit(&p, PermitClass::Read, "other", now)
+            .await
+            .unwrap()
+        {
+            held.borrow_mut().push(permit);
+        }
+        assert_eq!(held.borrow().len(), p.max_conns as usize);
+        let started = fx.bridge.clock.now();
+
+        let r = fx.post("/drill/scratch/k").await;
+        match frees {
+            true => {
+                assert_eq!(r.status, 200, "{}", r.text());
+                let v = r.json();
+                assert_eq!((&v["match"], &v["retries"]), (&json!(true), &json!(3)));
+                assert_eq!(polls.get(), 3);
+            }
+            false => {
+                assert_eq!(r.status, 503, "{}", r.text());
+                assert!(r.text().contains("SlowDown"));
+                let waited = fx.bridge.clock.now().0 - started.0;
+                assert!(
+                    (i64::from(COLD_WAIT_MS)
+                        ..i64::from(COLD_WAIT_MS + COLD_POLL_MS + COLD_JITTER_MS))
+                        .contains(&waited),
+                    "waited {waited} ms"
+                );
+            }
+        }
+        assert_eq!(fx.bridge.nntp.live(), 0);
+        assert_eq!(fx.bridge.budget.in_use(), 0);
+    }
 }
 
 #[tokio::test]
@@ -1351,6 +1535,159 @@ async fn status_reports_provider_health_without_credentials() {
         assert!(!body.contains(secret), "status leaks provider details");
     }
     fx.bridge.catalog.release_permit(&permit).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Provider probes
+// ---------------------------------------------------------------------------
+
+/// `(healthy, failures)` of provider `id` in the status.
+async fn health_of(fx: &Fx, id: &str) -> (Value, Value) {
+    let status = fx.get("/status").await.json();
+    let one = status["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .unwrap()
+        .clone();
+    (one["healthy"].clone(), one["failures"].clone())
+}
+
+/// A provider whose strikes stay below the cooldown threshold, and that
+/// nothing picks, recovers by a probe once it has been quiet: one
+/// session, given back, and no client read. The probe asks nothing of a
+/// healthy provider.
+#[tokio::test]
+async fn a_provider_whose_strikes_nothing_clears_recovers_by_a_probe() {
+    use velmora_bridge::probe::{Probed, PROBE_QUIET_MS};
+    let fx = Fx::new().await;
+    let b = &fx.bridge;
+    let now = b.clock.now();
+    for _ in 0..2 {
+        let failed = b
+            .catalog
+            .provider_failed("p0", ProviderFault::SessionFailed, now);
+        failed.await.unwrap();
+    }
+    assert_eq!(health_of(&fx, "p0").await, (json!(false), json!(2)));
+
+    // Struck just now: not yet.
+    assert!(b.probe_providers().await.unwrap().is_empty());
+    b.clock.advance_ms(PROBE_QUIET_MS - 1);
+    assert!(b.probe_providers().await.unwrap().is_empty());
+    assert_eq!(b.nntp.connects(), 0);
+
+    b.clock.advance_ms(1);
+    let probed = b.probe_providers().await.unwrap();
+    assert_eq!(probed, [("p0".to_string(), Probed::Recovered)]);
+    assert_eq!(b.nntp.connects_to("p0"), 1);
+    assert_eq!(b.nntp.live(), 0);
+    assert_eq!(health_of(&fx, "p0").await, (json!(true), json!(0)));
+    let held = fx.get("/status").await.json()["providers"][0]["held"].clone();
+    assert_eq!(held, 0, "the probe gave its slot back");
+
+    // Healthy now: nothing to ask.
+    b.clock.advance_ms(PROBE_QUIET_MS);
+    assert!(b.probe_providers().await.unwrap().is_empty());
+    assert_eq!(b.nntp.connects(), 1);
+}
+
+/// A probe that fails is one more strike, with its reason, and the
+/// quiet time starts again; a later probe that goes well clears them.
+#[tokio::test]
+async fn a_failed_probe_is_one_more_strike() {
+    use velmora_bridge::probe::{Probed, PROBE_QUIET_MS};
+    let fx = Fx::new().await;
+    let b = &fx.bridge;
+    let failed = b
+        .catalog
+        .provider_failed("p0", ProviderFault::SessionFailed, b.clock.now());
+    failed.await.unwrap();
+    b.clock.advance_ms(PROBE_QUIET_MS);
+
+    fx.server.drop_next_stats(1).await;
+    let probed = b.probe_providers().await.unwrap();
+    let fault = Probed::Failed(ProviderFault::SessionFailed);
+    assert_eq!(probed, [("p0".to_string(), fault)]);
+    assert_eq!(health_of(&fx, "p0").await, (json!(false), json!(2)));
+    assert!(b.probe_providers().await.unwrap().is_empty());
+
+    b.clock.advance_ms(PROBE_QUIET_MS);
+    let probed = b.probe_providers().await.unwrap();
+    assert_eq!(probed, [("p0".to_string(), Probed::Recovered)]);
+    assert_eq!(health_of(&fx, "p0").await, (json!(true), json!(0)));
+    assert_eq!(b.nntp.live(), 0);
+}
+
+/// Only an enabled provider is probed, and only under a slot of its
+/// own: one whose slots are all held is left as it is. A provider that
+/// only posts is asked for its login and nothing else.
+#[tokio::test]
+async fn a_probe_needs_an_enabled_provider_and_a_free_slot() {
+    use velmora_bridge::probe::{Probed, PROBE_QUIET_MS};
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut off = providers[0].clone();
+        off.id = "p1".to_string();
+        off.enabled = false;
+        let mut poster = providers[0].clone();
+        poster.id = "p2".to_string();
+        poster.read = false;
+        providers.extend([off, poster]);
+    })
+    .await;
+    let b = &fx.bridge;
+    let now = b.clock.now();
+    for id in ["p0", "p1", "p2"] {
+        let failed = b
+            .catalog
+            .provider_failed(id, ProviderFault::SessionFailed, now);
+        failed.await.unwrap();
+    }
+    b.clock.advance_ms(PROBE_QUIET_MS);
+    let now = b.clock.now();
+    let p0 = b.cfg.providers[0].clone();
+    let mut held = Vec::new();
+    while let Some(permit) = b
+        .catalog
+        .acquire_permit(&p0, PermitClass::Read, "other", now)
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+    }
+    // A `STAT` now would break the connection: the poster is not asked one.
+    fx.server.drop_next_stats(1).await;
+
+    let probed = b.probe_providers().await.unwrap();
+    assert_eq!(
+        probed,
+        [
+            ("p0".to_string(), Probed::NoSlot),
+            ("p2".to_string(), Probed::Recovered),
+        ]
+    );
+    assert_eq!((b.nntp.connects_to("p0"), b.nntp.connects_to("p1")), (0, 0));
+    assert_eq!(health_of(&fx, "p0").await, (json!(false), json!(1)));
+    assert_eq!(health_of(&fx, "p1").await, (json!(false), json!(1)));
+    assert_eq!(health_of(&fx, "p2").await, (json!(true), json!(0)));
+    for permit in &held {
+        b.catalog.release_permit(permit).await.unwrap();
+    }
+}
+
+/// Under `MAINTENANCE=restore` nothing is probed, as nothing is sent.
+#[tokio::test]
+async fn no_probe_under_restore_maintenance() {
+    let fx = Fx::with(Environment::Dev, Maintenance::Restore).await;
+    let b = &fx.bridge;
+    let failed = b
+        .catalog
+        .provider_failed("p0", ProviderFault::SessionFailed, b.clock.now());
+    failed.await.unwrap();
+    b.clock.advance_ms(velmora_bridge::probe::PROBE_QUIET_MS);
+    assert!(b.probe_providers().await.unwrap().is_empty());
+    assert_eq!(b.nntp.connects(), 0);
 }
 
 /// The status says how each provider is reached: directly or through

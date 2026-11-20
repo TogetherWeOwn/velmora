@@ -527,6 +527,73 @@ async fn a_refused_login_cools_down_for_up_to_six_hours() {
     assert_eq!(l.cooldown_until, now.plus_ms(15 * MINUTE_MS));
 }
 
+/// The providers due for a probe at `now`, with the probe's quiet times.
+async fn due(c: &SqlCatalog<RusqliteSql>, now: UnixMs) -> Vec<String> {
+    use velmora_bridge::probe::{LOGIN_REFUSED_QUIET_MS, PROBE_QUIET_MS};
+    let quiet = now.plus_ms(-PROBE_QUIET_MS);
+    let login = now.plus_ms(-LOGIN_REFUSED_QUIET_MS);
+    c.providers_to_probe(now, quiet, login).await.unwrap()
+}
+
+/// A provider is due for a probe once it has a strike or a cooldown on
+/// record, is not cooling, and has had no strike for the quiet time:
+/// after a refused login, for hours. A good session takes it off the
+/// list, and a provider that never failed is never on it.
+#[tokio::test]
+async fn providers_with_strikes_nothing_cleared_are_due_for_a_probe() {
+    use velmora_bridge::probe::{LOGIN_REFUSED_QUIET_MS, PROBE_QUIET_MS};
+    let c = catalog();
+    let session = ProviderFault::SessionFailed;
+    // p1: two strikes, below the threshold. p2: three, a cooldown that
+    // ends after a minute. p3: two strikes and then a good session.
+    // p4: a refused login. p5: a slot only, never a strike.
+    for _ in 0..2 {
+        c.provider_failed("p1", session, T0).await.unwrap();
+        c.provider_failed("p3", session, T0).await.unwrap();
+    }
+    for _ in 0..3 {
+        c.provider_failed("p2", session, T0).await.unwrap();
+    }
+    c.provider_recovered("p3", T0).await.unwrap();
+    c.provider_failed("p4", ProviderFault::LoginRefused, T0)
+        .await
+        .unwrap();
+    c.seed_permits(&[provider("p5", 1)]).await.unwrap();
+
+    assert!(due(&c, T0).await.is_empty());
+    assert!(due(&c, T0.plus_ms(PROBE_QUIET_MS - 1)).await.is_empty());
+    // Quiet long enough: the strikes below the threshold, and the
+    // cooldowns in a row once the last cooldown is over.
+    assert_eq!(due(&c, T0.plus_ms(PROBE_QUIET_MS)).await, ["p1", "p2"]);
+    assert_eq!(
+        due(&c, T0.plus_ms(LOGIN_REFUSED_QUIET_MS - 1)).await,
+        ["p1", "p2"]
+    );
+    assert_eq!(
+        due(&c, T0.plus_ms(LOGIN_REFUSED_QUIET_MS)).await,
+        ["p1", "p2", "p4"]
+    );
+
+    // A cooling provider is not due, however long ago its last strike:
+    // p2 fails at the end of each cooldown until one is longer than the
+    // quiet time.
+    let mut later = T0.plus_ms(PROBE_QUIET_MS);
+    for _ in 0..4 {
+        c.provider_failed("p2", session, later).await.unwrap();
+        later = load_of(&c, "p2", later).await.unwrap().cooldown_until;
+    }
+    c.provider_failed("p2", session, later).await.unwrap();
+    let cooling = load_of(&c, "p2", later).await.unwrap().cooldown_until;
+    assert_eq!(cooling, later.plus_ms(15 * MINUTE_MS));
+    assert_eq!(due(&c, later.plus_ms(PROBE_QUIET_MS)).await, ["p1"]);
+    assert_eq!(due(&c, cooling).await, ["p1", "p2"]);
+    // A new strike starts the quiet time again; a good session ends it.
+    c.provider_failed("p1", session, cooling).await.unwrap();
+    c.provider_recovered("p2", cooling).await.unwrap();
+    assert!(due(&c, cooling).await.is_empty());
+    assert_eq!(due(&c, cooling.plus_ms(PROBE_QUIET_MS)).await, ["p1"]);
+}
+
 /// The codes are stable: they are stored and shown.
 #[test]
 fn fault_codes_are_stable() {
