@@ -262,7 +262,7 @@ impl NntpConnector for TcpConnector {
 // In-memory catalogue
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutboxRow {
     pub generation: GenerationId,
     pub stage: OutboxStage,

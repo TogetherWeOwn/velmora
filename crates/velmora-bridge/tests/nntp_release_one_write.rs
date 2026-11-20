@@ -327,17 +327,13 @@ async fn a_release_the_guard_refuses_writes_nothing() {
                 done.unwrap()
             }
         };
-        // The whole of both rows: the stage, the tries, the next run.
-        let rows = || {
-            format!(
-                "{:?}",
-                (catalog.extent(&s.extent), catalog.outbox(&s.extent))
-            )
-        };
-        let unchanged = |before: &str, what: &str| {
+        // The whole of both rows, every field: the stage, the tries, the
+        // next run.
+        let rows = || (catalog.extent(&s.extent), catalog.outbox(&s.extent));
+        let unchanged = |before: &(ExtentRow, OutboxRow), what: &str| {
             assert!(rig.held(&s), "{check:?}: {what}");
             assert_eq!(rig.stage(&s), OutboxStage::Release, "{check:?}: {what}");
-            assert_eq!(rows(), before, "{check:?}: {what}");
+            assert!(rows() == *before, "{check:?}: {what}");
         };
         let now = rig.bridge.clock.now();
         let before = rows();
