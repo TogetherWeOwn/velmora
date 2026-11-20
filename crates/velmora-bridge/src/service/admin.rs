@@ -1389,6 +1389,14 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 // Drill
 // ---------------------------------------------------------------------------
 
+/// Whether `e` is a catalogue that did not answer: a statement the
+/// store failed, which asking again may mend. A row that was read and
+/// cannot be decoded is not: it reads the same every time, and a caller
+/// told to retry would never see it.
+fn catalogue_unanswered(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Sql(what) if !what.starts_with("row decode"))
+}
+
 /// A failure inside a drill. The drill writes nothing, so a catalogue
 /// that did not answer is a reason to ask again, not an error of the
 /// object or the bridge: `503`, with the class said. (Before, any one
@@ -1396,7 +1404,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 /// drill a `500`.) Every other failure stays a `500`.
 fn drill_failed(e: &BridgeError) -> S3Response {
     match e {
-        BridgeError::Sql(_) => json_response(
+        e if catalogue_unanswered(e) => json_response(
             503,
             &json!({
                 "error": "SlowDown",
@@ -1482,7 +1490,7 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
     let deadline = bridge.clock.now().plus_ms(i64::from(COLD_WAIT_MS));
     let mut slept = 0u32;
     let mut interrupted = 0u32;
-    let mut last = None;
+    let mut last: Option<BridgeError>;
     loop {
         if charge.is_none() {
             // A try after a wait starts only inside the allowance, and
@@ -1492,7 +1500,8 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
                 return Err(busy());
             };
             let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
-            let taken = core::pin::pin!(bridge.budget.charge(bytes));
+            // After a request that waited for this room before.
+            let taken = core::pin::pin!(bridge.budget.charge_in_turn(bytes));
             let taken = match select(taken, sleep(left)).await {
                 Either::Left((taken, _)) => taken.map_err(|_| busy())?,
                 Either::Right(_) => return Err(busy()),
@@ -1522,14 +1531,17 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
                 return Ok(Some(cipher));
             }
             Ok((ColdFetch::Unavailable, _)) => return Ok(None),
-            Ok((ColdFetch::Busy, _)) => {}
+            // `last` is why the last try failed: the answer says the
+            // class of that one, not of an earlier one.
+            Ok((ColdFetch::Busy, _)) => last = None,
             Ok((ColdFetch::Interrupted, _)) if interrupted < INTERRUPTED_RETRIES => {
                 interrupted += 1;
+                last = None;
             }
             Ok((ColdFetch::Interrupted, _)) => return Err(busy()),
             // The catalogue failed under the read. What the reader
             // holds is ended below, and the extent is read again.
-            Err(e @ BridgeError::Sql(_)) if interrupted < INTERRUPTED_RETRIES => {
+            Err(e) if catalogue_unanswered(&e) && interrupted < INTERRUPTED_RETRIES => {
                 interrupted += 1;
                 last = Some(e);
             }
@@ -1579,9 +1591,8 @@ async fn drill_extents<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
     };
     // One charge for the whole drill, for its largest extent: ciphertext
     // and plaintext of one extent are held together, and beside the
-    // ciphertext the wire text on the sockets. It is not given back
-    // between extents: the sessions would sit open, their slots not
-    // renewed, for as long as the wait for it lasted.
+    // ciphertext the wire text on the sockets. It is kept from extent to
+    // extent unless a request waits for the room (below).
     let bytes = extents
         .iter()
         .map(|e| cold_step_bytes(e.cipher_size, reader.sockets()).max(e.cipher_size + e.plain_size))
@@ -1595,8 +1606,24 @@ async fn drill_extents<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
         done.matched = false;
         return Ok(done);
     }
+    // An object has an extent, an empty one too: of no extent nothing
+    // was read, and nothing is said to match.
+    done.matched &= !extents.is_empty();
     let mut covered = 0u64;
-    for extent in extents {
+    for (nth, extent) in extents.iter().enumerate() {
+        // Between extents the drill holds no buffer. A request of this
+        // isolate that waits for room the drill alone keeps it out of is
+        // let in here, or a drill of many extents would hold it off for
+        // minutes: the sessions are ended (they are not to sit open for
+        // as long as that request runs), and the charge is taken again
+        // after it, inside the allowance of the extent.
+        if nth > 0 {
+            drop(charge.take());
+            charge = bridge.budget.try_charge_in_turn(bytes);
+            if charge.is_none() {
+                reader.hang_up().await;
+            }
+        }
         let (Some(base), Ok(plain_len)) = (expect, usize::try_from(extent.plain_size)) else {
             done.matched = false;
             break;
@@ -1653,10 +1680,11 @@ async fn drill_extents<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 /// - `sockets=<n>`: connections to read over, `1` to `COLD_SOCKETS`
 ///   (the default). They come from the providers' `drill_conns`; see
 ///   [`Bridge::drill_reader`].
-/// - `state=<token>`: the `state` of the answer for the bytes just
-///   before this range. The `running` digests then cover those bytes
-///   too, so the last answer of a run of ranges carries the MD5 and the
-///   SHA-256 of all of it ([`crate::hashstate`]).
+/// - `state=<token>`: the `state` of the answer for the bytes before
+///   this range, all of them from the first of the object (`400` for
+///   the state of any other count). The `running` digests then cover
+///   those bytes too, so the last answer of a run of ranges carries the
+///   MD5 and the SHA-256 of the object ([`crate::hashstate`]).
 async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &str,
@@ -1672,11 +1700,11 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             .filter(|n| (1..=bridge.cfg.cold_sockets.max(1)).contains(n))
             .ok_or_else(|| bad("sockets is 1 to COLD_SOCKETS."))?,
     };
-    let running = match query_param(raw_target, "state") {
-        None => Running::default(),
-        Some(token) => {
-            Running::from_token(token).ok_or_else(|| bad("state is not the state of a drill."))?
-        }
+    let state = match query_param(raw_target, "state") {
+        None => None,
+        Some(token) => Some(
+            Running::from_token(token).ok_or_else(|| bad("state is not the state of a drill."))?,
+        ),
     };
     let catalogue = |e: BridgeError| drill_failed(&e);
     let bucket = match bridge.catalog.bucket_by_name(bucket).await {
@@ -1715,6 +1743,13 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         }
     };
 
+    // A state stands for the bytes of the object before the range, all
+    // of them: `running` is then the digest of the object up to `last`.
+    if state.as_ref().is_some_and(|s| s.bytes() != start) {
+        return Err(bad("state is not of the bytes before the range."));
+    }
+    let running = state.unwrap_or_default();
+
     let mut reader = bridge.drill_reader(sockets).or_internal()?;
     let ask = DrillAsk {
         start,
@@ -1727,6 +1762,19 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     // Every exit ends the sessions and frees their slots.
     reader.close().await;
     let done = read?;
+    if !done.matched {
+        // "Not on Usenet" is said of the live object only. One that was
+        // overwritten or deleted while it was read may have had its
+        // rows and articles taken away under the drill: ask again.
+        let live = bridge
+            .catalog
+            .live_generation(&bucket.id, key)
+            .await
+            .map_err(catalogue)?;
+        if live.map(|g| g.id) != Some(generation.id.clone()) {
+            return Err(busy());
+        }
+    }
 
     let digests = |run: &Running| {
         let (sha256, md5) = run.digests();

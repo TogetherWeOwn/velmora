@@ -1707,6 +1707,61 @@ async fn ranges_handed_their_state_give_the_digests_of_the_whole() {
         assert_eq!(r.status, 400, "{}", r.text());
     }
     assert_eq!(fx.bridge.nntp.connects(), connects);
+
+    // Nor is the state of other bytes than those before the range: the
+    // running digests would be of no object.
+    let first = fx.post("/drill/scratch/k?range=0-999999").await.json();
+    let state = first["state"].as_str().expect("a state");
+    for range in ["0-9", "999999-", "1000001-"] {
+        let r = fx
+            .post(&format!("/drill/scratch/k?range={range}&state={state}"))
+            .await;
+        assert_eq!(r.status, 400, "{range}: {}", r.text());
+    }
+    let connects = fx.bridge.nntp.connects() - connects;
+    assert_eq!(connects, 1, "only the range that gave the state was read");
+    let r = fx
+        .post(&format!("/drill/scratch/k?range=1000000-&state={state}"))
+        .await;
+    assert_eq!(r.json()["running"]["md5"], md5_hex(&whole));
+}
+
+/// A drill of many extents does not hold a request of the same isolate
+/// off until it ends: between two extents it gives its room to a charge
+/// that waits for it, and reads on after it.
+#[tokio::test]
+async fn a_drill_lets_a_waiting_request_in_between_extents() {
+    use velmora_bridge::ingress::CHARGE_POLL_MS;
+    // A wait for room is a short real one; any other sleep is a timer
+    // that watches over a call, and never fires.
+    let fx = Fx::with_sleeper(|_| {
+        Rc::new(|ms| match ms == CHARGE_POLL_MS {
+            true => Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))),
+            false => Box::pin(std::future::pending()),
+        })
+    })
+    .await;
+    let (_, whole) = drill_object(&fx).await;
+    let drilled = Cell::new(false);
+    let let_in = Cell::new(false);
+    let drill = async {
+        let r = fx.post("/drill/scratch/k").await;
+        drilled.set(true);
+        r
+    };
+    // Fits alone, and not beside the drill's charge.
+    let other = async {
+        let charge = fx.bridge.budget.charge(BUDGET - 1024).await;
+        let_in.set(charge.is_ok() && !drilled.get());
+    };
+    let (r, ()) = tokio::join!(drill, other);
+    assert!(let_in.get(), "the request waited for the whole drill");
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["extents"]), (&json!(true), &json!(3)));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
 }
 
 /// A drill logs in once and reads every extent over that session: not
@@ -1852,6 +1907,9 @@ async fn a_drill_over_several_sockets_outlives_a_broken_session() {
         assert_eq!(v["plaintext_sha256"], hex(&sha256(&whole)));
         assert_eq!(fx.bridge.nntp.live(), 0);
         assert_eq!(fx.bridge.budget.in_use(), 0);
+        // The slots of the sessions that broke are free as well.
+        let held = "SELECT COUNT(*) FROM provider_permits WHERE lease_until > 0";
+        assert_eq!(fx.scalar(held, &[]).await, "0");
     }
     assert_eq!(blobs(&fx), 0);
 }
@@ -1897,6 +1955,21 @@ async fn a_catalogue_failure_under_a_drill_is_retried_then_a_slow_down() {
             assert_eq!(fx.bridge.budget.in_use(), 0, "{part}");
         }
     }
+
+    // A row that cannot be read is no reason to ask again: it stays a
+    // `500`, at once, so that it is seen.
+    let polls = Rc::new(Cell::new(0u32));
+    let fx = drill_fx(&polls, |_| Rc::new(|_| Box::pin(async {}))).await;
+    drill_object(&fx).await;
+    let sql = &fx.bridge.catalog.sql;
+    let n = sql.exec("UPDATE articles SET cipher_len = 'x'", &[]).await;
+    assert!(n.unwrap() > 0);
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 500, "{}", r.text());
+    assert_eq!(r.json()["class"], "catalog");
+    assert_eq!(polls.get(), 0);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
 
     // Before anything is read: whether a replay is pending, the bucket,
     // the generation, the extents.
