@@ -1603,6 +1603,18 @@ async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone(
             let SqlValue::Text(step) = &row[3] else {
                 panic!("unexpected {row:?}")
             };
+            if step.starts_with("SCAN extents") && sql.starts_with("INSERT INTO generations") {
+                // With triggers on `generations` (the usage counters),
+                // SQLite compiles the parent side of each foreign key into
+                // the INSERT: a walk of the child rows that runs only when
+                // the statement itself broke a key, which fails it anyway.
+                // `FkIfZero` jumps over it otherwise, so it reads nothing.
+                assert!(
+                    only_fk_guarded(&fx, sql, &params, "extents").await,
+                    "{sql}\n{step}"
+                );
+                continue;
+            }
             assert!(
                 !step.starts_with("SCAN extents") && !step.starts_with("SCAN e"),
                 "{sql}\n{step}"
@@ -1614,4 +1626,30 @@ async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone(
             }
         }
     }
+}
+
+/// Every open of `table` in the program of `sql` comes right after an
+/// `FkIfZero`: it runs only when a foreign key of the statement is broken.
+async fn only_fk_guarded(fx: &Fx, sql: &str, params: &[SqlValue], table: &str) -> bool {
+    let db = &fx.cat.sql.db;
+    let root = db
+        .query(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            &[text(table)],
+        )
+        .await
+        .unwrap();
+    let root = root[0][0].clone();
+    let code = db.query(&format!("EXPLAIN {sql}"), params).await.unwrap();
+    let op = |row: &Row| match &row[1] {
+        SqlValue::Text(op) => op.clone(),
+        other => panic!("unexpected {other:?}"),
+    };
+    let opens: Vec<usize> = (0..code.len())
+        .filter(|&i| op(&code[i]) == "OpenRead" && code[i][3] == root)
+        .collect();
+    !opens.is_empty()
+        && opens
+            .iter()
+            .all(|&i| i > 0 && op(&code[i - 1]) == "FkIfZero")
 }
