@@ -1,0 +1,39 @@
+{
+  "read_on": "2026-11-18",
+  "plan": "Workers Paid, list prices with no allowance (the unit cost once the included usage is used up)",
+  "sources": {
+    "workers": "https://developers.cloudflare.com/workers/platform/pricing/",
+    "d1": "https://developers.cloudflare.com/d1/platform/pricing/",
+    "r2": "https://developers.cloudflare.com/r2/pricing/",
+    "queues": "https://developers.cloudflare.com/queues/platform/pricing/",
+    "durable_objects": "https://developers.cloudflare.com/durable-objects/platform/pricing/"
+  },
+  "usd": {
+    "workers_requests_per_m": 0.30,
+    "workers_cpu_ms_per_m": 0.02,
+    "d1_rows_read_per_m": 0.001,
+    "d1_rows_written_per_m": 1.00,
+    "d1_storage_gb_month": 0.75,
+    "r2_storage_gb_month": 0.015,
+    "r2_class_a_per_m": 4.50,
+    "r2_class_b_per_m": 0.36,
+    "queues_ops_per_m": 0.40,
+    "do_requests_per_m": 0.15
+  },
+  "included_per_month": {
+    "workers_requests": 10000000,
+    "workers_cpu_ms": 30000000,
+    "d1_rows_read": 25000000000,
+    "d1_rows_written": 50000000,
+    "d1_storage_gb": 5,
+    "r2_storage_gb": 10,
+    "r2_class_a": 1000000,
+    "r2_class_b": 10000000,
+    "queues_ops": 1000000
+  },
+  "notes": [
+    "A queue message is billed as three operations (write, read, delete) per 64 KB; each redelivery is one more read.",
+    "R2 egress is free; DeleteObject is free.",
+    "GB is decimal (1e9 bytes); TB is 1e12 bytes of plaintext."
+  ]
+}

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# run-local.sh: layer 1 of the benchmark, one command.
+#
+#   bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] [--cpu <cpu.json>]
+#
+# Runs the scenario of crates/velmora-bridge/tests/bench_counts.rs (native
+# rig, fake NNTP, the production [vars]), replays its D1 trace through the
+# local D1 runtime for D1's own rows read and written, and writes
+# <out>/results.json and <out>/results.md (bench/report.py).
+#
+# --ref measures another commit with this checkout's harness: the ref is
+# checked out in a temporary worktree, this checkout's
+# tests/bench_counts.rs is copied into it, and the worktree is removed at
+# the end. Without --ref the working tree itself is measured.
+#
+# Nothing here touches the network except `npm ci` (pinned by
+# workers/s3-bridge/package-lock.json) on the first run. Scratch and build
+# output go under $BENCH_WORK (default /var/tmp/velmora-bench); the cargo
+# target directory of a --ref run is removed with its worktree.
+set -euo pipefail
+umask 022
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$HERE/.." && pwd)
+WORK=${BENCH_WORK:-/var/tmp/velmora-bench}
+REF='' NAME='' OUT='' TINY='' CPU=''
+while (($#)); do
+  case $1 in
+    --ref) REF=$2; shift 2 ;;
+    --name) NAME=$2; shift 2 ;;
+    --out) OUT=$2; shift 2 ;;
+    --tiny) TINY=$2; shift 2 ;;
+    --cpu) CPU=$2; shift 2 ;;
+    *) echo "unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+log() { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+mkdir -p "$WORK"
+
+SRC=$REPO
+CLEAN=()
+cleanup() { for c in "${CLEAN[@]}"; do eval "$c" || true; done; }
+trap cleanup EXIT
+if [[ -n $REF ]]; then
+  SHA=$(git -C "$REPO" rev-parse --short=7 "$REF^{commit}")
+  SRC=$WORK/src-$SHA
+  git -C "$REPO" worktree remove --force "$SRC" 2>/dev/null || rm -rf "$SRC"
+  git -C "$REPO" worktree add --detach "$SRC" "$SHA" >/dev/null 2>&1
+  CLEAN+=("git -C '$REPO' worktree remove --force '$SRC'")
+  cp "$REPO/crates/velmora-bridge/tests/bench_counts.rs" "$SRC/crates/velmora-bridge/tests/bench_counts.rs"
+  TARGET=$WORK/target-$SHA
+  CLEAN+=("rm -rf '$TARGET'")
+else
+  SHA=$(git -C "$REPO" rev-parse --short=7 HEAD)
+  [[ -z $(git -C "$REPO" status --porcelain --untracked-files=no) ]] || SHA="$SHA-dirty"
+  TARGET=${CARGO_TARGET_DIR:-$WORK/target-worktree}
+fi
+NAME=${NAME:-$SHA}
+OUT=${OUT:-$WORK/runs/$NAME}
+mkdir -p "$OUT"
+log "measuring $NAME ($SRC) into $OUT"
+
+# Pinned wrangler (local D1 runtime), installed once.
+NODE_DIR=$WORK/node
+if ! cmp -s "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/package-lock.json" 2>/dev/null \
+  || [[ ! -x $NODE_DIR/node_modules/.bin/wrangler ]]; then
+  log "installing the pinned wrangler into $NODE_DIR"
+  mkdir -p "$NODE_DIR"
+  cp "$REPO/workers/s3-bridge/package.json" "$REPO/workers/s3-bridge/package-lock.json" "$NODE_DIR/"
+  (cd "$NODE_DIR" && npm ci --no-audit --no-fund >/dev/null)
+fi
+
+t=$(date +%s)
+(
+  cd "$SRC"
+  export CARGO_TARGET_DIR=$TARGET CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+  export VELMORA_BENCH_OUT=$OUT ${TINY:+VELMORA_BENCH_TINY=$TINY}
+  cargo test -q -p velmora-bridge --test bench_counts -- --ignored --exact bench_counts_full >"$OUT/cargo.log" 2>&1
+) || { tail -n 40 "$OUT/cargo.log" >&2; log "FAILED: the native run (log: $OUT/cargo.log)"; exit 1; }
+log "native run done in $(($(date +%s) - t)) s"
+
+t=$(date +%s)
+NODE_DIR=$NODE_DIR node "$HERE/d1-replay.mjs" "$OUT/d1-trace.jsonl" "$SRC/workers/s3-bridge/migrations" \
+  "$WORK/d1-$NAME" "$OUT/d1.json" 2>"$OUT/replay.log" || { cat "$OUT/replay.log" >&2; log "FAILED: the D1 replay"; exit 1; }
+rm -rf "$WORK/d1-$NAME"
+log "D1 replay done in $(($(date +%s) - t)) s: $(tail -n 1 "$OUT/replay.log")"
+gzip -f "$OUT/d1-trace.jsonl"
+
+python3 -I "$HERE/report.py" "$OUT" --name "$NAME" ${CPU:+--cpu "$CPU"} >&2
+echo "$OUT/results.md"
