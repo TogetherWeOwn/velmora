@@ -8,6 +8,12 @@
 # local D1 runtime for D1's own rows read and written, and writes
 # <out>/results.json and <out>/results.md (bench/report.py).
 #
+# BENCH_VARS=KEY=VALUE,KEY=VALUE in the environment changes Worker
+# variables for this run only (after the rig's own overrides; a value may
+# hold commas, a new pair starts only at ",KEY="). The variables that run
+# the rig itself (ENVIRONMENT, S3_HOST, NNTP_PROVIDERS, ADMIN_TOKEN, the
+# KEKs) are refused. results.json records them under "bench_vars".
+#
 # --ref measures another commit with this checkout's harness: the ref is
 # checked out in a temporary worktree, this checkout's
 # tests/bench_counts.rs is copied into it, and the worktree is removed at
@@ -65,7 +71,7 @@ fi
 NAME=${NAME:-$SHA}
 OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
-log "measuring $NAME ($SRC) into $OUT"
+log "measuring $NAME ($SRC) into $OUT${BENCH_VARS:+ with BENCH_VARS=$BENCH_VARS}"
 
 # Pinned wrangler (local D1 runtime), installed once. One run installs at a
 # time: two `npm ci` in one directory leave it half written.
@@ -89,7 +95,7 @@ t=$(date +%s)
 (
   cd "$SRC"
   export CARGO_TARGET_DIR=$TARGET CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
-  export VELMORA_BENCH_OUT=$OUT ${TINY:+VELMORA_BENCH_TINY=$TINY}
+  export VELMORA_BENCH_OUT=$OUT ${TINY:+VELMORA_BENCH_TINY=$TINY} VELMORA_BENCH_VARS=${BENCH_VARS:-}
   cargo test -q -p velmora-bridge --test bench_counts -- --ignored --exact bench_counts_full >"$OUT/cargo.log" 2>&1
 ) || { tail -n 40 "$OUT/cargo.log" >&2; log "FAILED: the native run (log: $OUT/cargo.log)"; exit 1; }
 log "native run done in $(($(date +%s) - t)) s"

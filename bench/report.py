@@ -253,6 +253,9 @@ def render(name, counts, d1, labels, m, chk):
         "",
         "Variables: " + ", ".join(f"{k}={v}" for k, v in counts["vars"].items()),
         "",
+        "BENCH_VARS (changed for this run): "
+        + (", ".join(f"{k}={v}" for k, v in counts.get("bench_vars", {}).items()) or "none"),
+        "",
         "## Per S3 operation (per call)",
         "",
     ]
@@ -316,6 +319,10 @@ def compare(a_dir, b_dir, out):
     rb = json.loads((Path(b_dir) / "results.json").read_text())
     stale = [r["name"] for r in (ra, rb) if d1_written(r)]
     L = [f"| per call / per extent | {ra['name']} | {rb['name']} | change |", "|---|---:|---:|---:|"]
+    va, vb = ra.get("bench_vars", {}), rb.get("bench_vars", {})
+    if va or vb:
+        show = lambda v: ", ".join(f"{k}={x}" for k, x in v.items()) or "none"
+        L.append(f"| BENCH_VARS | {show(va)} | {show(vb)} | |")
     keys = ["invocations", "d1_calls", "d1_rows_read", "d1_rows_written", "r2_class_a", "r2_class_b", "queue_messages", "nntp_asks", "nntp_bodies"]
     for section in ("ops", "stages"):
         for label in sorted(set(ra[section]) | set(rb[section])):
@@ -365,6 +372,7 @@ def main(argv):
     result = {
         "name": name,
         "vars": counts["vars"],
+        "bench_vars": counts.get("bench_vars", {}),
         "classes": counts["classes"],
         "replay": {"calls": d1["calls"], "disagreements": d1["disagreements"]},
         "rows_written_check": chk,

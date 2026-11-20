@@ -524,6 +524,69 @@ fn overrides(server: &TestNntpServer) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Variables the rig needs as set above: overriding them would break the
+/// run itself (fake providers, request signing, the admin route, sealing).
+const FIXED_VARS: [&str; 5] = [
+    "ENVIRONMENT",
+    "S3_HOST",
+    "NNTP_PROVIDERS",
+    "ADMIN_TOKEN",
+    "VELMORA_KEK_1",
+];
+
+/// `VELMORA_BENCH_VARS=KEY=VALUE,KEY=VALUE` (`bench/run-local.sh` sets it
+/// from `BENCH_VARS`): Worker variables changed for one run, applied after
+/// [`overrides`]. A value may hold commas: a new pair starts only at
+/// `,KEY=` with KEY in `[A-Z][A-Z0-9_]*`.
+fn parse_bench_vars(spec: &str) -> Vec<(String, String)> {
+    fn is_key(k: &str) -> bool {
+        let mut c = k.chars();
+        c.next().is_some_and(|f| f.is_ascii_uppercase())
+            && c.all(|x| x.is_ascii_uppercase() || x.is_ascii_digit() || x == '_')
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for piece in spec.split(',') {
+        match piece.split_once('=') {
+            Some((k, v)) if is_key(k) => out.push((k.to_string(), v.to_string())),
+            _ => match out.last_mut() {
+                Some((_, v)) => {
+                    v.push(',');
+                    v.push_str(piece);
+                }
+                None if spec.trim().is_empty() => {}
+                None => panic!("VELMORA_BENCH_VARS: not KEY=VALUE: {piece:?}"),
+            },
+        }
+    }
+    for (k, _) in &out {
+        assert!(
+            !FIXED_VARS.contains(&k.as_str()) && !k.starts_with("VELMORA_KEK"),
+            "VELMORA_BENCH_VARS: {k} is fixed by the rig"
+        );
+    }
+    out
+}
+
+#[test]
+fn bench_vars_parse() {
+    assert!(parse_bench_vars("").is_empty());
+    assert_eq!(
+        parse_bench_vars("PARITY=on,NEWSGROUPS=a.b,c.d,POST_SOCKETS=6"),
+        vec![
+            ("PARITY".to_string(), "on".to_string()),
+            ("NEWSGROUPS".to_string(), "a.b,c.d".to_string()),
+            ("POST_SOCKETS".to_string(), "6".to_string()),
+        ]
+    );
+    assert_eq!(
+        parse_bench_vars("X=a=b"),
+        vec![("X".to_string(), "a=b".to_string())]
+    );
+    assert!(std::panic::catch_unwind(|| parse_bench_vars("bad")).is_err());
+    assert!(std::panic::catch_unwind(|| parse_bench_vars("ADMIN_TOKEN=x")).is_err());
+    assert!(std::panic::catch_unwind(|| parse_bench_vars("VELMORA_KEK_2=x")).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Scenario sizes
 // ---------------------------------------------------------------------------
@@ -577,6 +640,8 @@ struct Bench {
     hub: Rc<Hub>,
     signer: Signer,
     vars: BTreeMap<String, String>,
+    /// What `VELMORA_BENCH_VARS` changed for this run.
+    bench_vars: Vec<(String, String)>,
     /// Distinct extents, plaintext bytes and objects, by class.
     classes: BTreeMap<String, (u64, u64, u64)>,
 }
@@ -613,6 +678,10 @@ impl Bench {
         let mut vars = production_vars();
         for (k, v) in overrides(&server) {
             vars.insert(k.to_string(), v);
+        }
+        let bench_vars = parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        for (k, v) in &bench_vars {
+            vars.insert(k.clone(), v.clone());
         }
         let cfg = BridgeConfig::from_vars(|k| vars.get(k).cloned()).expect("bench configuration");
 
@@ -695,6 +764,7 @@ impl Bench {
             hub,
             signer: Signer::new(AKID, secret),
             vars,
+            bench_vars,
             classes: BTreeMap::new(),
         }
     }
@@ -1250,8 +1320,11 @@ fn report(b: &Bench, scale: &str) -> serde_json::Value {
     ];
     let vars: BTreeMap<&str, &String> = keep
         .iter()
-        .filter_map(|k| b.vars.get(*k).map(|v| (*k, v)))
+        .copied()
+        .chain(b.bench_vars.iter().map(|(k, _)| k.as_str()))
+        .filter_map(|k| b.vars.get(k).map(|v| (k, v)))
         .collect();
+    let bench_vars: BTreeMap<&String, &String> = b.bench_vars.iter().map(|(k, v)| (k, v)).collect();
     let classes: BTreeMap<&String, serde_json::Value> = b
         .classes
         .iter()
@@ -1268,6 +1341,7 @@ fn report(b: &Bench, scale: &str) -> serde_json::Value {
     serde_json::json!({
         "scale": scale,
         "vars": vars,
+        "bench_vars": bench_vars,
         "classes": classes,
         "calls": *b.hub.calls.borrow(),
         "counts": *b.hub.counts.borrow(),

@@ -32,6 +32,10 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--tiny <n>] [--cpu <cpu.js
 - `report.py` writes `results.json` and `results.md`: per S3 operation, per
   pipeline stage and extent (classes `big` = 16 MiB extents, `mix`, `tiny`),
   the statements that read the most rows, and the cost model.
+- `BENCH_VARS=KEY=VALUE,...` (environment) changes Worker variables for one
+  run, for example `BENCH_VARS=PARITY=on,POST_SOCKETS=6`. The variables that
+  run the rig itself are refused; `results.json` lists the change under
+  `bench_vars`, and `report.py --compare` shows it beside the counts.
 - `--ref` measures another commit with this checkout's harness (temporary
   worktree and cargo target of its own, removed at the end, so runs may
   overlap). `--tiny <n>` changes the number of small
