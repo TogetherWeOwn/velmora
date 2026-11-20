@@ -924,6 +924,65 @@ fn config_rejects_invalid_and_unsafe_values() {
     );
 }
 
+/// The dashboard's settings: a read-only token, the admin host and the
+/// metrics sample. All three are optional.
+#[test]
+fn admin_read_token_host_and_metrics_sample() {
+    let (prod, _) = wrangler_vars();
+    let prod = with_secrets(prod, &prod_providers());
+    let with = |pairs: &[(&str, &str)]| {
+        let mut m = prod.clone();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.to_string());
+        }
+        load(&m)
+    };
+    let invalid = |k: &str| ConfigError::Invalid(k.to_string());
+
+    let unset = with(&[]).unwrap();
+    assert!(unset.admin_read_token.is_none() && unset.admin_host.is_none());
+    assert_eq!(unset.metrics_sample, 10);
+
+    let read = "read-token-fixture-read-token-fixture";
+    let set = with(&[
+        ("ADMIN_READ_TOKEN", read),
+        ("ADMIN_HOST", "admin.internal"),
+        ("METRICS_SAMPLE", "1"),
+    ])
+    .unwrap();
+    assert_eq!(
+        set.admin_read_token.as_ref().map(|t| t.expose()),
+        Some(read)
+    );
+    assert_eq!(set.admin_host.as_deref(), Some("admin.internal"));
+    assert_eq!(set.metrics_sample, 1);
+    assert!(
+        !format!("{set:?}").contains(read),
+        "Debug leaks the read token"
+    );
+
+    // A read token as long as the admin token, and never the same one:
+    // that would hand the dashboard every route.
+    for bad in ["short", ADMIN_TOKEN_FIXTURE] {
+        assert_eq!(
+            with(&[("ADMIN_READ_TOKEN", bad)]).unwrap_err(),
+            invalid("ADMIN_READ_TOKEN")
+        );
+    }
+    for bad in ["Admin.Internal", "admin internal", "admin/x", "admin:443"] {
+        assert_eq!(
+            with(&[("ADMIN_HOST", bad)]).unwrap_err(),
+            invalid("ADMIN_HOST")
+        );
+    }
+    for bad in ["0", "-1", "ten", "10001"] {
+        assert_eq!(
+            with(&[("METRICS_SAMPLE", bad)]).unwrap_err(),
+            invalid("METRICS_SAMPLE")
+        );
+    }
+}
+
 #[test]
 fn config_errors_and_debug_never_show_secret_values() {
     let (prod, _) = wrangler_vars();
@@ -1163,6 +1222,10 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "upload_part_extents",
             "upload_parts",
             "uploads",
+            "usage_buckets",
+            "usage_global",
+            "usage_hours",
+            "usage_recounts",
             "verifications",
             "verify_escalations",
             "verify_raises",
@@ -1213,7 +1276,11 @@ async fn ddl_applies_cleanly_with_fixed_times() {
     let changed = db.batch(rows).await.unwrap();
     // The committed extent (statement 5) also gets its reference row
     // in `generation_extents`, written by the migration's trigger.
-    let want: Vec<u64> = (0..changed.len()).map(|n| 1 + u64::from(n == 5)).collect();
+    // The usage counters are on in this rig: the generation (3), both
+    // extents (5, 12) and the outbox row (10) each move one counter row.
+    let want: Vec<u64> = (0..changed.len())
+        .map(|n| 1 + u64::from(n == 5) + u64::from([3, 5, 10, 12].contains(&n)))
+        .collect();
     assert_eq!(changed, want);
     let refs = db
         .query(

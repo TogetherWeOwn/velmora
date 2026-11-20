@@ -176,6 +176,9 @@ impl Fx {
             verify: Default::default(),
             providers,
             admin_token: Secret::new(TOKEN.to_string()),
+            admin_read_token: None,
+            admin_host: None,
+            metrics_sample: 10,
         };
         let bridge = Bridge {
             catalog: SqlCatalog::new(RacingSql {
@@ -479,6 +482,11 @@ fn routes() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
         ("POST", "/_admin/evict/scratch/k?include_safety=1", None),
         ("POST", "/_admin/drill/scratch/k", None),
         ("POST", "/_admin/pack-plans?limit=1", None),
+        ("GET", "/_admin/ops-snapshot", None),
+        ("GET", "/_admin/usage/buckets", None),
+        ("GET", "/_admin/cost", None),
+        ("POST", "/_admin/usage/recount", None),
+        ("POST", "/_admin/usage/off", None),
         ("POST", "/_admin/dev/guard-selftest", None),
         ("POST", "/_admin/dev/suppress-notify?n=1", None),
         ("GET", "/_admin/no-such-route", None),
@@ -558,6 +566,11 @@ async fn unknown_routes_and_methods_are_refused() {
         ("GET", "/evict/scratch/k"),
         ("GET", "/drill/scratch/k"),
         ("GET", "/dev/guard-selftest"),
+        ("POST", "/ops-snapshot"),
+        ("POST", "/usage/buckets"),
+        ("POST", "/cost"),
+        ("GET", "/usage/recount"),
+        ("GET", "/usage/off"),
     ] {
         assert_eq!(
             fx.admin(method, path, None).await.status,
@@ -1613,4 +1626,353 @@ async fn pack_plans_is_refused_in_restore_maintenance() {
     Rc::get_mut(&mut fx.bridge).unwrap().cfg.packed_plans = true;
     let r = fx.post("/pack-plans").await;
     assert_eq!(r.status, 503, "{}", r.text());
+}
+
+// ---------------------------------------------------------------------------
+// Usage counters, the dashboard reads and who may make them
+// ---------------------------------------------------------------------------
+
+const READ_TOKEN: &str = "read-token-for-the-dashboard-0123456789";
+
+/// The fixture with `edit` applied to its configuration.
+async fn fx_with(edit: impl FnOnce(&mut BridgeConfig)) -> Fx {
+    let mut fx = Fx::new().await;
+    edit(&mut Rc::get_mut(&mut fx.bridge).expect("one owner").cfg);
+    fx
+}
+
+#[tokio::test]
+async fn ops_snapshot_reads_the_counters() {
+    let fx = Fx::new().await;
+    let r = fx.get("/ops-snapshot").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let empty = r.json();
+    assert_eq!(empty["seeded"], true);
+    assert_eq!(empty["live_objects"], 0);
+    assert_eq!(
+        empty["oldest_due_ms"],
+        json!({ "post": null, "verify": null, "release": null })
+    );
+    assert_eq!(empty["recount"]["running"], false);
+    assert_eq!(empty["last_recount"], Value::Null);
+
+    let bucket = fx.bucket("scratch").await;
+    let done = fx.put(&bucket, "done", &plaintext()).await;
+    fx.drive(&done, OutboxStage::Done).await;
+    fx.put(&bucket, "waiting", b"yy").await;
+    fx.bridge.clock.advance_secs(90);
+
+    let r = fx.get("/ops-snapshot?hours=1").await.json();
+    let c = &r["counters"];
+    assert_eq!(
+        (&c["outbox_post"], &c["outbox_done"], &c["outbox_dead"]),
+        (&json!(1), &json!(1), &json!(0))
+    );
+    assert_eq!(
+        c["extents_unreleased"].as_i64().unwrap() + c["extents_released"].as_i64().unwrap(),
+        2
+    );
+    assert_eq!(c["posts_total"], 1);
+    assert_eq!(c["verifies_total"], 1);
+    assert_eq!(r["live_objects"], 2);
+    assert_eq!(r["live_bytes"], plaintext().len() as u64 + 2);
+    assert_eq!(r["buckets_counted"], 1);
+    // The row that waits to be posted has been due for 90 s.
+    assert_eq!(r["oldest_due_ms"]["post"], 90_000);
+    assert_eq!(r["oldest_due_ms"]["verify"], Value::Null);
+    assert_eq!(r["now"], fx.bridge.clock.now().0);
+
+    // The status page says where its totals come from, and agrees.
+    let status = fx.get("/status").await.json();
+    assert_eq!(status["usage_counters"], "on");
+    assert_eq!(status["outbox"], json!({ "post": 1, "done": 1 }));
+    assert_eq!(
+        status["hot"]["pinned_extents"], c["extents_unreleased"],
+        "{status}"
+    );
+
+    // Nothing of an object is in the snapshot: no key, no bucket name.
+    let text = fx.get("/ops-snapshot").await.text();
+    for (i, private) in ["waiting", "scratch", TOKEN].iter().enumerate() {
+        assert!(
+            !text.contains(private),
+            "private text {i} is in the snapshot"
+        );
+    }
+    assert_eq!(fx.get("/ops-snapshot?hours=x").await.status, 400);
+}
+
+#[tokio::test]
+async fn usage_buckets_pages_in_id_order() {
+    let fx = Fx::new().await;
+    let mut ids = Vec::new();
+    for name in ["bucket-a", "bucket-b", "bucket-c"] {
+        let bucket = fx.bucket(name).await;
+        fx.put(&bucket, "k", name.as_bytes()).await;
+        ids.push(bucket.id.as_str().to_string());
+    }
+    ids.sort();
+
+    let all = fx.get("/usage/buckets").await.json();
+    assert_eq!(all["next_after"], Value::Null);
+    assert_eq!(all["seeded"], true);
+    // A page past the last bucket is empty, and still says so.
+    let past = fx.get("/usage/buckets?after=zzzz").await.json();
+    assert_eq!(
+        (&past["seeded"], &past["buckets"]),
+        (&json!(true), &json!([]))
+    );
+    let listed = all["buckets"].as_array().unwrap();
+    assert_eq!(listed.len(), 3);
+    for (row, id) in listed.iter().zip(&ids) {
+        assert_eq!(row["bucket_id"], id.as_str());
+        assert_eq!(
+            (&row["live_objects"], &row["live_bytes"]),
+            (&json!(1), &json!(8))
+        );
+    }
+
+    let first = fx.get("/usage/buckets?limit=2").await.json();
+    assert_eq!(first["buckets"].as_array().unwrap().len(), 2);
+    assert_eq!(first["next_after"], ids[1].as_str());
+    let rest = fx
+        .get(&format!("/usage/buckets?limit=2&after={}", ids[1]))
+        .await
+        .json();
+    assert_eq!(rest["buckets"][0]["bucket_id"], ids[2].as_str());
+    assert_eq!(rest["next_after"], Value::Null);
+
+    assert_eq!(fx.get("/usage/buckets?after=a%27b").await.status, 400);
+    assert_eq!(fx.get("/usage/buckets?limit=many").await.status, 400);
+}
+
+#[tokio::test]
+async fn cost_serves_the_meter_report_or_says_there_is_none() {
+    let fx = Fx::new().await;
+    let r = fx.get("/cost").await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (404, json!("NoCostReport"))
+    );
+
+    let id = BucketId::mint([9; 8]);
+    let extent = ExtentId::mint([9; 13]);
+    // As the cost meter writes it: a plain object in the cache bucket.
+    let write = |bytes: Vec<u8>| {
+        let (fx, id, extent) = (&fx, &id, &extent);
+        async move {
+            let digest: [u8; 32] = sha256(&bytes);
+            let meta = BlobMeta {
+                bucket: id,
+                extent,
+                cipher_sha256: &digest,
+            };
+            let key = "ops/cost/latest.json";
+            fx.bridge.cache.put(key, bytes, &meta).await.unwrap();
+        }
+    };
+    let report = json!({ "month_to_date_usd": 1.25, "lines": [{ "name": "d1_rows_written" }] });
+    write(report.to_string().into_bytes()).await;
+    let r = fx.get("/cost").await;
+    assert_eq!((r.status, r.json()), (200, report));
+
+    // Not JSON, or far larger than a report: refused, never passed on.
+    write(b"<html>".to_vec()).await;
+    let r = fx.get("/cost").await;
+    assert_eq!(r.status, 502);
+    assert!(!r.text().contains("html"));
+    write(vec![b' '; 300 * 1024]).await;
+    assert_eq!(fx.get("/cost").await.status, 502);
+}
+
+#[tokio::test]
+async fn recount_runs_in_steps_and_off_switches_the_counters_off() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    for i in 0..5u8 {
+        fx.put(&bucket, &format!("k{i}"), &[i; 10]).await;
+    }
+    let before = fx.get("/ops-snapshot").await.json()["counters"].clone();
+
+    // Off: the status page reads the tables again and says so.
+    let r = fx.post("/usage/off").await;
+    assert_eq!((r.status, r.json()), (200, json!({ "counters": "off" })));
+    let status = fx.get("/status").await.json();
+    assert_eq!(status["usage_counters"], "off");
+    assert_eq!(status["outbox"], json!({ "post": 5 }));
+    assert_eq!(fx.get("/ops-snapshot").await.json()["seeded"], false);
+    fx.put(&bucket, "while-off", b"z").await;
+    // The bucket figures are marked as stale while the counters are off.
+    let stale = fx.get("/usage/buckets").await.json();
+    assert_eq!(stale["seeded"], false);
+    assert_eq!(stale["buckets"][0]["live_objects"], 5);
+
+    // One request, one bounded step: 2 of the 6 extents.
+    let r = fx.post("/usage/recount?steps=1&chunk=2").await.json();
+    assert_eq!((&r["started"], &r["rows"]), (&json!(true), &json!(2)));
+    assert_eq!(r["finished"], Value::Null);
+    assert_eq!(r["recount"]["table"], "extents");
+    // The next goes on where that one stopped, and ends.
+    let r = fx.post("/usage/recount?steps=16&chunk=4").await.json();
+    assert_eq!((&r["started"], &r["rows"]), (&json!(false), &json!(16)));
+    assert_eq!(r["finished"]["adopted"], true);
+    assert_eq!(r["finished"]["drift"], 0);
+    assert_eq!(r["recount"]["running"], false);
+
+    let snap = fx.get("/ops-snapshot").await.json();
+    assert_eq!(snap["seeded"], true);
+    assert_eq!(snap["live_objects"], 6);
+    assert_eq!(snap["counters"]["outbox_post"], 6);
+    assert_eq!(
+        snap["counters"]["extents_unreleased"].as_i64().unwrap(),
+        before["extents_unreleased"].as_i64().unwrap() + 1
+    );
+    assert_eq!(snap["last_recount"]["rows"], 18);
+
+    // A later one compares, and finds the counters right.
+    let r = fx.post("/usage/recount?steps=16").await.json();
+    assert_eq!(
+        (&r["finished"]["adopted"], &r["finished"]["drift"]),
+        (&json!(false), &json!(0))
+    );
+    assert_eq!(fx.post("/usage/recount?steps=x").await.status, 400);
+}
+
+#[tokio::test]
+async fn the_cron_goes_on_with_a_recount_and_reports_its_end() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    fx.put(&bucket, "k", b"abc").await;
+
+    // Nothing to do: no recount has ever run, and none is started here.
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.recount_rows, report.recount_drift), (0, None));
+
+    // One that an operator began is carried to its end.
+    let r = fx.post("/usage/recount?steps=1&chunk=1").await.json();
+    assert_eq!(r["recount"]["running"], true);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.recount_rows, report.recount_drift), (2, Some(0)));
+    assert!(!report.recount_failed);
+
+    // The next begins a week after that one ended, not before.
+    fx.bridge.clock.advance_secs(6 * 24 * 3600);
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.recount_rows, report.recount_drift), (0, None));
+    fx.bridge.clock.advance_secs(24 * 3600);
+    // A counter that went wrong meanwhile is found, and left as it is.
+    fx.bridge
+        .catalog
+        .sql
+        .exec("UPDATE usage_global SET ob_dead = 4 WHERE id = 1", &[])
+        .await
+        .unwrap();
+    let report = fx.bridge.dispatch().await.unwrap();
+    assert_eq!((report.recount_rows, report.recount_drift), (3, Some(1)));
+    let snap = fx.get("/ops-snapshot").await.json();
+    assert_eq!(snap["counters"]["outbox_dead"], 4);
+    assert_eq!(snap["last_recount"]["drift"], 1);
+    assert_eq!(snap["last_recount"]["adopted"], false);
+}
+
+#[tokio::test]
+async fn the_read_token_opens_only_the_read_routes() {
+    let fx = fx_with(|cfg| cfg.admin_read_token = Some(Secret::new(READ_TOKEN.to_string()))).await;
+    let bucket = fx.bucket("scratch").await;
+    fx.put(&bucket, "k", b"payload").await;
+    let read = format!("Bearer {READ_TOKEN}");
+
+    for target in [
+        "/_admin/status",
+        "/_admin/ops-snapshot",
+        "/_admin/ops-snapshot?hours=2",
+        "/_admin/usage/buckets",
+    ] {
+        let r = fx.send("GET", target, Some(&read), None).await;
+        assert_eq!(r.status, 200, "GET {target}: {}", r.text());
+        assert!(!r.text().contains(READ_TOKEN) && !r.text().contains(TOKEN));
+    }
+    // Allowed and absent: the route answered, not the gate.
+    assert_eq!(
+        fx.send("GET", "/_admin/cost", Some(&read), None)
+            .await
+            .status,
+        404
+    );
+
+    // Every other route, and every other method on a read route.
+    for (method, target, body) in routes() {
+        let allowed = method == "GET"
+            && matches!(
+                target,
+                "/_admin/status"
+                    | "/_admin/ops-snapshot"
+                    | "/_admin/usage/buckets"
+                    | "/_admin/cost"
+            );
+        if allowed {
+            continue;
+        }
+        let r = fx.send(method, target, Some(&read), body).await;
+        assert_eq!(r.status, 403, "{method} {target}");
+    }
+    for target in [
+        "/_admin/status",
+        "/_admin/ops-snapshot",
+        "/_admin/usage/buckets",
+    ] {
+        let r = fx.send("POST", target, Some(&read), None).await;
+        assert_eq!(r.status, 403, "POST {target}");
+    }
+    // Nothing was changed by any of it.
+    assert!(fx.bucket_row("probe").await.is_none());
+    assert_eq!(fx.get("/ops-snapshot").await.json()["seeded"], true);
+
+    // The write token still opens everything, and without a read token
+    // configured the read token is just a wrong one.
+    assert_eq!(fx.post("/usage/off").await.status, 200);
+    let plain = Fx::new().await;
+    let r = plain.send("GET", "/_admin/status", Some(&read), None).await;
+    assert_eq!(r.status, 403);
+}
+
+#[tokio::test]
+async fn admin_answers_only_on_its_host_when_one_is_set() {
+    let fx = fx_with(|cfg| cfg.admin_host = Some("admin.internal".to_string())).await;
+    let auth = format!("Bearer {TOKEN}");
+    let send = |host: Option<&'static str>, auth: Option<String>| {
+        let fx = &fx;
+        async move {
+            let mut headers = Vec::new();
+            if let Some(host) = host {
+                headers.push(("host".to_string(), host.to_string()));
+            }
+            if let Some(auth) = auth {
+                headers.push(("authorization".to_string(), auth));
+            }
+            let req = S3Request {
+                method: Method::parse("GET"),
+                raw_target: "/_admin/status".to_string(),
+                headers,
+                body: Body::Empty,
+            };
+            Rc::clone(&fx.bridge).handle(req).await.status
+        }
+    };
+    // The public host: as if there were no such route, token or not.
+    assert_eq!(send(Some("s3.test"), Some(auth.clone())).await, 404);
+    assert_eq!(send(Some("s3.test"), None).await, 404);
+    assert_eq!(send(None, Some(auth.clone())).await, 404);
+    assert_eq!(
+        send(Some("admin.internal.evil.test"), Some(auth.clone())).await,
+        404
+    );
+    // Its own host: the token decides.
+    assert_eq!(send(Some("admin.internal"), Some(auth.clone())).await, 200);
+    assert_eq!(send(Some("ADMIN.internal:443"), Some(auth)).await, 200);
+    assert_eq!(send(Some("admin.internal"), None).await, 401);
+    assert_eq!(
+        send(Some("admin.internal"), Some("Bearer wrong".to_string())).await,
+        403
+    );
 }

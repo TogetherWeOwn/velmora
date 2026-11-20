@@ -261,6 +261,9 @@ impl Fx {
             release: true,
         }];
         let cfg = BridgeConfig {
+            admin_read_token: None,
+            admin_host: None,
+            metrics_sample: 10,
             environment: Environment::Dev,
             s3_host: "s3.test".to_string(),
             region: "auto".to_string(),
@@ -1234,6 +1237,9 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             resend_post_secs: RESEND_SECS,
             resend_verify_secs: RESEND_SECS,
             verify_escalated: Vec::new(),
+            recount_rows: 0,
+            recount_drift: None,
+            recount_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();

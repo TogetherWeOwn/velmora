@@ -286,7 +286,7 @@ pub(super) async fn handle<
     req: S3Request,
     rest: &str,
 ) -> S3Response {
-    let mut resp = match check_admin_bearer(&req, bridge.cfg.admin_token.expose()) {
+    let mut resp = match ingress::check_admin(&req, &bridge.cfg) {
         Err(e) => e.response(),
         Ok(_) => match route(bridge, req, rest).await {
             Ok(r) | Err(r) => r,
@@ -416,9 +416,198 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             let body: RestoreBody = read_json(bridge, req).await?;
             restore(bridge, body).await
         }
-        "/status" | "/buckets" | "/keys" | "/restore" | "/pack-plans" => Err(wrong_method()),
+        "/ops-snapshot" if get => ops_snapshot(bridge, &req.raw_target).await,
+        "/usage/buckets" if get => usage_buckets(bridge, &req.raw_target).await,
+        "/cost" if get => cost(bridge).await,
+        "/usage/recount" if post => {
+            mutable(bridge).await?;
+            usage_recount(bridge, &req.raw_target).await
+        }
+        "/usage/off" if post => {
+            mutable(bridge).await?;
+            bridge.catalog.usage_off().await.or_internal()?;
+            Ok(ok(&json!({ "counters": "off" })))
+        }
+        "/status" | "/buckets" | "/keys" | "/restore" | "/pack-plans" | "/ops-snapshot"
+        | "/usage/buckets" | "/cost" | "/usage/recount" | "/usage/off" => Err(wrong_method()),
         _ => Err(not_found()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Usage counters and the dashboard reads
+// ---------------------------------------------------------------------------
+
+/// Completed hours `GET /_admin/ops-snapshot` returns unless asked.
+const SNAPSHOT_HOURS: u32 = 48;
+/// Most completed hours one snapshot returns: a week.
+const MAX_SNAPSHOT_HOURS: u32 = 168;
+/// Buckets on one page of `GET /_admin/usage/buckets`.
+const USAGE_BUCKETS_PAGE: u32 = 200;
+/// Recount steps one `POST /_admin/usage/recount` runs unless asked.
+const RECOUNT_STEPS: u32 = 4;
+/// Most recount steps one request runs: each is a few catalogue calls.
+const MAX_RECOUNT_STEPS: u32 = 16;
+/// Where the cost meter leaves its last report, in the cache bucket.
+pub const COST_REPORT_KEY: &str = "ops/cost/latest.json";
+/// Largest cost report served. The meter writes a few kilobytes.
+const MAX_COST_REPORT: u64 = 256 * 1024;
+
+/// A whole-number query parameter, or `default` when it is not there.
+fn number_param(raw_target: &str, name: &str, default: u32) -> Admin<u32> {
+    match query_param(raw_target, name) {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<u32>()
+            .map_err(|_| fail(400, "InvalidArgument", "Not a number.")),
+    }
+}
+
+/// `GET /_admin/ops-snapshot[?hours=N]`: the counters, the oldest row
+/// waiting in each stage, the last completed hours and the recount.
+/// Nothing read here grows with the tables.
+async fn ops_snapshot<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    raw_target: &str,
+) -> Admin<S3Response> {
+    let hours = number_param(raw_target, "hours", SNAPSHOT_HOURS)?.min(MAX_SNAPSHOT_HOURS);
+    let now = bridge.clock.now();
+    let snap = bridge.catalog.usage_snapshot(hours).await.or_internal()?;
+    // How long the earliest row of a stage has been due; 0 when it is
+    // not due yet, `null` when the stage is empty.
+    let due_for = |at: Option<crate::types::UnixMs>| at.map(|t| (now.0 - t.0).max(0));
+    Ok(ok(&json!({
+        "now": now.0,
+        // While `false` the figures are not maintained: run a recount.
+        "seeded": snap.counters.seeded,
+        "counters": snap.counters,
+        "live_objects": snap.live_objects,
+        "live_bytes": snap.live_bytes,
+        "buckets_counted": snap.buckets_counted,
+        "oldest_due_ms": {
+            "post": due_for(snap.oldest_post),
+            "verify": due_for(snap.oldest_verify),
+            "release": due_for(snap.oldest_release),
+        },
+        "hours": snap.hours,
+        "recount": snap.recount,
+        "last_recount": snap.last_recount,
+    })))
+}
+
+/// `GET /_admin/usage/buckets[?after=ID][&limit=N]`: live objects and
+/// bytes per bucket, a page in bucket-id order. `seeded: false` says
+/// that the counters are off and the figures are stale or missing.
+async fn usage_buckets<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    raw_target: &str,
+) -> Admin<S3Response> {
+    let limit = number_param(raw_target, "limit", USAGE_BUCKETS_PAGE)?.clamp(1, USAGE_BUCKETS_PAGE);
+    let after = query_param(raw_target, "after").unwrap_or("");
+    // A bucket id is plain text; anything else names no page.
+    if after.len() > 128
+        || !after
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return Err(fail(400, "InvalidArgument", "after is not a bucket id."));
+    }
+    let (seeded, page) = bridge
+        .catalog
+        .usage_buckets(after, limit)
+        .await
+        .or_internal()?;
+    let next = (page.len() as u64 == u64::from(limit))
+        .then(|| page.last().map(|b| b.bucket_id.clone()))
+        .flatten();
+    Ok(ok(
+        &json!({ "seeded": seeded, "buckets": page, "next_after": next }),
+    ))
+}
+
+/// `GET /_admin/cost`: the cost meter's last report, as it was written.
+/// The meter runs outside the Worker; without a report this is a 404.
+async fn cost<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+) -> Admin<S3Response> {
+    let none = || fail(404, "NoCostReport", "No cost report has been written.");
+    // The range is exactly the bytes a HEAD saw, and so no more than
+    // the limit: a report replaced by a larger one since is cut short
+    // and fails as JSON below, without being held whole. A report
+    // replaced by a shorter one fails the read; that is tried again.
+    let mut tries = 0;
+    let bytes = loop {
+        tries += 1;
+        let size = bridge
+            .cache
+            .head(COST_REPORT_KEY)
+            .await
+            .or_internal()?
+            .ok_or_else(none)?;
+        if size > MAX_COST_REPORT {
+            return Err(fail(502, "BadCostReport", "The cost report is too large."));
+        }
+        let span = crate::types::ByteSpan {
+            start: 0,
+            len: size,
+        };
+        match bridge.cache.get(COST_REPORT_KEY, Some(span)).await {
+            Ok(bytes) => break bytes.ok_or_else(none)?,
+            Err(_) if tries < 2 => {}
+            Err(e) => return Err(e).or_internal(),
+        }
+    };
+    let report: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| fail(502, "BadCostReport", "The cost report is not JSON."))?;
+    Ok(ok(&report))
+}
+
+/// `POST /_admin/usage/recount[?adopt=1][&restart=1][&steps=N][&chunk=N]`:
+/// starts a recount unless one is running, then runs a few bounded
+/// steps of it. The cron goes on with the rest. The first recount
+/// switches the counters on; a later one replaces them only with
+/// `adopt`.
+async fn usage_recount<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    raw_target: &str,
+) -> Admin<S3Response> {
+    let steps = number_param(raw_target, "steps", RECOUNT_STEPS)?.min(MAX_RECOUNT_STEPS);
+    let chunk = number_param(raw_target, "chunk", crate::sql::usage::RECOUNT_CHUNK)?;
+    let now = bridge.clock.now();
+    let started = bridge
+        .catalog
+        .usage_recount_start(
+            now,
+            flag(raw_target, "adopt"),
+            flag(raw_target, "restart"),
+            false,
+        )
+        .await
+        .or_internal()?;
+    let mut rows = 0u64;
+    let mut finished = None;
+    for _ in 0..steps {
+        let step = bridge
+            .catalog
+            .usage_recount_step(chunk, bridge.clock.now())
+            .await
+            .or_internal()?;
+        rows += step.rows;
+        if step.finished.is_some() {
+            finished = step.finished;
+        }
+        if step.idle || finished.is_some() {
+            break;
+        }
+    }
+    let (recount, last) = bridge.catalog.usage_recounts().await.or_internal()?;
+    Ok(ok(&json!({
+        "started": started,
+        "rows": rows,
+        "finished": finished,
+        "recount": recount,
+        "last_recount": last,
+    })))
 }
 
 /// Refuses a mutation while the catalogue is being restored: under
@@ -1352,6 +1541,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<S3Response> {
     let stats = bridge.catalog.outbox_stats().await.or_internal()?;
+    let usage = bridge.catalog.usage_counters().await.or_internal()?;
     let replaying = bridge.catalog.restore_pending().await.or_internal()?;
     // A stamp row of another catalogue id is said, not failed on: this
     // is where the operator looks for it.
@@ -1459,6 +1649,9 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         "inflight_bytes": bridge.budget.in_use(),
         "inflight_budget_bytes": bridge.budget.capacity(),
         "job_budget_bytes": bridge.budget.job_capacity(),
+        // `on`: the totals above come from the usage counters. `off`:
+        // from the tables, until a recount switches the counters on.
+        "usage_counters": if usage.seeded { "on" } else { "off" },
         "outbox": outbox,
         "dead": stats.dead,
         "last_dispatch_at": stats.last_dispatch_at,

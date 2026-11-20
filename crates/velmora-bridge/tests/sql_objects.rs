@@ -44,6 +44,10 @@ impl Sql for Probe {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params);
         self.queries.set(self.queries.get() + 1);
+        // A write that returns its rows is a statement that ran.
+        if sql.starts_with("UPDATE ") {
+            self.ran.borrow_mut().push(sql.to_owned());
+        }
         self.db.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
@@ -526,8 +530,14 @@ async fn outbox_cancel_does_not_scan_the_outbox() {
                 .lines()
                 // `a` is the constant action list and `x` the retiring
                 // extents, themselves found through the live pointer.
+                // `SCAN objects` is the foreign-key recheck SQLite
+                // compiles into an insert of a parent row once the
+                // table has an insert trigger; it runs only while the
+                // statement has an open violation, which an insert of a
+                // generation never has (`usage` tests count its steps).
                 .filter(|l| {
-                    l.starts_with("SCAN") && !["SCAN CONSTANT ROW", "SCAN a", "SCAN x"].contains(l)
+                    l.starts_with("SCAN")
+                        && !["SCAN CONSTANT ROW", "SCAN a", "SCAN x", "SCAN objects"].contains(l)
                 })
                 .collect();
             assert!(scans.is_empty(), "{sql}\n{plan}");

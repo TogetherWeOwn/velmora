@@ -122,7 +122,19 @@ pub(super) async fn evictable_bytes<S: Sql>(c: &SqlCatalog<S>) -> Result<u64> {
 /// Pinned and evictable totals. Pinned bytes are safety copies only: a
 /// cache fill is evictable even while the extent's safety copy is pinned.
 pub(super) async fn hot_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<HotStats> {
-    let (pinned_bytes, pinned_extents) = total(c, PINNED_TOTAL).await?;
+    // Pinned totals from the usage counters once they are switched on:
+    // one row read instead of every pinned extent. The evictable total
+    // stays a read of its partial index, which holds only what the hot
+    // tier holds and is bounded by the tier's cap, not by the catalogue.
+    let usage = super::usage::counters(c).await?;
+    let (pinned_bytes, pinned_extents) = if usage.seeded {
+        (
+            u64::try_from(usage.unreleased_bytes).unwrap_or(0),
+            u64::try_from(usage.extents_unreleased).unwrap_or(0),
+        )
+    } else {
+        total(c, PINNED_TOTAL).await?
+    };
     let (evictable_bytes, evictable_extents) = evictable(c).await?;
     Ok(HotStats {
         pinned_bytes,

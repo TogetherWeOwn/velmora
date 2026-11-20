@@ -1025,4 +1025,17 @@ async fn admin_refusals_of_the_precheck_are_no_store() {
     ] {
         assert_eq!(ingress::is_admin_url(url), admin, "{url}");
     }
+    // The host a URL was sent to, as a Host header has it.
+    for (url, host) in [
+        ("https://h/_admin", Some("h")),
+        (
+            "https://Admin.example:8443/x?y=1",
+            Some("Admin.example:8443"),
+        ),
+        ("https://user@h?x", Some("h")),
+        ("https:///x", None),
+        ("not a url", None),
+    ] {
+        assert_eq!(ingress::url_authority(url), host, "{url}");
+    }
 }

@@ -176,6 +176,15 @@ PACKED_PLANS = "on"
 # GET_FANOUT_BYTES" in ops/README.md.
 GET_FANOUT_BYTES = "1073741824"
 
+# Request metrics: one request in METRICS_SAMPLE (default 10) and every
+# 5xx is a data point with method, status, latency, bytes and colo; a
+# run of reads from Usenet (cache misses) is a point of its own. No bucket, key,
+# query, header or request id is written. Without this binding the
+# Worker writes none. See "Usage counters and metrics" in ops/README.md.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "velmora_requests"
+
 # This Worker, bound to itself: `service` must be the name above. The
 # sub-requests of a large GET go through it and never through the
 # internet; one that arrives from the internet is refused.
@@ -398,6 +407,10 @@ vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.
+
+[[env.dev.analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "velmora_requests_dev"
 
 [[env.dev.services]]
 binding = "SELF"

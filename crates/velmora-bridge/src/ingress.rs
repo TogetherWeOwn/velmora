@@ -73,6 +73,9 @@ pub enum IngressError {
     AdminUnauthenticated,
     /// Admin request with a wrong bearer token: `403`.
     AdminForbidden,
+    /// Admin request on a host the admin routes do not answer on
+    /// (`ADMIN_HOST`): `404`, as for a route that does not exist.
+    AdminHidden,
     /// `Content-Length` repeated, merged or not a decimal number: `400`.
     InvalidContentLength,
     /// PUT or UploadPart without `Content-Length`: `411`.
@@ -94,6 +97,7 @@ impl IngressError {
             | IngressError::AccessDenied
             | IngressError::AdminForbidden => 403,
             IngressError::AdminUnauthenticated => 401,
+            IngressError::AdminHidden => 404,
             IngressError::MissingContentLength => 411,
             IngressError::SlowDown => 503,
             IngressError::Internal => 500,
@@ -111,6 +115,7 @@ impl IngressError {
             | IngressError::AccessDenied
             | IngressError::AdminForbidden => "AccessDenied",
             IngressError::AdminUnauthenticated => "Unauthorized",
+            IngressError::AdminHidden => "NotFound",
             IngressError::MissingContentLength => "MissingContentLength",
             IngressError::EntityTooLarge => "EntityTooLarge",
             IngressError::IncompleteBody => "IncompleteBody",
@@ -126,6 +131,7 @@ impl IngressError {
             IngressError::AccessDenied => "Access Denied",
             IngressError::AdminUnauthenticated => "A bearer token is required.",
             IngressError::AdminForbidden => "Access Denied",
+            IngressError::AdminHidden => "Not found.",
             IngressError::InvalidContentLength => "The Content-Length header is not valid.",
             IngressError::MissingContentLength => "You must provide the Content-Length HTTP header.",
             IngressError::EntityTooLarge => {
@@ -346,6 +352,67 @@ pub fn check_admin_bearer(req: &S3Request, token: &str) -> Result<(), IngressErr
     Ok(())
 }
 
+/// The admin routes a read-only token may `GET`, without the query.
+/// None of them changes anything or returns a secret.
+pub const ADMIN_READ_ROUTES: [&str; 4] = [
+    "/_admin/status",
+    "/_admin/ops-snapshot",
+    "/_admin/usage/buckets",
+    "/_admin/cost",
+];
+
+/// The whole check of an admin request, in this order:
+///
+/// 1. With `ADMIN_HOST` set, the request must name that host; any other
+///    is answered as if the route did not exist, token or not.
+/// 2. `ADMIN_TOKEN` opens every route.
+/// 3. `ADMIN_READ_TOKEN`, when one is configured, opens a `GET` of
+///    [`ADMIN_READ_ROUTES`] and nothing else.
+///
+/// Both tokens are compared in constant time, and both are compared
+/// whichever matches.
+pub fn check_admin(req: &S3Request, cfg: &BridgeConfig) -> Result<(), IngressError> {
+    if let Some(only) = &cfg.admin_host {
+        let host = header(req, "host").unwrap_or("");
+        // Without a port: the name is what is configured.
+        let host = host.rsplit_once(':').map_or(host, |(name, port)| {
+            if port.bytes().all(|b| b.is_ascii_digit()) {
+                name
+            } else {
+                host
+            }
+        });
+        if !host.eq_ignore_ascii_case(only) {
+            return Err(IngressError::AdminHidden);
+        }
+    }
+    let presented = header(req, "authorization").and_then(|v| {
+        let (scheme, rest) = v.split_once(' ')?;
+        scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+    });
+    let Some(presented) = presented.filter(|p| !p.is_empty()) else {
+        return Err(IngressError::AdminUnauthenticated);
+    };
+    let matches =
+        |token: &str| !token.is_empty() && bool::from(presented.as_bytes().ct_eq(token.as_bytes()));
+    let write = matches(cfg.admin_token.expose());
+    let read = cfg
+        .admin_read_token
+        .as_ref()
+        .is_some_and(|t| matches(t.expose()));
+    if write {
+        return Ok(());
+    }
+    let path = req
+        .raw_target
+        .split_once('?')
+        .map_or(req.raw_target.as_str(), |(p, _)| p);
+    if read && req.method == crate::types::Method::Get && ADMIN_READ_ROUTES.contains(&path) {
+        return Ok(());
+    }
+    Err(IngressError::AdminForbidden)
+}
+
 /// `true` when the request carries some SigV4 credential: an
 /// `Authorization` header or a presigned `X-Amz-Signature`/`X-Amz-Credential`
 /// query parameter. Presence only; the handler verifies it.
@@ -369,6 +436,18 @@ pub fn is_admin_target(raw_target: &str) -> bool {
         classify(&crate::types::Method::Get, raw_target),
         Route::Admin { .. }
     )
+}
+
+/// The host and port of a full request URL, as a `Host` header has
+/// them. A request that came through a service binding may carry no
+/// `Host` header; its URL names the host it was sent to.
+pub fn url_authority(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (!authority.is_empty()).then_some(authority)
 }
 
 /// [`is_admin_target`] of a full request URL. A URL whose target cannot
@@ -435,7 +514,7 @@ pub fn precheck(
         return Err(IngressError::InsecureTransport);
     }
     match route {
-        Route::Admin { .. } => check_admin_bearer(req, cfg.admin_token.expose())?,
+        Route::Admin { .. } => check_admin(req, cfg)?,
         _ if !has_s3_credential(req) => return Err(IngressError::AccessDenied),
         _ => {}
     }

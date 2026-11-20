@@ -190,7 +190,9 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 #[test]
 fn the_meter_matches_d1_statement_by_statement() {
-    let db = RusqliteSql::with_schema().expect("schema");
+    // The figures are D1's on the schema without usage counters: the
+    // triggers are as the migration leaves them, writing nothing.
+    let db = RusqliteSql::with_schema_unarmed().expect("schema");
     db.meter_writes().expect("meter");
     let mut wrong = Vec::new();
     let mut total = 0u64;

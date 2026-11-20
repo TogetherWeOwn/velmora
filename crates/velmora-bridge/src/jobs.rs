@@ -39,6 +39,13 @@ use crate::types::{
 };
 use crate::verify::release_labels;
 
+/// Recount steps one cron run takes: 5 chunks of 4,000 rows, about
+/// 5.7 million table rows a day.
+pub const RECOUNT_STEPS: u32 = 5;
+/// A recount of the usage counters starts this long after the last one
+/// ended: a week.
+pub const RECOUNT_EVERY_MS: i64 = 7 * 24 * 3600 * 1000;
+
 /// Jobs in one queue batch of the dispatcher (the bound of
 /// [`JobSink::send_many`]).
 pub const DISPATCH_BATCH: u32 = 100;
@@ -657,11 +664,53 @@ where
             }
         }
 
+        // The usage counters are checked against the tables a few
+        // bounded chunks at a time. An extra, like the checks above.
+        if self.recount_check(now, &mut report).await.is_err() {
+            report.recount_failed = true;
+        }
+
         if let Some(e) = send_failed {
             return Err(e);
         }
 
         self.catalog.record_dispatch(now).await?;
         Ok(report)
+    }
+
+    /// Goes on with a recount of the usage counters, or starts the
+    /// weekly one. The first recount, which switches the counters on, is
+    /// started by an operator (`POST /_admin/usage/recount`), never here.
+    async fn recount_check(&self, now: UnixMs, report: &mut DispatchReport) -> Result<()> {
+        let (state, last) = self.catalog.usage_recounts().await?;
+        if !state.running {
+            // Only a catalogue whose counters a recount switched on has
+            // a last one: nothing is started before the operator's.
+            let due = last.is_some_and(|l| now.0 - l.finished_at.0 >= RECOUNT_EVERY_MS);
+            // Started only while the counters are on, which the
+            // statement that starts it checks: not after an `off`.
+            if !due
+                || !self
+                    .catalog
+                    .usage_recount_start(now, false, false, true)
+                    .await?
+            {
+                return Ok(());
+            }
+        }
+        for _ in 0..RECOUNT_STEPS {
+            let step = self
+                .catalog
+                .usage_recount_step(crate::sql::usage::RECOUNT_CHUNK_MAX, now)
+                .await?;
+            report.recount_rows += step.rows;
+            if let Some(done) = step.finished {
+                report.recount_drift = Some(done.drift);
+            }
+            if step.idle || report.recount_drift.is_some() {
+                break;
+            }
+        }
+        Ok(())
     }
 }

@@ -1426,6 +1426,13 @@ pub struct DispatchReport {
     pub resend_post_secs: u32,
     /// The same for a sent verify or release row and the verify queues.
     pub resend_verify_secs: u32,
+    /// Table rows this run counted for a recount of the usage counters.
+    pub recount_rows: u64,
+    /// A recount ended in this run and found this many counters that
+    /// differed from the tables. 0 is the expected figure.
+    pub recount_drift: Option<u64>,
+    /// The recount step failed; the rest of the run went on without it.
+    pub recount_failed: bool,
 }
 
 /// The oldest message that waits in the queues of one kind, as far as
@@ -1759,4 +1766,134 @@ impl fmt::Debug for S3Response {
             .field("headers", &self.headers)
             .finish_non_exhaustive()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Usage counters
+// ---------------------------------------------------------------------------
+
+/// The catalogue-wide usage counters (`usage_global`, row 1). Signed: a
+/// counter that has drifted below zero is reported as it is, for the
+/// recount to explain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageCounters {
+    /// `false` until a recount has switched the counters on. The figures
+    /// mean nothing before that.
+    pub seeded: bool,
+    /// Extents whose safety copy is held or releasing, and their
+    /// ciphertext bytes: what R2 must keep.
+    pub extents_unreleased: i64,
+    pub unreleased_bytes: i64,
+    pub extents_released: i64,
+    pub released_bytes: i64,
+    pub extents_deleted: i64,
+    pub outbox_post: i64,
+    pub outbox_verify: i64,
+    pub outbox_release: i64,
+    pub outbox_done: i64,
+    pub outbox_cancelled: i64,
+    pub outbox_dead: i64,
+    /// Events since the counters were switched on.
+    pub posts_total: i64,
+    pub verifies_total: i64,
+    pub releases_total: i64,
+    pub dead_total: i64,
+    pub failures_total: i64,
+    /// The hour still being counted, as `UnixMs / 3_600_000`.
+    pub current: UsageHour,
+}
+
+impl UsageCounters {
+    /// Outbox rows of `stage`.
+    pub fn outbox(&self, stage: OutboxStage) -> i64 {
+        match stage {
+            OutboxStage::Post => self.outbox_post,
+            OutboxStage::Verify => self.outbox_verify,
+            OutboxStage::Release => self.outbox_release,
+            OutboxStage::Done => self.outbox_done,
+            OutboxStage::Cancelled => self.outbox_cancelled,
+            OutboxStage::Dead => self.outbox_dead,
+        }
+    }
+}
+
+/// Events of one hour (`hour` = `UnixMs / 3_600_000`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageHour {
+    pub hour: i64,
+    pub posts: i64,
+    pub verifies: i64,
+    pub releases: i64,
+    pub dead: i64,
+    pub failures: i64,
+}
+
+/// A finished recount of the usage counters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsageRecount {
+    pub started_at: UnixMs,
+    pub finished_at: UnixMs,
+    /// Table rows it counted.
+    pub rows: u64,
+    /// Whether its figures replaced the live counters.
+    pub adopted: bool,
+    /// Counters (and buckets) whose live value differed from the count.
+    pub drift: u64,
+    /// The live and the counted values, as JSON, when it compared them.
+    pub detail: Option<String>,
+}
+
+/// A recount under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RecountState {
+    pub running: bool,
+    pub started_at: UnixMs,
+    pub rows_seen: u64,
+    /// The table being counted: `extents`, `outbox`, `generations`, or
+    /// `finish` when all three are counted.
+    pub table: &'static str,
+    pub adopt: bool,
+}
+
+/// What one step of a recount did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RecountStep {
+    /// No recount is running; nothing was done.
+    pub idle: bool,
+    /// Table rows counted while this step ran: this step's, and those
+    /// of a step that ran beside it. A progress figure; the record of
+    /// the recount has the exact total.
+    pub rows: u64,
+    /// The recount ended with this step.
+    pub finished: Option<UsageRecount>,
+}
+
+/// Everything the operations page reads, without a table scan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UsageSnapshot {
+    pub counters: UsageCounters,
+    /// Live objects and their plaintext bytes, over all buckets.
+    pub live_objects: i64,
+    pub live_bytes: i64,
+    /// Bucket rows in the counters: buckets with a live object, and
+    /// those emptied since the last adopted recount.
+    pub buckets_counted: u64,
+    /// The earliest `next_at` of the rows waiting in each stage.
+    pub oldest_post: Option<UnixMs>,
+    pub oldest_verify: Option<UnixMs>,
+    pub oldest_release: Option<UnixMs>,
+    /// Completed hours that had an event, newest first: `hour` says
+    /// which, and an hour without events has no entry.
+    pub hours: Vec<UsageHour>,
+    pub recount: RecountState,
+    pub last_recount: Option<UsageRecount>,
+}
+
+/// Live objects of one bucket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BucketUsage {
+    pub bucket_id: String,
+    pub name: String,
+    pub live_objects: i64,
+    pub live_bytes: i64,
 }
