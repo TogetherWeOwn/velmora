@@ -1890,6 +1890,38 @@ async fn sql_rejects_more_than_100_params_like_d1() {
         0,
         "an over-limit statement rolls back its batch"
     );
+
+    // An integer crosses to D1 as a JS number: one that a number does
+    // not hold exactly is refused, by the fixture as by the adapter.
+    for ok in [MAX_SQL_INT, -MAX_SQL_INT, 0] {
+        db.query("SELECT ?1", &[SqlValue::Int(ok)]).await.unwrap();
+    }
+    for bad in [MAX_SQL_INT + 1, -MAX_SQL_INT - 1, i64::MAX, i64::MIN] {
+        for err in [
+            db.query("SELECT ?1", &[SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.exec(INSERT_GC_MARKER, &[text("x_a"), SqlValue::Int(bad)])
+                .await
+                .unwrap_err(),
+            db.batch(vec![
+                (INSERT_GC_MARKER, vec![text("x_a"), SqlValue::Int(T0.0)]),
+                (INSERT_GC_MARKER, vec![text("x_b"), SqlValue::Int(bad)]),
+            ])
+            .await
+            .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, BridgeError::Sql(m) if m.contains("outside JS safe range")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+    assert_eq!(
+        count(&db, "gc"),
+        0,
+        "an out-of-range integer rolls back its batch"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

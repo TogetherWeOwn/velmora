@@ -82,7 +82,8 @@ pub trait Sql {
 }
 
 // The limits of the database behind [`Sql`] live here and nowhere else:
-// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`] and [`SqlLimits`]. They are
+// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`], [`MAX_SQL_INT`] and
+// [`SqlLimits`]. They are
 // D1's. The statements themselves are plain SQLite and run unchanged on
 // any SQLite behind the port.
 
@@ -91,6 +92,12 @@ pub const MAX_SQL_PARAMS: usize = 100;
 
 /// D1's limit on one bound text or blob value, in bytes. More is an error.
 pub const MAX_SQL_VALUE_BYTES: usize = 2_000_000;
+
+/// The largest integer D1 takes or returns, and the negative of the
+/// smallest: a value crosses to D1 as a JS number, which is exact up to
+/// `Number.MAX_SAFE_INTEGER` only. A bound integer outside
+/// `-MAX_SQL_INT..=MAX_SQL_INT` is an error, before the statement runs.
+pub const MAX_SQL_INT: i64 = (1 << 53) - 1;
 
 /// How much a set-based statement may carry: one that takes its rows from
 /// a single JSON parameter (the publish of a generation).

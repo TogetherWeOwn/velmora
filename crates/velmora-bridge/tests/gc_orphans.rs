@@ -536,6 +536,53 @@ async fn a_dropped_part_goes_at_the_grace_period_and_not_a_millisecond_before() 
     assert!(t.get("a").await == kept);
 }
 
+/// The scan binds its place as integers, and the database takes only
+/// those a JS number holds exactly (the fixture refuses the others as
+/// D1 does). A first pass, a pass after a rest, and a cursor this code
+/// did not write all start before every row, with a number it takes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_starts_at_a_number_the_database_takes() {
+    let t = setup().await;
+    let cursors = [
+        None,
+        Some(""),
+        Some("at"),
+        Some("at:1:2:3"),
+        Some("at:x:1"),
+        Some("rest:soon"),
+        Some("at:-9223372036854775808:0"),
+        Some("at:-9007199254740992:0"),
+        Some("at:9007199254740992:0"),
+        Some("at:0:9223372036854775807"),
+        Some("rest:9223372036854775807"),
+        Some("rest:-9007199254740992"),
+        // A rest that is over.
+        Some("rest:1"),
+    ];
+    for (i, cursor) in cursors.into_iter().enumerate() {
+        let before = t.blobs();
+        let upload = t.create("a").await;
+        t.part("a", &upload, 1, &pattern(i as u8, 700)).await;
+        let part: BTreeSet<String> = t.blobs().difference(&before).cloned().collect();
+        assert_eq!(part.len(), 1);
+        t.abort("a", &upload).await;
+        t.advance(ORPHAN_GRACE_MS);
+        t.sql("DELETE FROM scan_cursors WHERE k = 'orphans'");
+        if let Some(v) = cursor {
+            t.sql(&format!(
+                "INSERT INTO scan_cursors(k, v) VALUES ('orphans', '{v}')"
+            ));
+        }
+        t.pass().await;
+        assert!(t.blobs().is_disjoint(&part), "cursor {cursor:?}");
+        assert_eq!(
+            t.count("SELECT COUNT(*) FROM gc WHERE action = 'delete_safety' AND done_at IS NULL"),
+            0,
+            "cursor {cursor:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn an_upload_in_progress_keeps_every_part_however_old() {
     // Production limits: three parts of 5 MiB and a tail.

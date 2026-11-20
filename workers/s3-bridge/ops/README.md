@@ -893,8 +893,12 @@ has no object). The parts go with the pass after that.
      "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND created_at < (SELECT CAST(strftime('%s', applied_at) AS INTEGER) * 1000 FROM d1_migrations WHERE name = '0007_key_floors.sql')"
    ```
 
-   If it does not, settle every key that had an upload before that
-   migration (PUT or DELETE, as above) first.
+   If it does not, leave the switch off until every key that had an
+   upload before that migration has been written again: PUT an object
+   to it, and DELETE that object after if the key should hold none. A
+   DELETE alone is not enough there: such a key carries no mark, and
+   on a key with no object and no mark a delete stores nothing, so the
+   old record would stay the newest one of the key.
 2. Run it on a deployed test environment: abort an upload, upload a
    part twice, keep one upload open, date the `gc` rows of the dropped
    parts 31 days back, wait for a cron run, and see that the open
