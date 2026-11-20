@@ -10,7 +10,122 @@
 //! bring one back (a copy's record sorts after the record that retired
 //! its source); nothing collects while a restore runs, and afterwards the
 //! re-check here refuses the rows the replay left open.
+//!
+//! # Orphaned upload parts (`GC_ORPHANS`)
+//!
+//! A second, narrower collector takes only the safety copies of upload
+//! parts that left their upload and were never part of an object. It
+//! runs in every bucket, whatever `GC_MODE` says, so its rule is stated
+//! here in full. The safety copy of an extent may go when all of these
+//! hold in one batch of the catalogue ([`gc_orphan_claim`]):
+//!
+//! 1. an open `delete_safety` row names the extent. Only three writes
+//!    queue one for an extent that is still `staged`: a part that was
+//!    uploaded again under the same number, an abort, and a completion
+//!    that left the part out of its list. Each queues it in the batch
+//!    that takes the part out of the upload, dated with that moment;
+//! 2. that moment is at least `ORPHAN_GRACE_MS` ago;
+//! 3. the extent is `staged` and has no generation: it was never
+//!    adopted, so no object was ever made of it;
+//! 4. no `generation_extents` row names it, of a live generation or any
+//!    other: no object and no server-side copy reads it or ever did;
+//! 5. no part of an open upload names it (`upload_parts`,
+//!    `upload_part_extents`): an upload in progress keeps every part it
+//!    lists, however old;
+//! 6. no replay is under way and no rollback is waiting for one;
+//! 7. no recovery record that a replay could make the live object of
+//!    its key names it. A CompleteMultipartUpload stores its record,
+//!    which names every part it was given, before its batch runs. When
+//!    the batch does not run and the record could not be removed, the
+//!    record stays, the upload stays open, and the same parts can then
+//!    be aborted or uploaded again. The catalogue marks the key of
+//!    every record it may not have published (`key_floors.unpublished`,
+//!    raised before the record is stored), and only an acknowledged
+//!    write or delete of the key takes the mark away. While the key of
+//!    the part's upload carries it, the part stays: a replay would
+//!    publish that record, and its object must read. Without it every
+//!    record of the key lies under an acknowledged one, and a replay,
+//!    which folds the records of a key in id order, never leaves such
+//!    a record live.
+//!
+//! Once 1 and 3 to 5 hold they keep holding while requests and jobs
+//! run, which is why the scan may read them first and the claim later.
+//! An extent id is minted from random bytes for one stored part and is
+//! never issued again; a part enters `upload_parts` only in the batch
+//! that inserts its extent; CompleteMultipartUpload adopts only extents
+//! its open upload lists at the revision it validated; a copy
+//! references only extents of a live generation; UploadPartCopy stores
+//! new extents. A replay is the exception (it inserts `staged` extents
+//! without a `gc` row before it publishes them, and closes the open
+//! rows of every extent it publishes), and 1 and 6 keep the collector
+//! away from it. A catalogue taken back to before the part was dropped
+//! is the other one, and 2 is for that.
+//!
+//! 7 is decided by the claim alone. Only a completion of the part's own
+//! upload stores a record that names it, and only one that read the
+//! part list before the part was dropped. Such a request raises the
+//! mark and stores its record within the life of one request, which
+//! `ORPHAN_GRACE_MS` exceeds many times over: by the time 2 holds, every
+//! record that names the part is stored and its mark is set or was
+//! taken away by an acknowledged record above it.
+//!
+//! What the mark does not cover: a record stored before the catalogue
+//! had `key_floors` (migration 0007). Such a record names only parts
+//! that were stored before it was, so the switch may be turned on in a
+//! catalogue whose `staged` extents were all created after that
+//! migration was applied (the ops notes give the query).
 
+// The rule above in SQL, for the extent id expression `$x`: 3, 4 and 5.
+// `deleted` is the state the claim itself wrote: a row whose blob
+// delete then failed is claimed again and the delete repeated.
+macro_rules! orphan {
+    ($x:literal) => {
+        concat!(
+            "(EXISTS (SELECT 1 FROM extents oe WHERE oe.id = ",
+            $x,
+            " AND oe.state = 'staged' AND oe.generation_id IS NULL \
+               AND oe.safety_state IN ('held', 'deleted')) \
+             AND NOT EXISTS (SELECT 1 FROM generation_extents og WHERE og.extent_id = ",
+            $x,
+            ") AND NOT ",
+            part_ref!($x),
+            ")"
+        )
+    };
+}
+
+// Point 7 of the rule, for the extent id expression `$x`. The first
+// extent of a part that an abort or a completion dropped is still named
+// by its `upload_parts` row, which is never deleted: the key is that
+// upload's, and the check is one row of `key_floors`. A part that was
+// uploaded again lost that row to its successor, and the further
+// extents of a sliced part lost theirs when the part was dropped: for
+// those the key is not known, and every key an upload of the bucket was
+// ever made on must be free of the mark. That reads the uploads of the
+// catalogue once per claim, which is why the scan leaves this point to
+// the claim.
+macro_rules! no_stale_record {
+    ($x:literal) => {
+        concat!(
+            "(NOT EXISTS (SELECT 1 FROM upload_parts sp \
+               JOIN uploads su ON su.id = sp.upload_id \
+               JOIN key_floors sf ON sf.bucket_id = su.bucket_id AND sf.key = su.key \
+               WHERE sp.extent_id = ",
+            $x,
+            " AND sf.unpublished <> 0) \
+             AND (EXISTS (SELECT 1 FROM upload_parts sp WHERE sp.extent_id = ",
+            $x,
+            ") OR NOT EXISTS (SELECT 1 FROM uploads su \
+               WHERE su.bucket_id = (SELECT se.bucket_id FROM extents se WHERE se.id = ",
+            $x,
+            ") AND EXISTS (SELECT 1 FROM key_floors sf \
+                 WHERE sf.bucket_id = su.bucket_id AND sf.key = su.key \
+                   AND sf.unpublished <> 0))))"
+        )
+    };
+}
+
+use super::replay::guard_no_replay;
 use super::uploads::{guarded, ms, text, Cols, Stmt};
 use super::SqlCatalog;
 use crate::ports::{Guard, Sql, SqlValue};
@@ -19,6 +134,12 @@ use crate::types::{BlobStoreKind, ExtentId, GcAction, GcRow, GcStep, Result, Uni
 /// A refused row is looked at again after this long, so it cannot keep
 /// newer work out of the bounded `gc_due` window.
 const SKIP_RETRY_MS: i64 = 60 * 60 * 1000;
+
+/// After a pass over every due row, the scan for orphaned parts starts
+/// the next one this much later. A part waits `ORPHAN_GRACE_MS` before
+/// it may go, so an hour more changes nothing, and a catalogue with
+/// nothing to collect costs one row read per dispatcher run in between.
+const ORPHAN_REST_MS: i64 = 60 * 60 * 1000;
 
 /// True while the extent `?1` must not be touched: a live generation
 /// references it (its own, or a copy), or an open upload does.
@@ -204,6 +325,191 @@ pub(super) async fn gc_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> 
                 vec![SqlValue::Int(id), ms(now)],
             ),
         ])
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned upload parts
+// ---------------------------------------------------------------------------
+
+/// Where the scan for orphaned parts is (`scan_cursors`, key `orphans`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanCursor {
+    /// The last open row read: `(due_at, id)`.
+    At(i64, i64),
+    /// A pass ended; the next one starts at this time.
+    Rest(i64),
+}
+
+impl OrphanCursor {
+    /// Before every row.
+    const START: OrphanCursor = OrphanCursor::At(i64::MIN, 0);
+
+    /// A value this code did not write reads as the start: the scan
+    /// decides nothing, so reading rows again costs only the reads.
+    fn parse(v: &str) -> OrphanCursor {
+        let num = |s: &str| s.parse::<i64>().ok();
+        let parsed = match v.split(':').collect::<Vec<_>>().as_slice() {
+            ["at", due, id] => num(due).zip(num(id)).map(|(d, i)| OrphanCursor::At(d, i)),
+            ["rest", until] => num(until).map(OrphanCursor::Rest),
+            _ => None,
+        };
+        parsed.unwrap_or(OrphanCursor::START)
+    }
+
+    fn encode(self) -> String {
+        match self {
+            OrphanCursor::At(due, id) => format!("at:{due}:{id}"),
+            OrphanCursor::Rest(until) => format!("rest:{until}"),
+        }
+    }
+}
+
+async fn orphan_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<OrphanCursor> {
+    let rows = c
+        .sql
+        .query("SELECT v FROM scan_cursors WHERE k = 'orphans'", &[])
+        .await?;
+    Ok(match rows.into_iter().next() {
+        Some(row) => OrphanCursor::parse(&Cols::new(row).text()?),
+        None => OrphanCursor::START,
+    })
+}
+
+pub(super) async fn gc_orphans_due<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<bool> {
+    Ok(!matches!(orphan_cursor(c).await?, OrphanCursor::Rest(until) if until > now.0))
+}
+
+/// One window of the scan. The open rows are read in `(due_at, id)`
+/// order from where the last window ended, `scan` of them at most, so a
+/// run costs the same however many rows are open: the rows of deleted
+/// objects, which this collector never takes, are stepped over a window
+/// at a time and not read whole in search of a part. The scan is moved
+/// past what it returns before the caller acts on it: a row whose blob
+/// delete fails is met again by the next pass.
+pub(super) async fn gc_orphans<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+    cutoff: UnixMs,
+    scan: u32,
+    limit: u32,
+) -> Result<Vec<GcRow>> {
+    let (due, id) = match orphan_cursor(c).await? {
+        OrphanCursor::Rest(until) if until > now.0 => return Ok(Vec::new()),
+        OrphanCursor::Rest(_) => (i64::MIN, 0),
+        OrphanCursor::At(due, id) => (due, id),
+    };
+    // Two ranges of the index of open rows: the rest of the rows due at
+    // the same millisecond as the last one read (one abort queues a row
+    // for every part at once), then the rows due later.
+    let rows = c
+        .sql
+        .query(
+            concat!(
+                "SELECT w.id, w.extent_id, w.due_at, \
+                   (w.action = 'delete_safety' AND ",
+                orphan!("w.extent_id"),
+                ") FROM (SELECT id, extent_id, action, due_at FROM \
+                   (SELECT id, extent_id, action, due_at FROM gc \
+                     WHERE done_at IS NULL AND due_at = ?2 AND id > ?3 AND due_at <= ?1 \
+                     ORDER BY id LIMIT ?4) \
+                  UNION ALL SELECT id, extent_id, action, due_at FROM \
+                   (SELECT id, extent_id, action, due_at FROM gc \
+                     WHERE done_at IS NULL AND due_at > ?2 AND due_at <= ?1 \
+                     ORDER BY due_at, id LIMIT ?4) \
+                  ORDER BY due_at, id LIMIT ?4) w \
+                 ORDER BY w.due_at, w.id"
+            ),
+            &[
+                ms(cutoff),
+                SqlValue::Int(due),
+                SqlValue::Int(id),
+                SqlValue::Int(i64::from(scan)),
+            ],
+        )
+        .await?;
+    let read = rows.len();
+    let mut out = Vec::new();
+    let mut next = OrphanCursor::Rest(now.plus_ms(ORPHAN_REST_MS).0);
+    for (i, row) in rows.into_iter().enumerate() {
+        let mut r = Cols::new(row);
+        let row = GcRow {
+            id: r.num()?,
+            extent_id: ExtentId::new(r.text()?),
+            action: GcAction::DeleteSafety,
+            due_at: UnixMs(r.num()?),
+            done_at: None,
+        };
+        let orphan = r.num::<i64>()? != 0;
+        let at = OrphanCursor::At(row.due_at.0, row.id);
+        if orphan {
+            out.push(row);
+        }
+        // The pass goes on from here unless this was the last due row.
+        let full = out.len() >= limit as usize;
+        if read >= scan as usize || (full && i + 1 < read) {
+            next = at;
+        }
+        if full {
+            break;
+        }
+    }
+    c.sql
+        .exec(
+            "INSERT INTO scan_cursors(k, v) VALUES ('orphans', ?1) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            &[text(&next.encode())],
+        )
+        .await?;
+    Ok(out)
+}
+
+/// The decision. One batch proves the whole rule of the module doc for
+/// the row and records that the copy is gone; `false` = refused, and
+/// nothing was written. The caller's copy of the row is not trusted:
+/// the id, the extent and the action must be those of one open row.
+pub(super) async fn gc_orphan_claim<S: Sql>(
+    c: &SqlCatalog<S>,
+    row: &GcRow,
+    cutoff: UnixMs,
+) -> Result<bool> {
+    let extent = || text(row.extent_id.as_str());
+    let stmts: Vec<Stmt> = vec![
+        guard_no_replay(),
+        (
+            concat!(
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT (EXISTS \
+                   (SELECT 1 FROM gc WHERE id = ?2 AND extent_id = ?1 \
+                      AND action = 'delete_safety' AND done_at IS NULL AND due_at <= ?3) AND ",
+                orphan!("?1"),
+                " AND ",
+                no_stale_record!("?1"),
+                ")"
+            ),
+            vec![extent(), SqlValue::Int(row.id), ms(cutoff)],
+        ),
+        // The catalogue says the copy is gone before it goes, never
+        // after: from this batch on nothing is told that a pinned copy
+        // exists. The row stays open until the delete is known to have
+        // happened, so a delete that failed is repeated.
+        (
+            "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
+               evict_seq = evict_seq + 1 WHERE id = ?1 AND safety_state = 'held'",
+            vec![extent()],
+        ),
+    ];
+    Ok(guarded(c, stmts).await? == Guard::Applied(()))
+}
+
+/// Closes the row of a part whose safety copy is deleted.
+pub(super) async fn gc_orphan_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
+    c.sql
+        .exec(
+            "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND action = 'delete_safety' \
+               AND done_at IS NULL",
+            &[SqlValue::Int(id), ms(now)],
+        )
         .await?;
     Ok(())
 }
