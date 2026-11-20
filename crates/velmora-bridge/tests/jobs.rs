@@ -252,6 +252,7 @@ impl Fx {
             read: true,
             max_conns: 2,
             max_ips: None,
+            drill_conns: 0,
             priority: 0,
             retention_days: None,
             pool: None,

@@ -1107,12 +1107,65 @@ pub(crate) struct ColdReader<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// Slow connections that may still be replaced ([`SLOW_REPLACEMENTS`]).
     replacements: u32,
     stats: std::rc::Rc<core::cell::RefCell<ColdStats>>,
+    /// Whether this is the reader of a drill ([`Bridge::drill_reader`]).
+    drill: bool,
+    /// Providers that refused this drill's login. They are not asked
+    /// again by this reader: each ask would be one more refused login
+    /// on the account's record, and a cooldown begins only after
+    /// several. Always empty for a read.
+    shunned: Vec<String>,
+}
+
+/// The tier a reader asks `p` in, lowest first. A read: its `priority`.
+/// A drill: the providers with drill connections first, as one tier
+/// whatever their `priority` (the drill is to read over all of them at
+/// once, and takes nothing from a read on any); then the others by
+/// `priority`, for what the first tier could not supply.
+fn tier_of(drill: bool, p: &ProviderConfig) -> u16 {
+    match (drill, p.drill_conns) {
+        (false, _) => u16::from(p.priority),
+        (true, 0) => 1 + u16::from(p.priority),
+        (true, _) => 0,
+    }
+}
+
+/// The class of the slots a reader takes on `p`.
+fn class_of(drill: bool, p: &ProviderConfig) -> PermitClass {
+    if drill && p.drill_conns > 0 {
+        PermitClass::Drill
+    } else {
+        PermitClass::Read
+    }
+}
+
+/// The most connections a reader holds on `p` at once. A read: as many
+/// as it has sockets. A drill: the provider's drill connections; on a
+/// provider without them one, taken from `max_conns` as the drill
+/// always took it, so that a drill of many sockets is not that many
+/// connections fewer for reads.
+fn cap_of(drill: bool, p: &ProviderConfig) -> usize {
+    match (drill, p.drill_conns) {
+        (false, _) => usize::MAX,
+        (true, 0) => 1,
+        (true, n) => usize::try_from(n).unwrap_or(usize::MAX),
+    }
 }
 
 impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// Ends every session and frees its slot.
     pub(crate) async fn close(mut self) {
         ProviderSession::close_all(core::mem::take(&mut self.sessions)).await;
+    }
+
+    /// Ends every session and frees its slot; the reader can be used
+    /// again and opens new ones. For a caller that is about to wait.
+    pub(crate) async fn hang_up(&mut self) {
+        ProviderSession::close_all(core::mem::take(&mut self.sessions)).await;
+    }
+
+    /// The most connections the reader holds at once.
+    pub(crate) fn sockets(&self) -> u32 {
+        u32::try_from(self.sockets).unwrap_or(u32::MAX)
     }
 
     /// How long the reader may still sit with its sessions open and
@@ -1160,18 +1213,22 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         out: &mut [Option<Out>],
         full: &mut [bool],
     ) -> Result<()> {
+        let drill = self.drill;
+        // Sessions a provider may be given: one per article it has to
+        // read, and no more than the reader may hold there.
+        let room = |i: usize| work[i].min(cap_of(drill, order[i]));
         loop {
             let tier = (0..order.len())
                 .filter(|&i| work[i] > 0 && out[i].is_none())
-                .map(|i| order[i].priority)
+                .map(|i| tier_of(drill, order[i]))
                 .min();
             let needy: Vec<usize> = (0..order.len())
                 .filter(|&i| {
-                    Some(order[i].priority) == tier
+                    Some(tier_of(drill, order[i])) == tier
                         && work[i] > 0
                         && out[i].is_none()
                         && !full[i]
-                        && self.held(order[i]) < work[i]
+                        && self.held(order[i]) < room(i)
                 })
                 .collect();
             if needy.is_empty() {
@@ -1195,7 +1252,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             for turn in 0..need {
                 for &i in &needy {
                     let mine = asked.iter().filter(|&&a| a == i).count();
-                    if asked.len() < need && mine == turn && self.held(order[i]) + mine < work[i] {
+                    if asked.len() < need && mine == turn && self.held(order[i]) + mine < room(i) {
                         asked.push(i);
                     }
                 }
@@ -1232,7 +1289,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     self.nntp,
                     self.clock,
                     order[i],
-                    PermitClass::Read,
+                    class_of(drill, order[i]),
                     &self.holder,
                 )
             }))
@@ -1278,6 +1335,16 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// is asked of every reader before the read gives up.
     pub(crate) async fn fetch(&mut self, extent: &ExtentRow) -> Result<ColdFetch> {
         let plan = self.catalog.articles(&extent.id).await?;
+        self.fetch_planned(extent, plan).await
+    }
+
+    /// [`Self::fetch`] with the extent's article rows already read.
+    pub(crate) async fn fetch_planned(
+        &mut self,
+        extent: &ExtentRow,
+        plan: Vec<ArticleRow>,
+    ) -> Result<ColdFetch> {
+        let drill = self.drill;
         let size =
             usize::try_from(extent.cipher_size).map_err(|_| BridgeError::Invalid("extent size"))?;
         let spans = article_spans(extent.cipher_size);
@@ -1293,6 +1360,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let pool = Pool::load(self.catalog, self.providers, now).await?;
         let readers: Vec<&'a ProviderConfig> = self.providers.iter().filter(|p| p.read).collect();
         let mut order = pool.order(readers.clone(), PermitClass::Read);
+        // Stable: the providers of a tier keep the pool's order.
+        order.sort_by_key(|p| tier_of(drill, p));
         if order.is_empty() {
             // Every reader is cooling: a read is worth one attempt on the
             // provider that is due back first, unless that one refused
@@ -1300,6 +1369,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             // again when its cooldown ends, not on every read.
             order.extend(pool.soonest_cooling(&readers));
         }
+        order.retain(|p| !self.shunned.contains(&p.id));
         // A session on a provider that is no longer in the order (it is
         // cooling now) is not used.
         let (kept, gone): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
@@ -1356,7 +1426,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 // not given articles the better tier has.
                 let tier = (0..order.len())
                     .filter(|&i| work[i] > 0 && out[i].is_none())
-                    .map(|i| order[i].priority)
+                    .map(|i| tier_of(drill, order[i]))
                     .min();
                 // Nor is a session of a provider that is out kept: it
                 // would read nothing, with nobody renewing its slot, and
@@ -1368,7 +1438,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 let (kept, other): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)
                     .into_iter()
                     .partition(|s| {
-                        Some(s.provider.priority) == tier
+                        Some(tier_of(drill, s.provider)) == tier
                             && index(s).is_some_and(|i| out[i].is_none())
                     });
                 self.sessions = kept;
@@ -1387,7 +1457,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     .any(|s| index(s).is_some_and(|i| work[i] > 0 && out[i].is_none()));
                 if !staffed {
                     for i in 0..order.len() {
-                        if Some(order[i].priority) == tier && work[i] > 0 && out[i].is_none() {
+                        if Some(tier_of(drill, order[i])) == tier && work[i] > 0 && out[i].is_none()
+                        {
                             out[i] = Some(Out::Busy);
                         }
                     }
@@ -1426,6 +1497,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 for ((session, end), lags) in sessions.into_iter().zip(ended).zip(lagging) {
                     match (end, index(&session)) {
                         (Err(stop), Some(i)) => {
+                            let refused = session.health == Some(Err(ProviderFault::LoginRefused));
+                            if drill && refused && !self.shunned.contains(&session.provider.id) {
+                                self.shunned.push(session.provider.id.clone());
+                            }
                             stops.push((i, stop));
                             dead.push(session);
                         }
@@ -1499,11 +1574,22 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 .copied()
                 .filter(|p| !was_asked(p) && lacks(p))
                 .collect();
-            let interrupted =
-                out.contains(&Some(Out::Broken)) || pool.cooling_until(&waiting).is_some();
+            let broken = out.contains(&Some(Out::Broken));
+            let busy = out.contains(&Some(Out::Busy));
+            // A provider that was not asked because it cools, or because
+            // it refused this drill's login, may hold what the others
+            // lack.
+            let unasked = pool.cooling_until(&waiting).is_some()
+                || waiting.iter().any(|p| self.shunned.contains(&p.id));
+            // A drill waits for a slot of a provider that is full
+            // (`Busy`, as long as a cold read may wait) before it counts
+            // a try against a provider it does not ask: the tries would
+            // be spent on that one while the provider that has the
+            // articles frees a slot.
+            let interrupted = broken || (unasked && !(drill && busy));
             return Ok(if interrupted {
                 ColdFetch::Interrupted
-            } else if out.contains(&Some(Out::Busy)) {
+            } else if busy {
                 ColdFetch::Busy
             } else {
                 ColdFetch::Unavailable
@@ -1715,6 +1801,38 @@ where
             sessions: Vec::new(),
             replacements: SLOW_REPLACEMENTS,
             stats: Default::default(),
+            drill: false,
+            shunned: Vec::new(),
+        })
+    }
+
+    /// A reader for one drill (`POST /_admin/drill`), with up to
+    /// `sockets` connections and never more than `COLD_SOCKETS`.
+    ///
+    /// It reads as a cold read does, with these differences. It takes
+    /// its connections from the providers' drill connections
+    /// ([`ProviderConfig::drill_conns`]), over all such providers at
+    /// once whatever their `priority`, and holds no slot of `max_conns`
+    /// there. A provider without drill connections is asked after
+    /// those, for what they lack, over one connection of `max_conns`.
+    /// With no drill connections on any reader the drill has one socket
+    /// in all: it then reads as it always did, one connection of
+    /// `max_conns` at a time.
+    pub(crate) fn drill_reader(&self, sockets: u32) -> Result<ColdReader<'_, C, N, T>> {
+        let dedicated = self
+            .cfg
+            .providers
+            .iter()
+            .any(|p| p.read && p.enabled && p.drill_conns > 0);
+        let sockets = match dedicated {
+            true => sockets.clamp(1, self.cfg.cold_sockets.max(1)),
+            false => 1,
+        };
+        Ok(ColdReader {
+            sockets: usize::try_from(sockets).unwrap_or(1),
+            holder: request_holder("drill")?,
+            drill: true,
+            ..self.cold_reader()?
         })
     }
 

@@ -49,6 +49,17 @@
 //! read's slot is short-lived: on a provider with one address a dropped
 //! read keeps every other caller out for that long and no longer.
 
+//!
+//! # Drill slots
+//!
+//! A provider with `drill_conns` has that many slots more, for drills
+//! only ([`PermitClass::Drill`]). They are rows of the same table under
+//! another name ([`ProviderConfig::drill_key`]), so every count above
+//! (a provider's slots, its holders, its pool) is a count without them:
+//! a drill that holds all of them takes nothing from a read or a job,
+//! and no read or job is ever handed one. They are fenced, renewed and
+//! freed like any slot, with the lifetime of a read.
+
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
 use crate::gate::{PermitGate, GATE_HOLDER_PREFIX, GATE_IDLE_PREFIX, SEIZED_UNTIL_MS};
@@ -79,12 +90,17 @@ pub(super) async fn seed_permits<S: Sql>(
 }
 
 async fn seed<S: Sql>(c: &SqlCatalog<S>, p: &ProviderConfig) -> Result<u64> {
+    seed_slots(c, &p.id, SqlValue::Int(i64::from(p.max_conns))).await
+}
+
+/// Inserts the missing slots `0..conns` under `key`.
+async fn seed_slots<S: Sql>(c: &SqlCatalog<S>, key: &str, conns: SqlValue) -> Result<u64> {
     c.sql
         .exec(
             "INSERT OR IGNORE INTO provider_permits(provider_id, slot) \
              WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n + 1 < ?2) \
              SELECT ?1, n FROM s WHERE n < ?2",
-            &[text(&p.id), SqlValue::Int(i64::from(p.max_conns))],
+            &[text(key), conns],
         )
         .await
 }
@@ -184,9 +200,12 @@ pub(super) async fn acquire_permit<S: Sql>(
     holder: &str,
     now: UnixMs,
 ) -> Result<Option<Permit>> {
+    if class == PermitClass::Drill {
+        return acquire_drill(c, p, holder, now).await;
+    }
     let background = class == PermitClass::Background;
     let conns = match class {
-        PermitClass::Read => p.max_conns,
+        PermitClass::Read | PermitClass::Drill => p.max_conns,
         PermitClass::Background => p.background_conns(),
     };
     // The pool keeps a read reserve of its own, like each provider.
@@ -214,7 +233,7 @@ pub(super) async fn acquire_permit<S: Sql>(
     // Reads fill from the top, so they use the reserved slot first and
     // leave the shared ones to background jobs.
     let sql = match class {
-        PermitClass::Read => take_slot!("DESC"),
+        PermitClass::Read | PermitClass::Drill => take_slot!("DESC"),
         PermitClass::Background => take_slot!("ASC"),
     };
     // A second try only when this call had to create the provider's slots.
@@ -236,6 +255,56 @@ pub(super) async fn acquire_permit<S: Sql>(
     Ok(None)
 }
 
+/// Takes a free or expired drill slot of `p`, one of its `drill_conns`
+/// (see the module docs). `None` = they are all held, or it has none.
+///
+/// No pool and no address count: the slots are outside the pool, and a
+/// provider with an address limit has them only behind its proxies
+/// (the configuration refuses it otherwise), where an invocation more
+/// is not an address more.
+async fn acquire_drill<S: Sql>(
+    c: &SqlCatalog<S>,
+    p: &ProviderConfig,
+    holder: &str,
+    now: UnixMs,
+) -> Result<Option<Permit>> {
+    if p.drill_conns == 0 {
+        return Ok(None);
+    }
+    let key = p.drill_key();
+    let conns = SqlValue::Int(i64::from(p.drill_conns));
+    let params = [
+        text(&key),
+        text(holder),
+        ms(now.plus_ms(ttl_ms(PermitClass::Drill))),
+        conns.clone(),
+        ms(now),
+    ];
+    // A second try only when this call had to create the slots.
+    for attempt in 0..2 {
+        let rows = c
+            .sql
+            .query(
+                "UPDATE provider_permits SET token = token + 1, holder = ?2, lease_until = ?3,                    pool = NULL, background = 0                  WHERE provider_id = ?1 AND slot = (SELECT slot FROM provider_permits                    WHERE provider_id = ?1 AND slot < ?4 AND lease_until < ?5                    ORDER BY slot LIMIT 1)                  RETURNING slot, token",
+                &params,
+            )
+            .await?;
+        if let Some(row) = rows.into_iter().next() {
+            let mut r = Cols::new(row);
+            return Ok(Some(Permit {
+                provider: p.id.clone(),
+                slot: r.num()?,
+                token: r.num()?,
+                class: PermitClass::Drill,
+            }));
+        }
+        if attempt == 1 || seed_slots(c, &key, conns.clone()).await? == 0 {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 /// Frees every slot of `p` that expired before `now`, so that no late
 /// renewal can extend it (see the module docs). Free slots are not
 /// written again.
@@ -250,9 +319,20 @@ async fn free_expired<S: Sql>(c: &SqlCatalog<S>, p: &ProviderConfig, now: UnixMs
     Ok(())
 }
 
+/// The name a permit's slot is kept under: the provider's id, or for a
+/// drill slot what [`ProviderConfig::drill_key`] makes of it.
+fn slot_key(p: &Permit) -> SqlValue {
+    match p.class {
+        PermitClass::Drill => {
+            SqlValue::Text(format!("{}{}", p.provider, crate::types::DRILL_KEY_SUFFIX))
+        }
+        PermitClass::Read | PermitClass::Background => text(&p.provider),
+    }
+}
+
 fn permit_params(p: &Permit) -> Result<Vec<SqlValue>> {
     Ok(vec![
-        text(&p.provider),
+        slot_key(p),
         SqlValue::Int(i64::from(p.slot)),
         super::uploads::int(p.token)?,
     ])

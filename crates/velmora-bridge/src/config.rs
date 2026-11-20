@@ -968,6 +968,18 @@ fn validate_providers(
         if !pool_ok || !ips_ok || !hosts_ok(p) || !proxies_ok(p) || p.retention_days == Some(0) {
             return Err(bad());
         }
+        // Drill connections come from a provider that reads, and from an
+        // account with an address limit only through its proxies: a
+        // drill run directly would be one more address on the account,
+        // and could shut a read out of it. Their slots are kept under a
+        // name that no provider may have as its id.
+        let drill_ok = p.drill_conns == 0
+            || (p.read
+                && p.drill_conns <= MAX_CONNS_LIMIT
+                && (p.max_ips.is_none() || !p.proxies.is_empty()));
+        if !drill_ok || p.id.ends_with(crate::types::DRILL_KEY_SUFFIX) {
+            return Err(bad());
+        }
         if p.id.is_empty()
             || p.host.is_empty()
             || p.backbone.is_empty()

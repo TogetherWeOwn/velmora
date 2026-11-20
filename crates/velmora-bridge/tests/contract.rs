@@ -2537,6 +2537,47 @@ fn provider_hosts_only_on_tls() {
     assert!(load(&with_secrets(dev, &one_host)).is_ok());
 }
 
+/// `drill_conns` is optional and `0` without it: a drill then reads
+/// over one connection of the provider's own. Stated, it is refused
+/// where a drill connection could take something from production: on a
+/// provider that is not read, and on a direct account with an address
+/// limit, where it would be one more address. No provider may have the
+/// name the drill slots are kept under.
+#[test]
+fn provider_drill_conns_parse_and_fail_closed() {
+    let invalid = Err(ConfigError::Invalid("NNTP_PROVIDERS".into()));
+    let one = |extra: &str| providers_of(&[provider_json("a", extra)]);
+
+    let plain = one("").unwrap();
+    assert_eq!(plain[0].drill_conns, 0);
+    let with = one(r#""drill_conns":4"#).unwrap();
+    assert_eq!((with[0].drill_conns, with[0].max_conns), (4, 2));
+    assert_eq!(with[0].drill_key(), "a/drill");
+    assert!(format!("{:?}", with[0]).contains("drill_conns: 4"));
+
+    assert_eq!(one(r#""drill_conns":100000"#), invalid);
+    assert_eq!(one(r#""drill_conns":-1"#), invalid);
+    assert_eq!(one(r#""drill_conns":"4""#), invalid);
+    // Not read: nothing to drill over.
+    let unread =
+        provider_json("a", r#""drill_conns":1"#).replace(r#""read":true"#, r#""read":false"#);
+    assert_eq!(providers_of(std::slice::from_ref(&unread)), invalid);
+    assert!(providers_of(&[unread.replace(r#""drill_conns":1"#, r#""drill_conns":0"#)]).is_ok());
+    // An address limit: only through the account's proxies.
+    assert_eq!(one(r#""max_ips":1,"drill_conns":1"#), invalid);
+    let proxied = format!(
+        r#""max_ips":1,"drill_conns":1,"proxies":[{}]"#,
+        proxy_json("proxy.example", 1080, "proxy-login", "proxy-secret")
+    );
+    assert_eq!(one(&proxied).unwrap()[0].drill_conns, 1);
+    // The name of a provider's drill slots is no provider's id.
+    assert_eq!(providers_of(&[provider_json("a/drill", "")]), invalid);
+    assert_eq!(
+        providers_of(&[provider_json("a", ""), provider_json("a/drill", "")]),
+        invalid
+    );
+}
+
 #[test]
 fn provider_pool_settings_parse() {
     let pool = r#""pool":"bundle","pool_max_conns":3"#;

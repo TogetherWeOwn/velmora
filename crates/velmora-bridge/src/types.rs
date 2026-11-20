@@ -467,6 +467,9 @@ impl fmt::Debug for Secret {
 // Provider configuration
 // ---------------------------------------------------------------------------
 
+/// What [`ProviderConfig::drill_key`] adds to a provider id.
+pub const DRILL_KEY_SUFFIX: &str = "/drill";
+
 /// One entry of the `NNTP_PROVIDERS` secret (JSON array). Deserialize
 /// only: credentials are never serialized back out.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -504,6 +507,27 @@ pub struct ProviderConfig {
     /// `max_conns` leaves. `None` = no such limit: `max_conns` alone.
     #[serde(default)]
     pub max_ips: Option<u32>,
+    /// Connections a drill (`POST /_admin/drill`) may hold on this
+    /// account beside `max_conns`: what the account allows less what
+    /// `max_conns` already hands out. `0` (the default) = none: a drill
+    /// then reads this provider over one connection taken from
+    /// `max_conns`, as a read does.
+    ///
+    /// These are slots of their own ([`PermitClass::Drill`]). No read
+    /// and no job ever takes one, and a drill that has them takes none
+    /// of `max_conns`, so a drill of any size leaves every slot of
+    /// `max_conns` to reads and jobs. They are outside `pool_max_conns`.
+    ///
+    /// A drill is one more invocation, so on an account with `max_ips`
+    /// this needs `proxies`: the provider then sees the proxies'
+    /// addresses, however many invocations there are.
+    ///
+    /// Rollout and rollback as for `hosts`: an older Worker refuses a
+    /// secret that carries this field.
+    ///
+    /// [`PermitClass::Drill`]: crate::ports::PermitClass::Drill
+    #[serde(default)]
+    pub drill_conns: u32,
     /// Tier, `0` = tried first. Providers of one tier share the load.
     #[serde(default)]
     pub priority: u8,
@@ -655,6 +679,13 @@ impl ProviderConfig {
     pub fn background_ips(&self) -> Option<u32> {
         self.max_ips.map(|max| max - u32::from(max >= 2))
     }
+
+    /// The name the drill's slots are kept under in the permit table
+    /// (`drill_conns`): not a provider id, so nothing that counts a
+    /// provider's slots, holders or uses sees them.
+    pub fn drill_key(&self) -> String {
+        format!("{}{DRILL_KEY_SUFFIX}", self.id)
+    }
 }
 
 /// Why a session with a provider counts as a strike. The code is all
@@ -762,6 +793,7 @@ impl fmt::Debug for ProviderConfig {
             .field("read", &self.read)
             .field("max_conns", &self.max_conns)
             .field("max_ips", &self.max_ips)
+            .field("drill_conns", &self.drill_conns)
             .field("priority", &self.priority)
             .field("retention_days", &self.retention_days)
             .field("pool", &self.pool)

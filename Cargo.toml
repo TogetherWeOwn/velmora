@@ -74,6 +74,9 @@ opt-level = 3
 [profile.release.package.md5]
 opt-level = 3
 
+[profile.release.package.md-5]
+opt-level = 3
+
 [profile.release.package.crc32fast]
 opt-level = 3
 

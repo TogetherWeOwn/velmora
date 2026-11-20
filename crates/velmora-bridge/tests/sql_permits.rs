@@ -104,6 +104,7 @@ async fn permits_never_exceed_max_conns() {
                     .count();
                 match class {
                     PermitClass::Read => assert_eq!(live.len(), max_conns as usize),
+                    PermitClass::Drill => unreachable!("no drill slot is asked for here"),
                     // Refused although a slot may be free: it is the read reserve.
                     PermitClass::Background => assert!(
                         live.len() == max_conns as usize
@@ -1292,4 +1293,167 @@ async fn an_acquire_under_every_limit_is_one_statement() {
     let granted = c.acquire_permit(&p, PermitClass::Read, "c", T0).await;
     assert!(granted.unwrap().is_some());
     assert_eq!(sent(), (before.0 + 1, before.1));
+}
+
+// ---------------------------------------------------------------------------
+// Drill slots (`drill_conns`)
+// ---------------------------------------------------------------------------
+
+fn with_drill(mut p: ProviderConfig, drill_conns: u32) -> ProviderConfig {
+    p.drill_conns = drill_conns;
+    p
+}
+
+#[tokio::test]
+async fn a_drill_takes_its_own_slots_and_none_of_the_providers() {
+    let c = catalog();
+    let p = with_drill(provider("p1", 2), 3);
+    // A drill that holds every drill slot...
+    let mut drills = Vec::new();
+    for _ in 0..3 {
+        let permit = c
+            .acquire_permit(&p, PermitClass::Drill, "drill:a", T0)
+            .await;
+        let permit = permit.unwrap().expect("a drill slot");
+        assert_eq!(permit.provider, "p1");
+        assert_eq!(permit.class, PermitClass::Drill);
+        assert!(permit.slot < 3);
+        drills.push(permit);
+    }
+    let slots: BTreeSet<u32> = drills.iter().map(|d| d.slot).collect();
+    assert_eq!(slots.len(), 3, "one drill slot handed out twice");
+    let fourth = c
+        .acquire_permit(&p, PermitClass::Drill, "drill:b", T0)
+        .await;
+    assert_eq!(fourth.unwrap(), None, "drill_conns is the limit");
+    // ...has taken nothing from a job or a read: every slot of
+    // `max_conns` is still handed out, and the load of the provider
+    // (what the pool orders by and the status shows) counts none of the
+    // drill's.
+    assert_eq!(load_of(&c, "p1", T0).await.map_or(0, |l| l.held), 0);
+    let job = acquire(&c, &p, PermitClass::Background, T0).await;
+    let read = acquire(&c, &p, PermitClass::Read, T0).await;
+    assert!(job.is_some() && read.is_some());
+    assert_eq!(acquire(&c, &p, PermitClass::Read, T0).await, None);
+    let load = load_of(&c, "p1", T0).await.unwrap();
+    assert_eq!((load.held, load.holders), (2, 1));
+    assert_eq!(held(&c, T0).await, 5);
+}
+
+#[tokio::test]
+async fn a_drill_gets_its_slots_while_the_provider_is_full() {
+    let c = catalog();
+    let p = with_drill(provider("p1", 2), 1);
+    for _ in 0..2 {
+        assert!(acquire(&c, &p, PermitClass::Read, T0).await.is_some());
+    }
+    assert_eq!(acquire(&c, &p, PermitClass::Read, T0).await, None);
+    assert!(acquire(&c, &p, PermitClass::Drill, T0).await.is_some());
+    assert_eq!(acquire(&c, &p, PermitClass::Drill, T0).await, None);
+}
+
+#[tokio::test]
+async fn a_provider_without_drill_conns_has_no_drill_slot() {
+    let c = catalog();
+    let p = provider("p1", 4);
+    assert_eq!(p.drill_conns, 0, "absent from the secret = none");
+    assert_eq!(acquire(&c, &p, PermitClass::Drill, T0).await, None);
+    assert_eq!(held(&c, T0).await, 0);
+    assert_eq!(
+        count(&c, "SELECT COUNT(*) FROM provider_permits").await,
+        0,
+        "no slot row is made for it"
+    );
+}
+
+#[tokio::test]
+async fn a_drill_is_no_address_on_a_provider_with_an_address_limit() {
+    let c = catalog();
+    // One address, and a job holds it.
+    let p = with_drill(capped("p1", 4, 1), 2);
+    let job = c
+        .acquire_permit(&p, PermitClass::Background, "job:1", T0)
+        .await;
+    assert!(job.unwrap().is_some());
+    // The drill is let in (it leaves through the provider's proxies)...
+    for _ in 0..2 {
+        let drill = c
+            .acquire_permit(&p, PermitClass::Drill, "drill:a", T0)
+            .await;
+        assert!(drill.unwrap().is_some());
+    }
+    // ...and counts as no holder: the job's invocation takes more, and
+    // another invocation is refused for the job alone.
+    let more = c
+        .acquire_permit(&p, PermitClass::Background, "job:1", T0)
+        .await;
+    assert!(more.unwrap().is_some());
+    let other = c.acquire_permit(&p, PermitClass::Read, "get:2", T0).await;
+    assert_eq!(other.unwrap(), None);
+    assert_eq!(load_of(&c, "p1", T0).await.unwrap().holders, 1);
+    // With the job gone the read gets the address although the drill
+    // still holds its slots.
+    let later = T0.plus_ms(TTL_MS + 1);
+    for _ in 0..2 {
+        let drill = c
+            .acquire_permit(&p, PermitClass::Drill, "drill:b", later)
+            .await;
+        assert!(drill.unwrap().is_some());
+    }
+    let free = c
+        .acquire_permit(&p, PermitClass::Read, "get:2", later)
+        .await;
+    assert!(free.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_drill_slot_is_fenced_renewed_and_freed_like_a_reads() {
+    let c = catalog();
+    let p = with_drill(provider("p1", 1), 1);
+    let read = acquire(&c, &p, PermitClass::Read, T0).await.unwrap();
+    let drill = acquire(&c, &p, PermitClass::Drill, T0).await.unwrap();
+    // Same provider and slot number, two slots.
+    assert_eq!((read.slot, drill.slot), (0, 0));
+    // A drill's slot lives as long as a read's, from a renewal too.
+    let late = T0.plus_ms(READ_TTL_MS);
+    assert!(c.renew_permit(&drill, late).await.unwrap());
+    assert_eq!(
+        acquire(&c, &p, PermitClass::Drill, late.plus_ms(READ_TTL_MS)).await,
+        None
+    );
+    let gone = late.plus_ms(READ_TTL_MS + 1);
+    assert!(!c.renew_permit(&drill, gone).await.unwrap(), "expired");
+    // Taken over: the old permit neither renews nor frees it.
+    let next = acquire(&c, &p, PermitClass::Drill, gone).await.unwrap();
+    assert!(next.token > drill.token);
+    c.release_permit(&drill).await.unwrap();
+    assert!(!c.renew_permit(&drill, gone).await.unwrap());
+    assert!(c.renew_permit(&next, gone).await.unwrap());
+    // Freeing the drill's slot leaves the read's alone, and the other
+    // way round.
+    let read = acquire(&c, &p, PermitClass::Read, gone).await.unwrap();
+    c.release_permit(&next).await.unwrap();
+    assert!(c.renew_permit(&read, gone).await.unwrap());
+    assert!(!c.renew_permit(&next, gone).await.unwrap());
+    let again = acquire(&c, &p, PermitClass::Drill, gone).await.unwrap();
+    c.release_permit(&read).await.unwrap();
+    assert!(c.renew_permit(&again, gone).await.unwrap());
+}
+
+#[tokio::test]
+async fn lowered_drill_conns_is_obeyed() {
+    let c = catalog();
+    let wide = with_drill(provider("p1", 1), 3);
+    for _ in 0..3 {
+        assert!(acquire(&c, &wide, PermitClass::Drill, T0).await.is_some());
+    }
+    // The slots were all held under the old limit: once they expired
+    // the new one hands out one.
+    let narrow = with_drill(provider("p1", 1), 1);
+    let later = T0.plus_ms(READ_TTL_MS + 1);
+    let one = acquire(&c, &narrow, PermitClass::Drill, later)
+        .await
+        .unwrap();
+    assert_eq!(one.slot, 0);
+    assert_eq!(acquire(&c, &narrow, PermitClass::Drill, later).await, None);
 }

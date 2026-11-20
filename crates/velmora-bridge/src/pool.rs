@@ -71,6 +71,8 @@ impl<'a> Pool<'a> {
         if no_address {
             return 0;
         }
+        // Drill slots are not in the snapshot: a drill is ordered by
+        // what a read would find.
         let own = p.max_conns.saturating_sub(self.held(&p.id));
         match (&p.pool, p.pool_max_conns) {
             (Some(pool), Some(max)) => {
