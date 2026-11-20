@@ -64,6 +64,8 @@ pub struct Mem<'a> {
     held: Vec<u8>,
     sent: Vec<u8>,
     sent_total: usize,
+    /// Every byte written, in order, when asked for ([`Mem::recording`]).
+    wire: Option<Vec<u8>>,
 }
 
 impl<'a> Mem<'a> {
@@ -76,7 +78,21 @@ impl<'a> Mem<'a> {
             held: Vec::new(),
             sent: Vec::new(),
             sent_total: 0,
+            wire: None,
         }
+    }
+
+    /// Like [`Mem::new`], and keeps every byte written ([`Mem::wire`]).
+    pub fn recording(script: &'a [u8], chunk: usize) -> Self {
+        Mem {
+            wire: Some(Vec::new()),
+            ..Mem::new(script, chunk)
+        }
+    }
+
+    /// Every byte written so far, if recording.
+    pub fn wire(&self) -> &[u8] {
+        self.wire.as_deref().unwrap_or_default()
     }
 }
 
@@ -101,6 +117,9 @@ impl Transport for Mem<'_> {
         self.sent.clear();
         self.sent.extend_from_slice(buf);
         self.sent_total += buf.len();
+        if let Some(wire) = self.wire.as_mut() {
+            wire.extend_from_slice(buf);
+        }
         Ok(())
     }
 
@@ -432,7 +451,7 @@ impl Bench {
 /// [`fingerprint`] draws. `run.mjs` refuses to time a module that
 /// answers anything else, so a fast path that changes one output byte
 /// cannot be measured as a saving.
-pub const FINGERPRINT: u32 = 0x9698_af48;
+pub const FINGERPRINT: u32 = 0x5808_73f6;
 
 /// A digest over every byte the hot paths produce for one fixed extent:
 /// the sealed ciphertext and its hashes, each rendered article, the
@@ -555,6 +574,116 @@ pub fn fingerprint() -> u32 {
         accepted > 200 && refused > 200,
         "{accepted} accepted, {refused} refused"
     );
+    // Well-formed parts with a checksum, right or wrong, single and
+    // `=ypart`, decoded into a window of a larger buffer: the bytes on
+    // both sides of the window must stay as they were, and a wrong
+    // checksum must be refused.
+    let (mut good, mut bad) = (0, 0);
+    for case in 0..400usize {
+        let len = 1 + roll() % 3000;
+        let mut data = vec![0u8; len];
+        for b in data.iter_mut() {
+            // Dense in the bytes yEnc escapes.
+            *b = match roll() % 4 {
+                0 => [214, 224, 227, 19, 0, 10, 13, 61][roll() % 8],
+                _ => roll() as u8,
+            };
+        }
+        let multipart = case % 2 == 1;
+        let params = velmora::yenc::SegmentParams {
+            name: "t".into(),
+            part: if multipart { 2 } else { 1 },
+            total: if multipart { 3 } else { 1 },
+            begin: if multipart { 1001 } else { 1 },
+            end: if multipart {
+                1000 + len as u64
+            } else {
+                len as u64
+            },
+            file_size: if multipart {
+                1000 + len as u64 + 7
+            } else {
+                len as u64
+            },
+        };
+        let mut article = Vec::new();
+        velmora::yenc::encode_segment_vec(&mut article, &params, &data).unwrap();
+        let wrong = case % 4 >= 2;
+        if wrong {
+            // Flip one hex digit of the checksum on the `=yend` line.
+            let tail = article.len() - 3;
+            article[tail] = if article[tail] == b'0' { b'1' } else { b'0' };
+        }
+        const CANARY: usize = 32;
+        let window = len + roll() % 17;
+        let mut buf = vec![0x5Au8; CANARY + window + CANARY];
+        let out =
+            velmora::yenc::decode_part_to("<m@x>", &article, &mut buf[CANARY..CANARY + window]);
+        assert!(
+            buf[..CANARY]
+                .iter()
+                .chain(&buf[CANARY + window..])
+                .all(|&b| b == 0x5A),
+            "the decoder wrote outside its destination"
+        );
+        match out {
+            Ok(part) => {
+                assert!(!wrong, "a wrong checksum was accepted");
+                assert!(
+                    buf[CANARY..CANARY + part.written] == data[..],
+                    "decoded bytes differ"
+                );
+                good += 1;
+                all.extend_from_slice(&(part.written as u64).to_be_bytes());
+            }
+            Err(err) => {
+                assert!(wrong, "a right part was refused: {err}");
+                bad += 1;
+                all.extend_from_slice(err.to_string().as_bytes());
+            }
+        }
+        all.extend_from_slice(&buf);
+    }
+    assert!(good > 100 && bad > 100, "{good} accepted, {bad} refused");
+    // The bytes `POST` puts on the wire: the bench's articles, then
+    // articles with a `.` at byte 0 and after every CRLF (dot-stuffed),
+    // then articles the framing check must refuse (a bare CR, a bare
+    // LF), whose refusal goes into the digest instead.
+    let mut posts: Vec<Vec<u8>> = bench.articles.clone();
+    posts.push(b".\r\n..\r\n.x\r\nend".to_vec());
+    posts.push(b"a\r\n.\r\n.\r\n.".to_vec());
+    let refused_posts = [b"a\rb".to_vec(), b"a\nb".to_vec(), b"a\r\nb\r".to_vec()];
+    let mut script = GREETING.to_vec();
+    for _ in 0..posts.len() {
+        script.extend_from_slice(b"340 send\r\n240 posted\r\n");
+    }
+    let wire = now(async {
+        let mut client = NntpClient::connect(Mem::recording(&script, 4096), &config())
+            .await
+            .unwrap();
+        for (i, article) in posts.iter().enumerate() {
+            let out = client
+                .post_article(&format!("p{i}.m1@bench.invalid"), article)
+                .await
+                .unwrap();
+            assert!(matches!(out, PostOutcome::Posted));
+        }
+        for (i, article) in refused_posts.iter().enumerate() {
+            match client
+                .post_article(&format!("r{i}.m1@bench.invalid"), article)
+                .await
+            {
+                Ok(_) => panic!("an article with a bare CR or LF was sent"),
+                Err(err) => all.extend_from_slice(err.to_string().as_bytes()),
+            }
+        }
+        client.into_inner().wire().to_vec()
+    });
+    assert!(
+        wire.windows(5).any(|w| w == b"\r\n..\r"),
+        "no dot-stuffing on the wire"
+    );
+    all.extend_from_slice(&wire);
     for chunk in [1, 7, 4096, 65536] {
         let cipher = bench.cold_fetch(chunk);
         assert!(cipher == bench.cipher(), "read back differs");

@@ -126,11 +126,14 @@ jobs:
       # release profile) must produce the bytes the native build pins:
       # run.mjs runs the self-check of velmora-cpu-bench under V8 and
       # fails on any difference. The timings it prints are not a gate.
-      - name: Hot-path self-check under wasm simd128
+      - name: Hot-path self-check under wasm (scalar, then simd128)
         run: |
           set -euo pipefail
+          wasm=target/wasm32-unknown-unknown/release/velmora_cpu_bench.wasm
+          cargo build --locked --release -p velmora-cpu-bench --target wasm32-unknown-unknown
+          node crates/velmora-cpu-bench/run.mjs "$wasm" --expect-simd off --check-only
           RUSTFLAGS="-C target-feature=+simd128" cargo build --locked --release -p velmora-cpu-bench --target wasm32-unknown-unknown
-          node crates/velmora-cpu-bench/run.mjs target/wasm32-unknown-unknown/release/velmora_cpu_bench.wasm --mib 2 --reps 1
+          node crates/velmora-cpu-bench/run.mjs "$wasm" --expect-simd on --mib 2 --reps 1
       # S3 bridge core and protocol crates are runtime-agnostic and must
       # build for the Worker target without engine transport features.
       - run: cargo check --locked -p velmora-bridge -p velmora-s3-proto --target wasm32-unknown-unknown
@@ -199,6 +202,7 @@ jobs:
       # Bridge core and protocol crates declare the same 1.89 MSRV.
       - run: cargo check --locked -p velmora-s3-proto -p velmora-bridge
       - run: cargo check --locked -p velmora-parity-bench
+      - run: cargo check --locked -p velmora-cpu-bench
       - name: Install Rust 1.91 (Worker SDK minimum)
         run: |
           rustup toolchain install 1.91 --profile minimal --no-self-update

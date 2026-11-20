@@ -334,8 +334,20 @@ fn decoder_matches_the_byte_model_on_hostile_lines() {
         }
         article.extend_from_slice(b"=yend\r\n");
 
-        let mut dst = vec![0xA5u8; dst_len];
-        let got = decode_part_to("<m@x>", &article, &mut dst);
+        // The destination is a window of a larger buffer: a store past
+        // either end of it shows in the guard bytes around it.
+        const GUARD: usize = 32;
+        let mut whole = vec![0x3Cu8; GUARD + dst_len + GUARD];
+        whole[GUARD..GUARD + dst_len].fill(0xA5);
+        let got = decode_part_to("<m@x>", &article, &mut whole[GUARD..GUARD + dst_len]);
+        assert!(
+            whole[..GUARD]
+                .iter()
+                .chain(&whole[GUARD + dst_len..])
+                .all(|&b| b == 0x3C),
+            "round {round}: the decoder wrote outside its destination"
+        );
+        let dst = &whole[GUARD..GUARD + dst_len];
         if declared > dst_len {
             assert!(got.is_err(), "round {round}: oversize must be refused");
             assert!(

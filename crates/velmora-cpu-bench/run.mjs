@@ -2,6 +2,10 @@
 // Times the stages of velmora-cpu-bench.wasm under node (V8).
 //
 //   node run.mjs <bench.wasm> [--mib 16] [--reps 7] [--json out.json] [--unchecked]
+//                [--expect-simd on|off] [--check-only]
+//
+// --expect-simd fails unless the module's simd128 state is the one named;
+// --check-only stops after the self-check (no timing).
 //
 // Prints CPU milliseconds per MiB of object data for each stage: the
 // median of `reps` runs after one warm-up run. The module is single
@@ -17,6 +21,12 @@ const flag = (name, fallback) => {
 const mib = Number(flag("--mib", "16"));
 const reps = Number(flag("--reps", "7"));
 const jsonOut = flag("--json", null);
+const expectSimd = flag("--expect-simd", null);
+if (expectSimd !== null && expectSimd !== "on" && expectSimd !== "off") {
+  console.error("--expect-simd takes on or off");
+  process.exit(2);
+}
+const checkOnly = args.includes("--check-only") && args.splice(args.indexOf("--check-only"), 1).length > 0;
 const unchecked = args.includes("--unchecked") && args.splice(args.indexOf("--unchecked"), 1).length > 0;
 const wasmPath = args[0];
 if (!wasmPath) {
@@ -46,6 +56,14 @@ if (unchecked && !wasm.selfcheck) {
   process.exit(1);
 }
 const simd = wasm.simd128?.() === 1;
+if (expectSimd !== null && simd !== (expectSimd === "on")) {
+  console.error(`${wasmPath}: simd128 is ${simd ? "on" : "off"}, expected ${expectSimd}`);
+  process.exit(1);
+}
+if (checkOnly) {
+  console.log(`${wasmPath}: ${bytes.length} bytes, simd128 ${simd ? "on" : "off"}, self-check ok`);
+  process.exit(0);
+}
 
 const articles = wasm.setup(mib * 1048576);
 
