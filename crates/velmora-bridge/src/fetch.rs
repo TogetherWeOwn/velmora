@@ -1076,6 +1076,9 @@ impl Board {
     }
 }
 
+/// The catalogue error of a cold read during which a statement failed.
+pub(crate) const CATALOGUE_FAILED: &str = "catalogue failed during a cold read";
+
 /// Which articles a provider is asked for in one phase of a cold read.
 #[derive(Clone, Copy)]
 enum Phase {
@@ -1308,9 +1311,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 self.stats.borrow_mut().broken += lost.len() as u32;
                 ProviderSession::close_all(lost).await;
                 if fatal {
-                    return Err(BridgeError::Sql(
-                        "catalogue failed during a cold read".into(),
-                    ));
+                    return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
                 }
             }
             let began = self.clock.now();
@@ -1349,21 +1350,26 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 ProviderSession::close_all(first.into_iter().map(|(_, s)| s).collect()).await;
                 return Err(e);
             }
-            // Each logs in now. One that cannot is ended and its
-            // provider is out, as after a read that broke off with no
-            // other session there; the next turn gives a provider that
-            // took the login the rest of its sessions.
-            let logins = join_all(
-                first
-                    .iter_mut()
-                    .map(|(_, s)| async move { s.session().await.map(|_| ()) }),
-            )
+            // Each logs in now, its slot renewed first as before any
+            // connect. One the provider refuses is ended and its provider
+            // is out, as after a read with no other session there; the
+            // next turn gives a provider that took the login the rest of
+            // its sessions. A connect that only broke off is not the
+            // provider's answer: that session stays, and the read
+            // connects it again as it does any session that broke.
+            let logins = join_all(first.iter_mut().map(|(_, s)| async move {
+                s.keep(None).await?;
+                s.session().await.map(|_| ())
+            }))
             .await;
             let mut fatal = false;
             for ((i, session), login) in first.into_iter().zip(logins) {
-                let Err(stop) = login else {
-                    self.sessions.push(session);
-                    continue;
+                let stop = match login {
+                    Ok(()) | Err(Stop::Session(_)) => {
+                        self.sessions.push(session);
+                        continue;
+                    }
+                    Err(stop) => stop,
                 };
                 if session.health == Some(Err(ProviderFault::LoginRefused))
                     && !self.shunned.contains(&session.provider.id)
@@ -1379,9 +1385,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 session.close().await;
             }
             if fatal {
-                return Err(BridgeError::Sql(
-                    "catalogue failed during a cold read".into(),
-                ));
+                return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
             }
             for &i in &needy {
                 if full[i] && self.held(order[i]) == 0 {
@@ -1609,9 +1613,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     }
                 }
                 if fatal {
-                    failure = Some(BridgeError::Sql(
-                        "catalogue failed during a cold read".into(),
-                    ));
+                    failure = Some(BridgeError::Sql(CATALOGUE_FAILED.into()));
                     break 'phases;
                 }
                 for i in 0..order.len() {

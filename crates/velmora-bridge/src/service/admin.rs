@@ -1390,11 +1390,17 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
 // ---------------------------------------------------------------------------
 
 /// Whether `e` is a catalogue that did not answer: a statement the
-/// store failed, which asking again may mend. A row that was read and
-/// cannot be decoded is not: it reads the same every time, and a caller
-/// told to retry would never see it.
+/// store failed or was too busy for, as its adapter says it
+/// (`<store>: statement failed`, `<store>: overloaded`), or one that
+/// failed under a cold read. Asking again may mend those. Any other
+/// catalogue error is of what was read (a row or a result that cannot
+/// be decoded): it reads the same every time, and a caller told to
+/// retry would never see it.
 fn catalogue_unanswered(e: &BridgeError) -> bool {
-    matches!(e, BridgeError::Sql(what) if !what.starts_with("row decode"))
+    matches!(e, BridgeError::Sql(what)
+        if what.ends_with(": statement failed")
+            || what.ends_with(": overloaded")
+            || what == crate::fetch::CATALOGUE_FAILED)
 }
 
 /// A failure inside a drill. The drill writes nothing, so a catalogue
