@@ -33,6 +33,7 @@ use crate::ports::{
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
+use crate::tenant::TenantScope;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
     GenerationId, Job, JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
@@ -178,7 +179,11 @@ where
     T: Clock,
 {
     /// Runs one queue job to an outcome. Never panics on a stale job.
-    pub async fn run_job(&self, job: &Job) -> JobOutcome {
+    ///
+    /// `scope` is the tenant the job runs for. The message does not name
+    /// one: the consumer makes the scope, and every stage that names a
+    /// stored blob takes its name from it.
+    pub async fn run_job(&self, scope: &TenantScope, job: &Job) -> JobOutcome {
         if self.cfg.maintenance == Maintenance::Restore {
             // The outbox keeps the obligation; the dispatcher re-sends it
             // once maintenance ends.
@@ -209,23 +214,23 @@ where
                 extent,
                 generation,
                 stage,
-            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
+            } if *v == JOB_VERSION => self.run_extent(scope, extent, generation, *stage).await,
             Job::Wake {
                 v,
                 extent,
                 generation,
                 stage,
                 ..
-            } if *v == JOB_VERSION => self.run_extent(extent, generation, *stage).await,
+            } if *v == JOB_VERSION => self.run_extent(scope, extent, generation, *stage).await,
             Job::Gc { v } if *v == JOB_VERSION => self.run_gc().await,
             Job::Evict { v, remaining } if *v == JOB_VERSION => {
-                match self.evict_batch(*remaining).await {
+                match self.evict_batch(scope, *remaining).await {
                     Ok(_) => JobOutcome::Ack,
                     // Every step is idempotent, so the batch simply runs again.
                     Err(_) => RETRY,
                 }
             }
-            Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
+            Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(scope, write).await,
             // Run by the adapter that holds the recovery store
             // (`crate::copy`), never here: one that arrives all the same
             // is dropped, and the next pass does its work.
@@ -257,6 +262,7 @@ where
 
     async fn run_extent(
         &self,
+        scope: &TenantScope,
         extent: &ExtentId,
         generation: &GenerationId,
         stage: OutboxStage,
@@ -281,10 +287,14 @@ where
             Err(_) => return RETRY,
         };
         if stage != OutboxStage::Post {
-            return self.run_leased(&lease, extent, generation, stage).await;
+            return self
+                .run_leased(scope, &lease, extent, generation, stage)
+                .await;
         }
         crate::trace::begin(extent, started);
-        let outcome = self.run_leased(&lease, extent, generation, stage).await;
+        let outcome = self
+            .run_leased(scope, &lease, extent, generation, stage)
+            .await;
         crate::trace::finish(extent, self.clock.now());
         outcome
     }
@@ -292,6 +302,7 @@ where
     /// The part of [`Self::run_extent`] after a successful claim.
     async fn run_leased(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentId,
         generation: &GenerationId,
@@ -318,8 +329,8 @@ where
             return settle(&self.catalog, &self.clock, lease, Stop::NoPermit).await;
         };
         match stage {
-            OutboxStage::Post => self.post_stage(lease, &row).await,
-            OutboxStage::Verify => self.verify_stage(lease, &row).await,
+            OutboxStage::Post => self.post_stage(scope, lease, &row).await,
+            OutboxStage::Verify => self.verify_stage(scope, lease, &row).await,
             _ => self.release_stage(lease, &row).await,
         }
     }
@@ -396,7 +407,7 @@ where
     /// the dispatcher starts a new drain if the tier is still over the
     /// cap. Only a first step that is retried after an error totals the
     /// tier again and goes on from there.
-    pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+    pub async fn evict_batch(&self, scope: &TenantScope, remaining: u64) -> Result<u64> {
         // As in garbage collection: no delete on a catalogue that is
         // behind its stamp.
         if self.catalogue_rolled_back().await? {
@@ -425,7 +436,7 @@ where
             if excess == 0 {
                 break;
             }
-            match self.evict_one(row).await {
+            match self.evict_one(scope, row).await {
                 Ok(Some(bytes)) => {
                     freed = freed.saturating_add(bytes);
                     excess = excess.saturating_sub(bytes);
@@ -464,7 +475,7 @@ where
     /// freed. `None` when something else changed the extent meanwhile:
     /// either the catalogue refused the eviction (nothing was deleted), or
     /// it could not be finished as begun.
-    async fn evict_one(&self, row: &EvictCandidate) -> Result<Option<u64>> {
+    async fn evict_one(&self, scope: &TenantScope, row: &EvictCandidate) -> Result<Option<u64>> {
         if !self.catalog.begin_evict(row).await? {
             return Ok(None);
         }
@@ -472,9 +483,9 @@ where
         // did not count goes too. The one exception is the safety copy of
         // a pinned extent, which is not part of the claim.
         if !row.pinned {
-            delete_blob(&self.safety, &row.extent.safety_key()).await?;
+            delete_blob(&self.safety, &scope.safety_key(&row.extent)).await?;
         }
-        delete_blob(&self.cache, &row.extent.cache_key()).await?;
+        delete_blob(&self.cache, &scope.cache_key(&row.extent)).await?;
         // `false`: a cold read refilled the cache, or another eviction
         // took the extent, since `begin_evict`. The counts stand, and
         // what this drain still has to evict is no longer known.

@@ -472,7 +472,7 @@ fn record_layout_is_flat_unless_tenant_is_asked_for() {
     for tenant in ["tenant", " tenant "] {
         vars.insert("RECORD_LAYOUT".into(), tenant.into());
         let records = load(&vars).unwrap().records;
-        assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
+        assert_eq!(records, Layout::of(&TENANT_ZERO), "{tenant:?}");
         assert_eq!(records.root(), "m/x/t_0000000000000000/");
     }
     for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/x/", "tenant,flat"] {
@@ -1602,7 +1602,7 @@ async fn contract_compiles_against_fakes() {
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });
-    let _ = bridge.run_job(&job).await;
+    let _ = bridge.run_job(&TENANT_ZERO, &job).await;
     let _ = bridge.dispatch().await;
     let resp = Rc::clone(&bridge)
         .handle(S3Request {
@@ -2628,3 +2628,6 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
         assert_eq!(sent.len(), producers.len(), "{env}: a queue bound twice");
     }
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

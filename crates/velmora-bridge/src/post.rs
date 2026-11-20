@@ -52,6 +52,7 @@ use crate::ports::{
     NNTP_CALL_SECS, PERMIT_SECS,
 };
 use crate::recovery::write_stored_plan;
+use crate::tenant::TenantScope;
 use crate::types::{
     valid_yenc_name, ArticleRow, ArticleState, BridgeError, ExtentRow, FailClass, Job, JobExtent,
     JobOutcome, OutboxStage, ProviderConfig, Result, SafetyState, SizeCommand, UnixMs, JOB_VERSION,
@@ -500,8 +501,13 @@ where
 {
     /// Runs the post stage for a claimed extent: plan, POST every planned
     /// article, then hand over to the verify stage.
-    pub async fn post_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.post_extent(lease, &job.extent).await {
+    pub async fn post_stage(
+        &self,
+        scope: &TenantScope,
+        lease: &Lease,
+        job: &JobExtent,
+    ) -> JobOutcome {
+        match self.post_extent(scope, lease, &job.extent).await {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
@@ -509,6 +515,7 @@ where
 
     async fn post_extent(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
     ) -> core::result::Result<(), Stop> {
@@ -517,7 +524,7 @@ where
         // provider: it only writes the recovery record again.
         let stored = self.catalog.stored_plan(&extent.id).await?;
         if !stored.rows.is_empty() && stored.rows.iter().all(|a| a.state == ArticleState::Posted) {
-            self.load_planned(lease, extent, stored).await?;
+            self.load_planned(scope, lease, extent, stored).await?;
             return self.to_verify(lease).await;
         }
         let holder = job_holder(lease);
@@ -583,7 +590,7 @@ where
         // the renewal interval, as after any renewal.
         let (turned_away, loaded) = join(
             self.connect_all(lease, &mut held, kept_at),
-            self.load_planned(lease, extent, stored),
+            self.load_planned(scope, lease, extent, stored),
         )
         .await;
         let (cipher, mut plan, drawn) = match loaded {
@@ -743,6 +750,7 @@ where
     /// drew the plan, so no article of it was ever sent.
     async fn load_planned(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
         stored: StoredPlan,
@@ -750,7 +758,7 @@ where
         let started = self.clock.now();
         let cipher = self
             .safety
-            .get(&extent.id.safety_key(), None)
+            .get(&scope.safety_key(&extent.id), None)
             .await?
             .ok_or(Stop::fail(FailClass::BlobError))?;
         // Only the exact sealed ciphertext is ever posted.
@@ -1140,6 +1148,7 @@ where
     /// on as if there were no repost.
     pub(crate) async fn repost(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
         plan: &[ArticleRow],
@@ -1163,7 +1172,7 @@ where
         let Ok(_charge) = self.budget.charge_job(bytes).await else {
             return Err(Stop::NoPermit);
         };
-        let cipher = match self.safety.get(&extent.id.safety_key(), None).await {
+        let cipher = match self.safety.get(&scope.safety_key(&extent.id), None).await {
             Ok(Some(cipher)) => cipher,
             _ => return Ok(false),
         };

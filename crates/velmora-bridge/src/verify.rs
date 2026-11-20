@@ -128,6 +128,7 @@ use crate::ports::{
     MAX_QUEUE_DELAY_SECS,
 };
 use crate::post::{settle, settle_at, Stop};
+use crate::tenant::TenantScope;
 use crate::types::{
     ArticleRow, ArticleState, BackboneStatus, ExtentId, ExtentRow, FailClass, GenerationState, Job,
     JobExtent, JobOutcome, KekBytes, OutboxStage, ProviderConfig, SafetyState, SizeCommand, UnixMs,
@@ -340,9 +341,17 @@ where
     /// connection) leaves the row at the first backbone without a
     /// result, so the next job does not read the ones before it again:
     /// the resume point goes with the write that gives the lease back.
-    pub async fn verify_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
+    pub async fn verify_stage(
+        &self,
+        scope: &TenantScope,
+        lease: &Lease,
+        job: &JobExtent,
+    ) -> JobOutcome {
         let mut reached = None;
-        match self.verify_extent(lease, &job.extent, &mut reached).await {
+        match self
+            .verify_extent(scope, lease, &job.extent, &mut reached)
+            .await
+        {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle_at(&self.catalog, &self.clock, lease, stop, reached).await,
         }
@@ -607,8 +616,10 @@ where
     /// on their own, so the backbone is only read again. Once it is over
     /// they are posted straight to a provider of this backbone, once per
     /// round, and read again; what that read finds is recorded.
+    #[allow(clippy::too_many_arguments)]
     async fn missing_wait(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
         plan: &[ArticleRow],
@@ -634,7 +645,10 @@ where
                 .iter()
                 .filter(|p| p.post && p.enabled && label(&p.backbone) == backbone)
                 .collect();
-            if self.repost(lease, extent, plan, missing, &posters).await? {
+            if self
+                .repost(scope, lease, extent, plan, missing, &posters)
+                .await?
+            {
                 self.cursor(lease, cursor - retries + REPOSTED).await?;
                 return Ok(Some(self.cfg.verify_delay_secs.max(1)));
             }
@@ -784,6 +798,7 @@ where
     /// stores it when the job stops ([`settle_at`]).
     async fn verify_extent(
         &self,
+        scope: &TenantScope,
         lease: &Lease,
         extent: &ExtentRow,
         reached: &mut Option<u32>,
@@ -850,7 +865,7 @@ where
                 // What this stores is the resume point of this backbone.
                 let stored = reached.take();
                 let wait = self
-                    .missing_wait(lease, extent, &plan, name, &tally.missing, cursor)
+                    .missing_wait(scope, lease, extent, &plan, name, &tally.missing, cursor)
                     .await;
                 let wait = match wait {
                     Ok(wait) => wait,
