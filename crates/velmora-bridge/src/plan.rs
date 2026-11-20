@@ -162,8 +162,8 @@ impl StoredPlan {
     /// `None` = the plan has no addendum.
     ///
     /// An addendum that is not exactly one of this plan is an error. A
-    /// read takes that for no parity; a job that posts, verifies or
-    /// releases fails on it.
+    /// read looks at it only when an article is lost, and then rebuilds
+    /// nothing; a job that posts, verifies or releases fails on it.
     pub fn parity_plan(
         &self,
         extent: &ExtentId,

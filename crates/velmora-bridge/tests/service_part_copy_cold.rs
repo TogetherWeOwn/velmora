@@ -53,12 +53,19 @@ async fn complete(rig: &ColdRig, signer: &Signer, key: &str, id: &str, etags: &[
     .expect(200);
 }
 
-/// A range that takes all but one byte of a part from one cold extent and
-/// its last byte from the next, which is cold and full-size. Reading that
-/// extent back needs twice its size; beside the piece already held that
-/// is more than the budget has. It is read on its own first.
-#[tokio::test(flavor = "current_thread")]
-async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
+/// What a copy reads from: the rig, its provider, and a source of two
+/// full-size extents with their plaintext.
+struct Source {
+    rig: ColdRig,
+    server: TestNntpServer,
+    signer: Signer,
+    halves: [Vec<u8>; 2],
+    extents: Vec<ExtentRow>,
+}
+
+/// A source of two full-size extents that are only on Usenet (with
+/// their parity, if `parity`), under a byte budget of `budget`.
+async fn cold_source(budget: u64, parity: bool) -> Source {
     let mut server_cfg = ServerConfig::for_test();
     server_cfg.articles = Vec::new();
     server_cfg.missing_ids.clear();
@@ -92,9 +99,10 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         enabled: true,
         release: true,
     }]);
-    // The shipped ratio: the budget is three extents.
     cfg.max_extent_bytes = CAP as u64;
-    cfg.inflight_budget_bytes = 3 * CAP as u64;
+    cfg.inflight_budget_bytes = budget;
+    cfg.packed_plans = parity;
+    cfg.parity = parity;
     let budget = ByteBudget::new(cfg.inflight_budget_bytes);
     let rig = rig_with_budget(TcpConnector::default(), cfg, budget);
     rig.bridge
@@ -161,11 +169,29 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
         .iter()
         .all(|k| recovery::is_record_key(k)));
 
-    let id = create(&rig, &signer, "dst").await;
+    Source {
+        rig,
+        server,
+        signer,
+        halves,
+        extents,
+    }
+}
+
+/// Copies all but the first byte of the first extent and the first byte
+/// of the second into a new object, and reads that back.
+async fn copy_across(src: &Source) {
+    let Source {
+        rig,
+        signer,
+        halves,
+        ..
+    } = src;
+    let id = create(rig, signer, "dst").await;
     let range = format!("bytes=1-{CAP}");
     let copied = rig
         .call(
-            &signer,
+            signer,
             Method::Put,
             &path(BUCKET, "dst"),
             &[("partNumber", "1"), ("uploadId", &id)],
@@ -180,11 +206,57 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
     assert_eq!(rig.bridge.budget.in_use(), 0);
     assert!(rig.bridge.budget.peak() <= rig.bridge.budget.capacity());
     let etag = copied.values("ETag").remove(0).replace("&quot;", "\"");
-    complete(&rig, &signer, "dst", &id, &[etag]).await;
+    complete(rig, signer, "dst", &id, &[etag]).await;
 
     let read = rig
-        .call(&signer, Method::Get, &path(BUCKET, "dst"), &[], &[], b"")
+        .call(signer, Method::Get, &path(BUCKET, "dst"), &[], &[], b"")
         .await;
     read.expect(200);
     assert!(read.body == [&halves[0][1..], &halves[1][..1]].concat());
+}
+
+/// A range that takes all but one byte of a part from one cold extent and
+/// its last byte from the next, which is cold and full-size. Reading that
+/// extent back needs twice its size; beside the piece already held that
+/// is more than the budget has. It is read on its own first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
+    // The shipped ratio: the budget is three extents.
+    let src = cold_source(3 * CAP as u64, false).await;
+    copy_across(&src).await;
+}
+
+/// The same range where the budget has room for the read of the second
+/// extent beside the piece already held, but not for that and a rebuild
+/// from its parity, and the extent lost as many articles as it has parity. It is
+/// read on its own first as well: the rebuild fits when nothing else is
+/// held.
+#[tokio::test(flavor = "current_thread")]
+async fn a_range_that_ends_in_a_cold_extent_to_rebuild_fits_the_budget() {
+    let budget = 20 * MIB as u64;
+    let src = cold_source(budget, true).await;
+    let extent = &src.extents[1];
+    let catalog = &src.rig.bridge.catalog;
+    let stored = catalog.stored_plan(&extent.id).await.unwrap();
+    let parity = stored
+        .parity_plan(&extent.id, extent.cipher_size)
+        .unwrap()
+        .expect("the extent has parity");
+    let sockets = src.rig.bridge.cfg.cold_sockets;
+    let held = CAP as u64 - 1;
+    let read = velmora_bridge::fetch::cold_read_bytes(extent.cipher_size, sockets);
+    let step = velmora_bridge::fetch::cold_step_bytes(extent.cipher_size, sockets);
+    let most = parity.articles.len();
+    assert_eq!(most, 2);
+    let rebuild = velmora_bridge::fetch::cold_rebuild_bytes(u64::from(parity.shard_len), 2);
+    assert!(
+        held + read <= budget && held + step + rebuild > budget,
+        "{held} {read} {step} {rebuild}"
+    );
+    assert!(step + rebuild <= budget);
+    for row in &stored.rows[1..=most] {
+        src.server.hide(&format!("<{}>", row.message_id)).await;
+    }
+
+    copy_across(&src).await;
 }
