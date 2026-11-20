@@ -238,11 +238,11 @@ struct Unreadable {
 /// put in its place.
 struct LostAddendum {
     extent: ExtentId,
-    /// The stored plan, `extents.parity` and `extents.parity_count`, as
-    /// they were read.
+    /// The stored plan and `extents.parity` as they were read, and the
+    /// SQL literal (`quote`) of `extents.parity_count`.
     plan: Vec<u8>,
     stored: SqlValue,
-    stored_count: SqlValue,
+    stored_count: String,
     /// The record's addendum and the number of its articles.
     parity: SqlValue,
     parity_count: SqlValue,
@@ -277,7 +277,7 @@ async fn unreadable_plans<S: Sql>(
                 &format!(
                     "SELECT id, cipher_size, plan, parity, \
                        CASE typeof(parity_count) WHEN 'real' THEN quote(parity_count) \
-                         ELSE parity_count END \
+                         ELSE parity_count END, quote(parity_count) \
                      FROM extents WHERE id IN ({marks}) AND plan IS NOT NULL"
                 ),
                 &chunk
@@ -294,10 +294,12 @@ async fn unreadable_plans<S: Sql>(
             let parity = r.opt_blob()?;
             // As it is stored: a count that is no number is damage of
             // this row, and must not stop the replay of the others. A
-            // fraction is read as its text (a row cannot carry one); the
-            // statements keyed on it still find the row, because the
-            // column compares a text that is a number as that number.
+            // fraction is read as its text (a row cannot carry one).
+            // The statements are keyed on the literal of the value, the
+            // same text for the same stored value whatever its type: a
+            // number that went through a text is not always itself.
             let count = r.value()?;
+            let count_literal = r.text()?;
             let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
                 continue;
             };
@@ -322,7 +324,7 @@ async fn unreadable_plans<S: Sql>(
                         extent: id,
                         plan: stored,
                         stored: on_row,
-                        stored_count: count,
+                        stored_count: count_literal,
                         parity: from_record,
                         parity_count: record_count,
                     });
@@ -406,20 +408,20 @@ pub(super) async fn replay_extents<S: Sql>(
                     text(a.extent.as_str()),
                     SqlValue::Blob(a.plan.clone()),
                     a.stored.clone(),
-                    a.stored_count.clone(),
+                    text(&a.stored_count),
                 ]
             };
             stmts.push((
                 "DELETE FROM verifications WHERE extent_id = ?1 \
                    AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS ?3 AND parity_count IS ?4)",
+                     AND parity IS ?3 AND quote(parity_count) = ?4)",
                 read(),
             ));
             let mut params = read();
             params.extend([a.parity.clone(), a.parity_count.clone()]);
             stmts.push((
                 "UPDATE extents SET parity = ?5, parity_count = ?6 \
-                 WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND parity_count IS ?4",
+                 WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND quote(parity_count) = ?4",
                 params,
             ));
         }
