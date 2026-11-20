@@ -1898,10 +1898,12 @@ async fn a_catalogue_failure_under_a_drill_is_retried_then_a_slow_down() {
         }
     }
 
-    // Before anything is read: the bucket, the generation, the extents.
+    // Before anything is read: whether a replay is pending, the bucket,
+    // the generation, the extents.
     let fx = Fx::new().await;
     drill_object(&fx).await;
     for part in [
+        "FROM restore_state",
         "FROM buckets",
         "FROM objects o JOIN generations",
         "FROM generation_extents",
@@ -1915,6 +1917,117 @@ async fn a_catalogue_failure_under_a_drill_is_retried_then_a_slow_down() {
         assert_eq!(r.json()["class"], "catalog", "{part}");
         assert_eq!(fx.bridge.nntp.connects(), connects);
     }
+}
+
+/// An empty object has an extent on Usenet too, and the drill reads it:
+/// `match` is never said of an object nothing was asked for.
+#[tokio::test]
+async fn a_drill_of_an_empty_object_reads_its_extent() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", b"").await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let connects = fx.bridge.nntp.connects();
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["size"]), (&json!(true), &json!(0)));
+    assert_eq!((&v["extents"], &v["articles"]), (&json!(1), &json!(1)));
+    assert_eq!(v["range"], Value::Null);
+    assert_eq!(v["plaintext_md5"], md5_hex(b""));
+    assert_eq!(v["plaintext_sha256"], hex(&sha256(b"")));
+    assert_eq!(fx.bridge.nntp.connects(), connects + 1);
+
+    // Its article gone from Usenet: not a match.
+    fx.server.set_hidden(fx.server.posted_ids().await).await;
+    let v = fx.post("/drill/scratch/k").await.json();
+    assert_eq!(v["match"], false, "{v}");
+    assert_eq!(v["plaintext_md5"], Value::Null);
+}
+
+/// A drill with several drill connections on an account that refuses
+/// the login asks it once, not once per connection: one strike, and the
+/// other provider reads the object over its own.
+#[tokio::test]
+async fn a_drill_logs_in_once_before_it_opens_more_connections() {
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        providers[0].drill_conns = 4;
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        providers.push(wrong);
+    };
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, edit).await;
+    // One extent of several articles: work for several connections.
+    let bucket = fx.bucket("scratch").await;
+    let whole = nntp_support::marked_plaintext(2_500_000);
+    let o = fx.put(&bucket, "k", &whole).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // The verify jobs asked p1 too, and were refused until it cooled:
+    // past the cooldown, a clean record.
+    fx.bridge.clock.advance_secs(3600);
+    let now = fx.bridge.clock.now();
+    let p1 = &fx.bridge.cfg.providers[1];
+    fx.bridge
+        .catalog
+        .provider_recovered(&p1.id, now)
+        .await
+        .unwrap();
+    let (dialed, good) = (
+        fx.bridge.nntp.dials_to("p1"),
+        fx.bridge.nntp.connects_to("p0"),
+    );
+
+    let r = fx.post("/drill/scratch/k?sockets=4").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["provider"]), (&json!(true), &json!("p0")));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(
+        fx.bridge.nntp.dials_to("p1") - dialed,
+        1,
+        "one refused login"
+    );
+    assert_eq!(health_of(&fx, "p1").await, (json!(false), json!(1)));
+    // The provider that took the first login was given more: as many
+    // as an extent has articles, of its four.
+    let more = fx.bridge.nntp.connects_to("p0") - good;
+    assert!((2..=4).contains(&more), "{more}");
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
+/// Before a drill says the bytes are gone it asks every reader, also
+/// one past the retention it states: here the reader that states enough
+/// refuses the login, and the other, two days past its one day, has
+/// every article.
+#[tokio::test]
+async fn a_drill_asks_a_reader_past_its_stated_retention() {
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        providers[0].retention_days = Some(1);
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        wrong.retention_days = None;
+        providers.push(wrong);
+    };
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, edit).await;
+    let (_, whole) = drill_object(&fx).await;
+    fx.bridge.clock.advance_secs(2 * 24 * 3600);
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["provider"]), (&json!(true), &json!("p0")));
+    assert_eq!(v["plaintext_md5"], md5_hex(&whole));
+    assert_eq!(fx.bridge.nntp.live(), 0);
 }
 
 #[tokio::test]

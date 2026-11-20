@@ -445,8 +445,11 @@ crons = ["*/5 * * * *"]
 # are slots of their own, so a drill that holds all of them takes none
 # from a read or a job, and no read or job is handed one. The provider
 # counts them like any connection: `max_conns` plus `drill_conns` must
-# stay within what the account allows at once. Without `drill_conns` on
-# any provider a drill reads over one connection, as a cold read does.
+# stay within what the account allows at once. They are outside `pool`
+# as well: where providers share one account limit, that limit must hold
+# the pool's own and the `drill_conns` of every provider in it. Without
+# `drill_conns` on any provider a drill reads over one connection, as a
+# cold read does.
 # `drill_conns` needs `read`, and on an account with `max_ips` it needs
 # `proxies`: a direct drill connection would be one more address. Deploy
 # the Worker that knows the field before NNTP_PROVIDERS carries it: an

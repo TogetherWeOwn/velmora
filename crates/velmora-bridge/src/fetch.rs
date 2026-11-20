@@ -1076,6 +1076,17 @@ impl Board {
     }
 }
 
+/// Which articles a provider is asked for in one phase of a cold read.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Those inside the retention it states.
+    Retained,
+    /// Those past the stated retention of every enabled reader.
+    Orphan,
+    /// All that are still missing.
+    Any,
+}
+
 /// Why a provider gets no (more) work in one cold read of an extent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Out {
@@ -1187,6 +1198,13 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         self.stats.borrow().clone()
     }
 
+    /// Whether a session of the reader is logged in to `provider`.
+    fn logged_in(&self, provider: &ProviderConfig) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.provider.id == provider.id && s.connected())
+    }
+
     fn held(&self, provider: &ProviderConfig) -> usize {
         self.sessions
             .iter()
@@ -1214,10 +1232,23 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         full: &mut [bool],
     ) -> Result<()> {
         let drill = self.drill;
-        // Sessions a provider may be given: one per article it has to
-        // read, and no more than the reader may hold there.
-        let room = |i: usize| work[i].min(cap_of(drill, order[i]));
         loop {
+            // A drill opens several connections on one account at once,
+            // and an account that refuses the login would refuse each of
+            // them: that many strikes against a provider reads use too.
+            // So on a provider where this reader has no login yet, the
+            // drill logs one connection in before it takes the others.
+            let unproven: Vec<bool> = order.iter().map(|p| drill && !self.logged_in(p)).collect();
+            // Sessions a provider may be given: one per article it has to
+            // read, and no more than the reader may hold there.
+            let room = |i: usize| {
+                let most = if unproven[i] {
+                    1
+                } else {
+                    cap_of(drill, order[i])
+                };
+                work[i].min(most)
+            };
             let tier = (0..order.len())
                 .filter(|&i| work[i] > 0 && out[i].is_none())
                 .map(|i| tier_of(drill, order[i]))
@@ -1296,11 +1327,17 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             .await;
             self.stats.borrow_mut().open_ms += self.clock.now().0 - began.0;
             let mut failed = None;
+            // The first sessions of a drill on their providers.
+            let mut first = Vec::new();
             for (&i, opened) in asked.iter().zip(opened) {
                 match opened {
                     Ok(Some(session)) => {
                         self.stats.borrow_mut().opened += 1;
-                        self.sessions.push(session.with_timer(self.timer.as_ref()));
+                        let session = session.with_timer(self.timer.as_ref());
+                        match unproven[i] {
+                            true => first.push((i, session)),
+                            false => self.sessions.push(session),
+                        }
                     }
                     Ok(None) => full[i] = true,
                     Err(e) => {
@@ -1309,7 +1346,42 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 }
             }
             if let Some(e) = failed {
+                ProviderSession::close_all(first.into_iter().map(|(_, s)| s).collect()).await;
                 return Err(e);
+            }
+            // Each logs in now. One that cannot is ended and its
+            // provider is out, as after a read that broke off with no
+            // other session there; the next turn gives a provider that
+            // took the login the rest of its sessions.
+            let logins = join_all(
+                first
+                    .iter_mut()
+                    .map(|(_, s)| async move { s.session().await.map(|_| ()) }),
+            )
+            .await;
+            let mut fatal = false;
+            for ((i, session), login) in first.into_iter().zip(logins) {
+                let Err(stop) = login else {
+                    self.sessions.push(session);
+                    continue;
+                };
+                if session.health == Some(Err(ProviderFault::LoginRefused))
+                    && !self.shunned.contains(&session.provider.id)
+                {
+                    self.shunned.push(session.provider.id.clone());
+                }
+                fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
+                out[i] = Some(match stop {
+                    Stop::NoPermit => Out::Busy,
+                    _ => Out::Broken,
+                });
+                self.stats.borrow_mut().broken += 1;
+                session.close().await;
+            }
+            if fatal {
+                return Err(BridgeError::Sql(
+                    "catalogue failed during a cold read".into(),
+                ));
             }
             for &i in &needy {
                 if full[i] && self.held(order[i]) == 0 {
@@ -1403,10 +1475,20 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         // Sessions of a provider that broke off in this read.
         let mut breaks = vec![0u32; order.len()];
         let mut failure = None;
-        'phases: for expired in [false, true] {
-            let wanted = |provider: usize, article: usize| match expired {
-                false => order[provider].retains(plan[article].posted_at, now),
-                true => orphan(&plan[article]),
+        // A drill has a third: its answer says whether Usenet has the
+        // object, so before it says no, every reader is asked for what is
+        // still missing, whatever retention it states. (A reader past its
+        // stated retention often has the article; the other readers'
+        // retention says nothing about that.)
+        let phases: &[Phase] = match drill {
+            true => &[Phase::Retained, Phase::Orphan, Phase::Any],
+            false => &[Phase::Retained, Phase::Orphan],
+        };
+        'phases: for &phase in phases {
+            let wanted = |provider: usize, article: usize| match phase {
+                Phase::Retained => order[provider].retains(plan[article].posted_at, now),
+                Phase::Orphan => orphan(&plan[article]),
+                Phase::Any => true,
             };
             loop {
                 let work: Vec<usize> = (0..order.len())
@@ -1559,9 +1641,10 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         if have.contains(&false) {
             // A cooling provider that retains a missing article and was
             // not asked may hold what the others lack: retry later.
+            // (A drill asks a reader whatever its retention.)
             let lacks = |p: &ProviderConfig| {
                 plan.iter()
-                    .any(|a| !have[a.idx as usize] && p.retains(a.posted_at, now))
+                    .any(|a| !have[a.idx as usize] && (drill || p.retains(a.posted_at, now)))
             };
             let was_asked = |p: &ProviderConfig| {
                 order

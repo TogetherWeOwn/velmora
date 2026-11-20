@@ -362,7 +362,9 @@ async fn route<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         if !post {
             return Err(wrong_method());
         }
-        mutable(bridge).await?;
+        // A catalogue that does not answer here is the drill's to ask
+        // again, as it is inside the drill.
+        mutable_or(bridge, drill_failed).await?;
         let (bucket, key) = object_target(target)?;
         return drill(bridge, bucket, &key, &req.raw_target).await;
     }
@@ -615,6 +617,15 @@ async fn usage_recount<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 async fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
 ) -> Admin<()> {
+    mutable_or(bridge, internal).await
+}
+
+/// [`mutable`], with the answer for a catalogue that did not say
+/// whether a replay is pending given by `failed`.
+async fn mutable_or<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    failed: fn(&BridgeError) -> S3Response,
+) -> Admin<()> {
     if bridge.cfg.maintenance == Maintenance::Restore {
         return Err(fail(
             503,
@@ -622,7 +633,12 @@ async fn mutable<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             "Maintenance: no changes are accepted.",
         ));
     }
-    if bridge.catalog.restore_pending().await.or_internal()? {
+    if bridge
+        .catalog
+        .restore_pending()
+        .await
+        .map_err(|e| failed(&e))?
+    {
         return Err(fail(
             503,
             "ServiceUnavailable",
@@ -1674,7 +1690,8 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .map_err(catalogue)?
         .ok_or_else(no_key)?;
     let (start, end) = match generation.size {
-        // Nothing to read: the digests of no bytes.
+        // No bytes to hash, but an extent to read: an empty object has
+        // one too, of ciphertext that says so.
         0 if query_param(raw_target, "range").is_none() => (0, 0),
         size => drill_range(raw_target, size)?,
     };
@@ -1684,7 +1701,18 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             .extents_in(&generation.id, start, end)
             .await
             .map_err(catalogue)?,
-        false => Vec::new(),
+        false => {
+            let live = bridge
+                .catalog
+                .live_object(&bucket.id, key)
+                .await
+                .map_err(catalogue)?;
+            match live {
+                Some((now, extents)) if now.id == generation.id => extents,
+                // Overwritten or deleted since: ask again.
+                _ => return Err(busy()),
+            }
+        }
     };
 
     let mut reader = bridge.drill_reader(sockets).or_internal()?;
