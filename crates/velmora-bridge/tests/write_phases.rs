@@ -50,8 +50,32 @@ const PHASES: [&str; 8] = [
     "auth_ms", "wait_ms", "read_ms", "hash_ms", "seal_ms", "r2_ms", "d1_ms", "other_ms",
 ];
 
+/// The line holds exactly these fields in this order, and nothing but
+/// a kind, an outcome and numbers: no key, bucket or id can be in it.
+fn check_grammar(line: &str) {
+    const FIELDS: [&str; 15] = [
+        "kind", "outcome", "bytes", "extents", "auth_ms", "wait_ms", "read_ms", "hash_ms",
+        "seal_ms", "r2_ms", "d1_ms", "other_ms", "wall_ms", "pieces", "ticks",
+    ];
+    let pairs: Vec<(&str, &str)> = line
+        .split(' ')
+        .map(|kv| kv.split_once('=').unwrap_or_else(|| panic!("{line}")))
+        .collect();
+    let names: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+    assert_eq!(names, FIELDS, "{line}");
+    assert!(
+        ["put", "part", "copy", "part_copy"].contains(&pairs[0].1),
+        "{line}"
+    );
+    assert!(["ok", "error"].contains(&pairs[1].1), "{line}");
+    for (k, v) in &pairs[2..] {
+        assert!(v.parse::<u64>().is_ok(), "{k}={v}: {line}");
+    }
+}
+
 /// Every phase is there, and together they are the wall time.
 fn check_sum(line: &str) {
+    check_grammar(line);
     let sum: i64 = PHASES.iter().map(|p| num(line, p)).sum();
     assert_eq!(sum, num(line, "wall_ms"), "{line}");
 }
@@ -140,8 +164,6 @@ async fn each_put_and_part_logs_one_line_whose_phases_add_up() {
         assert!(num(line, "r2_ms") >= extents, "{line}");
         assert!(num(line, "pieces") >= 1, "{line}");
         assert_eq!(num(line, "wall_ms"), num(line, "ticks"), "{line}");
-        // No key, bucket or id.
-        assert!(!line.contains(BUCKET) && !line.contains("mp") && !line.contains(&id));
     }
 }
 
@@ -199,5 +221,6 @@ async fn nothing_is_logged_or_written_more_unless_asked() {
     assert!(off_lines.is_empty(), "{off_lines:#?}");
     let (on_lines, on_calls) = run(true).await;
     assert_eq!(on_lines.len(), 3);
+    on_lines.iter().for_each(|l| check_sum(l));
     assert_eq!(on_calls, off_calls);
 }

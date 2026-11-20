@@ -211,7 +211,8 @@ pub(crate) enum Phase {
     Seal,
     /// Storing an extent's ciphertext in the safety store.
     R2,
-    /// Catalogue statements.
+    /// Catalogue statements, and the stamp raise (a statement and a
+    /// small object written to the safety store).
     D1,
     /// Everything else: the recovery record, the job message, choosing
     /// ids, copying a source.
@@ -247,7 +248,8 @@ pub fn log_writes(to: fn(&str), tick: Tick) {
 /// Where a write request's time went. Each stretch of time from the
 /// start to the last mark is in exactly one phase, so the phases add up
 /// to `wall_ms`. Logs its line when dropped, so a request that fails
-/// is logged too.
+/// is logged too; in such a line the call that failed is counted in
+/// `other_ms`, as it returned before its phase was closed.
 pub(crate) struct WriteTrace<'a> {
     on: Option<(WriteLog, &'a dyn crate::ports::Clock)>,
     kind: &'static str,

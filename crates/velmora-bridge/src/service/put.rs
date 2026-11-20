@@ -628,6 +628,7 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     // to a point before this commit is then found as such, and closes
     // the write gate. A raise that fails does not undo the commit.
     let _ = bridge.raise_stamp().await;
+    trace.lap(Phase::D1).await;
     drop(charge);
 
     // The commit wrote the posting obligations; the queue messages are
