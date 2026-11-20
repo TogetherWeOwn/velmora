@@ -327,6 +327,12 @@ jobs:
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
+      # The script of the deploy job's "Generate the production wrangler
+      # config" step, taken from this file and run on the shipped
+      # wrangler.toml with made-up values. No credential, no network.
+      - name: Test the production config generator
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_deploy_config.py
       # bundle.sh: worker-build, then the `name` section is dropped. The
       # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle
@@ -637,6 +643,31 @@ jobs:
       # other value fails this step and nothing is deployed. The shipped
       # file must say "body" exactly once, in the prod [vars] table, and
       # set VERIFY_MODE nowhere else in the prod section.
+      # The layout of new recovery records is the third switch:
+      # VELMORA_RECORD_LAYOUT (unset, empty or "flat": nothing is added
+      # and the file is the one this step wrote before the switch, byte
+      # for byte; "tenant": one line, RECORD_LAYOUT = "tenant", is added
+      # to the prod [vars] table, after the VERIFY_MODE line). Any other
+      # value fails this step and nothing is deployed. The shipped file
+      # must not set RECORD_LAYOUT in the prod section: with one there
+      # this step fails, whatever the switch says. Before the file is
+      # written its text is read back with Python's TOML 1.0 parser:
+      # the prod [vars] table must hold RECORD_LAYOUT = "tenant" when
+      # "tenant" was asked for and no RECORD_LAYOUT otherwise, or this
+      # step fails and writes no file. That parser is stricter than
+      # wrangler's: a shipped file it cannot read is refused here, also
+      # with the switch unset. The log then names the layout the
+      # generated config carries. It is the layout in force only once
+      # the deploy step of the same run has succeeded, and only while
+      # the Worker has no secret named RECORD_LAYOUT: the Worker reads
+      # a secret where the variable is absent, and a deploy keeps
+      # secrets. This job cannot see secrets; no such secret may exist.
+      # Set "tenant" only in a deploy after the one that brought this
+      # switch, and read "Record layout" and "Rollback floor" in
+      # workers/s3-bridge/ops/README.md first. The test of this step is
+      # workers/s3-bridge/tools/test_deploy_config.py: it runs the
+      # script below as it stands in this file, and it holds that the
+      # step is that script and nothing else.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -646,10 +677,11 @@ jobs:
           VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
           VELMORA_VERIFY_MODE: ${{ vars.VELMORA_VERIFY_MODE }}
+          VELMORA_RECORD_LAYOUT: ${{ vars.VELMORA_RECORD_LAYOUT }}
         run: |
           set -euo pipefail
           python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
-          import os, re, sys
+          import os, re, sys, tomllib
 
           src, dst = sys.argv[1], sys.argv[2]
           host = os.environ.get("VELMORA_S3_HOST", "")
@@ -672,6 +704,9 @@ jobs:
           mode = os.environ.get("VELMORA_VERIFY_MODE", "") or "body"
           if mode not in ("body", "light"):
               sys.exit("VELMORA_VERIFY_MODE must be unset, body or light")
+          layout = os.environ.get("VELMORA_RECORD_LAYOUT", "") or "flat"
+          if layout not in ("flat", "tenant"):
+              sys.exit("VELMORA_RECORD_LAYOUT must be unset, flat or tenant")
 
           with open(src, encoding="utf-8") as f:
               lines = f.read().split("\n")
@@ -697,8 +732,12 @@ jobs:
                  for i in range(end) if i not in switch):
               sys.exit("the prod section sets RECOVERY_COPY or RECOVERY_PREFIX a second time")
           # The verify mode: one line in, one line out.
+          # The record layout: no line in, and with "tenant" one line
+          # out, after the verify mode's. "flat" adds nothing: without
+          # the variable the Worker writes the flat names.
           shipped_mode = 'VERIFY_MODE = "body"'
-          subs.append((shipped_mode, f'VERIFY_MODE = "{mode}"'))
+          tenant_line = '\nRECORD_LAYOUT = "tenant"' if layout == "tenant" else ""
+          subs.append((shipped_mode, f'VERIFY_MODE = "{mode}"' + tenant_line))
           at = [i for i in range(end) if lines[i].strip() == shipped_mode]
           tables = [lines[i].strip() for i in range(at[0] if at else 0)
                     if header.match(lines[i])]
@@ -707,6 +746,8 @@ jobs:
           if any(re.match(r"\s*VERIFY_MODE\b", lines[i])
                  for i in range(end) if i not in at):
               sys.exit("the prod section sets VERIFY_MODE a second time")
+          if any(re.match(r"\s*RECORD_LAYOUT\b", lines[i]) for i in range(end)):
+              sys.exit("the prod section of the shipped file sets RECORD_LAYOUT")
           for placeholder, value in subs:
               hits = [i for i in range(end) if lines[i].strip() == placeholder]
               if len(hits) != 1:
@@ -719,9 +760,20 @@ jobs:
           start = builds[0]
           stop = next(i for i in range(start + 1, len(lines)) if header.match(lines[i]))
           del lines[start:stop]
+          text = "\n".join(lines)
+          # The layout is read back from the text that is about to be
+          # written, before the file exists: a refusal leaves no file.
+          # No RECORD_LAYOUT at all is "flat" to the Worker.
+          try:
+              found = tomllib.loads(text)["vars"].get("RECORD_LAYOUT")
+          except (tomllib.TOMLDecodeError, KeyError, AttributeError):
+              sys.exit("the generated config is not valid TOML with a prod [vars] table")
+          if found != ("tenant" if layout == "tenant" else None):
+              sys.exit("the generated config does not carry the record layout that was asked for")
           with open(dst, "w", encoding="utf-8") as f:
-              f.write("\n".join(lines))
+              f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
+          print(f"record layout in the generated config: {layout}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other
