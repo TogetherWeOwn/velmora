@@ -4589,6 +4589,9 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
         MIGRATION_0016,
         MIGRATION_0017,
         MIGRATION_0018,
+        MIGRATION_0019,
+        MIGRATION_0020,
+        MIGRATION_0021,
     ] {
         db.apply(script).unwrap();
     }
