@@ -1498,7 +1498,7 @@ async fn the_reads_after_a_refused_replay_wait_out_an_overloaded_database() {
         let (live, again, expected) = if lost {
             let id = [text(r.newer.1[3].extent_id.as_str())];
             let gone = "UPDATE extents SET safety_state = 'deleted' WHERE id = ?1";
-            assert_eq!(fx.run(gone, &id).await, 1);
+            assert!(fx.run(gone, &id).await >= 1); // the row, and the usage triggers' writes
             (&r.first, &r.newer, ReplayPublish::Damaged)
         } else {
             (&r.newer, &r.first, ReplayPublish::Refused)
@@ -1582,7 +1582,7 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
             SqlValue::Blob(plan),
             SqlValue::Int(cipher_size as i64),
         ];
-        assert_eq!(fx.run(set, &bound).await, 1);
+        assert!(fx.run(set, &bound).await >= 1); // the row, and the usage triggers' writes
     }
     assert!(many_bytes > plan_bytes * 10, "{many_bytes} {plan_bytes}");
     // Ten plans to an answer, and more than 500 extents to a value of
@@ -1636,7 +1636,7 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
         placed(&ids, &sizes),
     );
     let set = "UPDATE extents SET safety_state = 'deleted', plan = x'00' WHERE id = ?1";
-    assert_eq!(fx.run(set, &[text(ids[519].as_str())]).await, 1);
+    assert!(fx.run(set, &[text(ids[519].as_str())]).await >= 1);
     fx.sql().limits.set(Some(SqlLimits {
         set_rows: 600,
         result_bytes: plan_bytes * 10,
