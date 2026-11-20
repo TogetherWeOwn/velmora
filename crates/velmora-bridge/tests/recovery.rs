@@ -714,6 +714,36 @@ async fn a_record_removed_after_it_was_read_is_not_published() {
     assert!(rig.live(&bucket, "k08").await.is_some());
 }
 
+/// The step asks whether a record is still there a few records before
+/// it comes to it. When the records in between took long, that answer
+/// is old, and the step asks again.
+#[tokio::test(flavor = "current_thread")]
+async fn an_old_answer_that_a_record_is_there_is_asked_again() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for i in 0..20 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
+    let record = format!("m/{}", generation.id.as_str());
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    // The record goes right after the store said it was there, and the
+    // step comes to it three seconds later.
+    let clock = rig.bridge.clock.clone();
+    *store.lose_after_head.borrow_mut() =
+        Some((record.clone(), Box::new(move || clock.advance_ms(3000))));
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(store.lose_after_head.borrow().is_none());
+    assert_eq!(report.published, 19, "{report:?}");
+    assert!(rig.live(&bucket, "k07").await.is_none());
+    assert_eq!(rig.count("extents"), 19);
+}
+
 /// A replay over a catalogue that has the objects already asks the
 /// store nothing about the extents of the records a newer one is over:
 /// the step leaves them out, and so do the reads ahead.

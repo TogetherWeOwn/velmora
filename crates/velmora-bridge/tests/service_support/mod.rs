@@ -268,6 +268,9 @@ pub struct Blobs {
     pub fail_gets: RefCell<Option<(String, u32)>>,
     /// The blob of this key is gone once the next get of it answered.
     pub lose_after_get: RefCell<Option<String>>,
+    /// The blob of this key is gone once the next head of it answered,
+    /// and this is called then.
+    pub lose_after_head: RefCell<Option<(String, Then)>>,
 }
 
 /// A read that is under way.
@@ -295,6 +298,9 @@ impl Blobs {
 
 /// How long a held call waits, in turns of the executor.
 pub const HOLD_TURNS: u32 = 100_000;
+
+/// What a test does when a store has lost a blob.
+pub type Then = Box<dyn FnOnce()>;
 
 /// Something that happens in the middle of an operation on a store.
 pub type Hook = RefCell<Option<Box<dyn FnOnce(&str)>>>;
@@ -356,7 +362,19 @@ impl BlobStore for Blobs {
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
         self.read_turn().await;
-        self.trip.guard(blob_down, self.inner.head(key)).await
+        let answer = self.trip.guard(blob_down, self.inner.head(key)).await;
+        let lost = {
+            let mut lose = self.lose_after_head.borrow_mut();
+            match lose.as_ref() {
+                Some((losing, _)) if losing == key => lose.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, then)) = lost {
+            self.inner.lose(key);
+            then();
+        }
+        answer
     }
     async fn delete(&self, key: &str) -> Result<()> {
         fire(&self.before_delete, key);
