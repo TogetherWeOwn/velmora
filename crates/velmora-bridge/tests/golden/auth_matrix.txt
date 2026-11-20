@@ -10,11 +10,13 @@ Rw | GetObject range | 206 |  |  | retry-after -
 Rw | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 Rw | HeadObject | 200 |  |  | retry-after -
 Rw | PutObject | 200 |  |  | retry-after -
+Rw | PutObject chunked | 200 |  |  | retry-after -
 Rw | CopyObject | 200 |  |  | retry-after -
 Rw | DeleteObject | 204 |  |  | retry-after -
 Rw | DeleteObjects | 200 |  |  | retry-after -
 Rw | CreateMultipartUpload | 200 |  |  | retry-after -
 Rw | UploadPart | 200 |  |  | retry-after -
+Rw | UploadPart chunked | 200 |  |  | retry-after -
 Rw | UploadPartCopy | 200 |  |  | retry-after -
 Rw | ListParts | 200 |  |  | retry-after -
 Rw | AbortMultipartUpload | 204 |  |  | retry-after -
@@ -31,11 +33,13 @@ Ro | GetObject range | 206 |  |  | retry-after -
 Ro | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 Ro | HeadObject | 200 |  |  | retry-after -
 Ro | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+Ro | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 Ro | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 Ro | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 Ro | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 Ro | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
 Ro | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+Ro | UploadPart chunked | 403 | AccessDenied | Access Denied | retry-after -
 Ro | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
 Ro | ListParts | 200 |  |  | retry-after -
 Ro | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
@@ -52,15 +56,17 @@ Unknown | GetObject range | 403 | InvalidAccessKeyId | The AWS Access Key Id you
 Unknown | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Unknown | HeadObject | 403 |  |  | retry-after -
 Unknown | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Unknown | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Unknown | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Unknown | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Unknown | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-Unknown | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-Unknown | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-Unknown | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+Unknown | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Unknown | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Unknown | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Unknown | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Unknown | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-Unknown | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-Unknown | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+Unknown | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Unknown | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | HeadBucket | 403 |  |  | retry-after -
 Disabled | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
@@ -73,57 +79,63 @@ Disabled | GetObject range | 403 | InvalidAccessKeyId | The AWS Access Key Id yo
 Disabled | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | HeadObject | 403 |  |  | retry-after -
 Disabled | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Disabled | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-Disabled | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-Disabled | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-Disabled | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+Disabled | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Disabled | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Disabled | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Disabled | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Disabled | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-Disabled | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-Disabled | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+Disabled | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+Disabled | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 Ungranted | ListBuckets | 200 |  |  | retry-after -
-Ungranted | HeadBucket | 403 |  |  | retry-after -
-Ungranted | GetBucketLocation | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | ListObjectsV2 | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | ListMultipartUploads | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | GetObject | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | HeadObject | 403 |  |  | retry-after -
-Ungranted | PutObject | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | ListParts | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-Ungranted | CompleteMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+Ungranted | HeadBucket | 404 |  |  | retry-after -
+Ungranted | GetBucketLocation | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | ListObjectsV2 | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | ListMultipartUploads | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | CreateBucket | 403 | AccessDenied | Only the administrator can create a bucket. | retry-after -
+Ungranted | DeleteBucket | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | GetObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | GetObject range | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | GetObject absent | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | HeadObject | 404 |  |  | retry-after -
+Ungranted | PutObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | PutObject chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | CopyObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | DeleteObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | DeleteObjects | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | CreateMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | UploadPart | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | UploadPart chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | UploadPartCopy | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | ListParts | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | AbortMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+Ungranted | CompleteMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
 AbsentBucket | ListBuckets | 200 |  |  | retry-after -
-AbsentBucket | HeadBucket | 403 |  |  | retry-after -
-AbsentBucket | GetBucketLocation | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | ListObjectsV2 | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | ListMultipartUploads | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | GetObject | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | HeadObject | 403 |  |  | retry-after -
-AbsentBucket | PutObject | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | ListParts | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-AbsentBucket | CompleteMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+AbsentBucket | HeadBucket | 404 |  |  | retry-after -
+AbsentBucket | GetBucketLocation | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | ListObjectsV2 | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | ListMultipartUploads | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | CreateBucket | 403 | AccessDenied | Only the administrator can create a bucket. | retry-after -
+AbsentBucket | DeleteBucket | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | GetObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | GetObject range | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | GetObject absent | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | HeadObject | 404 |  |  | retry-after -
+AbsentBucket | PutObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | PutObject chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | CopyObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | DeleteObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | DeleteObjects | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | CreateMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | UploadPart | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | UploadPart chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | UploadPartCopy | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | ListParts | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | AbortMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+AbsentBucket | CompleteMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
 UnknownAbsentBucket | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownAbsentBucket | HeadBucket | 403 |  |  | retry-after -
 UnknownAbsentBucket | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
@@ -136,15 +148,17 @@ UnknownAbsentBucket | GetObject range | 403 | InvalidAccessKeyId | The AWS Acces
 UnknownAbsentBucket | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownAbsentBucket | HeadObject | 403 |  |  | retry-after -
 UnknownAbsentBucket | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownAbsentBucket | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownAbsentBucket | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownAbsentBucket | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownAbsentBucket | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-UnknownAbsentBucket | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownAbsentBucket | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownAbsentBucket | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+UnknownAbsentBucket | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownAbsentBucket | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownAbsentBucket | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownAbsentBucket | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownAbsentBucket | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-UnknownAbsentBucket | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownAbsentBucket | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+UnknownAbsentBucket | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownAbsentBucket | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 WrongSecret | ListBuckets | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | HeadBucket | 403 |  |  | retry-after -
 WrongSecret | GetBucketLocation | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -157,11 +171,13 @@ WrongSecret | GetObject range | 403 | SignatureDoesNotMatch | The request signat
 WrongSecret | GetObject absent | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | HeadObject | 403 |  |  | retry-after -
 WrongSecret | PutObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+WrongSecret | PutObject chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | CopyObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | DeleteObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | DeleteObjects | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | CreateMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | UploadPart | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+WrongSecret | UploadPart chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | UploadPartCopy | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | ListParts | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecret | AbortMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -178,11 +194,13 @@ Tampered | GetObject range | 403 | SignatureDoesNotMatch | The request signature
 Tampered | GetObject absent | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | HeadObject | 403 |  |  | retry-after -
 Tampered | PutObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+Tampered | PutObject chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | CopyObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | DeleteObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | DeleteObjects | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | CreateMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | UploadPart | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+Tampered | UploadPart chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | UploadPartCopy | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | ListParts | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 Tampered | AbortMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -199,11 +217,13 @@ WrongAlgorithm | GetObject range | 403 | AccessDenied | Access Denied | retry-af
 WrongAlgorithm | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | HeadObject | 403 |  |  | retry-after -
 WrongAlgorithm | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+WrongAlgorithm | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+WrongAlgorithm | UploadPart chunked | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | ListParts | 403 | AccessDenied | Access Denied | retry-after -
 WrongAlgorithm | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
@@ -220,11 +240,13 @@ CredentialInSignature | GetObject range | 403 | InvalidAccessKeyId | The AWS Acc
 CredentialInSignature | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 CredentialInSignature | HeadObject | 403 |  |  | retry-after -
 CredentialInSignature | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+CredentialInSignature | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 CredentialInSignature | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 CredentialInSignature | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 CredentialInSignature | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 CredentialInSignature | CreateMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 CredentialInSignature | UploadPart | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+CredentialInSignature | UploadPart chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 CredentialInSignature | UploadPartCopy | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 CredentialInSignature | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 CredentialInSignature | AbortMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -241,11 +263,13 @@ Anonymous | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | HeadObject | 403 |  |  | retry-after -
 Anonymous | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+Anonymous | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+Anonymous | UploadPart chunked | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | ListParts | 403 | AccessDenied | Access Denied | retry-after -
 Anonymous | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
@@ -262,11 +286,13 @@ RwReplaying | GetObject range | 206 |  |  | retry-after -
 RwReplaying | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RwReplaying | HeadObject | 200 |  |  | retry-after -
 RwReplaying | PutObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
+RwReplaying | PutObject chunked | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwReplaying | CopyObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwReplaying | DeleteObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwReplaying | DeleteObjects | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwReplaying | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwReplaying | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RwReplaying | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwReplaying | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwReplaying | ListParts | 200 |  |  | retry-after -
 RwReplaying | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
@@ -283,11 +309,13 @@ RoReplaying | GetObject range | 206 |  |  | retry-after -
 RoReplaying | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RoReplaying | HeadObject | 200 |  |  | retry-after -
 RoReplaying | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+RoReplaying | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+RoReplaying | UploadPart chunked | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
 RoReplaying | ListParts | 200 |  |  | retry-after -
 RoReplaying | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
@@ -304,11 +332,13 @@ RwMaintenance | GetObject range | 404 | NoSuchKey | The specified key does not e
 RwMaintenance | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RwMaintenance | HeadObject | 404 |  |  | retry-after -
 RwMaintenance | PutObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
+RwMaintenance | PutObject chunked | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwMaintenance | CopyObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwMaintenance | DeleteObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwMaintenance | DeleteObjects | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RwMaintenance | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwMaintenance | ListParts | 404 | NoSuchUpload | The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed. | retry-after -
 RwMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
@@ -325,11 +355,13 @@ UnknownMaintenance | GetObject range | 403 | InvalidAccessKeyId | The AWS Access
 UnknownMaintenance | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | HeadObject | 403 |  |  | retry-after -
 UnknownMaintenance | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownMaintenance | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UnknownMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UnknownMaintenance | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UnknownMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UnknownMaintenance | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
@@ -346,34 +378,38 @@ RoMaintenance | GetObject range | 404 | NoSuchKey | The specified key does not e
 RoMaintenance | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RoMaintenance | HeadObject | 404 |  |  | retry-after -
 RoMaintenance | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+RoMaintenance | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 RoMaintenance | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 RoMaintenance | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 RoMaintenance | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 RoMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RoMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RoMaintenance | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RoMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RoMaintenance | ListParts | 404 | NoSuchUpload | The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed. | retry-after -
 RoMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RoMaintenance | CompleteMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UngrantedMaintenance | ListBuckets | 200 |  |  | retry-after -
-UngrantedMaintenance | HeadBucket | 403 |  |  | retry-after -
-UngrantedMaintenance | GetBucketLocation | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | ListObjectsV2 | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | ListMultipartUploads | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | GetObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | HeadObject | 403 |  |  | retry-after -
-UngrantedMaintenance | PutObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedMaintenance | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | HeadBucket | 404 |  |  | retry-after -
+UngrantedMaintenance | GetBucketLocation | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | ListObjectsV2 | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | ListMultipartUploads | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | CreateBucket | 403 | AccessDenied | Only the administrator can create a bucket. | retry-after -
+UngrantedMaintenance | DeleteBucket | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | GetObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | GetObject range | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | GetObject absent | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | HeadObject | 404 |  |  | retry-after -
+UngrantedMaintenance | PutObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | PutObject chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | CopyObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | DeleteObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedMaintenance | DeleteObjects | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
 UngrantedMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UngrantedMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+UngrantedMaintenance | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UngrantedMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
-UngrantedMaintenance | ListParts | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedMaintenance | ListParts | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
 UngrantedMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 UngrantedMaintenance | CompleteMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RevokedMaintenance | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
@@ -388,11 +424,13 @@ RevokedMaintenance | GetObject range | 403 | InvalidAccessKeyId | The AWS Access
 RevokedMaintenance | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 RevokedMaintenance | HeadObject | 403 |  |  | retry-after -
 RevokedMaintenance | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+RevokedMaintenance | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 RevokedMaintenance | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 RevokedMaintenance | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 RevokedMaintenance | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 RevokedMaintenance | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RevokedMaintenance | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RevokedMaintenance | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RevokedMaintenance | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RevokedMaintenance | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 RevokedMaintenance | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
@@ -409,11 +447,13 @@ PresignedRw | GetObject range | 200 |  |  | retry-after -
 PresignedRw | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 PresignedRw | HeadObject | 200 |  |  | retry-after -
 PresignedRw | PutObject | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | PutObject chunked | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
 PresignedRw | CopyObject | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
 PresignedRw | DeleteObject | 204 |  |  | retry-after -
 PresignedRw | DeleteObjects | 400 | InvalidRequest | Missing required header for this request: Content-MD5. | retry-after -
 PresignedRw | CreateMultipartUpload | 200 |  |  | retry-after -
 PresignedRw | UploadPart | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
+PresignedRw | UploadPart chunked | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
 PresignedRw | UploadPartCopy | 411 | MissingContentLength | You must provide the Content-Length HTTP header. | retry-after -
 PresignedRw | ListParts | 200 |  |  | retry-after -
 PresignedRw | AbortMultipartUpload | 204 |  |  | retry-after -
@@ -430,11 +470,13 @@ PresignedRo | GetObject range | 200 |  |  | retry-after -
 PresignedRo | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 PresignedRo | HeadObject | 200 |  |  | retry-after -
 PresignedRo | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+PresignedRo | UploadPart chunked | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
 PresignedRo | ListParts | 200 |  |  | retry-after -
 PresignedRo | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
@@ -451,15 +493,17 @@ PresignedUnknown | GetObject range | 403 | InvalidAccessKeyId | The AWS Access K
 PresignedUnknown | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedUnknown | HeadObject | 403 |  |  | retry-after -
 PresignedUnknown | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedUnknown | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedUnknown | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedUnknown | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-PresignedUnknown | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-PresignedUnknown | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-PresignedUnknown | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedUnknown | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedUnknown | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-PresignedUnknown | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-PresignedUnknown | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedUnknown | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedUnknown | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedWrongSecret | ListBuckets | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | HeadBucket | 403 |  |  | retry-after -
 PresignedWrongSecret | GetBucketLocation | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -472,11 +516,13 @@ PresignedWrongSecret | GetObject range | 403 | SignatureDoesNotMatch | The reque
 PresignedWrongSecret | GetObject absent | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | HeadObject | 403 |  |  | retry-after -
 PresignedWrongSecret | PutObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | PutObject chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | CopyObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | DeleteObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | DeleteObjects | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | CreateMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | UploadPart | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+PresignedWrongSecret | UploadPart chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | UploadPartCopy | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | ListParts | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 PresignedWrongSecret | AbortMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -493,11 +539,13 @@ CatalogueFails | GetObject range | 500 | InternalError | We encountered an inter
 CatalogueFails | GetObject absent | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | HeadObject | 500 |  |  | retry-after -
 CatalogueFails | PutObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | PutObject chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | CopyObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | DeleteObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | DeleteObjects | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+CatalogueFails | UploadPart chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | ListParts | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 CatalogueFails | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
@@ -514,11 +562,13 @@ LostKek | GetObject range | 500 | InternalError | We encountered an internal err
 LostKek | GetObject absent | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | HeadObject | 500 |  |  | retry-after -
 LostKek | PutObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | PutObject chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | CopyObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | DeleteObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | DeleteObjects | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+LostKek | UploadPart chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | ListParts | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 LostKek | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
@@ -535,15 +585,17 @@ UnknownReplaying | GetObject range | 403 | InvalidAccessKeyId | The AWS Access K
 UnknownReplaying | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplaying | HeadObject | 403 |  |  | retry-after -
 UnknownReplaying | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownReplaying | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplaying | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplaying | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplaying | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-UnknownReplaying | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownReplaying | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownReplaying | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+UnknownReplaying | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownReplaying | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownReplaying | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownReplaying | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplaying | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-UnknownReplaying | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownReplaying | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+UnknownReplaying | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownReplaying | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | HeadBucket | 403 |  |  | retry-after -
 DisabledReplaying | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
@@ -556,36 +608,40 @@ DisabledReplaying | GetObject range | 403 | InvalidAccessKeyId | The AWS Access 
 DisabledReplaying | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | HeadObject | 403 |  |  | retry-after -
 DisabledReplaying | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+DisabledReplaying | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-DisabledReplaying | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-DisabledReplaying | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-DisabledReplaying | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+DisabledReplaying | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+DisabledReplaying | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+DisabledReplaying | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+DisabledReplaying | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 DisabledReplaying | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-DisabledReplaying | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-DisabledReplaying | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+DisabledReplaying | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+DisabledReplaying | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UngrantedReplaying | ListBuckets | 200 |  |  | retry-after -
-UngrantedReplaying | HeadBucket | 403 |  |  | retry-after -
-UngrantedReplaying | GetBucketLocation | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | ListObjectsV2 | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | ListMultipartUploads | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | GetObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | HeadObject | 403 |  |  | retry-after -
-UngrantedReplaying | PutObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | ListParts | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-UngrantedReplaying | CompleteMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+UngrantedReplaying | HeadBucket | 404 |  |  | retry-after -
+UngrantedReplaying | GetBucketLocation | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | ListObjectsV2 | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | ListMultipartUploads | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | CreateBucket | 403 | AccessDenied | Only the administrator can create a bucket. | retry-after -
+UngrantedReplaying | DeleteBucket | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | GetObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | GetObject range | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | GetObject absent | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | HeadObject | 404 |  |  | retry-after -
+UngrantedReplaying | PutObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | PutObject chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | CopyObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | DeleteObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | DeleteObjects | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | CreateMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | UploadPart | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | UploadPart chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | UploadPartCopy | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | ListParts | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | AbortMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+UngrantedReplaying | CompleteMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
 WrongSecretReplaying | ListBuckets | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | HeadBucket | 403 |  |  | retry-after -
 WrongSecretReplaying | GetBucketLocation | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -598,11 +654,13 @@ WrongSecretReplaying | GetObject range | 403 | SignatureDoesNotMatch | The reque
 WrongSecretReplaying | GetObject absent | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | HeadObject | 403 |  |  | retry-after -
 WrongSecretReplaying | PutObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+WrongSecretReplaying | PutObject chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | CopyObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | DeleteObject | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | DeleteObjects | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | CreateMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | UploadPart | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
+WrongSecretReplaying | UploadPart chunked | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | UploadPartCopy | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | ListParts | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
 WrongSecretReplaying | AbortMultipartUpload | 403 | SignatureDoesNotMatch | The request signature we calculated does not match the signature you provided. | retry-after -
@@ -619,11 +677,13 @@ PresignedRwReplaying | GetObject range | 200 |  |  | retry-after -
 PresignedRwReplaying | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 PresignedRwReplaying | HeadObject | 200 |  |  | retry-after -
 PresignedRwReplaying | PutObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
+PresignedRwReplaying | PutObject chunked | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 PresignedRwReplaying | CopyObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 PresignedRwReplaying | DeleteObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 PresignedRwReplaying | DeleteObjects | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 PresignedRwReplaying | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 PresignedRwReplaying | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+PresignedRwReplaying | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 PresignedRwReplaying | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 PresignedRwReplaying | ListParts | 200 |  |  | retry-after -
 PresignedRwReplaying | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
@@ -640,11 +700,13 @@ RwRolledBack | GetObject range | 206 |  |  | retry-after -
 RwRolledBack | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RwRolledBack | HeadObject | 200 |  |  | retry-after -
 RwRolledBack | PutObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
+RwRolledBack | PutObject chunked | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwRolledBack | CopyObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwRolledBack | DeleteObject | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwRolledBack | DeleteObjects | 503 | ServiceUnavailable | Writes are refused until the catalogue has been restored. Please try again later. | retry-after 30
 RwRolledBack | CreateMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwRolledBack | UploadPart | 503 | SlowDown | Please reduce your request rate. | retry-after 1
+RwRolledBack | UploadPart chunked | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwRolledBack | UploadPartCopy | 503 | SlowDown | Please reduce your request rate. | retry-after 1
 RwRolledBack | ListParts | 200 |  |  | retry-after -
 RwRolledBack | AbortMultipartUpload | 503 | SlowDown | Please reduce your request rate. | retry-after 1
@@ -661,11 +723,13 @@ RoRolledBack | GetObject range | 206 |  |  | retry-after -
 RoRolledBack | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RoRolledBack | HeadObject | 200 |  |  | retry-after -
 RoRolledBack | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+RoRolledBack | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
+RoRolledBack | UploadPart chunked | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
 RoRolledBack | ListParts | 200 |  |  | retry-after -
 RoRolledBack | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
@@ -682,15 +746,17 @@ UnknownRolledBack | GetObject range | 403 | InvalidAccessKeyId | The AWS Access 
 UnknownRolledBack | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownRolledBack | HeadObject | 403 |  |  | retry-after -
 UnknownRolledBack | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownRolledBack | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownRolledBack | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownRolledBack | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownRolledBack | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-UnknownRolledBack | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownRolledBack | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownRolledBack | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+UnknownRolledBack | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownRolledBack | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownRolledBack | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownRolledBack | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownRolledBack | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-UnknownRolledBack | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-UnknownRolledBack | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+UnknownRolledBack | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownRolledBack | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | HeadBucket | 403 |  |  | retry-after -
 PresignedDisabled | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
@@ -703,36 +769,40 @@ PresignedDisabled | GetObject range | 403 | InvalidAccessKeyId | The AWS Access 
 PresignedDisabled | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | HeadObject | 403 |  |  | retry-after -
 PresignedDisabled | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedDisabled | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-PresignedDisabled | CreateMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-PresignedDisabled | UploadPart | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-PresignedDisabled | UploadPartCopy | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedDisabled | CreateMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedDisabled | UploadPart | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedDisabled | UploadPart chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedDisabled | UploadPartCopy | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedDisabled | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
-PresignedDisabled | AbortMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
-PresignedDisabled | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The request is not valid. | retry-after -
+PresignedDisabled | AbortMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+PresignedDisabled | CompleteMultipartUpload | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 PresignedUngranted | ListBuckets | 200 |  |  | retry-after -
-PresignedUngranted | HeadBucket | 403 |  |  | retry-after -
-PresignedUngranted | GetBucketLocation | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | ListObjectsV2 | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | ListMultipartUploads | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | CreateBucket | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | DeleteBucket | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | GetObject | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | GetObject range | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | GetObject absent | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | HeadObject | 403 |  |  | retry-after -
-PresignedUngranted | PutObject | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | CreateMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | UploadPart | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | UploadPartCopy | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | ListParts | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | AbortMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
-PresignedUngranted | CompleteMultipartUpload | 403 | AccessDenied | Access Denied | retry-after -
+PresignedUngranted | HeadBucket | 404 |  |  | retry-after -
+PresignedUngranted | GetBucketLocation | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | ListObjectsV2 | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | ListMultipartUploads | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | CreateBucket | 403 | AccessDenied | Only the administrator can create a bucket. | retry-after -
+PresignedUngranted | DeleteBucket | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | GetObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | GetObject range | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | GetObject absent | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | HeadObject | 404 |  |  | retry-after -
+PresignedUngranted | PutObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | PutObject chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | CopyObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | DeleteObject | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | DeleteObjects | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | CreateMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | UploadPart | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | UploadPart chunked | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | UploadPartCopy | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | ListParts | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | AbortMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
+PresignedUngranted | CompleteMultipartUpload | 404 | NoSuchBucket | The specified bucket does not exist. | retry-after -
 UnknownReplayUnreadable | ListBuckets | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | HeadBucket | 403 |  |  | retry-after -
 UnknownReplayUnreadable | GetBucketLocation | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
@@ -745,11 +815,13 @@ UnknownReplayUnreadable | GetObject range | 403 | InvalidAccessKeyId | The AWS A
 UnknownReplayUnreadable | GetObject absent | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | HeadObject | 403 |  |  | retry-after -
 UnknownReplayUnreadable | PutObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
+UnknownReplayUnreadable | PutObject chunked | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | CopyObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | DeleteObject | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | DeleteObjects | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 UnknownReplayUnreadable | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+UnknownReplayUnreadable | UploadPart chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 UnknownReplayUnreadable | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 UnknownReplayUnreadable | ListParts | 403 | InvalidAccessKeyId | The AWS Access Key Id you provided does not exist in our records. | retry-after -
 UnknownReplayUnreadable | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
@@ -766,11 +838,13 @@ RoReplayUnreadable | GetObject range | 206 |  |  | retry-after -
 RoReplayUnreadable | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RoReplayUnreadable | HeadObject | 200 |  |  | retry-after -
 RoReplayUnreadable | PutObject | 403 | AccessDenied | Access Denied | retry-after -
+RoReplayUnreadable | PutObject chunked | 403 | AccessDenied | Access Denied | retry-after -
 RoReplayUnreadable | CopyObject | 403 | AccessDenied | Access Denied | retry-after -
 RoReplayUnreadable | DeleteObject | 403 | AccessDenied | Access Denied | retry-after -
 RoReplayUnreadable | DeleteObjects | 403 | AccessDenied | Access Denied | retry-after -
 RoReplayUnreadable | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RoReplayUnreadable | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RoReplayUnreadable | UploadPart chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RoReplayUnreadable | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RoReplayUnreadable | ListParts | 200 |  |  | retry-after -
 RoReplayUnreadable | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
@@ -787,12 +861,152 @@ RwReplayUnreadable | GetObject range | 206 |  |  | retry-after -
 RwReplayUnreadable | GetObject absent | 404 | NoSuchKey | The specified key does not exist. | retry-after -
 RwReplayUnreadable | HeadObject | 200 |  |  | retry-after -
 RwReplayUnreadable | PutObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | PutObject chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | CopyObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | DeleteObject | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | DeleteObjects | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | CreateMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | UploadPart | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+RwReplayUnreadable | UploadPart chunked | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | UploadPartCopy | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | ListParts | 200 |  |  | retry-after -
 RwReplayUnreadable | AbortMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
 RwReplayUnreadable | CompleteMultipartUpload | 500 | InternalError | We encountered an internal error. Please try again. | retry-after -
+WrongRegion | ListBuckets | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | HeadBucket | 400 |  |  | retry-after -
+WrongRegion | GetBucketLocation | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | ListObjectsV2 | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | ListMultipartUploads | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | CreateBucket | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | DeleteBucket | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | GetObject | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | GetObject range | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | GetObject absent | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | HeadObject | 400 |  |  | retry-after -
+WrongRegion | PutObject | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | PutObject chunked | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | CopyObject | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | DeleteObject | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | DeleteObjects | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | CreateMultipartUpload | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | UploadPart | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | UploadPart chunked | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | UploadPartCopy | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | ListParts | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | AbortMultipartUpload | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+WrongRegion | CompleteMultipartUpload | 400 | AuthorizationHeaderMalformed | The authorization header is malformed; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | ListBuckets | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | HeadBucket | 400 |  |  | retry-after -
+PresignedWrongRegion | GetBucketLocation | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | ListObjectsV2 | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | ListMultipartUploads | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | CreateBucket | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | DeleteBucket | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | GetObject | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | GetObject range | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | GetObject absent | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | HeadObject | 400 |  |  | retry-after -
+PresignedWrongRegion | PutObject | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | PutObject chunked | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | CopyObject | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | DeleteObject | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | DeleteObjects | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | CreateMultipartUpload | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | UploadPart | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | UploadPart chunked | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | UploadPartCopy | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | ListParts | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | AbortMultipartUpload | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+PresignedWrongRegion | CompleteMultipartUpload | 400 | AuthorizationQueryParametersError | Error parsing the X-Amz-Credential parameter; the region &apos;us-west-2&apos; is wrong; expecting &apos;auto&apos; | retry-after -
+VirtualHost | ListBuckets | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | HeadBucket | 400 |  |  | retry-after -
+VirtualHost | GetBucketLocation | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | ListObjectsV2 | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | ListMultipartUploads | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | CreateBucket | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | DeleteBucket | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | GetObject | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | GetObject range | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | GetObject absent | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | HeadObject | 400 |  |  | retry-after -
+VirtualHost | PutObject | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | PutObject chunked | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | CopyObject | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | DeleteObject | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | DeleteObjects | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | CreateMultipartUpload | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | UploadPart | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | UploadPart chunked | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | UploadPartCopy | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | ListParts | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | AbortMultipartUpload | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+VirtualHost | CompleteMultipartUpload | 400 | InvalidRequest | Virtual-hosted-style requests are not supported. Use path-style addressing: the bucket goes in the path, not in the host name. | retry-after -
+OtherHost | ListBuckets | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | HeadBucket | 400 |  |  | retry-after -
+OtherHost | GetBucketLocation | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | ListObjectsV2 | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | ListMultipartUploads | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | CreateBucket | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | DeleteBucket | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | GetObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | GetObject range | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | GetObject absent | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | HeadObject | 400 |  |  | retry-after -
+OtherHost | PutObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | PutObject chunked | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | CopyObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | DeleteObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | DeleteObjects | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | CreateMultipartUpload | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | UploadPart | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | UploadPart chunked | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | UploadPartCopy | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | ListParts | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | AbortMultipartUpload | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+OtherHost | CompleteMultipartUpload | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | ListBuckets | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | HeadBucket | 400 |  |  | retry-after -
+UnknownOtherHost | GetBucketLocation | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | ListObjectsV2 | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | ListMultipartUploads | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | CreateBucket | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | DeleteBucket | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | GetObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | GetObject range | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | GetObject absent | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | HeadObject | 400 |  |  | retry-after -
+UnknownOtherHost | PutObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | PutObject chunked | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | CopyObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | DeleteObject | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | DeleteObjects | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | CreateMultipartUpload | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | UploadPart | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | UploadPart chunked | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | UploadPartCopy | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | ListParts | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | AbortMultipartUpload | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+UnknownOtherHost | CompleteMultipartUpload | 400 | InvalidRequest | The Host header does not name this endpoint. Use the endpoint host name you were given, with path-style addressing. | retry-after -
+RefusedHeader | ListBuckets | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | HeadBucket | 501 |  |  | retry-after -
+RefusedHeader | GetBucketLocation | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | ListObjectsV2 | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | ListMultipartUploads | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | CreateBucket | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | DeleteBucket | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | GetObject | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | GetObject range | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | GetObject absent | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | HeadObject | 501 |  |  | retry-after -
+RefusedHeader | PutObject | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | PutObject chunked | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | CopyObject | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | DeleteObject | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | DeleteObjects | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | CreateMultipartUpload | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | UploadPart | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | UploadPart chunked | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | UploadPartCopy | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | ListParts | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | AbortMultipartUpload | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -
+RefusedHeader | CompleteMultipartUpload | 501 | NotImplemented | The header &apos;x-amz-tagging&apos; implies functionality that is not implemented. | retry-after -

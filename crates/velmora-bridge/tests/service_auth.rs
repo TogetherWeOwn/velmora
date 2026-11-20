@@ -4,11 +4,13 @@
 //! trips to the catalogue.
 //!
 //! The table was recorded before the key, the bucket and the grant
-//! were read in one statement. Reading the state of a replay with the
-//! key changed one thing on purpose: a multipart call that cannot read
-//! that state answers 500 whoever asks (the `*ReplayUnreadable` rows).
-//! Nothing else is to change with how they are read. `UPDATE_GOLDEN=1`
-//! writes it anew.
+//! were read in one statement: on the single reads, with the refusals
+//! that name their cause (a wrong `Host`, a wrong region, a header that
+//! is not served) and `NoSuchBucket` for a bucket the key has no grant
+//! on. Reading the state of a replay with the key changed one thing on
+//! purpose: a multipart call that cannot read that state answers 500
+//! whoever asks (the `*ReplayUnreadable` rows). Nothing else is to
+//! change with how they are read. `UPDATE_GOLDEN=1` writes it anew.
 
 mod service_support;
 
@@ -107,9 +109,23 @@ enum Case {
     /// The `rw` key while the state of a replay cannot be read: the
     /// one caller that could write, so the one that shows nothing is.
     RwReplayUnreadable,
+    /// The `rw` key, signed for a region this endpoint does not answer
+    /// for.
+    WrongRegion,
+    /// The `rw` key, presigned for such a region.
+    PresignedWrongRegion,
+    /// The `rw` key, the `Host` replaced after signing by the
+    /// virtual-hosted form (`<bucket>.<endpoint>`).
+    VirtualHost,
+    /// The `rw` key, the `Host` replaced after signing by another name.
+    OtherHost,
+    /// An unknown key with such a `Host`: told the same.
+    UnknownOtherHost,
+    /// The `rw` key, with a signed header that is not served.
+    RefusedHeader,
 }
 
-const CASES: [Case; 38] = [
+const CASES: [Case; 44] = [
     Case::Rw,
     Case::Ro,
     Case::Unknown,
@@ -148,6 +164,12 @@ const CASES: [Case; 38] = [
     Case::UnknownReplayUnreadable,
     Case::RoReplayUnreadable,
     Case::RwReplayUnreadable,
+    Case::WrongRegion,
+    Case::PresignedWrongRegion,
+    Case::VirtualHost,
+    Case::OtherHost,
+    Case::UnknownOtherHost,
+    Case::RefusedHeader,
 ];
 
 struct Op {
@@ -158,6 +180,20 @@ struct Op {
     query: Vec<(&'static str, String)>,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
+    /// The body goes as signed aws-chunked
+    /// (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`): the request signature is
+    /// the seed of the chunk signatures.
+    chunked: bool,
+}
+
+/// Size of a signed chunk on the wire: the smallest a chunk that is not
+/// the last may have.
+const CHUNK: usize = 8192;
+const STREAMING: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// A body of two full chunks and a part of a third.
+fn chunked_body() -> Vec<u8> {
+    (0..20_000u32).map(|i| (i % 251) as u8).collect()
 }
 
 fn op(name: &'static str, method: Method, key: &'static str) -> Op {
@@ -168,6 +204,7 @@ fn op(name: &'static str, method: Method, key: &'static str) -> Op {
         query: Vec::new(),
         headers: Vec::new(),
         body: Vec::new(),
+        chunked: false,
     }
 }
 
@@ -182,6 +219,10 @@ impl Op {
     }
     fn body(mut self, body: &[u8]) -> Self {
         self.body = body.to_vec();
+        self
+    }
+    fn chunked(mut self) -> Self {
+        self.chunked = true;
         self
     }
 }
@@ -208,6 +249,9 @@ fn ops(bucket: &str, one: &str, two: &str, etag: &str) -> Vec<Op> {
         op("GetObject absent", Method::Get, "absent"),
         op("HeadObject", Method::Head, "k"),
         op("PutObject", Method::Put, "new").body(b"new body"),
+        op("PutObject chunked", Method::Put, "new-chunked")
+            .body(&chunked_body())
+            .chunked(),
         op("CopyObject", Method::Put, "copy").h("x-amz-copy-source", &format!("/{bucket}/k")),
         op("DeleteObject", Method::Delete, "gone-0"),
         op("DeleteObjects", Method::Post, "")
@@ -219,6 +263,11 @@ fn ops(bucket: &str, one: &str, two: &str, etag: &str) -> Vec<Op> {
             .q("partNumber", "2")
             .q("uploadId", one)
             .body(b"part two"),
+        op("UploadPart chunked", Method::Put, "mp-one")
+            .q("partNumber", "4")
+            .q("uploadId", one)
+            .body(&chunked_body())
+            .chunked(),
         op("UploadPartCopy", Method::Put, "mp-one")
             .q("partNumber", "3")
             .q("uploadId", one)
@@ -253,6 +302,7 @@ impl Case {
                 | Case::PresignedRwReplaying
                 | Case::PresignedDisabled
                 | Case::PresignedUngranted
+                | Case::PresignedWrongRegion
         )
     }
 
@@ -350,6 +400,10 @@ async fn run(case: Case) -> Vec<Ran> {
     rig.grant(&ungranted.akid, &other, Perm::Rw).await;
     let unknown = Signer::new("AKIDTESTKEY000000NONE", secret());
     let wrong = Signer::new(&rw.akid, "not the secret of this key at all 00000");
+    let west = Signer {
+        region: "us-west-2".to_owned(),
+        ..rw.clone()
+    };
 
     // What the operations address. Under maintenance nothing can be
     // written, and nothing is: every answer there is a refusal.
@@ -444,7 +498,11 @@ async fn run(case: Case) -> Vec<Ran> {
         | Case::LostKek
         | Case::PresignedRwReplaying
         | Case::RwRolledBack
-        | Case::RwReplayUnreadable => (&rw, BUCKET),
+        | Case::RwReplayUnreadable
+        | Case::VirtualHost
+        | Case::OtherHost
+        | Case::RefusedHeader => (&rw, BUCKET),
+        Case::WrongRegion | Case::PresignedWrongRegion => (&west, BUCKET),
         Case::Ro
         | Case::RoReplaying
         | Case::RoMaintenance
@@ -456,7 +514,8 @@ async fn run(case: Case) -> Vec<Ran> {
         | Case::PresignedUnknown
         | Case::UnknownReplaying
         | Case::UnknownRolledBack
-        | Case::UnknownReplayUnreadable => (&unknown, BUCKET),
+        | Case::UnknownReplayUnreadable
+        | Case::UnknownOtherHost => (&unknown, BUCKET),
         Case::Disabled | Case::DisabledReplaying | Case::PresignedDisabled => (&disabled, BUCKET),
         Case::Ungranted
         | Case::UngrantedMaintenance
@@ -478,9 +537,32 @@ async fn run(case: Case) -> Vec<Ran> {
             key => path(name, key),
         };
         let query: Vec<(&str, &str)> = op.query.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let headers: Vec<(&str, &str)> = op.headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut headers: Vec<(&str, &str)> =
+            op.headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        if case == Case::RefusedHeader {
+            headers.push(("x-amz-tagging", "a=b"));
+        }
         let mut req = match case.presigned() {
             true => presign(signer, rig.now(), op.method, &target, &query),
+            false if op.chunked => {
+                let decoded = op.body.len().to_string();
+                let mut headers = headers.clone();
+                headers.push(("content-encoding", "aws-chunked"));
+                headers.push(("x-amz-decoded-content-length", &decoded));
+                let (mut req, seed) = signer.sign_as(
+                    rig.now(),
+                    op.method,
+                    &target,
+                    &query,
+                    &headers,
+                    Vec::new(),
+                    Some(STREAMING),
+                );
+                let wire = signer.signed_chunks(rig.now(), &seed, &op.body, CHUNK, None);
+                req.set_header("content-length", &wire.len().to_string());
+                req.body = wire;
+                req
+            }
             false => signer.sign(
                 rig.now(),
                 op.method,
@@ -520,6 +602,8 @@ async fn run(case: Case) -> Vec<Ran> {
                 );
             }
             Case::Anonymous => req.headers.retain(|(n, _)| n != "authorization"),
+            Case::VirtualHost => req.set_header("host", &format!("{BUCKET}.{HOST}")),
+            Case::OtherHost | Case::UnknownOtherHost => req.set_header("host", "elsewhere.test"),
             _ => {}
         }
         let before = rig.bridge.catalog.sql.trips.get();
@@ -561,8 +645,32 @@ async fn every_operation_answers_every_caller_as_recorded() {
         "Ro | PutObject | 403 | AccessDenied",
         "Unknown | GetObject | 403 | InvalidAccessKeyId",
         "Disabled | UploadPart | 403 | InvalidAccessKeyId",
-        "Ungranted | CreateMultipartUpload | 403 | AccessDenied",
-        "AbsentBucket | HeadObject | 403",
+        // To a key, a bucket it has no grant on does not exist.
+        "Ungranted | GetObject | 404 | NoSuchBucket",
+        "Ungranted | CreateMultipartUpload | 404 | NoSuchBucket",
+        "AbsentBucket | HeadObject | 404",
+        "UnknownAbsentBucket | GetObject | 403 | InvalidAccessKeyId",
+        // A chunked upload: its request signature seeds the chunks'.
+        "Rw | PutObject chunked | 200",
+        "Rw | UploadPart chunked | 200",
+        "Ro | PutObject chunked | 403 | AccessDenied",
+        "WrongSecret | GetObject | 403 | SignatureDoesNotMatch",
+        "WrongSecret | PutObject chunked | 403 | SignatureDoesNotMatch",
+        "WrongSecret | UploadPart chunked | 403 | SignatureDoesNotMatch",
+        "PresignedWrongSecret | GetObject | 403 | SignatureDoesNotMatch",
+        // Refusals that name their cause, on every way in.
+        "WrongRegion | GetObject | 400 | AuthorizationHeaderMalformed",
+        "WrongRegion | PutObject | 400 | AuthorizationHeaderMalformed",
+        "WrongRegion | UploadPart | 400 | AuthorizationHeaderMalformed",
+        "PresignedWrongRegion | GetObject | 400 | AuthorizationQueryParametersError",
+        "PresignedWrongRegion | UploadPart | 400 | AuthorizationQueryParametersError",
+        "VirtualHost | GetObject | 400 | InvalidRequest | Virtual-hosted-style",
+        "VirtualHost | CreateMultipartUpload | 400 | InvalidRequest | Virtual-hosted-style",
+        "OtherHost | GetObject | 400 | InvalidRequest | The Host header does not name",
+        "UnknownOtherHost | UploadPart | 400 | InvalidRequest | The Host header does not name",
+        "RefusedHeader | GetObject | 501 | NotImplemented",
+        "RefusedHeader | PutObject | 501 | NotImplemented",
+        "RefusedHeader | UploadPart | 501 | NotImplemented",
         "WrongSecret | CompleteMultipartUpload | 403 | SignatureDoesNotMatch",
         "Tampered | DeleteObject | 403 | SignatureDoesNotMatch",
         "WrongAlgorithm | GetObject | 403 | AccessDenied",
@@ -573,7 +681,7 @@ async fn every_operation_answers_every_caller_as_recorded() {
         "RevokedMaintenance | GetObject | 403 | InvalidAccessKeyId",
         "RevokedMaintenance | ListObjectsV2 | 403 | InvalidAccessKeyId",
         "RoMaintenance | ListObjectsV2 | 200",
-        "UngrantedMaintenance | ListObjectsV2 | 403 | AccessDenied",
+        "UngrantedMaintenance | ListObjectsV2 | 404 | NoSuchBucket",
         "PresignedRw | GetObject | 200",
         "PresignedRw | CreateMultipartUpload | 200",
         "PresignedRo | CreateMultipartUpload | 403 | AccessDenied",
