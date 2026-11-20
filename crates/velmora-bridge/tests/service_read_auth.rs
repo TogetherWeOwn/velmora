@@ -25,6 +25,11 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// A secret that is not the one of any key of the rig.
+fn another_secret() -> String {
+    hex(&sha256(secret().as_bytes()))
+}
+
 /// A presigned request: the signature in the query, `host` the only
 /// signed header, the payload unsigned.
 fn presign(
@@ -178,7 +183,7 @@ async fn judged_alike(maintenance: Maintenance) {
         .await;
     rig.grant(&revoked.akid, &bucket, Perm::Rw).await;
     let unknown = Signer::new("AKIDTESTKEY000000NONE", secret());
-    let wrong = Signer::new(&rw.akid, "not the secret of this key at all 00000");
+    let wrong = Signer::new(&rw.akid, &another_secret());
     let west = Signer {
         region: "us-west-2".to_owned(),
         ..rw.clone()
@@ -407,6 +412,52 @@ async fn a_read_under_maintenance_is_judged_as_every_other_request() {
     judged_alike(Maintenance::Restore).await;
 }
 
+/// Under maintenance the record of a revocation is the authority on a
+/// key. A read that cannot ask the catalogue, or cannot ask for that
+/// record, is answered 500 and nothing of the object: it is not judged
+/// without it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_that_cannot_ask_fails_closed() {
+    let mut rig = rig();
+    let (_, rw) = rig.standard(BUCKET).await;
+    rig.put(&rw, BUCKET, "k", b"the stored body")
+        .await
+        .expect(200);
+    std::rc::Rc::get_mut(&mut rig.bridge)
+        .expect("no request is in flight")
+        .cfg
+        .maintenance = Maintenance::Restore;
+    let object = path(BUCKET, "k");
+    // What a served read asks before it is admitted: the catalogue
+    // (the first call), then the safety store for the record.
+    for skip in 0..2 {
+        for presigned in [false, true] {
+            for head in [false, true] {
+                let how = format!("call {skip}, presigned {presigned}, head {head}");
+                let method = if head { Method::Head } else { Method::Get };
+                let req = match presigned {
+                    true => presign(&rw, rig.now(), method, &object, &[]),
+                    false => rw.sign(rig.now(), method, &object, &[], &[], Vec::new()),
+                };
+                rig.trip().arm(skip, Trip::Fail);
+                let resp = rig.send(req).await;
+                assert!(rig.trip().tripped(), "{how}");
+                assert_eq!(resp.status, 500, "{how}");
+                assert!(resp.header("etag").is_none(), "{how}");
+                assert!(resp.header("content-range").is_none(), "{how}");
+                match head {
+                    true => assert!(resp.body.is_empty(), "{how}"),
+                    false => assert_eq!(resp.code(), "InternalError", "{how}"),
+                }
+            }
+        }
+    }
+    // The same read with nothing in its way is served.
+    rig.trip().disarm();
+    let resp = rig.call(&rw, Method::Get, &object, &[], &[], b"").await;
+    assert_eq!(resp.expect(200).body, b"the stored body");
+}
+
 /// The refusals that name their cause say the same on a read: the
 /// region to use, and the style of addressing.
 #[tokio::test(flavor = "current_thread")]
@@ -493,7 +544,7 @@ async fn a_read_is_told_what_it_is_refused_for() {
 async fn a_chunked_upload_is_signed_and_read_back() {
     let rig = rig();
     let (_, rw) = rig.standard(BUCKET).await;
-    let wrong = Signer::new(&rw.akid, "not the secret of this key at all 00000");
+    let wrong = Signer::new(&rw.akid, &another_secret());
     let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
     let decoded = data.len().to_string();
     let chunked = |signer: &Signer, key: &str| {
