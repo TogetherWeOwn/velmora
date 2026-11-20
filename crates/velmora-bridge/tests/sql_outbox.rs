@@ -4884,13 +4884,16 @@ async fn release_refuses_passes_without_the_parity_articles() {
 #[tokio::test]
 async fn parity_costs_no_row_at_verify_and_release() {
     let fx = Fx::new().await;
+    // The first release of an hour also opens the hour's row of the usage
+    // counters, once. `first` pays for that, and is not compared.
+    let first = fx.posted_packed("first", false).await;
     let plain = fx.posted_packed("plain", false).await;
     let with = fx.posted_packed("with", true).await;
     let counting = labels(&["bb-a", "bb-b"]);
     fx.cat.sql.0.meter_writes().unwrap();
     let mut cost = Vec::new();
     let mut texts = Vec::new();
-    for ((o, l), n) in [(&plain, 2), (&with, 3)] {
+    for ((o, l), n) in [(&first, 2), (&plain, 2), (&with, 3)] {
         let (rows, at) = (fx.cat.sql.0.writes(), fx.statements());
         fx.pass_of(l, "bb-a", T0, VerifyKind::Body, n).await;
         fx.pass_of(l, "bb-b", T0, VerifyKind::Stat, n).await;
@@ -4918,9 +4921,9 @@ async fn parity_costs_no_row_at_verify_and_release() {
         let ran = &fx.cat.sql.1.borrow()[at..];
         texts.push(ran.iter().map(|(sql, _)| sql.clone()).collect::<Vec<_>>());
     }
-    assert_eq!(cost[0], cost[1], "{cost:?}");
-    assert!(cost[0].0 > 0);
-    assert_eq!(texts[0], texts[1]);
+    assert_eq!(cost[1], cost[2], "{cost:?}");
+    assert!(cost[1].0 > 0);
+    assert_eq!(texts[1], texts[2]);
     assert_eq!(fx.count("SELECT COUNT(*) FROM articles").await, 0);
 }
 
