@@ -328,6 +328,11 @@ fn log_budget(bridge: &env::WorkerBridge) {
     if let Some(line) = jobs::watch_line(&bridge.budget, env::isolate(), now) {
         console_error!("{line}");
     }
+    // What the requests and the jobs waited for each other's bytes: a
+    // measurement, so a plain log line and not an error.
+    if let Some(line) = jobs::pressure_line(&bridge.budget, env::isolate(), now) {
+        console_log!("{line}");
+    }
 }
 
 fn copier<'a>(

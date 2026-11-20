@@ -9,7 +9,8 @@
 //! timer of its own; the timers of a cancelled one never fire, so a job
 //! that has not been marked for a minute is dropped as well. A budget
 //! that stays full is said in the log, at most once a minute per isolate
-//! ([`Watch`]): sizes, counts and times only.
+//! ([`Watch`]): sizes, counts and times only. What waiting for room cost
+//! the requests and the jobs is said the same way ([`PressureWatch`]).
 //!
 //! Dev only: `DEV_ABANDON_JOB_N=<n>` abandons every n-th post job of an
 //! isolate two seconds after it began, as a cancelled invocation does:
@@ -21,7 +22,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use futures_util::future::{select, Either};
-use velmora_bridge::ingress::ByteBudget;
+use velmora_bridge::ingress::{ByteBudget, Pressure};
 use velmora_bridge::jobtable::{JobTable, Ran, JOB_BEAT_MS, JOB_MAX_AGE_MS, JOB_QUIET_MS};
 use velmora_bridge::{JobOutcome, UnixMs};
 
@@ -38,6 +39,7 @@ const WATCH_EVERY_MS: i64 = 60_000;
 thread_local! {
     static TABLE: JobTable<'static, JobOutcome> = JobTable::new();
     static WATCH: RefCell<Watch> = const { RefCell::new(Watch::new()) };
+    static PRESSURE: RefCell<PressureWatch> = const { RefCell::new(PressureWatch::new()) };
     static ABANDON: Cell<Abandon> = const { Cell::new(Abandon { every: 0, seen: 0 }) };
 }
 
@@ -274,6 +276,64 @@ pub fn watch_line(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<Stri
     WATCH.with(|w| w.borrow_mut().line(isolate, &reading))
 }
 
+/// Says what the shared budget cost the requests and the jobs of an
+/// isolate since the last line: how many charges waited for room, for
+/// how long, and how many were refused, each kind apart. A line when a
+/// count moved, at most one per [`WATCH_EVERY_MS`]; every figure is
+/// what was added since the line before, so the lines of an isolate
+/// sum to its totals. Held in memory, nothing is stored.
+pub struct PressureWatch {
+    last_at: Option<i64>,
+    last: Pressure,
+}
+
+impl PressureWatch {
+    pub const fn new() -> Self {
+        PressureWatch {
+            last_at: None,
+            last: Pressure {
+                request_waits: 0,
+                request_wait_ms: 0,
+                request_refused: 0,
+                job_waits: 0,
+                job_wait_ms: 0,
+                job_refused: 0,
+                too_large: 0,
+            },
+        }
+    }
+
+    pub fn line(&mut self, isolate: i64, now: UnixMs, p: Pressure) -> Option<String> {
+        if p == self.last {
+            return None;
+        }
+        if self
+            .last_at
+            .is_some_and(|at| now.0.saturating_sub(at) < WATCH_EVERY_MS)
+        {
+            return None;
+        }
+        let was = std::mem::replace(&mut self.last, p);
+        self.last_at = Some(now.0);
+        Some(format!(
+            "budget pressure: isolate={isolate} request_waits={} request_wait_ms={} \
+             request_refused={} job_waits={} job_wait_ms={} job_refused={} too_large={}",
+            p.request_waits.saturating_sub(was.request_waits),
+            p.request_wait_ms.saturating_sub(was.request_wait_ms),
+            p.request_refused.saturating_sub(was.request_refused),
+            p.job_waits.saturating_sub(was.job_waits),
+            p.job_wait_ms.saturating_sub(was.job_wait_ms),
+            p.job_refused.saturating_sub(was.job_refused),
+            p.too_large.saturating_sub(was.too_large),
+        ))
+    }
+}
+
+/// The line about what waiting for the budget cost, when one is due.
+pub fn pressure_line(budget: &ByteBudget, isolate: i64, now: UnixMs) -> Option<String> {
+    PRESSURE.with(|w| w.borrow_mut().line(isolate, now, budget.pressure()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +434,35 @@ mod tests {
         r.oldest_job = None;
         let line = watch.line(1, &r).expect("refused");
         assert!(line.contains(" oldest_job_age_s=- "), "{line}");
+    }
+
+    #[test]
+    fn what_waiting_cost_is_said_once_a_minute_as_what_was_added() {
+        let mut watch = PressureWatch::new();
+        let mut p = Pressure::default();
+        // Nothing waited: nothing is said.
+        assert_eq!(watch.line(7, UnixMs(1_000), p), None);
+        p.request_waits = 2;
+        p.request_wait_ms = 700;
+        p.job_refused = 1;
+        assert_eq!(
+            watch.line(7, UnixMs(2_000), p).as_deref(),
+            Some(
+                "budget pressure: isolate=7 request_waits=2 request_wait_ms=700 \
+                 request_refused=0 job_waits=0 job_wait_ms=0 job_refused=1 too_large=0"
+            )
+        );
+        // More within the minute: said when it is over, all of it, once.
+        p.request_waits = 5;
+        p.too_large = 1;
+        assert_eq!(watch.line(7, UnixMs(61_999), p), None);
+        let line = watch.line(7, UnixMs(62_000), p).expect("a minute on");
+        assert!(
+            line.contains(" request_waits=3 request_wait_ms=0 "),
+            "{line}"
+        );
+        assert!(line.ends_with(" job_refused=0 too_large=1"), "{line}");
+        // Nothing moved since: silence.
+        assert_eq!(watch.line(7, UnixMs(500_000), p), None);
     }
 }

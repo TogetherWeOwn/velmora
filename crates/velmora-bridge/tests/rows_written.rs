@@ -13,7 +13,7 @@
 //! that change nothing and a statement a trigger refuses.
 
 use velmora_bridge::ports::Sql;
-use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::testkit::{RusqliteSql, NEXT_DROP_SUPERSEDED_INDEXES};
 
 const MEASURED: &[(&str, Option<u64>)] = &[
     (
@@ -26,11 +26,11 @@ const MEASURED: &[(&str, Option<u64>)] = &[
     ),
     (
         r#"INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) VALUES ('x_c','b_c','g_c','committed',0,0,1,1,x'00',x'00',x'00',x'00','held',1)"#,
-        Some(7),
+        Some(8),
     ),
     (
         r#"INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) VALUES ('x_d','b_c',NULL,'staged',NULL,NULL,1,1,x'00',x'00',x'00',x'00','held',1)"#,
-        Some(5),
+        Some(6),
     ),
     (
         r#"UPDATE extents SET generation_id='g_c', state='committed', seq=1, plain_offset=1 WHERE id='x_d'"#,
@@ -82,15 +82,15 @@ const MEASURED: &[(&str, Option<u64>)] = &[
     ),
     (
         r#"UPDATE extents SET cipher_size=cipher_size WHERE id='x_c'"#,
-        Some(2),
-    ),
-    (
-        r#"UPDATE extents SET safety_state='held' WHERE id='x_c'"#,
         Some(3),
     ),
     (
+        r#"UPDATE extents SET safety_state='held' WHERE id='x_c'"#,
+        Some(4),
+    ),
+    (
         r#"UPDATE extents SET safety_state='releasing', release_evidence='[]', evict_seq=evict_seq+1 WHERE id='x_c'"#,
-        Some(2),
+        Some(3),
     ),
     (
         r#"UPDATE extents SET safety_state='released', released_at=2, hot_safety_bytes=cipher_size, last_read_at=COALESCE(last_read_at, created_at), evict_seq=evict_seq+1 WHERE id='x_c'"#,
@@ -179,6 +179,55 @@ const MEASURED: &[(&str, Option<u64>)] = &[
         r#"INSERT INTO scan_cursors(k,v) VALUES ('cal','b') ON CONFLICT(k) DO UPDATE SET v=excluded.v"#,
         Some(1),
     ),
+    (
+        r#"INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at) VALUES ('x_c','g_c','post',1,1)"#,
+        Some(3),
+    ),
+    // A claim of a row with attempts left: no entry in `outbox_exhausted`.
+    (
+        r#"UPDATE outbox SET attempts = attempts + 1, lease_token = lease_token + 1, lease_owner='a', lease_until=5 WHERE extent_id='x_c'"#,
+        Some(1),
+    ),
+    // The row runs out of attempts and enters the index.
+    (
+        r#"UPDATE outbox SET attempts = 51 WHERE extent_id='x_c'"#,
+        Some(2),
+    ),
+    (
+        r#"UPDATE outbox SET attempts = attempts + 1, lease_token = lease_token + 1, lease_owner='a', lease_until=5 WHERE extent_id='x_c'"#,
+        Some(2),
+    ),
+    (
+        r#"UPDATE outbox SET lease_owner=NULL, lease_until=NULL WHERE extent_id='x_c'"#,
+        Some(1),
+    ),
+    // The bury: the row and its `outbox_due` entry, as before the index.
+    (
+        r#"UPDATE outbox INDEXED BY outbox_exhausted SET stage = 'dead', updated_at = 9 WHERE attempts > 50 AND stage IN ('post', 'verify', 'release') AND attempts > 50 AND (lease_until IS NULL OR lease_until < 9)"#,
+        Some(2),
+    ),
+    (
+        r#"UPDATE outbox INDEXED BY outbox_exhausted SET stage = 'dead', updated_at = 9 WHERE attempts > 50 AND stage IN ('post', 'verify', 'release') AND attempts > 50 AND (lease_until IS NULL OR lease_until < 9)"#,
+        Some(0),
+    ),
+    (
+        r#"UPDATE outbox SET stage='post', attempts=0 WHERE extent_id='x_c'"#,
+        Some(2),
+    ),
+];
+
+/// The statements of `MEASURED` whose figure differs once the indexes
+/// that `extents_safety` replaced are dropped
+/// (`migrations-next/0023_drop_superseded_indexes.sql`), with the figure
+/// D1 returned for each on that schema. Every other statement kept its
+/// figure there.
+const MEASURED_AFTER_THE_DROPS: &[(&str, u64)] = &[
+    ("INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) VALUES ('x_c',", 5),
+    ("INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) VALUES ('x_d',", 3),
+    ("UPDATE extents SET generation_id='g_c', state='committed', seq=1, plain_offset=1 WHERE id='x_d'", 3),
+    ("UPDATE extents SET cipher_size=cipher_size WHERE id='x_c'", 2),
+    ("UPDATE extents SET safety_state='held' WHERE id='x_c'", 2),
+    ("UPDATE extents SET safety_state='releasing',", 2),
 ];
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -188,11 +237,9 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
-#[test]
-fn the_meter_matches_d1_statement_by_statement() {
-    // The figures are D1's on the schema without usage counters: the
-    // triggers are as the migration leaves them, writing nothing.
-    let db = RusqliteSql::with_schema_unarmed().expect("schema");
+/// Runs `MEASURED` on `db` and holds the meter to `figure` for each
+/// statement D1 ran.
+fn assert_meter_matches(db: &RusqliteSql, mut figure: impl FnMut(&str, u64) -> u64) {
     db.meter_writes().expect("meter");
     let mut wrong = Vec::new();
     let mut total = 0u64;
@@ -202,6 +249,7 @@ fn the_meter_matches_d1_statement_by_statement() {
         let metered = db.writes().since(&before).billed();
         match (measured, ran) {
             (Some(want), Ok(_)) => {
+                let want = &figure(sql, *want);
                 total += want;
                 if metered != *want {
                     wrong.push(format!("D1 {want}, meter {metered}: {sql}"));
@@ -224,6 +272,40 @@ fn the_meter_matches_d1_statement_by_statement() {
         wrong.join("\n")
     );
     assert_eq!(db.writes().billed(), total, "the report's total");
+}
+
+#[test]
+fn the_meter_matches_d1_statement_by_statement() {
+    // The figures are D1's on the schema without usage counters: the
+    // triggers are as the migration leaves them, writing nothing.
+    let db = RusqliteSql::with_schema_unarmed().expect("schema");
+    assert_meter_matches(&db, |_, measured| measured);
+}
+
+/// The same list on the schema of the next release, where the indexes
+/// `extents_safety` replaced are gone: an extent costs two entries less
+/// at its insert than before this release's migration (three less than
+/// with it), and an adopted part one less.
+#[test]
+fn the_meter_matches_d1_after_the_index_drops() {
+    // Without usage counters, as above.
+    let db = RusqliteSql::with_schema_unarmed().expect("schema");
+    db.apply(NEXT_DROP_SUPERSEDED_INDEXES)
+        .expect("the index drops apply");
+    let mut used = std::collections::BTreeSet::new();
+    assert_meter_matches(&db, |sql, measured| {
+        match MEASURED_AFTER_THE_DROPS
+            .iter()
+            .find(|(prefix, _)| sql.starts_with(prefix))
+        {
+            Some((prefix, figure)) => {
+                used.insert(*prefix);
+                *figure
+            }
+            None => measured,
+        }
+    });
+    assert_eq!(used.len(), MEASURED_AFTER_THE_DROPS.len());
 }
 
 #[test]

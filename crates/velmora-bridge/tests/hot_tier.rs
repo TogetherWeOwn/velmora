@@ -1012,18 +1012,40 @@ async fn garbage_collection_and_admin_evict_end_the_count() {
 // ---------------------------------------------------------------------------
 
 /// The statements the dispatcher and the eviction job run every time are
-/// answered from a partial covering index: no table scan, no sort.
+/// answered from a partial covering index: no table scan, no sort. Held
+/// on the schema as it is and as it will be once the next release has
+/// dropped the indexes that `extents_safety` replaces; until then the
+/// pinned total may be read from the older, narrower one.
 #[tokio::test(flavor = "current_thread")]
 async fn periodic_statements_read_only_their_index() {
     let hot = hot().await;
-    for (sql, index) in HOT_INDEX_ONLY {
-        let plan: Vec<String> = hot.bridge().catalog.sql.with_conn(|c| {
-            let sql = format!("EXPLAIN QUERY PLAN {}", sql.replace("?1", "10"));
-            let mut stmt = c.prepare(&sql).unwrap();
-            let rows = stmt.query_map((), |r| r.get::<_, String>(3)).unwrap();
-            rows.map(|r| r.unwrap()).collect()
-        });
-        let plan = plan.join(" | ");
+    let plans = || -> Vec<(&str, &str, String)> {
+        HOT_INDEX_ONLY
+            .iter()
+            .map(|(sql, index)| {
+                let plan: Vec<String> = hot.bridge().catalog.sql.with_conn(|c| {
+                    let sql = format!("EXPLAIN QUERY PLAN {}", sql.replace("?1", "10"));
+                    let mut stmt = c.prepare(&sql).unwrap();
+                    let rows = stmt.query_map((), |r| r.get::<_, String>(3)).unwrap();
+                    rows.map(|r| r.unwrap()).collect()
+                });
+                (*sql, *index, plan.join(" | "))
+            })
+            .collect()
+    };
+    for (sql, index, plan) in plans() {
+        let named = format!("USING COVERING INDEX {index}");
+        let replaced = "USING COVERING INDEX extents_pinned";
+        assert!(
+            plan.contains(&named) || (index == "extents_safety" && plan.contains(replaced)),
+            "{sql}\n{plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "{sql}\n{plan}");
+    }
+    let sql = &hot.bridge().catalog.sql;
+    sql.apply(velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES)
+        .unwrap();
+    for (sql, index, plan) in plans() {
         assert!(
             plan.contains(&format!("USING COVERING INDEX {index}")),
             "{sql}\n{plan}"

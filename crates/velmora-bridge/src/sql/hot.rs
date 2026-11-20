@@ -48,7 +48,7 @@ use crate::ports::{Sql, SqlValue};
 use crate::types::{EvictCandidate, ExtentId, HotStats, Result, UnixMs};
 
 /// True for an extent whose safety copy is pinned. The text matches the
-/// `extents_pinned` index.
+/// `extents_safety` index.
 macro_rules! pinned {
     () => {
         "safety_state IN ('held', 'releasing')"
@@ -107,7 +107,7 @@ const CANDIDATES: &str = concat!(
 pub const INDEX_ONLY: [(&str, &str); 3] = [
     (EVICTABLE_TOTAL, "extents_evictable"),
     (CANDIDATES, "extents_evictable"),
-    (PINNED_TOTAL, "extents_pinned"),
+    (PINNED_TOTAL, "extents_safety"),
 ];
 
 /// Evictable bytes and the extents that hold them.

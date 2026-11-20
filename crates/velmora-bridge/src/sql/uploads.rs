@@ -532,6 +532,21 @@ pub(super) async fn abort_upload<S: Sql>(
 // Complete
 // ---------------------------------------------------------------------------
 
+/// The extents generation `?1` adopted, as `e`: its references, kept to
+/// the extents first published in it. Every adopted extent has its
+/// reference by the time this is read, so these are the rows of
+/// `extents WHERE generation_id = ?1`, each found by its primary key.
+/// `CROSS JOIN` and the unary `+` fix that order. The trigger copies
+/// `seq` into the reference; `+e.seq = ge.seq` holds that, so the walk
+/// in `ge.seq` order is the extents' order, read from the primary key of
+/// `generation_extents` with no sort.
+macro_rules! adopted {
+    () => {
+        "generation_extents ge CROSS JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1 AND +e.generation_id = ?1 AND +e.seq = ge.seq"
+    };
+}
+
 /// Publishes the upload as one generation, in one batch.
 ///
 /// - Guard: the target is `open` at exactly `revision`, so the parts are
@@ -622,20 +637,37 @@ pub(super) async fn complete_upload<S: Sql>(
     ));
     // The references reads go through. `OR IGNORE`: the migration's
     // trigger records the same rows for the adoptions above.
+    //
+    // No statement of this batch filters `extents` by generation: no
+    // index serves that. The extents this generation adopted are found
+    // by primary key instead. Here from the parts of the upload, which
+    // an adopted extent always is one of ([`super::publish`]); below
+    // from the references this statement leaves, one per adopted extent.
     stmts.push((
         "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
-         SELECT generation_id, seq, id, plain_offset FROM extents WHERE generation_id = ?1",
-        vec![gen_id()],
+         SELECT e.generation_id, e.seq, e.id, e.plain_offset \
+           FROM (SELECT extent_id FROM upload_parts WHERE upload_id = ?2 \
+                 UNION SELECT extent_id FROM upload_part_extents WHERE upload_id = ?2) p \
+          CROSS JOIN extents e ON e.id = p.extent_id \
+          WHERE +e.generation_id = ?1",
+        vec![gen_id(), text(t.id.as_str())],
     ));
     stmts.push((
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-           (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
-           OR (SELECT COUNT(*) FROM extents WHERE generation_id = ?1) <> ?2 \
-           OR (SELECT COALESCE(SUM(plain_size), 0) FROM extents WHERE generation_id = ?1) <> ?3 \
-           OR EXISTS (SELECT 1 FROM (SELECT plain_offset, SUM(plain_size) OVER (ORDER BY seq \
-                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
-                FROM extents WHERE generation_id = ?1) \
-              WHERE plain_offset <> COALESCE(expected, 0))",
+        concat!(
+            "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
+               OR (SELECT COUNT(*) FROM ",
+            adopted!(),
+            ") <> ?2 \
+               OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM ",
+            adopted!(),
+            ") <> ?3 \
+               OR EXISTS (SELECT 1 FROM (SELECT e.plain_offset AS plain_offset, \
+                    SUM(e.plain_size) OVER (ORDER BY ge.seq \
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected FROM ",
+            adopted!(),
+            ") WHERE plain_offset <> COALESCE(expected, 0))"
+        ),
         vec![
             gen_id(),
             SqlValue::Int(i64::from(g.extent_count)),
@@ -656,8 +688,11 @@ pub(super) async fn complete_upload<S: Sql>(
         vec![text(t.id.as_str()), gen_id()],
     ));
     stmts.push((
-        "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-         SELECT id, generation_id, 'post', ?2, ?2 FROM extents WHERE generation_id = ?1",
+        concat!(
+            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+             SELECT e.id, e.generation_id, 'post', ?2, ?2 FROM ",
+            adopted!()
+        ),
         vec![gen_id(), ms(now)],
     ));
     // After adoption: whatever is still staged was not listed.

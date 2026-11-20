@@ -1198,20 +1198,46 @@ pub(super) async fn mark_sent<S: Sql>(
         .await
 }
 
+/// The attempts above which a row is in the `outbox_exhausted` index.
+/// The index says `attempts > 50` in its `WHERE`, and a statement is
+/// answered from it only when it spells the same condition, so the
+/// figure is part of the statement text below and not a bound value.
+pub const EXHAUSTED_INDEX_ATTEMPTS: u32 = 50;
+
+// The jobs' limit is never below the index's: every row the dispatcher
+// buries is in the index.
+const _: () = assert!(crate::jobs::MAX_ATTEMPTS >= EXHAUSTED_INDEX_ATTEMPTS);
+
+/// The bury for a limit at or above the index's: it reads the entries
+/// of `outbox_exhausted` (the rows out of attempts at a working stage)
+/// and nothing else, however many rows wait. `?1` narrows a higher
+/// limit further.
+pub const BURY_EXHAUSTED: &str = "UPDATE outbox INDEXED BY outbox_exhausted \
+       SET stage = 'dead', updated_at = ?2 \
+     WHERE attempts > 50 AND stage IN ('post', 'verify', 'release') AND attempts > ?1 \
+       AND (lease_until IS NULL OR lease_until < ?2)";
+
 /// Moves unleased rows with more than `max_attempts` claims to `dead`.
 pub(super) async fn bury_exhausted<S: Sql>(
     c: &SqlCatalog<S>,
     max_attempts: u32,
     now: UnixMs,
 ) -> Result<u64> {
+    // A limit below the index's would miss the rows between the two:
+    // those are read the long way. `jobs::MAX_ATTEMPTS` never is.
+    let sql = if max_attempts >= EXHAUSTED_INDEX_ATTEMPTS {
+        BURY_EXHAUSTED
+    } else {
+        "UPDATE outbox SET stage = 'dead', updated_at = ?2 \
+         WHERE stage IN ('post', 'verify', 'release') AND attempts > ?1 \
+           AND (lease_until IS NULL OR lease_until < ?2)"
+    };
     // Counted by the rows returned, not by the rows changed: a
     // usage-counter trigger adds to the latter.
     let buried = c
         .sql
         .query(
-            "UPDATE outbox SET stage = 'dead', updated_at = ?2 \
-             WHERE stage IN ('post', 'verify', 'release') AND attempts > ?1 \
-               AND (lease_until IS NULL OR lease_until < ?2) RETURNING 1",
+            &format!("{sql} RETURNING 1"),
             &[SqlValue::Int(i64::from(max_attempts)), ms(now)],
         )
         .await?;
@@ -1232,9 +1258,13 @@ pub(super) async fn redrive_underverified<S: Sql>(
 ) -> Result<u64> {
     let labels =
         serde_json::to_string(backbones).map_err(|_| BridgeError::Invalid("backbone labels"))?;
-    // One run looks at a window of `limit` held extents, read from the
-    // partial index alone, and the next run starts after it: the cost
-    // of a run does not grow with the number of held extents.
+    // One run looks at a window of `limit` pinned extents (held or
+    // releasing), read from the partial index alone, and the next run
+    // starts after it: the cost of a run does not grow with the number
+    // of pinned extents. The window counts releasing ones too, so a
+    // backlog of them is stepped over a window at a time rather than
+    // read whole in search of `limit` held ones; the update below takes
+    // the held ones of the window.
     let after = c
         .sql
         .query("SELECT v FROM scan_cursors WHERE k = 'redrive'", &[])
@@ -1247,7 +1277,11 @@ pub(super) async fn redrive_underverified<S: Sql>(
     let window = c
         .sql
         .query(
-            "SELECT id FROM extents INDEXED BY extents_held               WHERE safety_state = 'held' AND id > ?1 ORDER BY id LIMIT ?2",
+            // The condition is the index's own `WHERE`, word for word:
+            // the planner takes a partial index only then.
+            "SELECT id FROM extents INDEXED BY extents_safety \
+              WHERE safety_state IN ('held', 'releasing') \
+                AND id > ?1 ORDER BY id LIMIT ?2",
             &[text(&after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
@@ -1261,11 +1295,15 @@ pub(super) async fn redrive_underverified<S: Sql>(
         "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
            last_error = NULL, updated_at = ?1, ",
         unlease!(),
-        " WHERE stage = 'done' AND extent_id IN ( \
-           SELECT e.id FROM extents e INDEXED BY extents_held \
-             JOIN outbox o ON o.extent_id = e.id \
-            WHERE e.safety_state = 'held' AND e.id > ?4 AND e.id <= ?5 \
-              AND o.stage = 'done' AND ",
+        // Driven from the window of the index, each outbox row found by
+        // its key: `CROSS JOIN` fixes the order and the unary `+` keeps
+        // the planner off `outbox_due`, which would walk every `done`
+        // row (every extent ever posted) once per run.
+        " WHERE +stage = 'done' AND extent_id IN ( \
+           SELECT e.id FROM extents e INDEXED BY extents_safety \
+             CROSS JOIN outbox o ON o.extent_id = e.id \
+            WHERE e.safety_state IN ('held', 'releasing') AND e.safety_state = 'held' \
+              AND e.id > ?4 AND e.id <= ?5 AND +o.stage = 'done' AND ",
         live_ref!("e.id"),
         " AND (SELECT COUNT(*) FROM verifications v \
                     WHERE v.extent_id = e.id \

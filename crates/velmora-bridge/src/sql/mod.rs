@@ -81,6 +81,7 @@ mod uploads;
 pub mod usage;
 
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
+pub use outbox::{BURY_EXHAUSTED, EXHAUSTED_INDEX_ATTEMPTS};
 
 use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{

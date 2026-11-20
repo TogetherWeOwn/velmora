@@ -15,9 +15,9 @@
 //! The values are the outer loop (`CROSS JOIN`, and `FROM m` in the
 //! update), and the `+` keeps the filters on `extents` from being used
 //! as an index: the planner must find each extent by its primary key.
-//! Driven from `extents_by_generation` instead, the adopt scans the
-//! whole value once per extent row. `tests/sql_publish.rs` asserts the
-//! plan.
+//! Driven from an index on the generation instead
+//! (`extents_by_generation`, while it exists), the adopt scans the whole
+//! value once per extent row. `tests/sql_publish.rs` asserts the plan.
 
 use super::objects::{text, Stmt};
 use crate::ports::{SqlLimits, SqlValue};

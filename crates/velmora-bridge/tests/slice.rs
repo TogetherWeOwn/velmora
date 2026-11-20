@@ -39,7 +39,9 @@ use velmora::transports::NativeTlsTransport;
 use velmora_bridge::config::BridgeConfig;
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
+use velmora_bridge::testkit::{
+    FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, NEXT_DROP_SUPERSEDED_INDEXES,
+};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -3162,7 +3164,10 @@ async fn a_packed_plan_posted_but_not_recorded_is_not_posted_twice() {
 /// `(rows per extent, rows per object, bytes kept per extent)`: the bytes
 /// are what the catalogue holds for a released extent (`dbstat`, without
 /// the free space of its pages).
-async fn rows_written(packed_plans: &str, counters: bool) -> (u64, u64, i64) {
+/// `counters`: with the usage counters on, as production runs once
+/// counted. `dropped`: on the schema of the next release, without the
+/// indexes `extents_safety` replaced.
+async fn rows_written(packed_plans: &str, counters: bool, dropped: bool) -> (u64, u64, i64) {
     const DAY: u32 = 86_400;
     const EXTENT: usize = 16 * MIB;
     let rig = Rig::with_backbones(
@@ -3182,6 +3187,12 @@ async fn rows_written(packed_plans: &str, counters: bool) -> (u64, u64, i64) {
         // The usage counters as the migration leaves them: off.
         sql.apply("UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0")
             .expect("counters off");
+    }
+    if dropped {
+        sql.apply(NEXT_DROP_SUPERSEDED_INDEXES)
+            .expect("the index drops apply");
+        // The meter reads the schema again.
+        sql.reset_writes();
     }
     rig.setup_buckets_and_key(s).await;
 
@@ -3212,7 +3223,7 @@ async fn rows_written(packed_plans: &str, counters: bool) -> (u64, u64, i64) {
             rig.sql_count("SELECT COUNT(*) FROM outbox WHERE stage <> 'done'"),
         );
         let released = sql.writes();
-        println!("== PACKED_PLANS={packed_plans}, {label}: {extents} extent(s)");
+        println!("== PACKED_PLANS={packed_plans}, dropped={dropped}, {label}: {extents} extent(s)");
         println!("-- upload\n{}", uploaded.since(&start).render());
         println!("-- post and verify\n{}", verified.since(&uploaded).render());
         println!("-- release\n{}", released.since(&verified).render());
@@ -3251,7 +3262,7 @@ async fn rows_written(packed_plans: &str, counters: bool) -> (u64, u64, i64) {
     let per_object = w1 - per_extent * e1;
     let bytes = (b3 - b1) / (e3 - e1) as i64;
     println!(
-        "rows written, PACKED_PLANS={packed_plans}: {per_extent} per extent + {per_object} per object"
+        "rows written, PACKED_PLANS={packed_plans}, dropped={dropped}: {per_extent} per extent + {per_object} per object"
     );
     // 10^12 bytes of 16 MiB extents.
     let per_tb = 1_000_000_000_000 / EXTENT as i64;
@@ -3266,9 +3277,9 @@ async fn rows_written(packed_plans: &str, counters: bool) -> (u64, u64, i64) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn rows_written_per_extent() {
-    let rows = rows_written("off", true).await;
-    let packed = rows_written("on", true).await;
-    let uncounted = rows_written("on", false).await;
+    let rows = rows_written("off", true, false).await;
+    let packed = rows_written("on", true, false).await;
+    let uncounted = rows_written("on", false, false).await;
     println!(
         "rows written per extent: {} as rows, {} packed",
         rows.0, packed.0
@@ -3287,8 +3298,12 @@ async fn rows_written_per_extent() {
     // claim and the put-off, a row and an index entry each).
     // A verify job reads every backbone under one claim, and a job
     // that makes its calls within 20 s of its claim renews nothing.
+    //
+    // 48, not 46, while `extents_safety` and the two indexes it replaces
+    // exist side by side: its entry at the upload and at the start of
+    // the release. The drops give both back and three more.
     assert!(
-        uncounted.0 <= 46,
+        uncounted.0 <= 48,
         "rows written per packed extent: {}",
         uncounted.0
     );
@@ -3321,6 +3336,57 @@ async fn rows_written_per_extent() {
         packed.2
     );
     assert!(rows.2 >= 5 * packed.2, "{rows:?} {packed:?}");
+}
+
+/// The same on the schema of the next release, without the indexes
+/// `extents_safety` replaced: an extent of a multipart upload is three
+/// writes cheaper than before this release (its part, twice, and its
+/// adoption).
+#[tokio::test(flavor = "current_thread")]
+async fn rows_written_per_extent_after_the_index_drops() {
+    let packed = rows_written("on", false, true).await;
+    assert!(
+        packed.0 <= 43,
+        "rows written per packed extent: {}",
+        packed.0
+    );
+    assert!(packed.1 <= 21, "rows written per object: {}", packed.1);
+}
+
+/// Rows written by one PutObject of one extent, the common upload.
+async fn rows_written_per_put(dropped: bool) -> u64 {
+    let rig = Rig::with_backbones(&[("PACKED_PLANS", "on")], 2).await;
+    let s = "rows written per PutObject";
+    let sql = &rig.bridge.catalog.sql;
+    // The figures are without the usage counters, as the migration
+    // leaves them (the `uncounted` case of `rows_written`).
+    sql.apply("UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0")
+        .expect("counters off");
+    rig.setup_buckets_and_key(s).await;
+    if dropped {
+        sql.apply(NEXT_DROP_SUPERSEDED_INDEXES)
+            .expect("the index drops apply");
+        sql.reset_writes();
+    }
+    // The first write of a key and an overwrite cost the same here; the
+    // second is measured, so nothing a first request sets up is counted.
+    let r = rig.put("/slice/w/put.bin", &test_bytes(7, 4096)).await;
+    expect_status(s, "PutObject", 200, &r);
+    let before = sql.writes();
+    let r = rig.put("/slice/w/put2.bin", &test_bytes(8, 4096)).await;
+    expect_status(s, "PutObject", 200, &r);
+    let written = sql.writes().since(&before);
+    println!("-- PutObject, dropped={dropped}\n{}", written.render());
+    written.billed()
+}
+
+/// What an upload writes: 16 rows before this release, 17 while the old
+/// and the new index of the pinned set exist side by side, 14 once the
+/// old ones are dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn rows_written_per_put_object() {
+    assert_eq!(rows_written_per_put(false).await, 17);
+    assert_eq!(rows_written_per_put(true).await, 14);
 }
 
 #[test]

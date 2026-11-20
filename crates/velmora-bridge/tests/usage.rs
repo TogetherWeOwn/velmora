@@ -942,6 +942,9 @@ async fn an_old_worker_is_not_disturbed_until_the_counters_are_on() {
     for script in before_0020() {
         old.apply(script).unwrap();
     }
+    // And the migrations after it: the usage counters are the only
+    // difference between the two.
+    old.apply(MIGRATION_0021).unwrap();
     add_buckets(&old);
     old.meter_writes().unwrap();
     let expected = old_worker_changes(&old).await;
