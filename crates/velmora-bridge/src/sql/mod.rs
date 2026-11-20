@@ -83,6 +83,10 @@ pub mod usage;
 pub use hot::INDEX_ONLY as HOT_INDEX_ONLY;
 pub use outbox::{BURY_EXHAUSTED, EXHAUSTED_INDEX_ATTEMPTS};
 
+use std::cell::Cell;
+use std::rc::Rc;
+
+use crate::gate::PermitGate;
 use crate::plan::{PackReport, StoredPlan};
 use crate::ports::{
     Catalog, GrantPut, Guard, KeyHead, Lease, Permit, PermitClass, PublishOutcome, Sql, SqlValue,
@@ -114,14 +118,50 @@ const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
 /// deletes it.
 pub(crate) struct GuardRefused(());
 
+/// Puts what the gates hold in place of what the slot rows say.
+fn overlay(load: &mut [ProviderLoad], held: &[crate::gate::GateLoad]) {
+    for l in load {
+        let g = held.iter().find(|g| g.provider == l.provider_id);
+        l.held = g.map_or(0, |g| g.held);
+        l.holders = g.map_or(0, |g| g.holders);
+        l.background_holders = g.map_or(0, |g| g.background_holders);
+        l.uses = g.map_or(0, |g| g.uses);
+    }
+}
+
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
     pub sql: S,
+    /// Hands out provider permits from memory instead of slot rows
+    /// while it is active ([`crate::gate`]).
+    gate: Option<Rc<dyn PermitGate>>,
+    /// When this catalogue last ran the rollout step after an acquire
+    /// that found nothing.
+    nudged: Cell<i64>,
 }
 
 impl<S: Sql> SqlCatalog<S> {
     pub fn new(sql: S) -> Self {
-        SqlCatalog { sql }
+        SqlCatalog {
+            sql,
+            gate: None,
+            nudged: Cell::new(0),
+        }
+    }
+
+    /// The catalogue with a permit gate. Whether permits come from it
+    /// or from the slot rows is the gate's [`PermitGate::active`].
+    pub fn with_gate(sql: S, gate: Rc<dyn PermitGate>) -> Self {
+        SqlCatalog {
+            sql,
+            gate: Some(gate),
+            nudged: Cell::new(0),
+        }
+    }
+
+    /// The gate, while permits come from it.
+    fn active_gate(&self) -> Option<&dyn PermitGate> {
+        self.gate.as_deref().filter(|g| g.active())
     }
 }
 
@@ -516,7 +556,17 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         permits: &[Permit],
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
-        outbox::renew_all(self, l, permits, now).await
+        match self.active_gate() {
+            // The lease stays a fenced row; the permits are renewed at
+            // their gate in the same round.
+            Some(gate) => {
+                let (lease, held) =
+                    futures_util::future::join(outbox::renew(self, l, now), gate.renew(permits))
+                        .await;
+                Ok((lease?, held?))
+            }
+            None => outbox::renew_all(self, l, permits, now).await,
+        }
     }
     async fn record_verification(&self, l: &Lease, v: &VerificationRow) -> Result<bool> {
         outbox::record_verification(self, l, v).await
@@ -706,7 +756,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
 
     // provider permits
     async fn seed_permits(&self, providers: &[ProviderConfig]) -> Result<()> {
-        permits::seed_permits(self, providers).await
+        permits::seed_permits(self, providers).await?;
+        // A gate that cannot be reached is told again by the next call:
+        // the rest of the caller's work does not wait for it.
+        let _ = permits::sweep_gates(self, self.gate.as_deref()).await;
+        Ok(())
     }
     async fn acquire_permit(
         &self,
@@ -715,18 +769,69 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         holder: &str,
         now: UnixMs,
     ) -> Result<Option<Permit>> {
-        permits::acquire_permit(self, p, class, holder, now).await
+        let permit = match self.active_gate() {
+            Some(gate) => gate.acquire(p, class, holder).await?,
+            None => permits::acquire_permit(self, p, class, holder, now).await?,
+        };
+        // After a change of `PERMITS` the other side may still own the
+        // slots: the rollout step runs now, not at the next sweep. A
+        // gate says so itself when it is not in charge; the slot rows
+        // cannot, so there nothing free is taken for it. At most once
+        // per [`NUDGE_EVERY_MS`], and a failure of it is not a failure
+        // of the acquire.
+        if let (None, Some(gate)) = (&permit, self.gate.as_deref()) {
+            let due = match gate.active() {
+                true => gate.unowned(),
+                false => true,
+            };
+            if due && (now.0 - self.nudged.get()).abs() >= permits::NUDGE_EVERY_MS {
+                self.nudged.set(now.0);
+                let _ = permits::sweep_gates(self, Some(gate)).await;
+            }
+        }
+        Ok(permit)
     }
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool> {
-        permits::renew_permit(self, p, now).await
+        match self.active_gate() {
+            Some(gate) => Ok(gate
+                .renew(core::slice::from_ref(p))
+                .await?
+                .first()
+                .copied()
+                .unwrap_or(false)),
+            None => permits::renew_permit(self, p, now).await,
+        }
     }
     async fn release_permit(&self, p: &Permit) -> Result<()> {
-        permits::release_permit(self, p).await
+        match self.active_gate() {
+            Some(gate) => gate.release(p).await,
+            None => permits::release_permit(self, p).await,
+        }
+    }
+    fn forget_permit(&self, p: &Permit) {
+        if let Some(gate) = self.active_gate() {
+            gate.forget(p);
+        }
     }
 
     // provider pool
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
-        health::provider_load(self, now).await
+        let mut load = health::provider_load(self, now).await?;
+        if let Some(gate) = self.active_gate() {
+            // The slot rows are the gate's as a whole; what is in use
+            // is what the gates have handed out, as they last told
+            // this caller: the order of providers is a preference, and
+            // not worth a request to every gate.
+            overlay(&mut load, &gate.hint(now));
+        }
+        Ok(load)
+    }
+    async fn provider_status(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        let mut load = health::provider_load(self, now).await?;
+        if let Some(gate) = self.active_gate() {
+            overlay(&mut load, &gate.load().await?);
+        }
+        Ok(load)
     }
     async fn provider_failed(
         &self,

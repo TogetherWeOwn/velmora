@@ -573,6 +573,19 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // Where permits come from: absent or blank is the catalogue's
+        // slot rows, as before the switch existed. The Worker reads it,
+        // not this configuration.
+        if name == "PERMITS" {
+            use velmora_bridge::gate::PermitMode;
+            for _ in 0..2 {
+                load(&vars).unwrap();
+                let mode = PermitMode::from_var(vars.get(name).map(String::as_str));
+                assert_eq!(mode, Ok(PermitMode::Catalog));
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // The job budget: absent or blank is the request budget, which
         // is the smaller of the two bounds, so nothing fails open.
         if name == "JOB_BUDGET_BYTES" {
@@ -2744,5 +2757,94 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
         sent.sort();
         sent.dedup();
         assert_eq!(sent.len(), producers.len(), "{env}: a queue bound twice");
+    }
+}
+
+/// The tables of the shipped `wrangler.toml` by their first key, split
+/// into production's and those of an `[env.*]` environment, plus the
+/// first key of every line above the first table (root keys, which
+/// may name a table inline or dotted, e.g. `exports.X.type = ...`). A
+/// TOML header names its table from the root wherever it stands, so a
+/// table is production's by its name, not by its place in the file.
+/// Spaces, quotes and a trailing comment do not change a name.
+fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let toml = std::fs::read_to_string(path).unwrap();
+    let name = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect()
+    };
+    let (mut prod, mut env, mut root) = (Vec::new(), Vec::new(), Vec::new());
+    let mut seen_table = false;
+    for line in toml.lines() {
+        // No name in this file holds a `#`, so a comment starts at the first.
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            seen_table = true;
+            let header = line[..line.rfind(']').unwrap() + 1].to_string();
+            let path = name(header.trim_matches(|c| c == '[' || c == ']'));
+            if path.starts_with("env.") {
+                env.push(path);
+            } else {
+                prod.push(path);
+            }
+        } else if !seen_table {
+            if let Some((key, _)) = line.split_once('=') {
+                root.push(name(key));
+            }
+        }
+    }
+    (prod, env, root)
+}
+
+/// A Durable Object class can never be rolled back past, so production
+/// declares and binds the permit gate in deploys of their own, after the
+/// code that knows `PERMITS` has run ("Shipping the gate" in
+/// ops/README.md). Until then the production tables hold no class, no
+/// Durable Object binding and `PERMITS = "d1"`. The pull requests that
+/// add the class (deploy 2) and its binding (deploy 3) change this test
+/// on purpose. The legacy `[[migrations]]` array is never used: once a
+/// class is declared by `exports`, a deploy that declares one by
+/// `[[migrations]]` is refused.
+#[test]
+fn production_declares_no_durable_object_class_yet() {
+    let (prod, env, root) = wrangler_tables();
+    let gate = |key: &str| {
+        let first = key.split('.').next().unwrap_or_default();
+        [
+            "exports",
+            "durable_objects",
+            "migrations",
+            "version_metadata",
+        ]
+        .contains(&first)
+    };
+    for key in prod.iter().chain(&root) {
+        assert!(
+            !gate(key),
+            "production {key}: the gate ships in deploys of its own"
+        );
+    }
+    let (vars, dev) = wrangler_vars();
+    assert_eq!(vars.get("PERMITS").map(String::as_str), Some("d1"));
+    assert_eq!(dev.get("PERMITS").map(String::as_str), Some("d1"));
+    assert!(
+        !env.iter().any(|t| t.ends_with(".migrations")),
+        "a legacy [[migrations]] table"
+    );
+    // Dev (the end-to-end run with PERMITS = "do") declares and binds it.
+    for table in [
+        "env.dev.exports.PermitGate",
+        "env.dev.durable_objects.bindings",
+        "env.dev.version_metadata",
+    ] {
+        assert!(env.iter().any(|t| t == table), "dev lacks [{table}]");
     }
 }

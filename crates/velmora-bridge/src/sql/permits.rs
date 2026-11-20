@@ -51,6 +51,7 @@
 
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
+use crate::gate::{PermitGate, GATE_HOLDER_PREFIX, GATE_IDLE_PREFIX, SEIZED_UNTIL_MS};
 use crate::ports::{Permit, PermitClass, Sql, SqlValue};
 use crate::types::{ProviderConfig, Result, UnixMs};
 
@@ -86,6 +87,44 @@ async fn seed<S: Sql>(c: &SqlCatalog<S>, p: &ProviderConfig) -> Result<u64> {
             &[text(&p.id), SqlValue::Int(i64::from(p.max_conns))],
         )
         .await
+}
+
+/// The least time between two rollout steps one catalogue runs because
+/// an acquire found nothing.
+pub(super) const NUDGE_EVERY_MS: i64 = 30_000;
+
+/// The rollout step of the permit gates ([`crate::gate`]): reads which
+/// gates hold slot rows and lets the gate client tell each one whether
+/// it is in charge. Without a gate there is nothing to do.
+pub(super) async fn sweep_gates<S: Sql>(
+    c: &SqlCatalog<S>,
+    gate: Option<&dyn PermitGate>,
+) -> Result<()> {
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    let rows = c
+        .sql
+        .query(
+            "SELECT DISTINCT holder FROM provider_permits \
+             WHERE lease_until = ?1 AND holder IS NOT NULL ORDER BY holder",
+            &[SqlValue::Int(SEIZED_UNTIL_MS)],
+        )
+        .await?;
+    let mut seized_by = Vec::with_capacity(rows.len());
+    for row in rows {
+        let holder = Cols::new(row).text()?;
+        // A retired gate that has not freed its rows yet is told again.
+        let name = holder
+            .strip_prefix(GATE_HOLDER_PREFIX)
+            .or_else(|| holder.strip_prefix(GATE_IDLE_PREFIX));
+        if let Some(name) = name {
+            if !seized_by.iter().any(|n| n == name) {
+                seized_by.push(name.to_string());
+            }
+        }
+    }
+    gate.sweep(&seized_by).await
 }
 
 // One statement, so the pool count and the take cannot interleave with

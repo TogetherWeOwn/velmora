@@ -13,6 +13,7 @@ pub mod copy;
 pub mod crypto;
 pub mod fanout;
 pub mod fetch;
+pub mod gate;
 pub mod hosts;
 pub mod ingress;
 pub mod intents;

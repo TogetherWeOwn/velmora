@@ -48,6 +48,8 @@
 #   VELMORA_ADMIN_TOKEN_FILE  admin bearer file, mode 0600 (remote only)
 #   STEP4_TIMEOUT_SECS        step 4 poll limit (default 180 local, 900 remote)
 #   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
+#   E2E_PERMITS               local: d1 or do, the PERMITS the Worker runs
+#                             with (default: the dev var in wrangler.toml)
 #   E2E_SLICED                0 skips step 0c (a 99 MiB PutObject) against a
 #                             remote that runs without MAX_PUT_BYTES
 #
@@ -221,6 +223,12 @@ if [[ $MODE == local ]]; then
       printf 'DEV_DROP_NOTIFY_N=%s\n' "$1"
       # Dev only: every tombstone put waits this long first (step 7b).
       printf 'DEV_TOMBSTONE_PUT_DELAY_MS=%s\n' "${2:-0}"
+      # Where provider permits come from; unset leaves the shipped var.
+      case ${E2E_PERMITS:-} in
+        '') ;;
+        d1 | do) printf 'PERMITS=%s\n' "$E2E_PERMITS" ;;
+        *) fail "E2E_PERMITS" "d1 or do" "$E2E_PERMITS" ;;
+      esac
     } >"$WORKER_DIR/.dev.vars"
     chmod 600 "$WORKER_DIR/.dev.vars"
   }
@@ -1229,6 +1237,15 @@ if [[ $MODE == local ]]; then
   else
     log "rclone not on PATH: its purge is skipped"
   fi
+fi
+
+# With E2E_PERMITS=do the permits of this run came from the gate: its
+# start is in the Worker's log.
+if [[ $MODE == local && ${E2E_PERMITS:-} == do ]]; then
+  STEP=permits
+  n=$(grep -c 'permit gate started' "$T/wrangler.log" || true)
+  [[ $n -ge 1 ]] || fail "the permit gate served this run" "a 'permit gate started' line in the Worker's log" "$n lines"
+  log "permit gate: started $n time(s)"
 fi
 
 STEP=finished

@@ -1551,7 +1551,7 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         Err(e) => return Err(internal(&e)),
     };
     let now = bridge.clock.now();
-    let load = bridge.catalog.provider_load(now).await.or_internal()?;
+    let load = bridge.catalog.provider_status(now).await.or_internal()?;
     // Identity is `id` and `backbone` only: never a host or a login.
     let providers: Vec<Value> = bridge
         .cfg

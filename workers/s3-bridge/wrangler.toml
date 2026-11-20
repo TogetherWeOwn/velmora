@@ -131,6 +131,15 @@ INTENT_SWEEP = "off"
 # A missing or refused value stops the copy only, with an error line on
 # every cron run; it never stops the S3 service.
 RECOVERY_COPY = "off"
+# d1 | do. Where provider connection permits come from. d1: slot rows of
+# the catalogue (provider_permits), a row write for every acquire,
+# renewal and release. do: the permit gate (see below) holds them in memory
+# and the catalogue writes none. Both kinds of Worker can run against one
+# catalogue: a gate hands out nothing on an account until it holds every
+# slot row of it, and gives the rows back only once nothing it handed out
+# is live. Change it in a deploy of its own, with the provider limits and
+# pools unchanged in that deploy. See "Permit gate" in ops/README.md.
+PERMITS = "d1"
 # Optional vars and their defaults (production sets POST_SOCKETS and COLD_SOCKETS explicitly):
 #   SLICE_BYTES (8388608, 8 MiB): the slice of a PutObject or UploadPart body above MAX_EXTENT_BYTES; at most MAX_EXTENT_BYTES.
 #   MAX_OBJECT_EXTENTS (10000): most extents one object is made of, 1 to 10000. CompleteMultipartUpload, and an UploadPart
@@ -196,6 +205,19 @@ dataset = "velmora_requests"
 [[services]]
 binding = "SELF"
 service = "velmora-s3"
+
+# The permit gate (src/gate.rs, class PermitGate) is not declared or
+# bound here yet, so this Worker takes its permits from the catalogue
+# (PERMITS = "d1" above; "do" without the binding refuses to start).
+# Declaring a Durable Object class is a deploy that can never be rolled
+# back past, so the class, its binding and PERMITS = "do" each come in a
+# deploy of their own, in this order (see "Shipping the gate" in
+# ops/README.md, which has the exact tables):
+#   2. `[exports.PermitGate]` alone (one-way; nothing can reach it).
+#   3. The `PERMIT_GATE` binding and `[version_metadata]` (reversible).
+#   4. PERMITS = "do" (reversible).
+# Never with the legacy `[[migrations]]` array: once a class is declared
+# by `exports`, Cloudflare refuses a deploy that goes back to it.
 
 [[d1_databases]]
 binding = "CATALOG"
@@ -408,7 +430,7 @@ crons = ["*/5 * * * *"]
 # invocations, which is never the looser count.
 
 [env.dev]
-vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608" }
+vars = { ENVIRONMENT = "dev", S3_HOST = "127.0.0.1:8787", REQUIRED_BACKBONES = "1", SAFETY_MIN_AGE_SECS = "0", VERIFY_DELAY_SECS = "1", DEV_TRUST_HTTP = "1", NEWSGROUPS = "alt.binaries.test", MAX_EXTENT_BYTES = "16777216", S3_REGION = "auto", VELMORA_KEK_ACTIVE = "1", INFLIGHT_BUDGET_BYTES = "50331648", GC_MODE = "disposable", MAINTENANCE = "off", SERVER_SIDE_COPY = "on", PACKED_PLANS = "on", MAX_PUT_BYTES = "103809024", INTENT_SWEEP = "on", GET_FANOUT_BYTES = "8388608", PERMITS = "d1" }
 # dev secrets come from workers/s3-bridge/.dev.vars (gitignored; see .dev.vars.example).
 # Environments do not inherit bindings, so dev repeats them all, under
 # its own resource names (-dev) so a dev run can never touch prod data.
@@ -420,6 +442,21 @@ dataset = "velmora_requests_dev"
 [[env.dev.services]]
 binding = "SELF"
 service = "velmora-s3-dev"
+
+# The permit gate, declared and bound in dev only (the CI end-to-end
+# run takes its permits from it with PERMITS = "do"). Production
+# declares the class later, in a deploy of its own (see the comment
+# above [[d1_databases]]).
+[env.dev.exports.PermitGate]
+type = "durable-object"
+storage = "sqlite"
+
+[[env.dev.durable_objects.bindings]]
+name = "PERMIT_GATE"
+class_name = "PermitGate"
+
+[env.dev.version_metadata]
+binding = "CF_VERSION_METADATA"
 
 [[env.dev.d1_databases]]
 binding = "CATALOG"

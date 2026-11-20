@@ -1187,11 +1187,21 @@ pub trait Catalog {
     ) -> Result<Option<Permit>>;
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool>;
     async fn release_permit(&self, p: &Permit) -> Result<()>;
+    /// The holder of `p` is gone without releasing it: whatever is
+    /// kept open for it on this side is dropped, with nothing awaited.
+    /// The slot itself frees when its permit expires, or sooner.
+    fn forget_permit(&self, _p: &Permit) {}
 
     // provider pool
     /// Held slots, slots ever handed out and health, per provider that
     /// has a permit or a health row.
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>>;
+    /// [`Self::provider_load`] for the operator's status: what is held
+    /// at this moment, where `provider_load` may go by what its caller
+    /// last heard.
+    async fn provider_status(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
+        self.provider_load(now).await
+    }
     /// One failed session, and why. Repeated failures start a cooldown; a
     /// failure reported while the provider is cooling changes nothing.
     async fn provider_failed(

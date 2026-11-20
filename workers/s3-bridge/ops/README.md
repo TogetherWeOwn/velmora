@@ -527,6 +527,11 @@ the code real data relies on. Never roll back past the floor:
   switch on or off: off only stops new plans from being packed, and
   every such version reads both forms.
 
+- **Once deploy 2 of "Shipping the gate" (the `PermitGate` class) has
+  been deployed:** never to a version from before it; Cloudflare
+  refuses it (code 100402). Before that, a version that knows `PERMITS`
+  rolls back like any other. See "Permit gate".
+
 - **Once `RECORD_LAYOUT=tenant` has been deployed:** never to a version
   older than the first one that knows `RECORD_LAYOUT`. From then on a
   recovery record can be stored under `m/x/<tenant id>/`. An older
@@ -771,6 +776,284 @@ service, so such a value is not dropped by hand. The replay (below)
 replaces it: for each extent of a record it reads the stored plan, and
 one that cannot be read gives way to the plan in the extent's record.
 A plan that reads is left as it is.
+
+## Permit gate
+
+A provider permit is the right to hold one connection to one provider
+account: `max_conns`, `max_ips` and the pool limits are enforced by
+handing permits out. `PERMITS` chooses where they are kept:
+
+- `d1` (default, also when unset): slot rows in the catalogue
+  (`provider_permits`). Every acquire, renew and release writes a row.
+- `do`: in the memory of a Durable Object (`PermitGate`, binding
+  `PERMIT_GATE`). A holder (a job, a cold read) opens one WebSocket to
+  each object it needs; its first acquire travels with the opening,
+  and every renewal, further acquire and release is a message on it.
+  Calls a job makes at the same moment travel together. Nothing is
+  written for a permit: the permits of a session are kept with its
+  socket, the object leaves memory between two messages and finds them
+  again when the next one comes. When the socket ends (the job is
+  done, its invocation ended or failed) its permits are free at once.
+  The object stores one small record: written at the first start after
+  a deploy, and every 10 minutes while permits of a class are live.
+
+There is one object per provider account, named
+`permits:account.<id>:0`. Accounts that share `pool_max_conns` have one
+object for the pool (`permits:pool.<pool>:0`): a limit can only be kept
+by an object that sees everything under it. Two optional vars change
+that:
+
+- `PERMIT_SHARDS` (1 to 64, default 1) divides each account or pool
+  over that many objects, `permits:<unit>:<shard>`. One object answers
+  its requests in turn, about 1,000 a second; an account needs a second
+  object only when its permit calls come near that. Each object takes
+  the slots `n` with `n % shards == shard` and the matching part of
+  `max_ips` and of the pool limit. No account gets more objects than
+  its smallest limit (`max_conns`, `max_ips`, `pool_max_conns`) less
+  the one connection or address that limit keeps back for reads, so
+  that every object has a connection and an address to hand out to a
+  job. (`max_ips = 2` therefore means one object, whatever
+  `PERMIT_SHARDS` says.) A holder asks one object first and the others
+  only when that one has nothing left.
+- `PERMIT_GATES = "one"` puts every account behind the same objects
+  (`permits:all:<shard>`). That is the least duration to pay for (see
+  "Cost") and the lowest ceiling on requests.
+
+Change `PERMIT_SHARDS`, `PERMIT_GATES`, which pool an account is in, or
+(with more than one shard) a provider's limits only while `PERMITS` is
+`d1` and no gate holds rows (the query below is empty). An object
+keeps the rows it seized under the old division, and the objects of
+the new one wait for them without end: an account moved out of a pool
+that still has other members gets no permit, and one moved into
+another pool stops that pool too, until a round trip through `d1`.
+With three or more shards, a change of `max_conns` while both versions
+of a deploy run can also move address shares between objects and pass
+`max_ips` for that time.
+
+A permit is a limit on connections, not a guard of data: the lease
+token of a job in the catalogue is unchanged and still fences every
+write.
+
+### Restarts
+
+The object leaves memory about ten seconds after its last message and
+comes back at the next one with every open socket and the permits kept
+with it. That is not a restart, costs nothing and makes nobody wait.
+
+A deploy can cut every socket. The object then knows no holder, while
+Workers may still hold connections under permits of the old version.
+So:
+
+- The first start under a new version that is within the stored
+  horizon of the old permits (whether or not a socket is still listed
+  as open) waits until
+  every one of them has run out: up to 125 s for jobs and 40 s for
+  reads (the lease lengths plus 5 s), counted from the first request
+  after the deploy (the cron's, at the latest). During the jobs' wait
+  a read may use only the connection and the address that are kept
+  back for reads. The wait is stored with the version, so later starts
+  neither forget it nor begin it again.
+- A start with no horizon ahead (nothing was handed out for more than
+  10 minutes) hands out at once.
+- Permits from before the deploy are neither renewed nor released by
+  the new object. A job that cannot renew stops and is retried by the
+  queue, as it does when a slot row is lost.
+
+Not covered: an object that is reset without a deploy (it crashed, its
+machine was lost) while holders are connected through it. Their sockets
+are cut, their permits are free at once, and each of them goes on
+until its next renewal fails. A job renews every 20 s and before every
+call to the provider, and a call may run for 80 s: up to about 100 s
+for a job, 25 s for a read. In
+that time the account can be asked for more connections than
+`max_conns`; the provider refuses the extra ones and the job that was
+refused is retried. Closing this would take two stored rows for every
+busy period of every object.
+
+The version comes from the `CF_VERSION_METADATA` binding; without it
+the object answers every request with an error.
+
+Every time the object comes into memory it logs one line, `permit gate
+started: sessions=… jobs_until=… reads_until=… warm_until=… seized=…`.
+`warm_until` in the future is the wait after a deploy.
+
+### Turning it on, and back
+
+Old and new Workers run side by side during a deploy, one side asking
+the catalogue and one the gate. The slot rows decide between them, so
+the two together never exceed a limit: the gate hands out on a provider
+only while it holds every slot row of its part of it under the holder
+`do-gate:<gate>`, and every other row of the account (and of every
+account of its pool) is held by a gate of the same account or pool. It
+takes a row only when the row is free, so the gates start once the
+catalogue's callers have let go of the whole account. A gate told to
+retire keeps its rows, renamed `do-gate-idle:<gate>`, once none of its
+own permits is live; the rows of an account or pool become free
+together, when its last gate has retired. With several shards the
+address and pool limits are shared out among the gates, so the account
+is either all the gates' or all the catalogue's, never part of each.
+
+A gate that comes into memory under the version it last ran as takes
+what it stored about the rows. Its first start under a new version
+(every change of `PERMITS` is one), the cron (every 5 minutes) and
+every return to charge ask the catalogue again. Do not edit `do-gate:`
+rows by hand while `PERMITS` is `do`.
+
+1. Ship the class and its binding with `PERMITS = "d1"`, in the three
+   deploys of "Shipping the gate" below. Nothing calls the gate yet.
+2. In a deploy of its own, set `PERMITS = "do"`. Do not change a
+   provider's limits, pools or the provider list in that deploy, and do
+   not split its traffic by percentage: both sides must agree on the
+   slots. Jobs and cold reads pause until the rows have changed hands:
+   at most the length of the permits still held (120 s for jobs, 35 s
+   for reads), usually a few seconds.
+3. Check:
+
+   ```
+   SELECT provider_id, holder, COUNT(*) FROM provider_permits
+    WHERE holder IS NOT NULL GROUP BY 1, 2;
+   ```
+
+   Every row reads `do-gate:<gate>`. `/_admin/status` shows the permits
+   in use as before.
+
+To go back, set `PERMITS = "d1"` in a deploy of its own and keep the
+`PERMIT_GATE` binding. The first acquire that finds no free slot (and
+the cron, every 5 minutes) tells each gate that still holds rows to
+retire; the gates free them once their permits have run out. The query
+above is then empty or shows job holders. In `d1` mode a gate that
+cannot be reached delays only this hand-back, not the cron's other
+work.
+
+`PERMITS = "d1"` is not quite the code from before the gate: the cron
+and an acquire that finds no free slot (at most every 30 s) read the
+slot rows once more, to find gates to retire, and a job closes its
+provider sessions before it frees their slots.
+
+A rollback to a version from before the class (deploy 2 below) is not
+possible once deploy 2 is live: Cloudflare refuses it. This includes
+the automatic rollback of deploy 2 itself; if that deploy fails, fix
+forward (below). `do-gate:` and `do-gate-idle:` rows never run out by
+themselves. To clear them by hand, only with no Worker in `do` mode and
+after the longest permit has run out (125 s):
+
+```
+UPDATE provider_permits SET holder = NULL, lease_until = 0, pool = NULL
+ WHERE holder LIKE 'do-gate:%' OR holder LIKE 'do-gate-idle:%';
+```
+
+### Shipping the gate
+
+A Worker version that declares a Durable Object class can never be
+rolled back past: Cloudflare refuses a rollback, a `versions deploy`
+and a traffic split to any version from before the class (code 100402
+for a class declared by `exports`; 10210 for the legacy `[[migrations]]`
+array). So the class goes out on its own, with the same code that has
+already run, and nothing that uses it comes in the same deploy. The
+shipped `wrangler.toml` declares the class for `env.dev` only; the
+production tables come in three later pull requests, each a deploy of
+its own, in this order:
+
+| # | change to the production tables | rollback | merge the next one when |
+| - | ------------------------------- | -------- | ----------------------- |
+| 1 | none: the code that knows `PERMITS`, with `PERMITS = "d1"` and no class or binding | as for any release | about a day of normal traffic |
+| 2 | `[exports.PermitGate]` alone | none past it, ever | its deploy job is green |
+| 3 | the `PERMIT_GATE` binding and `[version_metadata]` | to deploy 2 | its deploy job is green and the active version has the binding |
+| 4 | `PERMITS = "do"` (step 2 above) | `PERMITS = "d1"`, or to deploy 3 | n/a |
+
+Merge each one only when the deploy before it is live and green. The
+deploy job ships the tip of main and rolls back to the version it
+replaced, so two of these merged close together go out as one deploy:
+2 with 3 would put the binding into the one deploy that has no
+rollback, and 3 with 4 would
+make the job's rollback target a version without the binding, which
+strands the gates' slot rows (below).
+
+Deploy 2 adds, at the top level of `wrangler.toml` (never with
+`[[migrations]]`: once a class is declared by `exports`, a deploy that
+declares it by `[[migrations]]` again is refused, code 100403):
+
+```toml
+[exports.PermitGate]
+type = "durable-object"
+storage = "sqlite"
+```
+
+Deploy 3 adds:
+
+```toml
+[[durable_objects.bindings]]
+name = "PERMIT_GATE"
+class_name = "PermitGate"
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+```
+
+Rules for deploy 2:
+
+- It goes out with `wrangler deploy` at 100 %, through the deploy job,
+  after deploy 1 has served normal traffic for about a day. A version
+  that adds a class cannot be uploaded with `versions upload` together
+  with its binding, and cannot share traffic with an older version.
+- It goes out last in the queue: every change waiting to ship goes
+  before it, so that no wanted version is left below the floor it sets.
+- If its smoke test fails, the deploy job's automatic rollback is
+  refused (code 100402) and the job fails at that step. The new version
+  keeps serving. Nothing is bound to the class and the code is the code
+  of deploy 1, so run the smoke test again; if it still fails, set
+  `MAINTENANCE` as needed and ship a fix forward. The class stays.
+
+After deploy 3 a fault is undone in the ordinary way: a rollback to
+the deploy 2 version (the job does it). After deploy 4, set
+`PERMITS = "d1"` again or roll back to the deploy 3 version, which
+keeps the binding, so the gates can hand their slot rows back (see
+above). Never roll back to a version without the `PERMIT_GATE` binding
+while the query above shows a `do-gate:` or `do-gate-idle:` row: no
+Worker could then tell the gates to let go, and those slots stay taken.
+
+Never delete the class to undo it. An unused class with no object
+costs nothing. Removing it takes a version without the class in its
+code plus a `state = "deleted"` entry under `[exports.PermitGate]` in
+one deploy (a deletion is refused while the code still exports the
+class), and is a class change of its own, with no rollback. After a
+deletion, a rollback to a version that declares the class creates it
+again, empty, and a later rollback to the deleting version deletes it
+again with whatever it held. Never reuse the name of a deleted class.
+
+### Cost
+
+Measured on a throwaway deployment (three accounts capped at two or
+three connections, four gate objects, 11 extents of 16 MiB per mode):
+
+| per 16 MiB extent              | `PERMITS=d1` | `PERMITS=do` |
+| ------------------------------ | ------------ | ------------ |
+| rows written to the catalogue  | 55.8         | 49.2         |
+| of those, slot rows            | about 6      | 0            |
+| billed requests to the gates   | 0            | 13 to 31     |
+| rows written by the gates      | 0            | about 1.3    |
+| gate duration, GB-s            | 0            | 0.12         |
+
+- A job opens one session with each gate it takes a slot at: one
+  billed request each, about two per job. The gates were entered 31
+  times per extent; 13 is that count with a message as a twentieth
+  and the end of a session as nothing, which is how they are priced
+  as far as the price list says. Renewals and the release
+  are messages on it, billed at a twentieth of a request. An extent is
+  about five job runs (the post, its retries and the checks).
+- A permit writes nothing. A gate writes its record once per
+  10 minutes of use and twice after a deploy (once more for each
+  further account or pool it serves), whatever the load.
+- A gate is in memory only while it answers: its sessions keep the
+  permits while it sleeps. An idle deployment asks each gate once per
+  cron run and writes nothing.
+- The time a job takes to get its slots was 47 ms at the median
+  against 354 ms with slot rows; the first job after a start of a
+  gate that has to ask the catalogue for its rows took 3.1 s.
+
+At the list prices of late 2026 that is $3.2 to $3.4 per TB posted in
+gate mode against $3.3 with slot rows: about the same bill, with the
+slot rows out of the catalogue's write path.
 
 ## The route
 
