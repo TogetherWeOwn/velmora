@@ -327,21 +327,31 @@ async fn a_release_the_guard_refuses_writes_nothing() {
                 done.unwrap()
             }
         };
-        let unchanged = |what: &str| {
+        // The whole of both rows: the stage, the tries, the next run.
+        let rows = || {
+            format!(
+                "{:?}",
+                (catalog.extent(&s.extent), catalog.outbox(&s.extent))
+            )
+        };
+        let unchanged = |before: &str, what: &str| {
             assert!(rig.held(&s), "{check:?}: {what}");
             assert_eq!(rig.stage(&s), OutboxStage::Release, "{check:?}: {what}");
+            assert_eq!(rows(), before, "{check:?}: {what}");
         };
         let now = rig.bridge.clock.now();
+        let before = rows();
 
         // Every pass on record is older than this claim.
         assert_eq!(release(now).await, Guard::Lost, "{check:?}");
-        unchanged("no pass under this claim");
+        unchanged(&before, "no pass under this claim");
 
         // The passes count now; the lease has run out.
         catalog.edit(&s.extent, |e| e.outbox.claimed_at = UnixMs(0));
         let until = catalog.outbox(&s.extent).lease_until.expect("leased");
+        let before = rows();
         assert_eq!(release(UnixMs(until.0 + 1)).await, Guard::Lost, "{check:?}");
-        unchanged("the lease ran out");
+        unchanged(&before, "the lease ran out");
 
         // In time: released, with the evidence, and the row done.
         assert_eq!(release(until).await, Guard::Applied(()), "{check:?}");
