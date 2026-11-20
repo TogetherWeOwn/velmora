@@ -734,18 +734,23 @@ const NO_COPY: &str = "e.safety_state = 'deleted' AND e.plan IS NULL \
 /// Extent ids per statement of [`unreadable_plans`].
 const LOST_CHUNK: usize = 50;
 
-/// Extents per query of [`has_unread_extent`]. Each row it returns
-/// carries a packed plan, so the answer is bounded by this and not by
-/// what a statement value may hold.
+/// Extents per query of [`has_unread_extent`] that asks for the sizes
+/// of their packed plans. The plans themselves are asked for in runs
+/// bounded by their bytes ([`SqlLimits::result_bytes`]): a plan grows
+/// with the articles of its extent, so a number of rows does not bound
+/// an answer that carries plans.
 const UNREAD_ROWS: usize = 500;
 
 /// Whether one of the extents has no copy anywhere. One query per value
 /// of placements ([`super::publish::placement_values`]).
+///
+/// Asked after the batch of a replay was refused, so through
+/// [`Sql::query_after_refusal`].
 async fn has_lost_extent<S: Sql>(c: &SqlCatalog<S>, values: &[String]) -> Result<bool> {
     for value in values {
         let rows = c
             .sql
-            .query(
+            .query_after_refusal(
                 &format!(
                     "SELECT 1 FROM json_each(?1) j \
                        CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
@@ -775,38 +780,91 @@ async fn has_unread_extent<S: Sql>(
         ..limits
     };
     for value in super::publish::placement_values(placements, window)? {
-        let rows = c
+        // Which of them have a plan to judge, and how large it is.
+        let sizes = c
             .sql
             .query(
-                "SELECT e.id, e.cipher_size, e.plan FROM json_each(?1) j \
+                "SELECT e.id, length(e.plan) FROM json_each(?1) j \
                    CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
                   WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL",
                 &[SqlValue::Text(value)],
             )
             .await?;
-        for row in rows {
+        let mut sized = Vec::with_capacity(sizes.len());
+        for row in sizes {
             let mut r = super::uploads::Cols::new(row);
-            let id = ExtentId::new(r.text()?);
-            let cipher_size: u64 = r.num()?;
-            let stored = r.blob()?;
-            if crate::plan::expand(&id, cipher_size, &stored, None, None).is_err() {
-                return Ok(true);
+            let id = r.text()?;
+            let bytes: u64 = r.num()?;
+            sized.push((id, bytes));
+        }
+        for ids in plan_runs(&sized, limits)? {
+            let rows = c
+                .sql
+                .query(
+                    "SELECT e.id, e.cipher_size, e.plan FROM json_each(?1) j \
+                       CROSS JOIN extents e ON e.id = j.value \
+                      WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL",
+                    &[SqlValue::Text(ids)],
+                )
+                .await?;
+            for row in rows {
+                let mut r = super::uploads::Cols::new(row);
+                let id = ExtentId::new(r.text()?);
+                let cipher_size: u64 = r.num()?;
+                let stored = r.blob()?;
+                if crate::plan::expand(&id, cipher_size, &stored, None, None).is_err() {
+                    return Ok(true);
+                }
             }
         }
     }
     Ok(false)
 }
 
+/// The ids of `sized` (an extent id and the bytes of its plan) as JSON
+/// arrays, in order, each naming plans of at most
+/// `limits.result_bytes` together, or one plan that is larger than that
+/// on its own.
+fn plan_runs(sized: &[(String, u64)], limits: SqlLimits) -> Result<Vec<String>> {
+    let budget = u64::try_from(limits.result_bytes).unwrap_or(u64::MAX);
+    let mut runs = Vec::new();
+    let mut run = String::new();
+    let mut held = 0u64;
+    for (id, bytes) in sized {
+        let id = serde_json::to_string(id)
+            .map_err(|_| BridgeError::Invalid("an extent id that is not JSON text"))?;
+        let full = held.saturating_add(*bytes) > budget
+            || run.len().saturating_add(id.len()).saturating_add(2) > limits.value_bytes;
+        if !run.is_empty() && full {
+            run.push(']');
+            runs.push(core::mem::take(&mut run));
+            held = 0;
+        }
+        run.push(if run.is_empty() { '[' } else { ',' });
+        run.push_str(&id);
+        held = held.saturating_add(*bytes);
+    }
+    if !run.is_empty() {
+        run.push(']');
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
 /// The id of the live generation of the key of `g`, if it is the same
 /// object: the same size and ETag, and exactly the extents of
 /// `placements` at their places. The placements are compared in SQL, a
 /// value at a time; no extent row is loaded.
+///
+/// A replay asks this of a record whose batch was just refused, so
+/// every read goes through [`Sql::query_after_refusal`].
 pub(super) async fn replay_twin<S: Sql>(
     c: &SqlCatalog<S>,
     g: &GenerationRow,
     placements: &[ExtentPlacement],
 ) -> Result<Option<GenerationId>> {
-    let Some(live) = super::objects::live_generation(c, &g.bucket_id, &g.key).await? else {
+    let Some(live) = super::objects::live_generation_asked(c, &g.bucket_id, &g.key, true).await?
+    else {
         return Ok(None);
     };
     // Each `seq` once: together with the counts below, every reference
@@ -828,7 +886,7 @@ pub(super) async fn replay_twin<S: Sql>(
     let wanted = placements.len() as u64;
     let held = count(
         c.sql
-            .query(
+            .query_after_refusal(
                 "SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1",
                 &[text(live.id.as_str())],
             )
@@ -841,7 +899,7 @@ pub(super) async fn replay_twin<S: Sql>(
     for value in super::publish::placement_values(placements, c.sql.limits())? {
         same += count(
             c.sql
-                .query(
+                .query_after_refusal(
                     "SELECT COUNT(*) FROM json_each(?2) j CROSS JOIN generation_extents ge \
                          ON ge.generation_id = ?1 AND ge.seq = json_extract(j.value,'$[1]') \
                       WHERE ge.extent_id = json_extract(j.value,'$[0]') \
@@ -855,20 +913,25 @@ pub(super) async fn replay_twin<S: Sql>(
 }
 
 /// Whether the catalogue knows an older generation of the key of `g`,
-/// live or not.
-async fn has_older<S: Sql>(c: &SqlCatalog<S>, g: &GenerationRow) -> Result<bool> {
-    let older = c
-        .sql
-        .query(
-            "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
-               AND id < ?3 LIMIT 1",
-            &[
-                text(g.bucket_id.as_str()),
-                text(&g.key),
-                text(g.id.as_str()),
-            ],
-        )
-        .await?;
+/// live or not. `after_refusal`: the batch of the replay was just
+/// refused, and the read goes through [`Sql::query_after_refusal`].
+async fn has_older<S: Sql>(
+    c: &SqlCatalog<S>,
+    g: &GenerationRow,
+    after_refusal: bool,
+) -> Result<bool> {
+    let sql = "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
+               AND id < ?3 LIMIT 1";
+    let params = [
+        text(g.bucket_id.as_str()),
+        text(&g.key),
+        text(g.id.as_str()),
+    ];
+    let older = if after_refusal {
+        c.sql.query_after_refusal(sql, &params).await?
+    } else {
+        c.sql.query(sql, &params).await?
+    };
     Ok(!older.is_empty())
 }
 
@@ -903,7 +966,7 @@ pub(super) async fn replay_publish<S: Sql>(
     // a replay), and only for a key that has an older generation: the
     // one case in which it decides.
     let limits = c.sql.limits();
-    if has_older(c, g).await? && has_unread_extent(c, placements, limits).await? {
+    if has_older(c, g, false).await? && has_unread_extent(c, placements, limits).await? {
         return Ok(ReplayPublish::Damaged);
     }
     let values = super::publish::placement_values(placements, limits)?;
@@ -1010,7 +1073,7 @@ pub(super) async fn replay_publish<S: Sql>(
         Err(BridgeError::GuardFailed) => {
             // Which guard refused it. Nothing else writes during a
             // replay, so the catalogue is as the batch found it.
-            if has_older(c, g).await? && has_lost_extent(c, &values).await? {
+            if has_older(c, g, true).await? && has_lost_extent(c, &values).await? {
                 Ok(ReplayPublish::Damaged)
             } else {
                 Ok(ReplayPublish::Refused)

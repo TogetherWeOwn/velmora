@@ -199,6 +199,7 @@ mod tests {
         let limits = SqlLimits {
             value_bytes: 1_900_000,
             set_rows: 100,
+            result_bytes: SqlLimits::D1.result_bytes,
         };
         let values = placement_values(&all, limits).unwrap();
         assert_eq!(values.len(), 3);
@@ -233,6 +234,7 @@ mod tests {
         let exact = SqlLimits {
             value_bytes: size,
             set_rows: 25_000,
+            result_bytes: SqlLimits::D1.result_bytes,
         };
         let values = placement_values(&all, exact).unwrap();
         assert_eq!(values.len(), 1);
@@ -250,6 +252,7 @@ mod tests {
             let limits = SqlLimits {
                 value_bytes,
                 set_rows: 25_000,
+                result_bytes: SqlLimits::D1.result_bytes,
             };
             let values = placement_values(&all, limits).unwrap();
             assert!(
@@ -276,6 +279,7 @@ mod tests {
         let limits = SqlLimits {
             value_bytes: entry - 1,
             set_rows: 25_000,
+            result_bytes: SqlLimits::D1.result_bytes,
         };
         assert!(matches!(
             placement_values(&all, limits),

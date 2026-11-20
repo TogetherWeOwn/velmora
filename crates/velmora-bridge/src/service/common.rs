@@ -576,13 +576,14 @@ pub(super) async fn check_precondition<
     key: &str,
     condition: &Precondition,
 ) -> Result<(), S3Response> {
+    // The ETag is on the generation row; no extent row is read for it.
     let live = bridge
         .catalog
-        .live_object(bucket, key)
+        .live_generation(bucket, key)
         .await
         .map_err(|_| internal())?;
     condition
-        .check(live.as_ref().map(|(g, _)| g.etag.as_str()))
+        .check(live.as_ref().map(|g| g.etag.as_str()))
         .map_err(precondition_error)
 }
 

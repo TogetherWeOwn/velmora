@@ -61,6 +61,18 @@ pub trait Sql {
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64>;
     /// Atomic. Returns rows changed per statement.
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>>;
+    /// [`Self::query`] for a read that is asked right after a batch was
+    /// refused: the read that finds out which guard refused it.
+    ///
+    /// A database may charge a refused batch in full and answer the
+    /// statements after a large one with an error for some seconds (D1
+    /// does: "D1 DB is overloaded", measured at 65,536 extents). An
+    /// adapter for such a database waits and asks again here, a bounded
+    /// number of times. A read is repeated safely; no write goes this
+    /// way. The default asks once.
+    async fn query_after_refusal(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.query(sql, params).await
+    }
     /// What one statement may carry on this database. An adapter for a
     /// database with other limits says so here; catalogue code never
     /// writes such a figure down itself.
@@ -88,6 +100,10 @@ pub struct SqlLimits {
     pub value_bytes: usize,
     /// Most rows one such value describes.
     pub set_rows: usize,
+    /// Most bytes of stored values (the packed plans of extents) one
+    /// query is asked to return. A row count does not bound them: a plan
+    /// grows with the articles of its extent.
+    pub result_bytes: usize,
 }
 
 impl SqlLimits {
@@ -95,10 +111,13 @@ impl SqlLimits {
     /// measured with there, in values of up to 1.3 MB. The byte limit is
     /// not from that measurement: it is D1's documented limit of a bound
     /// value ([`MAX_SQL_VALUE_BYTES`]) less a margin, and no value of
-    /// 25,000 placements comes near it.
+    /// 25,000 placements comes near it. Nor are the 8 MiB of a result:
+    /// they are far below what D1 returns for one query, and far above
+    /// the plan of one extent.
     pub const D1: SqlLimits = SqlLimits {
         value_bytes: 1_900_000,
         set_rows: 25_000,
+        result_bytes: 8 * 1024 * 1024,
     };
 }
 

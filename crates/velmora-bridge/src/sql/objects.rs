@@ -194,15 +194,28 @@ pub(super) async fn live_generation<S: Sql>(
     bucket: &BucketId,
     key: &str,
 ) -> Result<Option<GenerationRow>> {
+    live_generation_asked(c, bucket, key, false).await
+}
+
+/// [`live_generation`], asked through [`Sql::query_after_refusal`] when
+/// `after_refusal` is set: the caller follows a batch that was refused.
+pub(super) async fn live_generation_asked<S: Sql>(
+    c: &SqlCatalog<S>,
+    bucket: &BucketId,
+    key: &str,
+    after_refusal: bool,
+) -> Result<Option<GenerationRow>> {
     let sql = format!(
         "SELECT {GENERATION_COLS} FROM objects o JOIN generations g \
          ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
          WHERE o.bucket_id = ?1 AND o.key = ?2"
     );
-    let rows = c
-        .sql
-        .query(&sql, &[text(bucket.as_str()), text(key)])
-        .await?;
+    let params = [text(bucket.as_str()), text(key)];
+    let rows = if after_refusal {
+        c.sql.query_after_refusal(&sql, &params).await?
+    } else {
+        c.sql.query(&sql, &params).await?
+    };
     rows.into_iter().next().map(generation_row).transpose()
 }
 
@@ -243,11 +256,65 @@ const PLACED_EXTENT_COLS: &str =
      e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
      e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at";
 
+/// The last `seq` of generation `?1` whose reference begins at or
+/// before (`$cmp` is `<=`) or before (`<`) the offset `$at`, as a
+/// recursive common table expression named `$name`; -1 when there is
+/// none. Its answer is the row with `hi - lo <= 1`.
+///
+/// Offsets rise with `seq`, so the condition holds for a run of
+/// references from the first on, and the end of that run is found by
+/// halving `(lo, hi)`: `lo` is -1 or a `seq` the condition holds for,
+/// `hi` is one past the last `seq` or a `seq` it does not hold for. Each
+/// step seeks the primary key twice, once for each bound it sets: about
+/// 17 steps and 34 seeks for 131,072 references, where walking the key
+/// backwards read every reference behind the range.
+///
+/// Writers number references from 0 without a gap, but nothing in the
+/// schema says so. A step therefore reads the first reference at or
+/// after the middle rather than the one exactly there: the condition
+/// still holds for a run from the first `seq` on, and a `seq` that has
+/// no reference stands for the next one that has.
+macro_rules! bisect {
+    ($name:literal, $cmp:literal, $at:literal) => {
+        concat!(
+            $name,
+            "(lo, hi) AS (SELECT -1, COALESCE((SELECT MAX(seq) + 1 FROM generation_extents \
+                WHERE generation_id = ?1), 0) \
+              UNION ALL \
+              SELECT CASE WHEN (SELECT plain_offset FROM generation_extents \
+                                 WHERE generation_id = ?1 AND seq >= (b.lo + b.hi) / 2 \
+                                 ORDER BY seq LIMIT 1) ",
+            $cmp,
+            " ",
+            $at,
+            " THEN (b.lo + b.hi) / 2 ELSE b.lo END, \
+                     CASE WHEN (SELECT plain_offset FROM generation_extents \
+                                 WHERE generation_id = ?1 AND seq >= (b.lo + b.hi) / 2 \
+                                 ORDER BY seq LIMIT 1) ",
+            $cmp,
+            " ",
+            $at,
+            " THEN b.hi ELSE (b.lo + b.hi) / 2 END \
+                FROM ",
+            $name,
+            " b WHERE b.hi - b.lo > 1)"
+        )
+    };
+}
+
+/// The extents of `generation` that hold plaintext `[start, end)`.
+///
 /// Offsets rise with `seq`, so the range is one run of the primary key:
 /// from the last reference that begins at or before `start` to the last
-/// that begins before `end`. Both ends are found by walking the key
-/// backwards, which reads the references behind the range and no extent
-/// row; only the extents of the range itself are joined.
+/// that begins before `end`. Both ends are found by bisecting `seq`
+/// (`bisect!`), which reads a few references whatever the size of the
+/// object and no extent row; only the extents of the range itself are
+/// joined.
+///
+/// Which rows a range selects is not covered by the authentication of
+/// an extent. The reader checks that what it is given tiles the range
+/// (`service/get.rs`, `pieces`), and `tests/sql_objects.rs` holds this
+/// statement to the one it replaced.
 pub(super) async fn extents_in<S: Sql>(
     c: &SqlCatalog<S>,
     generation: &GenerationId,
@@ -258,16 +325,15 @@ pub(super) async fn extents_in<S: Sql>(
         return Err(bad("range offset"));
     };
     let sql = format!(
-        "SELECT {PLACED_EXTENT_COLS} \
+        "WITH RECURSIVE {first}, {last} \
+         SELECT {PLACED_EXTENT_COLS} \
          FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
          WHERE ge.generation_id = ?1 \
-           AND ge.seq >= COALESCE((SELECT s.seq FROM generation_extents s \
-                 WHERE s.generation_id = ?1 AND s.plain_offset <= ?2 \
-                 ORDER BY s.seq DESC LIMIT 1), 0) \
-           AND ge.seq <= COALESCE((SELECT s.seq FROM generation_extents s \
-                 WHERE s.generation_id = ?1 AND s.plain_offset < ?3 \
-                 ORDER BY s.seq DESC LIMIT 1), -1) \
-         ORDER BY ge.seq"
+           AND ge.seq >= (SELECT MAX(lo, 0) FROM first_ref WHERE hi - lo <= 1) \
+           AND ge.seq <= (SELECT lo FROM last_ref WHERE hi - lo <= 1) \
+         ORDER BY ge.seq",
+        first = bisect!("first_ref", "<=", "?2"),
+        last = bisect!("last_ref", "<", "?3"),
     );
     let rows = c
         .sql

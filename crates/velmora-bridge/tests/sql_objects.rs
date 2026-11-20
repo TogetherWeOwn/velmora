@@ -30,6 +30,8 @@ struct Probe {
     last_batch: RefCell<Vec<&'static str>>,
     /// Every statement run on its own, in order.
     ran: RefCell<Vec<String>>,
+    /// Every query, in order.
+    asked: RefCell<Vec<String>>,
 }
 
 fn check_params(params: &[SqlValue]) {
@@ -48,6 +50,7 @@ impl Sql for Probe {
         if sql.starts_with("UPDATE ") {
             self.ran.borrow_mut().push(sql.to_owned());
         }
+        self.asked.borrow_mut().push(sql.to_owned());
         self.db.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
@@ -83,6 +86,7 @@ impl Fx {
                 batches: Cell::new(0),
                 last_batch: RefCell::new(vec![]),
                 ran: RefCell::new(vec![]),
+                asked: RefCell::new(vec![]),
             }),
             next_id: Cell::new(1),
         }
@@ -2211,4 +2215,296 @@ async fn list_heads_refuses_more_than_one_batch() {
             .await,
         Err(BridgeError::Invalid(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// The extents of a byte range
+// ---------------------------------------------------------------------------
+
+/// The statement `extents_in` ran before it bisected `seq`: both ends of
+/// the run found by reading the references of the generation backwards
+/// until one begins low enough. It is right at any size and slow at a
+/// large one, which makes it the model the new statement is held to.
+const EXTENTS_IN_BY_WALK: &str = "SELECT ge.seq \
+     FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+     WHERE ge.generation_id = ?1 \
+       AND ge.seq >= COALESCE((SELECT s.seq FROM generation_extents s \
+             WHERE s.generation_id = ?1 AND s.plain_offset <= ?2 \
+             ORDER BY s.seq DESC LIMIT 1), 0) \
+       AND ge.seq <= COALESCE((SELECT s.seq FROM generation_extents s \
+             WHERE s.generation_id = ?1 AND s.plain_offset < ?3 \
+             ORDER BY s.seq DESC LIMIT 1), -1) \
+     ORDER BY ge.seq";
+
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+impl Fx {
+    /// Publishes an object whose extents have the given sizes.
+    async fn uneven(&self, bucket: &BucketId, key: &str, sizes: &[u64]) -> GenerationRow {
+        let mut c = self.commit(bucket, key, sizes.len() as u32, T0);
+        let tag = self.seed();
+        let mut offset = 0;
+        for (seq, (row, size)) in c.extents.iter_mut().zip(sizes).enumerate() {
+            let mut raw = [tag; 13];
+            raw[1..5].copy_from_slice(&(seq as u32).to_be_bytes());
+            row.id = ExtentId::mint(raw);
+            row.plain_offset = Some(offset);
+            row.plain_size = *size;
+            offset += size;
+        }
+        c.generation.size = offset;
+        self.cat.publish(&c).await.unwrap();
+        c.generation
+    }
+
+    fn by_walk(&self, generation: &GenerationId, start: u64, end: u64) -> Vec<u32> {
+        self.cat.sql.db.with_conn(|c| {
+            let mut stmt = c.prepare_cached(EXTENTS_IN_BY_WALK).unwrap();
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![generation.as_str(), start as i64, end as i64],
+                    |r| r.get::<_, u32>(0),
+                )
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        })
+    }
+
+    /// Asks for a range both ways and holds the answers to each other
+    /// and to the sizes the object was written with.
+    async fn same_run(&self, g: &GenerationRow, sizes: &[u64], start: u64, end: u64) {
+        let got = self.cat.extents_in(&g.id, start, end).await.unwrap();
+        let seqs: Vec<u32> = got.iter().map(|e| e.seq.unwrap()).collect();
+        let walked = self.by_walk(&g.id, start, end);
+        assert_eq!(seqs, walked, "range {start}..{end} of {sizes:?}");
+        let mut offset = 0;
+        let placed: Vec<(u64, u64)> = sizes
+            .iter()
+            .map(|size| {
+                offset += size;
+                (offset - size, *size)
+            })
+            .collect();
+        for e in &got {
+            let (at, size) = placed[e.seq.unwrap() as usize];
+            assert_eq!((e.plain_offset, e.plain_size), (Some(at), size));
+        }
+        // Every byte of the range that the object has is in the run.
+        let have = end.min(g.size);
+        if start < have {
+            let (first, last) = (got.first().unwrap(), got.last().unwrap());
+            assert!(first.plain_offset.unwrap() <= start, "{start}..{end}");
+            assert!(
+                last.plain_offset.unwrap() + last.plain_size >= have,
+                "{start}..{end}"
+            );
+        }
+    }
+}
+
+/// The bisecting statement returns the rows the walking one did, for
+/// objects of uneven extents and the ranges a client can name: the first
+/// byte, the last, one byte on either side of every border, suffixes,
+/// ranges that end past the object and ranges that begin past it.
+#[tokio::test(flavor = "current_thread")]
+async fn extents_in_matches_the_statement_it_replaced() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+    let counts = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 257];
+    for (n, count) in counts.into_iter().enumerate() {
+        // Extents of no bytes share their offset with the one after.
+        let mut sizes: Vec<u64> = (0..count)
+            .map(|_| match rng.below(8) {
+                0 => 1,
+                1 => 1 + rng.below(3),
+                2 | 3 => 0,
+                _ => 1 + rng.below(5_000),
+            })
+            .collect();
+        if sizes.iter().sum::<u64>() == 0 {
+            sizes[0] = 1;
+        }
+        let g = fx.uneven(&b.id, &format!("k{n}"), &sizes).await;
+        let size = g.size;
+
+        let mut ranges = vec![
+            (0, 1),
+            (size - 1, size),
+            (0, size),
+            (0, size + 1),
+            (size - 1, size + 10),
+            (size, size + 1),
+            (size + 5, size + 9),
+            (0, 0),
+            (size, size),
+            (0, u64::MAX >> 1),
+        ];
+        let mut border = 0;
+        for s in &sizes {
+            border += s;
+            for at in [border.saturating_sub(2), border.saturating_sub(1), border] {
+                // One byte at and next to the border, a range across
+                // it, and the suffix that begins there.
+                ranges.push((at, at + 1));
+                ranges.push((at, at + 3));
+                ranges.push((at, size));
+                ranges.push((at, at));
+            }
+        }
+        for _ in 0..200 {
+            let start = rng.below(size + 3);
+            let len = match rng.below(3) {
+                0 => 1,
+                1 => rng.below(40),
+                _ => rng.below(size + 3),
+            };
+            ranges.push((start, start + len));
+        }
+        // Suffix ranges: the last `n` bytes.
+        for _ in 0..50 {
+            let n = 1 + rng.below(size);
+            ranges.push((size - n, size));
+        }
+        for (start, end) in ranges {
+            fx.same_run(&g, &sizes, start, end).await;
+        }
+    }
+
+    // Runs of empty extents at the start, in the middle and at the end.
+    let sizes = [0, 0, 3, 0, 0, 5, 0, 0];
+    let g = fx.uneven(&b.id, "zeros", &sizes).await;
+    for start in 0..10 {
+        for end in start..11 {
+            fx.same_run(&g, &sizes, start, end).await;
+        }
+    }
+
+    // An empty object is one extent of no bytes; an unknown generation
+    // has no rows.
+    let empty = fx.uneven(&b.id, "empty", &[0]).await;
+    for (start, end) in [(0, 0), (0, 1), (1, 2)] {
+        fx.same_run(&empty, &[0], start, end).await;
+    }
+    let unknown = GenerationId::mint(T0, [0xEE; 8]);
+    assert!(fx.cat.extents_in(&unknown, 0, 10).await.unwrap().is_empty());
+    assert!(fx.by_walk(&unknown, 0, 10).is_empty());
+}
+
+/// Writers number the references of a generation from 0 without a gap,
+/// and nothing in the schema holds them to it. Where numbers are missing
+/// the bisection still returns what the walk returned: a missing number
+/// stands for the next reference that exists.
+#[tokio::test(flavor = "current_thread")]
+async fn extents_in_matches_the_walk_where_numbers_are_missing() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+    for (n, count) in [2u64, 5, 16, 33, 100].into_iter().enumerate() {
+        let sizes = vec![5u64; count as usize];
+        let g = fx.uneven(&b.id, &format!("k{n}"), &sizes).await;
+        // Drop about a third of the references, in runs, at either end
+        // and in the middle; always keep one.
+        let mut gone = vec![];
+        for seq in 0..count {
+            if rng.below(3) == 0 && gone.len() as u64 + 1 < count {
+                gone.push(seq);
+            }
+        }
+        fx.cat.sql.db.with_conn(|c| {
+            for seq in &gone {
+                let n = c
+                    .execute(
+                        "DELETE FROM generation_extents WHERE generation_id = ?1 AND seq = ?2",
+                        rusqlite::params![g.id.as_str(), *seq as i64],
+                    )
+                    .unwrap();
+                assert_eq!(n, 1);
+            }
+        });
+        let size = g.size;
+        for start in 0..size + 2 {
+            for end in [start, start + 1, start + 7, size, size + 3] {
+                let got = fx.cat.extents_in(&g.id, start, end).await.unwrap();
+                let seqs: Vec<u32> = got.iter().map(|e| e.seq.unwrap()).collect();
+                let walked = fx.by_walk(&g.id, start, end);
+                assert_eq!(seqs, walked, "{start}..{end} of {count} without {gone:?}");
+            }
+        }
+    }
+}
+
+/// A range read reaches `generation_extents` through its primary key
+/// alone and `extents` by id: nothing in the plan walks the references
+/// of the object, whatever their number.
+#[tokio::test(flavor = "current_thread")]
+async fn extents_in_only_searches_the_primary_key() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    let g = fx.uneven(&b.id, "k", &[5; 40]).await;
+    fx.cat.sql.asked.borrow_mut().clear();
+    let before = fx.cat.sql.queries.get();
+    let got = fx.cat.extents_in(&g.id, 101, 112).await.unwrap();
+    assert_eq!(
+        got.iter().map(|e| e.seq.unwrap()).collect::<Vec<_>>(),
+        [20, 21, 22]
+    );
+    assert_eq!(fx.cat.sql.queries.get() - before, 1);
+    let asked = fx.cat.sql.asked.borrow().clone();
+    let plan: Vec<String> = fx.cat.sql.db.with_conn(|c| {
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", asked[0]))
+            .unwrap();
+        let mut rows = stmt.raw_query();
+        let mut lines = vec![];
+        while let Some(row) = rows.next().unwrap() {
+            lines.push(row.get::<_, String>(3).unwrap());
+        }
+        lines
+    });
+    let text = plan.join("\n");
+    let mut references = 0;
+    for line in &plan {
+        if line.contains("generation_extents") || line.starts_with("SEARCH ge ") {
+            references += 1;
+            assert!(
+                line.starts_with("SEARCH") && line.contains("USING PRIMARY KEY"),
+                "{line}\n{text}"
+            );
+        }
+        // The only rows read without a key are the steps of the two
+        // bisections, which are a handful each.
+        if line.starts_with("SCAN") {
+            assert!(
+                [
+                    "SCAN b",
+                    "SCAN first_ref",
+                    "SCAN last_ref",
+                    "SCAN CONSTANT ROW"
+                ]
+                .contains(&line.as_str()),
+                "{line}\n{text}"
+            );
+        }
+        assert!(!line.contains("TEMP B-TREE"), "{line}\n{text}");
+    }
+    // The count, the two probes of each bisection and the range itself.
+    assert!(references >= 5, "{text}");
+    assert!(
+        text.contains("SEARCH e USING INDEX sqlite_autoindex_extents_1 (id=?)")
+            || text.contains("SEARCH e USING PRIMARY KEY"),
+        "{text}"
+    );
 }

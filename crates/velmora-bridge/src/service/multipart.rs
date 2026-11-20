@@ -1053,7 +1053,7 @@ where
         return Err(ErrorCode::InvalidRequest.into());
     }
     let key = super::copy::source_key(&a.headers, &a.policy, &a.bucket)?;
-    let (source, extents) = super::copy::source_object(bridge, &a.headers, &a.bucket, &key).await?;
+    let source = super::copy::source_generation(bridge, &a.headers, &a.bucket, &key).await?;
     let (start, len) = match a.headers.get("x-amz-copy-source-range") {
         Some(range) => copy_range(range, source.size)?,
         None => (0, source.size),
@@ -1061,6 +1061,12 @@ where
     if len > bridge.cfg.max_extent_bytes {
         return Err(ErrorCode::EntityTooLarge.into());
     }
+    // The extents of the range alone, by the generation the conditions
+    // were judged on: a source of any size costs the rows of one part.
+    // An empty source has no byte to ask for; its one empty extent
+    // begins at 0, where a range of one byte looks.
+    let end = start.checked_add(len.max(1)).ok_or(Fail::Internal)?;
+    let extents = bridge.catalog.extents_in(&source.id, start, end).await?;
     // The read holds what it needs piece by piece and hands back the
     // charge for the plaintext. Charging for the seal before the read
     // would leave a full-size extent no room to be read in.
