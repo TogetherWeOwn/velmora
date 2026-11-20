@@ -67,11 +67,18 @@ use crate::types::{
     ExtentRow, GenerationId, Result, UnixMs,
 };
 
-/// How much one call does. The default keeps a call below half of a
-/// Worker invocation's subrequest limit (10,000): a record costs one
-/// blob read and up to six catalogue calls, an extent two blob reads
-/// (three when its plan is looked for in a second layout) and a share
-/// of a catalogue batch.
+/// How much one call does. A record costs two blob reads (the record,
+/// and whether it is still there before it is published) and up to
+/// seven catalogue calls, an extent two blob reads (three when its
+/// plan is looked for in a second layout) and a share of a catalogue
+/// batch. With the default that is about 3,500 blob reads and 2,000
+/// catalogue calls, a little over half of a Worker invocation's
+/// subrequest limit (10,000). The most a call can come to is higher:
+/// the extents asked ahead are no more than `extents`, but those of a
+/// record the step then leaves out (it belongs to a bucket made again
+/// under the same name) were asked for nothing, and the step asks for
+/// as many again: up to 3,000 blob reads more with the default, which
+/// is still below the limit.
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayLimits {
     /// Records listed and finished at most.
@@ -80,9 +87,11 @@ pub struct ReplayLimits {
     pub extents: usize,
 }
 
-/// Extents a call asks the blob store about at the same time. A Worker
-/// invocation holds six connections open at most and queues the rest,
-/// so more than that is not faster there.
+/// Extents a call asks the blob store about ahead at the same time.
+/// An extent is two reads at once (its pinned copy and its article
+/// plan), so that is twelve reads, beside the ones of the step itself.
+/// A Worker invocation holds six connections open at most and queues
+/// the rest, so more than that is not faster there.
 pub const STORE_READS: usize = 6;
 
 /// Where the pinned copies are stored: [`ExtentId::safety_key`].
@@ -494,6 +503,11 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     }
                     // Out of budget inside this record.
                     Replayed::More => return Ok(true),
+                    // As a record that was removed before it was read.
+                    Replayed::Gone => {
+                        cursor.extent = 0;
+                        cursor.name.clear();
+                    }
                     Replayed::Unreadable(segment) => {
                         for unread in [segment, name.clone()] {
                             if !report.unreadable.contains(&unread) {
@@ -535,14 +549,26 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // here does not open in the step either, which reports it.
         let records: Vec<Vec<ExtentId>> = stream::iter(names.iter().map(|listed| async move {
             let record = read_stored_generation(keep, &self.kek, &listed.name).await;
-            match record {
-                Ok(Some(StoredGeneration::Single(m))) => m
-                    .extents
-                    .iter()
-                    .map(|e| ExtentId::new(e.id.clone()))
-                    .collect(),
-                _ => Vec::new(),
+            let Ok(Some(StoredGeneration::Single(m))) = record else {
+                return Vec::new();
+            };
+            // The step asks nothing about the extents of a record that
+            // a newer one of the object is over. The catalogue is only
+            // read here; the step asks it again and decides.
+            let superseded = match m.generation() {
+                Ok(generation) => matches!(
+                    self.catalog.replay_probe(&generation).await,
+                    Ok(ReplayProbe::Superseded)
+                ),
+                Err(_) => true,
+            };
+            if superseded {
+                return Vec::new();
             }
+            m.extents
+                .iter()
+                .map(|e| ExtentId::new(e.id.clone()))
+                .collect()
         }))
         .buffered(STORE_READS)
         .take_while(|_| std::future::ready(!store.full()))
@@ -839,6 +865,13 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         }
                     }
                 };
+                // The record was read at the start of its run, and
+                // a write that was under way when the restore began
+                // removes its record when the catalogue refuses it.
+                // What is published is a record the store has now.
+                if self.safety.head(&cursor.name).await?.is_none() {
+                    return Ok(Replayed::Gone);
+                }
                 match self
                     .catalog
                     .replay_publish(&generation, &placements, now)
@@ -1100,8 +1133,12 @@ struct Call {
     buckets: HashMap<String, BucketId>,
 }
 
-/// The most bytes of answers a call holds that it asked for ahead.
-/// What does not fit is asked for when the step comes to it.
+/// The bytes of answers after which a call keeps no more of what it
+/// asked for ahead, and asks no more ahead. The answers that were on
+/// their way when it was reached are kept or dropped as they come, so
+/// a call can hold more than this by the ones asked at the same time:
+/// [`STORE_READS`] records, or twice as many article plans. What is
+/// not kept is asked for when the step comes to it.
 const AHEAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// The blob store of one replay call, with the answers the call asked
@@ -1292,6 +1329,9 @@ enum Replayed {
     /// It is segmented, and the segment stored at this name is missing
     /// or is not the one its head names. Nothing of it was published.
     Unreadable(String),
+    /// The record was removed since it was read. Nothing of it was
+    /// published.
+    Gone,
 }
 
 /// Where a generation has the extent of a record.
