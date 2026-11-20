@@ -15,6 +15,7 @@ use zeroize::Zeroize;
 use crate::crypto::{seal_extent, DataKey, SealedExtent};
 use crate::ingress::{Charge, IngressError, UploadLengths};
 use crate::ports::{BlobMeta, BlobStore};
+use crate::trace::{Phase, WriteTrace};
 use crate::types::{Body, BucketId, ExtentId};
 
 /// Most encoded bytes handed to the validator at once. What it decodes
@@ -136,13 +137,16 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
         &mut self,
         plain: &[u8],
         stored: &mut Vec<StoredSlice>,
+        trace: &mut WriteTrace<'_>,
     ) -> Result<(), SliceError> {
+        trace.lap(Phase::Hash).await;
         let id = self.ids.get(stored.len()).ok_or(SliceError::Store)?;
         let mut rng = Replay::new(&mut *self.rng);
         for _ in 0..PUT_ATTEMPTS {
             rng.at = 0;
             let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, &mut rng)
                 .map_err(|_| SliceError::Store)?;
+            trace.lap(Phase::Seal).await;
             let ciphertext = std::mem::take(&mut sealed.ciphertext);
             let cipher_size = ciphertext.len() as u64;
             let put = self
@@ -157,6 +161,7 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
                     },
                 )
                 .await;
+            trace.lap(Phase::R2).await;
             if put.is_ok() {
                 stored.push(StoredSlice {
                     plain_size: plain.len() as u64,
@@ -183,6 +188,7 @@ pub(super) async fn store_slices<B: BlobStore, R: FillRandom>(
     lengths: UploadLengths,
     charge: &Charge,
     validator: &mut UploadValidator,
+    trace: &mut WriteTrace<'_>,
 ) -> Result<Vec<StoredSlice>, SliceError> {
     let slice = usize::try_from(sink.slice_bytes).map_err(|_| SliceError::Store)?;
     let count = lengths.decoded.div_ceil(sink.slice_bytes.max(1));
@@ -199,6 +205,7 @@ pub(super) async fn store_slices<B: BlobStore, R: FillRandom>(
     let mut received: u64 = 0;
     if let Body::Stream { mut stream, .. } = body {
         while let Some(chunk) = stream.next().await {
+            trace.mark(Phase::Read);
             let chunk = chunk.map_err(|_| IngressError::IncompleteBody)?;
             received = received.saturating_add(chunk.len() as u64);
             if lengths.encoded.is_some_and(|n| received > n) {
@@ -207,17 +214,20 @@ pub(super) async fn store_slices<B: BlobStore, R: FillRandom>(
             for encoded in chunk.chunks(piece) {
                 validator.push_body(encoded, &mut |decoded| plain.extend_from_slice(decoded))?;
                 while plain.len() >= slice {
-                    sink.store(&plain[..slice], &mut stored).await?;
+                    sink.store(&plain[..slice], &mut stored, trace).await?;
                     plain.drain(..slice);
                 }
             }
+            drop(chunk);
+            trace.piece().await;
         }
+        trace.mark(Phase::Read);
     }
     if lengths.encoded.is_some_and(|n| received != n) {
         return Err(IngressError::IncompleteBody.into());
     }
     if !plain.is_empty() {
-        sink.store(&plain, &mut stored).await?;
+        sink.store(&plain, &mut stored, trace).await?;
     }
     Ok(stored)
 }
