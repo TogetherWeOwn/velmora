@@ -594,6 +594,68 @@ here):
    version takes the answer of the version before it. Treat any other
    version without a CI message (an upload by hand) as below the floor.
 
+## Client settings
+
+Write with parts of 16 MiB, start multipart at 16 MiB, send 16 parts or
+files at once, and give rclone one connection per request:
+
+- rclone: `--s3-upload-cutoff 16M --s3-chunk-size 16M
+  --s3-upload-concurrency 16 --transfers 16 --disable-http2` (in
+  `rclone.conf`: `upload_cutoff = 16M`, `chunk_size = 16M`,
+  `upload_concurrency = 16`; `--disable-http2` is a global flag).
+- aws-cli, in `~/.aws/config`:
+
+  ```ini
+  [default]
+  s3 =
+    multipart_threshold = 16MB
+    multipart_chunksize = 16MB
+    max_concurrent_requests = 16
+  ```
+
+Why these values:
+
+- **Extents.** One extent holds 16 MiB. A part of 16 MiB is one full
+  extent; a smaller part is an extent of its own. Each extent costs the
+  same catalogue rows, queue jobs and Usenet posts whatever its size. A
+  single PutObject above 16 MiB is stored in slices of 8 MiB (see
+  below). With multipart from 16 MiB in 16 MiB parts, a file of 16 to
+  95 MiB takes `ceil(size / 16 MiB)` extents. Measured on a test
+  deployment, extents per file:
+
+  | File | rclone or aws-cli, these settings | aws-cli defaults (8 MiB) | rclone `--s3-upload-cutoff 95M` |
+  |---:|---:|---:|---:|
+  | 16 MiB | 1 | 2 | 1 |
+  | 17 MiB | 2 | 3 | 3 |
+  | 40 MiB | 3 | 5 | 5 |
+  | 95 MiB | 6 | 12 | 6 |
+
+- **Concurrency.** One UploadPart of 16 MiB takes 2.4 to 3.5 s through
+  the Worker at 4 at once: it is received whole, encrypted, then
+  stored. A small PutObject takes about 1.4 s, most of it round trips.
+  Both gain from more requests at once. Measured on a test deployment
+  from one client host, 256 MiB in 16 MiB parts and 40 PutObjects of
+  1 MiB (MiB/s; three deployments for the first and last columns, two
+  to six runs each for the clients):
+
+  | At once | Multipart, S3 test client | aws-cli | rclone `--disable-http2` | rclone default (HTTP/2) | 1 MiB PutObjects |
+  |---:|---:|---:|---:|---:|---:|
+  | 4 | 15.1 to 18.4 | 17.3, 18.5 | 14.8, 19.3 | 7.1 to 11.0 | 2.6 to 3.1 |
+  | 8 | 20.5 to 27.1 | | | 10.7, 16.4 | 4.5 to 5.3 |
+  | 16 | 19.6 to 27.8 | 24.0, 28.7 | 32.1, 27.8 | 7.5 to 15.0 | 8.1 to 9.3 |
+
+  No answer was a 5xx, and no client retried.
+  - Big parts gain less than small files: the parts in one Worker
+    isolate share its CPU and its in-flight byte budget, so one part
+    takes about 5.3 s at 16 at once.
+  - rclone sends all its requests to one host over a single HTTP/2
+    connection, and that one connection carries 7 to 15 MiB/s at any
+    concurrency. `--disable-http2` gives each request its own
+    connection.
+
+Flags of a running `rclone rcd` apply to new uploads only; restarting
+it aborts the copies it runs.
+
 ## A PutObject or an UploadPart above one extent
 
 With `MAX_PUT_BYTES` above `MAX_EXTENT_BYTES` (shipped: 99 MiB over
@@ -627,13 +689,12 @@ object above 156 GiB does not fit this build.
   per chunk. With chunks of 8 KiB, the smallest S3 allows, a body above
   about 98.9 MiB is over it and is refused there; chunks of 16 KiB or
   more fit up to 99 MiB. A client has to send larger
-  files as multipart uploads. aws-cli does so from 8 MiB. rclone does so
-  from 200 MiB by default: run it with `--s3-upload-cutoff 95M` and
-  `--s3-chunk-size 16M` (or `upload_cutoff = 95M` and `chunk_size = 16M`
-  in the remote's section of `rclone.conf`). A part of 16 MiB is one
-  full extent; rclone's default part of 5 MiB makes about three times as
-  many extents. Parts up to 95 MiB work too (`--s3-chunk-size 95M`;
-  aws-cli: `multipart_chunksize = 95MB`), within the object size above.
+  files as multipart uploads. aws-cli does so from 8 MiB in 8 MiB parts,
+  rclone from 200 MiB in 5 MiB parts. Use the settings in
+  [Client settings](#client-settings) instead: multipart from 16 MiB, in
+  parts of 16 MiB. Parts up to 95 MiB work too (`--s3-chunk-size 95M`;
+  aws-cli: `multipart_chunksize = 95MB`), within the object size above,
+  but they save requests, not extents.
 - Before its first slice is stored, the request writes one row per
   slice into `write_intents`. The commit removes the rows. A request
   that died leaves its rows, and its slices in `SAFETY`.
