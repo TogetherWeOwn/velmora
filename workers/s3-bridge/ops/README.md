@@ -519,9 +519,10 @@ the code real data relies on. Never roll back past the floor:
   switch on or off: off only stops new plans from being packed, and
   every such version reads both forms.
 
-- **Once a version that knows `PERMITS` has been deployed:** never to
-  an older one by `wrangler rollback`; Cloudflare refuses it, because
-  that deploy added a Durable Object class. See "Permit gate".
+- **Once deploy 2 of "Shipping the gate" (the `PermitGate` class) has
+  been deployed:** never to a version from before it; Cloudflare
+  refuses it (code 100402). Before that, a version that knows `PERMITS`
+  rolls back like any other. See "Permit gate".
 
 - **Once `RECORD_LAYOUT=tenant` has been deployed:** never to a version
   older than the first one that knows `RECORD_LAYOUT`. From then on a
@@ -924,11 +925,9 @@ provider sessions before it frees their slots.
 A rollback to a version from before the class (deploy 2 below) is not
 possible once deploy 2 is live: Cloudflare refuses it. This includes
 the automatic rollback of deploy 2 itself; if that deploy fails, fix
-forward (below). Roll back to a
-version that does not know `PERMITS` only while `PERMITS` is `d1` and
-the query above shows no `do-gate:` or `do-gate-idle:` row; such rows
-never run out by themselves. To clear them by hand, only with no Worker
-in `do` mode and after the longest permit has run out (125 s):
+forward (below). `do-gate:` and `do-gate-idle:` rows never run out by
+themselves. To clear them by hand, only with no Worker in `do` mode and
+after the longest permit has run out (125 s):
 
 ```
 UPDATE provider_permits SET holder = NULL, lease_until = 0, pool = NULL
@@ -947,12 +946,20 @@ shipped `wrangler.toml` declares the class for `env.dev` only; the
 production tables come in three later pull requests, each a deploy of
 its own, in this order:
 
-| # | change to the production tables | rollback |
-| - | ------------------------------- | -------- |
-| 1 | none: the code that knows `PERMITS`, with `PERMITS = "d1"` and no class or binding | as for any release |
-| 2 | `[exports.PermitGate]` alone | none past it, ever |
-| 3 | the `PERMIT_GATE` binding and `[version_metadata]` | to deploy 2 |
-| 4 | `PERMITS = "do"` (step 2 above) | `PERMITS = "d1"`, or to deploy 3 |
+| # | change to the production tables | rollback | merge the next one when |
+| - | ------------------------------- | -------- | ----------------------- |
+| 1 | none: the code that knows `PERMITS`, with `PERMITS = "d1"` and no class or binding | as for any release | about a day of normal traffic |
+| 2 | `[exports.PermitGate]` alone | none past it, ever | its deploy job is green |
+| 3 | the `PERMIT_GATE` binding and `[version_metadata]` | to deploy 2 | its deploy job is green and the active version has the binding |
+| 4 | `PERMITS = "do"` (step 2 above) | `PERMITS = "d1"`, or to deploy 3 | n/a |
+
+Merge each one only when the deploy before it is live and green. The
+deploy job ships the tip of main and rolls back to the version it
+replaced, so two of these merged close together go out as one deploy:
+2 with 3 would put the binding into the one deploy that has no
+rollback, and 3 with 4 would
+make the job's rollback target a version without the binding, which
+strands the gates' slot rows (below).
 
 Deploy 2 adds, at the top level of `wrangler.toml` (never with
 `[[migrations]]`: once a class is declared by `exports`, a deploy that

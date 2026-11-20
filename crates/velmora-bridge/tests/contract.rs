@@ -2642,21 +2642,46 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
     }
 }
 
-/// The table headers of the shipped `wrangler.toml`, split into the
-/// production tables and those of an `[env.*]` environment. A TOML
-/// header names its table from the root wherever it stands, so a table
-/// is production's by its name, not by its place in the file.
-fn wrangler_headers() -> (Vec<String>, Vec<String>) {
+/// The tables of the shipped `wrangler.toml` by their first key, split
+/// into production's and those of an `[env.*]` environment, plus the
+/// first key of every line above the first table (root keys, which
+/// may name a table inline or dotted, e.g. `exports.X.type = ...`). A
+/// TOML header names its table from the root wherever it stands, so a
+/// table is production's by its name, not by its place in the file.
+/// Spaces, quotes and a trailing comment do not change a name.
+fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../workers/s3-bridge/wrangler.toml"
     );
     let toml = std::fs::read_to_string(path).unwrap();
-    toml.lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with('['))
-        .map(str::to_string)
-        .partition(|h| !h.trim_start_matches('[').starts_with("env."))
+    let name = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect()
+    };
+    let (mut prod, mut env, mut root) = (Vec::new(), Vec::new(), Vec::new());
+    let mut seen_table = false;
+    for line in toml.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            seen_table = true;
+            let header = line[..line.rfind(']').unwrap() + 1].to_string();
+            let path = name(header.trim_matches(|c| c == '[' || c == ']'));
+            if path.starts_with("env.") {
+                env.push(path);
+            } else {
+                prod.push(path);
+            }
+        } else if !seen_table {
+            if let Some((key, _)) = line.split_once('=') {
+                root.push(name(key));
+            }
+        }
+    }
+    (prod, env, root)
 }
 
 /// A Durable Object class can never be rolled back past, so production
@@ -2670,29 +2695,36 @@ fn wrangler_headers() -> (Vec<String>, Vec<String>) {
 /// `[[migrations]]` is refused.
 #[test]
 fn production_declares_no_durable_object_class_yet() {
-    let (prod, rest) = wrangler_headers();
-    for header in &prod {
+    let (prod, env, root) = wrangler_tables();
+    let gate = |key: &str| {
+        let first = key.split('.').next().unwrap_or_default();
+        [
+            "exports",
+            "durable_objects",
+            "migrations",
+            "version_metadata",
+        ]
+        .contains(&first)
+    };
+    for key in prod.iter().chain(&root) {
         assert!(
-            !header.starts_with("[exports")
-                && !header.starts_with("[[durable_objects")
-                && !header.starts_with("[[migrations")
-                && header != "[version_metadata]",
-            "production table {header}: the gate ships in deploys of its own"
+            !gate(key),
+            "production {key}: the gate ships in deploys of its own"
         );
     }
     let (vars, dev) = wrangler_vars();
     assert_eq!(vars.get("PERMITS").map(String::as_str), Some("d1"));
     assert_eq!(dev.get("PERMITS").map(String::as_str), Some("d1"));
     assert!(
-        !rest.iter().any(|h| h.contains("migrations]]")),
+        !env.iter().any(|t| t.ends_with(".migrations")),
         "a legacy [[migrations]] table"
     );
     // Dev (the end-to-end run with PERMITS = "do") declares and binds it.
-    for header in [
-        "[env.dev.exports.PermitGate]",
-        "[[env.dev.durable_objects.bindings]]",
-        "[env.dev.version_metadata]",
+    for table in [
+        "env.dev.exports.PermitGate",
+        "env.dev.durable_objects.bindings",
+        "env.dev.version_metadata",
     ] {
-        assert!(rest.iter().any(|h| h == header), "dev lacks {header}");
+        assert!(env.iter().any(|t| t == table), "dev lacks [{table}]");
     }
 }
