@@ -5110,12 +5110,14 @@ async fn a_read_of_the_data_alone_does_not_clear_a_failed_full_read() {
 
 /// The light guard counts a pass only over every article, the parity
 /// articles included: `STAT` answers for the data articles alone release
-/// nothing, with or without the full check asked for.
+/// nothing, with or without the full check asked for. A full check is on
+/// record, so the short answer is all that stands in the way.
 #[tokio::test]
 async fn the_light_guard_refuses_passes_over_the_data_alone() {
     let fx = Fx::new().await;
     let (o, l) = fx.posted_packed("k", true).await;
     let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
     let later = T0.plus_ms(HOUR_MS);
     assert!(fx
         .cat
@@ -5137,12 +5139,55 @@ async fn the_light_guard_refuses_passes_over_the_data_alone() {
     }
     assert_eq!(fx.dump().await, before, "a refused release wrote something");
 
-    // Every article on both: released without a full check.
+    // Every article on both: released, the full check asked for too.
     fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Stat, 3)
         .await;
     let guard = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(4), false);
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(4), true);
+    assert_eq!(guard.await.unwrap(), Guard::Applied(()));
+}
+
+/// Under the light guard too, a backbone whose latest full read saw the
+/// data articles alone (a pass, as a version from before parity records
+/// it) holds no copy: fresh `STAT` answers for every article release
+/// nothing there until every article is read in full.
+#[tokio::test]
+async fn the_light_guard_refuses_a_full_read_of_the_data_alone() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
+    fx.pass_of(&l, "bb-b", T0, VerifyKind::Body, 2).await;
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    for backbone in ["bb-a", "bb-b"] {
+        fx.pass_of(&r, backbone, later.plus_ms(1), VerifyKind::Stat, 3)
+            .await;
+    }
+    let before = fx.dump().await;
+    for need_full in [false, true] {
+        let guard = fx
+            .cat
+            .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2), need_full);
+        assert_eq!(guard.await.unwrap(), Guard::Lost, "{need_full}");
+    }
+    assert_eq!(fx.dump().await, before, "a refused release wrote something");
+    assert_eq!(fx.extent(&o, "safety_state").await, "held");
+
+    // Read in full, parity included: the backbone holds a copy again.
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Body, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(4), VerifyKind::Stat, 3)
+        .await;
+    let guard = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(5), false);
     assert_eq!(guard.await.unwrap(), Guard::Applied(()));
 }
 
@@ -5155,7 +5200,7 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
     let mut replay = Vec::new();
     let mut made = Vec::new();
-    for key in ["damaged", "fraction", "sound"] {
+    for key in ["damaged", "fraction", "tiny", "sound"] {
         let (o, _) = fx.posted_packed(key, true).await;
         let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
@@ -5175,6 +5220,10 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let sql = "UPDATE extents SET parity_count = 1.5 WHERE id = ?1";
     assert_eq!(fx.run(sql, &[text(made[1].extent.as_str())]).await, 1);
     assert_eq!(fx.extent(&made[1], "typeof(parity_count)").await, "real");
+    // One that does not come back from its text as itself.
+    let sql = "UPDATE extents SET parity_count = 5e-324 WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[2].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[2], "typeof(parity_count)").await, "real");
 
     let stranded = fx
         .cat
