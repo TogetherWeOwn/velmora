@@ -8,11 +8,12 @@ mod service_support;
 
 use serde_json::{json, Value};
 use service_support::*;
+use sha2::Digest as _;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{
     delete_blob, tombstone_id, write_tombstone, Layout, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
-use velmora_bridge::replay::{RecordRef, ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::replay::{RecordRef, ReplayCursor, ReplayLimits, ReplayReport, STORE_READS};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
@@ -561,6 +562,236 @@ async fn export_plus_replay_restores_later_writes() {
 // ---------------------------------------------------------------------------
 // Total loss: the records alone rebuild the catalogue
 // ---------------------------------------------------------------------------
+
+/// A call asks the store ahead for the records it lists and for what
+/// their extents have there. The step then works with those answers:
+/// no record is read twice, the report is the one of a replay that
+/// takes one record and one extent a call, and so is the catalogue.
+#[tokio::test(flavor = "current_thread")]
+async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    for i in 0..40 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    // Some keys have an older generation, some a tombstone.
+    for i in 0..10 {
+        rig.put(&signer, BUCKET, &format!("k{i:02}"), b"again")
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    for i in 5..15 {
+        delete(&rig, &signer, &format!("k{i:02}")).await.expect(204);
+        tick(&rig);
+    }
+    multipart(&rig, &signer, "big", 3).await;
+
+    wipe(&rig);
+    let one = ReplayLimits {
+        records: 1,
+        extents: 1,
+    };
+    let (slow, calls) = replay(&rig, UnixMs(0), one).await;
+    assert!(calls > 60, "{calls} calls");
+    let by_one = dump(&rig);
+
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    let records: Vec<String> = store
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with("m/"))
+        .collect();
+    assert!(records.len() >= 61, "{} records", records.len());
+    let before: Vec<u64> = records.iter().map(|k| store.gets_under(k)).collect();
+    let limits = ReplayLimits {
+        records: 100,
+        extents: 1000,
+    };
+    // The store answers a turn later, as a real one does: the reads
+    // made ahead are under way together, and while the step works.
+    store.slow_reads.set(true);
+    let (fast, calls) = replay(&rig, UnixMs(0), limits).await;
+    assert_eq!(calls, 3, "manifests, tombstones, pinned copies");
+    for (key, before) in records.iter().zip(before) {
+        assert_eq!(store.gets_under(key) - before, 1, "{key} is read once");
+    }
+    let together = store.most_reading.get();
+    assert!(
+        (STORE_READS as u32..=4 * STORE_READS as u32).contains(&together),
+        "{together} reads at the same time"
+    );
+    assert_eq!(format!("{fast:?}"), format!("{slow:?}"));
+    assert_eq!(fast.manifests, 51, "{fast:?}");
+    assert_eq!((fast.tombstones, fast.deleted), (10, 10), "{fast:?}");
+    assert_eq!(dump(&rig), by_one);
+
+    // Calls that end inside a run of records that was asked ahead, and
+    // inside a record.
+    for (records, extents) in [(100, 7), (5, 1000), (3, 2)] {
+        wipe(&rig);
+        let limits = ReplayLimits { records, extents };
+        let (cut, _) = replay(&rig, UnixMs(0), limits).await;
+        assert_eq!(format!("{cut:?}"), format!("{slow:?}"), "{limits:?}");
+        assert_eq!(dump(&rig), by_one, "{limits:?}");
+    }
+}
+
+/// A read that fails ahead decides nothing: the step asks the store
+/// again, and the replay is the one of a store that never failed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_that_fails_ahead_is_asked_again_by_the_step() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for i in 0..20 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
+    let record = format!("m/{}", generation.id.as_str());
+    wipe(&rig);
+    let (whole, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    let reference = dump(&rig);
+
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    store.slow_reads.set(true);
+    let before = store.gets_under(&record);
+    *store.fail_gets.borrow_mut() = Some((record.clone(), 1));
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(store.gets_under(&record) - before, 1, "asked again, once");
+    assert_eq!(store.fail_gets.borrow().as_ref().unwrap().1, 0);
+    assert_eq!(format!("{report:?}"), format!("{whole:?}"));
+    assert_eq!(dump(&rig), reference);
+
+    // Twice: the step fails as it would have without the reads ahead.
+    wipe(&rig);
+    *store.fail_gets.borrow_mut() = Some((record, 2));
+    let failed = rig
+        .bridge
+        .replay_step_within(ReplayCursor::start(UnixMs(0)), ReplayLimits::default())
+        .await;
+    assert!(matches!(failed, Err(BridgeError::Blob(_))), "{failed:?}");
+}
+
+/// A record is read at the start of its run, before the step comes to
+/// it. One that was removed in between (by a write that was under way
+/// and that the catalogue refused) is not published from memory, and
+/// no row of it is written.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_removed_after_it_was_read_is_not_published() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for i in 0..20 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
+    let record = format!("m/{}", generation.id.as_str());
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    *store.lose_after_get.borrow_mut() = Some(record.clone());
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(store.stored(&record).is_none());
+    assert_eq!(report.published, 19, "{report:?}");
+    assert_eq!(report.manifests, 19, "{report:?}");
+    assert!(report.unreadable.is_empty(), "{report:?}");
+    assert!(rig.live(&bucket, "k07").await.is_none());
+    // Nothing of it was staged either.
+    assert_eq!(rig.count("extents"), 19);
+    assert_eq!(rig.count("generations"), 19);
+    assert!(rig.live(&bucket, "k08").await.is_some());
+}
+
+/// The step asks whether a record is still there a few records before
+/// it comes to it. When the records in between took long, that answer
+/// is old, and the step asks again.
+#[tokio::test(flavor = "current_thread")]
+async fn an_old_answer_that_a_record_is_there_is_asked_again() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for i in 0..20 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
+    let record = format!("m/{}", generation.id.as_str());
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    // The record goes right after the store said it was there, and the
+    // step comes to it three seconds later.
+    let clock = rig.bridge.clock.clone();
+    *store.lose_after_head.borrow_mut() =
+        Some((record.clone(), Box::new(move || clock.advance_ms(3000))));
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(store.lose_after_head.borrow().is_none());
+    assert_eq!(report.published, 19, "{report:?}");
+    assert!(rig.live(&bucket, "k07").await.is_none());
+    assert_eq!(rig.count("extents"), 19);
+}
+
+/// A replay over a catalogue that has the objects already asks the
+/// store nothing about the extents of the records a newer one is over:
+/// the step leaves them out, and so do the reads ahead.
+#[tokio::test(flavor = "current_thread")]
+async fn nothing_is_asked_ahead_about_the_extents_of_a_superseded_record() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    for round in 0..6 {
+        for i in 0..10 {
+            let body = format!("{round}-{i}");
+            rig.put(&signer, BUCKET, &format!("k{i:02}"), body.as_bytes())
+                .await
+                .expect(200);
+            tick(&rig);
+        }
+    }
+    wipe(&rig);
+    let (first, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(first.published, 60, "{first:?}");
+    let store = &rig.bridge.safety;
+    let plans = store.gets_under("m/art/");
+    assert!(plans >= 60, "{plans} reads of article plans");
+    // Again, over a catalogue that has the live generations only, as
+    // one has that was exported after the older ones were collected:
+    // fifty records are of generations that a newer one is over.
+    let live = "(SELECT generation_id FROM objects)";
+    let old = format!("(SELECT id FROM extents WHERE generation_id NOT IN {live})");
+    for table in ["outbox", "articles", "verifications", "generation_extents"] {
+        sql(
+            &rig,
+            &format!("DELETE FROM {table} WHERE extent_id IN {old};"),
+        );
+    }
+    sql(
+        &rig,
+        &format!(
+            "DELETE FROM extents WHERE generation_id NOT IN {live}; \
+             DELETE FROM generations WHERE id NOT IN {live};"
+        ),
+    );
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((again.superseded, again.present), (50, 10), "{again:?}");
+    let asked = store.gets_under("m/art/") - plans;
+    assert!(
+        asked * 6 <= plans,
+        "{asked} reads of article plans, {plans} before"
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn records_alone_rebuild_the_catalogue() {
@@ -2739,6 +2970,101 @@ async fn a_pinned_copy_released_after_the_export_is_found() {
     assert_eq!(report.held_checked, 1, "{report:?}");
     assert_eq!(report.held_missing_total, 0, "{report:?}");
     assert_eq!(report.safety_missing, 1, "{report:?}");
+}
+
+/// The pinned copies are found by a listing, and one the listing does
+/// not name is asked for by its key. Copies of extents the catalogue
+/// does not hold, however many lie before and between the ones it
+/// holds, hide none: every held extent is checked once, and the one
+/// whose copy is gone is the one reported.
+#[tokio::test(flavor = "current_thread")]
+async fn copies_the_catalogue_does_not_hold_hide_no_missing_one() {
+    let rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let mut held = Vec::new();
+    for i in 0..12 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        let (_, extents) = rig.live(&bucket, &key).await.unwrap();
+        held.extend(extents.into_iter().map(|x| x.id));
+        tick(&rig);
+    }
+    held.sort();
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+    let store = &rig.bridge.safety.inner;
+    // More copies of no extent of the catalogue than a call lists,
+    // before the first held one, and some after each of the first.
+    let sha: [u8; 32] = sha2::Sha256::digest(b"").into();
+    let mut strays: Vec<String> = (0..8500).map(|i| format!("x/x_{i:026}")).collect();
+    strays.extend(
+        held.iter()
+            .take(6)
+            .map(|id| format!("{}-", id.safety_key())),
+    );
+    for key in strays.iter().skip(8500) {
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &held[0],
+            cipher_sha256: &sha,
+        };
+        store.put(key, Vec::new(), &meta).await.unwrap();
+    }
+    let lost = &held[7];
+    assert!(store.lose(&lost.safety_key()));
+    wipe(&rig);
+    import(&rig);
+
+    // With the strays between only, one listing names every copy but
+    // the lost one.
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 12, "{report:?}");
+    assert_eq!(report.held_missing, [lost.as_str()]);
+    // With more of them than one listing holds between the held ones,
+    // the second listing goes on where the first ended.
+    let between: Vec<String> = (0..1500)
+        .map(|i| format!("{}-{i:04}", held[5].safety_key()))
+        .collect();
+    for key in &between {
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &held[0],
+            cipher_sha256: &sha,
+        };
+        store.put(key, Vec::new(), &meta).await.unwrap();
+    }
+    let copies = |rig: &Rig| {
+        let listed = rig.bridge.safety.listed.borrow();
+        listed.iter().filter(|p| p.starts_with("x/")).count()
+    };
+    let lists = copies(&rig);
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 12, "{report:?}");
+    assert_eq!(report.held_missing, [lost.as_str()]);
+    assert_eq!(copies(&rig) - lists, 2, "two listings");
+    // With more before the first than a call lists, every copy is asked
+    // for by its key.
+    for key in strays.iter().take(8500) {
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &held[0],
+            cipher_sha256: &sha,
+        };
+        store.put(key, Vec::new(), &meta).await.unwrap();
+    }
+    for extents in [1000, 5, 1] {
+        let limits = ReplayLimits {
+            records: 100,
+            extents,
+        };
+        let (report, _) = replay(&rig, exported_at, limits).await;
+        assert_eq!(report.held_checked, 12, "{extents}: {report:?}");
+        assert_eq!(report.held_missing_total, 1, "{extents}: {report:?}");
+        assert_eq!(report.held_missing, [lost.as_str()], "{extents}");
+    }
 }
 
 // ---------------------------------------------------------------------------
