@@ -3381,9 +3381,31 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
         0,
         rig.sql_count("SELECT COUNT(*) FROM articles"),
     );
+    // Released: the safety copy goes too, so the GET has no source but
+    // the articles.
+    let ev = rig
+        .admin_json(
+            s,
+            Method::Post,
+            "/evict/slice/y/one.bin?include_safety=1",
+            None,
+        )
+        .await;
+    expect(
+        s,
+        "evict .evicted > 0",
+        ev["evicted"].as_u64().is_some_and(|n| n > 0),
+        &ev,
+    );
     for key in rig.bridge.cache.keys() {
         rig.bridge.cache.delete(&key).await.expect("cache delete");
     }
+    expect(
+        s,
+        "no safety copy of the extent",
+        !rig.bridge.safety.contains(&id.safety_key()),
+        &id,
+    );
     let r = rig.get("/slice/y/one.bin").await;
     expect_status(s, "GET y/one.bin", 200, &r);
     expect_bytes(s, "GET y/one.bin body", &body, &r.body);

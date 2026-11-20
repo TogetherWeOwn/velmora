@@ -786,6 +786,33 @@ fn config_rejects_invalid_and_unsafe_values() {
         tuned.insert("PARITY".into(), "off".into());
         assert!(!load(&tuned).unwrap().packed_plans);
     }
+    // A packed plan counts its newsgroups in one byte; with parity on a
+    // longer list would fall back to plans of rows, without parity.
+    let many = |n: usize| {
+        (0..n)
+            .map(|i| format!("alt.binaries.g{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    for (n, parity, ok) in [(255, "on", true), (256, "on", false), (256, "off", true)] {
+        let mut tuned = prod.clone();
+        tuned.insert("PARITY".into(), parity.into());
+        tuned.insert("PACKED_PLANS".into(), "on".into());
+        tuned.insert("NEWSGROUPS".into(), many(n));
+        match load(&tuned) {
+            Ok(cfg) => assert!(
+                ok && cfg.newsgroups.len() == n,
+                "{n} groups, PARITY={parity}"
+            ),
+            Err(e) => {
+                assert!(!ok, "{n} groups, PARITY={parity}: {e:?}");
+                assert_eq!(
+                    e,
+                    ConfigError::Refused("PARITY with more than 255 NEWSGROUPS")
+                );
+            }
+        }
+    }
     // The limits of the slice settings themselves are accepted, and the
     // default slice is never above one extent.
     for (put, slice, sweep) in [

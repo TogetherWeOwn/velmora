@@ -712,6 +712,12 @@ impl BridgeConfig {
         if !newsgroups.iter().all(|g| valid_newsgroup(g)) {
             return Err(ConfigError::Invalid("NEWSGROUPS".into()));
         }
+        // A packed plan holds the newsgroup count in one byte. Past that a
+        // new plan is stored as rows, which carry no parity addendum, so
+        // with parity on such a list would post extents without parity.
+        if parity && newsgroups.len() > usize::from(u8::MAX) {
+            return Err(ConfigError::Refused("PARITY with more than 255 NEWSGROUPS"));
+        }
 
         let kek_active: u32 = number(&get, "VELMORA_KEK_ACTIVE")?;
         if kek_active == 0 || kek_active > MAX_KEK_VERSION {

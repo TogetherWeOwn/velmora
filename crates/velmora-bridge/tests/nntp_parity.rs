@@ -4,8 +4,9 @@
 
 mod nntp_support;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::Duration;
 
 use nntp_support::*;
@@ -259,6 +260,24 @@ async fn the_addendum_is_stored_before_the_first_post() {
     assert!(planned[0] < first_post);
 }
 
+/// The recovery record of the plan and its addendum is written before
+/// any article is sent: with the write refused, the job sends nothing.
+#[tokio::test]
+async fn a_refused_record_write_sends_no_article() {
+    let rig = parity_rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(TEN)).await;
+    rig.bridge.safety.refuse_puts(true);
+    assert_ne!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert!(post_starts().is_empty(), "{:?}", post_starts());
+    assert_eq!(rig.server().posted_count().await, 0);
+
+    // Once the write goes through, the job posts as usual.
+    rig.bridge.safety.refuse_puts(false);
+    rig.bridge.clock.advance_secs(LEASE_SECS + 1);
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    assert_eq!(rig.server().posted_count().await, 12);
+}
+
 /// A job that is refused every post leaves the plan and its addendum
 /// behind. The job after it computes the same shards, finds them in the
 /// stored addendum and posts them under the stored identifiers.
@@ -316,7 +335,10 @@ async fn a_crash_after_the_posts_sends_no_second_parity() {
     }
 
     rig.bridge.clock.advance_secs(LEASE_SECS + 1);
+    let sent = post_starts().len();
     assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+    // The successor finds every article: it sends no POST at all.
+    assert_eq!(post_starts().len(), sent, "{:?}", &post_starts()[sent..]);
 
     assert_eq!(addendum(&rig, &s), Some(first));
     assert_eq!(stored(&rig, 0).await, on_server);
@@ -478,12 +500,18 @@ async fn parity_goes_to_the_provider_with_fewer_data_articles() {
     let data = data_by(&plan);
     assert_eq!(rig.bridge.nntp.connects_to("p0"), 3);
     assert_eq!(rig.bridge.nntp.connects_to("p1"), 1);
-    assert!(data["p1"] < data["p0"], "{data:?}");
+    // The provider that took fewer data articles, as they came out; on a
+    // tie either one, but all four parity articles go to the same one.
+    let took = |p: &str| data.get(p).copied().unwrap_or(0);
     let by = parity_posted(&rig, &s);
     assert_eq!(by.len(), 4);
-    assert!(by.values().all(|p| p == "p1"), "{by:?}");
-    assert_eq!(stored(&rig, 1).await.len(), data["p1"] + 4);
-    assert_eq!(stored(&rig, 0).await.len(), data["p0"]);
+    let to = by.values().next().unwrap().clone();
+    assert!(by.values().all(|p| *p == to), "{by:?}");
+    let other = if to == "p0" { "p1" } else { "p0" };
+    assert!(took(&to) <= took(other), "{data:?} {by:?}");
+    let server = |p: &str| usize::from(p == "p1");
+    assert_eq!(stored(&rig, server(&to)).await.len(), took(&to) + 4);
+    assert_eq!(stored(&rig, server(other)).await.len(), took(other));
     // Each article is on one server, and all of them are somewhere.
     let mut all = stored(&rig, 0).await;
     all.extend(stored(&rig, 1).await);
@@ -526,9 +554,10 @@ async fn parity_waits_for_the_data_articles_in_flight() {
         while !held().await.is_superset(&data_ids) {
             tokio::task::yield_now().await;
         }
-        // Time enough for an idle socket to send a parity article.
+        // Time enough for an idle socket to send a parity article. A
+        // parity POST counts from the moment it is sent, stored or not.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        early.set(held().await.intersection(&parity_ids).next().is_some());
+        early.set(post_starts().iter().any(|(_, id)| parity_ids.contains(id)));
         release.set(true);
     };
     let both = async { tokio::join!(post, hold).0 };
@@ -566,20 +595,52 @@ async fn parity_falls_to_the_other_provider_when_the_preferred_one_fails() {
     let parity_ids = id_set(&parity.articles);
     rig.bridge.clock.advance_secs(3600);
 
+    // The first parity article goes to the preferred provider, whichever
+    // it is. Its later POSTs wait until that provider takes no more posts,
+    // so it stops in the middle of the parity whatever the timing.
+    let preferred: Rc<RefCell<Option<String>>> = Rc::default();
+    let refused = Rc::new(Cell::new(false));
+    {
+        let (preferred, refused, parity_ids) = (
+            Rc::clone(&preferred),
+            Rc::clone(&refused),
+            parity_ids.clone(),
+        );
+        before_post(move |provider, id| {
+            let mut first = preferred.borrow_mut();
+            match first.as_deref() {
+                None if parity_ids.contains(id) => {
+                    *first = Some(provider.to_string());
+                    None
+                }
+                Some(p) if p == provider => Some(Rc::clone(&refused)),
+                _ => None,
+            }
+        });
+    }
     let lease = rig.claim(&s, OutboxStage::Post).await;
     let job = rig.job(&s).await;
     let post = rig.bridge.post_stage(&lease, &job);
     let fail = async {
-        // As soon as the second server holds a parity article it takes
-        // no more.
+        // Once the preferred server holds its parity article it takes no
+        // more, and the POSTs held back for it go on (and are refused).
         loop {
-            let held = stored(&rig, 1).await;
-            if held.intersection(&parity_ids).next().is_some() {
-                break;
+            let p = preferred.borrow().clone();
+            if let Some(p) = p {
+                let at = usize::from(p == "p1");
+                if stored(&rig, at)
+                    .await
+                    .intersection(&parity_ids)
+                    .next()
+                    .is_some()
+                {
+                    rig.servers[at].set_posting_allowed(false).await;
+                    refused.set(true);
+                    break;
+                }
             }
             tokio::task::yield_now().await;
         }
-        rig.servers[1].set_posting_allowed(false).await;
     };
     let both = async { tokio::join!(post, fail).0 };
     let outcome = tokio::time::timeout(Duration::from_secs(120), both).await;
@@ -589,14 +650,23 @@ async fn parity_falls_to_the_other_provider_when_the_preferred_one_fails() {
     assert!(plan.iter().all(|a| a.state == ArticleState::Posted));
     let by = parity_posted(&rig, &s);
     assert_eq!(by.len(), 4);
-    // The second provider took the parity it was sent before it failed;
-    // the first took the rest.
+    // The preferred provider took the one parity article it was sent
+    // before it failed; the other provider took the rest.
+    let p = preferred
+        .borrow()
+        .clone()
+        .expect("a parity article was sent");
     let on_second = stored(&rig, 1).await;
     let on_first = stored(&rig, 0).await;
     let first_parity = on_first.intersection(&parity_ids).count();
     let second_parity = on_second.intersection(&parity_ids).count();
-    assert!(second_parity >= 1 && first_parity >= 1, "{by:?}");
-    assert_eq!(first_parity + second_parity, 4);
+    let (on_preferred, on_other) = if p == "p1" {
+        (second_parity, first_parity)
+    } else {
+        (first_parity, second_parity)
+    };
+    assert_eq!((on_preferred, on_other), (1, 3), "{p} {by:?}");
+    assert_eq!(by.values().filter(|q| **q == p).count(), 1, "{by:?}");
     assert_eq!(by.values().filter(|p| *p == "p0").count(), first_parity);
     let mut all = on_first;
     all.extend(on_second);
@@ -638,6 +708,45 @@ async fn a_lost_parity_article_is_posted_again() {
     assert!(entry.parity_reposted.contains(&11));
     assert!(entry.articles[3].reposted_at.is_some());
     assert_eq!(addendum(&rig, &s), entry.parity.clone());
+}
+
+/// A packed plan has one repost stamp for all its articles: a repost of
+/// a parity article alone moves the time its safety copy waits from,
+/// for the data articles too.
+#[tokio::test]
+async fn a_parity_only_repost_stamps_the_whole_plan() {
+    let rig = parity_rig(&[spec("bb0", 5)]).await;
+    let s = rig.seed(1, &marked_plaintext(TEN)).await;
+    rig.post(&s).await;
+    let parity = parity_of(&rig, &s).await;
+    let lost = &parity.articles[0];
+    rig.server().hide(&lost.message_id).await;
+    rig.bridge.clock.advance_secs(3600);
+    let now = rig.bridge.clock.now();
+
+    let lease = rig.claim(&s, OutboxStage::Verify).await;
+    let job = rig.job(&s).await;
+    assert_eq!(
+        rig.bridge.repost_run(&lease, &job, &[lost.idx]).await,
+        Ok(true)
+    );
+
+    let entries = rig.bridge.catalog.entries.borrow();
+    let entry = &entries[&s.extent];
+    assert!(
+        entry.parity_reposted.contains(&lost.idx),
+        "{:?}",
+        entry.parity_reposted
+    );
+    assert!(
+        entry.articles.iter().all(|a| a.reposted_at == Some(now)),
+        "{:?}",
+        entry
+            .articles
+            .iter()
+            .map(|a| a.reposted_at)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A repost never sends a shard the addendum does not describe: with
