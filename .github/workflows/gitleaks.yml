@@ -54,9 +54,25 @@ jobs:
           chmod 0755 "$RUNNER_TEMP/gitleaks"
           "$RUNNER_TEMP/gitleaks" version
 
+      # --text: a PR-added `.gitattributes` entry such as `creds.env -diff`
+      # would otherwise turn a text patch into "Binary files differ", which
+      # gitleaks skips. --diff-merges=first-parent: `git log -p` prints no
+      # patch for merge commits by default, so a secret added only while
+      # resolving a merge conflict would be missed. Both bypasses were
+      # reproduced with gitleaks 8.30.1 (exit 0 before, exit 1 after).
+      # .github/scripts/gitleaks-log-opts-test.sh re-proves both on every
+      # run, with the same options and the same policy file as the scan.
+      # It runs AFTER the scan: on pull_request it is the PR's copy, so it
+      # must not get a chance to touch the pinned policy or the binary
+      # before the scan has already passed or failed under `set -e`.
+      # Side effect: a finding merged in from another branch is reported
+      # again under the merge commit's SHA, so a `.gitleaksignore` entry for
+      # it does not cover a branch that merges main into itself. Rebase
+      # instead, or allowlist by rule/path in .gitleaks.toml.
       - name: Scan the full history
         env:
           GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
+          GITLEAKS_LOG_OPTS: --text --diff-merges=first-parent HEAD
         run: |
           set -euo pipefail
           # On pull_request use the base branch's policy AND the base
@@ -90,11 +106,15 @@ jobs:
               echo "::warning::PR touches .gitleaksignore; it is NOT in effect for this scan (base ignore pinned). Review the ignore change itself before merge."
             fi
             "$GITLEAKS_BIN" git . --redact --verbose --exit-code 1 \
-              --log-opts=HEAD --ignore-gitleaks-allow \
+              --log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow \
               --config "${scratch}/gitleaks.toml" \
               --gitleaks-ignore-path "${scratch}/.gitleaksignore"
+            bash .github/scripts/gitleaks-log-opts-test.sh \
+              "$GITLEAKS_BIN" "${scratch}/gitleaks.toml" "$GITLEAKS_LOG_OPTS"
           else
             "$GITLEAKS_BIN" git . --redact --verbose --exit-code 1 \
-              --log-opts=HEAD --ignore-gitleaks-allow \
+              --log-opts="$GITLEAKS_LOG_OPTS" --ignore-gitleaks-allow \
               --config .gitleaks.toml
+            bash .github/scripts/gitleaks-log-opts-test.sh \
+              "$GITLEAKS_BIN" .gitleaks.toml "$GITLEAKS_LOG_OPTS"
           fi
