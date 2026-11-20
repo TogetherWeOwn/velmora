@@ -360,6 +360,15 @@ pub fn assemble_article_with(
     out.extend_from_slice(b"\r\n");
     let body_start = out.len();
     write_body(&mut out)?;
+    // `write_body` appends; one that cut or rewrote the headers is refused.
+    if out.len() < body_start
+        || out[..headers.len()] != *headers
+        || out[headers.len()..body_start] != *b"\r\n"
+    {
+        return Err(Error::Malformed(
+            "article body writer changed the headers".into(),
+        ));
+    }
     check_body_framing(&out[body_start..])?;
     Ok(out)
 }

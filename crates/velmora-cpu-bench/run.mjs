@@ -7,9 +7,11 @@
 // --expect-simd fails unless the module's simd128 state is the one named;
 // --check-only stops after the self-check (no timing).
 //
-// Prints CPU milliseconds per MiB of object data for each stage: the
-// median of `reps` runs after one warm-up run. The module is single
-// threaded and does no I/O, so wall time is CPU time.
+// Prints milliseconds per MiB of object data for each stage: the median
+// of `reps` runs after one warm-up run. The module is single threaded and
+// does no I/O, so on an idle host this elapsed time is its CPU time; on a
+// busy host it also counts the time the thread was descheduled, so
+// compare runs taken on the same idle host.
 import { readFileSync, writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
@@ -20,6 +22,15 @@ const flag = (name, fallback) => {
 };
 const mib = Number(flag("--mib", "16"));
 const reps = Number(flag("--reps", "7"));
+// The extent size goes to wasm as a u32 of bytes.
+if (!Number.isInteger(mib) || mib < 1 || mib > 4095) {
+  console.error("--mib takes a whole number from 1 to 4095");
+  process.exit(2);
+}
+if (!Number.isInteger(reps) || reps < 1) {
+  console.error("--reps takes a whole number from 1");
+  process.exit(2);
+}
 const jsonOut = flag("--json", null);
 const expectSimd = flag("--expect-simd", null);
 if (expectSimd !== null && expectSimd !== "on" && expectSimd !== "off") {
@@ -34,7 +45,7 @@ if (checkOnly && (unchecked || jsonOut !== null)) {
   process.exit(2);
 }
 if (!wasmPath || args.length !== 1) {
-  console.error("usage: node run.mjs <bench.wasm> [--mib 16] [--reps 7] [--json out.json] [--unchecked]");
+  console.error("usage: node run.mjs <bench.wasm> [--mib 16] [--reps 7] [--json out.json] [--unchecked] [--expect-simd on|off] [--check-only]");
   process.exit(2);
 }
 
@@ -53,13 +64,21 @@ const wasm = new WebAssembly.Instance(module, imports).exports;
 // Refuse to time a build whose outputs differ from the pinned ones.
 // `--unchecked` times a module built from a tree older than the
 // self-check (the "before" side of a comparison).
+let checked = "passed";
 if (unchecked && !wasm.selfcheck) {
   console.error(`${wasmPath}: no self-check in this module; timing it unchecked`);
+  checked = "skipped";
 } else if (wasm.selfcheck() !== 1) {
   console.error(`${wasmPath}: self-check failed: this build's output bytes differ from the pinned fingerprint`);
   process.exit(1);
 }
-const simd = wasm.simd128?.() === 1;
+const state = wasm.simd128?.();
+const simd = state === 1;
+// A state that is asked for must be stated by the module: 0 or 1.
+if (expectSimd !== null && state !== 0 && state !== 1) {
+  console.error(`${wasmPath}: the module does not state its simd128 build`);
+  process.exit(1);
+}
 if (expectSimd !== null && simd !== (expectSimd === "on")) {
   console.error(`${wasmPath}: simd128 is ${simd ? "on" : "off"}, expected ${expectSimd}`);
   process.exit(1);
@@ -87,12 +106,16 @@ const stages = [
   ]),
   ["verify.check", "yEnc decode + CRC-32 + SHA-256", () => wasm.verify_check()],
   ...CHUNKS.map((c) => [`cold@${c}`, `whole cold read, ${c}-byte socket chunks`, () => wasm.cold(c)]),
-  ["cold.open", "decrypt (open_range); also a read from the cache", () => wasm.cold_open()],
+  ["cold.open", "decrypt (open_range) of bytes in memory; a cache hit's store read is not timed", () => wasm.cold_open()],
 ];
 
-const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+const median = (xs) => {
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+};
 const results = {};
-console.log(`${wasmPath}: ${bytes.length} bytes, simd128 ${simd ? "on" : "off"}, self-check ok; ${mib} MiB extent, ${articles} articles; median of ${reps}`);
+console.log(`${wasmPath}: ${bytes.length} bytes, simd128 ${simd ? "on" : "off"}, self-check ${checked}; ${mib} MiB extent, ${articles} articles; median of ${reps}; elapsed time`);
 console.log("stage".padEnd(22) + "ms/MiB".padStart(8) + "   what");
 for (const [name, what, run] of stages) {
   run();
@@ -107,5 +130,5 @@ for (const [name, what, run] of stages) {
   console.log(name.padEnd(22) + perMib.toFixed(2).padStart(8) + "   " + what);
 }
 if (jsonOut) {
-  writeFileSync(jsonOut, JSON.stringify({ wasm_bytes: bytes.length, simd128: simd, mib, articles, reps, ms_per_mib: results }, null, 2) + "\n");
+  writeFileSync(jsonOut, JSON.stringify({ wasm_bytes: bytes.length, simd128: simd, self_check: checked, mib, articles, reps, timing: "elapsed", ms_per_mib: results }, null, 2) + "\n");
 }

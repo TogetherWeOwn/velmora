@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Ranks the functions of a V8 CPU profile by self time.
 //
-//   node --cpu-prof --cpu-prof-dir=prof run.mjs <bench.wasm>
-//   node top.mjs prof/*.cpuprofile [--top 25]
+//   node --cpu-prof --cpu-prof-dir=prof --cpu-prof-name=run.cpuprofile run.mjs <bench.wasm>
+//   node top.mjs prof/run.cpuprofile [--top 25]
+//
+// Takes exactly one profile, and names it in its output.
 //
 // Rust symbol hashes and generic arguments are trimmed so that one
 // function is one line.
@@ -11,7 +13,12 @@ import { readFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const at = args.indexOf("--top");
 const top = at < 0 ? 25 : Number(args.splice(at, 2)[1]);
+if (args.length !== 1) {
+  console.error("usage: node top.mjs <one .cpuprofile> [--top 25]");
+  process.exit(2);
+}
 const profile = JSON.parse(readFileSync(args[0], "utf8"));
+console.log(`${args[0]}:`);
 
 const short = (name) =>
   name

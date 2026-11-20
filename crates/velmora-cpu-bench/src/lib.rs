@@ -395,6 +395,24 @@ impl Bench {
     /// Fetches the extent from Usenet as a cold read does: `BODY`, decode
     /// into place and check per article, then the check of the whole
     /// ciphertext.
+    /// What `BODY` hands back for every article, in order, read in
+    /// `chunk`-byte socket pieces: the bytes the decoder is given.
+    pub fn bodies(&self, chunk: usize) -> Vec<u8> {
+        now(async {
+            let mem = Mem::new(&self.body_script, chunk);
+            let mut client = NntpClient::connect(mem, &config()).await.unwrap();
+            let mut all = Vec::new();
+            let mut wire = Vec::new();
+            for row in &self.rows {
+                wire.clear();
+                client.body_to(&row.message_id, &mut wire).await.unwrap();
+                all.extend_from_slice(&(wire.len() as u64).to_be_bytes());
+                all.extend_from_slice(&wire);
+            }
+            all
+        })
+    }
+
     pub fn cold_fetch(&self, chunk: usize) -> Vec<u8> {
         let mut cipher = vec![0u8; self.cipher().len()];
         now(async {
@@ -451,7 +469,7 @@ impl Bench {
 /// [`fingerprint`] draws. `run.mjs` refuses to time a module that
 /// answers anything else, so a fast path that changes one output byte
 /// cannot be measured as a saving.
-pub const FINGERPRINT: u32 = 0x5808_73f6;
+pub const FINGERPRINT: u32 = 0x2e00_38fe;
 
 /// A digest over every byte the hot paths produce for one fixed extent:
 /// the sealed ciphertext and its hashes, each rendered article, the
@@ -720,6 +738,15 @@ pub fn fingerprint() -> u32 {
         );
     }
     all.extend_from_slice(&wire);
+    // The exact bytes `BODY` hands over, the same in every chunking.
+    let bodies = bench.bodies(65536);
+    for chunk in [1, 7, 4096] {
+        assert!(
+            bench.bodies(chunk) == bodies,
+            "BODY bytes differ at {chunk}-byte reads"
+        );
+    }
+    all.extend_from_slice(&bodies);
     for chunk in [1, 7, 4096, 65536] {
         let cipher = bench.cold_fetch(chunk);
         assert!(cipher == bench.cipher(), "read back differs");
