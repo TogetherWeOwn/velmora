@@ -596,13 +596,19 @@ here):
 
 ## Client settings
 
-Write with parts of 16 MiB, start multipart at 16 MiB, send 16 parts or
-files at once, and give rclone one connection per request:
+Write with parts of 16 MiB, start multipart at 16 MiB, keep about 16
+requests in flight, and give rclone one connection per request:
 
 - rclone: `--s3-upload-cutoff 16M --s3-chunk-size 16M
   --s3-upload-concurrency 16 --transfers 16 --disable-http2` (in
   `rclone.conf`: `upload_cutoff = 16M`, `chunk_size = 16M`,
-  `upload_concurrency = 16`; `--disable-http2` is a global flag).
+  `upload_concurrency = 16`; `--transfers` and `--disable-http2` are
+  global flags, not `rclone.conf` keys).
+  - The upload concurrency is per file: rclone sends up to
+    `transfers x upload_concurrency` parts at once. For a tree of many
+    files above 16 MiB, keep that product near 16, for example
+    `--transfers 4 --s3-upload-concurrency 4`. More than 16 requests at
+    once was not measured.
 - aws-cli, in `~/.aws/config`:
 
   ```ini
@@ -630,13 +636,13 @@ Why these values:
   | 40 MiB | 3 | 5 | 5 |
   | 95 MiB | 6 | 12 | 6 |
 
-- **Concurrency.** One UploadPart of 16 MiB takes 2.4 to 3.5 s through
+- **Concurrency.** One UploadPart of 16 MiB takes 2.4 to 3.6 s through
   the Worker at 4 at once: it is received whole, encrypted, then
   stored. A small PutObject takes about 1.4 s, most of it round trips.
   Both gain from more requests at once. Measured on a test deployment
   from one client host, 256 MiB in 16 MiB parts and 40 PutObjects of
   1 MiB (MiB/s; three deployments for the first and last columns, two
-  to six runs each for the clients):
+  to seven runs each for the clients):
 
   | At once | Multipart, S3 test client | aws-cli | rclone `--disable-http2` | rclone default (HTTP/2) | 1 MiB PutObjects |
   |---:|---:|---:|---:|---:|---:|
@@ -649,7 +655,7 @@ Why these values:
     isolate share its CPU and its in-flight byte budget, so one part
     takes about 5.3 s at 16 at once.
   - rclone sends all its requests to one host over a single HTTP/2
-    connection, and that one connection carries 7 to 15 MiB/s at any
+    connection, and that one connection carries 7 to 16 MiB/s at any
     concurrency. `--disable-http2` gives each request its own
     connection.
 
