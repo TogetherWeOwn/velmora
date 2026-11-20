@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Ranks the functions of a V8 CPU profile by self time.
 //
-//   node --cpu-prof --cpu-prof-dir=prof --cpu-prof-name=run.cpuprofile run.mjs <bench.wasm>
-//   node top.mjs prof/run.cpuprofile [--top 25]
+//   node --cpu-prof --cpu-prof-dir=prof --cpu-prof-name=<build>.cpuprofile run.mjs <bench.wasm>
+//   node top.mjs prof/<build>.cpuprofile [--top 25]
 //
 // Takes exactly one profile, and names it in its output.
 //

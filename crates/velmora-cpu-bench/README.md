@@ -20,9 +20,11 @@ node crates/velmora-cpu-bench/run.mjs \
   target/wasm32-unknown-unknown/release/velmora_cpu_bench.wasm
 
 # Rank functions by self time.
-node --cpu-prof --cpu-prof-dir=prof --cpu-prof-name=run.cpuprofile \
+# One file per build: name it after the build (here simd128), or a second
+# run overwrites the first.
+node --cpu-prof --cpu-prof-dir=prof --cpu-prof-name=simd128.cpuprofile \
   crates/velmora-cpu-bench/run.mjs target/wasm32-unknown-unknown/release/velmora_cpu_bench.wasm
-node crates/velmora-cpu-bench/top.mjs prof/run.cpuprofile
+node crates/velmora-cpu-bench/top.mjs prof/simd128.cpuprofile
 ```
 
 `run.mjs` first runs the module's self-check and refuses to time a build
