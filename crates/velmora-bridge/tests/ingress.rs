@@ -1309,3 +1309,37 @@ async fn the_budget_counts_waits_and_refusals_of_requests_and_jobs_apart() {
     drop((first, served));
     assert_eq!(budget.in_use(), 0);
 }
+
+/// A part split off a charge holds what it took, at most all of the
+/// charge, request bytes first; the budget holds as much as before, and
+/// both parts release what they hold when dropped.
+#[test]
+fn a_charge_split_in_two_holds_as_much_as_before() {
+    let budget = ByteBudget::new(MAX);
+    let mut whole = budget.try_charge(100).unwrap();
+    whole.absorb(budget.try_charge_job(50).unwrap());
+    assert_eq!((budget.in_use(), budget.jobs_in_use()), (150, 50));
+
+    let part = whole.split(120);
+    assert_eq!((part.bytes(), whole.bytes()), (120, 30));
+    assert_eq!((budget.in_use(), budget.jobs_in_use()), (150, 50));
+    drop(part);
+    assert_eq!((budget.in_use(), budget.jobs_in_use()), (30, 30));
+
+    // More than it holds: all of it, and nothing is left behind.
+    let rest = whole.split(1_000);
+    assert_eq!((rest.bytes(), whole.bytes()), (30, 0));
+    drop(whole);
+    assert_eq!(budget.in_use(), 30);
+    drop(rest);
+    assert_eq!((budget.in_use(), budget.jobs_in_use()), (0, 0));
+
+    // Through a request's handle the same holds.
+    let request = budget.for_request();
+    let mut charge = request.try_charge(64).unwrap();
+    let part = charge.split(16);
+    assert_eq!(budget.in_use(), 64);
+    drop(charge);
+    drop(part);
+    assert_eq!(budget.in_use(), 0);
+}

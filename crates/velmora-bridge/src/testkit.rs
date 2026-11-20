@@ -14,6 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use futures_util::stream::{self, StreamExt};
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection, StatementStatus};
 use sha2::{Digest, Sha256};
@@ -21,8 +22,8 @@ use sha2::{Digest, Sha256};
 use crate::meter::Meter;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
-    BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
-    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
+    BlobBody, BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql,
+    SqlValue, UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
 };
 use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
@@ -209,12 +210,24 @@ fn run_to_completion(conn: &Connection, sql: &str, params: &[SqlValue]) -> Resul
     Ok(conn.total_changes().saturating_sub(before))
 }
 
+/// Most terms D1 takes in one compound SELECT, measured on workerd.
+pub const D1_MAX_COMPOUND_SELECT: i32 = 5;
+
 impl RusqliteSql {
     /// Empty in-memory database with foreign keys on.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(map_err)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(map_err)?;
+        // D1 (workerd) refuses a compound SELECT of more than five
+        // terms ("too many terms in compound SELECT"); SQLite's own
+        // default is 500, so a sixth `UNION ALL` arm would pass here
+        // and fail every call on D1.
+        conn.set_limit(
+            rusqlite::limits::Limit::SQLITE_LIMIT_COMPOUND_SELECT,
+            D1_MAX_COMPOUND_SELECT,
+        )
+        .map_err(map_err)?;
         Ok(RusqliteSql {
             conn: RefCell::new(conn),
             meter: RefCell::new(None),
@@ -434,6 +447,8 @@ pub struct MemBlobStore {
     blobs: RefCell<BTreeMap<String, StoredBlob>>,
     gets: Cell<u64>,
     refuse_puts: Cell<bool>,
+    stream_chunk: Cell<usize>,
+    stall_after: Cell<Option<usize>>,
 }
 
 impl MemBlobStore {
@@ -450,7 +465,19 @@ impl MemBlobStore {
         self.refuse_puts.set(refuse);
     }
 
-    /// `get` calls so far.
+    /// From now on a body of `open` comes in chunks of `chunk` bytes
+    /// (0: in one, as before).
+    pub fn stream_in(&self, chunk: usize) {
+        self.stream_chunk.set(chunk);
+    }
+
+    /// The next body of `open` brings `bytes` bytes of its span and then
+    /// nothing, without ending.
+    pub fn stall_next_body_after(&self, bytes: usize) {
+        self.stall_after.set(Some(bytes));
+    }
+
+    /// `get` calls so far, those of `open` included.
     pub fn gets(&self) -> u64 {
         self.gets.get()
     }
@@ -521,6 +548,26 @@ impl BlobStore for MemBlobStore {
                 ))
             }
         }
+    }
+
+    async fn open(&self, key: &str, span: ByteSpan) -> Result<Option<BlobBody>> {
+        let Some(mut bytes) = self.get(key, Some(span)).await? else {
+            return Ok(None);
+        };
+        let stall = self.stall_after.take();
+        if let Some(keep) = stall {
+            bytes.truncate(keep);
+        }
+        let chunk = match self.stream_chunk.get() {
+            0 => bytes.len().max(1),
+            n => n,
+        };
+        let parts: Vec<Result<Vec<u8>>> = bytes.chunks(chunk).map(|c| Ok(c.to_vec())).collect();
+        let body = stream::iter(parts);
+        Ok(Some(match stall {
+            Some(_) => body.chain(stream::pending()).boxed_local(),
+            None => body.boxed_local(),
+        }))
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {

@@ -75,6 +75,7 @@ mod objects;
 mod outbox;
 mod permits;
 mod publish;
+mod read;
 mod recovery;
 mod replay;
 mod uploads;
@@ -96,9 +97,9 @@ use crate::types::{
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
     IntentFence, IntentStats, JobExtent, ListEntry, ListPage, ListQuery, ObjectStatus, OpenUpload,
-    OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig, ProviderFault,
-    ProviderLoad, Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow,
-    VerificationRow, VerifyEscalation, WriteId,
+    OutboxStage, OutboxStats, PartExtent, Perm, PinnedRead, Precondition, ProviderConfig,
+    ProviderFault, ProviderLoad, ReadLookup, ReadQuery, Result, SafetyState, UnixMs,
+    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation, WriteId,
 };
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
@@ -197,6 +198,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         end: u64,
     ) -> Result<Vec<ExtentRow>> {
         objects::extents_in(self, generation, start, end).await
+    }
+    async fn read_lookup(&self, q: &ReadQuery<'_>) -> Result<ReadLookup> {
+        read::read_lookup(self, q).await
+    }
+    async fn pinned_read(
+        &self,
+        bucket: &BucketId,
+        generation: &GenerationId,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<PinnedRead>> {
+        read::pinned_read(self, bucket, generation, start, end).await
     }
     async fn commit_generation(
         &self,

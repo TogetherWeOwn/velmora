@@ -14,24 +14,26 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures_util::future::{poll_fn, select, Either, FutureExt, LocalBoxFuture};
+use futures_util::future::{join3, poll_fn, select, Either, FutureExt, LocalBoxFuture};
 use futures_util::stream::{self, Stream, StreamExt};
-use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
+use velmora::media::{CIPHER_CHUNK_SIZE, HEADER_SIZE, PLAIN_CHUNK_SIZE};
+use velmora_s3_proto::{plan_read, Conditions, ErrorCode, Headers, ObjectMetadata};
 
 use super::common::{
-    authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
+    authenticate_read, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
-use crate::crypto::{cipher_span, open_range, unwrap_bdk};
+use super::flow::{within, Begun, Source};
+use crate::crypto::{cipher_span, open_range, unwrap_bdk, ExtentOpener};
 use crate::fanout::{admit, Fanout, Grant, TOKEN_TTL_MS};
 use crate::fetch::{
     cold_fetch_bytes, cold_poll_ms, cold_read_bytes, cold_step_bytes, ColdFetch, ColdReader,
     COLD_WAIT_MS,
 };
-use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
+use crate::ingress::{ByteBudget, Charge, Sleeper, Spawner, CHARGE_WAIT_MS};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
-    BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, RespBody, Result, S3Request, S3Response,
-    UnixMs,
+    BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, ReadExtent, ReadWindow, RespBody, Result,
+    S3Request, S3Response, UnixMs,
 };
 
 /// Least time between two `last_read_at` writes for one extent. The
@@ -276,14 +278,26 @@ async fn read<
     req: S3Request,
     head: bool,
 ) -> core::result::Result<S3Response, S3Response> {
-    let authed = authenticate(bridge, &req).await?;
+    // One round trip to the catalogue for the whole request: who asks,
+    // what the key holds now, and the extents of the range the headers
+    // name. The range is only a guess here (it is judged below, against
+    // the object); extents that do not cover what is served are asked
+    // for again.
+    let most = bridge.cfg.get_fanout_bytes.unwrap_or(u64::MAX);
+    let guess = |headers: &Headers| match head {
+        true => ReadWindow::Nothing,
+        false => window_hint(headers.get("range")),
+    };
+    let (authed, found) = authenticate_read(bridge, &req, guess, most).await?;
     let (bucket, key) = authed.object()?;
-    let Some(generation) = bridge
-        .catalog
-        .live_generation(&bucket.id, key)
-        .await
-        .map_err(|_| internal())?
-    else {
+    let (generation, near) = match found {
+        Some(found) => (found.generation, found.extents),
+        None => {
+            let live = bridge.catalog.live_generation(&bucket.id, key).await;
+            (live.map_err(|_| internal())?, Vec::new())
+        }
+    };
+    let Some(generation) = generation else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
 
@@ -351,13 +365,87 @@ async fn read<
         .start
         .checked_add(range.length())
         .ok_or_else(internal)?;
-    let extents = bridge
-        .catalog
-        .extents_in(&generation.id, range.start, end)
-        .await
-        .map_err(|_| internal())?;
+    let extents = match covers(&near, range.start, end) {
+        true => known(near, bridge.clock.now()),
+        false => bridge
+            .catalog
+            .extents_in(&generation.id, range.start, end)
+            .await
+            .map_err(|_| internal())?,
+    };
     resp.body = body(bridge, bucket.clone(), extents, range.start, range.length()).await?;
     Ok(resp)
+}
+
+/// The plaintext a `Range` header is expected to select, for the lookup
+/// that fetches the extents together with the object. Only a guess: the
+/// header is judged by `plan_read`, and extents that turn out not to
+/// cover the range served are fetched again. Without a header, or with
+/// one that is not a single plain range, the whole object.
+fn window_hint(range: Option<&str>) -> ReadWindow {
+    let all = ReadWindow::Span {
+        start: 0,
+        end: u64::MAX,
+    };
+    let Some(spec) = range.and_then(|r| r.trim().strip_prefix("bytes=")) else {
+        return all;
+    };
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return all;
+    };
+    match (first.trim().parse::<u64>(), last.trim().parse::<u64>()) {
+        (Ok(start), Ok(last)) => ReadWindow::Span {
+            start,
+            end: last.saturating_add(1),
+        },
+        (Ok(start), Err(_)) if last.trim().is_empty() => ReadWindow::Span {
+            start,
+            end: u64::MAX,
+        },
+        (Err(_), Ok(len)) if first.trim().is_empty() => ReadWindow::Tail { len },
+        _ => all,
+    }
+}
+
+/// Whether `extents`, in order, begin at or before `start` and reach
+/// `end`. Whether they tile the range between is judged by [`pieces`].
+fn covers(extents: &[ReadExtent], start: u64, end: u64) -> bool {
+    let begins = extents
+        .first()
+        .and_then(|e| e.row.plain_offset)
+        .is_some_and(|at| at <= start);
+    let reaches = extents
+        .last()
+        .and_then(|e| e.row.plain_offset?.checked_add(e.row.plain_size))
+        .is_some_and(|at| at >= end);
+    begins && reaches
+}
+
+/// The rows of `extents`. The read stamp each came with is remembered:
+/// an extent that was stamped within the last hour is not stamped by
+/// this read, as if this isolate had stamped it itself. An extent whose
+/// cache copy the catalogue does not count is not remembered: the stamp
+/// of a read from the cache is what counts it.
+fn known(extents: Vec<ReadExtent>, now: UnixMs) -> Vec<ExtentRow> {
+    STAMPED.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        for extent in &extents {
+            let Some(at) = extent.last_read_at.filter(|_| extent.cache_counted) else {
+                continue;
+            };
+            if !(0..READ_STAMP_MS).contains(&(now.0 - at.0)) {
+                continue;
+            }
+            if memo.len() >= STAMP_MEMO {
+                memo.clear();
+            }
+            let seen = memo
+                .entry(extent.row.id.as_str().to_owned())
+                .or_insert(at.0);
+            *seen = (*seen).max(at.0);
+        }
+    });
+    extents.into_iter().map(|extent| extent.row).collect()
 }
 
 /// Serves one sub-range of a large GET (see [`crate::fanout`]): the
@@ -396,22 +484,18 @@ async fn granted<
 ) -> core::result::Result<S3Response, S3Response> {
     // The grant was minted for a generation that existed and a range
     // inside it; anything else here is a fault, not a client error.
-    let (bucket, generation) = bridge
+    let end = grant.start.checked_add(grant.len).ok_or_else(internal)?;
+    let pinned = bridge
         .catalog
-        .generation_by_id(&grant.bucket, &grant.generation)
+        .pinned_read(&grant.bucket, &grant.generation, grant.start, end)
         .await
         .map_err(|_| internal())?
         .ok_or_else(internal)?;
-    let end = grant
-        .start
-        .checked_add(grant.len)
-        .filter(|&end| end <= generation.size)
-        .ok_or_else(internal)?;
-    let extents = bridge
-        .catalog
-        .extents_in(&generation.id, grant.start, end)
-        .await
-        .map_err(|_| internal())?;
+    if end > pinned.generation.size {
+        return Err(internal());
+    }
+    let bucket = pinned.bucket;
+    let extents = known(pinned.extents, bridge.clock.now());
     Ok(S3Response {
         status: 200,
         headers: vec![
@@ -711,7 +795,35 @@ async fn relay<C, B, N, J, K, T>(
     // again when the reader asks, and the body runs ahead again once
     // the reader asks for a piece soon after it took the one before.
     let mut eager = can_run_ahead;
-    for (at, piece) in todo.iter().enumerate() {
+    for (at, whole) in todo.iter().enumerate() {
+        // A piece that the cache or the safety copy holds goes out as
+        // it arrives, block by block. What that leaves of it, for any
+        // reason, is produced as before: in one, from whichever source
+        // has it.
+        let mut flowed = Flowed::default();
+        if cold.idle() {
+            if out.ahead() && !eager && !out.is_wanted() {
+                out.wanted().await;
+            }
+            let patience = timer.filter(|_| out.ahead());
+            flowed = cold.flow(&bucket, whole, &out, patience).await;
+            if flowed.sent == whole.len {
+                continue;
+            }
+            if flowed.stalled {
+                eager = false;
+            }
+        }
+        let rest = Piece {
+            extent: whole.extent.clone(),
+            off: whole.off + flowed.sent,
+            len: whole.len - flowed.sent,
+        };
+        let piece = &rest;
+        // What the stores answered counts for the first try only: a
+        // piece that was taken back is in the cache by the next.
+        let mut absent = flowed.absent;
+        let mut retried = false;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -719,8 +831,16 @@ async fn relay<C, B, N, J, K, T>(
                 cold.end().await;
                 out.wanted().await;
             }
-            cold.mid = at > 0;
-            let item = cold.piece(&bucket, piece).await;
+            cold.mid = at > 0 || flowed.sent > 0;
+            if retried {
+                // A piece taken back while the reader asked: the cache
+                // write of the extent may still run, and the cache is
+                // asked first.
+                cold.settle().await;
+            }
+            let item = cold.piece(&bucket, piece, absent).await;
+            absent = false;
+            retried = true;
             let failed = item.is_err();
             // Before the last item and before an error: the reader of
             // the body may never ask again after either, and the last
@@ -780,6 +900,29 @@ async fn relay<C, B, N, J, K, T>(
         }
     }
 }
+
+/// How far [`Cold::flow`] came with a piece.
+#[derive(Default)]
+struct Flowed {
+    /// Plaintext bytes from the start of the piece that were handed
+    /// over, all of them authenticated.
+    sent: u64,
+    /// Neither store has the extent: both answered so.
+    absent: bool,
+    /// The reader let a block wait too long; the block was taken back.
+    stalled: bool,
+}
+
+/// The budget a flow takes for ciphertext that is arriving and being
+/// opened. More is taken, if it is there, when the store brings larger
+/// chunks than this allows for.
+const FLOW_WINDOW: u64 = 4 << 20;
+/// Sealed bytes a block after the first is let grow to before it is
+/// opened and handed over: fewer, larger hand-overs.
+const FLOW_BLOCK: usize = 4 * CIPHER_CHUNK_SIZE as usize;
+/// Room kept for what the store brings while a block waits for the
+/// reader.
+const FLOW_READ_AHEAD: u64 = 1 << 20;
 
 /// How long a piece that was produced ahead waits for the reader of the
 /// body before it is taken back. Well under the time a request waits for
@@ -867,11 +1010,34 @@ fn open<K: Kek>(kek: &K, bucket: &Bucket, piece: &Piece, base: u64, src: &[u8]) 
     (n == plain.len()).then_some(plain)
 }
 
+/// How long one read of a span into memory may take. A full extent
+/// comes from the cache in well under a second; a read that takes this
+/// long is one of the rare ones that take half a minute.
+pub const WARM_READ_MS: u32 = 10_000;
+/// Reads of one span that may each take [`WARM_READ_MS`].
+const WARM_TRIES: u32 = 2;
+
 /// A blob-store read of exactly `span`. A missing, short or failing read
-/// is a miss.
-async fn warm<B: BlobStore>(store: &B, key: &str, span: ByteSpan) -> Option<Vec<u8>> {
-    let got: Result<Option<Vec<u8>>> = store.get(key, Some(span)).await;
-    got.ok()
+/// is a miss, and so is one that does not come in time twice: a read
+/// that is given up is dropped before the next one begins, so one span
+/// is in memory at most.
+async fn warm<B: BlobStore>(
+    store: &B,
+    key: &str,
+    span: ByteSpan,
+    sleep: Option<&Sleeper>,
+) -> Option<Vec<u8>> {
+    let mut got: Option<Result<Option<Vec<u8>>>> = None;
+    for _ in 0..WARM_TRIES {
+        got = match sleep {
+            Some(sleep) => within(sleep, WARM_READ_MS, store.get(key, Some(span))).await,
+            None => Some(store.get(key, Some(span)).await),
+        };
+        if got.is_some() {
+            break;
+        }
+    }
+    got?.ok()
         .flatten()
         .filter(|bytes| bytes.len() as u64 == span.len)
 }
@@ -912,7 +1078,7 @@ where
     T: Clock,
 {
     let mut cold = Cold::new(bridge);
-    let item = cold.piece(bucket, piece).await;
+    let item = cold.piece(bucket, piece, false).await;
     cold.end().await;
     item
 }
@@ -1137,7 +1303,8 @@ where
     /// If it does not, the copy and the charge are given up, all of it
     /// is waited for with nothing held, and the store is asked again:
     /// two reads that each held a part and waited for the rest would
-    /// wait for each other.
+    /// wait for each other. (The one exception, bounded in time, is the
+    /// top-up of a block in [`Self::flow`] once a block is out.)
     async fn warm(&mut self, bucket: &Bucket, piece: &Piece, span: ByteSpan) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
@@ -1160,9 +1327,10 @@ where
         for from_cache in [true, false] {
             loop {
                 let asked = async {
+                    let timer = bridge.budget.sleeper();
                     match from_cache {
-                        true => warm(&bridge.cache, &extent.id.cache_key(), span).await,
-                        false => warm(&bridge.safety, &extent.id.safety_key(), span).await,
+                        true => warm(&bridge.cache, &extent.id.cache_key(), span, timer).await,
+                        false => warm(&bridge.safety, &extent.id.safety_key(), span, timer).await,
                     }
                 };
                 let asked = Spent::time(&bridge.clock, &spent.warm, asked);
@@ -1193,13 +1361,228 @@ where
         Err(ReadFail::Unavailable)
     }
 
-    async fn piece(&mut self, bucket: &Bucket, piece: &Piece) -> Item {
+    /// Whether nothing is under way from an extent before: no cache
+    /// write and no connection to Usenet.
+    fn idle(&self) -> bool {
+        self.put.is_none() && self.reader.is_none()
+    }
+
+    /// Hands the piece to `out` block by block as its ciphertext
+    /// arrives from the cache or else the safety copy, and says how far
+    /// that went ([`Flowed`]). Called while [`Self::idle`].
+    ///
+    /// Every block is the plaintext of whole sealed chunks, each
+    /// authenticated under its own index (and the last one of the
+    /// extent as the last) before the block exists: a chunk that fails
+    /// ends the flow with nothing of it handed out. So does a body that
+    /// ends early or brings too much, a store that stalls for good, a
+    /// budget without room, and a reader that lets a block wait. The
+    /// caller produces what is left of the piece in one, from whichever
+    /// source has it intact.
+    ///
+    /// A source that fails before its first block is handed out is
+    /// followed by the next. After a block was handed out the flow ends
+    /// at the first failure.
+    ///
+    /// Held meanwhile: a window of the budget for the ciphertext that
+    /// is being put together and opened and for the plaintext of the
+    /// block that is made from it. It is not waited for before the
+    /// first block (without room there is no flow). A block goes to the
+    /// reader with its part of the window; what the window lacks for
+    /// the next one is charged then, and waited for.
+    async fn flow(
+        &mut self,
+        bucket: &Bucket,
+        piece: &Piece,
+        out: &Out<Item>,
+        patience: Option<&Sleeper>,
+    ) -> Flowed {
+        let bridge = self.bridge;
+        let extent = &piece.extent;
+        let mut done = Flowed::default();
+        let Some(span) = cipher_span(extent.plain_size, piece.off, piece.len) else {
+            return done;
+        };
+        let opener = unwrap_bdk(
+            &bridge.kek,
+            bucket.kek_version,
+            &bucket.id,
+            &bucket.bdk_wrapped,
+        )
+        .and_then(|bdk| ExtentOpener::new(&bdk, &bucket.id, extent));
+        let Ok(opener) = opener else {
+            return done;
+        };
+        let room = Rc::clone(&self.room);
+        let most = span.len.saturating_add(piece.len);
+        let Some(work) = room.try_charge_in_turn(FLOW_WINDOW.min(most)) else {
+            return done;
+        };
+        // Until the last block of the piece is opened.
+        let mut work = Some(work);
+        let timer = bridge.budget.sleeper();
+        let mut absent = true;
+        for from_cache in [true, false] {
+            let (store, key) = match from_cache {
+                true => (&bridge.cache, extent.id.cache_key()),
+                false => (&bridge.safety, extent.id.safety_key()),
+            };
+            let mut src = match Source::begin(store, key, span, timer.cloned()).await {
+                Begun::Absent => continue,
+                Begun::Failed => {
+                    absent = false;
+                    continue;
+                }
+                Begun::Body(src) => src,
+            };
+            absent = false;
+            // Ciphertext that arrived and was not opened yet; `base` is
+            // the offset of its first byte in the extent, always the
+            // start of a sealed chunk.
+            let mut buf: Vec<u8> = Vec::new();
+            let mut base = span.start;
+            // What was read while the block before waited for its reader.
+            let mut ahead: Option<Option<Vec<u8>>> = None;
+            loop {
+                let more = match ahead.take() {
+                    Some(more) => more,
+                    None => src.more().await,
+                };
+                let Some(bytes) = more else {
+                    break;
+                };
+                match buf.is_empty() {
+                    true => buf = bytes,
+                    false => buf.extend_from_slice(&bytes),
+                }
+                // Whole sealed chunks only. The last chunk of the span
+                // may be a short one: it is whole when the span is.
+                let complete = src.left() == 0;
+                let sealed = match complete {
+                    true => buf.len(),
+                    false => buf.len() - buf.len() % CIPHER_CHUNK_SIZE as usize,
+                };
+                // The first block leaves as soon as one chunk is there;
+                // later ones are let grow first.
+                let enough = complete || done.sent == 0 || sealed >= FLOW_BLOCK;
+                if sealed == 0 || !enough {
+                    continue;
+                }
+                let from = piece.off + done.sent;
+                let to = match complete {
+                    true => piece.off + piece.len,
+                    false => {
+                        let chunks = (base - HEADER_SIZE + sealed as u64) / CIPHER_CHUNK_SIZE;
+                        (chunks * PLAIN_CHUNK_SIZE).min(piece.off + piece.len)
+                    }
+                };
+                let Some(n) = to.checked_sub(from).filter(|&n| n > 0) else {
+                    break;
+                };
+                // Live from here: the ciphertext, its plaintext, and
+                // what the store brings while the block waits.
+                let need = (buf.len() as u64 + n + FLOW_READ_AHEAD).min(most.max(n));
+                let Some(window) = work.as_mut() else {
+                    break;
+                };
+                let short = need.saturating_sub(window.bytes());
+                if short > 0 {
+                    let more = match room.try_charge(short) {
+                        Some(more) => Some(more),
+                        // A block of this piece is out. These few bytes
+                        // are waited for: what is left of the piece in
+                        // one would need far more room than they do.
+                        // The one wait for room with room held (see
+                        // `warm`): bounded by `CHARGE_WAIT_MS`, after
+                        // which the window is dropped and the body ends
+                        // short. A later piece, which has sent nothing
+                        // of its own yet, does not wait here.
+                        None if done.sent > 0 => self.wait(room.charge(short)).await.ok(),
+                        None => None,
+                    };
+                    match (more, work.as_mut()) {
+                        (Some(more), Some(window)) => window.absorb(more),
+                        _ => break,
+                    }
+                }
+                let Ok(size) = usize::try_from(n) else {
+                    break;
+                };
+                let mut plain = vec![0u8; size];
+                match opener.open(base, &buf[..sealed], from, &mut plain) {
+                    Ok(opened) if opened == size => {}
+                    // Not authentic: nothing of the block leaves.
+                    _ => break,
+                }
+                buf.drain(..sealed);
+                base += sealed as u64;
+                // The plaintext goes to the reader with its part of
+                // the window, which counted it already.
+                let Some(held) = work.as_mut().map(|window| window.split(n)) else {
+                    break;
+                };
+                if complete {
+                    // Nothing more is read for this piece: what waits
+                    // for the reader is its plaintext alone.
+                    work = None;
+                }
+                let item: Item = Ok((plain, held));
+                let sending = async {
+                    match patience {
+                        Some(sleep) => out.send_within(item, sleep(PIECE_WAIT_MS)).await,
+                        None => {
+                            out.send(item).await;
+                            true
+                        }
+                    }
+                };
+                let reading = async {
+                    match src.left() {
+                        0 => None,
+                        _ => Some(src.more().await),
+                    }
+                };
+                // The stamp is written beside the first block, not
+                // before it: the reader has its first bytes meanwhile.
+                let stamping = async {
+                    if done.sent == 0 {
+                        stamp_read(bridge, &extent.id, from_cache).await;
+                    }
+                };
+                let (taken, read, ()) = join3(sending, reading, stamping).await;
+                if !taken {
+                    done.stalled = true;
+                    return done;
+                }
+                done.sent += n;
+                if done.sent == piece.len {
+                    return done;
+                }
+                ahead = read;
+            }
+            if done.sent > 0 {
+                return done;
+            }
+        }
+        done.absent = absent;
+        done
+    }
+
+    /// The piece from whichever source has it: the cache or the safety
+    /// copy ([`Self::warm`]), else Usenet. `absent`: both stores were
+    /// just asked and answered that they do not have the extent; they
+    /// are not asked again first.
+    async fn piece(&mut self, bucket: &Bucket, piece: &Piece, absent: bool) -> Item {
         let bridge = self.bridge;
         let extent = &piece.extent;
         self.until = None;
         let span =
             cipher_span(extent.plain_size, piece.off, piece.len).ok_or(ReadFail::Internal)?;
-        match self.warm(bucket, piece, span).await {
+        let found = match absent {
+            true => Err(ReadFail::Unavailable),
+            false => self.warm(bucket, piece, span).await,
+        };
+        match found {
             Err(ReadFail::Unavailable) => {}
             found => {
                 // Idle connections would outlive their slots.
@@ -1256,7 +1639,7 @@ where
                     // may have taken it. Then the extent is given up
                     // and read again under a charge for all of it, taken
                     // with nothing held: a read never waits for room
-                    // while it holds some.
+                    // while it holds some (but see `flow`).
                     let short = need.saturating_sub(work.bytes());
                     if short > 0 {
                         match room.try_charge(short) {

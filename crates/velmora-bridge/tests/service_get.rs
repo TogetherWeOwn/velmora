@@ -1312,6 +1312,66 @@ async fn a_slow_reader_gets_each_piece_when_it_asks_until_it_is_quick_again() {
     local.run_until(test).await;
 }
 
+/// A piece that follows one from the stores is asked for there first,
+/// found in neither, and read from Usenet. Taken back from a reader
+/// that let it wait, it is in the cache: it is served from there when
+/// the reader asks, not read from the provider a second time.
+#[tokio::test(flavor = "current_thread")]
+async fn a_piece_that_was_taken_back_is_served_from_the_cache_it_was_written_to() {
+    let local = tokio::task::LocalSet::new();
+    let test = async {
+        let sleeper = timed_sleeper(|ms| match ms == PIECE_WAIT_MS {
+            true => 20,
+            false => ms.into(),
+        });
+        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let rig = &cold.rig;
+        let parts = [
+            pattern(121, 300_000),
+            pattern(122, 300_000),
+            pattern(123, 300_000),
+        ];
+        let extents = cold_parts(&cold, "multi", &parts, &[0], &[]).await;
+        let req = cold.signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "multi"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut body) = resp.body else {
+            panic!("a GET body is a stream");
+        };
+        // The first piece is taken as it comes, then nothing.
+        let mut got = Vec::new();
+        while got.len() < parts[0].len() {
+            got.extend(body.next().await.unwrap().unwrap());
+        }
+        eventually("the second piece is taken back", || {
+            cached(rig, &extents[1])
+                && rig.bridge.budget.in_use() == 0
+                && rig.bridge.nntp.live() == 0
+        })
+        .await;
+        let connects = rig.bridge.nntp.connects();
+        while got.len() < parts[0].len() + parts[1].len() {
+            got.extend(body.next().await.unwrap().unwrap());
+        }
+        assert_eq!(rig.bridge.nntp.connects(), connects);
+        while let Some(item) = body.next().await {
+            got.extend(item.unwrap());
+        }
+        assert!(got == parts.concat());
+        assert!(extents[1..].iter().all(|e| cached(rig, e)));
+        assert_eq!(rig.bridge.nntp.live(), 0);
+        assert_eq!(rig.bridge.budget.in_use(), 0);
+    };
+    local.run_until(test).await;
+}
+
 /// A body that is produced ahead of a reader that keeps up holds a
 /// piece or the room for the next one at every moment. A request that
 /// waits for more room than is left beside one piece is served all the

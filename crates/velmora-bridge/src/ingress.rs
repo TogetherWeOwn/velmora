@@ -1038,6 +1038,22 @@ impl Charge {
         self.requests.saturating_add(self.jobs)
     }
 
+    /// Parts `bytes` of what this charge holds off as a charge of their
+    /// own, at most all of it. The budget holds as much as before, and
+    /// so does the request.
+    pub fn split(&mut self, bytes: u64) -> Charge {
+        let requests = bytes.min(self.requests);
+        let jobs = (bytes - requests).min(self.jobs);
+        self.requests -= requests;
+        self.jobs -= jobs;
+        Charge {
+            state: Rc::clone(&self.state),
+            requests,
+            jobs,
+            held: self.held.clone(),
+        }
+    }
+
     /// Takes over what `other` holds, so that one charge stands for both.
     /// A charge against another budget is released instead.
     pub fn absorb(&mut self, mut other: Charge) {

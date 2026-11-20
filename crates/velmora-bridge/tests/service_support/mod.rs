@@ -307,6 +307,9 @@ impl BlobStore for Blobs {
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
         self.trip.guard(blob_down, self.inner.get(key, span)).await
     }
+    async fn open(&self, key: &str, span: ByteSpan) -> Result<Option<BlobBody>> {
+        self.trip.guard(blob_down, self.inner.open(key, span)).await
+    }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
         self.trip.guard(blob_down, self.inner.head(key)).await
     }
@@ -386,6 +389,9 @@ pub struct FailSql {
     pub overloaded: Cell<u32>,
     /// Every call crosses it first.
     pub trip: Tripwire,
+    /// Round trips so far: every query, statement and batch that was
+    /// sent, whatever came of it.
+    pub trips: Cell<u64>,
 }
 
 /// How a publication batch fails: D1 may answer with an error before it
@@ -444,15 +450,23 @@ impl std::ops::Deref for FailSql {
 
 impl Sql for FailSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.trips.set(self.trips.get() + 1);
         self.over_budget()?;
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
+        }
+        // D1 counts in doubles: its adapter refuses an integer it cannot
+        // hold exactly, and so does this one.
+        let exact = |v: &SqlValue| !matches!(v, SqlValue::Int(i) if i.unsigned_abs() >= 1 << 53);
+        if !params.iter().all(exact) {
+            return Err(BridgeError::Sql("integer outside the exact range".into()));
         }
         self.trip
             .guard(sql_down, self.inner.query(sql, params))
             .await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.trips.set(self.trips.get() + 1);
         self.over_budget()?;
         if self.fail_writes.get() || self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
@@ -462,6 +476,7 @@ impl Sql for FailSql {
             .await
     }
     async fn batch(&self, mut stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        self.trips.set(self.trips.get() + 1);
         self.over_budget()?;
         if self.fail_writes.get() {
             return Err(BridgeError::Sql("database down".into()));
@@ -581,6 +596,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),
                 overloaded: Cell::new(0),
+                trips: Cell::new(0),
             }),
             safety: Blobs {
                 trip,

@@ -8,6 +8,8 @@
 // No `Send` bound is intended (see module docs).
 #![allow(async_fn_in_trait)]
 
+use futures_util::stream::{self, LocalBoxStream, StreamExt};
+
 use crate::config::BridgeConfig;
 use crate::ingress::ByteBudget;
 use crate::plan::{PackReport, StoredPlan};
@@ -18,11 +20,11 @@ use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Backlog, Bucket, BucketId,
     ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
-    IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
-    ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition,
-    ProviderConfig, ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs,
-    UploadId, UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation,
-    WriteId,
+    IntentFence, IntentStats, Job, JobExtent, KekBytes, KeyStatus, ListEntry, ListPage, ListQuery,
+    ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, PinnedRead, Precondition,
+    ProviderConfig, ProviderFault, ProviderLoad, ReadExtent, ReadLookup, ReadQuery, ReadWindow,
+    Resend, SafetyState, SizeCommand, UnixMs, UploadId, UploadListQuery, UploadPartRow, UploadRow,
+    VerificationRow, VerifyEscalation, WriteId,
 };
 use crate::types::{
     BucketUsage, RecountState, RecountStep, UsageCounters, UsageRecount, UsageSnapshot,
@@ -135,12 +137,29 @@ pub struct BlobEntry {
     pub md5: String,
 }
 
+/// The bytes of one blob read as they arrive ([`BlobStore::open`]).
+pub type BlobBody = LocalBoxStream<'static, Result<Vec<u8>>>;
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
     /// H2 adds `put_stream(len)`.
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()>;
     /// `None` = absent. With a span, exactly that range.
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
+    /// As [`Self::get`] of a non-empty span, with the bytes handed over
+    /// as they arrive: this returns once the store has answered, and the
+    /// items of the body are the bytes of the span in order. A body that
+    /// fails ends in an error. The reader counts the bytes: a store may
+    /// end a body short. Dropping the call or the body ends the read.
+    ///
+    /// A store without such a read answers with the whole span as one
+    /// item. That span is in memory before its reader has charged the
+    /// byte budget for more than a window of it: a store that serves
+    /// GETs has a read of its own.
+    async fn open(&self, key: &str, span: ByteSpan) -> Result<Option<BlobBody>> {
+        let bytes = self.get(key, Some(span)).await?;
+        Ok(bytes.map(|bytes| stream::once(async move { Ok(bytes) }).boxed_local()))
+    }
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
     /// Idempotent. Refuses a recovery record (any key under `m/`, which
@@ -524,6 +543,66 @@ pub struct KeyHead {
     pub unpublished: bool,
 }
 
+/// [`Catalog::read_lookup`] from the single reads of `c`, one after the
+/// other: what every adapter must answer, however it asks.
+pub async fn read_lookup_by_parts<C: Catalog + ?Sized>(
+    c: &C,
+    q: &ReadQuery<'_>,
+) -> Result<ReadLookup> {
+    let mut out = ReadLookup {
+        key: c
+            .access_key(q.akid)
+            .await?
+            .filter(|key| key.status == KeyStatus::Active),
+        bucket: c.bucket_by_name(q.bucket).await?,
+        ..ReadLookup::default()
+    };
+    let Some(bucket) = &out.bucket else {
+        return Ok(out);
+    };
+    if out.key.is_none() {
+        return Ok(out);
+    }
+    out.perm = c.grant(q.akid, &bucket.id).await?;
+    if out.perm.is_none() {
+        return Ok(out);
+    }
+    out.generation = c.live_generation(&bucket.id, q.key).await?;
+    let Some(generation) = &out.generation else {
+        return Ok(out);
+    };
+    let (start, end) = match q.window {
+        ReadWindow::Nothing => return Ok(out),
+        ReadWindow::Span { start, end } => (start, end.min(generation.size)),
+        ReadWindow::Tail { len } => (generation.size.saturating_sub(len), generation.size),
+    };
+    if start >= end || end - start > q.max_len {
+        return Ok(out);
+    }
+    let extents = c.extents_in(&generation.id, start, end).await?;
+    out.extents = extents.into_iter().map(ReadExtent::unstamped).collect();
+    Ok(out)
+}
+
+/// [`Catalog::pinned_read`] from the single reads of `c`.
+pub async fn pinned_read_by_parts<C: Catalog + ?Sized>(
+    c: &C,
+    bucket: &BucketId,
+    generation: &GenerationId,
+    start: u64,
+    end: u64,
+) -> Result<Option<PinnedRead>> {
+    let Some((bucket, generation)) = c.generation_by_id(bucket, generation).await? else {
+        return Ok(None);
+    };
+    let extents = c.extents_in(&generation.id, start, end).await?;
+    Ok(Some(PinnedRead {
+        bucket,
+        generation,
+        extents: extents.into_iter().map(ReadExtent::unstamped).collect(),
+    }))
+}
+
 /// The catalogue, implemented once: `sql::SqlCatalog<S: Sql>`.
 pub trait Catalog {
     // admin + auth
@@ -605,6 +684,30 @@ pub trait Catalog {
         start: u64,
         end: u64,
     ) -> Result<Vec<ExtentRow>>;
+    /// What a GET or HEAD of `q.key` in the bucket named `q.bucket`
+    /// needs, as one read of the catalogue: see [`ReadLookup`]. An
+    /// adapter that can ask all of it in one round trip does; this is
+    /// the same answer from the single reads, and the reference for it.
+    ///
+    /// The generation is looked up only for an active key that holds a
+    /// grant on the bucket. The extents are those `extents_in` returns
+    /// for the window cut at the size of that generation, and none when
+    /// that is longer than `q.max_len` or empty.
+    async fn read_lookup(&self, q: &ReadQuery<'_>) -> Result<ReadLookup> {
+        read_lookup_by_parts(self, q).await
+    }
+    /// [`Self::generation_by_id`] with the extents of plaintext
+    /// `[start, end)` ([`Self::extents_in`]), as one read of the
+    /// catalogue.
+    async fn pinned_read(
+        &self,
+        bucket: &BucketId,
+        generation: &GenerationId,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<PinnedRead>> {
+        pinned_read_by_parts(self, bucket, generation, start, end).await
+    }
     /// Single PUT; one batch (DESIGN §A.3 step 6). `Lost` = the key's
     /// live generation carries a newer id or its floor a higher one; nothing
     /// was written. The caller takes a newer id and tries again.

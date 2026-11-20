@@ -12,12 +12,12 @@
 
 use std::collections::HashMap;
 
-use futures_util::StreamExt;
+use futures_util::stream::{self, StreamExt};
 
 use velmora_bridge::recovery::{
     is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
-use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
+use velmora_bridge::{BlobBody, BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
 use worker::{Bucket, Range};
 
 /// R2 range offsets travel as JS numbers (workers-rs panics above this).
@@ -170,6 +170,29 @@ impl BlobStore for R2Blobs {
             ));
         }
         Ok(Some(bytes))
+    }
+
+    /// The body as R2 sends it, chunk by chunk: nothing of it is read
+    /// before the caller asks. The caller counts the bytes.
+    async fn open(&self, key: &str, span: ByteSpan) -> Result<Option<BlobBody>> {
+        if span.len == 0 {
+            // R2 has no empty range.
+            let whole = self.get(key, Some(span)).await?;
+            return Ok(whole.map(|bytes| stream::once(async { Ok(bytes) }).boxed_local()));
+        }
+        let req = self.bucket.get(key).range(r2_range(span)?);
+        let Some(object) = req.execute().await.map_err(blob_err("get"))? else {
+            return Ok(None);
+        };
+        let body = object
+            .body()
+            .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
+        let chunks = body.stream().map_err(blob_err("get body"))?;
+        Ok(Some(
+            chunks
+                .map(|chunk| chunk.map_err(blob_err("get body")))
+                .boxed_local(),
+        ))
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {

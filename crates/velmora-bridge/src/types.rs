@@ -857,6 +857,93 @@ pub struct GenerationRow {
     pub retired_at: Option<UnixMs>,
 }
 
+/// The part of the live object a read expects to serve, as far as its
+/// request line and headers tell before the object is known. It only
+/// chooses which extents [`ReadLookup`] brings along: the read is planned
+/// against the generation afterwards, and extents that do not cover what
+/// it then serves are read again for exactly that
+/// (`Catalog::extents_in`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadWindow {
+    /// No extents: a HEAD.
+    Nothing,
+    /// Plaintext `[start, end)`, `end` cut at the size of the object.
+    Span { start: u64, end: u64 },
+    /// The last `len` bytes of the object.
+    Tail { len: u64 },
+}
+
+/// What one GET or HEAD asks the catalogue (`Catalog::read_lookup`).
+#[derive(Clone, Copy, Debug)]
+pub struct ReadQuery<'a> {
+    /// The access key id the request claims.
+    pub akid: &'a str,
+    /// The bucket name of the request.
+    pub bucket: &'a str,
+    /// The decoded object key.
+    pub key: &'a str,
+    pub window: ReadWindow,
+    /// A window longer than this, once cut at the size of the object,
+    /// brings no extents: such a body is not read by the request itself
+    /// (`BridgeConfig::get_fanout_bytes`).
+    pub max_len: u64,
+}
+
+/// One extent as a read meets it, with the state of its read stamp at
+/// the moment of the lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadExtent {
+    pub row: ExtentRow,
+    /// `extents.last_read_at`, when the lookup read it.
+    pub last_read_at: Option<UnixMs>,
+    /// The catalogue counts a cache fill for the extent.
+    pub cache_counted: bool,
+}
+
+impl ReadExtent {
+    /// A row whose read stamp is not known: the read asks the catalogue
+    /// when it stamps.
+    pub fn unstamped(row: ExtentRow) -> Self {
+        ReadExtent {
+            row,
+            last_read_at: None,
+            cache_counted: false,
+        }
+    }
+}
+
+/// Everything a GET or HEAD needs from the catalogue, read in one round
+/// trip and at one moment: what `access_key`, `bucket_by_name`, `grant`,
+/// `live_generation` and `extents_in` answer one after the other.
+///
+/// `generation` and `extents` are of the bucket named `bucket`, whoever
+/// asks: the caller uses them only once the key authenticated and holds
+/// a grant, exactly as it would have asked for them only then.
+#[derive(Clone, Debug, Default)]
+pub struct ReadLookup {
+    /// The key's row, only while it is active.
+    pub key: Option<AccessKeyRow>,
+    pub bucket: Option<Bucket>,
+    /// The key's permission on the bucket; `None` for a disabled key.
+    pub perm: Option<Perm>,
+    /// The live generation of the key in the bucket.
+    pub generation: Option<GenerationRow>,
+    /// The extents of `generation` in the window, in order, placed as
+    /// the generation has them. Empty when the window was not asked for
+    /// or is longer than `max_len`.
+    pub extents: Vec<ReadExtent>,
+}
+
+/// What one sub-range of a large GET needs (`Catalog::pinned_read`): the
+/// generation it was planned against, with its bucket and the extents of
+/// the sub-range.
+#[derive(Clone, Debug)]
+pub struct PinnedRead {
+    pub bucket: Bucket,
+    pub generation: GenerationRow,
+    pub extents: Vec<ReadExtent>,
+}
+
 /// `extents` row. `Debug` hides the wrapped file key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExtentRow {
