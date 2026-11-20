@@ -181,6 +181,41 @@ const MEASURED: &[(&str, Option<u64>)] = &[
     ),
 ];
 
+/// A release as one write of the extent row, measured the same way on
+/// a new database: `held` to `released` in one statement (the last one,
+/// on `x_b`) is two, where the two statements of the older release (on
+/// `x_a`) are two each.
+const RELEASE: &[(&str, Option<u64>)] = &[
+    (
+        r#"INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) VALUES ('b_c','calc','o',x'00',1,1)"#,
+        Some(3),
+    ),
+    (
+        r#"INSERT INTO generations(id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at) VALUES ('g_c','b_c','k','live',1,'e','{}','{}',1,1)"#,
+        Some(3),
+    ),
+    (
+        r#"INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) VALUES ('x_a','b_c','g_c','committed',0,0,1,1,x'00','m','s','c','held',1)"#,
+        Some(7),
+    ),
+    (
+        r#"INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) VALUES ('x_b','b_c','g_c','committed',1,0,1,1,x'00','m','s','c','held',1)"#,
+        Some(7),
+    ),
+    (
+        r#"UPDATE extents SET safety_state='releasing', release_evidence='[]', evict_seq=evict_seq+1 WHERE id='x_a'"#,
+        Some(2),
+    ),
+    (
+        r#"UPDATE extents SET safety_state='released', released_at=2, hot_safety_bytes=cipher_size, last_read_at=COALESCE(last_read_at, created_at), evict_seq=evict_seq+1 WHERE id='x_a'"#,
+        Some(2),
+    ),
+    (
+        r#"UPDATE extents SET safety_state = 'released', release_evidence = '[]', released_at = 2, hot_safety_bytes = cipher_size, last_read_at = COALESCE(last_read_at, created_at), evict_seq = evict_seq + 1 WHERE id = 'x_b'"#,
+        Some(2),
+    ),
+];
+
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .build()
@@ -190,11 +225,22 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 #[test]
 fn the_meter_matches_d1_statement_by_statement() {
+    matches_d1(MEASURED);
+}
+
+#[test]
+fn the_meter_matches_d1_on_a_release_in_one_write() {
+    matches_d1(RELEASE);
+}
+
+/// Runs `list` on a new database: the meter must give D1's figure for
+/// every statement.
+fn matches_d1(list: &[(&str, Option<u64>)]) {
     let db = RusqliteSql::with_schema().expect("schema");
     db.meter_writes().expect("meter");
     let mut wrong = Vec::new();
     let mut total = 0u64;
-    for (sql, measured) in MEASURED {
+    for (sql, measured) in list {
         let before = db.writes();
         let ran = block_on(db.exec(sql, &[]));
         let metered = db.writes().since(&before).billed();
@@ -218,7 +264,7 @@ fn the_meter_matches_d1_statement_by_statement() {
         wrong.is_empty(),
         "the meter disagrees with D1 on {} of {} statements:\n{}",
         wrong.len(),
-        MEASURED.len(),
+        list.len(),
         wrong.join("\n")
     );
     assert_eq!(db.writes().billed(), total, "the report's total");

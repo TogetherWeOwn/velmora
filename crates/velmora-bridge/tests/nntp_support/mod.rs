@@ -262,7 +262,7 @@ impl NntpConnector for TcpConnector {
 // In-memory catalogue
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutboxRow {
     pub generation: GenerationId,
     pub stage: OutboxStage,
@@ -473,18 +473,30 @@ impl MemCatalog {
         rows
     }
 
-    /// The release guard, with the full check on record asked for or not.
-    fn release(
+    /// The release guard. `light`: as the SQL catalogue, `None` for the
+    /// guard of `body`, `Some(need_full)` for the light check.
+    fn release_as(
         &self,
         l: &Lease,
         required: u32,
         counting: &[String],
         evidence_json: &str,
-        need_full: bool,
-        light: bool,
+        now: UnixMs,
+        light: Option<bool>,
     ) -> Guard<()> {
+        let need_full = light.unwrap_or(true);
+        let light = light.is_some();
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
+            // As the SQL guard: a lease that has not run out.
+            if e.outbox.lease_until.is_none_or(|until| until < now) {
+                return false;
+            }
+            // As the SQL guard: a copy that is still pinned.
+            let state = e.job.extent.safety_state;
+            if !matches!(state, SafetyState::Held | SafetyState::Releasing) {
+                return false;
+            }
             // As the SQL guard: under the light check, the escalations
             // that had not ended when the extent was stored.
             let stored = e.job.extent.created_at;
@@ -524,8 +536,12 @@ impl MemCatalog {
             if !velmora_bridge::verify::release_rule(passes, counting, required, need_full) {
                 return false;
             }
-            e.job.extent.safety_state = SafetyState::Releasing;
+            // As the SQL catalogue: one write, released and the row done.
+            e.job.extent.safety_state = SafetyState::Released;
             e.job.extent.release_evidence = Some(evidence_json.to_string());
+            e.job.extent.released_at = Some(now);
+            e.outbox.stage = OutboxStage::Done;
+            e.outbox.lease_until = None;
             true
         });
         if applied == Some(true) {
@@ -635,13 +651,12 @@ impl Catalog for MemCatalog {
     }
 
     async fn fail(&self, l: &Lease, class: FailClass, next_at: UnixMs, _: UnixMs) -> Result<bool> {
-        Ok(self
-            .fenced(l, |e| {
-                e.outbox.last_error = Some(class);
-                e.outbox.next_at = next_at;
-                e.outbox.lease_until = None;
-            })
-            .is_some())
+        Ok(self.fenced(l, |e| {
+            e.outbox.last_error = Some(class);
+            e.outbox.next_at = next_at;
+            e.outbox.lease_until = None;
+            true
+        }) == Some(true))
     }
 
     async fn set_cursor(&self, l: &Lease, cursor: u32, _: UnixMs) -> Result<bool> {
@@ -649,13 +664,12 @@ impl Catalog for MemCatalog {
     }
 
     async fn defer(&self, l: &Lease, next_at: UnixMs, _: UnixMs) -> Result<bool> {
-        Ok(self
-            .fenced(l, |e| {
-                e.outbox.attempts -= 1;
-                e.outbox.next_at = next_at;
-                e.outbox.lease_until = None;
-            })
-            .is_some())
+        Ok(self.fenced(l, |e| {
+            e.outbox.attempts -= 1;
+            e.outbox.next_at = next_at;
+            e.outbox.lease_until = None;
+            true
+        }) == Some(true))
     }
 
     async fn job_extent(&self, extent: &ExtentId, _: &GenerationId) -> Result<Option<JobExtent>> {
@@ -767,27 +781,28 @@ impl Catalog for MemCatalog {
         Ok(found.unwrap_or_default())
     }
 
-    async fn begin_release(
+    async fn release(
         &self,
         l: &Lease,
         required: u32,
         counting: &[String],
         evidence_json: &str,
-        _: UnixMs,
+        now: UnixMs,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, true, false))
+        Ok(self.release_as(l, required, counting, evidence_json, now, None))
     }
 
-    async fn begin_release_light(
+    async fn release_light(
         &self,
         l: &Lease,
         required: u32,
         counting: &[String],
         evidence_json: &str,
-        _: UnixMs,
+        now: UnixMs,
         need_full: bool,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, need_full, true))
+        let light = Some(need_full);
+        Ok(self.release_as(l, required, counting, evidence_json, now, light))
     }
 
     async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {
@@ -826,14 +841,16 @@ impl Catalog for MemCatalog {
     }
 
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool> {
-        Ok(self
-            .fenced(l, |e| {
-                e.job.extent.safety_state = SafetyState::Released;
-                e.job.extent.released_at = Some(now);
-                e.outbox.stage = OutboxStage::Done;
-                e.outbox.lease_until = None;
-            })
-            .is_some())
+        Ok(self.fenced(l, |e| {
+            if e.job.extent.safety_state != SafetyState::Releasing {
+                return false;
+            }
+            e.job.extent.safety_state = SafetyState::Released;
+            e.job.extent.released_at = Some(now);
+            e.outbox.stage = OutboxStage::Done;
+            e.outbox.lease_until = None;
+            true
+        }) == Some(true))
     }
 
     // The hot tier is tested on the SQL catalogue; here nothing is ever

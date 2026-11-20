@@ -39,7 +39,9 @@ use velmora::transports::NativeTlsTransport;
 use velmora_bridge::config::BridgeConfig;
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
+use velmora_bridge::testkit::{
+    FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, WriteReport,
+};
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -3278,7 +3280,7 @@ async fn rows_written_per_extent() {
     // A verify job reads every backbone under one claim, and a job
     // that makes its calls within 20 s of its claim renews nothing.
     assert!(
-        packed.0 <= 46,
+        packed.0 <= 44,
         "rows written per packed extent: {}",
         packed.0
     );
@@ -3292,6 +3294,258 @@ async fn rows_written_per_extent() {
         packed.2
     );
     assert!(rows.2 >= 5 * packed.2, "{rows:?} {packed:?}");
+}
+
+/// The stages of an extent's life that write to the catalogue, in order.
+/// Rows written in each stage of [`STAGES`], without provider slots and
+/// without what a dispatcher run writes for itself: per extent of a
+/// multipart upload, once per multipart upload, per `PutObject` of one
+/// extent, and dispatcher marks per extent whose message is late.
+///
+/// The release is one write of the extent row (it was two, 9 rows).
+const PINNED: [(u64, u64, u64, u64); 4] =
+    [(15, 10, 16, 0), (5, 0, 5, 1), (6, 0, 6, 1), (7, 0, 7, 1)];
+
+const STAGES: [&str; 4] = ["upload", "post", "verify", "release"];
+
+/// Billed rows of one stage of a life, by what they are for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StageRows {
+    /// The extent's own rows: everything but the three kinds below.
+    own: u64,
+    /// Provider slots taken and given back (`provider_permits`): as
+    /// many as the connections the jobs took.
+    slots: u64,
+    /// Marks of the dispatcher on rows it sent a job for.
+    marks: u64,
+    /// What a dispatcher run writes whatever it finds: the stamp, its
+    /// cursors and the time of the run.
+    run: u64,
+}
+
+impl StageRows {
+    fn of(r: &WriteReport) -> StageRows {
+        let marks = r
+            .by_statement
+            .iter()
+            .filter(|(sql, _)| sql.starts_with("UPDATE outbox SET sent_at"))
+            .map(|(_, t)| t.billed())
+            .sum();
+        let slots = r.table("provider_permits");
+        let run = r.table("meta") + r.table("scan_cursors") + r.table("rollback_stamp");
+        StageRows {
+            own: r.billed() - slots - marks - run,
+            slots,
+            marks,
+            run,
+        }
+    }
+}
+
+impl Rig {
+    /// Runs every job that is due among `queue` and the ones sent since,
+    /// one after the other, as the queues would deliver them: a job that
+    /// is sent with a delay waits in `queue` for its time.
+    async fn deliver(&self, queue: &mut Vec<(UnixMs, Job)>) {
+        let b = &self.bridge;
+        loop {
+            let now = b.clock.now();
+            for s in b.jobs.take() {
+                queue.push((now.plus_secs(s.delay_secs), s.job));
+            }
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(queue)
+                .into_iter()
+                .partition(|(t, _)| *t <= now);
+            *queue = later;
+            if due.is_empty() {
+                return;
+            }
+            for (_, job) in due {
+                if let JobOutcome::Retry { delay_secs } = b.run_job(&job).await {
+                    queue.push((now.plus_secs(delay_secs), job));
+                }
+            }
+        }
+    }
+
+    /// One object from its upload to its release, with the catalogue
+    /// writes of each stage ([`STAGES`]). Every job is delivered by the
+    /// message the stage before it sent, at its time; the dispatcher
+    /// does not run. With `behind`, every message waits until one
+    /// dispatcher run has found its row due: the run sends a second
+    /// message and marks the row.
+    async fn life(
+        &self,
+        s: &str,
+        path: &str,
+        body: &[u8],
+        part: Option<usize>,
+        behind: bool,
+    ) -> Vec<WriteReport> {
+        const DAY: u32 = 86_400;
+        let b = &self.bridge;
+        let sql = &b.catalog.sql;
+        let mut queue = Vec::new();
+        let mut life = Vec::new();
+        let mut at = sql.writes();
+        let r = match part {
+            Some(part) => self.multipart_put(s, path, body, part).await,
+            None => self.put(path, body).await,
+        };
+        expect_status(s, "the upload", 200, &r);
+        life.push(sql.writes().since(&at));
+        at = sql.writes();
+        // post, verify, release
+        for wait in [0, 120, DAY] {
+            b.clock.advance_secs(wait);
+            if behind {
+                if let Err(e) = b.dispatch().await {
+                    fail(s, "Bridge::dispatch (cron tick)", "Ok", e);
+                }
+            }
+            self.deliver(&mut queue).await;
+            // A wake-up that came before its time was sent on: at its
+            // time it is the job.
+            // Within a day of the stage's start, and no later: a release
+            // that keeps failing ends the loop and fails the test below.
+            let end = b.clock.now().plus_secs(DAY);
+            while let Some(t) = queue.iter().map(|(t, _)| *t).min() {
+                if wait != DAY || t > end {
+                    break;
+                }
+                b.clock.set(t);
+                self.deliver(&mut queue).await;
+            }
+            life.push(sql.writes().since(&at));
+            at = sql.writes();
+        }
+        expect_eq(
+            s,
+            "extents not released",
+            0,
+            self.sql_count("SELECT COUNT(*) FROM extents WHERE safety_state <> 'released'"),
+        );
+        life
+    }
+}
+
+/// The catalogue writes of an extent's life by stage, as D1 bills them.
+#[tokio::test(flavor = "current_thread")]
+async fn rows_written_by_stage() {
+    const EXTENT: usize = 16 * MIB;
+    let rig = Rig::with_backbones(
+        &[
+            ("SAFETY_MIN_AGE_SECS", "86400"),
+            ("REQUIRED_BACKBONES", "2"),
+            ("VERIFY_DELAY_SECS", "120"),
+            ("MAX_PUT_BYTES", "103809024"),
+            ("PACKED_PLANS", "on"),
+        ],
+        2,
+    )
+    .await;
+    let s = "rows written by stage";
+    rig.setup_buckets_and_key(s).await;
+    // The first jobs make the rows of the provider slots, once.
+    let small = test_bytes(1, MIB);
+    rig.life(s, "/slice/w/warm.bin", &small, None, false).await;
+
+    let one = test_bytes(2, EXTENT);
+    let three = test_bytes(3, 3 * EXTENT);
+    let put = rig.life(s, "/slice/w/put.bin", &small, None, false).await;
+    let x1 = rig
+        .life(s, "/slice/w/x1.bin", &one, Some(EXTENT), false)
+        .await;
+    let x3 = rig
+        .life(s, "/slice/w/x3.bin", &three, Some(EXTENT), false)
+        .await;
+    let late = rig
+        .life(s, "/slice/w/late.bin", &three, Some(EXTENT), true)
+        .await;
+
+    println!("stage   | PutObject (1 extent) | multipart: per extent | per upload | late: marks per extent, per run");
+    let mut extent = StageRows::default();
+    let mut object = StageRows::default();
+    for (i, name) in STAGES.iter().enumerate() {
+        let (p, a, c, l) = (
+            StageRows::of(&put[i]),
+            StageRows::of(&x1[i]),
+            StageRows::of(&x3[i]),
+            StageRows::of(&late[i]),
+        );
+        let e = StageRows {
+            own: (c.own - a.own) / 2,
+            slots: (c.slots - a.slots) / 2,
+            marks: l.marks / 3,
+            run: l.run,
+        };
+        println!(
+            "{name:<7} | {:>2} + {:>2} slots | {:>2} + {:>2} slots | {:>2} | {} , {}",
+            p.own,
+            p.slots,
+            e.own,
+            e.slots,
+            a.own - e.own,
+            e.marks,
+            e.run
+        );
+        assert_eq!(l.own, c.own, "{name}: a late message changes nothing else");
+        assert_eq!((p.marks, a.marks, c.marks), (0, 0, 0), "{name}: no mark");
+        // The pins. A statement that starts to write one more row per
+        // extent, per upload or per object fails here, by its stage.
+        // Provider slots are counted apart and not pinned: they depend
+        // on how many sockets a job opens, not on the catalogue.
+        let (per_extent, per_upload, per_put, late_marks) = PINNED[i];
+        assert_eq!(e.own, per_extent, "{name}: rows per extent");
+        assert_eq!(a.own - e.own, per_upload, "{name}: rows per upload");
+        assert_eq!(p.own, per_put, "{name}: rows of a PutObject");
+        assert_eq!(c.own, a.own + 2 * e.own, "{name}: rows grow by the extent");
+        assert_eq!(l.marks, 3 * late_marks, "{name}: marks, messages late");
+        extent.own += e.own;
+        extent.slots += e.slots;
+        extent.marks += e.marks;
+        object.own += p.own;
+        object.slots += p.slots;
+        println!("-- {name}: multipart, 3 extents\n{}", x3[i].render());
+        println!("-- {name}: PutObject\n{}", put[i].render());
+        println!("-- {name}: late, 3 extents\n{}", late[i].render());
+    }
+    println!(
+        "rows written per extent of a multipart upload: {} + {} for provider slots \
+         (+ {} marks when every message is late); per PutObject of one extent: {} + {}",
+        extent.own, extent.slots, extent.marks, object.own, object.slots
+    );
+
+    // After the life: the hot tier evicts the safety copies (nine
+    // extents are released by now), and an object is deleted and
+    // collected (three extents).
+    let sql = &rig.bridge.catalog.sql;
+    let at = sql.writes();
+    let all = u64::MAX / 2;
+    let drain = rig.bridge.catalog.hot_drain_set(all).await;
+    drain.unwrap_or_else(|e| fail(s, "Catalog::hot_drain_set", "Ok", e));
+    let evicted = rig.bridge.evict_batch(all).await;
+    evicted.unwrap_or_else(|e| fail(s, "Bridge::evict_batch", "Ok", e));
+    let evict = sql.writes().since(&at);
+    println!("-- evict, 9 extents\n{}", evict.render());
+    let at = sql.writes();
+    let r = rig
+        .s3(Method::Delete, "/slice/w/x3.bin", &[], &[], Vec::new())
+        .await;
+    expect_status(s, "DELETE w/x3.bin", 204, &r);
+    let delete = sql.writes().since(&at);
+    println!("-- delete, 3 extents\n{}", delete.render());
+    let at = sql.writes();
+    rig.bridge.clock.advance_secs(2 * 86_400);
+    rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await;
+    let gc = sql.writes().since(&at);
+    println!("-- collect, 3 extents\n{}", gc.render());
+    println!(
+        "evict {} for 9 extents; delete {} and collect {} for an object of 3 extents",
+        evict.billed(),
+        delete.billed(),
+        gc.billed()
+    );
 }
 
 #[test]

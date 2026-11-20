@@ -1112,7 +1112,7 @@ async fn stat_passes_alone_never_release() {
     let guard = rig
         .bridge
         .catalog
-        .begin_release(&lease, 2, &counting, "[]", now)
+        .release(&lease, 2, &counting, "[]", now)
         .await
         .unwrap();
     assert_eq!(guard, Guard::Lost);
@@ -1143,7 +1143,7 @@ async fn the_guard_takes_fresh_stat_passes_with_the_full_check_on_record() {
     let counting = ["bb0".to_string(), "bb1".to_string()];
     let begin = || async {
         let catalog = &rig.bridge.catalog;
-        let guard = catalog.begin_release(&lease, 2, &counting, "[]", now);
+        let guard = catalog.release(&lease, 2, &counting, "[]", now);
         guard.await.unwrap()
     };
     assert_eq!(begin().await, Guard::Lost, "nothing asked under the claim");

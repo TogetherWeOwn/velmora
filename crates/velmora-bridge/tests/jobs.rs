@@ -2467,7 +2467,7 @@ async fn a_resent_release_job_is_fenced() {
     let later = fx.clock.now().plus_secs(1);
     assert!(!cat.renew(&first, later).await.unwrap());
     let counting = ["bb0".to_string()];
-    let begun = cat.begin_release(&first, 1, &counting, "[]", later);
+    let begun = cat.release(&first, 1, &counting, "[]", later);
     assert_eq!(begun.await.unwrap(), Guard::Lost);
     assert!(!cat.finish_release(&first, later).await.unwrap());
     assert_eq!(fx.extent(&o, "release_evidence").await, evidence);

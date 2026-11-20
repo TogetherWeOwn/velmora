@@ -1506,7 +1506,7 @@ async fn exercise_catalog<C: Catalog>(c: &C) {
     let _ = c.record_verification(&lease, &verification).await;
     let _ = c.backbone_status(&extent.id).await;
     let _ = c.body_checks(&extent.id).await;
-    let _ = c.begin_release(&lease, 1, &bbs(), "[]", T0).await;
+    let _ = c.release(&lease, 1, &bbs(), "[]", T0).await;
     let _ = c.finish_release(&lease, T0).await;
     let _ = c.due(T0, Resend::after(RESEND_SECS), 100).await;
     let _ = c.mark_sent(std::slice::from_ref(&extent.id), T0).await;

@@ -579,9 +579,7 @@ async fn stale_lease_is_fenced() {
     assert!(fx.verify(&r, "bb", "p1", t3, 3, 3, VerifyResult::Ok).await);
     let before = fx.dump().await;
     assert_eq!(
-        c.begin_release(&stale_r, 1, &bbs(), "[]", t3)
-            .await
-            .unwrap(),
+        c.release(&stale_r, 1, &bbs(), "[]", t3).await.unwrap(),
         Guard::Lost
     );
     assert!(!c.finish_release(&stale_r, t3).await.unwrap());
@@ -591,14 +589,21 @@ async fn stale_lease_is_fenced() {
         "a stale release lease wrote something"
     );
     assert_eq!(
-        c.begin_release(&r, 1, &bbs(), "[]", t3).await.unwrap(),
+        c.release(&r, 1, &bbs(), "[]", t3).await.unwrap(),
         Guard::Applied(())
     );
-    // The owner began; the stale lease still cannot finish for it.
+    // Released and done in that one write: nothing is left to finish,
+    // for the owner or for the stale lease.
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
     let before = fx.dump().await;
     assert!(!c.finish_release(&stale_r, t3).await.unwrap());
+    assert!(!c.finish_release(&r, t3).await.unwrap());
+    assert_eq!(
+        c.release(&r, 1, &bbs(), "[]", t3).await.unwrap(),
+        Guard::Lost
+    );
     assert_eq!(fx.dump().await, before);
-    assert!(c.finish_release(&r, t3).await.unwrap());
 }
 
 /// The object is overwritten while a job holds the lease. The cancelled
@@ -895,7 +900,7 @@ async fn same_backbone_counts_once() {
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, &bbs(), "[]", T0.plus_ms(4))
+            .release(&r, 2, &bbs(), "[]", T0.plus_ms(4))
             .await
             .unwrap(),
         Guard::Lost
@@ -908,7 +913,7 @@ async fn same_backbone_counts_once() {
     assert!(fx.counting(&o).await.is_empty());
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, &bbs(), "[]", T0.plus_ms(6))
+            .release(&r, 1, &bbs(), "[]", T0.plus_ms(6))
             .await
             .unwrap(),
         Guard::Lost
@@ -926,7 +931,7 @@ async fn same_backbone_counts_once() {
     assert_eq!(fx.counting(&o).await, vec!["bb-a", "bb-b"]);
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, &bbs(), "[]", T0.plus_ms(8))
+            .release(&r, 2, &bbs(), "[]", T0.plus_ms(8))
             .await
             .unwrap(),
         Guard::Applied(())
@@ -948,7 +953,7 @@ async fn release_needs_fresh_evidence() {
     );
     // Only a release lease may release.
     assert!(matches!(
-        fx.cat.begin_release(&l, 1, &bbs(), "[]", T0).await,
+        fx.cat.release(&l, 1, &bbs(), "[]", T0).await,
         Err(BridgeError::Invalid(_))
     ));
     let week = T0.plus_ms(7 * 24 * HOUR_MS);
@@ -969,7 +974,7 @@ async fn release_needs_fresh_evidence() {
     let before = fx.dump().await;
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, &bbs(), "[\"old\"]", week)
+            .release(&r, 1, &bbs(), "[\"old\"]", week)
             .await
             .unwrap(),
         Guard::Lost
@@ -981,7 +986,7 @@ async fn release_needs_fresh_evidence() {
     assert_eq!(fx.dump().await, before);
     // Zero required backbones is never a valid release.
     assert!(matches!(
-        fx.cat.begin_release(&r, 0, &bbs(), "[]", week).await,
+        fx.cat.release(&r, 0, &bbs(), "[]", week).await,
         Err(BridgeError::Invalid(_))
     ));
 
@@ -992,16 +997,13 @@ async fn release_needs_fresh_evidence() {
             .await
     );
     assert_eq!(
-        fx.cat
-            .begin_release(&r, 2, &bbs(), "[]", now)
-            .await
-            .unwrap(),
+        fx.cat.release(&r, 2, &bbs(), "[]", now).await.unwrap(),
         Guard::Lost,
         "one backbone is not two"
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, &bbs(), "[{\"backbone\":\"bb-a\"}]", now)
+            .release(&r, 1, &bbs(), "[{\"backbone\":\"bb-a\"}]", now)
             .await
             .unwrap(),
         Guard::Applied(())
@@ -1012,41 +1014,20 @@ async fn release_needs_fresh_evidence() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(je.extent.safety_state, SafetyState::Releasing);
+    // One write: the evidence, the new state and the row done together.
+    assert_eq!(je.extent.safety_state, SafetyState::Released);
     assert_eq!(
         je.extent.release_evidence.as_deref(),
         Some("[{\"backbone\":\"bb-a\"}]")
     );
-    assert_eq!(je.extent.released_at, None);
-    assert_eq!(fx.outbox(&o, "stage").await, "release");
-
-    // A crash after the blob delete is re-driven: begin again, then finish.
-    assert_eq!(
-        fx.cat
-            .begin_release(&r, 1, &bbs(), "[{\"backbone\":\"bb-a\"}]", now)
-            .await
-            .unwrap(),
-        Guard::Applied(())
-    );
-    let done_at = now.plus_ms(5);
-    assert!(fx.cat.finish_release(&r, done_at).await.unwrap());
-    let je = fx
-        .cat
-        .job_extent(&o.extent, &o.generation)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(je.extent.safety_state, SafetyState::Released);
+    let done_at = now;
     assert_eq!(je.extent.released_at, Some(done_at));
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
     // Done is final.
     assert!(!fx.cat.finish_release(&r, done_at).await.unwrap());
     assert_eq!(
-        fx.cat
-            .begin_release(&r, 1, &bbs(), "[]", done_at)
-            .await
-            .unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", done_at).await.unwrap(),
         Guard::Lost
     );
     assert!(fx
@@ -1076,7 +1057,7 @@ async fn release_refuses_stat_passes_alone() {
     for required in [1, 2] {
         assert_eq!(
             fx.cat
-                .begin_release(&r, required, &counting, "[]", T0.plus_ms(2))
+                .release(&r, required, &counting, "[]", T0.plus_ms(2))
                 .await
                 .unwrap(),
             Guard::Lost,
@@ -1089,7 +1070,7 @@ async fn release_refuses_stat_passes_alone() {
     assert!(fx.pass(&r, "bb-a", T0.plus_ms(3), VerifyKind::Body).await);
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, &counting, "[]", T0.plus_ms(4))
+            .release(&r, 2, &counting, "[]", T0.plus_ms(4))
             .await
             .unwrap(),
         Guard::Applied(())
@@ -1109,7 +1090,7 @@ async fn release_refuses_a_backbone_that_does_not_count() {
     for (required, counting) in [(2, labels(&["bb-a", "bb-b"])), (1, labels(&["bb-a"]))] {
         assert_eq!(
             fx.cat
-                .begin_release(&r, required, &counting, "[]", T0.plus_ms(2))
+                .release(&r, required, &counting, "[]", T0.plus_ms(2))
                 .await
                 .unwrap(),
             Guard::Lost,
@@ -1122,7 +1103,7 @@ async fn release_refuses_a_backbone_that_does_not_count() {
     assert!(fx.pass(&r, "bb-a", T0.plus_ms(3), VerifyKind::Body).await);
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, &labels(&["bb-a", "bb-b"]), "[]", T0.plus_ms(4))
+            .release(&r, 2, &labels(&["bb-a", "bb-b"]), "[]", T0.plus_ms(4))
             .await
             .unwrap(),
         Guard::Lost
@@ -1130,7 +1111,7 @@ async fn release_refuses_a_backbone_that_does_not_count() {
     // No list of backbones that count: nothing counts.
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, &[], "[]", T0.plus_ms(4))
+            .release(&r, 1, &[], "[]", T0.plus_ms(4))
             .await
             .unwrap(),
         Guard::Lost
@@ -1148,7 +1129,7 @@ async fn release_refuses_both_checks_on_one_backbone() {
     assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, &counting, "[]", T0.plus_ms(3))
+            .release(&r, 2, &counting, "[]", T0.plus_ms(3))
             .await
             .unwrap(),
         Guard::Lost
@@ -1160,7 +1141,7 @@ async fn release_refuses_both_checks_on_one_backbone() {
     assert_eq!(status[0].kind, VerifyKind::Stat);
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, &counting, "[]", T0.plus_ms(3))
+            .release(&r, 1, &counting, "[]", T0.plus_ms(3))
             .await
             .unwrap(),
         Guard::Applied(())
@@ -1201,7 +1182,7 @@ async fn release_takes_fresh_stat_passes_with_the_body_pass_on_record() {
     let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
     let lost = |at: UnixMs| {
         let (cat, r, counting) = (&fx.cat, &r, &counting);
-        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
+        async move { cat.release(r, 2, counting, "[]", at).await.unwrap() == Guard::Lost }
     };
     assert!(lost(later).await, "passes from before the claim");
     assert!(
@@ -1216,7 +1197,7 @@ async fn release_takes_fresh_stat_passes_with_the_body_pass_on_record() {
     // The `STAT` pass did not hide the full check of an hour before.
     assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
     assert!(!lost(later.plus_ms(4)).await);
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
 }
 
 /// The full check counts only on a backbone that answered under this
@@ -1238,7 +1219,7 @@ async fn release_refuses_stat_passes_without_the_backbone_read_in_full() {
     let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
     let begin = |at: UnixMs| {
         let (cat, r, counting) = (&fx.cat, &r, &counting);
-        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() }
+        async move { cat.release(r, 2, counting, "[]", at).await.unwrap() }
     };
     for backbone in ["bb-b", "bb-c"] {
         assert!(
@@ -1300,7 +1281,7 @@ async fn release_refuses_a_stat_pass_where_the_full_read_failed() {
     let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
     let begin = |at: UnixMs| {
         let (cat, r, counting) = (&fx.cat, &r, &counting);
-        async move { cat.begin_release(r, 2, counting, "[]", at).await.unwrap() }
+        async move { cat.release(r, 2, counting, "[]", at).await.unwrap() }
     };
     // The third backbone is not heard from: one copy.
     for backbone in ["bb-a", "bb-b"] {
@@ -1357,7 +1338,7 @@ async fn a_failed_stat_check_cancels_the_full_check_on_record() {
     }
     assert_eq!(on_record(&fx, &o).await, []);
     let at = later.plus_ms(2);
-    let got = fx.cat.begin_release(&r, 2, &counting, "[]", at).await;
+    let got = fx.cat.release(&r, 2, &counting, "[]", at).await;
     assert_eq!(got.unwrap(), Guard::Lost);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
 }
@@ -1412,7 +1393,7 @@ async fn release_refuses_a_plan_that_was_never_read_in_full() {
     for required in [1, 2] {
         assert_eq!(
             fx.cat
-                .begin_release(&r, required, &counting, "[]", later.plus_ms(2))
+                .release(&r, required, &counting, "[]", later.plus_ms(2))
                 .await
                 .unwrap(),
             Guard::Lost,
@@ -1430,7 +1411,7 @@ async fn release_refuses_a_plan_that_was_never_read_in_full() {
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 2, &counting, "[]", later.plus_ms(4))
+            .release(&r, 2, &counting, "[]", later.plus_ms(4))
             .await
             .unwrap(),
         Guard::Applied(())
@@ -1604,7 +1585,7 @@ async fn release_refuses_a_retired_generation_and_a_missing_safety_copy() {
     fx.run("UPDATE extents SET safety_state = 'deleted'", &[])
         .await;
     assert_eq!(
-        fx.cat.begin_release(&r, 1, &bbs(), "[]", T0).await.unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", T0).await.unwrap(),
         Guard::Lost
     );
 
@@ -1628,7 +1609,7 @@ async fn release_refuses_a_retired_generation_and_a_missing_safety_copy() {
     )
     .await;
     assert_eq!(
-        fx.cat.begin_release(&r, 1, &bbs(), "[]", T0).await.unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", T0).await.unwrap(),
         Guard::Lost
     );
     let je = fx
@@ -2014,12 +1995,12 @@ async fn release_evidence_must_come_from_this_claim() {
     let r = fx.claim(&o, OutboxStage::Release, t1).await.unwrap();
     assert_eq!(fx.counting(&o).await, vec!["bb-a"]);
     assert_eq!(
-        fx.cat.begin_release(&r, 1, &bbs(), "[]", t1).await.unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", t1).await.unwrap(),
         Guard::Lost
     );
     assert_eq!(
         fx.cat
-            .begin_release(&r, 1, &bbs(), "[]", t1.plus_ms(9 * 60_000))
+            .release(&r, 1, &bbs(), "[]", t1.plus_ms(9 * 60_000))
             .await
             .unwrap(),
         Guard::Lost
@@ -2032,7 +2013,7 @@ async fn release_evidence_must_come_from_this_claim() {
             .await
     );
     assert_eq!(
-        fx.cat.begin_release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
         Guard::Lost
     );
 
@@ -2053,7 +2034,7 @@ async fn release_evidence_must_come_from_this_claim() {
     assert!(fx.cat.set_cursor(&r, 1, t2).await.unwrap());
     assert!(fx.cat.renew(&r, t2).await.unwrap());
     assert_eq!(
-        fx.cat.begin_release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
         Guard::Applied(())
     );
 }
@@ -2078,26 +2059,76 @@ async fn expired_release_lease_cannot_release() {
     let expired = T0.plus_ms(LEASE_MS + 1);
     let before = fx.dump().await;
     assert_eq!(
-        fx.cat
-            .begin_release(&r, 1, &bbs(), "[]", expired)
-            .await
-            .unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", expired).await.unwrap(),
         Guard::Lost
     );
     assert_eq!(fx.dump().await, before);
-    // Begun in time, but the delete outlived the lease: not finished.
+    // In its last millisecond the lease still releases.
     let last = T0.plus_ms(LEASE_MS);
     assert_eq!(
-        fx.cat
-            .begin_release(&r, 1, &bbs(), "[]", last)
-            .await
-            .unwrap(),
+        fx.cat.release(&r, 1, &bbs(), "[]", last).await.unwrap(),
         Guard::Applied(())
     );
-    let before = fx.dump().await;
-    assert!(!fx.cat.finish_release(&r, expired).await.unwrap());
-    assert_eq!(fx.dump().await, before);
-    assert!(fx.cat.finish_release(&r, last).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+}
+
+/// A Worker from before the release was one write left the extent
+/// `releasing`: decided, with its evidence, and not finished. The step
+/// that finishes it is still there, fenced as before, and so is the
+/// one-write release, whose guard takes a `releasing` extent too.
+#[tokio::test]
+async fn a_release_left_half_done_by_an_older_worker_is_finished() {
+    for finish_with_release in [false, true] {
+        let fx = Fx::new().await;
+        let o = fx.publish(&fx.bucket, "k").await;
+        let l = fx.posted(&o, 1, T0).await;
+        assert!(fx
+            .cat
+            .advance(&l, OutboxStage::Release, T0, T0)
+            .await
+            .unwrap());
+        let old = fx.claim(&o, OutboxStage::Release, T0).await.unwrap();
+        // The first of the older Worker's two writes, as it ran it.
+        let begun = fx
+            .run(
+                "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+                   evict_seq = evict_seq + 1 WHERE id = ?1",
+                &[text(o.extent.as_str()), text("[\"old\"]")],
+            )
+            .await;
+        assert_eq!(begun, 1);
+        // It died there. The next job takes the row over.
+        let t1 = T0.plus_ms(LEASE_MS + 1);
+        let r = fx.claim(&o, OutboxStage::Release, t1).await.unwrap();
+        let before = fx.dump().await;
+        assert!(!fx.cat.finish_release(&old, t1).await.unwrap());
+        let expired = t1.plus_ms(LEASE_MS + 1);
+        assert!(!fx.cat.finish_release(&r, expired).await.unwrap());
+        assert_eq!(fx.dump().await, before, "a lease that does not hold wrote");
+        if finish_with_release {
+            // Not without the release rule: nothing was asked under this claim.
+            let lost = fx.cat.release(&r, 1, &bbs(), "[]", t1).await.unwrap();
+            assert_eq!(lost, Guard::Lost);
+            assert_eq!(fx.dump().await, before);
+            assert!(
+                fx.verify(&r, "bb-a", "p1", t1, 1, 1, VerifyResult::Ok)
+                    .await
+            );
+            let got = fx.cat.release(&r, 1, &bbs(), "[\"new\"]", t1).await;
+            assert_eq!(got.unwrap(), Guard::Applied(()));
+            assert_eq!(fx.extent(&o, "release_evidence").await, "[\"new\"]");
+        } else {
+            assert!(fx.cat.finish_release(&r, t1).await.unwrap());
+            assert_eq!(fx.extent(&o, "release_evidence").await, "[\"old\"]");
+        }
+        assert_eq!(fx.extent(&o, "safety_state").await, "released");
+        assert_eq!(fx.extent(&o, "released_at").await, t1.0.to_string());
+        let size = fx.extent(&o, "cipher_size").await;
+        assert_eq!(fx.extent(&o, "hot_safety_bytes").await, size);
+        assert_eq!(fx.outbox(&o, "stage").await, "done");
+        assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
+    }
 }
 
 /// Two results for one backbone in the same millisecond: the failure
@@ -3534,37 +3565,48 @@ async fn the_light_guard_releases_without_a_full_check() {
     let at = T0.plus_ms(2);
     let before = fx.dump().await;
     // One backbone is not two.
-    let light = fx
-        .cat
-        .begin_release_light(&r, 2, &counting, "[]", at, false);
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert!(fx.pass(&r, "bb-c", T0.plus_ms(1), VerifyKind::Stat).await);
     // Nor is a backbone that does not count a second one.
-    let light = fx
-        .cat
-        .begin_release_light(&r, 2, &counting, "[]", at, false);
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
     assert_ne!(fx.dump().await, before);
 
     // No backbone was read in full: `body` refuses.
-    let body = fx.cat.begin_release(&r, 2, &counting, "[]", at);
+    let body = fx.cat.release(&r, 2, &counting, "[]", at);
     assert_eq!(body.await.unwrap(), Guard::Lost);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
     // Zero backbones never release.
-    let light = fx
-        .cat
-        .begin_release_light(&r, 0, &counting, "[]", at, false);
+    let light = fx.cat.release_light(&r, 0, &counting, "[]", at, false);
     assert!(matches!(light.await, Err(BridgeError::Invalid(_))));
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
 
+    // Every refusal above wrote nothing.
+    let before = fx.dump().await;
+    let light = fx.cat.release_light(&r, 3, &counting, "[]", at, false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, true);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before, "a refused release wrote something");
+
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[\"light\"]", at, false);
+        .release_light(&r, 2, &counting, "[\"light\"]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    // One write: released with its evidence and the row done.
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
     assert_eq!(fx.extent(&o, "release_evidence").await, "[\"light\"]");
+    assert_eq!(fx.extent(&o, "released_at").await, at.0.to_string());
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    // Nothing is left to finish, and a second release is refused.
+    let before = fx.dump().await;
+    assert!(!fx.cat.finish_release(&r, at).await.unwrap());
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, false);
+    assert_eq!(light.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before);
 }
 
 /// The light guard keeps the rest of the release guard: the lease, the
@@ -3588,7 +3630,7 @@ async fn the_light_guard_keeps_the_lease_and_the_fresh_evidence() {
     let begin = |lease: &Lease, at: UnixMs| {
         let (cat, counting, lease) = (&fx.cat, &counting, lease.clone());
         async move {
-            cat.begin_release_light(&lease, 2, counting, "[]", at, false)
+            cat.release_light(&lease, 2, counting, "[]", at, false)
                 .await
                 .unwrap()
         }
@@ -3663,15 +3705,11 @@ async fn a_wrong_size_holds_the_backbone_until_it_is_read_in_full() {
         );
     }
     let at = later.plus_ms(2);
-    let light = fx
-        .cat
-        .begin_release_light(&r, 2, &counting, "[]", at, false);
+    let light = fx.cat.release_light(&r, 2, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
     // The other backbone alone is one copy.
-    let light = fx
-        .cat
-        .begin_release_light(&r, 1, &counting, "[]", at, false);
+    let light = fx.cat.release_light(&r, 1, &counting, "[]", at, false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
 
     // A second extent: the same, then read in full.
@@ -3699,7 +3737,7 @@ async fn a_wrong_size_holds_the_backbone_until_it_is_read_in_full() {
         );
     }
     // Both guards: the full read of `bb-b` is also the full check.
-    let body = fx.cat.begin_release(&r, 2, &counting, "[]", at);
+    let body = fx.cat.release(&r, 2, &counting, "[]", at);
     assert_eq!(body.await.unwrap(), Guard::Applied(()));
 }
 
@@ -3729,7 +3767,7 @@ async fn the_light_guard_refuses_a_backbone_whose_full_read_failed() {
     }
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2), false);
+        .release_light(&r, 2, &counting, "[]", later.plus_ms(2), false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     // Read in full again, as a sampled read: it holds a copy, and that
     // read is the full check on record for the guard of `body` too.
@@ -3737,9 +3775,7 @@ async fn the_light_guard_refuses_a_backbone_whose_full_read_failed() {
         fx.pass(&r, "bb-a", later.plus_ms(3), VerifyKind::Sampled)
             .await
     );
-    let body = fx
-        .cat
-        .begin_release(&r, 2, &counting, "[]", later.plus_ms(4));
+    let body = fx.cat.release(&r, 2, &counting, "[]", later.plus_ms(4));
     assert_eq!(body.await.unwrap(), Guard::Applied(()));
 }
 
@@ -3767,9 +3803,7 @@ async fn the_light_guard_reads_the_escalations_itself() {
     fx.cat.escalate_verify(&raised, 1).await.unwrap();
     let late = T0.plus_secs(7 * 86_400);
     for at in [T0.plus_ms(2), late] {
-        let light = fx
-            .cat
-            .begin_release_light(&r, 2, &counting, "[]", at, false);
+        let light = fx.cat.release_light(&r, 2, &counting, "[]", at, false);
         assert_eq!(light.await.unwrap(), Guard::Lost);
     }
     // The full read of another backbone does not stand in for it.
@@ -3780,7 +3814,7 @@ async fn the_light_guard_reads_the_escalations_itself() {
     for need_full in [false, true] {
         let light = fx
             .cat
-            .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(4), need_full);
+            .release_light(&r, 2, &counting, "[]", T0.plus_ms(4), need_full);
         assert_eq!(light.await.unwrap(), Guard::Lost);
     }
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
@@ -3791,9 +3825,9 @@ async fn the_light_guard_reads_the_escalations_itself() {
     );
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(4), false);
+        .release_light(&r, 2, &counting, "[]", T0.plus_ms(4), false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
 
     // One that had ended when the extent was stored, and one on a
     // backbone that does not count, say nothing.
@@ -3810,9 +3844,9 @@ async fn the_light_guard_reads_the_escalations_itself() {
     assert!(fx.pass(&r, "bb-b", T0.plus_ms(1), VerifyKind::Size).await);
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
+        .release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
 }
 
 /// With a third backbone that counts: an extent under an escalation is
@@ -3839,7 +3873,7 @@ async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
     fx.cat.escalate_verify(&raised, 1).await.unwrap();
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
+        .release_light(&r, 2, &counting, "[]", T0.plus_ms(2), false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     assert_eq!(fx.extent(&o, "safety_state").await, "held");
 
@@ -3847,7 +3881,7 @@ async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
     assert!(fx.pass(&r, "bb-c", T0.plus_ms(3), VerifyKind::Stat).await);
     let light = fx
         .cat
-        .begin_release_light(&r, 3, &counting, "[]", T0.plus_ms(4), false);
+        .release_light(&r, 3, &counting, "[]", T0.plus_ms(4), false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
 
     assert!(
@@ -3856,13 +3890,13 @@ async fn the_light_guard_asks_for_a_full_check_under_an_escalation() {
     );
     let light = fx
         .cat
-        .begin_release_light(&r, 3, &counting, "[]", T0.plus_ms(6), false);
+        .release_light(&r, 3, &counting, "[]", T0.plus_ms(6), false);
     assert_eq!(light.await.unwrap(), Guard::Lost);
     let light = fx
         .cat
-        .begin_release_light(&r, 2, &counting, "[]", T0.plus_ms(6), false);
+        .release_light(&r, 2, &counting, "[]", T0.plus_ms(6), false);
     assert_eq!(light.await.unwrap(), Guard::Applied(()));
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
 }
 
 /// The backbones read in full for a while: one row per backbone, the

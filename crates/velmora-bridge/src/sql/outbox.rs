@@ -869,9 +869,14 @@ pub(super) async fn body_checks<S: Sql>(
     Ok(out)
 }
 
-/// Authorizes unpinning the safety copy (it becomes evictable). One batch whose guard requires:
+/// Releases the extent: its safety copy is unpinned and becomes
+/// evictable (it stays in R2, and nothing is deleted here), and the row
+/// is done. A never-read extent starts its eviction order at its upload
+/// time. One batch, so one write of the extent row: the decision and its
+/// evidence land with the new state or not at all. Its guard requires:
 /// the release lease still holds, a live generation references the extent, the copy is
-/// `held` (or `releasing`, when re-driven), and the release rule holds:
+/// `held` (or `releasing`, left by a Worker that still wrote the state
+/// in two steps), and the release rule holds:
 /// - at least `required` of the `counting` backbones have a complete pass
 ///   recorded under this claim (between the claim time and `now`); a
 ///   `stat` pass is enough here, except on a backbone whose last full
@@ -898,7 +903,7 @@ pub(super) async fn body_checks<S: Sql>(
 /// reads the second point holds whatever `need_full` says. They are
 /// read in the guard, so one raised after the job read them is not
 /// missed.
-pub(super) async fn begin_release<S: Sql>(
+pub(super) async fn release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
     required: u32,
@@ -961,10 +966,14 @@ pub(super) async fn begin_release<S: Sql>(
             )?,
         ),
         (
-            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+            "UPDATE extents SET safety_state = 'released', release_evidence = ?2, \
+               released_at = ?3, hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
                evict_seq = evict_seq + 1 WHERE id = ?1",
-            vec![text(l.extent.as_str()), text(evidence_json)],
+            vec![text(l.extent.as_str()), text(evidence_json), ms(now)],
         ),
+        // Last: after this the lease no longer holds.
+        (RELEASE_DONE, lease_params(l, [ms(now)])?),
     ];
     super::uploads::guarded(c, stmts).await
 }
@@ -1052,9 +1061,20 @@ pub(super) async fn verify_escalations<S: Sql>(
     Ok(out)
 }
 
-/// `releasing` → `released`, row done. The safety copy stays in R2: from
-/// here on it is evictable, and counted as such. A never-read extent
-/// starts its eviction order at its upload time.
+/// Ends the release row of a lease: `done`, and the lease given up.
+const RELEASE_DONE: &str = concat!(
+    "UPDATE outbox SET stage = 'done', updated_at = ?5, ",
+    unlease!(),
+    " WHERE ",
+    held!()
+);
+
+/// `releasing` → `released`, row done: the second half of a release that
+/// a Worker from before [`release`] began and did not finish. Such a
+/// Worker wrote the decision and its evidence first (`releasing`), under
+/// the same guard, and this step after it. No Worker writes `releasing`
+/// any more; this stays for the rows left in it and for a Worker of the
+/// older version that runs beside this one during a deploy.
 pub(super) async fn finish_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -1067,12 +1087,6 @@ pub(super) async fn finish_release<S: Sql>(
          OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
            AND safety_state = 'releasing')"
     );
-    let done = concat!(
-        "UPDATE outbox SET stage = 'done', updated_at = ?5, ",
-        unlease!(),
-        " WHERE ",
-        held!()
-    );
     let stmts = vec![
         (guard, lease_params(l, [ms(now)])?),
         (
@@ -1084,7 +1098,7 @@ pub(super) async fn finish_release<S: Sql>(
             vec![text(l.extent.as_str()), ms(now)],
         ),
         // Last: after this the lease no longer holds.
-        (done, lease_params(l, [ms(now)])?),
+        (RELEASE_DONE, lease_params(l, [ms(now)])?),
     ];
     fenced_batch(c, stmts).await
 }
