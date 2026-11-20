@@ -417,7 +417,8 @@ async fn a_corrupt_parity_article_in_the_sample_releases_nothing() {
     assert!(raised.iter().any(|e| e.backbone == name), "{raised:?}");
 }
 
-/// The guard of the catalogue itself, behind the job's own rule: a
+/// The guard of the test catalogue itself (the double of the SQL guard,
+/// whose own tests are in `sql_outbox.rs`), behind the job's rule: a
 /// backbone whose latest full read covered the data articles alone holds
 /// no copy, whatever `STAT` says afterwards, under the guard of `body`
 /// and under the light guard. Read in full with the parity articles, it
