@@ -416,9 +416,25 @@ jobs:
         working-directory: apps/console
         run: node --test test/*.test.js
 
+  # The alerts Worker (workers/alerts): plain JavaScript, no dependencies,
+  # tested with the Node test runner over node:sqlite (Node 22.13 or later).
+  alerts-test:
+    name: alerts worker tests (node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Node version
+        run: node --version
+      - name: Unit tests
+        working-directory: workers/alerts
+        run: node --test test/*.test.js
+
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test]
+    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -839,3 +855,48 @@ jobs:
             echo "- Worker version id: \`${version_id}\`"
             echo "- Previous version id: \`${PREV_VERSION:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Emails the operator when the production deploy fails (it then rolls
+  # back) or its build fails, through the alerts Worker's report endpoint
+  # (workers/alerts). Both values live in the `production` environment:
+  # vars.ALERTS_INGEST_URL and secrets.ALERTS_INGEST_TOKEN; without them
+  # this job only writes a warning. It never fails the run itself. The
+  # token reaches curl on stdin, never argv, and curl's own messages (which
+  # would name the host) stay out of the public log.
+  deploy-alert:
+    name: deploy alert
+    needs: [deploy-build, deploy]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Report the failed deploy
+        env:
+          ALERTS_INGEST_URL: ${{ vars.ALERTS_INGEST_URL }}
+          ALERTS_INGEST_TOKEN: ${{ secrets.ALERTS_INGEST_TOKEN }}
+          BUILD_RESULT: ${{ needs.deploy-build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${ALERTS_INGEST_URL}" ] || [ -z "${ALERTS_INGEST_TOKEN}" ]; then
+            echo "::warning::deploy alert not sent: ALERTS_INGEST_URL or ALERTS_INGEST_TOKEN is not set in the production environment"
+            exit 0
+          fi
+          body=$(jq -n --arg sha "$GITHUB_SHA" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" '{
+            source: "ci", key: "deploy-failed",
+            title: "Production deploy failed",
+            detail: ("Commit \($sha): deploy build \($b), deploy \($d). "
+              + (if $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
+                 else "The deploy job rolls back to the version before it when it can; whether it did, or asks for a manual check, is in the run'"'"'s \"Roll back to the recorded version\" step." end)
+              + " Run: \($run)")}')
+          if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \
+            | curl -fs --max-time 30 -H @- -H 'Content-Type: application/json' \
+                --data "$body" "${ALERTS_INGEST_URL%/}/v1/alert" >/dev/null 2>&1; then
+            echo "deploy alert sent"
+          else
+            echo "::warning::deploy alert could not be delivered"
+          fi
