@@ -629,12 +629,15 @@ Why these values:
   95 MiB takes `ceil(size / 16 MiB)` extents. Measured on a test
   deployment, extents per file:
 
-  | File | rclone or aws-cli, these settings | aws-cli defaults (8 MiB) | rclone `--s3-upload-cutoff 95M` |
+  | File | rclone or aws-cli, these settings | aws-cli defaults (8 MiB) | rclone `--s3-upload-cutoff 95M --s3-chunk-size 16M` |
   |---:|---:|---:|---:|
   | 16 MiB | 1 | 2 | 1 |
   | 17 MiB | 2 | 3 | 3 |
   | 40 MiB | 3 | 5 | 5 |
   | 95 MiB | 6 | 12 | 6 |
+
+  At 95 MiB rclone reaches its cutoff and goes multipart, so that row
+  is six parts of 16 MiB, not twelve slices.
 
 - **Concurrency.** One UploadPart of 16 MiB takes 2.4 to 3.6 s through
   the Worker at 4 at once: it is received whole, encrypted, then
