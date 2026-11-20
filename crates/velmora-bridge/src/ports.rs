@@ -1074,6 +1074,30 @@ pub trait Catalog {
     /// After the blob delete that `GcStep::DeleteBlob` asked for.
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()>;
 
+    // orphaned upload parts (`GC_ORPHANS`)
+    /// False while the scan for orphaned parts rests after a full pass:
+    /// the dispatcher sends no job for it.
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool>;
+    /// Reads the next `scan` open `gc` rows due at or before `cutoff`
+    /// and moves the scan past them. Returns the `delete_safety` rows
+    /// among them whose extent is an orphaned upload part, at most
+    /// `limit` (the scan then stops at the last one returned).
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>>;
+    /// Records that the safety copy of the row's extent is gone, in one
+    /// batch with the proof that it may go: the row is open and was due
+    /// at or before `cutoff`, the extent is still an orphaned upload
+    /// part, and no replay or rollback is being handled. `false`:
+    /// nothing was written and the blob must stay.
+    async fn gc_orphan_claim(&self, row: &GcRow, cutoff: UnixMs) -> Result<bool>;
+    /// Closes the row after the blob delete that a claim allowed.
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()>;
+
     // recovery replay (DESIGN §A.8); every call is idempotent
     /// Where a manifest's generation stands in this catalogue.
     async fn replay_probe(&self, g: &GenerationRow) -> Result<ReplayProbe>;

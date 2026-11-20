@@ -692,6 +692,24 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()> {
         gc::gc_done(self, id, now).await
     }
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool> {
+        gc::gc_orphans_due(self, now).await
+    }
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>> {
+        gc::gc_orphans(self, now, cutoff, scan, limit).await
+    }
+    async fn gc_orphan_claim(&self, row: &GcRow, cutoff: UnixMs) -> Result<bool> {
+        gc::gc_orphan_claim(self, row, cutoff).await
+    }
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()> {
+        gc::gc_orphan_done(self, id, now).await
+    }
 
     // recovery replay
     async fn replay_probe(&self, g: &GenerationRow) -> Result<ReplayProbe> {
