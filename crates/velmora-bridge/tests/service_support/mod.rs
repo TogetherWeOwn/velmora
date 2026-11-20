@@ -275,6 +275,18 @@ pub struct Blobs {
     pub stop_stream_after: Cell<Option<usize>>,
     /// What a stream put answers in place of the true receipt.
     pub false_receipt: Cell<Option<ReceiptLie>>,
+    /// A `get` or a `head` answers a turn of the executor later, so
+    /// that calls made at the same time are under way together.
+    pub slow_reads: Cell<bool>,
+    /// The most reads that were under way together, with `slow_reads`.
+    pub most_reading: Cell<u32>,
+    reading: Cell<u32>,
+    /// The prefix of every listing that was asked for.
+    pub listed: RefCell<Vec<String>>,
+    /// The next this many gets of this key fail.
+    pub fail_gets: RefCell<Option<(String, u32)>>,
+    /// The blob of this key is gone once the next get of it answered.
+    pub lose_after_get: RefCell<Option<String>>,
 }
 
 /// Told the length of a piece of a stream.
@@ -301,6 +313,29 @@ pub struct StreamSeen {
 impl StreamSeen {
     pub fn taken(&self) -> u64 {
         self.pieces.iter().map(|n| *n as u64).sum()
+    }
+}
+
+/// A read that is under way.
+struct Reading<'a>(&'a Cell<u32>);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+impl Blobs {
+    /// With `slow_reads`: counts the read and lets the others go on.
+    async fn read_turn(&self) {
+        if !self.slow_reads.get() {
+            return;
+        }
+        self.reading.set(self.reading.get() + 1);
+        let _reading = Reading(&self.reading);
+        self.most_reading
+            .set(self.most_reading.get().max(self.reading.get()));
+        tokio::task::yield_now().await;
     }
 }
 
@@ -438,9 +473,22 @@ impl BlobStore for Blobs {
         })
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
-        self.trip.guard(blob_down, self.inner.get(key, span)).await
+        self.read_turn().await;
+        if let Some((failing, left)) = self.fail_gets.borrow_mut().as_mut() {
+            if failing == key && *left > 0 {
+                *left -= 1;
+                return Err(BridgeError::Blob("store down".into()));
+            }
+        }
+        let answer = self.trip.guard(blob_down, self.inner.get(key, span)).await;
+        if self.lose_after_get.borrow().as_deref() == Some(key) {
+            self.lose_after_get.borrow_mut().take();
+            self.inner.lose(key);
+        }
+        answer
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.read_turn().await;
         self.trip.guard(blob_down, self.inner.head(key)).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
@@ -476,6 +524,7 @@ impl BlobStore for Blobs {
             .await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.listed.borrow_mut().push(prefix.to_string());
         if self.fail_list.get() {
             return Err(BridgeError::Blob("list failed".into()));
         }

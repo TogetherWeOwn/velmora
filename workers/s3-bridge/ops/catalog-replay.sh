@@ -66,6 +66,7 @@ case "$RETRIES" in '' | *[!0-9]*) echo "catalog-replay: VELMORA_REPLAY_RETRIES i
 # command-line argument may hold.
 echo '{}' >"$WORK/total.json"
 calls=0
+resent=0
 started=$(date +%s)
 while :; do
   calls=$((calls + 1))
@@ -78,6 +79,7 @@ while :; do
     case "$status" in 000 | 5??) ;; *) break ;; esac
     [ "$tries" -lt "$RETRIES" ] || break
     tries=$((tries + 1))
+    resent=$((resent + 1))
     wait=$((30 + tries * 5))
     echo "catalog-replay: call $calls answered $status; sent again in $wait s ($tries of $RETRIES)" >&2
     sleep "$wait"
@@ -131,6 +133,14 @@ done
 
 echo "catalog-replay: complete after $calls calls"
 jq . "$WORK/total.json"
+# What a call did before its answer was lost is in the catalogue and
+# not in the total: the call that was sent again reports the records
+# the first one published as present, and leaves out a damaged one
+# that a newer record of its object is over since.
+if [ "$resent" != 0 ]; then
+  echo "catalog-replay: $resent calls were sent again after no answer; the total counts what the last answer of each said" >&2
+  echo "catalog-replay: a damaged record that a newer one of its object replaced may be missing from damaged_unpublished" >&2
+fi
 if [ "$(jq -r '.held_missing_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: the catalogue is older than the release of some pinned copies" >&2
   echo "catalog-replay: run it again with restore point 0 before leaving maintenance" >&2
