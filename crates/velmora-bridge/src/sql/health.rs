@@ -169,12 +169,15 @@ pub(super) async fn providers_to_probe<S: Sql>(
     login_quiet_since: UnixMs,
 ) -> Result<Vec<String>> {
     // One row per provider that ever failed, read whole: a handful.
+    // Quiet counts from the later of the last strike and the end of the
+    // last cooldown: a probe never answers for real work right after a
+    // cooldown, and so never clears a ladder of cooldowns real work built.
     let rows = c
         .sql
         .query(
             "SELECT provider_id FROM provider_health \
              WHERE (failures > 0 OR cooldowns > 0) AND cooldown_until <= ?1 \
-               AND COALESCE(last_failure_at, 0) <= CASE \
+               AND MAX(COALESCE(last_failure_at, 0), cooldown_until) <= CASE \
                  WHEN last_failure_reason = ?4 THEN ?3 ELSE ?2 END \
              ORDER BY provider_id",
             &[

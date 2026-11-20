@@ -1194,7 +1194,7 @@ type Hook = Rc<dyn Fn(u32) -> futures_util::future::LocalBoxFuture<'static, ()>>
 /// A sleeper for the drill's waits: each one moves the bridge's clock
 /// on by its length, counts in `polls`, checks that the drill holds no
 /// budget while it waits, and then runs `hook` with the poll's number.
-/// A longer sleep is a timer that watches over a call: it never fires.
+/// Any other sleep is a timer that watches over a call: it never fires.
 fn drill_sleeper(
     polls: Rc<Cell<u32>>,
     weak: Rc<RefCell<std::rc::Weak<TestBridge>>>,
@@ -1202,10 +1202,9 @@ fn drill_sleeper(
 ) -> impl FnOnce(FixedClock) -> Sleeper {
     move |clock| {
         Rc::new(move |ms| {
-            if ms > COLD_POLL_MS + COLD_JITTER_MS {
+            if !(COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) {
                 return Box::pin(std::future::pending());
             }
-            assert!(ms >= COLD_POLL_MS, "{ms} ms");
             let (polls, weak, hook, clock) =
                 (polls.clone(), weak.clone(), hook.clone(), clock.clone());
             Box::pin(async move {
@@ -1348,6 +1347,82 @@ async fn a_drill_waits_for_a_slot_then_slows_down() {
         assert_eq!(fx.bridge.nntp.live(), 0);
         assert_eq!(fx.bridge.budget.in_use(), 0);
     }
+}
+
+/// A provider that refuses the login is not asked again within the
+/// drill: one refused login, not one per try. While the provider that
+/// has the articles has no free slot, the drill waits for it.
+#[tokio::test]
+async fn a_drill_asks_a_refusing_provider_once() {
+    let polls = Rc::new(Cell::new(0u32));
+    let held: Rc<RefCell<Vec<Permit>>> = Rc::default();
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        providers.insert(0, wrong);
+    };
+    let weak: Rc<RefCell<std::rc::Weak<TestBridge>>> = Rc::default();
+    let hook: Hook = {
+        let (held, weak) = (held.clone(), weak.clone());
+        Rc::new(move |poll| {
+            let (held, weak) = (held.clone(), weak.clone());
+            Box::pin(async move {
+                // The reader that has the articles is free from the
+                // fourth poll on.
+                let bridge = weak.borrow().upgrade().expect("fixture is alive");
+                let permits: Vec<Permit> = held.borrow().clone();
+                for permit in &permits {
+                    match poll {
+                        4 => bridge.catalog.release_permit(permit).await.unwrap(),
+                        _ => {
+                            let now = bridge.clock.now();
+                            let _ = bridge.catalog.renew_permit(permit, now).await.unwrap();
+                        }
+                    }
+                }
+            })
+        })
+    };
+    let sleeper = drill_sleeper(polls.clone(), weak.clone(), hook);
+    let sleeper: Box<dyn FnOnce(FixedClock) -> Sleeper> = Box::new(sleeper);
+    let fx = Fx::build(Environment::Dev, Maintenance::Off, edit, Some(sleeper)).await;
+    *weak.borrow_mut() = Rc::downgrade(&fx.bridge);
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let p0 = fx.bridge.cfg.providers[1].clone();
+    assert_eq!(p0.id, "p0");
+    let now = fx.bridge.clock.now();
+    while let Some(permit) = fx
+        .bridge
+        .catalog
+        .acquire_permit(&p0, PermitClass::Read, "other", now)
+        .await
+        .unwrap()
+    {
+        held.borrow_mut().push(permit);
+    }
+    // The verify jobs asked p1 too, and were refused: a clean record.
+    let p1 = &fx.bridge.cfg.providers[0];
+    fx.bridge
+        .catalog
+        .provider_recovered(&p1.id, now)
+        .await
+        .unwrap();
+    let dialed = fx.bridge.nntp.dials_to("p1");
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["provider"]), (&json!(true), &json!("p0")));
+    assert_eq!(v["retries"], 4);
+    let refused = fx.bridge.nntp.dials_to("p1") - dialed;
+    assert_eq!(refused, 1, "one refused login");
+    assert_eq!(health_of(&fx, "p1").await, (json!(false), json!(1)));
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
 }
 
 #[tokio::test]
@@ -1676,18 +1751,61 @@ async fn a_probe_needs_an_enabled_provider_and_a_free_slot() {
     }
 }
 
-/// Under `MAINTENANCE=restore` nothing is probed, as nothing is sent.
+/// Under `MAINTENANCE=restore`, and while a replay is not finished,
+/// nothing is probed, as the dispatcher sends nothing then either.
 #[tokio::test]
-async fn no_probe_under_restore_maintenance() {
-    let fx = Fx::with(Environment::Dev, Maintenance::Restore).await;
+async fn no_probe_under_restore_maintenance_or_during_a_replay() {
+    for maintenance in [Maintenance::Restore, Maintenance::Off] {
+        let fx = Fx::with(Environment::Dev, maintenance).await;
+        let b = &fx.bridge;
+        let failed = b
+            .catalog
+            .provider_failed("p0", ProviderFault::SessionFailed, b.clock.now());
+        failed.await.unwrap();
+        b.clock.advance_ms(velmora_bridge::probe::PROBE_QUIET_MS);
+        if maintenance == Maintenance::Off {
+            let arm = "INSERT INTO restore_state(id, state, since_ms, started_at) \
+                       VALUES (1, 'replaying', -1, 0)";
+            b.catalog.sql.exec(arm, &[]).await.unwrap();
+        }
+        assert!(b.probe_providers().await.unwrap().is_empty());
+        assert_eq!(b.nntp.connects(), 0);
+    }
+}
+
+/// A provider whose last strike was a refused login is probed only after
+/// the long quiet time: each probe is one more refused login on the
+/// account's record. A refused probe is that strike again, with its
+/// reason, and the long quiet time starts over.
+#[tokio::test]
+async fn a_refused_login_is_probed_after_hours_only() {
+    use velmora_bridge::probe::{Probed, LOGIN_REFUSED_QUIET_MS, PROBE_QUIET_MS};
+    let fx = Fx::with_providers(Environment::Dev, Maintenance::Off, |providers| {
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        providers.push(wrong);
+    })
+    .await;
     let b = &fx.bridge;
-    let failed = b
+    let refused = b
         .catalog
-        .provider_failed("p0", ProviderFault::SessionFailed, b.clock.now());
-    failed.await.unwrap();
-    b.clock.advance_ms(velmora_bridge::probe::PROBE_QUIET_MS);
+        .provider_failed("p1", ProviderFault::LoginRefused, b.clock.now());
+    refused.await.unwrap();
+
+    b.clock.advance_ms(PROBE_QUIET_MS);
     assert!(b.probe_providers().await.unwrap().is_empty());
-    assert_eq!(b.nntp.connects(), 0);
+    b.clock.advance_ms(LOGIN_REFUSED_QUIET_MS - PROBE_QUIET_MS);
+    let probed = b.probe_providers().await.unwrap();
+    let fault = Probed::Failed(ProviderFault::LoginRefused);
+    assert_eq!(probed, [("p1".to_string(), fault)]);
+    assert_eq!(b.nntp.dials_to("p1"), 1);
+    assert_eq!(health_of(&fx, "p1").await, (json!(false), json!(2)));
+
+    b.clock.advance_ms(LOGIN_REFUSED_QUIET_MS - 1);
+    assert!(b.probe_providers().await.unwrap().is_empty());
+    assert_eq!(b.nntp.dials_to("p1"), 1);
+    assert_eq!(b.nntp.live(), 0);
 }
 
 /// The status says how each provider is reached: directly or through

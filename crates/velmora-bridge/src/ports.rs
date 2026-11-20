@@ -1214,9 +1214,9 @@ pub trait Catalog {
     /// the provider is cooling now.
     async fn provider_recovered(&self, provider: &str, now: UnixMs) -> Result<()>;
     /// The providers due for a probe session ([`crate::probe`]): a
-    /// strike or a cooldown on record, not cooling at `now`, and no
-    /// strike since `quiet_since`, or since `login_quiet_since` when the
-    /// last strike was a refused login.
+    /// strike or a cooldown on record, not cooling at `now`, and neither
+    /// a strike nor the end of a cooldown after `quiet_since`, or after
+    /// `login_quiet_since` when the last strike was a refused login.
     async fn providers_to_probe(
         &self,
         now: UnixMs,

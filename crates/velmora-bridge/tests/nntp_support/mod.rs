@@ -1661,7 +1661,9 @@ impl Catalog for MemCatalog {
                     Some(ProviderFault::LoginRefused) => login_quiet_since,
                     _ => quiet_since,
                 };
-                (h.failures > 0 || h.cooldowns > 0) && h.until <= now.0 && h.at <= since.0
+                (h.failures > 0 || h.cooldowns > 0)
+                    && h.until <= now.0
+                    && h.at.max(h.until) <= since.0
             })
             .map(|(id, _)| id.clone())
             .collect())

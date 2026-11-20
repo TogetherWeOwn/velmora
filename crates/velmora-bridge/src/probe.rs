@@ -16,7 +16,9 @@
 //! usual ladder of cooldowns.
 //!
 //! Which providers: enabled, a strike or a cooldown on record, not
-//! cooling now, and no strike for [`PROBE_QUIET_MS`]. After a refused
+//! cooling now, and quiet for [`PROBE_QUIET_MS`]: no strike and no
+//! cooldown end in that time, so a provider whose cooldowns grew is
+//! asked by real work first once its cooldown is over. After a refused
 //! login the quiet time is [`LOGIN_REFUSED_QUIET_MS`]: every probe of a
 //! refused account is one more refused login on its record. A probe
 //! takes a read slot as any read does (no slot, no probe), so the
@@ -24,7 +26,7 @@
 //!
 //! Load: the cron run looks once every [`PROBE_EVERY_MS`]
 //! ([`probe_tick`]), with one read of `provider_health` (one row per
-//! provider that ever failed). While every provider is healthy nothing
+//! provider that ever failed) and one of the replay state. While every provider is healthy nothing
 //! is written. A probe writes its slot (taken and given back) and at
 //! most one health row; a provider that keeps failing is probed at most
 //! once per tick, and less often once its cooldowns grow past the
@@ -102,9 +104,10 @@ where
 {
     /// Probes every provider that is due ([`crate::probe`]), all at
     /// once, and says how each probe went. Nothing in maintenance
-    /// `restore`, as nothing else is sent then.
+    /// `restore` or while a replay is not finished, as the dispatcher
+    /// sends nothing then either.
     pub async fn probe_providers(&self) -> Result<Vec<(String, Probed)>> {
-        if self.cfg.maintenance == Maintenance::Restore {
+        if self.cfg.maintenance == Maintenance::Restore || self.catalog.restore_pending().await? {
             return Ok(Vec::new());
         }
         let now = self.clock.now();

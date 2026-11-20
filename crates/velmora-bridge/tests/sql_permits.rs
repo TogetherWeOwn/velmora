@@ -562,9 +562,12 @@ async fn providers_with_strikes_nothing_cleared_are_due_for_a_probe() {
 
     assert!(due(&c, T0).await.is_empty());
     assert!(due(&c, T0.plus_ms(PROBE_QUIET_MS - 1)).await.is_empty());
-    // Quiet long enough: the strikes below the threshold, and the
-    // cooldowns in a row once the last cooldown is over.
-    assert_eq!(due(&c, T0.plus_ms(PROBE_QUIET_MS)).await, ["p1", "p2"]);
+    // Quiet long enough: the strikes below the threshold. The cooldowns
+    // in a row count from the end of the last cooldown, a minute later.
+    let cooled = T0.plus_ms(MINUTE_MS);
+    assert_eq!(due(&c, T0.plus_ms(PROBE_QUIET_MS)).await, ["p1"]);
+    assert_eq!(due(&c, cooled.plus_ms(PROBE_QUIET_MS - 1)).await, ["p1"]);
+    assert_eq!(due(&c, cooled.plus_ms(PROBE_QUIET_MS)).await, ["p1", "p2"]);
     assert_eq!(
         due(&c, T0.plus_ms(LOGIN_REFUSED_QUIET_MS - 1)).await,
         ["p1", "p2"]
@@ -574,10 +577,10 @@ async fn providers_with_strikes_nothing_cleared_are_due_for_a_probe() {
         ["p1", "p2", "p4"]
     );
 
-    // A cooling provider is not due, however long ago its last strike:
-    // p2 fails at the end of each cooldown until one is longer than the
-    // quiet time.
-    let mut later = T0.plus_ms(PROBE_QUIET_MS);
+    // A cooling provider is not due, however long ago its last strike,
+    // nor one whose cooldown ended within the quiet time: p2 fails at the
+    // end of each cooldown until one is longer than the quiet time.
+    let mut later = cooled.plus_ms(PROBE_QUIET_MS);
     for _ in 0..4 {
         c.provider_failed("p2", session, later).await.unwrap();
         later = load_of(&c, "p2", later).await.unwrap().cooldown_until;
@@ -586,12 +589,18 @@ async fn providers_with_strikes_nothing_cleared_are_due_for_a_probe() {
     let cooling = load_of(&c, "p2", later).await.unwrap().cooldown_until;
     assert_eq!(cooling, later.plus_ms(15 * MINUTE_MS));
     assert_eq!(due(&c, later.plus_ms(PROBE_QUIET_MS)).await, ["p1"]);
-    assert_eq!(due(&c, cooling).await, ["p1", "p2"]);
-    // A new strike starts the quiet time again; a good session ends it.
-    c.provider_failed("p1", session, cooling).await.unwrap();
-    c.provider_recovered("p2", cooling).await.unwrap();
-    assert!(due(&c, cooling).await.is_empty());
-    assert_eq!(due(&c, cooling.plus_ms(PROBE_QUIET_MS)).await, ["p1"]);
+    assert_eq!(due(&c, cooling).await, ["p1"]);
+    assert_eq!(due(&c, cooling.plus_ms(PROBE_QUIET_MS - 1)).await, ["p1"]);
+    let quiet = cooling.plus_ms(PROBE_QUIET_MS);
+    assert_eq!(due(&c, quiet).await, ["p1", "p2"]);
+    // A new strike starts the quiet time again (p1's third: a cooldown
+    // of a minute, and the quiet time after it); a good session ends it.
+    c.provider_failed("p1", session, quiet).await.unwrap();
+    c.provider_recovered("p2", quiet).await.unwrap();
+    assert!(due(&c, quiet).await.is_empty());
+    let back = quiet.plus_ms(MINUTE_MS + PROBE_QUIET_MS);
+    assert!(due(&c, back.plus_ms(-1)).await.is_empty());
+    assert_eq!(due(&c, back).await, ["p1"]);
 }
 
 /// The codes are stable: they are stored and shown.
