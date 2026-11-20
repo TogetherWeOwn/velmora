@@ -610,7 +610,7 @@ jobs:
       # other value fails this step and nothing is deployed. The shipped
       # file must say "body" exactly once, in the prod [vars] table, and
       # set VERIFY_MODE nowhere else in the prod section.
-      # The layout of new recovery records is the fourth switch:
+      # The layout of new recovery records is the third switch:
       # VELMORA_RECORD_LAYOUT (unset, empty or "flat": nothing is added
       # and the file is the one this step wrote before the switch, byte
       # for byte; "tenant": one line, RECORD_LAYOUT = "tenant", is added
@@ -618,15 +618,23 @@ jobs:
       # value fails this step and nothing is deployed. The shipped file
       # must not set RECORD_LAYOUT in the prod section: with one there
       # this step fails, whatever the switch says. Before the file is
-      # written its text is read back as TOML: the prod [vars] table
-      # must hold RECORD_LAYOUT = "tenant" when "tenant" was asked for
-      # and no RECORD_LAYOUT otherwise, or this step fails and writes no
-      # file. The log then names the layout in force. Set "tenant" only
-      # in a deploy after the one that brought this switch, and read
-      # "Record layout" and "Rollback floor" in
+      # written its text is read back with Python's TOML 1.0 parser:
+      # the prod [vars] table must hold RECORD_LAYOUT = "tenant" when
+      # "tenant" was asked for and no RECORD_LAYOUT otherwise, or this
+      # step fails and writes no file. That parser is stricter than
+      # wrangler's: a shipped file it cannot read is refused here, also
+      # with the switch unset. The log then names the layout the
+      # generated config carries. It is the layout in force only once
+      # the deploy step of the same run has succeeded, and only while
+      # the Worker has no secret named RECORD_LAYOUT: the Worker reads
+      # a secret where the variable is absent, and a deploy keeps
+      # secrets. This job cannot see secrets; no such secret may exist.
+      # Set "tenant" only in a deploy after the one that brought this
+      # switch, and read "Record layout" and "Rollback floor" in
       # workers/s3-bridge/ops/README.md first. The test of this step is
       # workers/s3-bridge/tools/test_deploy_config.py: it runs the
-      # script below as it stands in this file.
+      # script below as it stands in this file, and it holds that the
+      # step is that script and nothing else.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -720,9 +728,9 @@ jobs:
           stop = next(i for i in range(start + 1, len(lines)) if header.match(lines[i]))
           del lines[start:stop]
           text = "\n".join(lines)
-          # The layout in force is read back from the text wrangler will
-          # get, before the file is written: a refusal leaves no file.
-          # "flat" is in force when no RECORD_LAYOUT is set at all.
+          # The layout is read back from the text that is about to be
+          # written, before the file exists: a refusal leaves no file.
+          # No RECORD_LAYOUT at all is "flat" to the Worker.
           try:
               found = tomllib.loads(text)["vars"].get("RECORD_LAYOUT")
           except (tomllib.TOMLDecodeError, KeyError, AttributeError):
@@ -732,7 +740,7 @@ jobs:
           with open(dst, "w", encoding="utf-8") as f:
               f.write(text)
           print(f"wrangler.deploy.toml: prod placeholders substituted, prod [build] removed, recovery copy {copy}, verify mode {mode}")
-          print(f"record layout in force: {layout}")
+          print(f"record layout in the generated config: {layout}")
           PY
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other

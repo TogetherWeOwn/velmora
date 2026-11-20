@@ -3,9 +3,12 @@
 
 The generator is the Python script of the step "Generate the production
 wrangler config" in .github/workflows/ci.yml. These tests take the
-script from that file as it stands and run it the way the step does
-(`python3 -I - wrangler.toml wrangler.deploy.toml`), on the shipped
-wrangler.toml and with made-up values. No credential, no network.
+script from that file as it stands and run it with the call the step
+makes (`python3 -I - wrangler.toml wrangler.deploy.toml`), on the
+shipped wrangler.toml and with made-up values. No credential, no
+network. The step itself is held to one shape (see Step): its shell is
+`set -euo pipefail`, that call and the script, and nothing else, so
+that what runs here is all that runs there.
 
 Run: python3 -I tools/test_deploy_config.py
 
@@ -31,7 +34,13 @@ CI_YML = os.path.join(_ROOT, ".github", "workflows", "ci.yml")
 WRANGLER_TOML = os.path.join(_HERE, "..", "wrangler.toml")
 
 STEP = "- name: Generate the production wrangler config"
+STRICT = "set -euo pipefail"
 CALL = "python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'"
+END = "PY"
+# The keys of the step, in this order. No `shell:`, no
+# `continue-on-error:`: the default shell stops at the first failure
+# and a failed step fails the job.
+STEP_KEYS = ["if", "working-directory", "env", "run"]
 
 # Made-up values of the right shape. Neither is a real host or database.
 HOST = "s3.generator-test.example"
@@ -43,6 +52,7 @@ SWITCH = "VELMORA_RECORD_LAYOUT"
 TENANT_LINE = 'RECORD_LAYOUT = "tenant"'
 REFUSED_VALUE = "VELMORA_RECORD_LAYOUT must be unset, flat or tenant"
 REFUSED_SHIPPED = "the prod section of the shipped file sets RECORD_LAYOUT"
+LOG = "record layout in the generated config: "
 REFUSED_READ_BACK = "the generated config does not carry the record layout that was asked for"
 REFUSED_TOML = "the generated config is not valid TOML with a prod [vars] table"
 
@@ -57,7 +67,24 @@ def indent_of(line):
 
 
 class Step:
-    """The generator step of a ci.yml: its script and what it is given."""
+    """The generator step of a ci.yml: its script and what it is given.
+
+    The step must have this shape and no other, or nothing is run:
+
+        - name: Generate the production wrangler config
+          if: ...
+          working-directory: ...
+          env:
+            NAME: ${{ vars.NAME }}      (one line for each variable)
+          run: |
+            set -euo pipefail
+            python3 -I - wrangler.toml wrangler.deploy.toml <<'PY'
+            (the script)
+            PY
+
+    A shell line before, between or after these would run in the deploy
+    and not in the tests, so there is none.
+    """
 
     def __init__(self, ci_text):
         lines = ci_text.split("\n")
@@ -66,32 +93,57 @@ class Step:
             raise AssertionError(f"expected one step {STEP!r}, found {len(at)}")
         self.line = at[0]
         level = indent_of(lines[self.line])
-        stop = next(
+        self.stop = next(
             (i for i in range(self.line + 1, len(lines))
              if lines[i].strip() and indent_of(lines[i]) <= level),
             len(lines),
         )
-        self.lines = lines[self.line:stop]
-        calls = [i for i, line in enumerate(self.lines) if line.strip() == CALL]
-        if len(calls) != 1:
-            raise AssertionError(f"expected one line {CALL!r} in the step, found {len(calls)}")
-        pad = self.lines[calls[0]][: indent_of(self.lines[calls[0]])]
-        body = []
-        for line in self.lines[calls[0] + 1:]:
-            if line == pad + "PY":
-                break
-            if line.strip() and not line.startswith(pad):
-                raise AssertionError(f"a script line is left of its block: {line!r}")
-            body.append(line[len(pad):] if line.strip() else "")
-        else:
-            raise AssertionError("the script has no end")
-        self.script = "\n".join(body) + "\n"
-        # `NAME: ${{ vars.NAME }}` lines of the step's env table.
+        self.lines = lines[self.line:self.stop]
+        while self.lines and not self.lines[-1].strip():
+            self.lines.pop()
+        # The keys of the step are the lines two columns right of its dash.
+        key_pad = " " * (level + 2)
+        keys = [
+            (i, line[len(key_pad):].split(":", 1)[0])
+            for i, line in enumerate(self.lines)
+            if i and line.startswith(key_pad) and not line[len(key_pad):].startswith((" ", "#"))
+        ]
+        self.keys = [name for _, name in keys]
+        if self.keys != STEP_KEYS:
+            raise AssertionError(f"the step has the keys {self.keys}, expected {STEP_KEYS}")
+        where = dict((name, i) for i, name in keys)
+        if self.lines[where["env"]] != key_pad + "env:":
+            raise AssertionError("the step's env is not a table of its own lines")
+        if self.lines[where["run"]] != key_pad + "run: |":
+            raise AssertionError("the step's run is not a `|` block")
+        # `NAME: ${{ vars.NAME }}` lines of the step's env table, and no
+        # line of another form.
         self.env = {}
-        for line in self.lines[: calls[0]]:
-            m = re.fullmatch(r"\s*([A-Z0-9_]+): \$\{\{ (.+) \}\}", line)
-            if m:
-                self.env[m.group(1)] = m.group(2)
+        for line in self.lines[where["env"] + 1: where["run"]]:
+            m = re.fullmatch(r"\s+([A-Z0-9_]+): \$\{\{ (.+) \}\}", line)
+            if not m or m.group(1) in self.env:
+                raise AssertionError(f"an env line of the step is not `NAME: ${{{{ ... }}}}`: {line!r}")
+            self.env[m.group(1)] = m.group(2)
+        # The run block, as the shell gets it: YAML takes the indentation
+        # of the first line off every line.
+        block = self.lines[where["run"] + 1:]
+        if not block or indent_of(block[0]) <= len(key_pad):
+            raise AssertionError("the step's run block is empty")
+        pad = block[0][: indent_of(block[0])]
+        shell = []
+        for line in block:
+            if line.strip() and not line.startswith(pad):
+                raise AssertionError(f"a line of the run block is left of the block: {line!r}")
+            shell.append(line[len(pad):] if line.strip() else "")
+        self.shell = shell
+        # `set -euo pipefail`, the call, the script, the end of the
+        # script. The shell ends the script at the first line that is
+        # `PY`, so that line must be the last one of the block.
+        if shell[:2] != [STRICT, CALL] or len(shell) < 4:
+            raise AssertionError(f"the run block does not start with {STRICT!r} and {CALL!r}")
+        if shell.index(END) != len(shell) - 1:
+            raise AssertionError(f"the run block does not end with the script's {END!r} line")
+        self.script = "\n".join(shell[2:-1]) + "\n"
 
     def run(self, toml_text, env):
         """Returns (exit code, stdout, stderr, bytes written or None)."""
@@ -159,6 +211,27 @@ def without_switches(toml_text):
     return "\n".join(out).encode("utf-8")
 
 
+def with_older(toml_text, older):
+    """What the generator wrote for a setting of the two older switches
+    before the record layout existed, worked out here: without_switches()
+    and the one replacement each of the two switches makes."""
+    want = without_switches(toml_text)
+    swaps = []
+    if older.get("VELMORA_VERIFY_MODE") == "light":
+        swaps.append((b'\nVERIFY_MODE = "body"\n', b'\nVERIFY_MODE = "light"\n'))
+    if older.get("VELMORA_RECOVERY_COPY") == "on":
+        prefix = older["VELMORA_RECOVERY_PREFIX"]
+        swaps.append((
+            b'\nRECOVERY_COPY = "off"\n',
+            f'\nRECOVERY_COPY = "on"\nRECOVERY_PREFIX = "{prefix}"\n'.encode("utf-8"),
+        ))
+    for old, new in swaps:
+        if want.count(old) != 1:
+            raise AssertionError(f"expected one line {old!r}, found {want.count(old)}")
+        want = want.replace(old, new)
+    return want
+
+
 def add_after(toml_text, anchor, new_line):
     """The shipped text with one line more, after the prod line `anchor`."""
     lines = toml_text.split("\n")
@@ -186,7 +259,7 @@ class GeneratorCase(unittest.TestCase):
         self.assertNotEqual(code, 0, env)
         self.assertIn(message, err, env)
         self.assertIsNone(written, f"{env!r}: a refusal must leave no file")
-        self.assertNotIn("record layout in force", out, env)
+        self.assertNotIn("record layout", out, env)
         return err
 
 
@@ -214,22 +287,26 @@ class RecordLayoutTest(GeneratorCase):
         for value in NOT_ASKED:
             out, written = self.ok({SWITCH: value})
             self.assertEqual(written, before, repr(value))
-            self.assertEqual(out.splitlines()[-1], "record layout in force: flat", repr(value))
+            self.assertEqual(out.splitlines()[-1], LOG + "flat", repr(value))
             self.assertNotIn(b"\nRECORD_LAYOUT", written, repr(value))
             self.assertNotIn("RECORD_LAYOUT", tomllib.loads(written.decode("utf-8"))["vars"])
 
     def test_unset_or_flat_adds_nothing_under_any_older_switch(self):
+        seen = set()
         for older in OLDER:
-            _, unset = self.ok({**older, SWITCH: None})
-            for value in NOT_ASKED[1:]:
+            want = with_older(self.shipped, older)
+            seen.add(want)
+            for value in NOT_ASKED:
                 _, written = self.ok({**older, SWITCH: value})
-                self.assertEqual(written, unset, f"{older!r} {value!r}")
+                self.assertEqual(written, want, f"{older!r} {value!r}")
+        # body or light, copy off or on: four files, and no more.
+        self.assertEqual(len(seen), 4)
 
     def test_tenant_adds_one_line_to_the_prod_vars(self):
         for older in OLDER:
             _, flat = self.ok({**older, SWITCH: "flat"})
             out, tenant = self.ok({**older, SWITCH: "tenant"})
-            self.assertEqual(out.splitlines()[-1], "record layout in force: tenant", older)
+            self.assertEqual(out.splitlines()[-1], LOG + "tenant", older)
             lines = flat.decode("utf-8").split("\n")
             mode = older["VELMORA_VERIFY_MODE"] or "body"
             at = [i for i, line in enumerate(lines) if line == f'VERIFY_MODE = "{mode}"']
@@ -277,8 +354,8 @@ class RecordLayoutTest(GeneratorCase):
     def test_the_log_names_the_layout_and_no_value(self):
         for value, name in ((None, "flat"), ("flat", "flat"), ("tenant", "tenant")):
             out, _ = self.ok({**OLDER[-1], SWITCH: value})
-            self.assertEqual(out.count("record layout in force: "), 1, value)
-            self.assertIn(f"record layout in force: {name}\n", out, value)
+            self.assertEqual(out.count("record layout"), 1, value)
+            self.assertIn(f"{LOG}{name}\n", out, value)
             for secret in (HOST, DBID, PREFIX):
                 self.assertNotIn(secret, out, value)
 
@@ -301,11 +378,68 @@ class RecordLayoutTest(GeneratorCase):
             self.assertEqual(len(hits), 1, later)
             place[later] = hits[0]
             self.assertLess(step.line, hits[0], later)
-        self.assertIn("set -euo pipefail", [line.strip() for line in step.lines])
-        # Nothing else in the workflow chooses a layout.
-        mentions = [line for line in lines if "RECORD_LAYOUT" in line and not line.strip().startswith("#")]
-        outside = [line for line in mentions if line not in step.lines]
+        # Nothing outside the step chooses a layout.
+        outside = [
+            line for i, line in enumerate(lines)
+            if "RECORD_LAYOUT" in line and not line.strip().startswith("#")
+            and not step.line <= i < step.stop
+        ]
         self.assertEqual(outside, [])
+
+    def test_the_step_is_the_script_and_nothing_else(self):
+        # Step() refuses any other shape; this holds the shape in a test
+        # of its own, by name.
+        step = self.step
+        self.assertEqual(step.keys, STEP_KEYS)
+        self.assertEqual(step.shell[:2], [STRICT, CALL])
+        self.assertEqual(step.shell[-1], END)
+        self.assertEqual("\n".join(step.shell[2:-1]) + "\n", step.script)
+        self.assertEqual(step.shell.count(END), 1)
+        # Inside the step the layout is named by the env line and by the
+        # script, and by no other line.
+        named = [line.strip() for line in step.lines if "RECORD_LAYOUT" in line]
+        in_script = [line.strip() for line in step.script.split("\n") if "RECORD_LAYOUT" in line]
+        self.assertEqual(named, [f"{SWITCH}: ${{{{ vars.{SWITCH} }}}}"] + in_script)
+
+    def test_a_step_of_another_shape_is_not_run(self):
+        lines = self.ci.split("\n")
+        step = self.step
+        call = next(i for i in range(step.line, step.stop) if lines[i].strip() == CALL)
+        end = next(i for i in range(call, step.stop) if lines[i].strip() == END)
+        run = next(i for i in range(step.line, call) if lines[i].strip() == "run: |")
+        pad = lines[call][: indent_of(lines[call])]
+        key_pad = lines[run][: indent_of(lines[run])]
+
+        def put(at, *new):
+            return "\n".join(lines[:at] + list(new) + lines[at:])
+
+        def drop(at):
+            return "\n".join(lines[:at] + lines[at + 1:])
+
+        Step(put(step.stop, ""))  # the file as it stands, one empty line more: accepted
+        for name, text in {
+            "a shell line before the call": put(call, pad + f"export {SWITCH}=tenant"),
+            "a shell line before set": put(call - 1, pad + f"export {SWITCH}=tenant"),
+            "a shell line after the script": put(end + 1, pad + "sed -i /RECORD_LAYOUT/d wrangler.deploy.toml"),
+            "an echo after the script": put(end + 1, pad + "echo 'RECORD_LAYOUT = \"tenant\"' >> wrangler.deploy.toml"),
+            "a command after the script": put(end + 1, pad + "true"),
+            "a status that is ignored": "\n".join(lines[:call] + [lines[call] + " || true"] + lines[call + 1:]),
+            "another interpreter call": "\n".join(lines[:call] + [lines[call].replace("-I ", "")] + lines[call + 1:]),
+            "no strict mode": drop(call - 1),
+            "set +e before the call": put(call, pad + "set +e"),
+            "a second end line": put(end, pad + END),
+            "the script moved right of the call": "\n".join(
+                lines[:call] + [pad + "{"] + ["  " + line if line.strip() else line for line in lines[call:end + 1]]
+                + [pad + "} || true"] + lines[end + 1:]),
+            "continue-on-error": put(run, key_pad + "continue-on-error: true"),
+            "another shell": put(run, key_pad + "shell: bash {0}"),
+            "a literal in env": put(run, key_pad + f"  {SWITCH}_DEFAULT: tenant"),
+            "the variable twice in env": put(run, lines[run - 1]),
+            "a key after run": put(end + 1, key_pad + "continue-on-error: true"),
+        }.items():
+            self.assertNotEqual(text, self.ci, name)
+            with self.assertRaises(AssertionError, msg=name):
+                Step(text)
 
 
 class OlderSwitchesTest(GeneratorCase):
