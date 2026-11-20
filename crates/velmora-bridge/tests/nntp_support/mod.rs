@@ -848,8 +848,19 @@ impl Catalog for MemCatalog {
                 return false;
             }
             e.verifications.push(v.clone());
-            if v.result == VerifyResult::Ok && v.kind.is_full() {
-                e.job.extent.last_verified_at = Some(v.verified_at);
+            // As the SQL catalogue: a full read of every article of
+            // this plan, the parity articles included, and a later one.
+            let extent = &mut e.job.extent;
+            let total = extent.article_count;
+            let total = total.map(|data| data + e.job.parity_count.unwrap_or(0));
+            if v.result == VerifyResult::Ok
+                && v.kind.is_full()
+                && v.articles_ok == v.articles_total
+                && Some(v.articles_total) == total
+                && v.plan_rev == extent.plan_rev
+                && extent.last_verified_at.is_none_or(|at| at < v.verified_at)
+            {
+                extent.last_verified_at = Some(v.verified_at);
             }
             true
         });

@@ -416,3 +416,80 @@ async fn a_corrupt_parity_article_in_the_sample_releases_nothing() {
     let raised = rig.bridge.catalog.escalations.borrow().clone();
     assert!(raised.iter().any(|e| e.backbone == name), "{raised:?}");
 }
+
+/// The guard of the catalogue itself, behind the job's own rule: a
+/// backbone whose latest full read covered the data articles alone holds
+/// no copy, whatever `STAT` says afterwards, under the guard of `body`
+/// and under the light guard. Read in full with the parity articles, it
+/// counts again.
+#[tokio::test]
+async fn the_guard_refuses_a_full_read_of_the_data_alone() {
+    for (n, light) in [(51u8, false), (52u8, true)] {
+        let rig = rig_of(Check::Body, true).await;
+        let (s, _) = rig.posted(n, true).await;
+        let catalog = &rig.bridge.catalog;
+        catalog.edit(&s.extent, |e| {
+            e.outbox.stage = OutboxStage::Release;
+            e.outbox.lease_until = None;
+        });
+        rig.wait_until_due(&s);
+        let lease = rig.claim(&s, OutboxStage::Release).await;
+        let plan_rev = catalog.extent(&s.extent).plan_rev;
+        let t0 = rig.bridge.clock.now();
+        let pass = |i: usize, ms: i64, kind: VerifyKind, articles: u32| VerificationRow {
+            extent_id: s.extent.clone(),
+            backbone: format!("bb{i}"),
+            provider_id: format!("p{i}"),
+            verified_at: UnixMs(t0.0 + ms),
+            plan_rev,
+            articles_ok: articles,
+            articles_total: articles,
+            result: VerifyResult::Ok,
+            kind,
+        };
+        let all = DATA + PARITY;
+        let record = |row: VerificationRow| {
+            let lease = &lease;
+            async move { assert!(catalog.record_verification(lease, &row).await.unwrap()) }
+        };
+        let release = |ms: i64| {
+            let lease = &lease;
+            async move {
+                let counting = ["bb0".to_string(), "bb1".to_string()];
+                let now = UnixMs(t0.0 + ms);
+                let guard = match light {
+                    false => catalog.begin_release(lease, 2, &counting, "[]", now).await,
+                    true => {
+                        catalog
+                            .begin_release_light(lease, 2, &counting, "[]", now, false)
+                            .await
+                    }
+                };
+                guard.unwrap()
+            }
+        };
+
+        record(pass(0, 1, VerifyKind::Body, all)).await;
+        // As a version from before parity reads: the data alone.
+        record(pass(1, 2, VerifyKind::Body, DATA)).await;
+        // Nor does it say the extent was verified.
+        assert_eq!(
+            catalog.extent(&s.extent).last_verified_at,
+            Some(UnixMs(t0.0 + 1))
+        );
+        for i in [0, 1] {
+            record(pass(i, 3, VerifyKind::Stat, all)).await;
+        }
+        assert_eq!(release(4).await, Guard::Lost, "light={light}");
+        assert!(rig.held(&s), "light={light}");
+        assert_eq!(rig.stage(&s), OutboxStage::Release, "light={light}");
+
+        // Read in full, parity included: the backbone holds a copy again.
+        record(pass(1, 5, VerifyKind::Body, all)).await;
+        record(pass(1, 6, VerifyKind::Stat, all)).await;
+        assert_eq!(release(7).await, Guard::Applied(()), "light={light}");
+        let extent = catalog.extent(&s.extent);
+        assert_eq!(extent.safety_state, SafetyState::Releasing, "light={light}");
+        assert_eq!(extent.last_verified_at, Some(UnixMs(t0.0 + 5)));
+    }
+}
