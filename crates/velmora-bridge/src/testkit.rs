@@ -22,7 +22,7 @@ use crate::meter::Meter;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
     BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
-    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
+    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_INT, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
 };
 use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
@@ -191,6 +191,12 @@ fn check_params(params: &[SqlValue]) -> Result<()> {
         return Err(BridgeError::Sql(format!(
             "bound value too large: {n} > {MAX_SQL_VALUE_BYTES}"
         )));
+    }
+    // And an integer that a JS number does not hold exactly.
+    let unsafe_int =
+        |v: &SqlValue| matches!(v, SqlValue::Int(i) if !(-MAX_SQL_INT..=MAX_SQL_INT).contains(i));
+    if params.iter().any(unsafe_int) {
+        return Err(BridgeError::Sql("integer outside JS safe range".into()));
     }
     Ok(())
 }

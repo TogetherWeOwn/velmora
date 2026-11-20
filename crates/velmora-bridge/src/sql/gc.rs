@@ -128,7 +128,7 @@ macro_rules! no_stale_record {
 use super::replay::guard_no_replay;
 use super::uploads::{guarded, ms, text, Cols, Stmt};
 use super::SqlCatalog;
-use crate::ports::{Guard, Sql, SqlValue};
+use crate::ports::{Guard, Sql, SqlValue, MAX_SQL_INT};
 use crate::types::{BlobStoreKind, ExtentId, GcAction, GcRow, GcStep, Result, UnixMs};
 
 /// A refused row is looked at again after this long, so it cannot keep
@@ -343,13 +343,19 @@ enum OrphanCursor {
 }
 
 impl OrphanCursor {
-    /// Before every row.
-    const START: OrphanCursor = OrphanCursor::At(i64::MIN, 0);
+    /// Before every row: the lowest `due_at` the database takes as a
+    /// bound value ([`MAX_SQL_INT`]), so no row can be due earlier.
+    const START: OrphanCursor = OrphanCursor::At(-MAX_SQL_INT, 0);
 
     /// A value this code did not write reads as the start: the scan
-    /// decides nothing, so reading rows again costs only the reads.
+    /// decides nothing, so reading rows again costs only the reads. So
+    /// does a number the database would refuse as a bound value.
     fn parse(v: &str) -> OrphanCursor {
-        let num = |s: &str| s.parse::<i64>().ok();
+        let num = |s: &str| {
+            s.parse::<i64>()
+                .ok()
+                .filter(|n| (-MAX_SQL_INT..=MAX_SQL_INT).contains(n))
+        };
         let parsed = match v.split(':').collect::<Vec<_>>().as_slice() {
             ["at", due, id] => num(due).zip(num(id)).map(|(d, i)| OrphanCursor::At(d, i)),
             ["rest", until] => num(until).map(OrphanCursor::Rest),
@@ -397,7 +403,7 @@ pub(super) async fn gc_orphans<S: Sql>(
 ) -> Result<Vec<GcRow>> {
     let (due, id) = match orphan_cursor(c).await? {
         OrphanCursor::Rest(until) if until > now.0 => return Ok(Vec::new()),
-        OrphanCursor::Rest(_) => (i64::MIN, 0),
+        OrphanCursor::Rest(_) => (-MAX_SQL_INT, 0),
         OrphanCursor::At(due, id) => (due, id),
     };
     // Two ranges of the index of open rows: the rest of the rows due at
