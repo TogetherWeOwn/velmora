@@ -40,7 +40,11 @@ REQUIRED_BACKBONES = "2"
 # (2026-11-16..20): of 287,742 extents asked again 24-72 h after their
 # post, none had lost an article on either backbone, so a wait caught
 # nothing. A value above 0 delays every release by that many seconds
-# after the newest post or repost of the extent's articles.
+# after the newest post or repost of the extent's articles. Under
+# VERIFY_MODE=light it is also how long a backbone the sample raises
+# (VERIFY_ESCALATE_SECS) still reaches extents that passed on STAT
+# alone: a raise covers only extents still held. At 0 it reaches none
+# released before it.
 SAFETY_MIN_AGE_SECS = "0"
 VERIFY_DELAY_SECS = "120"
 # How the verify stage checks an extent: body | light.
@@ -291,9 +295,10 @@ bucket_name = "velmora-cache-enam"
 # To take one away: remove the producer with the highest number, and its
 # consumer only when the queue is empty (the cron run sends a due
 # extent's job again, to a queue that is still bound, so a job left
-# behind delays its extent and loses nothing). A verify queue also holds
-# the delayed wake-ups of extents that wait for their minimum age, so it
-# is rarely empty; the same holds for those.
+# behind delays its extent and loses nothing). While SAFETY_MIN_AGE_SECS
+# is above 0, or extents released under an earlier value still wait, a
+# verify queue also holds the delayed wake-ups of extents that wait for
+# their minimum age, so it is rarely empty; the same holds for those.
 [[queues.producers]]
 binding = "POST_Q"
 queue = "velmora-post"

@@ -301,7 +301,10 @@ exists: restore it to a timestamp, then replay from that timestamp.
    - Use restore point `0` if the database copy is older than
      `SAFETY_MIN_AGE_SECS`, or if the replay ends with
      `held_missing_total` above 0. It reads every record, so it takes
-     longer; it is always correct.
+     longer; it is always correct. With `SAFETY_MIN_AGE_SECS` at 0 (as
+     shipped) a copy may be released minutes after its post, so a
+     database copy of any age can hold such rows: always read
+     `held_missing_total`.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
