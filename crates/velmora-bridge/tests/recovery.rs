@@ -700,9 +700,10 @@ async fn a_read_that_fails_ahead_is_asked_again_by_the_step() {
     assert!(matches!(failed, Err(BridgeError::Blob(_))), "{failed:?}");
 }
 
-/// A record is read at the start of its run and published later in the
-/// call. One that was removed in between (by a write that was under
-/// way and that the catalogue refused) is not published from memory.
+/// A record is read at the start of its run, before the step comes to
+/// it. One that was removed in between (by a write that was under way
+/// and that the catalogue refused) is not published from memory, and
+/// no row of it is written.
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_removed_after_it_was_read_is_not_published() {
     let rig = rig();
@@ -725,6 +726,9 @@ async fn a_record_removed_after_it_was_read_is_not_published() {
     assert_eq!(report.manifests, 19, "{report:?}");
     assert!(report.unreadable.is_empty(), "{report:?}");
     assert!(rig.live(&bucket, "k07").await.is_none());
+    // Nothing of it was staged either.
+    assert_eq!(rig.count("extents"), 19);
+    assert_eq!(rig.count("generations"), 19);
     assert!(rig.live(&bucket, "k08").await.is_some());
 }
 

@@ -68,7 +68,7 @@ use crate::types::{
 };
 
 /// How much one call does. A record costs two blob reads (the record,
-/// and whether it is still there before it is published) and up to
+/// and whether it is still there when the step comes to it) and up to
 /// seven catalogue calls, an extent two blob reads (three when its
 /// plan is looked for in a second layout) and a share of a catalogue
 /// batch. With the default that is about 3,500 blob reads and 2,000
@@ -709,6 +709,16 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 return Ok(Replayed::Done);
             }
         }
+        // The record was read at the start of its run, some time
+        // before the step comes to it, and a write that was under way
+        // when the restore began removes its record when the catalogue
+        // refuses it. The store is asked now, itself, before a row of
+        // the record is written: a record that is gone leaves nothing
+        // behind, and one that is there is as new as a record the step
+        // had read at this point.
+        if probe != ReplayProbe::Present && self.safety.head(&cursor.name).await?.is_none() {
+            return Ok(Replayed::Gone);
+        }
         let now = self.clock.now();
         let total = generation.extent_count as usize;
         let mut at = cursor.extent as usize;
@@ -876,13 +886,6 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         }
                     }
                 };
-                // The record was read at the start of its run, and
-                // a write that was under way when the restore began
-                // removes its record when the catalogue refuses it.
-                // What is published is a record the store has now.
-                if self.safety.head(&cursor.name).await?.is_none() {
-                    return Ok(Replayed::Gone);
-                }
                 match self
                     .catalog
                     .replay_publish(&generation, &placements, now)
@@ -1340,8 +1343,8 @@ enum Replayed {
     /// It is segmented, and the segment stored at this name is missing
     /// or is not the one its head names. Nothing of it was published.
     Unreadable(String),
-    /// The record was removed since it was read. Nothing of it was
-    /// published.
+    /// The record was removed since it was read. No row of it was
+    /// written in this call, and it was not published.
     Gone,
 }
 
