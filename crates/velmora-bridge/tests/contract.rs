@@ -2662,8 +2662,10 @@ fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
     };
     let (mut prod, mut env, mut root) = (Vec::new(), Vec::new(), Vec::new());
     let mut seen_table = false;
-    for line in toml.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
+    for line in toml.lines() {
+        // No name in this file holds a `#`, so a comment starts at the first.
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
             continue;
         }
         if line.starts_with('[') {
