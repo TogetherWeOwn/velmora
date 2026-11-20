@@ -2103,6 +2103,78 @@ async fn a_drill_asks_a_reader_past_its_stated_retention() {
     assert_eq!(fx.bridge.nntp.live(), 0);
 }
 
+/// "Not on Usenet" is said of the live object only. One that was
+/// deleted while the drill read it (here during the wait after a broken
+/// read) is asked for again: its rows and articles may have been taken
+/// away under the drill. The same article gone from the object that is
+/// still live is the mismatch it is.
+#[tokio::test]
+async fn a_drill_of_an_object_replaced_under_it_is_not_a_mismatch() {
+    for replaced in [true, false] {
+        let polls = Rc::new(Cell::new(0u32));
+        let fx = drill_fx(&polls, |weak| {
+            Rc::new(move |_| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let bridge = weak.borrow().upgrade().expect("fixture is alive");
+                    if replaced {
+                        let n = bridge.catalog.sql.exec("DELETE FROM objects", &[]).await;
+                        assert_eq!(n.unwrap(), 1);
+                    }
+                })
+            })
+        })
+        .await;
+        let bucket = fx.bucket("scratch").await;
+        let o = fx.put(&bucket, "k", &plaintext()).await;
+        fx.drive(&o, OutboxStage::Done).await;
+        let id = fx
+            .scalar("SELECT message_id FROM articles WHERE idx = 1", &[])
+            .await;
+        fx.server.hide(&id).await;
+        // The first read breaks off: the drill waits, then reads again
+        // and finds the article gone.
+        fx.server.drop_next_bodies(3).await;
+        let r = fx.post("/drill/scratch/k").await;
+        assert_eq!(polls.get(), 1);
+        match replaced {
+            true => {
+                assert_eq!(r.status, 503, "{}", r.text());
+                assert!(r.json().get("match").is_none());
+            }
+            false => {
+                assert_eq!(r.status, 200, "{}", r.text());
+                assert_eq!(r.json()["match"], false);
+            }
+        }
+        assert_eq!(fx.bridge.nntp.live(), 0);
+        assert_eq!(fx.bridge.budget.in_use(), 0);
+    }
+}
+
+/// A first login that breaks off is one of the connects a pass may
+/// spend on a provider, not one more: after three that broke, the
+/// provider is out of the pass, and the drill reads again after its
+/// wait.
+#[tokio::test]
+async fn a_drill_counts_a_broken_first_login_among_its_reconnects() {
+    let polls = Rc::new(Cell::new(0u32));
+    let fx = drill_fx(&polls, |_| Rc::new(|_| Box::pin(async {}))).await;
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let dialed = fx.bridge.nntp.dials_to("p0");
+    fx.server.drop_next_logins(3).await;
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["retries"]), (&json!(true), &json!(1)));
+    assert_eq!(polls.get(), 1);
+    assert_eq!(fx.bridge.nntp.dials_to("p0") - dialed, 4);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
 #[tokio::test]
 async fn drill_refuses_an_object_that_was_never_posted() {
     let fx = Fx::new().await;

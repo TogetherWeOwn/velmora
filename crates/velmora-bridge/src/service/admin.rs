@@ -1623,6 +1623,9 @@ async fn drill_extents<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
         // minutes: the sessions are ended (they are not to sit open for
         // as long as that request runs), and the charge is taken again
         // after it, inside the allowance of the extent.
+        // The price is the drill's: it logs in again for the next
+        // extent (`sessions` in the answer counts those), which a drill
+        // on an isolate with nothing else to do never pays.
         if nth > 0 {
             drop(charge.take());
             charge = bridge.budget.try_charge_in_turn(bytes);
@@ -1951,4 +1954,37 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         "last_dispatch_at": stats.last_dispatch_at,
         "providers": providers,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a statement the store failed or was too busy for is asked
+    /// again. What the store's adapter says of a value or a result it
+    /// could not decode is of the stored row: a `500`, never a retry.
+    #[test]
+    fn only_an_unanswered_statement_is_asked_again() {
+        let sql = |what: &str| BridgeError::Sql(what.to_string());
+        for what in [
+            "d1: statement failed",
+            "d1: overloaded",
+            crate::fetch::CATALOGUE_FAILED,
+        ] {
+            assert!(catalogue_unanswered(&sql(what)), "{what}");
+        }
+        for what in [
+            "d1: non-integer or unsafe number",
+            "d1: integer outside JS safe range",
+            "d1: unexpected result shape",
+            "d1: constraint violation",
+            "d1: bind failed",
+            "row decode: cipher_len",
+        ] {
+            assert!(!catalogue_unanswered(&sql(what)), "{what}");
+        }
+        assert!(!catalogue_unanswered(&BridgeError::NotImplemented(
+            "statement failed"
+        )));
+    }
 }

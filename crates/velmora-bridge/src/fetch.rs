@@ -6,7 +6,7 @@
 //! decoded, and compared with the SHA-256 stored in its plan row before
 //! anything uses its bytes.
 
-use futures_util::future::{join_all, select, Either};
+use futures_util::future::{join_all, select, Either, LocalBoxFuture};
 use velmora::rng::{FillRandom, SystemRng};
 use velmora::transport::is_article_limit_error;
 use velmora::yenc::decode_part_to;
@@ -52,6 +52,11 @@ pub(crate) struct ProviderSession<'a, C: Catalog, N: NntpConnector, T: Clock> {
     held_from: UnixMs,
     /// The slot was given back ([`Self::finish`]).
     freed: bool,
+    /// Connects that broke off before any read used this session (the
+    /// first login of a drill): the next read counts them among its
+    /// reconnects, so a pass never dials a provider more often for
+    /// having logged in first.
+    broke_early: u32,
 }
 
 impl<C: Catalog, N: NntpConnector, T: Clock> Drop for ProviderSession<'_, C, N, T> {
@@ -197,6 +202,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
             kept: (class == PermitClass::Background).then_some((asked, false)),
             held_from: asked,
             freed: false,
+            broke_early: 0,
         }))
     }
 
@@ -1215,6 +1221,86 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             .count()
     }
 
+    /// Renews the slot of every session before a connect, which may
+    /// take as long as a call: none runs out while its socket is open.
+    /// One that lost its slot is ended. Says whether the catalogue
+    /// failed. (Boxed, like [`Self::first_logins`]: sessions are moved
+    /// here, and a future that moves them in place makes every read's
+    /// larger by each move.)
+    fn renew_all(&mut self) -> LocalBoxFuture<'_, bool> {
+        Box::pin(async move {
+            let kept = join_all(self.sessions.iter_mut().map(|s| s.keep(None))).await;
+            let mut lost = Vec::new();
+            let mut fatal = false;
+            for (n, kept) in kept.into_iter().enumerate().rev() {
+                if let Err(stop) = kept {
+                    fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
+                    lost.push(self.sessions.remove(n));
+                }
+            }
+            self.stats.borrow_mut().broken += lost.len() as u32;
+            ProviderSession::close_all(lost).await;
+            fatal
+        })
+    }
+
+    /// The first logins of a drill: each session of `first` (its
+    /// provider's place in the order, its own in `sessions`) logs in
+    /// now, its slot renewed first as before any connect. One the
+    /// provider refuses is ended and its provider is out, as after a
+    /// read with no other session there; the next turn gives a provider
+    /// that took the login the rest of its sessions. A connect that only
+    /// broke off is not the provider's answer: that session stays, and
+    /// the read connects it again as it does any session that broke,
+    /// counting this connect. Says whether the catalogue failed.
+    fn first_logins<'s>(
+        &'s mut self,
+        first: &'s [(usize, usize)],
+        out: &'s mut [Option<Out>],
+    ) -> LocalBoxFuture<'s, bool> {
+        Box::pin(async move {
+            let logins = join_all(
+                self.sessions
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(n, _)| first.iter().any(|f| f.1 == *n))
+                    .map(|(_, s)| async move {
+                        s.keep(None).await?;
+                        s.session().await.map(|_| ())
+                    }),
+            )
+            .await;
+            let mut fatal = false;
+            let mut ended = Vec::new();
+            // From the last: taking one out moves only those after it.
+            for (&(i, n), login) in first.iter().zip(logins).rev() {
+                let stop = match login {
+                    Ok(()) => continue,
+                    Err(Stop::Session(_)) => {
+                        self.sessions[n].broke_early += 1;
+                        continue;
+                    }
+                    Err(stop) => stop,
+                };
+                let session = self.sessions.remove(n);
+                if session.health == Some(Err(ProviderFault::LoginRefused))
+                    && !self.shunned.contains(&session.provider.id)
+                {
+                    self.shunned.push(session.provider.id.clone());
+                }
+                fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
+                out[i] = Some(match stop {
+                    Stop::NoPermit => Out::Busy,
+                    _ => Out::Broken,
+                });
+                ended.push(session);
+            }
+            self.stats.borrow_mut().broken += ended.len() as u32;
+            ProviderSession::close_all(ended).await;
+            fatal
+        })
+    }
+
     /// Gives the providers of `order` that have work (`work[i]` articles
     /// they may still be asked for) sessions, up to `sockets` in all and
     /// never more on one provider than it has articles to read.
@@ -1295,24 +1381,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             // wait for it have their slots renewed first, so none runs
             // out while its socket is open; one that lost its slot is
             // ended.
-            if !asked.is_empty() && !self.sessions.is_empty() {
-                let kept = join_all(self.sessions.iter_mut().map(|s| s.keep(None))).await;
-                let mut lost = Vec::new();
-                let mut fatal = false;
-                for (session, kept) in core::mem::take(&mut self.sessions).into_iter().zip(kept) {
-                    match kept {
-                        Ok(()) => self.sessions.push(session),
-                        Err(stop) => {
-                            fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
-                            lost.push(session);
-                        }
-                    }
-                }
-                self.stats.borrow_mut().broken += lost.len() as u32;
-                ProviderSession::close_all(lost).await;
-                if fatal {
-                    return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
-                }
+            if !asked.is_empty() && !self.sessions.is_empty() && self.renew_all().await {
+                return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
             }
             let began = self.clock.now();
             let opened = join_all(asked.iter().map(|&i| {
@@ -1328,17 +1398,17 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             .await;
             self.stats.borrow_mut().open_ms += self.clock.now().0 - began.0;
             let mut failed = None;
-            // The first sessions of a drill on their providers.
+            // The first sessions of a drill on their providers: the
+            // provider's place in `order`, the session's in `sessions`.
             let mut first = Vec::new();
             for (&i, opened) in asked.iter().zip(opened) {
                 match opened {
                     Ok(Some(session)) => {
                         self.stats.borrow_mut().opened += 1;
-                        let session = session.with_timer(self.timer.as_ref());
-                        match unproven[i] {
-                            true => first.push((i, session)),
-                            false => self.sessions.push(session),
+                        if unproven[i] {
+                            first.push((i, self.sessions.len()));
                         }
+                        self.sessions.push(session.with_timer(self.timer.as_ref()));
                     }
                     Ok(None) => full[i] = true,
                     Err(e) => {
@@ -1347,44 +1417,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                 }
             }
             if let Some(e) = failed {
-                ProviderSession::close_all(first.into_iter().map(|(_, s)| s).collect()).await;
                 return Err(e);
             }
-            // Each logs in now, its slot renewed first as before any
-            // connect. One the provider refuses is ended and its provider
-            // is out, as after a read with no other session there; the
-            // next turn gives a provider that took the login the rest of
-            // its sessions. A connect that only broke off is not the
-            // provider's answer: that session stays, and the read
-            // connects it again as it does any session that broke.
-            let logins = join_all(first.iter_mut().map(|(_, s)| async move {
-                s.keep(None).await?;
-                s.session().await.map(|_| ())
-            }))
-            .await;
-            let mut fatal = false;
-            for ((i, session), login) in first.into_iter().zip(logins) {
-                let stop = match login {
-                    Ok(()) | Err(Stop::Session(_)) => {
-                        self.sessions.push(session);
-                        continue;
-                    }
-                    Err(stop) => stop,
-                };
-                if session.health == Some(Err(ProviderFault::LoginRefused))
-                    && !self.shunned.contains(&session.provider.id)
-                {
-                    self.shunned.push(session.provider.id.clone());
-                }
-                fatal |= matches!(stop, Stop::Fenced | Stop::Catalog);
-                out[i] = Some(match stop {
-                    Stop::NoPermit => Out::Busy,
-                    _ => Out::Broken,
-                });
-                self.stats.borrow_mut().broken += 1;
-                session.close().await;
-            }
-            if fatal {
+            if !first.is_empty() && self.first_logins(&first, out).await {
                 return Err(BridgeError::Sql(CATALOGUE_FAILED.into()));
             }
             for &i in &needy {
@@ -1773,7 +1808,7 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
     wanted: impl Fn(usize) -> bool,
 ) -> core::result::Result<Pace, Stop> {
     let mut wire = Vec::new();
-    let mut reconnects = 0;
+    let mut reconnects = core::mem::take(&mut session.broke_early);
     let mut pace = Pace::default();
     loop {
         let Some(article) = board.borrow_mut().take(provider, &wanted) else {
