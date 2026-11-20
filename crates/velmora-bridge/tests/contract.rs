@@ -2643,24 +2643,20 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
 }
 
 /// The table headers of the shipped `wrangler.toml`, split into the
-/// production part (before the first `[env.*]` table) and the rest.
+/// production tables and those of an `[env.*]` environment. A TOML
+/// header names its table from the root wherever it stands, so a table
+/// is production's by its name, not by its place in the file.
 fn wrangler_headers() -> (Vec<String>, Vec<String>) {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../workers/s3-bridge/wrangler.toml"
     );
     let toml = std::fs::read_to_string(path).unwrap();
-    let headers: Vec<String> = toml
-        .lines()
+    toml.lines()
         .map(str::trim)
         .filter(|l| l.starts_with('['))
         .map(str::to_string)
-        .collect();
-    let env = headers
-        .iter()
-        .position(|h| h.starts_with("[env.") || h.starts_with("[[env."))
-        .unwrap_or(headers.len());
-    (headers[..env].to_vec(), headers[env..].to_vec())
+        .partition(|h| !h.trim_start_matches('[').starts_with("env."))
 }
 
 /// A Durable Object class can never be rolled back past, so production

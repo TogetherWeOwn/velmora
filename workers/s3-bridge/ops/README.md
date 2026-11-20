@@ -989,8 +989,13 @@ Rules for deploy 2:
   of deploy 1, so run the smoke test again; if it still fails, set
   `MAINTENANCE` as needed and ship a fix forward. The class stays.
 
-After deploy 3 or 4 a fault is undone in the ordinary way: a rollback
-to the deploy 2 version (the job does it), or `PERMITS = "d1"` again.
+After deploy 3 a fault is undone in the ordinary way: a rollback to
+the deploy 2 version (the job does it). After deploy 4, set
+`PERMITS = "d1"` again or roll back to the deploy 3 version, which
+keeps the binding, so the gates can hand their slot rows back (see
+above). Never roll back to a version without the `PERMIT_GATE` binding
+while the query above shows a `do-gate:` or `do-gate-idle:` row: no
+Worker could then tell the gates to let go, and those slots stay taken.
 
 Never delete the class to undo it. An unused class with no object
 costs nothing. Removing it takes a version without the class in its
