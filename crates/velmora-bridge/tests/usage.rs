@@ -1,4 +1,4 @@
-//! The usage counters (migration 0022) against the tables they count.
+//! The usage counters (migration 0020) against the tables they count.
 //!
 //! - Random sequences of row changes, failed batches, rolled-back
 //!   transactions and recount steps: whenever the counters are switched
@@ -845,7 +845,7 @@ fn top_level(script: &str) -> Vec<String> {
 /// is the recount, run afterwards in bounded steps.
 #[test]
 fn the_migration_adds_tables_and_triggers_and_reads_nothing() {
-    let statements = top_level(MIGRATION_0022);
+    let statements = top_level(MIGRATION_0020);
     assert_eq!(statements.len(), 5, "{statements:?}");
     for s in &statements {
         assert!(
@@ -855,16 +855,16 @@ fn the_migration_adds_tables_and_triggers_and_reads_nothing() {
         );
     }
     for word in ["ALTER ", "DROP ", "CREATE INDEX", "CREATE UNIQUE", "PRAGMA"] {
-        assert!(!MIGRATION_0022.to_uppercase().contains(word), "{word}");
+        assert!(!MIGRATION_0020.to_uppercase().contains(word), "{word}");
     }
 
     // On a catalogue with rows it adds its two rows and counts nothing.
     let db = RusqliteSql::open_in_memory().unwrap();
-    for script in before_0022() {
+    for script in before_0020() {
         db.apply(script).unwrap();
     }
     fill(&db, 30);
-    db.apply(MIGRATION_0022).unwrap();
+    db.apply(MIGRATION_0020).unwrap();
     assert_eq!(
         row(
             &db,
@@ -880,7 +880,7 @@ fn the_migration_adds_tables_and_triggers_and_reads_nothing() {
     assert!(!armed(&db));
 }
 
-fn before_0022() -> Vec<&'static str> {
+fn before_0020() -> Vec<&'static str> {
     vec![
         MIGRATION_0001,
         MIGRATION_0002,
@@ -939,7 +939,7 @@ async fn old_worker_changes(db: &RusqliteSql) -> Vec<u64> {
 #[tokio::test]
 async fn an_old_worker_is_not_disturbed_until_the_counters_are_on() {
     let old = RusqliteSql::open_in_memory().unwrap();
-    for script in before_0022() {
+    for script in before_0020() {
         old.apply(script).unwrap();
     }
     add_buckets(&old);

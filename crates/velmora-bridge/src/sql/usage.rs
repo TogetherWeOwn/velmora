@@ -1,7 +1,7 @@
 //! Usage counters: what the status page and the dashboard read instead
 //! of scanning `extents`, `outbox` and `generations`.
 //!
-//! The counters are moved by triggers (migration 0022), in the statement
+//! The counters are moved by triggers (migration 0020), in the statement
 //! that changes the row they count: no code path here or elsewhere has
 //! to remember them, and a batch that rolls back takes its counter
 //! changes with it.

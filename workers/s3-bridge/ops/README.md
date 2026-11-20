@@ -928,7 +928,7 @@ The catalogue keeps running totals so that the status and dashboard
 routes read a handful of rows instead of counting tables: extents by
 state, outbox rows by stage, bytes not yet released and bytes pinned,
 live objects and bytes per bucket, posts, verifies and releases per
-hour, and the failed and dead counts. Triggers (migration 0022) change
+hour, and the failed and dead counts. Triggers (migration 0020) change
 a total in the same statement as the row it counts, so a batch that
 fails leaves both as they were.
 

@@ -98,8 +98,8 @@ pub const MIGRATION_0018: &str =
 pub const MIGRATION_0019: &str =
     include_str!("../../../workers/s3-bridge/migrations/0019_verify_mode.sql");
 /// Usage counters: the tables and the triggers that move them.
-pub const MIGRATION_0022: &str =
-    include_str!("../../../workers/s3-bridge/migrations/0022_usage_counters.sql");
+pub const MIGRATION_0020: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0020_usage_counters.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -277,7 +277,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0017)?;
         db.apply(MIGRATION_0018)?;
         db.apply(MIGRATION_0019)?;
-        db.apply(MIGRATION_0022)?;
+        db.apply(MIGRATION_0020)?;
         Ok(db)
     }
 
