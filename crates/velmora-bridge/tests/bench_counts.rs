@@ -683,7 +683,21 @@ impl Bench {
         for (k, v) in &bench_vars {
             vars.insert(k.clone(), v.clone());
         }
-        let cfg = BridgeConfig::from_vars(|k| vars.get(k).cloned()).expect("bench configuration");
+        let asked = RefCell::new(std::collections::BTreeSet::new());
+        let cfg = BridgeConfig::from_vars(|k| {
+            asked.borrow_mut().insert(k.to_string());
+            vars.get(k).cloned()
+        })
+        .expect("bench configuration");
+        // A BENCH_VARS key the configuration never reads changed nothing:
+        // a typo, or a variable the measured commit does not have.
+        let asked = asked.into_inner();
+        for (k, _) in &bench_vars {
+            assert!(
+                asked.contains(k),
+                "VELMORA_BENCH_VARS: {k} is not read by this commit's configuration"
+            );
+        }
 
         let hub = Rc::new(Hub::default());
         hub.set("setup");

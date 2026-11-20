@@ -12,7 +12,10 @@
 # variables for this run only (after the rig's own overrides; a value may
 # hold commas, a new pair starts only at ",KEY="). The variables that run
 # the rig itself (ENVIRONMENT, S3_HOST, NNTP_PROVIDERS, ADMIN_TOKEN, the
-# KEKs) are refused. results.json records them under "bench_vars".
+# KEKs) are refused, and so is a key the configuration never reads (a typo,
+# or a variable the measured commit does not have). results.json records
+# them under "bench_vars"; without --name or --out the run is named
+# <sha>-vars-<BENCH_VARS>, apart from the plain run of the commit.
 #
 # --ref measures another commit with this checkout's harness: the ref is
 # checked out in a temporary worktree, this checkout's
@@ -67,6 +70,11 @@ else
   SHA=$(git -C "$REPO" rev-parse --short=7 HEAD)
   [[ -z $(git -C "$REPO" status --porcelain --untracked-files=no) ]] || SHA="$SHA-dirty"
   TARGET=${CARGO_TARGET_DIR:-$WORK/target-worktree}
+fi
+# A BENCH_VARS run without --name or --out gets its own name, so it never
+# overwrites the plain run of the same commit it is compared against.
+if [[ -n ${BENCH_VARS:-} && -z $NAME && -z $OUT ]]; then
+  NAME="$SHA-vars-$(printf '%s' "$BENCH_VARS" | tr -c 'A-Za-z0-9._=-' '_' | cut -c1-80)"
 fi
 NAME=${NAME:-$SHA}
 OUT=${OUT:-$WORK/runs/$NAME}
