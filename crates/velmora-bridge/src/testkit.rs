@@ -107,7 +107,7 @@ pub const MIGRATION_0021: &str =
 /// Not a migration yet: the drops that follow [`MIGRATION_0021`] in the
 /// next release. [`RusqliteSql::with_contracted_schema`] applies them.
 pub const NEXT_DROP_SUPERSEDED_INDEXES: &str =
-    include_str!("../../../workers/s3-bridge/migrations-next/0022_drop_superseded_indexes.sql");
+    include_str!("../../../workers/s3-bridge/migrations-next/0023_drop_superseded_indexes.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.

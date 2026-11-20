@@ -218,7 +218,7 @@ const MEASURED: &[(&str, Option<u64>)] = &[
 
 /// The statements of `MEASURED` whose figure differs once the indexes
 /// that `extents_safety` replaced are dropped
-/// (`migrations-next/0022_drop_superseded_indexes.sql`), with the figure
+/// (`migrations-next/0023_drop_superseded_indexes.sql`), with the figure
 /// D1 returned for each on that schema. Every other statement kept its
 /// figure there.
 const MEASURED_AFTER_THE_DROPS: &[(&str, u64)] = &[

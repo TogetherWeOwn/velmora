@@ -34,7 +34,7 @@ CREATE INDEX outbox_exhausted
 -- less at its insert than before this migration. `extents_by_generation`
 -- goes with them (one more off every insert and every adopted part):
 -- from this release on no statement filters `extents` by generation.
--- The drops are `migrations-next/0022_drop_superseded_indexes.sql`,
+-- The drops are `migrations-next/0023_drop_superseded_indexes.sql`,
 -- moved into this directory by the release after this one.
 CREATE INDEX extents_safety
   ON extents(id, cipher_size, safety_state)

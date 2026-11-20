@@ -3,6 +3,8 @@
 -- `0021_ingest_indexes.sql`, once no Worker from before that release can
 -- run or be rolled back to: such a Worker names `extents_held` in its
 -- statements and filters `extents` by generation.
+-- Its number is the next free one when it moves, after every file then
+-- in `migrations/` (0023 holds a place behind 0020-0022 of the open PRs).
 --
 -- Contract: the indexes `extents_safety` replaced, and the one nothing
 -- reads any more. Each drop takes one index entry off every extent
