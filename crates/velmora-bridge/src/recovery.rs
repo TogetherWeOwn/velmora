@@ -10,15 +10,30 @@
 //! | `m/<generation_id>` | [`GenerationManifest`]: bucket, generation, every extent | before the publication batch |
 //! | `m/del/<tombstone_id>` | [`Tombstone`]: bucket, key | before the delete batch |
 //! | `m/art/<extent_id>` | [`ArticleManifest`]: the article plan | after the plan is stored, before any POST |
+//! | `m/seg/<set id>/<index>` | [`Segment`]: one run of the extents of a segmented generation record | before the head that names it |
 //!
 //! Those are the names of the **flat layout**, which every record
 //! written before the tenant layout has and keeps: a record is never
-//! renamed. The **tenant layout** ([`Layout`]) puts the same three names
+//! renamed. The **tenant layout** ([`Layout`]) puts the same names
 //! in a directory of their tenant, `m/x/<tenant id>/`, in place of
 //! `m/`: `m/x/<tenant id>/g_…`, `m/x/<tenant id>/del/g_…`,
-//! `m/x/<tenant id>/art/<extent_id>`. Which of the two a new record gets
-//! is a setting (`RECORD_LAYOUT`); every reader reads both, whatever the
-//! setting, and for ever.
+//! `m/x/<tenant id>/art/<extent_id>`, `m/x/<tenant id>/seg/…`. Which of
+//! the two a new record gets is a setting (`RECORD_LAYOUT`); every
+//! reader reads both, whatever the setting, and for ever.
+//!
+//! A generation record has one of two formats. **Format 1**
+//! ([`GenerationManifest`]) is one document with every extent, and it
+//! is what every write stores. **Format 2** is for an object of more
+//! extents than one document should hold: the extents are cut into
+//! [`Segment`]s in `seq` order, each sealed under its own name, and a
+//! [`GenerationHead`] stands where the format-1 record stands. The head
+//! has the object without its extents and, for every segment, where it
+//! begins, how much it holds and the SHA-256 of its sealed bytes. The
+//! segments are stored before the head. A reader takes every count from
+//! the head and believes a segment only if it is the one the head
+//! names ([`GenerationHead::open_segment`]); a record with a segment
+//! that is missing, does not open or does not match is unreadable as a
+//! whole. This version reads format 2 and does not write it.
 //!
 //! Generation and tombstone ids start with their mint time, so the blob
 //! keys of one layout list in time order and a replay can start at a restore point.
@@ -78,8 +93,8 @@ pub const TOMBSTONE_PREFIX: &str = "m/del/g_";
 /// [`RECORD_PREFIX`], so no delete removes such a key, in a Worker of
 /// any version, and the walk of the recovery copy reaches it. It sorts
 /// after every other family under `m/` (`m/art/`, `m/del/`, `m/g_`,
-/// `m/rk/`, `m/tk/`, and `m/k/`, `m/t/`, `m/tref/`, `m/u/`, which are
-/// left free for records about a tenant itself), so the sweep of the
+/// `m/rk/`, `m/seg/`, `m/tk/`, and `m/k/`, `m/t/`, `m/tref/`, `m/u/`,
+/// which are left free for records about a tenant itself), so the sweep of the
 /// recovery copy that ends here passes over all of them, and holds
 /// nothing but these records.
 pub const TENANT_DIR: &str = "m/x/";
@@ -91,11 +106,42 @@ const MAX_TENANT_ID_LEN: usize = 64;
 const GENERATION_NAME: &str = "g_";
 const TOMBSTONE_NAME: &str = "del/g_";
 const ARTICLE_NAME: &str = "art/";
+const SEGMENT_NAME: &str = "seg/";
 
-/// Format version of every record.
+/// Format version of every record that is one document.
 const RECORD_VERSION: u32 = 1;
+/// Format version of a segmented generation record: of its head and of
+/// each of its segments.
+pub const SEGMENTED_VERSION: u32 = 2;
+/// Most segments one head names: a head with more is malformed, and a
+/// writer never makes one. Every reader has to get through all the
+/// segments of a head in one go (the recovery copy before it sends the
+/// head, a replay before it publishes), so this is what one job of each
+/// can read, and the one bound for them all. At 4,096 extents to a
+/// segment it is 786,432 extents. It bounds the reads, not the memory:
+/// a reader holds the extent records of one segment at a time (the
+/// call of a replay that publishes also holds a placement for every
+/// extent of the record), and nothing here bounds the extents of one
+/// segment (the writer does).
+pub const MAX_SEGMENTS: usize = 192;
 
 const ERR_RECORD: BridgeError = BridgeError::Invalid("recovery record is malformed");
+const ERR_VERSION: BridgeError = BridgeError::Invalid("recovery record version is unknown");
+const ERR_SEGMENT: BridgeError = BridgeError::Invalid("recovery record segment is missing");
+const ERR_SEGMENT_OTHER: BridgeError =
+    BridgeError::Invalid("recovery record segment is not the one its head names");
+
+/// The id of a set of segments as a segment name takes it: `s_`, then
+/// 1 to 64 lowercase ASCII letters and digits. It starts with its mint
+/// time, as a generation id does.
+pub fn valid_set_id(id: &str) -> bool {
+    id.strip_prefix("s_").is_some_and(|rest| {
+        (1..=64).contains(&rest.len())
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
 
 /// A tenant id as a record name takes it: `t_`, then 1 to 64 lowercase
 /// ASCII letters and digits.
@@ -178,6 +224,12 @@ impl Layout {
         format!("{}{ARTICLE_NAME}{}", self.root, extent.as_str())
     }
 
+    /// Segment `index` of the set `set`: `seg/<set id>/<index>`, the
+    /// index in five digits, so the segments of a set list in order.
+    pub fn segment_key(&self, set: &str, index: u32) -> String {
+        format!("{}{SEGMENT_NAME}{set}/{index:05}", self.root)
+    }
+
     /// The key of this layout for the same record as `flat`, a key of
     /// the flat layout.
     pub fn of_flat(&self, flat: &str) -> String {
@@ -222,7 +274,9 @@ impl RecordName<'_> {
 
 /// Takes `key` apart when it is the name of a generation record, a
 /// tombstone or an article plan, of either layout and of any tenant.
-/// `None` for every other key, also for the other keys under `m/`.
+/// `None` for every other key, also for the other keys under `m/`: a
+/// segment (`seg/…`) is no record of its own, and is read only through
+/// the head that names it.
 pub fn record_name(key: &str) -> Option<RecordName<'_>> {
     let (layout, rest) = match key.strip_prefix(TENANT_DIR) {
         Some(rest) => {
@@ -298,17 +352,29 @@ pub fn plan_keys(plain: &[u8], layout: &Layout) -> Option<Vec<String>> {
         extents: Vec<Extent>,
     }
     let named: Named = serde_json::from_slice(plain).ok()?;
-    let id = |id: &str| {
-        id.strip_prefix("x_").is_some_and(|rest| {
-            (1..=64).contains(&rest.len())
-                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        })
-    };
     named
         .extents
         .iter()
-        .map(|e| id(&e.id).then(|| format!("{}{ARTICLE_NAME}{}", layout.root, e.id)))
+        .map(|e| plan_key(&e.id, layout))
         .collect()
+}
+
+/// The blob key of the article plan of the extent a record names `id`,
+/// as `layout` names it. `None` = `id` is not an extent id.
+fn plan_key(id: &str, layout: &Layout) -> Option<String> {
+    id.strip_prefix("x_")
+        .is_some_and(|rest| {
+            (1..=64).contains(&rest.len())
+                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+        .then(|| format!("{}{ARTICLE_NAME}{id}", layout.root))
+}
+
+/// The blob keys of the article plans of `extents`, the extents of one
+/// segment, in their order, as `layout` names them. `None` = one of
+/// them is not named by an extent id.
+pub fn segment_plan_keys(extents: &[ExtentRecord], layout: &Layout) -> Option<Vec<String>> {
+    extents.iter().map(|e| plan_key(&e.id, layout)).collect()
 }
 
 /// Reserved for tenant keys. It lies under [`RECORD_PREFIX`], so no
@@ -573,6 +639,54 @@ pub struct GenerationManifest {
     pub extents: Vec<ExtentRecord>,
 }
 
+/// One segment as the head of a segmented generation record names it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SegmentEntry {
+    /// `seq` of its first extent.
+    pub seq: u32,
+    /// How many extents it holds.
+    pub count: u32,
+    /// Where its first extent begins in the object.
+    pub plain_offset: u64,
+    /// The plaintext bytes of its extents together.
+    pub plain_size: u64,
+    /// SHA-256 of the segment as it is stored: sealed.
+    #[serde(with = "b64")]
+    pub sha256: Vec<u8>,
+}
+
+/// `m/<generation_id>` of a segmented record (format 2): what
+/// [`GenerationManifest`] holds, with the extents in [`Segment`]s of
+/// their own that this names.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationHead {
+    pub v: u32,
+    pub bucket: BucketRecord,
+    pub generation: GenerationRecord,
+    /// The id of the set of segments, minted with the record.
+    pub set: String,
+    /// In `seq` order: segment `i` is stored at
+    /// [`Layout::segment_key`]`(set, i)`.
+    pub segments: Vec<SegmentEntry>,
+}
+
+/// `m/seg/<set id>/<index>`: one run of the extents of a segmented
+/// generation record, as format 1 lists them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Segment {
+    pub v: u32,
+    pub set: String,
+    pub index: u32,
+    pub extents: Vec<ExtentRecord>,
+}
+
+/// A generation record as it is stored: in one document or segmented.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StoredGeneration {
+    Single(GenerationManifest),
+    Segmented(GenerationHead),
+}
+
 /// `m/del/<tombstone_id>`: the key had no object once every generation
 /// older than the tombstone was applied.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,65 +811,221 @@ impl GenerationManifest {
     }
 
     pub fn bucket(&self) -> Bucket {
-        let b = &self.bucket;
-        Bucket {
-            id: BucketId::new(b.id.clone()),
-            name: b.name.clone(),
-            owner: b.owner.clone(),
-            bdk_wrapped: b.bdk_wrapped.clone(),
-            kek_version: b.kek_version,
-            disposable: b.disposable,
-            created_at: UnixMs(b.created_at),
-        }
+        self.bucket.row()
     }
 
     /// The generation as it was published: live.
     pub fn generation(&self) -> Result<GenerationRow> {
-        let g = &self.generation;
-        Ok(GenerationRow {
-            id: GenerationId::new(g.id.clone()),
-            bucket_id: BucketId::new(self.bucket.id.clone()),
-            key: g.key.clone(),
-            state: GenerationState::Live,
-            size: g.size,
-            etag: g.etag.clone(),
-            checksum_json: g.checksum_json.clone(),
-            content_json: g.content_json.clone(),
-            user_meta_json: g.user_meta_json.clone(),
-            extent_count: u32::try_from(self.extents.len()).map_err(|_| ERR_RECORD)?,
-            created_at: UnixMs(g.created_at),
-            retired_at: None,
-        })
+        let count = u32::try_from(self.extents.len()).map_err(|_| ERR_RECORD)?;
+        Ok(self.generation.row(&self.bucket, count))
     }
 
     /// Extent `index` as a committed row of this generation whose safety
     /// copy is held and that has no article plan yet.
     pub fn extent(&self, index: usize) -> Result<ExtentRow> {
-        let e = self.extents.get(index).ok_or(ERR_RECORD)?;
+        self.extents
+            .get(index)
+            .ok_or(ERR_RECORD)?
+            .row(&self.bucket, &self.generation)
+    }
+}
+
+impl BucketRecord {
+    fn row(&self) -> Bucket {
+        Bucket {
+            id: BucketId::new(self.id.clone()),
+            name: self.name.clone(),
+            owner: self.owner.clone(),
+            bdk_wrapped: self.bdk_wrapped.clone(),
+            kek_version: self.kek_version,
+            disposable: self.disposable,
+            created_at: UnixMs(self.created_at),
+        }
+    }
+}
+
+impl GenerationRecord {
+    /// The generation of `count` extents as it was published: live.
+    fn row(&self, bucket: &BucketRecord, count: u32) -> GenerationRow {
+        GenerationRow {
+            id: GenerationId::new(self.id.clone()),
+            bucket_id: BucketId::new(bucket.id.clone()),
+            key: self.key.clone(),
+            state: GenerationState::Live,
+            size: self.size,
+            etag: self.etag.clone(),
+            checksum_json: self.checksum_json.clone(),
+            content_json: self.content_json.clone(),
+            user_meta_json: self.user_meta_json.clone(),
+            extent_count: count,
+            created_at: UnixMs(self.created_at),
+            retired_at: None,
+        }
+    }
+}
+
+impl ExtentRecord {
+    /// Whether its digests have the lengths [`Self::row`] takes.
+    fn has_digests(&self) -> bool {
+        digest::<16>(&self.plain_md5).is_ok()
+            && digest::<32>(&self.plain_sha256).is_ok()
+            && digest::<32>(&self.cipher_sha256).is_ok()
+    }
+
+    /// The extent as a committed row of `generation` whose safety copy
+    /// is held and that has no article plan yet.
+    fn row(&self, bucket: &BucketRecord, generation: &GenerationRecord) -> Result<ExtentRow> {
         Ok(ExtentRow {
-            id: ExtentId::new(e.id.clone()),
-            bucket_id: BucketId::new(self.bucket.id.clone()),
-            generation_id: Some(GenerationId::new(self.generation.id.clone())),
+            id: ExtentId::new(self.id.clone()),
+            bucket_id: BucketId::new(bucket.id.clone()),
+            generation_id: Some(GenerationId::new(generation.id.clone())),
             state: ExtentState::Committed,
-            seq: Some(e.seq),
-            plain_offset: Some(e.plain_offset),
-            plain_size: e.plain_size,
-            cipher_size: e.cipher_size,
-            media_header: e.media_header.clone(),
-            key_mode: e.key_mode,
-            wrapped_file_key: Some(e.wrapped_file_key.clone()),
-            plain_md5: digest(&e.plain_md5)?,
-            plain_sha256: digest(&e.plain_sha256)?,
-            cipher_sha256: digest(&e.cipher_sha256)?,
+            seq: Some(self.seq),
+            plain_offset: Some(self.plain_offset),
+            plain_size: self.plain_size,
+            cipher_size: self.cipher_size,
+            media_header: self.media_header.clone(),
+            key_mode: self.key_mode,
+            wrapped_file_key: Some(self.wrapped_file_key.clone()),
+            plain_md5: digest(&self.plain_md5)?,
+            plain_sha256: digest(&self.plain_sha256)?,
+            cipher_sha256: digest(&self.cipher_sha256)?,
             safety_state: SafetyState::Held,
             article_count: None,
             plan_rev: 0,
             last_verified_at: None,
             release_evidence: None,
             released_at: None,
-            created_at: UnixMs(e.created_at),
+            created_at: UnixMs(self.created_at),
         })
     }
+}
+
+impl GenerationHead {
+    /// The head stored at `name`, from its plaintext. `Err` unless it
+    /// is a head of [`SEGMENTED_VERSION`], is the record its name
+    /// promises, and names segments that tile the object: the first at
+    /// `seq` 0 and offset 0, each one where the one before ends, none
+    /// empty, and all of them together the size of the generation.
+    pub fn parse(name: &str, plain: &[u8]) -> Result<GenerationHead> {
+        if record_version(plain) != Some(SEGMENTED_VERSION) {
+            return Err(ERR_VERSION);
+        }
+        let head: GenerationHead = serde_json::from_slice(plain).map_err(|_| ERR_RECORD)?;
+        if !names(name, RecordKind::Generation, &head.generation.id)
+            || !valid_set_id(&head.set)
+            || head.segments.is_empty()
+            || head.segments.len() > MAX_SEGMENTS
+        {
+            return Err(ERR_RECORD);
+        }
+        let (mut seq, mut offset) = (0u32, 0u64);
+        for entry in &head.segments {
+            if entry.seq != seq
+                || entry.plain_offset != offset
+                || entry.count == 0
+                || entry.sha256.len() != 32
+            {
+                return Err(ERR_RECORD);
+            }
+            seq = seq.checked_add(entry.count).ok_or(ERR_RECORD)?;
+            offset = offset.checked_add(entry.plain_size).ok_or(ERR_RECORD)?;
+        }
+        if offset != head.generation.size {
+            return Err(ERR_RECORD);
+        }
+        Ok(head)
+    }
+
+    pub fn bucket(&self) -> Bucket {
+        self.bucket.row()
+    }
+
+    /// How many extents the segments hold together.
+    pub fn extent_count(&self) -> u32 {
+        // `parse` added them up without overflow.
+        self.segments.iter().map(|s| s.count).sum()
+    }
+
+    /// The generation as it was published: live.
+    pub fn generation(&self) -> GenerationRow {
+        self.generation.row(&self.bucket, self.extent_count())
+    }
+
+    /// The index of the segment that holds the extent with `seq`.
+    pub fn segment_of(&self, seq: u32) -> Option<usize> {
+        let after = self.segments.partition_point(|s| s.seq <= seq);
+        let index = after.checked_sub(1)?;
+        let entry = &self.segments[index];
+        (seq - entry.seq < entry.count).then_some(index)
+    }
+
+    /// The name of segment `index` beside a head stored in `layout`.
+    pub fn segment_key(&self, layout: &Layout, index: usize) -> String {
+        layout.segment_key(&self.set, u32::try_from(index).unwrap_or(u32::MAX))
+    }
+
+    /// Opens `sealed`, the bytes stored at the name of segment `index`,
+    /// and returns its extents. `Err` unless it is the segment this
+    /// head names there: the bytes have the digest in the head, open
+    /// under the name, say the set and the index, and hold the count of
+    /// extents the head says, from its `seq` and offset on without a
+    /// gap, of its size together.
+    pub fn open_segment<K: Kek>(
+        &self,
+        kek: &K,
+        layout: &Layout,
+        index: usize,
+        sealed: &[u8],
+    ) -> Result<Vec<ExtentRecord>> {
+        let entry = self.segments.get(index).ok_or(ERR_RECORD)?;
+        let sha: [u8; 32] = Sha256::digest(sealed).into();
+        if sha[..] != entry.sha256[..] {
+            return Err(ERR_SEGMENT_OTHER);
+        }
+        let plain = open_manifest(kek, &self.segment_key(layout, index), sealed)?;
+        if record_version(&plain) != Some(SEGMENTED_VERSION) {
+            return Err(ERR_VERSION);
+        }
+        let segment: Segment = serde_json::from_slice(&plain).map_err(|_| ERR_RECORD)?;
+        if segment.set != self.set
+            || usize::try_from(segment.index).ok() != Some(index)
+            || usize::try_from(entry.count).ok() != Some(segment.extents.len())
+        {
+            return Err(ERR_SEGMENT_OTHER);
+        }
+        let (mut seq, mut offset) = (entry.seq, entry.plain_offset);
+        for e in &segment.extents {
+            // Also what makes a row of every extent: a segment that
+            // opens is one the whole of which can be replayed.
+            if e.seq != seq || e.plain_offset != offset || !e.has_digests() {
+                return Err(ERR_SEGMENT_OTHER);
+            }
+            // The head was checked: its counts and sizes do not overflow.
+            seq = seq.wrapping_add(1);
+            offset = offset.checked_add(e.plain_size).ok_or(ERR_SEGMENT_OTHER)?;
+        }
+        if offset - entry.plain_offset != entry.plain_size {
+            return Err(ERR_SEGMENT_OTHER);
+        }
+        Ok(segment.extents)
+    }
+
+    /// `extent`, one of a segment of this head, as a committed row of
+    /// the generation whose safety copy is held and that has no article
+    /// plan yet.
+    pub fn extent(&self, extent: &ExtentRecord) -> Result<ExtentRow> {
+        extent.row(&self.bucket, &self.generation)
+    }
+}
+
+/// The format version a record's plaintext states.
+pub fn record_version(plain: &[u8]) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct Versioned {
+        v: u32,
+    }
+    serde_json::from_slice::<Versioned>(plain).ok().map(|r| r.v)
 }
 
 impl ArticleManifest {
@@ -866,17 +1136,13 @@ async fn read<B: BlobStore, K: Kek, R: for<'de> Deserialize<'de>>(
         return Ok(None);
     };
     let plain = open_manifest(kek, name, &sealed)?;
-    #[derive(Deserialize)]
-    struct Versioned {
-        v: u32,
+    match record_version(&plain) {
+        Some(RECORD_VERSION) => serde_json::from_slice(&plain)
+            .map(Some)
+            .map_err(|_| ERR_RECORD),
+        Some(_) => Err(ERR_VERSION),
+        None => Err(ERR_RECORD),
     }
-    let head: Versioned = serde_json::from_slice(&plain).map_err(|_| ERR_RECORD)?;
-    if head.v != RECORD_VERSION {
-        return Err(BridgeError::Invalid("recovery record version is unknown"));
-    }
-    serde_json::from_slice(&plain)
-        .map(Some)
-        .map_err(|_| ERR_RECORD)
 }
 
 /// Writes the generation record (`m/<generation_id>` in the flat
@@ -1131,8 +1397,9 @@ pub async fn generation_recorded<B: BlobStore>(safety: &B, id: &GenerationId) ->
     Ok(false)
 }
 
-/// Reads the record stored at `name` (a key from a listing, of either
-/// layout).
+/// Reads the format-1 record stored at `name` (a key from a listing, of
+/// either layout). A segmented record is an error here, as a version
+/// that is not known: [`read_stored_generation`] reads both.
 pub async fn read_generation<B: BlobStore, K: Kek>(
     safety: &B,
     kek: &K,
@@ -1144,6 +1411,56 @@ pub async fn read_generation<B: BlobStore, K: Kek>(
         Some(m) if !names(name, RecordKind::Generation, &m.generation.id) => Err(ERR_RECORD),
         _ => Ok(record),
     }
+}
+
+/// Reads the generation record stored at `name` (a key from a listing,
+/// of either layout), in whichever format it has: the whole of a
+/// format-1 record, the head of a segmented one. `None` = no record at
+/// `name`. Any other version is an error, as is a record that does not
+/// open, does not parse or is not the one its name promises.
+pub async fn read_stored_generation<B: BlobStore, K: Kek>(
+    safety: &B,
+    kek: &K,
+    name: &str,
+) -> Result<Option<StoredGeneration>> {
+    let Some(sealed) = safety.get(name, None).await? else {
+        return Ok(None);
+    };
+    let plain = open_manifest(kek, name, &sealed)?;
+    match record_version(&plain) {
+        Some(RECORD_VERSION) => {
+            let m: GenerationManifest = serde_json::from_slice(&plain).map_err(|_| ERR_RECORD)?;
+            if !names(name, RecordKind::Generation, &m.generation.id) {
+                return Err(ERR_RECORD);
+            }
+            Ok(Some(StoredGeneration::Single(m)))
+        }
+        Some(SEGMENTED_VERSION) => {
+            GenerationHead::parse(name, &plain).map(|h| Some(StoredGeneration::Segmented(h)))
+        }
+        Some(_) => Err(ERR_VERSION),
+        None => Err(ERR_RECORD),
+    }
+}
+
+/// Reads segment `index` of `head`, a head stored in `layout`, and
+/// returns its extents ([`GenerationHead::open_segment`]).
+///
+/// `Err(BridgeError::Blob)` = the store could not be asked. Every other
+/// error says the record is unreadable: the segment is not stored, or
+/// is not the one the head names.
+pub async fn read_segment<B: BlobStore, K: Kek>(
+    safety: &B,
+    kek: &K,
+    layout: &Layout,
+    head: &GenerationHead,
+    index: usize,
+) -> Result<Vec<ExtentRecord>> {
+    let name = head.segment_key(layout, index);
+    let Some(sealed) = safety.get(&name, None).await? else {
+        return Err(ERR_SEGMENT);
+    };
+    head.open_segment(kek, layout, index, &sealed)
 }
 
 /// Reads the tombstone stored at `name` (a key from a listing, of

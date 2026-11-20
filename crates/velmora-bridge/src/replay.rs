@@ -16,6 +16,15 @@
 //! extents spans several calls; it is published by the call that
 //! finishes its last extent.
 //!
+//! A segmented record ([`GenerationHead`]) is replayed the same way,
+//! with its extents read from its segments: a call reads the head and
+//! the segment its cursor is in. Before the first extent of such a
+//! record is restored, and again in the call that publishes it, every
+//! segment is read, one at a time, and held to the head. A record with
+//! a segment that is missing, does not open or is not the one its head
+//! names is unreadable as a whole: its names are reported, and nothing
+//! of it is published.
+//!
 //! What a replay cannot bring back: access keys and grants (re-issue them
 //! through the admin API), uploads that were in progress, and an extent
 //! with neither a pinned copy nor an article plan record. A generation
@@ -33,11 +42,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{
-    read_article_plan, read_generation, read_tombstone, record_name, start_after,
-    GenerationManifest, Layout, GENERATION_PREFIX, TOMBSTONE_PREFIX,
+    read_article_plan, read_segment, read_stored_generation, read_tombstone, record_name,
+    start_after, ExtentRecord, GenerationHead, Layout, StoredGeneration, GENERATION_PREFIX,
+    MAX_SEGMENTS, TOMBSTONE_PREFIX,
 };
 use crate::types::{
-    ArticleRow, ArticleState, BucketId, ExtentPlacement, ExtentRow, GenerationId, Result, UnixMs,
+    ArticleRow, ArticleState, BridgeError, BucketId, ExtentPlacement, ExtentRow, GenerationId,
+    Result, UnixMs,
 };
 
 /// How much one call does. The default keeps a call far below a Worker
@@ -129,6 +140,13 @@ pub struct ReplayCursor {
     pub after: String,
     /// Extents already handled of the record after `after`.
     pub extent: u32,
+    /// The name the record `extent` counts in is stored under: a record
+    /// of one id may be stored under a name of each layout, and the
+    /// count is of the one that was read. Empty between two records,
+    /// and in a cursor of a build from before segmented records, whose
+    /// count is of a record in one part under the first name of its id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// The replay this cursor belongs to, as the restore route recorded
     /// it when the replay started. Only that replay is ended by it.
     #[serde(default)]
@@ -187,6 +205,7 @@ impl ReplayCursor {
             phase: ReplayPhase::Manifests,
             after: start_after(GENERATION_PREFIX, since),
             extent: 0,
+            name: String::new(),
             run_ms: 0,
         }
     }
@@ -312,37 +331,83 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             .listed(GENERATION_PREFIX, &cursor.after, limits.records, report)
             .await?;
         let mut budget = limits.extents;
+        // Segments read by this call.
+        let mut reads = 0;
         for listed in &names {
             let flat = &listed.flat;
-            // The first name of the id that opens: a name that does not
-            // must not hide a record of the same id that does.
-            let mut opened = None;
+            // The name the cursor counts extents in: the one it holds,
+            // or, when it holds none (a cursor of an older build, which
+            // counted in records in one part only), the first name of
+            // the id. A count made in one name is never used in
+            // another, and the names before it were given up and are
+            // not read again. A count without a name cannot be told
+            // from one made in a record that is gone since; every
+            // cursor this build makes inside a record names it.
+            let named = std::mem::take(&mut cursor.name);
+            let mut skip = listed.names().any(|(name, _)| *name == named);
+            let owner = if named.is_empty() {
+                listed.name.clone()
+            } else {
+                named.clone()
+            };
+            // The first name of the id that can be read: a name that
+            // cannot must not hide a record of the same id that can.
             for (name, layout) in listed.names() {
-                match read_generation(&self.safety, &self.kek, name).await {
-                    Ok(Some(m)) => {
-                        opened = Some((m, layout));
+                if skip && *name != owner {
+                    continue;
+                }
+                skip = false;
+                // Another name than the one the count was made in, be
+                // it that the record of that name is gone, or that it
+                // does not open any more: this one starts at its first
+                // extent.
+                if *name != owner {
+                    cursor.extent = 0;
+                }
+                let record = match read_stored_generation(&self.safety, &self.kek, name).await {
+                    Ok(Some(record)) => record,
+                    // Removed by an operator since the listing.
+                    Ok(None) => continue,
+                    Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+                    Err(_) => {
+                        report.unreadable.push(name.clone());
+                        continue;
+                    }
+                };
+                let segmented = matches!(record, StoredGeneration::Segmented(_));
+                // A count the cursor did not name was made in a record
+                // in one part.
+                if segmented && named.is_empty() {
+                    cursor.extent = 0;
+                }
+                // The cursor names the record it is in, so that the
+                // count is not used in another when this one is gone
+                // by the next call.
+                cursor.name.clone_from(name);
+                let mut budget = (&mut budget, &mut reads);
+                match self
+                    .replay_manifest(&record, layout, &mut cursor, &mut budget, report)
+                    .await?
+                {
+                    Replayed::Done => {
+                        report.manifests += 1;
                         break;
                     }
-                    // Removed by an operator since the listing.
-                    Ok(None) => {}
-                    Err(crate::types::BridgeError::Blob(e)) => {
-                        return Err(crate::types::BridgeError::Blob(e))
+                    // Out of budget inside this record.
+                    Replayed::More => return Ok(Some(cursor)),
+                    Replayed::Unreadable(segment) => {
+                        for unread in [segment, name.clone()] {
+                            if !report.unreadable.contains(&unread) {
+                                report.unreadable.push(unread);
+                            }
+                        }
+                        // The record under the other name starts at its
+                        // first extent, whatever was read of this one.
+                        cursor.extent = 0;
+                        cursor.name.clear();
                     }
-                    Err(_) => report.unreadable.push(name.clone()),
                 }
             }
-            let Some((manifest, layout)) = opened else {
-                cursor = finished(cursor, flat);
-                continue;
-            };
-            if !self
-                .replay_manifest(&manifest, layout, &mut cursor, &mut budget, report)
-                .await?
-            {
-                // Out of budget inside this record.
-                return Ok(Some(cursor));
-            }
-            report.manifests += 1;
             cursor = finished(cursor, flat);
         }
         if names.len() as u64 == u64::from(limits.records) {
@@ -351,28 +416,65 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         Ok(Some(ReplayCursor {
             phase: ReplayPhase::Tombstones,
             after: start_after(TOMBSTONE_PREFIX, UnixMs(cursor.since_ms)),
+            // A count in a record that is not listed any more is of
+            // nothing.
+            extent: 0,
+            name: String::new(),
             ..cursor
         }))
     }
 
-    /// `false` = the extent budget ran out; `cursor` says where.
+    /// Reads every segment of `head`, one at a time, and holds each to
+    /// the head. `Ok(Err(name))` = the segment stored at `name` is
+    /// missing or is not the one the head names: the record is
+    /// unreadable. `Ok(Ok(placements))` = where the generation has each
+    /// of its extents, when `placed`; empty otherwise.
+    async fn read_segments(
+        &self,
+        head: &GenerationHead,
+        layout: &Layout,
+        placed: bool,
+    ) -> Result<std::result::Result<Vec<ExtentPlacement>, String>> {
+        let mut placements = Vec::new();
+        for index in 0..head.segments.len() {
+            match read_segment(&self.safety, &self.kek, layout, head, index).await {
+                Ok(extents) if placed => {
+                    // Room for what the head counts, once a segment of
+                    // it is what the head says.
+                    if index == 0 {
+                        placements.reserve_exact(head.extent_count() as usize);
+                    }
+                    placements.extend(extents.iter().map(placement));
+                }
+                Ok(_) => {}
+                Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+                Err(_) => return Ok(Err(head.segment_key(layout, index))),
+            }
+        }
+        Ok(Ok(placements))
+    }
+
     async fn replay_manifest(
         &self,
-        m: &GenerationManifest,
-        // The layout the record is stored in: where the article plans
-        // of its extents are looked for first.
+        record: &StoredGeneration,
+        // The layout the record is stored in: where its segments are,
+        // and where the article plans of its extents are looked for
+        // first.
         layout: &Layout,
         cursor: &mut ReplayCursor,
-        budget: &mut usize,
+        // Extents this call may still handle, and segments it has read.
+        (budget, reads): &mut (&mut usize, &mut usize),
         report: &mut ReplayReport,
-    ) -> Result<bool> {
-        let generation = m.generation()?;
+    ) -> Result<Replayed> {
+        let (generation, bucket) = match record {
+            StoredGeneration::Single(m) => (m.generation()?, m.bucket()),
+            StoredGeneration::Segmented(head) => (head.generation(), head.bucket()),
+        };
         let probe = self.catalog.replay_probe(&generation).await?;
         if probe == ReplayProbe::Superseded {
             report.superseded += 1;
-            return Ok(true);
+            return Ok(Replayed::Done);
         }
-        let bucket = m.bucket();
         // A bucket made again under the same name since the export has
         // another id and another data key. Nothing of the record can go
         // into it, and its rows cannot go in beside it: the name is
@@ -383,19 +485,69 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 if report.other_bucket.len() < OTHER_BUCKET_LISTED {
                     report.other_bucket.push(generation.id.as_str().to_owned());
                 }
-                return Ok(true);
+                return Ok(Replayed::Done);
             }
         }
         let now = self.clock.now();
+        let total = generation.extent_count as usize;
         let mut at = cursor.extent as usize;
-        while at < m.extents.len() {
-            if *budget == 0 {
-                return Ok(false);
+        if let StoredGeneration::Segmented(head) = record {
+            // Before the first row of the record is written: a record
+            // that cannot be read when the replay comes to it leaves
+            // nothing behind. (One that loses a segment after that
+            // leaves extent rows of no generation. Nothing reads them
+            // and no sweep removes them; a replay of the record, once
+            // it reads again, writes the same rows.)
+            if at == 0 {
+                if **budget == 0 || !fits(reads, head.segments.len()) {
+                    return Ok(Replayed::More);
+                }
+                if let Err(segment) = self.read_segments(head, layout, false).await? {
+                    return Ok(Replayed::Unreadable(segment));
+                }
             }
-            let end = m.extents.len().min(at + *budget);
+        }
+        // The segment the cursor is in: its index and its extents.
+        let mut held: Option<(usize, Vec<ExtentRecord>)> = None;
+        while at < total {
+            if **budget == 0 {
+                return Ok(Replayed::More);
+            }
+            // The run of extents the cursor is in, and the `seq` of its
+            // first: the whole record, or one segment of it.
+            let (first, run): (usize, &[ExtentRecord]) = match record {
+                StoredGeneration::Single(m) => (0, &m.extents),
+                StoredGeneration::Segmented(head) => {
+                    let seq = u32::try_from(at).unwrap_or(u32::MAX);
+                    let Some(index) = head.segment_of(seq) else {
+                        return Err(BridgeError::Invalid("recovery record is malformed"));
+                    };
+                    if held.as_ref().is_none_or(|(i, _)| *i != index) {
+                        drop(held.take());
+                        // The cursor is at the first extent of a
+                        // segment: the next call reads it.
+                        if !fits(reads, 1) {
+                            return Ok(Replayed::More);
+                        }
+                        match read_segment(&self.safety, &self.kek, layout, head, index).await {
+                            Ok(extents) => held = Some((index, extents)),
+                            Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
+                            Err(_) => {
+                                return Ok(Replayed::Unreadable(head.segment_key(layout, index)))
+                            }
+                        }
+                    }
+                    let extents = held.as_ref().map_or(&[][..], |(_, e)| e);
+                    (head.segments[index].seq as usize, extents)
+                }
+            };
+            let end = total.min(at + **budget).min(first + run.len());
             let mut chunk = Vec::with_capacity(end - at);
             for index in at..end {
-                let mut row = m.extent(index)?;
+                let mut row = match record {
+                    StoredGeneration::Single(m) => m.extent(index),
+                    StoredGeneration::Segmented(head) => head.extent(&run[index - first]),
+                }?;
                 let safety_present = self.safety.head(&row.id.safety_key()).await?.is_some();
                 // A plan in an existing catalogue row is kept; this one
                 // fills the gap when the row or its plan is missing.
@@ -466,7 +618,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     report.unreadable.push(layout.article_key(&extent));
                 }
             }
-            *budget -= end - at;
+            **budget -= end - at;
             at = end;
             cursor.extent = u32::try_from(at).unwrap_or(u32::MAX);
         }
@@ -474,15 +626,23 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         match probe {
             ReplayProbe::Present => report.present += 1,
             _ => {
-                let placements: Vec<ExtentPlacement> = m
-                    .extents
-                    .iter()
-                    .map(|e| ExtentPlacement {
-                        extent_id: crate::types::ExtentId::new(e.id.clone()),
-                        seq: e.seq,
-                        plain_offset: e.plain_offset,
-                    })
-                    .collect();
+                // The segment of the last extents is not held twice.
+                drop(held);
+                let placements: Vec<ExtentPlacement> = match record {
+                    StoredGeneration::Single(m) => m.extents.iter().map(placement).collect(),
+                    // Every segment again, whatever the calls before
+                    // this one read: what is published is what the head
+                    // names, all of it, as it is stored now.
+                    StoredGeneration::Segmented(head) => {
+                        if !fits(reads, head.segments.len()) {
+                            return Ok(Replayed::More);
+                        }
+                        match self.read_segments(head, layout, true).await? {
+                            Ok(placements) => placements,
+                            Err(segment) => return Ok(Replayed::Unreadable(segment)),
+                        }
+                    }
+                };
                 match self
                     .catalog
                     .replay_publish(&generation, &placements, now)
@@ -522,7 +682,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 }
             }
         }
-        Ok(true)
+        Ok(Replayed::Done)
     }
 
     async fn replay_tombstones(
@@ -670,6 +830,48 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     }
 }
 
+/// The most segments one call of a replay reads: twice the most a head
+/// names. Each is one read of the blob store, and a call has a bounded
+/// number of those.
+///
+/// This bounds a call, not a restore. Over the calls of a restore a
+/// segment of an unpublished record is read three times (before the
+/// first row, for its extents, and to publish), and once more for each
+/// call that stops inside it, which the next call reads again.
+pub const SEGMENT_READS: usize = 2 * MAX_SEGMENTS;
+
+/// Whether a call that has read `reads` segments may read every segment
+/// of a head that has `all` as well, and counts them if so. A call that
+/// has read none may: no head has more than [`MAX_SEGMENTS`].
+fn fits(reads: &mut usize, all: usize) -> bool {
+    if *reads > 0 && *reads + all > SEGMENT_READS {
+        return false;
+    }
+    *reads += all;
+    true
+}
+
+/// What a call made of one generation record.
+enum Replayed {
+    /// Nothing is left to do for it.
+    Done,
+    /// The call is out of extents or of segment reads; the cursor says
+    /// where the next one goes on.
+    More,
+    /// It is segmented, and the segment stored at this name is missing
+    /// or is not the one its head names. Nothing of it was published.
+    Unreadable(String),
+}
+
+/// Where a generation has the extent of a record.
+fn placement(e: &ExtentRecord) -> ExtentPlacement {
+    ExtentPlacement {
+        extent_id: crate::types::ExtentId::new(e.id.clone()),
+        seq: e.seq,
+        plain_offset: e.plain_offset,
+    }
+}
+
 /// A record a replay step is to read.
 struct Listed {
     /// Its blob key.
@@ -697,6 +899,33 @@ fn finished(cursor: ReplayCursor, flat: &str) -> ReplayCursor {
     ReplayCursor {
         after: flat.to_owned(),
         extent: 0,
+        name: String::new(),
         ..cursor
+    }
+}
+
+#[cfg(test)]
+mod segment_reads {
+    use super::*;
+
+    /// A call reads no more than [`SEGMENT_READS`] segments, however
+    /// they fall over the passes of a record or over several records;
+    /// a call that has read none takes any head.
+    #[test]
+    fn a_call_reads_a_bounded_number_of_segments() {
+        let mut reads = 0;
+        assert!(fits(&mut reads, MAX_SEGMENTS));
+        assert!(fits(&mut reads, MAX_SEGMENTS));
+        assert_eq!(reads, SEGMENT_READS);
+        assert!(!fits(&mut reads, 1));
+        assert_eq!(reads, SEGMENT_READS);
+
+        let mut reads = 1;
+        assert!(!fits(&mut reads, SEGMENT_READS));
+        assert!(fits(&mut reads, SEGMENT_READS - 1));
+
+        // Whatever a head says, the first of a call is read.
+        let mut reads = 0;
+        assert!(fits(&mut reads, SEGMENT_READS + 1));
     }
 }

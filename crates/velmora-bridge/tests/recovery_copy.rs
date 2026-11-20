@@ -5,6 +5,8 @@
 //! The fake store panics on any method but GET, HEAD and PUT, in every
 //! test of this file: nothing here may ever send a DELETE.
 
+mod segmented_support;
+
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
@@ -4857,4 +4859,585 @@ async fn the_cursors_of_a_pass_keep_their_names() {
     }
     let named = |names: &str| parts.iter().any(|p| names.contains(p.as_str()));
     assert!(named("dgab") && named("ehcfz"), "{parts:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Segmented generation records
+// ---------------------------------------------------------------------------
+
+use segmented_support::Sealed;
+use velmora_bridge::recovery::{
+    record_name, BucketRecord, ExtentRecord, GenerationManifest, GenerationRecord, Layout,
+    MAX_SEGMENTS,
+};
+
+/// A record of `extents` extents of 10 bytes for the generation `id`;
+/// `tail` makes the ids of its extents its own.
+fn manifest(id: &str, tail: &str, extents: usize) -> GenerationManifest {
+    GenerationManifest {
+        v: 1,
+        bucket: BucketRecord {
+            id: "b_0123456789abcdef".into(),
+            name: "vault".into(),
+            owner: "o_1".into(),
+            bdk_wrapped: vec![0x42; 40],
+            kek_version: 1,
+            disposable: false,
+            created_at: NOW - 86_400_000,
+        },
+        generation: GenerationRecord {
+            id: id.into(),
+            key: "big".into(),
+            size: extents as u64 * 10,
+            etag: "\"etag\"".into(),
+            checksum_json: None,
+            content_json: "{}".into(),
+            user_meta_json: "{}".into(),
+            created_at: NOW,
+        },
+        extents: (0..extents)
+            .map(|seq| ExtentRecord {
+                id: format!("x_{tail}{seq:05}"),
+                seq: seq as u32,
+                plain_offset: seq as u64 * 10,
+                plain_size: 10,
+                cipher_size: 50,
+                media_header: vec![1, 2, 3],
+                key_mode: 1,
+                wrapped_file_key: vec![7; 40],
+                plain_md5: vec![1; 16],
+                plain_sha256: vec![2; 32],
+                cipher_sha256: vec![3; 32],
+                created_at: NOW,
+            })
+            .collect(),
+    }
+}
+
+/// Key of a generation record of `layout` minted `age_ms` ago.
+fn generation_in(layout: &Layout, age_ms: i64, tail: &str) -> String {
+    layout.of_flat(&generation(age_ms, tail))
+}
+
+impl World {
+    /// Stores a segmented generation record of `extents` extents at
+    /// `key`, in segments of `per`, segments first; with `plans`, the
+    /// article plan of every extent as well.
+    async fn segmented(&self, key: &str, extents: usize, per: usize, plans: bool) -> Sealed {
+        let name = record_name(key).expect("a generation record");
+        let m = manifest(name.id, &name.id[name.id.len() - 2..], extents);
+        if plans {
+            for e in &m.extents {
+                let plan = name.layout.article_key(&ExtentId::new(e.id.clone()));
+                self.record(&plan, b"plan").await;
+            }
+        }
+        // A set of its own for every record.
+        let digest = Sha256::digest(key.as_bytes());
+        let tail = u64::from_be_bytes(digest[..8].try_into().unwrap());
+        let set = segmented_support::set_id(NOW, tail);
+        let sealed = segmented_support::seal(&self.kek, &name.layout, key, &m, &set, per);
+        for (name, bytes) in &sealed.segments {
+            self.raw(name, bytes.clone()).await;
+        }
+        self.raw(key, sealed.head_sealed.clone()).await;
+        sealed
+    }
+}
+
+/// How many PUTs of `key` the store was sent.
+fn puts_of(e2: &FakeE2, key: &str) -> usize {
+    let line = format!("PUT {key}");
+    e2.log.borrow().iter().filter(|l| **l == line).count()
+}
+
+/// Every segment is over there, was sent once and before the head, in
+/// order, and the head was sent once.
+fn assert_segments_then_head(w: &World, key: &str, sealed: &Sealed) {
+    let mut before = None;
+    for (name, bytes) in &sealed.segments {
+        assert_eq!(w.e2.get(name).as_ref(), Some(bytes), "{name}");
+        assert_eq!(puts_of(w.e2, name), 1, "{name}");
+        let at = put_at(w.e2, name);
+        assert!(before < at, "{name}");
+        before = at;
+    }
+    assert_eq!(w.e2.get(key).as_ref(), Some(&sealed.head_sealed));
+    assert_eq!(puts_of(w.e2, key), 1);
+    assert!(before < put_at(w.e2, key));
+}
+
+/// A fresh segmented record: the article plans and the segments go
+/// first, the segments in order, and the head last, in both layouts.
+/// The next pass sends nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_segmented_record_is_sent_after_its_plans_and_its_segments() {
+    for layout in Layout::all() {
+        let w = World::new();
+        let key = generation_in(&layout, 600_000, "_a");
+        let sealed = w.segmented(&key, 10, 4, true).await;
+        assert_eq!(sealed.segments.len(), 3);
+        let counts = w.pass().await;
+        assert_eq!((counts.copied, w.e2.puts()), (14, 14), "{counts:?}");
+        assert_eq!((counts.failed, counts.refused, counts.pending), (0, 0, 0));
+        assert_eq!(counts.source_unreadable, 0);
+        assert_segments_then_head(&w, &key, &sealed);
+        let head = put_at(w.e2, &key);
+        for e in sealed.plain.iter().flat_map(|s| &s.extents) {
+            let plan = layout.article_key(&ExtentId::new(e.id.clone()));
+            assert!(put_at(w.e2, &plan).is_some());
+            assert!(put_at(w.e2, &plan) < head, "{plan}");
+        }
+
+        w.clock.advance_ms(PASS_INTERVAL_MS);
+        let counts = w.pass().await;
+        assert_eq!((counts.copied, w.e2.puts()), (0, 14), "{counts:?}");
+    }
+}
+
+/// A fresh segmented record with a plan that is not written is held
+/// back: its head is not sent. Once it is old, the walk sends it as it
+/// is, segments first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_segmented_record_is_held_back_for_an_article_plan() {
+    let w = World::new();
+    let key = generation(600_000, "_a");
+    let sealed = w.segmented(&key, 10, 4, true).await;
+    // An extent of the second segment has no plan.
+    let missing = format!("m/art/{}", sealed.plain[1].extents[2].id);
+    assert!(w.safety.lose(&missing));
+    let counts = w.pass().await;
+    assert_eq!(counts.pending, 1, "{counts:?}");
+    assert!(w.e2.get(&key).is_none());
+    // The nine plans, and the segments as the keys under `m/` they
+    // are: without its head a segment says nothing to a reader.
+    assert_eq!(w.e2.puts(), 9 + 3, "{counts:?}");
+
+    w.clock.advance_ms(FRESH_MS);
+    let counts = w.pass().await;
+    assert_eq!(counts.pending, 0, "{counts:?}");
+    assert_eq!(w.e2.get(&key), Some(sealed.head_sealed.clone()));
+    for (name, bytes) in &sealed.segments {
+        assert_eq!(w.e2.get(name).as_ref(), Some(bytes));
+        assert!(put_at(w.e2, name) < put_at(w.e2, &key));
+    }
+}
+
+/// The walk sends an old segmented record after its segments, with no
+/// look at its plans, in both layouts.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_sends_a_segmented_record_after_its_segments() {
+    for layout in Layout::all() {
+        let w = World::new();
+        let key = generation_in(&layout, OLD, "_a");
+        let sealed = w.segmented(&key, 10, 4, false).await;
+        let counts = w.pass().await;
+        assert_eq!((counts.copied, w.e2.puts()), (4, 4), "{counts:?}");
+        assert_eq!((counts.failed, counts.source_unreadable), (0, 0));
+        assert_segments_then_head(&w, &key, &sealed);
+    }
+}
+
+/// A head is not sent unless every segment is stored, opens under its
+/// own name and is the one the head names. The record is counted, the
+/// records around it are copied, and once the segment is back the
+/// record goes over.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_is_not_sent_when_a_segment_is_missing_or_wrong() {
+    for layout in Layout::all() {
+        for age in [600_000, OLD] {
+            for (what, at) in [
+                ("missing", 0),
+                ("missing", 1),
+                ("missing", 2),
+                ("changed", 1),
+                ("other set", 1),
+                ("other index", 2),
+            ] {
+                let case = format!("{layout:?} age {age}: {what} {at}");
+                let w = World::new();
+                let key = generation_in(&layout, age, "_a");
+                let sealed = w.segmented(&key, 10, 4, true).await;
+                let neighbour = generation_in(&layout, age, "_b");
+                w.generation(&neighbour, &[]).await;
+                let (name, good) = sealed.segments[at].clone();
+                assert!(w.safety.lose(&name));
+                match what {
+                    "missing" => {}
+                    "changed" => {
+                        let mut bytes = good.clone();
+                        let last = bytes.len() - 1;
+                        bytes[last] ^= 1;
+                        w.raw(&name, bytes).await;
+                    }
+                    // A segment that opens under this name, and is the
+                    // one of another head. The head names its digest:
+                    // only what the segment says of itself is wrong.
+                    _ => {
+                        let mut segment = sealed.plain[at].clone();
+                        if what == "other set" {
+                            segment.set = "s_other".into();
+                        } else {
+                            segment.index = 0;
+                        }
+                        let plain = serde_json::to_vec(&segment).unwrap();
+                        let stored = w.record(&name, &plain).await;
+                        let mut head = sealed.head.clone();
+                        head.segments[at].sha256 = Sha256::digest(&stored).to_vec();
+                        let plain = serde_json::to_vec(&head).unwrap();
+                        velmora_bridge::recovery::GenerationHead::parse(&key, &plain).expect(what);
+                        w.record(&key, &plain).await;
+                    }
+                }
+                let counts = w.pass().await;
+                assert!(w.e2.get(&key).is_none(), "{case}");
+                assert_eq!(puts_of(w.e2, &key), 0, "{case}");
+                assert!(counts.source_unreadable >= 1, "{case}: {counts:?}");
+                assert!(w.e2.get(&neighbour).is_some(), "{case}");
+
+                // The segment is back: the walk comes round and sends
+                // the record.
+                assert!(w.safety.lose(&name) || what == "missing");
+                w.raw(&name, good).await;
+                w.raw(&key, sealed.head_sealed.clone()).await;
+                w.clock.advance_ms(WALK_INTERVAL_MS + FRESH_MS);
+                let counts = w.pass().await;
+                assert_eq!(counts.source_unreadable, 0, "{case}: {counts:?}");
+                assert_eq!(w.e2.get(&key), Some(sealed.head_sealed.clone()), "{case}");
+                for (name, bytes) in &sealed.segments {
+                    assert_eq!(w.e2.get(name).as_ref(), Some(bytes), "{case}");
+                    assert!(put_at(w.e2, name) < put_at(w.e2, &key), "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// A head that does not say which segments it has is never sent, by
+/// the sweep or by the walk.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_that_does_not_tile_its_object_is_not_sent() {
+    for age in [600_000, OLD] {
+        let w = World::new();
+        let key = generation(age, "_a");
+        let mut sealed = w.segmented(&key, 10, 4, true).await;
+        sealed.head.segments[1].seq += 1;
+        sealed.reseal_head(&w.kek);
+        assert!(w.safety.lose(&key));
+        w.raw(&key, sealed.head_sealed.clone()).await;
+        let counts = w.pass().await;
+        assert_eq!(counts.source_unreadable, 1, "{counts:?}");
+        assert!(w.e2.get(&key).is_none());
+    }
+}
+
+/// A segment that is damaged or missing over there is made equal
+/// before the head is sent; one that is equal is not sent again. And a
+/// segment that is missing over there under a head that is equal is
+/// sent by the walk, as any key under `m/` is.
+#[tokio::test(flavor = "current_thread")]
+async fn segments_over_there_are_made_equal_before_the_head() {
+    let w = World::new();
+    let key = generation(OLD, "_a");
+    let sealed = w.segmented(&key, 10, 4, false).await;
+    w.e2.set(&sealed.segments[0].0, &sealed.segments[0].1);
+    w.e2.set(&sealed.segments[1].0, b"damaged");
+    let counts = w.pass().await;
+    assert_eq!((counts.copied, w.e2.puts()), (3, 3), "{counts:?}");
+    assert_eq!(puts_of(w.e2, &sealed.segments[0].0), 0);
+    for (name, bytes) in &sealed.segments {
+        assert_eq!(w.e2.get(name).as_ref(), Some(bytes));
+        assert!(put_at(w.e2, name) < put_at(w.e2, &key));
+    }
+    assert_eq!(w.e2.get(&key), Some(sealed.head_sealed.clone()));
+
+    assert!(w
+        .e2
+        .objects
+        .borrow_mut()
+        .remove(&sealed.segments[2].0)
+        .is_some());
+    w.clock.advance_ms(WALK_INTERVAL_MS + FRESH_MS);
+    let counts = w.pass().await;
+    assert_eq!((counts.copied, w.e2.puts()), (1, 4), "{counts:?}");
+    assert_eq!(
+        w.e2.get(&sealed.segments[2].0).as_ref(),
+        Some(&sealed.segments[2].1)
+    );
+}
+
+/// A job that runs out of time among the segments stops, and the next
+/// one goes on: every segment is sent once, and the head last.
+#[tokio::test(flavor = "current_thread")]
+async fn a_segmented_record_that_takes_several_jobs_is_sent_once() {
+    let w = World::new();
+    let key = generation(OLD, "_a");
+    let sealed = w.segmented(&key, 40, 1, false).await;
+    assert_eq!(sealed.segments.len(), 40);
+    let clock = TickClock(w.clock.clone());
+    let copier = Copier {
+        safety: &w.safety,
+        kek: &w.kek,
+        clock: &clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let mut jobs = 0;
+    let mut cursor = Some(walk(""));
+    while let Some(at) = cursor {
+        jobs += 1;
+        assert!(jobs < 200, "the walk does not end");
+        let step = copier.step(UnixMs(NOW), &at).await.unwrap();
+        if w.e2.get(&key).is_none() {
+            // Not finished: the cursor has not passed the head.
+            let next = step.next.as_deref().expect("the walk goes on");
+            assert!(!next.contains(&format!("\"k\":\"{key}\"")), "{next}");
+            // Each job got at least one segment over.
+            assert!(w.e2.puts() >= jobs, "{jobs} jobs, {} puts", w.e2.puts());
+        }
+        cursor = step.next;
+    }
+    assert!(jobs >= 3, "{jobs}");
+    assert_segments_then_head(&w, &key, &sealed);
+    assert_eq!(w.e2.puts(), 41);
+}
+
+/// A segmented record with more plans than a job takes: the plans over
+/// several jobs, no plan and no segment twice, and the head last.
+#[tokio::test(flavor = "current_thread")]
+async fn a_segmented_record_with_more_plans_than_a_job_takes_several() {
+    let w = World::new();
+    let key = generation(600_000, "_a");
+    let sealed = w.segmented(&key, 600, 64, true).await;
+    assert_eq!(sealed.segments.len(), 10);
+    let mut jobs = 0;
+    let mut cursor = Some(String::new());
+    let mut copied = 0;
+    while let Some(at) = cursor {
+        jobs += 1;
+        assert!(jobs < 100, "the pass does not end");
+        let step = w.copier().step(UnixMs(NOW), &at).await.unwrap();
+        copied += step.counts.copied;
+        assert_eq!(step.counts.failed + step.counts.source_unreadable, 0);
+        cursor = step.next;
+    }
+    assert!(jobs >= 3, "{jobs}");
+    // Every key was put once. A job that stops at the head does not
+    // count what it sent of the keys after it: those are the segments,
+    // which the sweep also comes to as keys of their own.
+    assert_eq!(w.e2.puts(), 611);
+    assert!((601..=611).contains(&copied), "{copied}");
+    assert_segments_then_head(&w, &key, &sealed);
+    let head = put_at(w.e2, &key);
+    for e in sealed.plain.iter().flat_map(|s| &s.extents) {
+        let plan = format!("m/art/{}", e.id);
+        assert_eq!(puts_of(w.e2, &plan), 1, "{plan}");
+        assert!(put_at(w.e2, &plan) < head, "{plan}");
+    }
+}
+
+/// A head with the most segments there are is sent, in the sweep and
+/// in the walk; one with more is no head, and holds nothing back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_with_the_most_segments_is_sent_and_one_with_more_is_none() {
+    for age in [600_000, OLD] {
+        let w = World::new();
+        let key = generation(age, "_a");
+        let fresh = age != OLD;
+        w.segmented(&key, MAX_SEGMENTS + 1, 1, fresh).await;
+        let most = generation(age, "_b");
+        let sealed = w.segmented(&most, MAX_SEGMENTS, 1, fresh).await;
+        let counts = w.pass().await;
+        assert_eq!(counts.source_unreadable, 1, "{counts:?}");
+        assert_eq!(counts.failed, 0, "{counts:?}");
+        assert!(w.e2.get(&key).is_none());
+        assert_eq!(puts_of(w.e2, &key), 0);
+        assert_eq!(w.e2.get(&most), Some(sealed.head_sealed.clone()));
+        assert_eq!(puts_of(w.e2, &most), 1);
+        for (name, bytes) in &sealed.segments {
+            assert_eq!(w.e2.get(name).as_ref(), Some(bytes));
+            assert!(put_at(w.e2, name) < put_at(w.e2, &most), "{name}");
+        }
+    }
+}
+
+/// A head the job comes to with too little room left for its segments
+/// is left to the next job, which sends it: after some plans that were
+/// still to look at, and after a group of plans looked at again for a
+/// record that is fresh for the last time.
+#[tokio::test(flavor = "current_thread")]
+async fn a_head_that_does_not_fit_into_the_rest_of_a_job_is_sent_by_the_next() {
+    // Fresh with every plan written, and fresh for the last time with
+    // one plan that is not.
+    for (age, lost) in [(600_000, false), (FRESH_MS - 60_000, true)] {
+        let case = format!("age {age}");
+        let w = World::new();
+        let key = generation(age, "_a");
+        // 192 segments, and 192 plans of which 70 are still to send:
+        // the job that sends those has no room for the segments.
+        let sealed = w.segmented(&key, MAX_SEGMENTS, 1, true).await;
+        let plans: Vec<String> = sealed
+            .plain
+            .iter()
+            .flat_map(|s| &s.extents)
+            .map(|e| format!("m/art/{}", e.id))
+            .collect();
+        for plan in &plans[..MAX_SEGMENTS - 70] {
+            w.e2.set(plan, &w.safety.stored(plan).unwrap().bytes);
+        }
+        if lost {
+            assert!(w.safety.lose(&plans[MAX_SEGMENTS - 1]));
+        }
+        let mut jobs = 0;
+        let mut head_job = None;
+        let mut cursor = Some(String::new());
+        let pass = w.clock.now();
+        while let Some(at) = cursor {
+            jobs += 1;
+            assert!(jobs < 50, "{case}: the pass does not end");
+            let step = w.copier().step(pass, &at).await.unwrap();
+            assert_eq!(step.counts.failed, 0, "{case}");
+            if head_job.is_none() && w.e2.get(&key).is_some() {
+                head_job = Some(jobs);
+            }
+            cursor = step.next;
+        }
+        assert!(head_job.is_some_and(|job| job > 1), "{case}: {head_job:?}");
+        // The head once, after every segment. A segment may go twice:
+        // the pass also comes to it as a key of its own, and sends it
+        // again when it listed the store before the head's job did.
+        assert_eq!(w.e2.get(&key), Some(sealed.head_sealed.clone()), "{case}");
+        assert_eq!(puts_of(w.e2, &key), 1, "{case}");
+        for (name, bytes) in &sealed.segments {
+            assert_eq!(w.e2.get(name).as_ref(), Some(bytes), "{case}");
+            assert!(put_at(w.e2, name) < put_at(w.e2, &key), "{case}: {name}");
+            assert!(puts_of(w.e2, name) <= 2, "{case}: {name}");
+        }
+        for plan in &plans {
+            assert!(puts_of(w.e2, plan) <= 1, "{case}: {plan}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory of a pass over segmented records
+// ---------------------------------------------------------------------------
+
+mod heap {
+    //! Counts the bytes each thread has allocated and not freed, and the
+    //! most it had at once. A test on a current-thread runtime reads its
+    //! own numbers, whatever the tests beside it do.
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    fn moved(by: isize) {
+        let _ = LIVE.try_with(|live| {
+            let now = live.get() + by;
+            live.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+
+    // SAFETY: every call goes to the system allocator unchanged; the
+    // counters are plain thread-local cells that allocate nothing.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            moved(layout.size() as isize);
+            System.alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            moved(-(layout.size() as isize));
+            System.dealloc(ptr, layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            moved(new_size as isize - layout.size() as isize);
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    /// Bytes this thread holds now.
+    pub fn live() -> isize {
+        LIVE.with(Cell::get)
+    }
+
+    /// Starts a new measurement: the peak is what is held now.
+    pub fn mark() -> isize {
+        let now = live();
+        PEAK.with(|peak| peak.set(now));
+        now
+    }
+
+    /// The most this thread held since the last [`mark`].
+    pub fn peak() -> isize {
+        PEAK.with(Cell::get)
+    }
+}
+
+#[global_allocator]
+static HEAP: heap::Counting = heap::Counting;
+
+/// Six heads of 32 segments each, in both layouts: what a pass holds at
+/// once, above what it held before, is a few segments and not a
+/// record. Measured with segments of 256 extents and scaled to the
+/// 4,096 a writer may fill, it stays inside the 48 MiB a request may
+/// hold. The records are old, so the walk sends them; the sweep reads
+/// the segments of a fresh one the same way.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pass_over_six_segmented_records_holds_a_few_segments_at_once() {
+    const PER: usize = 256;
+    const SEGMENTS: usize = 32;
+    const FULL: usize = 4096;
+    const BUDGET: isize = 48 << 20;
+    for layout in Layout::all() {
+        // Every segment is over there already, and every segment is
+        // to send.
+        for there in [true, false] {
+            let case = format!("{layout:?} there {there}");
+            let w = World::new();
+            let mut heads = Vec::new();
+            let mut segment_bytes = 0;
+            let mut sent = 0;
+            for n in 0..6 {
+                let key = generation_in(&layout, OLD + n, &format!("_{n}"));
+                let sealed = w.segmented(&key, PER * SEGMENTS, PER, false).await;
+                assert_eq!(sealed.segments.len(), SEGMENTS);
+                for (name, bytes) in &sealed.segments {
+                    segment_bytes = segment_bytes.max(bytes.len() as isize);
+                    if there {
+                        w.e2.set(name, bytes);
+                    } else {
+                        sent += bytes.len() as isize;
+                    }
+                }
+                heads.push((key, sealed.head_sealed));
+            }
+            let before = heap::mark();
+            let counts = w.pass().await;
+            let peak = heap::peak() - before;
+            assert_eq!(counts.failed + counts.source_unreadable, 0, "{case}");
+            for (key, head) in &heads {
+                assert_eq!(w.e2.get(key).as_ref(), Some(head), "{case}");
+            }
+            // What the fake store kept of the segments it was sent is
+            // not the pass's own.
+            let held = peak - sent;
+            // Six keys are read at once, as any six records are. A
+            // record of 32 segments held whole would be 32, and six of
+            // them 192.
+            assert!(
+                held < 12 * segment_bytes,
+                "{case}: {held} bytes, segments of {segment_bytes}"
+            );
+            let scaled = held * (FULL / PER) as isize;
+            assert!(scaled < BUDGET, "{case}: {scaled} bytes at {FULL} extents");
+        }
+    }
 }

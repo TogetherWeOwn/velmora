@@ -3813,7 +3813,8 @@ async fn plan_record_in(
 /// What a replay of the records alone gives a client, with the records
 /// listed `page` at a time. Also: no record is unreadable, none is
 /// stored twice, and no cursor names a key of the tenant layout (a
-/// cursor is the same whichever layout the records are in).
+/// cursor over records in one part, each under one name, is the same
+/// whichever layout the records are in).
 async fn answers_of_a_replay(
     rig: &Rig,
     page: Option<u32>,

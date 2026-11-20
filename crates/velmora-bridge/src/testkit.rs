@@ -433,6 +433,7 @@ pub struct StoredBlob {
 pub struct MemBlobStore {
     blobs: RefCell<BTreeMap<String, StoredBlob>>,
     gets: Cell<u64>,
+    got: RefCell<Vec<String>>,
     refuse_puts: Cell<bool>,
 }
 
@@ -453,6 +454,12 @@ impl MemBlobStore {
     /// `get` calls so far.
     pub fn gets(&self) -> u64 {
         self.gets.get()
+    }
+
+    /// `get` calls so far for keys that begin with `prefix`.
+    pub fn gets_under(&self, prefix: &str) -> u64 {
+        let got = self.got.borrow();
+        got.iter().filter(|k| k.starts_with(prefix)).count() as u64
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -504,6 +511,7 @@ impl BlobStore for MemBlobStore {
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
         self.gets.set(self.gets.get() + 1);
+        self.got.borrow_mut().push(key.to_owned());
         let blobs = self.blobs.borrow();
         let Some(blob) = blobs.get(key) else {
             return Ok(None);

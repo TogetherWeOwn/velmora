@@ -351,8 +351,12 @@ generation, tombstone and article plan records:
 | `tenant` | `m/x/<tenant>/<id>` | `m/x/<tenant>/del/<id>` | `m/x/<tenant>/art/<extent>` |
 
 Every write belongs to tenant `t_0000000000000000` today. The names
-under `m/x/<tenant>/seg/` are reserved for records that hold a part of
-an article plan. Any other value of the variable refuses to start.
+under `m/seg/` and `m/x/<tenant>/seg/` are the segments of a segmented
+generation record: each holds a run of the extents of one object. A
+restore reads a segment only through the generation record that names
+it; the recovery copy also sends it to the remote store as a key of its
+own, like any other key under `m/`, and before the record that names
+it. No build writes them yet. Any other value of the variable refuses to start.
 
 - A record is never renamed, moved or rewritten: it is sealed under its
   whole name and would not open under another. Changing the setting
@@ -364,8 +368,12 @@ an article plan. Any other value of the variable refuses to start.
   the record that names it first, then in the other one, because a plan
   can be written after the setting changed and a copy shares the
   extents of its source).
-- The replay reads the two listings as one, in id order. Its cursor did
-  not change, so a replay can be continued across a deploy.
+- The replay reads the two listings as one, in id order. A cursor of
+  an older build is still read, so a replay can be continued across a
+  deploy. Not across a rollback to a build from before segmented
+  records: a cursor that stops inside a record carries the `name` of
+  that record, which such a build refuses. Start that replay again from
+  the beginning; a replay can be repeated.
 - The names stay under `m/`, so what is true of `m/` stays true of
   them: the store refuses to delete them, and the recovery copy sends
   them under the same names.
