@@ -3357,8 +3357,12 @@ async fn rows_written_per_extent_after_the_index_drops() {
 async fn rows_written_per_put(dropped: bool) -> u64 {
     let rig = Rig::with_backbones(&[("PACKED_PLANS", "on")], 2).await;
     let s = "rows written per PutObject";
-    rig.setup_buckets_and_key(s).await;
     let sql = &rig.bridge.catalog.sql;
+    // The figures are without the usage counters, as the migration
+    // leaves them (the `uncounted` case of `rows_written`).
+    sql.apply("UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0")
+        .expect("counters off");
+    rig.setup_buckets_and_key(s).await;
     if dropped {
         sql.apply(NEXT_DROP_SUPERSEDED_INDEXES)
             .expect("the index drops apply");
