@@ -5098,8 +5098,10 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
     let mut replay = Vec::new();
     let mut made = Vec::new();
-    for key in ["damaged", "fraction", "tiny", "huge", "sound"] {
-        let (o, _) = fx.posted_packed(key, true).await;
+    for key in ["damaged", "fraction", "tiny", "huge", "none", "sound"] {
+        let (o, l) = fx.posted_packed(key, true).await;
+        // A full read on record: it speaks for the addendum of now.
+        fx.pass_of(&l, "bb-a", T0, VerifyKind::Body, 3).await;
         let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
         replay.push(ReplayExtent {
@@ -5118,7 +5120,7 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let sql = "UPDATE extents SET parity_count = 1.5 WHERE id = ?1";
     assert_eq!(fx.run(sql, &[text(made[1].extent.as_str())]).await, 1);
     assert_eq!(fx.extent(&made[1], "typeof(parity_count)").await, "real");
-    // One that does not come back from its text as itself.
+    // A fraction at the edge of what a number is.
     let sql = "UPDATE extents SET parity_count = 5e-324 WHERE id = ?1";
     assert_eq!(fx.run(sql, &[text(made[2].extent.as_str())]).await, 1);
     assert_eq!(fx.extent(&made[2], "typeof(parity_count)").await, "real");
@@ -5127,6 +5129,9 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let sql = "UPDATE extents SET parity_count = 9007199254740993 WHERE id = ?1";
     assert_eq!(fx.run(sql, &[text(made[3].extent.as_str())]).await, 1);
     assert_eq!(fx.extent(&made[3], "typeof(parity_count)").await, "integer");
+    // No count beside an addendum.
+    let sql = "UPDATE extents SET parity_count = NULL WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[4].extent.as_str())]).await, 1);
 
     let stranded = fx
         .cat
@@ -5134,11 +5139,24 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
         .await
         .unwrap();
     assert!(stranded.is_empty(), "{stranded:?}");
-    for o in &made {
+    for (i, o) in made.iter().enumerate() {
         assert_eq!(fx.extent(o, "typeof(parity_count)").await, "integer");
         assert_eq!(fx.extent(o, "parity_count").await, "1");
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
         let parity = stored.parity_plan(&o.extent, TWO_ARTICLES).unwrap();
         assert_eq!(parity.unwrap().articles.len(), 1);
+        // A row whose addendum was written again lost its passes: none
+        // speaks for parity articles it did not read. The sound row,
+        // the last, keeps its own.
+        let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
+        let passes = fx
+            .cat
+            .sql
+            .0
+            .query(sql, &[text(o.extent.as_str())])
+            .await
+            .unwrap();
+        let kept = i64::from(i + 1 == made.len());
+        assert_eq!(passes[0][0], SqlValue::Int(kept), "row {i}");
     }
 }
