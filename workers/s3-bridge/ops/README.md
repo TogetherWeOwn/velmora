@@ -617,7 +617,12 @@ requests in flight, and give rclone one connection per request:
     multipart_threshold = 16MB
     multipart_chunksize = 16MB
     max_concurrent_requests = 16
+    preferred_transfer_client = classic
   ```
+
+  `classic` keeps these three settings in force: on some instance
+  types the default (`auto`) picks the CRT client, which ignores
+  `multipart_threshold` and `max_concurrent_requests`.
 
 Why these values:
 
