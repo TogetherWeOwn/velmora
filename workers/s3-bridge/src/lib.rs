@@ -166,8 +166,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         if internal.get() && status < 500 {
             return;
         }
-        // A request without a ray id (one through a service binding)
-        // is drawn by its place in this isolate's count instead.
+        // Every request has an ID now (a ray ID, or one of its own for a
+        // request through a service binding), so the draw is by that ID.
+        // The count of this isolate stays as a guard for an empty one.
         let drawn = if request_id.is_empty() {
             // The start time too: every isolate counts from one.
             format!("{started}n{}", metrics::next())
