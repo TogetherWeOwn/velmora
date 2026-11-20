@@ -104,7 +104,7 @@ jobs:
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport
       - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport -- -D warnings
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
-      # Wasm SIMD; consumers enable it via this RUSTFLAGS).
+      # Wasm SIMD; workers/s3-bridge/bundle.sh builds with this RUSTFLAGS).
       - run: RUSTFLAGS="-C target-feature=+simd128" cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
       # Repair-parity codec: the scalar and the simd128 wasm builds (release
       # profile, as the Worker is built) must both produce the bytes the
@@ -122,6 +122,18 @@ jobs:
           node crates/velmora-parity-bench/run.mjs "$wasm" --expect-simd off --check-only
           RUSTFLAGS="-C target-feature=+simd128" cargo build --locked --release -p velmora-parity-bench --target wasm32-unknown-unknown
           node crates/velmora-parity-bench/run.mjs "$wasm" --expect-simd on --reps 1
+      # The hot paths as the Worker bundle compiles them (wasm32, simd128,
+      # release profile) must produce the bytes the native build pins:
+      # run.mjs runs the self-check of velmora-cpu-bench under V8 and
+      # fails on any difference. The timings it prints are not a gate.
+      - name: Hot-path self-check under wasm (scalar, then simd128)
+        run: |
+          set -euo pipefail
+          wasm=target/wasm32-unknown-unknown/release/velmora_cpu_bench.wasm
+          cargo build --locked --release -p velmora-cpu-bench --target wasm32-unknown-unknown
+          node crates/velmora-cpu-bench/run.mjs "$wasm" --expect-simd off --check-only
+          RUSTFLAGS="-C target-feature=+simd128" cargo build --locked --release -p velmora-cpu-bench --target wasm32-unknown-unknown
+          node crates/velmora-cpu-bench/run.mjs "$wasm" --expect-simd on --mib 2 --reps 1
       # S3 bridge core and protocol crates are runtime-agnostic and must
       # build for the Worker target without engine transport features.
       - run: cargo check --locked -p velmora-bridge -p velmora-s3-proto --target wasm32-unknown-unknown
@@ -190,6 +202,7 @@ jobs:
       # Bridge core and protocol crates declare the same 1.89 MSRV.
       - run: cargo check --locked -p velmora-s3-proto -p velmora-bridge
       - run: cargo check --locked -p velmora-parity-bench
+      - run: cargo check --locked -p velmora-cpu-bench
       - name: Install Rust 1.91 (Worker SDK minimum)
         run: |
           rustup toolchain install 1.91 --profile minimal --no-self-update

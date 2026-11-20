@@ -22,6 +22,8 @@ worker-pinned-tls = ["worker-transport", "dep:tokio-rustls", "dep:rustls", "dep:
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crc32fast = "1"
+# Line and dot scans on the article hot paths (already in the tree).
+memchr = "2"
 quick-xml = "0.42"
 sha2 = "0.11"
 md5 = "0.8"
