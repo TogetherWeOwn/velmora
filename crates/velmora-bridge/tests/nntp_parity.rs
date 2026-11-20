@@ -603,7 +603,10 @@ async fn parity_falls_to_the_other_provider_when_the_preferred_one_fails() {
 
     // The first parity article goes to the preferred provider, whichever
     // it is. Its later POSTs wait until that provider takes no more posts,
-    // so it stops in the middle of the parity whatever the timing.
+    // so it stops in the middle of the parity whatever the timing. The
+    // other provider's parity POSTs wait for the refusal too: on a tie in
+    // data articles both would post parity at once, and the rest must
+    // come from the failover, not from that.
     let preferred: Rc<RefCell<Option<String>>> = Rc::default();
     let refused = Rc::new(Cell::new(false));
     {
@@ -620,6 +623,7 @@ async fn parity_falls_to_the_other_provider_when_the_preferred_one_fails() {
                     None
                 }
                 Some(p) if p == provider => Some(Rc::clone(&refused)),
+                Some(_) if parity_ids.contains(id) => Some(Rc::clone(&refused)),
                 _ => None,
             }
         });
