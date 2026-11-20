@@ -1005,7 +1005,12 @@ async fn a_record_under_two_names_is_replayed_from_the_one_that_reads() {
 async fn a_single_record_behind_a_segmented_one_that_does_not_read_is_replayed() {
     for lost in [0, 2] {
         for limits in [
-            ReplayLimits::default(),
+            // A call that stops inside the record, in many records and
+            // in one.
+            ReplayLimits {
+                records: 50,
+                extents: 100,
+            },
             ReplayLimits {
                 records: 1,
                 extents: 7,

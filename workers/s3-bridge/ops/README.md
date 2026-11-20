@@ -408,6 +408,11 @@ older Worker cannot enforce it on a direct replay call.
      `SAFETY_MIN_AGE_SECS` is likely to need it, and with the shipped 0 a
      copy of any age can, because a copy may be released minutes after
      its post.
+   - One call replays up to 250 records and 1,000 extents. The script
+     prints the running rate after each call.
+   - A call that gets no answer is sent again by the script after a
+     wait. Leave that wait in place: the Worker may still be at work
+     on the call it did not answer.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the
