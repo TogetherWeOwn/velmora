@@ -275,8 +275,10 @@ async fn unreadable_plans<S: Sql>(
             .sql
             .query(
                 &format!(
-                    "SELECT id, cipher_size, plan, parity, parity_count FROM extents \
-                     WHERE id IN ({marks}) AND plan IS NOT NULL"
+                    "SELECT id, cipher_size, plan, parity, \
+                       CASE typeof(parity_count) WHEN 'real' THEN quote(parity_count) \
+                         ELSE parity_count END \
+                     FROM extents WHERE id IN ({marks}) AND plan IS NOT NULL"
                 ),
                 &chunk
                     .iter()
@@ -291,7 +293,10 @@ async fn unreadable_plans<S: Sql>(
             let stored = r.blob()?;
             let parity = r.opt_blob()?;
             // As it is stored: a count that is no number is damage of
-            // this row, and must not stop the replay of the others.
+            // this row, and must not stop the replay of the others. A
+            // fraction is read as its text (a row cannot carry one); the
+            // statements keyed on it still find the row, because the
+            // column compares a text that is a number as that number.
             let count = r.value()?;
             let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
                 continue;

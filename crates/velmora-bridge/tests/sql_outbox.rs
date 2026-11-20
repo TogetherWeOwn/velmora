@@ -5108,6 +5108,44 @@ async fn a_read_of_the_data_alone_does_not_clear_a_failed_full_read() {
     assert_eq!(guard.unwrap(), Guard::Applied(()));
 }
 
+/// The light guard counts a pass only over every article, the parity
+/// articles included: `STAT` answers for the data articles alone release
+/// nothing, with or without the full check asked for.
+#[tokio::test]
+async fn the_light_guard_refuses_passes_over_the_data_alone() {
+    let fx = Fx::new().await;
+    let (o, l) = fx.posted_packed("k", true).await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx
+        .cat
+        .advance(&l, OutboxStage::Release, later, T0)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    // Two data articles and one parity article; `bb-b` answers for two.
+    fx.pass_of(&r, "bb-a", later.plus_ms(1), VerifyKind::Stat, 3)
+        .await;
+    fx.pass_of(&r, "bb-b", later.plus_ms(1), VerifyKind::Stat, 2)
+        .await;
+    let before = fx.dump().await;
+    for need_full in [false, true] {
+        let guard = fx
+            .cat
+            .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(2), need_full);
+        assert_eq!(guard.await.unwrap(), Guard::Lost, "{need_full}");
+    }
+    assert_eq!(fx.dump().await, before, "a refused release wrote something");
+
+    // Every article on both: released without a full check.
+    fx.pass_of(&r, "bb-b", later.plus_ms(3), VerifyKind::Stat, 3)
+        .await;
+    let guard = fx
+        .cat
+        .begin_release_light(&r, 2, &counting, "[]", later.plus_ms(4), false);
+    assert_eq!(guard.await.unwrap(), Guard::Applied(()));
+}
+
 /// A parity count that is no number is damage of one row: the replay
 /// goes on, and puts the addendum of the record back with its count.
 #[tokio::test]
@@ -5117,7 +5155,7 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
     let mut replay = Vec::new();
     let mut made = Vec::new();
-    for key in ["damaged", "sound"] {
+    for key in ["damaged", "fraction", "sound"] {
         let (o, _) = fx.posted_packed(key, true).await;
         let (_, mut extent_rows) = fx.cat.live_object(&fx.bucket, key).await.unwrap().unwrap();
         let stored = fx.cat.stored_plan(&o.extent).await.unwrap();
@@ -5133,6 +5171,10 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
     let sql = "UPDATE extents SET parity_count = 'x' WHERE id = ?1";
     assert_eq!(fx.run(sql, &[text(made[0].extent.as_str())]).await, 1);
     assert_eq!(fx.extent(&made[0], "typeof(parity_count)").await, "text");
+    // Nor is a fraction a count: the column takes one as it is.
+    let sql = "UPDATE extents SET parity_count = 1.5 WHERE id = ?1";
+    assert_eq!(fx.run(sql, &[text(made[1].extent.as_str())]).await, 1);
+    assert_eq!(fx.extent(&made[1], "typeof(parity_count)").await, "real");
 
     let stranded = fx
         .cat
