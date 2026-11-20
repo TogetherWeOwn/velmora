@@ -192,6 +192,14 @@ pub struct BridgeConfig {
     /// switch goes on only once no older version can come back, and a
     /// rollback after that is to a version that knows it, with it off.
     pub packed_plans: bool,
+    /// Give the plan of a new extent a parity addendum (`PARITY`,
+    /// [`crate::parity`]) and post its parity articles with the data
+    /// articles. Only a plan that is stored packed gets one. The switch
+    /// says nothing about an addendum that is stored: that one is always
+    /// posted and read. A Worker from before the switch ignores an
+    /// addendum, so a rollback past it posts and releases extents
+    /// without their parity.
+    pub parity: bool,
     /// The layout of new recovery records (`RECORD_LAYOUT`,
     /// [`crate::recovery::Layout`]): `flat`, or `tenant` for the
     /// directory of the tenant. It names what is written only. Every
@@ -656,6 +664,16 @@ impl BridgeConfig {
             Some("on") => true,
             Some(_) => return Err(ConfigError::Invalid("PACKED_PLANS".into())),
         };
+        let parity = match get("PARITY").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("PARITY".into())),
+        };
+        // The addendum is stored beside a packed plan only: with plans
+        // of rows the switch would be on and no extent would get parity.
+        if parity && !packed_plans {
+            return Err(ConfigError::Refused("PARITY without PACKED_PLANS"));
+        }
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
             Some("tenant") => crate::recovery::Layout::default_tenant(),
@@ -693,6 +711,12 @@ impl BridgeConfig {
             .collect();
         if !newsgroups.iter().all(|g| valid_newsgroup(g)) {
             return Err(ConfigError::Invalid("NEWSGROUPS".into()));
+        }
+        // A packed plan holds the newsgroup count in one byte. Past that a
+        // new plan is stored as rows, which carry no parity addendum, so
+        // with parity on such a list would post extents without parity.
+        if parity && newsgroups.len() > usize::from(u8::MAX) {
+            return Err(ConfigError::Refused("PARITY with more than 255 NEWSGROUPS"));
         }
 
         let kek_active: u32 = number(&get, "VELMORA_KEK_ACTIVE")?;
@@ -855,6 +879,7 @@ impl BridgeConfig {
             max_object_extents,
             intent_sweep,
             packed_plans,
+            parity,
             records,
             required_backbones,
             safety_min_age_secs,

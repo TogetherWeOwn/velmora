@@ -1078,6 +1078,9 @@ pub struct JobExtent {
     pub extent: ExtentRow,
     pub bucket: Bucket,
     pub generation_state: GenerationState,
+    /// How many parity articles the extent's plan has
+    /// (`extents.parity_count`). `None` = no parity.
+    pub parity_count: Option<u32>,
 }
 
 /// Admin view of one extent.

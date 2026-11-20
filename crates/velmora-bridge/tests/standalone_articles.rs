@@ -318,6 +318,7 @@ async fn the_plan_record_carries_a_seeded_plan() {
     let seeded = StoredPlan {
         rows: rows.clone(),
         packed: Some(blob.clone()),
+        parity: None,
     };
     let record = ArticleManifest::of(&extent, &seeded);
     assert_eq!(record.packed.as_deref(), Some(&blob[..]));
@@ -343,6 +344,7 @@ async fn the_plan_record_carries_a_seeded_plan() {
     let stored = StoredPlan {
         rows: plan.clone(),
         packed: Some(explicit.clone()),
+        parity: None,
     };
     let record = ArticleManifest::of(&extent, &stored);
     assert_eq!(record, ArticleManifest::new(&extent, &plan));
@@ -361,4 +363,100 @@ async fn the_plan_record_carries_a_seeded_plan() {
     let mut odd = replayed.clone();
     odd[0].cipher_len -= 1;
     assert_eq!(repack(&extent.id, size, &odd, Some(&blob)), None);
+}
+
+/// The record of a plan with parity carries the addendum next to the
+/// packed plan it is beside, and never without it. A record of a plan
+/// without parity is the same bytes as before, and a reader from before
+/// the field reads both.
+#[tokio::test]
+async fn the_plan_record_carries_the_parity_addendum() {
+    use velmora_bridge::parity;
+    use velmora_bridge::plan::{plan_seeded, StoredPlan};
+    use velmora_bridge::recovery::ArticleRecord;
+
+    /// The record as a Worker from before parity reads it.
+    #[derive(serde::Deserialize)]
+    struct Before {
+        plan_rev: u32,
+        articles: Vec<ArticleRecord>,
+        packed: Option<String>,
+    }
+
+    let rig = simple_rig().await;
+    let (s, plan) = rig.posted_as(9, Form::Standalone).await;
+    let extent = rig.bridge.catalog.extent(&s.extent);
+    let size = extent.cipher_size;
+    let groups = ["alt.binaries.test"];
+    let rng = &mut velmora::rng::SystemRng;
+    let (blob, rows) = plan_seeded(rng, 1_800_000_000, &groups, &extent.id, size, |span| {
+        plan.iter()
+            .find(|a| a.cipher_offset == span.start)
+            .map(|a| a.payload_sha256)
+    })
+    .unwrap();
+    let shards: Vec<(u16, [u8; 32])> = parity::new_rows(rows.len())
+        .into_iter()
+        .map(|row| (row, [row as u8 + 1; 32]))
+        .collect();
+    let addendum = parity::build(
+        rng,
+        1_800_000_000,
+        &groups,
+        &extent.id,
+        size,
+        &blob,
+        &shards,
+    )
+    .unwrap();
+
+    let stored = StoredPlan {
+        rows: rows.clone(),
+        packed: Some(blob.clone()),
+        parity: Some(addendum.clone()),
+    };
+    let record = ArticleManifest::of(&extent, &stored);
+    assert_eq!(record.parity.as_deref(), Some(&addendum[..]));
+    // The data articles only: the addendum says where the others are.
+    assert_eq!(record.articles.len(), rows.len());
+    let json = serde_json::to_value(&record).unwrap();
+    assert!(json["parity"].is_string());
+    let back: ArticleManifest = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(back, record);
+    let read = parity::expand(
+        &extent.id,
+        size,
+        back.packed.as_deref().unwrap(),
+        back.parity.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(read.articles.len(), shards.len());
+    let before: Before = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!((before.plan_rev, &before.articles), (1, &record.articles));
+    assert_eq!(
+        before.packed.as_ref(),
+        json["packed"].as_str().map(String::from).as_ref()
+    );
+
+    // Without parity: no key at all, the record of before.
+    let plain = StoredPlan {
+        parity: None,
+        ..stored.clone()
+    };
+    let without = ArticleManifest::of(&extent, &plain);
+    let plain_json = serde_json::to_value(&without).unwrap();
+    assert!(plain_json.get("parity").is_none());
+    let mut stripped = json;
+    stripped.as_object_mut().unwrap().remove("parity");
+    assert_eq!(stripped, plain_json);
+    let back: ArticleManifest = serde_json::from_value(plain_json).unwrap();
+    assert_eq!((back.parity.as_ref(), &back), (None, &without));
+
+    // A plan of rows has no addendum to carry.
+    let as_rows = StoredPlan {
+        packed: None,
+        ..stored
+    };
+    let record = ArticleManifest::of(&extent, &as_rows);
+    assert_eq!((record.packed, record.parity), (None, None));
 }

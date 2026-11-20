@@ -287,6 +287,8 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.maintenance, Maintenance::Off);
     assert!(cfg.server_side_copy);
     assert!(cfg.packed_plans);
+    // No parity until it is turned on.
+    assert!(!cfg.parity);
     // A GET above 1 GiB is served in sub-ranges of 1 GiB.
     assert_eq!(cfg.get_fanout_bytes, Some(1 << 30));
     assert!(!cfg.dev_trust_http);
@@ -754,6 +756,9 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("INTENT_SWEEP", "1"),
         ("INTENT_SWEEP", "ON"),
         ("INTENT_SWEEP", "disposable"),
+        ("PARITY", "1"),
+        ("PARITY", "ON"),
+        ("PARITY", "true"),
     ] {
         assert_eq!(set(&prod, name, bad), invalid(name), "{name}={bad}");
     }
@@ -762,6 +767,52 @@ fn config_rejects_invalid_and_unsafe_values() {
     tuned.insert("PROPAGATION_GRACE_SECS".into(), "0".into());
     let cfg = load(&tuned).unwrap();
     assert_eq!((cfg.post_sockets, cfg.propagation_grace_secs), (8, 0));
+    // The parity switch: absent, blank and `off` are off.
+    for (value, on) in [("", false), ("  ", false), ("off", false), (" on ", true)] {
+        let mut tuned = prod.clone();
+        tuned.insert("PARITY".into(), value.into());
+        assert_eq!(load(&tuned).unwrap().parity, on, "PARITY={value:?}");
+    }
+    // Parity is stored beside a packed plan: on without packed plans it
+    // would give no extent parity, so it is refused.
+    for packed in ["off", ""] {
+        let mut tuned = prod.clone();
+        tuned.insert("PARITY".into(), "on".into());
+        tuned.insert("PACKED_PLANS".into(), packed.into());
+        assert_eq!(
+            load(&tuned).unwrap_err(),
+            ConfigError::Refused("PARITY without PACKED_PLANS")
+        );
+        tuned.insert("PARITY".into(), "off".into());
+        assert!(!load(&tuned).unwrap().packed_plans);
+    }
+    // A packed plan counts its newsgroups in one byte; with parity on a
+    // longer list would fall back to plans of rows, without parity.
+    let many = |n: usize| {
+        (0..n)
+            .map(|i| format!("alt.binaries.g{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    for (n, parity, ok) in [(255, "on", true), (256, "on", false), (256, "off", true)] {
+        let mut tuned = prod.clone();
+        tuned.insert("PARITY".into(), parity.into());
+        tuned.insert("PACKED_PLANS".into(), "on".into());
+        tuned.insert("NEWSGROUPS".into(), many(n));
+        match load(&tuned) {
+            Ok(cfg) => assert!(
+                ok && cfg.newsgroups.len() == n,
+                "{n} groups, PARITY={parity}"
+            ),
+            Err(e) => {
+                assert!(!ok, "{n} groups, PARITY={parity}: {e:?}");
+                assert_eq!(
+                    e,
+                    ConfigError::Refused("PARITY with more than 255 NEWSGROUPS")
+                );
+            }
+        }
+    }
     // The limits of the slice settings themselves are accepted, and the
     // default slice is never above one extent.
     for (put, slice, sweep) in [

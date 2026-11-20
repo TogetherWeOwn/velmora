@@ -108,6 +108,9 @@ pub const MIGRATION_0021: &str =
 /// next release. [`RusqliteSql::with_contracted_schema`] applies them.
 pub const NEXT_DROP_SUPERSEDED_INDEXES: &str =
     include_str!("../../../workers/s3-bridge/migrations-next/0023_drop_superseded_indexes.sql");
+/// The parity addendum of an extent (`extents.parity`, `parity_count`).
+pub const MIGRATION_0022: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0022_parity.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -287,6 +290,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0019)?;
         db.apply(MIGRATION_0020)?;
         db.apply(MIGRATION_0021)?;
+        db.apply(MIGRATION_0022)?;
         Ok(db)
     }
 

@@ -45,7 +45,7 @@ pub const TAG_EXPLICIT: u8 = 2;
 
 /// Bytes of the seed of a seeded plan.
 pub const SEED_LEN: usize = 16;
-const CHECK_LEN: usize = 16;
+pub(crate) const CHECK_LEN: usize = 16;
 
 /// `extents.posted_at` of a plan that is posted at a time nobody knows
 /// (a catalogue replayed for an extent whose pinned copy is gone).
@@ -57,7 +57,8 @@ const ERR_PLAN: BridgeError = BridgeError::Invalid("packed article plan");
 /// is `HMAC-SHA256(seed, "velmora article plan v1" || idx || n)`. One
 /// stream per article, so an article's identifiers do not depend on how
 /// many bytes the articles before it drew.
-struct SeedRng {
+pub(crate) struct SeedRng {
+    label: &'static [u8; 23],
     seed: [u8; SEED_LEN],
     idx: u32,
     block: u32,
@@ -68,8 +69,15 @@ struct SeedRng {
 const STREAM_LABEL: &[u8; 23] = b"velmora article plan v1";
 
 impl SeedRng {
-    fn new(seed: &[u8; SEED_LEN], idx: u32) -> Self {
+    pub(crate) fn new(seed: &[u8; SEED_LEN], idx: u32) -> Self {
+        Self::labelled(STREAM_LABEL, seed, idx)
+    }
+
+    /// A stream under another label than the data plan's: whatever the
+    /// seed and `idx`, it is not a stream of [`SeedRng::new`].
+    pub(crate) fn labelled(label: &'static [u8; 23], seed: &[u8; SEED_LEN], idx: u32) -> Self {
         SeedRng {
+            label,
             seed: *seed,
             idx,
             block: 0,
@@ -79,11 +87,11 @@ impl SeedRng {
     }
 }
 
-/// `HMAC-SHA256(seed, STREAM_LABEL || idx || block)` (RFC 2104), as two
+/// `HMAC-SHA256(seed, label || idx || block)` (RFC 2104), as two
 /// plain SHA-256 calls: the key is shorter than a hash block and the
 /// message is short and of one length, so both hashes are over a small
 /// buffer on the stack.
-fn stream_block(seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
+fn labelled_block(label: &[u8; 23], seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
     const BLOCK: usize = 64;
     const LABEL: usize = STREAM_LABEL.len();
     let mut inner = [0x36u8; BLOCK + LABEL + 8];
@@ -92,18 +100,24 @@ fn stream_block(seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
         inner[at] ^= k;
         outer[at] ^= k;
     }
-    inner[BLOCK..BLOCK + LABEL].copy_from_slice(STREAM_LABEL);
+    inner[BLOCK..BLOCK + LABEL].copy_from_slice(label);
     inner[BLOCK + LABEL..BLOCK + LABEL + 4].copy_from_slice(&idx.to_be_bytes());
     inner[BLOCK + LABEL + 4..].copy_from_slice(&block.to_be_bytes());
     outer[BLOCK..].copy_from_slice(&sha256(&inner));
     sha256(&outer)
 }
 
+/// A block of the data plan's stream.
+#[cfg(test)]
+fn stream_block(seed: &[u8; SEED_LEN], idx: u32, block: u32) -> [u8; 32] {
+    labelled_block(STREAM_LABEL, seed, idx, block)
+}
+
 impl FillRandom for SeedRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) -> velmora::Result<()> {
         for byte in dest {
             if self.used == self.buf.len() {
-                self.buf = stream_block(&self.seed, self.idx, self.block);
+                self.buf = labelled_block(self.label, &self.seed, self.idx, self.block);
                 self.block = self.block.checked_add(1).ok_or_else(|| {
                     velmora::Error::Malformed("article plan stream is exhausted".into())
                 })?;
@@ -136,6 +150,39 @@ pub struct StoredPlan {
     pub rows: Vec<ArticleRow>,
     /// The packed form, when the plan is stored packed.
     pub packed: Option<Vec<u8>>,
+    /// The parity addendum beside a packed plan ([`crate::parity`]), as
+    /// it is stored: not checked. `None` = the extent has no parity.
+    pub parity: Option<Vec<u8>>,
+}
+
+impl StoredPlan {
+    /// The parity articles the plan's addendum gives for `extent`
+    /// (`cipher_size` bytes of ciphertext), after the data articles in
+    /// `idx` order, with the posting state and the stamps of the plan.
+    /// `None` = the plan has no addendum.
+    ///
+    /// An addendum that is not exactly one of this plan is an error. A
+    /// read takes that for no parity; a job that posts, verifies or
+    /// releases fails on it.
+    pub fn parity_plan(
+        &self,
+        extent: &ExtentId,
+        cipher_size: u64,
+    ) -> Result<Option<crate::parity::ParityPlan>> {
+        let Some(addendum) = &self.parity else {
+            return Ok(None);
+        };
+        let packed = self.packed.as_deref().ok_or(crate::parity::ERR_PARITY)?;
+        let mut parity = crate::parity::expand(extent, cipher_size, packed, addendum)?;
+        if let Some(first) = self.rows.first() {
+            for a in &mut parity.articles {
+                a.state = first.state;
+                a.posted_at = first.posted_at;
+                a.reposted_at = first.reposted_at;
+            }
+        }
+        Ok(Some(parity))
+    }
 }
 
 /// What a seeded plan is derived from.
@@ -217,13 +264,13 @@ fn check_of(extent: &ExtentId, rows: &[ArticleRow]) -> [u8; CHECK_LEN] {
 }
 
 #[inline(never)]
-fn put_str8(out: &mut Vec<u8>, s: &[u8]) -> Result<()> {
+pub(crate) fn put_str8(out: &mut Vec<u8>, s: &[u8]) -> Result<()> {
     out.push(u8::try_from(s.len()).map_err(|_| ERR_PLAN)?);
     out.extend_from_slice(s);
     Ok(())
 }
 
-fn put_groups(out: &mut Vec<u8>, groups: &[&str]) -> Result<()> {
+pub(crate) fn put_groups(out: &mut Vec<u8>, groups: &[&str]) -> Result<()> {
     if groups.is_empty() {
         return Err(ERR_PLAN);
     }
@@ -435,11 +482,11 @@ pub fn repack(
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
     #[inline(never)]
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.0.len() < n {
             return Err(ERR_PLAN);
         }
@@ -448,25 +495,25 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         <[u8; N]>::try_from(self.take(N)?).map_err(|_| ERR_PLAN)
     }
 
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.array()?))
     }
 
     #[inline(never)]
-    fn str8(&mut self) -> Result<&'a str> {
+    pub(crate) fn str8(&mut self) -> Result<&'a str> {
         let len = usize::from(self.u8()?);
         core::str::from_utf8(self.take(len)?).map_err(|_| ERR_PLAN)
     }
 
-    fn groups(&mut self) -> Result<Vec<&'a str>> {
+    pub(crate) fn groups(&mut self) -> Result<Vec<&'a str>> {
         let n = usize::from(self.u8()?);
         if n == 0 {
             return Err(ERR_PLAN);
@@ -478,7 +525,7 @@ impl<'a> Reader<'a> {
         Ok(groups)
     }
 
-    fn end(&self) -> Result<()> {
+    pub(crate) fn end(&self) -> Result<()> {
         match self.0.is_empty() {
             true => Ok(()),
             false => Err(ERR_PLAN),
@@ -588,6 +635,19 @@ pub fn expand(
         }
     }
     Ok(rows)
+}
+
+/// The digest a packed plan carries of the plan it expands to
+/// ([`check_of`]): the same for either form of the same plan. `None` =
+/// not a packed plan. Nothing is checked: a caller that needs the plan
+/// to be good expands it.
+pub(crate) fn check_digest(blob: &[u8]) -> Option<[u8; CHECK_LEN]> {
+    let at = match *blob.first()? {
+        TAG_SEEDED => 1 + SEED_LEN + 8,
+        TAG_EXPLICIT => 1,
+        _ => return None,
+    };
+    blob.get(at..at + CHECK_LEN)?.try_into().ok()
 }
 
 /// The seed of a seeded plan, for a test or a report. `None` = the plan

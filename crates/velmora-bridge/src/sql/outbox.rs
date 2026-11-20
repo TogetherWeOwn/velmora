@@ -350,7 +350,7 @@ pub(super) async fn job_extent<S: Sql>(
            b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
            CASE WHEN ",
         live_ref!("e.id"),
-        " THEN 'live' ELSE g.state END \
+        " THEN 'live' ELSE g.state END, e.parity_count \
          FROM extents e JOIN buckets b ON b.id = e.bucket_id \
          JOIN generations g ON g.id = e.generation_id \
          WHERE e.id = ?1 AND e.generation_id = ?2"
@@ -399,12 +399,15 @@ pub(super) async fn job_extent<S: Sql>(
         extent,
         bucket,
         generation_state: r.parsed(GenerationState::parse)?,
+        parity_count: r.opt_num()?,
     }))
 }
 
 /// The plan of `extent`: its packed plan when it has one
 /// (`extents.plan`), else its rows in `articles`. One statement reads
-/// both, the packed plan first.
+/// both, the packed plan first, and the parity addendum with it
+/// (`extents.parity`). The addendum is handed out as it is stored: one
+/// that cannot be read does not fail the read of the plan.
 pub(super) async fn stored_plan<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
@@ -414,7 +417,7 @@ pub(super) async fn stored_plan<S: Sql>(
         .query(
             "SELECT 0 AS packed, id AS extent_id, -1 AS idx, NULL AS message_id, \
                NULL AS newsgroup, plan AS headers, cipher_size AS cipher_offset, \
-               0 AS cipher_len, NULL AS payload_sha256, NULL AS yenc_name, NULL AS state, \
+               0 AS cipher_len, parity AS payload_sha256, NULL AS yenc_name, NULL AS state, \
                NULL AS provider_id, posted_at, reposted_at \
              FROM extents WHERE id = ?1 AND plan IS NOT NULL \
              UNION ALL \
@@ -438,7 +441,7 @@ pub(super) async fn stored_plan<S: Sql>(
             let packed = r.blob()?;
             let cipher_size: u64 = r.num()?;
             r.num::<i64>()?;
-            r.opt_blob()?;
+            let parity = r.opt_blob()?;
             r.opt_text()?;
             r.opt_text()?;
             r.opt_text()?;
@@ -448,6 +451,7 @@ pub(super) async fn stored_plan<S: Sql>(
             return Ok(StoredPlan {
                 rows,
                 packed: Some(packed),
+                parity,
             });
         }
         out.push(ArticleRow {
@@ -469,6 +473,7 @@ pub(super) async fn stored_plan<S: Sql>(
     Ok(StoredPlan {
         rows: out,
         packed: None,
+        parity: None,
     })
 }
 
@@ -534,23 +539,40 @@ pub(super) async fn plan_articles<S: Sql>(
 /// `plan` must expand to a plan of the leased extent, whose ciphertext
 /// has `cipher_size` bytes: a value that does not is refused before
 /// anything is written.
+///
+/// `parity` is the plan's parity addendum, stored by the same statement
+/// as the plan: an extent never has one without the other being the plan
+/// it was made for, and a plan that lost to an earlier one leaves its
+/// addendum unwritten with it. It must expand beside `plan`, or nothing
+/// is written.
 pub(super) async fn plan_packed<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
     cipher_size: u64,
     plan: &[u8],
+    parity: Option<&[u8]>,
 ) -> Result<Option<StoredPlan>> {
     let count = crate::plan::expand(&l.extent, cipher_size, plan, None, None)?.len();
+    let parity_count = match parity {
+        Some(addendum) => {
+            let parity = crate::parity::expand(&l.extent, cipher_size, plan, addendum)?;
+            int(parity.articles.len())?
+        }
+        None => SqlValue::Null,
+    };
     let stmts: Vec<Stmt> = vec![
         (held_guard!(), lease_params(l, [])?),
         (
-            "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3 \
+            "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3, \
+               parity = ?5, parity_count = ?6 \
              WHERE id = ?1 AND article_count IS NULL AND cipher_size = ?4",
             vec![
                 text(l.extent.as_str()),
                 int(count)?,
                 SqlValue::Blob(plan.to_vec()),
                 int(cipher_size)?,
+                parity.map_or(SqlValue::Null, |p| SqlValue::Blob(p.to_vec())),
+                parity_count,
             ],
         ),
     ];
@@ -583,7 +605,9 @@ pub(super) async fn mark_posted<S: Sql>(
 /// lease guard, so a stale lease writes nothing.
 ///
 /// A packed plan is posted as a whole: its extent is stamped when the
-/// call lists every article of the plan. A call that lists fewer writes
+/// call lists every article of the plan, the parity articles of its
+/// addendum included (`extents.parity_count` of them, `idx` from
+/// `article_count` on). A call that lists fewer writes
 /// nothing at all and is an error ([`ERR_PARTIAL_PLAN`]): a plan is
 /// never taken for posted when its stamp was not written, and a caller
 /// that holds its lease never hears that it lost it.
@@ -624,13 +648,15 @@ pub(super) async fn mark_posted_many<S: Sql>(
         ));
     }
     let listed: Vec<u32> = posted.iter().map(|(idx, _)| *idx).collect();
-    // Every article of the plan is `0..article_count`: as many distinct
-    // ones below the count are all of them.
+    // Every article of the plan is `0..article_count`, and then its
+    // parity articles when it has an addendum: as many distinct ones
+    // below the count of both are all of them.
     stmts.push((
         "UPDATE extents SET posted_at = ?2 \
          WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL \
-           AND article_count = \
-               (SELECT COUNT(DISTINCT value) FROM json_each(?3) WHERE value < article_count)",
+           AND article_count + COALESCE(parity_count, 0) = \
+               (SELECT COUNT(DISTINCT value) FROM json_each(?3) \
+                 WHERE value < article_count + COALESCE(parity_count, 0))",
         vec![text(l.extent.as_str()), ms(now), text(&idx_list(&listed))],
     ));
     // A packed plan that the call did not mark is not posted: nothing

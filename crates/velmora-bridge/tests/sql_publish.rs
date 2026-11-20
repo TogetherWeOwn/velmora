@@ -518,6 +518,7 @@ impl Fx {
                 row: self.extent(&self.bucket, *size),
                 plan: None,
                 packed: None,
+                parity: None,
                 safety_present: true,
             })
             .collect();

@@ -895,22 +895,30 @@ pub trait Catalog {
     /// stored as one value on the extent's row unless the extent already
     /// has a plan. `cipher_size` is the extent's. Returns the STORED plan
     /// (`None` = fenced).
+    ///
+    /// `parity` is the parity addendum of the plan ([`crate::parity`]),
+    /// stored in the same write as the plan or not at all: the plan that
+    /// was stored first keeps the addendum it was stored with, or none.
     async fn plan_packed(
         &self,
         l: &Lease,
         cipher_size: u64,
         plan: &[u8],
+        parity: Option<&[u8]>,
     ) -> Result<Option<StoredPlan>>;
     /// The plan of the extent, in `idx` order: its packed plan when it
     /// has one, else its rows. A packed plan is posted as a whole, so
     /// its articles all have the state and the stamps of their extent.
+    /// The data articles only: the parity articles of a plan are in its
+    /// addendum ([`StoredPlan::parity_plan`]).
     async fn articles(&self, extent: &ExtentId) -> Result<Vec<ArticleRow>>;
     /// [`Catalog::articles`], with the packed form when the plan is
-    /// stored packed.
+    /// stored packed, and the parity addendum beside it as it is stored.
     async fn stored_plan(&self, extent: &ExtentId) -> Result<StoredPlan> {
         Ok(StoredPlan {
             rows: self.articles(extent).await?,
             packed: None,
+            parity: None,
         })
     }
     /// Marks one article row posted. A packed plan has no row to mark
@@ -920,7 +928,9 @@ pub trait Catalog {
     /// Marks several articles posted in one atomic write; each entry is
     /// `(idx, provider)`. `false` = fenced, and then nothing was written.
     /// A packed plan is marked only as a whole: by a call that lists
-    /// every one of its articles. A call that lists fewer writes
+    /// every one of its articles, the parity articles of its addendum
+    /// (`idx` from the number of data articles on) included. A call
+    /// that lists fewer writes
     /// nothing and is an error: `false` is a lost lease and nothing
     /// else.
     async fn mark_posted_many(
