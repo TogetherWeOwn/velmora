@@ -298,6 +298,17 @@ exists: restore it to a timestamp, then replay from that timestamp.
 4. `VELMORA_ADMIN_TOKEN_FILE=<file> ops/catalog-replay.sh <base-url> <restore point>`.
    It prints the counts. Exit status 2 means damage was found: read the
    lists before going on.
+   - How long it takes: one call replays up to 250 records and 1000
+     extents, and the script prints the running rate after each call.
+     The store is the limit: a call reads it about 30 to 40 times a
+     second (six reads at a time, the most a Worker invocation has
+     open), a record costs one read and each of its extents two. On a
+     drill that was 8 records a second for objects of one extent and
+     12 extents a second inside large objects; count on an hour for
+     every 100,000 to 130,000 reads.
+   - A call that gets no answer is sent again by the script after a
+     wait. Leave that wait in place: the Worker may still be at work
+     on the call it did not answer.
    - Use restore point `0` if the database copy is older than
      `SAFETY_MIN_AGE_SECS`, or if the replay ends with
      `held_missing_total` above 0. It reads every record, so it takes
