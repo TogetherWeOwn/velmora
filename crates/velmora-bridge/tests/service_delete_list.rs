@@ -405,13 +405,10 @@ async fn delete_objects_is_held_to_the_grants_and_gates_of_a_delete() {
         .expect_error(403, "AccessDenied");
     delete_objects(&rig, &stranger, BUCKET, &xml)
         .await
-        .expect_error(403, "AccessDenied");
-    assert_eq!(
-        delete_objects(&rig, &signer, "bkt-nowhere", &xml)
-            .await
-            .status,
-        403
-    );
+        .expect_error(404, "NoSuchBucket");
+    delete_objects(&rig, &signer, "bkt-nowhere", &xml)
+        .await
+        .expect_error(404, "NoSuchBucket");
     let mut req = signer.sign(
         rig.now(),
         Method::Post,
@@ -765,7 +762,7 @@ async fn list_multipart_uploads_lists_the_open_uploads_of_the_bucket() {
     assert_eq!(resp.expect(200).values("UploadId").len(), 3);
     list_uploads(&rig, &ro, OTHER, &[])
         .await
-        .expect_error(403, "AccessDenied");
+        .expect_error(404, "NoSuchBucket");
     for (name, value) in [("max-uploads", "many"), ("encoding-type", "base64")] {
         list_uploads(&rig, &signer, BUCKET, &[(name, value)])
             .await
@@ -869,7 +866,7 @@ async fn list_parts_lists_the_parts_of_one_open_upload() {
         .expect(200);
     list_parts(&rig, &ro, OTHER, key, &foreign, &[])
         .await
-        .expect_error(403, "AccessDenied");
+        .expect_error(404, "NoSuchBucket");
 
     // Aborted or completed: no such upload any more.
     abort(&rig, &signer, key, &id).await;
@@ -984,8 +981,8 @@ async fn delete_bucket_removes_a_bucket_that_never_held_anything() {
     assert_eq!(rig.head(&signer, OTHER, "k").await.status, 200);
 
     // Gone for every request, and deleting it again says so.
-    assert_eq!(rig.head(&signer, BUCKET, "k").await.status, 403);
-    assert_eq!(rig.put(&signer, BUCKET, "k", b"payload").await.status, 403);
+    assert_eq!(rig.head(&signer, BUCKET, "k").await.status, 404);
+    assert_eq!(rig.put(&signer, BUCKET, "k", b"payload").await.status, 404);
     delete_bucket(&rig, BUCKET)
         .await
         .expect_error(404, "NoSuchBucket");
@@ -1168,7 +1165,7 @@ async fn a_write_that_lost_its_bucket_stores_no_record() {
     assert_eq!(rig.count("key_floors"), 0);
     assert_eq!(rig.count("uploads"), 0);
     // And a new request finds no bucket.
-    assert_eq!(rig.put(&signer, BUCKET, "k", b"payload").await.status, 403);
+    assert_eq!(rig.put(&signer, BUCKET, "k", b"payload").await.status, 404);
     assert_eq!(
         rig.call(
             &signer,
@@ -1180,7 +1177,7 @@ async fn a_write_that_lost_its_bucket_stores_no_record() {
         )
         .await
         .status,
-        403
+        404
     );
     assert_eq!(rig.bridge.safety.keys(), stored);
 }
@@ -1260,7 +1257,7 @@ async fn a_rollback_to_before_a_bucket_deletion_is_repaired_by_deleting_it_again
 
     // Grants are not in the records: the key is granted the bucket again.
     assert_eq!(rig.count("grants"), 0);
-    assert_eq!(get(&rig, &signer, "k").await.status, 403);
+    assert_eq!(get(&rig, &signer, "k").await.status, 404);
     let restored = rig
         .bridge
         .catalog

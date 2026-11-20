@@ -8,8 +8,8 @@ breadcrumbs, sizes, dates and a filter; and uploads files and folders by
 drag and drop. Files of 16 MiB or more go up as multipart in 16 MiB parts,
 with progress, cancel and resume. Downloads support Range. It also does
 rename and move, new folders, and single or bulk delete. Each object has
-an info view that shows velmora's state for it (posting, verifying,
-verified, released). A status panel shows `/_admin/status` and refreshes
+an info view that shows velmora's state for it (archiving, verifying,
+verified, stored). A status panel shows `/_admin/status` and refreshes
 only on demand.
 
 ## How it is put together

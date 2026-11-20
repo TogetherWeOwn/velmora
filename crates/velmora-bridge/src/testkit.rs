@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params_from_iter, Connection, StatementStatus};
 use sha2::{Digest, Sha256};
 
 use crate::meter::Meter;
@@ -107,6 +107,19 @@ pub struct RusqliteSql {
     conn: RefCell<Connection>,
     /// Counts rows written the way D1 bills them, once switched on.
     meter: RefCell<Option<Meter>>,
+    /// What [`Sql::query`] has cost since the last reset.
+    reads: Cell<ReadStats>,
+}
+
+/// The cost of the statements run through [`Sql::query`]: how many (one
+/// round trip to the database each), the rows they returned, and the
+/// virtual-machine steps SQLite spent on them, which grow with the rows
+/// a statement has to visit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadStats {
+    pub queries: u64,
+    pub rows: u64,
+    pub vm_steps: u64,
 }
 
 fn to_value(v: &SqlValue) -> Value {
@@ -187,7 +200,17 @@ impl RusqliteSql {
         Ok(RusqliteSql {
             conn: RefCell::new(conn),
             meter: RefCell::new(None),
+            reads: Cell::new(ReadStats::default()),
         })
+    }
+
+    /// What `query` has cost since the last [`Self::reset_read_stats`].
+    pub fn read_stats(&self) -> ReadStats {
+        self.reads.get()
+    }
+
+    pub fn reset_read_stats(&self) {
+        self.reads.set(ReadStats::default());
     }
 
     /// Starts counting rows written as D1 bills them (see
@@ -273,6 +296,11 @@ impl Sql for RusqliteSql {
             out.push(r);
         }
         drop(rows);
+        let mut reads = self.reads.get();
+        reads.queries += 1;
+        reads.rows += out.len() as u64;
+        reads.vm_steps += u64::try_from(stmt.get_status(StatementStatus::VmStep)).unwrap_or(0);
+        self.reads.set(reads);
         drop(stmt);
         // A statement with RETURNING writes too.
         if let Some(m) = self.meter.borrow_mut().as_mut() {

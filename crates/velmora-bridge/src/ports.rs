@@ -18,10 +18,11 @@ use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Backlog, Bucket, BucketId,
     ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
-    IntentFence, IntentStats, Job, JobExtent, KekBytes, ListPage, ListQuery, ObjectStatus,
-    OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig,
-    ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs, UploadId,
-    UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation, WriteId,
+    IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
+    ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition,
+    ProviderConfig, ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs,
+    UploadId, UploadListQuery, UploadPartRow, UploadRow, VerificationRow, VerifyEscalation,
+    WriteId,
 };
 
 // ---------------------------------------------------------------------------
@@ -770,6 +771,20 @@ pub trait Catalog {
         deletes: &[(&str, &GenerationId, UnixMs)],
     ) -> Result<bool>;
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage>;
+    /// The rows a listing page has to see, in key order, at most
+    /// `q.max_keys` of them: the keys of the range `q` describes (as
+    /// [`Self::list`] reads `prefix`, `after` and `skip_prefix`), except
+    /// that after a key that holds `q.delimiter` past the prefix, the
+    /// other keys of its group (those that start with that key up to and
+    /// including the delimiter) may be left out. The caller folds: it
+    /// gets the first key of every group and never needs the rest. Fewer
+    /// than `q.max_keys` rows means the range is exhausted.
+    ///
+    /// One call reads one batch: `q.max_keys` above 1,001 (a full S3
+    /// page of 1,000 plus the one row that shows whether it is
+    /// truncated) is refused with `Invalid`. A caller that wants more
+    /// rows pages, as both listing versions do.
+    async fn list_heads(&self, bucket: &BucketId, q: &ListQuery) -> Result<Vec<ListEntry>>;
     /// Admin view.
     async fn object_status(&self, bucket: &BucketId, key: &str) -> Result<Option<ObjectStatus>>;
     /// Compare-and-set; admin evict.

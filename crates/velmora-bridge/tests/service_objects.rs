@@ -403,7 +403,7 @@ async fn unauthenticated_body_never_read() {
     let mut req = good();
     req.set_header("host", "other.test");
     let (resp, polled) = rig.send_watched(req).await;
-    resp.expect_error(403, "AccessDenied");
+    resp.expect_error(400, "InvalidRequest");
     assert!(!polled);
 
     assert_nothing_stored(&rig);
@@ -480,9 +480,9 @@ async fn denials_do_not_reveal_what_exists() {
         .await;
 
     // A key that is unknown or disabled is refused as S3 refuses an
-    // unknown key, whatever bucket it names; a usable key is refused the
-    // same way whether the bucket exists, is granted elsewhere or holds
-    // nothing for it. Neither answer tells what exists.
+    // unknown key, whatever bucket it names; a usable key is told
+    // `NoSuchBucket` the same way whether the bucket exists, is granted
+    // elsewhere or holds nothing for it. Neither answer tells what exists.
     let mut by_key = Vec::new();
     let mut by_grant = Vec::new();
     for (who, bucket) in [
@@ -494,17 +494,17 @@ async fn denials_do_not_reveal_what_exists() {
         (&signer, "bkt-absent"),  // valid key, bucket does not exist
     ] {
         let key_refused = who.akid == unknown.akid || who.akid == disabled.akid;
-        let (code, denials) = if key_refused {
-            ("InvalidAccessKeyId", &mut by_key)
+        let (status, code, denials) = if key_refused {
+            (403, "InvalidAccessKeyId", &mut by_key)
         } else {
-            ("AccessDenied", &mut by_grant)
+            (404, "NoSuchBucket", &mut by_grant)
         };
         for method in [Method::Get, Method::Head, Method::Put, Method::Delete] {
             let head = method == Method::Head;
             let resp = rig
                 .call(who, method, &path(bucket, "k"), &[], &[], b"")
                 .await;
-            assert_eq!(resp.status, 403, "{} on {bucket}", who.akid);
+            assert_eq!(resp.status, status, "{} on {bucket}", who.akid);
             if !head {
                 assert_eq!(resp.code(), code);
                 denials.push(resp.body);
@@ -520,7 +520,7 @@ async fn denials_do_not_reveal_what_exists() {
                 b"",
             )
             .await;
-        list.expect_error(403, code);
+        list.expect_error(status, code);
         denials.push(list.body);
     }
     for denials in [&mut by_key, &mut by_grant] {

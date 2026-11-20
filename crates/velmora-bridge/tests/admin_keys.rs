@@ -502,7 +502,7 @@ async fn a_grant_opens_another_bucket_to_the_key() {
     rig.bucket("bkt-second", true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     // Before the grant the key cannot write there.
-    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 403);
+    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 404);
 
     let r = grant_req(
         &rig,
@@ -662,7 +662,7 @@ async fn only_the_admin_bearer_grants() {
         .await;
     assert!(matches!(r.status, 401 | 403), "{}", r.status);
     assert_eq!(rig.count("grants"), 1);
-    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 403);
+    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 404);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -886,7 +886,7 @@ async fn no_grant_is_accepted_while_a_replay_is_unfinished() {
     .await;
     assert_eq!(r.status, 503, "{}", r.text());
     assert_eq!(rig.count("grants"), 1);
-    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 403);
+    assert_eq!(rig.put(&key, "bkt-second", "k", b"x").await.status, 404);
 }
 
 #[tokio::test(flavor = "current_thread")]

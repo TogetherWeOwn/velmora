@@ -34,7 +34,7 @@ async fn head_bucket_answers_for_a_granted_bucket_only() {
         let resp = rig
             .call(&signer, Method::Head, &format!("/{name}"), &[], &[], b"")
             .await;
-        assert_eq!(resp.status, 403, "{name}");
+        assert_eq!(resp.status, 404, "{name}");
         assert!(resp.body.is_empty());
     }
 
@@ -127,7 +127,7 @@ async fn get_bucket_location_reports_the_region() {
             b"",
         )
         .await;
-    assert_eq!((resp.status, code(&resp).as_str()), (403, "AccessDenied"));
+    assert_eq!((resp.status, code(&resp).as_str()), (404, "NoSuchBucket"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -164,6 +164,11 @@ async fn signed_create_bucket_only_confirms_an_owned_bucket() {
         assert_eq!(
             (resp.status, code(&resp).as_str()),
             (403, "AccessDenied"),
+            "{name}"
+        );
+        assert!(
+            String::from_utf8_lossy(&resp.body)
+                .contains("Only the administrator can create a bucket."),
             "{name}"
         );
     }

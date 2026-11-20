@@ -297,7 +297,15 @@ where
             Route::AbortMultipartUpload { bucket, key } => {
                 multipart::abort(&self, req, bucket, key).await
             }
-            Route::NotImplemented => S3Response::not_implemented(),
+            // A host that is not this endpoint is the likelier cause
+            // (virtual-hosted style shifts the bucket out of the path), so
+            // it is named first, as on the routes that parse a target.
+            Route::NotImplemented => req
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .and_then(|(_, host)| common::host_value_refused(host, &self.cfg))
+                .unwrap_or_else(S3Response::not_implemented),
         }
     }
 }

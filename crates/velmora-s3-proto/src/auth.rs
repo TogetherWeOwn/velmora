@@ -2,7 +2,8 @@
 // original path crates/qerith-core/src/s3/auth.rs. License: MIT.
 // Copied verbatim except: test fixture path `../../tests/fixtures/published-crypto.json` -> `../tests/fixtures/published-crypto.json` (line 245); this header;
 // added (not from qerith): `SINGLE_VALUE_HEADERS` (with the copy-source conditions) and the
-// signed comma-value check in `verify`;
+// signed comma-value check in `verify`; a scope may name a region alias of the policy,
+// and a region outside them is `AuthorizationHeaderMalformed` (query: `AuthorizationQueryParametersError`);
 // the `STREAMING-*` (aws-chunked) payload values, the streaming seed in `VerifiedRequest`
 // and the `signing_key`/`sign` helpers.
 
@@ -23,7 +24,7 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 /// (`a, b` vs `a,b`) and fails closed with SignatureDoesNotMatch; where it does
 /// match (`public` plus an empty field merges to `public,`), the verified string
 /// is the one acted on, so nothing unsigned is ever accepted.
-pub const SINGLE_VALUE_HEADERS: [&str; 23] = [
+pub const SINGLE_VALUE_HEADERS: [&str; 24] = [
     "host",
     "content-type",
     "content-md5",
@@ -32,6 +33,9 @@ pub const SINGLE_VALUE_HEADERS: [&str; 23] = [
     "x-amz-date",
     "x-amz-content-sha256",
     "x-amz-security-token",
+    // Ignored (`IGNORED_HEADERS`): its value is never acted on, so a
+    // comma in it carries no meaning to mistake.
+    "x-amz-user-agent",
     "x-amz-copy-source",
     "x-amz-copy-source-if-modified-since",
     "x-amz-copy-source-if-unmodified-since",
@@ -65,6 +69,10 @@ pub struct Credential<'a> {
 /// disabled or revoked keys must return None (`verify` then answers
 /// `InvalidAccessKeyId`). Authorization must not disclose the existence of a
 /// bucket or object. Recheck it when queuing, publishing and admitting serving reads.
+///
+/// [`verify`] calls `authorize` only for a request whose signature it has
+/// verified, so an implementation may let the caller tell such a refusal
+/// apart from a failed authentication.
 pub trait Authority {
     fn credential(&self, access_key: &str) -> Option<Credential<'_>>;
     fn authorize(&self, principal: &str, method: &str, target: &Target) -> bool;
@@ -179,10 +187,22 @@ pub fn verify(
         )
     };
     let scope: Vec<_> = credential.split('/').collect();
+    // A well-formed scope for a region this endpoint does not answer for
+    // gets the error S3 gives, which names the region to use. It is
+    // answered before the key is looked up or the signature checked, as
+    // the scope is not a secret and neither is the configured region
+    // (HeadBucket and GetBucketLocation report it).
+    if scope.len() == 5 && !scope[2].is_empty() && !policy.accepts_region(scope[2]) {
+        return Err(if presigned {
+            ErrorCode::AuthorizationQueryParametersError
+        } else {
+            ErrorCode::AuthorizationHeaderMalformed
+        });
+    }
     if scope.len() != 5
         || scope[0].is_empty()
         || scope[1].len() != 8
-        || scope[2] != policy.region
+        || !policy.accepts_region(scope[2])
         || scope[3] != "s3"
         || scope[4] != "aws4_request"
         || date.len() != 16

@@ -1355,6 +1355,9 @@ impl Catalog for MemCatalog {
     async fn list(&self, _: &BucketId, _: &ListQuery) -> Result<ListPage> {
         unused()
     }
+    async fn list_heads(&self, _: &BucketId, _: &ListQuery) -> Result<Vec<ListEntry>> {
+        unused()
+    }
     async fn object_status(&self, _: &BucketId, _: &str) -> Result<Option<ObjectStatus>> {
         unused()
     }

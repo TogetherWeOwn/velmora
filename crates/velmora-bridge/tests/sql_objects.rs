@@ -2183,3 +2183,22 @@ async fn a_conditional_delete_is_judged_by_its_own_batch() {
         .unwrap());
     assert!(fx.cat.live_object(&b.id, "k2").await.unwrap().is_none());
 }
+
+/// Fewer heads than asked for means the range is exhausted, so asking for
+/// more than one statement returns is an error, never a short answer.
+#[tokio::test]
+async fn list_heads_refuses_more_than_one_batch() {
+    let fx = Fx::new();
+    let bucket = BucketId::new("b_none");
+    assert!(fx
+        .cat
+        .list_heads(&bucket, &query("", Some("/"), 1001))
+        .await
+        .is_ok());
+    assert!(matches!(
+        fx.cat
+            .list_heads(&bucket, &query("", Some("/"), 1002))
+            .await,
+        Err(BridgeError::Invalid(_))
+    ));
+}

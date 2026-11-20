@@ -93,7 +93,7 @@ use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, BridgeError, Bucket, BucketId,
     CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
     ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
-    IntentFence, IntentStats, JobExtent, ListPage, ListQuery, ObjectStatus, OpenUpload,
+    IntentFence, IntentStats, JobExtent, ListEntry, ListPage, ListQuery, ObjectStatus, OpenUpload,
     OutboxStage, OutboxStats, PartExtent, Perm, Precondition, ProviderConfig, ProviderFault,
     ProviderLoad, Result, SafetyState, UnixMs, UploadListQuery, UploadPartRow, UploadRow,
     VerificationRow, VerifyEscalation, WriteId,
@@ -344,6 +344,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn list(&self, bucket: &BucketId, q: &ListQuery) -> Result<ListPage> {
         objects::list(self, bucket, q).await
+    }
+    async fn list_heads(&self, bucket: &BucketId, q: &ListQuery) -> Result<Vec<ListEntry>> {
+        objects::list_heads(self, bucket, q).await
     }
     async fn object_status(&self, bucket: &BucketId, key: &str) -> Result<Option<ObjectStatus>> {
         objects::object_status(self, bucket, key).await

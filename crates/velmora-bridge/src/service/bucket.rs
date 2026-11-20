@@ -1,9 +1,11 @@
 //! Bucket-level calls clients make with an access key: HeadBucket,
 //! GetBucketLocation, and a SigV4-signed CreateBucket or DeleteBucket.
 //!
-//! All four authenticate exactly like an object request. A bucket that
-//! does not exist and one the key holds no grant on are indistinguishable
-//! (`AccessDenied`), so none of them tells a caller which names exist.
+//! All four authenticate exactly like an object request. To a caller
+//! whose signature verified, a bucket that does not exist and one the key
+//! holds no grant on are indistinguishable (`NoSuchBucket`), so none of
+//! them tells a caller which names exist; a caller that did not
+//! authenticate learns nothing about buckets at all.
 //! None of them changes state: buckets are created and deleted with the
 //! admin bearer token.
 
@@ -73,9 +75,11 @@ pub(super) async fn get_bucket_location<
 /// `PUT /bucket` signed with an access key. Keys cannot create buckets
 /// (that stays an admin call), but clients such as rclone create the
 /// bucket before every upload and accept `BucketAlreadyOwnedByYou`. A key
-/// with write on an existing bucket gets exactly that; anything else is
-/// `AccessDenied`. The request body (a `CreateBucketConfiguration`) is
-/// never read.
+/// with write on an existing bucket gets exactly that. A name the key
+/// holds no grant on, existing or not, is `AccessDenied` with a message
+/// that says who creates buckets (never `NoSuchBucket`, which no client
+/// expects of a create). The request body (a
+/// `CreateBucketConfiguration`) is never read.
 pub(super) async fn create_bucket_signed<
     C: Catalog,
     B: BlobStore,
@@ -95,6 +99,11 @@ pub(super) async fn create_bucket_signed<
             "BucketAlreadyOwnedByYou",
             "The bucket you tried to create already exists, and you own it.",
         ),
+        Err(resp) if resp.status == 404 => S3Response::error(
+            403,
+            "AccessDenied",
+            "Only the administrator can create a bucket.",
+        ),
         Err(resp) => resp,
     }
 }
@@ -103,7 +112,8 @@ pub(super) async fn create_bucket_signed<
 /// admin action (the admin bearer token), so this never changes state.
 /// A key that may write the bucket learns `BucketNotEmpty` while the
 /// bucket could not be deleted anyway, as S3 clients expect of a bucket
-/// that still holds objects; otherwise the answer is `AccessDenied`.
+/// that still holds objects; an empty one is `AccessDenied`, and a bucket
+/// the key holds no grant on is `NoSuchBucket` like everywhere else.
 pub(super) async fn delete_bucket_signed<
     C: Catalog,
     B: BlobStore,

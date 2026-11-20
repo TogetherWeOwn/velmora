@@ -2,7 +2,8 @@
 // original path crates/qerith-core/src/s3/mod.rs. License: MIT.
 // Copied verbatim except: removed line 9 `pub mod archive;` (the archive module is not copied); this header.
 // Re-typed for S3 STANDARD semantics: the cold-archive restore module, its error codes,
-// limits and `Policy::restore` are removed; `storage_class` accepts STANDARD only;
+// limits and `Policy::restore` are removed; `storage_class` stores every class it
+// accepts as STANDARD and refuses the archive classes;
 // the `listing` module is added; `xml` also maps U+FFFE/U+FFFF to U+FFFD;
 // the `checksum` and `chunked` (aws-chunked) modules are added.
 
@@ -29,7 +30,9 @@ mod wire;
 pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest, SINGLE_VALUE_HEADERS};
 pub use read::{plan_read, ByteRange, Conditions, ObjectMetadata, ReadPlan, StoredChecksum};
 pub use upload::{is_aws_chunked, ChecksumAlgorithm, DecodedUpload, UploadValidator};
-pub use wire::{canonical_request, storable_key, Headers, Target, MAX_KEY_BYTES};
+pub use wire::{
+    canonical_request, storable_key, HeaderRefusal, Headers, Target, IGNORED_HEADERS, MAX_KEY_BYTES,
+};
 
 pub type Result<T> = std::result::Result<T, ErrorCode>;
 
@@ -41,6 +44,15 @@ pub enum ErrorCode {
     InvalidAccessKeyId,
     SignatureDoesNotMatch,
     RequestTimeTooSkewed,
+    /// The `Authorization` header names a region this endpoint does not
+    /// answer for. Says only what the endpoint is configured with.
+    AuthorizationHeaderMalformed,
+    /// The same for the credential of a presigned URL.
+    AuthorizationQueryParametersError,
+    /// `x-amz-storage-class` names a class that is not offered.
+    InvalidStorageClass,
+    /// An ACL that would grant access (`x-amz-acl`, `x-amz-grant-*`).
+    AccessControlListNotSupported,
     InvalidRequest,
     InvalidArgument,
     InvalidDigest,
@@ -141,6 +153,9 @@ pub struct Policy {
     pub(crate) limits: Limits,
     pub(crate) host: String,
     pub(crate) region: String,
+    /// Other regions a credential scope may name, see
+    /// [`Policy::with_region_aliases`].
+    pub(crate) region_aliases: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +196,35 @@ impl Policy {
             limits,
             host,
             region,
+            region_aliases: Vec::new(),
         })
+    }
+
+    /// Also accepts a credential scope that names one of `aliases` in
+    /// place of the configured region. The signature is then checked
+    /// with the region the client named: the client derived its signing
+    /// key from that name, and the name is all a region is here (one
+    /// endpoint, no per-region data). The signed `host` still binds the
+    /// request to this endpoint, so a request signed for another service
+    /// that shares the alias cannot be replayed here.
+    pub fn with_region_aliases(mut self, aliases: &[&str]) -> Result<Self> {
+        if aliases
+            .iter()
+            .any(|a| a.is_empty() || !a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+        {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        self.region_aliases = aliases.iter().map(|a| (*a).to_owned()).collect();
+        Ok(self)
+    }
+
+    /// The configured region: what a refused scope is told to use.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub(crate) fn accepts_region(&self, region: &str) -> bool {
+        region == self.region || self.region_aliases.iter().any(|a| a == region)
     }
 }
 
@@ -226,10 +269,34 @@ pub(crate) fn unhex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Only STANDARD is offered; any other class is rejected, never silently mapped.
+/// The class an object is stored and reported as, for the class a
+/// request names. Only STANDARD is offered.
+///
+/// The classes S3 reads synchronously (`STANDARD_IA`, `ONEZONE_IA`,
+/// `INTELLIGENT_TIERING`, `GLACIER_IR`, `REDUCED_REDUNDANCY`) are accepted
+/// and stored as STANDARD. They differ from STANDARD only in price and
+/// placement, which a client cannot observe through the API: every call
+/// behaves as it does at S3, and the object is honestly reported as
+/// STANDARD by HEAD, GET and the listings. Backup tools ship presets
+/// with these classes, and S3 itself accepts them, so refusing them
+/// would fail a request that S3 serves.
+///
+/// The archive classes (`GLACIER`, `DEEP_ARCHIVE`) are refused with
+/// `InvalidStorageClass`: a client that picks one expects GET to fail
+/// until `RestoreObject`, which is not offered. Anything else is not a
+/// class this service knows, and S3 answers `InvalidStorageClass` to an
+/// unknown class too.
 pub fn storage_class(value: Option<&str>) -> Result<&'static str> {
     match value {
-        None | Some("STANDARD") => Ok("STANDARD"),
-        _ => Err(ErrorCode::InvalidRequest),
+        None
+        | Some(
+            "STANDARD"
+            | "STANDARD_IA"
+            | "ONEZONE_IA"
+            | "INTELLIGENT_TIERING"
+            | "GLACIER_IR"
+            | "REDUCED_REDUNDANCY",
+        ) => Ok("STANDARD"),
+        _ => Err(ErrorCode::InvalidStorageClass),
     }
 }
