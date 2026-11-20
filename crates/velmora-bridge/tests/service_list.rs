@@ -625,16 +625,19 @@ async fn a_folder_of_150_subfolders_is_one_catalogue_query() {
     assert_eq!(p.prefixes.len(), 150);
     assert!(p.keys.is_empty() && !p.truncated);
 
-    // What authentication alone costs, to tell the listing's share.
+    // What authentication alone costs, to tell the listing's share: a
+    // HeadBucket reads nothing else, and is authenticated as a LIST is.
     sql.reset_read_stats();
-    rig.head(&signer, BUCKET, "photos/none").await.expect(404);
+    rig.call(&signer, Method::Head, &format!("/{BUCKET}"), &[], &[], b"")
+        .await
+        .expect(200);
     let auth = sql.read_stats();
     println!(
         "LIST 150 sub-folders x 200 keys: {} queries, {} rows returned, {} vm steps \
-         (of which a HEAD of a missing key, auth included: {} queries, {} rows, {} vm steps)",
+         (of which authentication, as a HeadBucket costs it: {} queries, {} rows, {} vm steps)",
         cost.queries, cost.rows, cost.vm_steps, auth.queries, auth.rows, auth.vm_steps
     );
-    let listing = cost.queries - (auth.queries - 1);
+    let listing = cost.queries - auth.queries;
     assert_eq!(listing, 1, "catalogue queries for the page itself");
     assert!(cost.rows < 200, "rows returned: {}", cost.rows);
     // The work does not grow with the 30 000 keys under the sub-folders:
@@ -810,9 +813,12 @@ async fn a_page_reads_in_step_with_max_keys() {
     seed_folders(&rig, &bucket, "template", 150, 20);
     let sql = &rig.bridge.catalog.sql;
 
+    // Authentication alone, as a HeadBucket costs it.
     sql.reset_read_stats();
-    rig.head(&signer, BUCKET, "photos/none").await.expect(404);
-    let auth = sql.read_stats().queries - 1;
+    rig.call(&signer, Method::Head, &format!("/{BUCKET}"), &[], &[], b"")
+        .await
+        .expect(200);
+    let auth = sql.read_stats().queries;
 
     let mut seen = Vec::new();
     let mut token: Option<String> = None;
