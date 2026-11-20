@@ -40,8 +40,8 @@ REQUIRED_BACKBONES = "2"
 # (2026-11-16..20): of 287,742 extents asked again 24-72 h after their
 # post, none had lost an article on either backbone, so a wait caught
 # nothing. A value above 0 delays every release by that many seconds
-# after the newest post or repost of the extent's articles. Under
-# VERIFY_MODE=light it is also how long a backbone the sample raises
+# after the newest post or repost of the extent's articles. Under the
+# light VERIFY_MODE it is also how long a backbone the sample raises
 # (VERIFY_ESCALATE_SECS) still reaches extents that passed on STAT
 # alone: a raise covers only extents still held. At 0 it reaches none
 # released before it.
