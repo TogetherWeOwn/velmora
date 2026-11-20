@@ -1349,6 +1349,9 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                         && out[i].is_none()
                         && !full[i]
                         && self.held(order[i]) < room(i)
+                        // Refused since this extent's order was made: a
+                        // session it still has reads on, no other logs in.
+                        && !self.shunned.contains(&order[i].id)
                 })
                 .collect();
             if needy.is_empty() {
@@ -1470,7 +1473,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
         let now = self.clock.now();
         let pool = Pool::load(self.catalog, self.providers, now).await?;
         let readers: Vec<&'a ProviderConfig> = self.providers.iter().filter(|p| p.read).collect();
-        let mut order = pool.order(readers.clone(), PermitClass::Read);
+        // A provider that refused this drill's login is not asked again
+        // by it, and is not the one a fallback below is spent on.
+        let askable: Vec<&'a ProviderConfig> = readers
+            .iter()
+            .copied()
+            .filter(|p| !self.shunned.contains(&p.id))
+            .collect();
+        let mut order = pool.order(askable.clone(), PermitClass::Read);
         // Stable: the providers of a tier keep the pool's order.
         order.sort_by_key(|p| tier_of(drill, p));
         if order.is_empty() {
@@ -1478,9 +1488,8 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             // provider that is due back first, unless that one refused
             // the login. A refused account answers no read: it is asked
             // again when its cooldown ends, not on every read.
-            order.extend(pool.soonest_cooling(&readers));
+            order.extend(pool.soonest_cooling(&askable));
         }
-        order.retain(|p| !self.shunned.contains(&p.id));
         // A session on a provider that is no longer in the order (it is
         // cooling now) is not used.
         let (kept, gone): (Vec<_>, Vec<_>) = core::mem::take(&mut self.sessions)

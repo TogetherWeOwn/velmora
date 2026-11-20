@@ -1715,6 +1715,7 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             Running::from_token(token).ok_or_else(|| bad("state is not the state of a drill."))?,
         ),
     };
+    let had_state = state.is_some();
     let catalogue = |e: BridgeError| drill_failed(&e);
     let bucket = match bridge.catalog.bucket_by_name(bucket).await {
         Ok(found) => found.ok_or_else(no_bucket)?,
@@ -1790,6 +1791,7 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         json!({ "bytes": run.bytes(), "sha256": hex(&sha256), "md5": hex(&md5) })
     };
     let (sha256, md5) = done.range.digests();
+    let chained = done.matched && (start == 0 || had_state);
     // The provider that supplied the most; `providers` has them all.
     let provider = stats
         .share
@@ -1816,9 +1818,12 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         "plaintext_md5": done.matched.then(|| hex(&md5)),
         // Of those and of every byte the `state` of the request stood
         // for: the whole object after the last of a run of ranges.
-        "running": done.matched.then(|| digests(&done.running)),
+        // A range that starts past byte 0 without a `state` has neither:
+        // its state would stand for the range alone, and no later
+        // request takes that.
+        "running": chained.then(|| digests(&done.running)),
         // For the request that reads the bytes after `range`.
-        "state": done.matched.then(|| done.running.token()),
+        "state": chained.then(|| done.running.token()),
         "match": done.matched,
         // Tries of an extent after its first: waits for a slot and
         // reads begun again after a provider broke off.

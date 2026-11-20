@@ -1563,7 +1563,8 @@ async fn object_rows(fx: &Fx) -> String {
     let mut out = String::new();
     for sql in [
         "SELECT group_concat(id || ':' || state || ':' || safety_state || ':' || plan_rev || ':' \
-           || coalesce(last_verified_at, '') || ':' || coalesce(released_at, ''), ',') \
+           || coalesce(last_verified_at, '') || ':' || coalesce(released_at, '') || ':' \
+           || coalesce(last_read_at, ''), ',') \
          FROM (SELECT * FROM extents ORDER BY id)",
         "SELECT group_concat(extent_id || ':' || idx || ':' || state, ',') \
          FROM (SELECT * FROM articles ORDER BY extent_id, idx)",
@@ -1612,10 +1613,9 @@ async fn a_drill_of_a_range_reads_its_extents_and_hashes_its_bytes() {
     assert_eq!(v["articles"].to_string(), expected);
     assert_eq!(v["plaintext_sha256"], hex(&sha256(piece)));
     assert_eq!(v["plaintext_md5"], md5_hex(piece));
-    assert_eq!(
-        v["running"],
-        json!({ "bytes": piece.len(), "sha256": hex(&sha256(piece)), "md5": md5_hex(piece) })
-    );
+    // A range past byte 0 that was handed no state hands none on: it
+    // would stand for these bytes alone.
+    assert_eq!((&v["running"], &v["state"]), (&Value::Null, &Value::Null));
 
     // To the end: the last extent alone. A last byte past the end is the end.
     let from = PIECES[0] + PIECES[1];
