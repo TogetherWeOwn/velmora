@@ -500,18 +500,24 @@ async fn parity_goes_to_the_provider_with_fewer_data_articles() {
     let data = data_by(&plan);
     assert_eq!(rig.bridge.nntp.connects_to("p0"), 3);
     assert_eq!(rig.bridge.nntp.connects_to("p1"), 1);
-    // The provider that took fewer data articles, as they came out; on a
-    // tie either one, but all four parity articles go to the same one.
+    // The provider that took fewer data articles, as they came out, takes
+    // all four parity articles. On a tie neither holds back, so the parity
+    // may be split between them.
     let took = |p: &str| data.get(p).copied().unwrap_or(0);
     let by = parity_posted(&rig, &s);
     assert_eq!(by.len(), 4);
-    let to = by.values().next().unwrap().clone();
-    assert!(by.values().all(|p| *p == to), "{by:?}");
-    let other = if to == "p0" { "p1" } else { "p0" };
-    assert!(took(&to) <= took(other), "{data:?} {by:?}");
-    let server = |p: &str| usize::from(p == "p1");
-    assert_eq!(stored(&rig, server(&to)).await.len(), took(&to) + 4);
-    assert_eq!(stored(&rig, server(other)).await.len(), took(other));
+    let parity_to = |p: &str| by.values().filter(|q| *q == p).count();
+    if took("p0") != took("p1") {
+        let fewer = if took("p1") < took("p0") { "p1" } else { "p0" };
+        assert_eq!(parity_to(fewer), 4, "{data:?} {by:?}");
+    }
+    for (server, p) in [(0, "p0"), (1, "p1")] {
+        assert_eq!(
+            stored(&rig, server).await.len(),
+            took(p) + parity_to(p),
+            "{p}"
+        );
+    }
     // Each article is on one server, and all of them are somewhere.
     let mut all = stored(&rig, 0).await;
     all.extend(stored(&rig, 1).await);
