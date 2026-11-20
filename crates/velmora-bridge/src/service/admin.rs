@@ -1523,10 +1523,15 @@ async fn drill_read<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
                 };
                 let sleep = bridge.budget.sleeper().ok_or_else(busy)?;
                 let charge = core::pin::pin!(bridge.budget.charge(bytes));
-                match select(charge, sleep(left)).await {
+                let charge = match select(charge, sleep(left)).await {
                     Either::Left((charge, _)) => charge.map_err(|_| busy())?,
                     Either::Right(_) => return Err(busy()),
+                };
+                // Budget that came as the time ran out is given back.
+                if bridge.clock.now() >= deadline {
+                    return Err(busy());
                 }
+                charge
             }
         };
         match drill_extent(bridge, extent, plan, refused)

@@ -19,8 +19,12 @@
 //! cooling now, and quiet for [`PROBE_QUIET_MS`]: no strike and no
 //! cooldown end in that time, so a provider whose cooldowns grew is
 //! asked by real work first once its cooldown is over. After a refused
-//! login the quiet time is [`LOGIN_REFUSED_QUIET_MS`]: every probe of a
-//! refused account is one more refused login on its record. A probe
+//! login the quiet time is [`LOGIN_REFUSED_QUIET_MS`], counted from the
+//! strike: every probe of a refused account is one more refused login on
+//! its record. That time is never shorter than the cooldown the strike
+//! started, and real work does not try a refused account before its
+//! cooldown ends either, so a probe may follow at once a cooldown that
+//! reached its cap of six hours. A probe
 //! takes a read slot as any read does (no slot, no probe), so the
 //! provider's connection and address limits hold.
 //!

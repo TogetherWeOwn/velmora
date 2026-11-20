@@ -1425,6 +1425,45 @@ async fn a_drill_asks_a_refusing_provider_once() {
     assert_eq!(fx.bridge.budget.in_use(), 0);
 }
 
+/// A pass that did not ask a provider (it refused the login earlier in
+/// the drill) never makes the drill say the bytes are gone: that
+/// provider may hold what the others lack. The drill answers `SlowDown`,
+/// not `match: false`.
+#[tokio::test]
+async fn a_drill_that_skipped_a_refusing_provider_is_never_a_mismatch() {
+    let polls = Rc::new(Cell::new(0u32));
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        providers.insert(0, wrong);
+    };
+    let weak: Rc<RefCell<std::rc::Weak<TestBridge>>> = Rc::default();
+    let sleeper = drill_sleeper(polls.clone(), weak.clone(), Rc::new(|_| Box::pin(async {})));
+    let sleeper: Box<dyn FnOnce(FixedClock) -> Sleeper> = Box::new(sleeper);
+    let fx = Fx::build(Environment::Dev, Maintenance::Off, edit, Some(sleeper)).await;
+    *weak.borrow_mut() = Rc::downgrade(&fx.bridge);
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    // p0, the reader with the right login, lacks one article.
+    let id = fx
+        .scalar("SELECT message_id FROM articles WHERE idx = 1", &[])
+        .await;
+    fx.server.hide(&id).await;
+    let dialed = fx.bridge.nntp.dials_to("p1");
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 503, "{}", r.text());
+    assert!(r.text().contains("SlowDown"));
+    assert!(r.json().get("match").is_none());
+    assert_eq!(fx.bridge.nntp.dials_to("p1") - dialed, 1);
+    assert_eq!(polls.get(), service::INTERRUPTED_RETRIES);
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
 #[tokio::test]
 async fn drill_refuses_an_object_that_was_never_posted() {
     let fx = Fx::new().await;
