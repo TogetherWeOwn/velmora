@@ -1523,8 +1523,11 @@ where
                 };
                 if complete {
                     // Nothing more is read for this piece: what waits
-                    // for the reader is its plaintext alone.
+                    // for the reader is its plaintext alone. The drained
+                    // buffer goes too: it would keep its allocation,
+                    // which the window no longer counts.
                     work = None;
+                    buf = Vec::new();
                 }
                 let item: Item = Ok((plain, held));
                 let sending = async {
