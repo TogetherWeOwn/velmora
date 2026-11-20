@@ -645,6 +645,37 @@ pub fn fingerprint() -> u32 {
         all.extend_from_slice(&buf);
     }
     assert!(good > 100 && bad > 100, "{good} accepted, {bad} refused");
+    // `=ypart` parts whose window is shorter than the part: the decoder
+    // must refuse them and store nothing past the window, also where a
+    // 16-byte lane would reach over its end. Not in the digest: the
+    // refusal must happen, its wording is not pinned here.
+    for _ in 0..200usize {
+        let len = 17 + roll() % 3000;
+        let data: Vec<u8> = (0..len).map(|_| roll() as u8).collect();
+        let params = velmora::yenc::SegmentParams {
+            name: "t".into(),
+            part: 2,
+            total: 3,
+            begin: 1001,
+            end: 1000 + len as u64,
+            file_size: 1000 + len as u64 + 7,
+        };
+        let mut article = Vec::new();
+        velmora::yenc::encode_segment_vec(&mut article, &params, &data).unwrap();
+        const CANARY: usize = 32;
+        let window = len - 1 - roll() % 16;
+        let mut buf = vec![0x5Au8; CANARY + window + CANARY];
+        let out =
+            velmora::yenc::decode_part_to("<m@x>", &article, &mut buf[CANARY..CANARY + window]);
+        assert!(out.is_err(), "a part longer than its window was accepted");
+        assert!(
+            buf[..CANARY]
+                .iter()
+                .chain(&buf[CANARY + window..])
+                .all(|&b| b == 0x5A),
+            "the decoder wrote outside its destination"
+        );
+    }
     // The bytes `POST` puts on the wire: the bench's articles, then
     // articles with a `.` at byte 0 and after every CRLF (dot-stuffed),
     // then articles the framing check must refuse (a bare CR, a bare
@@ -654,7 +685,7 @@ pub fn fingerprint() -> u32 {
     posts.push(b"a\r\n.\r\n.\r\n.".to_vec());
     let refused_posts = [b"a\rb".to_vec(), b"a\nb".to_vec(), b"a\r\nb\r".to_vec()];
     let mut script = GREETING.to_vec();
-    for _ in 0..posts.len() {
+    for _ in 0..posts.len() + refused_posts.len() {
         script.extend_from_slice(b"340 send\r\n240 posted\r\n");
     }
     let wire = now(async {
@@ -679,10 +710,15 @@ pub fn fingerprint() -> u32 {
         }
         client.into_inner().wire().to_vec()
     });
-    assert!(
-        wire.windows(5).any(|w| w == b"\r\n..\r"),
-        "no dot-stuffing on the wire"
-    );
+    for stuffed in [
+        &b"..\r\n...\r\n..x\r\nend\r\n.\r\n"[..],
+        b"a\r\n..\r\n..\r\n..\r\n.\r\n",
+    ] {
+        assert!(
+            wire.windows(stuffed.len()).any(|w| w == stuffed),
+            "an article is not dot-stuffed on the wire"
+        );
+    }
     all.extend_from_slice(&wire);
     for chunk in [1, 7, 4096, 65536] {
         let cipher = bench.cold_fetch(chunk);

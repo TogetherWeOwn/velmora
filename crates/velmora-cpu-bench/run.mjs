@@ -29,7 +29,11 @@ if (expectSimd !== null && expectSimd !== "on" && expectSimd !== "off") {
 const checkOnly = args.includes("--check-only") && args.splice(args.indexOf("--check-only"), 1).length > 0;
 const unchecked = args.includes("--unchecked") && args.splice(args.indexOf("--unchecked"), 1).length > 0;
 const wasmPath = args[0];
-if (!wasmPath) {
+if (checkOnly && (unchecked || jsonOut !== null)) {
+  console.error("--check-only does not go with --unchecked or --json");
+  process.exit(2);
+}
+if (!wasmPath || args.length !== 1) {
   console.error("usage: node run.mjs <bench.wasm> [--mib 16] [--reps 7] [--json out.json] [--unchecked]");
   process.exit(2);
 }
