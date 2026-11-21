@@ -785,7 +785,8 @@ pub fn next(
             match z.selector {
                 Selector::D1
                     if z.undo_stamp == Some(*undo_stamp)
-                        && z.catalogue_id.as_deref() == Some(frozen.as_str()) =>
+                        && z.catalogue_id.as_deref() == Some(frozen.as_str())
+                        && m.levelled_to == Some(*levelled_to) =>
                 {
                     return Ok(Outcome::Unchanged)
                 }

@@ -1853,6 +1853,8 @@ fn the_fallback_undo_lands_on_the_frozen_catalogue_after_its_stamp_is_levelled()
     assert_eq!(z.catalogue_id.as_deref(), Some("main"));
     assert!(z.undone());
     unchanged(&back, fallback(10, 9), Actor::MoveTool);
+    // The same undo with another levelled counter is no repeat.
+    assert_eq!(refused(&back, fallback(10, 12), Actor::MoveTool), SELECTOR);
     // Not before the flip.
     assert_eq!(
         refused(&moving(), fallback(10, 9), Actor::MoveTool),
