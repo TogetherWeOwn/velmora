@@ -1256,5 +1256,23 @@ if [[ $MODE == local && ${E2E_PERMITS:-} == do ]]; then
   log "permit gate: started $n time(s)"
 fi
 
+# The writers sent the format this run asked for: the consumer's count
+# lines say which formats it read, and a kind it read is always said.
+if [[ $MODE == local ]]; then
+  STEP=job-format
+  want=${E2E_JOB_FORMAT:-1}
+  formats=$(grep -oE 'job message formats: v1=[0-9]+ v2=[0-9]+ refused=[0-9]+' "$T/wrangler.log" || true)
+  [[ -n $formats ]] || fail "the consumer said which job message formats it read" "a 'job message formats' line in the Worker's log" "none"
+  read_v1=$(grep -cE 'v1=[1-9]' <<<"$formats" || true)
+  read_v2=$(grep -cE 'v2=[1-9]' <<<"$formats" || true)
+  refused=$(grep -cE 'refused=[1-9]' <<<"$formats" || true)
+  case $want in
+    1) [[ $read_v1 -ge 1 && $read_v2 == 0 ]] || fail "the writers sent format 1 only" "v1 lines >= 1, v2 lines 0" "v1 lines $read_v1, v2 lines $read_v2" ;;
+    2) [[ $read_v2 -ge 1 && $read_v1 == 0 ]] || fail "the writers sent format 2 only" "v2 lines >= 1, v1 lines 0" "v1 lines $read_v1, v2 lines $read_v2" ;;
+  esac
+  [[ $refused == 0 ]] || fail "no job message was refused" "0 lines with refused > 0" "$refused lines"
+  log "job message formats read: format $want only ($(wc -l <<<"$formats") count lines), none refused"
+fi
+
 STEP=finished
 log "slice acceptance passed ($MODE, $BASE)"
