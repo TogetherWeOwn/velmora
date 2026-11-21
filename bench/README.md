@@ -47,7 +47,9 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] 
   `do_messages` (messages and closes on a session, billed 1/20 each),
   `do_starts` and `do_storage_writes`; the report prices them, and the
   gate's duration from `--cpu do_gb_s_per_request` (a deployed Worker's
-  figure).
+  figure). Where the measured commit binds no `PERMIT_GATE` (before deploy 3
+  of the gate) the rig builds no client and refuses `PERMITS=do`; the harness
+  compiles only against commits that have the gate module (#136 on).
 - `--ref` measures another commit with this checkout's harness (temporary
   worktree and cargo target of its own, removed at the end, so runs may
   overlap). `--tiny <n>` changes the number of small

@@ -240,24 +240,39 @@ impl Sql for MeterSql {
 /// (`workers/s3-bridge/src/env.rs`) and here by the rig.
 const PERMIT_VARS: [&str; 3] = ["PERMITS", "PERMIT_GATES", "PERMIT_SHARDS"];
 
-/// The gate client a Worker builds from `vars` (as `env.rs` does).
+/// The permit variables, parsed (and refused) as `env.rs` does, whether
+/// or not the gate is bound.
+struct PermitSettings {
+    mode: PermitMode,
+    sharding: GateSharding,
+    shards: u32,
+}
+
+impl PermitSettings {
+    fn from_vars(vars: &BTreeMap<String, String>) -> Self {
+        let get = |k: &str| vars.get(k).map(String::as_str);
+        PermitSettings {
+            mode: PermitMode::from_var(get("PERMITS")).expect("PERMITS"),
+            sharding: GateSharding::from_var(get("PERMIT_GATES")).expect("PERMIT_GATES"),
+            shards: shards_from_var(get("PERMIT_SHARDS")).expect("PERMIT_SHARDS"),
+        }
+    }
+}
+
+/// The gate client a Worker builds (as `env.rs` does).
 fn gate_client(
     host: &Rc<GateHost>,
-    vars: &BTreeMap<String, String>,
+    permits: &PermitSettings,
     cfg: &BridgeConfig,
     clock: &FixedClock,
 ) -> Rc<dyn PermitGate> {
-    let get = |k: &str| vars.get(k).map(String::as_str);
-    let mode = PermitMode::from_var(get("PERMITS")).expect("PERMITS");
-    let sharding = GateSharding::from_var(get("PERMIT_GATES")).expect("PERMIT_GATES");
-    let shards = shards_from_var(get("PERMIT_SHARDS")).expect("PERMIT_SHARDS");
     let clock = clock.clone();
     GateClient::new(
         GateWire(Rc::clone(host)),
         move || clock.now(),
-        mode,
-        sharding,
-        shards,
+        permits.mode,
+        permits.sharding,
+        permits.shards,
         &cfg.providers,
     )
     .into_gate()
@@ -690,7 +705,12 @@ fn gate_bound() -> bool {
     );
     let text = std::fs::read_to_string(file).expect("wrangler.toml");
     let mut in_binding = false;
-    for line in text.lines().map(str::trim) {
+    // A comment never holds the binding: cut it (no `#` occurs inside
+    // the strings of these lines).
+    for line in text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+    {
         if line.starts_with("[env.") {
             break;
         }
@@ -992,12 +1012,12 @@ impl Bench {
         // Only where the measured commit binds the gate, as `env.rs`
         // attaches the client only with the binding (and refuses
         // `PERMITS=do` without it).
+        let permits = PermitSettings::from_vars(&vars);
         let catalog = if gate_bound() {
-            SqlCatalog::with_gate(sql, gate_client(&gates, &vars, &cfg, &clock))
+            SqlCatalog::with_gate(sql, gate_client(&gates, &permits, &cfg, &clock))
         } else {
-            let mode = PermitMode::from_var(vars.get("PERMITS").map(String::as_str));
             assert!(
-                mode.expect("PERMITS") == PermitMode::Catalog,
+                permits.mode == PermitMode::Catalog,
                 "PERMITS=do: the measured commit binds no permit gate (PERMIT_GATE)"
             );
             SqlCatalog::new(sql)
