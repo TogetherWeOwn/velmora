@@ -32,7 +32,7 @@ class RowsWrittenCheck(unittest.TestCase):
         chk = report.rows_written_check(labels({"stage:big:verify": (12, 11), "stage:mix:verify": (5, 5)}))
         self.assertTrue(chk["ok"])
         self.assertEqual(chk["rows_off"], 1)
-        self.assertIn("within the noise", report.check_line(chk))
+        self.assertIn("within the tolerance (1 row)", report.check_line(chk))
 
     def test_differences_add_up_across_labels(self):
         # +1 and -1 on two labels cancel in the totals but are 2 rows off.
@@ -97,6 +97,7 @@ class ReportRun(unittest.TestCase):
         code, results, md = self.run_report({"stage:tiny:verify": 1, "op:put_tiny": 1})
         self.assertEqual(code, 1)
         self.assertFalse(results["rows_written_check"]["ok"])
+        self.assertIn("rows-written check FAILED", results["model"]["not_valid"])
         self.assertIn("FAILED, rows-written check", md)
 
     def test_empty_replay_fails_after_writing_the_report(self):
@@ -114,8 +115,8 @@ class ReportRun(unittest.TestCase):
         out = good.parent / "compare.md"
         report.main(["--compare", str(good), str(bad), "--out", str(out)])
         text = out.read_text()
-        self.assertIn("the rows-written check of fixture FAILED (2 rows apart, allowed 1)", text)
-        self.assertEqual(text.count("rows-written check of"), 1)
+        self.assertIn("the model totals of fixture are not valid: the rows-written check FAILED (2 rows apart, allowed 1)", text)
+        self.assertEqual(text.count("rows-written check FAILED"), 1)
 
 
 if __name__ == "__main__":
