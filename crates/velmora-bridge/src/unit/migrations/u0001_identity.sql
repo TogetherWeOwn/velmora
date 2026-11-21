@@ -1,4 +1,4 @@
--- The unit's own tables (tenancy ADR §2.3, §2.4 rules 5, 6, 7). Applied
+-- The unit's own tables (docs/units.md, rules 5, 6, 7). Applied
 -- at birth, after every catalogue migration, in the same transaction.
 
 -- The birth certificate (rule 6): one row, written once by `provision`.

@@ -1,5 +1,5 @@
-//! The schema a unit is born with (tenancy ADR §2.3: "The schema is
-//! today's catalogue schema"), and the unit's own tables after it.
+//! The schema a unit is born with: today's catalogue schema, and the
+//! unit's own tables after it.
 //!
 //! [`CATALOGUE`] is every migration of the D1 catalogue, in order, from
 //! `workers/s3-bridge/migrations/` (a test holds that the list is the

@@ -1,5 +1,5 @@
 //! A tenancy unit: one tenant's catalogue in its own SQLite Durable
-//! Object (tenancy ADR §2.1 to §2.4, §8.3).
+//! Object (`docs/units.md`).
 //!
 //! The rules live here, generic over the database, so they run natively
 //! in tests and unchanged in the object (`workers/unit`):

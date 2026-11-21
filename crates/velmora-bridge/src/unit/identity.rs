@@ -1,4 +1,4 @@
-//! The identity check of every call (tenancy ADR §2.4 rule 5).
+//! The identity check of every call (`docs/units.md`, rule 5).
 //!
 //! A call carries the tenant and unit it is addressed to and the two
 //! chain numbers the caller knows: `state_seq` (the tenant chain

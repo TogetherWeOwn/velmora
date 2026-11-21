@@ -1,5 +1,5 @@
-//! The unit's core rules (tenancy ADR §2.4 rules 1 to 7 and 11; package
-//! W2, core part), on the native database. The same unit runs in a
+//! The unit's core rules (`docs/units.md`, rules 1 to 7, 11, 13 and 14),
+//! on the native database. The same unit runs in a
 //! Durable Object through `DoSql` (workers/unit); `workers/unit-suite`
 //! runs this file against it as well.
 

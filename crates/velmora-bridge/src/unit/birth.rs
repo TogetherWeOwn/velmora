@@ -1,4 +1,4 @@
-//! The birth certificate of a unit (tenancy ADR §2.4 rules 6, 7, 13).
+//! The birth certificate of a unit (`docs/units.md`, rules 6, 7, 13, 14).
 //!
 //! A unit is created only by `provision(token)`. The token names the
 //! tenant, the unit, the jurisdiction, the record seq, the schema
@@ -114,7 +114,7 @@ pub fn may_provision(
         }
         // The token is bound to the restore it was made for: the head
         // must still hold this unit's entry with `since_seq` = its seq
-        // (ADR §8.6 step 5). A stale token of an earlier restore is
+        // of the restore procedure. A stale token of an earlier restore is
         // refused.
         BirthKind::Restore => {
             if head.restoring_since != Some(token.record_seq) {

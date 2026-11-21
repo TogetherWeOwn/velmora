@@ -1,5 +1,5 @@
 //! The Durable Object side of a velmora unit: one tenant's catalogue in
-//! its own SQLite Durable Object.
+//! its own SQLite Durable Object (`docs/units.md`).
 //!
 //! - [`DoSql`]: the catalogue's [`velmora_bridge::Sql`] port over the
 //!   object's SQLite storage. A batch is one transaction through the
@@ -11,7 +11,8 @@
 //!   in [`velmora_bridge::unit`]. Exported by a Worker that depends on
 //!   this crate; bound by none yet.
 //!
-//! Nothing here holds a key, reaches the network or sets a timer.
+//! Nothing here holds a key, reaches the network or sets a timer
+//! (rules 3 and 4).
 
 mod do_sql;
 mod object;

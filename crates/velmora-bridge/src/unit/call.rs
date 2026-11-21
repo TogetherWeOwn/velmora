@@ -1,5 +1,5 @@
-//! A call to a unit and its answer, as they cross `fetch` (tenancy ADR
-//! §2.4 rules 1, 5, 7, 11).
+//! A call to a unit and its answer, as they cross `fetch`
+//! (`docs/units.md`, rules 1, 5, 7, 11).
 //!
 //! Both are JSON. A call names the unit it is for, who makes it, the
 //! chain numbers the caller knows, whether the Worker has verified the
@@ -107,7 +107,7 @@ impl HoldMode {
     }
 }
 
-/// Who a fan-out sub-request reads for (ADR §2.4 rule 5, third case).
+/// Who a fan-out sub-request reads for (rule 5, the fan-out case).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reader {
@@ -135,7 +135,7 @@ pub enum UnitOp {
     /// so that an unknown field next to it is refused.
     Ping {},
     /// The key row of an access key: the first of the two calls of a cold
-    /// isolate (ADR §8.4). Allowed without `authenticated`.
+    /// isolate. Allowed without `authenticated`.
     KeyRow { access_key_id: String },
     /// The read plan of a range of an object: the live generation and
     /// its extents in `[start, end)`. Allowed without `authenticated`,
@@ -166,7 +166,7 @@ impl UnitOp {
         matches!(self, UnitOp::Provision { .. } | UnitOp::Sync { .. })
     }
 
-    /// A read, for the tenant-state rule (ADR §2.8: `read_only` serves
+    /// A read, for the tenant-state rule (`read_only` serves
     /// reads only).
     pub fn is_read(&self) -> bool {
         matches!(
@@ -181,9 +181,9 @@ impl UnitOp {
 #[serde(rename_all = "snake_case")]
 pub enum Closed {
     /// The tenant record carries `restoring` for this unit: `503` until
-    /// the restore gate lifts it (ADR §2.8, §8.6).
+    /// the restore gate lifts it.
     Restoring,
-    /// The tenant is `provisioning`: `503` (ADR §2.8).
+    /// The tenant is `provisioning`: `503`.
     Provisioning,
 }
 
@@ -206,7 +206,7 @@ pub enum Refused {
     /// records: the key-chain apply moves it, together with the rows.
     KeysNotApplied,
     /// The tenant's state does not allow this call: `403 AccountProblem`
-    /// once the signature verified (ADR §2.8).
+    /// once the signature verified.
     AccountProblem,
     /// The fan-out reader is no longer allowed (`403 AccessDenied`, as
     /// the full request would get).

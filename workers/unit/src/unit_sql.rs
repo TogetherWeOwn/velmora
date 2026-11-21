@@ -1,5 +1,5 @@
 //! [`UnitSql`] for [`DoSql`]: a whole unit call inside one
-//! `storage.transactionSync` (tenancy ADR §2.4 rule 2).
+//! `storage.transactionSync` (`docs/units.md`, rule 2).
 //!
 //! The call runs as a Rust closure that the shim calls back from inside
 //! the transaction. A batch inside it is a nested `transactionSync`,

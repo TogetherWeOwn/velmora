@@ -1,4 +1,4 @@
-//! The unit's Durable Object class (tenancy ADR §2.1, §2.4).
+//! The unit's Durable Object class (`docs/units.md`).
 //!
 //! One `POST` per call: the body is a [`UnitCall`] as JSON, the answer a
 //! [`UnitAnswer`] as JSON with status 200 (the Worker maps answers to S3
@@ -58,7 +58,7 @@ impl DurableObject for UnitObject {
 }
 
 /// The jurisdiction of the object's namespace (`ctx.id.jurisdiction`),
-/// "" when it has none (ADR §2.4 rule 14).
+/// "" when it has none (rule 14).
 fn jurisdiction(state: &State) -> String {
     let id: &JsValue = state.as_raw().as_ref();
     Reflect::get(id, &JsValue::from_str("id"))

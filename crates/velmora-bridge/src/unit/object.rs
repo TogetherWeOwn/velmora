@@ -1,4 +1,4 @@
-//! The unit: one call in, one answer out (tenancy ADR §2.4 rules 1 to 7
+//! The unit: one call in, one answer out (`docs/units.md`, rules 1 to 7
 //! and 11).
 //!
 //! - **Rule 1, same code.** The unit is a [`SqlCatalog`] over its own
@@ -323,7 +323,7 @@ impl<S: UnitSql> Unit<S> {
         }
         // The tenant's state decides an authenticated call here. An
         // unauthenticated read gets the state with its answer, and the
-        // Worker applies it after the signature verified (ADR §8.4).
+        // Worker applies it after the signature verified.
         if call.authenticated && !allows(&head, call.op.is_read()) {
             return Ok(refused(Refused::AccountProblem, false));
         }
@@ -397,7 +397,7 @@ impl<S: UnitSql> Unit<S> {
             } => {
                 let Some(b) = self.cat.bucket_by_name(bucket).await? else {
                     // A missing bucket is decided by the Worker after the
-                    // signature (ADR §8.4: a missing bucket and a missing
+                    // signature (a missing bucket and a missing
                     // grant both answer AccessDenied), so the answer
                     // carries the key row like any other. A fan-out read
                     // was granted on a bucket that is gone.
@@ -585,7 +585,7 @@ pub fn transact<S: UnitSql>(
     }
 }
 
-/// What the tenant's state lets an S3 call do (ADR §2.8).
+/// What the tenant's state lets an S3 call do (`docs/units.md`).
 fn allows(head: &Head, read: bool) -> bool {
     match head.tenant_state {
         TenantState::Active => true,

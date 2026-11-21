@@ -1,4 +1,4 @@
-//! The name of a unit: `<tenant>/<unit number>` (tenancy ADR §2.1).
+//! The name of a unit: `<tenant>/<unit number>`.
 //!
 //! A tenant id is `t_` and 16 lowercase hex digits; tenant 0 is
 //! [`crate::recovery::DEFAULT_TENANT`]. A unit number is a decimal
