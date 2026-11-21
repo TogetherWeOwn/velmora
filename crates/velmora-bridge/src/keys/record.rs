@@ -323,10 +323,19 @@ pub struct KeyRecord {
     /// Unix ms the writer recorded the change.
     pub at: u64,
     pub door: SubjectDoor,
-    /// `None` when the private part did not open.
+    /// `None` when the private part did not open, or when the record
+    /// carries none ([`Self::private_unchanged`]).
     pub private: Option<SubjectPrivate>,
     /// The tenant key version that seals the private part.
     pub tk_version: u32,
+    /// The record closes a door (revoke, disable, narrow), as its writer
+    /// classed it from the head. A retry of the same change is classed the
+    /// same way.
+    pub closes: bool,
+    /// The record carries no private part: the subject's private part is
+    /// the one it had before (a closing status change whose writer could
+    /// not open it).
+    pub private_unchanged: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -338,6 +347,8 @@ struct DoorBody {
     op: KeyOp,
     at: u64,
     subject: SubjectDoor,
+    closes: bool,
+    private_unchanged: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -388,8 +399,9 @@ impl TkRing for NoKeys {
 /// Seals the record of `op` at `seq` under the ring's current key
 /// version. `private` is `None` only for a closing status change whose
 /// writer could not open the subject's private part: the record then
-/// closes the door, and the subject is folded with its private part
-/// closed (and so `disabled` or `revoked` everywhere).
+/// carries none and says so ([`KeyRecord::private_unchanged`]), and a
+/// reader keeps the private part the subject had before. `closes` is the
+/// writer's class of the change.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
     kek: &K,
@@ -400,10 +412,11 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
     at: u64,
     door: &SubjectDoor,
     private: Option<&SubjectPrivate>,
+    closes: bool,
     rng: &mut R,
 ) -> Result<Vec<u8>> {
     check_subject(tenant, door, private)?;
-    let closing_status = op == KeyOp::Status && door.status != SubjectStatus::Active;
+    let closing_status = op == KeyOp::Status && door.status != SubjectStatus::Active && closes;
     if private.is_none() && !closing_status {
         return Err(ERR_KEY_RECORD);
     }
@@ -417,6 +430,8 @@ pub fn seal_key_record<K: Kek, T: TkRing, R: FillRandom>(
         op,
         at,
         subject: door.clone(),
+        closes,
+        private_unchanged: private.is_none(),
     })
     .map_err(|_| ERR_KEY_RECORD)?;
     let private_body = zeroize::Zeroizing::new(
@@ -466,6 +481,15 @@ pub fn open_key_record<K: Kek, T: TkRing>(
         .filter(|p| p.v == KEY_RECORD_VERSION && p.id == door.subject.id)
         .and_then(|p| p.subject)
         .filter(|p| check_subject(tenant, &door.subject, Some(p)).is_ok());
+    // A record without a private part must be a closing status change.
+    let closing_status = door.op == KeyOp::Status && door.subject.status != SubjectStatus::Active;
+    if door.private_unchanged && (!closing_status || !door.closes) {
+        return Err(ERR_KEY_RECORD);
+    }
+    let private = match door.private_unchanged {
+        true => None,
+        false => private,
+    };
     Ok(KeyRecord {
         seq,
         op: door.op,
@@ -473,6 +497,8 @@ pub fn open_key_record<K: Kek, T: TkRing>(
         door: door.subject,
         private,
         tk_version,
+        closes: door.closes,
+        private_unchanged: door.private_unchanged,
     })
 }
 
@@ -484,12 +510,17 @@ pub fn open_key_record<K: Kek, T: TkRing>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub door: SubjectDoor,
-    /// `None`: the newest record's private part did not open.
+    /// `None`: the private part did not open.
     pub private: Option<SubjectPrivate>,
     /// The seq of the subject's newest record.
     pub last_seq: u64,
-    /// The key version that seals the newest record's private part.
+    /// The seq of the record that holds the subject's private part: the
+    /// newest one, or an older one when the newer ones carry none.
+    pub private_seq: u64,
+    /// The key version that seals that record's private part.
     pub tk_version: u32,
+    /// The newest record closes a door.
+    pub closes: bool,
 }
 
 impl Entry {
@@ -632,13 +663,26 @@ impl KeyTable {
         }
         self.admits(record.op, &record.door, record.private.as_ref())
             .map_err(|_| ERR_KEY_RECORD)?;
+        // A record that carries no private part keeps the one before.
+        let (private, private_seq, tk_version) =
+            match (record.private_unchanged, self.subjects.get(&record.door.id)) {
+                (true, Some(before)) => (
+                    before.private.clone(),
+                    before.private_seq,
+                    before.tk_version,
+                ),
+                (true, None) => return Err(ERR_KEY_RECORD),
+                (false, _) => (record.private.clone(), record.seq, record.tk_version),
+            };
         self.subjects.insert(
             record.door.id.clone(),
             Entry {
                 door: record.door.clone(),
-                private: record.private.clone(),
+                private,
                 last_seq: record.seq,
-                tk_version: record.tk_version,
+                private_seq,
+                tk_version,
+                closes: record.closes,
             },
         );
         self.seq = record.seq;

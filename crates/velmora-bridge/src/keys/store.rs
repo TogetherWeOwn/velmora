@@ -21,7 +21,9 @@ pub trait RecordStore {
     /// The bytes under `name`; `None` when absent.
     async fn get(&self, name: &str) -> Result<Option<Vec<u8>>>;
     /// Up to `limit` names that start with `prefix` and sort after
-    /// `start_after`, in name order. Fewer than `limit` = no more names.
+    /// `start_after`, in name order. Fewer than `limit` = no more names:
+    /// an adapter whose store may answer a short page while more names
+    /// exist (R2 with `truncated` set) pages on itself before it answers.
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>>;
     /// Whether something is stored under `name`. An adapter with a cheaper
     /// check (a HEAD) overrides it.

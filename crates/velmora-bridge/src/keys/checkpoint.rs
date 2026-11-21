@@ -12,9 +12,12 @@
 //!   that seq, so a checkpoint cannot be moved to another point of the
 //!   chain; and, per subject, the door fields of a key record.
 //! - Its private part, under the current tenant key, holds the private
-//!   fields of every subject whose newest record opened. A subject whose
-//!   newest record did not open is carried with its door fields only,
-//!   and is `disabled` wherever it is applied.
+//!   fields of every subject whose private part opened. A subject whose
+//!   private part did not open is carried with its door fields only and
+//!   is `disabled` wherever it is applied, until a reader whose ring
+//!   holds its key opens it again from the record that holds its private
+//!   part; the finisher reports such a subject as an attention
+//!   condition.
 //! - A reader takes the newest checkpoint that verifies, whose named
 //!   record is the one in the chain and whose private part opens; with
 //!   none it takes the one before, and at last the chain from seq 1.
@@ -44,11 +47,6 @@ pub const CHECKPOINT_EVERY: u64 = 256;
 
 const CHECKPOINT_VERSION: u32 = 1;
 const ERR_CHECKPOINT: BridgeError = BridgeError::Invalid("key checkpoint is malformed");
-/// A checkpoint is not written while a subject that is not revoked has
-/// a private part the ring could not open: it would carry that subject
-/// closed to every later reader, also one that holds every key.
-pub const ERR_CHECKPOINT_CLOSED: BridgeError =
-    BridgeError::Invalid("key checkpoint would carry a closed subject");
 
 /// The directory of `tenant`'s checkpoints.
 pub fn checkpoint_prefix(tenant: &TenantId) -> String {
@@ -76,7 +74,9 @@ struct CheckpointDoor {
 struct DoorEntry {
     door: SubjectDoor,
     last_seq: u64,
+    private_seq: u64,
     tk_version: u32,
+    closes: bool,
     /// Whether the private part below holds this subject.
     open: bool,
 }
@@ -109,12 +109,6 @@ pub fn seal_checkpoint<K: Kek, T: TkRing, R: FillRandom>(
     rng: &mut R,
 ) -> Result<Vec<u8>> {
     let tenant = table.tenant();
-    let closed = table
-        .entries()
-        .any(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked);
-    if closed {
-        return Err(ERR_CHECKPOINT_CLOSED);
-    }
     let tk = ring
         .current()
         .ok_or(BridgeError::Crypto("tenant key unavailable"))?;
@@ -128,7 +122,9 @@ pub fn seal_checkpoint<K: Kek, T: TkRing, R: FillRandom>(
             .map(|e| DoorEntry {
                 door: e.door.clone(),
                 last_seq: e.last_seq,
+                private_seq: e.private_seq,
                 tk_version: e.tk_version,
+                closes: e.closes,
                 open: e.private.is_some(),
             })
             .collect(),
@@ -203,7 +199,11 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
             true => Some(privates.remove(&d.door.id)?),
             false => None,
         };
-        if d.last_seq == 0 || d.last_seq > seq || subjects.contains_key(&d.door.id) {
+        let seqs_fit = d.last_seq != 0
+            && d.last_seq <= seq
+            && d.private_seq != 0
+            && d.private_seq <= d.last_seq;
+        if !seqs_fit || subjects.contains_key(&d.door.id) {
             return None;
         }
         // The same rules as a record: grants aligned, ids, the secret.
@@ -214,7 +214,9 @@ pub fn open_checkpoint<K: Kek, T: TkRing>(
                 door: d.door,
                 private,
                 last_seq: d.last_seq,
+                private_seq: d.private_seq,
                 tk_version: d.tk_version,
+                closes: d.closes,
             },
         );
     }
@@ -360,7 +362,7 @@ fn is_record_error(e: &BridgeError) -> bool {
 
 /// Opens again, from its own record, every subject of `table` that is
 /// closed and not revoked, when the ring now holds its key.
-async fn reopen_closed<S: RecordStore, K: Kek, T: TkRing>(
+pub(super) async fn reopen_closed<S: RecordStore, K: Kek, T: TkRing>(
     store: &S,
     kek: &K,
     ring: &T,
@@ -371,7 +373,7 @@ async fn reopen_closed<S: RecordStore, K: Kek, T: TkRing>(
         .entries()
         .filter(|e| e.private.is_none() && e.door.status != SubjectStatus::Revoked)
         .filter(|e| ring.key(e.tk_version).is_some())
-        .map(|e| (e.door.id.clone(), e.last_seq))
+        .map(|e| (e.door.id.clone(), e.private_seq))
         .collect();
     for (id, seq) in closed {
         let bytes = chain.get(store, seq).await?;
