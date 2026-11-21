@@ -1022,6 +1022,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         scrub::repin(self, token, extent, (now, next_at), unread).await
     }
+    async fn scrub_block(&self, token: u64, blocked: &[String]) -> Result<bool> {
+        scrub::block(self, token, blocked).await
+    }
     async fn scrub_defer(&self, token: u64, extent: &ExtentId, next_at: UnixMs) -> Result<bool> {
         scrub::defer(self, token, extent, next_at).await
     }

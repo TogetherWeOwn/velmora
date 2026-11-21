@@ -1623,6 +1623,11 @@ pub trait Catalog {
     ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
+    /// Stores the backbones under an incident (`scrub_state.last_incident`)
+    /// at once, under the lease of `token`.
+    async fn scrub_block(&self, _token: u64, _blocked: &[String]) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
     /// Moves an extent's due time only: a check that could not finish.
     async fn scrub_defer(&self, _token: u64, _extent: &ExtentId, _next_at: UnixMs) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
