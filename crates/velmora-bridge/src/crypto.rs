@@ -701,6 +701,12 @@ impl ExtentSealer {
         self.plain_size.saturating_sub(self.sealed)
     }
 
+    /// Whether nothing of the stream has been asked for yet: the sealer
+    /// is as [`ExtentSealer::begin`] made it.
+    pub fn is_new(&self) -> bool {
+        self.given == 0 && self.sealed == 0 && !self.sealer.is_finished()
+    }
+
     /// Whether the final chunk has been sealed.
     pub fn is_complete(&self) -> bool {
         self.sealer.is_finished() && self.given == self.cipher_size

@@ -1156,14 +1156,18 @@ fn seal_in_pieces(
         media::ciphertext_size(plain.len() as u64).unwrap()
     );
     let mut pieces = Vec::new();
+    // New until the first piece is asked for, also for an empty extent,
+    // and never again afterwards.
+    assert!(sealer.is_new());
     if plain.is_empty() {
         pieces.push(sealer.seal_next(&[]).unwrap());
     }
     for chunk in plain.chunks(CHUNK) {
         assert!(!sealer.is_complete());
         pieces.push(sealer.seal_next(chunk).unwrap());
+        assert!(!sealer.is_new());
     }
-    assert!(sealer.is_complete());
+    assert!(sealer.is_complete() && !sealer.is_new());
     assert_eq!(sealer.remaining(), 0);
     (pieces, sealer.finish().unwrap())
 }

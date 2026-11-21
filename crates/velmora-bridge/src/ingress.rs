@@ -1477,9 +1477,11 @@ pub fn seal_upload(
     sealer: ExtentSealer,
     charge: &Charge,
 ) -> Result<(ByteStream, UploadSeal), IngressError> {
+    // A sealer that already gave out a piece would make a stream that
+    // lacks it.
     if validator.decoded_length() != lengths.decoded
         || sealer.remaining() != lengths.decoded
-        || sealer.is_complete()
+        || !sealer.is_new()
     {
         return Err(IngressError::Internal);
     }

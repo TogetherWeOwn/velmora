@@ -690,6 +690,9 @@ async fn whole_extents_are_stored_at_once_within_a_small_budget() {
     let all = futures_util::future::join_all(sends);
     let release = async {
         // Every upload has given its whole stream and waits in the store.
+        // An upload that never gets there fails the test instead of
+        // leaving it waiting.
+        let mut turns = 0u32;
         while rig.bridge.safety.streams.borrow().len() < AT_ONCE as usize
             || rig
                 .bridge
@@ -699,6 +702,15 @@ async fn whole_extents_are_stored_at_once_within_a_small_budget() {
                 .iter()
                 .any(|s| s.taken() < s.len)
         {
+            turns += 1;
+            if turns > 1_000_000 {
+                let streams = rig.bridge.safety.streams.borrow();
+                let seen: Vec<_> = streams
+                    .iter()
+                    .map(|s| (&s.key, s.len, s.taken(), s.failed))
+                    .collect();
+                panic!("uploads did not reach the store: {seen:?}");
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(rig.bridge.budget.in_use(), AT_ONCE * STREAM_CHARGE_BYTES);
