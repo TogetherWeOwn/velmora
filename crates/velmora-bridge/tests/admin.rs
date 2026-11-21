@@ -28,6 +28,10 @@ const TOKEN: &str = "admin-token-fixture-0123456789abcdef";
 type TestBridge =
     Bridge<SqlCatalog<RacingSql>, MemBlobStore, TcpConnector, FakeJobs, TestKek, FixedClock>;
 
+/// A part of a statement's text, and what happens just before a query
+/// with it runs.
+type Meanwhile = (&'static str, Box<dyn Fn()>);
+
 /// The SQLite catalogue, plus one test hook: with `race` set, the next
 /// safety-state compare-and-set finds that another writer moved every
 /// extent to that state first.
@@ -39,7 +43,7 @@ struct RacingSql {
     fail: RefCell<Option<(&'static str, u32)>>,
     /// Run before every query whose text contains the string: what
     /// another request of the isolate does at that moment.
-    meanwhile: RefCell<Option<(&'static str, Box<dyn Fn()>)>>,
+    meanwhile: RefCell<Option<Meanwhile>>,
 }
 
 impl RacingSql {
