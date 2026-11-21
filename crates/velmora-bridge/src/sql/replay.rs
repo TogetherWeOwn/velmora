@@ -36,9 +36,12 @@ type Stmt = (&'static str, Vec<SqlValue>);
 /// `?2`, the addendum `?3` and the count whose literal is `?4`: the
 /// lease token moves on, as when a lease is given up, so every write of
 /// a job that holds the row is refused (`held!` in `sql/outbox.rs`).
+/// A verify that had got past a backbone starts at the first again: the
+/// passes it would skip are the ones deleted here.
 /// Run before the statement that changes those values, in its batch.
 const FENCE_CLAIMS: &str =
-    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL \
+    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL, \
+       cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
      WHERE extent_id = ?1 \
        AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
          AND parity IS ?3 AND quote(parity_count) = ?4)";
@@ -415,7 +418,8 @@ pub(super) async fn replay_extents<S: Sql>(
             ));
             stmts.push((
                 "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, \
-                   lease_until = NULL \
+                   lease_until = NULL, \
+                   cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
                  WHERE extent_id = ?1 \
                    AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
                      AND parity IS NOT ?3)",

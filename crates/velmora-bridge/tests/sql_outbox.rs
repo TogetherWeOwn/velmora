@@ -5336,6 +5336,8 @@ async fn a_replay_that_replaces_an_addendum_ends_the_claims_in_flight() {
 
     // A verify job in flight: its full read is of the old addendum.
     let (o, l) = fx.posted_packed("verify", true).await;
+    // It had passed the first backbone: its resume point says so.
+    assert!(fx.cat.set_cursor(&l, 8, T0).await.unwrap());
     let replay = replace(&o, "verify", T0.plus_secs(1)).await;
     let read = pass(&l, "bb-a", T0.plus_secs(2), VerifyKind::Body);
     assert!(!fx.cat.record_verification(&l, &read).await.unwrap());
@@ -5350,6 +5352,8 @@ async fn a_replay_that_replaces_an_addendum_ends_the_claims_in_flight() {
     let again = fx.claim(&o, OutboxStage::Verify, T0.plus_secs(2)).await;
     let again = again.expect("the row is free");
     assert_ne!(again.token, l.token);
+    // It starts at the first backbone: the pass it had there is gone.
+    assert_eq!(again.cursor, 0);
     // A second replay of the same record changes nothing: the claim
     // taken since stands.
     let at = T0.plus_secs(3);
