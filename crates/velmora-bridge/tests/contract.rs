@@ -2767,6 +2767,42 @@ fn every_shipped_job_queue_has_one_consumer_and_bindings_have_no_gap() {
 /// TOML header names its table from the root wherever it stands, so a
 /// table is production's by its name, not by its place in the file.
 /// Spaces, quotes and a trailing comment do not change a name.
+/// The keys and values of one table of the shipped `wrangler.toml`, as
+/// `key=value` with the value's quotes removed, sorted. The table is
+/// found by its header with spaces removed (`[exports . X]` is
+/// `[exports.X]`); a value keeps its inner spaces, so `"sql ite"` is not
+/// `sqlite`.
+fn table_body(header: &str) -> Vec<String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    let toml = std::fs::read_to_string(path).unwrap();
+    let squeeze = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let want = squeeze(header);
+    let mut body = Vec::new();
+    let mut inside = false;
+    for line in toml.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            inside = squeeze(line) == want;
+            continue;
+        }
+        if !inside || line.is_empty() {
+            continue;
+        }
+        let (key, value) = line.split_once('=').expect("a key = value line");
+        let value = value.trim();
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        body.push(format!("{}={unquoted}", key.trim()));
+    }
+    body.sort();
+    body
+}
+
 fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2807,14 +2843,14 @@ fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
 /// A Durable Object class can never be rolled back past, so production
 /// declares and binds the permit gate in deploys of their own, after the
 /// code that knows `PERMITS` has run ("Shipping the gate" in
-/// ops/README.md). Until then the production tables hold no class, no
-/// Durable Object binding and `PERMITS = "d1"`. The pull requests that
-/// add the class (deploy 2) and its binding (deploy 3) change this test
+/// ops/README.md). Deploy 2 declares the class `PermitGate` alone: no
+/// Durable Object binding, no `[version_metadata]`, `PERMITS = "d1"`.
+/// The pull request that adds the binding (deploy 3) changes this test
 /// on purpose. The legacy `[[migrations]]` array is never used: once a
 /// class is declared by `exports`, a deploy that declares one by
 /// `[[migrations]]` is refused.
 #[test]
-fn production_declares_no_durable_object_class_yet() {
+fn production_declares_the_gate_class_alone() {
     let (prod, env, root) = wrangler_tables();
     let gate = |key: &str| {
         let first = key.split('.').next().unwrap_or_default();
@@ -2826,10 +2862,20 @@ fn production_declares_no_durable_object_class_yet() {
         ]
         .contains(&first)
     };
-    for key in prod.iter().chain(&root) {
-        assert!(
-            !gate(key),
-            "production {key}: the gate ships in deploys of its own"
+    let declared: Vec<&String> = prod.iter().chain(&root).filter(|k| gate(k)).collect();
+    assert_eq!(
+        declared,
+        ["exports.PermitGate"],
+        "production declares the class and nothing else of the gate"
+    );
+    // The storage of a class is fixed when it is created, and a deletion
+    // has no rollback: the table holds exactly these two keys, in
+    // production and in dev.
+    for header in ["[exports.PermitGate]", "[env.dev.exports.PermitGate]"] {
+        assert_eq!(
+            table_body(header),
+            ["storage=sqlite", "type=durable-object"],
+            "{header}"
         );
     }
     let (vars, dev) = wrangler_vars();

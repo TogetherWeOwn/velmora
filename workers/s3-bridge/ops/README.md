@@ -950,13 +950,13 @@ and a traffic split to any version from before the class (code 100402
 for a class declared by `exports`; 10210 for the legacy `[[migrations]]`
 array). So the class goes out on its own, with the same code that has
 already run, and nothing that uses it comes in the same deploy. The
-shipped `wrangler.toml` declares the class for `env.dev` only; the
-production tables come in three later pull requests, each a deploy of
-its own, in this order:
+production tables change in three pull requests after the code, each a
+deploy of its own, in this order. Production now declares the class
+(deploy 2), so the rollback floor it sets is in force:
 
 | # | change to the production tables | rollback | merge the next one when |
 | - | ------------------------------- | -------- | ----------------------- |
-| 1 | none: the code that knows `PERMITS`, with `PERMITS = "d1"` and no class or binding | as for any release | about a day of normal traffic |
+| 1 | none: the code that knows `PERMITS`, with `PERMITS = "d1"` and no class or binding | as for any release | its deploy job is green, it alone serves 100 %, and in a status check after it the outbox `done` count has risen and every provider is healthy |
 | 2 | `[exports.PermitGate]` alone | none past it, ever | its deploy job is green |
 | 3 | the `PERMIT_GATE` binding and `[version_metadata]` | to deploy 2 | its deploy job is green and the active version has the binding |
 | 4 | `PERMITS = "do"` (step 2 above) | `PERMITS = "d1"`, or to deploy 3 | n/a |
@@ -993,11 +993,16 @@ binding = "CF_VERSION_METADATA"
 Rules for deploy 2:
 
 - It goes out with `wrangler deploy` at 100 %, through the deploy job,
-  after deploy 1 has served normal traffic for about a day. A version
-  that adds a class cannot be uploaded with `versions upload` together
-  with its binding, and cannot share traffic with an older version.
-- It goes out last in the queue: every change waiting to ship goes
-  before it, so that no wanted version is left below the floor it sets.
+  once deploy 1 meets the condition in the table above. Deploy 1 changes
+  the slot path that every post and verify job takes, which runs
+  thousands of times in one status interval, so a fault there shows
+  before deploy 2. Faults that appear only after hours cannot be ruled
+  out this way: after deploy 2 they are fixed forward. A version that
+  adds a class cannot be uploaded with `versions upload` together with
+  its binding, and cannot share traffic with an older version.
+- Every change already shipped has run cleanly before it. Changes that
+  ship after it are above the floor it sets and roll back to it or
+  later like any other release.
 - If its smoke test fails, the deploy job's automatic rollback is
   refused (code 100402) and the job fails at that step. The new version
   keeps serving. Nothing is bound to the class and the code is the code
