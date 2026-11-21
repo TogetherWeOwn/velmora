@@ -604,7 +604,11 @@ here):
 
 ## Deploy switches
 
-Set these GitHub configuration variables for production:
+Set these GitHub configuration variables for production. Set
+`VELMORA_DEPLOY_FREEZE` and `VELMORA_CATALOGUE_MIGRATIONS` as **repository**
+variables under Settings → Secrets and variables → Actions → Variables →
+Repository. The build job and pull request checks run without the production
+environment, and the deploy job reads the same repository values.
 
 | Variable | Effect and default |
 |---|---|
@@ -614,7 +618,7 @@ Set these GitHub configuration variables for production:
 | `VELMORA_DEPLOY_FREEZE` | Allows only the specified full lowercase commit SHA to deploy. Unset allows any commit that passes the tip check. |
 | `VELMORA_FLOOR_MIN` | Sets the minimum bundle floor level. Defaults to `0`. |
 | `VELMORA_FLOOR_VERSION` | Sets the earliest automatic rollback target by Worker version UUID and creation time. Unset disables this comparison. |
-| `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. Set this as a repository variable so PR checks and the deploy job read the same setting. |
+| `VELMORA_CATALOGUE_MIGRATIONS` | `on` (default) applies catalogue migrations. `off` checks that none are pending and refuses the deploy if any are. |
 | `VELMORA_DIRECTORY_D1_ID` | Binds the directory D1 database by lowercase UUID and applies its migrations. Unset leaves it unbound. |
 
 For a switch deploy, set the variable and re-run the deploy job of the

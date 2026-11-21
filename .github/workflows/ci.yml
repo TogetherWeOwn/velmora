@@ -618,16 +618,23 @@ jobs:
     outputs:
       fresh: ${{ steps.fresh.outputs.fresh }}
     steps:
-      # Stale-run guard: build and deploy only while this commit is still
-      # the tip of main, so an older run never replaces a newer release.
+      # Build only for the tip of main or the frozen commit.
       - id: fresh
         name: Check that this commit is still the tip of main
+        env:
+          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}
         run: |
           set -euo pipefail
           tip=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "deploy: ${GITHUB_SHA} is the tip of main"
             echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ "${VELMORA_DEPLOY_FREEZE:-}" = "$GITHUB_SHA" ]; then
+            echo "deploy: ${GITHUB_SHA} is the frozen commit; it builds although main is at ${tip}"
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${VELMORA_DEPLOY_FREEZE:-}" ]; then
+            echo "::error::main moved from ${GITHUB_SHA} to ${tip}; the deploy freeze is set to another commit"
+            exit 1
           else
             echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
             echo "fresh=false" >> "$GITHUB_OUTPUT"
@@ -706,6 +713,7 @@ jobs:
       contents: read
     outputs:
       rollback: ${{ steps.rollback.outputs.rollback }}
+      refused: ${{ steps.fresh.outputs.refused || steps.switches.outputs.refused }}
     # One production deploy at a time; a running deploy is never cancelled.
     concurrency:
       group: deploy-production
@@ -729,6 +737,7 @@ jobs:
             echo "fresh=true" >> "$GITHUB_OUTPUT"
           elif [ -n "${VELMORA_DEPLOY_FREEZE:-}" ]; then
             echo "::error::main moved from ${GITHUB_SHA} to ${tip}; the deploy freeze is set to another commit"
+            echo "refused=freeze" >> "$GITHUB_OUTPUT"
             exit 1
           else
             echo "skipped: main moved from ${GITHUB_SHA} to ${tip}; the newer run deploys"
@@ -759,14 +768,18 @@ jobs:
           from pathlib import Path
           import os, re, sys
 
+          def refuse(message):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("refused=switches\n")
+              sys.exit(message)
+
           freeze = os.environ.get("VELMORA_DEPLOY_FREEZE", "")
           if freeze:
               if not re.fullmatch(r"[0-9a-f]{40}", freeze):
-                  sys.exit("VELMORA_DEPLOY_FREEZE must be unset or a full 40-hex commit id")
+                  refuse("VELMORA_DEPLOY_FREEZE must be unset or a full 40-hex commit id")
               sha = os.environ["GITHUB_SHA"]
               if freeze != sha:
-                  print(f"::error::deploy frozen: only commit {freeze} may deploy; this run is {sha}")
-                  sys.exit(1)
+                  refuse(f"::error::deploy frozen: only commit {freeze} may deploy; this run is {sha}")
               print("deploy freeze: on, this commit is the one allowed")
           else:
               print("deploy freeze: off")
@@ -776,22 +789,21 @@ jobs:
           except OSError:
               level = b""
           if not re.fullmatch(rb"[0-9]+\n?", level):
-              sys.exit("the bundle has no valid floor level")
+              refuse("the bundle has no valid floor level")
           minimum = os.environ.get("VELMORA_FLOOR_MIN", "") or "0"
           if not re.fullmatch(r"[0-9]+", minimum):
-              sys.exit("VELMORA_FLOOR_MIN must be unset or a whole number")
+              refuse("VELMORA_FLOOR_MIN must be unset or a whole number")
           # Compare decimal digits without an integer conversion size limit.
           level = level.decode("ascii").rstrip("\n").lstrip("0") or "0"
           minimum = minimum.lstrip("0") or "0"
           if (len(level), level) < (len(minimum), minimum):
-              print(f"::error::bundle floor level {level} is below VELMORA_FLOOR_MIN {minimum}; refusing to deploy")
-              sys.exit(1)
+              refuse(f"::error::bundle floor level {level} is below VELMORA_FLOOR_MIN {minimum}; refusing to deploy")
           print(f"floor level of this bundle: {level}; required minimum: {minimum}")
 
           version = os.environ.get("VELMORA_FLOOR_VERSION", "")
           uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
           if version and not re.fullmatch(uuid, version):
-              sys.exit("VELMORA_FLOOR_VERSION must be unset or a lowercase version id (UUID)")
+              refuse("VELMORA_FLOOR_VERSION must be unset or a lowercase version id (UUID)")
           print(f"rollback floor version: {version or 'unset'}")
 
           migrations = os.environ.get("VELMORA_CATALOGUE_MIGRATIONS", "") or "on"
@@ -1351,7 +1363,7 @@ jobs:
   deploy-alert:
     name: deploy alert
     needs: [ci-ok, deploy-build, deploy]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && (needs.ci-ok.result == 'failure' || needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.ci-ok.result != 'cancelled' && (needs.ci-ok.result == 'failure' || needs.deploy-build.result == 'failure' || needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: production
@@ -1366,6 +1378,7 @@ jobs:
           BUILD_RESULT: ${{ needs.deploy-build.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           ROLLBACK: ${{ needs.deploy.outputs.rollback }}
+          REFUSED: ${{ needs.deploy.outputs.refused }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -1373,18 +1386,21 @@ jobs:
             echo "::warning::deploy alert not sent: ALERTS_INGEST_URL or ALERTS_INGEST_TOKEN is not set in the production environment"
             exit 0
           fi
-          body=$(jq -n --arg sha "$GITHUB_SHA" --arg ci "$CI_RESULT" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" --arg rollback "$ROLLBACK" '
+          body=$(jq -n --arg sha "$GITHUB_SHA" --arg ci "$CI_RESULT" --arg b "$BUILD_RESULT" --arg d "$DEPLOY_RESULT" --arg run "$RUN_URL" --arg rollback "$ROLLBACK" --arg refusal "$REFUSED" '
             ($rollback == "refused" or $rollback == "refused-floor"
              or $rollback == "refused-floor-unknown" or $rollback == "manual-check") as $refused | {
             source: "ci",
-            key: (if $refused then "deploy-rollback-refused" else "deploy-failed" end),
-            title: (if $rollback == "manual-check" then "Production deploy failed; rollback needs a manual check"
+            key: (if $ci == "failure" then "ci-failed" elif $refused then "deploy-rollback-refused" else "deploy-failed" end),
+            title: (if $ci == "failure" then "Checks failed on main"
+                    elif $rollback == "manual-check" then "Production deploy failed; rollback needs a manual check"
                     elif $refused then "Production deploy failed and was not rolled back" else "Production deploy failed" end),
             detail: ((if $rollback == "manual-check" then "The active Worker version needs a manual check. "
                       elif $refused then "The rollback was refused (\($rollback)): production runs the version this run deployed. " else "" end)
               + "Commit \($sha): deploy build \($b), deploy \($d). "
               + (if $ci == "failure" then "The checks failed on main, so nothing was deployed."
                  elif $b == "failure" then "The build failed, so nothing was deployed; production is unchanged."
+                 elif $refusal == "freeze" then "The deploy was refused by the deploy freeze; nothing was deployed."
+                 elif $refusal == "switches" then "The deploy switches refused this commit (see the \"Check the deploy switches\" step); nothing was deployed."
                  else "The deploy job rolls back to the version before it when it can; whether it did, or asks for a manual check, is in the run'"'"'s \"Roll back to the recorded version\" step." end)
               + " Run: \($run)")}')
           if printf 'Authorization: Bearer %s\n' "$ALERTS_INGEST_TOKEN" \

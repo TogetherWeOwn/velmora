@@ -40,6 +40,14 @@ def deploy_job(ci):
 
 
 class WorkflowWiringTest(unittest.TestCase):
+    def test_deploy_guard(self):
+        deploy = deploy_job(read(CI_YML))
+        self.assertEqual(
+            deploy.splitlines()[2],
+            "    if: ${{ !cancelled() && needs.deploy-build.result == 'success' && "
+            "needs.deploy-build.outputs.fresh == 'true' }}",
+        )
+
     def test_switches(self):
         step = extract("- name: Check the deploy switches", ["if", "id", "env", "run"])
         self.assertEqual(step.lines[step.where["if"]].strip(), f"if: {FRESH_IF}")
@@ -67,37 +75,54 @@ class WorkflowWiringTest(unittest.TestCase):
         ci = read(CI_YML)
         deploy = deploy_job(ci)
         self.assertIn("\n    outputs:\n      rollback: ${{ steps.rollback.outputs.rollback }}\n", deploy)
+        self.assertIn(
+            "\n      refused: ${{ steps.fresh.outputs.refused || steps.switches.outputs.refused }}\n",
+            deploy,
+        )
         step = extract("- id: rollback", ["name", "if", "working-directory", "env", "run"])
         self.assertIn("\n      - id: rollback\n", deploy)
+        self.assertEqual(
+            step.lines[step.where["if"]].strip(),
+            "if: ${{ (failure() || cancelled()) && steps.prev.outputs.version != '' }}",
+        )
         self.assertIn("          FLOOR_VERSION: ${{ steps.switches.outputs.floor_version }}",
                       step.lines[step.where["env"] + 1:step.where["run"]])
         alert = ci.split("\n  deploy-alert:\n", 1)[1]
         self.assertIn("\n    needs: [ci-ok, deploy-build, deploy]\n", alert)
         self.assertIn(
             "\n    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && "
-            "(needs.ci-ok.result == 'failure' || needs.deploy-build.result == 'failure' || "
+            "needs.ci-ok.result != 'cancelled' && (needs.ci-ok.result == 'failure' || needs.deploy-build.result == 'failure' || "
             "needs.deploy.result == 'failure' || needs.deploy.result == 'cancelled') }}\n",
             alert,
         )
         step = extract("- name: Report the failed deploy", ["env", "run"])
         env = step.lines[step.where["env"] + 1:step.where["run"]]
         self.assertIn("          ROLLBACK: ${{ needs.deploy.outputs.rollback }}", env)
+        self.assertIn("          REFUSED: ${{ needs.deploy.outputs.refused }}", env)
         self.assertIn("          CI_RESULT: ${{ needs.ci-ok.result }}", env)
 
 
 class FreshTest(unittest.TestCase):
     def test_tip_and_freeze(self):
-        step = ShellStep(deploy_job(read(CI_YML)), "- id: fresh", ["name", "env", "run"])
+        self.check_fresh(deploy_job(read(CI_YML)), "deploys", "refused=freeze\n")
+
+    def test_build_tip_and_freeze(self):
+        build = read(CI_YML).split("\n  deploy-build:\n", 1)[1].split("\n  deploy:\n", 1)[0]
+        self.check_fresh(build, "builds", "")
+
+    def check_fresh(self, job, action, refusal):
+        step = ShellStep(job, "- id: fresh", ["name", "env", "run"])
         self.assertEqual(step.lines[step.where["env"] + 1:step.where["run"]], [
             "          VELMORA_DEPLOY_FREEZE: ${{ vars.VELMORA_DEPLOY_FREEZE }}",
         ])
         newer = "b" * 40
         for tip, freeze, code, output, message in (
             (SHA, "", 0, "fresh=true\n", "is the tip of main"),
+            (SHA, newer, 0, "fresh=true\n", "is the tip of main"),
             (newer, "", 0, "fresh=false\n", "the newer run deploys"),
             (newer, SHA, 0, "fresh=true\n",
-             f"deploy: {SHA} is the frozen commit; it deploys although main is at {newer}"),
-            (newer, newer, 1, "", f"::error::main moved from {SHA} to {newer}"),
+             f"deploy: {SHA} is the frozen commit; it {action} although main is at {newer}"),
+            (newer, newer, 1, refusal, f"::error::main moved from {SHA} to {newer}"),
         ):
             with self.subTest(tip=tip, freeze=freeze), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -148,7 +173,7 @@ class PendingMigrationsTest(unittest.TestCase):
 
 
 class DeployAlertTest(unittest.TestCase):
-    def check(self, *, ci="success", rollback=""):
+    def check(self, *, ci="success", rollback="", refused=""):
         step = extract("- name: Report the failed deploy", ["env", "run"])
         with tempfile.TemporaryDirectory() as tmp:
             stub = Path(tmp, "curl")
@@ -164,7 +189,7 @@ class DeployAlertTest(unittest.TestCase):
                 ALERTS_INGEST_URL="https://example.invalid", ALERTS_INGEST_TOKEN="test",
                 GITHUB_SHA=SHA, CI_RESULT=ci, BUILD_RESULT="skipped" if ci == "failure" else "success",
                 DEPLOY_RESULT="skipped" if ci == "failure" else "failure", ROLLBACK=rollback,
-                RUN_URL="https://example.invalid/run",
+                REFUSED=refused, RUN_URL="https://example.invalid/run",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("deploy alert sent", result.stdout)
@@ -172,8 +197,20 @@ class DeployAlertTest(unittest.TestCase):
 
     def test_failed_checks(self):
         body = self.check(ci="failure")
-        self.assertEqual(body["key"], "deploy-failed")
+        self.assertEqual(body["key"], "ci-failed")
+        self.assertEqual(body["title"], "Checks failed on main")
         self.assertIn("The checks failed on main, so nothing was deployed.", body["detail"])
+
+    def test_deploy_refusals(self):
+        for refused, detail in (
+            ("freeze", "The deploy was refused by the deploy freeze; nothing was deployed."),
+            ("switches", 'The deploy switches refused this commit (see the "Check the deploy switches" '
+                         'step); nothing was deployed.'),
+        ):
+            with self.subTest(refused=refused):
+                body = self.check(refused=refused)
+                self.assertIn(detail, body["detail"])
+                self.assertNotIn("rolls back", body["detail"])
 
     def test_rollback_refusals(self):
         for rollback in ("refused", "refused-floor", "refused-floor-unknown", "manual-check"):
@@ -203,11 +240,11 @@ class DeploySwitchesTest(unittest.TestCase):
             )
             return result, output.read_text() if output.exists() else None
 
-    def refused(self, message, **options):
+    def refused(self, message, *, output_expected="refused=switches\n", **options):
         result, output = self.check(**options)
         self.assertEqual(result.returncode, 1)
         self.assertIn(message, result.stdout + result.stderr)
-        self.assertIsNone(output)
+        self.assertEqual(output, output_expected)
 
     def test_freeze_unset_empty_or_equal(self):
         for options, message in (
@@ -254,7 +291,7 @@ class DeploySwitchesTest(unittest.TestCase):
         self.refused("VELMORA_FLOOR_VERSION must be unset or a lowercase version id (UUID)",
                      VELMORA_FLOOR_VERSION="bad")
         self.refused("VELMORA_CATALOGUE_MIGRATIONS must be unset, on or off",
-                     VELMORA_CATALOGUE_MIGRATIONS="OFF")
+                     VELMORA_CATALOGUE_MIGRATIONS="OFF", output_expected=None)
 
 
 class BuildFloorTest(unittest.TestCase):
