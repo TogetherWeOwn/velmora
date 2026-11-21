@@ -371,10 +371,17 @@ dead_letter_queue = "velmora-dlq"
 # the read rate is about 1 MiB/s for every job that runs: measured about
 # 9 MiB/s with two queues of eight, about 14 MiB/s with four queues of
 # six, where the reading provider's slots became the limit.
+# Under VERIFY_MODE=light a job asks for the extent's articles together
+# and charges 2 MiB to the job budget, with about 45 ms of CPU and 6 to
+# 7 s of wall time per invocation. Four queues of six then ran all 24
+# consumers all the time and verified about 19 MiB/s, below the 30 MiB/s
+# posted, while the reading provider used 13 to 18 of its 19 background
+# holders. Eight per queue is the step that provider's holders allow:
+# past about 30 consumers its jobs are put off instead of running.
 [[queues.consumers]]
 queue = "velmora-verify"
 max_batch_size = 1
-max_concurrency = 6
+max_concurrency = 8
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"
@@ -382,7 +389,7 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify2"
 max_batch_size = 1
-max_concurrency = 6
+max_concurrency = 8
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"
@@ -390,7 +397,7 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify3"
 max_batch_size = 1
-max_concurrency = 6
+max_concurrency = 8
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"
@@ -398,7 +405,7 @@ dead_letter_queue = "velmora-dlq"
 [[queues.consumers]]
 queue = "velmora-verify4"
 max_batch_size = 1
-max_concurrency = 6
+max_concurrency = 8
 max_retries = 20
 retry_delay = 120
 dead_letter_queue = "velmora-dlq"
