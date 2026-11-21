@@ -59,6 +59,7 @@
 //!   breaker ends without tripping it.
 //! - At most `SCRUB_REPAIRS_PER_RUN` re-pins per run.
 
+use futures_util::future::{select, Either};
 use sha2::{Digest, Sha256};
 
 use crate::fetch::ProviderSession;
@@ -157,10 +158,13 @@ impl Found {
     }
 }
 
-/// Why a check stopped the run.
+/// Why a check did not finish.
 enum Halt {
-    /// A provider had no slot, or a read broke off: the extent waits.
+    /// A provider had no slot: the run stops, the extent waits.
     Busy,
+    /// The read broke off: the extent is looked at again later, and the
+    /// run goes on.
+    Deferred,
     /// The catalogue failed, or the lease is gone.
     Stopped,
 }
@@ -181,6 +185,8 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     blocked: Vec<String>,
     /// The `STAT` sessions, kept from one extent to the next.
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
+    /// Providers that refused this run's login: not asked again in it.
+    refused: Vec<String>,
 }
 
 /// The breaker's tally for one run.
@@ -259,7 +265,7 @@ where
         let blocked = state.blocked();
         let mut run = ScrubRun::default();
         let mut breaker = Breaker::default();
-        let mut reader = self.drill_reader(cfg.sockets)?;
+        let mut reader = self.scrub_reader(cfg.sockets)?;
         let mut stats = Vec::new();
         let mut walk = Walk {
             token,
@@ -267,6 +273,7 @@ where
             breaker: &mut breaker,
             blocked,
             stats: &mut stats,
+            refused: Vec::new(),
         };
         let ended = self.scrub_pages(started, &mut reader, &mut walk).await;
         let blocked = core::mem::take(&mut walk.blocked);
@@ -276,16 +283,25 @@ where
         // The backbones under an incident after this run: its own trip
         // adds one; a run that checked enough extents to trip the
         // breaker and did not clears them all.
-        run.blocked = match &run.incident {
+        // (A trip starts the count of clean checks again; once runs
+        // without a trip have checked as many extents as a trip needs,
+        // the incidents clear.)
+        (run.blocked, run.incident_clean) = match &run.incident {
             Some(label) => {
                 let mut kept = blocked;
                 if !kept.contains(label) {
                     kept.push(label.clone());
                 }
-                kept
+                (kept, 0)
             }
-            None if run.checked >= INCIDENT_MIN_EXTENTS => Vec::new(),
-            None => blocked,
+            None if blocked.is_empty() => (blocked, 0),
+            None => {
+                let clean = state.incident_clean + u64::from(run.checked);
+                match clean >= u64::from(INCIDENT_MIN_EXTENTS) {
+                    true => (Vec::new(), 0),
+                    false => (blocked, clean),
+                }
+            }
         };
         let now = self.clock.now();
         // A run that lost its lease adds nothing: the totals are another
@@ -310,6 +326,44 @@ where
         Ok(Some(run))
     }
 
+    /// Runs `f`, which is not a provider call, while the run's sessions
+    /// sit unused: once the first of their slots has only the goodbye and
+    /// the slack left ([`ColdReader::idle_ms`], [`ProviderSession::idle_ms`])
+    /// they are all ended, and `f` goes on. No socket outlives its slot.
+    async fn idle<'s, F: core::future::Future>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        stats: &mut Vec<ProviderSession<'s, C, N, T>>,
+        f: F,
+    ) -> F::Output {
+        let limit = stats
+            .iter()
+            .map(ProviderSession::idle_ms)
+            .chain(reader.idle_ms())
+            .min();
+        let mut f = core::pin::pin!(f);
+        if let (Some(ms), Some(sleep)) = (limit, self.budget.sleeper()) {
+            match select(f.as_mut(), sleep(ms)).await {
+                Either::Left((out, _)) => return out,
+                Either::Right(_) => {
+                    ProviderSession::close_all(core::mem::take(stats)).await;
+                    reader.hang_up().await;
+                }
+            }
+        }
+        f.await
+    }
+
+    /// Ends every session of the run: before a step that holds none of
+    /// them for long (a repair's blob reads and writes).
+    async fn hang_up_all<'s>(
+        reader: &mut ColdReader<'s, C, N, T>,
+        stats: &mut Vec<ProviderSession<'s, C, N, T>>,
+    ) {
+        ProviderSession::close_all(core::mem::take(stats)).await;
+        reader.hang_up().await;
+    }
+
     async fn scrub_pages<'s>(
         &'s self,
         started: UnixMs,
@@ -331,7 +385,8 @@ where
             if now >= deadline {
                 return ScrubEnd::Time;
             }
-            let page = match self.catalog.scrub_due(now, left.min(SCRUB_PAGE)).await {
+            let due = self.catalog.scrub_due(now, left.min(SCRUB_PAGE));
+            let page = match self.idle(reader, walk.stats, due).await {
                 Ok(page) => page,
                 Err(_) => return ScrubEnd::Stopped,
             };
@@ -356,6 +411,8 @@ where
                     Ok(()) => {}
                     Err(Halt::Busy) => return ScrubEnd::Busy,
                     Err(Halt::Stopped) => return ScrubEnd::Stopped,
+                    // Handled where it arises; never reaches here.
+                    Err(Halt::Deferred) => {}
                 }
                 if walk.run.incident.is_some() {
                     return ScrubEnd::Incident;
@@ -364,21 +421,21 @@ where
         }
     }
 
-    async fn scrub_record_one(
-        &self,
-        token: u64,
+    async fn scrub_record_one<'s>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
-        result: ScrubResult,
-        next_in_secs: u64,
+        (result, next_in_secs): (ScrubResult, u64),
     ) -> core::result::Result<(), Halt> {
+        let token = walk.token;
         let now = self.clock.now();
         let next =
             now.plus_ms(i64::try_from(next_in_secs.saturating_mul(1000)).unwrap_or(i64::MAX));
-        match self
+        let write = self
             .catalog
-            .scrub_record(token, &extent.id, result, now, next)
-            .await?
-        {
+            .scrub_record(token, &extent.id, result, now, next);
+        match self.idle(reader, walk.stats, write).await? {
             true => Ok(()),
             // The lease is gone, or the extent left the states the scrub
             // looks at under the check: either way, nothing more here.
@@ -404,23 +461,24 @@ where
             Some(ScrubResult::Repairing | ScrubResult::Stalled | ScrubResult::Unrecoverable)
         );
         let interval = u64::from(cfg.interval_days) * 86_400;
+        let confirm = u64::from(cfg.confirm_secs);
         let plan = match extent.safety_state {
             SafetyState::Released => {
                 // An extent no live object holds (deleted or overwritten,
                 // before garbage collection) is not read, and never
                 // brought back.
-                if !self.catalog.scrub_live(&extent.id).await? {
+                let live = self.catalog.scrub_live(&extent.id);
+                if !self.idle(reader, walk.stats, live).await? {
                     return self
-                        .scrub_record_one(token, extent, ScrubResult::Skipped, interval)
+                        .scrub_record_one(reader, walk, extent, (ScrubResult::Skipped, interval))
                         .await;
                 }
-                self.catalog.articles(&extent.id).await?
+                let plan = self.catalog.articles(&extent.id);
+                self.idle(reader, walk.stats, plan).await?
             }
             SafetyState::Held | SafetyState::Releasing if repinned => {
                 let plan = self.catalog.articles(&extent.id).await?;
-                return self
-                    .watch_repair(token, reader, extent, plan, walk.run)
-                    .await;
+                return self.watch_repair(reader, walk, extent, plan).await;
             }
             // Deleted, or pinned by something else than the scrub: off
             // the due list (it leaves the index with its due time).
@@ -432,35 +490,62 @@ where
         if plan.is_empty() || plan.iter().any(|a| a.state != ArticleState::Posted) {
             // Not on Usenet in full: nothing to read back.
             return self
-                .scrub_record_one(token, extent, ScrubResult::Skipped, interval)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Skipped, interval))
                 .await;
         }
 
-        let found = self.check(reader, walk.stats, extent, plan).await?;
-        let (run, breaker) = (&mut *walk.run, &mut *walk.breaker);
-        run.checked += 1;
-        breaker.note(&found);
-        if found.cipher.is_some() {
-            run.bytes_read += extent.cipher_size;
+        let found = match self.check(reader, walk, extent, plan).await {
+            Ok(found) => found,
+            // The read broke off (a provider went away under it, or one
+            // that may still hold an article is cooling): nothing is
+            // known. Looked at again after the confirm interval; the run
+            // goes on, so one such extent does not hold up the rest.
+            Err(Halt::Deferred) => {
+                let next = self
+                    .clock
+                    .now()
+                    .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
+                self.catalog.scrub_defer(token, &extent.id, next).await?;
+                return Ok(());
+            }
+            Err(halt) => return Err(halt),
+        };
+        {
+            let run = &mut *walk.run;
+            run.checked += 1;
+            walk.breaker.note(&found);
+            if found.cipher.is_some() {
+                run.bytes_read += extent.cipher_size;
+            }
         }
         if !found.loss() {
-            run.ok += 1;
+            walk.run.ok += 1;
             if found.refetched > 0 {
-                run.refetched += found.refetched;
+                walk.run.refetched += found.refetched;
+                // Every backbone says it has every article, yet a provider
+                // served one with other bytes (or broke off on it): a copy
+                // that a re-post under the same id cannot replace.
+                crate::trace::alert(|| {
+                    format!(
+                        "scrub-refetched {} articles={} served whole only by another provider",
+                        extent.id.as_str(),
+                        found.refetched
+                    )
+                });
             }
             return self
-                .scrub_record_one(token, extent, ScrubResult::Ok, interval)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Ok, interval))
                 .await;
         }
 
-        if let Some((backbone, lacking)) = breaker.tripped() {
-            let line = format!("{backbone} {lacking}/{}", breaker.checked);
+        if let Some((backbone, lacking)) = walk.breaker.tripped() {
+            let line = format!("{backbone} {lacking}/{}", walk.breaker.checked);
+            let backbone = backbone.to_owned();
             crate::trace::alert(|| format!("scrub-incident {line}"));
-            run.incident = Some(backbone.to_owned());
-            run.suspect += 1;
-            let confirm = u64::from(cfg.confirm_secs);
+            walk.run.incident = Some(backbone);
+            walk.run.suspect += 1;
             return self
-                .scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
                 .await;
         }
 
@@ -469,51 +554,74 @@ where
             Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
         );
         if !confirmed {
-            run.suspect += 1;
-            let confirm = u64::from(cfg.confirm_secs);
+            walk.run.suspect += 1;
             return self
-                .scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
                 .await;
         }
         // Held back from a re-pin, not from the finding: an extent with
         // no intact copy anywhere is still said to be unrecoverable.
         let may_repin = !found.lacking.iter().any(|l| walk.blocked.contains(l))
-            && run.repaired < cfg.repairs_per_run;
-        self.repair(token, extent, found, run, may_repin).await
+            && walk.run.repaired < cfg.repairs_per_run;
+        self.repair(reader, walk, extent, found, may_repin).await
     }
 
     /// `STAT` on every backbone that counts, then the whole extent read
-    /// with the drill reader.
+    /// with the scrub's reader.
     async fn check<'s>(
         &'s self,
         reader: &mut ColdReader<'s, C, N, T>,
-        stats: &mut Vec<ProviderSession<'s, C, N, T>>,
+        walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
         plan: Vec<ArticleRow>,
     ) -> core::result::Result<Found, Halt> {
-        let mut lacking = Vec::new();
-        for (name, providers) in release_backbones(&self.cfg.providers) {
-            match self
-                .presence(reader.holder(), stats, &plan, &providers)
-                .await?
-            {
-                Presence::Lacks(missing) if missing.is_empty() => {}
-                Presence::Lacks(_) => lacking.push(name),
-                Presence::Unknown => return Err(Halt::Busy),
+        // The reader's sessions wait while the backbones are asked.
+        let holder = reader.holder().to_owned();
+        let lacking = {
+            let asked = self.presence_all(&holder, walk.stats, &mut walk.refused, &plan);
+            let mut asked = core::pin::pin!(asked);
+            let limit = reader.idle_ms();
+            match (limit, self.budget.sleeper()) {
+                (Some(ms), Some(sleep)) => match select(asked.as_mut(), sleep(ms)).await {
+                    Either::Left((out, _)) => out,
+                    Either::Right(_) => {
+                        reader.hang_up().await;
+                        asked.await
+                    }
+                },
+                _ => asked.await,
             }
-        }
+        }?;
 
         let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
         let Ok(charge) = self.budget.charge_job(bytes).await else {
             return Err(Halt::Busy);
         };
         let before = reader.stats();
-        let read = reader.fetch_planned(extent, plan).await;
+        // The `STAT` sessions wait while the extent is read.
+        let read = {
+            let limit = walk.stats.iter().map(ProviderSession::idle_ms).min();
+            let fetch = reader.fetch_planned(extent, plan);
+            let mut fetch = core::pin::pin!(fetch);
+            match (limit, self.budget.sleeper()) {
+                (Some(ms), Some(sleep)) => match select(fetch.as_mut(), sleep(ms)).await {
+                    Either::Left((out, _)) => out,
+                    Either::Right(_) => {
+                        ProviderSession::close_all(core::mem::take(walk.stats)).await;
+                        fetch.await
+                    }
+                },
+                _ => fetch.await,
+            }
+        };
         let after = reader.stats();
         let cipher = match read? {
             ColdFetch::Filled(cipher) => Some(cipher),
             ColdFetch::Unavailable => None,
-            ColdFetch::Busy | ColdFetch::Interrupted => return Err(Halt::Busy),
+            // No provider that may hold a missing article has a free
+            // slot: the run waits for the next one.
+            ColdFetch::Busy => return Err(Halt::Busy),
+            ColdFetch::Interrupted => return Err(Halt::Deferred),
         };
         Ok(Found {
             lacking,
@@ -524,15 +632,40 @@ where
         })
     }
 
+    /// The labels of the backbones that count and lack articles of
+    /// `plan`. `Busy`: a backbone could not be asked.
+    async fn presence_all<'s>(
+        &'s self,
+        holder: &str,
+        stats: &mut Vec<ProviderSession<'s, C, N, T>>,
+        refused: &mut Vec<String>,
+        plan: &[ArticleRow],
+    ) -> core::result::Result<Vec<String>, Halt> {
+        let mut lacking = Vec::new();
+        for (name, providers) in release_backbones(&self.cfg.providers) {
+            match self
+                .presence(holder, stats, refused, plan, &providers)
+                .await?
+            {
+                Presence::Lacks(missing) if missing.is_empty() => {}
+                Presence::Lacks(_) => lacking.push(name),
+                Presence::Unknown => return Err(Halt::Busy),
+            }
+        }
+        Ok(lacking)
+    }
+
     /// What one backbone holds of `plan`, asked with `STAT` of one of its
     /// `providers`, all articles at once. The session is kept in
     /// `stats` for the next extent of the run: one login per backbone
     /// and run, not per extent. A kept session whose slot was lost is
-    /// ended and one is opened anew.
+    /// ended and one is opened anew; a kept session on a provider the
+    /// backbone no longer asks first is ended.
     async fn presence<'s>(
         &'s self,
         holder: &str,
         stats: &mut Vec<ProviderSession<'s, C, N, T>>,
+        refused: &mut Vec<String>,
         plan: &[ArticleRow],
         providers: &[&'s ProviderConfig],
     ) -> core::result::Result<Presence, Halt> {
@@ -542,16 +675,30 @@ where
         // As verify asks: the providers that still retain the oldest
         // article first; the others only when none does. A provider past
         // its retention answers 430 for what it no longer keeps, which
-        // is no loss of the backbone.
+        // is no loss of the backbone. One that refused this run's login
+        // is not asked again in it.
         let oldest = plan.iter().filter_map(|a| a.posted_at).min();
-        let (mut fresh, expired): (Vec<_>, Vec<_>) = providers
+        let askable: Vec<&ProviderConfig> = providers
             .iter()
             .copied()
-            .partition(|p| p.retains(oldest, now));
+            .filter(|p| !refused.contains(&p.id))
+            .collect();
+        let (mut fresh, expired): (Vec<_>, Vec<_>) =
+            askable.into_iter().partition(|p| p.retains(oldest, now));
         if fresh.is_empty() {
             fresh = expired;
         }
-        for provider in pool.order(fresh, PermitClass::Background) {
+        let order = pool.order(fresh, PermitClass::Background);
+        // Sessions of this backbone on a provider other than the one to
+        // ask first are ended: one session per backbone at most.
+        let first = order.first().map(|p| p.id.clone());
+        let (stale, keep): (Vec<_>, Vec<_>) = core::mem::take(stats).into_iter().partition(|s| {
+            providers.iter().any(|p| p.id == s.provider.id)
+                && first.as_deref() != Some(s.provider.id.as_str())
+        });
+        *stats = keep;
+        ProviderSession::close_all(stale).await;
+        for provider in order {
             let kept = stats.iter().position(|s| s.provider.id == provider.id);
             let mut tries = 0;
             loop {
@@ -579,10 +726,11 @@ where
                         session.close().await;
                         continue;
                     }
-                    // The account was refused: the next provider of the
-                    // backbone is asked.
+                    // The account was refused: not asked again in this
+                    // run; the next provider of the backbone is asked.
                     Err(Stop::Refused) => {
                         session.close().await;
+                        refused.push(provider.id.clone());
                         break;
                     }
                     Err(Stop::Catalog) => {
@@ -631,26 +779,41 @@ where
         Ok(None)
     }
 
+    /// Whether some enabled provider posts to the backbone `name`: only
+    /// such a provider can be sent an article that backbone lacks.
+    fn posts_to(&self, name: &str) -> bool {
+        self.cfg
+            .providers
+            .iter()
+            .any(|p| p.post && p.enabled && crate::verify::label(&p.backbone) == name)
+    }
+
     /// A confirmed loss: the bytes from the first source that has them
     /// intact, back in the safety store, and the extent re-pinned.
-    async fn repair(
-        &self,
-        token: u64,
+    async fn repair<'s>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
         found: Found,
-        run: &mut ScrubRun,
         may_repin: bool,
     ) -> core::result::Result<(), Halt> {
         let cfg = &self.cfg.scrub;
+        let token = walk.token;
         let confirm = u64::from(cfg.confirm_secs);
+        let interval = u64::from(cfg.interval_days) * 86_400;
         let lacking = found.lacking.join(",");
+        // Blob reads and writes and catalogue writes follow: no session
+        // is to sit open through them.
+        Self::hang_up_all(reader, walk.stats).await;
+        let read = found.cipher.is_some();
         let (source, cipher) = match found.cipher {
             Some(cipher) if found.rebuilt > 0 => (RepairSource::Parity, Some(cipher)),
             Some(cipher) => (RepairSource::Usenet, Some(cipher)),
             None => self.stored_copy(extent).await,
         };
         let Some(cipher) = cipher else {
-            run.unrecoverable += 1;
+            walk.run.unrecoverable += 1;
             crate::trace::alert(|| {
                 format!(
                     "scrub-unrecoverable {} lacking=[{lacking}] no intact copy on Usenet, \
@@ -659,33 +822,70 @@ where
                 )
             });
             return self
-                .scrub_record_one(token, extent, ScrubResult::Unrecoverable, confirm)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Unrecoverable, confirm))
                 .await;
         };
+        // A re-pin helps only if verify can post what a backbone lacks,
+        // or if the copy has to stay pinned because too few backbones
+        // that count hold the extent without it.
+        let counting = crate::verify::release_labels(&self.cfg.providers);
+        let holding = counting
+            .iter()
+            .filter(|b| !found.lacking.contains(b))
+            .count();
+        let needed = read && holding < self.cfg.required_backbones as usize || !read;
+        let postable = found.lacking.iter().any(|l| self.posts_to(l));
+        if !postable && !needed {
+            walk.run.stalled += 1;
+            crate::trace::alert(|| {
+                format!(
+                    "scrub-unpostable {} lacking=[{lacking}]: no provider posts to it, and \
+                     enough backbones hold the extent without it",
+                    extent.id.as_str()
+                )
+            });
+            return self
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Stalled, interval))
+                .await;
+        }
         if !may_repin {
             // Under an incident on a backbone it lacks, or past the run's
             // re-pins: looked at again later.
-            run.suspect += 1;
+            walk.run.suspect += 1;
             return self
-                .scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
                 .await;
         }
-        if source != RepairSource::Safety && !self.put_safety(extent, cipher).await {
+        if source != RepairSource::Safety && !self.put_safety(extent, cipher.clone()).await {
             // The store did not take it: try again at the next look.
-            run.suspect += 1;
+            walk.run.suspect += 1;
             return self
-                .scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
                 .await;
         }
         let now = self.clock.now();
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
         let next = now.plus_ms(i64::try_from(bound * 1000).unwrap_or(i64::MAX));
+        // No provider served the bytes: every backbone that counts gets a
+        // failed full read, so verify reads each in full and none counts
+        // toward the release before it has passed one, whatever `STAT`
+        // says (it says "present" for a body no provider serves).
+        let unread: Vec<String> = match read {
+            true => Vec::new(),
+            false => counting,
+        };
         if self
             .catalog
-            .scrub_repin(token, &extent.id, now, next)
+            .scrub_repin(token, &extent.id, (now, next), &unread)
             .await?
         {
-            run.repaired += 1;
+            // An eviction that began before the re-pin may have deleted
+            // the copy since: it is put back while the bytes are here.
+            let key = extent.id.safety_key();
+            if !matches!(self.safety.head(&key).await, Ok(Some(_))) {
+                let _ = self.put_safety(extent, cipher).await;
+            }
+            walk.run.repaired += 1;
             crate::trace::alert(|| {
                 format!(
                     "scrub-repair {} source={} lacking=[{lacking}]",
@@ -696,10 +896,9 @@ where
             return Ok(());
         }
         // Refused: the extent is no longer released and done, or no live
-        // object holds it, or the lease is gone. Looked at again later;
-        // the safety copy written stays an evictable copy.
-        run.suspect += 1;
-        self.scrub_record_one(token, extent, ScrubResult::Suspect, confirm)
+        // object holds it, or the lease is gone. Looked at again later.
+        walk.run.suspect += 1;
+        self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
             .await
     }
 
@@ -737,16 +936,17 @@ where
     /// A re-pinned extent at its repair bound, still pinned: the repair
     /// has stalled. Its safety copy is made sure of, from Usenet or the
     /// cache if it is gone.
-    async fn watch_repair(
-        &self,
-        token: u64,
-        reader: &mut ColdReader<'_, C, N, T>,
+    async fn watch_repair<'s>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
         plan: Vec<ArticleRow>,
-        run: &mut ScrubRun,
     ) -> core::result::Result<(), Halt> {
         let cfg = &self.cfg.scrub;
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
+        // Blob reads come first: no session sits open through them.
+        Self::hang_up_all(reader, walk.stats).await;
         // One charge for all this holds at once: the safety copy read
         // back, or a read from Usenet and the copy written from it.
         let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
@@ -762,21 +962,30 @@ where
             let read = reader.fetch_planned(extent, plan).await;
             let cipher = match read? {
                 ColdFetch::Filled(cipher) => {
-                    run.bytes_read += extent.cipher_size;
+                    walk.run.bytes_read += extent.cipher_size;
                     Some(cipher)
                 }
                 ColdFetch::Unavailable => {
+                    reader.hang_up().await;
                     match self.cache.get(&extent.id.cache_key(), None).await {
                         Ok(Some(bytes)) if digest_ok(extent, &bytes) => Some(bytes),
                         _ => None,
                     }
                 }
-                ColdFetch::Busy | ColdFetch::Interrupted => return Err(Halt::Busy),
+                ColdFetch::Busy => return Err(Halt::Busy),
+                ColdFetch::Interrupted => {
+                    let next = self.clock.now().plus_ms(i64::from(cfg.confirm_secs) * 1000);
+                    self.catalog
+                        .scrub_defer(walk.token, &extent.id, next)
+                        .await?;
+                    return Ok(());
+                }
             };
+            reader.hang_up().await;
             match cipher {
                 Some(cipher) => rewrote = self.put_safety(extent, cipher).await,
                 None => {
-                    run.unrecoverable += 1;
+                    walk.run.unrecoverable += 1;
                     crate::trace::alert(|| {
                         format!(
                             "scrub-unrecoverable {} re-pinned, its safety copy is gone and no \
@@ -786,12 +995,17 @@ where
                     });
                     let confirm = u64::from(cfg.confirm_secs);
                     return self
-                        .scrub_record_one(token, extent, ScrubResult::Unrecoverable, confirm)
+                        .scrub_record_one(
+                            reader,
+                            walk,
+                            extent,
+                            (ScrubResult::Unrecoverable, confirm),
+                        )
                         .await;
                 }
             }
         }
-        run.stalled += 1;
+        walk.run.stalled += 1;
         crate::trace::alert(|| {
             format!(
                 "scrub-stalled {} still pinned at its repair bound; safety copy {}",
@@ -803,7 +1017,7 @@ where
                 }
             )
         });
-        self.scrub_record_one(token, extent, ScrubResult::Stalled, bound)
+        self.scrub_record_one(reader, walk, extent, (ScrubResult::Stalled, bound))
             .await
     }
 }

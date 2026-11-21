@@ -1498,13 +1498,21 @@ pub trait Catalog {
     /// `repairing`, due again at `next_at`. Only if the run of `token`
     /// holds the lease, the extent is released, its posting is done and
     /// a live generation references it; `false`: nothing was written.
+    ///
+    /// `unread`: the backbones that get a failed full read of the current
+    /// plan in the same batch (no provider served the extent's bytes), so
+    /// verify reads them in full and no release counts them before that.
     async fn scrub_repin(
         &self,
         _token: u64,
         _extent: &ExtentId,
-        _now: UnixMs,
-        _next_at: UnixMs,
+        _at: (UnixMs, UnixMs),
+        _unread: &[String],
     ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Moves an extent's due time only: a check that could not finish.
+    async fn scrub_defer(&self, _token: u64, _extent: &ExtentId, _next_at: UnixMs) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
     /// Adds a run's totals and frees the lease, if the run of `token`
@@ -1528,6 +1536,13 @@ pub trait Catalog {
     /// Ends an eviction after the blob deletes. `false` when a hot copy
     /// was recorded since `begin_evict`; the counts then stand.
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Asked right before the safety copy of a started eviction is
+    /// deleted: `false` once the extent is pinned again or its sequence
+    /// moved since `begin_evict` (a re-pin). The default keeps the old
+    /// behaviour of a catalogue that cannot tell.
+    async fn evict_safety_still_ok(&self, _x: &EvictCandidate) -> Result<bool> {
+        Ok(true)
+    }
     /// Counts the extent's cache fill and stamps the read. Called before
     /// and after the cache write.
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;

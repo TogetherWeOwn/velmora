@@ -634,7 +634,10 @@ where
         // Both keys go whatever the counts say, so a copy the catalogue
         // did not count goes too. The one exception is the safety copy of
         // a pinned extent, which is not part of the claim.
-        if !row.pinned {
+        // The safety copy only if nothing pinned the extent again since
+        // the begin: the scrub re-pins a released extent and puts its
+        // copy back.
+        if !row.pinned && self.catalog.evict_safety_still_ok(row).await? {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;
         }
         delete_blob(&self.cache, &row.extent.cache_key()).await?;

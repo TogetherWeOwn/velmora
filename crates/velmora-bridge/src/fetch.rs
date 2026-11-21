@@ -357,6 +357,24 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
     }
 
     /// The slot this session holds.
+    /// How long the session may still sit unused, in milliseconds: until
+    /// its slot, last renewed at `held_from`, has only the goodbye and the
+    /// slack left. A caller that waits for anything else ends it then.
+    pub(crate) fn idle_ms(&self) -> u32 {
+        let life = i64::from(
+            self.permit
+                .class
+                .permit_secs()
+                .saturating_sub(QUIT_SECS + READ_SLACK_SECS),
+        ) * 1000;
+        let left = self
+            .held_from
+            .0
+            .saturating_add(life)
+            .saturating_sub(self.clock.now().0);
+        u32::try_from(left.clamp(0, life)).unwrap_or(0)
+    }
+
     pub(crate) fn permit(&self) -> &Permit {
         &self.permit
     }
@@ -1134,6 +1152,10 @@ pub(crate) struct ColdReader<'a, C: Catalog, N: NntpConnector, T: Clock> {
     /// on the account's record, and a cooldown begins only after
     /// several. Always empty for a read.
     shunned: Vec<String>,
+    /// The reader of a background job (the scrub): where a drill would
+    /// take a read slot (a provider without drill connections), it takes
+    /// a background one, which leaves the reads their reserve.
+    background: bool,
 }
 
 /// The tier a reader asks `p` in, lowest first. A read: its `priority`.
@@ -1422,12 +1444,16 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             }
             let began = self.clock.now();
             let opened = join_all(asked.iter().map(|&i| {
+                let class = match (self.background, class_of(drill, order[i])) {
+                    (true, PermitClass::Read) => PermitClass::Background,
+                    (_, class) => class,
+                };
                 ProviderSession::open(
                     self.catalog,
                     self.nntp,
                     self.clock,
                     order[i],
-                    class_of(drill, order[i]),
+                    class,
                     &self.holder,
                 )
             }))
@@ -1964,6 +1990,7 @@ where
             stats: Default::default(),
             drill: false,
             shunned: Vec::new(),
+            background: false,
         })
     }
 
@@ -1994,6 +2021,18 @@ where
             holder: request_holder("drill")?,
             drill: true,
             ..self.cold_reader()?
+        })
+    }
+
+    /// The reader of a scrub run ([`crate::scrub`]): a drill reader of
+    /// `sockets` connections that, where a drill would take a read slot,
+    /// takes a background one, so a job never holds the slot a request's
+    /// cold read is kept.
+    pub(crate) fn scrub_reader(&self, sockets: u32) -> Result<ColdReader<'_, C, N, T>> {
+        Ok(ColdReader {
+            holder: request_holder("scrub")?,
+            background: true,
+            ..self.drill_reader(sockets)?
         })
     }
 

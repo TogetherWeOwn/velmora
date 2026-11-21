@@ -66,7 +66,7 @@ pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
         .query(
             "SELECT lease_token, lease_until, runs, checked, ok, suspect, repaired, unrecoverable, stalled, \
                incidents, bytes_read, last_run_at, last_unrecoverable_at, last_incident_at, \
-               last_incident FROM scrub_state WHERE id = 1",
+               last_incident, incident_clean FROM scrub_state WHERE id = 1",
             &[],
         )
         .await?;
@@ -90,7 +90,20 @@ pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
         last_unrecoverable_at: r.opt_ms()?,
         last_incident_at: r.opt_ms()?,
         last_incident: r.opt_text()?,
+        incident_clean: r.num()?,
     })
+}
+
+/// The due query, as it runs.
+pub(crate) fn due_sql() -> String {
+    format!(
+        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at FROM extents \
+          INDEXED BY extents_scrub_due \
+          WHERE {scrubbed} AND {key} <= ?1 \
+          ORDER BY {key} LIMIT ?2",
+        scrubbed = scrubbed!(),
+        key = due_key!(),
+    )
 }
 
 pub(super) async fn due<S: Sql>(
@@ -98,14 +111,7 @@ pub(super) async fn due<S: Sql>(
     now: UnixMs,
     limit: u32,
 ) -> Result<Vec<ScrubCandidate>> {
-    let sql = format!(
-        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at FROM extents \
-          INDEXED BY extents_scrub_due \
-          WHERE {scrubbed} AND {key} <= ?1 \
-          ORDER BY {key} LIMIT ?2",
-        scrubbed = scrubbed!(),
-        key = due_key!(),
-    );
+    let sql = due_sql();
     let rows = c
         .sql
         .query(&sql, &[ms(now), SqlValue::Int(i64::from(limit))])
@@ -190,12 +196,29 @@ pub(super) async fn drop_due<S: Sql>(
     Ok(changed == 1)
 }
 
+pub(super) async fn defer<S: Sql>(
+    c: &SqlCatalog<S>,
+    token: u64,
+    extent: &ExtentId,
+    next_at: UnixMs,
+) -> Result<bool> {
+    let sql = concat!(
+        "UPDATE extents SET scrub_next_at = ?3 WHERE id = ?1 AND ",
+        run_holds!()
+    );
+    let changed = c
+        .sql
+        .exec(sql, &[text(extent.as_str()), uint(token)?, ms(next_at)])
+        .await?;
+    Ok(changed == 1)
+}
+
 pub(super) async fn repin<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
     extent: &ExtentId,
-    now: UnixMs,
-    next_at: UnixMs,
+    (now, next_at): (UnixMs, UnixMs),
+    unread: &[String],
 ) -> Result<bool> {
     // Fires unless this run holds the lease, the extent is released, its
     // posting is done, and a live generation references it: an extent of
@@ -208,7 +231,7 @@ pub(super) async fn repin<S: Sql>(
           OR NOT ",
         live_ref!("?1")
     );
-    let stmts: Vec<Stmt> = vec![
+    let mut stmts: Vec<Stmt> = vec![
         (guard, vec![text(extent.as_str()), uint(token)?]),
         // Pinned again: no eviction listing from before can begin on it
         // (`evict_seq`), and the copy it holds is counted.
@@ -231,6 +254,22 @@ pub(super) async fn repin<S: Sql>(
             vec![text(extent.as_str()), ms(now)],
         ),
     ];
+    if !unread.is_empty() {
+        // No provider served the bytes: a failed full read of the current
+        // plan on each of these backbones, so verify reads them in full
+        // and no release counts them until that read passes (whatever
+        // `STAT` says, under either VERIFY_MODE).
+        let labels =
+            serde_json::to_string(unread).map_err(|_| BridgeError::Invalid("backbone labels"))?;
+        stmts.push((
+            "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, plan_rev, \
+               articles_ok, articles_present, articles_total, result, kind) \
+             SELECT e.id, j.value, 'scrub', ?3, e.plan_rev, 0, 0, COALESCE(e.article_count, 0), \
+               'missing', 'body' FROM extents e, json_each(?2) j WHERE e.id = ?1 \
+             ON CONFLICT(extent_id, backbone, verified_at) DO NOTHING",
+            vec![text(extent.as_str()), text(&labels), ms(now)],
+        ));
+    }
     Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
 
@@ -255,7 +294,7 @@ pub(super) async fn end<S: Sql>(
                bytes_read = bytes_read + ?10, last_run_at = ?1, \
                last_unrecoverable_at = CASE WHEN ?7 > 0 THEN ?1 ELSE last_unrecoverable_at END, \
                last_incident_at = CASE WHEN ?11 IS NOT NULL THEN ?1 ELSE last_incident_at END, \
-               last_incident = ?12 \
+               last_incident = ?12, incident_clean = ?13 \
              WHERE id = 1 AND lease_token = ?2",
             &[
                 ms(now),
@@ -276,6 +315,7 @@ pub(super) async fn end<S: Sql>(
                             .map_err(|_| BridgeError::Invalid("backbone labels"))?,
                     ),
                 },
+                uint(run.incident_clean)?,
             ],
         )
         .await?;
