@@ -173,7 +173,8 @@ pub trait GateSteps {
     async fn finisher(&self) -> Result<StepReport>;
     /// Step 8: a new epoch of the event feed; the shred brake and the
     /// delete caps restart as used up for the current window, the other
-    /// counters at zero.
+    /// counters at zero. It refuses an epoch below the newest it has
+    /// started: a run that was closed over may reach it late.
     async fn counters(&self, epoch: u64) -> Result<StepReport>;
     /// Step 9: the sealed-usage-day index from `m/u/`; the pressure flag
     /// treated as set until its job has run.
@@ -221,6 +222,11 @@ pub struct GateRun {
     pub steps: Vec<(&'static str, StepReport)>,
     /// Whether this run opened the gate.
     pub opened: bool,
+    /// A newer run closed the gate over this one, which stopped.
+    pub closed_over: bool,
+    /// Names under the anchor prefix that are no anchor. Each alarms: one
+    /// after the open epoch keeps the gate closed until it is removed.
+    pub anchor_strays: u64,
 }
 
 /// The prefix of the gate anchors in R2: `m/dg/<epoch>`, put once each.
@@ -543,38 +549,49 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     now: UnixMs,
 ) -> Result<GateRun> {
     let epoch = close(chain.store, dir, reason, now).await?;
-    let mut reports: Vec<(&'static str, StepReport)> = Vec::new();
-    reports.push(("revocations", steps.revocations().await?));
-    let tenants = rebuild_tenants(chain, dir, now).await?;
-    reports.push((
-        "key_locations_and_registry",
-        steps.key_locations_and_registry().await?,
-    ));
-    reports.push(("key_versions", steps.key_versions().await?));
-    reports.push((
-        "key_routes_and_labels",
-        steps.key_routes_and_labels().await?,
-    ));
-    reports.push(("root_units", steps.root_units().await?));
-    dir.clear_all_pending().await?;
-    reports.push(("finisher", steps.finisher().await?));
-    // A newer run closed the gate over this one: it does the rest.
-    if anchored_epoch(chain.store).await?.0 != epoch {
-        return Ok(GateRun {
-            epoch,
-            tenants,
-            steps: reports,
-            opened: false,
-        });
+    let mut run = GateRun {
+        epoch,
+        tenants: TenantStep::default(),
+        steps: Vec::new(),
+        opened: false,
+        closed_over: false,
+        anchor_strays: 0,
+    };
+    // Before every step: a newer run that closed the gate over this one
+    // does the rest, and this one writes nothing more.
+    macro_rules! step {
+        ($name:expr, $call:expr) => {{
+            if !ours(chain.store, epoch).await? {
+                run.closed_over = true;
+                return Ok(run);
+            }
+            run.steps.push(($name, $call.await?));
+        }};
     }
-    reports.push(("counters", steps.counters(epoch).await?));
-    reports.push(("sealed_days", steps.sealed_days().await?));
+    step!("revocations", steps.revocations());
+    if !ours(chain.store, epoch).await? {
+        run.closed_over = true;
+        return Ok(run);
+    }
+    run.tenants = rebuild_tenants(chain, dir, now).await?;
+    step!(
+        "key_locations_and_registry",
+        steps.key_locations_and_registry()
+    );
+    step!("key_versions", steps.key_versions());
+    step!("key_routes_and_labels", steps.key_routes_and_labels());
+    step!("root_units", steps.root_units());
+    // Only while the gate is closed at this run's epoch.
+    dir.clear_pending_in_gate(epoch).await?;
+    step!("finisher", steps.finisher());
+    step!("counters", steps.counters(epoch));
+    step!("sealed_days", steps.sealed_days());
 
     // The rows must equal the heads now, not only at step 2: a closing
     // call may have written meanwhile. Rows that differ get another
     // round of the tenant step.
     let mut clean = false;
-    if !tenants.damaged() {
+    if !run.tenants.damaged() {
         for _ in 0..MAX_TENANT_ROUNDS {
             let left = compare_tenants(chain, dir).await?;
             if left.is_empty() {
@@ -587,15 +604,19 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
             rebuild_tenants(chain, dir, now).await?;
         }
     }
-    let ready = clean && reports.iter().all(|(_, r)| r.done);
-    let opened =
-        ready && anchored_epoch(chain.store).await?.0 == epoch && dir.open_gate(epoch, now).await?;
-    Ok(GateRun {
-        epoch,
-        tenants,
-        steps: reports,
-        opened,
-    })
+    let (anchored, strays) = anchored_epoch(chain.store).await?;
+    run.anchor_strays = strays;
+    run.closed_over = anchored != epoch;
+    let ready = clean && !run.closed_over && run.steps.iter().all(|(_, r)| r.done);
+    // Open, and say so only if the open check agrees: a stray anchor
+    // name keeps the gate closed, and the run reports it.
+    run.opened = ready && dir.open_gate(epoch, now).await? && is_open(chain.store, dir).await?;
+    Ok(run)
+}
+
+/// Whether the newest anchor is still this run's.
+async fn ours<S: RecordStore>(store: &S, epoch: u64) -> Result<bool> {
+    Ok(anchored_epoch(store).await?.0 == epoch)
 }
 
 /// How old the oldest pending operation may get (est): an alarm at 10

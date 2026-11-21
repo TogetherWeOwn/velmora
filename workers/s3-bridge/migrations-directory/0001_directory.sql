@@ -45,8 +45,10 @@ CREATE TABLE units (
   PRIMARY KEY (tenant, unit)
 );
 
--- Access key id to tenant. A route never changes, so it is cached without
--- a time limit; the unit decides the key's status. `kind` is `s3`,
+-- Access key id to tenant. A route does not change (but by the move of
+-- tenant 0's data and its undo, under maintenance and followed by a
+-- deploy), so it is cached without a time limit; the unit decides the
+-- key's status. `kind` is `s3`,
 -- `app_password`, `internal` or `principal`.
 CREATE TABLE key_routes (
   akid        TEXT PRIMARY KEY,
@@ -108,7 +110,8 @@ CREATE TABLE registry (
 -- grows at every closing; the event feed starts a new one with it. Each
 -- closing is anchored first by a put-once object `m/dg/<epoch>` in R2,
 -- and the gate is open only while this row says open at the newest
--- anchored epoch, so a restore of this database cannot open it.
+-- anchored epoch. A restore of this database after a closing therefore
+-- cannot open it; a restore is run only by a tool that closes first.
 -- No row = closed at epoch 0: a directory that no rebuild has filled
 -- serves nothing to the management plane.
 CREATE TABLE directory_gate (

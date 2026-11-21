@@ -1195,8 +1195,111 @@ fn a_run_that_another_closed_over_stops_before_the_counters() {
             .await
             .unwrap();
         assert!(!run.opened);
+        assert!(run.closed_over);
         assert!(!steps.counted.get());
         assert_eq!(dir.gate().await.unwrap().epoch, run.epoch + 1);
         assert!(!is_open(&store, &dir).await.unwrap());
+    });
+}
+
+/// A stray anchor name keeps the gate closed, and the run says so.
+#[test]
+fn a_stray_anchor_keeps_the_run_from_saying_it_opened() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let store = MemRecords::new();
+        let chain = TenantChain {
+            store: &store,
+            seal: &PlainSeal::new(),
+        };
+        store.plant("m/dg/zz", vec![1]);
+        let run = run_gate(&chain, &dir, &AllDone, "rebuild", NOW)
+            .await
+            .unwrap();
+        assert!(!run.opened, "{run:?}");
+        assert_eq!(run.anchor_strays, 1);
+        assert!(!is_open(&store, &dir).await.unwrap());
+        assert!(store.lose("m/dg/zz"));
+        let run = run_gate(&chain, &dir, &AllDone, "rebuild", NOW)
+            .await
+            .unwrap();
+        assert!(run.opened, "{run:?}");
+        assert_eq!(run.anchor_strays, 0);
+    });
+}
+
+/// The pending table is emptied only while the gate is closed at the
+/// run's own epoch.
+#[test]
+fn pending_operations_are_emptied_only_by_the_run_that_holds_the_gate() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let store = MemRecords::new();
+        let op = pending(TenantId::parse(A1).unwrap());
+        dir.add_pending(&op).await.unwrap();
+        let e1 = close(&store, &dir, "first", NOW).await.unwrap();
+        let e2 = close(&store, &dir, "second", NOW).await.unwrap();
+        assert_eq!(dir.clear_pending_in_gate(e1).await.unwrap(), 0);
+        assert!(dir.open_gate(e2, NOW).await.unwrap());
+        assert_eq!(dir.clear_pending_in_gate(e2).await.unwrap(), 0);
+        assert_eq!(dir.pending_before(FAR_FUTURE, 10).await.unwrap().len(), 1);
+        let e3 = close(&store, &dir, "third", NOW).await.unwrap();
+        assert_eq!(dir.clear_pending_in_gate(e3).await.unwrap(), 1);
+    });
+}
+
+/// The move and its undo move a route from one tenant to the other, and
+/// only from the tenant it names.
+#[test]
+fn a_route_moves_only_from_the_tenant_it_names() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let zero = TenantId::zero();
+        let owner = TenantId::parse(A1).unwrap();
+        create_zero(&chain, &zero).await;
+        active(&chain, &owner).await;
+        for t in [&zero, &owner] {
+            dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
+        }
+        let route = KeyRoute {
+            akid: "AKIA3".into(),
+            tenant: zero.clone(),
+            kind: RouteKind::S3,
+            owner_ref: None,
+            created_at: NOW,
+        };
+        assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::Inserted);
+        let other = TenantId::parse(B2).unwrap();
+        assert!(!dir
+            .move_route("AKIA3", &other, &owner, RouteKind::S3)
+            .await
+            .unwrap());
+        assert!(dir
+            .move_route("AKIA3", &zero, &owner, RouteKind::AppPassword)
+            .await
+            .unwrap());
+        let moved = dir.route("AKIA3").await.unwrap().unwrap();
+        assert_eq!(
+            (moved.tenant, moved.kind),
+            (owner.clone(), RouteKind::AppPassword)
+        );
+        // Again from tenant 0: it no longer names it.
+        assert!(!dir
+            .move_route("AKIA3", &zero, &owner, RouteKind::S3)
+            .await
+            .unwrap());
+        // The undo moves it back.
+        assert!(dir
+            .move_route("AKIA3", &owner, &zero, RouteKind::S3)
+            .await
+            .unwrap());
+        assert_eq!(dir.route("AKIA3").await.unwrap().unwrap().tenant, zero);
     });
 }

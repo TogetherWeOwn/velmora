@@ -451,9 +451,11 @@ impl<S: Sql> SqlDirectory<'_, S> {
         Ok(changed > 0)
     }
 
-    /// Stores a route. A route never changes: an existing one to another
+    /// Stores a route. A route does not change: an existing one to another
     /// tenant or of another kind is [`RoutePut::Conflict`], and stays. A
-    /// tenant with no row, or a shredded one, gets no route.
+    /// tenant with no row, or a shredded one, gets no route. The two
+    /// exceptions, the move of tenant 0's data and its undo, go through
+    /// [`SqlDirectory::move_route`].
     pub async fn put_route(&self, route: &KeyRoute) -> Result<RoutePut> {
         let changed = self
             .sql
@@ -478,6 +480,33 @@ impl<S: Sql> SqlDirectory<'_, S> {
             Some(_) => Ok(RoutePut::Conflict),
             None => Ok(RoutePut::NoTenant),
         }
+    }
+
+    /// Moves a route from tenant `from` to tenant `to`, if it names `from`:
+    /// the move of tenant 0's data and its undo, under maintenance. The
+    /// kind may change with it (a WebDAV key becomes an app password).
+    /// `false` = the route did not name `from`, and nothing changed.
+    pub async fn move_route(
+        &self,
+        akid: &str,
+        from: &TenantId,
+        to: &TenantId,
+        kind: RouteKind,
+    ) -> Result<bool> {
+        let changed = self
+            .sql
+            .exec(
+                "UPDATE key_routes SET tenant = ?3, kind = ?4 WHERE akid = ?1 AND tenant = ?2 \
+                 AND EXISTS (SELECT 1 FROM tenants WHERE id = ?3 AND state <> 'shredded')",
+                &[
+                    SqlValue::Text(akid.to_string()),
+                    SqlValue::Text(from.as_str().to_string()),
+                    SqlValue::Text(to.as_str().to_string()),
+                    SqlValue::Text(kind.as_str().to_string()),
+                ],
+            )
+            .await?;
+        Ok(changed > 0)
     }
 
     /// The route of `akid`, `None` = no tenant has such a key.
@@ -581,9 +610,17 @@ impl<S: Sql> SqlDirectory<'_, S> {
         }
     }
 
-    /// Empties the pending table (the gate rebuilds it empty).
-    pub async fn clear_all_pending(&self) -> Result<u64> {
-        self.sql.exec("DELETE FROM pending_ops", &[]).await
+    /// Empties the pending table (the gate rebuilds it empty), only while
+    /// the gate is closed at `epoch`: a run that a newer one closed over,
+    /// or one whose gate opened meanwhile, removes nothing.
+    pub async fn clear_pending_in_gate(&self, epoch: u64) -> Result<u64> {
+        self.sql
+            .exec(
+                "DELETE FROM pending_ops WHERE EXISTS \
+                 (SELECT 1 FROM directory_gate WHERE id = 1 AND closed = 1 AND epoch = ?1)",
+                &[int(epoch)?],
+            )
+            .await
     }
 
     /// The gate row as stored. No row = closed at epoch 0. Whether the
