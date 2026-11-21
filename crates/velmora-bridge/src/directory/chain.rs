@@ -26,6 +26,9 @@
 //! ([`super::transition::next`]), seals the new record and puts it with
 //! put-if-absent at the head's seq + 1. A lost put means another writer
 //! took that seq: it reads the head again and validates the change again.
+//! A change that replaces a whole field (limits, features, units) names
+//! the head it was built from, so on the new head it is refused
+//! (`stale_base`) and its caller builds it again.
 //! After [`MAX_PUT_TRIES`] lost puts it answers [`ChainError::Busy`],
 //! which a caller turns into `503` with `Retry-After`.
 //!

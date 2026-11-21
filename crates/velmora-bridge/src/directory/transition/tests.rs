@@ -1822,6 +1822,45 @@ fn a_bucket_create_names_its_creator_in_its_own_record_only() {
     );
 }
 
+/// The list of dropped ids is bounded: past the cap no bucket is made,
+/// and a bucket can still be dropped.
+#[test]
+fn dropped_bucket_ids_are_capped() {
+    let mut a = active();
+    a.door.placements.push(Placement {
+        bucket: "b_live".into(),
+        unit: 0,
+        epoch: 1,
+    });
+    a.door.max_move_epoch = 1;
+    a.door.dropped_buckets = (0..MAX_DROPPED_BUCKETS).map(|i| format!("d_{i}")).collect();
+    let create = Change::CreateBucket {
+        bucket: "b_new".into(),
+        unit: 0,
+        creator: "p_owner".into(),
+    };
+    assert_eq!(refused(&a, create, Actor::Customer), TOO_MANY_DROPPED);
+    let dropped = apply(
+        &a,
+        Change::DropBucket {
+            bucket: "b_live".into(),
+        },
+        Actor::Customer,
+    );
+    assert_eq!(dropped.door.dropped_buckets.len(), MAX_DROPPED_BUCKETS + 1);
+    let mut below = active();
+    below.door.dropped_buckets = (1..MAX_DROPPED_BUCKETS).map(|i| format!("d_{i}")).collect();
+    apply(
+        &below,
+        Change::CreateBucket {
+            bucket: "b_new".into(),
+            unit: 0,
+            creator: "p_owner".into(),
+        },
+        Actor::Customer,
+    );
+}
+
 #[test]
 fn the_shred_jobs_last_step_can_be_repeated() {
     let a = active();

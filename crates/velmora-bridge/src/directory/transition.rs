@@ -51,6 +51,11 @@ pub const OPERATOR_DELETE_MIN_MS: i64 = 3_600_000 - 60_000;
 pub const KEY_CHECK_LEN: usize = 8;
 
 /// How long tenant 0 stays `moved` before it can be retired: 30 days.
+/// The most dropped bucket ids a tenant's record keeps: past it, no new
+/// bucket is made (`409 too_many_dropped_buckets`), so a create and drop
+/// loop cannot grow every record of the chain without end. About 40 KB
+/// at the longest ids.
+pub const MAX_DROPPED_BUCKETS: usize = 1024;
 pub const RETIRE_AFTER_MS: i64 = 30 * 24 * 3_600_000;
 
 /// Who makes a change.
@@ -270,6 +275,7 @@ const SELECTOR: Refusal = refuse(409, "selector_does_not_allow");
 const NOT_TENANT_ZERO: Refusal = refuse(409, "not_tenant_zero");
 const BUCKET_EXISTS: Refusal = refuse(409, "bucket_exists");
 const STALE_BASE: Refusal = refuse(409, "stale_base");
+const TOO_MANY_DROPPED: Refusal = refuse(409, "too_many_dropped_buckets");
 
 /// Validates `change` against `head` and builds the record that follows.
 /// See the [module](self).
@@ -652,6 +658,9 @@ pub fn next(
                 || h.dropped_buckets.contains(bucket)
             {
                 return Err(BUCKET_EXISTS);
+            }
+            if h.dropped_buckets.len() >= MAX_DROPPED_BUCKETS {
+                return Err(TOO_MANY_DROPPED);
             }
             let epoch = h.max_move_epoch.checked_add(1).ok_or(INVALID)?;
             door.placements.push(Placement {

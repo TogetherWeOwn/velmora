@@ -13,7 +13,8 @@
 //! |---|---|---|
 //! | `d1`, no move | no marker | serve |
 //! | `d1`, no move | the next move's marker | reads only: the window is opening or was given up, and nothing writes |
-//! | `moving` | its id is the frozen one | reads only |
+//! | `moving` | its id is the frozen one, with this window's marker | reads only |
+//! | `moving` | its id is the frozen one, no marker or another move's | `503`, paged: a database left behind |
 //! | `moving` | another id | `503`, paged |
 //! | `moved` | any | [`ZeroServe::Moved`]: drop cached tenant-0 routes and resolve the key again |
 //! | `d1`, a move with no undo above its stamp | any | `503`, paged: a database left behind |
