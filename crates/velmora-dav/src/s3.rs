@@ -146,6 +146,7 @@ pub async fn error_of<U: Upstream>(up: &U, resp: Response<U::Body>) -> S3Error {
     let bytes = match resp.body {
         Body::Native(mut b) => up.read(&mut b, 64 * 1024).await.unwrap_or_default(),
         Body::Bytes(b) => b,
+        Body::Shared(b) => b.to_vec(),
         Body::Empty => Vec::new(),
     };
     let code = xml::parse(&bytes)
@@ -164,6 +165,7 @@ pub async fn read_all<U: Upstream>(
     match body {
         Body::Empty => Ok(Vec::new()),
         Body::Bytes(b) => Ok(b),
+        Body::Shared(b) => Ok(b.to_vec()),
         Body::Native(mut b) => {
             let mut out = Vec::new();
             loop {
@@ -588,7 +590,7 @@ impl<'a, U: Upstream> S3<'a, U> {
         key: &str,
         upload_id: &str,
         number: u32,
-        bytes: Vec<u8>,
+        bytes: std::rc::Rc<Vec<u8>>,
     ) -> Result<String, S3Error> {
         let n = number.to_string();
         let len = bytes.len() as u64;
@@ -598,7 +600,7 @@ impl<'a, U: Upstream> S3<'a, U> {
                 &format!("/{bucket}/{key}"),
                 &[("partNumber", &n), ("uploadId", upload_id)],
                 Vec::new(),
-                Body::Bytes(bytes),
+                Body::Shared(bytes),
                 Some(len),
             )
             .await?;

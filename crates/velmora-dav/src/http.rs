@@ -5,10 +5,12 @@
 //! download or an upload, stays a `B` from end to end and is never read
 //! by the gateway.
 
-/// A body: nothing, bytes the gateway made, or a body of the runtime.
+/// A body: nothing, bytes the gateway made, bytes it keeps (a part that
+/// may be sent again), or a body of the runtime.
 pub enum Body<B> {
     Empty,
     Bytes(Vec<u8>),
+    Shared(std::rc::Rc<Vec<u8>>),
     Native(B),
 }
 
@@ -17,6 +19,7 @@ impl<B> Body<B> {
         match self {
             Body::Empty => true,
             Body::Bytes(b) => b.is_empty(),
+            Body::Shared(b) => b.is_empty(),
             Body::Native(_) => false,
         }
     }

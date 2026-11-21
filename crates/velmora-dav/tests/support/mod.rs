@@ -57,6 +57,8 @@ pub struct Up {
     /// Requests sent with no entry marker (as the default entrypoint
     /// would): an app password must then be refused.
     pub unmarked: Cell<bool>,
+    /// The most part slots held while any request was sent.
+    pub most_slots: Cell<usize>,
 }
 
 impl Upstream for Up {
@@ -73,12 +75,17 @@ impl Upstream for Up {
         self.sent
             .borrow_mut()
             .push((method.to_owned(), target.to_owned()));
+        let held = velmora_dav::slots::Slot::held();
+        if held > self.most_slots.get() {
+            self.most_slots.set(held);
+        }
         if !self.unmarked.get() {
             headers.push((ENTRY_HEADER.to_owned(), WEBDAV.to_owned()));
         }
         let bytes = match body {
             Body::Empty => Vec::new(),
             Body::Bytes(b) => b,
+            Body::Shared(b) => b.to_vec(),
             Body::Native(b) => b.bytes[b.pos..].to_vec(),
         };
         let body = if bytes.is_empty() && len.is_none() {
@@ -305,6 +312,7 @@ impl World {
                     uuids: Cell::new(0),
                     sent: RefCell::new(Vec::new()),
                     unmarked: Cell::new(false),
+                    most_slots: Cell::new(0),
                 },
                 state: states,
                 cfg,
@@ -372,6 +380,7 @@ impl World {
         let body = match resp.body {
             Body::Empty => Vec::new(),
             Body::Bytes(b) => b,
+            Body::Shared(b) => b.to_vec(),
             Body::Native(b) => b.bytes[b.pos..].to_vec(),
         };
         Got {

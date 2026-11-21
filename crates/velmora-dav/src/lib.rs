@@ -18,6 +18,7 @@ pub mod path;
 pub mod props;
 pub mod s3;
 pub mod sigv4;
+pub mod slots;
 pub mod state;
 pub mod time;
 pub mod xml;

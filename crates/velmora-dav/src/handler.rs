@@ -11,6 +11,7 @@ use crate::path::{self, as_collection, as_file, parent, Loc, PathError};
 use crate::props::{self, Resource, LIVE};
 use crate::s3::{Cond, Meta, S3Error, Upstream, S3};
 use crate::sigv4::Credentials;
+use crate::slots::Slot;
 use crate::state::{Check, DeadProp, Lock, Op, Patch, Reply, Scope};
 use crate::xml::{self, Element, DAV};
 
@@ -43,8 +44,11 @@ pub struct Config {
     /// (MAX_EXTENT_BYTES, 16 MiB), so each part is one extent; a single
     /// PutObject above it is stored in half-size slices.
     pub part_bytes: usize,
-    /// Parts sent at once: the storage Worker's per-isolate request
-    /// budget (INFLIGHT_BUDGET_BYTES, 48 MiB) holds three 16 MiB parts.
+    /// Parts held in memory at once, across every upload of the isolate
+    /// ([`crate::slots`]): a part costs its 16 MiB and the runtime's copy
+    /// while it is sent, so two are 64 MiB of the isolate's 128 MB. Two
+    /// is also within the storage Worker's per-isolate request budget
+    /// (INFLIGHT_BUDGET_BYTES, 48 MiB, three parts).
     pub parts_in_flight: usize,
     /// Copies or deletes at once: the Workers limit of six simultaneous
     /// open connections per invocation.
@@ -79,7 +83,7 @@ impl Default for Config {
             region: "auto".into(),
             tenant: "t0".into(),
             part_bytes: 16 * 1024 * 1024,
-            parts_in_flight: 3,
+            parts_in_flight: 2,
             fan_out: 6,
             max_tree: 2_000,
             max_listing: 50_000,
@@ -1029,18 +1033,14 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 self.upload_parts(bucket, key, b, content_type, meta, guard)
                     .await
             }
-            (Body::Bytes(bytes), _) => {
-                let len = bytes.len() as u64;
+            (body @ (Body::Bytes(_) | Body::Shared(_)), _) => {
+                let len = match &body {
+                    Body::Bytes(b) => b.len() as u64,
+                    Body::Shared(b) => b.len() as u64,
+                    _ => 0,
+                };
                 self.s3
-                    .put(
-                        bucket,
-                        key,
-                        Body::Bytes(bytes),
-                        len,
-                        content_type,
-                        meta,
-                        guard,
-                    )
+                    .put(bucket, key, body, len, content_type, meta, guard)
                     .await
                     .map_err(|e| from_s3(&e))
             }
@@ -1071,7 +1071,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         Ok(buf)
     }
 
-    /// An upload in parts of `part_bytes`, several at once.
+    /// An upload in parts of `part_bytes`, several at once. Each part
+    /// held in memory takes a slot of the isolate first ([`Slot`]); the
+    /// body is read only when one is free.
     async fn upload_parts(
         &self,
         bucket: &str,
@@ -1081,11 +1083,12 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         meta: &[(String, String)],
         guard: Option<&Cond>,
     ) -> Result<String, Resp<U::Body>> {
+        let slot = Slot::acquire(self.cfg().parts_in_flight).await;
         let first = self.read_part(&mut body).await?;
         if first.len() < self.cfg().part_bytes {
             // The whole body fit in one part.
             let len = first.len() as u64;
-            return self
+            let r = self
                 .s3
                 .put(
                     bucket,
@@ -1098,6 +1101,8 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
                 )
                 .await
                 .map_err(|e| from_s3(&e));
+            drop(slot);
+            return r;
         }
         let upload_id = self
             .s3
@@ -1105,7 +1110,7 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
             .await
             .map_err(|e| from_s3(&e))?;
         let result = self
-            .send_parts(bucket, key, &upload_id, first, &mut body)
+            .send_parts(bucket, key, &upload_id, (first, slot), &mut body)
             .await;
         let parts = match result {
             Ok(parts) => parts,
@@ -1132,25 +1137,38 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         bucket: &str,
         key: &str,
         upload_id: &str,
-        first: Vec<u8>,
+        first: (Vec<u8>, Slot),
         body: &mut U::Body,
     ) -> Result<Vec<(u32, String)>, Resp<U::Body>> {
+        let max = self.cfg().parts_in_flight;
+        let part = self.cfg().part_bytes;
         let mut inflight = futures_util::stream::FuturesUnordered::new();
         let mut done: Vec<(u32, String)> = Vec::new();
-        let mut next = Some(first);
         let mut number = 1u32;
+        let mut next = Some(first);
         loop {
-            while inflight.len() < self.cfg().parts_in_flight {
-                let Some(bytes) = next.take() else { break };
-                let full = bytes.len() == self.cfg().part_bytes;
-                let n = number;
+            if let Some((bytes, slot)) = next.take() {
+                let more = bytes.len() == part;
+                inflight.push(self.send_part(bucket, key, upload_id, number, bytes, slot));
                 number += 1;
-                inflight.push(self.send_part(bucket, key, upload_id, n, bytes));
-                if full {
-                    let more = self.read_part(body).await?;
-                    if !more.is_empty() {
-                        next = Some(more);
+                if more {
+                    // A slot for the next part, while the parts in flight
+                    // go on.
+                    let slot = loop {
+                        if let Some(slot) = Slot::try_acquire(max) {
+                            break slot;
+                        }
+                        match select(std::pin::pin!(Slot::acquire(max)), inflight.next()).await {
+                            Either::Left((slot, _)) => break slot,
+                            Either::Right((Some(r), _)) => done.push(r?),
+                            Either::Right((None, _)) => break Slot::acquire(max).await,
+                        }
+                    };
+                    let bytes = self.read_part(body).await?;
+                    if !bytes.is_empty() {
+                        next = Some((bytes, slot));
                     }
+                    continue;
                 }
             }
             match inflight.next().await {
@@ -1163,7 +1181,9 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
     }
 
     /// One part, sent again on `503 SlowDown` as the AWS SDKs' standard
-    /// retry mode does: three attempts, backoff 1 s then 2 s.
+    /// retry mode does: three attempts, backoff 1 s then 2 s. The bytes
+    /// are shared with each attempt, never copied; the slot is let go
+    /// when the part is done.
     async fn send_part(
         &self,
         bucket: &str,
@@ -1171,22 +1191,26 @@ impl<U: Upstream, S: StatePort> Ctx<'_, U, S> {
         upload_id: &str,
         n: u32,
         bytes: Vec<u8>,
+        slot: Slot,
     ) -> Result<(u32, String), Resp<U::Body>> {
+        let bytes = std::rc::Rc::new(bytes);
         let mut attempt = 0;
-        loop {
+        let out = loop {
             match self
                 .s3
-                .upload_part(bucket, key, upload_id, n, bytes.clone())
+                .upload_part(bucket, key, upload_id, n, std::rc::Rc::clone(&bytes))
                 .await
             {
-                Ok(etag) => return Ok((n, etag)),
+                Ok(etag) => break Ok((n, etag)),
                 Err(e) if (e.status == 503 || e.is("SlowDown")) && attempt < 2 => {
                     self.dav.up.sleep(1000 << attempt).await;
                     attempt += 1;
                 }
-                Err(e) => return Err(from_s3(&e)),
+                Err(e) => break Err(from_s3(&e)),
             }
-        }
+        };
+        drop(slot);
+        out
     }
 
     // -----------------------------------------------------------------

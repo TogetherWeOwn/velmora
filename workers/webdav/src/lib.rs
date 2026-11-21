@@ -68,6 +68,8 @@ fn js_body(body: Body<WBody>, len: Option<u64>) -> Result<Option<JsValue>> {
         Body::Empty if len == Some(0) => Some(js_sys::Uint8Array::new_with_length(0).into()),
         Body::Empty => None,
         Body::Bytes(b) => Some(js_sys::Uint8Array::from(b.as_slice()).into()),
+        // Copied straight from the shared buffer: no second Rust copy.
+        Body::Shared(b) => Some(js_sys::Uint8Array::from(b.as_slice()).into()),
         Body::Native(WBody::Js(stream)) => match len {
             Some(len) => {
                 let s = worker::ByteStream::from(stream);
@@ -263,6 +265,7 @@ fn to_response(resp: DavResponse<WBody>) -> Result<Response> {
     let out = match resp.body {
         Body::Empty => Response::empty()?,
         Body::Bytes(b) => Response::from_bytes(b)?,
+        Body::Shared(b) => Response::from_bytes(b.to_vec())?,
         Body::Native(WBody::Js(s)) => Response::from_body(ResponseBody::Stream(s))?,
         Body::Native(WBody::Reading { stream, left }) => {
             let head = futures_util::stream::once(async move { Ok(left) });

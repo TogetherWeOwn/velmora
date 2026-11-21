@@ -961,3 +961,31 @@ async fn a_false_condition_on_a_locked_resource() {
     // A fragment in the target is refused, never cut off.
     w.req("DELETE", "/dav/f#frag", &[], b"").await.expect(400);
 }
+
+#[tokio::test]
+async fn parallel_large_puts_share_the_isolates_part_slots() {
+    let part = 5 * MIB;
+    let w = World::with(Config {
+        part_bytes: part,
+        ..Config::default()
+    })
+    .await;
+    let a = pattern(5, 3 * part + 7);
+    let b = pattern(6, 4 * part);
+    let (ra, rb) = futures_util::future::join(
+        w.req("PUT", "/dav/a.bin", &[], &a),
+        w.req("PUT", "/dav/b.bin", &[], &b),
+    )
+    .await;
+    ra.expect(201);
+    rb.expect(201);
+    assert!(w.s3_get("a.bin").await.1 == a);
+    assert!(w.s3_get("b.bin").await.1 == b);
+    // Never more parts in memory than the isolate allows, and none left.
+    assert!(
+        w.dav.up.most_slots.get() <= 2,
+        "{}",
+        w.dav.up.most_slots.get()
+    );
+    assert_eq!(velmora_dav::slots::Slot::held(), 0);
+}
