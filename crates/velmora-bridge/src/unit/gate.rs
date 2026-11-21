@@ -54,22 +54,70 @@ pub struct GateFindings {
 }
 
 impl GateFindings {
-    /// The findings of the last call of a replay.
-    pub fn from_report(r: &ReplayReport) -> GateFindings {
-        GateFindings {
-            complete: r.next.is_none(),
-            damaged_total: r.damaged_total,
-            damaged: r.damaged.clone(),
-            unreadable: r.unreadable.clone(),
-            unpublishable: r.unpublishable.clone(),
-            damaged_unpublished: r.damaged_unpublished.iter().map(|d| d.id.clone()).collect(),
-            twins: r.twins.clone(),
-            other_bucket_total: r.other_bucket_total,
-            other_bucket: r.other_bucket.clone(),
-            held_missing_total: r.held_missing_total,
-            held_missing: r.held_missing.clone(),
-            held_missing_live: None,
+    /// Adds one step of a replay, as the replay script does: every report
+    /// covers its own call, so the counts are summed and the lists joined,
+    /// except `damaged_total` and `damaged`, which the last call sets for
+    /// the whole replay. The replay is complete when the step added is its
+    /// last (`next` is `None`). Start from `GateFindings::default()` and
+    /// add every step in order.
+    pub fn add(&mut self, step: &ReplayReport) {
+        fn join(into: &mut Vec<String>, more: impl IntoIterator<Item = String>, dedup: bool) {
+            for id in more {
+                if !dedup || !into.contains(&id) {
+                    into.push(id);
+                }
+            }
         }
+        self.complete = step.next.is_none();
+        self.damaged_total = step.damaged_total;
+        self.damaged = step.damaged.clone();
+        join(&mut self.unreadable, step.unreadable.iter().cloned(), true);
+        join(
+            &mut self.unpublishable,
+            step.unpublishable.iter().cloned(),
+            false,
+        );
+        join(
+            &mut self.damaged_unpublished,
+            step.damaged_unpublished.iter().map(|d| d.id.clone()),
+            false,
+        );
+        join(&mut self.twins, step.twins.iter().cloned(), true);
+        self.other_bucket_total = self
+            .other_bucket_total
+            .saturating_add(step.other_bucket_total);
+        join(
+            &mut self.other_bucket,
+            step.other_bucket.iter().cloned(),
+            false,
+        );
+        self.held_missing_total = self
+            .held_missing_total
+            .saturating_add(step.held_missing_total);
+        join(
+            &mut self.held_missing,
+            step.held_missing.iter().cloned(),
+            false,
+        );
+    }
+
+    /// The findings of a whole replay, its steps in order.
+    pub fn of_replay<'a>(steps: impl IntoIterator<Item = &'a ReplayReport>) -> GateFindings {
+        let mut found = GateFindings::default();
+        for step in steps {
+            found.add(step);
+        }
+        found
+    }
+
+    /// Rows other than those of a bucket of this name, counted by the
+    /// larger of the total and the ids listed: neither is trusted alone.
+    fn other_bucket_rows(&self) -> u64 {
+        u64::from(self.other_bucket_total).max(self.other_bucket.len() as u64)
+    }
+
+    fn held_missing_rows(&self) -> u64 {
+        u64::from(self.held_missing_total).max(self.held_missing.len() as u64)
     }
 
     /// The replay is whole: nothing it found was left unapplied.
@@ -78,15 +126,15 @@ impl GateFindings {
             && self.unpublishable.is_empty()
             && self.damaged_unpublished.is_empty()
             && self.twins.is_empty()
-            && self.other_bucket_total == 0
+            && self.other_bucket_rows() == 0
     }
 
     /// The held rows without a copy that count as live: all of them
     /// while the replay is not whole or the rows are not classified.
-    pub fn held_missing_live(&self) -> u32 {
+    pub fn held_missing_live(&self) -> u64 {
         match (self.whole(), self.held_missing_live) {
-            (true, Some(live)) => live.min(self.held_missing_total),
-            _ => self.held_missing_total,
+            (true, Some(live)) => u64::from(live).min(self.held_missing_rows()),
+            _ => self.held_missing_rows(),
         }
     }
 }
@@ -216,7 +264,7 @@ pub fn lift(found: &GateFindings, ack: &Acknowledged) -> Lift {
     need(
         "other_bucket",
         &found.other_bucket,
-        u64::from(found.other_bucket_total),
+        found.other_bucket_rows(),
         &ack.other_bucket,
         &mut needed.other_bucket,
     );
@@ -227,7 +275,7 @@ pub fn lift(found: &GateFindings, ack: &Acknowledged) -> Lift {
         need(
             "held_missing",
             &found.held_missing,
-            u64::from(found.held_missing_total),
+            found.held_missing_rows(),
             &ack.held_missing,
             &mut needed.held_missing,
         );
@@ -447,18 +495,84 @@ mod tests {
         );
     }
 
+    fn step(last: bool) -> ReplayReport {
+        ReplayReport {
+            next: (!last).then(|| crate::replay::ReplayCursor {
+                since_ms: 0,
+                phase: crate::replay::ReplayPhase::Held,
+                after: String::new(),
+                extent: 0,
+                name: String::new(),
+                run_ms: 0,
+            }),
+            ..ReplayReport::default()
+        }
+    }
+
     #[test]
-    fn findings_come_from_the_last_report_of_a_replay() {
-        let mut r = ReplayReport::default();
-        assert_eq!(GateFindings::from_report(&r), clean());
-        r.next = Some(crate::replay::ReplayCursor {
-            since_ms: 0,
-            phase: crate::replay::ReplayPhase::Held,
-            after: String::new(),
-            extent: 0,
-            name: String::new(),
-            run_ms: 0,
-        });
-        assert!(!GateFindings::from_report(&r).complete);
+    fn a_blocker_of_an_earlier_step_keeps_the_unit_closed() {
+        let mut first = step(false);
+        first.unreadable = v(&["m/x/a"]);
+        first.held_missing_total = 3;
+        first.held_missing = v(&["x1", "x2", "x3"]);
+        let last = step(true);
+        let found = GateFindings::of_replay([&first, &last]);
+        assert!(found.complete);
+        assert!(!found.whole());
+        assert_eq!(found.held_missing_live(), 3);
+        assert!(matches!(
+            lift(&found, &Acknowledged::default()),
+            Lift::Closed { .. }
+        ));
+        // The last step alone would have lifted: the gate never reads it alone.
+        assert_eq!(
+            lift(&GateFindings::of_replay([&last]), &Acknowledged::default()),
+            Lift::Clean
+        );
+    }
+
+    #[test]
+    fn steps_add_up_as_the_replay_script_adds_them() {
+        let mut a = step(false);
+        a.other_bucket_total = 1;
+        a.other_bucket = v(&["g1"]);
+        a.twins = v(&["t1"]);
+        a.unreadable = v(&["u1"]);
+        a.damaged_total = 9;
+        a.damaged = v(&["old"]);
+        let mut b = step(true);
+        b.other_bucket_total = 2;
+        b.other_bucket = v(&["g2", "g3"]);
+        b.twins = v(&["t1"]);
+        b.unreadable = v(&["u1", "u2"]);
+        b.damaged_total = 1;
+        b.damaged = v(&["g9"]);
+        let found = GateFindings::of_replay([&a, &b]);
+        assert_eq!(found.other_bucket_total, 3);
+        assert_eq!(found.other_bucket, v(&["g1", "g2", "g3"]));
+        assert_eq!(found.twins, v(&["t1"]));
+        assert_eq!(found.unreadable, v(&["u1", "u2"]));
+        // The last call sets the damage for the whole replay.
+        assert_eq!(found.damaged_total, 1);
+        assert_eq!(found.damaged, v(&["g9"]));
+        let mut unfinished = GateFindings::of_replay([&a]);
+        assert!(!unfinished.complete);
+        unfinished.add(&b);
+        assert!(unfinished.complete);
+    }
+
+    #[test]
+    fn ids_without_a_total_still_count() {
+        let found = GateFindings {
+            held_missing: v(&["x1"]),
+            other_bucket: v(&["g1"]),
+            ..clean()
+        };
+        assert!(!found.whole());
+        assert_eq!(found.held_missing_live(), 1);
+        assert!(matches!(
+            lift(&found, &Acknowledged::default()),
+            Lift::Closed { .. }
+        ));
     }
 }
