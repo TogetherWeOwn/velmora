@@ -1,0 +1,538 @@
+//! The directory database: tenant rows, unit rows, key routes, pending
+//! operations and the gate, over the [`Sql`] port.
+//!
+//! The schema is `workers/s3-bridge/migrations-directory/`. Every tenant
+//! row is a copy of a chain head ([`super::chain`]): it is written from a
+//! [`TenantDoor`] and nothing else, and an older head never replaces a
+//! newer one. The directory decides nothing on the S3 path; it is read
+//! for a route on a cache miss, by the management plane, and by the
+//! operator.
+
+use super::record::{Selector, TenantDoor, TenantId};
+use crate::ports::{Row, Sql, SqlValue};
+use crate::types::{BridgeError, Result, UnixMs};
+
+/// The directory over one database.
+pub struct SqlDirectory<'a, S> {
+    pub sql: &'a S,
+}
+
+/// A tenant row as stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TenantRow {
+    pub id: TenantId,
+    pub record_seq: u64,
+    pub keys_seq: u64,
+    pub door: TenantDoor,
+    pub updated_at: UnixMs,
+}
+
+/// A unit row as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitRow {
+    pub unit: u32,
+    pub restoring_since: Option<u64>,
+}
+
+/// What [`SqlDirectory::apply_tenant`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// The row now copies this head.
+    Applied,
+    /// The row already copies this head or a newer one: nothing changed.
+    NotNewer,
+}
+
+/// The kind of credential a route leads to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteKind {
+    S3,
+    AppPassword,
+    Internal,
+    Principal,
+}
+
+impl RouteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteKind::S3 => "s3",
+            RouteKind::AppPassword => "app_password",
+            RouteKind::Internal => "internal",
+            RouteKind::Principal => "principal",
+        }
+    }
+
+    fn parse(s: &str) -> Option<RouteKind> {
+        Some(match s {
+            "s3" => RouteKind::S3,
+            "app_password" => RouteKind::AppPassword,
+            "internal" => RouteKind::Internal,
+            "principal" => RouteKind::Principal,
+            _ => return None,
+        })
+    }
+}
+
+/// An access key id and the tenant it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRoute {
+    pub akid: String,
+    pub tenant: TenantId,
+    pub kind: RouteKind,
+    pub owner_ref: Option<String>,
+    pub created_at: UnixMs,
+}
+
+/// What [`SqlDirectory::put_route`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutePut {
+    /// Stored now.
+    Inserted,
+    /// The same route was there.
+    Same,
+    /// A route to another tenant or of another kind was there. A route
+    /// never changes: this is damage or a forged call, and it pages.
+    Conflict,
+}
+
+/// Which chain a pending operation is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainKind {
+    Tenant,
+    Keys,
+}
+
+impl ChainKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChainKind::Tenant => "t",
+            ChainKind::Keys => "k",
+        }
+    }
+
+    fn parse(s: &str) -> Option<ChainKind> {
+        match s {
+            "t" => Some(ChainKind::Tenant),
+            "k" => Some(ChainKind::Keys),
+            _ => None,
+        }
+    }
+}
+
+/// A control change that is not yet applied everywhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingOp {
+    pub tenant: TenantId,
+    pub chain: ChainKind,
+    pub seq: u64,
+    pub kind: String,
+    pub created_at: UnixMs,
+}
+
+/// The directory gate as stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateState {
+    pub closed: bool,
+    pub epoch: u64,
+}
+
+const ERR_ROW: BridgeError = BridgeError::Invalid("directory row");
+
+const UPSERT_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction, door_json, updated_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+     ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
+     WHERE excluded.record_seq > tenants.record_seq";
+
+/// The gate's form: the row takes the head whatever it held, a higher
+/// seq included (a restored or damaged row is not trusted over R2).
+const REPLACE_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction, door_json, updated_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+     ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at";
+
+// The unit statements run only when the tenant row holds exactly this
+// head after the upsert, so an older head changes no unit row.
+const DROP_UNLISTED_UNITS: &str = "DELETE FROM units WHERE tenant = ?1 \
+     AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2 \
+     AND unit NOT IN (SELECT value FROM json_each(?3))";
+
+const ADD_LISTED_UNITS: &str = "INSERT INTO units (tenant, unit) \
+     SELECT ?1, value FROM json_each(?3) WHERE (SELECT record_seq FROM tenants WHERE id = ?1) = ?2 \
+     ON CONFLICT (tenant, unit) DO NOTHING";
+
+const SET_RESTORING: &str = "UPDATE units SET restoring_since = \
+     (SELECT json_extract(r.value, '$.since_seq') FROM json_each(?3) r WHERE json_extract(r.value, '$.unit') = units.unit) \
+     WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2";
+
+// A shredded tenant keeps its row and loses every route and label.
+const DROP_SHREDDED_ROUTES: &str = "DELETE FROM key_routes WHERE tenant = ?1 \
+     AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'";
+
+const DROP_SHREDDED_LABELS: &str = "DELETE FROM bucket_index WHERE tenant = ?1 \
+     AND (SELECT state FROM tenants WHERE id = ?1 AND record_seq = ?2) = 'shredded'";
+
+const TENANT_COLUMNS: &str = "id, record_seq, keys_seq, door_json, updated_at";
+
+impl<S: Sql> SqlDirectory<'_, S> {
+    /// Copies a chain head into the tenant's row and unit rows, if it is
+    /// newer than what the row holds. One atomic batch.
+    pub async fn apply_tenant(&self, door: &TenantDoor, now: UnixMs) -> Result<Applied> {
+        let changed = self.write_tenant(UPSERT_TENANT, door, now).await?;
+        Ok(match changed {
+            0 => Applied::NotNewer,
+            _ => Applied::Applied,
+        })
+    }
+
+    /// The gate's copy of a head: the row takes it whatever it held.
+    pub async fn replace_tenant(&self, door: &TenantDoor, now: UnixMs) -> Result<()> {
+        self.write_tenant(REPLACE_TENANT, door, now)
+            .await
+            .map(|_| ())
+    }
+
+    async fn write_tenant(
+        &self,
+        upsert: &'static str,
+        door: &TenantDoor,
+        now: UnixMs,
+    ) -> Result<u64> {
+        let id = SqlValue::Text(door.tenant.as_str().to_string());
+        let seq = int(door.seq)?;
+        let units = SqlValue::Text(serde_json::to_string(&door.units).map_err(|_| ERR_ROW)?);
+        let restoring =
+            SqlValue::Text(serde_json::to_string(&door.restoring).map_err(|_| ERR_ROW)?);
+        let state = door.state();
+        let hold_mode = door.holds.mode().map(|m| match m {
+            super::record::HoldMode::ReadOnly => "read_only",
+            super::record::HoldMode::Locked => "locked",
+        });
+        let selector = door.tenant_zero.as_ref().map(|z| match z.selector {
+            Selector::D1 => "d1",
+            Selector::Moved { .. } => "moved",
+        });
+        let door_json = serde_json::to_string(door).map_err(|_| ERR_ROW)?;
+        let params = vec![
+            id.clone(),
+            seq.clone(),
+            SqlValue::Text(state.name().to_string()),
+            opt_text(hold_mode),
+            door.deletion
+                .as_ref()
+                .map_or(SqlValue::Null, |d| SqlValue::Int(d.shred_due_at.0)),
+            SqlValue::Int(i64::from(door.tk_version)),
+            door.rotating_to
+                .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
+            opt_text(selector),
+            SqlValue::Int(i64::from(door.synthetic)),
+            SqlValue::Text(door.jurisdiction.clone()),
+            SqlValue::Text(door_json),
+            SqlValue::Int(now.0),
+        ];
+        let changed = self
+            .sql
+            .batch(vec![
+                (upsert, params),
+                (
+                    DROP_UNLISTED_UNITS,
+                    vec![id.clone(), seq.clone(), units.clone()],
+                ),
+                (ADD_LISTED_UNITS, vec![id.clone(), seq.clone(), units]),
+                (SET_RESTORING, vec![id.clone(), seq.clone(), restoring]),
+                (DROP_SHREDDED_ROUTES, vec![id.clone(), seq.clone()]),
+                (DROP_SHREDDED_LABELS, vec![id, seq]),
+            ])
+            .await?;
+        Ok(changed.first().copied().unwrap_or(0))
+    }
+
+    /// The row of `tenant`, `None` = no row.
+    pub async fn tenant(&self, tenant: &TenantId) -> Result<Option<TenantRow>> {
+        let rows = self
+            .sql
+            .query(
+                &format!("SELECT {TENANT_COLUMNS} FROM tenants WHERE id = ?1"),
+                &[SqlValue::Text(tenant.as_str().to_string())],
+            )
+            .await?;
+        rows.into_iter().next().map(tenant_row).transpose()
+    }
+
+    /// Up to `limit` tenant ids after `after`, in id order.
+    pub async fn tenant_ids(&self, after: &str, limit: u32) -> Result<Vec<TenantId>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT id FROM tenants WHERE id > ?1 ORDER BY id LIMIT ?2",
+                &[
+                    SqlValue::Text(after.to_string()),
+                    SqlValue::Int(i64::from(limit)),
+                ],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| text(&row, 0).and_then(|s| TenantId::parse(&s).ok_or(ERR_ROW)))
+            .collect()
+    }
+
+    /// Removes a tenant row that no chain backs, with its units, routes
+    /// and labels. Only the gate calls this.
+    pub async fn remove_tenant(&self, tenant: &TenantId) -> Result<()> {
+        let id = || vec![SqlValue::Text(tenant.as_str().to_string())];
+        self.sql
+            .batch(vec![
+                ("DELETE FROM units WHERE tenant = ?1", id()),
+                ("DELETE FROM key_routes WHERE tenant = ?1", id()),
+                ("DELETE FROM bucket_index WHERE tenant = ?1", id()),
+                ("DELETE FROM tenants WHERE id = ?1", id()),
+            ])
+            .await
+            .map(|_| ())
+    }
+
+    /// The unit rows of `tenant`, by unit number.
+    pub async fn units(&self, tenant: &TenantId) -> Result<Vec<UnitRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT unit, restoring_since FROM units WHERE tenant = ?1 ORDER BY unit",
+                &[SqlValue::Text(tenant.as_str().to_string())],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(UnitRow {
+                    unit: u32::try_from(int_at(&row, 0)?).map_err(|_| ERR_ROW)?,
+                    restoring_since: match row.get(1) {
+                        Some(SqlValue::Null) => None,
+                        _ => Some(u64::try_from(int_at(&row, 1)?).map_err(|_| ERR_ROW)?),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Raises the tenant's key chain head; a lower seq changes nothing.
+    pub async fn raise_keys_seq(&self, tenant: &TenantId, keys_seq: u64) -> Result<bool> {
+        let changed = self
+            .sql
+            .exec(
+                "UPDATE tenants SET keys_seq = ?2 WHERE id = ?1 AND keys_seq < ?2",
+                &[SqlValue::Text(tenant.as_str().to_string()), int(keys_seq)?],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
+    /// Stores a route. A route never changes: an existing one to another
+    /// tenant or of another kind is [`RoutePut::Conflict`], and stays.
+    pub async fn put_route(&self, route: &KeyRoute) -> Result<RoutePut> {
+        let changed = self
+            .sql
+            .exec(
+                "INSERT INTO key_routes (akid, tenant, kind, owner_ref, created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (akid) DO NOTHING",
+                &[
+                    SqlValue::Text(route.akid.clone()),
+                    SqlValue::Text(route.tenant.as_str().to_string()),
+                    SqlValue::Text(route.kind.as_str().to_string()),
+                    opt_text(route.owner_ref.as_deref()),
+                    SqlValue::Int(route.created_at.0),
+                ],
+            )
+            .await?;
+        if changed > 0 {
+            return Ok(RoutePut::Inserted);
+        }
+        match self.route(&route.akid).await? {
+            Some(old) if old.tenant == route.tenant && old.kind == route.kind => Ok(RoutePut::Same),
+            _ => Ok(RoutePut::Conflict),
+        }
+    }
+
+    /// The route of `akid`, `None` = no tenant has such a key.
+    pub async fn route(&self, akid: &str) -> Result<Option<KeyRoute>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT akid, tenant, kind, owner_ref, created_at FROM key_routes WHERE akid = ?1",
+                &[SqlValue::Text(akid.to_string())],
+            )
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(|row| {
+                Ok(KeyRoute {
+                    akid: text(&row, 0)?,
+                    tenant: TenantId::parse(&text(&row, 1)?).ok_or(ERR_ROW)?,
+                    kind: RouteKind::parse(&text(&row, 2)?).ok_or(ERR_ROW)?,
+                    owner_ref: match row.get(3) {
+                        Some(SqlValue::Null) => None,
+                        _ => Some(text(&row, 3)?),
+                    },
+                    created_at: UnixMs(int_at(&row, 4)?),
+                })
+            })
+            .transpose()
+    }
+
+    /// Records a pending operation; the same one twice is one row.
+    pub async fn add_pending(&self, op: &PendingOp) -> Result<()> {
+        self.sql
+            .exec(
+                "INSERT INTO pending_ops (tenant, chain, seq, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (tenant, chain, seq) DO NOTHING",
+                &[
+                    SqlValue::Text(op.tenant.as_str().to_string()),
+                    SqlValue::Text(op.chain.as_str().to_string()),
+                    int(op.seq)?,
+                    SqlValue::Text(op.kind.clone()),
+                    SqlValue::Int(op.created_at.0),
+                ],
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// Clears every pending operation of the chain up to `seq`: the
+    /// finisher applies a chain up to its head, which covers them all.
+    pub async fn clear_pending(
+        &self,
+        tenant: &TenantId,
+        chain: ChainKind,
+        seq: u64,
+    ) -> Result<u64> {
+        self.sql
+            .exec(
+                "DELETE FROM pending_ops WHERE tenant = ?1 AND chain = ?2 AND seq <= ?3",
+                &[
+                    SqlValue::Text(tenant.as_str().to_string()),
+                    SqlValue::Text(chain.as_str().to_string()),
+                    int(seq)?,
+                ],
+            )
+            .await
+    }
+
+    /// Up to `limit` pending operations created before `before`, oldest
+    /// first: the pending sweep's work.
+    pub async fn pending_before(&self, before: UnixMs, limit: u32) -> Result<Vec<PendingOp>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT tenant, chain, seq, kind, created_at FROM pending_ops WHERE created_at < ?1 \
+                 ORDER BY created_at, tenant, chain, seq LIMIT ?2",
+                &[SqlValue::Int(before.0), SqlValue::Int(i64::from(limit))],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingOp {
+                    tenant: TenantId::parse(&text(&row, 0)?).ok_or(ERR_ROW)?,
+                    chain: ChainKind::parse(&text(&row, 1)?).ok_or(ERR_ROW)?,
+                    seq: u64::try_from(int_at(&row, 2)?).map_err(|_| ERR_ROW)?,
+                    kind: text(&row, 3)?,
+                    created_at: UnixMs(int_at(&row, 4)?),
+                })
+            })
+            .collect()
+    }
+
+    /// When the oldest pending operation was created, `None` = none.
+    pub async fn oldest_pending(&self) -> Result<Option<UnixMs>> {
+        let rows = self
+            .sql
+            .query("SELECT MIN(created_at) FROM pending_ops", &[])
+            .await?;
+        match rows.first().and_then(|r| r.first()) {
+            None | Some(SqlValue::Null) => Ok(None),
+            Some(SqlValue::Int(ms)) => Ok(Some(UnixMs(*ms))),
+            Some(_) => Err(ERR_ROW),
+        }
+    }
+
+    /// Empties the pending table (the gate rebuilds it empty).
+    pub async fn clear_all_pending(&self) -> Result<u64> {
+        self.sql.exec("DELETE FROM pending_ops", &[]).await
+    }
+
+    /// The gate as stored. No row = closed at epoch 0.
+    pub async fn gate(&self) -> Result<GateState> {
+        let rows = self
+            .sql
+            .query("SELECT closed, epoch FROM directory_gate WHERE id = 1", &[])
+            .await?;
+        match rows.first() {
+            None => Ok(GateState {
+                closed: true,
+                epoch: 0,
+            }),
+            Some(row) => Ok(GateState {
+                closed: int_at(row, 0)? != 0,
+                epoch: u64::try_from(int_at(row, 1)?).map_err(|_| ERR_ROW)?,
+            }),
+        }
+    }
+
+    /// Closes the gate in a new epoch and answers it.
+    pub async fn close_gate(&self, reason: &str, now: UnixMs) -> Result<u64> {
+        self.sql
+            .exec(
+                "INSERT INTO directory_gate (id, closed, epoch, reason, closed_at) VALUES (1, 1, 1, ?1, ?2) \
+                 ON CONFLICT (id) DO UPDATE SET closed = 1, epoch = directory_gate.epoch + 1, reason = excluded.reason, closed_at = excluded.closed_at",
+                &[SqlValue::Text(reason.to_string()), SqlValue::Int(now.0)],
+            )
+            .await?;
+        Ok(self.gate().await?.epoch)
+    }
+
+    /// Opens the gate closed at `epoch`. A gate closed again since (a
+    /// newer epoch) stays closed: `false`.
+    pub async fn open_gate(&self, epoch: u64, now: UnixMs) -> Result<bool> {
+        let changed = self
+            .sql
+            .exec(
+                "UPDATE directory_gate SET closed = 0, opened_at = ?2 WHERE id = 1 AND epoch = ?1",
+                &[int(epoch)?, SqlValue::Int(now.0)],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+}
+
+fn tenant_row(row: Row) -> Result<TenantRow> {
+    let id = TenantId::parse(&text(&row, 0)?).ok_or(ERR_ROW)?;
+    let door: TenantDoor = serde_json::from_str(&text(&row, 3)?).map_err(|_| ERR_ROW)?;
+    let record_seq = u64::try_from(int_at(&row, 1)?).map_err(|_| ERR_ROW)?;
+    if door.tenant != id || door.seq != record_seq {
+        return Err(ERR_ROW);
+    }
+    Ok(TenantRow {
+        id,
+        record_seq,
+        keys_seq: u64::try_from(int_at(&row, 2)?).map_err(|_| ERR_ROW)?,
+        door,
+        updated_at: UnixMs(int_at(&row, 4)?),
+    })
+}
+
+fn int(v: u64) -> Result<SqlValue> {
+    i64::try_from(v).map(SqlValue::Int).map_err(|_| ERR_ROW)
+}
+
+fn opt_text(v: Option<&str>) -> SqlValue {
+    v.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string()))
+}
+
+fn text(row: &Row, i: usize) -> Result<String> {
+    match row.get(i) {
+        Some(SqlValue::Text(s)) => Ok(s.clone()),
+        _ => Err(ERR_ROW),
+    }
+}
+
+fn int_at(row: &Row, i: usize) -> Result<i64> {
+    match row.get(i) {
+        Some(SqlValue::Int(v)) => Ok(*v),
+        _ => Err(ERR_ROW),
+    }
+}
