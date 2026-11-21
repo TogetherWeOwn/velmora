@@ -971,6 +971,9 @@ pub trait Catalog {
     /// Renews the lease and every permit in one round trip. `.0` = the
     /// lease still holds; `.1[i]` = `permits[i]` is still held. Each
     /// renewal stands on its own: a lost lease does not undo the permits.
+    /// The permits are those of a lease's job: none of
+    /// [`PermitClass::Drill`], which no lease holds and which is renewed
+    /// by [`Self::renew_permit`] alone.
     async fn renew_all(
         &self,
         l: &Lease,
