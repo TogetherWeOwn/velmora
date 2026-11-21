@@ -363,8 +363,9 @@ jobs:
       # throwaway Workers placed in aws:us-east-1 on 2026-11-21 (median of
       # the first 9 requests: 209 ms at 3.0 MB, 240 at 5.0, 262 at 8.0, 345
       # at 16.0). 4,000,000 bytes keeps that within about 10 ms of the 3.0 MB
-      # bundle of that date, inside the sizes measured with real code (up
-      # to 3.8 MB). Raise it only with a new measurement.
+      # bundle of that date. It lies between the padded 3.0 and 5.0 MB
+      # bundles measured, and above the largest real-code build measured
+      # (3.7 MB, no change seen). Raise it only with a new measurement.
       - name: Size budget (index_bg.wasm under 4 MB)
         working-directory: workers/s3-bridge
         run: |
