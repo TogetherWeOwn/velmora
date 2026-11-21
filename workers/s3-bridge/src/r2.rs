@@ -12,15 +12,15 @@
 
 use std::collections::HashMap;
 
-use futures_util::StreamExt;
-
 use velmora_bridge::recovery::{
     is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
 use velmora_bridge::{BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, Result};
-use worker::js_sys::{ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
+use worker::js_sys::{ArrayBuffer, Object, Promise, Reflect, Uint8Array};
+use worker::wasm_bindgen::prelude::wasm_bindgen;
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
+use worker::web_sys::ReadableStream;
 use worker::{Bucket, Range};
 
 /// R2 range offsets travel as JS numbers (workers-rs panics above this).
@@ -113,7 +113,7 @@ fn empty_span(span: ByteSpan, size: u64) -> Result<Vec<u8>> {
 }
 
 /// Why a body read failed.
-#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum BodyError {
     /// The body ended before the expected length.
     Short,
@@ -133,29 +133,36 @@ trait BodyReads {
 ///
 /// The buffer is reserved up to [`MAX_PRESIZE`] ahead of what has arrived,
 /// so a larger body grows as it arrives. Each read lands in place: no chunk
-/// is held twice. A body longer than `expected` is found by one more read
-/// of a single byte once the buffer is full.
+/// is held twice. The buffer has room for one byte past `expected`, so a
+/// longer body shows itself without being read further.
 async fn fill_body<R: BodyReads>(
     reads: &mut R,
     expected: u64,
 ) -> std::result::Result<Vec<u8>, BodyError> {
     // Only a 32-bit target refuses here, and no extent comes near 4 GiB.
-    let expected = usize::try_from(expected).map_err(|_| BodyError::Read)?;
+    let room = usize::try_from(expected)
+        .ok()
+        .and_then(|e| e.checked_add(1))
+        .ok_or(BodyError::Read)?;
     let mut bytes = Vec::new();
     let mut filled = 0;
-    while filled < expected {
+    loop {
         if filled == bytes.len() {
-            bytes.resize(expected.min(filled + MAX_PRESIZE as usize), 0);
+            bytes.resize(room.min(filled + MAX_PRESIZE as usize), 0);
         }
         match reads.read(&mut bytes[filled..]).await? {
-            0 => return Err(BodyError::Short),
+            0 => break,
             n => filled += n,
         }
+        if filled == room {
+            return Err(BodyError::Long);
+        }
     }
-    match reads.read(&mut [0u8; 1]).await? {
-        0 => Ok(bytes),
-        _ => Err(BodyError::Long),
+    if filled + 1 < room {
+        return Err(BodyError::Short);
     }
+    bytes.truncate(filled);
+    Ok(bytes)
 }
 
 /// Largest single read asked of R2. R2 fills about 64 KiB per read
@@ -167,30 +174,40 @@ const MAX_READ: u32 = 1024 * 1024;
 /// new array that is copied twice on its way into the body; a BYOB read is
 /// about 64 KiB, copied once, into its place in the body.
 struct ByobReads {
-    reader: JsValue,
-    read: Function,
+    reader: ByobReader,
     /// The runtime buffer; a read transfers it and hands it back.
     buffer: Option<ArrayBuffer>,
 }
 
+#[wasm_bindgen(wasm_bindgen = worker::wasm_bindgen)]
+extern "C" {
+    /// A `ReadableStream` of bytes.
+    type ByteBody;
+    /// A `ReadableStreamBYOBReader`.
+    type ByobReader;
+    #[wasm_bindgen(method, catch, js_name = getReader)]
+    fn byob_reader(this: &ByteBody, options: &Object) -> std::result::Result<ByobReader, JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn read(this: &ByobReader, view: &Uint8Array) -> std::result::Result<Promise, JsValue>;
+    /// What a read resolves to.
+    type ReadResult;
+    #[wasm_bindgen(method, getter)]
+    fn done(this: &ReadResult) -> bool;
+    #[wasm_bindgen(method, getter)]
+    fn value(this: &ReadResult) -> Option<Uint8Array>;
+}
+
 impl ByobReads {
     /// `None` when the stream has no BYOB reader (it is not a byte
-    /// stream); the stream is then still unlocked.
-    fn new(stream: &worker::web_sys::ReadableStream) -> Option<Self> {
-        let get_reader: Function = Reflect::get(stream, &"getReader".into())
-            .ok()?
-            .dyn_into()
-            .ok()?;
+    /// stream). R2 bodies are byte streams, so `get` then fails closed.
+    fn new(stream: &ReadableStream) -> Option<Self> {
         let options = Object::new();
         Reflect::set(&options, &"mode".into(), &"byob".into()).ok()?;
-        let reader = get_reader.call1(stream, &options).ok()?;
-        let read = Reflect::get(&reader, &"read".into())
-            .ok()?
-            .dyn_into()
-            .ok()?;
         Some(ByobReads {
-            reader,
-            read,
+            reader: stream
+                .unchecked_ref::<ByteBody>()
+                .byob_reader(&options)
+                .ok()?,
             buffer: Some(ArrayBuffer::new(MAX_READ)),
         })
     }
@@ -198,24 +215,18 @@ impl ByobReads {
 
 impl BodyReads for ByobReads {
     async fn read(&mut self, dst: &mut [u8]) -> std::result::Result<usize, BodyError> {
-        // The buffer is gone only after a read that failed.
+        // The buffer is gone only after a read that failed or ended.
         let buffer = self.buffer.take().ok_or(BodyError::Read)?;
-        let want = u32::try_from(dst.len()).unwrap_or(MAX_READ).min(MAX_READ);
+        let want = dst.len().min(MAX_READ as usize) as u32;
         let view = Uint8Array::new_with_byte_offset_and_length(&buffer, 0, want);
-        let promise: Promise = self
-            .read
-            .call1(&self.reader, &view)
-            .and_then(JsCast::dyn_into)
-            .map_err(|_| BodyError::Read)?;
-        let result = JsFuture::from(promise).await.map_err(|_| BodyError::Read)?;
-        let done = Reflect::get(&result, &"done".into())
+        let promise = self.reader.read(&view).map_err(|_| BodyError::Read)?;
+        let result: ReadResult = JsFuture::from(promise)
+            .await
             .map_err(|_| BodyError::Read)?
-            .is_truthy();
-        let value = Reflect::get(&result, &"value".into()).map_err(|_| BodyError::Read)?;
-        // No view back: the stream was canceled, which is not an end.
-        let filled = value.dyn_ref::<Uint8Array>().ok_or(BodyError::Read)?;
-        self.buffer = Some(filled.buffer());
-        if done {
+            .unchecked_into();
+        // A canceled stream also says done, with no view: that is not an end.
+        let filled = result.value().ok_or(BodyError::Read)?;
+        if result.done() {
             return Ok(0);
         }
         let n = filled.length() as usize;
@@ -223,43 +234,7 @@ impl BodyReads for ByobReads {
             return Err(BodyError::Read);
         }
         filled.copy_to(&mut dst[..n]);
-        Ok(n)
-    }
-}
-
-/// A body read chunk by chunk from the stream, for a stream that is not a
-/// byte stream; a chunk larger than the read keeps its rest for the next.
-struct ChunkReads<S> {
-    stream: S,
-    held: Vec<u8>,
-    at: usize,
-}
-
-impl<S> ChunkReads<S> {
-    fn new(stream: S) -> Self {
-        ChunkReads {
-            stream,
-            held: Vec::new(),
-            at: 0,
-        }
-    }
-}
-
-impl<S, E> BodyReads for ChunkReads<S>
-where
-    S: futures_util::Stream<Item = std::result::Result<Vec<u8>, E>> + Unpin,
-{
-    async fn read(&mut self, dst: &mut [u8]) -> std::result::Result<usize, BodyError> {
-        while self.at == self.held.len() {
-            match self.stream.next().await {
-                None => return Ok(0),
-                Some(Err(_)) => return Err(BodyError::Read),
-                Some(Ok(chunk)) => (self.held, self.at) = (chunk, 0),
-            }
-        }
-        let n = dst.len().min(self.held.len() - self.at);
-        dst[..n].copy_from_slice(&self.held[self.at..self.at + n]);
-        self.at += n;
+        self.buffer = Some(filled.buffer());
         Ok(n)
     }
 }
@@ -306,22 +281,20 @@ impl BlobStore for R2Blobs {
             worker::ResponseBody::Stream(stream) => stream,
             _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
         };
-        let bytes = match ByobReads::new(&stream) {
-            Some(mut reads) => fill_body(&mut reads, expected).await,
-            // Not a byte stream: read its chunks as they come.
-            None => {
-                fill_body(
-                    &mut ChunkReads::new(worker::ByteStream::from(stream)),
-                    expected,
-                )
-                .await
-            }
+        let Some(mut reads) = ByobReads::new(&stream) else {
+            return Err(BridgeError::Blob("r2: get body failed".into()));
         };
-        bytes.map(Some).map_err(|e| match (e, span) {
-            (BodyError::Short, Some(_)) => BridgeError::Blob("r2: short range".into()),
-            (BodyError::Short, None) => BridgeError::Blob("r2: short body".into()),
-            (BodyError::Long, _) => BridgeError::Blob("r2: long body".into()),
-            (BodyError::Read, _) => BridgeError::Blob("r2: get body failed".into()),
+        let bytes = fill_body(&mut reads, expected).await;
+        bytes.map(Some).map_err(|e| {
+            BridgeError::Blob(
+                match (e, span) {
+                    (BodyError::Short, Some(_)) => "r2: short range",
+                    (BodyError::Short, None) => "r2: short body",
+                    (BodyError::Long, _) => "r2: long body",
+                    (BodyError::Read, _) => "r2: get body failed",
+                }
+                .into(),
+            )
         })
     }
 
@@ -503,12 +476,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_body_ends_with_one_probe_byte() {
+    fn exact_body_ends_with_one_spare_byte() {
         let mut r = scripted(1000, vec![]);
         assert_eq!(run(fill_body(&mut r, 1000)).unwrap().len(), 1000);
         assert_eq!(
             r.asked,
-            vec![1000, 1],
+            vec![1001, 1],
             "one read for the body, one for its end"
         );
     }
@@ -552,26 +525,6 @@ mod tests {
         let len = MAX_PRESIZE as usize + 5;
         let mut r = scripted(len, vec![]);
         assert_eq!(run(fill_body(&mut r, len as u64)).unwrap(), r.body);
-        assert_eq!(r.asked, vec![MAX_PRESIZE as usize, 5, 1]);
-    }
-
-    #[test]
-    fn chunk_reads_split_and_join_chunks() {
-        let chunks: Vec<std::result::Result<Vec<u8>, ()>> = vec![
-            Ok(vec![1, 2, 3]),
-            Ok(vec![]),
-            Ok(vec![4, 5, 6, 7]),
-            Ok(vec![8]),
-        ];
-        let mut r = ChunkReads::new(futures_util::stream::iter(chunks));
-        assert_eq!(
-            run(fill_body(&mut r, 8)).unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
-        );
-        let mut r = ChunkReads::new(futures_util::stream::iter(vec![Ok::<_, ()>(vec![1, 2, 3])]));
-        assert_eq!(run(fill_body(&mut r, 2)), Err(BodyError::Long));
-        let failing: Vec<std::result::Result<Vec<u8>, ()>> = vec![Ok(vec![1]), Err(())];
-        let mut r = ChunkReads::new(futures_util::stream::iter(failing));
-        assert_eq!(run(fill_body(&mut r, 2)), Err(BodyError::Read));
+        assert_eq!(r.asked, vec![MAX_PRESIZE as usize, 6, 1]);
     }
 }
