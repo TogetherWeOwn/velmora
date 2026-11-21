@@ -868,6 +868,46 @@ replaces it: for each extent of a record it reads the stored plan, and
 one that cannot be read gives way to the plan in the extent's record.
 A plan that reads is left as it is.
 
+## Release by the verify job
+
+`RELEASE_AT_VERIFY = "on"` lets the verify job whose round passed release
+the pinned copy itself when `SAFETY_MIN_AGE_SECS` is already over at that
+moment (always, when it is `0`). The release job would ask the same
+backbones the same question a moment later; with the switch on that
+second round of `STAT`, its job and its writes are not made.
+
+- What a release needs is the same: every article present on
+  `REQUIRED_BACKBONES` backbones that count, by checks recorded under the
+  claim of the job that releases, and the full read on record. The
+  catalogue refuses anything less, whichever job asks.
+- A backbone the releasing verify job did not ask itself is asked with
+  `STAT` in that job first: one a job before it checked (a round that
+  waited for propagation or made a repost), and one whose check began
+  before the minimum age was over. If there is no provider slot for
+  that question, the row goes to the release stage, which asks every
+  backbone.
+- With a minimum age above the time a verify round takes (the shipped
+  24 h), the round ends before it is over and the release job does the
+  release as before. The verify job releases only where its round passes
+  at least `SAFETY_MIN_AGE_SECS` after the newest post: a backlog of
+  that length, the waits for a missing article, a row a release job sent
+  back to verify. A repost starts the minimum age again, so the round
+  after one goes to the release job.
+- The release by a verify job is one write to the catalogue: the copy
+  goes from `held` to `released` and the row from `verify` to `done`
+  together, or nothing changes. A job that dies leaves the copy held and
+  the row at `verify` for the next verify job. No copy is `releasing`
+  under a row at `verify`.
+- The switch can be turned on and off at any time, and Workers of both
+  values, and Workers from before the switch, may run side by side:
+  none of them meets a state it does not know.
+- `outbox` rows of such an extent go from `verify` to `done`, so the
+  `release` count of `/_admin/status` stays near 0. The release counters
+  (`releases_total` and the hourly `releases`) count these releases from
+  migration `0023_usage_release_at_verify.sql` on. Apply it before the
+  Worker that has the switch on: without it such a release is counted as
+  a verify only.
+
 ## Permit gate
 
 A provider permit is the right to hold one connection to one provider

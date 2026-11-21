@@ -674,7 +674,10 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 impl Bench {
-    async fn new(trace: Option<File>) -> Bench {
+    /// `set`: Worker variables of this run, as `VELMORA_BENCH_VARS` gives
+    /// them to a full run (a test cannot set the environment of its
+    /// process: the tests of a binary share it).
+    async fn new(trace: Option<File>, set: &[(&str, &str)]) -> Bench {
         let mut cfg = ServerConfig::for_test();
         cfg.group = GROUP.to_string();
         cfg.users.clear();
@@ -693,7 +696,9 @@ impl Bench {
         for (k, v) in overrides(&server) {
             vars.insert(k.to_string(), v);
         }
-        let bench_vars = parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        let mut bench_vars =
+            parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        bench_vars.extend(set.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         for (k, v) in &bench_vars {
             vars.insert(k.clone(), v.clone());
         }
@@ -1108,8 +1113,8 @@ impl Bench {
 // The scenario
 // ---------------------------------------------------------------------------
 
-async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
-    let mut b = Bench::new(trace).await;
+async fn scenario(s: &Scale, trace: Option<File>, set: &[(&str, &str)]) -> Bench {
+    let mut b = Bench::new(trace, set).await;
     let big_parts = s.part * s.parts;
 
     // Ingest. `big/`: whole extents (PutObject and a multipart upload);
@@ -1358,6 +1363,7 @@ fn report(b: &Bench, scale: &str) -> serde_json::Value {
         "MAX_PUT_BYTES",
         "REQUIRED_BACKBONES",
         "SAFETY_MIN_AGE_SECS",
+        "RELEASE_AT_VERIFY",
         "VERIFY_DELAY_SECS",
         "VERIFY_MODE",
         "PACKED_PLANS",
@@ -1418,17 +1424,35 @@ fn sanity(b: &Bench) {
     assert!(sum(|c| c.nntp_posts) > 0, "no post metered");
     assert!(sum(|c| c.nntp_bodies) > 0, "no cold read metered");
     assert!(sum(|c| c.queue_messages) > 0, "no queue message metered");
+    // Who releases. With RELEASE_AT_VERIFY=on the verify job does
+    // (its figures hold the release) whenever the minimum age is over
+    // when its round passes: always with a minimum age of 0, never with
+    // one longer than the scenario waits before the release, and with a
+    // short one in between it depends on the waits of the run, so
+    // either is taken. Read from the variables, so that a commit from
+    // before the switch is measured too.
+    let var = |k: &str| b.vars.get(k).map(|v| v.trim());
+    let on = var("RELEASE_AT_VERIFY") == Some("on");
+    let min_age = b.bridge.cfg.safety_min_age_secs;
     for label in [
         "op:get_cold_big",
         "op:put_big",
         "stage:big:post",
         "stage:big:verify",
-        "stage:big:release",
     ] {
         assert!(
             counts.contains_key(label),
             "no figures for {label}: {:?}",
             counts.keys()
+        );
+    }
+    let release_job = counts.contains_key("stage:big:release");
+    if !on {
+        assert!(release_job, "no figures for stage:big:release");
+    } else if min_age == 0 {
+        assert!(
+            !release_job,
+            "a release job ran under RELEASE_AT_VERIFY=on without a minimum age"
         );
     }
     // A cold read comes from Usenet and refills the cache; the read
@@ -1439,7 +1463,7 @@ fn sanity(b: &Bench) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn bench_counts_smoke() {
-    let b = scenario(&SMOKE, None).await;
+    let b = scenario(&SMOKE, None, &[]).await;
     sanity(&b);
     let json = report(&b, "smoke");
     assert!(
@@ -1447,6 +1471,61 @@ async fn bench_counts_smoke() {
             .as_u64()
             .unwrap_or(0)
             > 0
+    );
+    // The shipped minimum age ends long after a verify round: every
+    // extent is released by a release job, which asks again (four rows
+    // an extent). A run whose variables let the verify job release
+    // (`sanity` says when) has the two rows of that job, or anything
+    // between the two with a short minimum age.
+    let rows = &json["catalogue_rows"];
+    let (checks, extents) = (rows["verifications"].as_u64(), rows["extents"].as_u64());
+    let (checks, extents) = (checks.unwrap(), extents.unwrap());
+    let on = b.vars.get("RELEASE_AT_VERIFY").map(|v| v.trim()) == Some("on");
+    match (on, b.bridge.cfg.safety_min_age_secs) {
+        (false, _) => assert_eq!(checks, 4 * extents),
+        (true, 0) => assert_eq!(checks, 2 * extents),
+        (true, _) => assert!((2 * extents..=4 * extents).contains(&checks), "{checks}"),
+    }
+}
+
+/// The whole scenario on the real SQL with `RELEASE_AT_VERIFY=on` and no
+/// minimum age: every extent is released by the verify job that checked
+/// it, on the two rows of that job, and no release job runs.
+#[tokio::test(flavor = "current_thread")]
+async fn bench_counts_smoke_release_at_verify() {
+    let set = [("SAFETY_MIN_AGE_SECS", "0"), ("RELEASE_AT_VERIFY", "on")];
+    let b = scenario(&SMOKE, None, &set).await;
+    // No figures of a release job (`sanity`), and the scenario went on
+    // only once no outbox row was left before `done`.
+    sanity(&b);
+    assert!(b
+        .hub
+        .counts
+        .borrow()
+        .keys()
+        .all(|k| !k.ends_with(":release")));
+    assert_eq!(
+        b.sql_count("SELECT count(*) FROM outbox WHERE stage <> 'done'"),
+        0
+    );
+    // One row for each of the two backbones, of the job that released.
+    let extents = b.sql_count("SELECT count(*) FROM extents");
+    assert!(extents > 0);
+    assert_eq!(
+        b.sql_count("SELECT count(*) FROM verifications"),
+        2 * extents
+    );
+    assert_eq!(
+        b.sql_count(
+            "SELECT count(*) FROM extents e WHERE released_at IS NULL OR 2 <> \
+               (SELECT count(DISTINCT v.backbone) FROM verifications v \
+                 WHERE v.extent_id = e.id AND v.result = 'ok' \
+                   AND v.articles_total = e.article_count AND v.plan_rev = e.plan_rev \
+                   AND v.articles_total = \
+                     (CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END) \
+                   AND v.verified_at <= e.released_at)"
+        ),
+        0
     );
 }
 
@@ -1467,7 +1546,7 @@ async fn bench_counts_full() {
         .map(|v| v.parse().expect("VELMORA_BENCH_TINY is a count"))
         .unwrap_or(FULL.tiny);
     let scale = Scale { tiny, ..FULL };
-    let b = scenario(&scale, Some(trace)).await;
+    let b = scenario(&scale, Some(trace), &[]).await;
     sanity(&b);
     let json = report(&b, "full");
     std::fs::write(

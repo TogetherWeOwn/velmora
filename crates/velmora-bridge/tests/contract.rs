@@ -271,6 +271,9 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.job_budget_bytes, 72 * 1024 * 1024);
     assert_eq!(cfg.safety_min_age_secs, 86_400);
     assert_eq!(cfg.verify_delay_secs, 120);
+    // Shipped on: a verify round that passes once the minimum age is
+    // over releases the extent itself.
+    assert!(cfg.release_at_verify);
     assert_eq!(
         cfg.newsgroups,
         [
@@ -313,6 +316,7 @@ fn config_loads_from_documented_vars() {
     assert!(cfg.is_dev());
     assert_eq!(cfg.required_backbones, 1);
     assert_eq!(cfg.safety_min_age_secs, 0);
+    assert!(cfg.release_at_verify);
     assert_eq!(cfg.verify_delay_secs, 1);
     assert_eq!(cfg.gc_mode, GcMode::Disposable);
     assert!(cfg.server_side_copy);
@@ -564,6 +568,15 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // Who releases after a verify round: absent or blank is the
+        // release job, as before the switch existed.
+        if name == "RELEASE_AT_VERIFY" {
+            for _ in 0..2 {
+                assert!(!load(&vars).unwrap().release_at_verify);
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // Absent or blank: every GET is served by one invocation, as
         // before the variable existed.
         if name == "GET_FANOUT_BYTES" {
@@ -772,6 +785,9 @@ fn config_rejects_invalid_and_unsafe_values() {
         ("PARITY", "1"),
         ("PARITY", "ON"),
         ("PARITY", "true"),
+        ("RELEASE_AT_VERIFY", "1"),
+        ("RELEASE_AT_VERIFY", "ON"),
+        ("RELEASE_AT_VERIFY", "true"),
     ] {
         assert_eq!(set(&prod, name, bad), invalid(name), "{name}={bad}");
     }
@@ -780,6 +796,16 @@ fn config_rejects_invalid_and_unsafe_values() {
     tuned.insert("PROPAGATION_GRACE_SECS".into(), "0".into());
     let cfg = load(&tuned).unwrap();
     assert_eq!((cfg.post_sockets, cfg.propagation_grace_secs), (8, 0));
+    // Who releases after a verify round: absent, blank and `off` leave
+    // it to the release job.
+    let mut tuned = prod.clone();
+    tuned.remove("RELEASE_AT_VERIFY");
+    assert!(!load(&tuned).unwrap().release_at_verify);
+    for (value, on) in [("", false), ("  ", false), ("off", false), (" on ", true)] {
+        tuned.insert("RELEASE_AT_VERIFY".into(), value.into());
+        let cfg = load(&tuned).unwrap();
+        assert_eq!(cfg.release_at_verify, on, "RELEASE_AT_VERIFY={value:?}");
+    }
     // The parity switch: absent, blank and `off` are off.
     for (value, on) in [("", false), ("  ", false), ("off", false), (" on ", true)] {
         let mut tuned = prod.clone();

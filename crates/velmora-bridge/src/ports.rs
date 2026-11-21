@@ -1026,6 +1026,27 @@ pub trait Catalog {
         now: UnixMs,
         need_full: bool,
     ) -> Result<Guard<()>>;
+    /// The whole release in one step, for the verify job that releases
+    /// what it has just checked (`RELEASE_AT_VERIFY`). `l` is the lease
+    /// of that verify job. The guard is that of
+    /// [`Catalog::begin_release`] (`light` = `None`) or of
+    /// [`Catalog::begin_release_light`] (`light` = `Some(need_full)`),
+    /// word for word: "under this claim" is the claim `l` is of, so a
+    /// pass from an earlier job counts for nothing. Where it holds, the
+    /// copy goes from `held` to `released` and the row from `verify` to
+    /// `done` in the same batch, as [`Catalog::finish_release`] leaves
+    /// them. Nothing is left `releasing` in between: a job that dies
+    /// has released or has not. Only a copy that is `held` is taken: one
+    /// found `releasing` is refused, and is for a release job to finish.
+    async fn release_at_verify(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        now: UnixMs,
+        light: Option<bool>,
+    ) -> Result<Guard<()>>;
     /// Notes that a full read of a sampled extent failed on `backbone`:
     /// until `until` every extent is read in full there. An earlier end
     /// never replaces a later one. An extent raises a backbone once for

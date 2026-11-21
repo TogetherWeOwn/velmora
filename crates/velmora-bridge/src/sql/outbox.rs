@@ -924,6 +924,16 @@ pub(super) async fn body_checks<S: Sql>(
 /// reads the second point holds whatever `need_full` says. They are
 /// read in the guard, so one raised after the job read them is not
 /// missed.
+///
+/// `whole` is false for a release job: the copy becomes `releasing`,
+/// and [`finish_release`] is the last step. With `whole` the lease is
+/// that of the verify job that releases what it has just checked
+/// ([`crate::ports::Catalog::release_at_verify`]): the same guard over
+/// the claim of that lease, then the last step in the same batch. The
+/// copy goes from `held` to `released` and the row from `verify` to
+/// `done` together or not at all, so no copy is left `releasing` under
+/// a row in `verify`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_release<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
@@ -932,47 +942,84 @@ pub(super) async fn begin_release<S: Sql>(
     evidence_json: &str,
     now: UnixMs,
     light: Option<bool>,
+    whole: bool,
 ) -> Result<Guard<()>> {
     let need_full = light.unwrap_or(true);
     let light = light.is_some();
-    if l.stage != OutboxStage::Release || required == 0 {
-        return Err(BridgeError::Invalid(
-            "release needs a release lease and at least one required backbone",
-        ));
+    let stage = match whole {
+        false => OutboxStage::Release,
+        true => OutboxStage::Verify,
+    };
+    if l.stage != stage || required == 0 {
+        return Err(BridgeError::Invalid(match whole {
+            false => "release needs a release lease and at least one required backbone",
+            true => "release at verify needs a verify lease and at least one required backbone",
+        }));
     }
     let labels =
         serde_json::to_string(counting).map_err(|_| BridgeError::Invalid("backbone labels"))?;
-    let guard = concat!(
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
-        held!(),
-        " AND lease_until >= ?6) \
+    macro_rules! release_guard {
+        ($states:literal) => {
+            concat!(
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+                held!(),
+                " AND lease_until >= ?6) \
          OR NOT ",
-        live_ref!("?1"),
-        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
-              AND safety_state IN ('held', 'releasing')) \
+                live_ref!("?1"),
+                " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
+              AND safety_state ",
+                $states,
+                ") \
          OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
               WHERE ",
-        fresh_pass!(),
-        " AND NOT (?9 = 1 \
+                fresh_pass!(),
+                " AND NOT (?9 = 1 \
                 AND EXISTS (SELECT 1 FROM verify_escalations z \
                   WHERE z.backbone = v.backbone AND z.until > e.created_at) \
                 AND NOT EXISTS (SELECT 1 FROM verifications b \
                   WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-        body_on_record!(),
-        "))) < ?5 \
+                body_on_record!(),
+                "))) < ?5 \
          OR ((?8 = 1 OR (?9 = 1 AND EXISTS (SELECT 1 FROM verify_escalations z \
                 JOIN extents o ON o.id = ?1 \
                 WHERE z.until > o.created_at \
                   AND z.backbone IN (SELECT value FROM json_each(?7))))) \
              AND NOT EXISTS (SELECT 1 FROM verifications v \
               JOIN extents e ON e.id = v.extent_id WHERE ",
-        fresh_pass!(),
-        " AND EXISTS (SELECT 1 FROM verifications b \
+                fresh_pass!(),
+                " AND EXISTS (SELECT 1 FROM verifications b \
                 WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-        body_on_record!(),
-        ")))"
-    );
-    let stmts = vec![
+                body_on_record!(),
+                ")))"
+            )
+        };
+    }
+    // A release job finishes a release that a job before it began and
+    // left `releasing`. A verify job never begins one, so it meets no
+    // such copy, and its one write takes a held copy only.
+    let guard = match whole {
+        false => release_guard!("IN ('held', 'releasing')"),
+        true => release_guard!("= 'held'"),
+    };
+    let mark = match whole {
+        false => (
+            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+               evict_seq = evict_seq + 1 WHERE id = ?1",
+            vec![text(l.extent.as_str()), text(evidence_json)],
+        ),
+        // The mark and the write of [`finish_release`] as one: the row
+        // ends as the two steps of a release job leave it, but for the
+        // fence, which moves once for the one change of state.
+        true => (
+            "UPDATE extents SET safety_state = 'released', release_evidence = ?2, \
+               released_at = ?3, hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1",
+            vec![text(l.extent.as_str()), text(evidence_json), ms(now)],
+        ),
+    };
+    let mut stmts = vec![
         (
             guard,
             lease_params(
@@ -986,12 +1033,21 @@ pub(super) async fn begin_release<S: Sql>(
                 ],
             )?,
         ),
-        (
-            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
-               evict_seq = evict_seq + 1 WHERE id = ?1",
-            vec![text(l.extent.as_str()), text(evidence_json)],
-        ),
+        mark,
     ];
+    if whole {
+        // The row as the move to the release stage and then
+        // [`finish_release`] leave it: nothing of the verify rounds (the
+        // resume point, the last error) stays on a row that is done.
+        // Last: after this the lease no longer holds.
+        let done = concat!(
+            "UPDATE outbox SET stage = 'done', updated_at = ?5, cursor = 0, last_error = NULL, ",
+            unlease!(),
+            " WHERE ",
+            held!()
+        );
+        stmts.push((done, lease_params(l, [ms(now)])?));
+    }
     super::uploads::guarded(c, stmts).await
 }
 
