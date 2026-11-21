@@ -107,8 +107,6 @@ extern "C" {
         this: &ByteBody,
         options: &worker::js_sys::Object,
     ) -> Result<ByobReader, worker::wasm_bindgen::JsValue>;
-    #[wasm_bindgen(method, catch)]
-    fn cancel(this: &ByobReader) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
 }
 
 #[worker::wasm_bindgen::prelude::wasm_bindgen(
@@ -120,11 +118,14 @@ extern "C" {
     const r = await reader.read(new Uint8Array(buf, off, cap - off));
     if (r.value === undefined) throw new Error('body canceled');
     buf = r.value.buffer;
+    off += r.value.byteLength;
     if (r.done) return { buf, n: off, done: true };
     if (r.value.byteLength === 0) throw new Error('empty read');
-    off += r.value.byteLength;
     if (off === cap) return { buf, n: off, done: false };
   }
+}
+export function cancelBody(reader) {
+  reader.cancel().catch(() => {});
 }"
 )]
 extern "C" {
@@ -133,6 +134,9 @@ extern "C" {
     /// 2,060 reads per 16 MiB part into a 64 KiB view), and each read that
     /// came back into wasm cost a task and a wake. Rejects when the body
     /// failed or was canceled (a done read without a view).
+    /// Cancels the body; a stream that already failed is not an error.
+    #[wasm_bindgen(js_name = cancelBody)]
+    fn cancel_body(reader: &ByobReader);
     #[wasm_bindgen(catch, js_name = fillBody)]
     fn fill_body(
         reader: &ByobReader,
@@ -210,7 +214,7 @@ impl ByobReads {
 impl Drop for ByobReads {
     fn drop(&mut self) {
         if !self.settled {
-            let _ = self.reader.cancel();
+            cancel_body(&self.reader);
         }
     }
 }
@@ -223,14 +227,13 @@ impl PieceReads for ByobReads {
         let Some(buffer) = self.buffer.take() else {
             return if self.ended { Ok(None) } else { Err(failed()) };
         };
-        // A fill that fails or ends leaves nothing to cancel; a piece
-        // that is not the last sets this back.
-        self.settled = true;
         let promise = fill_body(&self.reader, buffer).map_err(|_| failed())?;
-        let filled: Filled = worker::wasm_bindgen_futures::JsFuture::from(promise)
-            .await
-            .map_err(|_| failed())?
-            .unchecked_into();
+        let filled = worker::wasm_bindgen_futures::JsFuture::from(promise).await;
+        // A fill that failed or ended leaves nothing to cancel; a piece
+        // that is not the last sets this back. Dropped while a fill is
+        // under way, the body is still canceled.
+        self.settled = true;
+        let filled: Filled = filled.map_err(|_| failed())?.unchecked_into();
         let n = filled.n();
         let back = filled.buf();
         let gave = fill_gave(n, filled.done());
