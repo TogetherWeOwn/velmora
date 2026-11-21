@@ -365,7 +365,8 @@ it. No build writes them yet. Any other value of the variable refuses to start.
   whole name and would not open under another. Changing the setting
   changes where the next record goes, nothing else. It can be changed
   in either direction until a build has written segments (below); from
-  then on it stays `tenant`.
+  then on `flat` is set only under the conditions of "Turning it off
+  again" at the end of this section.
 - Every reader reads both layouts whatever the setting says: the
   replay, the recovery copy, the intent sweep, and the lookup of an
   article plan (in the layout of
@@ -408,18 +409,28 @@ at the next CI deploy. The deploy job writes it from the variable
 repository (unset, empty or `flat`: flat; `tenant`; any other value
 fails the job before the deploy). Step 2 in production:
 
-1. Let nothing else merge to `main` until step 5 has passed.
-2. Check that the push run of the tip of `main` is younger than 1 day:
-   the deploy jobs take the bundle that run built, and it is kept for 1
+1. Let nothing else merge to `main` until step 6 has passed.
+2. Check that the version that serves production was deployed by the
+   push run of the tip of `main`: its message is `ci <run>.<attempt>
+   <commit>`, and the commit is the tip. If the tip was not deployed
+   (its deploy failed or was rolled back), stop: the switch would then
+   deploy other code together with the variable.
+3. Check that this push run is younger than 1 day: the job `deploy
+   (production)` takes the bundle the run built, and it is kept for 1
    day. If it is older, wait for the day of the next deploy.
-3. Set `VELMORA_RECORD_LAYOUT` to `tenant` in the `production`
+4. Set `VELMORA_RECORD_LAYOUT` to `tenant` in the `production`
    environment.
-4. Run the deploy jobs of that push run again. (`workflow_dispatch`
-   does not deploy.)
-5. Read the deploy log: the step "Generate the production wrangler
+5. Run the job `deploy (production)` of that push run again, and that
+   job only. Running `deploy-build` again builds a new bundle from the
+   same commit with the toolchain of that day, which is not the bundle
+   that serves. (`workflow_dispatch` does not deploy.)
+6. Read the deploy log: the step "Generate the production wrangler
    config" names the layout the generated config carries, `tenant`,
    and the deploy message carries the same commit as the version that
-   served before. Nothing else changed.
+   served before. Then check that the job ended green and that the
+   version that serves production carries this run's message: a job
+   that fails after the deploy rolls back to the version before it.
+   Nothing else changed.
 
 `wrangler secret list` must show no secret named `RECORD_LAYOUT`,
 before and after: the Worker reads a secret where the variable is
