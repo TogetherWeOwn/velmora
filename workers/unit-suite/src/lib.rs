@@ -15,28 +15,66 @@
 //! `{"i":<int>}`, `{"t":<text>}` or `{"b":<base64>}`. The answer is
 //! `{"ok":…}`, `{"err":"guard"}` or `{"err":"sql","class":…}`.
 //!
-//! Never deployed with production bindings: it has one binding, its own
-//! object class.
+//! `POST /unit/<tenant>/<unit>` reaches the unit object of that name
+//! ([`velmora_unit_do::UnitObject`], the real class), and
+//! `POST /unit-unnamed` one made without a name (`newUniqueId`).
+//! `POST /atomic/<name>` runs the whole-call transaction of `DoSql`
+//! (`UnitSql::atomically`) through three cases and answers what each
+//! left (`unit-smoke.py`).
+//!
+//! Never deployed with production bindings: it binds only its own
+//! object classes.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use velmora_bridge::unit::{poll_once, UnitSql};
 use velmora_bridge::{BridgeError, Row, Sql, SqlValue};
 use velmora_unit_do::{DoSql, PointInTime};
+pub use velmora_unit_do::UnitObject;
 // The class macro names `wasm_bindgen` at the crate root.
 use worker::wasm_bindgen;
 use worker::{durable_object, event, Context, DurableObject, Env, Request, Response, State};
 
 const BINDING: &str = "SUITE_DB";
+const UNIT_BINDING: &str = "UNIT";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
     let url = req.url()?;
-    let Some(name) = url.path().strip_prefix("/db/").map(str::to_string) else {
+    let path = url.path().to_string();
+    if let Some(name) = path.strip_prefix("/unit/") {
+        let stub = env
+            .durable_object(UNIT_BINDING)?
+            .id_from_name(name)?
+            .get_stub()?;
+        return stub.fetch_with_request(req).await;
+    }
+    if path == "/unit-unnamed" {
+        let stub = env.durable_object(UNIT_BINDING)?.unique_id()?.get_stub()?;
+        return stub.fetch_with_request(req).await;
+    }
+    let (op, name) = if let Some(name) = path.strip_prefix("/atomic/") {
+        ("atomic", name.to_string())
+    } else if let Some(name) = path.strip_prefix("/db/") {
+        ("db", name.to_string())
+    } else {
         return Response::error("not found", 404);
     };
+    if op == "atomic" {
+        let stub = env
+            .durable_object(BINDING)?
+            .id_from_name(&format!("atomic-{name}"))?
+            .get_stub()?;
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Post);
+        init.with_body(Some(r#"{"op":"atomic"}"#.into()));
+        return stub
+            .fetch_with_request(Request::new_with_init("https://suite/atomic", &init)?)
+            .await;
+    }
     if name.is_empty() || name.contains('/') {
         return Response::error("bad name", 400);
     }
@@ -142,7 +180,59 @@ impl SuiteDb {
                 }
                 json!(self.sql.batch(stmts).await?)
             }
+            Some("atomic") => self.atomic()?,
             _ => return Ok(None),
+        }))
+    }
+
+    /// The whole-call transaction of `DoSql`, in three cases: a call that
+    /// keeps its writes; one that fails after a write (nothing kept); and
+    /// one whose inner batch is refused by its guard (only the batch is
+    /// rolled back). Answers the rows each left.
+    fn atomic(&self) -> velmora_bridge::Result<Value> {
+        let sql = &self.sql;
+        sql.apply(
+            "CREATE TABLE IF NOT EXISTS t (n INTEGER NOT NULL); \
+             CREATE TABLE IF NOT EXISTS tx_guard (ok INTEGER NOT NULL CHECK (ok = 1)); \
+             DELETE FROM t;",
+        )?;
+        let rows = || -> velmora_bridge::Result<Value> {
+            let r = poll_once(sql.query("SELECT n FROM t ORDER BY n", &[]))??;
+            Ok(json!(r
+                .iter()
+                .map(|row| match row[0] {
+                    SqlValue::Int(n) => n,
+                    _ => -1,
+                })
+                .collect::<Vec<_>>()))
+        };
+        let insert = |n: i64| -> velmora_bridge::Result<()> {
+            poll_once(sql.exec("INSERT INTO t(n) VALUES (?1)", &[SqlValue::Int(n)]))??;
+            Ok(())
+        };
+        let kept = sql.atomically(&mut || insert(1));
+        let after_kept = rows()?;
+        let failed = sql.atomically(&mut || {
+            insert(2)?;
+            Err(BridgeError::Invalid("the call fails after a write"))
+        });
+        let after_failed = rows()?;
+        let inner = sql.atomically(&mut || {
+            insert(3)?;
+            let refused = poll_once(sql.batch(vec![
+                ("INSERT INTO t(n) VALUES (4)", vec![]),
+                ("INSERT INTO tx_guard(ok) VALUES (0)", vec![]),
+            ]))?;
+            match refused {
+                Err(BridgeError::GuardFailed) => Ok(()),
+                _ => Err(BridgeError::Invalid("the guard did not refuse the batch")),
+            }
+        });
+        let after_inner = rows()?;
+        Ok(json!({
+            "kept": { "ok": kept.is_ok(), "rows": after_kept },
+            "failed": { "error": failed.err().map(|e| e.to_string()), "rows": after_failed },
+            "inner": { "ok": inner.is_ok(), "rows": after_inner },
         }))
     }
 }

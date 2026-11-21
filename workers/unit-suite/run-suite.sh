@@ -22,10 +22,11 @@
 #   CARGO_TARGET_DIR and the other cargo variables are passed through.
 #
 # Without arguments every test target of velmora-bridge runs
-# (`--no-fail-fast --lib --tests`). The script exits non-zero when cargo
-# does, and also on any divergence, any twin it could not reach, and any
-# twin that stopped being compared for a reason other than a state with
-# broken foreign keys. The summary counts the databases, the calls
+# (`--no-fail-fast --lib --tests`). Then unit-smoke.py drives the unit's
+# Durable Object class itself in the same workerd. The script exits
+# non-zero when cargo or the smoke does, and also on any divergence, any
+# twin it could not reach, and any twin that stopped being compared for
+# a reason other than a state with broken foreign keys. The summary counts the databases, the calls
 # compared, the twins rebuilt after a test changed its database behind
 # the port (`with_conn`), and names the tests whose twin stopped.
 
@@ -79,9 +80,13 @@ const suite :Workerd.Worker = (
   compatibilityDate = "2026-11-01",
   durableObjectNamespaces = [
     (className = "SuiteDb", uniqueKey = "velmora-unit-suite", enableSql = true),
+    (className = "UnitObject", uniqueKey = "velmora-unit-object", enableSql = true),
   ],
   durableObjectStorage = (localDisk = "disk"),
-  bindings = [ (name = "SUITE_DB", durableObjectNamespace = "SuiteDb") ],
+  bindings = [
+    (name = "SUITE_DB", durableObjectNamespace = "SuiteDb"),
+    (name = "UNIT", durableObjectNamespace = "UnitObject"),
+  ],
 );
 CAPNP
 }
@@ -134,6 +139,12 @@ VELMORA_SQL_SHADOW_PRIMARY="$PRIMARY" \
 VELMORA_SQL_SHADOW_LOG="$RUN/shadow.log" \
   cargo test -p velmora-bridge "$@" 2>&1 | tee "$RUN/cargo.log" || status=$?
 
+log "unit object smoke in workerd"
+smoke=0
+python3 -I "$HERE/unit-smoke.py" "http://127.0.0.1:$PORT" > "$RUN/smoke.log" 2>&1 || smoke=$?
+cat "$RUN/smoke.log" >&2
+[ "$smoke" -eq 0 ] || [ "$status" -ne 0 ] || status=$smoke
+
 touch "$RUN/shadow.log"
 # Lines of the twin log: DIVERGENCE / UNREACHABLE (written when they
 # happen, so a panic that a test's own task swallowed still counts), and
@@ -161,6 +172,7 @@ fi
   printf '%s\n' "$DB_LINES" | awk -F'\t' '$4 ~ /^desynced:/ {print "  " $1 " " $4}' | sort | uniq -c
   echo "failed tests:"
   grep -E '^test .* FAILED$' "$RUN/cargo.log" | sed 's/^/  /' || true
+  echo "unit object smoke: $(tail -1 "$RUN/smoke.log")"
   echo "exit status: $status"
 } | tee ${SUITE_REPORT:+"$SUITE_REPORT"}
 exit "$status"

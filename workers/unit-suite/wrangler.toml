@@ -15,3 +15,11 @@ storage = "sqlite"
 [[durable_objects.bindings]]
 name = "SUITE_DB"
 class_name = "SuiteDb"
+
+[exports.UnitObject]
+type = "durable-object"
+storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "UNIT"
+class_name = "UnitObject"

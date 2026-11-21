@@ -78,3 +78,12 @@ export async function pitrRestoreNow(state, storage, bookmark) {
   await storage.onNextSessionRestoreBookmark(bookmark);
   state.abort("point-in-time restore");
 }
+
+// One unit call as one transaction: `run` is the Rust side of the call.
+// A throw from it rolls every write of the call back and reaches the
+// caller.
+export function doAtomically(storage, run) {
+  storage.transactionSync(() => {
+    run();
+  });
+}

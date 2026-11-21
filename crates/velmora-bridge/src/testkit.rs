@@ -417,7 +417,9 @@ impl RusqliteSql {
         if let Some(m) = meter.as_mut() {
             m.discard();
         }
-        let tx = conn.transaction().map_err(map_err)?;
+        // A savepoint: a transaction of its own at the top level, and a
+        // nested one inside a unit call (`UnitSql::atomically`).
+        let tx = conn.savepoint().map_err(map_err)?;
         let mut changed = Vec::with_capacity(stmts.len());
         let mut priced = Vec::new();
         for (sql, params) in stmts {
@@ -472,6 +474,37 @@ impl Sql for RusqliteSql {
             (true, Some(shadow)) => shadow.batch(&stmts, local),
             _ => local,
         }
+    }
+}
+
+/// A unit call is one transaction: a savepoint around it. When it rolls
+/// back, a workerd twin is rebuilt from what is left.
+impl crate::unit::UnitSql for RusqliteSql {
+    fn atomically(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.conn
+            .borrow()
+            .execute_batch("SAVEPOINT unit_call")
+            .map_err(map_err)?;
+        match f() {
+            Ok(()) => self
+                .conn
+                .borrow()
+                .execute_batch("RELEASE unit_call")
+                .map_err(map_err),
+            Err(e) => {
+                let conn = self.conn.borrow();
+                conn.execute_batch("ROLLBACK TO unit_call; RELEASE unit_call")
+                    .map_err(map_err)?;
+                if let Some(shadow) = &self.shadow {
+                    shadow.rebuild(&conn);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn apply_script(&self, script: &str) -> Result<()> {
+        self.apply(script)
     }
 }
 

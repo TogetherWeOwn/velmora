@@ -97,6 +97,11 @@ impl DoSql {
         do_apply(&self.storage, &script[..end]).map_err(map_err)
     }
 
+    /// The storage handle, for the other shim calls of this crate.
+    pub(crate) fn raw(&self) -> &DurableObjectStorage {
+        &self.storage
+    }
+
     /// Size of the database in bytes, as the runtime reports it.
     pub fn database_size(&self) -> Result<u64> {
         let n = do_database_size(&self.storage).map_err(map_err)?;
@@ -448,6 +453,10 @@ fn decode_err() -> BridgeError {
 /// The runtime's error as a class. The `tx_guard` CHECK is
 /// `GuardFailed`; a constraint failure and any other failure keep only
 /// their class.
+pub(crate) fn runtime_error(e: JsValue) -> BridgeError {
+    map_err(e)
+}
+
 fn map_err(e: JsValue) -> BridgeError {
     let message = e
         .dyn_ref::<js_sys::Error>()
