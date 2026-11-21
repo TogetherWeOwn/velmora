@@ -18,7 +18,9 @@
 //!
 //! `proof_start` is the Worker's clock just before the first of these
 //! reads, and the unit sets `fresh_until = proof_start + T` from it
-//! ([`super::lease::FreshLease::renew`]).
+//! ([`super::lease::FreshLease::renew`]). The proof also returns the
+//! state it was made for ([`Proven`]); `renew` carries it, and the unit
+//! refuses when it no longer holds exactly that state.
 //!
 //! What a finding means:
 //!
@@ -39,6 +41,7 @@ use crate::ports::{BlobStore, Clock};
 use crate::stamp::{stamp_key, STAMP_PREFIX};
 use crate::types::{BridgeError, Result, UnixMs};
 
+use super::lease::Proven;
 use super::stamp_id::UnitStampId;
 
 /// Keys per list call of the revocations.
@@ -76,11 +79,12 @@ pub struct UnitView<'a> {
 /// What a proof found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Proof {
-    /// The unit may be renewed with `proof_start`, after the listed
-    /// revocations are applied to it. `revocations` is empty when the
-    /// counts agree, and every id of the directory when they do not.
+    /// The unit may be renewed with `proof_start` and `proven`, after the
+    /// listed revocations are applied to it. `revocations` is empty when
+    /// the counts agree, and every id of the directory when they do not.
     Fresh {
         proof_start: UnixMs,
+        proven: Proven,
         revocations: Vec<String>,
     },
     /// A newer record exists in the named chain(s): `sync`, then prove
@@ -144,13 +148,20 @@ where
 
     let ids = revocations(safety, names, tenant).await?;
     let listed = ids.len() as u64;
+    let proven = Proven {
+        state_seq: unit.state_seq,
+        keys_seq: unit.keys_seq,
+        stamp_counter: unit.stamp_counter,
+    };
     match listed.cmp(&unit.revoked) {
         std::cmp::Ordering::Equal => Ok(Proof::Fresh {
             proof_start,
+            proven,
             revocations: Vec::new(),
         }),
         std::cmp::Ordering::Greater => Ok(Proof::Fresh {
             proof_start,
+            proven,
             revocations: ids,
         }),
         std::cmp::Ordering::Less => Ok(Proof::RevocationsShort {

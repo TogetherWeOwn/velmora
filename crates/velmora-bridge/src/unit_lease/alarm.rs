@@ -26,8 +26,9 @@
 //!
 //! This module decides and does nothing: the unit object computes the
 //! due time of each [`Duty`] from its own tables, asks [`on_alarm`] what
-//! to run, runs it, computes the due times again, and arms what
-//! [`rearm`] answers. It is pure, so every rule above is a native test.
+//! to run, runs it, computes the due times again, asks [`next_alarm`]
+//! when to wake, and arms what [`rearm`] answers. After a successful
+//! `renew` it arms what [`rearm`] answers for [`after_renew`]. It is pure, so every rule above is a native test.
 
 use crate::types::UnixMs;
 
@@ -205,20 +206,56 @@ pub fn on_alarm(
     }
 }
 
-/// After a `renew` succeeded at `now`: `Some(now)` when work is due, so
-/// the unit sets its alarm to now and the next run does it, the day
-/// close first. `None` = nothing waits; the armed alarm stays.
+/// After a `renew` succeeded at `now`: the time to pass to [`rearm`].
+/// Work that is due now gives `now`, so the next run does it at once,
+/// the day close first (RD-9). Work that is due later gives its time, so
+/// a retry alarm that the backoff armed further out is moved earlier.
+/// `None` = nothing waits.
 pub fn after_renew(now: UnixMs, dues: &Dues) -> Option<UnixMs> {
-    (!dues.due_at(now).is_empty()).then_some(now)
+    dues.earliest().map(|at| at.max(now))
 }
 
-/// The time the alarm should next fire: the earliest due time, and the
-/// renewal retry of the last run if it is earlier.
-pub fn next_alarm(dues: &Dues, retry_at: Option<UnixMs>) -> Option<UnixMs> {
-    match (dues.earliest(), retry_at) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
+/// The least time from a run to the alarm it arms. A duty still due
+/// after its run (it took a bounded number of rows) is taken up again
+/// after this gap rather than at once. 1 s (est).
+pub const MIN_ALARM_GAP_MS: i64 = 1000;
+
+/// When the alarm should next fire after a run at `now`, given the due
+/// times as the unit computes them after the run and the run's
+/// [`AlarmRun::retry_at`]. Never at or before `now`:
+///
+/// - a closed unit: `None`; the restore gate's lift arms it again;
+/// - a fresh lease: the earliest due time, at least
+///   [`MIN_ALARM_GAP_MS`] after `now`;
+/// - an expired lease: the earliest due time, but not before the renewal
+///   retry (`retry_at`, or without one `now` plus the backoff for
+///   `renew_tries`). Work that is due never wakes the alarm before the
+///   renewal it waits for, so the expired case sends one renew job per
+///   retry period and no more (rule 12).
+pub fn next_alarm(
+    now: UnixMs,
+    unit: &UnitAt<'_>,
+    dues: &Dues,
+    retry_at: Option<UnixMs>,
+    lease_rules: &LeaseRules,
+    rules: &AlarmRules,
+) -> Option<UnixMs> {
+    if unit.closed {
+        return None;
     }
+    let earliest = dues.earliest()?;
+    let floor = if unit.lease.is_fresh(now, lease_rules) {
+        now.0.saturating_add(MIN_ALARM_GAP_MS)
+    } else {
+        retry_at.map_or_else(
+            || {
+                now.0
+                    .saturating_add(renew_retry_ms(unit.renew_tries, rules))
+            },
+            |at| at.0,
+        )
+    };
+    Some(UnixMs(earliest.0.max(floor)))
 }
 
 /// What to do with the alarm.
@@ -231,7 +268,7 @@ pub enum Rearm {
 }
 
 /// `armed` is the alarm in force (`None` after it fired, or never set);
-/// `wanted` is [`next_alarm`]. Sets only when nothing is armed or the
+/// `wanted` is [`next_alarm`] or [`after_renew`]. Sets only when nothing is armed or the
 /// wanted time is earlier than the armed one.
 pub fn rearm(armed: Option<UnixMs>, wanted: Option<UnixMs>) -> Rearm {
     match (armed, wanted) {

@@ -13,6 +13,12 @@ use velmora_bridge::UnixMs;
 const T0: UnixMs = UnixMs(1_800_000_000_000);
 const LEASE_RULES: LeaseRules = LeaseRules::DEFAULT;
 const ALARM_RULES: AlarmRules = AlarmRules::DEFAULT;
+/// The state every proof in these tests was made for, and the unit holds.
+const HEAD: Proven = Proven {
+    state_seq: 4,
+    keys_seq: 9,
+    stamp_counter: Some(2),
+};
 
 /// The alarm's view of an open unit with no failed renewals.
 fn open(lease: &FreshLease) -> UnitAt<'_> {
@@ -31,7 +37,9 @@ fn renew(lease: &mut FreshLease, proof_start: UnixMs, now: UnixMs) -> UnixMs {
     let previous = lease.fresh_until();
     let proof_end = UnixMs(proof_start.0 + LEASE_RULES.term_ms);
     let upper_bound = previous.map_or(proof_end, |until| until.max(proof_end));
-    let until = lease.renew(proof_start, now, &LEASE_RULES).unwrap();
+    let until = lease
+        .renew(proof_start, &HEAD, &HEAD, now, &LEASE_RULES)
+        .unwrap();
     assert_eq!(lease.fresh_until(), Some(until));
     assert!(until <= upper_bound);
     until
@@ -92,7 +100,7 @@ fn stalled_proof_uses_proof_start() {
 fn proof_age_boundary() {
     let mut lease = FreshLease::expired();
     assert_eq!(
-        lease.renew(T0, at(30_001), &LEASE_RULES),
+        lease.renew(T0, &HEAD, &HEAD, at(30_001), &LEASE_RULES),
         Err(RenewRefused::ProofTooOld { behind_ms: 30_001 }),
     );
     assert_eq!(lease, FreshLease::expired());
@@ -104,7 +112,7 @@ fn proof_age_boundary() {
 fn proof_ahead_boundary() {
     let mut lease = FreshLease::expired();
     assert_eq!(
-        lease.renew(at(5_001), T0, &LEASE_RULES),
+        lease.renew(at(5_001), &HEAD, &HEAD, T0, &LEASE_RULES),
         Err(RenewRefused::ProofAhead { ahead_ms: 5_001 }),
     );
     assert_eq!(lease, FreshLease::expired());
@@ -273,20 +281,160 @@ fn renewal_rearms_deferred_work() {
 #[test]
 fn renewal_without_due_work_needs_no_alarm() {
     assert_eq!(after_renew(T0, &Dues::none()), None);
-    let future = Dues::none().with(Duty::Sweep, Some(at(1)));
-    assert_eq!(after_renew(T0, &future), None);
+    // Work due later: its own time, so a far retry alarm is moved earlier.
+    let future = Dues::none().with(Duty::Sweep, Some(at(300_000)));
+    assert_eq!(after_renew(T0, &future), Some(at(300_000)));
+    assert_eq!(
+        rearm(Some(at(1_800_000)), after_renew(T0, &future)),
+        Rearm::Set(at(300_000))
+    );
+    // Work overdue: now.
+    let overdue = Dues::none().with(Duty::Sweep, Some(at(-5)));
+    assert_eq!(after_renew(T0, &overdue), Some(T0));
 }
 
-/// The next alarm uses the earlier available time for work or a renewal retry.
+/// The next alarm: the earliest due time, never at or before now; with
+/// an expired lease never before the renewal retry; none for a closed unit.
 #[test]
-fn next_alarm_chooses_earliest_available_time() {
+fn next_alarm_is_never_in_the_past() {
+    let fresh = FreshLease::from_stored(Some(at(600_000)));
+    let expired = FreshLease::expired();
     let empty = Dues::none();
-    let dues = empty.with(Duty::Sweep, Some(at(5)));
-    assert_eq!(next_alarm(&dues, Some(at(2))), Some(at(2)));
-    assert_eq!(next_alarm(&dues, Some(at(8))), Some(at(5)));
-    assert_eq!(next_alarm(&dues, None), Some(at(5)));
-    assert_eq!(next_alarm(&empty, Some(at(2))), Some(at(2)));
-    assert_eq!(next_alarm(&empty, None), None);
+    let later = empty.with(Duty::Sweep, Some(at(5_000)));
+    let overdue = empty.with(Duty::Sweep, Some(at(-5_000)));
+
+    // Fresh lease.
+    let unit = open(&fresh);
+    let n = |d: &Dues, r| next_alarm(T0, &unit, d, r, &LEASE_RULES, &ALARM_RULES);
+    assert_eq!(n(&empty, None), None);
+    assert_eq!(n(&later, None), Some(at(5_000)));
+    assert_eq!(n(&overdue, None), Some(at(MIN_ALARM_GAP_MS)));
+
+    // Expired lease: the retry decides when work is due before it.
+    let unit = open(&expired);
+    let n = |d: &Dues, r| next_alarm(T0, &unit, d, r, &LEASE_RULES, &ALARM_RULES);
+    assert_eq!(n(&empty, Some(at(60_000))), None);
+    assert_eq!(n(&overdue, Some(at(60_000))), Some(at(60_000)));
+    assert_eq!(n(&later, Some(at(60_000))), Some(at(60_000)));
+    let far = empty.with(Duty::Report, Some(at(90_000)));
+    assert_eq!(n(&far, Some(at(60_000))), Some(at(90_000)));
+    // Without a retry from the run: the backoff of the tries so far.
+    let tried = UnitAt {
+        lease: &expired,
+        closed: false,
+        renew_tries: 2,
+    };
+    assert_eq!(
+        next_alarm(T0, &tried, &overdue, None, &LEASE_RULES, &ALARM_RULES),
+        Some(at(240_000))
+    );
+
+    // Closed: nothing, whatever is due.
+    for lease in [&fresh, &expired] {
+        let unit = UnitAt {
+            lease,
+            closed: true,
+            renew_tries: 0,
+        };
+        assert_eq!(
+            next_alarm(
+                T0,
+                &unit,
+                &overdue,
+                Some(at(60_000)),
+                &LEASE_RULES,
+                &ALARM_RULES
+            ),
+            None
+        );
+    }
+}
+
+/// The run, the next alarm and the re-arm composed: with an expired lease
+/// and work due, the alarm is armed once at the retry, never at or before
+/// now, so it sends one renew job per retry period (rule 12); a closed
+/// unit arms nothing.
+#[test]
+fn an_expired_or_closed_unit_does_not_loop_its_alarm() {
+    let dues = Dues::none()
+        .with(Duty::DayClose, Some(at(-1)))
+        .with(Duty::HandOut, Some(T0));
+    let expired = FreshLease::expired();
+    let mut now = T0;
+    let mut renew_jobs = Vec::new();
+    for tries in 0..8 {
+        let unit = UnitAt {
+            lease: &expired,
+            closed: false,
+            renew_tries: tries,
+        };
+        let run = on_alarm(now, &unit, &dues, &LEASE_RULES, &ALARM_RULES);
+        assert!(run.run.is_empty());
+        assert!(run.send_renew);
+        renew_jobs.push(now);
+        let wanted = next_alarm(now, &unit, &dues, run.retry_at, &LEASE_RULES, &ALARM_RULES);
+        // The alarm fired, so none is armed.
+        let Rearm::Set(next) = rearm(None, wanted) else {
+            panic!("work is due: an alarm must be armed");
+        };
+        assert!(next > now, "armed in the past at {now:?}");
+        now = next;
+    }
+    let gaps: Vec<i64> = renew_jobs.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    assert_eq!(
+        gaps,
+        [60_000, 120_000, 240_000, 480_000, 960_000, 1_800_000, 1_800_000]
+    );
+
+    let fresh = FreshLease::from_stored(Some(at(600_000)));
+    for lease in [&expired, &fresh] {
+        let unit = UnitAt {
+            lease,
+            closed: true,
+            renew_tries: 0,
+        };
+        let run = on_alarm(T0, &unit, &dues, &LEASE_RULES, &ALARM_RULES);
+        assert!(!run.send_renew && run.run.is_empty());
+        let wanted = next_alarm(T0, &unit, &dues, run.retry_at, &LEASE_RULES, &ALARM_RULES);
+        assert_eq!(rearm(None, wanted), Rearm::Keep);
+    }
+}
+
+/// A renewal proven for another state than the unit holds is refused and
+/// changes nothing: a unit rolled back below the counter, or below a seq,
+/// that the proof covered gets no lease.
+#[test]
+fn a_renewal_for_another_state_is_refused() {
+    let mut lease = FreshLease::expired();
+    for own in [
+        Proven {
+            stamp_counter: Some(1),
+            ..HEAD
+        },
+        Proven {
+            stamp_counter: None,
+            ..HEAD
+        },
+        Proven {
+            state_seq: 3,
+            ..HEAD
+        },
+        Proven {
+            keys_seq: 8,
+            ..HEAD
+        },
+        Proven {
+            keys_seq: 10,
+            ..HEAD
+        },
+    ] {
+        assert_eq!(
+            lease.renew(T0, &HEAD, &own, T0, &LEASE_RULES),
+            Err(RenewRefused::NotProven { proven: HEAD, own })
+        );
+        assert_eq!(lease, FreshLease::expired());
+    }
+    assert!(lease.renew(T0, &HEAD, &HEAD, T0, &LEASE_RULES).is_ok());
 }
 
 /// An alarm is set only when no alarm is armed or the wanted time is earlier.

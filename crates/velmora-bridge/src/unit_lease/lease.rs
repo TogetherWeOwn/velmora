@@ -15,6 +15,14 @@
 //! clock (the proof is stale) or ahead of it (the Worker's clock is
 //! wrong) is refused, and the Worker proves again.
 //!
+//! **A renewal is bound to what it proved.** The proof was made for the
+//! unit's `state_seq`, `keys_seq` and stamp counter as the Worker knew
+//! them ([`Proven`]); `renew` carries them and the unit refuses unless
+//! they are its own, in the same transaction that sets the lease. A unit
+//! that was rolled back to a lower counter (or seq) after the Worker took
+//! its view therefore gets no lease from a proof of the newer state, and
+//! a renewal that crosses a close or a restore is refused the same way.
+//!
 //! A renewal never moves the lease back: of two renewals that cross,
 //! the one with the later proof decides. Each of them was a whole proof,
 //! so the later bound is the one the proofs support.
@@ -73,6 +81,15 @@ pub enum Admit {
     RenewNeeded,
 }
 
+/// The unit state a renewal proof was made for: the two chain seqs and
+/// the stamp counter (`None` = never raised).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Proven {
+    pub state_seq: u64,
+    pub keys_seq: u64,
+    pub stamp_counter: Option<u64>,
+}
+
 /// Why a `renew` was refused. The unit answers `renew_needed` for
 /// both; the Worker proves again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +100,9 @@ pub enum RenewRefused {
     /// `proof_start` is more than [`LeaseRules::max_ahead_ms`] ahead of
     /// the unit's clock.
     ProofAhead { ahead_ms: i64 },
+    /// The proof was made for another state than the unit holds now
+    /// (`proven` is what the proof covered).
+    NotProven { proven: Proven, own: Proven },
 }
 
 /// The lease of one unit.
@@ -131,9 +151,10 @@ impl FreshLease {
         matches!(self.admit(now, rules), Admit::Fresh { .. })
     }
 
-    /// `renew(proof_start)`, called by the unit at its own `now`, after
-    /// the Worker proved the unit fresh (and after any `sync` and the
-    /// revocations that the proof asked for).
+    /// `renew(proof_start, proven)`, called by the unit at its own `now`,
+    /// after the Worker proved the unit fresh (and after any `sync` and
+    /// the revocations that the proof asked for). `own` is what the unit
+    /// holds, read in the same transaction; it must equal `proven`.
     ///
     /// Sets `fresh_until` to `proof_start + T` unless it is already
     /// later, and answers the lease in force afterwards. It is never set
@@ -145,9 +166,17 @@ impl FreshLease {
     pub fn renew(
         &mut self,
         proof_start: UnixMs,
+        proven: &Proven,
+        own: &Proven,
         now: UnixMs,
         rules: &LeaseRules,
     ) -> Result<UnixMs, RenewRefused> {
+        if proven != own {
+            return Err(RenewRefused::NotProven {
+                proven: *proven,
+                own: *own,
+            });
+        }
         let behind_ms = now.0.saturating_sub(proof_start.0);
         if behind_ms > rules.max_behind_ms {
             return Err(RenewRefused::ProofTooOld { behind_ms });

@@ -23,8 +23,10 @@
 //! with `RETURNING`). The rule errs one way only: a read counted as a
 //! write makes a dump `fuzzy`, which is safe; a write that is not
 //! counted would make a torn dump `exact`, which is not. The count is
-//! raised **before** the statement runs, so a page read can never see a
-//! row of a write whose count it does not see.
+//! raised **before** the statement runs and **again after** it answers
+//! (also when it fails, and when the call is dropped half-way): a page read during a write that yields before it
+//! applies sees a count that the next page no longer sees, whichever side
+//! of the write it fell on.
 //!
 //! **How it is held.** The unit builds its catalogue only over
 //! `MarkedSql<its Sql>`, and the inner database is a private field: no
@@ -50,6 +52,8 @@ pub struct Mark {
 pub struct WriteMark {
     wake_id: [u8; 16],
     writes: Cell<u64>,
+    /// Writes that have begun and not yet answered.
+    in_flight: Cell<u32>,
 }
 
 impl WriteMark {
@@ -60,6 +64,7 @@ impl WriteMark {
         WriteMark {
             wake_id,
             writes: Cell::new(0),
+            in_flight: Cell::new(0),
         }
     }
 
@@ -71,10 +76,37 @@ impl WriteMark {
         }
     }
 
+    /// Whether a write is under way: between its two raises. An audit
+    /// below the mark asks this for every call that changed a row.
+    pub fn writing(&self) -> bool {
+        self.in_flight.get() > 0
+    }
+
     fn raise(&self) {
         // A wake that reached 2^64 writes is not a case; saturating keeps
         // the count from wrapping back to a value a page already saw.
         self.writes.set(self.writes.get().saturating_add(1));
+    }
+
+    /// Raises the mark and holds it raised until the guard is dropped,
+    /// which raises it again: after the answer, after an error, and when
+    /// the call is dropped half-way.
+    fn begin(&self) -> Writing<'_> {
+        self.raise();
+        self.in_flight.set(self.in_flight.get().saturating_add(1));
+        Writing(self)
+    }
+}
+
+/// One write under way. See [`WriteMark::begin`].
+struct Writing<'a>(&'a WriteMark);
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .set(self.0.in_flight.get().saturating_sub(1));
+        self.0.raise();
     }
 }
 
@@ -151,26 +183,28 @@ impl<S: Sql> MarkedSql<S> {
 
 impl<S: Sql> Sql for MarkedSql<S> {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        if statement_may_write(sql) {
-            self.mark.raise();
+        if !statement_may_write(sql) {
+            return self.inner.query(sql, params).await;
         }
+        let _writing = self.mark.begin();
         self.inner.query(sql, params).await
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        self.mark.raise();
+        let _writing = self.mark.begin();
         self.inner.exec(sql, params).await
     }
 
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
-        self.mark.raise();
+        let _writing = self.mark.begin();
         self.inner.batch(stmts).await
     }
 
     async fn query_after_refusal(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        if statement_may_write(sql) {
-            self.mark.raise();
+        if !statement_may_write(sql) {
+            return self.inner.query_after_refusal(sql, params).await;
         }
+        let _writing = self.mark.begin();
         self.inner.query_after_refusal(sql, params).await
     }
 

@@ -4,14 +4,16 @@
 //!
 //! The catalogue runs over `MarkedSql<AuditSql>`. `AuditSql` sits below
 //! the mark and, for every call that reaches the database, compares the
-//! database's change count before and after with the mark: a call that
-//! changed a row while the mark did not move is a violation. The S3
+//! database's change count before and after: a call that changed a row
+//! while no write was under way in the mark ([`WriteMark::writing`]) is a
+//! violation. The S3
 //! paths, multipart, the cron dispatcher, GC and the stamp all run over
 //! it. A second test runs a write beside the mark and shows that the
 //! audit catches it, so the first test cannot pass by auditing nothing.
 
 #![allow(async_fn_in_trait)]
 
+mod nntp_support;
 mod service_support;
 
 use std::cell::{Cell, RefCell};
@@ -25,6 +27,7 @@ use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{FixedClock, RusqliteSql, TestKek};
 use velmora_bridge::unit_lease::mark::{exact, MarkedSql, WriteMark};
 use velmora_bridge::*;
+use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 const BUCKET: &str = "marked";
 
@@ -32,8 +35,6 @@ const BUCKET: &str = "marked";
 struct AuditSql {
     inner: RusqliteSql,
     mark: Rc<WriteMark>,
-    /// The mark's count at the previous call.
-    last: Cell<Option<u64>>,
     /// Calls that changed a row.
     changing: Cell<u64>,
     /// Statements that changed a row without the mark moving.
@@ -45,7 +46,6 @@ impl AuditSql {
         AuditSql {
             inner: RusqliteSql::with_schema().unwrap(),
             mark,
-            last: Cell::new(None),
             changing: Cell::new(0),
             violations: RefCell::new(Vec::new()),
         }
@@ -61,9 +61,7 @@ impl AuditSql {
         what: &str,
         call: impl std::future::Future<Output = Result<V>>,
     ) -> Result<V> {
-        let writes = self.mark.mark().writes;
-        let raised = self.last.get() != Some(writes);
-        self.last.set(Some(writes));
+        let raised = self.mark.writing();
         let before = self.changes();
         let out = call.await;
         if self.changes() != before {
@@ -96,23 +94,28 @@ impl Sql for AuditSql {
     }
 }
 
-type MarkedBridge =
-    Bridge<SqlCatalog<MarkedSql<AuditSql>>, Blobs, NoNntp, Jobs, TestKek, FixedClock>;
+type MarkedBridge<N> = Bridge<SqlCatalog<MarkedSql<AuditSql>>, Blobs, N, Jobs, TestKek, FixedClock>;
 
-struct MarkRig {
-    bridge: Rc<MarkedBridge>,
+struct MarkRig<N: NntpConnector + 'static = NoNntp> {
+    bridge: Rc<MarkedBridge<N>>,
     mark: Rc<WriteMark>,
 }
 
 impl MarkRig {
     fn new() -> MarkRig {
+        MarkRig::with(NoNntp, Vec::new())
+    }
+}
+
+impl<N: NntpConnector + 'static> MarkRig<N> {
+    fn with(nntp: N, providers: Vec<ProviderConfig>) -> MarkRig<N> {
         let mark = Rc::new(WriteMark::new([7; 16]));
-        let cfg = config(Vec::new());
+        let cfg = config(providers);
         let bridge = Rc::new(Bridge {
             catalog: SqlCatalog::new(MarkedSql::new(AuditSql::new(mark.clone()), mark.clone())),
             safety: Blobs::default(),
             cache: Blobs::default(),
-            nntp: NoNntp,
+            nntp,
             jobs: Jobs::default(),
             kek: TestKek::new(),
             clock: FixedClock::new(T0),
@@ -297,7 +300,10 @@ async fn every_write_of_the_catalogue_raises_the_mark() {
     // The cron work, GC and the stamp.
     rig.bridge.clock.advance_secs(3600);
     rig.bridge.dispatch().await.unwrap();
-    let _ = rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await;
+    assert_eq!(
+        rig.bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
     rig.bridge.raise_stamp().await.unwrap();
     rig.bridge.dispatch().await.unwrap();
 
@@ -313,6 +319,97 @@ async fn every_write_of_the_catalogue_raises_the_mark() {
         audit.changing.get()
     );
     assert!(rig.mark.mark().writes >= audit.changing.get());
+}
+
+/// The job pipeline: post, verify and release over a test NNTP server,
+/// with the dispatcher handing the jobs out, write only through the mark.
+#[tokio::test(flavor = "current_thread")]
+async fn the_post_verify_release_pipeline_writes_only_through_the_mark() {
+    let mut server_cfg = ServerConfig::for_test();
+    server_cfg.articles = Vec::new();
+    server_cfg.missing_ids.clear();
+    server_cfg.users.insert(
+        nntp_support::USER.to_string(),
+        UserConfig {
+            password: nntp_support::PASS.to_string(),
+            max_connections: 2,
+        },
+    );
+    let server = TestNntpServer::spawn(server_cfg).await;
+    let provider = ProviderConfig {
+        id: "p0".to_string(),
+        host: server.addr().ip().to_string(),
+        hosts: Vec::new(),
+        host_select: Default::default(),
+        port: server.addr().port(),
+        tls: false,
+        user: nntp_support::USER.to_string(),
+        pass: nntp_support::PASS.to_string(),
+        backbone: "bb0".to_string(),
+        post: true,
+        read: true,
+        max_conns: 2,
+        max_ips: None,
+        drill_conns: 0,
+        priority: 0,
+        retention_days: None,
+        pool: None,
+        pool_max_conns: None,
+        proxies: Vec::new(),
+        enabled: true,
+        release: true,
+    };
+    let rig = MarkRig::with(nntp_support::TcpConnector::default(), vec![provider]);
+    let signer = rig.setup().await;
+    let body = nntp_support::marked_plaintext(2 * 1024 * 1024 + 4321);
+    rig.call(&signer, Method::Put, "posted", &[], &[], &body)
+        .await
+        .expect(200);
+
+    rig.bridge.dispatch().await.unwrap();
+    let mut queue: Vec<(UnixMs, Job)> = Vec::new();
+    let mut runs = 0;
+    loop {
+        let now = rig.bridge.clock.now();
+        for sent in rig.bridge.jobs.inner.take() {
+            queue.push((now.plus_secs(sent.delay_secs), sent.job));
+        }
+        if queue.is_empty() {
+            break;
+        }
+        queue.sort_by_key(|(due, _)| *due);
+        let (due, job) = queue.remove(0);
+        if due > rig.bridge.clock.now() {
+            rig.bridge.clock.set(due);
+        }
+        runs += 1;
+        assert!(runs < 200, "the queue does not drain");
+        if let JobOutcome::Retry { delay_secs } = rig.bridge.run_job(&job).await {
+            queue.push((rig.bridge.clock.now().plus_secs(delay_secs), job));
+        }
+    }
+    rig.bridge.dispatch().await.unwrap();
+
+    let state = rig
+        .bridge
+        .catalog
+        .sql
+        .query("SELECT safety_state FROM extents", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        state,
+        vec![vec![SqlValue::Text("released".to_string())]],
+        "posted, verified and released"
+    );
+    assert!(server.posted_count().await >= 3);
+    let audit = rig.audit();
+    assert_eq!(
+        audit.violations.borrow().as_slice(),
+        &[] as &[String],
+        "statements that wrote past the mark"
+    );
+    assert!(audit.changing.get() >= 10);
 }
 
 /// A write run beside the mark is caught by the audit: the test above

@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::stamp::{stamp_key, Stamp, StampLedger, StampRow, ERR_ROLLED_BACK};
 use velmora_bridge::testkit::{FixedClock, MemBlobStore};
-use velmora_bridge::unit_lease::lease::{FreshLease, LeaseRules};
+use velmora_bridge::unit_lease::lease::{FreshLease, LeaseRules, Proven, RenewRefused};
 use velmora_bridge::unit_lease::renewal::{prove, revocations, ChainNames, Proof, UnitView};
 use velmora_bridge::unit_lease::UnitStampId;
 use velmora_bridge::*;
@@ -207,6 +207,11 @@ async fn a_unit_at_the_head_is_proven_with_two_heads_and_two_lists() {
         proof,
         Proof::Fresh {
             proof_start: T0,
+            proven: Proven {
+                state_seq: 3,
+                keys_seq: 5,
+                stamp_counter: None,
+            },
             revocations: Vec::new(),
         }
     );
@@ -225,7 +230,11 @@ async fn the_lease_runs_from_the_start_of_the_proof() {
     chains(&bucket, TENANT, 1, 1).await;
     let id = unit_id(0);
 
-    let Proof::Fresh { proof_start, .. } = prove(&bucket, &clock, &Names, &view(&id, 1, 1, 0))
+    let Proof::Fresh {
+        proof_start,
+        proven,
+        ..
+    } = prove(&bucket, &clock, &Names, &view(&id, 1, 1, 0))
         .await
         .unwrap()
     else {
@@ -239,14 +248,18 @@ async fn the_lease_runs_from_the_start_of_the_proof() {
     clock.advance_ms(20_000);
     let mut lease = FreshLease::expired();
     let rules = LeaseRules::DEFAULT;
-    let until = lease.renew(proof_start, clock.now(), &rules).unwrap();
+    let until = lease
+        .renew(proof_start, &proven, &proven, clock.now(), &rules)
+        .unwrap();
     assert_eq!(until, UnixMs(T0.0 + rules.term_ms));
     assert!(until.0 < clock.now().0 + rules.term_ms);
 
     // A stall past the bound: the unit refuses, the Worker proves again.
     let mut lease = FreshLease::expired();
     clock.advance_ms(rules.max_behind_ms);
-    assert!(lease.renew(proof_start, clock.now(), &rules).is_err());
+    assert!(lease
+        .renew(proof_start, &proven, &proven, clock.now(), &rules)
+        .is_err());
     assert_eq!(lease.fresh_until(), None);
 }
 
@@ -328,6 +341,11 @@ async fn a_revocation_only_in_the_bucket_is_applied_at_renewal_of_every_unit() {
         second_proof,
         Proof::Fresh {
             proof_start: clock.now().0.checked_sub(4 * CALL_MS).map(UnixMs).unwrap(),
+            proven: Proven {
+                state_seq: 2,
+                keys_seq: 7,
+                stamp_counter: None,
+            },
             revocations: vec!["AKIAFIRST".to_string(), "AKIASECOND".to_string()],
         }
     );
@@ -540,4 +558,65 @@ async fn a_stamp_under_another_id_is_refused() {
     let err = stamp.raise().await.unwrap_err();
     assert!(velmora_bridge::stamp::is_catalogue_id_error(&err));
     assert_eq!(bucket.count("put"), 0);
+}
+
+/// H2 of the first review: the Worker's view of the unit is newer than
+/// the unit (it was taken before the platform rolled the unit back, with
+/// the same seqs). The list after the view's counter is empty, so the
+/// proof passes; the renewal carries the proven counter and the unit,
+/// which holds a lower one, refuses it and stays without a lease.
+#[tokio::test(flavor = "current_thread")]
+async fn a_proof_from_a_newer_view_gives_a_rolled_back_unit_no_lease() {
+    let clock = FixedClock::new(T0);
+    let bucket = SlowBucket::new(&clock);
+    chains(&bucket, TENANT, 1, 1).await;
+    let id = unit_id(0);
+    let ledger = UnitLedger::new(&id);
+    let stamp = Stamp {
+        ledger: &ledger,
+        safety: &bucket,
+        clock: &clock,
+        id: id.as_str(),
+    };
+    for _ in 0..3 {
+        stamp.raise().await.unwrap();
+    }
+    let mut v = view(&id, 1, 1, 0);
+    v.stamp_counter = Some(3);
+    // The unit goes back to counter 1; the Worker still holds counter 3.
+    ledger.counter.set(Some(1));
+
+    let Proof::Fresh {
+        proof_start,
+        proven,
+        ..
+    } = prove(&bucket, &clock, &Names, &v).await.unwrap()
+    else {
+        panic!("the listing after counter 3 is empty: the proof passes");
+    };
+    let own = Proven {
+        state_seq: 1,
+        keys_seq: 1,
+        stamp_counter: ledger.counter.get(),
+    };
+    let mut lease = FreshLease::expired();
+    assert_eq!(
+        lease.renew(
+            proof_start,
+            &proven,
+            &own,
+            clock.now(),
+            &LeaseRules::DEFAULT
+        ),
+        Err(RenewRefused::NotProven { proven, own })
+    );
+    assert!(!lease.is_fresh(clock.now(), &LeaseRules::DEFAULT));
+
+    // The Worker proves again from the unit's own counter: the stamp
+    // objects after it are found.
+    v.stamp_counter = own.stamp_counter;
+    assert_eq!(
+        prove(&bucket, &clock, &Names, &v).await.unwrap(),
+        Proof::StampAhead { seen: Some(1) }
+    );
 }
