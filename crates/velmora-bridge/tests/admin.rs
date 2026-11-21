@@ -1302,31 +1302,54 @@ async fn drill_fx(
 /// A drill rebuilds an article that no provider has from the extent's
 /// parity, as a cold read does, and says so. When the rebuild finds no
 /// room in the byte budget, the next try waits for the read and the
-/// rebuild together and has the rebuild's room in hand.
+/// rebuild together and has the rebuild's room in hand: with room for
+/// the read alone it does not read the extent again only to be refused
+/// its rebuild again.
 #[tokio::test]
 async fn a_drill_rebuilds_a_lost_article_from_parity() {
+    use velmora_bridge::ingress::CHARGE_POLL_MS;
     for crowded in [false, true] {
-        // What another request of the isolate holds, until the drill's
-        // first wait.
+        // What another request of the isolate holds, and what it holds
+        // from the drill's first wait on: one byte too many for the read
+        // and the rebuild together, until someone waits for the budget.
         let other: Rc<RefCell<Option<ingress::Charge>>> = Rc::default();
+        let then = Rc::new(Cell::new(0u64));
         let polls = Rc::new(Cell::new(0u32));
-        let (held, counted) = (other.clone(), polls.clone());
+        let weak: Rc<RefCell<std::rc::Weak<TestBridge>>> = Rc::default();
+        let (held, next, counted, bridge) =
+            (other.clone(), then.clone(), polls.clone(), weak.clone());
         let mut fx = Fx::with_sleeper(move |clock| {
             Rc::new(move |ms| {
-                if !(COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) {
+                let cold = (COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms);
+                if !cold && ms != CHARGE_POLL_MS {
                     return Box::pin(std::future::pending());
                 }
-                let (held, counted, clock) = (held.clone(), counted.clone(), clock.clone());
+                let (held, next, counted, bridge, clock) = (
+                    held.clone(),
+                    next.clone(),
+                    counted.clone(),
+                    bridge.clone(),
+                    clock.clone(),
+                );
                 Box::pin(async move {
-                    counted.set(counted.get() + 1);
                     clock.advance_ms(i64::from(ms));
                     held.borrow_mut().take();
+                    if !cold {
+                        return;
+                    }
+                    counted.set(counted.get() + 1);
+                    if counted.get() == 1 && next.get() > 0 {
+                        let bridge = bridge.borrow().upgrade().expect("fixture is alive");
+                        let rest = bridge.budget.try_charge(next.get());
+                        *held.borrow_mut() = Some(rest.expect("the drill holds nothing"));
+                    }
                 })
             })
         })
         .await;
         let cfg = &mut Rc::get_mut(&mut fx.bridge).unwrap().cfg;
         (cfg.packed_plans, cfg.parity) = (true, true);
+        *weak.borrow_mut() = Rc::downgrade(&fx.bridge);
         let bucket = fx.bucket("scratch").await;
         let o = fx.put(&bucket, "k", &plaintext()).await;
         fx.drive(&o, OutboxStage::Done).await;
@@ -1336,11 +1359,14 @@ async fn a_drill_rebuilds_a_lost_article_from_parity() {
         // Whole on Usenet: nothing is rebuilt.
         let v = fx.post("/drill/scratch/k").await.json();
         assert_eq!((&v["match"], &v["rebuilt"]), (&json!(true), &json!(0)));
-        // What the drill holds to read the extent, over its one socket.
+        // What the drill holds to read the extent, over its one socket,
+        // and what the rebuild of one article takes beside it.
         let cipher = fx.scalar("SELECT cipher_size FROM extents", &[]).await;
         let cipher: u64 = cipher.parse().unwrap();
         let read =
             velmora_bridge::fetch::cold_step_bytes(cipher, 1).max(cipher + o.plain.len() as u64);
+        let (_, shard) = velmora_bridge::parity::stripe_of(cipher).unwrap();
+        let need = velmora_bridge::fetch::cold_rebuild_bytes(u64::from(shard), 1);
 
         let stored = fx.bridge.catalog.stored_plan(&o.extent).await.unwrap();
         fx.server.hide(&stored.rows[1].message_id).await;
@@ -1348,14 +1374,18 @@ async fn a_drill_rebuilds_a_lost_article_from_parity() {
             // Room for the read, none for the rebuild beside it.
             let rest = fx.bridge.budget.try_charge(BUDGET - read);
             *other.borrow_mut() = Some(rest.expect("the budget is free"));
+            then.set(BUDGET - read - need + 1);
         }
         let r = fx.post("/drill/scratch/k").await;
         assert_eq!(r.status, 200, "{}", r.text());
         let v = r.json();
         assert_eq!((&v["match"], &v["rebuilt"]), (&json!(true), &json!(1)));
         assert_eq!(v["plaintext_sha256"], hex(&sha256(&o.plain)));
+        // One try that lacked the room, one that had it: the extent is
+        // not read a third time.
         assert_eq!(v["retries"], u32::from(crowded));
         assert_eq!(polls.get(), u32::from(crowded));
+        assert!(other.borrow().is_none());
         assert_eq!(fx.bridge.budget.in_use(), 0);
         assert_eq!(fx.bridge.nntp.live(), 0);
 

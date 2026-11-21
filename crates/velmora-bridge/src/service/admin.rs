@@ -1544,7 +1544,10 @@ async fn drill_extent<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K:
             // An extent that is not posted in full is not on Usenet:
             // nothing is asked for.
             Ok(plan) if plan.rows.iter().any(|a| a.state != ArticleState::Posted) => {
-                return Ok(None)
+                // The room this try was given for a rebuild goes back
+                // now, not when the drill has closed its sessions.
+                reader.settle();
+                return Ok(None);
             }
             Ok(plan) => {
                 let count = plan.rows.len() as u64;
