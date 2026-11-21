@@ -743,6 +743,33 @@ async fn a_job_without_a_slot_waits_for_one_under_its_claim() {
     assert_eq!(rig.servers[1].posted_count().await, 0);
 }
 
+/// A cooldown of the only poster that begins while a job waits for its
+/// slot is met as by a job claimed then: the job is put off until the
+/// cooldown ends, with no attempt spent, no connect and nothing read,
+/// although the slots came free meanwhile.
+#[tokio::test]
+async fn a_cooldown_that_begins_during_the_wait_puts_the_job_off() {
+    let mut rig = rig(&[spec("bb0", 5)]).await;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    let half = i64::from(PERMIT_SECS) * 500;
+    rig.take_slots(0, now.plus_ms(-half)).await;
+    let until = now.plus_secs(600);
+    rig.bridge.catalog.cool_from("p0", now.plus_secs(10), until);
+    let (connects, reads) = (rig.bridge.nntp.connects(), rig.bridge.safety.gets());
+
+    let out = rig.run_post(&s).await;
+
+    assert!(matches!(out, JobOutcome::Retry { .. }), "{out:?}");
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!((10_000..half).contains(&waited), "{waited}");
+    assert_eq!(rig.bridge.nntp.connects(), connects);
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    let row = rig.bridge.catalog.outbox(&s.extent);
+    assert_eq!((row.attempts, row.next_at), (0, until));
+}
+
 /// Two sockets. While one has a POST in flight, the permits are taken
 /// over and the other socket's renewal finds them gone. The first socket
 /// makes no call after its POST returns. Nothing is recorded (a plan is

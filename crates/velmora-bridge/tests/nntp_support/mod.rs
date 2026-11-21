@@ -373,6 +373,8 @@ pub struct MemCatalog {
     pub entries: RefCell<BTreeMap<ExtentId, Entry>>,
     slots: RefCell<BTreeMap<String, Vec<Slot>>>,
     health: RefCell<BTreeMap<String, Health>>,
+    /// A cooldown that begins by itself: `(provider, from, until)`.
+    later_cooldown: RefCell<Option<(String, i64, i64)>>,
     /// The next `n` `mark_posted` calls fail before writing (a job that
     /// dies between the POST and the catalogue write).
     pub fail_mark_posted: Cell<u32>,
@@ -462,6 +464,12 @@ impl MemCatalog {
     }
 
     /// Every held slot passes to someone else: its holder's permit is dead.
+    /// Provider `id` reads as cooling until `until` from `from` on, as
+    /// when another job's failures begin a cooldown at `from`.
+    pub fn cool_from(&self, id: &str, from: UnixMs, until: UnixMs) {
+        *self.later_cooldown.borrow_mut() = Some((id.to_string(), from.0, until.0));
+    }
+
     pub fn revoke_permits(&self) {
         for slot in self.slots.borrow_mut().values_mut().flatten() {
             slot.token += 1;
@@ -1601,12 +1609,23 @@ impl Catalog for MemCatalog {
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
         let slots = self.slots.borrow();
         let health = self.health.borrow();
-        let ids: std::collections::BTreeSet<&String> = slots.keys().chain(health.keys()).collect();
+        let later = self.later_cooldown.borrow();
+        let ids: std::collections::BTreeSet<&String> = slots
+            .keys()
+            .chain(health.keys())
+            .chain(later.as_ref().map(|l| &l.0))
+            .collect();
         Ok(ids
             .into_iter()
             .map(|id| {
                 let s = slots.get(id).map(Vec::as_slice).unwrap_or_default();
-                let h = health.get(id).copied().unwrap_or_default();
+                let mut h = health.get(id).copied().unwrap_or_default();
+                if let Some((_, _, until)) = later
+                    .as_ref()
+                    .filter(|(p, from, _)| p == id.as_str() && *from <= now.0)
+                {
+                    h.until = *until;
+                }
                 ProviderLoad {
                     provider_id: id.clone(),
                     held: s.iter().filter(|s| s.until >= now.0).count() as u32,

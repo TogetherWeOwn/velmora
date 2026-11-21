@@ -601,20 +601,6 @@ where
             return self.to_verify(lease).await;
         }
         let holder = job_holder(lease);
-        let pool = Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await?;
-        let posters: Vec<&ProviderConfig> = self.cfg.providers.iter().filter(|p| p.post).collect();
-        let cooling = pool.cooling_until(&posters);
-        let probing = pool.refusing(&posters);
-        let order = pool.order(posters, PermitClass::Background);
-        // The slots first. Loading and hashing the extent is the expensive
-        // part of the job: one that would only find every slot of its
-        // first tier taken gives its lease back before it, not after.
-        let Some(first_tier) = order.chunk_by(|a, b| a.priority == b.priority).next() else {
-            return Err(match cooling {
-                Some(until) => Stop::Cooling(until),
-                None => Stop::fail(FailClass::Internal),
-            });
-        };
         // The articles left to post are known before the extent is read:
         // every one of a new plan, the planned ones of a stored plan.
         // The parity articles of a plan are posted with it.
@@ -636,17 +622,43 @@ where
             }
         };
         let asked = self.clock.now();
-        // Every slot of the tier taken: one is waited for under the
-        // claim for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]),
-        // before the extent is read. The tier is the one the job found:
-        // a cooldown that begins meanwhile is met as by a job at work.
-        let mut held = loop {
-            let (held, _) = self
+        let mut waited = false;
+        // The slots first. Loading and hashing the extent is the expensive
+        // part of the job: one that would only find every slot of its
+        // first tier taken gives its lease back before it, not after.
+        // Before that it waits for one under the claim for a bounded time
+        // ([`crate::jobs::SLOT_WAIT_MS`]). Each ask reads the pool again,
+        // so a cooldown or a login refusal that begins during the wait is
+        // met as a job claimed then meets it. A catalogue error of a
+        // later ask ends the wait as a put-off, not as a spent attempt.
+        let (cooling, probing, order, mut held) = loop {
+            let pool = match Pool::load(&self.catalog, &self.cfg.providers, self.clock.now()).await
+            {
+                Err(_) if waited => return Err(Stop::NoPermit),
+                pool => pool?,
+            };
+            let posters: Vec<&ProviderConfig> =
+                self.cfg.providers.iter().filter(|p| p.post).collect();
+            let cooling = pool.cooling_until(&posters);
+            let probing = pool.refusing(&posters);
+            let order = pool.order(posters, PermitClass::Background);
+            let Some(first_tier) = order.chunk_by(|a, b| a.priority == b.priority).next() else {
+                return Err(match cooling {
+                    Some(until) => Stop::Cooling(until),
+                    None => Stop::fail(FailClass::Internal),
+                });
+            };
+            let held = match self
                 .open_sessions(first_tier, &holder, todo, &probing)
-                .await?;
+                .await
+            {
+                Err(_) if waited => return Err(Stop::NoPermit),
+                opened => opened?.0,
+            };
             if !held.is_empty() || !self.slot_wait(lease).await {
-                break held;
+                break (cooling, probing, order, held);
             }
+            waited = true;
         };
         let permits_ms = self.clock.now().0 - asked.0;
         crate::trace::note(&lease.extent, |t| {
