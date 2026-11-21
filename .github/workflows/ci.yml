@@ -424,6 +424,9 @@ jobs:
       - name: Test the production config generator
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_deploy_config.py
+      - name: Test the catalogue export and import scripts
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_catalog_export.py
       # bundle.sh: worker-build, then the `name` section is dropped. The
       # same script builds the deploy artifact and the wrangler dev bundle.
       - name: Build the Worker bundle

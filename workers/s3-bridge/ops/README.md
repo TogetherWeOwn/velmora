@@ -253,11 +253,21 @@ new key does not get the id of a revoked one.
 
 ## Routine: export
 
-`ops/catalog-export.sh` runs `wrangler d1 export` and stores the SQL file
-in the bucket `velmora-catalog-export` (create it once with
-`npx wrangler r2 bucket create velmora-catalog-export`). Run it from cron,
-for example daily. It prints the **restore point**, which is also the
-object's name. D1 does not answer queries while an export runs.
+`ops/catalog-export.sh` runs `wrangler d1 export`, compresses the SQL with
+zstd, and uploads the parts to `velmora-catalog-export` (create it once
+with `npx wrangler r2 bucket create velmora-catalog-export`). Run it from
+cron, for example daily. D1 does not answer queries while an export runs.
+
+The script prints the **restore point** in milliseconds. Under `d1/<db>/`,
+the parts are named `<restore point>.sql.zst.part-000`, `-001`, and so on.
+The script uploads `<restore point>.manifest.json` last. The manifest lists
+the parts and checksums and marks a complete export.
+
+Wrangler uploads each part by default. Splitting keeps each upload under
+Wrangler's 300 MiB limit. `VELMORA_EXPORT_PART_BYTES` defaults to 268435456
+(256 MiB) and accepts positive integers up to 300000000. To use rclone for
+uploads and restores, set `VELMORA_EXPORT_RCLONE_REMOTE` to the name of a
+configured remote for the R2 S3 endpoint.
 
 Take a fresh export after every deploy that applied a migration. An
 export carries the schema of its day and the list of the migrations
@@ -275,10 +285,12 @@ exists: restore it to a timestamp, then replay from that timestamp.
 2. Bring the database back, one of:
    - Time Travel: `npx wrangler d1 time-travel restore <db> --timestamp <T>`.
      The restore point is `T` in milliseconds.
-   - Export: create an empty database (do not apply the migrations
-     first: the export carries the schema and the list of applied
-     migrations), download the newest `d1/<db>/<restore point>.sql` and
-     load it with `npx wrangler d1 execute <db> --remote --file <file>`.
+   - Export: create an empty database and run
+     `ops/catalog-import.sh <new db> <restore point>`. The export carries
+     the schema and the list of applied migrations, so apply migrations
+     after loading it. The script checks every checksum in the manifest and
+     refuses a non-empty database. Legacy single-file exports have no
+     checksums.
    - Nothing: create a database. The restore point is `0`.
 
    Then, in every case, bring the schema up to date and close the

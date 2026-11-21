@@ -2,8 +2,8 @@
 # Snapshots the D1 catalogue into an R2 bucket that is separate from the
 # data buckets: ops/catalog-export.sh [wrangler args, e.g. --env dev]
 #
-# The object is stored as `d1/<database>/<restore point ms>.sql`. The
-# restore point is taken before the export starts, so every commit the
+# Compressed SQL parts and their manifest are stored under d1/<database>/.
+# The restore point is taken before the export starts, so every commit the
 # snapshot misses has a recovery record that is newer than it; a restore
 # passes that number to ops/catalog-replay.sh.
 #
@@ -16,10 +16,11 @@
 # Environment:
 #   VELMORA_D1             database name (default velmora-catalog)
 #   VELMORA_EXPORT_BUCKET  R2 bucket (default velmora-catalog-export)
+#   VELMORA_EXPORT_PART_BYTES     maximum part size (default 268435456)
+#   VELMORA_EXPORT_RCLONE_REMOTE  optional configured rclone remote
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID  for wrangler
 #
-# wrangler uploads at most 315 MB in one `r2 object put`; a larger
-# snapshot must be uploaded with an S3 client instead.
+# The manifest is uploaded last. Without it the parts are incomplete.
 
 set -euo pipefail
 set +x
@@ -29,7 +30,24 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$HERE/.."
 DB=${VELMORA_D1:-velmora-catalog}
 BUCKET=${VELMORA_EXPORT_BUCKET:-velmora-catalog-export}
-WORK=$(mktemp -d)
+remote=${VELMORA_EXPORT_RCLONE_REMOTE-}
+part_bytes=${VELMORA_EXPORT_PART_BYTES-268435456}
+
+for tool in zstd jq split sha256sum; do
+  command -v "$tool" >/dev/null || { echo "catalog-export: missing tool: $tool" >&2; exit 1; }
+done
+if [[ ${VELMORA_EXPORT_RCLONE_REMOTE+x} && ! $remote =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "catalog-export: invalid VELMORA_EXPORT_RCLONE_REMOTE" >&2
+  exit 1
+fi
+if [[ $part_bytes =~ ^0*([1-9][0-9]{0,8})$ ]] && (( BASH_REMATCH[1] <= 300000000 )); then
+  part_bytes=${BASH_REMATCH[1]}
+else
+  echo "catalog-export: VELMORA_EXPORT_PART_BYTES must be an integer from 1 to 300000000" >&2
+  exit 1
+fi
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/velmora-export.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 since_ms=$(($(date +%s) * 1000))
@@ -42,13 +60,52 @@ npx wrangler d1 export "$DB" --remote --output "$file" "$@" >"$WORK/export.log" 
 [ -s "$file" ] || { echo "catalog-export: the export is empty" >&2; exit 1; }
 grep -q 'CREATE TABLE' "$file" || { echo "catalog-export: the export has no schema" >&2; exit 1; }
 
-key="d1/$DB/$since_ms.sql"
-npx wrangler r2 object put "$BUCKET/$key" --file "$file" --remote \
-  --content-type application/sql "$@" >"$WORK/put.log" 2>&1 || {
-  echo "catalog-export: wrangler r2 object put failed:" >&2
-  tail -n 20 "$WORK/put.log" >&2
-  exit 1
+put() {
+  local key=$1 path=$2 type=$3
+  shift 3
+  if [[ -n $remote ]]; then
+    rclone copyto "$path" "$remote:$BUCKET/$key" --s3-upload-cutoff 64M \
+      --header-upload "Content-Type: $type"
+  else
+    npx wrangler r2 object put "$BUCKET/$key" --file "$path" --remote \
+      --content-type "$type" "$@"
+  fi >"$WORK/put.log" 2>&1 || {
+    echo "catalog-export: put of $key failed:" >&2
+    tail -n 20 "$WORK/put.log" >&2
+    exit 1
+  }
 }
-printf 'catalog-export: %s bytes, sha256 %s, stored as %s/%s\n' \
-  "$(wc -c <"$file" | tr -d ' ')" "$(sha256sum "$file" | cut -d' ' -f1)" "$BUCKET" "$key"
+
+zstd -q -T0 -10 "$file" -o "$file.zst"
+zstd -q -t "$file.zst"
+split -b "$part_bytes" -d -a 3 "$file.zst" "$file.zst.part-"
+
+sql_bytes=$(wc -c <"$file")
+sql_sha256=$(sha256sum <"$file")
+sql_sha256=${sql_sha256%% *}
+zst_bytes=$(wc -c <"$file.zst")
+zst_sha256=$(sha256sum <"$file.zst")
+zst_sha256=${zst_sha256%% *}
+prefix="d1/$DB/$since_ms"
+parts=("$file.zst.part-"*)
+for part in "${parts[@]}"; do
+  key="$prefix.sql.zst.part-${part##*-}"
+  bytes=$(wc -c <"$part")
+  sha256=$(sha256sum <"$part")
+  jq -n --arg key "$key" --argjson bytes "$bytes" --arg sha256 "${sha256%% *}" \
+    '{$key, $bytes, $sha256}' >>"$WORK/parts.json"
+  put "$key" "$part" application/zstd "$@"
+done
+
+manifest="$prefix.manifest.json"
+jq -n --argjson restore_point_ms "$since_ms" --arg database "$DB" \
+  --argjson sql_bytes "$sql_bytes" --arg sql_sha256 "$sql_sha256" \
+  --argjson zst_bytes "$zst_bytes" --arg zst_sha256 "$zst_sha256" \
+  --slurpfile parts "$WORK/parts.json" \
+  '{format: 1, $restore_point_ms, $database, $sql_bytes, $sql_sha256,
+    $zst_bytes, $zst_sha256, $parts}' >"$WORK/manifest.json"
+put "$manifest" "$WORK/manifest.json" application/json "$@"
+
+printf 'catalog-export: sql %s bytes, sha256 %s, zst %s bytes in %s part(s), manifest %s/%s\n' \
+  "$sql_bytes" "$sql_sha256" "$zst_bytes" "${#parts[@]}" "$BUCKET" "$manifest"
 printf 'restore point: %s\n' "$since_ms"
