@@ -75,7 +75,8 @@ fi
 # overwrites the plain run of the same commit it is compared against.
 # The readable part is cut at 60 characters; a hash of the whole value keeps
 # two different values apart.
-if [[ -n ${BENCH_VARS//[[:space:]]/} && -z $NAME && -z $OUT ]]; then
+BV=${BENCH_VARS:-}
+if [[ -n ${BV//[[:space:]]/} && -z $NAME && -z $OUT ]]; then
   NAME="$SHA-vars-$(printf '%s' "$BENCH_VARS" | tr -c 'A-Za-z0-9._=-' '_' | cut -c1-60)-$(printf '%s' "$BENCH_VARS" | sha256sum | cut -c1-8)"
 fi
 NAME=${NAME:-$SHA}
