@@ -513,12 +513,22 @@ fn rearm_sets_only_new_or_earlier_alarms() {
     assert_eq!(rearm(Some(T0), None), Rearm::Keep);
 }
 
-/// The first write schedules a stamp raise one lease term later.
+/// The first write schedules a stamp raise half a lease term later.
 #[test]
-fn stamp_raise_follows_first_write_by_one_term() {
+fn stamp_raise_follows_first_write_by_half_a_term() {
     assert_eq!(stamp_raise_due(None, &ALARM_RULES), None);
-    assert_eq!(stamp_raise_due(Some(T0), &ALARM_RULES), Some(at(600_000)));
-    assert_eq!(ALARM_RULES.stamp_period_ms, LEASE_RULES.term_ms);
+    assert_eq!(stamp_raise_due(Some(T0), &ALARM_RULES), Some(at(300_000)));
+    assert_eq!(ALARM_RULES.stamp_period_ms, LEASE_RULES.term_ms / 2);
+    // A raise due inside a lease that a write's renewal opened.
+    let mut lease = FreshLease::expired();
+    renew(&mut lease, T0, T0);
+    let due = stamp_raise_due(Some(T0), &ALARM_RULES).unwrap();
+    assert!(lease.is_fresh(due, &LEASE_RULES));
+    assert!(!AlarmRules {
+        stamp_period_ms: LEASE_RULES.term_ms,
+        ..ALARM_RULES
+    }
+    .valid());
 }
 
 /// A unit stamp ID carries its tenant and unit number in its displayed form.

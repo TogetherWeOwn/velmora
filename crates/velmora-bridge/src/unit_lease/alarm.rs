@@ -121,9 +121,13 @@ pub struct AlarmRules {
     /// The longest wait between two renew jobs of the alarm. 30 minutes
     /// (est).
     pub renew_retry_max_ms: i64,
-    /// The period of the alarm's stamp raise. 10 minutes (est), the
-    /// lease term: a rollback of a unit with writes is then found by a
-    /// stamp at most one lease term old even when no request raised one.
+    /// The period of the alarm's stamp raise. 5 minutes (est), half the
+    /// lease term. A write was made under a fresh lease, and a request
+    /// renews in the background once less than half of T is left, so the
+    /// raise usually falls while the lease still holds. If it does not
+    /// (the unit went idle and its lease ran out), the alarm renews first
+    /// and asks for the raise right after the renewal (rule 12, RD-9): the
+    /// alarm's raise then comes up to one renewal later than the period.
     pub stamp_period_ms: i64,
 }
 
@@ -131,14 +135,16 @@ impl AlarmRules {
     pub const DEFAULT: AlarmRules = AlarmRules {
         renew_retry_ms: 60 * 1000,
         renew_retry_max_ms: 30 * 60 * 1000,
-        stamp_period_ms: LeaseRules::DEFAULT.term_ms,
+        stamp_period_ms: LeaseRules::DEFAULT.term_ms / 2,
     };
 
-    /// Positive waits, and a cap not below the first wait.
+    /// Positive waits, a cap not below the first wait, and a stamp period
+    /// of at most half the lease term.
     pub const fn valid(&self) -> bool {
         self.renew_retry_ms > 0
             && self.renew_retry_max_ms >= self.renew_retry_ms
             && self.stamp_period_ms > 0
+            && self.stamp_period_ms <= LeaseRules::DEFAULT.term_ms / 2
     }
 }
 

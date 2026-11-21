@@ -440,13 +440,16 @@ async fn pages_with_one_mark_are_exact() {
 
     let first = rig.mark.mark();
     c.stamp(&rig.bridge.cfg.catalogue_id).await.unwrap();
-    c.sql
+    // Column names that hold a write word as part of them are reads.
+    let rows = c
+        .sql
         .query(
-            "SELECT count(*) FROM buckets WHERE updated_at IS NULL OR 1",
+            "SELECT count(*) AS updated_count, max(created_at) AS last_inserted FROM buckets",
             &[],
         )
         .await
-        .ok();
+        .unwrap();
+    assert_eq!(rows.len(), 1);
     let second = rig.mark.mark();
     assert!(exact(&[first, second]));
 
