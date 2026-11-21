@@ -38,6 +38,16 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] 
   run, for example `BENCH_VARS=PARITY=on,POST_SOCKETS=6`. The variables that
   run the rig itself are refused; `results.json` lists the change under
   `bench_vars`, and `report.py --compare` shows it beside the counts.
+- Permits: as production binds the permit gate, the rig always builds the
+  gate client; `PERMITS` (`d1` from the `[vars]`, or `BENCH_VARS=PERMITS=do`),
+  `PERMIT_GATES` and `PERMIT_SHARDS` choose where permits come from. The gate
+  objects run in process over the same metered D1, out of memory between two
+  invocations (the most starts a hibernating object can have). Counted per
+  label: `do_requests` (sessions opened, requests outside one),
+  `do_messages` (messages and closes on a session, billed 1/20 each),
+  `do_starts` and `do_storage_writes`; the report prices them, and the
+  gate's duration from `--cpu do_gb_s_per_request` (a deployed Worker's
+  figure).
 - `--ref` measures another commit with this checkout's harness (temporary
   worktree and cargo target of its own, removed at the end, so runs may
   overlap). `--tiny <n>` changes the number of small

@@ -32,6 +32,9 @@ Cost model (list prices of prices.json, no included allowance):
 Worker CPU is not measured locally (the native run is not the Worker). It
 is priced from --cpu (ms per extent ingested, per MiB served hot and cold,
 measured on a deployed Worker); without it the CPU lines are 0 and say so.
+Permit gate (PERMITS=do) requests and storage writes are counted locally;
+their duration is priced from --cpu do_gb_s_per_request (GB-s per billed
+gate request, measured on a deployed Worker), else 0 and said so.
 """
 import json
 import math
@@ -59,6 +62,7 @@ FIELDS = [
     ("nntp_posts", "posts"),
     ("nntp_asks", "STAT/size"),
     ("nntp_bodies", "bodies"),
+    ("do_billed", "DO req"),
     ("wall_ms", "native ms"),
 ]
 
@@ -83,6 +87,8 @@ def load(run):
         c["r2_mib_in"] = c["r2_bytes_in"] / MIB
         c["r2_mib_out"] = c["r2_bytes_out"] / MIB
         c["wall_ms"] = c["wall_us"] / 1000
+        # Permit gate requests as billed: a WebSocket message is 1/20.
+        c["do_billed"] = c.get("do_requests", 0) + c.get("do_messages", 0) / 20
         labels[label] = c
     return counts, d1, labels
 
@@ -174,8 +180,14 @@ def model(counts, labels, prices, cpu):
     # post) and the minimum age, not their sum.
     hold_days = max(int(vars_.get("SAFETY_MIN_AGE_SECS", 0)), int(vars_.get("VERIFY_DELAY_SECS", 0))) / 86400
 
+    do_gb_s = cpu.get("do_gb_s_per_request", 0.0) if cpu else 0.0
+
     def dollars(c, cpu_ms=0.0):
+        billed = c.get("do_billed", 0)
         return {
+            "do_requests": billed * usd["do_requests_per_m"] / 1e6,
+            "do_duration": billed * do_gb_s * usd["do_duration_gb_s_per_m"] / 1e6,
+            "do_storage_writes": c.get("do_storage_writes", 0) * usd["do_rows_written_per_m"] / 1e6,
             "workers_requests": c.get("invocations", 0) * usd["workers_requests_per_m"] / 1e6,
             "workers_cpu": cpu_ms * usd["workers_cpu_ms_per_m"] / 1e6,
             "d1_rows_read": c.get("d1_rows_read", 0) * usd["d1_rows_read_per_m"] / 1e6,
@@ -190,6 +202,8 @@ def model(counts, labels, prices, cpu):
 
     cpu = cpu or {}
     missing_cpu = [k for k in ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib") if k not in cpu]
+    if any(c.get("do_billed", 0) for c in labels.values()) and "do_gb_s_per_request" not in cpu:
+        missing_cpu.append("do_gb_s_per_request (permit gate duration)")
     ingest_parts = {
         "s3_upload": ingest_s3,
         "post": stages["post"],
@@ -336,7 +350,8 @@ def compare(a_dir, b_dir, out):
     if va or vb:
         show = lambda v: ", ".join(f"{k}={x}" for k, x in v.items()) or "none"
         L.append(f"| BENCH_VARS | {show(va)} | {show(vb)} | |")
-    keys = ["invocations", "d1_calls", "d1_rows_read", "d1_rows_written", "r2_class_a", "r2_class_b", "queue_messages", "nntp_asks", "nntp_bodies"]
+    keys = ["invocations", "d1_calls", "d1_rows_read", "d1_rows_written", "r2_class_a", "r2_class_b", "queue_messages", "nntp_asks", "nntp_bodies",
+            "do_billed", "do_storage_writes"]
     for section in ("ops", "stages"):
         for label in sorted(set(ra[section]) | set(rb[section])):
             ca, cb = ra[section].get(label, {}), rb[section].get(label, {})
@@ -370,7 +385,7 @@ def load_cpu(path):
     >= 0 and at least one must be there; other keys ("source") are
     provenance. Exits with the reason otherwise."""
     cpu = json.loads(Path(path).read_text())
-    timed = ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib")
+    timed = ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib", "do_gb_s_per_request")
     unknown = sorted(set(cpu) - set(timed) - {"source"})
     if unknown:
         sys.exit(f"--cpu: unknown keys (a typo?): {', '.join(unknown)}")

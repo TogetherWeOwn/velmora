@@ -18,7 +18,9 @@
     "r2_class_a_per_m": 4.50,
     "r2_class_b_per_m": 0.36,
     "queues_ops_per_m": 0.40,
-    "do_requests_per_m": 0.15
+    "do_requests_per_m": 0.15,
+    "do_duration_gb_s_per_m": 12.50,
+    "do_rows_written_per_m": 1.00
   },
   "included_per_month": {
     "workers_requests": 10000000,
@@ -29,11 +31,14 @@
     "r2_storage_gb": 10,
     "r2_class_a": 1000000,
     "r2_class_b": 10000000,
-    "queues_ops": 1000000
+    "queues_ops": 1000000,
+    "do_requests": 1000000,
+    "do_duration_gb_s": 400000
   },
   "notes": [
     "A queue message is billed as three operations (write, read, delete) per 64 KB; each redelivery is one more read.",
     "R2 egress is free; DeleteObject is free.",
-    "GB is decimal (1e9 bytes); TB is 1e12 bytes of plaintext."
+    "GB is decimal (1e9 bytes); TB is 1e12 bytes of plaintext.",
+    "Durable Objects (read 2026-11-21): a request is a WebSocket session opened or a request outside one; incoming WebSocket messages are billed 20 to 1 (the rig counts the close of a session as one). SQLite-backed storage: each put is billed as rows written. Duration (GB-s at 128 MB, only while an object cannot hibernate) is not measured by the native rig: report.py prices it from --cpu do_gb_s_per_request, measured on a deployed Worker."
   ]
 }
