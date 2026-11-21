@@ -248,6 +248,8 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
     // What an operator has to see of a job: a failed full read of a
     // sampled extent, for one.
     velmora_bridge::trace::log_alerts(|line| console_error!("alert: {line}"));
+    // One line per scrub run.
+    velmora_bridge::trace::log_scrub_runs(|line| console_log!("scrub: {line}"));
     let bridge = match env::bridge(&env) {
         Ok(bridge) => bridge,
         Err(class) => {
