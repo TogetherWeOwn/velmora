@@ -115,8 +115,9 @@ fn a_scope_is_made_only_at_the_listed_places() {
             // The replay: the listing, and the plans of an extent.
             ("bridge/replay.rs", 3),
             // The reader of a queue message: the tenant a message names
-            // (one scope), and whether it is tenant 0 (`is_tenant_zero`).
-            ("bridge/jobmsg.rs", 2),
+            // (one scope), and whether a scope is tenant 0
+            // (`is_tenant_zero`, twice).
+            ("bridge/jobmsg.rs", 3),
             // The queue consumer.
             ("worker/lib.rs", 1),
         ],

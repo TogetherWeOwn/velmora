@@ -16,9 +16,17 @@
 //! 2. **The writer switch.** A deploy that sets `JOB_FORMAT=2` and
 //!    nothing else. Its undo sets it back to 1; both formats stay
 //!    readable. While it is 2 a Worker from before step 1 must not be
-//!    deployed: it drops every `v` 2 message as malformed, and the
-//!    outbox sends the rows again only after their resend timeout.
-//! 3. **The default removed** (later): a `v` 1 message is refused.
+//!    deployed: it drops every `v` 2 message as malformed. A job with an
+//!    outbox row is then sent again by the dispatcher after the row's
+//!    resend timeout. A job with no outbox row (an eviction step, a step
+//!    of a recovery-copy pass, a copy hint) is lost, and its work waits
+//!    for the next cron run or the next pass.
+//! 3. **The default removed** (later): a `v` 1 message is refused. Only
+//!    after the count of `v` 1 messages ([`FormatCount`]) has stayed at
+//!    zero for a queue-retention period.
+//!
+//! The next change of a job's body takes `v` 3: a body of `v` 2 could not
+//! be told from this format (a compile-time check holds it).
 //!
 //! # What is never run
 //!
@@ -28,8 +36,21 @@
 //! tenant that is not tenant 0, with a unit for tenant 0, or with fields
 //! this build does not know is **refused** ([`Refusal`]): the consumer
 //! hands it back to the queue until its deliveries are used up, so it
-//! lands in the dead-letter queue, which pages. It is never run under
-//! another tenant's scope, and it is never dropped in silence.
+//! lands in the dead-letter queue, which pages (in production; the
+//! dead-letter queues of `wrangler dev` and of drills have no consumer
+//! that pages). It is never run under another tenant's scope, and it is
+//! never dropped in silence ([`Admission::disposition`]).
+//!
+//! **The outbox row of a refused message is left as it is.** The
+//! message's job never claims its row, so the dispatcher sends the row
+//! again after its resend timeout, through the writer of the Worker that
+//! runs then. That writer and the reader of the same build agree on
+//! every message (a test holds it for every job), so the message sent
+//! again runs. A refusal that comes back for one row means two builds
+//! that disagree are deployed side by side, and it lasts as long as that
+//! deploy does. The row is not marked: a refused message may name no
+//! tenant, or another tenant, and the reader marks nothing in tenant 0's
+//! catalogue on the word of such a message.
 //!
 //! Tenant 0's `state_seq` and `keys_seq` are carried and not checked:
 //! the D1 catalogue has no identity check to make with them. A unit
@@ -58,6 +79,14 @@ use crate::types::{ExtentId, GenerationId, Job, OutboxStage, UnixMs, WriteId, JO
 
 /// `v` of a message that names its tenant.
 pub const TENANT_FORMAT_VERSION: u8 = 2;
+
+// A body of the version of this format could not be told from it.
+const _: () = assert!(JOB_VERSION < TENANT_FORMAT_VERSION);
+
+/// The delay of the retry that hands a refused message back to its queue:
+/// none, so that its deliveries are used up at once and it reaches the
+/// dead-letter queue within seconds.
+pub const REFUSED_RETRY_DELAY_SECS: u32 = 0;
 
 /// Name of the configuration switch of the writers' format.
 pub const JOB_FORMAT_VAR: &str = "JOB_FORMAT";
@@ -112,8 +141,11 @@ pub struct JobTenant {
 
 impl JobTenant {
     /// The fields for a job of `scope`. Tenant 0 has no unit, and no
-    /// tenant chain or key chain yet: its numbers are 0.
+    /// tenant chain or key chain yet: its numbers are 0. Tenant 0 is the
+    /// only scope there is; a second one brings its unit and its numbers
+    /// with it, and this function changes then.
     pub fn of(scope: &TenantScope) -> JobTenant {
+        debug_assert!(scope.is_tenant_zero(), "a job tenant other than tenant 0");
         JobTenant {
             tenant: scope.tenant_id().to_string(),
             unit: None,
@@ -385,6 +417,29 @@ pub enum Admission {
     Refused(Refusal),
 }
 
+/// What the consumer does with a message's delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// Run the job; its outcome says ack or retry.
+    Run,
+    /// Acknowledge without running: the message is no job.
+    Drop,
+    /// Hand it back with [`REFUSED_RETRY_DELAY_SECS`], never acknowledge
+    /// it: it reaches the dead-letter queue when its deliveries are used
+    /// up.
+    Refuse,
+}
+
+impl Admission {
+    pub fn disposition(&self) -> Disposition {
+        match self {
+            Admission::Run { .. } => Disposition::Run,
+            Admission::Malformed => Disposition::Drop,
+            Admission::Refused(_) => Disposition::Refuse,
+        }
+    }
+}
+
 /// Why a `v` 2 message is refused. [`Refusal::code`] is what the log
 /// says: a fixed word, never a field of the message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,6 +607,32 @@ mod tests {
         );
         assert_eq!(count, FormatCount::default());
         assert_eq!(count.count(&plain, t(60_001)), None);
+    }
+
+    #[test]
+    fn a_refused_message_is_never_run_nor_acknowledged() {
+        for refusal in [
+            Refusal::NoTenant,
+            Refusal::BadTenant,
+            Refusal::OtherTenant,
+            Refusal::UnitOfTenantZero,
+            Refusal::BadBody,
+        ] {
+            assert_eq!(
+                Admission::Refused(refusal).disposition(),
+                Disposition::Refuse
+            );
+        }
+        assert_eq!(Admission::Malformed.disposition(), Disposition::Drop);
+        assert_eq!(
+            admit(&json!({"t": "gc", "v": 1})).disposition(),
+            Disposition::Run
+        );
+        assert_eq!(
+            admit(&json!({"t": "gc", "v": 2})).disposition(),
+            Disposition::Refuse
+        );
+        assert_eq!(REFUSED_RETRY_DELAY_SECS, 0);
     }
 
     #[test]
