@@ -1716,9 +1716,10 @@ pub struct ScrubState {
     /// The backbones no loss is repaired on, as a JSON array of labels
     /// (`scrub_state.last_incident`); `None` = none.
     pub last_incident: Option<String>,
-    /// Extents checked by runs that did not trip the breaker since the
-    /// last trip; at [`crate::scrub::INCIDENT_MIN_EXTENTS`] the incident
-    /// clears.
+    /// Checks in a row, across runs, that found nothing lacking on a
+    /// backbone under an incident; a trip or a check that still lacks
+    /// there sets it back to 0, and at
+    /// [`crate::scrub::INCIDENT_MIN_EXTENTS`] the incidents clear.
     pub incident_clean: u64,
 }
 

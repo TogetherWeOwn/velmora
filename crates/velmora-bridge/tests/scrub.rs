@@ -1478,12 +1478,15 @@ async fn a_copy_that_cannot_be_written_back_is_tried_again_and_said() {
         .iter()
         .any(|a| a.starts_with("scrub-repair-copy-missing ")));
     assert_eq!(w.safety_state(&o).await, "held");
+    // Looked at again after the confirm interval, not at the bound.
+    assert_eq!(
+        w.next_at(&o).await,
+        Some(w.bridge().clock.now().0 + 3_600_000)
+    );
     *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
-    // The watch at the bound writes it.
-    let bound = repair_bound_secs(w.bridge().cfg.safety_min_age_secs, 3600);
-    w.advance_secs(u32::try_from(bound).unwrap());
+    w.advance_secs(3600);
     assert_eq!(w.scrub().await.stalled, 1);
-    assert!(w.has_safety(&o));
+    assert!(w.has_safety(&o), "written by the watch");
 }
 
 /// The scrub's reader never takes the read slot a request's cold read is
@@ -1617,4 +1620,75 @@ async fn a_trip_is_stored_when_it_happens() {
     let state = w.state().await;
     assert_eq!(state.runs, 0, "the end was not written");
     assert_eq!(state.blocked(), ["beta"]);
+}
+
+/// From the cache copy (the last copy), the safety copy is written before
+/// the re-pin; a re-pin the guard refuses takes that copy back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cache_sourced_copy_is_written_first_and_taken_back_when_refused() {
+    let w = world().await;
+    let o = w.released("a", 230).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    // The guard will refuse: the outbox row is not `done`.
+    w.bridge()
+        .catalog
+        .sql
+        .exec(
+            "UPDATE outbox SET stage = 'verify' WHERE extent_id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_string())],
+        )
+        .await
+        .unwrap();
+    w.advance_secs(3600);
+    let puts = w.bridge().safety.puts.borrow().len();
+    let run = w.scrub().await;
+    assert_eq!(run.repaired, 0);
+    assert_eq!(
+        w.bridge().safety.puts.borrow().len(),
+        puts + 1,
+        "written first"
+    );
+    assert!(!w.has_safety(&o), "taken back: the re-pin was refused");
+    assert_eq!(w.result(&o).await, "suspect");
+}
+
+/// A clean check carries the count of clean checks across runs: at 8 in a
+/// row the incident clears, however short the runs.
+#[tokio::test(flavor = "current_thread")]
+async fn clean_checks_count_across_runs() {
+    let w = world().await;
+    let _ = w.released("a", 240).await;
+    w.bridge()
+        .catalog
+        .sql
+        .exec(
+            "UPDATE scrub_state SET last_incident = '[\"beta\"]', incident_clean = 7",
+            &[],
+        )
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    assert_eq!(w.scrub().await.ok, 1);
+    assert!(w.state().await.blocked().is_empty(), "7 + 1 clean checks");
 }
