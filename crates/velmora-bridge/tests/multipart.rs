@@ -45,12 +45,15 @@ const KEY: &str = "dir/big file+@.bin";
 // Catalogue probe and unused NNTP
 // ---------------------------------------------------------------------------
 
+/// One statement and its parameters.
+type Recorded = (String, Vec<SqlValue>);
+
 struct Probe {
     db: RusqliteSql,
     /// When set, every batch first yields to the other request.
     yield_before_batch: Cell<bool>,
     /// When set, every statement is kept here with its parameters.
-    recorded: RefCell<Option<Vec<(String, Vec<SqlValue>)>>>,
+    recorded: RefCell<Option<Vec<Recorded>>>,
 }
 
 impl Probe {
