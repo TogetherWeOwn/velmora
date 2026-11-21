@@ -1406,6 +1406,43 @@ never sampled. One GET can have several such runs and a copy reads
 too, so these points show how much is read from Usenet over time; they
 are not a hit rate and are not to be subtracted from the GET count. No bucket, key, query, header or request id is written.
 
+## Provider routes
+
+Each entry of `NNTP_PROVIDERS` is reached one of two ways (`route` in
+`/_admin/status`):
+
+- **direct** (no `proxies`): the Worker opens the socket and the
+  platform makes the TLS session. The provider sees the address of
+  each invocation, and those change, so only an account without an
+  address limit may go direct. Leave `max_ips` out: without `proxies`
+  it counts invocations, and with it set a drill cannot have
+  `drill_conns`.
+- **proxy** (`proxies` with `max_ips`): every socket goes through a
+  SOCKS5 proxy and TLS runs inside the Worker (wasm). The provider sees
+  only the proxies' addresses. An account with an address limit must
+  use this route.
+
+A proxy is one more failure domain: when every reading provider goes
+through the same proxies, a proxy outage stops every read from Usenet
+(cache misses, verification, drills) at once. An account without an
+address limit can go direct, and then reads survive the outage.
+
+Measured on a deployed Worker placed in `aws:us-east-1`, proxies in the
+same metro, `COLD_SOCKETS = "2"`, a cold GET of 256 MiB (16 extents of
+16 MiB), three runs each, the routes interleaved on one deployment:
+
+| read provider and route | MiB/s | CPU ms per MiB |
+|---|---|---|
+| provider A through the proxies | 13.3 / 10.4 / 13.4 | 35 / 64 / 40 |
+| provider B direct | 9.9 / 9.7 / 10.2 | 38 / 36 / 42 |
+| provider B through one proxy | 9.0 / 10.0 / 9.7 | 61 / 41 / 42 |
+
+The route changes neither speed nor CPU beyond run-to-run spread
+(about +2% and -10% for direct, inside the spread); the provider does
+(its reading time is 12.6 to 14.9 s against 20.8 to 22.9 s), and writing
+each extent to the cache takes as long as reading it. Choose the route
+for the failure domain and the account's address limit, not for speed.
+
 ## KEK
 
 The escrow file holds one `VELMORA_KEK_<version>=<base64 of 32 bytes>` line
