@@ -112,7 +112,7 @@ def rows_written_check(labels):
         "labels": len(labels),
         "labels_differing": differ,
         "rows_off": off,
-        "noise": ROWS_WRITTEN_NOISE,
+        "tolerance": ROWS_WRITTEN_NOISE,
         # A replay with nothing in it compares nothing: not a pass.
         "ok": bool(labels) and sum(c["d1_rows_written"] for c in labels.values()) > 0 and off <= ROWS_WRITTEN_NOISE,
     }
@@ -124,7 +124,7 @@ def check_line(chk):
     if not chk["labels_differing"]:
         return f"Rows-written check: the native meter equals D1's count on all {chk['labels']} labels ({chk['d1']:,} rows)."
     worst = sorted(chk["labels_differing"].items(), key=lambda kv: -abs(kv[1]["native"] - kv[1]["d1"]))[:5]
-    head = "Rows-written check, within the noise" if chk["ok"] else "FAILED, rows-written check"
+    head = f"Rows-written check, within the tolerance ({chk['tolerance']} row)" if chk["ok"] else "FAILED, rows-written check"
     tail = (
         "The figures below are D1's."
         if chk["ok"]
@@ -134,7 +134,7 @@ def check_line(chk):
     )
     return (
         f"{head}: the native meter gives {chk['native']:,} rows, D1 {chk['d1']:,}, "
-        f"{chk['rows_off']:,} rows apart (allowed {chk['noise']}); "
+        f"{chk['rows_off']:,} rows apart (allowed {chk['tolerance']}); "
         f"{len(chk['labels_differing'])} of {chk['labels']} labels differ; largest: "
         + ", ".join(f"{k} {v['native']:,} vs {v['d1']:,}" for k, v in worst)
         + ". "
@@ -387,13 +387,6 @@ def compare(a_dir, b_dir, out):
     for r in (ra, rb):
         if r["model"].get("not_valid"):
             L.append(f"| note | | | the model totals of {r['name']} are not valid: {r['model']['not_valid']} |")
-    for r in (ra, rb):
-        chk = r.get("rows_written_check", {})
-        if chk.get("ok") is False:
-            L.append(
-                f"| note | | | the rows-written check of {r['name']} FAILED ({chk.get('rows_off', '?')} rows apart, "
-                f"allowed {chk.get('noise', '?')}): its D1 rows written and model totals are not valid |"
-            )
     for name in stale:
         L.append(
             f"| note | | | the model totals of {name} price the native meter's rows written, "
@@ -445,6 +438,12 @@ def main(argv):
         m["not_valid"] = f"MAX_EXTENT_BYTES={extent}: the cost model assumes {EXTENT}-byte extents; its $ figures do not apply"
         print("WARNING, " + m["not_valid"], file=sys.stderr)
     chk = rows_written_check(labels)
+    if not chk["ok"]:
+        # Recorded with the model, so whatever reads results.json (and
+        # --compare) sees it, not only this run's exit status.
+        m["not_valid"] = "; ".join(
+            x for x in (m.get("not_valid"), f"the rows-written check FAILED ({chk['rows_off']:,} rows apart, allowed {chk['tolerance']})") if x
+        )
     ops = {k[3:]: per(v, counts["calls"].get(k, 1)) for k, v in labels.items() if k.startswith("op:")}
     stages = {}
     for k, v in labels.items():
