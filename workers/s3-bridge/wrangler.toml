@@ -1,5 +1,10 @@
 name = "velmora-s3"
-main = "build/worker/shim.mjs"
+# entry.mjs wraps the Rust Worker (build/index.js): the default
+# entrypoint deletes the entry marker a client may send, and the named
+# entrypoint `DavEntry` (no route; reached only through a service binding
+# that names it) marks a request as the WebDAV gateway's. See entry.mjs
+# and crates/velmora-bridge/src/entry.rs.
+main = "entry.mjs"
 compatibility_date = "2026-11-01"
 
 # The account id comes from the deploy environment (CLOUDFLARE_ACCOUNT_ID),

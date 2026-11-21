@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::unwrap_secret;
+use crate::entry::Entry;
 use crate::ingress::IngressError;
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
@@ -370,13 +371,12 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     (!akid.is_empty()).then(|| akid.to_owned())
 }
 
-/// Headers the edge adds. They are never signed and their values are not
-/// always printable ASCII, so they are dropped before header validation.
-/// Dropping a header can only fail a signature, never satisfy one.
+/// Headers the edge adds, and the entry marker. They are never signed and
+/// the edge's values are not always printable ASCII, so they are dropped
+/// before header validation. Dropping a header can only fail a
+/// signature, never satisfy one.
 pub(super) fn edge_header(name: &str) -> bool {
-    name.starts_with("cf-")
-        || name.starts_with("x-forwarded-")
-        || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
+    crate::entry::dropped_header(name)
 }
 
 /// Authenticates and authorizes from the request line and headers only.
@@ -427,8 +427,13 @@ where
         .check_features()
         .map_err(|refusal| header_refused(&refusal))?;
 
+    // The entry point admits one kind of key (`crate::entry`): a key of
+    // the other kind is looked up as if it did not exist.
+    let entry = Entry::of(&req.headers);
     let mut authority = OneKey {
-        akid: claimed_key(&headers, &target).unwrap_or_default(),
+        akid: claimed_key(&headers, &target)
+            .filter(|akid| entry.admits(akid))
+            .unwrap_or_default(),
         principal: String::new(),
         secret: None,
         perm: None,
