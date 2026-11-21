@@ -69,7 +69,21 @@
 //! The door part is sealed with the same AAD **plus the SHA-256 of the
 //! sealed private part**, so opening the door with the control key alone
 //! proves the whole record: no private part can be swapped in from
-//! another record, and none can be cut off.
+//! another record, and none can be cut off. The private part is reached
+//! only through an opened door ([`OpenedControl`]).
+//!
+//! The name of a control record must lie in its owner's directories:
+//! [`MANAGED_CONTROL_DIRS`] followed by the tenant id for a tenant's own
+//! records (tenant 0's too), [`GLOBAL_CONTROL_DIRS`] for a record sealed
+//! with a door part only. Sealing and opening both refuse any other name.
+//!
+//! # A tenant key knows whose it is
+//!
+//! A [`TenantKey`] carries its tenant and its key version, and every
+//! function takes them from the key. A key of one tenant can therefore
+//! not wrap or seal for another tenant, nor under another version label;
+//! and every open function compares the tenant and the version that the
+//! data names with the key's.
 
 use core::fmt;
 
@@ -105,6 +119,17 @@ pub const CONTROL_MAGIC: &[u8; 4] = b"VCR1";
 pub const CONTROL_HEADER_LEN: usize = 4 + 4 + 1 + 4 + 4 + 4;
 /// Where the wrapped tenant keys live, in the key buckets only.
 pub const TK_PREFIX: &str = "m/tk/";
+/// The directories of a tenant's own control records, each followed by
+/// the tenant id and `/`: the tenant chain, the key chain, the key-chain
+/// checkpoints, and the bucket configuration chains below the tenant's
+/// record directory (`m/x/<t>/b/`).
+pub const MANAGED_CONTROL_DIRS: [&str; 4] = ["m/t/", "m/k/", "m/kc/", "m/x/"];
+/// The directories of control records with a door part only: key
+/// locations, the registry, routes, revocations of keys and of service
+/// tokens, born markers and external references.
+pub const GLOBAL_CONTROL_DIRS: [&str; 7] = [
+    "m/kl/", "m/reg/", "m/kr/", "m/rk/", "m/rst/", "m/ub/", "m/tref/",
+];
 
 const TK_DOMAIN: &str = "velmora/tk/v1";
 const TK_WRAP_INFO: &[u8] = b"velmora/tk-wrap/v1";
@@ -114,6 +139,8 @@ const CONTROL_DOOR_DOMAIN: &str = "velmora/control/v1";
 const CONTROL_PRIVATE_DOMAIN: &str = "velmora/control-private/v1";
 const BDK_V2_DOMAIN: &str = "velmora/bdk/v2";
 const AK_V2_DOMAIN: &str = "velmora/ak/v2";
+/// The bucket configuration directory below `m/x/<t>/`.
+const BUCKET_CONFIG_DIR: &str = "b/";
 /// The owner of a global control record in an AAD. No tenant id can be
 /// it.
 const GLOBAL_OWNER: &str = "-";
@@ -128,12 +155,15 @@ const ERR_SCHEME: BridgeError = BridgeError::Crypto("key scheme does not match t
 const ERR_TK_VERSION: BridgeError = BridgeError::Crypto("tenant key version invalid");
 const ERR_TK_BLOB: BridgeError = BridgeError::Crypto("tenant key blob invalid");
 const ERR_TK_CHECK: BridgeError = BridgeError::Crypto("tenant key check value mismatch");
+const ERR_TK_OTHER: BridgeError = BridgeError::Crypto("tenant key is not the one the data names");
 const ERR_RECORD_V2: BridgeError = BridgeError::Crypto("v2 record authentication failed");
 const ERR_RECORD_TENANT: BridgeError = BridgeError::Crypto("record names another tenant");
 const ERR_CONTROL: BridgeError = BridgeError::Crypto("control record authentication failed");
 const ERR_CONTROL_FORMAT: BridgeError = BridgeError::Crypto("control record malformed");
 const ERR_CONTROL_KIND: BridgeError =
     BridgeError::Crypto("control record private key does not match its owner");
+const ERR_CONTROL_NAME: BridgeError =
+    BridgeError::Crypto("control record name does not match its owner");
 
 // ---------------------------------------------------------------------------
 // Tenant ids and the scheme
@@ -212,23 +242,46 @@ impl Scheme {
 // Tenant keys
 // ---------------------------------------------------------------------------
 
-/// A tenant key (TK): 32 random bytes per tenant and key version. Zeroed
-/// on drop; never rendered by `Debug`; never used directly, only through
-/// the HKDF outputs of this module.
-pub struct TenantKey(Zeroizing<[u8; KEY_LEN]>);
+/// A tenant key (TK): 32 random bytes for one tenant and one key
+/// version, which the key carries. Zeroed on drop; never rendered by
+/// `Debug`; never used directly, only through the HKDF outputs of this
+/// module.
+pub struct TenantKey {
+    tenant: TenantId,
+    version: u32,
+    key: Zeroizing<[u8; KEY_LEN]>,
+}
 
 impl TenantKey {
-    /// A fresh random key.
-    pub fn generate<R: FillRandom>(rng: &mut R) -> Result<Self> {
+    /// A fresh random key for key version `version` of `tenant`.
+    pub fn generate<R: FillRandom>(tenant: &TenantId, version: u32, rng: &mut R) -> Result<Self> {
+        let version = valid_tk_version(version)?;
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         rng.fill_bytes(key.as_mut()).map_err(|_| ERR_RNG)?;
-        Ok(TenantKey(key))
+        Ok(TenantKey {
+            tenant: tenant.clone(),
+            version,
+            key,
+        })
     }
 
-    /// Wraps existing key bytes (tests, the escrow restore). The caller's
-    /// copy is its own to wipe.
-    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
-        TenantKey(Zeroizing::new(bytes))
+    /// Existing key bytes for key version `version` of `tenant` (tests).
+    /// The caller's copy is its own to wipe. A key from a key bucket or
+    /// an escrow copy comes from [`unwrap_tenant_key`] instead.
+    pub fn from_bytes(tenant: &TenantId, version: u32, bytes: [u8; KEY_LEN]) -> Result<Self> {
+        Ok(TenantKey {
+            tenant: tenant.clone(),
+            version: valid_tk_version(version)?,
+            key: Zeroizing::new(bytes),
+        })
+    }
+
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     /// The key check value: the first 8 bytes of
@@ -242,13 +295,24 @@ impl TenantKey {
     }
 
     fn derive(&self, info: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
-        derive_key(&self.0, info)
+        derive_key(&self.key, info)
+    }
+
+    /// Refuses a key that is not version `version` of `tenant`.
+    fn is(&self, tenant: &TenantId, version: u32) -> Result<()> {
+        if self.tenant != *tenant || self.version != version {
+            return Err(ERR_TK_OTHER);
+        }
+        Ok(())
     }
 }
 
 impl fmt::Debug for TenantKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("TenantKey(<redacted>)")
+        f.debug_struct("TenantKey")
+            .field("tenant", &self.tenant)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
     }
 }
 
@@ -258,6 +322,17 @@ fn derive_key(ikm: &[u8; KEY_LEN], info: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
         .expand(info, key.as_mut())
         .expect("HKDF-SHA256 output of 32 bytes");
     key
+}
+
+/// Copies an opened 32-byte key into wiped-on-drop storage, with no
+/// plain copy on the way.
+fn key_bytes(plain: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    if plain.len() != KEY_LEN {
+        return Err(ERR_UNWRAP);
+    }
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    out.copy_from_slice(plain);
+    Ok(out)
 }
 
 fn valid_tk_version(tk_version: u32) -> Result<u32> {
@@ -295,31 +370,27 @@ fn tk_aad(tenant: &TenantId, tk_version: u32, kek_version: u32, kcv: &[u8; KCV_L
 /// (it is part of the blob's name) and the 81-byte blob.
 pub fn wrap_tenant_key<K: Kek, R: FillRandom>(
     kek: &K,
-    tenant: &TenantId,
-    tk_version: u32,
     tk: &TenantKey,
     rng: &mut R,
 ) -> Result<(u32, Vec<u8>)> {
     let (version, _) = kek.active();
-    let blob = wrap_tenant_key_as(kek, version, tenant, tk_version, tk, rng)?;
+    let blob = wrap_tenant_key_as(kek, version, tk, rng)?;
     Ok((version, blob))
 }
 
-/// Wraps a tenant key under KEK version `kek_version`, which need not be
-/// the active one: a KEK rotation writes `<n>.<v+1>` beside `<n>.<v>`.
+/// Wraps a tenant key under KEK version `kek_version_to_use`, which need
+/// not be the active one: a KEK rotation writes `<n>.<v+1>` beside
+/// `<n>.<v>`.
 pub fn wrap_tenant_key_as<K: Kek, R: FillRandom>(
     kek: &K,
     kek_version_to_use: u32,
-    tenant: &TenantId,
-    tk_version: u32,
     tk: &TenantKey,
     rng: &mut R,
 ) -> Result<Vec<u8>> {
-    let tk_version = valid_tk_version(tk_version)?;
     let key = kek_version(kek, kek_version_to_use)?;
     let kcv = tk.check_value();
-    let aad = tk_aad(tenant, tk_version, kek_version_to_use, &kcv);
-    let wrapped = wrap_bytes_as(WRAP_VERSION, key.expose(), aad.as_bytes(), &tk.0[..], rng)?;
+    let aad = tk_aad(&tk.tenant, tk.version, kek_version_to_use, &kcv);
+    let wrapped = wrap_bytes_as(WRAP_VERSION, key.expose(), aad.as_bytes(), &tk.key[..], rng)?;
     let mut blob = Vec::with_capacity(TK_BLOB_LEN);
     blob.extend_from_slice(&kcv);
     blob.extend_from_slice(&wrapped);
@@ -342,7 +413,8 @@ pub fn tk_blob_check_value(blob: &[u8]) -> Result<[u8; KCV_LEN]> {
 
 /// Opens a TK blob stored as `m/tk/<tenant>/<tk_version>.<kek_version>`.
 /// Fails unless the blob was made for exactly that name, and unless the
-/// key inside has the check value the blob carries.
+/// key inside has the check value the blob carries. The key it returns
+/// is bound to `tenant` and `tk_version`.
 pub fn unwrap_tenant_key<K: Kek>(
     kek: &K,
     kek_version_stored: u32,
@@ -355,8 +427,11 @@ pub fn unwrap_tenant_key<K: Kek>(
     let key = kek_version(kek, kek_version_stored)?;
     let aad = tk_aad(tenant, tk_version, kek_version_stored, &kcv);
     let plain = unwrap_bytes_as(WRAP_VERSION, key.expose(), aad.as_bytes(), &blob[KCV_LEN..])?;
-    let bytes = <[u8; KEY_LEN]>::try_from(plain.as_slice()).map_err(|_| ERR_UNWRAP)?;
-    let tk = TenantKey::from_bytes(bytes);
+    let tk = TenantKey {
+        tenant: tenant.clone(),
+        version: tk_version,
+        key: key_bytes(&plain)?,
+    };
     // The AAD already binds the check value; this proves the writer put
     // the check value of this key and not of another one.
     if !bool::from(tk.check_value()[..].ct_eq(&kcv)) {
@@ -376,18 +451,16 @@ fn bdk_v2_aad(tenant: &TenantId, bucket: &BucketId, tk_version: u32) -> Result<S
     ))
 }
 
-/// Wraps a bucket data key under key version `tk_version` of `tenant`'s
-/// tenant key: `0x02 ‖ nonce ‖ ct ‖ tag`, 73 bytes.
+/// Wraps a bucket data key under the tenant key `tk` (its tenant and its
+/// version): `0x02 ‖ nonce ‖ ct ‖ tag`, 73 bytes. The row stores
+/// `tk.version()` beside it.
 pub fn wrap_bdk_v2<R: FillRandom>(
     tk: &TenantKey,
-    tenant: &TenantId,
-    tk_version: u32,
     bucket: &BucketId,
     bdk: &DataKey,
     rng: &mut R,
 ) -> Result<Vec<u8>> {
-    let tk_version = valid_tk_version(tk_version)?;
-    let aad = bdk_v2_aad(tenant, bucket, tk_version)?;
+    let aad = bdk_v2_aad(&tk.tenant, bucket, tk.version)?;
     let wrap_key = tk.derive(TK_WRAP_INFO);
     let wrapped = wrap_bytes_as(WRAP_VERSION_2, &wrap_key, aad.as_bytes(), &bdk.0[..], rng)?;
     if wrapped.len() != WRAPPED_KEY_LEN {
@@ -396,9 +469,10 @@ pub fn wrap_bdk_v2<R: FillRandom>(
     Ok(wrapped)
 }
 
-/// Unwraps a scheme-2 bucket data key. Fails for a scheme-1 wrap, for a
-/// wrap of another tenant, bucket or key version, and for any changed
-/// byte.
+/// Unwraps a scheme-2 bucket data key of `tenant`'s bucket `bucket`,
+/// stored with key version `tk_version`. Refuses a key that is not that
+/// version of that tenant's key, a scheme-1 wrap, a wrap of another
+/// tenant, bucket or version, and any changed byte.
 pub fn unwrap_bdk_v2(
     tk: &TenantKey,
     tenant: &TenantId,
@@ -406,15 +480,14 @@ pub fn unwrap_bdk_v2(
     bucket: &BucketId,
     wrapped: &[u8],
 ) -> Result<DataKey> {
-    let tk_version = valid_tk_version(tk_version)?;
+    tk.is(tenant, tk_version)?;
     if wrapped.len() != WRAPPED_KEY_LEN {
         return Err(ERR_UNWRAP);
     }
     let aad = bdk_v2_aad(tenant, bucket, tk_version)?;
     let wrap_key = tk.derive(TK_WRAP_INFO);
     let plain = unwrap_bytes_as(WRAP_VERSION_2, &wrap_key, aad.as_bytes(), wrapped)?;
-    let bytes = <[u8; KEY_LEN]>::try_from(plain.as_slice()).map_err(|_| ERR_UNWRAP)?;
-    Ok(DataKey::from_bytes(bytes))
+    Ok(DataKey(key_bytes(&plain)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,11 +547,18 @@ fn record_v2_aad(name: &str, tenant: &TenantId, tk_version: u32) -> Result<Strin
     ))
 }
 
+/// The part of `name` after `<dir><tenant>/`; `None` when `name` does not
+/// lie below that directory or nothing follows it.
+fn below<'a>(name: &'a str, dir: &str, tenant: &str) -> Option<&'a str> {
+    name.strip_prefix(dir)?
+        .strip_prefix(tenant)?
+        .strip_prefix('/')
+        .filter(|rest| !rest.is_empty())
+}
+
 /// Whether `name` lies in `tenant`'s record directory `m/x/<t>/`.
 fn under_tenant_dir(name: &str, tenant: &TenantId) -> bool {
-    name.strip_prefix(TENANT_DIR)
-        .and_then(|rest| rest.strip_prefix(tenant.as_str()))
-        .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'))
+    below(name, TENANT_DIR, tenant.as_str()).is_some()
 }
 
 /// Whether `sealed` starts like a VMR2 record. Says nothing about
@@ -496,55 +576,60 @@ pub fn record_v2_header(sealed: &[u8]) -> Result<(TenantId, u32)> {
     }
     let tenant = core::str::from_utf8(&sealed[4..4 + TENANT_ID_LEN]).map_err(|_| ERR_RECORD_V2)?;
     let tenant = TenantId::parse(tenant).map_err(|_| ERR_RECORD_V2)?;
-    let mut version = [0u8; 4];
-    version.copy_from_slice(&sealed[4 + TENANT_ID_LEN..RECORD_V2_HEADER_LEN]);
-    Ok((tenant, u32::from_be_bytes(version)))
+    Ok((tenant, header_version(sealed)))
 }
 
-/// Seals a data record of `tenant` stored under `name`, which must lie
-/// in `m/x/<tenant>/`, under key version `tk_version`.
+fn header_version(sealed: &[u8]) -> u32 {
+    let mut version = [0u8; 4];
+    version.copy_from_slice(&sealed[4 + TENANT_ID_LEN..RECORD_V2_HEADER_LEN]);
+    u32::from_be_bytes(version)
+}
+
+/// Seals a data record of `tk`'s tenant stored under `name`, which must
+/// lie in `m/x/<tenant>/`, under `tk`'s version.
 pub fn seal_record_v2<R: FillRandom>(
     tk: &TenantKey,
-    tenant: &TenantId,
-    tk_version: u32,
     name: &str,
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u8>> {
-    let tk_version = valid_tk_version(tk_version)?;
-    if !under_tenant_dir(name, tenant) {
+    if !under_tenant_dir(name, &tk.tenant) {
         return Err(ERR_RECORD_TENANT);
     }
-    let aad = record_v2_aad(name, tenant, tk_version)?;
+    let aad = record_v2_aad(name, &tk.tenant, tk.version)?;
     let key = tk.derive(MANIFEST_V2_DOMAIN.as_bytes());
     let wrapped = wrap_bytes_as(WRAP_VERSION, &key, aad.as_bytes(), plaintext, rng)?;
     let mut out = Vec::with_capacity(RECORD_V2_HEADER_LEN + wrapped.len());
     out.extend_from_slice(RECORD_V2_MAGIC);
-    out.extend_from_slice(tenant.as_str().as_bytes());
-    out.extend_from_slice(&tk_version.to_be_bytes());
+    out.extend_from_slice(tk.tenant.as_str().as_bytes());
+    out.extend_from_slice(&tk.version.to_be_bytes());
     out.extend_from_slice(&wrapped);
     Ok(out)
 }
 
 /// Opens a VMR2 record stored under `name` for `tenant`. Refuses, with
 /// its own error that the reader alarms on, a record whose name or
-/// envelope names another tenant; then refuses any record that does not
-/// authenticate under `tk` at `tk_version`.
+/// envelope names another tenant (tenant 0, or an id that does not
+/// parse, included); then refuses a key that is not the version the
+/// envelope names, and any record that does not authenticate.
 pub fn open_record_v2(
     tk: &TenantKey,
     tenant: &TenantId,
-    tk_version: u32,
     name: &str,
     sealed: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let (in_envelope, version) = record_v2_header(sealed)?;
-    if in_envelope != *tenant || !under_tenant_dir(name, tenant) {
-        return Err(ERR_RECORD_TENANT);
-    }
-    if version != valid_tk_version(tk_version)? {
+    if sealed.len() < RECORD_V2_HEADER_LEN + WRAP_OVERHEAD || !is_record_v2(sealed) {
         return Err(ERR_RECORD_V2);
     }
-    let aad = record_v2_aad(name, tenant, tk_version)?;
+    // The raw bytes, before any parse: an envelope that names tenant 0
+    // or no tenant at all is another tenant's too.
+    let envelope_tenant = &sealed[4..4 + TENANT_ID_LEN];
+    if envelope_tenant != tenant.as_str().as_bytes() || !under_tenant_dir(name, tenant) {
+        return Err(ERR_RECORD_TENANT);
+    }
+    let version = header_version(sealed);
+    tk.is(tenant, version)?;
+    let aad = record_v2_aad(name, tenant, version)?;
     let key = tk.derive(MANIFEST_V2_DOMAIN.as_bytes());
     unwrap_bytes_as(
         WRAP_VERSION,
@@ -562,17 +647,14 @@ pub fn open_record_v2(
 /// Who a control record belongs to, with the key its private part is
 /// sealed under.
 pub enum ControlSealer<'a> {
-    /// A global record (`m/kl/`, `m/reg/`): a door part only.
+    /// A global record: a door part only.
     Global,
     /// Tenant 0: the private part under a KEK-derived key (the active
     /// KEK).
     TenantZero,
-    /// A managed tenant: the private part under its tenant key.
-    Managed {
-        tenant: &'a TenantId,
-        tk: &'a TenantKey,
-        tk_version: u32,
-    },
+    /// A managed tenant: the private part under its tenant key, whose
+    /// tenant and version the record names.
+    Managed(&'a TenantKey),
 }
 
 /// Who a control record belongs to, as a reader names it. The reader
@@ -600,6 +682,25 @@ impl ControlOwner<'_> {
             ControlOwner::Managed(_) => PRIVATE_TENANT,
         }
     }
+
+    /// Whether `name` lies in this owner's directories.
+    fn owns(&self, name: &str) -> bool {
+        match self {
+            ControlOwner::Global => GLOBAL_CONTROL_DIRS
+                .iter()
+                .any(|dir| name.strip_prefix(dir).is_some_and(|rest| !rest.is_empty())),
+            ControlOwner::TenantZero | ControlOwner::Managed(_) => {
+                MANAGED_CONTROL_DIRS.iter().any(|dir| {
+                    below(name, dir, self.label()).is_some_and(|rest| {
+                        // Below `m/x/<t>/` only the bucket configuration
+                        // chains are control records; the rest are data
+                        // records.
+                        *dir != TENANT_DIR || rest.starts_with(BUCKET_CONFIG_DIR)
+                    })
+                })
+            }
+        }
+    }
 }
 
 impl ControlSealer<'_> {
@@ -607,7 +708,7 @@ impl ControlSealer<'_> {
         match self {
             ControlSealer::Global => ControlOwner::Global,
             ControlSealer::TenantZero => ControlOwner::TenantZero,
-            ControlSealer::Managed { tenant, .. } => ControlOwner::Managed(tenant),
+            ControlSealer::Managed(tk) => ControlOwner::Managed(&tk.tenant),
         }
     }
 }
@@ -649,10 +750,11 @@ fn len_u32(n: usize) -> Result<u32> {
     u32::try_from(n).map_err(|_| ERR_CONTROL_FORMAT)
 }
 
-/// Seals a control record stored under `name`: the door part under the
-/// control key of the active KEK, the private part under the key of
-/// `sealer`. A global record takes no private part; tenant 0 and a
-/// managed tenant always have one (it may be empty).
+/// Seals a control record stored under `name`, which must lie in the
+/// owner's directories: the door part under the control key of the
+/// active KEK, the private part under the key of `sealer`. A global
+/// record takes no private part; tenant 0 and a managed tenant always
+/// have one (it may be empty).
 pub fn seal_control<K: Kek, R: FillRandom>(
     kek: &K,
     name: &str,
@@ -662,13 +764,14 @@ pub fn seal_control<K: Kek, R: FillRandom>(
     rng: &mut R,
 ) -> Result<Vec<u8>> {
     let owner = sealer.owner();
+    if !owner.owns(name) {
+        return Err(ERR_CONTROL_NAME);
+    }
     let (kek_v, kek_bytes) = kek.active();
     let (kind, priv_v) = match sealer {
         ControlSealer::Global => (PRIVATE_NONE, 0),
         ControlSealer::TenantZero => (PRIVATE_KEK, kek_v),
-        ControlSealer::Managed { tk_version, .. } => {
-            (PRIVATE_TENANT, valid_tk_version(*tk_version)?)
-        }
+        ControlSealer::Managed(tk) => (PRIVATE_TENANT, tk.version),
     };
     let private = match (kind, private) {
         (PRIVATE_NONE, None) => None,
@@ -691,7 +794,7 @@ pub fn seal_control<K: Kek, R: FillRandom>(
 
     let private_sealed = match (private, sealer) {
         (None, _) => Vec::new(),
-        (Some(p), ControlSealer::Managed { tk, .. }) => {
+        (Some(p), ControlSealer::Managed(tk)) => {
             let aad = control_aad(CONTROL_PRIVATE_DOMAIN, name, owner.label(), &header)?;
             let key = tk.derive(CONTROL_PRIVATE_DOMAIN.as_bytes());
             wrap_bytes_as(WRAP_VERSION, &key, &aad, p, rng)?
@@ -720,7 +823,8 @@ pub fn seal_control<K: Kek, R: FillRandom>(
 }
 
 /// A control record split into its parts. Nothing in it is trusted
-/// before [`ControlEnvelope::open_door`] succeeded.
+/// before [`ControlEnvelope::open_door`] succeeded, and its private part
+/// is reached only through what that returns.
 pub struct ControlEnvelope<'a> {
     header: &'a [u8],
     kek_version: u32,
@@ -746,7 +850,8 @@ fn be_u32(bytes: &[u8], at: usize) -> u32 {
 }
 
 /// Splits a control record. Refuses one whose lengths do not add up to
-/// its size or whose private-key kind is unknown.
+/// its size or whose private-key kind is unknown or does not fit its
+/// lengths.
 pub fn parse_control(bytes: &[u8]) -> Result<ControlEnvelope<'_>> {
     if bytes.len() < CONTROL_HEADER_LEN || !bytes.starts_with(CONTROL_MAGIC) {
         return Err(ERR_CONTROL_FORMAT);
@@ -780,7 +885,7 @@ pub fn parse_control(bytes: &[u8]) -> Result<ControlEnvelope<'_>> {
     })
 }
 
-impl ControlEnvelope<'_> {
+impl<'a> ControlEnvelope<'a> {
     /// The KEK version the door part is sealed under.
     pub fn kek_version(&self) -> u32 {
         self.kek_version
@@ -796,61 +901,98 @@ impl ControlEnvelope<'_> {
         }
     }
 
-    fn check_owner(&self, owner: &ControlOwner<'_>) -> Result<()> {
-        if self.kind != owner.private_kind() {
-            return Err(ERR_CONTROL_KIND);
-        }
-        Ok(())
-    }
-
     /// Opens the door part of a record stored under `name` for `owner`.
     /// Success proves the whole record, the private part included, with
     /// the control key alone.
     pub fn open_door<K: Kek>(
-        &self,
+        self,
         kek: &K,
-        name: &str,
-        owner: ControlOwner<'_>,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        self.check_owner(&owner)?;
+        name: &'a str,
+        owner: ControlOwner<'a>,
+    ) -> Result<OpenedControl<'a>> {
+        if self.kind != owner.private_kind() {
+            return Err(ERR_CONTROL_KIND);
+        }
+        if !owner.owns(name) {
+            return Err(ERR_CONTROL_NAME);
+        }
         let key = kek_version(kek, self.kek_version)?;
         let mut aad = control_aad(CONTROL_DOOR_DOMAIN, name, owner.label(), self.header)?;
         aad.extend_from_slice(&Sha256::digest(self.private));
-        unwrap_bytes_as(WRAP_VERSION, &control_door_key(key), &aad, self.door)
-            .map_err(|_| ERR_CONTROL)
+        let door = unwrap_bytes_as(WRAP_VERSION, &control_door_key(key), &aad, self.door)
+            .map_err(|_| ERR_CONTROL)?;
+        Ok(OpenedControl {
+            env: self,
+            name,
+            owner,
+            door,
+        })
+    }
+}
+
+/// A control record whose door part opened: the whole record is proven.
+pub struct OpenedControl<'a> {
+    env: ControlEnvelope<'a>,
+    name: &'a str,
+    owner: ControlOwner<'a>,
+    door: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for OpenedControl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenedControl")
+            .field("env", &self.env)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenedControl<'_> {
+    /// The door part's plaintext.
+    pub fn door(&self) -> &[u8] {
+        &self.door
     }
 
-    /// Opens the private part of a managed tenant's record with key
-    /// version [`PrivateKeyRef::Tenant`] of its tenant key.
-    pub fn open_private_managed(
-        &self,
-        tk: &TenantKey,
-        name: &str,
-        tenant: &TenantId,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        let owner = ControlOwner::Managed(tenant);
-        self.check_owner(&owner)?;
-        let aad = control_aad(CONTROL_PRIVATE_DOMAIN, name, owner.label(), self.header)?;
+    /// The key the private part is sealed under, now authenticated.
+    pub fn private_key(&self) -> PrivateKeyRef {
+        self.env.private_key()
+    }
+
+    /// Opens the private part of a managed tenant's record. Refuses a key
+    /// that is not of this record's tenant and of the version its header
+    /// names.
+    pub fn open_private_managed(&self, tk: &TenantKey) -> Result<Zeroizing<Vec<u8>>> {
+        let ControlOwner::Managed(tenant) = self.owner else {
+            return Err(ERR_CONTROL_KIND);
+        };
+        tk.is(tenant, self.env.private_version)?;
+        let aad = control_aad(
+            CONTROL_PRIVATE_DOMAIN,
+            self.name,
+            tenant.as_str(),
+            self.env.header,
+        )?;
         let key = tk.derive(CONTROL_PRIVATE_DOMAIN.as_bytes());
-        unwrap_bytes_as(WRAP_VERSION, &key, &aad, self.private).map_err(|_| ERR_CONTROL)
+        unwrap_bytes_as(WRAP_VERSION, &key, &aad, self.env.private).map_err(|_| ERR_CONTROL)
     }
 
     /// Opens the private part of a tenant-0 record with the KEK version
     /// its header names.
-    pub fn open_private_tenant_zero<K: Kek>(
-        &self,
-        kek: &K,
-        name: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        let owner = ControlOwner::TenantZero;
-        self.check_owner(&owner)?;
-        let key = kek_version(kek, self.private_version)?;
-        let aad = control_aad(CONTROL_PRIVATE_DOMAIN, name, owner.label(), self.header)?;
+    pub fn open_private_tenant_zero<K: Kek>(&self, kek: &K) -> Result<Zeroizing<Vec<u8>>> {
+        if self.owner != ControlOwner::TenantZero {
+            return Err(ERR_CONTROL_KIND);
+        }
+        let key = kek_version(kek, self.env.private_version)?;
+        let aad = control_aad(
+            CONTROL_PRIVATE_DOMAIN,
+            self.name,
+            DEFAULT_TENANT,
+            self.env.header,
+        )?;
         unwrap_bytes_as(
             WRAP_VERSION,
             &control_private_kek_key(key),
             &aad,
-            self.private,
+            self.env.private,
         )
         .map_err(|_| ERR_CONTROL)
     }
@@ -898,5 +1040,42 @@ mod tests {
         assert!(!under_tenant_dir("m/x/t_00000000000000a1", &t));
         assert!(!under_tenant_dir("m/x/t_00000000000000a10/g_1", &t));
         assert!(!under_tenant_dir("m/g_1", &t));
+    }
+
+    #[test]
+    fn control_names_lie_in_their_owners_directories() {
+        let t = TenantId::parse("t_00000000000000a1").unwrap();
+        let m = ControlOwner::Managed(&t);
+        for name in [
+            "m/t/t_00000000000000a1/00000000000000000001",
+            "m/k/t_00000000000000a1/00000000000000000001",
+            "m/kc/t_00000000000000a1/00000000000000000256",
+            "m/x/t_00000000000000a1/b/b_01/00000000000000000001",
+        ] {
+            assert!(m.owns(name), "{name}");
+            assert!(!ControlOwner::TenantZero.owns(name), "{name}");
+            assert!(!ControlOwner::Global.owns(name), "{name}");
+        }
+        for name in [
+            "m/k/t_00000000000000a2/00000000000000000001",
+            "m/k/t_00000000000000a1/",
+            "m/k/t_00000000000000a1",
+            "m/x/t_00000000000000a1/g_1",
+            "m/kl/00000000000000000001",
+            "m/g_1",
+        ] {
+            assert!(!m.owns(name), "{name}");
+        }
+        assert!(ControlOwner::TenantZero.owns("m/k/t_0000000000000000/00000000000000000001"));
+        for name in [
+            "m/kl/00000000000000000001",
+            "m/kr/AKVL0001",
+            "m/rk/t_00000000000000a1/AKVL0001",
+            "m/rst/0011223344556677",
+        ] {
+            assert!(ControlOwner::Global.owns(name), "{name}");
+        }
+        assert!(!ControlOwner::Global.owns("m/kl/"));
+        assert!(!ControlOwner::Global.owns("m/t/t_00000000000000a1/00000000000000000001"));
     }
 }

@@ -24,6 +24,7 @@ use velmora_bridge::crypto::{
     open_manifest, open_range, seal_extent, seal_manifest, unwrap_bdk, unwrap_secret, wrap_bdk,
     wrap_secret, DataKey, WrappedKey, WRAPPED_KEY_LEN, WRAP_OVERHEAD,
 };
+use velmora_bridge::recovery::DEFAULT_TENANT;
 use velmora_bridge::testkit::TestKek;
 use velmora_bridge::{
     BridgeError, BucketId, ExtentId, ExtentRow, ExtentState, SafetyState, UnixMs,
@@ -89,8 +90,9 @@ fn tenant(n: u8) -> TenantId {
     TenantId::parse(&format!("t_00000000000000{n:02x}")).unwrap()
 }
 
-fn tk(label: &str) -> TenantKey {
-    TenantKey::from_bytes(derived(label))
+/// Key version `v` of tenant `n`, from a label.
+fn tk(n: u8, v: u32, label: &str) -> TenantKey {
+    TenantKey::from_bytes(&tenant(n), v, derived(label)).unwrap()
 }
 
 fn bucket(n: u8) -> BucketId {
@@ -141,8 +143,8 @@ fn is_crypto(e: &BridgeError, msg: &str) -> bool {
 fn a_tenant_key_blob_opens_under_its_own_name_only() {
     let kek = kek_v1();
     let t = tenant(1);
-    let key = tk("tk a");
-    let (v, blob) = wrap_tenant_key(&kek, &t, 1, &key, &mut rng()).unwrap();
+    let key = tk(1, 1, "tk a");
+    let (v, blob) = wrap_tenant_key(&kek, &key, &mut rng()).unwrap();
     assert_eq!(v, 1);
     assert_eq!(blob.len(), TK_BLOB_LEN);
     assert_eq!(TK_BLOB_LEN, 81);
@@ -151,6 +153,8 @@ fn a_tenant_key_blob_opens_under_its_own_name_only() {
 
     let opened = unwrap_tenant_key(&kek, 1, &t, 1, &blob).unwrap();
     assert_eq!(opened.check_value(), key.check_value());
+    assert_eq!(opened.tenant(), &t);
+    assert_eq!(opened.version(), 1);
 
     // Another tenant, key version or KEK version: the AAD differs.
     assert!(unwrap_tenant_key(&kek, 1, &tenant(2), 1, &blob).is_err());
@@ -160,21 +164,22 @@ fn a_tenant_key_blob_opens_under_its_own_name_only() {
     // An unknown KEK version and version 0 are refused.
     assert!(unwrap_tenant_key(&kek, 9, &t, 1, &blob).is_err());
     assert!(unwrap_tenant_key(&kek, 1, &t, 0, &blob).is_err());
-    assert!(wrap_tenant_key(&kek, &t, 0, &key, &mut rng()).is_err());
+    assert!(TenantKey::from_bytes(&t, 0, derived("x")).is_err());
+    assert!(TenantKey::generate(&t, 0, &mut rng()).is_err());
 }
 
 #[test]
 fn a_changed_byte_or_a_changed_check_value_does_not_open() {
     let kek = kek_v1();
     let t = tenant(1);
-    let (_, blob) = wrap_tenant_key(&kek, &t, 1, &tk("tk a"), &mut rng()).unwrap();
+    let (_, blob) = wrap_tenant_key(&kek, &tk(1, 1, "tk a"), &mut rng()).unwrap();
     for i in 0..blob.len() {
         let mut bad = blob.clone();
         bad[i] ^= 0x01;
         assert!(unwrap_tenant_key(&kek, 1, &t, 1, &bad).is_err(), "byte {i}");
     }
     // A check value taken from another key, put in front of this wrap.
-    let other = tk("tk b").check_value();
+    let other = tk(1, 1, "tk b").check_value();
     let mut swapped = blob.clone();
     swapped[..KCV_LEN].copy_from_slice(&other);
     assert!(unwrap_tenant_key(&kek, 1, &t, 1, &swapped).is_err());
@@ -185,9 +190,9 @@ fn a_changed_byte_or_a_changed_check_value_does_not_open() {
 fn a_kek_rewrap_keeps_the_check_value() {
     let both = kek_v2();
     let t = tenant(3);
-    let key = tk("tk a");
-    let old = wrap_tenant_key_as(&both, 1, &t, 1, &key, &mut rng()).unwrap();
-    let (v, new) = wrap_tenant_key(&both, &t, 1, &key, &mut TestRng::new("other")).unwrap();
+    let key = tk(3, 1, "tk a");
+    let old = wrap_tenant_key_as(&both, 1, &key, &mut rng()).unwrap();
+    let (v, new) = wrap_tenant_key(&both, &key, &mut TestRng::new("other")).unwrap();
     assert_eq!(v, 2);
     assert_ne!(old, new);
     assert_eq!(
@@ -204,23 +209,27 @@ fn a_kek_rewrap_keeps_the_check_value() {
 
 #[test]
 fn different_keys_have_different_check_values() {
-    assert_ne!(tk("tk a").check_value(), tk("tk b").check_value());
+    assert_ne!(
+        tk(1, 1, "tk a").check_value(),
+        tk(1, 1, "tk b").check_value()
+    );
     let mut r = rng();
-    let a = TenantKey::generate(&mut r).unwrap();
-    let b = TenantKey::generate(&mut r).unwrap();
+    let a = TenantKey::generate(&tenant(1), 1, &mut r).unwrap();
+    let b = TenantKey::generate(&tenant(1), 1, &mut r).unwrap();
     assert_ne!(a.check_value(), b.check_value());
-    assert!(TenantKey::generate(&mut BrokenRng).is_err());
-    assert_eq!(format!("{a:?}"), "TenantKey(<redacted>)");
+    assert!(TenantKey::generate(&tenant(1), 1, &mut BrokenRng).is_err());
+    let shown = format!("{a:?}");
+    assert!(shown.contains("t_0000000000000001"), "{shown}");
+    assert!(!shown.contains(&hexs(&derived("tk a"))), "{shown}");
 }
 
 /// The blob, re-derived by hand from the documented strings.
 #[test]
 fn the_tenant_key_blob_has_the_documented_format() {
     let kek = kek_v1();
-    let t = tenant(1);
     let key_bytes = derived("tk a");
-    let key = TenantKey::from_bytes(key_bytes);
-    let (_, blob) = wrap_tenant_key(&kek, &t, 7, &key, &mut rng()).unwrap();
+    let key = TenantKey::from_bytes(&tenant(1), 7, key_bytes).unwrap();
+    let (_, blob) = wrap_tenant_key(&kek, &key, &mut rng()).unwrap();
 
     let kcv = &hkdf(&key_bytes, "velmora/tk-check/v1")[..8];
     assert_eq!(&blob[..8], kcv);
@@ -236,21 +245,17 @@ fn the_tenant_key_blob_has_the_documented_format() {
 #[test]
 fn a_scheme_two_bdk_opens_for_its_tenant_bucket_and_version_only() {
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     let bdk = DataKey::from_bytes(derived("bdk"));
-    let wrapped = wrap_bdk_v2(&key, &t, 1, &bucket(1), &bdk, &mut rng()).unwrap();
+    let wrapped = wrap_bdk_v2(&key, &bucket(1), &bdk, &mut rng()).unwrap();
     assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
     assert_eq!(wrapped[0], WRAP_VERSION_2);
     assert!(Scheme::Two(t.clone()).check(&wrapped).is_ok());
     assert!(Scheme::One.check(&wrapped).is_err());
     assert!(unwrap_bdk_v2(&key, &t, 1, &bucket(1), &wrapped).is_ok());
 
-    assert!(unwrap_bdk_v2(&key, &tenant(2), 1, &bucket(1), &wrapped).is_err());
-    assert!(unwrap_bdk_v2(&key, &t, 2, &bucket(1), &wrapped).is_err());
     assert!(unwrap_bdk_v2(&key, &t, 1, &bucket(2), &wrapped).is_err());
-    assert!(unwrap_bdk_v2(&tk("tk b"), &t, 1, &bucket(1), &wrapped).is_err());
-    assert!(unwrap_bdk_v2(&key, &t, 0, &bucket(1), &wrapped).is_err());
-    assert!(wrap_bdk_v2(&key, &t, 0, &bucket(1), &bdk, &mut rng()).is_err());
+    assert!(unwrap_bdk_v2(&tk(1, 1, "tk b"), &t, 1, &bucket(1), &wrapped).is_err());
     for i in 0..wrapped.len() {
         let mut bad = wrapped.clone();
         bad[i] ^= 0x80;
@@ -261,11 +266,60 @@ fn a_scheme_two_bdk_opens_for_its_tenant_bucket_and_version_only() {
     }
 }
 
+/// A key of one tenant or version cannot be used as another's (M1).
+#[test]
+fn a_tenant_key_works_only_for_its_own_tenant_and_version() {
+    let a = tenant(1);
+    let b = tenant(2);
+    let bdk = DataKey::from_bytes(derived("bdk"));
+    let key_a = tk(1, 1, "tk a");
+    let wrapped = wrap_bdk_v2(&key_a, &bucket(1), &bdk, &mut rng()).unwrap();
+    // The row says tenant b, or version 2: a's key is refused before any
+    // decryption, with its own error.
+    let e = unwrap_bdk_v2(&key_a, &b, 1, &bucket(1), &wrapped).unwrap_err();
+    assert!(
+        is_crypto(&e, "tenant key is not the one the data names"),
+        "{e:?}"
+    );
+    let e = unwrap_bdk_v2(&key_a, &a, 2, &bucket(1), &wrapped).unwrap_err();
+    assert!(
+        is_crypto(&e, "tenant key is not the one the data names"),
+        "{e:?}"
+    );
+    // The same bytes under b's key, bound to b, do not open a's wrap.
+    let same_bytes_b = tk(2, 1, "tk a");
+    assert!(unwrap_bdk_v2(&same_bytes_b, &b, 1, &bucket(1), &wrapped).is_err());
+    // A version-2 key with the same bytes does not open a version-1 wrap.
+    let v2 = tk(1, 2, "tk a");
+    assert!(unwrap_bdk_v2(&v2, &a, 2, &bucket(1), &wrapped).is_err());
+
+    // Records and control records take the tenant and version from the key.
+    let name_a = "m/x/t_0000000000000001/g_1";
+    let sealed = seal_record_v2(&key_a, name_a, b"x", &mut rng()).unwrap();
+    assert!(open_record_v2(&v2, &a, name_a, &sealed).is_err());
+    let control = seal_control(
+        &kek_v1(),
+        KEY_NAME,
+        &ControlSealer::Managed(&key_a),
+        b"d",
+        Some(b"p"),
+        &mut rng(),
+    )
+    .unwrap();
+    let opened = parse_control(&control)
+        .unwrap()
+        .open_door(&kek_v1(), KEY_NAME, ControlOwner::Managed(&a))
+        .unwrap();
+    assert!(opened.open_private_managed(&v2).is_err());
+    assert!(opened.open_private_managed(&tk(2, 1, "tk a")).is_err());
+    assert_eq!(&opened.open_private_managed(&key_a).unwrap()[..], b"p");
+}
+
 #[test]
 fn the_two_bdk_schemes_never_open_each_other() {
     let kek = kek_v1();
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     let bdk = DataKey::from_bytes(derived("bdk"));
 
     // Scheme 1 bytes are refused by scheme 2, also with the byte changed.
@@ -276,7 +330,7 @@ fn the_two_bdk_schemes_never_open_each_other() {
     assert!(unwrap_bdk_v2(&key, &t, 1, &bucket(1), &relabelled).is_err());
 
     // Scheme 2 bytes are refused by scheme 1, also with the byte changed.
-    let two = wrap_bdk_v2(&key, &t, 1, &bucket(1), &bdk, &mut rng()).unwrap();
+    let two = wrap_bdk_v2(&key, &bucket(1), &bdk, &mut rng()).unwrap();
     assert!(WrappedKey::from_slice(&two).is_err());
     assert!(unwrap_bdk(&kek, v, &bucket(1), &two).is_err());
     let mut relabelled = two.clone();
@@ -290,7 +344,7 @@ fn the_two_bdk_schemes_never_open_each_other() {
 fn an_extent_opens_under_a_bdk_rewrapped_to_scheme_two() {
     let kek = kek_v1();
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     let b = bucket(4);
     let x = ExtentId::mint([9; 13]);
     let bdk = DataKey::from_bytes(derived("bdk"));
@@ -299,7 +353,7 @@ fn an_extent_opens_under_a_bdk_rewrapped_to_scheme_two() {
 
     let (v, one) = wrap_bdk(&kek, &b, &bdk, &mut rng()).unwrap();
     let from_one = unwrap_bdk(&kek, v, &b, one.as_bytes()).unwrap();
-    let two = wrap_bdk_v2(&key, &t, 1, &b, &from_one, &mut rng()).unwrap();
+    let two = wrap_bdk_v2(&key, &b, &from_one, &mut rng()).unwrap();
     let from_two = unwrap_bdk_v2(&key, &t, 1, &b, &two).unwrap();
 
     let row = ExtentRow {
@@ -333,13 +387,11 @@ fn an_extent_opens_under_a_bdk_rewrapped_to_scheme_two() {
 
 #[test]
 fn the_scheme_two_bdk_wrap_has_the_documented_format() {
-    let t = tenant(1);
     let key_bytes = derived("tk a");
-    let key = TenantKey::from_bytes(key_bytes);
+    let key = TenantKey::from_bytes(&tenant(1), 3, key_bytes).unwrap();
     let bdk_bytes = derived("bdk");
     let b = bucket(1);
-    let wrapped =
-        wrap_bdk_v2(&key, &t, 3, &b, &DataKey::from_bytes(bdk_bytes), &mut rng()).unwrap();
+    let wrapped = wrap_bdk_v2(&key, &b, &DataKey::from_bytes(bdk_bytes), &mut rng()).unwrap();
     let wrap_key = hkdf(&key_bytes, "velmora/tk-wrap/v1");
     let aad = format!("velmora/bdk/v2|t_0000000000000001|{}|3", b.as_str());
     let plain = raw_open(&wrap_key, aad.as_bytes(), &wrapped, 0x02).unwrap();
@@ -403,9 +455,9 @@ fn the_two_secret_schemes_never_open_each_other() {
 #[test]
 fn a_v2_record_opens_under_its_name_tenant_and_key_version_only() {
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 2, "tk a");
     let name = "m/x/t_0000000000000001/g_0195c2a4b3e7f00112233445566778";
-    let sealed = seal_record_v2(&key, &t, 2, name, b"{\"v\":1}", &mut rng()).unwrap();
+    let sealed = seal_record_v2(&key, name, b"{\"v\":1}", &mut rng()).unwrap();
     assert!(is_record_v2(&sealed));
     assert_eq!(&sealed[..4], b"VMR2");
     assert_eq!(&sealed[4..22], b"t_0000000000000001");
@@ -413,19 +465,19 @@ fn a_v2_record_opens_under_its_name_tenant_and_key_version_only() {
     assert_eq!(sealed[RECORD_V2_HEADER_LEN], 0x01);
     assert_eq!(record_v2_header(&sealed).unwrap(), (t.clone(), 2));
     assert_eq!(
-        &open_record_v2(&key, &t, 2, name, &sealed).unwrap()[..],
+        &open_record_v2(&key, &t, name, &sealed).unwrap()[..],
         b"{\"v\":1}"
     );
 
     // Renamed within the tenant, another key, another version.
     let renamed = "m/x/t_0000000000000001/g_0195c2a4b3e7f00112233445566779";
-    assert!(open_record_v2(&key, &t, 2, renamed, &sealed).is_err());
-    assert!(open_record_v2(&tk("tk b"), &t, 2, name, &sealed).is_err());
-    assert!(open_record_v2(&key, &t, 1, name, &sealed).is_err());
+    assert!(open_record_v2(&key, &t, renamed, &sealed).is_err());
+    assert!(open_record_v2(&tk(1, 2, "tk b"), &t, name, &sealed).is_err());
+    assert!(open_record_v2(&tk(1, 1, "tk a"), &t, name, &sealed).is_err());
     for i in 0..sealed.len() {
         let mut bad = sealed.clone();
         bad[i] ^= 0x04;
-        assert!(open_record_v2(&key, &t, 2, name, &bad).is_err(), "byte {i}");
+        assert!(open_record_v2(&key, &t, name, &bad).is_err(), "byte {i}");
     }
 }
 
@@ -433,46 +485,67 @@ fn a_v2_record_opens_under_its_name_tenant_and_key_version_only() {
 fn a_v2_record_of_another_tenant_is_refused_by_its_own_error() {
     let a = tenant(1);
     let b = tenant(2);
-    let key = tk("tk a");
+    let key_a = tk(1, 1, "tk a");
+    let key_b = tk(2, 1, "tk a");
     let name_a = "m/x/t_0000000000000001/g_1";
     let name_b = "m/x/t_0000000000000002/g_1";
-    let sealed = seal_record_v2(&key, &a, 1, name_a, b"x", &mut rng()).unwrap();
+    let sealed = seal_record_v2(&key_a, name_a, b"x", &mut rng()).unwrap();
+    let tenant_error = |e: BridgeError| is_crypto(&e, "record names another tenant");
 
     // Stored under b's prefix: the envelope names a.
-    let e = open_record_v2(&key, &b, 1, name_b, &sealed).unwrap_err();
-    assert!(is_crypto(&e, "record names another tenant"), "{e:?}");
+    assert!(tenant_error(
+        open_record_v2(&key_b, &b, name_b, &sealed).unwrap_err()
+    ));
     // Read as a's record under b's name, or under a flat name.
-    let e = open_record_v2(&key, &a, 1, name_b, &sealed).unwrap_err();
-    assert!(is_crypto(&e, "record names another tenant"), "{e:?}");
-    let e = open_record_v2(&key, &a, 1, "m/g_1", &sealed).unwrap_err();
-    assert!(is_crypto(&e, "record names another tenant"), "{e:?}");
+    assert!(tenant_error(
+        open_record_v2(&key_a, &a, name_b, &sealed).unwrap_err()
+    ));
+    assert!(tenant_error(
+        open_record_v2(&key_a, &a, "m/g_1", &sealed).unwrap_err()
+    ));
+    // An envelope naming tenant 0, or no tenant at all, under b's prefix
+    // (L3): the same error, not a failed authentication.
+    for planted in [
+        DEFAULT_TENANT.as_bytes(),
+        b"t_ZZZZZZZZZZZZZZZZ",
+        b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    ] {
+        let mut bad = sealed.clone();
+        bad[4..22].copy_from_slice(planted);
+        assert!(tenant_error(
+            open_record_v2(&key_b, &b, name_b, &bad).unwrap_err()
+        ));
+    }
+    // A VMR2 record under tenant 0's prefix is never one of b's.
+    assert!(tenant_error(
+        open_record_v2(&key_b, &b, "m/x/t_0000000000000000/g_1", &sealed).unwrap_err()
+    ));
     // The writer refuses a name outside its tenant.
-    assert!(seal_record_v2(&key, &a, 1, name_b, b"x", &mut rng()).is_err());
-    assert!(seal_record_v2(&key, &a, 1, "m/g_1", b"x", &mut rng()).is_err());
-    assert!(seal_record_v2(&key, &a, 0, name_a, b"x", &mut rng()).is_err());
+    assert!(seal_record_v2(&key_a, name_b, b"x", &mut rng()).is_err());
+    assert!(seal_record_v2(&key_a, "m/g_1", b"x", &mut rng()).is_err());
+    assert!(seal_record_v2(&key_a, "m/x/t_0000000000000000/g_1", b"x", &mut rng()).is_err());
 }
 
 #[test]
 fn v1_and_v2_records_are_never_taken_for_each_other() {
     let kek = kek_v1();
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     let name = "m/x/t_0000000000000001/g_1";
     let v1 = seal_manifest(&kek, name, b"x", &mut rng()).unwrap();
     assert!(!is_record_v2(&v1));
     assert!(record_v2_header(&v1).is_err());
-    assert!(open_record_v2(&key, &t, 1, name, &v1).is_err());
-    let v2 = seal_record_v2(&key, &t, 1, name, b"x", &mut rng()).unwrap();
+    assert!(open_record_v2(&key, &t, name, &v1).is_err());
+    let v2 = seal_record_v2(&key, name, b"x", &mut rng()).unwrap();
     assert!(open_manifest(&kek, name, &v2).is_err());
 }
 
 #[test]
 fn the_v2_record_has_the_documented_format() {
-    let t = tenant(1);
     let key_bytes = derived("tk a");
-    let key = TenantKey::from_bytes(key_bytes);
+    let key = TenantKey::from_bytes(&tenant(1), 5, key_bytes).unwrap();
     let name = "m/x/t_0000000000000001/art/x_01";
-    let sealed = seal_record_v2(&key, &t, 5, name, b"plan", &mut rng()).unwrap();
+    let sealed = seal_record_v2(&key, name, b"plan", &mut rng()).unwrap();
     let k = hkdf(&key_bytes, "velmora/manifest/v2");
     let aad = format!("velmora/manifest/v2|{name}|t_0000000000000001|5");
     assert_eq!(
@@ -488,23 +561,15 @@ fn the_v2_record_has_the_documented_format() {
 const KEY_NAME: &str = "m/k/t_0000000000000001/00000000000000000001";
 const KEY_NAME_0: &str = "m/k/t_0000000000000000/00000000000000000001";
 
-fn managed<'a>(t: &'a TenantId, key: &'a TenantKey, v: u32) -> ControlSealer<'a> {
-    ControlSealer::Managed {
-        tenant: t,
-        tk: key,
-        tk_version: v,
-    }
-}
-
 #[test]
 fn a_managed_control_record_opens_its_door_without_the_tenant_key() {
     let kek = kek_v1();
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 4, "tk a");
     let sealed = seal_control(
         &kek,
         KEY_NAME,
-        &managed(&t, &key, 4),
+        &ControlSealer::Managed(&key),
         b"door",
         Some(b"private"),
         &mut rng(),
@@ -513,32 +578,31 @@ fn a_managed_control_record_opens_its_door_without_the_tenant_key() {
     let env = parse_control(&sealed).unwrap();
     assert_eq!(env.kek_version(), 1);
     assert_eq!(env.private_key(), PrivateKeyRef::Tenant(4));
-    assert_eq!(
-        &env.open_door(&kek, KEY_NAME, ControlOwner::Managed(&t))
-            .unwrap()[..],
-        b"door"
-    );
-    assert_eq!(
-        &env.open_private_managed(&key, KEY_NAME, &t).unwrap()[..],
-        b"private"
-    );
+    let opened = env
+        .open_door(&kek, KEY_NAME, ControlOwner::Managed(&t))
+        .unwrap();
+    assert_eq!(opened.door(), b"door");
+    assert_eq!(opened.private_key(), PrivateKeyRef::Tenant(4));
+    assert_eq!(&opened.open_private_managed(&key).unwrap()[..], b"private");
     // The private part needs the tenant key.
-    assert!(env.open_private_managed(&tk("tk b"), KEY_NAME, &t).is_err());
+    assert!(opened.open_private_managed(&tk(1, 4, "tk b")).is_err());
+    assert!(opened.open_private_tenant_zero(&kek).is_err());
     // A tenant-0 reader, a global reader or another tenant is refused.
-    assert!(env
-        .open_door(&kek, KEY_NAME, ControlOwner::TenantZero)
-        .is_err());
-    assert!(env.open_door(&kek, KEY_NAME, ControlOwner::Global).is_err());
-    assert!(env
-        .open_door(&kek, KEY_NAME, ControlOwner::Managed(&tenant(2)))
-        .is_err());
-    assert!(env.open_private_tenant_zero(&kek, KEY_NAME).is_err());
+    let door = |owner| {
+        parse_control(&sealed)
+            .unwrap()
+            .open_door(&kek, KEY_NAME, owner)
+            .map(|_| ())
+    };
+    assert!(door(ControlOwner::TenantZero).is_err());
+    assert!(door(ControlOwner::Global).is_err());
+    assert!(door(ControlOwner::Managed(&tenant(2))).is_err());
     // Another name.
     let other = "m/k/t_0000000000000001/00000000000000000002";
-    assert!(env
+    assert!(parse_control(&sealed)
+        .unwrap()
         .open_door(&kek, other, ControlOwner::Managed(&t))
         .is_err());
-    assert!(env.open_private_managed(&key, other, &t).is_err());
 }
 
 #[test]
@@ -555,18 +619,15 @@ fn a_tenant_zero_control_record_seals_its_private_part_under_the_kek() {
     .unwrap();
     let env = parse_control(&sealed).unwrap();
     assert_eq!(env.private_key(), PrivateKeyRef::Kek(1));
+    let opened = env
+        .open_door(&kek, KEY_NAME_0, ControlOwner::TenantZero)
+        .unwrap();
+    assert_eq!(opened.door(), b"door");
     assert_eq!(
-        &env.open_door(&kek, KEY_NAME_0, ControlOwner::TenantZero)
-            .unwrap()[..],
-        b"door"
-    );
-    assert_eq!(
-        &env.open_private_tenant_zero(&kek, KEY_NAME_0).unwrap()[..],
+        &opened.open_private_tenant_zero(&kek).unwrap()[..],
         b"secrets"
     );
-    assert!(env
-        .open_private_managed(&tk("tk a"), KEY_NAME_0, &tenant(1))
-        .is_err());
+    assert!(opened.open_private_managed(&tk(1, 1, "tk a")).is_err());
 }
 
 #[test]
@@ -584,11 +645,9 @@ fn a_global_control_record_has_a_door_part_only() {
     .unwrap();
     let env = parse_control(&sealed).unwrap();
     assert_eq!(env.private_key(), PrivateKeyRef::None);
-    assert_eq!(
-        &env.open_door(&kek, name, ControlOwner::Global).unwrap()[..],
-        b"locations"
-    );
-    assert!(env.open_private_tenant_zero(&kek, name).is_err());
+    let opened = env.open_door(&kek, name, ControlOwner::Global).unwrap();
+    assert_eq!(opened.door(), b"locations");
+    assert!(opened.open_private_tenant_zero(&kek).is_err());
     // A global record takes no private part; a tenant's always has one.
     assert!(seal_control(
         &kek,
@@ -608,37 +667,65 @@ fn a_global_control_record_has_a_door_part_only() {
         &mut rng()
     )
     .is_err());
-    let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     assert!(seal_control(
         &kek,
         KEY_NAME,
-        &managed(&t, &key, 1),
+        &ControlSealer::Managed(&key),
         b"d",
         None,
         &mut rng()
     )
     .is_err());
+}
+
+/// L4: a record can be sealed and opened only under its owner's names.
+#[test]
+fn a_control_record_is_sealed_only_under_its_owners_names() {
+    let kek = kek_v1();
+    let key_a = tk(1, 1, "tk a");
+    let other_tenant = "m/k/t_0000000000000002/00000000000000000001";
+    for (name, sealer) in [
+        (other_tenant, ControlSealer::Managed(&key_a)),
+        (KEY_NAME_0, ControlSealer::Managed(&key_a)),
+        ("m/x/t_0000000000000001/g_1", ControlSealer::Managed(&key_a)),
+        ("m/kl/00000000000000000001", ControlSealer::Managed(&key_a)),
+        (KEY_NAME, ControlSealer::TenantZero),
+        (KEY_NAME, ControlSealer::Global),
+        ("m/g_1", ControlSealer::Global),
+    ] {
+        let private: Option<&[u8]> = match sealer {
+            ControlSealer::Global => None,
+            _ => Some(b"p"),
+        };
+        let e = seal_control(&kek, name, &sealer, b"d", private, &mut rng()).unwrap_err();
+        assert!(
+            is_crypto(&e, "control record name does not match its owner"),
+            "{name}: {e:?}"
+        );
+    }
+    // A bucket configuration record lies in the tenant's record directory.
     assert!(seal_control(
         &kek,
-        KEY_NAME,
-        &managed(&t, &key, 0),
+        "m/x/t_0000000000000001/b/b_01/00000000000000000001",
+        &ControlSealer::Managed(&key_a),
         b"d",
         Some(b"p"),
         &mut rng()
     )
-    .is_err());
+    .is_ok());
 }
 
+/// L1: the private part is reached only through an opened door.
 #[test]
 fn the_door_part_binds_the_private_part() {
     let kek = kek_v1();
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     let a = seal_control(
         &kek,
         KEY_NAME,
-        &managed(&t, &key, 1),
+        &ControlSealer::Managed(&key),
         b"door a",
         Some(b"private a"),
         &mut rng(),
@@ -647,23 +734,21 @@ fn the_door_part_binds_the_private_part() {
     let b = seal_control(
         &kek,
         KEY_NAME,
-        &managed(&t, &key, 1),
+        &ControlSealer::Managed(&key),
         b"door a",
         Some(b"private b"),
         &mut TestRng::new("b"),
     )
     .unwrap();
-    // Same name, same header length: graft b's private part onto a.
+    // Same name, same header length: graft b's private part onto a. The
+    // door refuses the record, so its private part cannot be reached.
     let door_len = u32::from_be_bytes(a[13..17].try_into().unwrap()) as usize;
     let split = CONTROL_HEADER_LEN + door_len;
     assert_eq!(a.len(), b.len());
     let mut grafted = a[..split].to_vec();
     grafted.extend_from_slice(&b[split..]);
-    let env = parse_control(&grafted).unwrap();
-    // The private part alone still opens (it is b's, under the same name
-    // and header), but the door refuses the record as a whole.
-    assert!(env.open_private_managed(&key, KEY_NAME, &t).is_ok());
-    assert!(env
+    assert!(parse_control(&grafted)
+        .unwrap()
         .open_door(&kek, KEY_NAME, ControlOwner::Managed(&t))
         .is_err());
 
@@ -682,29 +767,86 @@ fn the_door_part_binds_the_private_part() {
     assert!(parse_control(&longer).is_err());
 }
 
+/// Each kind of private key fits only its own lengths and version.
+#[test]
+fn the_parser_refuses_kinds_that_do_not_fit_their_lengths() {
+    let kek = kek_v1();
+    let global = seal_control(
+        &kek,
+        "m/kl/00000000000000000001",
+        &ControlSealer::Global,
+        b"d",
+        None,
+        &mut rng(),
+    )
+    .unwrap();
+    let managed = seal_control(
+        &kek,
+        KEY_NAME,
+        &ControlSealer::Managed(&tk(1, 1, "tk a")),
+        b"d",
+        Some(b"p"),
+        &mut rng(),
+    )
+    .unwrap();
+    assert!(parse_control(&global).is_ok());
+    assert!(parse_control(&managed).is_ok());
+    let with = |bytes: &[u8], at: usize, value: &[u8]| {
+        let mut b = bytes.to_vec();
+        b[at..at + value.len()].copy_from_slice(value);
+        b
+    };
+    // `none` with a private version, or a private length.
+    assert!(parse_control(&with(&global, 9, &1u32.to_be_bytes())).is_err());
+    let mut padded = with(&global, 17, &(WRAP_OVERHEAD as u32).to_be_bytes());
+    padded.extend_from_slice(&[0u8; WRAP_OVERHEAD]);
+    assert!(parse_control(&padded).is_err());
+    // `tenant` or `kek` with version 0, or with no private part.
+    assert!(parse_control(&with(&managed, 9, &0u32.to_be_bytes())).is_err());
+    assert!(parse_control(&with(&with(&managed, 8, &[1]), 9, &0u32.to_be_bytes())).is_err());
+    let door_len = u32::from_be_bytes(managed[13..17].try_into().unwrap()) as usize;
+    let cut = with(
+        &managed[..CONTROL_HEADER_LEN + door_len],
+        17,
+        &0u32.to_be_bytes(),
+    );
+    assert!(parse_control(&cut).is_err());
+    // An unknown kind, a door shorter than a wrap, a wrong magic.
+    assert!(parse_control(&with(&managed, 8, &[3])).is_err());
+    assert!(parse_control(&with(&global, 13, &1u32.to_be_bytes())).is_err());
+    assert!(parse_control(&with(&global, 0, b"VCR2")).is_err());
+    // Lengths whose sum overflows.
+    let huge = with(
+        &with(&managed, 13, &u32::MAX.to_be_bytes()),
+        17,
+        &u32::MAX.to_be_bytes(),
+    );
+    assert!(parse_control(&huge).is_err());
+}
+
 #[test]
 fn a_control_record_opens_after_the_kek_moves_on() {
     let t = tenant(1);
-    let key = tk("tk a");
+    let key = tk(1, 1, "tk a");
     let sealed = seal_control(
         &kek_v1(),
         KEY_NAME,
-        &managed(&t, &key, 1),
+        &ControlSealer::Managed(&key),
         b"door",
         Some(b"p"),
         &mut rng(),
     )
     .unwrap();
     let both = kek_v2();
-    let env = parse_control(&sealed).unwrap();
-    assert_eq!(env.kek_version(), 1);
-    assert!(env
+    assert_eq!(parse_control(&sealed).unwrap().kek_version(), 1);
+    assert!(parse_control(&sealed)
+        .unwrap()
         .open_door(&both, KEY_NAME, ControlOwner::Managed(&t))
         .is_ok());
     let resealed = seal_control(
         &both,
         KEY_NAME,
-        &managed(&t, &key, 1),
+        &ControlSealer::Managed(&key),
         b"door",
         Some(b"p"),
         &mut rng(),
@@ -713,7 +855,8 @@ fn a_control_record_opens_after_the_kek_moves_on() {
     assert_eq!(parse_control(&resealed).unwrap().kek_version(), 2);
     // Without KEK 1 the old record's door does not open.
     let only_two = TestKek::with_versions(2, &[(2, derived("kek v2"))]);
-    assert!(env
+    assert!(parse_control(&sealed)
+        .unwrap()
         .open_door(&only_two, KEY_NAME, ControlOwner::Managed(&t))
         .is_err());
 }
@@ -722,13 +865,12 @@ fn a_control_record_opens_after_the_kek_moves_on() {
 fn the_control_record_has_the_documented_format() {
     let kek_bytes = derived("kek v1");
     let kek = kek_v1();
-    let t = tenant(1);
     let key_bytes = derived("tk a");
-    let key = TenantKey::from_bytes(key_bytes);
+    let key = TenantKey::from_bytes(&tenant(1), 6, key_bytes).unwrap();
     let sealed = seal_control(
         &kek,
         KEY_NAME,
-        &managed(&t, &key, 6),
+        &ControlSealer::Managed(&key),
         b"door",
         Some(b"private"),
         &mut rng(),
