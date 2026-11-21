@@ -1484,9 +1484,16 @@ async fn a_copy_that_cannot_be_written_back_is_tried_again_and_said() {
         Some(w.bridge().clock.now().0 + 3_600_000)
     );
     *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
+    let repinned_at = w.scrubbed_at(&o).await.unwrap();
     w.advance_secs(3600);
-    assert_eq!(w.scrub().await.stalled, 1);
+    // The early look writes the copy; the repair has not stalled, and is
+    // due again at its own bound.
+    let early = w.scrub().await;
+    assert_eq!(early.stalled, 0);
     assert!(w.has_safety(&o), "written by the watch");
+    assert_eq!(w.result(&o).await, "repairing");
+    let bound = repair_bound_secs(w.bridge().cfg.safety_min_age_secs, 3600) as i64;
+    assert_eq!(w.next_at(&o).await, Some(repinned_at + bound * 1000));
 }
 
 /// The scrub's reader never takes the read slot a request's cold read is
@@ -1711,4 +1718,29 @@ async fn a_run_that_fails_at_its_start_keeps_the_incidents() {
     let state = w.state().await;
     assert_eq!(state.blocked(), ["beta"]);
     assert_eq!(state.lease_until, None, "the lease is free");
+}
+
+/// A backbone that answers `STAT` for every article but whose provider
+/// does not serve one whole is a loss there too: after the re-pin it gets
+/// a failed full read, so no release counts it on `STAT` alone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_backbone_that_does_not_serve_what_it_says_it_holds_is_read_in_full() {
+    let w = world().await;
+    let o = w.released("a", 250).await;
+    w.advance_secs(31 * DAY_SECS);
+    // Alpha serves no body (but answers STAT); beta serves them all.
+    w.servers[0].set_body_gone(true).await;
+    let first = w.scrub().await;
+    assert_eq!(first.suspect, 1, "a loss, not ok");
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.repaired, 1);
+    let failed = w
+        .scalar(
+            "SELECT group_concat(backbone) FROM verifications WHERE extent_id = ?1 \
+               AND provider_id = 'scrub'",
+            &o.extent,
+        )
+        .await;
+    assert_eq!(failed, "alpha");
+    assert!(alerts().iter().any(|a| a.contains("lacking=[alpha]")));
 }
