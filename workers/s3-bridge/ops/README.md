@@ -930,13 +930,16 @@ pass starts then).
    DELETE alone is not enough there: such a key carries no mark, and
    on a key with no object and no mark a delete stores nothing, so the
    old record would stay the newest one of the key.
-2. Run it on a deployed test environment with `GC_MODE` off there:
-   with `GC_MODE=disposable` the older collector deletes a dropped
-   part in a bucket flagged disposable as soon as it is dropped, and
-   the run would show nothing about this one. Abort an upload, upload
-   a part twice and keep one upload open. After a cron run the copies
-   of the dropped parts are still in `SAFETY` (`x/<extent id>`): the
-   grace period holds them. Then date the `gc` rows of the dropped
+2. Run it on a deployed test environment, with `GC_ORPHANS = "on"`
+   and `GC_MODE` off there: with `GC_MODE=disposable` the older
+   collector deletes a dropped part in a bucket flagged disposable as
+   soon as it is dropped, and the run would show nothing about this
+   one. Abort an upload, upload a part twice and keep one upload open.
+   Wait until the row `orphans` of `scan_cursors` reads `rest:<ms>`:
+   the collector has then made a pass (the first cron run of a new
+   deployment can be a quarter of an hour away). The copies of the
+   dropped parts are still in `SAFETY` (`x/<extent id>`): the grace
+   period holds them. Then date the `gc` rows of the dropped
    parts 31 days back, delete the row `orphans` of `scan_cursors` on
    that environment (the scan rests a day after a pass that found
    nothing), and wait for a cron run. Then see both: the
