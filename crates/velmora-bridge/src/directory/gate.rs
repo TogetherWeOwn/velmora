@@ -22,9 +22,13 @@
 //! while the row says open **and** its epoch is the newest anchor
 //! ([`is_open`]). A restored row that says open at an older epoch is
 //! therefore closed. An anchor says only "closed at this epoch", so a
-//! forged one can close the gate and never open it. The runbook closes the
-//! gate before a restore of the directory database, and the restore keeps
-//! it closed until a gate run has ended.
+//! forged one can close the gate and never open it.
+//!
+//! This holds for a restore that follows a closing. A Time Travel restore
+//! made with no closing before it brings back a row that is open at the
+//! newest epoch, and it is open until a gate run closes it: the restore
+//! of the directory database is therefore run only by a tool that closes
+//! the gate first.
 //!
 //! # What passes a closed gate
 //!
@@ -233,30 +237,41 @@ fn anchor_key(epoch: u64) -> String {
     format!("{GATE_ANCHOR_PREFIX}{epoch:020}")
 }
 
-/// The newest anchored epoch, 0 = none. A name under the prefix that is
-/// not an anchor is damage.
-pub async fn anchored_epoch<S: RecordStore>(store: &S) -> Result<u64> {
+/// The highest epoch an anchor may name: well inside the integers that
+/// every store and every JSON reader keeps exactly.
+pub const MAX_EPOCH: u64 = 1 << 53;
+
+/// The newest anchored epoch, 0 = none, and the number of names under
+/// the prefix that are no anchor (a stray name, or an epoch above
+/// [`MAX_EPOCH`]). A stray name alarms; it never stops a closing.
+pub async fn anchored_epoch<S: RecordStore>(store: &S) -> Result<(u64, u64)> {
     let mut newest = 0;
+    let mut strays = 0;
     let mut after = String::new();
     loop {
         let keys = store.list(GATE_ANCHOR_PREFIX, &after, 1000).await?;
         for key in &keys {
-            let epoch = key
-                .strip_prefix(GATE_ANCHOR_PREFIX)
-                .filter(|d| d.len() == 20 && d.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|d| d.parse::<u64>().ok())
-                .ok_or(BridgeError::Invalid("stray name under the gate anchors"))?;
-            newest = newest.max(epoch);
+            match anchor_epoch(key) {
+                Some(epoch) => newest = newest.max(epoch),
+                None => strays += 1,
+            }
         }
         match keys.last() {
             Some(last) if keys.len() == 1000 => after = last.clone(),
-            _ => return Ok(newest),
+            _ => return Ok((newest, strays)),
         }
     }
 }
 
-/// Closes the gate at a new epoch: the anchor first, then the row. The
-/// epoch is above every anchor and above the row's.
+fn anchor_epoch(key: &str) -> Option<u64> {
+    key.strip_prefix(GATE_ANCHOR_PREFIX)
+        .filter(|d| d.len() == 20 && d.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|d| d.parse::<u64>().ok())
+        .filter(|&e| (1..=MAX_EPOCH).contains(&e))
+}
+
+/// Closes the gate at a new epoch: the anchor first, then the row, which
+/// is read back. The epoch is above every anchor and above the row's.
 pub async fn close<S: RecordStore, Q: Sql>(
     store: &S,
     dir: &SqlDirectory<'_, Q>,
@@ -264,7 +279,12 @@ pub async fn close<S: RecordStore, Q: Sql>(
     now: UnixMs,
 ) -> Result<u64> {
     for _ in 0..MAX_ANCHOR_TRIES {
-        let epoch = anchored_epoch(store).await?.max(dir.gate().await?.epoch) + 1;
+        let (anchored, _strays) = anchored_epoch(store).await?;
+        let epoch = anchored
+            .max(dir.gate().await?.epoch)
+            .checked_add(1)
+            .filter(|&e| e <= MAX_EPOCH)
+            .ok_or(BridgeError::Invalid("gate epoch out of range"))?;
         let body = serde_json::to_vec(&serde_json::json!({
             "epoch": epoch,
             "closed_at": now.0,
@@ -272,17 +292,31 @@ pub async fn close<S: RecordStore, Q: Sql>(
         .map_err(|_| BridgeError::Invalid("gate anchor"))?;
         if store.put_if_absent(&anchor_key(epoch), body).await? {
             dir.mark_closed(epoch, reason, now).await?;
+            let row = dir.gate().await?;
+            if !row.closed || row.epoch < epoch {
+                return Err(BridgeError::Invalid("gate row did not take the closing"));
+            }
             return Ok(epoch);
         }
     }
     Err(BridgeError::Invalid("gate anchor: lost every put"))
 }
 
-/// Whether the gate is open: the row says open, and its epoch is the
-/// newest anchor.
+/// Whether the gate is open: the row says open at epoch E, and the names
+/// under the anchor prefix after E - 1 are exactly E's anchor. One short
+/// listing; any other name there (a newer anchor, a stray) keeps it
+/// closed. An `Err` is closed too: the caller answers `503`.
 pub async fn is_open<S: RecordStore, Q: Sql>(store: &S, dir: &SqlDirectory<'_, Q>) -> Result<bool> {
     let row = dir.gate().await?;
-    Ok(!row.closed && row.epoch > 0 && anchored_epoch(store).await? == row.epoch)
+    if row.closed || row.epoch == 0 || row.epoch > MAX_EPOCH {
+        return Ok(false);
+    }
+    let after = match row.epoch - 1 {
+        0 => String::new(),
+        e => anchor_key(e),
+    };
+    let names = store.list(GATE_ANCHOR_PREFIX, &after, 2).await?;
+    Ok(names == [anchor_key(row.epoch)])
 }
 
 /// Every tenant id that has a chain, in id order: one listing call per
@@ -338,6 +372,11 @@ async fn heads<S: RecordStore, C: ControlSeal>(chain: &TenantChain<'_, S, C>) ->
             Ok(None) => Err("chain_empty"),
             Err(ChainError::Damaged(what)) => Err(what),
             Err(ChainError::Store(e)) => return Err(e),
+            // A key version this isolate does not hold yet: the run fails
+            // and is run again, it is not damage.
+            Err(ChainError::KeyNotHeld { .. }) => {
+                return Err(BridgeError::Invalid("tenant key version not held yet"))
+            }
             Err(_) => Err("chain_unreadable"),
         };
         out.push((tenant, head));
@@ -369,7 +408,7 @@ async fn compare<Q: Sql>(heads: &Heads, dir: &SqlDirectory<'_, Q>) -> Result<Com
     for (tenant, head) in heads {
         let raw = dir.raw_tenant(tenant).await?;
         out.observed
-            .insert(tenant.clone(), raw.as_ref().map(|r| r.record_seq));
+            .insert(tenant.clone(), raw.as_ref().and_then(|r| r.record_seq));
         let head = match head {
             Ok(door) => door,
             Err(what) => {
@@ -382,29 +421,29 @@ async fn compare<Q: Sql>(heads: &Heads, dir: &SqlDirectory<'_, Q>) -> Result<Com
         };
         let difference = match raw {
             None => Some(Difference::Missing(tenant.clone())),
-            Some(row) => match row.door {
-                None => Some(Difference::Unreadable(tenant.clone())),
-                Some(_) if row.record_seq < head.seq => Some(Difference::Behind {
+            Some(row) => match (row.door, row.record_seq) {
+                (None, _) | (_, None) => Some(Difference::Unreadable(tenant.clone())),
+                (Some(_), Some(seq)) if seq < head.seq => Some(Difference::Behind {
                     tenant: tenant.clone(),
-                    row_seq: row.record_seq,
+                    row_seq: seq,
                     head_seq: head.seq,
                 }),
-                Some(_) if row.record_seq > head.seq => Some(Difference::Ahead {
+                (Some(_), Some(seq)) if seq > head.seq => Some(Difference::Ahead {
                     tenant: tenant.clone(),
-                    row_seq: row.record_seq,
+                    row_seq: seq,
                     head_seq: head.seq,
                 }),
-                Some(door) if door != *head || !units_match(dir, head).await? => {
+                (Some(door), _) if door != *head || !units_match(dir, head).await => {
                     Some(Difference::Changed(tenant.clone()))
                 }
-                Some(_) => None,
+                (Some(_), _) => None,
             },
         };
         out.differences.extend(difference);
     }
     for tenant in row_tenants(dir).await? {
         if !heads.iter().any(|(t, _)| *t == tenant) {
-            let seq = dir.raw_tenant(&tenant).await?.map(|r| r.record_seq);
+            let seq = dir.raw_tenant(&tenant).await?.and_then(|r| r.record_seq);
             out.observed.insert(tenant.clone(), seq);
             out.differences.push(Difference::Orphan(tenant));
         }
@@ -412,9 +451,12 @@ async fn compare<Q: Sql>(heads: &Heads, dir: &SqlDirectory<'_, Q>) -> Result<Com
     Ok(out)
 }
 
-/// Whether the unit rows say what the head says.
-async fn units_match<Q: Sql>(dir: &SqlDirectory<'_, Q>, head: &TenantDoor) -> Result<bool> {
-    let rows = dir.units(&head.tenant).await?;
+/// Whether the unit rows say what the head says. Rows that do not read
+/// do not say it, and the rebuild writes them again.
+async fn units_match<Q: Sql>(dir: &SqlDirectory<'_, Q>, head: &TenantDoor) -> bool {
+    let Ok(rows) = dir.units(&head.tenant).await else {
+        return false;
+    };
     let listed: Vec<(u32, Option<u64>)> = head
         .units
         .iter()
@@ -422,7 +464,7 @@ async fn units_match<Q: Sql>(dir: &SqlDirectory<'_, Q>, head: &TenantDoor) -> Re
         .collect();
     let stored: Vec<(u32, Option<u64>)> =
         rows.iter().map(|r| (r.unit, r.restoring_since)).collect();
-    Ok(listed == stored)
+    listed == stored
 }
 
 /// Gate step 2 (and the tenant part of step 1): every row takes its
@@ -440,31 +482,47 @@ pub async fn rebuild_tenants<S: RecordStore, C: ControlSeal, Q: Sql>(
 ) -> Result<TenantStep> {
     let heads = heads(chain).await?;
     let compared = compare(&heads, dir).await?;
-    let observed = |t: &TenantId| compared.observed.get(t).copied().flatten();
     let mut step = TenantStep {
         differences: compared.differences.clone(),
         ..TenantStep::default()
     };
     for (tenant, head) in &heads {
-        if let Ok(door) = head {
-            step.chains += 1;
-            match dir.replace_tenant(door, observed(tenant), now).await? {
-                true => step.written += 1,
-                false => step.raced += 1,
+        if head.is_err() {
+            continue;
+        }
+        step.chains += 1;
+        // The row first, then the head: a closing call that lands between
+        // the two either is in the head read here, or changed the row and
+        // makes the write below a no-op. Never an older head over a newer
+        // row.
+        let observed = dir.row_seq(tenant).await?;
+        let fresh = match chain.head(tenant, 0).await {
+            Ok(Some(read)) => read.door,
+            Ok(None) | Err(ChainError::Damaged(_)) | Err(ChainError::PrivateUnreadable) => {
+                step.raced += 1;
+                continue;
             }
+            Err(ChainError::Store(e)) => return Err(e),
+            Err(_) => return Err(BridgeError::Invalid("tenant chain not readable now")),
+        };
+        match dir.replace_tenant(&fresh, &observed, now).await? {
+            true => step.written += 1,
+            false => step.raced += 1,
         }
     }
     for d in &compared.differences {
         if let Difference::Orphan(tenant) = d {
-            let Some(seq) = observed(tenant) else {
-                continue;
-            };
-            // A chain that appeared since the listing keeps its row.
-            if chain.head_seq(tenant, 0).await.ok().flatten().is_some() {
-                step.raced += 1;
-                continue;
+            let observed = dir.row_seq(tenant).await?;
+            // Removed only when the chain is surely still absent; an
+            // error is not "absent".
+            match chain.head_seq(tenant, 0).await {
+                Ok(None) => {}
+                _ => {
+                    step.raced += 1;
+                    continue;
+                }
             }
-            match dir.remove_tenant(tenant, seq).await? {
+            match dir.remove_tenant(tenant, &observed).await? {
                 true => step.removed += 1,
                 false => step.raced += 1,
             }
@@ -500,6 +558,15 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     reports.push(("root_units", steps.root_units().await?));
     dir.clear_all_pending().await?;
     reports.push(("finisher", steps.finisher().await?));
+    // A newer run closed the gate over this one: it does the rest.
+    if anchored_epoch(chain.store).await?.0 != epoch {
+        return Ok(GateRun {
+            epoch,
+            tenants,
+            steps: reports,
+            opened: false,
+        });
+    }
     reports.push(("counters", steps.counters(epoch).await?));
     reports.push(("sealed_days", steps.sealed_days().await?));
 
@@ -522,7 +589,7 @@ pub async fn run_gate<S: RecordStore, C: ControlSeal, Q: Sql, G: GateSteps>(
     }
     let ready = clean && reports.iter().all(|(_, r)| r.done);
     let opened =
-        ready && anchored_epoch(chain.store).await? == epoch && dir.open_gate(epoch, now).await?;
+        ready && anchored_epoch(chain.store).await?.0 == epoch && dir.open_gate(epoch, now).await?;
     Ok(GateRun {
         epoch,
         tenants,

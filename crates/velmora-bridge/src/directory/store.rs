@@ -8,7 +8,7 @@
 //! for a route on a cache miss, by the management plane, and by the
 //! operator.
 
-use super::record::{Selector, TenantDoor, TenantId};
+use super::record::{TenantDoor, TenantId};
 use crate::ports::{Row, Sql, SqlValue};
 use crate::types::{BridgeError, Result, UnixMs};
 
@@ -189,9 +189,15 @@ const DERIVED_COLUMNS: &str =
 /// column taken from it says what the door says).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawTenant {
-    pub record_seq: u64,
+    /// `None` when the column holds no seq.
+    pub record_seq: Option<u64>,
     pub door: Option<TenantDoor>,
 }
+
+/// The seq column of a tenant row exactly as stored (`NULL` for no row),
+/// for a write that must find the row as the gate saw it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowSeq(SqlValue);
 
 /// The values of a tenant row for `door`, in the order of the columns of
 /// the upsert statements.
@@ -200,10 +206,7 @@ fn tenant_params(door: &TenantDoor, now: UnixMs) -> Result<Vec<SqlValue>> {
         super::record::HoldMode::ReadOnly => "read_only",
         super::record::HoldMode::Locked => "locked",
     });
-    let selector = door.tenant_zero.as_ref().map(|z| match z.selector {
-        Selector::D1 => "d1",
-        Selector::Moved { .. } => "moved",
-    });
+    let selector = door.tenant_zero.as_ref().map(|z| z.selector.as_str());
     Ok(vec![
         SqlValue::Text(door.tenant.as_str().to_string()),
         int(door.seq)?,
@@ -234,21 +237,34 @@ impl<S: Sql> SqlDirectory<'_, S> {
         })
     }
 
+    /// The seq column of `tenant`'s row as stored, `NULL` for no row.
+    pub async fn row_seq(&self, tenant: &TenantId) -> Result<RowSeq> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT record_seq FROM tenants WHERE id = ?1",
+                &[SqlValue::Text(tenant.as_str().to_string())],
+            )
+            .await?;
+        Ok(RowSeq(
+            rows.into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or(SqlValue::Null),
+        ))
+    }
+
     /// The gate's copy of a head: the row takes it whatever seq it held,
-    /// if it still holds `observed` (`None` = there was no row). `false` =
-    /// the row changed since the gate read it, and nothing was written.
+    /// if it still holds `observed`. `false` = the row changed since the
+    /// gate read it, and nothing was written.
     pub async fn replace_tenant(
         &self,
         door: &TenantDoor,
-        observed: Option<u64>,
+        observed: &RowSeq,
         now: UnixMs,
     ) -> Result<bool> {
-        let observed = match observed {
-            None => SqlValue::Null,
-            Some(seq) => int(seq)?,
-        };
         let changed = self
-            .write_tenant(REPLACE_TENANT, Some(observed), door, now)
+            .write_tenant(REPLACE_TENANT, Some(observed.0.clone()), door, now)
             .await?;
         Ok(changed > 0)
     }
@@ -301,11 +317,11 @@ impl<S: Sql> SqlDirectory<'_, S> {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        let record_seq = u64::try_from(int_at(&row, 0)?).map_err(|_| ERR_ROW)?;
+        let record_seq = int_at(&row, 0).ok().and_then(|v| u64::try_from(v).ok());
         let door = text(&row, 1)
             .ok()
             .and_then(|json| serde_json::from_str::<TenantDoor>(&json).ok())
-            .filter(|door| &door.tenant == tenant && door.seq == record_seq)
+            .filter(|door| &door.tenant == tenant && Some(door.seq) == record_seq)
             .filter(|door| {
                 tenant_params(door, UnixMs(0))
                     .map(|expected| expected[2..10] == row[2..10])
@@ -346,11 +362,14 @@ impl<S: Sql> SqlDirectory<'_, S> {
     /// Removes a tenant row that no chain backs, with its units, routes
     /// and labels, if the row still holds the seq the gate saw. Only the
     /// gate calls this. `false` = the row changed, nothing was removed.
-    pub async fn remove_tenant(&self, tenant: &TenantId, observed: u64) -> Result<bool> {
+    pub async fn remove_tenant(&self, tenant: &TenantId, observed: &RowSeq) -> Result<bool> {
+        if observed.0 == SqlValue::Null {
+            return Ok(false);
+        }
         let p = || {
             Ok::<_, BridgeError>(vec![
                 SqlValue::Text(tenant.as_str().to_string()),
-                int(observed)?,
+                observed.0.clone(),
             ])
         };
         let changed = self
@@ -409,13 +428,24 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// Sets the tenant's key chain head as the gate rebuilt it, lower
-    /// included: a floor that is too high is not harmless.
-    pub async fn set_keys_seq(&self, tenant: &TenantId, keys_seq: u64) -> Result<bool> {
+    /// included (a floor that is too high is not harmless), if the row
+    /// still holds `observed`: a raise that an admitted closing call made
+    /// meanwhile stays.
+    pub async fn set_keys_seq(
+        &self,
+        tenant: &TenantId,
+        keys_seq: u64,
+        observed: u64,
+    ) -> Result<bool> {
         let changed = self
             .sql
             .exec(
-                "UPDATE tenants SET keys_seq = ?2 WHERE id = ?1",
-                &[SqlValue::Text(tenant.as_str().to_string()), int(keys_seq)?],
+                "UPDATE tenants SET keys_seq = ?2 WHERE id = ?1 AND keys_seq = ?3",
+                &[
+                    SqlValue::Text(tenant.as_str().to_string()),
+                    int(keys_seq)?,
+                    int(observed)?,
+                ],
             )
             .await?;
         Ok(changed > 0)
@@ -577,7 +607,7 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// Marks the gate closed at `epoch`, which the caller has anchored in
-    /// R2. An older epoch changes nothing.
+    /// R2. An older epoch changes nothing; the caller reads the row back.
     pub async fn mark_closed(&self, epoch: u64, reason: &str, now: UnixMs) -> Result<()> {
         self.sql
             .exec(
