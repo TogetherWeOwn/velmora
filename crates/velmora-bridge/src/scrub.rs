@@ -139,10 +139,20 @@ fn rebuilt(_before: &ColdStats, _after: &ColdStats) -> u32 {
 
 /// What one backbone said to `STAT` for every article.
 enum Presence {
-    /// The indexes of the articles it lacks (empty: it holds them all).
-    Lacks(Vec<u32>),
+    /// The indexes of the articles it lacks (empty: it holds them all),
+    /// and the provider that said so.
+    Lacks(Vec<u32>, String),
     /// No slot, or it could not be asked: nothing is known.
     Unknown,
+}
+
+/// What the backbones that count said to `STAT`.
+#[derive(Default)]
+struct Asked {
+    /// The labels of those that lack articles.
+    lacking: Vec<String>,
+    /// Each backbone, and the provider that answered for it.
+    by: Vec<(String, String)>,
 }
 
 /// What a check of a released extent found.
@@ -158,11 +168,6 @@ struct Found {
     /// The read broke off: `cipher` is `None` for that, not because no
     /// provider has the bytes.
     interrupted: bool,
-    /// Backbones that count, said with `STAT` they hold every article,
-    /// and yet did not serve one of them whole (other bytes, or `430` on
-    /// `BODY`): in `lacking` too, and read in full by verify after a
-    /// re-pin.
-    bad_bodies: Vec<String>,
     /// The bytes the read holds, charged until the check is done with.
     _charge: Option<crate::ingress::Charge>,
 }
@@ -654,7 +659,7 @@ where
         // from the extent before: the slot may be one of them (a provider
         // with one background slot). They are ended and it is asked once
         // more.
-        let lacking = match lacking {
+        let asked = match lacking {
             Err(Halt::Busy) if reader.idle_ms().is_some() => {
                 reader.hang_up().await;
                 self.presence_all(&holder, walk.stats, &mut walk.refused, &plan)
@@ -662,6 +667,7 @@ where
             }
             other => other,
         }?;
+        let lacking = asked.lacking;
 
         let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
         // The wait for room in the byte budget is no provider call: the
@@ -701,23 +707,14 @@ where
         };
         let after = reader.stats();
         let interrupted = matches!(read, Ok(ColdFetch::Interrupted));
-        // A provider of a backbone that counts, which `STAT` said holds
-        // every article, did not serve one: that backbone does not hold
-        // the extent whole.
+        // The provider that answered `STAT` for a backbone that counts
+        // did not serve an article whole: that backbone does not hold the
+        // extent whole (another of its accounts says nothing of it).
         let mut lacking = lacking;
-        let mut bad_bodies = Vec::new();
-        for (name, providers) in release_backbones(&self.cfg.providers) {
-            if lacking.contains(&name) {
-                continue;
-            }
-            let failed_here = providers.iter().any(|p| {
-                let count =
-                    |s: &ColdStats| s.failed.iter().find(|f| f.0 == p.id).map_or(0, |f| f.1);
-                count(&after) > count(&before)
-            });
-            if failed_here {
-                lacking.push(name.clone());
-                bad_bodies.push(name);
+        for (name, by) in asked.by {
+            let count = |s: &ColdStats| s.failed.iter().find(|f| f.0 == by).map_or(0, |f| f.1);
+            if count(&after) > count(&before) && !lacking.contains(&name) {
+                lacking.push(name);
             }
         }
         let cipher = match read? {
@@ -737,7 +734,6 @@ where
             rebuilt: rebuilt(&before, &after),
             refetched: after.refetched.saturating_sub(before.refetched),
             interrupted,
-            bad_bodies,
             _charge: Some(charge),
         })
     }
@@ -750,19 +746,23 @@ where
         stats: &mut Vec<ProviderSession<'s, C, N, T>>,
         refused: &mut Vec<String>,
         plan: &[ArticleRow],
-    ) -> core::result::Result<Vec<String>, Halt> {
-        let mut lacking = Vec::new();
+    ) -> core::result::Result<Asked, Halt> {
+        let mut asked = Asked::default();
         for (name, providers) in release_backbones(&self.cfg.providers) {
             match self
                 .presence(holder, stats, refused, plan, &providers)
                 .await?
             {
-                Presence::Lacks(missing) if missing.is_empty() => {}
-                Presence::Lacks(_) => lacking.push(name),
+                Presence::Lacks(missing, by) => {
+                    if !missing.is_empty() {
+                        asked.lacking.push(name.clone());
+                    }
+                    asked.by.push((name, by));
+                }
                 Presence::Unknown => return Err(Halt::Busy),
             }
         }
-        Ok(lacking)
+        Ok(asked)
     }
 
     /// What one backbone holds of `plan`, asked with `STAT` of one of its
@@ -863,7 +863,7 @@ where
                                 // Never a size pass here, so `corrupt` stays
                                 // empty; a provider that says so lacks it.
                                 lacks.extend(tally.corrupt);
-                                return Ok(Presence::Lacks(lacks));
+                                return Ok(Presence::Lacks(lacks, provider.id.clone()));
                             }
                             // A kept session whose slot expired: a new one.
                             Err(Stop::NoPermit) if reused => {
@@ -1038,8 +1038,12 @@ where
         // verify reads each in full and none counts toward the release
         // before it has passed one, whatever `STAT` says (it says
         // "present" for a body no provider serves).
+        // Read from Usenet: the backbones that lack articles, or did not
+        // serve one whole, get the failed full read, so verify reads them
+        // in full (a second loss there that `STAT` does not show is found
+        // then, not after the release).
         let unread: Vec<String> = match read {
-            true => found.bad_bodies.clone(),
+            true => found.lacking.clone(),
             false => counting,
         };
         // The cache copy is the last copy when it is the source (Usenet
@@ -1320,7 +1324,6 @@ mod tests {
             rebuilt: 0,
             refetched: 0,
             interrupted: false,
-            bad_bodies: Vec::new(),
             _charge: None,
         };
         for _ in 0..7 {
