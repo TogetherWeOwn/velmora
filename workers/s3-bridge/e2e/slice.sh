@@ -50,6 +50,8 @@
 #   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
 #   E2E_PERMITS               local: d1 or do, the PERMITS the Worker runs
 #                             with (default: the dev var in wrangler.toml)
+#   E2E_JOB_FORMAT            local: 1 or 2, the JOB_FORMAT the writers send
+#                             (default: unset, which is 1)
 #   E2E_SLICED                0 skips step 0c (a 99 MiB PutObject) against a
 #                             remote that runs without MAX_PUT_BYTES
 #
@@ -228,6 +230,12 @@ if [[ $MODE == local ]]; then
         '') ;;
         d1 | do) printf 'PERMITS=%s\n' "$E2E_PERMITS" ;;
         *) fail "E2E_PERMITS" "d1 or do" "$E2E_PERMITS" ;;
+      esac
+      # The format of the job messages the writers send; unset is 1.
+      case ${E2E_JOB_FORMAT:-} in
+        '') ;;
+        1 | 2) printf 'JOB_FORMAT=%s\n' "$E2E_JOB_FORMAT" ;;
+        *) fail "E2E_JOB_FORMAT" "1 or 2" "$E2E_JOB_FORMAT" ;;
       esac
     } >"$WORKER_DIR/.dev.vars"
     chmod 600 "$WORKER_DIR/.dev.vars"
