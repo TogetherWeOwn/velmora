@@ -7,6 +7,8 @@
 //!   replaces the counters only when asked to.
 //! - The migration: additive, reads no table, and leaves a Worker from
 //!   before it with the row counts it had.
+//! - Migration 0023: a release by the verify job is counted as a verify
+//!   and a release, and nothing else is counted differently.
 
 use velmora_bridge::sql::usage::{
     BUCKET_TOTALS, COUNTERS, OLDEST, RECOUNT_CHUNK_MAX, STEP_EXTENTS, STEP_GENERATIONS_BUCKETS,
@@ -878,6 +880,157 @@ fn the_migration_adds_tables_and_triggers_and_reads_nothing() {
     );
     assert_eq!(levels(&db, 1), vec![0; 11]);
     assert!(!armed(&db));
+}
+
+/// The catalogue as it is before migration 0023, counters on.
+fn before_0023() -> RusqliteSql {
+    let db = RusqliteSql::open_in_memory().unwrap();
+    for script in before_0020() {
+        db.apply(script).unwrap();
+    }
+    for script in [MIGRATION_0020, MIGRATION_0021, MIGRATION_0022, ARM_USAGE] {
+        db.apply(script).unwrap();
+    }
+    db
+}
+
+/// Row changes as the Worker makes them, one batch each: the extent
+/// first where it changes, then its outbox row.
+fn stage_changes(db: &RusqliteSql) {
+    add_buckets(db);
+    let rows = [
+        ("x_a", "held", "verify"),
+        ("x_b", "held", "verify"),
+        ("x_c", "released", "verify"),
+        ("x_d", "releasing", "release"),
+        ("x_e", "held", "verify"),
+        ("x_f", "held", "verify"),
+    ];
+    db.with_conn(|c| {
+        for (id, safety, stage) in rows {
+            c.execute(ADD_EXTENT, (id, "b_1", 100, safety)).unwrap();
+            c.execute(ADD_OUTBOX, (id, stage, T0)).unwrap();
+        }
+        c.execute(
+            "UPDATE extents SET released_at = ?1 WHERE id = 'x_c'",
+            (T0 - 1,),
+        )
+        .unwrap();
+    });
+    let released = "UPDATE extents SET safety_state = 'released', released_at = ?2 WHERE id = ?1";
+    let to = "UPDATE outbox SET stage = ?3, updated_at = ?2 WHERE extent_id = ?1";
+    let batch = |id: &str, at: i64, release: bool, stage: &str| {
+        db.with_conn(|c| {
+            c.execute_batch("BEGIN").unwrap();
+            if release {
+                assert_eq!(c.execute(released, (id, at)).unwrap(), 1);
+            }
+            assert!(c.execute(to, (id, at, stage)).unwrap() >= 1);
+            c.execute_batch("COMMIT").unwrap();
+        })
+    };
+    // Released by the verify job that checked it.
+    batch("x_a", T0 + 5, true, "done");
+    // Parked with the copy held: too few backbones count.
+    batch("x_b", T0 + 6, false, "done");
+    // Its copy was released at another time.
+    batch("x_c", T0 + 7, false, "done");
+    // The last step of a release job.
+    batch("x_d", T0 + 8, true, "done");
+    // A verify that passed before the minimum age was over.
+    batch("x_e", T0 + 9, false, "release");
+    // Released by a verify job two hours later.
+    batch("x_f", T0 + 2 * 3_600_000, true, "done");
+}
+
+/// Migration 0023. A row that goes from `verify` to `done` in the batch
+/// that releases its copy is a verify and a release, in the totals and
+/// in the hours. Every other change counts as it did.
+#[test]
+fn a_release_by_the_verify_job_counts_as_a_verify_and_a_release() {
+    let db = RusqliteSql::with_schema().unwrap();
+    stage_changes(&db);
+    let want = Totals {
+        verifies: 5,
+        releases: 3,
+        ..Totals::default()
+    };
+    assert_eq!(totals(&db), want);
+    assert_eq!(hourly_sum(&db), want);
+    assert_exact(&db, "after the releases");
+    // The hour of the first five was filed when the sixth came.
+    let filed = "SELECT COUNT(*), SUM(verifies), SUM(releases) FROM usage_hours";
+    assert_eq!(row(&db, filed, 3), [1, 4, 2]);
+
+    // Before the migration the two releases by a verify job were
+    // verifies only: that is all it changes.
+    let old = before_0023();
+    stage_changes(&old);
+    let before = Totals {
+        releases: 1,
+        ..want
+    };
+    assert_eq!(totals(&old), before);
+    assert_eq!(levels(&old, 1), levels(&db, 1));
+}
+
+/// Migration 0023 replaces one trigger: the text of 0020 but for the
+/// two places that count a release. It reads and writes no row, so it
+/// takes the same time on any catalogue, and the counters stay as they
+/// are and switched on.
+#[test]
+fn migration_0023_replaces_the_stage_trigger_and_nothing_else() {
+    assert_eq!(
+        top_level(MIGRATION_0023),
+        ["DROP TRIGGER usage_outbox_stage"]
+    );
+    let trigger = |script: &str| {
+        let at = script.find("CREATE TRIGGER usage_outbox_stage").unwrap();
+        let end = script[at..].find("\nEND;").unwrap() + at + 5;
+        script[at..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(MIGRATION_0023.matches("CREATE TRIGGER").count(), 1);
+    let was = "(OLD.stage = 'release' AND NEW.stage = 'done')";
+    let is = "((OLD.stage = 'release' AND NEW.stage = 'done') \
+               OR (OLD.stage = 'verify' AND NEW.stage = 'done' \
+               AND EXISTS (SELECT 1 FROM extents e WHERE e.id = NEW.extent_id \
+               AND e.safety_state = 'released' AND e.released_at = NEW.updated_at)))";
+    let old = trigger(MIGRATION_0020);
+    assert_eq!(old.matches(was).count(), 2);
+    assert_eq!(trigger(MIGRATION_0023), old.replace(was, is));
+
+    let db = before_0023();
+    fill(&db, 30);
+    let other = "SELECT type, name, sql FROM sqlite_master \
+                  WHERE name <> 'usage_outbox_stage' ORDER BY 1, 2";
+    let schema = |db: &RusqliteSql| pairs_of(db, other);
+    let counters = "SELECT * FROM usage_global ORDER BY id";
+    let state = |db: &RusqliteSql| (schema(db), levels(db, 1), totals(db), armed(db));
+    let (before, global) = (state(&db), pairs_of(&db, counters));
+    db.meter_writes().unwrap();
+    db.apply(MIGRATION_0023).unwrap();
+    assert_eq!(db.writes().billed(), 0);
+    assert_eq!(state(&db), before);
+    assert_eq!(pairs_of(&db, counters), global);
+    assert!(armed(&db));
+}
+
+/// Every column of every row of a query, as text.
+fn pairs_of(db: &RusqliteSql, sql: &str) -> Vec<Vec<String>> {
+    db.with_conn(|c| {
+        let mut q = c.prepare(sql).unwrap();
+        let n = q.column_count();
+        let mut rows = q.query(()).unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            let columns = (0..n).map(|i| format!("{:?}", r.get_ref(i).unwrap()));
+            out.push(columns.collect());
+        }
+        out
+    })
 }
 
 fn before_0020() -> Vec<&'static str> {

@@ -44,13 +44,15 @@ VERIFY_DELAY_SECS = "120"
 # on: the verify job itself, on the checks it has just recorded under its
 # own claim: one round of questions for an extent instead of two, and one
 # job instead of two. A backbone that job did not ask itself (it resumed
-# an earlier round, or its check ended before the minimum age did) is
-# asked (STAT) before the release. The rule is the same either way:
+# an earlier round, or its check began before the minimum age was over)
+# is asked (STAT) before the release. The rule is the same either way:
 # REQUIRED_BACKBONES backbones that count hold every article, by checks
 # made under the claim that releases, and the full read is on record.
 # A round that ends before the minimum age is over goes to the release
-# job as before, whatever this says. Workers of both values may run side
-# by side, and an older Worker finishes a release this one began.
+# job as before, whatever this says. The release by a verify job is one
+# write (copy released and row done together), so Workers of both values
+# and older Workers may run side by side. Its count in the release
+# totals needs migration 0023.
 RELEASE_AT_VERIFY = "on"
 # How the verify stage checks an extent: body | light.
 # body: every article is read in full (BODY) on one backbone that counts

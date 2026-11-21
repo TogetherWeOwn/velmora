@@ -954,14 +954,9 @@ async fn release_needs_fresh_evidence() {
         fx.verify(&l, "bb-a", "p1", T0, 2, 2, VerifyResult::Ok)
             .await
     );
-    // Only the lease of a job that checks may release: a release job,
-    // or a verify job (`a_verify_lease_releases_on_its_own_claim_only`).
-    let post = Lease {
-        stage: OutboxStage::Post,
-        ..l.clone()
-    };
+    // Only a release lease may release.
     assert!(matches!(
-        fx.cat.begin_release(&post, 1, &bbs(), "[]", T0).await,
+        fx.cat.begin_release(&l, 1, &bbs(), "[]", T0).await,
         Err(BridgeError::Invalid(_))
     ));
     let week = T0.plus_ms(7 * 24 * HOUR_MS);
@@ -2071,10 +2066,11 @@ async fn release_evidence_must_come_from_this_claim() {
     );
 }
 
-/// A verify job may release what it has just checked: the guard is the
-/// one of a release job. Only passes recorded under the claim of the
-/// lease count, so a pass from an earlier verify job is not presence,
-/// and a lease that is stale or expired authorizes nothing.
+/// A verify job may release what it has just checked, in one write:
+/// the guard is the one of a release job. Only passes recorded under
+/// the claim of the lease count, so a pass from an earlier verify job
+/// is not presence, and a lease that is stale or expired authorizes
+/// nothing. The two steps of a release job stay closed to it.
 #[tokio::test]
 async fn a_verify_lease_releases_on_its_own_claim_only() {
     let fx = Fx::new().await;
@@ -2086,9 +2082,12 @@ async fn a_verify_lease_releases_on_its_own_claim_only() {
     let later = T0.plus_ms(HOUR_MS);
     assert!(fx.cat.defer_at(&first, 8, later, T0).await.unwrap());
     let l = fx.claim(&o, OutboxStage::Verify, later).await.unwrap();
-    let begin = |l: &Lease, at: UnixMs| {
+    let release = |l: &Lease, at: UnixMs| {
         let (cat, l, counting) = (&fx.cat, l.clone(), &counting);
-        async move { cat.begin_release(&l, 2, counting, "[]", at).await.unwrap() }
+        async move {
+            cat.release_at_verify(&l, 2, counting, "[\"e\"]", at, None)
+                .await
+        }
     };
 
     // The job that resumes asks the second backbone only.
@@ -2098,8 +2097,7 @@ async fn a_verify_lease_releases_on_its_own_claim_only() {
     );
     assert_eq!(fx.counting(&o).await, ["bb-a", "bb-b"]);
     let before = fx.dump().await;
-    assert_eq!(begin(&l, later.plus_ms(2)).await, Guard::Lost);
-    assert!(!fx.cat.finish_release(&l, later.plus_ms(2)).await.unwrap());
+    assert_eq!(release(&l, later.plus_ms(2)).await.unwrap(), Guard::Lost);
     assert_eq!(fx.dump().await, before, "a pass from an earlier claim");
 
     // It asks the first one too: presence on both under this claim,
@@ -2109,58 +2107,135 @@ async fn a_verify_lease_releases_on_its_own_claim_only() {
             .await
     );
     assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
-    // Not for a lease that is over, nor past the end of this one.
     let before = fx.dump().await;
-    assert_eq!(begin(&first, later.plus_ms(4)).await, Guard::Lost);
+    // Not for a lease that is over, nor past the end of this one.
+    let at = later.plus_ms(4);
+    assert_eq!(release(&first, at).await.unwrap(), Guard::Lost);
     let expired = later.plus_ms(LEASE_MS + 1);
-    assert_eq!(begin(&l, expired).await, Guard::Lost);
+    assert_eq!(release(&l, expired).await.unwrap(), Guard::Lost);
+    // Not without a required backbone, and not by the steps of a
+    // release job: those take a release lease, and this step takes none.
+    let none = fx.cat.release_at_verify(&l, 0, &counting, "[]", at, None);
+    assert!(matches!(none.await, Err(BridgeError::Invalid(_))));
+    let begun = fx.cat.begin_release(&l, 2, &counting, "[]", at).await;
+    assert!(matches!(begun, Err(BridgeError::Invalid(_))));
+    let begun = fx.cat.begin_release_light(&l, 2, &counting, "[]", at, true);
+    assert!(matches!(begun.await, Err(BridgeError::Invalid(_))));
+    assert!(!fx.cat.finish_release(&l, at).await.unwrap());
+    let as_release = Lease {
+        stage: OutboxStage::Release,
+        ..l.clone()
+    };
+    assert!(matches!(
+        release(&as_release, at).await,
+        Err(BridgeError::Invalid(_))
+    ));
     assert_eq!(fx.dump().await, before);
 
-    assert_eq!(begin(&l, later.plus_ms(4)).await, Guard::Applied(()));
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
-    assert_eq!(fx.outbox(&o, "stage").await, "verify");
-    let before = fx.dump().await;
-    assert!(!fx
-        .cat
-        .finish_release(&first, later.plus_ms(5))
-        .await
-        .unwrap());
-    assert!(!fx.cat.finish_release(&l, expired).await.unwrap());
-    assert_eq!(fx.dump().await, before);
-    let done_at = later.plus_ms(5);
-    assert!(fx.cat.finish_release(&l, done_at).await.unwrap());
+    assert_eq!(release(&l, at).await.unwrap(), Guard::Applied(()));
     let je = fx.cat.job_extent(&o.extent, &o.generation).await;
     let je = je.unwrap().unwrap();
     assert_eq!(je.extent.safety_state, SafetyState::Released);
-    assert_eq!(je.extent.released_at, Some(done_at));
+    assert_eq!(je.extent.released_at, Some(at));
+    assert_eq!(je.extent.release_evidence.as_deref(), Some("[\"e\"]"));
     assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.outbox(&o, "updated_at").await, at.0.to_string());
     assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
+    // Done is final.
+    let before = fx.dump().await;
+    assert_eq!(release(&l, at).await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before);
 }
 
-/// A verify job that died between the two steps of its release: the
-/// row is still at verify and the copy `releasing`. The next verify job
-/// hands the row on, and the release stage finishes it.
+/// The one write of a verify job leaves the extent and its outbox row
+/// as the two steps of a release job leave them, column for column:
+/// whatever reads a released extent reads the same of both.
 #[tokio::test]
-async fn a_release_begun_by_a_verify_job_is_finished_by_the_release_stage() {
+async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
     let fx = Fx::new().await;
-    let o = fx.publish(&fx.bucket, "k").await;
-    let l = fx.posted(&o, 1, T0).await;
+    let at = T0.plus_secs(30);
+    // By a release job, in its two steps.
+    let two = fx.publish(&fx.bucket, "two").await;
+    let l = fx.posted(&two, 1, T0).await;
     assert!(fx.pass_of(&l, "bb-a", T0, 1).await);
-    assert_eq!(
-        fx.cat.begin_release(&l, 1, &bbs(), "[]", T0).await.unwrap(),
-        Guard::Applied(())
-    );
-    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
-    // The job dies; its lease runs out.
-    let later = T0.plus_ms(LEASE_MS + 1);
-    let next = fx.claim(&o, OutboxStage::Verify, later).await.unwrap();
     assert!(fx
         .cat
-        .advance(&next, OutboxStage::Release, later, later)
+        .advance(&l, OutboxStage::Release, T0, T0)
         .await
         .unwrap());
-    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
-    assert!(fx.cat.finish_release(&r, later).await.unwrap());
+    let r = fx.claim(&two, OutboxStage::Release, T0).await.unwrap();
+    assert!(fx.pass_of(&r, "bb-a", at, 1).await);
+    // By a verify job, in one.
+    let one = fx.publish(&fx.bucket, "one").await;
+    let v = fx.posted(&one, 1, T0).await;
+    assert!(fx.pass_of(&v, "bb-a", at, 1).await);
+
+    // All but the fence, which counts writes: one here, two there.
+    let extent_columns = "safety_state, released_at, release_evidence, hot_safety_bytes, \
+                          cipher_size, last_read_at, created_at, plan_rev, article_count, \
+                          last_verified_at";
+    let outbox_columns = "stage, attempts, next_at, lease_owner, lease_until, cursor, \
+                          last_error, updated_at, sent_at";
+    let rows = |o: &Obj| {
+        let (sql, id) = (&fx.cat.sql.0, text(o.extent.as_str()));
+        async move {
+            let extent = format!("SELECT {extent_columns} FROM extents WHERE id = ?1");
+            let outbox = format!("SELECT {outbox_columns} FROM outbox WHERE extent_id = ?1");
+            let mut rows = sql.query(&extent, std::slice::from_ref(&id)).await.unwrap();
+            rows.extend(sql.query(&outbox, &[id]).await.unwrap());
+            rows
+        }
+    };
+    // Before, the two differ in the stage of the row and in nothing else.
+    let (before_one, before_two) = (rows(&one).await, rows(&two).await);
+    assert_eq!(before_one[0], before_two[0]);
+    assert_eq!(before_one[1][1..], before_two[1][1..]);
+    let seq_one = fx.extent(&one, "evict_seq").await;
+    let seq_two = fx.extent(&two, "evict_seq").await;
+
+    let begun = fx.cat.begin_release(&r, 1, &bbs(), "[\"e\"]", at).await;
+    assert_eq!(begun.unwrap(), Guard::Applied(()));
+    assert!(fx.cat.finish_release(&r, at).await.unwrap());
+    let counting = bbs();
+    let released = fx
+        .cat
+        .release_at_verify(&v, 1, &counting, "[\"e\"]", at, None);
+    assert_eq!(released.await.unwrap(), Guard::Applied(()));
+    assert_eq!(fx.extent(&one, "safety_state").await, "released");
+    assert_eq!(fx.extent(&one, "hot_safety_bytes = cipher_size").await, "1");
+    assert_eq!(fx.outbox(&one, "stage").await, "done");
+    assert_eq!(rows(&one).await, rows(&two).await, "after");
+    // The eviction fence moved under both, so a list of evictable
+    // extents taken before either release is refused after it.
+    assert_ne!(fx.extent(&one, "evict_seq").await, seq_one);
+    assert_ne!(fx.extent(&two, "evict_seq").await, seq_two);
+    // And both are counted as a release (migration 0023).
+    let counted = "SELECT releases_total FROM usage_global WHERE id = 1";
+    assert_eq!(fx.count(counted).await, 2);
+}
+
+/// The same guard under the light check: a verify lease releases an
+/// extent outside the sample on the size passes of its own claim, and
+/// not when the release asks for a full check that is not on record.
+#[tokio::test]
+async fn a_verify_lease_releases_under_the_light_guard() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    let l = fx.posted(&o, 2, T0).await;
+    let at = T0.plus_ms(5);
+    assert!(fx.pass(&l, "bb-a", T0, VerifyKind::Size).await);
+    assert!(fx.pass(&l, "bb-b", T0, VerifyKind::Size).await);
+    let before = fx.dump().await;
+    let cat = &fx.cat;
+    // In the sample, or under the full rule: the full check is needed.
+    let sampled = cat.release_at_verify(&l, 2, &counting, "[]", at, Some(true));
+    assert_eq!(sampled.await.unwrap(), Guard::Lost);
+    let full = cat.release_at_verify(&l, 2, &counting, "[]", at, None);
+    assert_eq!(full.await.unwrap(), Guard::Lost);
+    assert_eq!(fx.dump().await, before);
+    let light = cat.release_at_verify(&l, 2, &counting, "[]", at, Some(false));
+    assert_eq!(light.await.unwrap(), Guard::Applied(()));
     assert_eq!(fx.extent(&o, "safety_state").await, "released");
     assert_eq!(fx.outbox(&o, "stage").await, "done");
 }
