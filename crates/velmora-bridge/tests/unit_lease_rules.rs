@@ -18,6 +18,7 @@ const HEAD: Proven = Proven {
     state_seq: 4,
     keys_seq: 9,
     stamp_counter: Some(2),
+    revoked: 3,
 };
 
 /// The alarm's view of an open unit with no failed renewals.
@@ -26,6 +27,7 @@ fn open(lease: &FreshLease) -> UnitAt<'_> {
         lease,
         closed: false,
         renew_tries: 0,
+        failed_runs: 0,
     }
 }
 
@@ -323,6 +325,7 @@ fn next_alarm_is_never_in_the_past() {
         lease: &expired,
         closed: false,
         renew_tries: 2,
+        failed_runs: 0,
     };
     assert_eq!(
         next_alarm(T0, &tried, &overdue, None, &LEASE_RULES, &ALARM_RULES),
@@ -335,6 +338,7 @@ fn next_alarm_is_never_in_the_past() {
             lease,
             closed: true,
             renew_tries: 0,
+            failed_runs: 0,
         };
         assert_eq!(
             next_alarm(
@@ -367,6 +371,7 @@ fn an_expired_or_closed_unit_does_not_loop_its_alarm() {
             lease: &expired,
             closed: false,
             renew_tries: tries,
+            failed_runs: 0,
         };
         let run = on_alarm(now, &unit, &dues, &LEASE_RULES, &ALARM_RULES);
         assert!(run.run.is_empty());
@@ -392,6 +397,7 @@ fn an_expired_or_closed_unit_does_not_loop_its_alarm() {
             lease,
             closed: true,
             renew_tries: 0,
+            failed_runs: 0,
         };
         let run = on_alarm(T0, &unit, &dues, &LEASE_RULES, &ALARM_RULES);
         assert!(!run.send_renew && run.run.is_empty());
@@ -400,11 +406,13 @@ fn an_expired_or_closed_unit_does_not_loop_its_alarm() {
     }
 }
 
-/// A renewal proven for another state than the unit holds is refused and
-/// changes nothing: a unit rolled back below the counter, or below a seq,
-/// that the proof covered gets no lease.
+/// A renewal is refused when the unit holds less than the proof covered:
+/// a lower seq or stamp counter (rolled back below the Worker's view), or
+/// fewer revocations (an apply that failed half-way, SEC-6). It changes
+/// nothing then. A unit that holds more (a raise or a sync after the
+/// proof began) is renewed: a busy unit's stamp moves during every proof.
 #[test]
-fn a_renewal_for_another_state_is_refused() {
+fn a_renewal_is_refused_only_below_what_it_proved() {
     let mut lease = FreshLease::expired();
     for own in [
         Proven {
@@ -423,10 +431,7 @@ fn a_renewal_for_another_state_is_refused() {
             keys_seq: 8,
             ..HEAD
         },
-        Proven {
-            keys_seq: 10,
-            ..HEAD
-        },
+        Proven { revoked: 2, ..HEAD },
     ] {
         assert_eq!(
             lease.renew(T0, &HEAD, &own, T0, &LEASE_RULES),
@@ -434,7 +439,35 @@ fn a_renewal_for_another_state_is_refused() {
         );
         assert_eq!(lease, FreshLease::expired());
     }
-    assert!(lease.renew(T0, &HEAD, &HEAD, T0, &LEASE_RULES).is_ok());
+    for own in [
+        HEAD,
+        Proven {
+            stamp_counter: Some(4),
+            ..HEAD
+        },
+        Proven {
+            keys_seq: 10,
+            ..HEAD
+        },
+        Proven {
+            state_seq: 5,
+            ..HEAD
+        },
+        Proven { revoked: 4, ..HEAD },
+    ] {
+        let mut lease = FreshLease::expired();
+        assert!(
+            lease.renew(T0, &HEAD, &own, T0, &LEASE_RULES).is_ok(),
+            "{own:?}"
+        );
+    }
+    // A unit never raised is below one that was; two never raised agree.
+    let never = Proven {
+        stamp_counter: None,
+        ..HEAD
+    };
+    assert!(never.covers(&never));
+    assert!(!never.covers(&HEAD));
 }
 
 /// An alarm is set only when no alarm is armed or the wanted time is earlier.
@@ -566,11 +599,19 @@ fn exact_requires_matching_wakes_and_write_counts() {
     let mark = Mark {
         wake_id: [1; 16],
         writes: 5,
+        writing: false,
     };
     assert!(!exact(&[]));
     assert!(exact(&[mark]));
     assert!(exact(&[mark, mark, mark]));
     assert!(!exact(&[mark, Mark { writes: 6, ..mark }]));
+    // Pages read inside one write carry one mark and are still not exact.
+    let inside = Mark {
+        writing: true,
+        ..mark
+    };
+    assert!(!exact(&[inside]));
+    assert!(!exact(&[inside, inside]));
     assert!(!exact(&[
         mark,
         Mark {
@@ -600,6 +641,7 @@ fn closed_unit_alarm_does_nothing() {
             lease: &lease,
             closed: true,
             renew_tries: 0,
+            failed_runs: 0,
         };
         assert_eq!(on_alarm(T0, &unit, &dues, &LEASE_RULES, &ALARM_RULES), idle);
     }
@@ -620,8 +662,64 @@ fn failing_renewals_back_off_to_a_cap() {
         lease: &lease,
         closed: false,
         renew_tries: 3,
+        failed_runs: 0,
     };
     let run = on_alarm(T0, &unit, &dues, &LEASE_RULES, &ALARM_RULES);
     assert!(run.send_renew);
     assert_eq!(run.retry_at, Some(at(480_000)));
+}
+
+/// A stale renewal retry, or a retry already in the past, never arms the
+/// alarm at or before now.
+#[test]
+fn a_stale_retry_never_arms_in_the_past() {
+    let expired = FreshLease::expired();
+    let unit = open(&expired);
+    let overdue = Dues::none().with(Duty::HandOut, Some(at(-10_000)));
+    assert_eq!(
+        next_alarm(
+            T0,
+            &unit,
+            &overdue,
+            Some(at(-5_000)),
+            &LEASE_RULES,
+            &ALARM_RULES
+        ),
+        Some(at(MIN_ALARM_GAP_MS))
+    );
+    assert!(AlarmRules::DEFAULT.valid());
+    assert!(!AlarmRules {
+        renew_retry_ms: 0,
+        ..AlarmRules::DEFAULT
+    }
+    .valid());
+    assert!(!AlarmRules {
+        renew_retry_max_ms: 1,
+        ..AlarmRules::DEFAULT
+    }
+    .valid());
+}
+
+/// A duty that keeps failing on a fresh lease backs off like a renewal:
+/// 1 s after a clean run, then 1, 2, 4 ... minutes, at most 30.
+#[test]
+fn failing_duties_back_off() {
+    let fresh = FreshLease::from_stored(Some(at(600_000)));
+    let overdue = Dues::none().with(Duty::HandOut, Some(at(-1)));
+    let gap = |failed_runs| {
+        let unit = UnitAt {
+            lease: &fresh,
+            closed: false,
+            renew_tries: 0,
+            failed_runs,
+        };
+        next_alarm(T0, &unit, &overdue, None, &LEASE_RULES, &ALARM_RULES)
+            .unwrap()
+            .0
+            - T0.0
+    };
+    assert_eq!(gap(0), MIN_ALARM_GAP_MS);
+    assert_eq!(gap(1), 60_000);
+    assert_eq!(gap(2), 120_000);
+    assert_eq!(gap(10), 1_800_000);
 }

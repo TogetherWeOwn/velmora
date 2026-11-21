@@ -152,6 +152,7 @@ where
         state_seq: unit.state_seq,
         keys_seq: unit.keys_seq,
         stamp_counter: unit.stamp_counter,
+        revoked: listed,
     };
     match listed.cmp(&unit.revoked) {
         std::cmp::Ordering::Equal => Ok(Proof::Fresh {

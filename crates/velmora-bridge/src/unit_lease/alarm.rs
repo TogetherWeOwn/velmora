@@ -133,7 +133,16 @@ impl AlarmRules {
         renew_retry_max_ms: 30 * 60 * 1000,
         stamp_period_ms: LeaseRules::DEFAULT.term_ms,
     };
+
+    /// Positive waits, and a cap not below the first wait.
+    pub const fn valid(&self) -> bool {
+        self.renew_retry_ms > 0
+            && self.renew_retry_max_ms >= self.renew_retry_ms
+            && self.stamp_period_ms > 0
+    }
 }
+
+const _: () = assert!(AlarmRules::DEFAULT.valid());
 
 /// What one alarm run does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +167,9 @@ pub struct UnitAt<'a> {
     pub closed: bool,
     /// Renew jobs the alarm sent since the last successful renewal.
     pub renew_tries: u32,
+    /// Runs in a row in which a duty failed (a queue send refused, say).
+    /// Reset by a run in which every duty succeeded.
+    pub failed_runs: u32,
 }
 
 /// The wait before renew try `tries + 1`: [`AlarmRules::renew_retry_ms`]
@@ -226,7 +238,8 @@ pub const MIN_ALARM_GAP_MS: i64 = 1000;
 ///
 /// - a closed unit: `None`; the restore gate's lift arms it again;
 /// - a fresh lease: the earliest due time, at least
-///   [`MIN_ALARM_GAP_MS`] after `now`;
+///   [`MIN_ALARM_GAP_MS`] after `now`; after runs in which a duty
+///   failed, at least the renewal backoff for that many failures;
 /// - an expired lease: the earliest due time, but not before the renewal
 ///   retry (`retry_at`, or without one `now` plus the backoff for
 ///   `renew_tries`). Work that is due never wakes the alarm before the
@@ -244,17 +257,20 @@ pub fn next_alarm(
         return None;
     }
     let earliest = dues.earliest()?;
-    let floor = if unit.lease.is_fresh(now, lease_rules) {
-        now.0.saturating_add(MIN_ALARM_GAP_MS)
+    let gap = if unit.lease.is_fresh(now, lease_rules) {
+        // Work that keeps failing backs off like a renewal does.
+        match unit.failed_runs {
+            0 => MIN_ALARM_GAP_MS,
+            n => renew_retry_ms(n - 1, rules),
+        }
     } else {
         retry_at.map_or_else(
-            || {
-                now.0
-                    .saturating_add(renew_retry_ms(unit.renew_tries, rules))
-            },
-            |at| at.0,
+            || renew_retry_ms(unit.renew_tries, rules),
+            |at| at.0.saturating_sub(now.0),
         )
     };
+    // Never at or before now, whatever the dials or a stale retry say.
+    let floor = now.0.saturating_add(gap.max(MIN_ALARM_GAP_MS));
     Some(UnixMs(earliest.0.max(floor)))
 }
 

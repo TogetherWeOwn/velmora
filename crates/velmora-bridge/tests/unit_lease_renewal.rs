@@ -211,6 +211,7 @@ async fn a_unit_at_the_head_is_proven_with_two_heads_and_two_lists() {
                 state_seq: 3,
                 keys_seq: 5,
                 stamp_counter: None,
+                revoked: 1,
             },
             revocations: Vec::new(),
         }
@@ -329,12 +330,15 @@ async fn a_revocation_only_in_the_bucket_is_applied_at_renewal_of_every_unit() {
     let root = unit_id(0);
     let second = unit_id(1);
 
-    let root_proof = prove(&bucket, &clock, &Names, &view(&root, 2, 7, 2))
+    // The root unit got the first revocation only.
+    let root_proof = prove(&bucket, &clock, &Names, &view(&root, 2, 7, 1))
         .await
         .unwrap();
-    assert!(matches!(root_proof, Proof::Fresh { ref revocations, .. } if revocations.is_empty()));
+    let both = vec!["AKIAFIRST".to_string(), "AKIASECOND".to_string()];
+    assert!(matches!(root_proof, Proof::Fresh { ref revocations, .. } if *revocations == both));
 
-    let second_proof = prove(&bucket, &clock, &Names, &view(&second, 2, 7, 1))
+    // The second unit got neither.
+    let second_proof = prove(&bucket, &clock, &Names, &view(&second, 2, 7, 0))
         .await
         .unwrap();
     assert_eq!(
@@ -345,10 +349,57 @@ async fn a_revocation_only_in_the_bucket_is_applied_at_renewal_of_every_unit() {
                 state_seq: 2,
                 keys_seq: 7,
                 stamp_counter: None,
+                revoked: 2,
             },
-            revocations: vec!["AKIAFIRST".to_string(), "AKIASECOND".to_string()],
+            revocations: both.clone(),
         }
     );
+
+    // A unit that holds all of them gets nothing to apply.
+    let caught_up = prove(&bucket, &clock, &Names, &view(&second, 2, 7, 2))
+        .await
+        .unwrap();
+    assert!(matches!(caught_up, Proof::Fresh { ref revocations, .. } if revocations.is_empty()));
+
+    // The second unit's apply failed half-way: it holds one of the two.
+    // Its renewal from that proof is refused, so the revoked key gets no
+    // lease there.
+    let Proof::Fresh {
+        proof_start,
+        proven,
+        ..
+    } = second_proof
+    else {
+        unreachable!()
+    };
+    let own = Proven {
+        revoked: 1,
+        ..proven
+    };
+    let mut lease = FreshLease::expired();
+    assert_eq!(
+        lease.renew(
+            proof_start,
+            &proven,
+            &own,
+            clock.now(),
+            &LeaseRules::DEFAULT
+        ),
+        Err(RenewRefused::NotProven { proven, own })
+    );
+    let own = Proven {
+        revoked: 2,
+        ..proven
+    };
+    assert!(lease
+        .renew(
+            proof_start,
+            &proven,
+            &own,
+            clock.now(),
+            &LeaseRules::DEFAULT
+        )
+        .is_ok());
 }
 
 /// A unit that holds more revocations than the put-only directory lists
@@ -598,6 +649,7 @@ async fn a_proof_from_a_newer_view_gives_a_rolled_back_unit_no_lease() {
         state_seq: 1,
         keys_seq: 1,
         stamp_counter: ledger.counter.get(),
+        revoked: 0,
     };
     let mut lease = FreshLease::expired();
     assert_eq!(

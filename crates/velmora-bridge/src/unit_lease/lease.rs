@@ -17,11 +17,23 @@
 //!
 //! **A renewal is bound to what it proved.** The proof was made for the
 //! unit's `state_seq`, `keys_seq` and stamp counter as the Worker knew
-//! them ([`Proven`]); `renew` carries them and the unit refuses unless
-//! they are its own, in the same transaction that sets the lease. A unit
-//! that was rolled back to a lower counter (or seq) after the Worker took
-//! its view therefore gets no lease from a proof of the newer state, and
-//! a renewal that crosses a close or a restore is refused the same way.
+//! them, and it listed a number of revocations ([`Proven`]). `renew`
+//! carries them, and the unit refuses, in the same transaction that sets
+//! the lease, when any of its own is **below** the proven one:
+//!
+//! - a unit rolled back to a lower counter or seq after the Worker took
+//!   its view gets no lease from a proof of the newer state;
+//! - a unit that holds fewer revocations than the proof listed was not
+//!   given every listed id (an apply that failed half-way), so a revoked
+//!   key cannot keep a lease of T on it (SEC-6). The unit counts a listed
+//!   id it holds no key for as revoked too (a tombstone), or the two
+//!   counts would never meet.
+//!
+//! A value **above** the proven one is accepted. The proof saw no stamp
+//! object after its counter and no record after its seqs at the time it
+//! listed, so a higher value in the unit came from a raise or a `sync`
+//! after `proof_start`. Refusing it would fail the renewals of every busy
+//! unit, whose stamp moves twice per commit during the 300 ms of a proof.
 //!
 //! A renewal never moves the lease back: of two renewals that cross,
 //! the one with the later proof decides. Each of them was a whole proof,
@@ -88,6 +100,20 @@ pub struct Proven {
     pub state_seq: u64,
     pub keys_seq: u64,
     pub stamp_counter: Option<u64>,
+    /// Revoked keys: what the proof listed under `m/rk/<t>/`, and for the
+    /// unit what it holds, tombstones included.
+    pub revoked: u64,
+}
+
+impl Proven {
+    /// Whether `self` (the unit's own) is at least `proven` in every part.
+    /// A stamp counter of `None` (never raised) is below every `Some`.
+    pub fn covers(&self, proven: &Proven) -> bool {
+        self.state_seq >= proven.state_seq
+            && self.keys_seq >= proven.keys_seq
+            && self.stamp_counter >= proven.stamp_counter
+            && self.revoked >= proven.revoked
+    }
 }
 
 /// Why a `renew` was refused. The unit answers `renew_needed` for
@@ -100,8 +126,8 @@ pub enum RenewRefused {
     /// `proof_start` is more than [`LeaseRules::max_ahead_ms`] ahead of
     /// the unit's clock.
     ProofAhead { ahead_ms: i64 },
-    /// The proof was made for another state than the unit holds now
-    /// (`proven` is what the proof covered).
+    /// The unit holds less than the proof covered in some part: a lower
+    /// seq or stamp counter, or fewer revocations.
     NotProven { proven: Proven, own: Proven },
 }
 
@@ -154,7 +180,8 @@ impl FreshLease {
     /// `renew(proof_start, proven)`, called by the unit at its own `now`,
     /// after the Worker proved the unit fresh (and after any `sync` and
     /// the revocations that the proof asked for). `own` is what the unit
-    /// holds, read in the same transaction; it must equal `proven`.
+    /// holds, read in the same transaction; it must cover `proven`
+    /// ([`Proven::covers`]).
     ///
     /// Sets `fresh_until` to `proof_start + T` unless it is already
     /// later, and answers the lease in force afterwards. It is never set
@@ -171,7 +198,7 @@ impl FreshLease {
         now: UnixMs,
         rules: &LeaseRules,
     ) -> Result<UnixMs, RenewRefused> {
-        if proven != own {
+        if !own.covers(proven) {
             return Err(RenewRefused::NotProven {
                 proven: *proven,
                 own: *own,

@@ -45,6 +45,9 @@ use crate::types::Result;
 pub struct Mark {
     pub wake_id: [u8; 16],
     pub writes: u64,
+    /// A write was under way when the mark was read. A page read then may
+    /// hold part of it, so a dump with such a page is never `exact`.
+    pub writing: bool,
 }
 
 /// The unit's write mark. One per wake of the unit object.
@@ -73,6 +76,7 @@ impl WriteMark {
         Mark {
             wake_id: self.wake_id,
             writes: self.writes.get(),
+            writing: self.writing(),
         }
     }
 
@@ -111,15 +115,16 @@ impl Drop for Writing<'_> {
 }
 
 /// Whether a dump whose pages carried `marks` is `exact`: one mark on
-/// every page. An empty list is not exact (there was no page to compare).
+/// every page, and no page read while a write was under way. An empty
+/// list is not exact (there was no page to compare).
 pub fn exact(marks: &[Mark]) -> bool {
     marks
         .first()
-        .is_some_and(|first| marks.iter().all(|m| m == first))
+        .is_some_and(|first| marks.iter().all(|m| m == first && !m.writing))
 }
 
 /// Words that make a statement one that can change the database.
-const WRITE_WORDS: [&str; 19] = [
+const WRITE_WORDS: [&str; 21] = [
     "INSERT",
     "UPDATE",
     "DELETE",
@@ -139,6 +144,8 @@ const WRITE_WORDS: [&str; 19] = [
     "COMMIT",
     "ROLLBACK",
     "SAVEPOINT",
+    "RELEASE",
+    "END",
 ];
 
 /// Whether `sql` may change the database: it holds one of the write
