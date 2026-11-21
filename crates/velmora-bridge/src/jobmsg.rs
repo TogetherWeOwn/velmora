@@ -323,6 +323,50 @@ fn body_version(job: &Job) -> u8 {
     }
 }
 
+/// How many messages of each format a consumer read, said in one log
+/// line at most once every [`FormatCount::EVERY_MS`]. It is the check
+/// line of the switch (both formats are read after step 1; no `v` 1
+/// message is left before step 3) and costs no storage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormatCount {
+    plain: u64,
+    tenant: u64,
+    refused: u64,
+    since: Option<crate::types::UnixMs>,
+}
+
+impl FormatCount {
+    /// The shortest time between two lines.
+    pub const EVERY_MS: i64 = 60_000;
+
+    /// Counts one admission at `now`. Returns the line to log when the
+    /// time since the first count of this line has come, and starts a
+    /// new one. A malformed message is not counted: it has no format.
+    pub fn count(&mut self, admission: &Admission, now: crate::types::UnixMs) -> Option<String> {
+        match admission {
+            Admission::Run { tenant: None, .. } => self.plain += 1,
+            Admission::Run {
+                tenant: Some(_), ..
+            } => self.tenant += 1,
+            Admission::Refused(_) => self.refused += 1,
+            Admission::Malformed => return None,
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.0.saturating_sub(since.0) < Self::EVERY_MS {
+            return None;
+        }
+        let line = format!(
+            "job message formats: v1={} v2={} refused={} over {} s",
+            self.plain,
+            self.tenant,
+            self.refused,
+            now.0.saturating_sub(since.0) / 1000
+        );
+        *self = FormatCount::default();
+        Some(line)
+    }
+}
+
 /// What the consumer does with a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -473,6 +517,41 @@ mod tests {
             assert!(JobFormat::from_var(Some(raw)).is_err(), "{raw}");
         }
         assert_eq!(JobFormat::default(), JobFormat::Plain);
+    }
+
+    #[test]
+    fn the_format_line_comes_at_most_once_a_minute() {
+        let mut count = FormatCount::default();
+        let t = |ms: i64| crate::types::UnixMs(1_000_000 + ms);
+        let Admission::Run { scope, job, .. } = admit(&json!({"t": "gc", "v": 1})) else {
+            panic!("a gc job of v 1 runs");
+        };
+        let plain = Admission::Run {
+            scope: scope.clone(),
+            job: job.clone(),
+            tenant: None,
+        };
+        let tenant = admit(
+            &json!({"t": "gc", "v": 2, "tenant": scope.tenant_id(), "state_seq": 0, "keys_seq": 0}),
+        );
+        assert!(matches!(
+            tenant,
+            Admission::Run {
+                tenant: Some(_),
+                ..
+            }
+        ));
+        let refused = Admission::Refused(Refusal::NoTenant);
+        assert_eq!(count.count(&plain, t(0)), None);
+        assert_eq!(count.count(&tenant, t(1)), None);
+        assert_eq!(count.count(&Admission::Malformed, t(70_000)), None);
+        assert_eq!(count.count(&refused, t(59_999)), None);
+        assert_eq!(
+            count.count(&tenant, t(60_000)).as_deref(),
+            Some("job message formats: v1=1 v2=2 refused=1 over 60 s")
+        );
+        assert_eq!(count, FormatCount::default());
+        assert_eq!(count.count(&plain, t(60_001)), None);
     }
 
     #[test]
