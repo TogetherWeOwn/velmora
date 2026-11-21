@@ -806,8 +806,8 @@ async fn a_key_is_never_recorded_wider_than_its_principal_at_its_seq() {
     assert_eq!(answer, KeyAnswer::Refused(Refusal::NotSubset));
     assert_eq!(
         adm.calls.get(),
-        4,
-        "seed 2, then the lost try and the retry"
+        5,
+        "seed 2, then the lost try, the retry, and one ask after a catch-up"
     );
     assert_eq!(w.head(), 3);
     let read = read_key_chain(&w.store, &w.kek, &w.ring, &w.t)
@@ -2063,4 +2063,94 @@ async fn a_cached_table_reopens_from_the_record_that_holds_the_private_part() {
         KeyAnswer::Done { seq: 4 }
     );
     assert_eq!(w.root.status("AKVL0001"), Some(SubjectStatus::Active));
+}
+
+/// A root restored behind the head refuses a key whose principal is at
+/// the head: the writer brings the units up once and asks again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refusal_by_a_restored_root_is_asked_again_after_catch_up() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let mut table = seed(&w, &adm).await;
+    let units = w.units();
+    let env = env!(w, &adm, &units);
+    let mut rng = TestRng(111);
+    w.root.reset();
+    let key = s3_key(&w.t, "AKVL0002", "PR0001", &[grant("b_01", RO, None)]);
+    assert_eq!(
+        env.change(&mut table, "c", &KeyRequest::Create(key), &mut rng)
+            .await
+            .unwrap(),
+        KeyAnswer::Done { seq: 3 }
+    );
+    assert_eq!(w.root.status("AKVL0002"), Some(SubjectStatus::Active));
+}
+
+/// A store that plants `bytes` under `name` on its `nth` list call: a
+/// record that lands while the finisher reads.
+struct PlantOnList<'a> {
+    inner: &'a MemRecords,
+    nth: u32,
+    calls: Cell<u32>,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl RecordStore for PlantOnList<'_> {
+    async fn put_if_absent(&self, name: &str, bytes: Vec<u8>) -> Result<bool> {
+        self.inner.put_if_absent(name, bytes).await
+    }
+    async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name).await
+    }
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() == self.nth {
+            self.inner.plant(&self.name, self.bytes.clone());
+        }
+        self.inner.list(prefix, start_after, limit).await
+    }
+}
+
+/// A chain that cannot be read to its head makes the run fail.
+#[tokio::test(flavor = "current_thread")]
+async fn a_finisher_that_cannot_read_to_the_head_asks_for_a_retry() {
+    let w = World::new();
+    let adm = FakeAdmission::new(&w.root);
+    let _ = seed(&w, &adm).await;
+    let units = w.units();
+    let mut rng = TestRng(112);
+    let mut seen = None;
+    for nth in 1..12 {
+        let store = PlantOnList {
+            inner: &w.store,
+            nth,
+            calls: Cell::new(0),
+            name: key_chain(&w.t).name(3),
+            bytes: b"not a record".to_vec(),
+        };
+        let env = KeyEnv {
+            store: &store,
+            kek: &w.kek,
+            ring: &w.ring,
+            tenant: &w.t,
+            admission: &adm,
+            intents: &w.intents,
+            units: &units,
+            directory: &&w.directory,
+            clock: &w.clock,
+        };
+        // The first list call that lands the record after the read and
+        // before the final one; an earlier one fails the read itself.
+        let result = finish_keys(&env, &mut rng).await;
+        let planted = store.calls.get() >= nth;
+        w.store.lose(&key_chain(&w.t).name(3));
+        if let (Ok(report), true) = (result, planted) {
+            seen = Some(report);
+            break;
+        }
+    }
+    let report = seen.expect("a run that read the planted record after its first read");
+    assert!(report.failed.contains(&"chain".to_owned()), "{report:?}");
+    assert!(report.retry());
 }

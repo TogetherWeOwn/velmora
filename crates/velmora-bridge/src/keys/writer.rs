@@ -498,6 +498,7 @@ where
             .into_iter()
             .collect();
         let mut puts = 0;
+        let mut caught_up = false;
         while puts < MAX_PUTS {
             advance(self.store, self.kek, self.ring, &chain, table).await?;
             // A cached table opens what this ring can open now.
@@ -534,6 +535,15 @@ where
                         .admit(self.tenant, idempotency_key, &change)
                         .await?
                     {
+                        // A refusal by a unit that is behind the head
+                        // (restored, or down during a change) may be
+                        // stale: bring the units up once and ask again.
+                        Admission::Refused(Refusal::NotSubset | Refusal::CapFull) if !caught_up => {
+                            caught_up = true;
+                            let _ = self.apply_all(table, &revoked).await;
+                            puts += 1;
+                            continue;
+                        }
                         Admission::Refused(r) => return Ok(KeyAnswer::Refused(r)),
                         Admission::Admitted { keys_seq } if keys_seq == table.seq() => keys_seq + 1,
                         Admission::Admitted { keys_seq } => {
@@ -643,7 +653,8 @@ pub struct FinishReport {
     /// key could not be loaded, a store error): they are in force in the
     /// stores all the same, by their `m/rk/` record.
     pub append_failed: Vec<String>,
-    /// Stores that did not acknowledge, by label.
+    /// Stores that did not acknowledge, by label; `chain` when the chain
+    /// could not be read to its head.
     pub failed: Vec<String>,
     /// The checkpoint written by this run.
     pub checkpoint: Option<u64>,
@@ -746,7 +757,14 @@ where
             report.append_failed.push(id);
         }
     }
-    let _ = advance(env.store, env.kek, env.ring, &chain, &mut table).await;
+    // A chain that cannot be read to its head is a failed run: the stores
+    // get the verified prefix, and the queue retries.
+    if advance(env.store, env.kek, env.ring, &chain, &mut table)
+        .await
+        .is_err()
+    {
+        report.failed.push("chain".to_owned());
+    }
 
     // The units with what closes, the directory, then the units in full
     // once the directory has the head: nothing opens at a unit before the
