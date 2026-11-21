@@ -39,14 +39,19 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     }
     ingress::restore_accept_encoding(&mut headers, client_accept_encoding(&req).as_deref());
     let declared_len = ingress::declared_length(&headers).unwrap_or(None);
-    let body = if req.inner().body().is_some() {
-        let stream = req
-            .stream()
-            .map_err(|_| IngressError::Internal)?
-            .map(|chunk| chunk.map_err(|_| BridgeError::Invalid("request body stream")));
+    let body = if let Some(raw) = req.inner().body() {
+        let stream: velmora_bridge::ByteStream = match ByobReads::new(&raw) {
+            Some(reads) => Box::pin(pieces(reads)),
+            // Not a byte stream: the runtime's default reader.
+            None => Box::pin(
+                req.stream()
+                    .map_err(|_| IngressError::Internal)?
+                    .map(|chunk| chunk.map_err(|_| BridgeError::Invalid("request body stream"))),
+            ),
+        };
         Body::Stream {
             declared_len,
-            stream: Box::pin(stream),
+            stream,
         }
     } else {
         Body::Empty
@@ -60,6 +65,161 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
         },
         https,
     })
+}
+
+/// The most one body read asks for, and so the size of the one runtime
+/// buffer every read reuses. The default reader hands a deployed request
+/// body out in 4 KiB items, each a new array crossing into wasm on its
+/// own task; a BYOB read fills up to this much at once. It is one plain
+/// chunk, inside the item allowance of a streamed upload's charge
+/// (`ingress::STREAM_ITEM_ALLOWANCE`).
+const BODY_READ: u32 = velmora::media::PLAIN_CHUNK_SIZE as u32;
+
+/// Reads of a body: `Ok(None)` is its end. After an error or the end
+/// nothing more is asked.
+trait PieceReads {
+    async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError>;
+}
+
+/// The body as a stream of pieces, in order. It ends at the end of the
+/// body or after the first failed read.
+fn pieces<R: PieceReads + 'static>(
+    reads: R,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, BridgeError>> {
+    futures_util::stream::unfold(Some(reads), |state| async move {
+        let mut reads = state?;
+        match reads.next_piece().await {
+            Ok(Some(piece)) => Some((Ok(piece), Some(reads))),
+            Ok(None) => None,
+            Err(e) => Some((Err(e), None)),
+        }
+    })
+}
+
+#[worker::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = worker::wasm_bindgen)]
+extern "C" {
+    /// A `ReadableStream` of bytes.
+    type ByteBody;
+    /// A `ReadableStreamBYOBReader`.
+    type ByobReader;
+    #[wasm_bindgen(method, catch, js_name = getReader)]
+    fn byob_reader(
+        this: &ByteBody,
+        options: &worker::js_sys::Object,
+    ) -> Result<ByobReader, worker::wasm_bindgen::JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn cancel(this: &ByobReader) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn read(
+        this: &ByobReader,
+        view: &worker::js_sys::Uint8Array,
+    ) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
+    /// What a read resolves to.
+    type ReadResult;
+    #[wasm_bindgen(method, getter)]
+    fn done(this: &ReadResult) -> bool;
+    #[wasm_bindgen(method, getter)]
+    fn value(this: &ReadResult) -> Option<worker::js_sys::Uint8Array>;
+}
+
+/// What one BYOB read gave, from its `done` flag and the length of the
+/// view it handed back (`None`: no view).
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum ReadGave {
+    /// The end of the body.
+    End,
+    /// A piece of this many bytes.
+    Piece,
+    /// A failed or canceled body, or a read that gave nothing.
+    Failed,
+}
+
+/// At the end a read says done and hands the (empty) view back (workerd
+/// from compatibility date 2024-05-13, `internal_stream_byob_return_view`;
+/// ours is later). A canceled body says done with no view: that is not
+/// an end. A read that is not the end fills at least one byte.
+fn read_gave(done: bool, view_len: Option<u32>) -> ReadGave {
+    match (done, view_len) {
+        (_, None) => ReadGave::Failed,
+        (true, Some(_)) => ReadGave::End,
+        (false, Some(0)) => ReadGave::Failed,
+        (false, Some(_)) => ReadGave::Piece,
+    }
+}
+
+/// A request body read with a BYOB reader into one runtime buffer; each
+/// read is copied once, into a piece of its own length.
+struct ByobReads {
+    reader: ByobReader,
+    /// The runtime buffer; a read transfers it and hands it back. `None`
+    /// after the end or a failure, and while a read is under way.
+    buffer: Option<worker::js_sys::ArrayBuffer>,
+    /// The body ended or failed: there is nothing left to cancel.
+    settled: bool,
+}
+
+impl ByobReads {
+    /// `None` when the body has no BYOB reader (it is not a byte stream).
+    fn new(stream: &worker::web_sys::ReadableStream) -> Option<Self> {
+        use worker::wasm_bindgen::JsCast;
+        let options = worker::js_sys::Object::new();
+        worker::js_sys::Reflect::set(&options, &"mode".into(), &"byob".into()).ok()?;
+        Some(ByobReads {
+            reader: stream
+                .unchecked_ref::<ByteBody>()
+                .byob_reader(&options)
+                .ok()?,
+            buffer: Some(worker::js_sys::ArrayBuffer::new(BODY_READ)),
+            settled: false,
+        })
+    }
+}
+
+/// A body left unread (a refused upload) is canceled, as the default
+/// reader's stream did when it was dropped.
+impl Drop for ByobReads {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.reader.cancel();
+        }
+    }
+}
+
+impl PieceReads for ByobReads {
+    async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
+        use worker::wasm_bindgen::JsCast;
+        let failed = || BridgeError::Invalid("request body stream");
+        let buffer = self.buffer.take().ok_or_else(failed)?;
+        // A read that fails or ends leaves nothing to cancel; a piece
+        // sets this back.
+        self.settled = true;
+        let view = worker::js_sys::Uint8Array::new(&buffer);
+        let promise = self.reader.read(&view).map_err(|_| failed())?;
+        let result: ReadResult = worker::wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|_| failed())?
+            .unchecked_into();
+        let filled = result.value();
+        match read_gave(result.done(), filled.as_ref().map(|v| v.length())) {
+            ReadGave::End => Ok(None),
+            ReadGave::Failed => Err(failed()),
+            ReadGave::Piece => {
+                let filled = filled.ok_or_else(failed)?;
+                let piece = filled.to_vec();
+                // The runtime hands the whole buffer back; one that came
+                // back smaller would cap every later read, so it is
+                // replaced.
+                let back = filled.buffer();
+                self.buffer = Some(if back.byte_length() < BODY_READ {
+                    worker::js_sys::ArrayBuffer::new(BODY_READ)
+                } else {
+                    back
+                });
+                self.settled = false;
+                Ok(Some(piece))
+            }
+        }
+    }
 }
 
 /// `request.cf.clientAcceptEncoding`, the client's own `Accept-Encoding`
@@ -140,4 +300,97 @@ pub fn internal_error() -> Response {
     try_response(IngressError::Internal.response())
         .or_else(|_| Response::error("Internal Error", 500))
         .unwrap_or_else(|_| Response::empty().expect("empty response").with_status(500))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pieces from a script: `Some(Ok(n))` is a piece of `n` bytes,
+    /// `Some(Err(()))` a failed read, `None` the end.
+    struct Scripted {
+        steps: Vec<Option<Result<usize, ()>>>,
+        asked: std::rc::Rc<std::cell::Cell<usize>>,
+        next_byte: u8,
+    }
+
+    impl PieceReads for Scripted {
+        async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
+            self.asked.set(self.asked.get() + 1);
+            assert!(!self.steps.is_empty(), "read after the end or a failure");
+            match self.steps.remove(0) {
+                None => Ok(None),
+                Some(Err(())) => Err(BridgeError::Invalid("request body stream")),
+                Some(Ok(n)) => Ok(Some(
+                    (0..n)
+                        .map(|_| {
+                            self.next_byte = self.next_byte.wrapping_add(1);
+                            self.next_byte
+                        })
+                        .collect(),
+                )),
+            }
+        }
+    }
+
+    use std::future::Future;
+
+    fn collect(steps: Vec<Option<Result<usize, ()>>>) -> (Vec<Result<Vec<u8>, ()>>, usize) {
+        use std::task::{Context, Poll, Waker};
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reads = Scripted {
+            steps,
+            asked: asked.clone(),
+            next_byte: 0,
+        };
+        let fut = pieces(reads).map(|p| p.map_err(|_| ())).collect::<Vec<_>>();
+        let out = match std::pin::pin!(fut).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("scripted reads never wait"),
+        };
+        (out, asked.get())
+    }
+
+    #[test]
+    fn pieces_come_in_order_and_end_with_the_body() {
+        let (out, asked) = collect(vec![Some(Ok(3)), Some(Ok(65_536)), Some(Ok(1)), None]);
+        let bytes: Vec<u8> = out.into_iter().flat_map(|p| p.unwrap()).collect();
+        assert_eq!(bytes.len(), 65_540);
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == ((i + 1) % 256) as u8));
+        assert_eq!(asked, 4, "no read after the end");
+    }
+
+    #[test]
+    fn an_empty_body_is_no_piece() {
+        let (out, asked) = collect(vec![None]);
+        assert!(out.is_empty());
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_failed_read_is_the_last_item() {
+        let (out, asked) = collect(vec![Some(Ok(10)), Some(Err(())), Some(Ok(10))]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_ok());
+        assert!(out[1].is_err());
+        assert_eq!(asked, 2, "nothing is read after a failure");
+    }
+
+    #[test]
+    fn a_read_ends_gives_a_piece_or_fails() {
+        assert_eq!(read_gave(true, Some(0)), ReadGave::End);
+        assert_eq!(read_gave(true, None), ReadGave::Failed, "canceled");
+        assert_eq!(read_gave(false, None), ReadGave::Failed);
+        assert_eq!(read_gave(false, Some(0)), ReadGave::Failed, "empty read");
+        assert_eq!(read_gave(false, Some(1)), ReadGave::Piece);
+        assert_eq!(read_gave(false, Some(BODY_READ)), ReadGave::Piece);
+    }
+
+    #[test]
+    fn one_read_fits_the_item_allowance() {
+        assert!(u64::from(BODY_READ) <= velmora_bridge::ingress::STREAM_ITEM_ALLOWANCE);
+    }
 }

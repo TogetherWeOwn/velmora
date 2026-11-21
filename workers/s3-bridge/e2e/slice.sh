@@ -467,6 +467,21 @@ same_bytes "GET w/small.bin equals the upload" "$T/small.bin" "$T/got-w-small.bi
 run_aws "GET w/mid.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3[@]}" cp "s3://$SB/w/mid.bin" "$T/got-w-mid.bin" >/dev/null
 same_bytes "GET w/mid.bin equals the upload" "$T/mid.bin" "$T/got-w-mid.bin"
 rm -f "$T/mid.bin" "$T/got-w-mid.bin" "$T/got-w-small.bin"
+# Bodies of 0 and 1 byte, both framings: the body reader's end of a body
+# that has (almost) nothing in it.
+: >"$T/len0.bin"
+head -c 1 /dev/urandom >"$T/len1.bin"
+for n in 0 1; do
+  run_aws "PutObject w/len$n.bin" "${S3API[@]}" put-object --bucket "$SB" --key "w/len$n.bin" --body "$T/len$n.bin" >/dev/null
+  run_aws "PutObject w/len$n-wr.bin (when_required)" "${WHEN_REQUIRED[@]}" "${S3API[@]}" put-object --bucket "$SB" \
+    --key "w/len$n-wr.bin" --body "$T/len$n.bin" >/dev/null
+  for k in "len$n" "len$n-wr"; do
+    run_aws "GET w/$k.bin" "${S3API[@]}" get-object --bucket "$SB" --key "w/$k.bin" "$T/got-$k.bin" >/dev/null
+    same_bytes "GET w/$k.bin equals the upload" "$T/len$n.bin" "$T/got-$k.bin"
+    rm -f "$T/got-$k.bin"
+  done
+done
+rm -f "$T/len0.bin" "$T/len1.bin"
 
 # ---------------------------------------------------------------------------
 # 0c one PutObject above one extent (stored as slices of 8 MiB)
