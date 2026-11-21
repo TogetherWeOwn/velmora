@@ -2359,9 +2359,14 @@ impl<T: GateTransport> GateClient<T> {
         old.iter().for_each(|permit| self.forget(permit));
         let permit = found?;
         let held = self.renew(core::slice::from_ref(&permit)).await;
-        match held.ok()?.first() {
+        match held.ok().and_then(|held| held.first().copied()) {
             Some(true) => Some(permit),
-            _ => None,
+            // Not renewed, or not known to be: given up, as it is in
+            // no pocket any more and its session holds nothing else.
+            _ => {
+                self.forget(&permit);
+                None
+            }
         }
     }
 
