@@ -1845,3 +1845,43 @@ async fn an_uncounted_fill_behind_a_counted_safety_copy_waits_for_the_eviction()
     hot.bridge().evict_batch(0).await.unwrap();
     assert!(!hot.has_cache(&x) && !hot.has_safety(&x));
 }
+
+/// A damaged or short copy in the store asked first is a miss like an
+/// absent one: the other store serves, in either order.
+#[tokio::test(flavor = "current_thread")]
+async fn a_damaged_first_copy_is_skipped_for_the_other_store() {
+    let hot = hot_with(|cfg| cfg.hot_cap_bytes = u64::MAX / 4).await;
+    let flip = |b: &mut Vec<u8>| b[1000] ^= 1;
+    let cut = |b: &mut Vec<u8>| b.truncate(500);
+
+    // Safety first (pinned), the safety copy damaged or short: the
+    // uncounted cache blob serves, and the read counts it.
+    for (key, damage) in [
+        ("held-flip", &flip as &dyn Fn(&mut Vec<u8>)),
+        ("held-cut", &cut),
+    ] {
+        let held = hot.put(key).await;
+        hot.discard_jobs();
+        hot.uncounted_fill(&held).await;
+        assert!(hot.bridge().safety.corrupt(&held.id.safety_key(), damage));
+        assert_eq!(hot.read_cost(key).await, ((1, 1), 0));
+        assert!(hot.hint(key).await.cache);
+    }
+
+    // Cache first (counted fill), the cache blob damaged or short: the
+    // released safety copy serves.
+    hot.bridge().clock.advance_secs(60);
+    for (key, damage) in [
+        ("counted-flip", &flip as &dyn Fn(&mut Vec<u8>)),
+        ("counted-cut", &cut),
+    ] {
+        let x = hot.released(key).await;
+        hot.uncounted_fill(&x).await;
+        hot.sql(
+            "UPDATE extents SET hot_cache_bytes = cipher_size WHERE id = ?1",
+            &x,
+        );
+        assert!(hot.bridge().cache.corrupt(&x.id.cache_key(), damage));
+        assert_eq!(hot.read_cost(key).await, ((1, 1), 0));
+    }
+}
