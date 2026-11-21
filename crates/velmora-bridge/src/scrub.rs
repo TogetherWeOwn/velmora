@@ -798,32 +798,13 @@ where
         if fresh.is_empty() {
             fresh = expired;
         }
-        // A kept session of another backbone that could run out of its
-        // slot while this one is asked is ended first. This one is asked
-        // in one call of the class of its session: the one kept for it,
-        // else the class a new one would take first. Its own sessions are
-        // renewed as they are used.
-        let mine =
-            |s: &ProviderSession<'s, C, N, T>| providers.iter().any(|p| p.id == s.provider.id);
-        let class = stats
-            .iter()
-            .find(|s| mine(s))
-            .map(|s| s.permit().class)
-            .unwrap_or_else(|| {
-                match providers
-                    .iter()
-                    .any(|p| p.drill_conns > self.cfg.scrub.sockets)
-                {
-                    true => PermitClass::Drill,
-                    false => PermitClass::Background,
-                }
-            });
-        let call_ms = i64::from(class.call_secs()) * 1000;
-        let (short, kept): (Vec<_>, Vec<_>) = core::mem::take(stats)
+        // The sessions kept for other backbones sit unused while this one
+        // is asked (a pass that can take several calls): they are set
+        // aside, and ended if their slots would run out first.
+        let (mine, parked): (Vec<_>, Vec<_>) = core::mem::take(stats)
             .into_iter()
-            .partition(|s| !mine(s) && i64::from(s.idle_ms()) <= call_ms);
-        *stats = kept;
-        ProviderSession::close_all(short).await;
+            .partition(|s| providers.iter().any(|p| p.id == s.provider.id));
+        *stats = mine;
         let mut order = pool.order(fresh, PermitClass::Background);
         // A provider this run keeps a session on comes first: the session
         // itself counts as load there, and moving to the next one would
@@ -844,60 +825,85 @@ where
         });
         *stats = keep;
         ProviderSession::close_all(stale).await;
-        for provider in order {
-            let kept = stats.iter().position(|s| s.provider.id == provider.id);
-            let mut tries = 0;
-            loop {
-                tries += 1;
-                let reused = kept.is_some() && tries == 1;
-                let mut session = match kept.filter(|_| reused) {
-                    Some(at) => Some(stats.swap_remove(at)),
-                    None => self.stat_session(provider, holder).await?,
-                };
-                if session.is_none() && !stats.is_empty() {
-                    // The slot may be one this run keeps for another
-                    // backbone (providers that share a pool): those are
-                    // ended, and the slot asked for once more.
-                    ProviderSession::close_all(core::mem::take(stats)).await;
-                    session = self.stat_session(provider, holder).await?;
+        let limit = parked.iter().map(ProviderSession::idle_ms).min();
+        let parked = core::cell::RefCell::new(parked);
+        // Ends the sessions set aside (borrowed only to take them out).
+        let end_parked = || async {
+            let gone: Vec<_> = parked.borrow_mut().drain(..).collect();
+            ProviderSession::close_all(gone).await;
+        };
+        let answer = {
+            let ask = async {
+                for provider in order {
+                    let kept = stats.iter().position(|s| s.provider.id == provider.id);
+                    let mut tries = 0;
+                    loop {
+                        tries += 1;
+                        let reused = kept.is_some() && tries == 1;
+                        let mut session = match kept.filter(|_| reused) {
+                            Some(at) => Some(stats.swap_remove(at)),
+                            None => self.stat_session(provider, holder).await?,
+                        };
+                        if session.is_none() && (!stats.is_empty() || !parked.borrow().is_empty()) {
+                            // The slot may be one this run keeps for another
+                            // backbone (providers that share a pool): those are
+                            // ended, and the slot asked for once more.
+                            ProviderSession::close_all(core::mem::take(stats)).await;
+                            end_parked().await;
+                            session = self.stat_session(provider, holder).await?;
+                        }
+                        let Some(mut session) = session else {
+                            break;
+                        };
+                        let tally = ask_articles_together(&mut session, None, &rows, None).await;
+                        match tally {
+                            Ok(tally) => {
+                                stats.push(session);
+                                let mut lacks = tally.missing;
+                                // Never a size pass here, so `corrupt` stays
+                                // empty; a provider that says so lacks it.
+                                lacks.extend(tally.corrupt);
+                                return Ok(Presence::Lacks(lacks));
+                            }
+                            // A kept session whose slot expired: a new one.
+                            Err(Stop::NoPermit) if reused => {
+                                session.close().await;
+                                continue;
+                            }
+                            // The account was refused: not asked again in this
+                            // run; the next provider of the backbone is asked.
+                            Err(Stop::Refused) => {
+                                session.close().await;
+                                refused.push(provider.id.clone());
+                                break;
+                            }
+                            Err(Stop::Catalog) => {
+                                session.close().await;
+                                return Err(Halt::Stopped);
+                            }
+                            Err(_) => {
+                                session.close().await;
+                                return Ok(Presence::Unknown);
+                            }
+                        }
+                    }
                 }
-                let Some(mut session) = session else {
-                    break;
-                };
-                let tally = ask_articles_together(&mut session, None, &rows, None).await;
-                match tally {
-                    Ok(tally) => {
-                        stats.push(session);
-                        let mut lacks = tally.missing;
-                        // Never a size pass here, so `corrupt` stays
-                        // empty; a provider that says so lacks it.
-                        lacks.extend(tally.corrupt);
-                        return Ok(Presence::Lacks(lacks));
+                Ok(Presence::Unknown)
+            };
+            let mut ask = core::pin::pin!(ask);
+            match (limit, self.budget.sleeper()) {
+                (Some(ms), Some(sleep)) => match select(ask.as_mut(), sleep(ms)).await {
+                    Either::Left((out, _)) => out,
+                    Either::Right(_) => {
+                        end_parked().await;
+                        ask.await
                     }
-                    // A kept session whose slot expired: a new one.
-                    Err(Stop::NoPermit) if reused => {
-                        session.close().await;
-                        continue;
-                    }
-                    // The account was refused: not asked again in this
-                    // run; the next provider of the backbone is asked.
-                    Err(Stop::Refused) => {
-                        session.close().await;
-                        refused.push(provider.id.clone());
-                        break;
-                    }
-                    Err(Stop::Catalog) => {
-                        session.close().await;
-                        return Err(Halt::Stopped);
-                    }
-                    Err(_) => {
-                        session.close().await;
-                        return Ok(Presence::Unknown);
-                    }
-                }
+                },
+                _ => ask.await,
             }
-        }
-        Ok(Presence::Unknown)
+        };
+        stats.extend(parked.into_inner());
+        answer
     }
 
     /// A slot to ask `provider` with: one of its drill connections when
