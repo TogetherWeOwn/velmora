@@ -145,7 +145,10 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rig.bridge.post_stage(&lease, &job).await, JobOutcome::Ack);
+        assert_eq!(
+            rig.bridge.post_stage(&TENANT_ZERO, &lease, &job).await,
+            JobOutcome::Ack
+        );
         for (store, key) in [
             (&rig.bridge.cache, extent.id.cache_key()),
             (&rig.bridge.safety, extent.id.safety_key()),
@@ -189,3 +192,6 @@ async fn a_range_that_ends_in_a_cold_full_size_extent_fits_the_budget() {
     read.expect(200);
     assert!(read.body == [&halves[0][1..], &halves[1][..1]].concat());
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

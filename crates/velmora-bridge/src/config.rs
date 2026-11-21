@@ -683,7 +683,9 @@ impl BridgeConfig {
         }
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
-            Some("tenant") => crate::recovery::Layout::default_tenant(),
+            Some("tenant") => {
+                crate::recovery::Layout::of(&crate::tenant::TenantScope::tenant_zero())
+            }
             Some(_) => return Err(ConfigError::Invalid("RECORD_LAYOUT".into())),
         };
 

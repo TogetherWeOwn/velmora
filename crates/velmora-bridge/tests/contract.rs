@@ -474,7 +474,7 @@ fn record_layout_is_flat_unless_tenant_is_asked_for() {
     for tenant in ["tenant", " tenant "] {
         vars.insert("RECORD_LAYOUT".into(), tenant.into());
         let records = load(&vars).unwrap().records;
-        assert_eq!(records, Layout::default_tenant(), "{tenant:?}");
+        assert_eq!(records, Layout::of(&TENANT_ZERO), "{tenant:?}");
         assert_eq!(records.root(), "m/x/t_0000000000000000/");
     }
     for bad in ["on", "off", "TENANT", "Flat", "t_1", "m/x/", "tenant,flat"] {
@@ -1733,7 +1733,7 @@ async fn contract_compiles_against_fakes() {
         budget: ByteBudget::new(cfg.inflight_budget_bytes),
         cfg,
     });
-    let _ = bridge.run_job(&job).await;
+    let _ = bridge.run_job(&TENANT_ZERO, &job).await;
     let _ = bridge.dispatch().await;
     let resp = Rc::clone(&bridge)
         .handle(S3Request {
@@ -2971,3 +2971,6 @@ fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
     assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
     assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

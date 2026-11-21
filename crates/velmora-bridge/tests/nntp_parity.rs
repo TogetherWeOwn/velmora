@@ -233,6 +233,7 @@ async fn the_addendum_is_stored_before_the_first_post() {
             let record = read_article_plan(
                 &rig.bridge.safety,
                 &rig.bridge.kek,
+                &TENANT_ZERO,
                 &s.extent,
                 &Layout::flat(),
             )
@@ -549,7 +550,7 @@ async fn parity_waits_for_the_data_articles_in_flight() {
     let early = Cell::new(true);
     let lease = rig.claim(&s, OutboxStage::Post).await;
     let job = rig.job(&s).await;
-    let post = rig.bridge.post_stage(&lease, &job);
+    let post = rig.bridge.post_stage(&TENANT_ZERO, &lease, &job);
     let hold = async {
         let held = async || {
             let mut all = stored(&rig, 0).await;
@@ -630,7 +631,7 @@ async fn parity_falls_to_the_other_provider_when_the_preferred_one_fails() {
     }
     let lease = rig.claim(&s, OutboxStage::Post).await;
     let job = rig.job(&s).await;
-    let post = rig.bridge.post_stage(&lease, &job);
+    let post = rig.bridge.post_stage(&TENANT_ZERO, &lease, &job);
     let fail = async {
         // Once the preferred server holds its parity article it takes no
         // more, and the POSTs held back for it go on (and are refused).
@@ -701,7 +702,10 @@ async fn a_lost_parity_article_is_posted_again() {
     let job = rig.job(&s).await;
     // A data article and a parity article in one go.
     rig.server().hide(&plan[3].message_id).await;
-    let done = rig.bridge.repost_run(&lease, &job, &[3, 11]).await;
+    let done = rig
+        .bridge
+        .repost_run(&TENANT_ZERO, &lease, &job, &[3, 11])
+        .await;
     assert_eq!(done, Ok(true));
 
     assert!(!rig.server().is_hidden(&lost.message_id).await);
@@ -737,7 +741,9 @@ async fn a_parity_only_repost_stamps_the_whole_plan() {
     let lease = rig.claim(&s, OutboxStage::Verify).await;
     let job = rig.job(&s).await;
     assert_eq!(
-        rig.bridge.repost_run(&lease, &job, &[lost.idx]).await,
+        rig.bridge
+            .repost_run(&TENANT_ZERO, &lease, &job, &[lost.idx])
+            .await,
         Ok(true)
     );
 
@@ -791,11 +797,20 @@ async fn a_repost_of_parity_checks_the_shard() {
 
     let lease = rig.claim(&s, OutboxStage::Verify).await;
     let job = rig.job(&s).await;
-    let done = rig.bridge.repost_run(&lease, &job, &[11]).await;
+    let done = rig
+        .bridge
+        .repost_run(&TENANT_ZERO, &lease, &job, &[11])
+        .await;
     assert_eq!(done, Err(Some(FailClass::Corrupt)));
     assert_eq!(stored(&rig, 0).await, before);
     // A repost of data articles alone does not compute the shards.
-    let done = rig.bridge.repost_run(&lease, &job, &[2]).await;
+    let done = rig
+        .bridge
+        .repost_run(&TENANT_ZERO, &lease, &job, &[2])
+        .await;
     assert_eq!(done, Ok(true));
     assert_eq!(stored(&rig, 0).await, before);
 }
+
+/// The one tenant there is.
+const TENANT_ZERO: velmora_bridge::TenantScope = velmora_bridge::TenantScope::tenant_zero();

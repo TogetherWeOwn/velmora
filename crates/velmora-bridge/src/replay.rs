@@ -46,6 +46,7 @@ use crate::recovery::{
     start_after, ExtentRecord, GenerationHead, Layout, StoredGeneration, GENERATION_PREFIX,
     MAX_SEGMENTS, TOMBSTONE_PREFIX,
 };
+use crate::tenant::TenantScope;
 use crate::types::{
     ArticleRow, ArticleState, BridgeError, BucketId, ExtentPlacement, ExtentRow, GenerationId,
     Result, UnixMs,
@@ -563,7 +564,9 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 // The plan may be in the other layout than the record:
                 // an extent is posted after its object is published,
                 // and a copy names the extents of an older object.
-                let read = read_article_plan(&self.safety, &self.kek, &row.id, layout).await?;
+                let scope = TenantScope::tenant_zero();
+                let read =
+                    read_article_plan(&self.safety, &self.kek, &scope, &row.id, layout).await?;
                 let mut unopened = read.unreadable;
                 let record = read.record;
                 let mut packed = None;
@@ -610,7 +613,8 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             // record replaces is named like a record that does not
             // open: the extent cannot be read from Usenet.
             for extent in self.catalog.replay_extents(&bucket, &chunk, now).await? {
-                let named = Layout::all().iter().any(|l| {
+                let scope = TenantScope::tenant_zero();
+                let named = Layout::all(&scope).iter().any(|l| {
                     let name = l.article_key(&extent);
                     report.unreadable.contains(&name)
                 });
@@ -755,7 +759,9 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         report: &mut ReplayReport,
     ) -> Result<Vec<Listed>> {
         let mut all: Vec<Listed> = Vec::new();
-        for layout in Layout::all() {
+        // A replay goes through the records of the whole store, and
+        // tenant 0 is the one tenant that has any.
+        for layout in Layout::all(&TenantScope::tenant_zero()) {
             let names = self
                 .safety
                 .list(&layout.of_flat(prefix), &layout.of_flat(after), limit)
