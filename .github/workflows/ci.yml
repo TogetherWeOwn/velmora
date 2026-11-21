@@ -73,6 +73,8 @@ jobs:
       - name: Install reference par2 binary for creator interop test
         run: sudo apt-get update && sudo apt-get install -y par2
       - run: cargo test --locked --workspace
+      # The local benchmark's report: its native-vs-replay rows-written check.
+      - run: python3 -I -m unittest discover -s bench -p 'test_*.py'
       # Transport-free portable core on the same native runner: executes
       # velmora without default TLS features. This is native portable
       # behavior, not a wasm-runtime check (see rust-wasm).

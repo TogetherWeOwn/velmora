@@ -720,7 +720,13 @@ impl Bench {
 
         let hub = Rc::new(Hub::default());
         hub.set("setup");
-        let sql = RusqliteSql::with_schema().expect("schema");
+        // The migrations leave the usage counters off; production switches
+        // them on with its first recount, and counts with them on from then
+        // on. The rig starts from the migrations alone (as the replay
+        // does) and switches them on with a traced call, below, so the
+        // native run and the replay run the same statements from the same
+        // state.
+        let sql = RusqliteSql::with_schema_unarmed().expect("schema");
         sql.meter_writes().expect("write meter");
         let bridge = Rc::new(Bridge {
             catalog: SqlCatalog::new(MeterSql {
@@ -752,6 +758,18 @@ impl Bench {
         // The schema is in place before the trace starts: the replay
         // applies the same migrations itself.
         *hub.trace.borrow_mut() = trace.map(BufWriter::new);
+        // The counters on, as production runs once its first recount is
+        // done. Over an empty catalogue the recount's end state is this
+        // statement (zero is the right count of nothing). It is the first
+        // call of the trace, so the replay switches them on too: without
+        // it every counter trigger matched no row in the replay and wrote
+        // nothing there, while the native run counted them.
+        bridge
+            .catalog
+            .sql
+            .exec(velmora_bridge::testkit::ARM_USAGE, &[])
+            .await
+            .expect("switch the usage counters on");
 
         // One disposable bucket and one read-write key, as the admin API
         // makes them.
@@ -1459,6 +1477,50 @@ fn sanity(b: &Bench) {
     // after it does not touch Usenet.
     assert!(counts["op:get_cold_big"].nntp_bodies > 0);
     assert_eq!(counts["op:get_cache_big"].nntp_bodies, 0);
+}
+
+/// The usage counters are on in the native run, and the call that
+/// switches them on is the first of the trace, so the replay runs with
+/// them on too (it starts from the migrations, which leave them off).
+#[tokio::test(flavor = "current_thread")]
+async fn bench_trace_switches_the_counters_on_first() {
+    // A directory of its own (create_dir refuses one that is already
+    // there), removed when the test ends, also on a failed assertion.
+    struct Gone(std::path::PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("velmora-bench-arm-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir).expect("temp dir");
+    let dir = Gone(dir);
+    let path = dir.0.join("d1-trace.jsonl");
+    let b = Bench::new(Some(File::create(&path).expect("trace file"))).await;
+    assert_eq!(
+        b.sql_count("SELECT all_x AND all_o AND all_g FROM usage_global WHERE id = 1"),
+        1,
+        "the native run counts with the usage counters on"
+    );
+    b.hub
+        .trace
+        .borrow_mut()
+        .as_mut()
+        .expect("trace")
+        .flush()
+        .expect("trace flush");
+    let text = std::fs::read_to_string(&path).expect("trace");
+    let first: serde_json::Value =
+        serde_json::from_str(text.lines().next().expect("a traced call")).expect("trace line");
+    assert_eq!(first["l"], "setup");
+    assert_eq!(first["k"], "e");
+    assert_eq!(first["ok"], true);
+    assert_eq!(first["s"][0]["q"], velmora_bridge::testkit::ARM_USAGE);
 }
 
 #[tokio::test(flavor = "current_thread")]
