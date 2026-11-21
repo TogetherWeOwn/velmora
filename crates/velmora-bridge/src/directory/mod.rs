@@ -14,7 +14,10 @@
 //!   rows copied from chain heads, unit rows, key routes, pending
 //!   operations and the gate;
 //! - [`gate`]: the directory gate and the rebuild of the tenant rows from
-//!   the chains, and the read-only comparison of the two.
+//!   the chains, and the read-only comparison of the two;
+//! - [`tenant_zero`]: whether tenant 0 may be served from the D1
+//!   catalogue, from its record and the database's own marker, and the
+//!   route of a request when the directory cannot be read.
 //!
 //! Nothing in the Worker calls this module yet. No request is routed by
 //! it and no record is written by it in production.
@@ -23,6 +26,7 @@ pub mod chain;
 pub mod gate;
 pub mod record;
 pub mod store;
+pub mod tenant_zero;
 pub mod transition;
 
 #[cfg(any(test, feature = "testkit"))]
