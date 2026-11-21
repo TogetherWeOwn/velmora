@@ -8,19 +8,20 @@
 
 -- One row per tenant: a copy of its chain head. `door_json` is the head's
 -- door part as written; the other columns are taken from it so that they
--- can be queried. `record_seq` only grows (an older head never replaces a
+-- can be queried. The code writes and checks their values; the table has
+-- no list of allowed values, so that a later value needs no new table. `record_seq` only grows (an older head never replaces a
 -- newer one). `keys_seq` is the head of the tenant's key chain, written by
 -- the key chain's own steps.
 CREATE TABLE tenants (
   id            TEXT PRIMARY KEY CHECK (id GLOB 't_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
   record_seq    INTEGER NOT NULL CHECK (record_seq > 0),
   keys_seq      INTEGER NOT NULL DEFAULT 0 CHECK (keys_seq >= 0),
-  state         TEXT NOT NULL CHECK (state IN ('provisioning', 'active', 'suspended', 'deleting', 'shredding', 'shredded')),
-  hold_mode     TEXT CHECK (hold_mode IN ('read_only', 'locked')),
+  state         TEXT NOT NULL,
+  hold_mode     TEXT,
   shred_due_at  INTEGER,
   tk_version    INTEGER NOT NULL CHECK (tk_version >= 0),
   rotating_to   INTEGER,
-  selector      TEXT CHECK (selector IN ('d1', 'moved')),
+  selector      TEXT,
   synthetic     INTEGER NOT NULL CHECK (synthetic IN (0, 1)),
   jurisdiction  TEXT NOT NULL,
   door_json     TEXT NOT NULL,
@@ -50,7 +51,7 @@ CREATE TABLE units (
 CREATE TABLE key_routes (
   akid        TEXT PRIMARY KEY,
   tenant      TEXT NOT NULL REFERENCES tenants (id),
-  kind        TEXT NOT NULL CHECK (kind IN ('s3', 'app_password', 'internal', 'principal')),
+  kind        TEXT NOT NULL,
   owner_ref   TEXT,
   created_at  INTEGER NOT NULL
 );
@@ -104,7 +105,10 @@ CREATE TABLE registry (
 
 -- The directory gate. While `closed` is 1 the management plane answers
 -- 503 but for the closing calls that need no directory row. The epoch
--- grows by one at every closing; the event feed starts a new one with it.
+-- grows at every closing; the event feed starts a new one with it. Each
+-- closing is anchored first by a put-once object `m/dg/<epoch>` in R2,
+-- and the gate is open only while this row says open at the newest
+-- anchored epoch, so a restore of this database cannot open it.
 -- No row = closed at epoch 0: a directory that no rebuild has filled
 -- serves nothing to the management plane.
 CREATE TABLE directory_gate (

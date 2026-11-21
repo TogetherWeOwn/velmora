@@ -93,6 +93,8 @@ pub enum RoutePut {
     /// A route to another tenant or of another kind was there. A route
     /// never changes: this is damage or a forged call, and it pages.
     Conflict,
+    /// The tenant has no row, or is shredded: no route was stored.
+    NoTenant,
 }
 
 /// Which chain a pending operation is on.
@@ -143,25 +145,30 @@ const UPSERT_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mo
      ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
      WHERE excluded.record_seq > tenants.record_seq";
 
-/// The gate's form: the row takes the head whatever it held, a higher
-/// seq included (a restored or damaged row is not trusted over R2).
+/// The gate's form: the row takes the head whatever seq it held, a higher
+/// one included (a restored or damaged row is not trusted over R2), but
+/// only if the row still holds the seq the gate saw (`?13`, NULL for no
+/// row): a head that a closing call applied in between is newer than the
+/// gate's and stays.
 const REPLACE_TENANT: &str = "INSERT INTO tenants (id, record_seq, state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction, door_json, updated_at) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-     ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at";
+     ON CONFLICT (id) DO UPDATE SET record_seq = excluded.record_seq, state = excluded.state, hold_mode = excluded.hold_mode, shred_due_at = excluded.shred_due_at, tk_version = excluded.tk_version, rotating_to = excluded.rotating_to, selector = excluded.selector, synthetic = excluded.synthetic, jurisdiction = excluded.jurisdiction, door_json = excluded.door_json, updated_at = excluded.updated_at \
+     WHERE tenants.record_seq IS ?13";
 
 // The unit statements run only when the tenant row holds exactly this
-// head after the upsert, so an older head changes no unit row.
+// head after the upsert (its seq and its door), so an older head, or
+// another door at the same seq, changes no unit row.
 const DROP_UNLISTED_UNITS: &str = "DELETE FROM units WHERE tenant = ?1 \
-     AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2 \
+     AND (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4 \
      AND unit NOT IN (SELECT value FROM json_each(?3))";
 
 const ADD_LISTED_UNITS: &str = "INSERT INTO units (tenant, unit) \
-     SELECT ?1, value FROM json_each(?3) WHERE (SELECT record_seq FROM tenants WHERE id = ?1) = ?2 \
+     SELECT ?1, value FROM json_each(?3) WHERE (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4 \
      ON CONFLICT (tenant, unit) DO NOTHING";
 
 const SET_RESTORING: &str = "UPDATE units SET restoring_since = \
      (SELECT json_extract(r.value, '$.since_seq') FROM json_each(?3) r WHERE json_extract(r.value, '$.unit') = units.unit) \
-     WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2";
+     WHERE tenant = ?1 AND (SELECT door_json FROM tenants WHERE id = ?1 AND record_seq = ?2) = ?4";
 
 // A shredded tenant keeps its row and loses every route and label.
 const DROP_SHREDDED_ROUTES: &str = "DELETE FROM key_routes WHERE tenant = ?1 \
@@ -172,77 +179,139 @@ const DROP_SHREDDED_LABELS: &str = "DELETE FROM bucket_index WHERE tenant = ?1 \
 
 const TENANT_COLUMNS: &str = "id, record_seq, keys_seq, door_json, updated_at";
 
+/// The columns that are taken from the door, in the order of
+/// [`tenant_params`] from its third value on.
+const DERIVED_COLUMNS: &str =
+    "state, hold_mode, shred_due_at, tk_version, rotating_to, selector, synthetic, jurisdiction";
+
+/// A tenant row as the gate reads it: its seq, and its door only if the
+/// row is whole (the door parses, names the row's id and seq, and every
+/// column taken from it says what the door says).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawTenant {
+    pub record_seq: u64,
+    pub door: Option<TenantDoor>,
+}
+
+/// The values of a tenant row for `door`, in the order of the columns of
+/// the upsert statements.
+fn tenant_params(door: &TenantDoor, now: UnixMs) -> Result<Vec<SqlValue>> {
+    let hold_mode = door.holds.mode().map(|m| match m {
+        super::record::HoldMode::ReadOnly => "read_only",
+        super::record::HoldMode::Locked => "locked",
+    });
+    let selector = door.tenant_zero.as_ref().map(|z| match z.selector {
+        Selector::D1 => "d1",
+        Selector::Moved { .. } => "moved",
+    });
+    Ok(vec![
+        SqlValue::Text(door.tenant.as_str().to_string()),
+        int(door.seq)?,
+        SqlValue::Text(door.state().name().to_string()),
+        opt_text(hold_mode),
+        door.deletion
+            .as_ref()
+            .map_or(SqlValue::Null, |d| SqlValue::Int(d.shred_due_at.0)),
+        SqlValue::Int(i64::from(door.tk_version)),
+        door.rotating_to
+            .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
+        opt_text(selector),
+        SqlValue::Int(i64::from(door.synthetic)),
+        SqlValue::Text(door.jurisdiction.clone()),
+        SqlValue::Text(serde_json::to_string(door).map_err(|_| ERR_ROW)?),
+        SqlValue::Int(now.0),
+    ])
+}
+
 impl<S: Sql> SqlDirectory<'_, S> {
     /// Copies a chain head into the tenant's row and unit rows, if it is
     /// newer than what the row holds. One atomic batch.
     pub async fn apply_tenant(&self, door: &TenantDoor, now: UnixMs) -> Result<Applied> {
-        let changed = self.write_tenant(UPSERT_TENANT, door, now).await?;
+        let changed = self.write_tenant(UPSERT_TENANT, None, door, now).await?;
         Ok(match changed {
             0 => Applied::NotNewer,
             _ => Applied::Applied,
         })
     }
 
-    /// The gate's copy of a head: the row takes it whatever it held.
-    pub async fn replace_tenant(&self, door: &TenantDoor, now: UnixMs) -> Result<()> {
-        self.write_tenant(REPLACE_TENANT, door, now)
-            .await
-            .map(|_| ())
+    /// The gate's copy of a head: the row takes it whatever seq it held,
+    /// if it still holds `observed` (`None` = there was no row). `false` =
+    /// the row changed since the gate read it, and nothing was written.
+    pub async fn replace_tenant(
+        &self,
+        door: &TenantDoor,
+        observed: Option<u64>,
+        now: UnixMs,
+    ) -> Result<bool> {
+        let observed = match observed {
+            None => SqlValue::Null,
+            Some(seq) => int(seq)?,
+        };
+        let changed = self
+            .write_tenant(REPLACE_TENANT, Some(observed), door, now)
+            .await?;
+        Ok(changed > 0)
     }
 
     async fn write_tenant(
         &self,
         upsert: &'static str,
+        observed: Option<SqlValue>,
         door: &TenantDoor,
         now: UnixMs,
     ) -> Result<u64> {
-        let id = SqlValue::Text(door.tenant.as_str().to_string());
-        let seq = int(door.seq)?;
+        let mut params = tenant_params(door, now)?;
+        let id = params[0].clone();
+        let seq = params[1].clone();
+        let door_json = params[10].clone();
+        if let Some(observed) = observed {
+            params.push(observed);
+        }
         let units = SqlValue::Text(serde_json::to_string(&door.units).map_err(|_| ERR_ROW)?);
         let restoring =
             SqlValue::Text(serde_json::to_string(&door.restoring).map_err(|_| ERR_ROW)?);
-        let state = door.state();
-        let hold_mode = door.holds.mode().map(|m| match m {
-            super::record::HoldMode::ReadOnly => "read_only",
-            super::record::HoldMode::Locked => "locked",
-        });
-        let selector = door.tenant_zero.as_ref().map(|z| match z.selector {
-            Selector::D1 => "d1",
-            Selector::Moved { .. } => "moved",
-        });
-        let door_json = serde_json::to_string(door).map_err(|_| ERR_ROW)?;
-        let params = vec![
-            id.clone(),
-            seq.clone(),
-            SqlValue::Text(state.name().to_string()),
-            opt_text(hold_mode),
-            door.deletion
-                .as_ref()
-                .map_or(SqlValue::Null, |d| SqlValue::Int(d.shred_due_at.0)),
-            SqlValue::Int(i64::from(door.tk_version)),
-            door.rotating_to
-                .map_or(SqlValue::Null, |v| SqlValue::Int(i64::from(v))),
-            opt_text(selector),
-            SqlValue::Int(i64::from(door.synthetic)),
-            SqlValue::Text(door.jurisdiction.clone()),
-            SqlValue::Text(door_json),
-            SqlValue::Int(now.0),
-        ];
+        let unit_params = |list: SqlValue| vec![id.clone(), seq.clone(), list, door_json.clone()];
         let changed = self
             .sql
             .batch(vec![
                 (upsert, params),
-                (
-                    DROP_UNLISTED_UNITS,
-                    vec![id.clone(), seq.clone(), units.clone()],
-                ),
-                (ADD_LISTED_UNITS, vec![id.clone(), seq.clone(), units]),
-                (SET_RESTORING, vec![id.clone(), seq.clone(), restoring]),
+                (DROP_UNLISTED_UNITS, unit_params(units.clone())),
+                (ADD_LISTED_UNITS, unit_params(units)),
+                (SET_RESTORING, unit_params(restoring)),
                 (DROP_SHREDDED_ROUTES, vec![id.clone(), seq.clone()]),
                 (DROP_SHREDDED_LABELS, vec![id, seq]),
             ])
             .await?;
         Ok(changed.first().copied().unwrap_or(0))
+    }
+
+    /// The row of `tenant` as the gate reads it: a row that does not parse
+    /// or whose columns disagree with its door is a row without a door,
+    /// never an error, so that the gate can write it again.
+    pub async fn raw_tenant(&self, tenant: &TenantId) -> Result<Option<RawTenant>> {
+        let rows = self
+            .sql
+            .query(
+                &format!(
+                    "SELECT record_seq, door_json, {DERIVED_COLUMNS} FROM tenants WHERE id = ?1"
+                ),
+                &[SqlValue::Text(tenant.as_str().to_string())],
+            )
+            .await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let record_seq = u64::try_from(int_at(&row, 0)?).map_err(|_| ERR_ROW)?;
+        let door = text(&row, 1)
+            .ok()
+            .and_then(|json| serde_json::from_str::<TenantDoor>(&json).ok())
+            .filter(|door| &door.tenant == tenant && door.seq == record_seq)
+            .filter(|door| {
+                tenant_params(door, UnixMs(0))
+                    .map(|expected| expected[2..10] == row[2..10])
+                    .unwrap_or(false)
+            });
+        Ok(Some(RawTenant { record_seq, door }))
     }
 
     /// The row of `tenant`, `None` = no row.
@@ -275,18 +344,34 @@ impl<S: Sql> SqlDirectory<'_, S> {
     }
 
     /// Removes a tenant row that no chain backs, with its units, routes
-    /// and labels. Only the gate calls this.
-    pub async fn remove_tenant(&self, tenant: &TenantId) -> Result<()> {
-        let id = || vec![SqlValue::Text(tenant.as_str().to_string())];
-        self.sql
-            .batch(vec![
-                ("DELETE FROM units WHERE tenant = ?1", id()),
-                ("DELETE FROM key_routes WHERE tenant = ?1", id()),
-                ("DELETE FROM bucket_index WHERE tenant = ?1", id()),
-                ("DELETE FROM tenants WHERE id = ?1", id()),
+    /// and labels, if the row still holds the seq the gate saw. Only the
+    /// gate calls this. `false` = the row changed, nothing was removed.
+    pub async fn remove_tenant(&self, tenant: &TenantId, observed: u64) -> Result<bool> {
+        let p = || {
+            Ok::<_, BridgeError>(vec![
+                SqlValue::Text(tenant.as_str().to_string()),
+                int(observed)?,
             ])
-            .await
-            .map(|_| ())
+        };
+        let changed = self
+            .sql
+            .batch(vec![
+                (
+                    "DELETE FROM units WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2",
+                    p()?,
+                ),
+                (
+                    "DELETE FROM key_routes WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2",
+                    p()?,
+                ),
+                (
+                    "DELETE FROM bucket_index WHERE tenant = ?1 AND (SELECT record_seq FROM tenants WHERE id = ?1) = ?2",
+                    p()?,
+                ),
+                ("DELETE FROM tenants WHERE id = ?1 AND record_seq = ?2", p()?),
+            ])
+            .await?;
+        Ok(changed.last().copied().unwrap_or(0) > 0)
     }
 
     /// The unit rows of `tenant`, by unit number.
@@ -323,13 +408,28 @@ impl<S: Sql> SqlDirectory<'_, S> {
         Ok(changed > 0)
     }
 
+    /// Sets the tenant's key chain head as the gate rebuilt it, lower
+    /// included: a floor that is too high is not harmless.
+    pub async fn set_keys_seq(&self, tenant: &TenantId, keys_seq: u64) -> Result<bool> {
+        let changed = self
+            .sql
+            .exec(
+                "UPDATE tenants SET keys_seq = ?2 WHERE id = ?1",
+                &[SqlValue::Text(tenant.as_str().to_string()), int(keys_seq)?],
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
     /// Stores a route. A route never changes: an existing one to another
-    /// tenant or of another kind is [`RoutePut::Conflict`], and stays.
+    /// tenant or of another kind is [`RoutePut::Conflict`], and stays. A
+    /// tenant with no row, or a shredded one, gets no route.
     pub async fn put_route(&self, route: &KeyRoute) -> Result<RoutePut> {
         let changed = self
             .sql
             .exec(
-                "INSERT INTO key_routes (akid, tenant, kind, owner_ref, created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                "INSERT INTO key_routes (akid, tenant, kind, owner_ref, created_at) \
+                 SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM tenants WHERE id = ?2 AND state <> 'shredded') \
                  ON CONFLICT (akid) DO NOTHING",
                 &[
                     SqlValue::Text(route.akid.clone()),
@@ -345,7 +445,8 @@ impl<S: Sql> SqlDirectory<'_, S> {
         }
         match self.route(&route.akid).await? {
             Some(old) if old.tenant == route.tenant && old.kind == route.kind => Ok(RoutePut::Same),
-            _ => Ok(RoutePut::Conflict),
+            Some(_) => Ok(RoutePut::Conflict),
+            None => Ok(RoutePut::NoTenant),
         }
     }
 
@@ -455,7 +556,9 @@ impl<S: Sql> SqlDirectory<'_, S> {
         self.sql.exec("DELETE FROM pending_ops", &[]).await
     }
 
-    /// The gate as stored. No row = closed at epoch 0.
+    /// The gate row as stored. No row = closed at epoch 0. Whether the
+    /// gate is open also depends on its anchor in R2
+    /// ([`super::gate::is_open`]).
     pub async fn gate(&self) -> Result<GateState> {
         let rows = self
             .sql
@@ -473,16 +576,18 @@ impl<S: Sql> SqlDirectory<'_, S> {
         }
     }
 
-    /// Closes the gate in a new epoch and answers it.
-    pub async fn close_gate(&self, reason: &str, now: UnixMs) -> Result<u64> {
+    /// Marks the gate closed at `epoch`, which the caller has anchored in
+    /// R2. An older epoch changes nothing.
+    pub async fn mark_closed(&self, epoch: u64, reason: &str, now: UnixMs) -> Result<()> {
         self.sql
             .exec(
-                "INSERT INTO directory_gate (id, closed, epoch, reason, closed_at) VALUES (1, 1, 1, ?1, ?2) \
-                 ON CONFLICT (id) DO UPDATE SET closed = 1, epoch = directory_gate.epoch + 1, reason = excluded.reason, closed_at = excluded.closed_at",
-                &[SqlValue::Text(reason.to_string()), SqlValue::Int(now.0)],
+                "INSERT INTO directory_gate (id, closed, epoch, reason, closed_at) VALUES (1, 1, ?1, ?2, ?3) \
+                 ON CONFLICT (id) DO UPDATE SET closed = 1, epoch = excluded.epoch, reason = excluded.reason, closed_at = excluded.closed_at \
+                 WHERE excluded.epoch >= directory_gate.epoch",
+                &[int(epoch)?, SqlValue::Text(reason.to_string()), SqlValue::Int(now.0)],
             )
-            .await?;
-        Ok(self.gate().await?.epoch)
+            .await
+            .map(|_| ())
     }
 
     /// Opens the gate closed at `epoch`. A gate closed again since (a

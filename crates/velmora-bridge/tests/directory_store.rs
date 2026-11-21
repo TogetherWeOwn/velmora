@@ -1,16 +1,18 @@
 use velmora_bridge::directory::chain::{record_key, TenantChain, Written};
 use velmora_bridge::directory::gate::{
-    admitted, chain_tenants, compare_tenants, rebuild_tenants, run_gate, ClosingCall, Difference,
-    GateSteps, ManagementCall, NotBuilt, StepReport,
+    admitted, chain_tenants, close, compare_tenants, is_open, pending_level, rebuild_tenants,
+    run_gate, ClosingCall, Difference, GateSteps, ManagementCall, NotBuilt, PendingLevel,
+    StepReport, PENDING_ALARM_MS, PENDING_PAGE_MS,
 };
 use velmora_bridge::directory::record::{
-    DeletionReason, HoldMode, Placement, TenantDoor, TenantId, TenantState,
+    DeletionReason, HoldMode, Lifecycle, OperatorReason, Placement, Restoring, TenantDoor,
+    TenantId, TenantState,
 };
 use velmora_bridge::directory::store::{
     Applied, ChainKind, GateState, KeyRoute, PendingOp, RouteKind, RoutePut, SqlDirectory, UnitRow,
 };
 use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
-use velmora_bridge::directory::transition::{Actor, Change};
+use velmora_bridge::directory::transition::{Actor, Change, OperatorHoldRequest};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::{Result, UnixMs};
 
@@ -469,6 +471,7 @@ fn the_gate_checks_epochs_and_admits_closing_calls() {
     block_on(async {
         let db = database();
         let dir = SqlDirectory { sql: &db };
+        let store = MemRecords::new();
         assert_eq!(
             dir.gate().await.unwrap(),
             GateState {
@@ -476,7 +479,9 @@ fn the_gate_checks_epochs_and_admits_closing_calls() {
                 epoch: 0
             }
         );
-        assert_eq!(dir.close_gate("first rebuild", NOW).await.unwrap(), 1);
+        assert!(!is_open(&store, &dir).await.unwrap());
+        assert_eq!(close(&store, &dir, "first_rebuild", NOW).await.unwrap(), 1);
+        assert!(store.raw("m/dg/00000000000000000001").is_some());
         assert_eq!(
             dir.gate().await.unwrap(),
             GateState {
@@ -485,9 +490,10 @@ fn the_gate_checks_epochs_and_admits_closing_calls() {
             }
         );
         assert!(dir.open_gate(1, NOW).await.unwrap());
-        assert!(!dir.gate().await.unwrap().closed);
-        assert_eq!(dir.close_gate("second rebuild", NOW).await.unwrap(), 2);
+        assert!(is_open(&store, &dir).await.unwrap());
+        assert_eq!(close(&store, &dir, "second_rebuild", NOW).await.unwrap(), 2);
         assert!(!dir.open_gate(1, NOW).await.unwrap());
+        assert!(!is_open(&store, &dir).await.unwrap());
         assert_eq!(
             dir.gate().await.unwrap(),
             GateState {
@@ -508,6 +514,41 @@ fn the_gate_checks_epochs_and_admits_closing_calls() {
     }
     assert!(!admitted(true, ManagementCall::Other));
     assert!(admitted(false, ManagementCall::Other));
+}
+
+/// A restore of the directory database to a moment when the gate was open
+/// does not open it: the anchor of the closing before the restore is in R2.
+#[test]
+fn a_restored_gate_row_does_not_open_the_gate() {
+    block_on(async {
+        let store = MemRecords::new();
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let epoch = close(&store, &dir, "rebuild", NOW).await.unwrap();
+        assert!(dir.open_gate(epoch, NOW).await.unwrap());
+        assert!(is_open(&store, &dir).await.unwrap());
+        // The runbook closes the gate, then the database is restored to
+        // the moment before (the row says open at the old epoch).
+        let closed = close(&store, &dir, "before_restore", NOW).await.unwrap();
+        assert_eq!(closed, epoch + 1);
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE directory_gate SET closed = 0, epoch = ?1",
+                [epoch as i64],
+            )
+        })
+        .unwrap();
+        assert!(!is_open(&store, &dir).await.unwrap());
+        // The next closing takes an epoch above every anchor, not the
+        // restored row's next.
+        assert_eq!(close(&store, &dir, "gate", NOW).await.unwrap(), epoch + 2);
+        // An anchor can only close: one put by hand at a higher epoch
+        // closes an open gate.
+        assert!(dir.open_gate(epoch + 2, NOW).await.unwrap());
+        assert!(is_open(&store, &dir).await.unwrap());
+        store.plant("m/dg/00000000000000000099", b"{}".to_vec());
+        assert!(!is_open(&store, &dir).await.unwrap());
+    });
 }
 
 #[test]
@@ -714,5 +755,304 @@ fn chain_tenants_lists_each_tenant_once_in_id_order() {
         let tenants = chain_tenants(&store).await.unwrap();
         assert_eq!(store.lists() - before, tenants.len() as u64 + 1);
         assert_eq!(tenants, [zero, a, b]);
+    });
+}
+
+#[test]
+fn the_pending_age_alarm() {
+    assert_eq!(pending_level(None, NOW), PendingLevel::Ok);
+    let at = |ago: i64| Some(UnixMs(NOW.0 - ago));
+    assert_eq!(
+        pending_level(at(PENDING_ALARM_MS - 1), NOW),
+        PendingLevel::Ok
+    );
+    assert_eq!(
+        pending_level(at(PENDING_ALARM_MS), NOW),
+        PendingLevel::Alarm
+    );
+    assert_eq!(
+        pending_level(at(PENDING_PAGE_MS - 1), NOW),
+        PendingLevel::Alarm
+    );
+    assert_eq!(pending_level(at(PENDING_PAGE_MS), NOW), PendingLevel::Page);
+}
+
+/// The gate's write takes the head only over the row it saw: a newer head
+/// applied meanwhile stays, and a row that changed is not removed.
+#[test]
+fn the_gate_does_not_overwrite_a_row_that_moved_on() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let t = TenantId::parse(A1).unwrap();
+        active(&chain, &t).await;
+        let old = head(&chain, &t).await;
+        let new = billing_hold(&chain, &t, Some(HoldMode::Locked), old.seq).await;
+        dir.apply_tenant(&new, NOW).await.unwrap();
+        // The gate saw no row, or the old seq: either way the newer row stays.
+        assert!(!dir.replace_tenant(&old, None, NOW).await.unwrap());
+        assert!(!dir.replace_tenant(&old, Some(old.seq), NOW).await.unwrap());
+        assert_eq!(dir.tenant(&t).await.unwrap().unwrap().record_seq, new.seq);
+        // Over the row it saw, the gate's head is written, a lower seq too.
+        assert!(dir.replace_tenant(&old, Some(new.seq), NOW).await.unwrap());
+        assert_eq!(dir.tenant(&t).await.unwrap().unwrap().record_seq, old.seq);
+        // A removal of a row that changed since it was seen removes nothing.
+        assert!(!dir.remove_tenant(&t, new.seq).await.unwrap());
+        assert!(dir.tenant(&t).await.unwrap().is_some());
+        assert!(dir.remove_tenant(&t, old.seq).await.unwrap());
+        assert!(dir.tenant(&t).await.unwrap().is_none());
+    });
+}
+
+/// Gate steps that write a tenant record while the gate runs, as an
+/// admitted closing call would.
+struct WritesDuringTheGate<'a> {
+    chain: &'a Chain<'a>,
+    dir: &'a Directory<'a>,
+    tenant: TenantId,
+    apply: bool,
+}
+
+impl GateSteps for WritesDuringTheGate<'_> {
+    async fn revocations(&self) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+
+    async fn key_locations_and_registry(&self) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+
+    async fn key_versions(&self) -> Result<StepReport> {
+        // An operator hold, written after the tenant step.
+        let head = head(self.chain, &self.tenant).await;
+        let w = write(
+            self.chain,
+            &self.tenant,
+            Change::SetOperatorHold {
+                hold: Some(OperatorHoldRequest {
+                    mode: HoldMode::Locked,
+                    reason: OperatorReason::Security,
+                    preserve: None,
+                }),
+            },
+            Actor::Operator,
+            NOW,
+            head.seq,
+        )
+        .await;
+        if self.apply {
+            self.dir.apply_tenant(&w, NOW).await?;
+        }
+        Ok(StepReport::done())
+    }
+
+    async fn key_routes_and_labels(&self) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+
+    async fn root_units(&self) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+
+    async fn finisher(&self) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+
+    async fn counters(&self, _epoch: u64) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+
+    async fn sealed_days(&self) -> Result<StepReport> {
+        Ok(StepReport::done())
+    }
+}
+
+#[test]
+fn a_record_written_while_the_gate_runs_is_in_the_rows_when_it_opens() {
+    for apply in [true, false] {
+        block_on(async {
+            let db = database();
+            let dir = SqlDirectory { sql: &db };
+            let store = MemRecords::new();
+            let seal = PlainSeal::new();
+            let chain = TenantChain {
+                store: &store,
+                seal: &seal,
+            };
+            let t = TenantId::parse(A1).unwrap();
+            active(&chain, &t).await;
+            let steps = WritesDuringTheGate {
+                chain: &chain,
+                dir: &dir,
+                tenant: t.clone(),
+                apply,
+            };
+            let run = run_gate(&chain, &dir, &steps, "rebuild", NOW)
+                .await
+                .unwrap();
+            assert!(run.opened, "apply {apply}: {run:?}");
+            let row = dir.tenant(&t).await.unwrap().unwrap();
+            assert_eq!(row.door, head(&chain, &t).await, "apply {apply}");
+            assert!(row.door.holds.operator.is_some());
+            assert!(compare_tenants(&chain, &dir).await.unwrap().is_empty());
+        });
+    }
+}
+
+/// A row that does not parse, or whose columns disagree with its door, is
+/// reported and written again; it does not stop the gate.
+#[test]
+fn a_damaged_row_is_rewritten_by_the_gate() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let a = TenantId::parse(A1).unwrap();
+        let b = TenantId::parse(B2).unwrap();
+        for t in [&a, &b] {
+            active(&chain, t).await;
+            dir.apply_tenant(&head(&chain, t).await, NOW).await.unwrap();
+        }
+        db.with_conn(|c| c.execute("UPDATE tenants SET door_json = '{' WHERE id = ?1", [A1]))
+            .unwrap();
+        db.with_conn(|c| c.execute("UPDATE tenants SET state = 'deleting' WHERE id = ?1", [B2]))
+            .unwrap();
+        // `tenant()` refuses a damaged row; the gate's read does not.
+        assert!(dir.tenant(&a).await.is_err());
+        let found = compare_tenants(&chain, &dir).await.unwrap();
+        assert!(
+            found.contains(&Difference::Unreadable(a.clone())),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&Difference::Unreadable(b.clone())),
+            "{found:?}"
+        );
+        let step = rebuild_tenants(&chain, &dir, NOW).await.unwrap();
+        assert_eq!(step.written, 2);
+        assert!(compare_tenants(&chain, &dir).await.unwrap().is_empty());
+        assert_eq!(
+            dir.tenant(&b).await.unwrap().unwrap().door.state(),
+            TenantState::Active
+        );
+    });
+}
+
+/// A stray name inside one tenant's chain is that tenant's damage; the
+/// listing of tenants does not stall on it.
+#[test]
+fn a_stray_name_inside_a_chain_does_not_stall_the_listing() {
+    block_on(async {
+        let store = MemRecords::new();
+        let chain = TenantChain {
+            store: &store,
+            seal: &PlainSeal::new(),
+        };
+        let a = TenantId::parse(A1).unwrap();
+        let b = TenantId::parse(B2).unwrap();
+        active(&chain, &a).await;
+        active(&chain, &b).await;
+        for stray in ["~x", "\u{7f}", "\u{e9}"] {
+            store.plant(&format!("m/t/{A1}/{stray}"), vec![1]);
+        }
+        assert_eq!(chain_tenants(&store).await.unwrap(), [a.clone(), b.clone()]);
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let found = compare_tenants(&chain, &dir).await.unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|d| matches!(d, Difference::Damaged { tenant, .. } if *tenant == a)),
+            "{found:?}"
+        );
+        assert!(found.contains(&Difference::Missing(b)), "{found:?}");
+    });
+}
+
+#[test]
+fn a_route_needs_a_tenant_that_is_not_shredded() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let route = KeyRoute {
+            akid: "AKIA2".into(),
+            tenant: TenantId::parse(A1).unwrap(),
+            kind: RouteKind::AppPassword,
+            owner_ref: None,
+            created_at: NOW,
+        };
+        assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::NoTenant);
+        assert_eq!(dir.route("AKIA2").await.unwrap(), None);
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        active(&chain, &route.tenant).await;
+        let mut door = head(&chain, &route.tenant).await;
+        dir.apply_tenant(&door, NOW).await.unwrap();
+        assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::Inserted);
+        // A late route after the shred stays out.
+        door.seq += 1;
+        door.lifecycle = Lifecycle::Shredded;
+        dir.apply_tenant(&door, NOW).await.unwrap();
+        assert_eq!(dir.route("AKIA2").await.unwrap(), None);
+        assert_eq!(dir.put_route(&route).await.unwrap(), RoutePut::NoTenant);
+    });
+}
+
+#[test]
+fn the_gate_sets_the_key_seq_lower_too() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let t = TenantId::parse(A1).unwrap();
+        active(&chain, &t).await;
+        dir.apply_tenant(&head(&chain, &t).await, NOW)
+            .await
+            .unwrap();
+        assert!(dir.raise_keys_seq(&t, 9).await.unwrap());
+        assert!(dir.set_keys_seq(&t, 4).await.unwrap());
+        assert_eq!(dir.tenant(&t).await.unwrap().unwrap().keys_seq, 4);
+    });
+}
+
+/// Another door at the seq a row already holds changes neither the row
+/// nor its unit rows.
+#[test]
+fn another_door_at_the_same_seq_changes_no_unit_row() {
+    block_on(async {
+        let db = database();
+        let dir = SqlDirectory { sql: &db };
+        let chain = TenantChain {
+            store: &MemRecords::new(),
+            seal: &PlainSeal::new(),
+        };
+        let t = TenantId::parse(A1).unwrap();
+        active(&chain, &t).await;
+        let door = head(&chain, &t).await;
+        dir.apply_tenant(&door, NOW).await.unwrap();
+        let mut forged = door.clone();
+        forged.units = vec![0, 1, 2];
+        forged.restoring = vec![Restoring {
+            unit: 0,
+            since_seq: 1,
+        }];
+        assert_eq!(
+            dir.apply_tenant(&forged, NOW).await.unwrap(),
+            Applied::NotNewer
+        );
+        assert_eq!(dir.units(&t).await.unwrap(), [ROOT_UNIT]);
+        assert_eq!(dir.tenant(&t).await.unwrap().unwrap().door, door);
     });
 }
