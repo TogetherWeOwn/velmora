@@ -102,9 +102,13 @@ record.
 
 **The stored plan of an extent never changes.** `plan_rev` is 0 or 1;
 `tests/plan_rev_contract.rs` holds the list of every statement that writes
-it, and `plan_rev::bound` refuses a bound value above 1. A change that would
-write a higher revision needs its own design first and lifts that test on
-purpose.
+it, word for word. `plan_rev::bound` is the one function that turns a
+`plan_rev` into a bound value and refuses one above 1, and
+`plan_rev::readable` tells a record this code may write from; binding the
+catalogue's statements through them, and reporting a record above 1 as
+unreadable in the replay, is a separate change to the catalogue's SQL. A
+change that would write a higher revision needs its own design first and
+lifts that test on purpose.
 
 ## The database of a unit
 

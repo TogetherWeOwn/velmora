@@ -168,14 +168,21 @@ fn rust_pieces(src: &str) -> Vec<String> {
             i = next;
             continue;
         }
-        if src[i..].starts_with("concat!(") && !prev_ident(b, i) {
-            if concat.is_none() {
-                concat = Some((1, Vec::new()));
-            } else if let Some((depth, _)) = concat.as_mut() {
-                *depth += 1;
+        if b[i..].starts_with(b"concat!") && !prev_ident(b, i) {
+            // `concat!(…)`, `concat![…]` or `concat! {…}`.
+            let mut j = i + "concat!".len();
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
             }
-            i += "concat!(".len();
-            continue;
+            if matches!(b.get(j), Some(b'(' | b'[' | b'{')) {
+                if concat.is_none() {
+                    concat = Some((1, Vec::new()));
+                } else if let Some((depth, _)) = concat.as_mut() {
+                    *depth += 1;
+                }
+                i = j + 1;
+                continue;
+            }
         }
         if let Some((depth, parts)) = concat.as_mut() {
             match b[i] {
@@ -183,7 +190,8 @@ fn rust_pieces(src: &str) -> Vec<String> {
                 b')' | b']' | b'}' => {
                     *depth -= 1;
                     if *depth == 0 {
-                        out.push(normalise(&parts.join(" ")));
+                        // Rust joins the pieces of a `concat!` with nothing.
+                        out.push(parts.concat());
                         concat = None;
                     }
                 }
@@ -202,13 +210,14 @@ fn prev_ident(b: &[u8], i: usize) -> bool {
 fn push(out: &mut Vec<String>, concat: &mut Option<(usize, Vec<String>)>, text: String) {
     match concat {
         Some((_, parts)) => parts.push(text),
-        None => out.push(normalise(&text)),
+        None => out.push(text),
     }
 }
 
 /// A `"…"` literal from `start` (after the quote): its text with escapes
-/// read (`\n`, `\t`, `\r` as white space; a line continuation as
-/// nothing), and the index after the closing quote.
+/// read (`\n` as a new line, which ends an SQL line comment; `\t`, `\r`
+/// as white space; `\x..` and `\u{..}` as their characters; a line
+/// continuation as nothing), and the index after the closing quote.
 fn cooked(b: &[u8], start: usize) -> (String, usize) {
     let mut s = String::new();
     let mut i = start;
@@ -221,9 +230,31 @@ fn cooked(b: &[u8], start: usize) -> (String, usize) {
                         i += 1;
                     }
                 }
-                Some(b'n') | Some(b't') | Some(b'r') => {
+                Some(b'n') => {
+                    s.push('\n');
+                    i += 2;
+                }
+                Some(b't') | Some(b'r') => {
                     s.push(' ');
                     i += 2;
+                }
+                Some(b'x') => {
+                    let hex = std::str::from_utf8(&b[i + 2..(i + 4).min(b.len())]).unwrap_or("");
+                    if let Ok(n) = u8::from_str_radix(hex, 16) {
+                        s.push(n as char);
+                    }
+                    i += 4;
+                }
+                Some(b'u') if b.get(i + 2) == Some(&b'{') => {
+                    let close = b[i..]
+                        .iter()
+                        .position(|c| *c == b'}')
+                        .map_or(b.len(), |k| i + k);
+                    let hex = std::str::from_utf8(&b[i + 3..close]).unwrap_or("");
+                    if let Some(c) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
+                        s.push(c);
+                    }
+                    i = close + 1;
                 }
                 Some(&c) => {
                     s.push(c as char);
@@ -243,13 +274,9 @@ fn normalise(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A `.sql` file as pieces: the whole file, comments removed.
+/// A `.sql` file as one piece; its comments are dropped by [`words`].
 fn sql_pieces(src: &str) -> Vec<String> {
-    let text: Vec<&str> = src
-        .lines()
-        .map(|l| l.split("--").next().unwrap_or(""))
-        .collect();
-    vec![normalise(&text.join(" "))]
+    vec![src.to_string()]
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +291,17 @@ fn words(sql: &str) -> Vec<String> {
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
-        if c.is_ascii_whitespace() {
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if c.is_ascii_whitespace() {
             i += 1;
         } else if c == b'\'' {
             i += 1;
@@ -304,11 +341,24 @@ fn target(w: &[String], mut j: usize, after_update: bool) -> Option<(String, usi
     if after_update && w.get(j).map(String::as_str) == Some("or") {
         j += 2;
     }
-    let first = w.get(j)?.clone();
-    if w.get(j + 1).map(String::as_str) == Some(".") {
-        return Some((w.get(j + 2)?.clone(), j + 3));
+    let (table, mut next) = if w.get(j + 1).map(String::as_str) == Some(".") {
+        (w.get(j + 2)?.clone(), j + 3)
+    } else {
+        (w.get(j)?.clone(), j + 1)
+    };
+    // `AS alias`, `INDEXED BY index`, `NOT INDEXED`.
+    loop {
+        match (
+            w.get(next).map(String::as_str),
+            w.get(next + 1).map(String::as_str),
+        ) {
+            (Some("as"), Some(_)) => next += 2,
+            (Some("indexed"), Some("by")) => next += 3,
+            (Some("not"), Some("indexed")) => next += 2,
+            _ => break,
+        }
     }
-    Some((first, j + 1))
+    Some((table, next))
 }
 
 /// The words of a `SET` list that starts at `j` (after `SET`): every
@@ -356,12 +406,18 @@ fn bracketed(w: &[String], j: usize) -> &[String] {
 
 /// Whether a piece of SQL writes `plan_rev` on an extent row, or may: in
 /// the `SET` list of an `UPDATE` of `extents`; in the column list of an
-/// insert into `extents`, or in its `ON CONFLICT … DO UPDATE SET`; or
-/// by an insert into `extents` without a column list, which writes every
-/// column.
+/// insert into `extents`, or in its `ON CONFLICT … DO UPDATE SET`; by an
+/// insert into `extents` without a column list, which writes every
+/// column; or by a table renamed to `extents` (a rebuild).
 fn writes_plan_rev(sql: &str) -> bool {
     let w = words(sql);
     let has = |list: &[String]| list.iter().any(|t| t == "plan_rev");
+    // A table rebuilt and renamed to `extents` writes every row of it.
+    if w.windows(3)
+        .any(|x| x[0] == "rename" && x[1] == "to" && x[2] == "extents")
+    {
+        return true;
+    }
     for (i, t) in w.iter().enumerate() {
         match t.as_str() {
             "update" => {
@@ -444,7 +500,7 @@ fn found() -> Vec<(String, String)> {
         }
         for piece in rust_pieces(&std::fs::read_to_string(&path).unwrap()) {
             if writes_plan_rev(&piece) {
-                out.push((file.clone(), piece));
+                out.push((file.clone(), normalise(&piece)));
             }
         }
     }
@@ -452,7 +508,7 @@ fn found() -> Vec<(String, String)> {
         let file = rel(&path);
         for piece in sql_pieces(&std::fs::read_to_string(&path).unwrap()) {
             if writes_plan_rev(&piece) {
-                out.push((file.clone(), piece));
+                out.push((file.clone(), normalise(&piece)));
             }
         }
     }
@@ -508,6 +564,19 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         "const X: &str = \"INSERT INTO extents VALUES (?1, ?2)\";",
         // An upsert.
         "const X: &str = \"INSERT INTO extents(id) VALUES (?1) ON CONFLICT(id) DO UPDATE SET plan_rev = plan_rev + 1\";",
+        // An alias and the index hints.
+        "const X: &str = \"UPDATE extents AS e SET plan_rev = 2\";",
+        "const X: &str = \"UPDATE extents INDEXED BY ix SET plan_rev = 2\";",
+        "const X: &str = \"UPDATE extents NOT INDEXED SET plan_rev = 2\";",
+        // Comments inside the statement, and `--` inside a literal.
+        "const X: &str = \"UPDATE /* c */ extents SET plan_rev = 2\";",
+        "const X: &str = \"UPDATE extents -- c\\nSET plan_rev = 2\";",
+        "const X: &str = \"UPDATE extents SET note = '--', plan_rev = 2\";",
+        // Rust's own ways of building a literal.
+        "const X: &str = concat![\"UPDATE extents SET \", \"plan_rev = 2\"];",
+        "const X: &str = concat! (\"UPDATE extents SET plan_\", \"rev = 2\");",
+        "const X: &str = \"UPDATE extents SET plan\\u{5f}rev = 2\";",
+        "const X: &str = \"UPDATE extents SET plan\\x5frev = 2\";",
     ] {
         assert_eq!(one(src).len(), 1, "not found: {src}");
     }
@@ -525,7 +594,17 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
     ] {
         assert!(one(src).is_empty(), "found: {src}");
     }
-    // A migration's trigger body is read too.
+    // A migration's trigger body is read too, and a comment in it hides
+    // nothing.
     let sql = "CREATE TRIGGER t AFTER INSERT ON x BEGIN UPDATE extents SET plan_rev = 2; END; -- plan_rev";
     assert!(writes_plan_rev(&sql_pieces(sql)[0]));
+    let sql = "UPDATE /* backfill */ extents SET plan_rev = 2;";
+    assert!(writes_plan_rev(&sql_pieces(sql)[0]));
+    // A rebuild of the table writes every row of it.
+    let rebuild = "CREATE TABLE extents_new (id TEXT, plan_rev INTEGER);\n\
+                   INSERT INTO extents_new(id, plan_rev) SELECT id, plan_rev + 1 FROM extents;\n\
+                   DROP TABLE extents;\nALTER TABLE extents_new RENAME TO extents;";
+    assert!(writes_plan_rev(&sql_pieces(rebuild)[0]));
+    // A character outside ASCII outside a literal does not trip the reader.
+    assert!(one("let \u{e9} = 1; const X: &str = \"UPDATE extents SET plan_rev = 2\";").len() == 1);
 }

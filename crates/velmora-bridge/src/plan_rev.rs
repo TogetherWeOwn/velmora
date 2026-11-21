@@ -3,11 +3,12 @@
 //!
 //! The stored plan of an extent never changes, so `plan_rev` is 0 (no
 //! plan yet) or 1 (the plan its articles were posted under), and nothing
-//! raises it. Every statement that binds a `plan_rev` takes it from
-//! [`bound`], which refuses a value above 1 before any statement runs; a
-//! record that carries one is not [`readable`] and is reported, never
-//! written from. Part 1, the statements by name, is the test
-//! `tests/plan_rev_contract.rs`.
+//! raises it. A statement that binds a `plan_rev` is to take it from
+//! [`bound`], which refuses a value above 1 before any statement runs,
+//! and a record that carries one is not [`readable`]: it is reported,
+//! never written from. Binding the catalogue's statements through these
+//! is a separate change to its SQL modules. Part 1, the statements by
+//! name, is the test `tests/plan_rev_contract.rs`.
 //!
 //! The first change that writes a `plan_rev` above 1 needs the
 //! plan-change design first and lifts this on purpose.
