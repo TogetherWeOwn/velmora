@@ -1461,10 +1461,19 @@ a slot that ran out) it gives the slot to the first in the line that
 can use it and sends that session the reply. The job then takes its
 slot with its next question and goes on in the same run.
 
-- A job that waits sends nothing and holds no slot. Its wait is one
-  session (one billed request) and the reply; if a slot runs out with
-  no event, the first in the line asks once (a message, a twentieth of
-  a request).
+- A job that waits holds no slot. Its wait is one session (one billed
+  request) and the reply. The gate has no timer of its own: it tells
+  each waiter when the first held slot can run out with no event, and
+  each waiter sends one message then (a twentieth of a request):
+  about every 30 s while a read holds a slot (a read slot lives 35 s
+  and is renewed every 5 s), and about once in a wait where only jobs
+  do.
+- The line is for the providers the job asked. One that was cooling
+  is not among them: the job leaves the line when that cooldown ends
+  and asks again with the pool as it is then.
+- A job that was handed a slot and stops before it takes it gives the
+  slot up when it stops; a slot it did not need because it found one
+  elsewhere goes back with the first slot it releases.
 - The line lives with the sessions, not in the gate's storage: it is
   there when the gate leaves memory and comes back. A waiter whose
   invocation died leaves the line when its connection ends, and a slot

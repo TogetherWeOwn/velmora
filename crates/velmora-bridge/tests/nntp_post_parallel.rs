@@ -890,6 +890,36 @@ async fn a_job_in_the_line_asks_again_when_a_slot_is_its_own() {
     assert_eq!(rig.bridge.nntp.live(), 0);
 }
 
+/// The line is for the providers the job asked. One that was cooling
+/// then is not among them, so the job leaves the line when its cooldown
+/// ends and asks with the pool as it is then: it posts there in the
+/// run that claimed it, and does not stand out its time behind the
+/// taken slots of the other.
+#[tokio::test]
+async fn a_job_in_the_line_asks_again_when_a_cooldown_ends() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    rig.bridge.catalog.cool_from("p0", now, now.plus_secs(10));
+    // Held past the end of the wait, and the line never frees them.
+    rig.take_slots(1, now.plus_secs(30)).await;
+    rig.bridge.catalog.line.set(Some(SlotWait::Elapsed));
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let waits = rig.bridge.catalog.line_waits.borrow().clone();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    let (_, providers, ms) = &waits[0];
+    assert_eq!(providers, &["p1".to_string()], "the one that was asked");
+    assert!((9_000..=10_000).contains(ms), "{ms}");
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!((9_000..12_000).contains(&waited), "{waited}");
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
 /// The line did not come to the job in the time it had: it is put off
 /// as a job that polled in vain is, without having asked again, with
 /// no attempt spent and nothing loaded.
@@ -909,6 +939,10 @@ async fn a_job_whose_time_in_the_line_ran_out_is_put_off() {
 
     let catalog = &rig.bridge.catalog;
     assert_eq!(catalog.line_waits.borrow().len(), 1);
+    // The job says that it stopped, under the name it waited with: a
+    // slot on its way to it is not kept.
+    let waited_as = catalog.line_waits.borrow()[0].0.clone();
+    assert_eq!(*catalog.line_left.borrow(), [waited_as]);
     let asked = catalog.permit_refusals.get() - refused;
     assert!(
         (1..=rig.bridge.cfg.post_sockets).contains(&asked),

@@ -584,7 +584,11 @@ where
     /// Runs the post stage for a claimed extent: plan, POST every planned
     /// article, then hand over to the verify stage.
     pub async fn post_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.post_extent(lease, job).await {
+        let done = self.post_extent(lease, job).await;
+        // A slot that came to the job while it waited and that it did
+        // not take: it stopped first.
+        self.catalog.leave_line(&job_holder(lease));
+        match done {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
@@ -655,7 +659,7 @@ where
                 Err(_) if waited => return Err(Stop::NoPermit),
                 opened => opened?.0,
             };
-            if !held.is_empty() || !self.slot_wait(lease, first_tier).await {
+            if !held.is_empty() || !self.slot_wait(lease, first_tier, cooling).await {
                 break (cooling, probing, order, held);
             }
             waited = true;

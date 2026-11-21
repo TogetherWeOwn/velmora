@@ -434,24 +434,37 @@ where
     /// Where the slots have a line ([`Catalog::await_permit`]) the job
     /// stands in it for the rest of that time, with no call and no
     /// sleep of its own, and asks again when a slot is its own; the
-    /// time over, it is put off. Elsewhere it sleeps [`slot_poll_ms`]:
-    /// longer the more providers it asks.
+    /// time over, it is put off. The line knows only the providers the
+    /// job asked: `back`, when one that was cooling can be asked again,
+    /// ends the stand there, and the job asks with the pool as it is
+    /// then. Elsewhere it sleeps [`slot_poll_ms`]: longer the more
+    /// providers it asks.
     /// The lease is not renewed here: a job that connects after a wait
     /// renews it first, as after any wait ([`Lease::fresh_at`]).
-    pub(crate) async fn slot_wait(&self, lease: &Lease, providers: &[&ProviderConfig]) -> bool {
-        let age = self.clock.now().0 - lease.claimed_at.0;
+    pub(crate) async fn slot_wait(
+        &self,
+        lease: &Lease,
+        providers: &[&ProviderConfig],
+        back: Option<UnixMs>,
+    ) -> bool {
+        let now = self.clock.now().0;
+        let age = now - lease.claimed_at.0;
         let sleep = match self.budget.sleeper() {
             Some(sleep) if (0..SLOT_WAIT_MS).contains(&age) => sleep,
             _ => return false,
         };
         let (holder, left) = (job_holder(lease), SLOT_WAIT_MS - age);
-        let line = self.catalog.await_permit(providers, &holder, left, sleep);
+        let poll = slot_poll_ms(providers.len());
+        // Never shorter than the sleep between two asks without a line.
+        let stand = back.map_or(left, |at| left.min((at.0 - now).max(i64::from(poll))));
+        let line = self.catalog.await_permit(providers, &holder, stand, sleep);
         match line.await {
             Ok(SlotWait::Granted) => true,
-            Ok(SlotWait::Elapsed) => false,
+            // Cut short for a provider that is back: asked again.
+            Ok(SlotWait::Elapsed) => stand < left,
             // No line here, or it could not be stood in: as before.
             Ok(SlotWait::Unsupported) | Err(_) => {
-                sleep(slot_poll_ms(providers.len())).await;
+                sleep(poll).await;
                 true
             }
         }

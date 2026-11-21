@@ -397,7 +397,11 @@ where
     /// the resume point goes with the write that gives the lease back.
     pub async fn verify_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
         let mut reached = None;
-        match self.verify_extent(lease, job, &mut reached).await {
+        let done = self.verify_extent(lease, job, &mut reached).await;
+        // A slot that came to the job while it waited and that it did
+        // not take: it stopped first.
+        self.catalog.leave_line(&job_holder(lease));
+        match done {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle_at(&self.catalog, &self.clock, lease, stop, reached).await,
         }
@@ -407,7 +411,9 @@ where
     /// that counts for every article now (`STAT`), require the full check
     /// on record from verify, then mark the safety copy evictable.
     pub async fn release_stage(&self, lease: &Lease, job: &JobExtent) -> JobOutcome {
-        match self.release_extent(lease, job).await {
+        let done = self.release_extent(lease, job).await;
+        self.catalog.leave_line(&job_holder(lease));
+        match done {
             Ok(()) => JobOutcome::Ack,
             Err(stop) => settle(&self.catalog, &self.clock, lease, stop).await,
         }
@@ -596,7 +602,10 @@ where
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
             // row is not given back and delivered again for a slot
             // that comes free in seconds.
-            if !self.slot_wait(lease, &asked).await {
+            if !self
+                .slot_wait(lease, &asked, pool.cooling_until(&fresh))
+                .await
+            {
                 return Err(Stop::NoPermit);
             }
             waited = true;

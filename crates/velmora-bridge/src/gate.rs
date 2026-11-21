@@ -1194,12 +1194,16 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
     }
 
     /// In how many milliseconds a job slot can next come free with no
-    /// event at the gate: the first slot that runs out unrenewed, or
-    /// the end of the wait for jobs after a restart.
+    /// event at the gate: the first slot that runs out unrenewed, or,
+    /// after a restart, the end of the wait in which no job gets one
+    /// (that of either class: [`Warm`]).
     fn wake(&self, now: UnixMs) -> Option<i64> {
         self.with(|i| {
-            let warm = Some(i.record.warm_jobs).filter(|until| *until > now.0);
-            let next = i.core.next_expiry(now.0).into_iter().chain(warm).min();
+            let warm = i.record.warm_jobs.max(i.record.warm_reads);
+            let next = match warm > now.0 {
+                true => Some(warm),
+                false => i.core.next_expiry(now.0),
+            };
             next.map(|at| (at - now.0).max(1))
         })
     }
@@ -1858,6 +1862,11 @@ pub trait PermitGate {
         ms: i64,
         sleep: &'a Sleeper,
     ) -> LocalBoxFuture<'a, Result<SlotWait>>;
+    /// `holder` has stopped. A slot that came to it from a line and
+    /// that it never asked for is given up as by [`Self::forget`]: its
+    /// session, which holds nothing else, is closed, and the gate
+    /// hands the slot to the next in the line.
+    fn leave(&self, holder: &str);
     /// The holder of `permit` is gone without having released it (its
     /// job was abandoned). Nothing is awaited: the session is closed
     /// if this was the last slot on it, and the gate frees what was
@@ -2680,6 +2689,17 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
                 Either::Right(_) => SlotWait::Elapsed,
             })
         })
+    }
+
+    fn leave(&self, holder: &str) {
+        let Ok(mut pocket) = self.pocket.try_borrow_mut() else {
+            return;
+        };
+        let (left, kept) = pocket.drain(..).partition(|(by, ..)| by == holder);
+        *pocket = kept;
+        drop(pocket);
+        let left: Vec<(String, Permit, i64)> = left;
+        left.iter().for_each(|(_, permit, _)| self.forget(permit));
     }
 
     fn forget(&self, permit: &Permit) {

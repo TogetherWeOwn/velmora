@@ -1393,6 +1393,11 @@ pub trait Catalog {
     ) -> Result<SlotWait> {
         Ok(SlotWait::Unsupported)
     }
+    /// `holder` has stopped: a slot that came to it from a line
+    /// ([`Self::await_permit`]) and that it never took is given up,
+    /// with nothing awaited, so that it goes to the next in the line
+    /// and does not lie until it runs out.
+    fn leave_line(&self, _holder: &str) {}
     /// The holder of `p` is gone without releasing it: whatever is
     /// kept open for it on this side is dropped, with nothing awaited.
     /// The slot itself frees when its permit expires, or sooner.

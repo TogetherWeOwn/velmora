@@ -99,6 +99,8 @@ struct Socket {
 /// [`World::restart`]), the clock, and the replies it sends to
 /// sessions that wait.
 struct World {
+    /// The name the object is asked under.
+    name: String,
     db: Db,
     now: Cell<i64>,
     store: Store,
@@ -121,8 +123,25 @@ struct World {
 
 impl World {
     fn new() -> Rc<Self> {
+        Self::named(GATE)
+    }
+
+    /// The gate `name` of a deployment with a catalogue of its own.
+    fn named(name: &str) -> Rc<Self> {
+        let db = Db(Rc::new(RusqliteSql::with_schema().unwrap()), Rc::default());
+        Self::on(db, name)
+    }
+
+    /// The gate `name` of the deployment `other` is of: an object of
+    /// its own on the same catalogue.
+    fn beside(other: &World, name: &str) -> Rc<Self> {
+        Self::on(other.db.clone(), name)
+    }
+
+    fn on(db: Db, name: &str) -> Rc<Self> {
         Rc::new(World {
-            db: Db(Rc::new(RusqliteSql::with_schema().unwrap()), Rc::default()),
+            name: name.to_string(),
+            db,
             now: Cell::new(T0),
             store: Store::default(),
             gate: RefCell::new(None),
@@ -318,7 +337,7 @@ impl World {
         let gate = self.gate().await;
         let request = GateRequest {
             id: 0,
-            gate: GATE.into(),
+            gate: self.name.clone(),
             ops: vec![GateOp::Load],
         };
         let reply = gate.handle(None, request, self.now()).await.unwrap();
@@ -423,6 +442,79 @@ impl GateSession for Line {
         if self.world.sockets.borrow_mut().remove(&self.id).is_some() {
             self.world.ended.borrow_mut().push(self.id);
         }
+    }
+}
+
+/// The way from one invocation to the gates of two accounts, each an
+/// object of its own.
+struct Wires(Vec<(String, Wire)>);
+
+impl Wires {
+    fn to(&self, gate: &str) -> &Wire {
+        let found = self.0.iter().find(|(name, _)| name == gate);
+        &found.unwrap_or_else(|| panic!("no gate {gate}")).1
+    }
+}
+
+impl GateTransport for Wires {
+    type Session = Line;
+
+    async fn open(&self, request: GateRequest) -> Result<(Line, GateReply)> {
+        self.to(&request.gate).open(request).await
+    }
+
+    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        self.to(&request.gate).call(request).await
+    }
+}
+
+/// Two accounts with one job slot each, both taken by `c`, and a gate
+/// for each: `(p, its gate)`, `(q, its gate)`.
+struct Two {
+    p: (ProviderConfig, Rc<World>),
+    q: (ProviderConfig, Rc<World>),
+    c: SqlCatalog<Db>,
+    held: [Permit; 2],
+}
+
+impl Two {
+    async fn new() -> Two {
+        let wp = World::named(&gate_name("account.p", 0));
+        let wq = World::beside(&wp, &gate_name("account.q", 0));
+        let (p, q) = (provider("p", 2), provider("q", 2));
+        let c = Two::client(&wp, &wq, "holders", &[p.clone(), q.clone()]);
+        let on_p = take(&c, &wp, &p, JOB, "job-1").await.unwrap();
+        let on_q = take(&c, &wq, &q, JOB, "job-2").await.unwrap();
+        assert!(take(&c, &wp, &p, JOB, "job-3").await.is_none(), "full");
+        assert!(take(&c, &wq, &q, JOB, "job-3").await.is_none(), "full");
+        Two {
+            p: (p, wp),
+            q: (q, wq),
+            c,
+            held: [on_p, on_q],
+        }
+    }
+
+    /// A catalogue of the invocation `owner`, which waits in the lines.
+    fn client(
+        wp: &Rc<World>,
+        wq: &Rc<World>,
+        owner: &str,
+        providers: &[ProviderConfig],
+    ) -> SqlCatalog<Db> {
+        let wire = |w: &Rc<World>| (w.name.clone(), Wire(w.clone(), owner.into()));
+        let wires = Wires(vec![wire(wp), wire(wq)]);
+        let clock = {
+            let w = wp.clone();
+            move || w.now()
+        };
+        let (mode, by) = (PermitMode::Gate, GateSharding::Account);
+        let client = GateClient::new(wires, clock, mode, by, 1, providers);
+        SqlCatalog::with_gate(wp.db.clone(), client.with_push(true).into_gate())
+    }
+
+    fn both(&self) -> [ProviderConfig; 2] {
+        [self.p.0.clone(), self.q.0.clone()]
     }
 }
 
@@ -952,6 +1044,134 @@ async fn a_restart_ends_the_line_and_the_jobs_ask_again() {
     assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
 }
 
+/// After a restart no job gets a slot while a read of the old object
+/// may still hold one, which can be later than the last of its jobs.
+/// The job in the line is told that time, not the earlier one: it asks
+/// once, then, and is served.
+#[tokio::test]
+async fn a_job_waits_out_the_reads_of_the_old_object_with_one_question() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let c = w.pushing("c", core::slice::from_ref(&p));
+    let (sleep, on) = (w.sleeper(), [&p]);
+    // The horizon stored for jobs ends 5 s after the restart below;
+    // the one for reads was stored just before it.
+    let job = take(&c, &w, &p, JOB, "job-0").await.unwrap();
+    c.release_permit(&job).await.unwrap();
+    w.pass(JOB_MS + HORIZON_STEP_MS - 5_000);
+    let read = take(&c, &w, &p, READ, "read-0").await.unwrap();
+    c.release_permit(&read).await.unwrap();
+
+    w.restart();
+    w.pass(1);
+
+    let read_ms = i64::from(READ_PERMIT_SECS) * 1000;
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let mut wait_a = wait(&a, &on, "job-a", 300_000, &sleep);
+    assert_eq!(turn(&mut wait_a), None);
+    let asked = (w.opens.get(), w.msgs.get());
+    let mut waited = 0;
+    while turn(&mut wait_a).is_none() {
+        w.pass(1_000);
+        waited += 1_000;
+        assert!(waited <= read_ms + SKEW_MS + 1_000, "{waited}");
+    }
+    assert!(waited >= read_ms - 1_000, "{waited}");
+    assert_eq!((w.opens.get(), w.msgs.get()), (asked.0, asked.1 + 1));
+    assert!(take(&a, &w, &p, JOB, "job-a").await.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// A slot that came and was not taken
+// ---------------------------------------------------------------------------
+
+/// A job that was handed a slot and stops before it takes it (the
+/// catalogue failed, or its provider began to cool) gives it up when
+/// it stops: the next in the line has it then, not when it runs out.
+#[tokio::test]
+async fn a_slot_a_job_did_not_take_goes_to_the_next_when_the_job_stops() {
+    let Full {
+        w, p, c, second, ..
+    } = full().await;
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let (a, b) = (
+        w.pushing("a", core::slice::from_ref(&p)),
+        w.pushing("b", core::slice::from_ref(&p)),
+    );
+    let mut wait_a = wait(&a, &on, "job-a", 60_000, &sleep);
+    assert_eq!(turn(&mut wait_a), None);
+    let mut wait_b = wait(&b, &on, "job-b", 60_000, &sleep);
+    assert_eq!(turn(&mut wait_b), None);
+    c.release_permit(&second).await.unwrap();
+    assert_eq!(turn(&mut wait_a), Some(SlotWait::Granted));
+    assert_eq!(turn(&mut wait_b), None);
+    let sessions = w.sessions();
+
+    // Another job's stop changes nothing.
+    a.leave_line("job-b");
+    assert_eq!(w.sessions(), sessions);
+    a.leave_line("job-a");
+    assert_eq!(w.sessions(), sessions - 1);
+    w.hear().await;
+
+    assert_eq!(turn(&mut wait_b), Some(SlotWait::Granted));
+    assert!(take(&a, &w, &p, JOB, "job-a").await.is_none());
+    assert!(take(&b, &w, &p, JOB, "job-b").await.is_some());
+    assert_eq!(w.held("p").await, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Gates of two accounts
+// ---------------------------------------------------------------------------
+
+/// A job that can use two accounts stands in the line of each gate,
+/// takes the first slot that comes, and leaves the other line: a slot
+/// that comes free there later is not held for it.
+#[tokio::test]
+async fn a_job_in_the_lines_of_two_gates_takes_the_first_slot_and_leaves_the_other() {
+    let two = Two::new().await;
+    let (wp, wq) = (&two.p.1, &two.q.1);
+    let (sleep, both) = (wp.sleeper(), two.both());
+    let on = [&both[0], &both[1]];
+    let a = Two::client(wp, wq, "a", &both);
+    let before = (wp.sessions(), wq.sessions());
+    let mut wait_a = wait(&a, &on, "job-a", 60_000, &sleep);
+    assert_eq!(turn(&mut wait_a), None);
+    assert_eq!((wp.sessions(), wq.sessions()), (before.0 + 1, before.1 + 1));
+
+    two.c.release_permit(&two.held[1]).await.unwrap();
+    assert_eq!(turn(&mut wait_a), Some(SlotWait::Granted));
+    assert_eq!(wp.sessions(), before.0, "out of the other line");
+    assert_eq!((wp.held("p").await, wq.held("q").await), (1, 1));
+
+    two.c.release_permit(&two.held[0]).await.unwrap();
+    assert_eq!((wp.held("p").await, wq.held("q").await), (0, 1));
+    assert!(take(&a, wq, &both[1], JOB, "job-a").await.is_some());
+    assert_eq!((wp.pushed.get(), wq.pushed.get()), (0, 1));
+}
+
+/// One of the two gates keeps no line (it runs code from before it):
+/// the job leaves the line of the other and asks both as before.
+#[tokio::test]
+async fn a_gate_without_a_line_ends_the_wait_at_the_other_gate_too() {
+    let two = Two::new().await;
+    let (wp, wq) = (&two.p.1, &two.q.1);
+    let (sleep, both) = (wp.sleeper(), two.both());
+    let on = [&both[0], &both[1]];
+    let a = Two::client(wp, wq, "a", &both);
+    let before = (wp.sessions(), wq.sessions());
+    wq.old_code.set(true);
+
+    let mut wait_a = wait(&a, &on, "job-a", 60_000, &sleep);
+    assert_eq!(turn(&mut wait_a), Some(SlotWait::Unsupported));
+    assert_eq!((wp.sessions(), wq.sessions()), before);
+    // Nothing waits at the gate that has a line: its slot, freed, is
+    // there for who asks.
+    two.c.release_permit(&two.held[0]).await.unwrap();
+    assert_eq!(wp.held("p").await, 0);
+    assert!(take(&a, wp, &both[0], JOB, "job-a").await.is_some());
+}
+
 // ---------------------------------------------------------------------------
 // Duplicate delivery
 // ---------------------------------------------------------------------------
@@ -995,6 +1215,33 @@ async fn a_job_delivered_twice_is_never_handed_one_slot_twice() {
     assert_ne!((got.slot, got.token), (other.slot, other.token));
     w.end("one").await;
     assert!(two.renew_permit(&other, w.now()).await.unwrap());
+    assert_eq!(w.held("p").await, 1);
+}
+
+/// The same in one isolate, where both invocations ask through one
+/// client: the second finds the name in the line and asks as a job
+/// does where there is none. The slot that comes is taken once.
+#[tokio::test]
+async fn a_job_delivered_twice_in_one_isolate_is_handed_a_slot_once() {
+    let Full {
+        w, p, c, second, ..
+    } = full().await;
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let both = w.pushing("isolate", core::slice::from_ref(&p));
+    let name = "job:x_1:post:7";
+    let mut wait_one = wait(&both, &on, name, 60_000, &sleep);
+    assert_eq!(turn(&mut wait_one), None);
+    let mut wait_two = wait(&both, &on, name, 60_000, &sleep);
+    assert_eq!(turn(&mut wait_two), None);
+    assert_eq!(w.sessions(), 3, "one place in the line");
+
+    c.release_permit(&second).await.unwrap();
+    assert_eq!(turn(&mut wait_one), Some(SlotWait::Granted));
+    assert_eq!(turn(&mut wait_two), Some(SlotWait::Unsupported));
+    assert_eq!(w.held("p").await, 2);
+    let got = take(&both, &w, &p, JOB, name).await.unwrap();
+    assert!(take(&both, &w, &p, JOB, name).await.is_none());
+    both.release_permit(&got).await.unwrap();
     assert_eq!(w.held("p").await, 1);
 }
 

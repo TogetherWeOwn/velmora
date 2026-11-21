@@ -1966,6 +1966,10 @@ async fn a_job_whose_time_in_the_line_ran_out_is_put_off_without_an_attempt() {
     assert!((15..=60).contains(&delay), "delay {delay}");
     let catalog = &rig.bridge.catalog;
     assert_eq!(catalog.line_waits.borrow().len(), 1);
+    // The job says that it stopped, under the name it waited with: a
+    // slot on its way to it is not kept.
+    let waited_as = catalog.line_waits.borrow()[0].0.clone();
+    assert_eq!(catalog.line_left.borrow().last(), Some(&waited_as));
     assert_eq!(catalog.permit_refusals.get() - refused, 1, "asked once");
     let waited = rig.bridge.clock.now().0 - now.0;
     assert!(

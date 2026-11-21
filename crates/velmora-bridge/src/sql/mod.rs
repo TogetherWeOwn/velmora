@@ -866,6 +866,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
             None => Ok(SlotWait::Unsupported),
         }
     }
+    fn leave_line(&self, holder: &str) {
+        if let Some(gate) = self.gate_of(PermitClass::Background) {
+            gate.leave(holder);
+        }
+    }
     fn forget_permit(&self, p: &Permit) {
         if let Some(gate) = self.gate_of(p.class) {
             gate.forget(p);
