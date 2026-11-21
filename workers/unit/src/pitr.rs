@@ -1,4 +1,4 @@
-//! The point-in-time bridge (tenancy ADR §8.3, gate 4).
+//! The point-in-time bridge: a unit's 30 days of history.
 //!
 //! A SQLite Durable Object keeps 30 days of history. The calls that
 //! reach it exist only on the object's own storage, and workers-rs

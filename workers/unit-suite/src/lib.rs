@@ -1,4 +1,4 @@
-//! Test Worker for the unit's database adapter (tenancy ADR §8.3, P0b).
+//! Test Worker for the unit's database adapter and its object class.
 //!
 //! `POST /db/<name>` reaches the SQLite Durable Object `<name>` and runs
 //! one call of the [`Sql`] port on it through the production adapter

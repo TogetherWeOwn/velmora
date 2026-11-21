@@ -1,5 +1,4 @@
-//! The catalogue test suite on Durable Object SQLite in workerd (tenancy
-//! ADR §8.3, gate 1).
+//! The catalogue test suite on Durable Object SQLite in workerd.
 //!
 //! With `VELMORA_SQL_SHADOW` set to the base URL of the suite Worker
 //! (`workers/unit-suite`, served by workerd; a comma-separated list
@@ -19,8 +18,10 @@
 //!
 //! `VELMORA_SQL_SHADOW_PRIMARY=do` hands the catalogue the Durable
 //! Object's answer instead of SQLite's: the suite then runs **on** the
-//! object, with SQLite as the referee. An error keeps SQLite's message,
-//! because the adapter keeps only a class.
+//! object, with SQLite as the referee. An error is compared by its class
+//! (a difference fails the run) and keeps SQLite's message, because the
+//! adapter keeps only a class and some tests read the message of a
+//! trigger.
 //!
 //! A test that changes the database through
 //! [`super::RusqliteSql::with_conn`] bypasses the port. The twin is then
@@ -183,7 +184,6 @@ impl Shadow {
         self.check("query", sql, params, &mine, &remote);
         match (self.primary_do, remote) {
             (true, Answer::Rows(rows)) => Ok(rows),
-            (true, Answer::Sql(class)) => Err(BridgeError::Sql(class)),
             _ => local,
         }
     }
@@ -203,7 +203,6 @@ impl Shadow {
         self.check("exec", sql, params, &mine, &remote);
         match (self.primary_do, remote) {
             (true, Answer::Changed(n)) => Ok(n),
-            (true, Answer::Sql(class)) => Err(BridgeError::Sql(class)),
             _ => local,
         }
     }
@@ -240,7 +239,6 @@ impl Shadow {
         self.check("batch", &text, &[], &mine, &remote);
         match (self.primary_do, remote) {
             (true, Answer::Batch(n)) => Ok(n),
-            (true, Answer::Sql(class)) => Err(BridgeError::Sql(class)),
             _ => local,
         }
     }

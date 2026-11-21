@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 # The locked Worker SDK (worker 0.8.7) requires Rust 1.91.
 rust-version = "1.91"
-description = "Test Worker: runs the catalogue test suite on Durable Object SQLite in workerd through DoSql, and reads the unit probe gates; never part of the production Worker"
+description = "Test Worker: runs the catalogue test suite on Durable Object SQLite in workerd through DoSql, and drives the unit object class; never part of the production Worker"
 license = "MIT"
 repository = "https://github.com/TogetherWeOwn/velmora"
 publish = false
