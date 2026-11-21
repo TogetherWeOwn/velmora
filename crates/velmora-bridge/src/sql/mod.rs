@@ -566,6 +566,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         permits: &[Permit],
         now: UnixMs,
     ) -> Result<(bool, Vec<bool>)> {
+        // A job's permits, never a drill's: those are renewed one by
+        // one as slot rows (`renew_permit`), and a gate knows none.
+        debug_assert!(permits.iter().all(|p| p.class != PermitClass::Drill));
         match self.active_gate() {
             // The lease stays a fenced row; the permits are renewed at
             // their gate in the same round.
