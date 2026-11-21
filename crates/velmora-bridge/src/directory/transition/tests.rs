@@ -40,24 +40,24 @@ fn step(head: Option<&TenantRecord>, change: Change, actor: Actor) -> Result<Out
 
 /// Applies a change that must produce a record.
 fn apply(head: &TenantRecord, change: Change, actor: Actor) -> TenantRecord {
-    match step(Some(head), change.clone(), actor) {
+    match step(Some(head), change, actor) {
         Ok(Outcome::Next(r)) => r,
-        other => panic!("{change:?} by {actor:?}: {other:?}"),
+        Ok(Outcome::Unchanged) => panic!("unchanged, by {actor:?}"),
+        Err(r) => panic!("refused {}, by {actor:?}", r.code),
     }
 }
 
 fn refused(head: &TenantRecord, change: Change, actor: Actor) -> Refusal {
-    match step(Some(head), change.clone(), actor) {
+    match step(Some(head), change, actor) {
         Err(r) => r,
-        other => panic!("{change:?} by {actor:?} was not refused: {other:?}"),
+        Ok(_) => panic!("not refused, by {actor:?}"),
     }
 }
 
 fn unchanged(head: &TenantRecord, change: Change, actor: Actor) {
-    assert_eq!(
-        step(Some(head), change.clone(), actor),
-        Ok(Outcome::Unchanged),
-        "{change:?} by {actor:?}"
+    assert!(
+        matches!(step(Some(head), change, actor), Ok(Outcome::Unchanged)),
+        "not unchanged, by {actor:?}"
     );
 }
 

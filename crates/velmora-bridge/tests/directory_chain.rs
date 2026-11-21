@@ -75,7 +75,10 @@ async fn active(chain: &TenantChain<'_, MemRecords, PlainSeal>) {
         let w = chain
             .write(&t, &change, Actor::TenantCreation, NOW, 0)
             .await;
-        assert!(matches!(w, Ok(Written::Wrote(_))), "{change:?}: {w:?}");
+        assert!(
+            matches!(w, Ok(Written::Wrote(_))),
+            "a creation step did not write"
+        );
     }
 }
 
