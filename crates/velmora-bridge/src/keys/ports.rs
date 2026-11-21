@@ -27,7 +27,8 @@ pub trait KeyTarget {
     ///   above the row's; or when it is equal, the row is closed and the
     ///   entry is not (the same record, now opened); so a stale entry
     ///   never replaces a newer one, whichever way it closes or opens;
-    /// - a `revoked` entry sets the row `revoked` whatever its seq:
+    /// - a `revoked` entry sets the row `revoked` whatever its seq, and a
+    ///   row that is `revoked` stays `revoked` whatever replaces it:
     ///   revoked is final;
     /// - then the store's `keys_seq` becomes the larger of its own and
     ///   `to_seq`.
