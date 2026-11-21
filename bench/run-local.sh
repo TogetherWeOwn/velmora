@@ -118,7 +118,11 @@ OUT=$(cd -- "$OUT" && pwd)
 if [[ -n $CPU ]]; then
   [[ -f $CPU ]] || { log "FAILED: --cpu $CPU: no such file"; exit 1; }
   CPU=$(realpath -- "$CPU")
+  # Checked before the run, not after it has replaced the measurements.
+  python3 -I "$HERE/report.py" --check-cpu "$CPU" || { log "FAILED: --cpu $CPU"; exit 1; }
 fi
+# A report from an earlier run here must not sit beside new measurements.
+rm -f "$OUT/results.json" "$OUT/results.md"
 log "measuring $NAME ($SRC) into $OUT${BV_KEYS:+ with BENCH_VARS keys $BV_KEYS}"
 
 # Pinned wrangler (local D1 runtime), installed once per lockfile: runs of

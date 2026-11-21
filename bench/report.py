@@ -363,23 +363,32 @@ def compare(a_dir, b_dir, out):
         sys.stdout.write(text)
 
 
+def load_cpu(path):
+    """The --cpu file: the timings the model prices must be finite numbers
+    >= 0 and at least one must be there; other keys ("source") are
+    provenance. Exits with the reason otherwise."""
+    cpu = json.loads(Path(path).read_text())
+    timed = ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib")
+    bad = [k for k in timed if k in cpu and (isinstance(cpu[k], bool) or not isinstance(cpu[k], (int, float))
+                                              or not math.isfinite(cpu[k]) or cpu[k] < 0)]
+    if bad:
+        sys.exit(f"--cpu: not a finite number >= 0: {', '.join(sorted(bad))}")
+    if not any(k in cpu for k in timed):
+        sys.exit(f"--cpu: none of {', '.join(timed)}: nothing to price")
+    return cpu
+
+
 def main(argv):
+    if argv and argv[0] == "--check-cpu":
+        load_cpu(argv[1])
+        return
     if argv and argv[0] == "--compare":
         out = argv[argv.index("--out") + 1] if "--out" in argv else None
         return compare(argv[1], argv[2], out)
     run = Path(argv[0])
     opts = dict(zip(argv[1::2], argv[2::2]))
     prices = json.loads(Path(opts.get("--prices", Path(__file__).with_name("prices.json"))).read_text())
-    cpu = json.loads(Path(opts["--cpu"]).read_text()) if "--cpu" in opts else None
-    if cpu is not None:
-        # The timings the model prices; other keys ("source") are provenance.
-        timed = ("ingest_ms_per_extent", "hot_get_ms_per_mib", "cold_get_ms_per_mib")
-        bad = [k for k in timed if k in cpu and (isinstance(cpu[k], bool) or not isinstance(cpu[k], (int, float))
-                                                  or not math.isfinite(cpu[k]) or cpu[k] < 0)]
-        if bad:
-            sys.exit(f"--cpu: not a finite number >= 0: {', '.join(sorted(bad))}")
-        if not any(k in cpu for k in timed):
-            sys.exit(f"--cpu: none of {', '.join(timed)}: nothing to price")
+    cpu = load_cpu(opts["--cpu"]) if "--cpu" in opts else None
     name = opts.get("--name", run.name)
     counts, d1, labels = load(run)
     # The cost model is for 16 MiB extents (one 16 MiB part = one extent).
