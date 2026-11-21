@@ -37,6 +37,9 @@ struct RacingSql {
     /// The next `n` statements whose text contains the string fail, as
     /// a catalogue that did not answer.
     fail: RefCell<Option<(&'static str, u32)>>,
+    /// Run before every query whose text contains the string: what
+    /// another request of the isolate does at that moment.
+    meanwhile: RefCell<Option<(&'static str, Box<dyn Fn()>)>>,
 }
 
 impl RacingSql {
@@ -55,6 +58,11 @@ impl RacingSql {
 impl Sql for RacingSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.injected(sql)?;
+        if let Some((part, run)) = self.meanwhile.borrow().as_ref() {
+            if sql.contains(*part) {
+                run();
+            }
+        }
         self.inner.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
@@ -234,6 +242,7 @@ impl Fx {
                 inner: RusqliteSql::with_schema().unwrap(),
                 race: RefCell::new(None),
                 fail: RefCell::new(None),
+                meanwhile: RefCell::new(None),
             }),
             safety: MemBlobStore::new(),
             cache: MemBlobStore::new(),
@@ -1314,6 +1323,7 @@ async fn a_drill_rebuilds_a_lost_article_from_parity() {
         // and the rebuild together, until someone waits for the budget.
         let other: Rc<RefCell<Option<ingress::Charge>>> = Rc::default();
         let then = Rc::new(Cell::new(0u64));
+        let taken: Rc<RefCell<Option<ingress::Charge>>> = Rc::default();
         let polls = Rc::new(Cell::new(0u32));
         let weak: Rc<RefCell<std::rc::Weak<TestBridge>>> = Rc::default();
         let (held, next, counted, bridge) =
@@ -1375,6 +1385,21 @@ async fn a_drill_rebuilds_a_lost_article_from_parity() {
             let rest = fx.bridge.budget.try_charge(BUDGET - read);
             *other.borrow_mut() = Some(rest.expect("the budget is free"));
             then.set(BUDGET - read - need + 1);
+            // And on the drill's second try, between its charge and its
+            // rebuild, the other request takes all that is free: only
+            // room the drill has in hand is left for the rebuild.
+            let (plans, bridge) = (Cell::new(0u32), weak.clone());
+            let held = taken.clone();
+            let take = move || {
+                plans.set(plans.get() + 1);
+                if plans.get() == 2 {
+                    let bridge = bridge.borrow().upgrade().expect("fixture is alive");
+                    let free = BUDGET - bridge.budget.in_use();
+                    *held.borrow_mut() = bridge.budget.try_charge(free);
+                }
+            };
+            let plan: &'static str = "FROM articles WHERE extent_id = ?1 ORDER BY packed, idx";
+            *fx.bridge.catalog.sql.meanwhile.borrow_mut() = Some((plan, Box::new(take)));
         }
         let r = fx.post("/drill/scratch/k").await;
         assert_eq!(r.status, 200, "{}", r.text());
@@ -1385,7 +1410,9 @@ async fn a_drill_rebuilds_a_lost_article_from_parity() {
         // not read a third time.
         assert_eq!(v["retries"], u32::from(crowded));
         assert_eq!(polls.get(), u32::from(crowded));
+        fx.bridge.catalog.sql.meanwhile.borrow_mut().take();
         assert!(other.borrow().is_none());
+        assert_eq!(taken.borrow_mut().take().is_some(), crowded);
         assert_eq!(fx.bridge.budget.in_use(), 0);
         assert_eq!(fx.bridge.nntp.live(), 0);
 
