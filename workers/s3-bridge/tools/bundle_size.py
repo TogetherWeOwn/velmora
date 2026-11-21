@@ -138,7 +138,8 @@ def report(cur, base=None, expected_base=""):
     if expected_base and base.get("sha") != expected_base:
         other = (
             f"main's measurement is from {base.get('sha', '')[:12] or 'an unknown commit'}, not this "
-            f"PR's base {expected_base[:12]}; the delta includes changes on main between them. "
+            f"PR's base {expected_base[:12]}; the delta also includes the changes between those two "
+            f"commits (on main, or on the branch this PR targets). "
         )
     lines.append(
         f"- Against main{src}: {b:,} bytes, delta **{d:+,} bytes ({pct:+.2f} %)**, "
