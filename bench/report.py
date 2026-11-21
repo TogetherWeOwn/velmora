@@ -91,9 +91,10 @@ def load(run):
 # The most the native meter and D1 may differ by, in rows written summed
 # over every label, before the run fails. The native run and the replay run
 # the same statements from the same state, so they agree exactly when both
-# are right (measured: 0). The allowance is the one count that varies from
-# run to run (bench/README.md, Repeatability): the light check's full read
-# of one sampled extent, 1 row written.
+# are right (measured: 0). This is a tolerance, not noise seen between the
+# two: it is set to the run-to-run noise of bench/README.md (Repeatability,
+# the light check's one sampled extent, 1 row written), so a miscount of a
+# single row in a whole run passes.
 ROWS_WRITTEN_NOISE = 1
 
 
@@ -112,11 +113,14 @@ def rows_written_check(labels):
         "labels_differing": differ,
         "rows_off": off,
         "noise": ROWS_WRITTEN_NOISE,
-        "ok": off <= ROWS_WRITTEN_NOISE,
+        # A replay with nothing in it compares nothing: not a pass.
+        "ok": bool(labels) and sum(c["d1_rows_written"] for c in labels.values()) > 0 and off <= ROWS_WRITTEN_NOISE,
     }
 
 
 def check_line(chk):
+    if not chk["ok"] and not chk["labels_differing"]:
+        return f"FAILED, rows-written check: nothing to compare ({chk['labels']} labels, {chk['d1']:,} rows in the replay)."
     if not chk["labels_differing"]:
         return f"Rows-written check: the native meter equals D1's count on all {chk['labels']} labels ({chk['d1']:,} rows)."
     worst = sorted(chk["labels_differing"].items(), key=lambda kv: -abs(kv[1]["native"] - kv[1]["d1"]))[:5]
@@ -458,7 +462,7 @@ def main(argv):
     (run / "results.json").write_text(json.dumps(result, indent=1, allow_nan=False))
     (run / "results.md").write_text(render(name, counts, d1, labels, m, chk))
     print(f"report: {run / 'results.md'}")
-    if chk["labels_differing"]:
+    if chk["labels_differing"] or not chk["ok"]:
         print(check_line(chk), file=sys.stderr)
     if not chk["ok"]:
         sys.exit(1)
