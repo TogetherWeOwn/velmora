@@ -1220,6 +1220,19 @@ fn a_bucket_moves_only_to_a_newer_epoch() {
     assert_eq!(refused(&at5, set(vec![p(0, 4)]), Actor::Operator), INVALID);
     let moved = apply(&at5, set(vec![p(1, 6)]), Actor::Operator);
     assert_eq!(moved.door.placements, vec![p(1, 6)]);
+    assert_eq!(moved.door.max_move_epoch, 6);
+    // Dropped and placed again, it takes an epoch above every one before.
+    let dropped = apply(&moved, set(vec![]), Actor::Operator);
+    assert_eq!(dropped.door.max_move_epoch, 6);
+    assert_eq!(
+        refused(&dropped, set(vec![p(1, 1)]), Actor::Operator),
+        INVALID
+    );
+    assert_eq!(
+        refused(&dropped, set(vec![p(1, 6)]), Actor::Operator),
+        INVALID
+    );
+    apply(&dropped, set(vec![p(1, 7)]), Actor::Operator);
 }
 
 /// Who may is checked before "the head carries it": a refused actor gets

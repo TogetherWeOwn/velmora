@@ -37,10 +37,11 @@ use crate::types::UnixMs;
 /// less 1 hour of tolerance.
 pub const BILLING_DELETE_MIN_MS: i64 = 60 * 24 * 3_600_000 - 3_600_000;
 
-/// The shortest hold period of a deletion by the customer plane: 7 days,
-/// less 1 hour of tolerance. A shorter one is a delete-now, which is the
-/// operator's alone.
-pub const CUSTOMER_DELETE_MIN_MS: i64 = 7 * 24 * 3_600_000 - 3_600_000;
+/// The shortest hold period of a deletion by the customer plane: 7 days.
+/// A shorter one is a delete-now, which is the operator's alone, and the
+/// caps count a hold below this one as a delete-now. A caller that
+/// computes the due date adds its own margin for the time to this check.
+pub const CUSTOMER_DELETE_MIN_MS: i64 = 7 * 24 * 3_600_000;
 
 /// The shortest hold period of any deletion, the operator's delete-now:
 /// 1 hour, less 1 minute of tolerance.
@@ -49,7 +50,10 @@ pub const OPERATOR_DELETE_MIN_MS: i64 = 3_600_000 - 60_000;
 /// Who makes a change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Actor {
-    /// The standard or the confirmed `kofra-api` token.
+    /// The standard or the confirmed `kofra-api` token. Which scopes each
+    /// token carries (a limit change or a delete request needs the
+    /// confirmed one) is checked by the management entrypoint before a
+    /// change reaches the chain; the chain checks the actor class.
     Customer,
     /// The billing token.
     Billing,
@@ -121,7 +125,9 @@ pub enum Change {
     },
     /// Clear the deletion and nothing else.
     UndoDeletion,
-    /// Replace the limits, and the rate class when `Some`.
+    /// Replace the limits, and the rate class when `Some`. The floor of a
+    /// limit set by the billing token (the free allowance) is a registry
+    /// value, checked by the management entrypoint with the registry.
     SetLimits {
         limits: BTreeMap<String, u64>,
         rate_json: Option<serde_json::Map<String, serde_json::Value>>,
@@ -424,7 +430,9 @@ pub fn next(
             if !h.restoring.is_empty() {
                 return Err(RESTORING);
             }
-            if !valid_units(units, placements) || !epochs_advance(&h.placements, placements) {
+            if !valid_units(units, placements)
+                || !epochs_advance(&h.placements, h.max_move_epoch, placements)
+            {
                 return Err(INVALID);
             }
             if *units == h.units && *placements == h.placements {
@@ -432,6 +440,10 @@ pub fn next(
             }
             door.units = units.clone();
             door.placements = placements.clone();
+            door.max_move_epoch = placements
+                .iter()
+                .map(|p| p.epoch)
+                .fold(h.max_move_epoch, u64::max);
         }
 
         Change::SetRestoring { unit } => {
@@ -535,6 +547,7 @@ fn first(
         features_json: Default::default(),
         units: vec![],
         placements: vec![],
+        max_move_epoch: 0,
         tk_version: 0,
         rotating_to: None,
         highest_claimed: 0,
@@ -661,6 +674,7 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         features_json: Default::default(),
         units: vec![],
         placements: vec![],
+        max_move_epoch: h.max_move_epoch,
         tk_version: h.tk_version,
         rotating_to: None,
         highest_claimed: h.highest_claimed,
@@ -696,14 +710,15 @@ fn valid_units(units: &[u32], placements: &[Placement]) -> bool {
             .all(|p| units.contains(&p.unit) && !p.bucket.is_empty())
 }
 
-/// A bucket that stays keeps or raises its move epoch, and raises it
-/// when it changes unit: the epoch is what fences a stale route.
-fn epochs_advance(old: &[Placement], new: &[Placement]) -> bool {
+/// A bucket that stays where it is keeps or raises its move epoch; one
+/// that is placed anew or changes unit takes an epoch above every epoch
+/// the tenant ever had. The epoch is what fences a stale route, so it
+/// never comes back.
+fn epochs_advance(old: &[Placement], max_epoch: u64, new: &[Placement]) -> bool {
     new.iter()
         .all(|p| match old.iter().find(|o| o.bucket == p.bucket) {
-            None => true,
             Some(o) if o.unit == p.unit => p.epoch >= o.epoch,
-            Some(o) => p.epoch > o.epoch,
+            _ => p.epoch > max_epoch,
         })
 }
 

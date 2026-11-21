@@ -429,3 +429,73 @@ fn the_head_is_found_across_listing_pages() {
         assert_eq!(store.lists() - before, 1);
     });
 }
+
+/// The shredded stub is written after every key version was destroyed: it
+/// is sealed with no tenant key and reads back as the head.
+#[test]
+fn the_shredded_stub_needs_no_tenant_key() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        let w = chain
+            .write(&t1(), &delete(1), Actor::Customer, NOW, 0)
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))), "{w:?}");
+        let due = UnixMs(NOW.0 + 7 * DAY);
+        let w = chain
+            .write(&t1(), &Change::StartShred, Actor::ShredJob, due, 0)
+            .await;
+        assert!(matches!(w, Ok(Written::Wrote(_))), "{w:?}");
+        // The shred destroys version 1; then the stub is written.
+        seal.destroy_version(1);
+        let w = chain
+            .write(&t1(), &Change::FinishShred, Actor::ShredJob, due, 0)
+            .await;
+        let Ok(Written::Wrote(stub)) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(stub.door.state(), TenantState::Shredded);
+        assert_eq!(stub.door.tk_version, 1);
+        let head = chain.head(&t1(), 0).await.unwrap().unwrap();
+        assert_eq!(head.door.state(), TenantState::Shredded);
+        assert_eq!(head.private.unwrap().external_ref, None);
+        // Older records keep their door part; their private part is gone.
+        let older = chain.read(&t1(), 4).await.unwrap().unwrap();
+        assert_eq!(older.private, None);
+        assert_eq!(older.door.state(), TenantState::Active);
+        // Nothing follows the stub.
+        let w = chain
+            .write(&t1(), &Change::UndoDeletion, Actor::Operator, due, 0)
+            .await;
+        let Err(ChainError::Refused(r)) = w else {
+            panic!("{w:?}")
+        };
+        assert_eq!(r.code, "tenant_shredded");
+    });
+}
+
+/// A record that does not open is damage of that record, not a failure of
+/// the store.
+#[test]
+fn a_record_that_does_not_open_is_damage() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(active(&chain));
+    let mut bytes = store.raw(&record_key(&t1(), 4)).unwrap();
+    bytes[0] ^= 1;
+    store.plant(&record_key(&t1(), 4), bytes);
+    let r = block_on(chain.head(&t1(), 0));
+    assert!(
+        matches!(r, Err(ChainError::Damaged("record_does_not_open"))),
+        "{r:?}"
+    );
+}

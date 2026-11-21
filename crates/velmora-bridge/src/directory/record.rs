@@ -305,6 +305,10 @@ pub struct TenantDoor {
     pub units: Vec<u32>,
     #[serde(default)]
     pub placements: Vec<Placement>,
+    /// The highest move epoch any placement ever had. A bucket that is
+    /// placed anew or moves takes an epoch above it, so an epoch never
+    /// comes back, also for a placement that was dropped and added again.
+    pub max_move_epoch: u64,
     /// The tenant key version in force; 0 for tenant 0, which has none.
     pub tk_version: u32,
     /// An open rotation claim.
@@ -448,6 +452,7 @@ mod tests {
             features_json: Default::default(),
             units: vec![0],
             placements: vec![],
+            max_move_epoch: 0,
             tk_version: 1,
             rotating_to: None,
             highest_claimed: 1,

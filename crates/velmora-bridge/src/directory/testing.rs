@@ -103,6 +103,7 @@ impl RecordStore for MemRecords {
 #[derive(Default)]
 pub struct PlainSeal {
     private_lost: Cell<bool>,
+    destroyed: RefCell<Vec<u32>>,
 }
 
 impl PlainSeal {
@@ -112,6 +113,14 @@ impl PlainSeal {
 
     pub fn lose_private(&self, lost: bool) {
         self.private_lost.set(lost);
+    }
+
+    /// Destroys tenant key version `v`, as a shred does: nothing is sealed
+    /// under it any more, and what was sealed under it does not open its
+    /// private part. Version 0 (no key) cannot be destroyed.
+    pub fn destroy_version(&self, v: u32) {
+        assert_ne!(v, 0, "version 0 is no key");
+        self.destroyed.borrow_mut().push(v);
     }
 }
 
@@ -143,6 +152,9 @@ impl ControlSeal for PlainSeal {
         door: &[u8],
         private: &[u8],
     ) -> Result<Vec<u8>> {
+        if self.destroyed.borrow().contains(&key_version) {
+            return Err(BridgeError::Crypto("plain seal: key version destroyed"));
+        }
         let mut out = PLAIN_MAGIC.to_vec();
         push_part(&mut out, name.as_bytes());
         push_part(&mut out, tenant.as_str().as_bytes());
@@ -171,7 +183,8 @@ impl ControlSeal for PlainSeal {
         }
         Ok(OpenedParts {
             door,
-            private: (!self.private_lost.get()).then(|| Zeroizing::new(private)),
+            private: (!self.private_lost.get() && !self.destroyed.borrow().contains(&key_version))
+                .then(|| Zeroizing::new(private)),
             key_version,
         })
     }
