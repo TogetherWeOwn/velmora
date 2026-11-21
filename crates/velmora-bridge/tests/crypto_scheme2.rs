@@ -464,6 +464,11 @@ fn a_v2_record_opens_under_its_name_tenant_and_key_version_only() {
     assert_eq!(&sealed[22..26], &2u32.to_be_bytes());
     assert_eq!(sealed[RECORD_V2_HEADER_LEN], 0x01);
     assert_eq!(record_v2_header(&sealed).unwrap(), (t.clone(), 2));
+    // A header naming key version 0, which no record is sealed under.
+    let mut zero = sealed.clone();
+    zero[22..26].copy_from_slice(&0u32.to_be_bytes());
+    assert!(record_v2_header(&zero).is_err());
+    assert!(open_record_v2(&key, &t, name, &zero).is_err());
     assert_eq!(
         &open_record_v2(&key, &t, name, &sealed).unwrap()[..],
         b"{\"v\":1}"
