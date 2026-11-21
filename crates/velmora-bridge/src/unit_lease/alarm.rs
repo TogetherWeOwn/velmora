@@ -1,0 +1,253 @@
+//! The alarm dispatcher of a unit: what one alarm run does, and when the
+//! next one is armed (ADR-TENANCY §2.4 rules 4, 8 and 12; RD-9).
+//!
+//! - **Only the alarm sends to a queue** (rule 4). A call never does.
+//! - **One alarm, re-armed only when the earliest due time moves
+//!   earlier** (rule 8): each `setAlarm` is a billed row write. An alarm
+//!   that is armed earlier than needed is left as it is; it wakes, finds
+//!   nothing due, and arms the next time.
+//! - **The alarm obeys the lease** (rule 12). With an expired lease it
+//!   sends one `renew` job and nothing else: no sweep, no day close, no
+//!   job hand-out. The work that was due is not dropped (RD-9): it stays
+//!   due, the alarm is armed again for a later try of the renewal, and
+//!   when a `renew` succeeds while work is due the unit sets its alarm to
+//!   now ([`after_renew`]). The next run does the due work, **the day
+//!   close first**.
+//!
+//! - **A closed unit runs nothing and asks for nothing.** A unit that is
+//!   `restoring`, behind its stamp, or `UNBORN` refuses `renew` (§8.6
+//!   step 2), so a renew job would only be refused; the restore gate's
+//!   lift arms the alarm again.
+//! - **Renewals that keep failing back off**: the retry doubles from
+//!   [`AlarmRules::renew_retry_ms`] up to [`AlarmRules::renew_retry_max_ms`],
+//!   so a unit whose renewal cannot succeed costs a bounded number of
+//!   queue messages and alarm writes. The unit counts the tries since its
+//!   last successful renewal and resets the count at one.
+//!
+//! This module decides and does nothing: the unit object computes the
+//! due time of each [`Duty`] from its own tables, asks [`on_alarm`] what
+//! to run, runs it, computes the due times again, and arms what
+//! [`rearm`] answers. It is pure, so every rule above is a native test.
+
+use crate::types::UnixMs;
+
+use super::lease::{FreshLease, LeaseRules};
+
+/// The work an alarm run hands out, in the order it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Duty {
+    /// Close the usage day and put its seal message in the outbox
+    /// (§4.4). First, always (RD-9).
+    DayClose,
+    /// The unit's sweeps: reservations older than their hour (§2.5 step
+    /// 0), expired write intents.
+    Sweep,
+    /// Send the due outbox rows as jobs, and the GC, evict, scrub and
+    /// repair jobs of this unit: today's cron work, per unit.
+    HandOut,
+    /// Ask the Worker for one more stamp raise: once per period in which
+    /// the unit had writes (§8.5). An addition to the raises of the
+    /// request path, never their replacement.
+    StampRaise,
+    /// Report changed numbers to the directory through the outbox, at
+    /// most once per 5 minutes (est, §7.3).
+    Report,
+}
+
+impl Duty {
+    /// Every duty, in run order.
+    pub const ALL: [Duty; 5] = [
+        Duty::DayClose,
+        Duty::Sweep,
+        Duty::HandOut,
+        Duty::StampRaise,
+        Duty::Report,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Duty::DayClose => 0,
+            Duty::Sweep => 1,
+            Duty::HandOut => 2,
+            Duty::StampRaise => 3,
+            Duty::Report => 4,
+        }
+    }
+}
+
+/// When each duty is next due. `None` = nothing of that kind is waiting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dues([Option<UnixMs>; 5]);
+
+impl Dues {
+    /// Nothing due.
+    pub const fn none() -> Dues {
+        Dues([None; 5])
+    }
+
+    /// With `duty` due at `at` (or not due, for `None`).
+    pub fn with(mut self, duty: Duty, at: Option<UnixMs>) -> Dues {
+        self.0[duty.index()] = at;
+        self
+    }
+
+    /// When `duty` is due.
+    pub fn get(&self, duty: Duty) -> Option<UnixMs> {
+        self.0[duty.index()]
+    }
+
+    /// The earliest due time of any duty.
+    pub fn earliest(&self) -> Option<UnixMs> {
+        self.0.iter().flatten().min().copied()
+    }
+
+    /// The duties due at `now`, in run order.
+    pub fn due_at(&self, now: UnixMs) -> Vec<Duty> {
+        Duty::ALL
+            .into_iter()
+            .filter(|d| self.get(*d).is_some_and(|at| at.0 <= now.0))
+            .collect()
+    }
+}
+
+/// The dials of the dispatcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlarmRules {
+    /// After a run with an expired lease: when to send the next `renew`
+    /// job if no renewal has succeeded by then, for the first try. 60 s
+    /// (est). Doubled for every further try without a successful renewal.
+    pub renew_retry_ms: i64,
+    /// The longest wait between two renew jobs of the alarm. 30 minutes
+    /// (est).
+    pub renew_retry_max_ms: i64,
+    /// The period of the alarm's stamp raise. 10 minutes (est), the
+    /// lease term: a rollback of a unit with writes is then found by a
+    /// stamp at most one lease term old even when no request raised one.
+    pub stamp_period_ms: i64,
+}
+
+impl AlarmRules {
+    pub const DEFAULT: AlarmRules = AlarmRules {
+        renew_retry_ms: 60 * 1000,
+        renew_retry_max_ms: 30 * 60 * 1000,
+        stamp_period_ms: LeaseRules::DEFAULT.term_ms,
+    };
+}
+
+/// What one alarm run does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlarmRun {
+    /// The duties to run now, in order. Empty when the lease has expired.
+    pub run: Vec<Duty>,
+    /// Send one `renew` job (the lease has expired and work is due). The
+    /// unit adds one to its count of renew tries.
+    pub send_renew: bool,
+    /// Arm at least this early after the run, whatever the duties say
+    /// then: the retry of the renewal. `None` = only the due times
+    /// decide.
+    pub retry_at: Option<UnixMs>,
+}
+
+/// The state of the unit an alarm finds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitAt<'a> {
+    pub lease: &'a FreshLease,
+    /// `restoring`, behind its stamp, or `UNBORN`: the unit refuses
+    /// `renew` and every job.
+    pub closed: bool,
+    /// Renew jobs the alarm sent since the last successful renewal.
+    pub renew_tries: u32,
+}
+
+/// The wait before renew try `tries + 1`: [`AlarmRules::renew_retry_ms`]
+/// doubled `tries` times, at most [`AlarmRules::renew_retry_max_ms`].
+pub fn renew_retry_ms(tries: u32, rules: &AlarmRules) -> i64 {
+    let factor = 1i64.checked_shl(tries.min(62)).unwrap_or(i64::MAX);
+    rules
+        .renew_retry_ms
+        .saturating_mul(factor)
+        .min(rules.renew_retry_max_ms)
+}
+
+/// What an alarm that fires at `now` does, for `unit` with `dues`.
+pub fn on_alarm(
+    now: UnixMs,
+    unit: &UnitAt<'_>,
+    dues: &Dues,
+    lease_rules: &LeaseRules,
+    rules: &AlarmRules,
+) -> AlarmRun {
+    let due = dues.due_at(now);
+    if due.is_empty() || unit.closed {
+        // Woken early or for work a request already did: nothing to do,
+        // and nothing to renew for. Or closed: nothing may run, and a
+        // renewal would be refused.
+        return AlarmRun {
+            run: Vec::new(),
+            send_renew: false,
+            retry_at: None,
+        };
+    }
+    if unit.lease.is_fresh(now, lease_rules) {
+        return AlarmRun {
+            run: due,
+            send_renew: false,
+            retry_at: None,
+        };
+    }
+    AlarmRun {
+        run: Vec::new(),
+        send_renew: true,
+        retry_at: Some(UnixMs(
+            now.0
+                .saturating_add(renew_retry_ms(unit.renew_tries, rules)),
+        )),
+    }
+}
+
+/// After a `renew` succeeded at `now`: `Some(now)` when work is due, so
+/// the unit sets its alarm to now and the next run does it, the day
+/// close first. `None` = nothing waits; the armed alarm stays.
+pub fn after_renew(now: UnixMs, dues: &Dues) -> Option<UnixMs> {
+    (!dues.due_at(now).is_empty()).then_some(now)
+}
+
+/// The time the alarm should next fire: the earliest due time, and the
+/// renewal retry of the last run if it is earlier.
+pub fn next_alarm(dues: &Dues, retry_at: Option<UnixMs>) -> Option<UnixMs> {
+    match (dues.earliest(), retry_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What to do with the alarm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rearm {
+    /// Leave it: no `setAlarm`, no row write.
+    Keep,
+    /// `setAlarm(at)`.
+    Set(UnixMs),
+}
+
+/// `armed` is the alarm in force (`None` after it fired, or never set);
+/// `wanted` is [`next_alarm`]. Sets only when nothing is armed or the
+/// wanted time is earlier than the armed one.
+pub fn rearm(armed: Option<UnixMs>, wanted: Option<UnixMs>) -> Rearm {
+    match (armed, wanted) {
+        (_, None) => Rearm::Keep,
+        (None, Some(at)) => Rearm::Set(at),
+        (Some(cur), Some(at)) if at.0 < cur.0 => Rearm::Set(at),
+        (Some(_), Some(_)) => Rearm::Keep,
+    }
+}
+
+/// The due time of the alarm's stamp raise: one period after the first
+/// write since the last raise the alarm asked for. `None` = no write
+/// since, so no raise is due (an idle unit costs nothing).
+pub fn stamp_raise_due(
+    first_write_since_raise: Option<UnixMs>,
+    rules: &AlarmRules,
+) -> Option<UnixMs> {
+    first_write_since_raise.map(|at| UnixMs(at.0.saturating_add(rules.stamp_period_ms)))
+}

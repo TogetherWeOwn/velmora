@@ -35,6 +35,7 @@ pub mod sql;
 pub mod stamp;
 pub mod trace;
 pub mod types;
+pub mod unit_lease;
 pub mod verify;
 
 #[cfg(feature = "testkit")]
