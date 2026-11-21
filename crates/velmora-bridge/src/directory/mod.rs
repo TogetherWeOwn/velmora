@@ -9,13 +9,17 @@
 //! - [`transition`]: which record may follow which, and who may write it;
 //! - [`chain`]: the chain `m/t/<tenant>/<seq>` in R2, its head, its reader
 //!   and its put-once writer, over two ports (a record store with
-//!   put-if-absent, and the two-part control seal).
+//!   put-if-absent, and the two-part control seal);
+//! - [`tenant_zero`]: whether tenant 0 may be served from the D1
+//!   catalogue, from its record and the database's own marker, and the
+//!   route of a request when the directory cannot be read.
 //!
 //! Nothing in the Worker calls this module yet. No request is routed by
 //! it and no record is written by it in production.
 
 pub mod chain;
 pub mod record;
+pub mod tenant_zero;
 pub mod transition;
 
 #[cfg(any(test, feature = "testkit"))]
