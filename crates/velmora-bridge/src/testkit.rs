@@ -792,8 +792,9 @@ pub trait PublishUnrecorded: Catalog {
         let record = Recorded::for_test(&c.generation.id);
         Ok(match self.commit_generation(c, condition, record).await? {
             PublishOutcome::Applied => {
-                let rows: Vec<ExtentId> = c.extents.iter().map(|e| e.id.clone()).collect();
-                self.unmark_sent(&rows, c.now).await?;
+                let ids = c.extents.iter().map(|e| e.id.clone());
+                self.unmark_sent(&post_jobs(ids, &c.generation.id), c.now)
+                    .await?;
                 Guard::Applied(())
             }
             PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
@@ -841,9 +842,9 @@ pub trait PublishUnrecorded: Catalog {
                 .await?
             {
                 PublishOutcome::Applied => {
-                    let rows: Vec<ExtentId> =
-                        c.placements.iter().map(|p| p.extent_id.clone()).collect();
-                    self.unmark_sent(&rows, c.now).await?;
+                    let ids = c.placements.iter().map(|p| p.extent_id.clone());
+                    self.unmark_sent(&post_jobs(ids, &c.generation.id), c.now)
+                        .await?;
                     Guard::Applied(())
                 }
                 PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Guard::Lost,
@@ -865,3 +866,19 @@ pub trait PublishUnrecorded: Catalog {
 }
 
 impl<C: Catalog> PublishUnrecorded for C {}
+
+/// The post job of each of `extents` of `generation`.
+pub fn post_jobs(
+    extents: impl IntoIterator<Item = ExtentId>,
+    generation: &crate::types::GenerationId,
+) -> Vec<Job> {
+    extents
+        .into_iter()
+        .map(|extent| Job::Extent {
+            v: crate::types::JOB_VERSION,
+            extent,
+            generation: generation.clone(),
+            stage: crate::types::OutboxStage::Post,
+        })
+        .collect()
+}

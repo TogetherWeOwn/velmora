@@ -569,15 +569,14 @@ where
     /// the next dispatcher run sends the job. If the mark cannot be
     /// taken back, or the job is lost after its send was answered, the
     /// dispatcher sends it again when the mark has aged.
-    async fn advance_notify(&self, lease: &Lease, to: OutboxStage, at: UnixMs) -> Staged<()> {
-        let now = self.clock.now();
-        if !self.catalog.advance_sent(lease, to, at, now).await? {
-            return Err(Stop::Fenced);
-        }
-        if self.notify_at(lease, to, at).await.is_err() {
-            let row = core::slice::from_ref(&lease.extent);
-            let _ = self.catalog.unmark_sent(row, at).await;
-        }
+    pub(crate) async fn advance_notify(
+        &self,
+        lease: &Lease,
+        to: OutboxStage,
+        at: UnixMs,
+    ) -> Staged<()> {
+        self.advance(lease, to, at).await?;
+        self.notify_at(lease, to, at).await;
         Ok(())
     }
 
@@ -589,7 +588,7 @@ where
     /// sent on until `at` when it is delivered: a release, due a
     /// minimum age after the post, is on its way from here on and does
     /// not wait for the dispatcher to find it.
-    async fn notify_at(&self, lease: &Lease, stage: OutboxStage, at: UnixMs) -> crate::Result<()> {
+    async fn notify_at(&self, lease: &Lease, stage: OutboxStage, at: UnixMs) {
         // Rounded up: a job that arrives early cannot claim the row.
         let ahead_ms = at.0.saturating_sub(self.clock.now().0).max(0);
         let secs = ahead_ms.saturating_add(999).div_euclid(1000);
@@ -610,9 +609,10 @@ where
                 at,
             },
         };
-        self.jobs
-            .send(&job, delay_secs.min(MAX_QUEUE_DELAY_SECS))
-            .await
+        let delay = delay_secs.min(MAX_QUEUE_DELAY_SECS);
+        if self.jobs.send(&job, delay).await.is_err() {
+            let _ = self.catalog.unmark_sent(&[job], at).await;
+        }
     }
 
     /// A backbone lacks articles. `Some` = the wait before it is read

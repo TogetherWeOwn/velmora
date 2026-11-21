@@ -255,35 +255,27 @@ pub(super) async fn renew_all<S: Sql>(
 /// Moves the row to `to` and gives the lease up. Attempts and cursor
 /// restart: they are per stage.
 ///
-/// With `sent`, the same write marks the row as sent for its new due
-/// time (`sent_at = next_at`, see [`due`]): the caller sends the job of
-/// the new stage itself, and takes the mark back if that send fails
-/// ([`unmark_sent`]). The mark is the due time and not the time of the
-/// send, because a mark older than the due time is outdated.
+/// The caller sends the job of a stage that has work (`post`, `verify`,
+/// `release`) itself, so the same write marks the row as sent for its
+/// new due time (`sent_at = next_at`, see [`due`]); the caller takes the
+/// mark back if that send fails ([`unmark_sent`]). The mark is the due
+/// time and not the time of the send, because a mark older than the due
+/// time is outdated. A row that moves to an end stage keeps no mark.
 pub(super) async fn advance<S: Sql>(
     c: &SqlCatalog<S>,
     l: &Lease,
     to: OutboxStage,
     next_at: UnixMs,
     now: UnixMs,
-    sent: bool,
 ) -> Result<bool> {
-    let sql = match sent {
-        false => concat!(
-            "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, \
-               cursor = 0, last_error = NULL, ",
-            unlease!(),
-            " WHERE ",
-            held!()
-        ),
-        true => concat!(
-            "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, \
-               cursor = 0, last_error = NULL, sent_at = ?6, ",
-            unlease!(),
-            " WHERE ",
-            held!()
-        ),
-    };
+    let sql = concat!(
+        "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, cursor = 0, \
+           last_error = NULL, \
+           sent_at = CASE WHEN ?5 IN ('post', 'verify', 'release') THEN ?6 END, ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
     fenced(c, sql, l, [text(to.as_str()), ms(next_at), ms(now)]).await
 }
 
@@ -1224,45 +1216,51 @@ pub(super) async fn mark_sent<S: Sql>(
     extents: &[ExtentId],
     now: UnixMs,
 ) -> Result<u64> {
-    if extents.is_empty() {
-        return Ok(0);
-    }
-    let ids: Vec<&str> = extents.iter().map(ExtentId::as_str).collect();
-    let ids = serde_json::to_string(&ids).map_err(|_| BridgeError::Sql("mark_sent".into()))?;
-    c.sql
-        .exec(
-            "UPDATE outbox SET sent_at = ?1 \
-             WHERE extent_id IN (SELECT value FROM json_each(?2)) \
-               AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
-               AND (lease_until IS NULL OR lease_until < ?1)",
-            &[ms(now), text(&ids)],
-        )
-        .await
+    let ids = ids_json(extents.iter().map(ExtentId::as_str).collect());
+    let sql = "UPDATE outbox SET sent_at = ?1 \
+               WHERE extent_id IN (SELECT value FROM json_each(?2)) \
+                 AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
+                 AND (lease_until IS NULL OR lease_until < ?1)";
+    set_mark(c, sql, ids, now).await
 }
 
-/// Takes back the mark `mark` of the rows of `extents`: the job that was
-/// to be sent for each of them was not ([`advance`] with `sent`, or a
+/// `ids` as one JSON array; `None` if there are none.
+fn ids_json(ids: Vec<&str>) -> Option<String> {
+    match ids.is_empty() {
+        true => None,
+        false => serde_json::to_string(&ids).ok(),
+    }
+}
+
+/// Runs `sql` with `?1 = at` and `?2 = ids`; nothing without ids.
+async fn set_mark<S: Sql>(
+    c: &SqlCatalog<S>,
+    sql: &str,
+    ids: Option<String>,
+    at: UnixMs,
+) -> Result<u64> {
+    match ids {
+        Some(ids) => c.sql.exec(sql, &[ms(at), text(&ids)]).await,
+        None => Ok(0),
+    }
+}
+
+/// Takes back the mark `mark` of the rows of `jobs`: the job that was
+/// to be sent for each of them was not ([`advance`], or a
 /// publication, whose rows are marked as they are inserted). Only a row
 /// that still carries this very mark is changed: one that a job claimed
 /// since has none, and one that was marked again keeps its newer mark.
 /// One row written per row changed; each row is found by its id.
 pub(super) async fn unmark_sent<S: Sql>(
     c: &SqlCatalog<S>,
-    extents: &[ExtentId],
+    jobs: &[crate::types::Job],
     mark: UnixMs,
 ) -> Result<u64> {
-    if extents.is_empty() {
-        return Ok(0);
-    }
-    let ids: Vec<&str> = extents.iter().map(ExtentId::as_str).collect();
-    let ids = serde_json::to_string(&ids).map_err(|_| BridgeError::Sql("unmark_sent".into()))?;
-    c.sql
-        .exec(
-            "UPDATE outbox SET sent_at = NULL \
-             WHERE extent_id IN (SELECT value FROM json_each(?2)) AND sent_at = ?1",
-            &[ms(mark), text(&ids)],
-        )
-        .await
+    let ids = jobs.iter().filter_map(|j| j.extent().map(ExtentId::as_str));
+    let ids = ids_json(ids.collect());
+    let sql = "UPDATE outbox SET sent_at = NULL \
+               WHERE extent_id IN (SELECT value FROM json_each(?2)) AND sent_at = ?1";
+    set_mark(c, sql, ids, mark).await
 }
 
 /// The attempts above which a row is in the `outbox_exhausted` index.

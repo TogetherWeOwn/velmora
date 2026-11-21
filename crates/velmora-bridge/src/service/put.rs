@@ -22,7 +22,8 @@ use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
     authenticate, check_precondition, checksum_json, conditional_gate, discard_before_retry,
-    from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, writes_refused,
+    from_proto, hold_precondition, internal, metadata_json, restore_gate, s3_error, send_post_jobs,
+    writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::{seal_extent, unwrap_bdk};
@@ -34,8 +35,7 @@ use crate::ports::{
 use crate::recovery::{id_after, write_generation};
 use crate::types::{
     Body, Bucket, CommitGeneration, ExtentId, ExtentRow, ExtentState, GenerationId, GenerationRow,
-    GenerationState, Job, OutboxStage, Precondition, S3Request, S3Response, SafetyState, WriteId,
-    JOB_VERSION,
+    GenerationState, Precondition, S3Request, S3Response, SafetyState, WriteId,
 };
 
 /// How often a PUT is published before it answers `SlowDown`: once
@@ -273,20 +273,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     };
     drop(charge);
 
-    // The commit wrote the posting obligation, marked as sent; the queue
-    // message is only a wake-up. A send that fails takes the mark back,
-    // so the next dispatcher run sends the job. One that is lost after
-    // it was taken, or a mark that could not be taken back, is made up
-    // for by the dispatcher when the mark has aged.
-    let job = Job::Extent {
-        v: JOB_VERSION,
-        extent: extent_id.clone(),
-        generation: generation_id,
-        stage: OutboxStage::Post,
-    };
-    if bridge.jobs.send(&job, 0).await.is_err() {
-        let _ = bridge.catalog.unmark_sent(&[extent_id], commit.now).await;
-    }
+    send_post_jobs(bridge, &generation_id, vec![extent_id], commit.now).await;
 
     let checksum = match checksum {
         Some((algorithm, value)) => {
@@ -598,24 +585,8 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
     let _ = bridge.raise_stamp().await;
     drop(charge);
 
-    // The commit wrote the posting obligations, marked as sent; the
-    // queue messages are only a wake-up. A send that fails takes the
-    // marks back (all of them: which jobs of a failed batch were taken
-    // is not known), so the next dispatcher run sends the jobs.
-    let jobs: Vec<Job> = commit
-        .extents
-        .iter()
-        .map(|e| Job::Extent {
-            v: JOB_VERSION,
-            extent: e.id.clone(),
-            generation: commit.generation.id.clone(),
-            stage: OutboxStage::Post,
-        })
-        .collect();
-    if bridge.jobs.send_many(&jobs).await.is_err() {
-        let rows: Vec<ExtentId> = commit.extents.iter().map(|e| e.id.clone()).collect();
-        let _ = bridge.catalog.unmark_sent(&rows, commit.now).await;
-    }
+    let rows = commit.extents.iter().map(|e| e.id.clone()).collect();
+    send_post_jobs(bridge, &commit.generation.id, rows, commit.now).await;
 
     let checksum = match checksum {
         Some((algorithm, value)) => {
