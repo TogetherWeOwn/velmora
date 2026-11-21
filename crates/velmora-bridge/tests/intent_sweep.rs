@@ -1451,6 +1451,18 @@ async fn a_sweep_job_that_fails_says_so_once_with_the_class_of_the_error() {
     take_alerts();
     assert_eq!(s.sweep(&s.write()).await, JobOutcome::Ack);
     assert_eq!(take_alerts(), [""; 0]);
+    // Also when the check every job makes first fails: the job is
+    // tried again like any other, and it is not a failed sweep.
+    s.rig.trip().arm(0, Trip::Fail);
+    assert_eq!(
+        s.sweep(&s.write()).await,
+        JobOutcome::Retry {
+            delay_secs: jobs::INFRA_RETRY_SECS
+        }
+    );
+    assert!(s.rig.trip().tripped());
+    s.rig.trip().disarm();
+    assert_eq!(take_alerts(), [""; 0]);
 }
 
 #[tokio::test(flavor = "current_thread")]
