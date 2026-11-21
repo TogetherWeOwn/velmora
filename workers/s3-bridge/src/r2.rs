@@ -229,7 +229,10 @@ impl BodyReads for ByobReads {
             .await
             .map_err(|_| BodyError::Read)?
             .unchecked_into();
-        // A canceled stream also says done, with no view: that is not an end.
+        // At the end a read says done and hands the (empty) view back, as
+        // workerd does from compatibility date 2024-05-13
+        // (`internal_stream_byob_return_view`; ours is later). A canceled
+        // stream says done with no view: that is not an end.
         let filled = result.value().ok_or(BodyError::Read)?;
         if result.done() {
             return Ok(0);
