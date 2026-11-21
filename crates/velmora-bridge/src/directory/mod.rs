@@ -10,6 +10,8 @@
 //! - [`chain`]: the chain `m/t/<tenant>/<seq>` in R2, its head, its reader
 //!   and its put-once writer, over two ports (a record store with
 //!   put-if-absent, and the two-part control seal);
+//! - [`fence`]: the move's freeze of tenant 0's D1 catalogue: the cutover
+//!   marker, the freeze triggers, the legacy stamp, and the thaw;
 //! - [`tenant_zero`]: whether tenant 0 may be served from the D1
 //!   catalogue, from its record and the database's own marker, and the
 //!   route of a request when the directory cannot be read.
@@ -18,6 +20,7 @@
 //! it and no record is written by it in production.
 
 pub mod chain;
+pub mod fence;
 pub mod record;
 pub mod tenant_zero;
 pub mod transition;
