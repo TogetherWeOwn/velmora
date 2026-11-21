@@ -72,6 +72,8 @@ impl Sql for Db {
 struct Store {
     record: Rc<RefCell<Option<GateRecord>>>,
     saves: Rc<Cell<u32>>,
+    /// The storage is down: nothing is saved.
+    down: Rc<Cell<bool>>,
 }
 
 impl GateStore for Store {
@@ -79,6 +81,9 @@ impl GateStore for Store {
         Ok(self.record.borrow().clone())
     }
     async fn save(&self, record: &GateRecord) -> Result<()> {
+        if self.down.get() {
+            return Err(BridgeError::Invalid("the storage is down"));
+        }
         self.saves.set(self.saves.get() + 1);
         *self.record.borrow_mut() = Some(record.clone());
         Ok(())
@@ -1627,6 +1632,42 @@ async fn a_slot_from_the_line_is_renewed_when_it_is_taken() {
     assert!(a.renew_permit(&fresh, w.now()).await.unwrap());
 }
 
+/// A slot from the line whose renewal the gate could not answer is
+/// given up at once: it is in no pocket any more, and nothing else
+/// would give it back before it runs out.
+#[tokio::test]
+async fn a_slot_from_the_line_that_could_not_be_renewed_is_given_up() {
+    let w = World::new();
+    let p = provider("p", 3);
+    let c = w.pushing("holders", core::slice::from_ref(&p));
+    let first = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+    let second = take(&c, &w, &p, JOB, "job-2").await.unwrap();
+    // To where the stored horizon of the job slots ends: the next
+    // renewal has to store a later one.
+    for _ in 0..5 {
+        w.pass(100_000);
+        assert!(c.renew_permit(&first, w.now()).await.unwrap());
+        assert!(c.renew_permit(&second, w.now()).await.unwrap());
+    }
+    let (sleep, on) = (w.sleeper(), [&p]);
+    let a = w.pushing("a", core::slice::from_ref(&p));
+    let mut wait_a = wait(&a, &on, "job-a", 60_000, &sleep);
+    assert_eq!(turn(&mut wait_a), None);
+    c.release_permit(&second).await.unwrap();
+    assert_eq!(turn(&mut wait_a), Some(SlotWait::Granted));
+    assert_eq!(w.held("p").await, 2);
+
+    w.pass(101_000);
+    let saved = w.store.saves.get();
+    w.store.down.set(true);
+    let asked = a.acquire_permit(&p, JOB, "job-a", w.now()).await;
+    assert!(asked.is_err(), "the gate could not answer: {asked:?}");
+    w.store.down.set(false);
+    assert_eq!(w.store.saves.get(), saved);
+    assert_eq!(w.held("p").await, 1, "the slot is free again");
+    assert!(take(&c, &w, &p, JOB, "job-3").await.is_some());
+}
+
 /// A slot that came from the line for another holder is not this
 /// holder's, and one on another provider is not asked for here.
 #[tokio::test]
@@ -1683,6 +1724,50 @@ async fn where_no_line_is_kept_the_job_is_told_at_once() {
     let mut waiting = wait(&a, &on, "job-a", 0, &sleep);
     assert_eq!(turn(&mut waiting), Some(SlotWait::Unsupported));
     assert_eq!(w.sessions(), 2);
+}
+
+/// A wait is kept with the session's connection, where the host keeps
+/// a bounded amount, and every account asked is written there with the
+/// accounts of its pool. A job that can use eight accounts of one pool
+/// waits in the line; with twelve the wait is not begun, nothing is
+/// held, and the job asks again as it did before the line.
+#[tokio::test]
+async fn a_wait_too_large_to_keep_is_not_begun() {
+    for (accounts, kept) in [(8, true), (12, false)] {
+        let w = World::new();
+        let pool: Vec<ProviderConfig> = (0..accounts)
+            .map(|i| {
+                let mut p = provider(&format!("account-{i}"), 2);
+                p.pool = Some("shared".to_string());
+                p.pool_max_conns = Some(2);
+                p
+            })
+            .collect();
+        let c = w.pushing("holders", &pool);
+        let mut held = Vec::new();
+        for p in &pool {
+            while let Some(permit) = take(&c, &w, p, JOB, "job-1").await {
+                held.push(permit);
+            }
+        }
+        assert!(!held.is_empty());
+        let (sleep, on) = (w.sleeper(), pool.iter().collect::<Vec<_>>());
+        let a = w.pushing("a", &pool);
+        let open = w.sessions();
+        let mut waiting = wait(&a, &on, "job-a", 60_000, &sleep);
+        match kept {
+            true => {
+                assert_eq!(turn(&mut waiting), None, "{accounts} accounts");
+                assert_eq!(w.sessions(), open + 1);
+                c.release_permit(&held[0]).await.unwrap();
+                assert_eq!(turn(&mut waiting), Some(SlotWait::Granted));
+            }
+            false => {
+                assert_eq!(turn(&mut waiting), Some(SlotWait::Unsupported));
+                assert_eq!(w.sessions(), open, "{accounts} accounts");
+            }
+        }
+    }
 }
 
 /// A gate that is not in charge of an account (a Worker on slot rows

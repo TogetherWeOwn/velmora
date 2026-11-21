@@ -1485,6 +1485,11 @@ slot with its next question and goes on in the same run.
 - A job that cannot stand in the line (`PERMITS = "d1"`, a gate from
   before the line, a gate that is not in charge of the account, a
   session that failed) asks again as with `poll`.
+- So does a job whose wait does not fit in what a session can keep
+  (12,000 bytes of the 16,384 the platform keeps per connection). A
+  wait names every account asked with the accounts of its pool: 2,100
+  to 2,700 bytes for a pool of four accounts, 7,400 to 9,500 for eight
+  (account ids of 2 to 31 bytes), and over the limit from about ten.
 - A job that waits holds one of its queue's consumers for the time of
   the wait, as it does with `poll`.
 

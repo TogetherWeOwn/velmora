@@ -29,7 +29,8 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use velmora_bridge::gate::{
-    Gate, GateRecord, GateReply, GateRequest, GateSession, GateStore, GateTransport, SessionState,
+    Gate, GateAnswer, GateRecord, GateReply, GateRequest, GateSession, GateStore, GateTransport,
+    SessionState,
 };
 use velmora_bridge::{BridgeError, Clock, Result};
 use worker::wasm_bindgen::closure::Closure;
@@ -203,7 +204,7 @@ impl PermitGate {
                 return;
             }
             let sockets = self.state.get_websockets();
-            let mut lost = false;
+            let (mut lost, mut slot) = (false, false);
             for (id, reply) in pushes {
                 let ws = sockets
                     .iter()
@@ -213,6 +214,8 @@ impl PermitGate {
                         && serde_json::to_string(&reply)
                             .is_ok_and(|raw| ws.send_with_str(&raw).is_ok())
                 });
+                // A reply without a slot tells a job to ask elsewhere.
+                slot |= sent && matches!(reply.answers[..], [GateAnswer::Acquired(Some(_))]);
                 if !sent {
                     gate.close(id);
                     if let Some(ws) = ws {
@@ -221,10 +224,10 @@ impl PermitGate {
                     lost = true;
                 }
             }
+            if slot && !self.handed.replace(true) {
+                console_log!("permit gate line: a slot went to a job that waited");
+            }
             if !lost {
-                if !self.handed.replace(true) {
-                    console_log!("permit gate line: a slot went to a job that waited");
-                }
                 return;
             }
             gate.settle(WorkerClock.now()).await;
