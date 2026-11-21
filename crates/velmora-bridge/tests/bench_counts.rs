@@ -46,8 +46,8 @@ use velmora::transports::NativeTlsTransport;
 use velmora_bridge::config::BridgeConfig;
 use velmora_bridge::crypto::{wrap_bdk, wrap_secret, DataKey};
 use velmora_bridge::gate::{
-    shards_from_var, Gate, GateClient, GateRecord, GateReply, GateRequest, GateSession, GateSharding,
-    GateStore, GateTransport, PermitGate, PermitMode, SessionState,
+    shards_from_var, Gate, GateClient, GateRecord, GateReply, GateRequest, GateSession,
+    GateSharding, GateStore, GateTransport, PermitGate, PermitMode, SessionState,
 };
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::recovery::Unpublished;
@@ -1716,17 +1716,38 @@ async fn bench_counts_smoke_gate() {
     let d1 = scenario(&SMOKE, None).await;
     let gate = scenario_with(&SMOKE, None, &[("PERMITS", "do")]).await;
     sanity(&gate);
-    let total = |b: &Bench, f: fn(&Counts) -> u64| b.hub.counts.borrow().values().map(f).sum::<u64>();
-    assert_eq!(total(&d1, |c| c.do_requests + c.do_messages), 0, "d1 asked a gate");
-    assert!(total(&gate, |c| c.do_requests) > 0, "no gate request metered");
-    assert!(total(&gate, |c| c.do_storage_writes) > 0, "the gate stored no record");
+    let total =
+        |b: &Bench, f: fn(&Counts) -> u64| b.hub.counts.borrow().values().map(f).sum::<u64>();
+    assert_eq!(
+        total(&d1, |c| c.do_requests + c.do_messages),
+        0,
+        "d1 asked a gate"
+    );
+    assert!(
+        total(&gate, |c| c.do_requests) > 0,
+        "no gate request metered"
+    );
+    assert!(
+        total(&gate, |c| c.do_storage_writes) > 0,
+        "the gate stored no record"
+    );
     // Slot-row tokens move once per catalogue acquire; with the gate in
     // charge only the rows it seizes move, once each.
     let moved = |b: &Bench| b.sql_count("SELECT COALESCE(SUM(token), 0) FROM provider_permits");
-    assert!(moved(&d1) > moved(&gate), "{} vs {}", moved(&d1), moved(&gate));
+    assert!(
+        moved(&d1) > moved(&gate),
+        "{} vs {}",
+        moved(&d1),
+        moved(&gate)
+    );
     // The post stage of a whole extent writes fewer rows: no slot row.
     let written = |b: &Bench| b.hub.counts.borrow()["stage:big:post"].d1_rows_written;
-    assert!(written(&gate) < written(&d1), "{} vs {}", written(&gate), written(&d1));
+    assert!(
+        written(&gate) < written(&d1),
+        "{} vs {}",
+        written(&gate),
+        written(&d1)
+    );
     let json = report(&gate, "smoke");
     assert_eq!(json["vars"]["PERMITS"], "do");
 }
