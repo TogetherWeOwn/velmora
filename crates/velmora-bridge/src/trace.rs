@@ -202,10 +202,13 @@ pub(crate) enum Phase {
     Auth,
     /// Waiting for room in the isolate's byte budget.
     Wait,
-    /// Waiting for the next piece of the body to arrive.
+    /// Taking in the body: waiting for each piece and the work on the
+    /// one before it (copying it into wasm, decoding, hashing). The
+    /// clock moves as each piece arrives, so the work on a piece shows
+    /// in the wait for the next.
     Read,
-    /// Taking in a piece that arrived: copying it into wasm, decoding
-    /// and hashing it.
+    /// The end of the body: the work on the last piece and the final
+    /// digest and signature checks.
     Hash,
     /// Encrypting and hashing an extent.
     Seal,
@@ -239,8 +242,9 @@ thread_local! {
 /// isolate waits on something: a phase that only computes (the seal)
 /// would read as 0 ms and its time would land in the next phase that
 /// waits. So at each phase boundary the trace awaits `tick` (a timer of
-/// 0 ms in a Worker) before it reads the clock. That costs the request
-/// one timer per boundary and per piece of the body, while it is on.
+/// 1 ms in a Worker; one of 0 ms did not move the clock) before it reads
+/// the clock. That costs the request one timer per boundary, about
+/// 1 ms each, while it is on.
 pub fn log_writes(to: fn(&str), tick: Tick) {
     WRITES.with(|log| log.set(Some((to, tick))));
 }
@@ -331,12 +335,10 @@ impl<'a> WriteTrace<'a> {
         }
     }
 
-    /// One piece of the body was taken in (see [`Phase::Hash`]).
-    pub(crate) async fn piece(&mut self) {
-        if self.on.is_some() {
-            self.pieces = self.pieces.saturating_add(1);
-            self.lap(Phase::Hash).await;
-        }
+    /// One piece of the body was taken in. Counted only: a tick per
+    /// piece would cost a timer for every few KiB of the body.
+    pub(crate) fn piece(&mut self) {
+        self.pieces = self.pieces.saturating_add(1);
     }
 
     fn note(&mut self, phase: Phase, now: i64) {

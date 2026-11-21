@@ -1186,7 +1186,7 @@ pub(crate) async fn read_upload_traced(
             }
             validator.push_body(&chunk, &mut |decoded| out.extend_from_slice(decoded))?;
             drop(chunk);
-            trace.piece().await;
+            trace.piece();
         }
         trace.mark(Phase::Read);
     }

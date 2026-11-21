@@ -219,7 +219,7 @@ pub(super) async fn store_slices<B: BlobStore, R: FillRandom>(
                 }
             }
             drop(chunk);
-            trace.piece().await;
+            trace.piece();
         }
         trace.mark(Phase::Read);
     }

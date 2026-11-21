@@ -117,7 +117,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if env.var("WRITE_PHASES").is_ok_and(|v| v.to_string() == "on") {
         velmora_bridge::trace::log_writes(
             |line| console_log!("write phases: {line}"),
-            || Box::pin(worker::Delay::from(std::time::Duration::ZERO)),
+            // A 0 ms timer does not move the clock (drill, 2026-11-21).
+            || Box::pin(worker::Delay::from(std::time::Duration::from_millis(1))),
         );
     }
     if let Ok(bridge) = env::bridge(&env) {
