@@ -2843,14 +2843,13 @@ fn wrangler_tables() -> (Vec<String>, Vec<String>, Vec<String>) {
 /// A Durable Object class can never be rolled back past, so production
 /// declares and binds the permit gate in deploys of their own, after the
 /// code that knows `PERMITS` has run ("Shipping the gate" in
-/// ops/README.md). Deploy 2 declares the class `PermitGate` alone: no
-/// Durable Object binding, no `[version_metadata]`, `PERMITS = "d1"`.
-/// The pull request that adds the binding (deploy 3) changes this test
-/// on purpose. The legacy `[[migrations]]` array is never used: once a
-/// class is declared by `exports`, a deploy that declares one by
-/// `[[migrations]]` is refused.
+/// ops/README.md). Deploy 2 declared the class `PermitGate`; deploy 3
+/// adds the `PERMIT_GATE` binding and `[version_metadata]`, and
+/// `PERMITS` stays `"d1"` until a deploy of its own. The legacy
+/// `[[migrations]]` array is never used: once a class is declared by
+/// `exports`, a deploy that declares one by `[[migrations]]` is refused.
 #[test]
-fn production_declares_the_gate_class_alone() {
+fn production_declares_and_binds_the_gate_with_permits_d1() {
     let (prod, env, root) = wrangler_tables();
     let gate = |key: &str| {
         let first = key.split('.').next().unwrap_or_default();
@@ -2865,8 +2864,20 @@ fn production_declares_the_gate_class_alone() {
     let declared: Vec<&String> = prod.iter().chain(&root).filter(|k| gate(k)).collect();
     assert_eq!(
         declared,
-        ["exports.PermitGate"],
-        "production declares the class and nothing else of the gate"
+        [
+            "exports.PermitGate",
+            "durable_objects.bindings",
+            "version_metadata"
+        ],
+        "production declares the class, binds it and has version metadata, nothing else"
+    );
+    assert_eq!(
+        table_body("[[durable_objects.bindings]]"),
+        ["class_name=PermitGate", "name=PERMIT_GATE"]
+    );
+    assert_eq!(
+        table_body("[version_metadata]"),
+        ["binding=CF_VERSION_METADATA"]
     );
     // The storage of a class is fixed when it is created, and a deletion
     // has no rollback: the table holds exactly these two keys, in
