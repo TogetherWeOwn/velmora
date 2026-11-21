@@ -39,7 +39,17 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--tiny <n>] [--cpu <cpu.js
 - `--ref` measures another commit with this checkout's harness (temporary
   worktree and cargo target of its own, removed at the end, so runs may
   overlap). `--tiny <n>` changes the number of small
-  objects, to see which figures grow with the size of the catalogue.
+  objects, to see which figures grow with the size of the catalogue; without
+  `--name` or `--out` such a run is named `<sha>-tiny<n>`, apart from the
+  full run. `--out` and `--cpu` may be relative to the caller's directory.
+- The D1 storage line of the cost model uses the fixture's average
+  catalogue bytes per extent over every class, so it moves with `--tiny`
+  (more small objects, more rows per byte stored); it is not the footprint
+  of a 16 MiB extent alone.
+- The dispatcher's runs in the release phase are charged to ingest
+  (`stage:cron`); those of the delete phase to `stage:cron_gc`, shown in
+  the stage table and not in the ingest price. `GC_MODE=off` skips the wait
+  for garbage collection; `SERVER_SIDE_COPY=off` expects 501 from CopyObject.
 - `report.py --compare <run A> <run B>` prints the change between two runs.
 
 Repeatability: every figure is a count, and two runs of one commit give

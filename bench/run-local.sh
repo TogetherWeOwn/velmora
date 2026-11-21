@@ -45,7 +45,14 @@ while (($#)); do
   esac
 done
 log() { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+# The scratch directory holds the wrangler this script runs: it must be
+# ours and closed to other users, or another local user could put code
+# there that runs as us.
 mkdir -p "$WORK"
+if [[ -L $WORK || ! -O $WORK ]]; then
+  log "FAILED: $WORK is a symlink or not owned by $(id -un)"; exit 1
+fi
+chmod 700 "$WORK"
 
 SRC=$REPO
 RUN=''
@@ -76,12 +83,22 @@ fi
 # The readable part is cut at 60 characters; a hash of the whole value keeps
 # two different values apart.
 BV=${BENCH_VARS:-}
-if [[ -n ${BV//[[:space:]]/} && -z $NAME && -z $OUT ]]; then
+AUTO_NAME=0
+[[ -n $NAME || -n $OUT ]] || AUTO_NAME=1
+if [[ -n ${BV//[[:space:]]/} && $AUTO_NAME == 1 ]]; then
   NAME="$SHA-vars-$(printf '%s' "$BENCH_VARS" | tr -c 'A-Za-z0-9._=-' '_' | cut -c1-60)-$(printf '%s' "$BENCH_VARS" | sha256sum | cut -c1-8)"
+fi
+# A --tiny run is named apart from the full run of the same commit.
+if [[ -n $TINY && $AUTO_NAME == 1 ]]; then
+  NAME="${NAME:-$SHA}-tiny$TINY"
 fi
 NAME=${NAME:-$SHA}
 OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
+# The native run works in the checkout and cargo runs it from the package
+# directory: every path handed on is absolute.
+OUT=$(cd "$OUT" && pwd)
+[[ -z $CPU ]] || CPU=$(cd "$(dirname "$CPU")" && pwd)/$(basename "$CPU")
 log "measuring $NAME ($SRC) into $OUT${BENCH_VARS:+ with BENCH_VARS=$BENCH_VARS}"
 
 # Pinned wrangler (local D1 runtime), installed once. One run installs at a

@@ -1044,12 +1044,15 @@ impl Bench {
     }
 
     /// Cron ticks, each running every job it sent, until `done` says so.
-    async fn ticks(&self, what: &str, done: impl Fn(&Bench) -> bool) {
+    /// Cron runs (charged to `cron_label`) and the jobs they send, until
+    /// `done`. The release phase charges its dispatcher runs to ingest
+    /// (`stage:cron`), the delete phase to `stage:cron_gc`.
+    async fn ticks(&self, what: &str, cron_label: &str, done: impl Fn(&Bench) -> bool) {
         for _ in 0..60 {
             if done(self) {
                 return;
             }
-            self.cron().await;
+            self.cron_as(cron_label).await;
             for sent in self.bridge.jobs.inner.take() {
                 self.run_job(&sent.job, false).await;
             }
@@ -1176,7 +1179,13 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
             Vec::new(),
         )
         .await;
-    b.expect("copy_big", 200, r).await;
+    // SERVER_SIDE_COPY=off (a BENCH_VARS run) answers 501 NotImplemented.
+    let copy_status = if b.vars["SERVER_SIDE_COPY"] == "on" {
+        200
+    } else {
+        501
+    };
+    b.expect("copy_big", copy_status, r).await;
     // A GET before the post: served from the pinned safety copy.
     b.get("get_pinned_big", "big/p0", None, s.big).await;
 
@@ -1184,7 +1193,7 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
     b.pump().await;
     let min_age: u32 = b.vars["SAFETY_MIN_AGE_SECS"].parse().expect("min age");
     b.bridge.clock.advance_secs(min_age + 600);
-    b.ticks("release", |b| {
+    b.ticks("release", "stage:cron", |b| {
         b.sql_count("SELECT count(*) FROM outbox WHERE stage <> 'done'") == 0
     })
     .await;
@@ -1214,7 +1223,8 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
     // Evict everything evictable, then cold reads from Usenet, then the
     // same read again from the cache it filled.
     b.hub.set("stage:evict");
-    let all = u64::MAX / 2;
+    // The largest integer D1 takes (JavaScript's safe range).
+    let all = (1u64 << 53) - 1;
     b.bridge
         .catalog
         .hot_drain_set(all)
@@ -1287,12 +1297,15 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
     }
     b.bridge.clock.advance_secs(30 * DAY);
     let now = b.bridge.clock.now().0;
-    b.ticks("gc", move |b| {
-        b.sql_count(&format!(
-            "SELECT count(*) FROM gc WHERE done_at IS NULL AND due_at <= {now}"
-        )) == 0
-    })
-    .await;
+    // GC_MODE=off (a BENCH_VARS run) never sends a GC job: nothing to wait for.
+    if b.vars["GC_MODE"] != "off" {
+        b.ticks("gc", "stage:cron_gc", move |b| {
+            b.sql_count(&format!(
+                "SELECT count(*) FROM gc WHERE done_at IS NULL AND due_at <= {now}"
+            )) == 0
+        })
+        .await;
+    }
     // Cron runs with nothing due: the fixed cost of the dispatcher, which
     // grows with the catalogue only through what its queries read.
     for _ in 0..3 {

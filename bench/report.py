@@ -167,7 +167,9 @@ def model(counts, labels, prices, cpu):
     # the fixed cost.
     cron = per(labels.get("stage:cron", z), all_extents)
     cron_idle = per(labels.get("stage:cron_idle", z), calls.get("stage:cron_idle", 0))
-    hold_days = (int(vars_.get("SAFETY_MIN_AGE_SECS", 0)) + int(vars_.get("VERIFY_DELAY_SECS", 0))) / 86400
+    # Release comes at the later of the verify (VERIFY_DELAY_SECS after the
+    # post) and the minimum age, not their sum.
+    hold_days = max(int(vars_.get("SAFETY_MIN_AGE_SECS", 0)), int(vars_.get("VERIFY_DELAY_SECS", 0))) / 86400
 
     def dollars(c, cpu_ms=0.0):
         return {

@@ -8,15 +8,20 @@ per measurement.
 Commands:
   mpu    --key K --size BYTES [--part BYTES] [--concurrency N]
          one multipart upload of random bytes; MiB/s from the first byte
-         sent to the Complete answer
+         sent to the Complete answer. The bytes are written to a temporary
+         file first (not timed), so at most N parts are in memory
   many   --prefix P --count N --size BYTES [--concurrency N]
          N PutObject calls of random bytes, N at a time; MiB/s over all
   get    --key K [--range START-END] [--sha256 HEX]
-         TTFB (request sent to response headers), body MiB/s, total,
-         SHA-256 of the body (compared when --sha256 is given)
+         TTFB (request sent to response headers), total, MiB/s over the
+         total (request sent to last byte, as in every earlier run), SHA-256
+         of the body (compared when --sha256 is given). A body shorter than
+         its Content-Length is a broken connection and is tried again
   list   --prefix P [--max-keys N]
          latency of each page of ListObjectsV2 until the prefix ends
-  evict  --key K          POST /_admin/evict/<bucket>/<key>?include_safety=1
+  evict  --key K          POST /_admin/evict/<bucket>/<key>?include_safety=1;
+                          exit 3 when a safety copy was kept (safety_kept > 0):
+                          a read after it would not come from Usenet only
   status --key K          GET /_admin/objects/<bucket>/<key>
 
 Credentials: the [default] profile of AWS_SHARED_CREDENTIALS_FILE; the admin
@@ -35,6 +40,7 @@ import json
 import os
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -177,15 +183,22 @@ def cmd_mpu(a, cl):
     upload = data.split(b"<UploadId>")[1].split(b"</UploadId>")[0].decode()
     nparts = -(-a.size // a.part)
     whole = hashlib.sha256()
-    parts = [os.urandom(min(a.part, a.size - i * a.part)) for i in range(nparts)]
-    for p in parts:
+    # The object goes to a temporary file first, one part at a time, so a
+    # large upload holds at most `concurrency` parts in memory.
+    spool = tempfile.TemporaryFile()
+    for i in range(nparts):
+        p = os.urandom(min(a.part, a.size - i * a.part))
         whole.update(p)
+        spool.write(p)
+    spool.flush()
+    fd = spool.fileno()
     etags = [None] * nparts
     lat = [0.0] * nparts
 
     def up(i):
+        body = os.pread(fd, min(a.part, a.size - i * a.part), i * a.part)
         t = time.monotonic()
-        s, etag, d, _, _, _ = cl.call("PUT", a.key, [("partNumber", str(i + 1)), ("uploadId", upload)], parts[i])
+        s, etag, d, _, _, _ = cl.call("PUT", a.key, [("partNumber", str(i + 1)), ("uploadId", upload)], body)
         if s != 200:
             raise RuntimeError(f"UploadPart {i + 1}: {s} {d[:300]!r}")
         etags[i], lat[i] = etag, time.monotonic() - t
@@ -194,6 +207,7 @@ def cmd_mpu(a, cl):
     with ThreadPoolExecutor(a.concurrency) as ex:
         list(ex.map(up, range(nparts)))
     t_parts = time.monotonic() - t0
+    spool.close()
     xml = "<CompleteMultipartUpload>" + "".join(
         f"<Part><PartNumber>{i + 1}</PartNumber><ETag>{e}</ETag></Part>" for i, e in enumerate(etags)) + "</CompleteMultipartUpload>"
     tc = time.monotonic()
@@ -239,13 +253,22 @@ def cmd_get(a, cl):
     h = hashlib.sha256()
 
     def drain(r):
+        # http.client returns EOF, not an error, when the connection ends
+        # before Content-Length: count the bytes and raise, so the call is
+        # tried again from the start (with a fresh hash).
+        nonlocal h
+        h = hashlib.sha256()
+        want = r.getheader("content-length")
         n = 0
         while True:
             chunk = r.read(MIB)
             if not chunk:
-                return n
+                break
             h.update(chunk)
             n += len(chunk)
+        if want is not None and n != int(want):
+            raise http.client.IncompleteRead(b"", int(want) - n)
+        return n
 
     st, _, _, ttfb, total, n = cl.call("GET", a.key, extra=extra, stream=drain)
     ok = st in (200, 206) and (not a.sha256 or a.sha256 == h.hexdigest())
@@ -290,6 +313,9 @@ def main():
     p.add_argument("--max-keys", type=int, default=1000)
     a = p.parse_args()
     global CLIENT
+    u = urllib.parse.urlsplit(a.base)
+    if u.scheme != "https" and u.hostname not in ("localhost", "127.0.0.1", "::1"):
+        sys.exit("--base: https only (the admin bearer and S3 signatures are sent with each call); http only for localhost")
     cl = CLIENT = Client(a.base, a.bucket)
     if a.command == "mpu":
         cmd_mpu(a, cl)
@@ -301,9 +327,12 @@ def main():
         cmd_list(a, cl)
     elif a.command == "evict":
         st, body, t = admin(a.base, "POST", f"/evict/{a.bucket}/{urllib.parse.quote(a.key, safe='/')}?include_safety=1")
-        emit(metric="evict", key=a.key, status=st, seconds=round(t, 3), answer=json.loads(body) if st == 200 else body[:200].decode("utf-8", "replace"))
+        answer = json.loads(body) if st == 200 else body[:200].decode("utf-8", "replace")
+        emit(metric="evict", key=a.key, status=st, seconds=round(t, 3), answer=answer)
         if st != 200:
             sys.exit(2)
+        if answer.get("safety_kept", 0) > 0:
+            sys.exit(3)
     else:
         st, body, t = admin(a.base, "GET", f"/objects/{a.bucket}/{urllib.parse.quote(a.key, safe='/')}")
         print(body.decode("utf-8", "replace"))
