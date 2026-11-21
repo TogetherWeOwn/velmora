@@ -932,8 +932,10 @@ pass starts then).
    old record would stay the newest one of the key.
 2. Run it on a deployed test environment: abort an upload, upload a
    part twice, keep one upload open, date the `gc` rows of the dropped
-   parts 31 days back, wait for a cron run, and see that the open
-   upload completes and reads back.
+   parts 31 days back, and wait for a cron run. Then see both: the
+   copies of the dropped parts are gone from `SAFETY` (`x/<extent id>`)
+   and their extents say `deleted` with the `gc` row closed, so the
+   collector did run; and the open upload completes and reads back.
 
 **What it costs.** While nothing is due, one row read per cron run. A
 pass reads the open `gc` rows in windows of 500, oldest first, and a
@@ -945,10 +947,11 @@ of deleted and replaced objects stay open, and every pass reads them
 again: one row read for each, plus one for its extent, once a day. The
 parts whose upload is no longer known (point 7) need one statement per
 bucket that reads every row of `uploads`, about two rows read per
-upload ever begun. It runs once a day per bucket at most, whatever the
-number of parts and jobs, and also while a marked key holds such parts
-back: those are then refused for the rest of the day without another
-read of the uploads.
+upload ever begun. It runs once a day per bucket, whatever the number
+of parts and jobs, and also while a marked key holds such parts back:
+those are then refused for the rest of the day without another read of
+the uploads. Two jobs that run at the same moment on an answer that is
+a day old both ask: the read is then done once for each of them.
 
 **After a restore.** Time Travel cannot reach back past the 31 days on
 the history the database is on. It can return to a state of a history
@@ -961,10 +964,17 @@ taken back takes no write before a replay has run to its end, and by
 then every state of a history left before it is out of reach.
 
 It cannot see a restore that was undone before the replay after it
-ended: the catalogue that is brought back holds no trace of the time
-it was away. So the rule stays as well: after every Time Travel
-restore, also one that undoes another, set `GC_ORPHANS` to off and
-leave it off for 31 days.
+ended, or in the minutes after it ended and before the next cron run
+raised the rollback stamp: the catalogue that is brought back holds no
+trace of the time it was away. So two rules stay as well, for every
+Time Travel restore, also one that undoes another, and also one that
+the rollback check did not report:
+
+1. set `GC_ORPHANS` to off and leave it off for 31 days;
+2. run the replay to its end before the switch goes back on. A restore
+   can take away the mark of a write whose outcome is not known while
+   its record stays; the replay publishes such a record and takes its
+   parts into the object, so they are not collected.
 
 A database loaded from an export file that is older than 31 days can
 list, in an open upload, a part whose copy was collected since. The

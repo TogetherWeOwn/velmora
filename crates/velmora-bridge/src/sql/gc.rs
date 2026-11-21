@@ -79,9 +79,10 @@
 //! statement that reads them). The claim proves in its own batch that
 //! the bucket was found free of marks no longer ago than that. This is
 //! as good as reading them in the batch: the answer is at most a day
-//! old, the part was dropped 31 days ago, and the marks that matter to
-//! the part were all raised within one request of its drop, so they
-//! were there to be found, or were already taken away for good. A mark
+//! old, so it was given 30 days or more after the part was dropped,
+//! and the marks that matter to the part were all raised within one
+//! request of its drop, so they were there to be found, or were
+//! already taken away for good. A mark
 //! raised after the answer was written is of a record that was stored
 //! then, from a part list the part had long left.
 //!
@@ -100,10 +101,14 @@
 //! it every state of a history that was left before it is out of reach.
 //!
 //! What this cannot see: a restore that was undone before a replay ended
-//! on it. The history it leaves is one the service never wrote on, so
-//! the catalogue that is brought back holds no trace of it and nothing
-//! tells it that it was away. The ops notes keep the rule for that case
-//! (the switch stays off for 31 days after any restore).
+//! on it, or after one did and before the rollback stamp was next raised
+//! (a cron run, minutes). The catalogue that is brought back holds no
+//! trace of the history that was left, and no stamp is ahead of it, so
+//! nothing tells it that it was away. Nor can it see a restore that was
+//! never replayed where the stamp did not show it: a mark of point 7
+//! raised after the restore point is gone with it, while its record
+//! stays. The ops notes keep the rules for these cases (a replay after
+//! every restore; the switch off for 31 days after any restore).
 //!
 //! What the mark does not cover: a record stored before the catalogue
 //! had `key_floors` (migration 0007). Such a record names only parts
@@ -157,7 +162,8 @@ macro_rules! no_stale_record_of_upload {
 // upload of the catalogue. It is therefore not part of a claim: it
 // writes what it found, with the time (`?3` when a key is marked, `?4`
 // when none is), to the row `?1` of `scan_cursors`, and the claims of
-// the next `ORPHAN_VERDICT_MS` are made behind that row.
+// the next `ORPHAN_VERDICT_MS` are made behind that row. Jobs that run
+// at the same moment on an old answer each ask once.
 const BUCKET_VERDICT: &str = "INSERT INTO scan_cursors(k, v) VALUES (?1, CASE WHEN EXISTS \
        (SELECT 1 FROM uploads su WHERE su.bucket_id = ?2 AND EXISTS \
           (SELECT 1 FROM key_floors sf WHERE sf.bucket_id = su.bucket_id \
@@ -621,9 +627,11 @@ impl Verdict {
 /// one that lost its row since the read is refused here and sorted
 /// right by the next pass.
 ///
-/// An error ends the claims. The answers up to it stand, and what they
+/// An error ends the claims of its group only: the other groups are
+/// still decided, so that a bucket whose batch keeps failing does not
+/// hold up the buckets after it. Every answer stands, and what they
 /// grant is recorded: the caller deletes those copies whatever the
-/// second value says.
+/// second value says, which is the first error met.
 pub(super) async fn gc_orphan_claim<S: Sql>(
     c: &SqlCatalog<S>,
     rows: &[GcRow],
@@ -684,6 +692,7 @@ async fn orphan_claims<S: Sql>(
     let young = |at: i64| fresh < at && at <= now.0;
     // Point 6, in every batch.
     let replay_guards = || vec![guard_no_replay(), (GUARD_NO_REPLAY_SINCE, vec![ms(cutoff)])];
+    let mut failed: Option<BridgeError> = None;
     for (bucket, members) in groups {
         let mut stmts: Vec<Stmt> = replay_guards();
         if let Some(bucket) = bucket {
@@ -709,7 +718,10 @@ async fn orphan_claims<S: Sql>(
                     match c.sql.batch(ask).await {
                         Ok(_) => {}
                         Err(BridgeError::GuardFailed) => continue,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            failed.get_or_insert(e);
+                            continue;
+                        }
                     }
                 }
             }
@@ -744,21 +756,31 @@ async fn orphan_claims<S: Sql>(
             // time ago; or a marked key in the bucket: the batch wrote
             // nothing and every row of it is refused.
             Err(BridgeError::GuardFailed) => continue,
-            Err(e) => return Err(e),
+            // This group is refused; the next one is still decided.
+            Err(e) => {
+                failed.get_or_insert(e);
+                continue;
+            }
         };
         for (i, n) in members.iter().zip(changed.iter().skip(guards)) {
             granted[*i] = *n != 0;
         }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// Closes the row of a part whose safety copy is deleted.
+///
+/// Only where the catalogue says so. One that was taken back to before
+/// the claim says `held` again: the row stays open there, and a later
+/// pass claims it once more, which sets the state and the usage right.
 pub(super) async fn gc_orphan_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
     c.sql
         .exec(
             "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND action = 'delete_safety' \
-               AND done_at IS NULL",
+               AND done_at IS NULL AND EXISTS \
+               (SELECT 1 FROM extents de WHERE de.id = gc.extent_id \
+                  AND de.safety_state = 'deleted')",
             &[SqlValue::Int(id), ms(now)],
         )
         .await?;

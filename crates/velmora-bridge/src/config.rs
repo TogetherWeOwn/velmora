@@ -135,9 +135,10 @@ pub enum GcMode {
 /// point in it. So the collector waits the same time once more after
 /// every replay: no claim is granted until this long after the last
 /// one ended (`sql/gc.rs`, "After a replay"). A restore that was undone
-/// before a replay ended on it leaves nothing in the catalogue to tell
-/// by: for that one the ops notes keep the rule that the switch stays
-/// off for this long ("After a restore").
+/// before a replay ended on it, or within the minutes before the
+/// rollback stamp was next raised, leaves nothing in the catalogue to
+/// tell by: for that one the ops notes keep the rule that the switch
+/// stays off for this long ("After a restore").
 pub const ORPHAN_GRACE_MS: i64 = 31 * 24 * 60 * 60 * 1000;
 
 /// `MAINTENANCE`.
