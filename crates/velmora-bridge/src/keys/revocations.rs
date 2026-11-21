@@ -12,7 +12,8 @@
 //! a listing with the delimiter `/` does. It
 //! skips each tenant directory with one list call: an access key id has
 //! no `_`, so no tenant-0 name begins with `t_`, and `<dir>0` sorts after
-//! every name below `<dir>/`.
+//! every name below `<dir>/`. That is one list call per tenant; an
+//! adapter whose store lists with a delimiter should do this in one.
 
 use serde::{Deserialize, Serialize};
 use velmora::rng::FillRandom;
@@ -147,12 +148,20 @@ pub async fn list_tenant_zero_revocations<B: BlobStore>(
         let mut jumped = false;
         for name in &names {
             let rest = name.strip_prefix(REVOKED_KEY_PREFIX).unwrap_or_default();
-            // Below a directory: skip the whole directory with the next
-            // list. `after` only ever grows, so the loop ends.
+            // Below a tenant's directory: skip the whole directory with
+            // the next list. `<dir>0` cannot be a key id (a tenant id has
+            // a `_`), so nothing of tenant 0 is skipped. `after` only ever
+            // grows, so the loop ends.
             if let Some((dir, _)) = rest.split_once('/') {
-                after = format!("{REVOKED_KEY_PREFIX}{dir}0");
-                jumped = true;
-                break;
+                if TenantId::parse(dir).is_ok() {
+                    after = format!("{REVOKED_KEY_PREFIX}{dir}0");
+                    jumped = true;
+                    break;
+                }
+                // A stray name below something else: no key id; step over
+                // it alone.
+                after.clone_from(name);
+                continue;
             }
             if let Some(id) = revoked_key_id(name) {
                 ids.push(id.to_owned());
