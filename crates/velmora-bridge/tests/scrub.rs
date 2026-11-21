@@ -326,13 +326,9 @@ impl World {
         self.bridge().safety.contains(&o.extent.safety_key())
     }
 
+    /// The POSTs sent so far in this test (every one, logged as it starts).
     fn posts(&self) -> u32 {
-        self.bridge()
-            .nntp
-            .calls()
-            .iter()
-            .filter(|(c, _)| *c == "post")
-            .count() as u32
+        nntp_support::post_starts().len() as u32
     }
 
     /// Reads the object back through S3 and compares it.
@@ -433,6 +429,7 @@ async fn a_loss_on_one_backbone_is_confirmed_then_reposted_there_and_released_on
     // The pipeline: verify posts the article to beta again and reads it
     // back; the release then needs both backbones.
     let plan = w.plan(&o).await;
+    let posts = w.posts();
     assert!(w.servers[1].is_hidden(&plan[1].message_id).await);
     w.drive(&o).await;
     assert_eq!(w.safety_state(&o).await, "released");
@@ -440,6 +437,7 @@ async fn a_loss_on_one_backbone_is_confirmed_then_reposted_there_and_released_on
         !w.servers[1].is_hidden(&plan[1].message_id).await,
         "the repost under the stored message-id put it back on beta"
     );
+    assert_eq!(w.posts(), posts + 1, "one POST: the lost article");
     let evidence = w
         .scalar(
             "SELECT release_evidence FROM extents WHERE id = ?1",
@@ -780,7 +778,12 @@ async fn a_repair_that_does_not_end_is_reported_stalled_and_its_safety_copy_kept
     assert!(w.bridge().safety.lose(&o.extent.safety_key()));
     let bound = repair_bound_secs(w.bridge().cfg.safety_min_age_secs, 3600);
     w.advance_secs(u32::try_from(bound).unwrap() - 1);
-    assert_eq!(w.scrub().await.checked + w.scrub().await.stalled, 0);
+    let early = w.scrub().await;
+    assert_eq!(
+        (early.checked, early.stalled),
+        (0, 0),
+        "not due before the bound"
+    );
     w.advance_secs(1);
     let run = w.scrub().await;
     assert_eq!(run.stalled, 1);
@@ -1314,10 +1317,14 @@ async fn the_read_gets_the_slot_the_stat_session_held() {
     })
     .await;
     let o = w.released("a", 190).await;
+    let p = w.released("b", 191).await;
     w.advance_secs(31 * DAY_SECS);
+    // The second extent's `STAT` needs the slot the read of the first
+    // kept: the read's sessions are ended for it.
     let run = w.scrub().await;
-    assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert_eq!((run.checked, run.ok, run.ended), (2, 2, ScrubEnd::Idle));
     assert_eq!(w.result(&o).await, "ok");
+    assert_eq!(w.result(&p).await, "ok");
 }
 
 /// The due query as it runs is read from its index.
@@ -1561,4 +1568,53 @@ async fn a_read_that_breaks_off_is_deferred_and_the_run_goes_on() {
     w.advance_secs(3600);
     let again = w.scrub().await;
     assert_eq!(again.ok, 2);
+}
+
+/// The extent at which the breaker trips is classified like any other
+/// confirmed loss: with no intact copy anywhere it is `unrecoverable`,
+/// not left `suspect`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_extent_that_trips_the_breaker_is_still_found_unrecoverable() {
+    let w = world().await;
+    let mut objs = Vec::new();
+    for i in 0..8u8 {
+        let o = w.released(&format!("k{i}"), 210 + i).await;
+        assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+        objs.push(o);
+    }
+    w.advance_secs(31 * DAY_SECS);
+    for o in &objs {
+        w.hide(0, o, 0).await;
+        w.hide(1, o, 0).await;
+    }
+    assert_eq!(w.scrub().await.ended, ScrubEnd::Incident);
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!(run.ended, ScrubEnd::Incident);
+    assert_eq!(run.unrecoverable, 8);
+    for o in &objs {
+        assert_eq!(w.result(o).await, "unrecoverable");
+    }
+}
+
+/// A trip is stored at once: a run whose end is never written still
+/// leaves the next one blocked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_trip_is_stored_when_it_happens() {
+    let w = world().await;
+    let mut objs = Vec::new();
+    for i in 0..8u8 {
+        objs.push(w.released(&format!("k{i}"), 220 + i).await);
+    }
+    w.advance_secs(31 * DAY_SECS);
+    for o in &objs {
+        w.hide(1, o, 0).await;
+    }
+    *w.bridge().catalog.sql.fail_matching.borrow_mut() =
+        Some(("UPDATE scrub_state SET lease_until = NULL", 0));
+    assert_eq!(w.scrub().await.ended, ScrubEnd::Incident);
+    *w.bridge().catalog.sql.fail_matching.borrow_mut() = None;
+    let state = w.state().await;
+    assert_eq!(state.runs, 0, "the end was not written");
+    assert_eq!(state.blocked(), ["beta"]);
 }

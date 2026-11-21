@@ -196,6 +196,24 @@ pub(super) async fn drop_due<S: Sql>(
     Ok(changed == 1)
 }
 
+pub(super) async fn block<S: Sql>(
+    c: &SqlCatalog<S>,
+    token: u64,
+    blocked: &[String],
+) -> Result<bool> {
+    let labels =
+        serde_json::to_string(blocked).map_err(|_| BridgeError::Invalid("backbone labels"))?;
+    let changed = c
+        .sql
+        .exec(
+            "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0 \
+             WHERE id = 1 AND lease_token = ?1",
+            &[uint(token)?, text(&labels)],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
 pub(super) async fn defer<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,

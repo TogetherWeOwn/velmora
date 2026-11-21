@@ -221,15 +221,13 @@ impl Breaker {
         }
     }
 
-    /// The backbone it trips for, if any, with its count.
-    fn tripped(&self) -> Option<(&str, u32)> {
+    /// The backbones it trips for, with their counts.
+    fn tripped(&self) -> Vec<(&str, u32)> {
         self.lacking
             .iter()
-            .find(|(_, n)| {
-                *n >= INCIDENT_MIN_EXTENTS
-                    && u64::from(*n) * 100 > u64::from(self.checked) * u64::from(INCIDENT_PERCENT)
-            })
+            .filter(|(_, n)| breaker_trips(*n, self.checked))
             .map(|(b, n)| (b.as_str(), *n))
+            .collect()
     }
 }
 
@@ -324,13 +322,8 @@ where
         // without a trip have checked as many extents as a trip needs,
         // the incidents clear.)
         (run.blocked, run.incident_clean) = match &run.incident {
-            Some(label) => {
-                let mut kept = blocked;
-                if !kept.contains(label) {
-                    kept.push(label.clone());
-                }
-                (kept, 0)
-            }
+            // Every backbone that tripped is in `blocked` already.
+            Some(_) => (blocked, 0),
             None if blocked.is_empty() => (blocked, 0),
             None => match clean >= u64::from(INCIDENT_MIN_EXTENTS) {
                 true => (Vec::new(), 0),
@@ -581,21 +574,40 @@ where
                 .await;
         }
 
-        if let Some((backbone, lacking)) = walk.breaker.tripped() {
-            let line = format!("{backbone} {lacking}/{}", walk.breaker.checked);
-            let backbone = backbone.to_owned();
-            crate::trace::alert(|| format!("scrub-incident {line}"));
-            walk.run.incident = Some(backbone);
+        let confirmed = matches!(
+            candidate.last,
+            Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
+        );
+        let tripped: Vec<(String, u32)> = walk
+            .breaker
+            .tripped()
+            .into_iter()
+            .map(|(b, n)| (b.to_owned(), n))
+            .collect();
+        if !tripped.is_empty() {
+            let checked = walk.breaker.checked;
+            for (backbone, lacking) in &tripped {
+                crate::trace::alert(|| format!("scrub-incident {backbone} {lacking}/{checked}"));
+                if !walk.blocked.contains(backbone) {
+                    walk.blocked.push(backbone.clone());
+                }
+            }
+            walk.run.incident = tripped.first().map(|(b, _)| b.clone());
+            walk.clean = 0;
+            // Stored now, under the lease: a run that dies before its end
+            // still leaves the next one blocked.
+            let _ = self.catalog.scrub_block(token, &walk.blocked).await;
+            if confirmed {
+                // Classified as any confirmed loss (unrecoverable when no
+                // copy is left), but not re-pinned.
+                return self.repair(reader, walk, extent, found, false).await;
+            }
             walk.run.suspect += 1;
             return self
                 .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
                 .await;
         }
 
-        let confirmed = matches!(
-            candidate.last,
-            Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
-        );
         if !confirmed {
             walk.run.suspect += 1;
             return self
@@ -640,10 +652,25 @@ where
                 },
                 _ => asked.await,
             }
+        };
+        // No slot to ask a backbone with while the reader keeps sessions
+        // from the extent before: the slot may be one of them (a provider
+        // with one background slot). They are ended and it is asked once
+        // more.
+        let lacking = match lacking {
+            Err(Halt::Busy) if reader.idle_ms().is_some() => {
+                reader.hang_up().await;
+                self.presence_all(&holder, walk.stats, &mut walk.refused, &plan)
+                    .await
+            }
+            other => other,
         }?;
 
         let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
-        let Ok(charge) = self.budget.charge_job(bytes).await else {
+        // The wait for room in the byte budget is no provider call: the
+        // run's sessions are ended if their slots would run out first.
+        let charged = self.budget.charge_job(bytes);
+        let Ok(charge) = self.idle(reader, walk.stats, charged).await else {
             return Err(Halt::Busy);
         };
         let before = reader.stats();
@@ -752,6 +779,14 @@ where
         if fresh.is_empty() {
             fresh = expired;
         }
+        // A kept session of another backbone that could run out of its
+        // slot while this one is asked (one call at most) is ended first.
+        let call_ms = i64::from(PermitClass::Background.call_secs()) * 1000;
+        let (short, kept): (Vec<_>, Vec<_>) = core::mem::take(stats)
+            .into_iter()
+            .partition(|s| i64::from(s.idle_ms()) <= call_ms);
+        *stats = kept;
+        ProviderSession::close_all(short).await;
         let mut order = pool.order(fresh, PermitClass::Background);
         // A provider this run keeps a session on comes first: the session
         // itself counts as load there, and moving to the next one would
@@ -890,7 +925,16 @@ where
         let (source, cipher) = match found.cipher {
             Some(cipher) if found.rebuilt > 0 => (RepairSource::Parity, Some(cipher)),
             Some(cipher) => (RepairSource::Usenet, Some(cipher)),
-            None => self.stored_copy(extent).await,
+            None => match self.stored_copy(extent).await {
+                Ok(stored) => stored,
+                // A blob store did not answer: not "no copy". Looked at
+                // again later.
+                Err(()) => {
+                    return self
+                        .scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, confirm))
+                        .await;
+                }
+            },
         };
         let Some(cipher) = cipher else {
             walk.run.unrecoverable += 1;
@@ -1007,18 +1051,27 @@ where
     }
 
     /// The cache copy if it is intact, else the safety copy if it is.
-    async fn stored_copy(&self, extent: &ExtentRow) -> (RepairSource, Option<Vec<u8>>) {
-        if let Ok(Some(bytes)) = self.cache.get(&extent.id.cache_key(), None).await {
-            if digest_ok(extent, &bytes) {
-                return (RepairSource::Cache, Some(bytes));
+    /// `Err(())`: a store could not be read, so whether it holds a copy
+    /// is not known.
+    async fn stored_copy(
+        &self,
+        extent: &ExtentRow,
+    ) -> core::result::Result<(RepairSource, Option<Vec<u8>>), ()> {
+        let mut unknown = false;
+        for (source, store, key) in [
+            (RepairSource::Cache, &self.cache, extent.id.cache_key()),
+            (RepairSource::Safety, &self.safety, extent.id.safety_key()),
+        ] {
+            match store.get(&key, None).await {
+                Ok(Some(bytes)) if digest_ok(extent, &bytes) => return Ok((source, Some(bytes))),
+                Ok(_) => {}
+                Err(_) => unknown = true,
             }
         }
-        if let Ok(Some(bytes)) = self.safety.get(&extent.id.safety_key(), None).await {
-            if digest_ok(extent, &bytes) {
-                return (RepairSource::Safety, Some(bytes));
-            }
+        match unknown {
+            true => Err(()),
+            false => Ok((RepairSource::Usenet, None)),
         }
-        (RepairSource::Usenet, None)
     }
 
     /// Writes verified ciphertext as the extent's safety copy.
@@ -1128,7 +1181,13 @@ where
                 }
             )
         });
-        self.scrub_record_one(reader, walk, extent, (ScrubResult::Stalled, bound))
+        // A copy that could not be written is tried again soon, not at
+        // the next bound.
+        let next = match kept || rewrote {
+            true => bound,
+            false => u64::from(cfg.confirm_secs),
+        };
+        self.scrub_record_one(reader, walk, extent, (ScrubResult::Stalled, next))
             .await
     }
 }
@@ -1175,8 +1234,8 @@ mod tests {
             b.note(&found(&["a"]));
             b.note(&found(&["b"]));
         }
-        assert!(b.tripped().is_none());
+        assert!(b.tripped().is_empty());
         b.note(&found(&["a"]));
-        assert_eq!(b.tripped(), Some(("a", 8)));
+        assert_eq!(b.tripped(), [("a", 8)]);
     }
 }
