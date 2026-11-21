@@ -1804,14 +1804,14 @@ SELECT runs, checked, ok, suspect, repaired, unrecoverable, stalled, incidents, 
   FROM scrub_state;
 ```
 
-Each run logs one `scrub: checked=... ended=...` line. `ended=busy` means a provider had no free slot (an operator drill holds the drill connections, or verify holds the background slots): the run stops and the next one goes on.
+Each run logs one `scrub: checked=... ended=...` line. An extent no live object holds (deleted or overwritten, waiting for garbage collection) is recorded `skipped` and not read. `ended=busy` means a provider had no free slot (an operator drill holds the drill connections, or verify holds the background slots): the run stops and the next one goes on.
 
 **Alert lines** (`alert:` in the Worker logs; no key, bucket, message-id or host):
 
 | Line | Meaning | What to do |
 |---|---|---|
 | `scrub-repair <extent> source=<usenet\|parity\|cache\|safety> lacking=[<backbones>]` | A loss seen twice; the extent is held again and its outbox row is in verify. | Nothing: verify posts what a backbone lacks and the release follows. |
-| `scrub-incident <backbone> <lost>/<checked>` | More than 12 % (and at least 8) of a run's extents lack articles on one backbone. No loss there is repaired until a run checks enough extents without tripping again. | Look at the provider: an outage, a purge, throttling that answers 430. `last_incident` names the backbone until it clears. |
+| `scrub-incident <backbone> <lost>/<checked>` | More than 12 % (and at least 8) of a run's extents lack articles on one backbone. No loss there is re-pinned until a run checks at least 8 extents without tripping. | Look at the provider: an outage, a purge, throttling that answers 430. `last_incident` (a JSON array of backbones) names every backbone under an incident until it clears. |
 | `scrub-stalled <extent> ...` | A re-pinned extent is still held when its repair should have ended (minimum age + every verify wait + one confirm interval). Its safety copy is made sure of. | Look at the extent's outbox row: no provider that posts to the backbone that lacks the article, or a backbone that refuses the stored message-id. The copy stays pinned in R2 meanwhile. |
 | `scrub-unrecoverable <extent> ...` | Lost on every backbone, and neither cache nor safety copy is intact. Checked again every `SCRUB_CONFIRM_SECS`. | The object's bytes in this extent cannot be read. Restore from another copy if one exists outside velmora. |
 
