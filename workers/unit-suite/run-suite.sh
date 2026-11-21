@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The catalogue test suite on Durable Object SQLite in workerd (tenancy
-# ADR §8.3, gate 1): run-suite.sh [cargo test arguments]
+# The catalogue test suite on Durable Object SQLite in workerd:
+# run-suite.sh [cargo test arguments]
 #
 # Builds this Worker, serves it with the pinned workerd (the binary that
 # wrangler 4.161.0 ships, from ../s3-bridge/node_modules) on loopback
