@@ -345,6 +345,12 @@ impl Fx {
         self.cat.record_verification(l, &v).await.unwrap()
     }
 
+    /// A complete full read of an extent of `n` articles.
+    async fn pass_of(&self, l: &Lease, backbone: &str, at: UnixMs, n: u32) -> bool {
+        self.verify(l, backbone, "p1", at, n, n, VerifyResult::Ok)
+            .await
+    }
+
     /// A two-article extent claimed for release at `T0`.
     async fn at_release(&self, key: &str) -> (Obj, Lease) {
         let o = self.publish(&self.bucket, key).await;
@@ -948,9 +954,14 @@ async fn release_needs_fresh_evidence() {
         fx.verify(&l, "bb-a", "p1", T0, 2, 2, VerifyResult::Ok)
             .await
     );
-    // Only a release lease may release.
+    // Only the lease of a job that checks may release: a release job,
+    // or a verify job (`a_verify_lease_releases_on_its_own_claim_only`).
+    let post = Lease {
+        stage: OutboxStage::Post,
+        ..l.clone()
+    };
     assert!(matches!(
-        fx.cat.begin_release(&l, 1, &bbs(), "[]", T0).await,
+        fx.cat.begin_release(&post, 1, &bbs(), "[]", T0).await,
         Err(BridgeError::Invalid(_))
     ));
     let week = T0.plus_ms(7 * 24 * HOUR_MS);
@@ -2058,6 +2069,100 @@ async fn release_evidence_must_come_from_this_claim() {
         fx.cat.begin_release(&r, 1, &bbs(), "[]", t2).await.unwrap(),
         Guard::Applied(())
     );
+}
+
+/// A verify job may release what it has just checked: the guard is the
+/// one of a release job. Only passes recorded under the claim of the
+/// lease count, so a pass from an earlier verify job is not presence,
+/// and a lease that is stale or expired authorizes nothing.
+#[tokio::test]
+async fn a_verify_lease_releases_on_its_own_claim_only() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let counting = labels(&["bb-a", "bb-b"]);
+    // A first verify job reads one backbone in full and is put off.
+    let first = fx.posted(&o, 2, T0).await;
+    assert!(fx.pass(&first, "bb-a", T0, VerifyKind::Body).await);
+    let later = T0.plus_ms(HOUR_MS);
+    assert!(fx.cat.defer_at(&first, 8, later, T0).await.unwrap());
+    let l = fx.claim(&o, OutboxStage::Verify, later).await.unwrap();
+    let begin = |l: &Lease, at: UnixMs| {
+        let (cat, l, counting) = (&fx.cat, l.clone(), &counting);
+        async move { cat.begin_release(&l, 2, counting, "[]", at).await.unwrap() }
+    };
+
+    // The job that resumes asks the second backbone only.
+    assert!(
+        fx.pass(&l, "bb-b", later.plus_ms(1), VerifyKind::Stat)
+            .await
+    );
+    assert_eq!(fx.counting(&o).await, ["bb-a", "bb-b"]);
+    let before = fx.dump().await;
+    assert_eq!(begin(&l, later.plus_ms(2)).await, Guard::Lost);
+    assert!(!fx.cat.finish_release(&l, later.plus_ms(2)).await.unwrap());
+    assert_eq!(fx.dump().await, before, "a pass from an earlier claim");
+
+    // It asks the first one too: presence on both under this claim,
+    // and the full check of the earlier job on record.
+    assert!(
+        fx.pass(&l, "bb-a", later.plus_ms(3), VerifyKind::Stat)
+            .await
+    );
+    assert_eq!(on_record(&fx, &o).await, [("bb-a".to_string(), T0)]);
+    // Not for a lease that is over, nor past the end of this one.
+    let before = fx.dump().await;
+    assert_eq!(begin(&first, later.plus_ms(4)).await, Guard::Lost);
+    let expired = later.plus_ms(LEASE_MS + 1);
+    assert_eq!(begin(&l, expired).await, Guard::Lost);
+    assert_eq!(fx.dump().await, before);
+
+    assert_eq!(begin(&l, later.plus_ms(4)).await, Guard::Applied(()));
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    assert_eq!(fx.outbox(&o, "stage").await, "verify");
+    let before = fx.dump().await;
+    assert!(!fx
+        .cat
+        .finish_release(&first, later.plus_ms(5))
+        .await
+        .unwrap());
+    assert!(!fx.cat.finish_release(&l, expired).await.unwrap());
+    assert_eq!(fx.dump().await, before);
+    let done_at = later.plus_ms(5);
+    assert!(fx.cat.finish_release(&l, done_at).await.unwrap());
+    let je = fx.cat.job_extent(&o.extent, &o.generation).await;
+    let je = je.unwrap().unwrap();
+    assert_eq!(je.extent.safety_state, SafetyState::Released);
+    assert_eq!(je.extent.released_at, Some(done_at));
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
+    assert_eq!(fx.outbox(&o, "lease_until").await, "NULL");
+}
+
+/// A verify job that died between the two steps of its release: the
+/// row is still at verify and the copy `releasing`. The next verify job
+/// hands the row on, and the release stage finishes it.
+#[tokio::test]
+async fn a_release_begun_by_a_verify_job_is_finished_by_the_release_stage() {
+    let fx = Fx::new().await;
+    let o = fx.publish(&fx.bucket, "k").await;
+    let l = fx.posted(&o, 1, T0).await;
+    assert!(fx.pass_of(&l, "bb-a", T0, 1).await);
+    assert_eq!(
+        fx.cat.begin_release(&l, 1, &bbs(), "[]", T0).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(fx.extent(&o, "safety_state").await, "releasing");
+    // The job dies; its lease runs out.
+    let later = T0.plus_ms(LEASE_MS + 1);
+    let next = fx.claim(&o, OutboxStage::Verify, later).await.unwrap();
+    assert!(fx
+        .cat
+        .advance(&next, OutboxStage::Release, later, later)
+        .await
+        .unwrap());
+    let r = fx.claim(&o, OutboxStage::Release, later).await.unwrap();
+    assert!(fx.cat.finish_release(&r, later).await.unwrap());
+    assert_eq!(fx.extent(&o, "safety_state").await, "released");
+    assert_eq!(fx.outbox(&o, "stage").await, "done");
 }
 
 /// An expired lease that nobody has taken over yet may be taken over at

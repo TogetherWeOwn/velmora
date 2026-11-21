@@ -997,6 +997,11 @@ pub trait Catalog {
     /// `stat` pass is enough, but none counts on a backbone whose last
     /// full read failed), and at least one of these also has the full
     /// check on record ([`Catalog::body_checks`]).
+    ///
+    /// `l` is the lease of a release job, or of the verify job that
+    /// releases what it has just checked (`RELEASE_AT_VERIFY`). The
+    /// guard is the same for both: "under this claim" is the claim `l`
+    /// is of, so a pass from an earlier job counts for neither.
     async fn begin_release(
         &self,
         l: &Lease,
@@ -1042,6 +1047,9 @@ pub trait Catalog {
     /// backbones of those that had not ended when it was stored (`at` =
     /// its `created_at`), whenever its job runs.
     async fn verify_escalations(&self, at: UnixMs) -> Result<Vec<VerifyEscalation>>;
+    /// The last step of a release begun under `l`
+    /// ([`Catalog::begin_release`]): `releasing` becomes `released` and
+    /// the row is done. `false` = the lease no longer holds the row.
     async fn finish_release(&self, l: &Lease, now: UnixMs) -> Result<bool>;
     /// Up to `limit` rows in `post`, `verify` or `release` that are due
     /// and held by no job, oldest due time first. Each stage has a third
