@@ -72,6 +72,26 @@ mod tests {
     }
 
     #[test]
+    fn the_unit_list_is_the_whole_unit_migrations_directory_in_order() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/unit/migrations");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names.len(),
+            UNIT.len(),
+            "a unit migration is missing from the list"
+        );
+        for (name, text) in names.iter().zip(UNIT) {
+            let on_disk = std::fs::read_to_string(format!("{dir}/{name}")).unwrap();
+            assert_eq!(&on_disk, text, "{name} is not in its place");
+        }
+    }
+
+    #[test]
     fn the_version_counts_every_migration() {
         assert_eq!(SCHEMA_VERSION as usize, all().count());
     }

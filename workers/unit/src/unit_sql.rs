@@ -36,6 +36,9 @@ impl UnitSql for DoSql {
         // runs its callback at once and keeps no reference to it, and the
         // closure is dropped right after the call. So `f` outlives every
         // use of the pointer, and nothing else borrows it meanwhile.
+        // A Rust panic inside `f` traps the instance: the transaction
+        // rolls back, the error reaches this frame as the runtime's, and
+        // the caller only turns it into a `failed` answer, with no SQL.
         let f: *mut (dyn FnMut() -> Result<()> + 'static) = unsafe { std::mem::transmute(f) };
         let fail = failure.clone();
         let run = Closure::<dyn FnMut() -> std::result::Result<(), JsValue>>::new(move || {

@@ -39,6 +39,7 @@ pub enum CallKind {
 
 /// The two chain numbers of a unit, or of a caller's view of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Seqs {
     pub state_seq: u64,
     pub keys_seq: u64,

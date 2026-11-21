@@ -89,14 +89,18 @@ pub struct Head {
 pub struct Unit<S: UnitSql> {
     cat: SqlCatalog<S>,
     own: UnitName,
+    /// The jurisdiction the object was made under ("" for none).
+    jurisdiction: String,
 }
 
 impl<S: UnitSql> Unit<S> {
-    /// `own`: the name the object was made under.
-    pub fn new(sql: S, own: UnitName) -> Self {
+    /// `own`: the name the object was made under; `jurisdiction`: the
+    /// jurisdiction of its namespace ("" for none).
+    pub fn new(sql: S, own: UnitName, jurisdiction: &str) -> Self {
         Unit {
             cat: SqlCatalog::new(sql),
             own,
+            jurisdiction: jurisdiction.to_string(),
         }
     }
 
@@ -221,7 +225,7 @@ impl<S: UnitSql> Unit<S> {
         caller_state_seq: Option<u64>,
         now: UnixMs,
     ) -> Result<UnitAnswer> {
-        if let Err(reason) = check_token(&self.own, token, caller_state_seq) {
+        if let Err(reason) = check_token(&self.own, &self.jurisdiction, token, caller_state_seq) {
             let alarm = reason == ProvisionRefusal::WrongName;
             return Ok(refused(Refused::Provision(reason), alarm));
         }
@@ -376,7 +380,7 @@ impl<S: UnitSql> Unit<S> {
             "tenant_mode": head.tenant_mode.map(HoldMode::as_str),
         });
         match &call.op {
-            UnitOp::Ping => Ok(Ok(state)),
+            UnitOp::Ping {} => Ok(Ok(state)),
             UnitOp::KeyRow { access_key_id } => {
                 let row = self.cat.access_key(access_key_id).await?;
                 Ok(Ok(
@@ -392,7 +396,27 @@ impl<S: UnitSql> Unit<S> {
                 reader,
             } => {
                 let Some(b) = self.cat.bucket_by_name(bucket).await? else {
-                    return Ok(Err(Refused::NotFound));
+                    // A missing bucket is decided by the Worker after the
+                    // signature (ADR §8.4: a missing bucket and a missing
+                    // grant both answer AccessDenied), so the answer
+                    // carries the key row like any other. A fan-out read
+                    // was granted on a bucket that is gone.
+                    if fanout_check {
+                        return Ok(Err(Refused::AccessDenied));
+                    }
+                    let key_row = match access_key_id {
+                        Some(akid) => Some(self.cat.access_key(akid).await?.as_ref().map_or(
+                            Value::Null,
+                            |row| json!({ "key": key_json(row), "grant": Value::Null }),
+                        )),
+                        None => None,
+                    };
+                    return Ok(Ok(json!({
+                        "bucket": Value::Null,
+                        "generation": Value::Null,
+                        "key_row": key_row,
+                        "state": state,
+                    })));
                 };
                 if fanout_check {
                     let reader = reader.as_ref().ok_or(BridgeError::Invalid("no reader"))?;

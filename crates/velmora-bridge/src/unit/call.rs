@@ -131,8 +131,9 @@ pub enum UnitOp {
     /// Copies a verified tenant record into the unit (rule 5). A Worker
     /// call.
     Sync { head: SyncHead },
-    /// The unit's numbers and state, and nothing else.
-    Ping,
+    /// The unit's numbers and state, and nothing else. A struct variant,
+    /// so that an unknown field next to it is refused.
+    Ping {},
     /// The key row of an access key: the first of the two calls of a cold
     /// isolate (ADR §8.4). Allowed without `authenticated`.
     KeyRow { access_key_id: String },
@@ -170,7 +171,7 @@ impl UnitOp {
     pub fn is_read(&self) -> bool {
         matches!(
             self,
-            UnitOp::Ping | UnitOp::KeyRow { .. } | UnitOp::ReadPlan { .. }
+            UnitOp::Ping {} | UnitOp::KeyRow { .. } | UnitOp::ReadPlan { .. }
         )
     }
 }

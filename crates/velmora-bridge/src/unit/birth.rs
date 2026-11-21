@@ -63,8 +63,9 @@ pub struct HeadView {
     /// The head is the record that **first** lists this unit (the
     /// `provisioning` record, or an add-unit record).
     pub first_lists_unit: bool,
-    /// The head carries a `restoring` entry for this unit.
-    pub restoring_this_unit: bool,
+    /// The `since_seq` of the head's `restoring` entry for this unit, if
+    /// it carries one.
+    pub restoring_since: Option<u64>,
 }
 
 /// Why `provision` is not to be called, or was refused.
@@ -76,7 +77,8 @@ pub enum ProvisionRefusal {
     /// A birth token, but the head is not the record that first lists
     /// the unit at the token's seq (a retried job that found a newer head).
     NotTheListingRecord,
-    /// A restore token, but the head carries no `restoring` for the unit.
+    /// A restore token, but the head carries no `restoring` entry for
+    /// the unit at the token's seq (none, or one of another restore).
     NotRestoring,
     /// The token names another tenant or unit than this object.
     WrongName,
@@ -89,6 +91,8 @@ pub enum ProvisionRefusal {
     StaleBirth,
     /// The object already holds a certificate.
     AlreadyBorn,
+    /// A `provision` call without the caller's numbers.
+    NoNumbers,
 }
 
 /// The Worker's rule (rule 6): `provision` is called only when it may
@@ -108,8 +112,12 @@ pub fn may_provision(
             }
             Ok(())
         }
+        // The token is bound to the restore it was made for: the head
+        // must still hold this unit's entry with `since_seq` = its seq
+        // (ADR §8.6 step 5). A stale token of an earlier restore is
+        // refused.
         BirthKind::Restore => {
-            if !head.restoring_this_unit {
+            if head.restoring_since != Some(token.record_seq) {
                 return Err(ProvisionRefusal::NotRestoring);
             }
             Ok(())
@@ -126,23 +134,30 @@ pub fn scheme_of(name: &UnitName) -> u8 {
     }
 }
 
-/// The unit's rule (rules 6 and 13): whether `token` may make the object
-/// `own`. `caller_state_seq`: the `state_seq` the `provision` call carries.
+/// The unit's rule (rules 6, 13 and 14): whether `token` may make the
+/// object `own`, made under `jurisdiction` ("" for none).
+/// `caller_state_seq`: the `state_seq` the `provision` call carries; a
+/// call without it is refused, so that a Worker that forgets it cannot
+/// turn a lost unit into an empty one.
 pub fn check_token(
     own: &UnitName,
+    jurisdiction: &str,
     token: &BirthToken,
     caller_state_seq: Option<u64>,
 ) -> Result<(), ProvisionRefusal> {
-    if &token.name != own {
+    if &token.name != own || token.jurisdiction != jurisdiction {
         return Err(ProvisionRefusal::WrongName);
     }
+    let Some(caller_state_seq) = caller_state_seq else {
+        return Err(ProvisionRefusal::NoNumbers);
+    };
     if token.key_scheme != scheme_of(own) {
         return Err(ProvisionRefusal::WrongScheme);
     }
     if token.schema_version != SCHEMA_VERSION {
         return Err(ProvisionRefusal::WrongSchema);
     }
-    if token.kind == BirthKind::Birth && caller_state_seq.is_some_and(|s| s > token.record_seq) {
+    if token.kind == BirthKind::Birth && caller_state_seq > token.record_seq {
         return Err(ProvisionRefusal::StaleBirth);
     }
     Ok(())
@@ -168,44 +183,50 @@ mod tests {
         }
     }
 
-    fn head(seq: u64, first_lists_unit: bool, restoring_this_unit: bool) -> HeadView {
+    fn head(seq: u64, first_lists_unit: bool, restoring_since: Option<u64>) -> HeadView {
         HeadView {
             seq,
             first_lists_unit,
-            restoring_this_unit,
+            restoring_since,
         }
     }
 
     #[test]
     fn a_birth_is_called_only_at_the_listing_record_without_a_marker() {
         let t = token(BirthKind::Birth, 3);
-        assert_eq!(may_provision(&head(3, true, false), &t, false), Ok(()));
+        assert_eq!(may_provision(&head(3, true, None), &t, false), Ok(()));
         assert_eq!(
-            may_provision(&head(3, true, false), &t, true),
+            may_provision(&head(3, true, None), &t, true),
             Err(ProvisionRefusal::BornBefore)
         );
         // A retried job that finds a newer head does not call provision.
         assert_eq!(
-            may_provision(&head(4, false, false), &t, false),
+            may_provision(&head(4, false, None), &t, false),
             Err(ProvisionRefusal::NotTheListingRecord)
         );
         assert_eq!(
-            may_provision(&head(4, true, false), &t, false),
+            may_provision(&head(4, true, None), &t, false),
             Err(ProvisionRefusal::NotTheListingRecord)
         );
         assert_eq!(
-            may_provision(&head(3, false, false), &t, false),
+            may_provision(&head(3, false, None), &t, false),
             Err(ProvisionRefusal::NotTheListingRecord)
         );
     }
 
     #[test]
-    fn a_restore_is_called_only_while_the_head_carries_restoring() {
+    fn a_restore_is_called_only_while_the_head_carries_its_entry() {
         let t = token(BirthKind::Restore, 9);
-        assert_eq!(may_provision(&head(12, false, true), &t, true), Ok(()));
-        assert_eq!(may_provision(&head(12, false, true), &t, false), Ok(()));
+        assert_eq!(may_provision(&head(12, false, Some(9)), &t, true), Ok(()));
+        assert_eq!(may_provision(&head(12, false, Some(9)), &t, false), Ok(()));
         assert_eq!(
-            may_provision(&head(12, false, false), &t, true),
+            may_provision(&head(12, false, None), &t, true),
+            Err(ProvisionRefusal::NotRestoring)
+        );
+        // A stale token of an earlier restore, while another restore of
+        // the unit is under way.
+        assert_eq!(
+            may_provision(&head(25, false, Some(20)), &t, true),
             Err(ProvisionRefusal::NotRestoring)
         );
     }
@@ -213,36 +234,42 @@ mod tests {
     #[test]
     fn the_unit_checks_names_scheme_schema_and_the_callers_seq() {
         let own = UnitName::new(tenant(), 0);
+        let birth = token(BirthKind::Birth, 3);
+        assert_eq!(check_token(&own, "", &birth, Some(3)), Ok(()));
         assert_eq!(
-            check_token(&own, &token(BirthKind::Birth, 3), Some(3)),
-            Ok(())
+            check_token(&own, "", &birth, None),
+            Err(ProvisionRefusal::NoNumbers)
         );
-        assert_eq!(check_token(&own, &token(BirthKind::Birth, 3), None), Ok(()));
         assert_eq!(
-            check_token(&own, &token(BirthKind::Birth, 3), Some(4)),
+            check_token(&own, "", &birth, Some(4)),
             Err(ProvisionRefusal::StaleBirth)
         );
         // A restore token is not bound to the caller's view.
         assert_eq!(
-            check_token(&own, &token(BirthKind::Restore, 3), Some(40)),
+            check_token(&own, "", &token(BirthKind::Restore, 3), Some(40)),
             Ok(())
+        );
+        // Rule 14: a token for another jurisdiction makes no object here.
+        assert_eq!(
+            check_token(&own, "eu", &birth, Some(3)),
+            Err(ProvisionRefusal::WrongName)
         );
 
         let other = UnitName::new(tenant(), 1);
         assert_eq!(
-            check_token(&other, &token(BirthKind::Birth, 3), None),
+            check_token(&other, "", &birth, Some(3)),
             Err(ProvisionRefusal::WrongName)
         );
         let mut t = token(BirthKind::Birth, 3);
         t.key_scheme = 1;
         assert_eq!(
-            check_token(&own, &t, None),
+            check_token(&own, "", &t, Some(3)),
             Err(ProvisionRefusal::WrongScheme)
         );
         let mut t = token(BirthKind::Birth, 3);
         t.schema_version += 1;
         assert_eq!(
-            check_token(&own, &t, None),
+            check_token(&own, "", &t, Some(3)),
             Err(ProvisionRefusal::WrongSchema)
         );
     }
@@ -254,11 +281,11 @@ mod tests {
         let mut t = token(BirthKind::Birth, 1);
         t.name = UnitName::new(TenantId::zero(), 0);
         assert_eq!(
-            check_token(&t.name.clone(), &t, None),
+            check_token(&t.name.clone(), "", &t, Some(1)),
             Err(ProvisionRefusal::WrongScheme)
         );
         t.key_scheme = 1;
-        assert_eq!(check_token(&t.name.clone(), &t, None), Ok(()));
+        assert_eq!(check_token(&t.name.clone(), "", &t, Some(1)), Ok(()));
     }
 
     #[test]

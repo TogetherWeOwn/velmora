@@ -5,8 +5,9 @@
 //! statuses). A body that is not a call answers 400 and touches nothing.
 //!
 //! The object's own name is the name it was made under
-//! (`idFromName("<tenant>/<unit>")`). An object made any other way has
-//! no name a call can match, and answers every call with a refusal.
+//! (`idFromName("<tenant>/<unit>")`), and its jurisdiction that of its
+//! namespace. An object made any other way has no name a call can match,
+//! and answers every call with a refusal.
 //!
 //! Nothing here sets a timer, opens a socket or sends to a queue (rule 4),
 //! and nothing holds a key (rule 3).
@@ -14,7 +15,8 @@
 use velmora_bridge::unit::identity::Refusal;
 use velmora_bridge::unit::{Refused, Unit, UnitAnswer, UnitCall, UnitName};
 use velmora_bridge::UnixMs;
-use worker::wasm_bindgen;
+use worker::js_sys::Reflect;
+use worker::wasm_bindgen::{self, JsValue};
 use worker::{durable_object, Date, DurableObject, Env, Method, Request, Response, State};
 
 use crate::DoSql;
@@ -27,7 +29,8 @@ pub struct UnitObject {
 impl DurableObject for UnitObject {
     fn new(state: State, _env: Env) -> Self {
         let name = state.id().name().and_then(|n| UnitName::parse(&n));
-        let unit = name.map(|own| Unit::new(DoSql::new(&state.storage()), own));
+        let jurisdiction = jurisdiction(&state);
+        let unit = name.map(|own| Unit::new(DoSql::new(&state.storage()), own, &jurisdiction));
         UnitObject { unit }
     }
 
@@ -52,4 +55,15 @@ impl DurableObject for UnitObject {
         };
         Response::from_json(&answer)
     }
+}
+
+/// The jurisdiction of the object's namespace (`ctx.id.jurisdiction`),
+/// "" when it has none (ADR §2.4 rule 14).
+fn jurisdiction(state: &State) -> String {
+    let id: &JsValue = state.as_raw().as_ref();
+    Reflect::get(id, &JsValue::from_str("id"))
+        .ok()
+        .and_then(|id| Reflect::get(&id, &JsValue::from_str("jurisdiction")).ok())
+        .and_then(|j| j.as_string())
+        .unwrap_or_default()
 }

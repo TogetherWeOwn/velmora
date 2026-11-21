@@ -25,7 +25,7 @@ fn own() -> UnitName {
 }
 
 fn unit() -> Unit<RusqliteSql> {
-    Unit::new(RusqliteSql::open_in_memory().unwrap(), own())
+    Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "")
 }
 
 fn token(kind: BirthKind, record_seq: u64) -> BirthToken {
@@ -171,7 +171,7 @@ fn an_unborn_unit_answers_unborn_and_writes_nothing() {
     let u = unit();
     for listed in [true, false] {
         for op in [
-            UnitOp::Ping,
+            UnitOp::Ping {},
             read_plan(None),
             UnitOp::KeyRow {
                 access_key_id: AKID.into(),
@@ -245,7 +245,7 @@ fn a_birth_makes_the_schema_the_certificate_and_the_numbers() {
     // Until the first sync the tenant is `provisioning`: 503 for S3.
     assert_eq!(
         u.handle(
-            &call(CallKind::Request, seqs(3, 0), true, UnitOp::Ping),
+            &call(CallKind::Request, seqs(3, 0), true, UnitOp::Ping {}),
             NOW
         ),
         UnitAnswer::Closed {
@@ -302,7 +302,7 @@ fn a_token_for_another_unit_or_scheme_or_schema_is_refused() {
     let mut other = token(BirthKind::Birth, 3);
     other.name = UnitName::new(tenant(), 1);
     assert_eq!(
-        provision(&u, other, None),
+        provision(&u, other, Some(3)),
         UnitAnswer::Refused {
             reason: Refused::Provision(ProvisionRefusal::WrongName),
             alarm: true
@@ -311,7 +311,7 @@ fn a_token_for_another_unit_or_scheme_or_schema_is_refused() {
     let mut scheme = token(BirthKind::Birth, 3);
     scheme.key_scheme = 1;
     assert_eq!(
-        provision(&u, scheme, None),
+        provision(&u, scheme, Some(3)),
         UnitAnswer::Refused {
             reason: Refused::Provision(ProvisionRefusal::WrongScheme),
             alarm: false
@@ -320,10 +320,36 @@ fn a_token_for_another_unit_or_scheme_or_schema_is_refused() {
     let mut schema = token(BirthKind::Birth, 3);
     schema.schema_version -= 1;
     assert_eq!(
-        provision(&u, schema, None),
+        provision(&u, schema, Some(3)),
         UnitAnswer::Refused {
             reason: Refused::Provision(ProvisionRefusal::WrongSchema),
             alarm: false
+        }
+    );
+    assert_eq!(tables(&u), 0);
+}
+
+#[test]
+fn a_provision_without_the_callers_numbers_is_refused() {
+    let u = unit();
+    assert_eq!(
+        provision(&u, token(BirthKind::Birth, 3), None),
+        UnitAnswer::Refused {
+            reason: Refused::Provision(ProvisionRefusal::NoNumbers),
+            alarm: false
+        }
+    );
+    assert_eq!(tables(&u), 0);
+}
+
+#[test]
+fn a_token_for_another_jurisdiction_makes_no_object() {
+    let u = Unit::new(RusqliteSql::open_in_memory().unwrap(), own(), "eu");
+    assert_eq!(
+        provision(&u, token(BirthKind::Birth, 3), Some(3)),
+        UnitAnswer::Refused {
+            reason: Refused::Provision(ProvisionRefusal::WrongName),
+            alarm: true
         }
     );
     assert_eq!(tables(&u), 0);
@@ -356,7 +382,7 @@ fn a_restored_unit_starts_closed_and_a_sync_still_reaches_it() {
     // Requests and jobs find it closed until the gate lifts the entry.
     for kind in [CallKind::Request, CallKind::Job] {
         assert_eq!(
-            u.handle(&call(kind, seqs(7, 0), true, UnitOp::Ping), NOW),
+            u.handle(&call(kind, seqs(7, 0), true, UnitOp::Ping {}), NOW),
             UnitAnswer::Closed {
                 seqs: Seqs {
                     state_seq: 7,
@@ -384,7 +410,7 @@ fn a_restored_unit_starts_closed_and_a_sync_still_reaches_it() {
     ));
     assert!(matches!(
         u.handle(
-            &call(CallKind::Request, seqs(9, 0), true, UnitOp::Ping),
+            &call(CallKind::Request, seqs(9, 0), true, UnitOp::Ping {}),
             NOW
         ),
         UnitAnswer::Closed {
@@ -416,7 +442,7 @@ fn a_call_for_another_name_is_refused_with_an_alarm() {
         UnitName::new(tenant(), 1),
         UnitName::new(TenantId::parse("t_0000000000000c02").unwrap(), 0),
     ] {
-        let mut c = call(CallKind::Request, seqs(3, 0), true, UnitOp::Ping);
+        let mut c = call(CallKind::Request, seqs(3, 0), true, UnitOp::Ping {});
         c.name = name;
         assert_eq!(
             u.handle(&c, NOW),
@@ -437,13 +463,13 @@ fn numbers_above_the_units_need_a_sync_and_below_are_stale() {
     };
     assert_eq!(
         u.handle(
-            &call(CallKind::Request, seqs(4, 0), true, UnitOp::Ping),
+            &call(CallKind::Request, seqs(4, 0), true, UnitOp::Ping {}),
             NOW
         ),
         UnitAnswer::SyncNeeded { seqs: own_seqs }
     );
     assert_eq!(
-        u.handle(&call(CallKind::Job, seqs(3, 1), true, UnitOp::Ping), NOW),
+        u.handle(&call(CallKind::Job, seqs(3, 1), true, UnitOp::Ping {}), NOW),
         UnitAnswer::SyncNeeded { seqs: own_seqs }
     );
     assert_eq!(
@@ -455,7 +481,7 @@ fn numbers_above_the_units_need_a_sync_and_below_are_stale() {
     );
     for s in [seqs(2, 0), None] {
         assert_eq!(
-            u.handle(&call(CallKind::Job, s, true, UnitOp::Ping), NOW),
+            u.handle(&call(CallKind::Job, s, true, UnitOp::Ping {}), NOW),
             UnitAnswer::Refused {
                 reason: Refused::Identity(Refusal::StaleJob),
                 alarm: false
@@ -621,7 +647,7 @@ fn an_unauthenticated_key_row_fetch_is_served_and_nothing_else_is() {
     assert_eq!(body["key"]["status"], json!("active"));
     assert_eq!(
         u.handle(
-            &call(CallKind::Request, seqs(3, 0), false, UnitOp::Ping),
+            &call(CallKind::Request, seqs(3, 0), false, UnitOp::Ping {}),
             NOW
         ),
         UnitAnswer::Refused {
@@ -753,16 +779,43 @@ fn a_sync_never_moves_back_and_never_claims_keys_it_does_not_hold() {
 }
 
 #[test]
-fn a_missing_bucket_is_refused_and_a_missing_object_is_an_empty_plan() {
+fn a_missing_bucket_answers_with_the_key_row_and_a_missing_object_is_an_empty_plan() {
     let u = ready();
     let mut op = read_plan(None);
     if let UnitOp::ReadPlan { bucket, .. } = &mut op {
         *bucket = "nope".into();
     }
+    // The Worker decides after the signature, so the key row comes back:
+    // a caller who holds only a key id learns nothing of which buckets
+    // exist.
+    for authenticated in [false, true] {
+        let answer = u.handle(
+            &call(CallKind::Request, seqs(3, 0), authenticated, op.clone()),
+            NOW,
+        );
+        let UnitAnswer::Ok { body, .. } = answer else {
+            panic!("a missing bucket is answered, not refused: {answer:?}");
+        };
+        assert_eq!(body["bucket"], json!(null));
+        assert_eq!(body["key_row"]["key"]["access_key_id"], json!(AKID));
+        assert_eq!(body["key_row"]["grant"], json!(null));
+    }
+    // A fan-out read granted on a bucket that is gone is refused as the
+    // full request would be.
+    assert!(matches!(
+        sync(&u, 4, TenantState::Active, None),
+        UnitAnswer::Ok { .. }
+    ));
+    let mut fan = read_plan(Some(Reader::Key {
+        access_key_id: AKID.into(),
+    }));
+    if let UnitOp::ReadPlan { bucket, .. } = &mut fan {
+        *bucket = "nope".into();
+    }
     assert_eq!(
-        u.handle(&call(CallKind::Request, seqs(3, 0), true, op), NOW),
+        u.handle(&call(CallKind::Fanout, seqs(3, 0), true, fan), NOW),
         UnitAnswer::Refused {
-            reason: Refused::NotFound,
+            reason: Refused::AccessDenied,
             alarm: false
         }
     );
@@ -770,9 +823,9 @@ fn a_missing_bucket_is_refused_and_a_missing_object_is_an_empty_plan() {
     if let UnitOp::ReadPlan { key, .. } = &mut op {
         *key = "missing".into();
     }
-    let UnitAnswer::Ok { body, .. } = u.handle(&call(CallKind::Request, seqs(3, 0), true, op), NOW)
-    else {
-        panic!("an empty plan");
+    let answer = u.handle(&call(CallKind::Request, seqs(4, 0), true, op), NOW);
+    let UnitAnswer::Ok { body, .. } = answer else {
+        panic!("an empty plan: {answer:?}");
     };
     assert_eq!(body["generation"], json!(null));
 }
@@ -802,6 +855,17 @@ fn a_call_reads_back_from_its_json_and_refuses_unknown_fields() {
     // A name that is not canonical is not a call.
     let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
     v["name"]["tenant"] = json!("main");
+    assert!(serde_json::from_value::<UnitCall>(v).is_err());
+    // Nor is a field the unit does not know, anywhere in it.
+    for (path, extra) in [("seqs", "x"), ("name", "x")] {
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v[path][extra] = json!(1);
+        assert!(serde_json::from_value::<UnitCall>(v).is_err(), "{path}");
+    }
+    let ping = call(CallKind::Request, seqs(3, 1), true, UnitOp::Ping {});
+    let mut v = serde_json::to_value(&ping).unwrap();
+    assert_eq!(v["op"], json!({ "op": "ping" }));
+    v["op"]["evil"] = json!(1);
     assert!(serde_json::from_value::<UnitCall>(v).is_err());
 }
 

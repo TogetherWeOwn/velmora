@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 BASE = sys.argv[1].rstrip("/")
@@ -46,7 +47,11 @@ def call(unit, kind, op, seqs=None, authenticated=True, listed=True):
 
 
 def unit_post(unit, body):
-    return post(f"/unit/{TENANT}/{unit}", body)
+    try:
+        return post(f"/unit/{TENANT}/{unit}", body)
+    except urllib.error.HTTPError as e:
+        # A body that is not a call is answered 400 and touches nothing.
+        return None if e.code == 400 else {"http": e.code}
 
 
 PING = {"op": "ping"}
@@ -91,7 +96,10 @@ check("an unauthenticated ping", unit_post(0, call(0, "request", PING, (3, 0), a
 check("an unauthenticated key-row fetch", unit_post(0, call(0, "request", {"op": "key_row", "access_key_id": "AKNOSUCHKEY000000000"}, (3, 0), authenticated=False)),
       {"answer": "ok", "seqs": S, "body": {"key": None, "state": {"tenant_state": "active", "tenant_mode": None}}})
 check("a read plan of a missing bucket", unit_post(0, call(0, "request", {"op": "read_plan", "bucket": "nope", "key": "k", "start": 0, "end": 1}, (3, 0))),
-      {"answer": "refused", "reason": "not_found", "alarm": False})
+      {"answer": "ok", "seqs": S, "body": {"bucket": None, "generation": None, "key_row": None,
+                                            "state": {"tenant_state": "active", "tenant_mode": None}}})
+check("an unknown field beside an operation", unit_post(0, dict(call(0, "request", PING, (3, 0)), op={"op": "ping", "evil": 1})),
+      None)
 
 # The whole-call transaction.
 atomic = post("/atomic/smoke", {}).get("ok", {})

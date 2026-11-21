@@ -62,6 +62,7 @@ impl fmt::Display for TenantId {
 
 /// One unit of one tenant.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnitName {
     pub tenant: TenantId,
     pub unit: u32,
