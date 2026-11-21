@@ -300,9 +300,21 @@ pub struct TenantZero {
     /// After an undo: the id of the catalogue that `d1` then means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogue_id: Option<String>,
+    /// Every catalogue id that a move froze, oldest first. An undo never
+    /// lands on one of them but by the fallback route, onto the newest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen_catalogues: Vec<String>,
 }
 
 impl TenantZero {
+    /// The catalogue that `d1` means now: the one an undo named, or
+    /// today's.
+    pub fn current_catalogue(&self) -> &str {
+        self.catalogue_id
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_CATALOGUE_ID)
+    }
+
     /// Whether the newest move was undone: an undo stamp above its stamp.
     pub fn undone(&self) -> bool {
         match (&self.moved, self.undo_stamp) {
@@ -349,6 +361,10 @@ pub struct TenantDoor {
     /// of every escrow copy.
     #[serde(default)]
     pub escrow_offline: bool,
+    /// The record that cleared `escrow_offline` names the SHA-256 of
+    /// every escrow copy that was destroyed (lowercase hex).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escrow_destroyed: Vec<String>,
     /// Limits by name, in their own unit (bytes, requests). A name that
     /// is absent has no limit.
     #[serde(default)]
@@ -515,6 +531,7 @@ mod tests {
             restoring: vec![],
             synthetic: false,
             escrow_offline: false,
+            escrow_destroyed: vec![],
             limits: BTreeMap::new(),
             rate_json: Default::default(),
             features_json: Default::default(),
@@ -636,13 +653,15 @@ mod tests {
             }),
             undo_stamp: None,
             catalogue_id: None,
+            frozen_catalogues: vec!["main".into()],
         };
         let json = serde_json::to_value(&z).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
                 "selector": "moved",
-                "move": {"to": "t_00000000000000a1", "catalogue_id_frozen": "main", "stamp": 7, "flipped_at": 5}
+                "move": {"to": "t_00000000000000a1", "catalogue_id_frozen": "main", "stamp": 7, "flipped_at": 5},
+                "frozen_catalogues": ["main"]
             })
         );
         assert!(!z.undone());

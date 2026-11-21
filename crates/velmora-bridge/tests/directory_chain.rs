@@ -585,3 +585,47 @@ fn a_key_version_not_held_yet_is_not_damage() {
     seal.not_held(1, false);
     assert!(block_on(chain.head(&t1(), 0)).unwrap().is_some());
 }
+
+/// A purge under way (it deletes from the first record up) leaves a
+/// contiguous tail that ends in the stub: the stub is the head.
+#[test]
+fn a_purge_under_way_reads_its_stub_as_the_head() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    block_on(async {
+        active(&chain).await;
+        chain
+            .write(&t1(), &delete(1), Actor::Customer, NOW, 0)
+            .await
+            .unwrap();
+        let due = UnixMs(NOW.0 + 7 * DAY);
+        chain
+            .write(&t1(), &Change::StartShred, Actor::ShredJob, due, 0)
+            .await
+            .unwrap();
+        seal.destroy_version(1);
+        chain
+            .write(&t1(), &Change::FinishShred, Actor::ShredJob, due, 0)
+            .await
+            .unwrap();
+        // Records 1 to 3 are gone; 4 to 7 are left.
+        for seq in 1..=3 {
+            assert!(store.lose(&record_key(&t1(), seq)));
+        }
+        for known in [0, 2, 4, 7] {
+            assert_eq!(
+                chain.head_seq(&t1(), known).await.unwrap(),
+                Some(7),
+                "known {known}"
+            );
+        }
+        // A gap inside the tail is still damage.
+        assert!(store.lose(&record_key(&t1(), 5)));
+        let r = chain.head_seq(&t1(), 0).await;
+        assert!(matches!(r, Err(ChainError::Damaged(_))), "{r:?}");
+    });
+}

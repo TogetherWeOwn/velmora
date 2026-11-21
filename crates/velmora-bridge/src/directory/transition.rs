@@ -172,9 +172,9 @@ pub enum Change {
     DropBucket { bucket: String },
     /// Mark the tenant's key as escrowed offline.
     SetEscrowOffline,
-    /// Clear the offline escrow mark. The operator states that every
-    /// escrow copy was destroyed; nothing else clears it.
-    ClearEscrowOffline { escrow_destroyed: bool },
+    /// Clear the offline escrow mark. The operator names the SHA-256 of
+    /// every escrow copy it destroyed; nothing else clears it.
+    ClearEscrowOffline { destroyed: Vec<String> },
     /// Tenant 0: open the move's window into tenant `to`.
     StartMove {
         to: TenantId,
@@ -184,10 +184,18 @@ pub enum Change {
     FlipMove { stamp: u64 },
     /// Tenant 0: give the move up before the flip.
     GiveUpMove,
-    /// Tenant 0: the undo of a flipped move, onto catalogue `catalogue_id`.
+    /// Tenant 0: the undo of a flipped move, onto a fresh catalogue
+    /// `catalogue_id` (the reverse move).
     UndoMove {
         undo_stamp: u64,
         catalogue_id: String,
+    },
+    /// Tenant 0: the undo of a flipped move onto the catalogue it froze
+    /// (the fallback route), after the tool levelled that catalogue's
+    /// stamp again.
+    UndoMoveOntoFrozen {
+        undo_stamp: u64,
+        stamp_levelled: bool,
     },
     /// Tenant 0: retired for good, 30 days after the flip.
     RetireTenantZero,
@@ -632,7 +640,7 @@ pub fn next(
             door.escrow_offline = true;
         }
 
-        Change::ClearEscrowOffline { escrow_destroyed } => {
+        Change::ClearEscrowOffline { destroyed } => {
             live(h)?;
             if actor != Actor::Operator {
                 return Err(FORBIDDEN);
@@ -640,10 +648,11 @@ pub fn next(
             if !h.escrow_offline {
                 return Ok(Outcome::Unchanged);
             }
-            if !escrow_destroyed {
+            if destroyed.is_empty() || !destroyed.iter().all(|d| valid_sha256(d)) {
                 return Err(INVALID);
             }
             door.escrow_offline = false;
+            door.escrow_destroyed = destroyed.clone();
         }
 
         Change::StartMove {
@@ -655,11 +664,20 @@ pub fn next(
                 return Err(INVALID);
             }
             match z.selector {
-                Selector::Moving if z.moved.as_ref().is_some_and(|m| m.to == *to) => {
+                Selector::Moving
+                    if z.moved.as_ref().is_some_and(|m| {
+                        m.to == *to && m.catalogue_id_frozen == *catalogue_id_frozen
+                    }) =>
+                {
                     return Ok(Outcome::Unchanged)
                 }
                 Selector::D1 if z.moved.is_none() || z.undone() => {}
                 _ => return Err(SELECTOR),
+            }
+            // A move freezes the catalogue that `d1` means now, and no
+            // other.
+            if catalogue_id_frozen != z.current_catalogue() {
+                return Err(INVALID);
             }
             if !h.restoring.is_empty() {
                 return Err(RESTORING);
@@ -673,6 +691,9 @@ pub fn next(
                 flipped_at: None,
             });
             z.undo_stamp = None;
+            if !z.frozen_catalogues.contains(catalogue_id_frozen) {
+                z.frozen_catalogues.push(catalogue_id_frozen.clone());
+            }
             door.tenant_zero = Some(z);
         }
 
@@ -725,9 +746,12 @@ pub fn next(
                 Selector::Moved => {}
                 _ => return Err(SELECTOR),
             }
-            // A fresh catalogue: never the frozen one, whose stamps mark
-            // it as rolled back.
-            if !valid_name(catalogue_id) || *catalogue_id == m.catalogue_id_frozen {
+            // A fresh catalogue: never one a move froze, whose stamps mark
+            // it as rolled back. The frozen one is the fallback route's.
+            if !valid_name(catalogue_id)
+                || *catalogue_id == m.catalogue_id_frozen
+                || z.frozen_catalogues.contains(catalogue_id)
+            {
                 return Err(INVALID);
             }
             if !m.stamp.is_some_and(|stamp| *undo_stamp > stamp) {
@@ -737,6 +761,33 @@ pub fn next(
             z.selector = Selector::D1;
             z.undo_stamp = Some(*undo_stamp);
             z.catalogue_id = Some(catalogue_id.clone());
+            door.tenant_zero = Some(z);
+        }
+
+        Change::UndoMoveOntoFrozen {
+            undo_stamp,
+            stamp_levelled,
+        } => {
+            let z = move_allowed(tenant, h, actor)?;
+            let m = z.moved.as_ref().ok_or(SELECTOR)?;
+            let frozen = m.catalogue_id_frozen.clone();
+            match z.selector {
+                Selector::D1
+                    if z.undo_stamp == Some(*undo_stamp)
+                        && z.catalogue_id.as_deref() == Some(frozen.as_str()) =>
+                {
+                    return Ok(Outcome::Unchanged)
+                }
+                Selector::Moved => {}
+                _ => return Err(SELECTOR),
+            }
+            if !stamp_levelled || !m.stamp.is_some_and(|stamp| *undo_stamp > stamp) {
+                return Err(INVALID);
+            }
+            let mut z = z.clone();
+            z.selector = Selector::D1;
+            z.undo_stamp = Some(*undo_stamp);
+            z.catalogue_id = Some(frozen);
             door.tenant_zero = Some(z);
         }
 
@@ -822,6 +873,7 @@ fn first(
         restoring: vec![],
         synthetic: false,
         escrow_offline: false,
+        escrow_destroyed: vec![],
         limits: BTreeMap::new(),
         rate_json: Default::default(),
         features_json: Default::default(),
@@ -889,6 +941,7 @@ fn first(
                 moved: None,
                 undo_stamp: None,
                 catalogue_id: None,
+                frozen_catalogues: vec![],
             });
             Ok(Outcome::Next(TenantRecord {
                 door,
@@ -952,6 +1005,12 @@ fn move_allowed<'a>(
     h.tenant_zero.as_ref().ok_or(INVALID)
 }
 
+fn valid_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -979,6 +1038,7 @@ fn shredded_stub(h: &TenantDoor) -> TenantDoor {
         restoring: vec![],
         synthetic: h.synthetic,
         escrow_offline: false,
+        escrow_destroyed: vec![],
         limits: BTreeMap::new(),
         rate_json: Default::default(),
         features_json: Default::default(),

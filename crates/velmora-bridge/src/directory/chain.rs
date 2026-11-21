@@ -219,22 +219,23 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
             0 => String::new(),
             n => record_key(tenant, n),
         };
-        let mut first_page = true;
+        let mut first_key = true;
+        // A shred's purge deletes a chain from its first record up, and
+        // leaves the stub: a gap below the first listed record is a purge
+        // (done or under way) only if the chain ends in the stub.
+        let mut purged = false;
         loop {
             let keys = self.store.list(&prefix, &after, LIST_PAGE).await?;
-            if first_page && keys.len() == 1 {
-                if let Some(seq) = record_seq(tenant, &keys[0]).filter(|&seq| seq > last + 1) {
-                    // A shred's purge leaves the stub alone: the one
-                    // record of the chain, with the gap below it.
-                    return self.purged_stub(tenant, seq, known).await;
-                }
-            }
-            first_page = false;
             for key in &keys {
                 match record_seq(tenant, key) {
                     Some(seq) if seq == last + 1 => last = seq,
+                    Some(seq) if first_key && seq > last + 1 => {
+                        purged = true;
+                        last = seq;
+                    }
                     _ => return Err(ChainError::Damaged("chain_gap_or_stray_name")),
                 }
+                first_key = false;
             }
             if (keys.len() as u32) < LIST_PAGE {
                 break;
@@ -244,28 +245,18 @@ impl<S: RecordStore, C: ControlSeal> TenantChain<'_, S, C> {
                 None => break,
             }
         }
-        match last {
-            0 if known == 0 => Ok(None),
-            n if n >= known => Ok(Some(n)),
-            _ => Err(ChainError::Damaged("known_above_head")),
+        let head = match last {
+            0 if known == 0 => return Ok(None),
+            n if n >= known => n,
+            _ => return Err(ChainError::Damaged("known_above_head")),
+        };
+        if purged {
+            match self.read(tenant, head).await? {
+                Some(r) if r.door.lifecycle == Lifecycle::Shredded => {}
+                _ => return Err(ChainError::Damaged("chain_gap_or_stray_name")),
+            }
         }
-    }
-
-    /// The one record left of a purged chain: it must be the `shredded`
-    /// stub, at or above `known`, or the chain is damaged.
-    async fn purged_stub(
-        &self,
-        tenant: &TenantId,
-        seq: u64,
-        known: u64,
-    ) -> Result<Option<u64>, ChainError> {
-        if seq < known {
-            return Err(ChainError::Damaged("known_above_head"));
-        }
-        match self.read(tenant, seq).await? {
-            Some(r) if r.door.lifecycle == Lifecycle::Shredded => Ok(Some(seq)),
-            _ => Err(ChainError::Damaged("chain_gap_or_stray_name")),
-        }
+        Ok(Some(head))
     }
 
     /// Reads and checks record `seq`. `None` = no such record.
