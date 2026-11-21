@@ -599,25 +599,19 @@ here):
 Write with parts of 16 MiB, start multipart at 16 MiB, keep about 16
 requests in flight, and give rclone one connection per request:
 
-- rclone: `--s3-upload-cutoff 16M --s3-chunk-size 16M
-  --s3-upload-concurrency 4 --transfers 4 --s3-disable-http2` (in the
-  remote's section of `rclone.conf`: `upload_cutoff = 16M`,
-  `chunk_size = 16M`, `upload_concurrency = 4`, `disable_http2 = true`;
-  a plain `transfers` key in the section is ignored: pass `--transfers`,
-  or write `global.transfers = 4` in the remote's section).
-  - The upload concurrency is per file and applies to multipart
-    uploads only: rclone sends up to `transfers x upload_concurrency`
-    parts at once, and one PutObject per transfer for a file below the
-    cutoff. Keep the requests in flight near 16:
-    - a tree of files above 16 MiB: `--transfers 4
-      --s3-upload-concurrency 4` (the line above);
-    - a tree of files below 16 MiB: `--transfers 16` (the upload
-      concurrency does not apply to them);
-    - one large file: `--transfers 1 --s3-upload-concurrency 16`;
-    - a mixed tree: `--transfers 16 --s3-upload-concurrency 1` keeps
-      16 requests for small files and large files alike.
-
-    More than 16 requests at once was not measured.
+- rclone, for a tree of files: `--s3-upload-cutoff 16M
+  --s3-chunk-size 16M --s3-upload-concurrency 1 --transfers 16
+  --s3-disable-http2` (in the remote's section of `rclone.conf`:
+  `upload_cutoff = 16M`, `chunk_size = 16M`, `upload_concurrency = 1`,
+  `disable_http2 = true`; `transfers` is not a remote key: pass
+  `--transfers` on the command line).
+  - rclone sends up to `transfers x upload_concurrency` requests at
+    once: one PutObject per file below the cutoff, and up to
+    `upload_concurrency` parts per file above it. `16 x 1` keeps 16
+    requests in flight whatever the file sizes, as long as 16 files
+    are being copied.
+  - For one large file: `--transfers 1 --s3-upload-concurrency 16`.
+  - More than 16 requests at once was not measured.
   - The global `--disable-http2` does the same for every remote of the
     command; `disable_http2` in the remote's section applies to this
     remote only.
@@ -688,12 +682,7 @@ Why these values:
 
 A running `rclone rcd` keeps the flags it was started with: a changed
 startup command takes effect only when the daemon restarts, and a
-restart aborts the copies it runs. Without a restart, `rclone rc
-backend/command command=set fs=<remote>: -o upload_cutoff=16M -o
-chunk_size=16M -o upload_concurrency=4` changes the remote's settings
-and `rclone rc options/set --json '{"main":{"Transfers":4}}'` the
-transfers, both for new copies; `disable_http2` applies only to a
-remote built anew (a job's fs string `<remote>,disable_http2=true:`).
+restart aborts the copies it runs.
 
 ## A PutObject or an UploadPart above one extent
 
