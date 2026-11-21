@@ -1553,6 +1553,9 @@ impl Catalog for MemCatalog {
     ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
         unused()
     }
+    async fn upload_state(&self, _: &UploadTarget<'_>) -> Result<Option<UploadState>> {
+        unused()
+    }
     async fn list_uploads(&self, _: &BucketId, _: &UploadListQuery) -> Result<Vec<OpenUpload>> {
         unused()
     }
