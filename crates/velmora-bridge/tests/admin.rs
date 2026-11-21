@@ -2204,6 +2204,42 @@ async fn a_drill_asks_a_reader_past_its_stated_retention() {
     assert_eq!(fx.bridge.nntp.live(), 0);
 }
 
+/// The same holds for the parity a rebuild needs: with one data article
+/// lost, the drill reads the others and a parity article from the reader
+/// that is past the retention it states, and rebuilds the lost one.
+#[tokio::test]
+async fn a_drill_rebuilds_from_a_reader_past_its_stated_retention() {
+    let edit = |providers: &mut Vec<ProviderConfig>| {
+        providers[0].retention_days = Some(1);
+        let mut wrong = providers[0].clone();
+        wrong.id = "p1".to_string();
+        wrong.pass = "not-the-password".to_string();
+        wrong.post = false;
+        wrong.retention_days = None;
+        providers.push(wrong);
+    };
+    let mut fx = Fx::with_providers(Environment::Dev, Maintenance::Off, edit).await;
+    let cfg = &mut Rc::get_mut(&mut fx.bridge).unwrap().cfg;
+    (cfg.packed_plans, cfg.parity) = (true, true);
+    let bucket = fx.bucket("scratch").await;
+    let o = fx.put(&bucket, "k", &plaintext()).await;
+    fx.drive(&o, OutboxStage::Done).await;
+    let r = fx.post("/evict/scratch/k?include_safety=1").await;
+    assert_eq!(r.status, 200);
+    let stored = fx.bridge.catalog.stored_plan(&o.extent).await.unwrap();
+    fx.server.hide(&stored.rows[0].message_id).await;
+    fx.bridge.clock.advance_secs(2 * 24 * 3600);
+
+    let r = fx.post("/drill/scratch/k").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!((&v["match"], &v["provider"]), (&json!(true), &json!("p0")));
+    assert_eq!(v["rebuilt"], 1);
+    assert_eq!(v["plaintext_sha256"], hex(&sha256(&o.plain)));
+    assert_eq!(fx.bridge.nntp.live(), 0);
+    assert_eq!(fx.bridge.budget.in_use(), 0);
+}
+
 /// "Not on Usenet" is said of the live object only. One that was
 /// deleted while the drill read it (here during the wait after a broken
 /// read) is asked for again: its rows and articles may have been taken
