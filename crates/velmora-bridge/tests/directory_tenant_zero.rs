@@ -79,7 +79,12 @@ fn undo(chain: &Chain<'_>, stamp: u64, id: &str) -> TenantDoor {
     )
 }
 
+/// A database; `marker` is the first move's marker.
 fn db(marker: bool, id: Option<&str>) -> DatabaseFacts {
+    db_marked(marker.then_some(1), id)
+}
+
+fn db_marked(marker: Option<i64>, id: Option<&str>) -> DatabaseFacts {
     DatabaseFacts {
         marker,
         catalogue_id: id.map(str::to_string),
@@ -378,7 +383,7 @@ fn the_database_says_whether_it_carries_the_marker_and_which_id() {
             .unwrap();
         assert_eq!(
             database_facts(&catalog).await.unwrap(),
-            db(true, Some("main"))
+            db_marked(Some(NOW.0), Some("main"))
         );
     });
 }
@@ -514,7 +519,7 @@ fn the_fallback_undo_serves_the_thawed_frozen_catalogue() {
         &chain,
         Change::UndoMoveOntoFrozen {
             undo_stamp: 10,
-            stamp_levelled: true,
+            levelled_to: 9,
         },
         Actor::MoveTool,
         NOW,
@@ -527,5 +532,46 @@ fn the_fallback_undo_serves_the_thawed_frozen_catalogue() {
     assert_eq!(
         decide(&back, &db(true, Some("main")), &mut seen),
         paged("database_left_behind")
+    );
+}
+
+/// After an undo, the next move writes its marker into the catalogue the
+/// undo named before its window's record: reads go on there. A marker of
+/// the move already made is a database left behind.
+#[test]
+fn the_next_moves_marker_opens_a_window_and_an_old_one_is_left_behind() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    first(&chain);
+    start(&chain, "main");
+    flip(&chain, 9);
+    let undone = undo(&chain, 10, "main2");
+    let mut seen = Seen { moved: true };
+    assert_eq!(
+        decide(&undone, &db_marked(Some(2), Some("main2")), &mut seen),
+        ZeroServe::ServeReadOnly
+    );
+    assert_eq!(
+        decide(&undone, &db_marked(Some(1), Some("main2")), &mut seen),
+        paged("database_left_behind")
+    );
+    // The give-up of that window before its record: unchanged, and the
+    // thawed catalogue serves again.
+    let w = block_on(chain.write(
+        &TenantId::zero(),
+        &Change::GiveUpMove,
+        Actor::MoveTool,
+        NOW,
+        0,
+    ))
+    .unwrap();
+    assert!(matches!(w, Written::Unchanged(_)));
+    assert_eq!(
+        decide(&undone, &db(false, Some("main2")), &mut seen),
+        ZeroServe::Serve
     );
 }

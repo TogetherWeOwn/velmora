@@ -12,13 +12,14 @@
 //! | Record | Bound D1 | Answer |
 //! |---|---|---|
 //! | `d1`, no move | no marker | serve |
-//! | `d1`, no move | marker | reads only: the window is opening or was given up, and nothing writes |
+//! | `d1`, no move | the next move's marker | reads only: the window is opening or was given up, and nothing writes |
 //! | `moving` | its id is the frozen one | reads only |
 //! | `moving` | another id | `503`, paged |
 //! | `moved` | any | [`ZeroServe::Moved`]: drop cached tenant-0 routes and resolve the key again |
 //! | `d1`, a move with no undo above its stamp | any | `503`, paged: a database left behind |
 //! | `d1` after an undo (it names a catalogue id) | its id is the named one, no marker | serve |
-//! | `d1` after an undo | the marker | `503`, paged: a database left behind |
+//! | `d1` after an undo | a marker of a move already made | `503`, paged: a database left behind |
+//! | `d1` after an undo | the next move's marker | reads only: its window is opening |
 //! | `d1` after an undo | another id | `503`, paged |
 //! | `retired`, or `d1` with an undo stamp and no move | any | `503`, paged |
 //!
@@ -62,14 +63,15 @@ use crate::types::{Result, UnixMs};
 pub const RECHECK_MS: i64 = 60_000;
 
 /// The `meta` key of the cutover marker in the D1 catalogue. Its value is
-/// the time it was written.
+/// the ordinal of the move that wrote it.
 pub const CUTOVER_MARKER_KEY: &str = "cutover_marker";
 
 /// What the bound D1 says about itself.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DatabaseFacts {
-    /// The cutover marker is there.
-    pub marker: bool,
+    /// The cutover marker's value: the ordinal of the move that wrote it
+    /// (1 for the first), `None` with no marker.
+    pub marker: Option<i64>,
     /// The catalogue id of the database's rollback stamp row, `None` when
     /// it has none.
     pub catalogue_id: Option<String>,
@@ -79,10 +81,15 @@ pub struct DatabaseFacts {
 pub async fn database_facts<S: Sql>(catalog: &S) -> Result<DatabaseFacts> {
     let marker = catalog
         .query(
-            "SELECT 1 FROM meta WHERE k = ?1",
+            "SELECT v FROM meta WHERE k = ?1",
             &[SqlValue::Text(CUTOVER_MARKER_KEY.to_string())],
         )
         .await?;
+    let marker = match marker.first().and_then(|r| r.first()) {
+        None => None,
+        Some(SqlValue::Int(v)) => Some(*v),
+        Some(_) => return Err(crate::types::BridgeError::Invalid("cutover marker")),
+    };
     let id = catalog
         .query("SELECT catalogue_id FROM rollback_stamp WHERE id = 1", &[])
         .await?;
@@ -91,7 +98,7 @@ pub async fn database_facts<S: Sql>(catalog: &S) -> Result<DatabaseFacts> {
         _ => None,
     };
     Ok(DatabaseFacts {
-        marker: !marker.is_empty(),
+        marker,
         catalogue_id,
     })
 }
@@ -173,12 +180,14 @@ fn d1(z: &TenantZero, db: &DatabaseFacts, seen: &Seen) -> ZeroServe {
             _ => return unavailable("database_is_not_the_named_one"),
         }
     }
-    match (db.marker, &z.moved) {
-        (false, _) => ZeroServe::Serve,
-        // The window is opening, or was given up: nothing writes.
-        (true, None) => ZeroServe::ServeReadOnly,
-        // A marker after a move: this database was left behind.
-        (true, Some(_)) => unavailable("database_left_behind"),
+    // The marker names its move: one of a move that already happened
+    // means this database was left behind; one of the next move means
+    // that move's window is opening (or was given up), and nothing writes.
+    let moves_done = z.frozen_catalogues.len() as i64;
+    match db.marker {
+        None => ZeroServe::Serve,
+        Some(ordinal) if ordinal > moves_done => ZeroServe::ServeReadOnly,
+        Some(_) => unavailable("database_left_behind"),
     }
 }
 
