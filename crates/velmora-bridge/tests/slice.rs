@@ -3195,7 +3195,7 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
     let planned = "SELECT COUNT(*) FROM extents WHERE parity IS NOT NULL";
     expect_eq(s, "addenda before the job", 0, rig.sql_count(planned));
     rig.server.set_posting_allowed(false).await;
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the post job did not finish",
@@ -3243,7 +3243,7 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
         )
         .expect("create trigger");
     });
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the post job did not finish",
@@ -3330,7 +3330,7 @@ async fn a_plan_with_parity_is_posted_and_recorded_as_a_whole() {
     });
     rig.server.set_posting_allowed(false).await;
     rig.bridge.clock.advance_secs(3600);
-    let outcome = rig.bridge.run_job(job).await;
+    let outcome = rig.bridge.run_job(&TENANT_ZERO, job).await;
     expect(
         s,
         "the job is done",

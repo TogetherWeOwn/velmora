@@ -241,6 +241,17 @@ fn every_stored_name_is_the_one_it_was() {
     assert_eq!(tenant.generation_prefix(), "m/x/t_0000000000000000/g_");
     assert_eq!(tenant.tombstone_prefix(), "m/x/t_0000000000000000/del/g_");
 
+    // A segment of a segmented generation record. This build reads
+    // segments and writes none; the name is pinned here so that the
+    // writer that comes later writes where the readers look.
+    let set = "s_0195c2a4b3e7f0011223344556677";
+    assert_eq!(flat.segment_key(set, 0), format!("m/seg/{set}/00000"));
+    assert_eq!(flat.segment_key(set, 12_345), format!("m/seg/{set}/12345"));
+    assert_eq!(
+        tenant.segment_key(set, 7),
+        format!("m/x/t_0000000000000000/seg/{set}/00007")
+    );
+
     // A revocation and a stamp have one name under either setting.
     assert_eq!(
         revocation_key("AKIDTESTKEY000000001"),
