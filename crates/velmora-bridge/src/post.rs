@@ -648,7 +648,6 @@ where
                     None => Stop::fail(FailClass::Internal),
                 });
             };
-            let tier = first_tier.len();
             let held = match self
                 .open_sessions(first_tier, &holder, todo, &probing)
                 .await
@@ -656,7 +655,7 @@ where
                 Err(_) if waited => return Err(Stop::NoPermit),
                 opened => opened?.0,
             };
-            if !held.is_empty() || !self.slot_wait(lease, tier).await {
+            if !held.is_empty() || !self.slot_wait(lease, first_tier).await {
                 break (cooling, probing, order, held);
             }
             waited = true;

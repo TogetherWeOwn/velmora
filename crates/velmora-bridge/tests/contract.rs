@@ -594,6 +594,21 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // What a job without a slot does: absent or blank is asking
+        // again, as before the switch existed. The Worker reads it, not
+        // this configuration.
+        if name == "SLOT_WAIT" {
+            use velmora_bridge::gate::slot_wait_from_var;
+            for _ in 0..2 {
+                load(&vars).unwrap();
+                let push = slot_wait_from_var(vars.get(name).map(String::as_str));
+                assert_eq!(push, Ok(false));
+                vars.insert(name.clone(), "  ".into());
+            }
+            assert_eq!(slot_wait_from_var(Some("push")), Ok(true));
+            assert!(slot_wait_from_var(Some("pull")).is_err());
+            continue;
+        }
         // The job budget: absent or blank is the request budget, which
         // is the smaller of the two bounds, so nothing fails open.
         if name == "JOB_BUDGET_BYTES" {

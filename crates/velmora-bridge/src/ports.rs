@@ -549,6 +549,18 @@ pub struct Permit {
     pub class: PermitClass,
 }
 
+/// How a job's wait for a slot ended ([`Catalog::await_permit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotWait {
+    /// A slot is the holder's: its next acquire on that provider
+    /// returns it.
+    Granted,
+    /// The time ran out. Nothing is held.
+    Elapsed,
+    /// Nothing waits for the caller here: it asks again later.
+    Unsupported,
+}
+
 /// Who takes a slot. Background jobs leave `READ_RESERVE` slots for
 /// cold GETs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1366,6 +1378,21 @@ pub trait Catalog {
     ) -> Result<Option<Permit>>;
     async fn renew_permit(&self, p: &Permit, now: UnixMs) -> Result<bool>;
     async fn release_permit(&self, p: &Permit) -> Result<()>;
+    /// Waits up to `ms` for a job slot on one of `providers` to be
+    /// `holder`'s, where the slots are handed out by something that
+    /// keeps a line (a permit gate with `SLOT_WAIT = "push"`): no
+    /// call is made while it waits, and the slot comes to the caller
+    /// that waited longest. Elsewhere [`SlotWait::Unsupported`], at
+    /// once.
+    async fn await_permit(
+        &self,
+        _providers: &[&ProviderConfig],
+        _holder: &str,
+        _ms: i64,
+        _sleep: &crate::ingress::Sleeper,
+    ) -> Result<SlotWait> {
+        Ok(SlotWait::Unsupported)
+    }
     /// The holder of `p` is gone without releasing it: whatever is
     /// kept open for it on this side is dropped, with nothing awaited.
     /// The slot itself frees when its permit expires, or sooner.

@@ -548,8 +548,8 @@ where
                     None => Stop::NoPermit,
                 });
             }
-            let asked = usable.len();
             let mut refused = false;
+            let asked = usable.clone();
             for provider in usable {
                 let opened = ProviderSession::open(
                     &self.catalog,
@@ -596,7 +596,7 @@ where
             // for a bounded time ([`crate::jobs::SLOT_WAIT_MS`]): the
             // row is not given back and delivered again for a slot
             // that comes free in seconds.
-            if !self.slot_wait(lease, asked).await {
+            if !self.slot_wait(lease, &asked).await {
                 return Err(Stop::NoPermit);
             }
             waited = true;

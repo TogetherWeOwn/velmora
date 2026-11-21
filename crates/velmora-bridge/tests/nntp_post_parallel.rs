@@ -842,6 +842,89 @@ async fn a_cooldown_that_begins_during_the_wait_puts_the_job_off() {
     assert_eq!((row.attempts, row.next_at), (0, until));
 }
 
+/// Where the slots have a line the job stands in it and does not ask
+/// while it waits: it is refused once, waits for the first tier only
+/// and for what is left of one permit lifetime from its claim, and
+/// asks again when a slot is its own. It posts in the run that claimed
+/// it.
+#[tokio::test]
+async fn a_job_in_the_line_asks_again_when_a_slot_is_its_own() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    // Held past the end of the wait: only the line frees them.
+    let held = rig.take_slots(0, now.plus_secs(30)).await;
+    let catalog = &rig.bridge.catalog;
+    catalog.line.set(Some(SlotWait::Granted));
+    catalog.line_frees.borrow_mut().extend(held);
+    let refused = catalog.permit_refusals.get();
+
+    assert_eq!(rig.run_post(&s).await, JobOutcome::Ack);
+
+    let catalog = &rig.bridge.catalog;
+    let waits = catalog.line_waits.borrow().clone();
+    assert_eq!(waits.len(), 1, "{waits:?}");
+    let (holder, providers, ms) = &waits[0];
+    assert!(
+        holder.starts_with("job:") && holder.contains(":post:"),
+        "{holder}"
+    );
+    assert_eq!(providers, &["p0".to_string()], "the first tier only");
+    assert!(
+        (jobs::SLOT_WAIT_MS - 1_000..=jobs::SLOT_WAIT_MS).contains(ms),
+        "{ms}"
+    );
+    // One refusal for each socket it asked for, in the one round
+    // before the wait: nothing was asked while it waited.
+    let asked = catalog.permit_refusals.get() - refused;
+    assert!(
+        (1..=rig.bridge.cfg.post_sockets).contains(&asked),
+        "{asked}"
+    );
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!(waited < i64::from(LINE_MS) + 1_000, "{waited}");
+    assert!(all_posted_by(&rig.plan(&s).await, "p0"));
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+    assert_eq!(rig.bridge.nntp.live(), 0);
+}
+
+/// The line did not come to the job in the time it had: it is put off
+/// as a job that polled in vain is, without having asked again, with
+/// no attempt spent and nothing loaded.
+#[tokio::test]
+async fn a_job_whose_time_in_the_line_ran_out_is_put_off() {
+    let mut rig = rig(&[spec("bb0", 5), spec("bb1", 5)]).await;
+    rig.bridge.cfg.providers[1].priority = 1;
+    rig.with_timer();
+    let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+    let now = rig.bridge.clock.now();
+    rig.take_slots(0, now.plus_secs(30)).await;
+    rig.bridge.catalog.line.set(Some(SlotWait::Elapsed));
+    let refused = rig.bridge.catalog.permit_refusals.get();
+    let reads = rig.bridge.safety.gets();
+
+    assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
+
+    let catalog = &rig.bridge.catalog;
+    assert_eq!(catalog.line_waits.borrow().len(), 1);
+    let asked = catalog.permit_refusals.get() - refused;
+    assert!(
+        (1..=rig.bridge.cfg.post_sockets).contains(&asked),
+        "{asked}"
+    );
+    let waited = rig.bridge.clock.now().0 - now.0;
+    assert!(
+        (jobs::SLOT_WAIT_MS - 1_000..=jobs::SLOT_WAIT_MS).contains(&waited),
+        "{waited}"
+    );
+    assert_eq!(rig.bridge.safety.gets(), reads);
+    assert!(rig.plan(&s).await.is_empty());
+    assert_eq!(catalog.outbox(&s.extent).attempts, 0);
+    assert_eq!(rig.servers[1].posted_count().await, 0);
+}
+
 /// Two sockets. While one has a POST in flight, the permits are taken
 /// over and the other socket's renewal finds them gone. The first socket
 /// makes no call after its POST returns. Nothing is recorded (a plan is
