@@ -199,7 +199,12 @@ def cmd_mpu(a, cl):
         buf = bytearray(want)
         view, got = memoryview(buf), 0
         while got < want:
-            n = os.preadv(fd, [view[got:]], off + got)
+            if hasattr(os, "preadv"):
+                n = os.preadv(fd, [view[got:]], off + got)
+            else:  # macOS before 11: one extra copy of a chunk
+                chunk = os.pread(fd, want - got, off + got)
+                n = len(chunk)
+                view[got:got + n] = chunk
             if not n:
                 raise RuntimeError(f"part {i + 1}: the spool file ended at {off + got}")
             got += n
