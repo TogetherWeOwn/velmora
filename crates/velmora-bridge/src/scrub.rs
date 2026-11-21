@@ -54,9 +54,9 @@
 //!   and repairs nothing more there. That is a backbone event (an outage,
 //!   a purge, a provider answering `430` while throttled), not lost
 //!   articles: re-pinning would copy the store back into R2. From then on
-//!   no loss on that backbone is repaired, and the extents stay
-//!   `suspect`, until a run that checked enough extents to trip the
-//!   breaker ends without tripping it.
+//!   at most one loss a run on that backbone is re-pinned
+//!   ([`BLOCKED_REPINS_PER_RUN`]); the others stay `suspect`, until 8
+//!   checks in a row, across runs, find nothing lacking there.
 //! - At most `SCRUB_REPAIRS_PER_RUN` re-pins per run.
 
 use futures_util::future::{select, Either};
@@ -155,6 +155,9 @@ struct Found {
     rebuilt: u32,
     /// Articles one provider did not serve intact that another did.
     refetched: u32,
+    /// The read broke off: `cipher` is `None` for that, not because no
+    /// provider has the bytes.
+    interrupted: bool,
     /// The bytes the read holds, charged until the check is done with.
     _charge: Option<crate::ingress::Charge>,
 }
@@ -556,19 +559,10 @@ where
         }
         if !found.loss() {
             walk.run.ok += 1;
-            if found.refetched > 0 {
-                walk.run.refetched += found.refetched;
-                // Every backbone says it has every article, yet a provider
-                // served one with other bytes (or broke off on it): a copy
-                // that a re-post under the same id cannot replace.
-                crate::trace::alert(|| {
-                    format!(
-                        "scrub-refetched {} articles={} served whole only by another provider",
-                        extent.id.as_str(),
-                        found.refetched
-                    )
-                });
-            }
+            // Articles a provider did not serve and another did: counted
+            // for the run's line. Not an alert: a `430` from a provider of
+            // a backbone that does not count is one of them.
+            walk.run.refetched += found.refetched;
             return self
                 .scrub_record_one(reader, walk, extent, (ScrubResult::Ok, interval))
                 .await;
@@ -703,6 +697,7 @@ where
             other => other,
         };
         let after = reader.stats();
+        let interrupted = matches!(read, Ok(ColdFetch::Interrupted));
         let cipher = match read? {
             ColdFetch::Filled(cipher) => Some(cipher),
             ColdFetch::Unavailable => None,
@@ -719,6 +714,7 @@ where
             cipher,
             rebuilt: rebuilt(&before, &after),
             refetched: after.refetched.saturating_sub(before.refetched),
+            interrupted,
             _charge: Some(charge),
         })
     }
@@ -937,6 +933,13 @@ where
             },
         };
         let Some(cipher) = cipher else {
+            if found.interrupted {
+                // The read broke off: Usenet may well hold it. Not
+                // unrecoverable on that.
+                return self
+                    .scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, confirm))
+                    .await;
+            }
             walk.run.unrecoverable += 1;
             crate::trace::alert(|| {
                 format!(
@@ -956,15 +959,6 @@ where
         // copy keeps it at two copies until a release, by its own rule
         // (a full read on record, `REQUIRED_BACKBONES` holding it), says
         // otherwise. The operator is told.
-        if found.refetched > 0 {
-            crate::trace::alert(|| {
-                format!(
-                    "scrub-refetched {} articles={} served whole only by another provider",
-                    extent.id.as_str(),
-                    found.refetched
-                )
-            });
-        }
         let counting = crate::verify::release_labels(&self.cfg.providers);
         let unpostable: Vec<&String> = found.lacking.iter().filter(|l| !self.posts_to(l)).collect();
         if !unpostable.is_empty() {
@@ -992,29 +986,43 @@ where
         let now = self.clock.now();
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
         let next = now.plus_ms(i64::try_from(bound * 1000).unwrap_or(i64::MAX));
-        // No provider served the bytes, or one served some with other
-        // bytes: every backbone that counts gets a failed full read, so
+        // No provider served the bytes: every backbone that counts gets a
+        // failed full read, so
         // verify reads each in full and none counts toward the release
         // before it has passed one, whatever `STAT` says (it says
         // "present" for a body no provider serves).
-        let unread: Vec<String> = match read && found.refetched == 0 {
+        let unread: Vec<String> = match read {
             true => Vec::new(),
             false => counting,
         };
-        // Re-pinned first, written after: a copy is never written for an
-        // extent the guard refuses (it would be counted nowhere), and an
-        // eviction listed before cannot begin on it any more.
-        if self
+        // The cache copy is the last copy when it is the source (Usenet
+        // lacks it everywhere and the safety copy is gone): it is written
+        // to the safety store before the re-pin, while the eviction may
+        // still take the cache fill, and taken back if the guard refuses
+        // (it did not exist before). From Usenet the copy is written
+        // after the re-pin: Usenet still holds the bytes meanwhile.
+        let key = extent.id.safety_key();
+        if source == RepairSource::Cache && !self.put_safety(extent, cipher.clone()).await {
+            walk.run.suspect += 1;
+            return self
+                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
+                .await;
+        }
+        let repinned = self
             .catalog
             .scrub_repin(token, &extent.id, (now, next), &unread)
-            .await?
-        {
-            // The copy goes back unless it is the safety copy just read;
-            // then it is looked for once more (an eviction that began
-            // before the re-pin may have deleted it since).
-            let key = extent.id.safety_key();
-            let mut there = source == RepairSource::Safety
-                && matches!(self.safety.head(&key).await, Ok(Some(_)));
+            .await;
+        if source == RepairSource::Cache && matches!(repinned, Ok(false)) {
+            // Written for this re-pin alone, and the guard refused it (an
+            // answer, not an error: after an error the re-pin may have
+            // gone through, and the copy stays).
+            let _ = crate::recovery::delete_blob(&self.safety, &key).await;
+        }
+        if repinned? {
+            // The copy is looked for (an eviction that began before the
+            // re-pin may have deleted it since), and written if it is not
+            // there.
+            let mut there = matches!(self.safety.head(&key).await, Ok(Some(_)));
             for _ in 0..2 {
                 if there {
                     break;
@@ -1031,15 +1039,20 @@ where
                 )
             });
             if !there {
-                // Pinned without its copy: verify cannot post from it, and
-                // the watch at the bound writes it from Usenet or the
-                // cache if either has it.
+                // Pinned without its copy: verify cannot post from it. The
+                // watch looks again after the confirm interval, not at the
+                // bound.
                 crate::trace::alert(|| {
                     format!(
                         "scrub-repair-copy-missing {} the safety copy could not be written",
                         extent.id.as_str()
                     )
                 });
+                let next = self
+                    .clock
+                    .now()
+                    .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
+                self.catalog.scrub_defer(token, &extent.id, next).await?;
             }
             return Ok(());
         }
@@ -1058,9 +1071,10 @@ where
         extent: &ExtentRow,
     ) -> core::result::Result<(RepairSource, Option<Vec<u8>>), ()> {
         let mut unknown = false;
+        // The safety copy first: when it is intact nothing is written.
         for (source, store, key) in [
-            (RepairSource::Cache, &self.cache, extent.id.cache_key()),
             (RepairSource::Safety, &self.safety, extent.id.safety_key()),
+            (RepairSource::Cache, &self.cache, extent.id.cache_key()),
         ] {
             match store.get(&key, None).await {
                 Ok(Some(bytes)) if digest_ok(extent, &bytes) => return Ok((source, Some(bytes))),
@@ -1228,6 +1242,7 @@ mod tests {
             cipher: Some(Vec::new()),
             rebuilt: 0,
             refetched: 0,
+            interrupted: false,
             _charge: None,
         };
         for _ in 0..7 {

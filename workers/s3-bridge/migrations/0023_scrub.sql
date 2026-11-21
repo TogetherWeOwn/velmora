@@ -48,6 +48,6 @@ CREATE TABLE scrub_state (
   last_unrecoverable_at INTEGER,
   last_incident_at      INTEGER,
   last_incident         TEXT,                       -- JSON array of the backbones under an incident; NULL = none
-  incident_clean        INTEGER NOT NULL DEFAULT 0  -- extents checked since the last trip by runs that did not trip
+  incident_clean        INTEGER NOT NULL DEFAULT 0  -- checks in a row since the last trip that found nothing lacking on a blocked backbone
 );
 INSERT INTO scrub_state(id) VALUES (1);
