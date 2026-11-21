@@ -60,8 +60,10 @@ const DAY: u32 = 86_400;
 const MAX_ROUNDS: u32 = 2_000;
 /// How a job's claim of its outbox row begins (`sql/outbox.rs`).
 const CLAIM_SQL: &str = "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = ?4";
-/// The late queue (`VELMORA_BENCH_LATE_QUEUE`): every message is delivered
-/// this long after it is due, so a dispatcher run always comes first.
+/// The late queue (`VELMORA_BENCH_LATE_QUEUE`): every message of the ingest
+/// loop is delivered this long after it is due, so a dispatcher run always
+/// comes first. (`ticks`, for the release and delete phases, gets the same
+/// order by delivering what is queued after its dispatcher run.)
 const LATE_SECS: u32 = CRON_SECS + 60;
 
 // ---------------------------------------------------------------------------
