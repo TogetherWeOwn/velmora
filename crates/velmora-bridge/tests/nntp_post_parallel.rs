@@ -744,16 +744,16 @@ async fn a_job_without_a_slot_waits_for_one_under_its_claim() {
 }
 
 /// A job that asks many providers asks less often, so that the asks of
-/// one wait stay within the catalogue calls a wait may make.
+/// one wait (those after the first, which a job always made) stay within
+/// the catalogue calls a wait may make.
 #[tokio::test]
 async fn a_wait_on_many_providers_stays_within_its_catalogue_calls() {
     assert_eq!(jobs::slot_poll_ms(1), jobs::SLOT_POLL_MS);
-    for providers in [1, 2, 5, 32] {
+    for providers in [1, 2, 4, 5, 32] {
         let poll = i64::from(jobs::slot_poll_ms(providers));
-        let asks = (jobs::SLOT_WAIT_MS + poll - 1) / poll;
-        let ask = 1 + 3 * providers as i64;
-        // The last sleep may begin just before the wait is over.
-        assert!((asks - 1) * ask <= jobs::SLOT_WAIT_CALLS, "{providers}");
+        let sleeps = (jobs::SLOT_WAIT_MS + poll - 1) / poll;
+        let calls = sleeps * (1 + 3 * providers as i64);
+        assert!(calls <= jobs::SLOT_WAIT_CALLS, "{providers}: {calls}");
     }
     let mut rig = rig(&[
         spec("bb0", 2),
@@ -768,21 +768,57 @@ async fn a_wait_on_many_providers_stays_within_its_catalogue_calls() {
     for index in 0..4 {
         rig.take_slots(index, now.plus_secs(30)).await;
     }
-    let loads = rig.bridge.catalog.pool_loads();
+    let before = rig.bridge.catalog.slot_asks();
 
     assert!(matches!(rig.run_post(&s).await, JobOutcome::Retry { .. }));
 
-    let asks = i64::from(rig.bridge.catalog.pool_loads() - loads);
+    let after = rig.bridge.catalog.slot_asks();
+    let (loads, acquires) = (after.0 - before.0, after.1 - before.1);
+    // Every ask read the pool once and asked each of the four once.
+    assert_eq!(acquires, 4 * loads);
     let poll = i64::from(jobs::slot_poll_ms(4));
-    assert_eq!(asks, 1 + (jobs::SLOT_WAIT_MS + poll - 1) / poll);
-    assert!((asks - 2) * 13 <= jobs::SLOT_WAIT_CALLS, "{asks}");
+    assert_eq!(i64::from(loads), 1 + (jobs::SLOT_WAIT_MS + poll - 1) / poll);
+    let calls = i64::from(loads - 1) + 3 * i64::from(acquires - 4);
+    assert!(calls <= jobs::SLOT_WAIT_CALLS, "{calls}");
     assert_eq!(rig.bridge.catalog.outbox(&s.extent).attempts, 0);
+}
+
+/// The catalogue fails at a later ask of a wait, at the read of the pool
+/// or at the take of a slot: the job is put off as one that found no
+/// slot, its attempt handed back, and has connected to nothing.
+#[tokio::test]
+async fn a_catalogue_error_at_a_later_ask_ends_the_wait_as_a_put_off() {
+    for acquire in [false, true] {
+        let mut rig = rig(&[spec("bb0", 5)]).await;
+        rig.with_timer();
+        let s = rig.seed(1, &marked_plaintext(PLAIN_LEN)).await;
+        let now = rig.bridge.clock.now();
+        rig.take_slots(0, now.plus_secs(30)).await;
+        let asks = rig.bridge.catalog.slot_asks().0;
+        rig.bridge.catalog.fail_slot_asks(asks + 3, acquire);
+
+        let out = rig.run_post(&s).await;
+
+        let JobOutcome::Retry { delay_secs } = out else {
+            panic!("{acquire}: {out:?}");
+        };
+        assert!((15..=60).contains(&delay_secs), "{acquire}: {delay_secs}");
+        let ended = rig.bridge.clock.now();
+        assert_eq!(ended.0 - now.0, 2 * i64::from(jobs::SLOT_POLL_MS));
+        let row = rig.bridge.catalog.outbox(&s.extent);
+        assert_eq!(
+            (row.attempts, row.next_at),
+            (0, ended.plus_secs(delay_secs))
+        );
+        assert_eq!(rig.bridge.nntp.connects(), 0);
+    }
 }
 
 /// A cooldown of the only poster that begins while a job waits for its
 /// slot is met as by a job claimed then: the job is put off until the
-/// cooldown ends, with no attempt spent, no connect and nothing read,
-/// although the slots came free meanwhile.
+/// cooldown ends, with no attempt spent, no connect and nothing read.
+/// A job that kept the pool of its claim would wait on, take the slots
+/// when they come free and post.
 #[tokio::test]
 async fn a_cooldown_that_begins_during_the_wait_puts_the_job_off() {
     let mut rig = rig(&[spec("bb0", 5)]).await;

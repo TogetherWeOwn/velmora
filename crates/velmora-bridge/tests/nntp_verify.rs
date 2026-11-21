@@ -1912,6 +1912,39 @@ async fn a_job_that_waited_in_vain_is_put_off_without_an_attempt() {
     );
 }
 
+/// The catalogue fails at a later ask of a wait, at the read of the pool
+/// or at the take of a slot: the job is put off as one that found no
+/// slot. Its attempt is handed back and the row keeps where it got to.
+#[tokio::test]
+async fn a_catalogue_error_at_a_later_ask_ends_the_wait_as_a_put_off() {
+    for acquire in [false, true] {
+        let mut rig = two_backbone_rig().await;
+        rig.with_timer();
+        let (s, _) = rig.posted(49).await;
+        rig.propagate(&s, 0, 1).await;
+        let now = rig.bridge.clock.now();
+        rig.take_slots(1, now.plus_secs(30)).await;
+        let attempts = rig.outbox(&s).attempts;
+
+        // The first backbone is read; the wait is for the second. Its
+        // third ask fails.
+        rig.bridge
+            .catalog
+            .fail_slot_asks(rig.bridge.catalog.slot_asks().0 + 4, acquire);
+        let delay = retry_delay(&rig.run(&s, OutboxStage::Verify).await);
+
+        assert!((15..=60).contains(&delay), "{acquire}: delay {delay}");
+        let ended = rig.bridge.clock.now();
+        assert_eq!(ended.0 - now.0, 2 * i64::from(jobs::SLOT_POLL_MS));
+        assert_eq!(checks(&rig, &s), [ok("bb0", VerifyKind::Body)]);
+        let outbox = rig.outbox(&s);
+        assert_eq!(
+            (outbox.stage, outbox.cursor, outbox.attempts, outbox.next_at),
+            (OutboxStage::Verify, 8, attempts, ended.plus_secs(delay))
+        );
+    }
+}
+
 /// A lease lost while a later backbone is read: the first backbone's
 /// result, written under the lease, stays; nothing more is written, and
 /// the new holder's row is as its claim found it.
