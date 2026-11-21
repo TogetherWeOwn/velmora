@@ -1632,6 +1632,11 @@ pub trait Catalog {
     async fn scrub_defer(&self, _token: u64, _extent: &ExtentId, _next_at: UnixMs) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
+    /// Frees the lease only (a run that failed before its first extent),
+    /// if the run of `token` still holds it.
+    async fn scrub_free(&self, _token: u64, _now: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
     /// Adds a run's totals and frees the lease, if the run of `token`
     /// still holds it.
     async fn scrub_end(&self, _token: u64, _run: &ScrubRun, _now: UnixMs) -> Result<bool> {
