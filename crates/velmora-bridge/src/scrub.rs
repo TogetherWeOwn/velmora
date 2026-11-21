@@ -187,6 +187,10 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
     /// Providers that refused this run's login: not asked again in it.
     refused: Vec<String>,
+    /// Checks in a row, since the last trip and across runs, that found
+    /// nothing lacking on a backbone under an incident. A check that does
+    /// sets it back to 0.
+    clean: u64,
 }
 
 /// The breaker's tally for one run.
@@ -274,9 +278,11 @@ where
             blocked,
             stats: &mut stats,
             refused: Vec::new(),
+            clean: state.incident_clean,
         };
         let ended = self.scrub_pages(started, &mut reader, &mut walk).await;
         let blocked = core::mem::take(&mut walk.blocked);
+        let clean = walk.clean;
         ProviderSession::close_all(stats).await;
         reader.close().await;
         run.ended = ended;
@@ -295,13 +301,10 @@ where
                 (kept, 0)
             }
             None if blocked.is_empty() => (blocked, 0),
-            None => {
-                let clean = state.incident_clean + u64::from(run.checked);
-                match clean >= u64::from(INCIDENT_MIN_EXTENTS) {
-                    true => (Vec::new(), 0),
-                    false => (blocked, clean),
-                }
-            }
+            None => match clean >= u64::from(INCIDENT_MIN_EXTENTS) {
+                true => (Vec::new(), 0),
+                false => (blocked, clean),
+            },
         };
         let now = self.clock.now();
         // A run that lost its lease adds nothing: the totals are another
@@ -510,6 +513,10 @@ where
             }
             Err(halt) => return Err(halt),
         };
+        match found.lacking.iter().any(|l| walk.blocked.contains(l)) {
+            true => walk.clean = 0,
+            false => walk.clean += 1,
+        }
         {
             let run = &mut *walk.run;
             run.checked += 1;
@@ -599,6 +606,7 @@ where
         };
         let before = reader.stats();
         // The `STAT` sessions wait while the extent is read.
+        let plan_again = plan.clone();
         let read = {
             let limit = walk.stats.iter().map(ProviderSession::idle_ms).min();
             let fetch = reader.fetch_planned(extent, plan);
@@ -613,6 +621,17 @@ where
                 },
                 _ => fetch.await,
             }
+        };
+        // No slot for the read while the run keeps `STAT` sessions: the
+        // slot may be one of them (a provider without drill connections
+        // and one background slot). They are ended and the read asked
+        // once more.
+        let read = match read {
+            Ok(ColdFetch::Busy) if !walk.stats.is_empty() => {
+                ProviderSession::close_all(core::mem::take(walk.stats)).await;
+                reader.fetch_planned(extent, plan_again).await
+            }
+            other => other,
         };
         let after = reader.stats();
         let cipher = match read? {
@@ -688,7 +707,17 @@ where
         if fresh.is_empty() {
             fresh = expired;
         }
-        let order = pool.order(fresh, PermitClass::Background);
+        let mut order = pool.order(fresh, PermitClass::Background);
+        // A provider this run keeps a session on comes first: the session
+        // itself counts as load there, and moving to the next one would
+        // log in again for every extent.
+        if let Some(at) = order
+            .iter()
+            .position(|p| stats.iter().any(|s| s.provider.id == p.id))
+        {
+            let kept = order.remove(at);
+            order.insert(0, kept);
+        }
         // Sessions of this backbone on a provider other than the one to
         // ask first are ended: one session per backbone at most.
         let first = order.first().map(|p| p.id.clone());
@@ -808,7 +837,6 @@ where
         let cfg = &self.cfg.scrub;
         let token = walk.token;
         let confirm = u64::from(cfg.confirm_secs);
-        let interval = u64::from(cfg.interval_days) * 86_400;
         let lacking = found.lacking.join(",");
         // Blob reads and writes and catalogue writes follow: no session
         // is to sit open through them.
@@ -832,28 +860,28 @@ where
                 .scrub_record_one(reader, walk, extent, (ScrubResult::Unrecoverable, confirm))
                 .await;
         };
-        // A re-pin helps only if verify can post what a backbone lacks,
-        // or if the copy has to stay pinned because too few backbones
-        // that count hold the extent without it.
+        // A backbone that lacks articles and that no provider posts to:
+        // verify cannot put them back there. The extent is re-pinned all
+        // the same: `STAT` and a read assembled across providers do not
+        // prove that the backbones left hold it whole, and the pinned
+        // copy keeps it at two copies until a release, by its own rule
+        // (a full read on record, `REQUIRED_BACKBONES` holding it), says
+        // otherwise. The operator is told.
         let counting = crate::verify::release_labels(&self.cfg.providers);
-        let holding = counting
-            .iter()
-            .filter(|b| !found.lacking.contains(b))
-            .count();
-        let needed = read && holding < self.cfg.required_backbones as usize || !read;
-        let postable = found.lacking.iter().any(|l| self.posts_to(l));
-        if !postable && !needed {
-            walk.run.stalled += 1;
+        let unpostable: Vec<&String> = found.lacking.iter().filter(|l| !self.posts_to(l)).collect();
+        if !unpostable.is_empty() {
+            let names = unpostable
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             crate::trace::alert(|| {
                 format!(
-                    "scrub-unpostable {} lacking=[{lacking}]: no provider posts to it, and \
-                     enough backbones hold the extent without it",
+                    "scrub-unpostable {} lacking=[{names}]: no provider posts to it; \
+                     a fresh article plan is the repair",
                     extent.id.as_str()
                 )
             });
-            return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Stalled, interval))
-                .await;
         }
         if !may_repin {
             // Under an incident on a backbone it lacks, or past the run's

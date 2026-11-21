@@ -212,10 +212,10 @@ PERMITS = "do"
 #     its outbox row back to verify, which posts what a backbone lacks and releases on REQUIRED_BACKBONES again. No
 #     intact copy anywhere: scrub_result unrecoverable and an "alert: scrub-unrecoverable" log line. See src/scrub.rs.
 #     Not set here: on only after the X2 read-back ends.
-#   SCRUB_EXTENTS_PER_RUN (96, 1 to 10000): extents one run checks at most. 6 TB every 30 days is 73 per run.
+#   SCRUB_EXTENTS_PER_RUN (96, 8 to 10000): extents one run checks at most; at least what the breaker needs. 6 TB every 30 days is 73 per run.
 #   SCRUB_SOCKETS (2, 1 to COLD_SOCKETS): drill connections one run reads over (of the providers' drill_conns).
 #   SCRUB_INTERVAL_DAYS (30): days between two checks of an extent; the first is due 30 days after its last verification.
-#   SCRUB_CONFIRM_SECS (3600): wait before a loss is looked at again, and repaired only if it is still there.
+#   SCRUB_CONFIRM_SECS (3600, at least 3600 outside dev): wait before a loss is looked at again, and repaired only if it is still there.
 #   SCRUB_RUN_SECS (240, at most 290): wall time a run takes new extents for; under the cron interval, so runs never overlap.
 #   SCRUB_REPAIRS_PER_RUN (8): extents one run re-pins at most.
 

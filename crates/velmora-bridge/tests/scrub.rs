@@ -1230,11 +1230,12 @@ async fn bodies_no_provider_serves_are_never_released_on_stat_alone() {
     assert!(w.has_safety(&o));
 }
 
-/// A loss on a backbone no provider posts to, with enough other
-/// backbones holding the extent: no re-pin (verify could not post it
-/// there, and the release would not need it), `stalled` with an alert.
+/// A loss on a backbone no provider posts to: verify cannot put it back
+/// there, so the operator is told; the extent is still re-pinned, since
+/// `STAT` and a read assembled across providers do not prove that the
+/// backbones left hold it whole.
 #[tokio::test(flavor = "current_thread")]
-async fn a_loss_nobody_can_post_is_stalled_not_re_pinned_when_enough_backbones_hold_it() {
+async fn a_loss_nobody_can_post_is_re_pinned_and_said() {
     let third = server().await;
     let w = world_with(|cfg| {
         cfg.providers[1].post = false;
@@ -1249,10 +1250,66 @@ async fn a_loss_nobody_can_post_is_stalled_not_re_pinned_when_enough_backbones_h
     assert_eq!(w.scrub().await.suspect, 1);
     w.advance_secs(3600);
     let run = w.scrub().await;
-    assert_eq!((run.repaired, run.stalled), (0, 1));
-    assert_eq!(w.result(&o).await, "stalled");
-    assert_eq!(w.safety_state(&o).await, "released");
-    assert!(alerts().iter().any(|a| a.starts_with("scrub-unpostable ")));
+    assert_eq!(run.repaired, 1);
+    assert_eq!(w.safety_state(&o).await, "held");
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-unpostable ") && a.contains("lacking=[beta]")));
+}
+
+/// A check that still finds a loss on a backbone under an incident sets
+/// the count of clean checks back: short runs do not clear an incident
+/// that lasts.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lasting_incident_is_not_cleared_by_short_runs() {
+    let w = world().await;
+    let a = w.released("a", 170).await;
+    let b = w.released("b", 171).await;
+    w.bridge()
+        .catalog
+        .sql
+        .exec(
+            "UPDATE scrub_state SET last_incident = '[\"beta\"]', incident_clean = 7",
+            &[],
+        )
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &a, 0).await;
+    let run = w.scrub().await;
+    assert_eq!(run.checked, 2);
+    let state = w.state().await;
+    assert_eq!(state.blocked(), ["beta"], "a or b still lacks there");
+    assert!(state.incident_clean <= 1, "{}", state.incident_clean);
+    // Clean checks in a row clear it.
+    let plan = w.plan(&a).await;
+    w.servers[1].unhide(&plan[0].message_id).await;
+    for i in 0..8u8 {
+        let _ = w.released(&format!("c{i}"), 172 + i).await;
+    }
+    w.advance_secs(31 * DAY_SECS);
+    let _ = w.scrub().await;
+    assert!(w.state().await.blocked().is_empty());
+    let _ = b;
+}
+
+/// A provider without drill connections whose one background slot the
+/// run's `STAT` session holds: the read gets it, and the run goes on.
+#[tokio::test(flavor = "current_thread")]
+async fn the_read_gets_the_slot_the_stat_session_held() {
+    let w = world_with(|cfg| {
+        for p in &mut cfg.providers {
+            p.drill_conns = 0;
+            p.max_conns = 2;
+        }
+        cfg.scrub.sockets = 1;
+    })
+    .await;
+    let o = w.released("a", 190).await;
+    w.advance_secs(31 * DAY_SECS);
+    let run = w.scrub().await;
+    assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert_eq!(w.result(&o).await, "ok");
 }
 
 /// The due query as it runs is read from its index.
