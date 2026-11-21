@@ -194,13 +194,16 @@ def cmd_mpu(a, cl):
     fd = spool.fileno()
 
     def part(i):
-        want, off, out = min(a.part, a.size - i * a.part), i * a.part, bytearray()
-        while len(out) < want:
-            chunk = os.pread(fd, want - len(out), off + len(out))
-            if not chunk:
-                raise RuntimeError(f"part {i + 1}: the spool file ended at {off + len(out)}")
-            out += chunk
-        return bytes(out)
+        # Read straight into one buffer of the part's size: no copies.
+        want, off = min(a.part, a.size - i * a.part), i * a.part
+        buf = bytearray(want)
+        view, got = memoryview(buf), 0
+        while got < want:
+            n = os.preadv(fd, [view[got:]], off + got)
+            if not n:
+                raise RuntimeError(f"part {i + 1}: the spool file ended at {off + got}")
+            got += n
+        return buf
 
     st, _, data, _, _, _ = cl.call("POST", a.key, [("uploads", "")])
     if st != 200:

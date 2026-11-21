@@ -51,7 +51,8 @@ log() { printf '[bench %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 # there that runs as us. A new one is made 700; an existing one that others
 # may write to is refused, not repaired (what they left there stays).
 while [[ $WORK == */ && $WORK != / ]]; do WORK=${WORK%/}; done
-if [[ ! -e $WORK ]]; then mkdir -p -- "$(dirname -- "$WORK")"; mkdir -m 700 -- "$WORK"; fi
+# Two first runs may race to make it: whichever loses goes on to the checks.
+if [[ ! -e $WORK ]]; then mkdir -p -- "$(dirname -- "$WORK")"; mkdir -m 700 -- "$WORK" 2>/dev/null || true; fi
 writable_by_others() { [[ -n $(find "$1" -maxdepth 0 -perm /022 2>/dev/null) ]]; }
 if [[ -L $WORK || ! -d $WORK || ! -O $WORK ]] || writable_by_others "$WORK"; then
   log "FAILED: $WORK is a symlink, not a directory, not owned by $(id -un) or writable by others"; exit 1
