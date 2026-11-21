@@ -165,9 +165,10 @@ async fn fill_body<R: BodyReads>(
     Ok(bytes)
 }
 
-/// Largest single read asked of R2. R2 fills about 64 KiB per read
-/// whatever the size, so this only bounds the runtime buffer.
-const MAX_READ: u32 = 1024 * 1024;
+/// Largest single read asked of R2, and so the most the runtime buffer
+/// holds. R2 fills about 64 KiB per read whatever the size (up to about
+/// 400 KiB measured), so 256 KiB loses nothing.
+const MAX_READ: u64 = 256 * 1024;
 
 /// A body read with a BYOB reader into one runtime buffer that every read
 /// reuses. The default reader hands R2 bodies out in 4 KiB chunks, each a
@@ -200,7 +201,9 @@ extern "C" {
 impl ByobReads {
     /// `None` when the stream has no BYOB reader (it is not a byte
     /// stream). R2 bodies are byte streams, so `get` then fails closed.
-    fn new(stream: &ReadableStream) -> Option<Self> {
+    /// The buffer is no larger than the body needs (`expected` plus the
+    /// spare byte), so a small range holds a small buffer.
+    fn new(stream: &ReadableStream, expected: u64) -> Option<Self> {
         let options = Object::new();
         Reflect::set(&options, &"mode".into(), &"byob".into()).ok()?;
         Some(ByobReads {
@@ -208,7 +211,9 @@ impl ByobReads {
                 .unchecked_ref::<ByteBody>()
                 .byob_reader(&options)
                 .ok()?,
-            buffer: Some(ArrayBuffer::new(MAX_READ)),
+            buffer: Some(ArrayBuffer::new(
+                expected.saturating_add(1).min(MAX_READ) as u32
+            )),
         })
     }
 }
@@ -217,7 +222,7 @@ impl BodyReads for ByobReads {
     async fn read(&mut self, dst: &mut [u8]) -> std::result::Result<usize, BodyError> {
         // The buffer is gone only after a read that failed or ended.
         let buffer = self.buffer.take().ok_or(BodyError::Read)?;
-        let want = dst.len().min(MAX_READ as usize) as u32;
+        let want = buffer.byte_length().min(dst.len() as u32);
         let view = Uint8Array::new_with_byte_offset_and_length(&buffer, 0, want);
         let promise = self.reader.read(&view).map_err(|_| BodyError::Read)?;
         let result: ReadResult = JsFuture::from(promise)
@@ -281,7 +286,7 @@ impl BlobStore for R2Blobs {
             worker::ResponseBody::Stream(stream) => stream,
             _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
         };
-        let Some(mut reads) = ByobReads::new(&stream) else {
+        let Some(mut reads) = ByobReads::new(&stream, expected) else {
             return Err(BridgeError::Blob("r2: get body failed".into()));
         };
         let bytes = fill_body(&mut reads, expected).await;
