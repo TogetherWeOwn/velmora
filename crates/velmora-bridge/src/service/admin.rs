@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `POST /_admin/buckets` `{name, disposable}` | `200` (a non-disposable bucket only with `"disposable": false`; `403` for one if `REAL_DATA_READY` is unset); `409` name taken |
 //! | `POST /_admin/keys` `{buckets, perm[, kind]}` | `200` with the secret, once. `kind` is `s3` (default) or `app_password`: a key pair for the WebDAV entry point only (`crate::entry`) |
-//! | `GET /_admin/keys[?after=<id>]` | `200`: ids, status, created time and grants, never a secret; `next` while more follow |
+//! | `GET /_admin/keys[?after=<id>]` | `200`: ids, kind, status, created time and grants, never a secret; `next` while more follow |
 //! | `POST /_admin/keys/<access_key_id>/grants` `{bucket, perm}` | `200` `{access_key_id, bucket, perm}`, widening (`ro` to `rw`) or repeating an earlier grant on that bucket; `409` `GrantNarrowingRefused` for `rw` to `ro`; `404` unknown key or bucket; `400` bad `perm` |
 //! | `DELETE /_admin/keys/<access_key_id>` | `204` revoked; `404` unknown (so a second call is `404`) |
 //! | `DELETE /_admin/keys/<access_key_id>/grants` | `405`: grants are not removed one by one |

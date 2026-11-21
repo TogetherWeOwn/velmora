@@ -86,12 +86,6 @@ const KEY_MODE_RANDOM: u8 = 1;
 /// Queue messages of one `send_many`.
 const JOB_BATCH: usize = 100;
 
-/// Headers the edge adds, and the entry marker: dropped before header
-/// validation (see `common::edge_header`).
-fn edge_header(name: &str) -> bool {
-    crate::entry::dropped_header(name)
-}
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -412,7 +406,7 @@ where
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy);
