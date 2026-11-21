@@ -200,6 +200,7 @@ impl Fx {
             parity: false,
             required_backbones: 1,
             safety_min_age_secs: 0,
+            release_at_verify: false,
             verify_delay_secs: 1,
             post_sockets: 4,
             cold_sockets: 4,

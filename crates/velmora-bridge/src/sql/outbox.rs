@@ -904,7 +904,8 @@ pub(super) async fn body_checks<S: Sql>(
 }
 
 /// Authorizes unpinning the safety copy (it becomes evictable). One batch whose guard requires:
-/// the release lease still holds, a live generation references the extent, the copy is
+/// the lease (of a release job, or of a verify job that releases) still holds, a live
+/// generation references the extent, the copy is
 /// `held` (or `releasing`, when re-driven), and the release rule holds:
 /// - at least `required` of the `counting` backbones have a complete pass
 ///   recorded under this claim (between the claim time and `now`); a
@@ -943,9 +944,13 @@ pub(super) async fn begin_release<S: Sql>(
 ) -> Result<Guard<()>> {
     let need_full = light.unwrap_or(true);
     let light = light.is_some();
-    if l.stage != OutboxStage::Release || required == 0 {
+    // A release job, or the verify job that releases what it has just
+    // checked: the guard below is the same for both, and counts only
+    // rows recorded under the claim the lease is of.
+    let stage = matches!(l.stage, OutboxStage::Release | OutboxStage::Verify);
+    if !stage || required == 0 {
         return Err(BridgeError::Invalid(
-            "release needs a release lease and at least one required backbone",
+            "release needs a release or verify lease and at least one required backbone",
         ));
     }
     let labels =
@@ -1097,7 +1102,7 @@ pub(super) async fn finish_release<S: Sql>(
     let guard = concat!(
         "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
         held!(),
-        " AND stage = 'release' AND lease_until >= ?5) \
+        " AND stage IN ('release', 'verify') AND lease_until >= ?5) \
          OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
            AND safety_state = 'releasing')"
     );

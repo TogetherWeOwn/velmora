@@ -1447,6 +1447,7 @@ fn report(b: &Bench, scale: &str) -> serde_json::Value {
         "MAX_PUT_BYTES",
         "REQUIRED_BACKBONES",
         "SAFETY_MIN_AGE_SECS",
+        "RELEASE_AT_VERIFY",
         "VERIFY_DELAY_SECS",
         "VERIFY_MODE",
         "PACKED_PLANS",
