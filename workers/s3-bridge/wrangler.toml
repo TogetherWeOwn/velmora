@@ -216,8 +216,8 @@ PERMITS = "do"
 #   SCRUB_SOCKETS (2, 1 to COLD_SOCKETS): drill connections one run reads over (of the providers' drill_conns).
 #   SCRUB_INTERVAL_DAYS (30): days between two checks of an extent; the first is due 30 days after its last verification.
 #   SCRUB_CONFIRM_SECS (3600, at least 3600 outside dev): wait before a loss is looked at again, and repaired only if it is still there.
-#   SCRUB_RUN_SECS (240, at most 290): wall time a run takes new extents for; under the cron interval, so runs never overlap.
-#   SCRUB_REPAIRS_PER_RUN (8): extents one run re-pins at most.
+#   SCRUB_RUN_SECS (240, 30 to 290): wall time a run takes new extents for; under the cron interval, so runs never overlap.
+#   SCRUB_REPAIRS_PER_RUN (8): extents one run re-pins at most; 0 means detect only.
 
 # off | on (CopyObject only; UploadPartCopy does not read it). On only in a
 # release after the one that added extent references (migration 0005): a
