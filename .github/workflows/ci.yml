@@ -26,6 +26,17 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # The test runner of the native test jobs. cargo test runs one test
+  # binary after another, and most of the native jobs' time was the few
+  # slow binaries running alone on 4 cores; nextest runs every test of
+  # every binary side by side, each in its own process, the same tests
+  # (counts below each run). Doc-tests, which nextest does not run, run
+  # with `cargo test --doc` beside it. The release digest is recorded
+  # here so a replaced artifact fails closed; re-pin deliberately, with
+  # the digest checked out of band (the release's .sha256 file and the
+  # GitHub asset digest agreed on 2026-11-21).
+  NEXTEST_VERSION: "0.9.152"
+  NEXTEST_SHA256: "521c5f790ed07ee69d0a88403d9d86a8c8ab27977f12fc73f22aa4e7e14a0f71"
 
 jobs:
   public-pr-security:
@@ -75,7 +86,44 @@ jobs:
       # the emitted bytes.
       - name: Install reference par2 binary for creator interop test
         run: sudo apt-get update && sudo apt-get install -y par2
-      - run: cargo test --locked --workspace
+      - name: Install pinned cargo-nextest
+        run: |
+          set -euo pipefail
+          asset="cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 -o "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/${asset}"
+          echo "${NEXTEST_SHA256}  ${RUNNER_TEMP}/${asset}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/nextest-bin"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/nextest-bin"
+          echo "${RUNNER_TEMP}/nextest-bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/nextest-bin/cargo-nextest" nextest --version
+      # Every test of the workspace (what `cargo test --workspace` ran but
+      # its doc-tests), then the doc-tests. --no-tests=fail: a run that
+      # finds no test fails.
+      - run: cargo nextest run --locked --workspace --no-fail-fast --no-tests=fail
+      - run: cargo test --locked --workspace --doc
+
+  # The same native runner with other feature sets of the engine crate,
+  # beside the workspace tests instead of after them.
+  rust-test-features:
+    name: rust test (native, engine feature sets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # As in rust-test: these runs had the binary too.
+      - name: Install reference par2 binary for creator interop test
+        run: sudo apt-get update && sudo apt-get install -y par2
       # Transport-free portable core on the same native runner: executes
       # velmora without default TLS features. This is native portable
       # behavior, not a wasm-runtime check (see rust-wasm).
@@ -313,7 +361,19 @@ jobs:
           # were built before. Change the prefix again with that profile.
           prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge
+      - name: Install pinned cargo-nextest
+        run: |
+          set -euo pipefail
+          asset="cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 -o "${RUNNER_TEMP}/${asset}" \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/${asset}"
+          echo "${NEXTEST_SHA256}  ${RUNNER_TEMP}/${asset}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/nextest-bin"
+          tar -xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/nextest-bin"
+          echo "${RUNNER_TEMP}/nextest-bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/nextest-bin/cargo-nextest" nextest --version
+      - run: cargo nextest run --locked -p velmora-s3-proto -p velmora-bridge --no-fail-fast --no-tests=fail
+      - run: cargo test --locked -p velmora-s3-proto -p velmora-bridge --doc
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
 
@@ -457,12 +517,27 @@ jobs:
   # It runs twice with aws-cli's default checksum settings: over HTTP (a
   # CRC64NVME header) and over local HTTPS (aws-chunked bodies with a
   # trailing checksum). Each run also covers `when_required` (step 0b).
+  # The two runs are independent (each starts from its own throwaway local
+  # state), so they run as two legs side by side; ci-ok reads the result
+  # of the job, which is a success only when both legs succeed.
   worker-e2e:
-    name: worker e2e (wrangler dev)
+    name: worker e2e (wrangler dev, ${{ matrix.leg }})
     needs: changes
     if: needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: http
+            url: http://127.0.0.1:8787
+            # Provider permits from the catalogue's slot rows.
+            permits: ""
+          - leg: https-aws-chunked
+            url: https://127.0.0.1:8787
+            # This run takes provider permits from the gate object.
+            permits: do
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -505,23 +580,21 @@ jobs:
       - name: Build fakesrv
         if: steps.script.outputs.present == 'true'
         run: cargo build --locked -p velmora-test-nntp --bin fakesrv
-      - name: Run the local slice (HTTP)
+      - name: Run the local slice (${{ matrix.leg }})
         if: steps.script.outputs.present == 'true'
         working-directory: workers/s3-bridge
         env:
           FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
           WRANGLER_SEND_METRICS: "false"
-        run: bash e2e/slice.sh http://127.0.0.1:8787
-      - name: Run the local slice (HTTPS, aws-chunked)
-        if: steps.script.outputs.present == 'true'
-        working-directory: workers/s3-bridge
-        env:
-          FAKESRV_BIN: ${{ github.workspace }}/target/debug/fakesrv
-          WRANGLER_SEND_METRICS: "false"
-          # This run takes provider permits from the gate object; the
-          # HTTP run above takes them from the catalogue's slot rows.
-          E2E_PERMITS: "do"
-        run: bash e2e/slice.sh https://127.0.0.1:8787
+          SLICE_URL: ${{ matrix.url }}
+          SLICE_PERMITS: ${{ matrix.permits }}
+        run: |
+          set -euo pipefail
+          # The HTTP leg leaves E2E_PERMITS unset, as before the split.
+          if [ -n "$SLICE_PERMITS" ]; then
+            export E2E_PERMITS="$SLICE_PERMITS"
+          fi
+          bash e2e/slice.sh "$SLICE_URL"
 
   # The console Worker (apps/console): plain JavaScript, no dependencies,
   # tested with the Node test runner. Cheap, so it runs on every event.
@@ -557,7 +630,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
+    needs: [rust-test, rust-test-features, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -588,13 +661,16 @@ jobs:
           BRIDGE: ${{ needs.changes.outputs.bridge }}
 
   # Production deploy of the S3 Worker after ci-ok on a push to main, in two
-  # jobs. They depend on ci-ok, never the reverse, and are not part of
-  # ci-ok. `!cancelled()` is needed because the PR-only public-pr-security
-  # job is a skipped ancestor, which would make the implicit success()
-  # skip these jobs.
+  # jobs. They are not part of ci-ok, and ci-ok never depends on them.
+  # `!cancelled()` is needed because the PR-only public-pr-security job is
+  # a skipped ancestor, which would make the implicit success() skip these
+  # jobs.
   #
   # deploy-build compiles the Worker with no environment and no secrets,
-  # and hands the bundle to deploy as an artifact. deploy runs in the
+  # and hands the bundle to deploy as an artifact. It runs beside the test
+  # jobs instead of after ci-ok (it took about 4 minutes of every merge):
+  # it ships nothing, and deploy, the only job that uses its bundle, still
+  # starts only after ci-ok succeeded. deploy runs in the
   # protected `production` environment (main only) and executes no cargo,
   # build.rs or worker-build code. Wrangler comes from the committed
   # workers/s3-bridge/package-lock.json, installed with `npm ci
@@ -607,8 +683,8 @@ jobs:
   # restores the previous Worker version but never reverts a migration.
   deploy-build:
     name: deploy build (s3-bridge bundle)
-    needs: [ci-ok, changes]
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.bridge == 'true' && needs.changes.result == 'success' && needs.ci-ok.result == 'success' }}
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.bridge == 'true' && needs.changes.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -683,8 +759,8 @@ jobs:
 
   deploy:
     name: deploy (production)
-    needs: [deploy-build]
-    if: ${{ !cancelled() && needs.deploy-build.result == 'success' && needs.deploy-build.outputs.fresh == 'true' }}
+    needs: [ci-ok, deploy-build]
+    if: ${{ !cancelled() && needs.ci-ok.result == 'success' && needs.deploy-build.result == 'success' && needs.deploy-build.outputs.fresh == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
