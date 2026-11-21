@@ -885,20 +885,28 @@ second round of `STAT`, its job and its writes are not made.
   catalogue refuses anything less, whichever job asks.
 - A backbone the releasing verify job did not ask itself is asked with
   `STAT` in that job first: one a job before it checked (a round that
-  waited for propagation or made a repost), and one whose check ended
-  before the minimum age did.
+  waited for propagation or made a repost), and one whose check began
+  before the minimum age was over. If there is no provider slot for
+  that question, the row goes to the release stage, which asks every
+  backbone.
 - With a minimum age above the time a verify round takes (the shipped
   24 h), the round ends before it is over and the release job does the
   release as before. Only a round that passes later, such as one after a
   repost, releases at once.
+- The release by a verify job is one write to the catalogue: the copy
+  goes from `held` to `released` and the row from `verify` to `done`
+  together, or nothing changes. A job that dies leaves the copy held and
+  the row at `verify` for the next verify job. No copy is `releasing`
+  under a row at `verify`.
 - The switch can be turned on and off at any time, and Workers of both
-  values, and Workers from before the switch, may run side by side. A
-  verify job that died in the middle of its release leaves the row at
-  `verify` and the extent `releasing`: the next verify job, of any
-  version, sends it to the release stage, which finishes it.
-- `outbox` rows of such an extent go from `verify` to `done`: the
-  `release` count of `/_admin/status` stays near 0 and says nothing
-  about how many copies were released.
+  values, and Workers from before the switch, may run side by side:
+  none of them meets a state it does not know.
+- `outbox` rows of such an extent go from `verify` to `done`, so the
+  `release` count of `/_admin/status` stays near 0. The release counters
+  (`releases_total` and the hourly `releases`) count these releases from
+  migration `0023_usage_release_at_verify.sql` on. Apply it before the
+  Worker that has the switch on: without it such a release is counted as
+  a verify only.
 
 ## Permit gate
 

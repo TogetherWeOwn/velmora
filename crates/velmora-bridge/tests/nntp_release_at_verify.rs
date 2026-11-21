@@ -396,14 +396,17 @@ async fn a_verify_after_the_minimum_age_releases() {
     );
 }
 
-/// The minimum age ends while the verify job reads: a check it made
-/// before the end is not presence for the release, and that backbone is
-/// asked again. Only checks made once the age was over count.
+/// The minimum age ends while the verify job reads. A check counts as
+/// presence for the release only if all of it was made once the age
+/// was over: one whose questions began before, and whose row is
+/// recorded after, holds answers from before. Both backbones are asked
+/// again here.
 #[tokio::test]
-async fn a_check_made_before_the_minimum_age_was_over_is_asked_again() {
+async fn a_check_that_began_before_the_minimum_age_was_over_is_asked_again() {
     let mut rig = rig_on().await;
     let (s, plan) = rig.on_two(6).await;
     let n = plan.len();
+    assert_eq!(n, 3);
     let posted = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
     // The age is over one second into the job.
     let start = rig.bridge.clock.now();
@@ -412,10 +415,64 @@ async fn a_check_made_before_the_minimum_age_was_over_is_asked_again() {
     rig.bridge.cfg.safety_min_age_secs = u32::try_from(age_ms / 1000).unwrap();
     let ready = UnixMs(start.0 + 1000);
 
-    // Every call takes 200 ms: the first backbone is done before the
-    // second, the second after it.
+    // Every call takes 150 ms, the connect too: the first backbone is
+    // done at 600 ms, and the second has had two answers of three when
+    // the age is over.
     assert_eq!(
-        rig.logged(&s, OutboxStage::Verify, 200).await,
+        rig.logged(&s, OutboxStage::Verify, 150).await,
+        JobOutcome::Ack
+    );
+    let rows = rig.rows(&s);
+    assert_eq!(
+        rig.checks(&s),
+        [
+            ok("bb0", VerifyKind::Body),
+            ok("bb1", VerifyKind::Stat),
+            ok("bb0", VerifyKind::Stat),
+            ok("bb1", VerifyKind::Stat),
+        ]
+    );
+    let log = rig.bridge.nntp.calls();
+    let asked: Vec<UnixMs> = log.iter().filter(|c| c.0 == "stat").map(|c| c.1).collect();
+    assert_eq!(rows[0].verified_at, UnixMs(start.0 + 600));
+    // Two questions before the age was over, the row after it: the
+    // time of the row alone would count the check.
+    assert!(asked[1] < ready && asked[2] >= ready);
+    assert_eq!(rows[1].verified_at, UnixMs(start.0 + 1200));
+    // Both backbones were asked a second time, all of it after.
+    assert_eq!(rig.calls(), (n, 3 * n, 0));
+    assert!(asked[n..].iter().all(|at| *at >= ready));
+    assert!(rig.released(&s));
+    assert_eq!(
+        rig.evidence(&s),
+        [
+            ("bb0".into(), "stat".into(), rows[2].verified_at, None),
+            ("bb1".into(), "stat".into(), rows[3].verified_at, None),
+            ("bb0".into(), "body".into(), rows[0].verified_at, None),
+        ]
+    );
+}
+
+/// The same at the boundary: the age is over at the instant the second
+/// backbone's check begins. That check is presence. The first one,
+/// recorded at that same instant but made before it, is not.
+#[tokio::test]
+async fn a_check_that_began_once_the_minimum_age_was_over_is_presence() {
+    let mut rig = rig_on().await;
+    let (s, plan) = rig.on_two(7).await;
+    let n = plan.len();
+    let posted = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
+    // Every call takes one second, the connect too: the first backbone
+    // is done `n + 1` seconds into the job, and the age is over then.
+    let start = rig.bridge.clock.now();
+    let check_ms = 1000 * (i64::try_from(n).unwrap() + 1);
+    let age_ms = start.0 + check_ms - posted.0;
+    assert_eq!(age_ms % 1000, 0);
+    rig.bridge.cfg.safety_min_age_secs = u32::try_from(age_ms / 1000).unwrap();
+    let ready = UnixMs(start.0 + check_ms);
+
+    assert_eq!(
+        rig.logged(&s, OutboxStage::Verify, 1000).await,
         JobOutcome::Ack
     );
     let rows = rig.rows(&s);
@@ -427,9 +484,8 @@ async fn a_check_made_before_the_minimum_age_was_over_is_asked_again() {
             ok("bb0", VerifyKind::Stat),
         ]
     );
-    assert!(rows[0].verified_at < ready);
-    assert!(rows[1].verified_at >= ready);
-    assert!(rows[2].verified_at >= ready);
+    assert_eq!(rows[0].verified_at, ready);
+    assert_eq!(rows[1].verified_at, UnixMs(ready.0 + check_ms));
     // The first backbone was asked a second time, the second was not.
     assert_eq!(rig.calls(), (n, 2 * n, 0));
     assert!(rig.released(&s));
@@ -480,6 +536,77 @@ async fn a_backbone_this_job_did_not_ask_is_asked_before_the_release() {
             ("bb0".into(), "body".into(), earlier.verified_at, None),
         ]
     );
+}
+
+/// A verify job that gets no slot for the question it has yet to ask
+/// makes its round only once: the row goes to the release stage, whose
+/// job asks every backbone when there is a slot. Nothing is released
+/// on the way.
+#[tokio::test]
+async fn without_a_slot_for_its_last_question_the_release_stage_asks() {
+    let rig = rig_on().await;
+    let (s, plan) = rig.on_two(8).await;
+    let n = plan.len();
+    rig.first_backbone_verified(&s).await;
+    // Another job holds every slot of the first backbone's provider.
+    let now = rig.bridge.clock.now();
+    let first = &rig.bridge.cfg.providers[0];
+    assert_eq!(first.backbone, "bb0");
+    let catalog = &rig.bridge.catalog;
+    let mut held = Vec::new();
+    let class = PermitClass::Background;
+    while let Some(permit) = catalog
+        .acquire_permit(first, class, "other", now)
+        .await
+        .unwrap()
+    {
+        held.push(permit);
+    }
+    assert!(!held.is_empty());
+
+    assert_eq!(
+        rig.logged(&s, OutboxStage::Verify, 0).await,
+        JobOutcome::Ack
+    );
+    // The second backbone as its verify, and no answer from the first.
+    assert_eq!(rig.calls(), (0, n, 0));
+    assert_eq!(rig.rows(&s).len(), 2);
+    assert!(rig.held(&s));
+    let outbox = rig.outbox(&s);
+    assert_eq!((outbox.stage, outbox.next_at), (OutboxStage::Release, now));
+    assert_eq!(rig.sent(), [(OutboxStage::Release, 0)]);
+
+    for permit in held {
+        catalog.release_permit(&permit).await.unwrap();
+    }
+    rig.bridge.clock.advance_secs(1);
+    assert_eq!(
+        rig.logged(&s, OutboxStage::Release, 0).await,
+        JobOutcome::Ack
+    );
+    assert_eq!(rig.calls(), (0, 2 * n, 0));
+    assert!(rig.released(&s));
+}
+
+/// The catalogue has the last word: a row taken over between the last
+/// check and the release is not released by the job that lost it, and
+/// the copy stays held for the job that has it now.
+#[tokio::test]
+async fn a_release_the_catalogue_refuses_keeps_the_copy() {
+    let rig = rig_on().await;
+    let (s, plan) = rig.on_two(18).await;
+    let n = plan.len();
+    rig.bridge.catalog.take_over_at_release.set(true);
+
+    rig.logged(&s, OutboxStage::Verify, 0).await;
+    // The round was made and recorded, and the release was asked for.
+    assert_eq!(rig.calls(), (n, n, 0));
+    assert_eq!(rig.rows(&s).len(), 2);
+    assert!(!rig.bridge.catalog.take_over_at_release.get());
+    assert!(rig.held(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).release_evidence, None);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Verify);
+    assert_eq!(rig.sent(), []);
 }
 
 /// The backbone an earlier job passed has lost an article since: the
@@ -656,26 +783,27 @@ async fn a_backbone_that_lacks_the_extent_is_no_part_of_the_release() {
     );
 }
 
-/// A verify job died between the release decision and its last step:
-/// the next verify job reads nothing and hands the row to the release
-/// stage, which finishes it.
+/// The release by a verify job is one write to the catalogue: the copy
+/// is never `releasing` under its row, so there is no step for another
+/// job to finish. A copy found `releasing` all the same is none of the
+/// verify job's: it reads as it always did and leaves the row to the
+/// release stage, which finishes it.
 #[tokio::test]
-async fn a_release_in_progress_is_finished_by_the_release_stage() {
+async fn a_copy_found_releasing_is_left_to_the_release_stage() {
     let rig = rig_on().await;
-    let (s, _) = rig.on_two(12).await;
+    let (s, plan) = rig.on_two(12).await;
+    let n = plan.len();
     rig.bridge.catalog.edit(&s.extent, |e| {
         e.job.extent.safety_state = SafetyState::Releasing;
     });
-    let now = rig.bridge.clock.now();
 
     assert_eq!(
         rig.logged(&s, OutboxStage::Verify, 0).await,
         JobOutcome::Ack
     );
-    assert_eq!(rig.calls(), (0, 0, 0));
-    assert_eq!(rig.rows(&s), []);
-    let outbox = rig.outbox(&s);
-    assert_eq!((outbox.stage, outbox.next_at), (OutboxStage::Release, now));
+    assert_eq!(rig.calls(), (n, n, 0));
+    assert_eq!(rig.state(&s), SafetyState::Releasing);
+    assert_eq!(rig.outbox(&s).stage, OutboxStage::Release);
     assert_eq!(rig.sent(), [(OutboxStage::Release, 0)]);
 
     assert_eq!(
@@ -687,9 +815,8 @@ async fn a_release_in_progress_is_finished_by_the_release_stage() {
 }
 
 /// What a release job answers without a check is still its answer: a
-/// deleted generation, one backbone outside development, a provider
-/// list with too few backbones that count. The verify job releases
-/// nothing there and leaves the row to the release stage.
+/// deleted generation, one backbone outside development. The verify
+/// job releases nothing there and leaves the row to the release stage.
 #[tokio::test]
 async fn what_the_release_stage_decides_is_left_to_it() {
     // A deleted generation is cancelled by the release stage.
@@ -752,7 +879,8 @@ async fn a_lease_taken_over_releases_nothing() {
 
 /// The guard of the catalogue, asked with a verify lease: a pass from
 /// an earlier claim is not presence, so one backbone asked under this
-/// claim releases nothing, and two do.
+/// claim releases nothing, and two do, in one step. The two steps of a
+/// release job are not open to a verify lease.
 #[tokio::test]
 async fn the_guard_counts_only_passes_of_the_claim_that_releases() {
     let rig = rig_on().await;
@@ -773,18 +901,20 @@ async fn the_guard_counts_only_passes_of_the_claim_that_releases() {
     // The second backbone under this claim, the first only before it.
     let second = stat("bb1", "p1");
     assert!(catalog.record_verification(&lease, &second).await.unwrap());
-    let begun = catalog.begin_release(&lease, 2, &labels, "[]", now).await;
-    assert_eq!(begun.unwrap(), Guard::Lost);
+    let released = catalog.release_at_verify(&lease, 2, &labels, "[]", now, None);
+    assert_eq!(released.await.unwrap(), Guard::Lost);
     assert!(rig.held(&s));
 
     // Both under this claim, and the full check on record.
     let first = stat("bb0", "p0");
     assert!(catalog.record_verification(&lease, &first).await.unwrap());
     let begun = catalog.begin_release(&lease, 2, &labels, "[]", now).await;
-    assert_eq!(begun.unwrap(), Guard::Applied(()));
-    assert_eq!(rig.state(&s), SafetyState::Releasing);
-    assert!(catalog.finish_release(&lease, now).await.unwrap());
+    assert!(matches!(begun, Err(BridgeError::Invalid(_))));
+    assert!(rig.held(&s));
+    let released = catalog.release_at_verify(&lease, 2, &labels, "[]", now, None);
+    assert_eq!(released.await.unwrap(), Guard::Applied(()));
     assert!(rig.released(&s));
+    assert_eq!(rig.bridge.catalog.extent(&s.extent).released_at, Some(now));
 }
 
 /// Under the light check an extent outside the sample is released by
@@ -842,6 +972,55 @@ async fn a_sampled_extent_is_released_with_its_full_read() {
     let mut want = [entry("bb0", "stat", None), entry("bb1", "stat", None)];
     want[drawn].1 = "sampled".into();
     assert_eq!(rig.evidence_kinds(&s), want);
+}
+
+/// Under the light check too, a check that began before the minimum
+/// age was over is not presence: both backbones are asked again, with
+/// `STAT`, and the size checks stay the record of what verify found.
+#[tokio::test]
+async fn the_light_check_asks_again_what_began_before_the_minimum_age() {
+    let sizes = [("p0", SizeCommand::Head), ("p1", SizeCommand::Head)];
+    let mut rig = light_rig(0, &sizes).await;
+    for server in &rig.servers {
+        server.set_reported_size(Some(0)).await;
+    }
+    let (s, plan) = rig.on_two(25).await;
+    let n = plan.len();
+    let posted = plan.iter().filter_map(|a| a.posted_at).max().unwrap();
+    // The age is over one second into the job; a call takes 150 ms.
+    let start = rig.bridge.clock.now();
+    let age_ms = start.0 + 1000 - posted.0;
+    assert_eq!(age_ms % 1000, 0);
+    rig.bridge.cfg.safety_min_age_secs = u32::try_from(age_ms / 1000).unwrap();
+    let ready = UnixMs(start.0 + 1000);
+
+    assert_eq!(
+        rig.logged(&s, OutboxStage::Verify, 150).await,
+        JobOutcome::Ack
+    );
+    assert_eq!(rig.calls(), (0, 2 * n, 2 * n));
+    let log = rig.bridge.nntp.calls();
+    let stats = log.iter().filter(|c| c.0 == "stat");
+    assert!(stats.into_iter().all(|c| c.1 >= ready));
+    assert_eq!(
+        rig.checks(&s),
+        [
+            ok("bb0", VerifyKind::Size),
+            ok("bb1", VerifyKind::Size),
+            ok("bb0", VerifyKind::Stat),
+            ok("bb1", VerifyKind::Stat),
+        ]
+    );
+    assert!(rig.released(&s));
+    assert_eq!(
+        rig.evidence_kinds(&s),
+        [
+            entry("bb0", "stat", None),
+            entry("bb1", "stat", None),
+            entry("bb0", "size", Some("head")),
+            entry("bb1", "size", Some("head")),
+        ]
+    );
 }
 
 /// A size that does not fit, or an article one backbone lacks, blocks

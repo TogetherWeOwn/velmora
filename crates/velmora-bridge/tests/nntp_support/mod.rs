@@ -419,6 +419,9 @@ pub struct MemCatalog {
     pub raises: RefCell<Vec<(ExtentId, String, u32)>>,
     /// The next this many `escalate_verify` calls fail and store nothing.
     pub fail_escalations: Cell<u32>,
+    /// Another job takes the row over just before the next release is
+    /// asked for: the lease of the job that asks is stale by then.
+    pub take_over_at_release: Cell<bool>,
 }
 
 impl MemCatalog {
@@ -530,6 +533,9 @@ impl MemCatalog {
     }
 
     /// The release guard, with the full check on record asked for or not.
+    /// `whole` = the time of a release by a verify job, which is over in
+    /// this one step; `None` = a release job, which marks the copy.
+    #[allow(clippy::too_many_arguments)]
     fn release(
         &self,
         l: &Lease,
@@ -538,7 +544,22 @@ impl MemCatalog {
         evidence_json: &str,
         need_full: bool,
         light: bool,
-    ) -> Guard<()> {
+        whole: Option<UnixMs>,
+    ) -> Result<Guard<()>> {
+        // As the SQL: each of the two ways takes the lease of its own
+        // stage and no other.
+        let stage = match whole {
+            None => OutboxStage::Release,
+            Some(_) => OutboxStage::Verify,
+        };
+        if l.stage != stage || required == 0 {
+            return Err(BridgeError::Invalid(
+                "release under a lease of another stage",
+            ));
+        }
+        if self.take_over_at_release.take() {
+            self.take_over(&l.extent);
+        }
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
             // As the SQL guard: under the light check, the escalations
@@ -580,15 +601,24 @@ impl MemCatalog {
             if !velmora_bridge::verify::release_rule(passes, counting, required, need_full) {
                 return false;
             }
-            e.job.extent.safety_state = SafetyState::Releasing;
             e.job.extent.release_evidence = Some(evidence_json.to_string());
+            match whole {
+                None => e.job.extent.safety_state = SafetyState::Releasing,
+                // As `finish_release`, in the same step.
+                Some(now) => {
+                    e.job.extent.safety_state = SafetyState::Released;
+                    e.job.extent.released_at = Some(now);
+                    e.outbox.stage = OutboxStage::Done;
+                    e.outbox.lease_until = None;
+                }
+            }
             true
         });
-        if applied == Some(true) {
+        Ok(if applied == Some(true) {
             Guard::Applied(())
         } else {
             Guard::Lost
-        }
+        })
     }
 
     /// The latest row per backbone for the current plan among `rows`.
@@ -869,7 +899,7 @@ impl Catalog for MemCatalog {
         evidence_json: &str,
         _: UnixMs,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, true, false))
+        self.release(l, required, counting, evidence_json, true, false, None)
     }
 
     async fn begin_release_light(
@@ -881,7 +911,29 @@ impl Catalog for MemCatalog {
         _: UnixMs,
         need_full: bool,
     ) -> Result<Guard<()>> {
-        Ok(self.release(l, required, counting, evidence_json, need_full, true))
+        self.release(l, required, counting, evidence_json, need_full, true, None)
+    }
+
+    async fn release_at_verify(
+        &self,
+        l: &Lease,
+        required: u32,
+        counting: &[String],
+        evidence_json: &str,
+        now: UnixMs,
+        light: Option<bool>,
+    ) -> Result<Guard<()>> {
+        let need_full = light.unwrap_or(true);
+        let light = light.is_some();
+        self.release(
+            l,
+            required,
+            counting,
+            evidence_json,
+            need_full,
+            light,
+            Some(now),
+        )
     }
 
     async fn escalate_verify(&self, e: &VerifyEscalation, plan_rev: u32) -> Result<()> {

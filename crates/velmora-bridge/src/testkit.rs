@@ -111,6 +111,9 @@ pub const NEXT_DROP_SUPERSEDED_INDEXES: &str =
 /// The parity addendum of an extent (`extents.parity`, `parity_count`).
 pub const MIGRATION_0022: &str =
     include_str!("../../../workers/s3-bridge/migrations/0022_parity.sql");
+/// The usage trigger that counts a release by a verify job as one.
+pub const MIGRATION_0023: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0023_usage_release_at_verify.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -291,6 +294,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0020)?;
         db.apply(MIGRATION_0021)?;
         db.apply(MIGRATION_0022)?;
+        db.apply(MIGRATION_0023)?;
         Ok(db)
     }
 

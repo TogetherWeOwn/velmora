@@ -35,14 +35,17 @@
 //!   same question a moment later: it releases the extent itself
 //!   ([`Bridge::verify_stage`]). Its presence is what it has just
 //!   recorded under its own claim. A backbone it did not ask itself in
-//!   this job (it resumed an earlier round), or asked before the minimum
-//!   age was over, it asks with `STAT` first. So the rule, the guard of
-//!   the catalogue and the evidence are those of a release job, and the
-//!   presence a release rests on is still asked in the job that
-//!   releases: once instead of twice. A round that ends before the
-//!   minimum age is over goes to the release job, as does everything a
-//!   release job answers without a check (a deleted generation, a
-//!   release that is paused).
+//!   this job (it resumed an earlier round), or began to ask before the
+//!   minimum age was over, it asks with `STAT` first (without a
+//!   provider slot for that, the row goes to the release stage). So the rule, the
+//!   guard of the catalogue and the evidence are those of a release
+//!   job, and the presence a release rests on is still asked in the job
+//!   that releases: once instead of twice. Its release is one write to
+//!   the catalogue ([`crate::ports::Catalog::release_at_verify`]), so
+//!   the copy is never `releasing` under a verify job. A round that
+//!   ends before the minimum age is over goes to the release job, as
+//!   does everything a release job answers without a check (a deleted
+//!   generation, a release that is paused).
 //! - A backbone whose last `BODY` read of the current plan failed
 //!   (missing or corrupt) holds no copy at release, whatever it answers
 //!   to `STAT`, until verify has read it in full again and it passed.
@@ -824,15 +827,6 @@ where
         reached: &mut Option<u32>,
     ) -> Staged<()> {
         let extent = &job.extent;
-        if extent.safety_state == SafetyState::Releasing {
-            // A verify job died between the release decision and its
-            // last step ([`Self::release_checked`]). The release stage
-            // owns what is left of it, and nothing is read here.
-            let now = self.clock.now();
-            self.advance(lease, OutboxStage::Release, now).await?;
-            self.notify_at(lease, OutboxStage::Release, now).await;
-            return Ok(());
-        }
         let plan = self.posted_plan(extent).await?;
         let groups = release_backbones(&self.cfg.providers);
         let labels: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
@@ -840,8 +834,10 @@ where
         let light = self.light(extent, &labels).await?;
         let need_full = light.as_ref().is_none_or(Light::need_full);
         // What this job records, under its own claim: the checks a
-        // release by this job may take as presence.
-        let mut seen: Vec<VerificationRow> = Vec::new();
+        // release by this job may take as presence. Each with the time
+        // before its first question to the provider: a check counts as
+        // made after the minimum age only if all of it was.
+        let mut seen: Vec<(UnixMs, VerificationRow)> = Vec::new();
 
         for (index, (name, providers)) in groups.iter().enumerate().skip(first) {
             // The retries used count for the backbone the row names;
@@ -884,6 +880,7 @@ where
             // ([`Self::sample_failed`]).
             let watched = light.is_some() && kind.is_full();
             let mut asked = false;
+            let began = self.clock.now();
             let (provider, mut tally) = self.read_backbone(lease, &plan, providers, kind).await?;
             if watched && result_of(&tally) == VerifyResult::Missing {
                 // Before the waits for a missing article, which may take
@@ -917,7 +914,7 @@ where
             }
             let kind = Self::recorded_kind(kind, &tally);
             let row = self.record(lease, extent, provider, &tally, kind).await?;
-            seen.push(row.clone());
+            seen.push((began, row.clone()));
             if watched && !asked && row.result != VerifyResult::Ok {
                 // Recorded first: the failure stands whatever comes of
                 // this. A raise that is not stored is made by the next
@@ -982,15 +979,17 @@ where
             if ready <= now && self.releases_at_verify(job) {
                 // The minimum age is over, so the checks this job has
                 // just made are the presence a release asks for. A check
-                // made before it was over is not: that backbone is asked
-                // again.
-                seen.retain(|row| row.verified_at >= ready);
+                // that began before it was over is not, whenever it
+                // ended: some of its answers may be from before. That
+                // backbone is asked again.
+                let seen: Vec<VerificationRow> = seen
+                    .into_iter()
+                    .filter(|(began, _)| *began >= ready)
+                    .map(|(_, row)| row)
+                    .collect();
                 return self.release_checked(lease, extent, &plan, now, &seen).await;
             }
-            let ready = ready.max(now);
-            return self
-                .advance_notify(lease, OutboxStage::Release, ready)
-                .await;
+            return self.to_release(lease, ready.max(now)).await;
         }
         if groups.is_empty() {
             // No backbone counts toward a release: nothing was checked
@@ -1082,13 +1081,15 @@ where
     /// has just passed (`RELEASE_AT_VERIFY`).
     ///
     /// `seen` are the checks this job has already made and recorded
-    /// under its claim, none before the minimum age was over: the rows
-    /// of a verify round, none for a release job. A backbone with a row
+    /// under its claim, none begun before the minimum age was over: the
+    /// rows of a verify round, none for a release job. A backbone with a row
     /// among them is not asked again, and counts only if that row is a
     /// complete pass. Every other backbone that counts is asked now with
     /// `STAT`. So the presence a release rests on is always asked in the
     /// job that releases, once, and the guard of the catalogue counts
-    /// only rows recorded under this claim, whoever calls.
+    /// only rows recorded under this claim, whoever calls. A release job
+    /// marks the copy and then finishes; a verify job does both in one
+    /// write.
     async fn release_checked(
         &self,
         lease: &Lease,
@@ -1169,13 +1170,31 @@ where
         let mut taken: Vec<VerificationRow> = Vec::new();
         let mut lacking = false;
         for (name, providers) in &groups {
-            match seen.iter().rev().find(|row| row.backbone == *name) {
-                Some(row) if passed(row) => taken.push(row.clone()),
-                Some(_) => lacking = true,
-                None => read.push(
-                    self.read_backbone(lease, plan, providers, VerifyKind::Stat)
-                        .await?,
-                ),
+            let asked = match seen.iter().rev().find(|row| row.backbone == *name) {
+                Some(row) if passed(row) => {
+                    taken.push(row.clone());
+                    continue;
+                }
+                Some(_) => {
+                    lacking = true;
+                    continue;
+                }
+                None => self.read_backbone(lease, plan, providers, VerifyKind::Stat),
+            };
+            match asked.await {
+                Ok(asked) => read.push(asked),
+                // A verify job that gets no slot for a question it has
+                // yet to ask leaves the release to the release stage,
+                // which asks every backbone. Put off as a verify job, it
+                // would make the checks of its round again each time it
+                // came back, and record them again.
+                Err(Stop::NoPermit | Stop::Refused) if lease.stage == OutboxStage::Verify => {
+                    return self.to_release(lease, now).await;
+                }
+                Err(Stop::Cooling(until)) if lease.stage == OutboxStage::Verify => {
+                    return self.to_release(lease, until.max(now)).await;
+                }
+                Err(stop) => return Err(stop),
             }
         }
         verified.retain(|s| {
@@ -1285,6 +1304,22 @@ where
         let evidence =
             serde_json::to_string(&evidence).map_err(|_| Stop::fail(FailClass::Internal))?;
         let at = self.clock.now();
+        if lease.stage == OutboxStage::Verify {
+            // The verify job that releases: the same guard, over its
+            // own claim, and the last step with it in one batch. A job
+            // that dies here has released or has not, and no copy is
+            // left `releasing` under a row in `verify`.
+            let light = light.as_ref().map(|_| need_full);
+            let released = self
+                .catalog
+                .release_at_verify(lease, required, &labels, &evidence, at, light)
+                .await?;
+            return match released {
+                Guard::Applied(()) => Ok(()),
+                // As below: the job comes back and reads again.
+                Guard::Lost => Err(Stop::fail(FailClass::Internal)),
+            };
+        }
         let begun = match light {
             None => {
                 self.catalog
@@ -1303,6 +1338,14 @@ where
             // lease still holds, the job comes back and reads again.
             Guard::Lost => Err(Stop::fail(FailClass::Internal)),
         }
+    }
+
+    /// The row of a verify round that passed goes to the release stage,
+    /// due at `due`.
+    async fn to_release(&self, lease: &Lease, due: UnixMs) -> Staged<()> {
+        self.advance(lease, OutboxStage::Release, due).await?;
+        self.notify_at(lease, OutboxStage::Release, due).await;
+        Ok(())
     }
 
     /// Sends a release that cannot go through back to the start of verify,
