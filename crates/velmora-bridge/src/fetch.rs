@@ -1149,6 +1149,23 @@ fn tier_of(drill: bool, p: &ProviderConfig) -> u16 {
     }
 }
 
+/// A session's slot kept, or its first login made.
+type Kept<'s> = LocalBoxFuture<'s, core::result::Result<(), Stop>>;
+
+/// Orders `order` by tier; the providers of a tier keep their order.
+/// An insertion sort: a handful of providers, and the library's stable
+/// sort for this one type is 6 KB of the Worker's wasm, which has a
+/// size budget.
+fn by_tier(order: &mut [&ProviderConfig], drill: bool) {
+    for i in 1..order.len() {
+        let mut j = i;
+        while j > 0 && tier_of(drill, order[j - 1]) > tier_of(drill, order[j]) {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
 /// The class of the slots a reader takes on `p`.
 fn class_of(drill: bool, p: &ProviderConfig) -> PermitClass {
     if drill && p.drill_conns > 0 {
@@ -1229,7 +1246,14 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
     /// larger by each move.)
     fn renew_all(&mut self) -> LocalBoxFuture<'_, bool> {
         Box::pin(async move {
-            let kept = join_all(self.sessions.iter_mut().map(|s| s.keep(None))).await;
+            // Boxed, here and in the first logins: one kind of future,
+            // so one copy of the join in the Worker's wasm.
+            let kept = join_all(
+                self.sessions
+                    .iter_mut()
+                    .map(|s| -> Kept<'_> { Box::pin(s.keep(None)) }),
+            )
+            .await;
             let mut lost = Vec::new();
             let mut fatal = false;
             for (n, kept) in kept.into_iter().enumerate().rev() {
@@ -1264,9 +1288,11 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
                     .iter_mut()
                     .enumerate()
                     .filter(|(n, _)| first.iter().any(|f| f.1 == *n))
-                    .map(|(_, s)| async move {
-                        s.keep(None).await?;
-                        s.session().await.map(|_| ())
+                    .map(|(_, s)| -> Kept<'_> {
+                        Box::pin(async move {
+                            s.keep(None).await?;
+                            s.session().await.map(|_| ())
+                        })
                     }),
             )
             .await;
@@ -1481,8 +1507,7 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             .filter(|p| !self.shunned.contains(&p.id))
             .collect();
         let mut order = pool.order(askable.clone(), PermitClass::Read);
-        // Stable: the providers of a tier keep the pool's order.
-        order.sort_by_key(|p| tier_of(drill, p));
+        by_tier(&mut order, drill);
         if order.is_empty() {
             // Every reader is cooling: a read is worth one attempt on the
             // provider that is due back first, unless that one refused

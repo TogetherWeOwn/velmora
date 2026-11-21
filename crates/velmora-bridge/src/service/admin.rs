@@ -1798,11 +1798,12 @@ async fn drill<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         .iter()
         .max_by_key(|(_, _, bytes)| *bytes)
         .map_or("", |(id, _, _)| id.as_str());
-    let providers: serde_json::Map<String, Value> = stats
-        .share
-        .iter()
-        .map(|(id, articles, bytes)| (id.clone(), json!({ "articles": articles, "bytes": bytes })))
-        .collect();
+    // One insert each: collecting into the map sorts the pairs first,
+    // with a sort of its own in the Worker's wasm.
+    let mut providers = serde_json::Map::new();
+    for (id, articles, bytes) in &stats.share {
+        providers.insert(id.clone(), json!({ "articles": articles, "bytes": bytes }));
+    }
     Ok(ok(&json!({
         "source": "nntp",
         "provider": provider,
