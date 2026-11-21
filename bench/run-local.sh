@@ -63,7 +63,8 @@ if writable_by_others "$WORK"; then
 fi
 # What another user may have left there while it was open: anything near
 # the top not owned by us is refused (the run opens paths there).
-foreign=$(find "$WORK" -mindepth 1 -maxdepth 2 ! -user "$(id -u)" -print -quit 2>/dev/null)
+# (Another run may remove its scratch meanwhile: a vanished entry is no error.)
+foreign=$(find "$WORK" -mindepth 1 -maxdepth 2 ! -user "$(id -u)" -print -quit 2>/dev/null || true)
 if [[ -n $foreign ]]; then
   log "FAILED: $foreign in $WORK is not owned by $(id -un)"; exit 1
 fi
