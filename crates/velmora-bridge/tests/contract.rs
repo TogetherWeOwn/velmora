@@ -1501,6 +1501,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "restore_state",
             "rollback_stamp",
             "scan_cursors",
+            "scrub_state",
             "tx_guard",
             "upload_part_extents",
             "upload_parts",

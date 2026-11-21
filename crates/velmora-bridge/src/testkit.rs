@@ -289,6 +289,9 @@ pub const MIGRATION_0025: &str =
 /// (`verifications.lease_token`).
 pub const MIGRATION_0026: &str =
     include_str!("../../../workers/s3-bridge/migrations/0026_verification_claim.sql");
+/// The scrub's columns, its due index and its state row.
+pub const MIGRATION_0023: &str =
+    include_str!("../../../workers/s3-bridge/migrations/0023_scrub.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -517,6 +520,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0022)?;
         db.apply(MIGRATION_0025)?;
         db.apply(MIGRATION_0026)?;
+        db.apply(MIGRATION_0023)?;
         Ok(db)
     }
 

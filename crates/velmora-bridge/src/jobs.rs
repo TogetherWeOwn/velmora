@@ -508,6 +508,7 @@ where
                 }
             }
             Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
+            Job::Scrub { v } if *v == JOB_VERSION => self.run_scrub().await,
             // Run by the adapter that holds the recovery store
             // (`crate::copy`), never here: one that arrives all the same
             // is dropped, and the next pass does its work.
@@ -1306,12 +1307,33 @@ where
             report.recount_failed = true;
         }
 
+        // A scrub run, when none holds the lease. An extra, like the
+        // checks above.
+        if self.cfg.scrub.on {
+            match self.scrub_check(now).await {
+                Ok(sent) => report.scrub_enqueued = sent,
+                Err(_) => report.scrub_failed = true,
+            }
+        }
+
         if let Some(e) = send_failed {
             return Err(e);
         }
 
         self.catalog.record_dispatch(now).await?;
         Ok(report)
+    }
+
+    /// Sends a scrub run ([`crate::scrub`]) if no run holds the lease.
+    /// One a cron run at most: runs are under the cron interval
+    /// (`SCRUB_RUN_SECS`), so they do not overlap.
+    async fn scrub_check(&self, now: UnixMs) -> Result<bool> {
+        let state = self.catalog.scrub_state().await?;
+        if state.lease_until.is_some_and(|until| until >= now) {
+            return Ok(false);
+        }
+        self.jobs.send(&Job::Scrub { v: JOB_VERSION }, 0).await?;
+        Ok(true)
     }
 
     /// Goes on with a recount of the usage counters, or starts the

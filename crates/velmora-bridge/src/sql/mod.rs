@@ -78,6 +78,7 @@ mod permits;
 mod publish;
 mod recovery;
 mod replay;
+mod scrub;
 mod uploads;
 pub mod usage;
 
@@ -974,6 +975,51 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn usage_off(&self) -> Result<()> {
         usage::off(self).await
+    }
+
+    // scrub
+    async fn scrub_take(&self, now: UnixMs, until: UnixMs) -> Result<Option<u64>> {
+        scrub::take(self, now, until).await
+    }
+    async fn scrub_state(&self) -> Result<crate::types::ScrubState> {
+        scrub::state(self).await
+    }
+    async fn scrub_due(
+        &self,
+        now: UnixMs,
+        limit: u32,
+    ) -> Result<Vec<crate::types::ScrubCandidate>> {
+        scrub::due(self, now, limit).await
+    }
+    async fn scrub_record(
+        &self,
+        token: u64,
+        extent: &ExtentId,
+        result: crate::types::ScrubResult,
+        now: UnixMs,
+        next_at: UnixMs,
+    ) -> Result<bool> {
+        scrub::record(self, token, extent, result, now, next_at).await
+    }
+    async fn scrub_drop(&self, token: u64, extent: &ExtentId) -> Result<bool> {
+        scrub::drop_due(self, token, extent).await
+    }
+    async fn scrub_repin(
+        &self,
+        token: u64,
+        extent: &ExtentId,
+        now: UnixMs,
+        next_at: UnixMs,
+    ) -> Result<bool> {
+        scrub::repin(self, token, extent, now, next_at).await
+    }
+    async fn scrub_end(
+        &self,
+        token: u64,
+        run: &crate::types::ScrubRun,
+        now: UnixMs,
+    ) -> Result<bool> {
+        scrub::end(self, token, run, now).await
     }
 
     // hot tier
