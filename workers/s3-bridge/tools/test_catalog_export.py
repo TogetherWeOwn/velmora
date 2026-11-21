@@ -235,6 +235,19 @@ class CatalogueScripts(unittest.TestCase):
         self.object_path(key).write_text(json.dumps(manifest))
         self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
 
+    def test_manifest_without_format_is_format_1(self):
+        # Exports made before the manifest carried "format" have the same
+        # layout; they load like format 1. Another format is refused.
+        ms, prefix, manifest, _ = self.export()
+        key = f"{prefix}.manifest.json"
+        del manifest["format"]
+        self.object_path(key).write_text(json.dumps(manifest))
+        self.assert_loaded(self.run_script("import", "scratch-db", ms), ms)
+        manifest["format"] = 2
+        self.object_path(key).write_text(json.dumps(manifest))
+        (self.db / "scratch-db").unlink()
+        self.assert_refused(self.run_script("import", "scratch-db", ms), f"invalid manifest {key}")
+
     def test_nonempty_target(self):
         ms, _, _, _ = self.export()
         self.env["FAKE_TABLES"] = "3"

@@ -68,7 +68,7 @@ if get "$manifest" "$WORK/manifest.json" "$@"; then
     def bytes: type == "number" and . >= 0 and floor == .;
     def sha256: type == "string" and test("^[0-9a-f]{64}$");
     length == 1 and (.[0] |
-      .format == 1 and .database == $db and
+      (.format // 1) == 1 and .database == $db and
       (.restore_point_ms | type == "number" and tostring == $ms) and
       (.sql_bytes | bytes) and (.sql_sha256 | sha256) and
       (.zst_bytes | bytes) and (.zst_sha256 | sha256) and
