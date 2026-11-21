@@ -605,7 +605,11 @@ impl Default for ScrubConfig {
 }
 
 impl ScrubConfig {
-    fn from_vars(get: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+    /// `dev`: a development deployment, where the confirm interval may
+    /// be short (tests, drills). Elsewhere it is at least
+    /// [`DEFAULT_SCRUB_CONFIRM_SECS`]: the second look of a loss comes an
+    /// hour after the first at the soonest.
+    fn from_vars(get: &impl Fn(&str) -> Option<String>, dev: bool) -> Result<Self, ConfigError> {
         let on = match get("SCRUB").as_deref().map(str::trim) {
             None | Some("") | Some("off") => false,
             Some("on") => true,
@@ -614,15 +618,24 @@ impl ScrubConfig {
         let d = ScrubConfig::default();
         Ok(ScrubConfig {
             on,
+            // At least as many as the breaker needs to trip, or to clear.
             extents_per_run: number_or(
                 get,
                 "SCRUB_EXTENTS_PER_RUN",
                 d.extents_per_run,
-                (1, 10_000),
+                (crate::scrub::INCIDENT_MIN_EXTENTS, 10_000),
             )?,
             sockets: number_or(get, "SCRUB_SOCKETS", d.sockets, (1, MAX_COLD_SOCKETS))?,
             interval_days: number_or(get, "SCRUB_INTERVAL_DAYS", d.interval_days, (1, 3650))?,
-            confirm_secs: number_or(get, "SCRUB_CONFIRM_SECS", d.confirm_secs, (1, 30 * 86_400))?,
+            confirm_secs: number_or(
+                get,
+                "SCRUB_CONFIRM_SECS",
+                d.confirm_secs,
+                (
+                    if dev { 1 } else { DEFAULT_SCRUB_CONFIRM_SECS },
+                    30 * 86_400,
+                ),
+            )?,
             // Under the cron interval of 300 s: runs must not overlap.
             run_secs: number_or(get, "SCRUB_RUN_SECS", d.run_secs, (1, 290))?,
             repairs_per_run: number_or(
@@ -1088,7 +1101,7 @@ impl BridgeConfig {
         let verify_delay_secs: u32 = number(&get, "VERIFY_DELAY_SECS")?;
 
         let post_sockets = number_or(&get, "POST_SOCKETS", DEFAULT_POST_SOCKETS, (1, 8))?;
-        let scrub = ScrubConfig::from_vars(&get)?;
+        let scrub = ScrubConfig::from_vars(&get, environment == Environment::Dev)?;
         let cold_sockets = number_or(
             &get,
             "COLD_SOCKETS",

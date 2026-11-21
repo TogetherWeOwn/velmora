@@ -138,6 +138,12 @@ fn overlay(load: &mut [ProviderLoad], held: &[crate::gate::GateLoad]) {
     }
 }
 
+/// The scrub's due query, word for word as it runs (for a test of its
+/// query plan).
+pub fn scrub_due_sql() -> String {
+    scrub::due_sql()
+}
+
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
     pub sql: S,
@@ -1011,10 +1017,13 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         &self,
         token: u64,
         extent: &ExtentId,
-        now: UnixMs,
-        next_at: UnixMs,
+        (now, next_at): (UnixMs, UnixMs),
+        unread: &[String],
     ) -> Result<bool> {
-        scrub::repin(self, token, extent, now, next_at).await
+        scrub::repin(self, token, extent, (now, next_at), unread).await
+    }
+    async fn scrub_defer(&self, token: u64, extent: &ExtentId, next_at: UnixMs) -> Result<bool> {
+        scrub::defer(self, token, extent, next_at).await
     }
     async fn scrub_end(
         &self,
@@ -1059,6 +1068,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::finish_evict(self, x).await
+    }
+    async fn evict_safety_still_ok(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::evict_safety_still_ok(self, x).await
     }
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
         hot::record_cache_fill(self, extent, now).await

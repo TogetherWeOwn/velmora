@@ -199,6 +199,31 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
     Ok(changed == 1)
 }
 
+/// Whether the safety copy of an eviction that `begin_evict` started may
+/// still go: the extent is not pinned and nothing moved its sequence
+/// since the begin (a re-pin by the scrub moves it). Asked right before
+/// the delete, it narrows the window in which a re-pin made after the
+/// begin could lose its copy to the time of one blob delete.
+pub(super) async fn evict_safety_still_ok<S: Sql>(
+    c: &SqlCatalog<S>,
+    x: &EvictCandidate,
+) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(
+            concat!(
+                "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+                pinned!()
+            ),
+            &[text(x.extent.as_str()), int(x.seq.saturating_add(1))?],
+        )
+        .await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(Cols::new(row).num::<i64>()? == 1),
+        None => Ok(false),
+    }
+}
+
 /// Ends an eviction after the blobs are deleted: the claimed copies are
 /// no longer counted. `false` when a hot copy was recorded since
 /// `begin_evict`; the counts then stand.

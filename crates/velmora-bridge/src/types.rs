@@ -1643,9 +1643,11 @@ pub struct ScrubRun {
     /// The breaker tripped in this run: the label of the backbone.
     pub incident: Option<String>,
     /// The backbones no loss is repaired on when the run ends: those of
-    /// the incidents before it and of its own, or none once a run that
-    /// checked enough extents to trip the breaker did not.
+    /// the incidents before it and of its own, or none once runs without
+    /// a trip have checked enough extents to have tripped it.
     pub blocked: Vec<String>,
+    /// [`ScrubState::incident_clean`] when the run ends.
+    pub incident_clean: u64,
     /// Ciphertext bytes read from Usenet.
     pub bytes_read: u64,
     /// Articles a provider did not serve intact that another one did,
@@ -1708,6 +1710,10 @@ pub struct ScrubState {
     /// The backbones no loss is repaired on, as a JSON array of labels
     /// (`scrub_state.last_incident`); `None` = none.
     pub last_incident: Option<String>,
+    /// Extents checked by runs that did not trip the breaker since the
+    /// last trip; at [`crate::scrub::INCIDENT_MIN_EXTENTS`] the incident
+    /// clears.
+    pub incident_clean: u64,
 }
 
 impl ScrubState {

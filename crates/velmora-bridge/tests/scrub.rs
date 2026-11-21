@@ -149,6 +149,46 @@ impl World {
         o
     }
 
+    /// [`Self::released`], with the articles copied to `extra` servers
+    /// too before verify.
+    async fn released_on(&self, extra: &[&TestNntpServer], key: &str, seed: u8) -> Obj {
+        let plain = pattern(seed, PLAIN);
+        self.rig
+            .put(&self.signer, BUCKET, key, &plain)
+            .await
+            .expect(200);
+        let (generation, extents) = self.rig.live(&self.bucket, key).await.unwrap();
+        let o = Obj {
+            extent: extents[0].id.clone(),
+            generation: generation.id,
+            plain,
+        };
+        self.run(&o, OutboxStage::Post).await;
+        self.mirror(&o).await;
+        for server in extra {
+            let addr = server.addr();
+            let mut dst = dial(&nntp_config(
+                &addr.ip().to_string(),
+                addr.port(),
+                USER,
+                PASS,
+            ))
+            .await
+            .unwrap();
+            for row in self.plan(&o).await {
+                let mut src = self.client(0).await;
+                let mut article = Vec::new();
+                src.article_to(&row.message_id, &mut article).await.unwrap();
+                dst.post_article(&row.message_id, &article).await.unwrap();
+                src.quit().await;
+            }
+            dst.quit().await;
+        }
+        self.drive(&o).await;
+        assert_eq!(self.safety_state(&o).await, "released");
+        o
+    }
+
     /// Runs the object's jobs until its outbox row is `done`.
     async fn drive(&self, o: &Obj) {
         for _ in 0..12 {
@@ -1007,4 +1047,230 @@ async fn incidents_on_two_backbones_block_both() {
     let run = w.scrub().await;
     assert_eq!(run.incident.as_deref(), Some("beta"));
     assert_eq!(w.state().await.blocked(), ["alpha", "beta"]);
+}
+
+/// Every write of a run names its lease's token: one whose lease was
+/// taken over writes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_run_whose_lease_was_taken_writes_nothing() {
+    let w = world().await;
+    let o = w.released("a", 110).await;
+    let c = &w.bridge().catalog;
+    let now = w.bridge().clock.now();
+    let old = c.scrub_take(now, now.plus_secs(10)).await.unwrap().unwrap();
+    w.advance_secs(11);
+    let now = w.bridge().clock.now();
+    let new = c
+        .scrub_take(now, now.plus_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(old, new);
+    let next = now.plus_secs(60);
+    assert!(!c
+        .scrub_record(old, &o.extent, ScrubResult::Ok, now, next)
+        .await
+        .unwrap());
+    assert!(!c.scrub_drop(old, &o.extent).await.unwrap());
+    assert!(!c.scrub_defer(old, &o.extent, next).await.unwrap());
+    assert!(!c
+        .scrub_repin(old, &o.extent, (now, next), &[])
+        .await
+        .unwrap());
+    assert!(!c.scrub_end(old, &ScrubRun::default(), now).await.unwrap());
+    assert_eq!(w.result(&o).await, "NULL");
+    assert_eq!(w.safety_state(&o).await, "released");
+    assert_eq!(w.state().await.runs, 0);
+    // The run that holds it writes.
+    assert!(c
+        .scrub_record(new, &o.extent, ScrubResult::Ok, now, next)
+        .await
+        .unwrap());
+}
+
+/// The re-pin's guard: only a released extent whose posting is done and
+/// that a live object holds.
+#[tokio::test(flavor = "current_thread")]
+async fn the_re_pin_is_refused_unless_released_done_and_live() {
+    let w = world().await;
+    let c = &w.bridge().catalog;
+    let now = w.bridge().clock.now();
+    let token = c
+        .scrub_take(now, now.plus_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    let at = (now, now.plus_secs(60));
+    // Held: not yet released.
+    let plain = pattern(111, PLAIN);
+    w.rig
+        .put(&w.signer, BUCKET, "held", &plain)
+        .await
+        .expect(200);
+    let held = w.rig.live(&w.bucket, "held").await.unwrap().1.remove(0);
+    assert!(!c.scrub_repin(token, &held.id, at, &[]).await.unwrap());
+    // Released, but its outbox row is not `done`.
+    let o = w.released("a", 112).await;
+    c.sql
+        .exec(
+            "UPDATE outbox SET stage = 'verify' WHERE extent_id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_string())],
+        )
+        .await
+        .unwrap();
+    assert!(!c.scrub_repin(token, &o.extent, at, &[]).await.unwrap());
+    // Released and done, but no live object holds it.
+    let gone = w.released("b", 113).await;
+    w.rig
+        .call(&w.signer, Method::Delete, &path(BUCKET, "b"), &[], &[], b"")
+        .await
+        .expect(204);
+    assert!(!c.scrub_repin(token, &gone.extent, at, &[]).await.unwrap());
+    // Released, done and live: re-pinned.
+    let ok = w.released("c", 114).await;
+    assert!(c.scrub_repin(token, &ok.extent, at, &[]).await.unwrap());
+    assert_eq!(w.safety_state(&ok).await, "held");
+    assert_eq!(w.stage(&ok).await, "verify");
+}
+
+/// At most `SCRUB_REPAIRS_PER_RUN` re-pins in a run: the rest stay
+/// `suspect` and come back at the confirm interval.
+#[tokio::test(flavor = "current_thread")]
+async fn a_run_re_pins_at_most_its_cap() {
+    let w = world_with(|cfg| cfg.scrub.repairs_per_run = 1).await;
+    let a = w.released("a", 120).await;
+    let b = w.released("b", 121).await;
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &a, 0).await;
+    w.hide(1, &b, 0).await;
+    assert_eq!(w.scrub().await.suspect, 2);
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!((run.repaired, run.suspect), (1, 1));
+    let states = [w.safety_state(&a).await, w.safety_state(&b).await];
+    assert_eq!(states.iter().filter(|s| *s == "held").count(), 1);
+}
+
+/// An eviction that began before the re-pin does not delete the safety
+/// copy the re-pin put back: the delete asks again first.
+#[tokio::test(flavor = "current_thread")]
+async fn an_eviction_begun_before_the_re_pin_keeps_the_safety_copy() {
+    let w = world().await;
+    let o = w.released("a", 130).await;
+    let c = &w.bridge().catalog;
+    let listed = c.evict_candidates(100).await.unwrap();
+    let mine = listed.into_iter().find(|x| x.extent == o.extent).unwrap();
+    assert!(!mine.pinned);
+    assert!(c.begin_evict(&mine).await.unwrap(), "the eviction begins");
+    assert!(
+        c.evict_safety_still_ok(&mine).await.unwrap(),
+        "not yet re-pinned"
+    );
+    let now = w.bridge().clock.now();
+    let token = c
+        .scrub_take(now, now.plus_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(c
+        .scrub_repin(token, &o.extent, (now, now.plus_secs(60)), &[])
+        .await
+        .unwrap());
+    assert!(
+        !c.evict_safety_still_ok(&mine).await.unwrap(),
+        "re-pinned since the begin: the safety copy stays"
+    );
+    // A listing from before the re-pin cannot begin either.
+    assert!(!c.begin_evict(&mine).await.unwrap());
+}
+
+/// Bodies no provider serves while every backbone answers `STAT`: the
+/// re-pin records a failed full read on every backbone, so even the
+/// light check reads them in full and releases nothing on `STAT` alone.
+#[tokio::test(flavor = "current_thread")]
+async fn bodies_no_provider_serves_are_never_released_on_stat_alone() {
+    let w = world_with(|cfg| {
+        cfg.verify.mode = velmora_bridge::config::VerifyMode::Light;
+        cfg.verify.sample_ppm = 0;
+    })
+    .await;
+    let o = w.released("a", 140).await;
+    w.advance_secs(31 * DAY_SECS);
+    for s in &w.servers {
+        s.set_body_gone(true).await;
+    }
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+    assert_eq!(
+        w.scrub().await.repaired,
+        1,
+        "from the safety copy still in R2"
+    );
+    let failed = w
+        .scalar(
+            "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1 AND provider_id = 'scrub' \
+               AND kind = 'body' AND result = 'missing'",
+            &o.extent,
+        )
+        .await;
+    assert_eq!(failed, "2");
+    for _ in 0..12 {
+        let stage = w.stage(&o).await;
+        if stage == "done" || stage == "dead" {
+            break;
+        }
+        w.advance_secs(3600);
+        w.run(&o, OutboxStage::parse(&stage).unwrap()).await;
+    }
+    assert_eq!(
+        w.safety_state(&o).await,
+        "held",
+        "never released on STAT alone"
+    );
+    assert!(w.has_safety(&o));
+}
+
+/// A loss on a backbone no provider posts to, with enough other
+/// backbones holding the extent: no re-pin (verify could not post it
+/// there, and the release would not need it), `stalled` with an alert.
+#[tokio::test(flavor = "current_thread")]
+async fn a_loss_nobody_can_post_is_stalled_not_re_pinned_when_enough_backbones_hold_it() {
+    let third = server().await;
+    let w = world_with(|cfg| {
+        cfg.providers[1].post = false;
+        let mut gamma = provider("p2", "gamma", &third);
+        gamma.post = false;
+        cfg.providers.push(gamma);
+    })
+    .await;
+    let o = w.released_on(&[&third], "a", 150).await;
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!((run.repaired, run.stalled), (0, 1));
+    assert_eq!(w.result(&o).await, "stalled");
+    assert_eq!(w.safety_state(&o).await, "released");
+    assert!(alerts().iter().any(|a| a.starts_with("scrub-unpostable ")));
+}
+
+/// The due query as it runs is read from its index.
+#[tokio::test(flavor = "current_thread")]
+async fn the_due_query_as_it_runs_uses_its_index() {
+    let w = world().await;
+    let sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        velmora_bridge::sql::scrub_due_sql()
+    );
+    let plan = w
+        .bridge()
+        .catalog
+        .sql
+        .query(&sql, &[SqlValue::Int(0), SqlValue::Int(8)])
+        .await
+        .unwrap();
+    let text = format!("{plan:?}");
+    assert!(text.contains("extents_scrub_due"), "{text}");
+    assert!(!text.contains("TEMP B-TREE"), "{text}");
 }
