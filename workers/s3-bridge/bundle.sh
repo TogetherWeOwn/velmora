@@ -18,7 +18,17 @@
 # load, so the local e2e (workerd) fails loudly rather than run slowly.
 # RUSTFLAGS in the environment replaces any `rustflags` of a cargo config
 # file; the repo has none. Add flags here, not there.
+#
+# A panic message names the source file it came from. For a dependency
+# that is the absolute path of its unpacked registry copy
+# (`$CARGO_HOME/registry/src/index.crates.io-<hash>/ring-0.17.14/src/..`),
+# about 66 bytes of build-host path per file, kept in the wasm data
+# section. Each registry source directory is remapped to `crates.io`, so
+# the message reads `crates.io/ring-0.17.14/src/..`: about 8 KB less
+# wasm, and no build-host path in the bundle. The directories come from
+# `cargo metadata`, which also unpacks a dependency missing from them.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+simd128" worker-build --release
+remap=$(cargo metadata --locked --format-version 1 | python3 -I tools/registry_src_dirs.py)
+RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+simd128${remap}" worker-build --release
 python3 -I tools/strip_wasm.py strip build/index_bg.wasm --unstripped symbols/index_bg.unstripped.wasm

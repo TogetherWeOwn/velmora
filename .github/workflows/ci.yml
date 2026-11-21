@@ -340,6 +340,9 @@ jobs:
       - name: Test the wasm section stripper
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_strip_wasm.py
+      - name: Test the registry path remap of bundle.sh
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_registry_src_dirs.py
       # The script of the deploy job's "Generate the production wrangler
       # config" step, taken from this file and run on the shipped
       # wrangler.toml with made-up values. No credential, no network.
@@ -351,7 +354,18 @@ jobs:
       - name: Build the Worker bundle
         working-directory: workers/s3-bridge
         run: bash bundle.sh
-      - name: Size budget (index_bg.wasm under 3 MB)
+      # The budget bounds latency; it is not a platform limit. Cloudflare
+      # allows 64 MiB uncompressed on every plan (no compressed limit) and
+      # 1 s of start-up CPU, and reported 3 to 6 ms of start-up for every
+      # bundle from 2.8 to 16.0 MB. What grows with the size is the first
+      # requests on a new isolate (after a deploy, or on a machine that has
+      # not run this version yet): about 10 ms per MB, measured on
+      # throwaway Workers placed in aws:us-east-1 on 2026-11-21 (median of
+      # the first 9 requests: 209 ms at 3.0 MB, 240 at 5.0, 262 at 8.0, 345
+      # at 16.0). 4,000,000 bytes keeps that within about 10 ms of the 3.0 MB
+      # bundle of that date, inside the sizes measured with real code (up
+      # to 3.8 MB). Raise it only with a new measurement.
+      - name: Size budget (index_bg.wasm under 4 MB)
         working-directory: workers/s3-bridge
         run: |
           set -euo pipefail
@@ -360,8 +374,8 @@ jobs:
           # deploy-build uploads; fails here, not after the merge.
           test -s symbols/index_bg.unstripped.wasm
           size=$(stat -c %s build/index_bg.wasm)
-          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
-          test "$size" -lt 3000000
+          echo "index_bg.wasm: ${size} bytes (budget 4000000)"
+          test "$size" -lt 4000000
 
   # Local end-to-end slice under `wrangler dev` with the fake NNTP server.
   # Passes with "skipped: no script" until workers/s3-bridge/e2e/slice.sh
@@ -571,8 +585,8 @@ jobs:
           bash bundle.sh
           python3 -I tools/strip_wasm.py check build/index_bg.wasm
           size=$(stat -c %s build/index_bg.wasm)
-          echo "index_bg.wasm: ${size} bytes (budget 3000000)"
-          test "$size" -lt 3000000
+          echo "index_bg.wasm: ${size} bytes (budget 4000000)"
+          test "$size" -lt 4000000
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.fresh.outputs.fresh == 'true'
         with:
