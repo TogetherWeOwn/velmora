@@ -126,9 +126,9 @@ class Client:
                 r = c.getresponse()
                 ttfb = time.monotonic() - t0
                 if r.status >= 500 or r.status == 429:
-                    r.read()
                     with self.lock:
                         self.errors[str(r.status)] = self.errors.get(str(r.status), 0) + 1
+                    r.read()
                     if attempt < 3:
                         continue
                 if stream and r.status < 300:
@@ -217,25 +217,44 @@ def cmd_mpu(a, cl):
     etags = [None] * nparts
     lat = [0.0] * nparts
 
+    failed = []
+
     def up(i):
-        body = part(i)
-        t = time.monotonic()
-        s, etag, d, _, _, _ = cl.call("PUT", a.key, [("partNumber", str(i + 1)), ("uploadId", upload)], body)
-        if s != 200:
-            raise RuntimeError(f"UploadPart {i + 1}: {s} {d[:300]!r}")
-        etags[i], lat[i] = etag, time.monotonic() - t
+        # A failure is kept as text, not as an exception whose traceback
+        # would hold the part's bytes until the end.
+        if failed:
+            return
+        try:
+            body = part(i)
+            t = time.monotonic()
+            s, etag, d, _, _, _ = cl.call("PUT", a.key, [("partNumber", str(i + 1)), ("uploadId", upload)], body)
+            del body
+            if s != 200:
+                failed.append(f"UploadPart {i + 1}: {s} {d[:300]!r}")
+                return
+            etags[i], lat[i] = etag, time.monotonic() - t
+        except Exception as e:  # noqa: BLE001 - reported below, the upload is aborted
+            failed.append(f"UploadPart {i + 1}: {type(e).__name__}: {str(e)[:300]}")
+
+    def abort(why):
+        try:
+            cl.call("DELETE", a.key, [("uploadId", upload)])
+        finally:
+            sys.exit(f"{why} (upload aborted)")
 
     t0 = time.monotonic()
     with ThreadPoolExecutor(a.concurrency) as ex:
         list(ex.map(up, range(nparts)))
     t_parts = time.monotonic() - t0
+    if failed:
+        abort(failed[0])
     spool.close()
     xml = "<CompleteMultipartUpload>" + "".join(
         f"<Part><PartNumber>{i + 1}</PartNumber><ETag>{e}</ETag></Part>" for i, e in enumerate(etags)) + "</CompleteMultipartUpload>"
     tc = time.monotonic()
     s, _, d, _, _, _ = cl.call("POST", a.key, [("uploadId", upload)], xml.encode(), {"content-type": "application/xml"})
     if s != 200 or b"<Error>" in d:
-        sys.exit(f"CompleteMultipartUpload: {s} {d[:300]!r}")
+        abort(f"CompleteMultipartUpload: {s} {d[:300]!r}")
     total = time.monotonic() - t0
     lat.sort()
     emit(metric="ingest_mpu", key=a.key, bytes=a.size, parts=nparts, part_bytes=a.part, concurrency=a.concurrency,
@@ -248,19 +267,31 @@ def cmd_many(a, cl):
     lat = []
     lock = threading.Lock()
 
+    failed = []
+
     def put(i):
-        body = os.urandom(a.size)
-        t = time.monotonic()
-        s, _, d, _, _, _ = cl.call("PUT", f"{a.prefix}{i:05d}", body=body)
-        if s != 200:
-            raise RuntimeError(f"PutObject {i}: {s} {d[:300]!r}")
-        with lock:
-            lat.append(time.monotonic() - t)
+        # As in cmd_mpu: a failure is text, so no traceback keeps a body.
+        if failed:
+            return
+        try:
+            body = os.urandom(a.size)
+            t = time.monotonic()
+            s, _, d, _, _, _ = cl.call("PUT", f"{a.prefix}{i:05d}", body=body)
+            del body
+            if s != 200:
+                failed.append(f"PutObject {i}: {s} {d[:300]!r}")
+                return
+            with lock:
+                lat.append(time.monotonic() - t)
+        except Exception as e:  # noqa: BLE001 - reported below
+            failed.append(f"PutObject {i}: {type(e).__name__}: {str(e)[:300]}")
 
     t0 = time.monotonic()
     with ThreadPoolExecutor(a.concurrency) as ex:
         list(ex.map(put, range(a.count)))
     total = time.monotonic() - t0
+    if failed:
+        sys.exit(failed[0])
     lat.sort()
     emit(metric="ingest_many", prefix=a.prefix, count=a.count, bytes_each=a.size, concurrency=a.concurrency,
          seconds=round(total, 3), mib_s=round(a.count * a.size / MIB / total, 2), objects_s=round(a.count / total, 2),

@@ -4,6 +4,9 @@
 //
 //   node bench/d1-replay.mjs <trace.jsonl> <migrations dir> <work dir> <out.json>
 //
+// The replay works in a new directory it makes inside <work dir> and
+// removes at the end; nothing else in <work dir> is touched.
+//
 // NODE_DIR names a directory with wrangler installed (npm ci of
 // workers/s3-bridge/package.json); run-local.sh sets it up.
 //
@@ -22,7 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 
-const [tracePath, migrations, work, outPath] = process.argv.slice(2).map((p) => path.resolve(p));
+const [tracePath, migrations, workRoot, outPath] = process.argv.slice(2).map((p) => path.resolve(p));
 if (!outPath) {
   console.error("usage: d1-replay.mjs <trace.jsonl> <migrations dir> <work dir> <out.json>");
   process.exit(2);
@@ -34,8 +37,8 @@ if (!nodeDir) {
 }
 const require = createRequire(path.join(nodeDir, "package.json"));
 
-fs.rmSync(work, { recursive: true, force: true });
-fs.mkdirSync(work, { recursive: true });
+fs.mkdirSync(workRoot, { recursive: true });
+const work = fs.mkdtempSync(path.join(workRoot, "replay-"));
 // wrangler writes its own scratch (.wrangler/) into the working directory.
 process.chdir(work);
 const config = path.join(work, "wrangler.toml");
@@ -148,4 +151,6 @@ fs.writeFileSync(
   ),
 );
 console.error(`d1-replay: ${calls} calls in ${((Date.now() - t0) / 1000).toFixed(1)} s, ${disagree.length} disagreements`);
+process.chdir(workRoot);
+fs.rmSync(work, { recursive: true, force: true });
 if (disagree.length) process.exit(1);

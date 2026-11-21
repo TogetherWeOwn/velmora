@@ -15,7 +15,7 @@
 # KEKs) are refused, and so is a key the configuration never reads (a typo,
 # or a variable the measured commit does not have). results.json records
 # them under "bench_vars"; without --name or --out the run is named
-# <sha>-vars-<BENCH_VARS>, apart from the plain run of the commit.
+# <sha>-vars-<keys>-<hash>, apart from the plain run of the commit.
 #
 # --ref measures another commit with this checkout's harness: the ref is
 # checked out in a temporary worktree, this checkout's
@@ -85,13 +85,14 @@ else
 fi
 # A BENCH_VARS run without --name or --out gets its own name, so it never
 # overwrites the plain run of the same commit it is compared against.
-# The readable part is cut at 60 characters; a hash of the whole value keeps
-# two different values apart.
+# The readable part is the keys only (a value never reaches a name or the
+# log); a hash of the whole value keeps two different values apart.
 BV=${BENCH_VARS:-}
+BV_KEYS=$(printf '%s' "$BV" | grep -oE '(^|,)[A-Z][A-Z0-9_]*=' | tr -d ',=' | paste -sd+ - || true)
 AUTO_NAME=0
 [[ -n $NAME || -n $OUT ]] || AUTO_NAME=1
 if [[ -n ${BV//[[:space:]]/} && $AUTO_NAME == 1 ]]; then
-  NAME="$SHA-vars-$(printf '%s' "$BENCH_VARS" | tr -c 'A-Za-z0-9._=-' '_' | cut -c1-60)-$(printf '%s' "$BENCH_VARS" | sha256sum | cut -c1-8)"
+  NAME="$SHA-vars-$(printf '%s' "$BV_KEYS" | cut -c1-60)-$(printf '%s' "$BENCH_VARS" | sha256sum | cut -c1-8)"
 fi
 # A --tiny run is named apart from the full run of the same commit.
 if [[ -n $TINY && $AUTO_NAME == 1 ]]; then
@@ -100,6 +101,11 @@ fi
 NAME=${NAME:-$SHA}
 OUT=${OUT:-$WORK/runs/$NAME}
 mkdir -p "$OUT"
+# One run at a time per output directory: two would mix their traces.
+if command -v flock >/dev/null; then
+  exec 8>"$OUT/.lock"
+  flock -n 8 || { log "FAILED: another run writes $OUT"; exit 1; }
+fi
 # The native run works in the checkout and cargo runs it from the package
 # directory: every path handed on is absolute.
 OUT=$(cd -- "$OUT" && pwd)
@@ -107,11 +113,12 @@ if [[ -n $CPU ]]; then
   [[ -f $CPU ]] || { log "FAILED: --cpu $CPU: no such file"; exit 1; }
   CPU=$(realpath -- "$CPU")
 fi
-log "measuring $NAME ($SRC) into $OUT${BENCH_VARS:+ with BENCH_VARS=$BENCH_VARS}"
+log "measuring $NAME ($SRC) into $OUT${BV_KEYS:+ with BENCH_VARS keys $BV_KEYS}"
 
-# Pinned wrangler (local D1 runtime), installed once. One run installs at a
-# time: two `npm ci` in one directory leave it half written.
-NODE_DIR=$WORK/node
+# Pinned wrangler (local D1 runtime), installed once per lockfile: runs of
+# checkouts that pin different versions never share an install. One run
+# installs at a time: two `npm ci` in one directory leave it half written.
+NODE_DIR=$WORK/node-$(sha256sum "$REPO/workers/s3-bridge/package-lock.json" | cut -c1-12)
 install_wrangler() {
   for d in "$NODE_DIR" "$NODE_DIR/node_modules"; do
     if [[ -e $d ]] && { [[ -L $d || ! -O $d ]] || writable_by_others "$d"; }; then
@@ -127,7 +134,7 @@ install_wrangler() {
   fi
 }
 if command -v flock >/dev/null; then
-  (flock 9; install_wrangler) 9>"$WORK/node.lock"
+  (flock 9; install_wrangler) 9>"$NODE_DIR.lock"
 else
   install_wrangler
 fi

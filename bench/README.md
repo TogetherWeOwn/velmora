@@ -24,7 +24,9 @@ bench/run-local.sh [--ref <git ref>] [--name <name>] [--out <dir>] [--tiny <n>] 
 - The D1 trace of the run is replayed in order through the local D1 runtime
   (`d1-replay.mjs`, wrangler's `getPlatformProxy`), which gives D1's own
   `rows_read` and `rows_written` for every statement. The replay must agree
-  with the native run on every call (0 disagreements). The rows read and
+  with the native run on every call (0 disagreements): a disagreement is a
+  call that succeeded in one runtime and failed in the other. Returned rows
+  and write effects are not compared call by call. The rows read and
   written that are reported and priced are D1's. The native rows-written
   meter is compared with them label by label: `results.md` and
   `results.json` (`rows_written_check`) say whether it agrees, and where

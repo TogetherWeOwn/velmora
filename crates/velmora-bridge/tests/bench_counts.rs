@@ -563,6 +563,17 @@ fn parse_bench_vars(spec: &str) -> Vec<(String, String)> {
             !FIXED_VARS.contains(&k.as_str()) && !k.starts_with("VELMORA_KEK"),
             "VELMORA_BENCH_VARS: {k} is fixed by the rig"
         );
+        // A secret would be written into counts.json and the report.
+        let secret = ["TOKEN", "SECRET", "PASS", "KEK", "CREDENTIAL"]
+            .iter()
+            .any(|w| k.contains(w))
+            || k.ends_with("_KEY");
+        assert!(!secret, "VELMORA_BENCH_VARS: {k} looks like a secret");
+        // The rig collects whole bodies; a fan-out answer it cannot.
+        assert!(
+            k != "GET_FANOUT_BYTES",
+            "VELMORA_BENCH_VARS: GET_FANOUT_BYTES is not measured by the rig"
+        );
     }
     out
 }
@@ -585,6 +596,9 @@ fn bench_vars_parse() {
     assert!(std::panic::catch_unwind(|| parse_bench_vars("bad")).is_err());
     assert!(std::panic::catch_unwind(|| parse_bench_vars("ADMIN_TOKEN=x")).is_err());
     assert!(std::panic::catch_unwind(|| parse_bench_vars("VELMORA_KEK_2=x")).is_err());
+    assert!(std::panic::catch_unwind(|| parse_bench_vars("ADMIN_READ_TOKEN=x")).is_err());
+    assert!(std::panic::catch_unwind(|| parse_bench_vars("E2_SECRET_ACCESS_KEY=x")).is_err());
+    assert!(std::panic::catch_unwind(|| parse_bench_vars("GET_FANOUT_BYTES=8388608")).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1065,15 @@ impl Bench {
             if done(self) {
                 return;
             }
+            // Jobs already queued (the last verify round's release wakes,
+            // due after the clock jump) are delivered before the
+            // dispatcher runs, so it does not send their work again.
+            for sent in self.bridge.jobs.inner.take() {
+                self.run_job(&sent.job, false).await;
+            }
+            if done(self) {
+                return;
+            }
             self.cron_as(cron_label).await;
             for sent in self.bridge.jobs.inner.take() {
                 self.run_job(&sent.job, false).await;
@@ -1190,8 +1213,11 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
 
     // Post and verify, then the release after SAFETY_MIN_AGE_SECS.
     b.pump().await;
-    let min_age: u32 = b.vars["SAFETY_MIN_AGE_SECS"].parse().expect("min age");
-    b.bridge.clock.advance_secs(min_age + 600);
+    // The validated value (the reader trims it), widened before the sum.
+    let min_age = u64::from(b.bridge.cfg.safety_min_age_secs);
+    b.bridge
+        .clock
+        .advance_secs(u32::try_from(min_age + 600).expect("min age + 600 s"));
     b.ticks("release", "stage:cron", |b| {
         b.sql_count("SELECT count(*) FROM outbox WHERE stage <> 'done'") == 0
     })

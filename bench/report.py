@@ -34,6 +34,7 @@ is priced from --cpu (ms per extent ingested, per MiB served hot and cold,
 measured on a deployed Worker); without it the CPU lines are 0 and say so.
 """
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -214,7 +215,9 @@ def model(counts, labels, prices, cpu):
         "d1_storage": EXTENTS_PER_TB * cat_bytes / 1e9 * usd["d1_storage_gb_month"],
         "r2_storage_released": 0.0,
     }
-    hot_cap_gb = int(vars_.get("HOT_CAP_BYTES", 0)) / 1e9
+    # Absent or empty is the Worker's default (100 GiB); 0 keeps nothing hot.
+    hot_cap_raw = str(vars_.get("HOT_CAP_BYTES", "")).strip()
+    hot_cap_gb = (int(hot_cap_raw) if hot_cap_raw else 100 * 2**30) / 1e9
     fixed_month = {
         "cron_idle": sum(dollars(cron_idle).values()) * CRON_RUNS_PER_MONTH,
         "r2_hot_tier_at_cap": hot_cap_gb * usd["r2_storage_gb_month"],
@@ -361,8 +364,15 @@ def main(argv):
     opts = dict(zip(argv[1::2], argv[2::2]))
     prices = json.loads(Path(opts.get("--prices", Path(__file__).with_name("prices.json"))).read_text())
     cpu = json.loads(Path(opts["--cpu"]).read_text()) if "--cpu" in opts else None
+    if cpu is not None:
+        bad = [k for k, v in cpu.items() if not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0]
+        if bad:
+            sys.exit(f"--cpu: not a finite number >= 0: {', '.join(sorted(bad))}")
     name = opts.get("--name", run.name)
     counts, d1, labels = load(run)
+    extent = int(str(counts["vars"].get("MAX_EXTENT_BYTES", EXTENT)).strip() or EXTENT)
+    if extent != EXTENT:
+        sys.exit(f"MAX_EXTENT_BYTES={extent}: the cost model is for {EXTENT}-byte extents (one 16 MiB part = one extent); not priced")
     m = model(counts, labels, prices, cpu)
     chk = rows_written_check(labels)
     ops = {k[3:]: per(v, counts["calls"].get(k, 1)) for k, v in labels.items() if k.startswith("op:")}
@@ -385,7 +395,7 @@ def main(argv):
         "model": m,
         "top_statements": d1["top_statements"][:20],
     }
-    (run / "results.json").write_text(json.dumps(result, indent=1))
+    (run / "results.json").write_text(json.dumps(result, indent=1, allow_nan=False))
     (run / "results.md").write_text(render(name, counts, d1, labels, m, chk))
     print(f"report: {run / 'results.md'}")
     if chk["labels_differing"]:
