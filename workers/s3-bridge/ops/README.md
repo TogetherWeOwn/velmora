@@ -952,7 +952,8 @@ array). So the class goes out on its own, with the same code that has
 already run, and nothing that uses it comes in the same deploy. The
 production tables change in three pull requests after the code, each a
 deploy of its own, in this order. Production now declares the class
-(deploy 2), so the rollback floor it sets is in force:
+(deploy 2), so the rollback floor it sets is in force, and binds it
+(deploy 3) with `PERMITS = "d1"`:
 
 | # | change to the production tables | rollback | merge the next one when |
 | - | ------------------------------- | -------- | ----------------------- |

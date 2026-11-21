@@ -206,22 +206,29 @@ dataset = "velmora_requests"
 binding = "SELF"
 service = "velmora-s3"
 
-# The permit gate (src/gate.rs, class PermitGate) is declared here but
-# not bound yet, so this Worker takes its permits from the catalogue
-# (PERMITS = "d1" above; "do" without the binding refuses to start).
+# The permit gate (src/gate.rs, class PermitGate) is declared and bound
+# here, but this Worker still takes its permits from the catalogue
+# (PERMITS = "d1" above) until PERMITS = "do" ships in a deploy of its own.
 # Declaring a Durable Object class is a deploy that can never be rolled
 # back past, so the class, its binding and PERMITS = "do" each come in a
 # deploy of their own, in this order (see "Shipping the gate" in
 # ops/README.md, which has the exact tables):
-#   2. `[exports.PermitGate]` alone (one-way; nothing can reach it). This
-#      table, below.
-#   3. The `PERMIT_GATE` binding and `[version_metadata]` (reversible).
+#   2. `[exports.PermitGate]` alone (one-way; nothing can reach it).
+#   3. The `PERMIT_GATE` binding and `[version_metadata]` (reversible; a
+#      rollback goes to the deploy 2 version, never below it).
 #   4. PERMITS = "do" (reversible).
 # Never with the legacy `[[migrations]]` array: once a class is declared
 # by `exports`, Cloudflare refuses a deploy that goes back to it.
 [exports.PermitGate]
 type = "durable-object"
 storage = "sqlite"
+
+[[durable_objects.bindings]]
+name = "PERMIT_GATE"
+class_name = "PermitGate"
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
 
 [[d1_databases]]
 binding = "CATALOG"
@@ -449,8 +456,7 @@ service = "velmora-s3-dev"
 
 # The permit gate, declared and bound in dev (the CI end-to-end run
 # takes its permits from it with PERMITS = "do"). Production declares
-# the class above [[d1_databases]] and binds it in a later deploy of its
-# own (see the comment there).
+# and binds the class above [[d1_databases]] (see the comment there).
 [env.dev.exports.PermitGate]
 type = "durable-object"
 storage = "sqlite"
