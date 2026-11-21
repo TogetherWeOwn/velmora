@@ -5,7 +5,7 @@
 # so the check measures the bundle that ships.
 #
 # After worker-build, the `name` custom section (function names, about
-# 600 KB) is dropped from build/index_bg.wasm (tools/strip_wasm.py). The
+# 800 KB) is dropped from build/index_bg.wasm (tools/strip_wasm.py). The
 # Worker never reads it; without it, stack traces show
 # `wasm-function[N]` instead of Rust function names. The unstripped wasm
 # is kept in symbols/ (outside build/, so it is never uploaded) to

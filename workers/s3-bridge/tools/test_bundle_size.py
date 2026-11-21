@@ -128,6 +128,17 @@ class Report(unittest.TestCase):
         _, warnings = bs.report(rec(10_050_000), rec(10_000_000))
         self.assertEqual(warnings, [])
 
+    def test_limit_is_64_mib(self):
+        self.assertEqual(bs.LIMIT_BYTES, 67_108_864)
+
+    def test_base_from_another_commit_is_named(self):
+        md, warnings = bs.report(rec(3_100_000), rec(3_000_000, "a" * 40), "b" * 40)
+        self.assertIn("not this PR's base bbbbbbbbbbbb", md)
+        self.assertTrue(warnings[0].startswith("main's measurement is from aaaaaaaaaaaa"))
+        md, warnings = bs.report(rec(3_100_000), rec(3_000_000, "a" * 40), "a" * 40)
+        self.assertNotIn("not this PR's base", md)
+        self.assertTrue(warnings[0].startswith("Worker upload grew"))
+
     def test_cost_in_the_line(self):
         md, _ = bs.report(rec(4_000_000), rec(3_000_000))
         self.assertIn("about +10.5 ms per request on a new isolate", md)
@@ -165,10 +176,13 @@ class Cli(unittest.TestCase):
                 md = f.read()
             self.assertIn("+68,361 bytes", md)
             self.assertNotIn("::warning", md)
-            # A missing base file is reported, never an error.
-            r = self.run_cli("report", cur, os.path.join(tmp, "nope.json"))
-            self.assertEqual(r.returncode, 0)
-            self.assertIn("No measurement from main", r.stdout)
+            # A missing or empty base file is reported, never an error.
+            empty = os.path.join(tmp, "empty.json")
+            open(empty, "w").close()
+            for b in (os.path.join(tmp, "nope.json"), empty):
+                r = self.run_cli("report", cur, b, "c" * 40)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("No measurement from main", r.stdout)
 
     def test_measure_over_limit_exits_1(self):
         with tempfile.TemporaryDirectory() as tmp:

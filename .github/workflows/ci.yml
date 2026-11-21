@@ -325,8 +325,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      # The size report reads main's last measurement (an artifact).
-      actions: read
+      actions: read # The size report reads main's last measurement (an artifact).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -418,13 +417,16 @@ jobs:
                    | sort_by(.created_at) | reverse
                    | ([.[] | select(.workflow_run.head_sha == $p)] + .)
                    | .[0].id // empty') || id=""
-          if [ -n "$id" ]; then
-            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$RUNNER_TEMP/base.zip"
-            unzip -p "$RUNNER_TEMP/base.zip" size.json > "$base"
+          # Best effort: without main's measurement the report still runs.
+          if [ -n "$id" ] \
+             && gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$RUNNER_TEMP/base.zip" \
+             && unzip -p "$RUNNER_TEMP/base.zip" size.json > "$base"; then
+            :
           else
-            echo "No size measurement from main found."
+            rm -f "$base"
+            echo "No size measurement from main could be read; reporting without a delta."
           fi
-          python3 -I tools/bundle_size.py report "$RUNNER_TEMP/size.json" "$base"
+          python3 -I tools/bundle_size.py report "$RUNNER_TEMP/size.json" "$base" "$parent"
       # main's measurement, for the reports of later PRs.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

@@ -27,10 +27,11 @@ Subcommands:
                           instead of building it again.
   measure OUTDIR LOG OUT  checks the limit; writes OUT (JSON). Exit 1 over
                           the limit or if wrangler's total disagrees.
-  report CUR [BASE]       markdown and `::warning` lines on stdout; the
+  report CUR [BASE [SHA]] markdown and `::warning` lines on stdout; the
                           markdown is also appended to $GITHUB_STEP_SUMMARY
                           when set. A missing BASE file is reported, not an
-                          error. Always exit 0.
+                          error. SHA, the PR's base commit, is named when
+                          BASE is from another commit. Always exit 0.
 """
 
 import json
@@ -111,8 +112,9 @@ def _mb(n):
     return n / 1_000_000
 
 
-def report(cur, base=None):
-    """Returns (markdown, warnings)."""
+def report(cur, base=None, expected_base=""):
+    """Returns (markdown, warnings). expected_base: the PR's base commit;
+    when main's measurement is from another commit, both say so."""
     up = cur["upload_bytes"]
     lines = [
         "### Worker upload size",
@@ -132,13 +134,21 @@ def report(cur, base=None):
     pct = 100 * d / b if b else 0.0
     ms = MS_PER_MB * _mb(d)
     src = f" at {base['sha'][:12]}" if base.get("sha") else ""
+    other = ""
+    if expected_base and base.get("sha") != expected_base:
+        other = (
+            f"main's measurement is from {base.get('sha', '')[:12] or 'an unknown commit'}, not this "
+            f"PR's base {expected_base[:12]}; the delta includes changes on main between them. "
+        )
     lines.append(
         f"- Against main{src}: {b:,} bytes, delta **{d:+,} bytes ({pct:+.2f} %)**, "
         f"about {ms:+.1f} ms per request on a new isolate"
     )
+    if other:
+        lines.append(f"- Note: {other.strip()}")
     if d > WARN_BYTES or (b and d > WARN_FRACTION * b):
         warnings.append(
-            f"Worker upload grew by {d:,} bytes ({pct:+.2f} %) against main, to {up:,} bytes. "
+            other + f"Worker upload grew by {d:,} bytes ({pct:+.2f} %) against main, to {up:,} bytes. "
             f"Measured cost: about {MS_PER_MB} ms per MB on every request served by a new "
             f"isolate (after a deploy, or on a machine that has not run this version), so "
             f"about {ms:.1f} ms here. Not blocking; keep the bundle small."
@@ -166,14 +176,14 @@ def main(argv):
         for e in errors:
             print(f"::error::{e}")
         return 1 if errors else 0
-    if len(argv) in (2, 3) and argv[0] == "report":
+    if len(argv) in (2, 3, 4) and argv[0] == "report":
         with open(argv[1]) as f:
             cur = json.load(f)
         base = None
-        if len(argv) == 3 and os.path.isfile(argv[2]):
+        if len(argv) >= 3 and os.path.isfile(argv[2]) and os.path.getsize(argv[2]) > 0:
             with open(argv[2]) as f:
                 base = json.load(f)
-        md, warnings = report(cur, base)
+        md, warnings = report(cur, base, argv[3] if len(argv) == 4 else "")
         sys.stdout.write(md)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
