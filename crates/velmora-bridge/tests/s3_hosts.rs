@@ -135,6 +135,17 @@ async fn presigned_get_requires_the_host_it_was_signed_for() {
     let resp = rig.send(req).await;
     resp.expect(200);
     assert_eq!(resp.body, payload);
+
+    // Signed for the customer host: good there, refused on the other.
+    let req = presign_for(&signer, rig.now(), &path(BUCKET, "presigned"), CUSTOMER);
+    let mut legacy_req = presign_for(&signer, rig.now(), &path(BUCKET, "presigned"), CUSTOMER);
+    legacy_req.set_header("host", HOST);
+    let resp = rig.send(req).await;
+    resp.expect(200);
+    assert_eq!(resp.body, payload);
+    rig.send(legacy_req)
+        .await
+        .expect_error(403, "SignatureDoesNotMatch");
 }
 
 #[tokio::test(flavor = "current_thread")]

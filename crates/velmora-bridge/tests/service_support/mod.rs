@@ -927,6 +927,11 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// A presigned GET of `raw_path`, signed at `now` and valid for an hour.
 pub fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
+    presign_for(signer, now, raw_path, HOST)
+}
+
+/// [`presign`] for another host: the URL is signed for, and sent to, `host`.
+pub fn presign_for(signer: &Signer, now: UnixMs, raw_path: &str, host: &str) -> Req {
     let (stamp, scope, key) = signer.scope(now);
     let credential = format!("{}/{scope}", signer.akid);
     let mut q: Vec<(String, String)> = [
@@ -945,7 +950,7 @@ pub fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
-    let canonical = format!("GET\n{raw_path}\n{query}\nhost:{HOST}\n\nhost\nUNSIGNED-PAYLOAD");
+    let canonical = format!("GET\n{raw_path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
     let to_sign = format!(
         "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
         hex(&sha256(canonical.as_bytes()))
@@ -954,7 +959,7 @@ pub fn presign(signer: &Signer, now: UnixMs, raw_path: &str) -> Req {
     Req {
         method: Method::Get,
         target: format!("{raw_path}?{query}&X-Amz-Signature={signature}"),
-        headers: vec![("host".to_string(), HOST.to_string())],
+        headers: vec![("host".to_string(), host.to_string())],
         body: Vec::new(),
     }
 }
