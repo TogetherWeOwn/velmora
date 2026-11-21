@@ -575,3 +575,53 @@ fn the_next_moves_marker_opens_a_window_and_an_old_one_is_left_behind() {
         ZeroServe::Serve
     );
 }
+
+/// An isolate that cached the d1 head before the window serves reads only
+/// once the database carries the marker, inside the interval too.
+#[test]
+fn a_cached_d1_head_meets_the_marker() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    first(&chain);
+    let mut watch = ZeroWatch::default();
+    assert_eq!(
+        block_on(watch.serve(&chain, &db(false, Some("main")), NOW)),
+        ZeroServe::Serve
+    );
+    let soon = UnixMs(NOW.0 + 1);
+    assert_eq!(
+        block_on(watch.serve(&chain, &db(true, Some("main")), soon)),
+        ZeroServe::ServeReadOnly
+    );
+}
+
+/// A second window that was given up leaves its marker until the thaw:
+/// reads only, never a page.
+#[test]
+fn a_given_up_second_window_serves_reads_until_the_thaw() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    first(&chain);
+    start(&chain, "main");
+    flip(&chain, 9);
+    undo(&chain, 10, "main2");
+    start(&chain, "main2");
+    let given_up = write(&chain, Change::GiveUpMove, Actor::MoveTool, NOW);
+    let mut seen = Seen { moved: true };
+    assert_eq!(
+        decide(&given_up, &db_marked(Some(2), Some("main2")), &mut seen),
+        ZeroServe::ServeReadOnly
+    );
+    assert_eq!(
+        decide(&given_up, &db_marked(Some(1), Some("main2")), &mut seen),
+        paged("database_left_behind")
+    );
+}

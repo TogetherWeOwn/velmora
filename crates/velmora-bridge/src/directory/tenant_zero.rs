@@ -183,7 +183,7 @@ fn d1(z: &TenantZero, db: &DatabaseFacts, seen: &Seen) -> ZeroServe {
     // The marker names its move: one of a move that already happened
     // means this database was left behind; one of the next move means
     // that move's window is opening (or was given up), and nothing writes.
-    let moves_done = z.frozen_catalogues.len() as i64;
+    let moves_done = i64::try_from(z.flips).unwrap_or(i64::MAX);
     match db.marker {
         None => ZeroServe::Serve,
         Some(ordinal) if ordinal > moves_done => ZeroServe::ServeReadOnly,
