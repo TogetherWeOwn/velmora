@@ -1,21 +1,24 @@
 //! The fence on tenant 0's D1 catalogue: the selector read from tenant 0's
-//! record, the cutover marker of the database, `moved` sticky until a
-//! stamped undo, and the route of a request when the directory fails.
+//! record, the cutover marker and the catalogue id of the database, what
+//! an isolate has seen, and the route of a request when the directory
+//! read fails.
 
 use std::cell::Cell;
 
-use velmora_bridge::directory::chain::{record_key, ControlSeal, TenantChain, Written};
-use velmora_bridge::directory::record::{Selector, TenantDoor, TenantId, TenantZero};
+use velmora_bridge::directory::chain::{record_key, TenantChain, Written};
+use velmora_bridge::directory::record::{TenantDoor, TenantId};
 use velmora_bridge::directory::tenant_zero::{
-    database_facts, decide, route_without_directory, DatabaseFacts, DirectoryAnswer, Route, Seen,
-    ZeroServe, ZeroWatch, CUTOVER_MARKER_KEY, RECHECK_MS,
+    database_facts, decide, route_without_directory, DatabaseFacts, DirectoryAnswer, Lookup, Route,
+    Seen, ZeroServe, ZeroWatch, CUTOVER_MARKER_KEY, RECHECK_MS,
 };
 use velmora_bridge::directory::testing::{MemRecords, PlainSeal};
-use velmora_bridge::directory::transition::{Actor, Change};
+use velmora_bridge::directory::transition::{Actor, Change, RETIRE_AFTER_MS};
 use velmora_bridge::testkit::RusqliteSql;
 use velmora_bridge::{Sql, SqlValue, UnixMs};
 
 const NOW: UnixMs = UnixMs(1_800_000_000_000);
+
+type Chain<'a> = TenantChain<'a, MemRecords, PlainSeal>;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -28,60 +31,52 @@ fn t1() -> TenantId {
     TenantId::parse("t_00000000000000a1").unwrap()
 }
 
-/// Tenant 0's first record, as the chain writes it.
-fn first_record(chain: &TenantChain<'_, MemRecords, PlainSeal>) -> TenantDoor {
-    let w = block_on(chain.write(
-        &TenantId::zero(),
-        &Change::CreateTenantZero {
-            jurisdiction: "us".into(),
-        },
-        Actor::Operator,
-        NOW,
-        0,
-    ))
-    .unwrap();
+/// Writes one change to tenant 0's chain and answers the new head.
+fn write(chain: &Chain<'_>, change: Change, actor: Actor, now: UnixMs) -> TenantDoor {
+    let w = block_on(chain.write(&TenantId::zero(), &change, actor, now, 0)).unwrap();
     let Written::Wrote(rec) = w else {
-        panic!("{w:?}")
+        panic!("{change:?}: {w:?}")
     };
     rec.door
 }
 
-/// A later record of tenant 0, put by hand as the move's own tool would.
-fn plant(store: &MemRecords, seal: &PlainSeal, prev: &TenantDoor, zero: TenantZero) -> TenantDoor {
-    let mut door = prev.clone();
-    door.seq += 1;
-    door.tenant_zero = Some(zero);
-    let name = record_key(&TenantId::zero(), door.seq);
-    let sealed = seal
-        .seal(
-            &name,
-            &TenantId::zero(),
-            0,
-            &serde_json::to_vec(&door).unwrap(),
-            b"{\"v\":1}",
-        )
-        .unwrap();
-    store.plant(&name, sealed);
-    door
+fn first(chain: &Chain<'_>) -> TenantDoor {
+    write(
+        chain,
+        Change::CreateTenantZero {
+            jurisdiction: "us".into(),
+        },
+        Actor::Operator,
+        NOW,
+    )
 }
 
-fn zero(selector: Selector, cut: Option<u64>, undo: Option<u64>, id: Option<&str>) -> TenantZero {
-    TenantZero {
-        selector,
-        cutover_stamp: cut,
-        undo_stamp: undo,
-        catalogue_id: id.map(str::to_string),
-    }
+fn start(chain: &Chain<'_>, frozen: &str) -> TenantDoor {
+    write(
+        chain,
+        Change::StartMove {
+            to: t1(),
+            catalogue_id_frozen: frozen.into(),
+        },
+        Actor::MoveTool,
+        NOW,
+    )
 }
 
-fn moved() -> Selector {
-    Selector::Moved { to: t1() }
+fn flip(chain: &Chain<'_>, stamp: u64) -> TenantDoor {
+    write(chain, Change::FlipMove { stamp }, Actor::MoveTool, NOW)
 }
 
-fn with(door: &TenantDoor, z: TenantZero) -> TenantDoor {
-    let mut d = door.clone();
-    d.tenant_zero = Some(z);
-    d
+fn undo(chain: &Chain<'_>, stamp: u64, id: &str) -> TenantDoor {
+    write(
+        chain,
+        Change::UndoMove {
+            undo_stamp: stamp,
+            catalogue_id: id.into(),
+        },
+        Actor::MoveTool,
+        NOW,
+    )
 }
 
 fn db(marker: bool, id: Option<&str>) -> DatabaseFacts {
@@ -91,49 +86,50 @@ fn db(marker: bool, id: Option<&str>) -> DatabaseFacts {
     }
 }
 
-fn unavailable(code: &'static str, page: bool) -> ZeroServe {
-    ZeroServe::Unavailable { code, page }
+fn paged(code: &'static str) -> ZeroServe {
+    ZeroServe::Unavailable { code, page: true }
+}
+
+fn fresh() -> Seen {
+    Seen::default()
 }
 
 #[test]
-fn the_selector_and_the_marker_decide() {
+fn the_selector_the_marker_and_the_catalogue_id_decide() {
     let store = MemRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
         seal: &seal,
     };
-    let base = first_record(&chain);
-    let fresh = || Seen::default();
-
-    // Today: d1, no stamp, no marker.
-    assert_eq!(
-        decide(&base, &db(false, Some("main")), &mut fresh()),
-        ZeroServe::Serve
-    );
-    // The move's window: the marker is written, the flip is not.
+    let main = db(false, Some("main"));
+    let base = first(&chain);
+    // Today.
+    assert_eq!(decide(&base, &main, &mut fresh()), ZeroServe::Serve);
+    // The marker is written before the window's record: reads only.
     assert_eq!(
         decide(&base, &db(true, Some("main")), &mut fresh()),
-        ZeroServe::Serve
+        ZeroServe::ServeReadOnly
     );
+    // The window: reads only, and only from the frozen catalogue.
+    let moving = start(&chain, "main");
+    assert_eq!(
+        decide(&moving, &db(true, Some("main")), &mut fresh()),
+        ZeroServe::ServeReadOnly
+    );
+    for other in [db(true, Some("main2")), db(true, None)] {
+        assert_eq!(
+            decide(&moving, &other, &mut fresh()),
+            paged("database_is_not_the_frozen_one")
+        );
+    }
     // After the flip: moved, whatever the database says.
-    let flipped = with(&base, zero(moved(), Some(7), None, None));
+    let moved = flip(&chain, 9);
     for facts in [db(false, None), db(true, Some("main"))] {
-        assert_eq!(
-            decide(&flipped, &facts, &mut fresh()),
-            unavailable("tenant_zero_moved", false)
-        );
+        assert_eq!(decide(&moved, &facts, &mut fresh()), ZeroServe::Moved);
     }
-    // A d1 head with a cutover stamp and no undo: a database left behind.
-    let left = with(&base, zero(Selector::D1, Some(7), None, None));
-    for facts in [db(true, Some("main")), db(false, Some("main"))] {
-        assert_eq!(
-            decide(&left, &facts, &mut fresh()),
-            unavailable("database_left_behind", true)
-        );
-    }
-    // After a stamped undo: only the database the record names serves.
-    let undone = with(&base, zero(Selector::D1, Some(7), Some(9), Some("main2")));
+    // The undo serves only the catalogue it names.
+    let undone = undo(&chain, 10, "main2");
     assert_eq!(
         decide(&undone, &db(false, Some("main2")), &mut fresh()),
         ZeroServe::Serve
@@ -145,126 +141,165 @@ fn the_selector_and_the_marker_decide() {
     ] {
         assert_eq!(
             decide(&undone, &facts, &mut fresh()),
-            unavailable("database_is_not_the_named_one", true)
+            paged("database_is_not_the_named_one")
         );
     }
-    // An undo stamp that is not above the cutover stamp is no undo.
-    let bad = with(&base, zero(Selector::D1, Some(7), Some(7), Some("main2")));
-    assert_eq!(
-        decide(&bad, &db(false, Some("main2")), &mut fresh()),
-        unavailable("database_left_behind", true)
+    // Retired 30 days after the flip of a second move, from the named
+    // catalogue.
+    start(&chain, "main2");
+    flip(&chain, 11);
+    let retired = write(
+        &chain,
+        Change::RetireTenantZero,
+        Actor::MoveTool,
+        UnixMs(NOW.0 + RETIRE_AFTER_MS),
     );
-    // Not tenant 0, or no selector: damage.
+    assert_eq!(
+        decide(&retired, &db(false, Some("main2")), &mut fresh()),
+        paged("tenant_zero_retired")
+    );
+}
+
+/// Heads that the transitions never write, as damage or a forged record
+/// would leave them.
+#[test]
+fn heads_that_no_transition_writes_are_refused() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let base = first(&chain);
+    start(&chain, "main");
+    let moved = flip(&chain, 9);
+    let main = db(false, Some("main"));
+
+    // d1 with the move and no undo above its stamp: left behind.
+    let mut left = moved.clone();
+    left.tenant_zero.as_mut().unwrap().selector = velmora_bridge::directory::record::Selector::D1;
+    assert_eq!(
+        decide(&left, &main, &mut fresh()),
+        paged("database_left_behind")
+    );
+    // An undo stamp with no move.
+    let mut stray = base.clone();
+    stray.tenant_zero.as_mut().unwrap().undo_stamp = Some(3);
+    assert_eq!(
+        decide(&stray, &main, &mut fresh()),
+        paged("undo_without_move")
+    );
+    // Not tenant 0's record, or no selector.
     let mut other = base.clone();
     other.tenant = t1();
     assert_eq!(
-        decide(&other, &db(false, None), &mut fresh()),
-        unavailable("not_tenant_zero", true)
+        decide(&other, &main, &mut fresh()),
+        paged("not_tenant_zero")
     );
     let mut none = base.clone();
     none.tenant_zero = None;
     assert_eq!(
-        decide(&none, &db(false, None), &mut fresh()),
-        unavailable("selector_missing", true)
+        decide(&none, &main, &mut fresh()),
+        paged("selector_missing")
     );
 }
 
-/// An isolate that has seen `moved` goes back to d1 only on a head with an
-/// undo stamp above what it saw and a catalogue id its database carries.
+/// An isolate that has met `moved` serves d1 afterwards only from the
+/// catalogue that an undo named.
 #[test]
-fn moved_is_sticky_until_a_stamped_undo() {
+fn moved_stays_seen() {
     let store = MemRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
         seal: &seal,
     };
-    let base = first_record(&chain);
-    let mut seen = Seen::default();
-    let flipped = with(&base, zero(moved(), Some(7), None, None));
-    let facts = db(false, Some("main2"));
+    let base = first(&chain);
+    start(&chain, "main");
+    let moved = flip(&chain, 9);
+    let mut seen = fresh();
     assert_eq!(
-        decide(&flipped, &facts, &mut seen),
-        unavailable("tenant_zero_moved", false)
+        decide(&moved, &db(false, Some("main")), &mut seen),
+        ZeroServe::Moved
     );
-    assert_eq!(seen.moved_at_stamp, Some(7));
-
-    // A rolled-back or forged view: d1 with no undo.
+    assert!(seen.moved);
+    // The first record again (a rolled-back view): refused.
     assert_eq!(
-        decide(&base, &facts, &mut seen),
-        unavailable("selector_went_back", true)
+        decide(&base, &db(false, Some("main")), &mut seen),
+        paged("selector_went_back")
     );
-    // An undo stamp not above the cutover stamp this isolate saw.
-    let stale = with(&base, zero(Selector::D1, Some(5), Some(6), Some("main2")));
+    // After the undo, the named catalogue only, and seen stays.
+    let undone = undo(&chain, 10, "main2");
     assert_eq!(
-        decide(&stale, &facts, &mut seen),
-        unavailable("selector_went_back", true)
+        decide(&undone, &db(false, Some("main2")), &mut seen),
+        ZeroServe::Serve
     );
-    assert_eq!(seen.moved_at_stamp, Some(7));
-    // The stamped undo, on the named database.
-    let undone = with(&base, zero(Selector::D1, Some(7), Some(8), Some("main2")));
+    assert!(seen.moved);
     assert_eq!(
-        decide(&undone, &db(false, Some("main")), &mut seen),
-        unavailable("database_is_not_the_named_one", true)
+        decide(&base, &db(false, Some("main2")), &mut seen),
+        paged("selector_went_back")
     );
-    assert_eq!(decide(&undone, &facts, &mut seen), ZeroServe::Serve);
-    assert_eq!(seen.moved_at_stamp, None);
+    // A second window and its give-up keep the named catalogue.
+    let moving = start(&chain, "main2");
+    assert_eq!(
+        decide(&moving, &db(true, Some("main2")), &mut seen),
+        ZeroServe::ServeReadOnly
+    );
+    let given_up = write(&chain, Change::GiveUpMove, Actor::MoveTool, NOW);
+    assert_eq!(
+        decide(&given_up, &db(false, Some("main2")), &mut seen),
+        ZeroServe::Serve
+    );
+    assert_eq!(
+        decide(&given_up, &db(false, Some("main")), &mut seen),
+        paged("database_is_not_the_named_one")
+    );
 }
 
 /// The isolate reads tenant 0's head once, checks it every RECHECK_MS by
-/// one listing, and reads it again when it moved.
+/// one listing, whatever it says, and reads it again when it moved.
 #[test]
-fn the_watch_rechecks_the_head_and_follows_a_move() {
+fn the_watch_rechecks_the_head_and_follows_the_move() {
     let store = MemRecords::new();
     let seal = PlainSeal::new();
     let chain = TenantChain {
         store: &store,
         seal: &seal,
     };
-    let base = first_record(&chain);
-    let facts = db(false, Some("main2"));
+    first(&chain);
+    let main = db(false, Some("main"));
     let mut watch = ZeroWatch::default();
     block_on(async {
-        assert_eq!(watch.serve(&chain, &facts, NOW).await, ZeroServe::Serve);
-        // The flip lands.
-        let flipped = plant(&store, &seal, &base, zero(moved(), Some(7), None, None));
+        assert_eq!(watch.serve(&chain, &main, NOW).await, ZeroServe::Serve);
+    });
+    start(&chain, "main");
+    flip(&chain, 9);
+    block_on(async {
         // Inside the interval the cached head stands, with no listing.
         let lists = store.lists();
         let soon = UnixMs(NOW.0 + RECHECK_MS - 1);
-        assert_eq!(watch.serve(&chain, &facts, soon).await, ZeroServe::Serve);
+        assert_eq!(watch.serve(&chain, &main, soon).await, ZeroServe::Serve);
         assert_eq!(store.lists(), lists);
         // After it, the head is checked and read again.
         let later = UnixMs(NOW.0 + RECHECK_MS);
-        assert_eq!(
-            watch.serve(&chain, &facts, later).await,
-            unavailable("tenant_zero_moved", false)
-        );
+        assert_eq!(watch.serve(&chain, &main, later).await, ZeroServe::Moved);
         assert_eq!(store.lists(), lists + 1);
-        // A head that goes back to d1 without an undo is refused.
-        let back = plant(
-            &store,
-            &seal,
-            &flipped,
-            zero(Selector::D1, Some(7), None, None),
-        );
-        let t = UnixMs(later.0 + RECHECK_MS);
-        assert_eq!(
-            watch.serve(&chain, &facts, t).await,
-            unavailable("selector_went_back", true)
-        );
-        // The stamped undo serves again.
-        plant(
-            &store,
-            &seal,
-            &back,
-            zero(Selector::D1, Some(7), Some(9), Some("main2")),
-        );
-        let t = UnixMs(t.0 + RECHECK_MS);
-        assert_eq!(watch.serve(&chain, &facts, t).await, ZeroServe::Serve);
-        // A clock that goes back does not keep a stale head.
-        let back_in_time = UnixMs(NOW.0);
+        // A moved head is checked on the same interval.
         let lists = store.lists();
-        watch.serve(&chain, &facts, back_in_time).await;
+        let t = UnixMs(later.0 + 1);
+        assert_eq!(watch.serve(&chain, &main, t).await, ZeroServe::Moved);
+        assert_eq!(store.lists(), lists);
+    });
+    undo(&chain, 10, "main2");
+    block_on(async {
+        let t = UnixMs(NOW.0 + 2 * RECHECK_MS);
+        assert_eq!(
+            watch.serve(&chain, &db(false, Some("main2")), t).await,
+            ZeroServe::Serve
+        );
+        // A clock that goes back does not keep a stale head.
+        let lists = store.lists();
+        watch.serve(&chain, &db(false, Some("main2")), NOW).await;
         assert_eq!(store.lists(), lists + 1);
     });
 }
@@ -277,27 +312,37 @@ fn a_record_that_cannot_be_read_answers_503() {
         store: &store,
         seal: &seal,
     };
-    let facts = db(false, Some("main"));
-    block_on(async {
-        // No record at all: damage, paged.
-        let mut watch = ZeroWatch::default();
-        assert_eq!(
-            watch.serve(&chain, &facts, NOW).await,
-            unavailable("record_damaged", true)
-        );
-    });
-    first_record(&chain);
-    block_on(async {
-        let mut watch = ZeroWatch::default();
-        assert_eq!(watch.serve(&chain, &facts, NOW).await, ZeroServe::Serve);
-        // R2 fails at the next check: 503, an outage and not damage.
-        store.fail_lists(true);
-        let t = UnixMs(NOW.0 + RECHECK_MS);
-        assert_eq!(
-            watch.serve(&chain, &facts, t).await,
-            unavailable("record_unreadable", false)
-        );
-    });
+    let main = db(false, Some("main"));
+    // No record at all: damage, paged.
+    let mut watch = ZeroWatch::default();
+    assert_eq!(
+        block_on(watch.serve(&chain, &main, NOW)),
+        paged("record_damaged")
+    );
+    first(&chain);
+    let mut watch = ZeroWatch::default();
+    assert_eq!(block_on(watch.serve(&chain, &main, NOW)), ZeroServe::Serve);
+    // R2 fails at the next check: 503, an outage and not damage.
+    store.fail_lists(true);
+    let t = UnixMs(NOW.0 + RECHECK_MS);
+    assert_eq!(
+        block_on(watch.serve(&chain, &main, t)),
+        ZeroServe::Unavailable {
+            code: "record_unreadable",
+            page: false
+        }
+    );
+    // A record changed behind the chain's back: damage.
+    store.fail_lists(false);
+    let key = record_key(&TenantId::zero(), 1);
+    let mut bytes = store.raw(&key).unwrap();
+    bytes[0] ^= 1;
+    store.plant(&key, bytes);
+    let mut watch = ZeroWatch::default();
+    assert_eq!(
+        block_on(watch.serve(&chain, &main, NOW)),
+        paged("record_damaged")
+    );
 }
 
 #[test]
@@ -333,74 +378,116 @@ fn the_database_says_whether_it_carries_the_marker_and_which_id() {
     });
 }
 
+/// Calls of the two lookups, so that a test can say which ran.
+#[derive(Default)]
+struct Asked {
+    record: Cell<u32>,
+    zero: Cell<u32>,
+}
+
+fn route(
+    asked: &Asked,
+    answer: DirectoryAnswer,
+    zero: ZeroServe,
+    record: Lookup<TenantId>,
+    held: Lookup<()>,
+) -> Route {
+    block_on(route_without_directory(
+        answer,
+        zero,
+        async || {
+            asked.record.set(asked.record.get() + 1);
+            record
+        },
+        async || {
+            asked.zero.set(asked.zero.get() + 1);
+            held
+        },
+    ))
+}
+
 #[test]
 fn a_failed_directory_read_is_not_an_unknown_key() {
-    let never = || -> bool { panic!("tenant 0 must not be asked") };
-    let no_record = || -> Option<TenantId> { panic!("no route record must be read") };
-    // A directory that was read decides.
-    assert_eq!(
-        route_without_directory(
-            DirectoryAnswer::Read(Some(t1())),
-            ZeroServe::Serve,
-            never,
-            no_record
-        ),
-        Route::Tenant(t1())
-    );
-    assert_eq!(
-        route_without_directory(
-            DirectoryAnswer::Read(None),
-            ZeroServe::Serve,
-            never,
-            no_record
-        ),
-        Route::UnknownKey
-    );
-    // A failed read: tenant 0's catalogue is asked while it serves.
-    assert_eq!(
-        route_without_directory(
-            DirectoryAnswer::Failed,
-            ZeroServe::Serve,
-            || true,
-            no_record
-        ),
-        Route::Tenant(TenantId::zero())
-    );
-    // Not tenant 0's key: the route record, or 503.
-    assert_eq!(
-        route_without_directory(
-            DirectoryAnswer::Failed,
-            ZeroServe::Serve,
-            || false,
-            || Some(t1())
-        ),
-        Route::Tenant(t1())
-    );
-    assert_eq!(
-        route_without_directory(DirectoryAnswer::Failed, ZeroServe::Serve, || false, || None),
-        Route::Unavailable
-    );
-    // After the move tenant 0's catalogue is not asked at all.
-    let asked = Cell::new(false);
-    let r = route_without_directory(
-        DirectoryAnswer::Failed,
-        unavailable("tenant_zero_moved", false),
-        || {
-            asked.set(true);
-            true
-        },
-        || Some(t1()),
+    let moved = ZeroServe::Moved;
+    let serve = ZeroServe::Serve;
+    // A directory that was read decides, and nothing else is asked.
+    let a = Asked::default();
+    let r = route(
+        &a,
+        DirectoryAnswer::Read(Some(t1())),
+        serve,
+        Lookup::Failed,
+        Lookup::Failed,
     );
     assert_eq!(r, Route::Tenant(t1()));
-    assert!(!asked.get());
-    // A route record never names tenant 0.
-    assert_eq!(
-        route_without_directory(
-            DirectoryAnswer::Failed,
-            unavailable("tenant_zero_moved", false),
-            || false,
-            || Some(TenantId::zero())
-        ),
-        Route::Unavailable
+    let r = route(
+        &a,
+        DirectoryAnswer::Read(None),
+        serve,
+        Lookup::Failed,
+        Lookup::Failed,
     );
+    assert_eq!(r, Route::UnknownKey);
+    assert_eq!((a.record.get(), a.zero.get()), (0, 0));
+
+    // A failed read: the route record first.
+    let a = Asked::default();
+    let r = route(
+        &a,
+        DirectoryAnswer::Failed,
+        serve,
+        Lookup::Found(t1()),
+        Lookup::Found(()),
+    );
+    assert_eq!(r, Route::Tenant(t1()));
+    assert_eq!((a.record.get(), a.zero.get()), (1, 0));
+    // A route record that cannot be read: 503, tenant 0 is not asked.
+    let a = Asked::default();
+    let r = route(
+        &a,
+        DirectoryAnswer::Failed,
+        serve,
+        Lookup::Failed,
+        Lookup::Found(()),
+    );
+    assert_eq!(r, Route::Unavailable);
+    assert_eq!(a.zero.get(), 0);
+
+    // No route record, tenant 0 on D1: its catalogue decides.
+    for zero in [ZeroServe::Serve, ZeroServe::ServeReadOnly] {
+        let a = Asked::default();
+        let r = route(
+            &a,
+            DirectoryAnswer::Failed,
+            zero,
+            Lookup::Absent,
+            Lookup::Found(()),
+        );
+        assert_eq!(r, Route::Tenant(TenantId::zero()));
+        // Not held, or the lookup failed: 503, never another tenant.
+        for held in [Lookup::Absent, Lookup::Failed] {
+            let r = route(&a, DirectoryAnswer::Failed, zero, Lookup::Absent, held);
+            assert_eq!(r, Route::Unavailable);
+        }
+    }
+    // After the move tenant 0's catalogue is not asked at all.
+    let a = Asked::default();
+    let r = route(
+        &a,
+        DirectoryAnswer::Failed,
+        moved,
+        Lookup::Absent,
+        Lookup::Found(()),
+    );
+    assert_eq!(r, Route::Unavailable);
+    assert_eq!(a.zero.get(), 0);
+    let r = route(
+        &a,
+        DirectoryAnswer::Failed,
+        paged("database_left_behind"),
+        Lookup::Absent,
+        Lookup::Found(()),
+    );
+    assert_eq!(r, Route::Unavailable);
+    assert_eq!(a.zero.get(), 0);
 }
