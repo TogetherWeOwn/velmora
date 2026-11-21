@@ -47,7 +47,10 @@ get() {
   local key=$1 out=$2
   shift 2
   if [[ -n $remote ]]; then
-    rclone copyto "$remote:$BUCKET/$key" "$out" </dev/null
+    # --ignore-times: parts of one size can share a modification time,
+    # and rclone would skip a download onto the previous part's file.
+    rm -f "$out"
+    rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
   fi >"$out.log" 2>&1 || return 1
@@ -73,7 +76,7 @@ get_restore_object() {
 
 verify() {
   local path=$1 key=$2 expected_bytes=$3 expected_sha256=$4 bytes sha256
-  bytes=$(wc -c <"$path")
+  bytes=$(( $(wc -c <"$path") ))
   [[ $bytes == "$expected_bytes" ]] || die "size mismatch for $key"
   sha256=$(sha256sum <"$path")
   [[ ${sha256%% *} == "$expected_sha256" ]] || die "sha256 mismatch for $key"

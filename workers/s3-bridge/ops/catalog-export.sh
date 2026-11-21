@@ -60,7 +60,10 @@ get() {
   local key=$1 out=$2
   shift 2
   if [[ -n $remote ]]; then
-    rclone copyto "$remote:$BUCKET/$key" "$out" </dev/null
+    # --ignore-times: parts of one size can share a modification time,
+    # and rclone would skip a download onto the previous part's file.
+    rm -f "$out"
+    rclone copyto "$remote:$BUCKET/$key" "$out" --ignore-times </dev/null
   else
     npx wrangler r2 object get "$BUCKET/$key" --file "$out" --remote "$@" </dev/null
   fi >"$WORK/get.log" 2>&1
@@ -108,18 +111,23 @@ put() {
 
 zstd -q -T0 -10 "$file" -o "$file.zst"
 zstd -q -t "$file.zst"
+# Part names have three digits: at most 1000 parts.
+if (( ($(wc -c <"$file.zst") + part_bytes - 1) / part_bytes > 1000 )); then
+  echo "catalog-export: VELMORA_EXPORT_PART_BYTES $part_bytes makes more than 1000 parts for this export" >&2
+  exit 1
+fi
 split -b "$part_bytes" -d -a 3 "$file.zst" "$file.zst.part-"
 
-sql_bytes=$(wc -c <"$file")
+sql_bytes=$(( $(wc -c <"$file") ))
 sql_sha256=$(sha256sum <"$file")
 sql_sha256=${sql_sha256%% *}
-zst_bytes=$(wc -c <"$file.zst")
+zst_bytes=$(( $(wc -c <"$file.zst") ))
 zst_sha256=$(sha256sum <"$file.zst")
 zst_sha256=${zst_sha256%% *}
 parts=("$file.zst.part-"*)
 for part in "${parts[@]}"; do
   key="$prefix.sql.zst.part-${part##*-}"
-  bytes=$(wc -c <"$part")
+  bytes=$(( $(wc -c <"$part") ))
   sha256=$(sha256sum <"$part")
   jq -n --arg key "$key" --argjson bytes "$bytes" --arg sha256 "${sha256%% *}" \
     '{$key, $bytes, $sha256}' >>"$WORK/parts.json"

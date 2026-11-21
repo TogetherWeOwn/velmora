@@ -287,6 +287,8 @@ exists: restore it to a timestamp, then replay from that timestamp.
      The restore point is `T` in milliseconds.
    - Export: find the newest complete export with
      `rclone lsf <remote>:velmora-catalog-export/d1/<db>/ --include '*.manifest.json' | sort | tail -n 1`.
+     An export from before the manifests is one `<restore point>.sql` object
+     (`--include '*.sql'`); it loads too, without checksums.
      The number before `.manifest.json` is the restore point. Set
      `VELMORA_D1` to the source database of the export. Create an empty
      database and run `ops/catalog-import.sh <new db> <restore point>`.

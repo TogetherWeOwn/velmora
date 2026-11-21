@@ -53,7 +53,13 @@ if Path(sys.argv[0]).name == "rclone":
     assert args[0] == "copyto"
     source, dest = args[1:3]
     if source.startswith("r2x:"):
-        download(bucket / source.removeprefix("r2x:"), dest)
+        src = bucket / source.removeprefix("r2x:")
+        # Like rclone: without --ignore-times, a destination of the same
+        # size (and here, any time) counts as up to date and is skipped.
+        if ("--ignore-times" not in args and Path(dest).exists() and src.exists()
+                and Path(dest).stat().st_size == src.stat().st_size):
+            sys.exit(0)
+        download(src, dest)
     else:
         assert dest.startswith("r2x:")
         dest = bucket / dest.removeprefix("r2x:")
@@ -215,6 +221,13 @@ class CatalogueScripts(unittest.TestCase):
                 self.assertIn(name, result.stderr)
                 self.assertEqual(self.calls(), [])
                 self.assertEqual(list(self.bucket.rglob("*.manifest.json")), [])
+
+    def test_more_than_1000_parts_is_refused_before_any_upload(self):
+        self.env["VELMORA_EXPORT_PART_BYTES"] = "1"
+        result = self.run_script("export")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("more than 1000 parts", result.stderr)
+        self.assertEqual(list(self.bucket.rglob("*")), [])
 
     def test_failed_put(self):
         self.env["FAKE_FAIL_PUT"] = ".sql.zst.part-001"
