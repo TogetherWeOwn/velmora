@@ -495,8 +495,15 @@ class SegmentWriterTest(GeneratorCase):
             r'match optional_u64\(&get, "MAX_OBJECT_EXTENTS"\)\? \{\n\s*None => ([A-Z_]+),\n', config)
         self.assertEqual(len(arm), 1, "the Worker's read of MAX_OBJECT_EXTENTS has another shape")
         self.assertLessEqual(self.bridge_const(arm[0]), SINGLE_RECORD_EXTENTS, arm[0])
-        # Unset and empty are one case there, as they are here.
-        self.assertIn("/// An optional `u64`; unset or empty = `None`.\nfn optional_u64(", config)
+        # Unset and empty are one case there, as they are here: the
+        # function gives `None` for everything but a value that is not
+        # empty after a trim.
+        body = re.findall(r"\nfn optional_u64\([^{]*\{\n(.*?)\n\}\n", config, re.S)
+        self.assertEqual(len(body), 1)
+        arms = [line.strip() for line in body[0].split("\n")]
+        self.assertEqual(arms[0], "match get(name) {")
+        self.assertEqual(arms[1], "Some(v) if !v.trim().is_empty() => v")
+        self.assertEqual(arms[-2:], ["_ => Ok(None),", "}"])
 
     def test_the_writer_on_is_refused_with_the_flat_layout(self):
         for value in (
