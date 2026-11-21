@@ -604,11 +604,19 @@ requests in flight, and give rclone one connection per request:
   remote's section of `rclone.conf`: `upload_cutoff = 16M`,
   `chunk_size = 16M`, `upload_concurrency = 4`, `disable_http2 = true`;
   `--transfers` is a global flag, not an `rclone.conf` key).
-  - The upload concurrency is per file: rclone sends up to
-    `transfers x upload_concurrency` parts at once. Keep that product
-    near 16: `4 x 4` for a tree of many files, `--transfers 1
-    --s3-upload-concurrency 16` for one large file. More than 16
-    requests at once was not measured.
+  - The upload concurrency is per file and applies to multipart
+    uploads only: rclone sends up to `transfers x upload_concurrency`
+    parts at once, and one PutObject per transfer for a file below the
+    cutoff. Keep the requests in flight near 16:
+    - a tree of files above 16 MiB: `--transfers 4
+      --s3-upload-concurrency 4` (the line above);
+    - a tree of files below 16 MiB: `--transfers 16` (the upload
+      concurrency does not apply to them);
+    - one large file: `--transfers 1 --s3-upload-concurrency 16`;
+    - a mixed tree: `--transfers 16 --s3-upload-concurrency 1` keeps
+      16 requests for small files and large files alike.
+
+    More than 16 requests at once was not measured.
   - The global `--disable-http2` does the same for every remote of the
     command; `disable_http2` in the remote's section applies to this
     remote only.
