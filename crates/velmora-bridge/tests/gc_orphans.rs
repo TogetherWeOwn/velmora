@@ -11,6 +11,11 @@
 //! back: a recovery record a replay could still publish over its key.
 //! The model knows those from the writes it made fail, and at the end
 //! of every history the catalogue is lost and rebuilt from the records.
+//! For a part whose upload the catalogue no longer knows, the collector
+//! asks about the whole bucket once a day and keeps the answer. The
+//! model reads the kept answer back, holds it against the writes it had
+//! made fail when the answer was given, and expects the claims of that
+//! day to go by it, also under a record stored since.
 //!
 //! Everything runs as production does: `GC_MODE=off`, a bucket that is
 //! not disposable. One test turns both collectors on in a disposable
@@ -23,8 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use futures_util::FutureExt;
+use serde_json::{json, Value};
 use service_support::*;
-use velmora_bridge::config::{BridgeConfig, GcMode, ORPHAN_GRACE_MS};
+use velmora_bridge::config::{BridgeConfig, GcMode, Maintenance, ORPHAN_GRACE_MS};
 use velmora_bridge::jobs::{ORPHAN_BATCH, ORPHAN_SCAN};
 use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
 use velmora_bridge::sql::SqlCatalog;
@@ -34,8 +40,9 @@ use velmora_bridge::*;
 const BUCKET: &str = "vault";
 const HOUR: i64 = 60 * 60 * 1000;
 const DAY: i64 = 24 * HOUR;
-/// Past the rest between two passes of the scan.
-const REST: i64 = HOUR + 1;
+/// Past the rest between two passes of the scan, and past the time the
+/// answer about the marks of a bucket is kept.
+const REST: i64 = DAY + 1;
 /// One extent up to 8 KiB and slices of 4 KiB: a part above 8 KiB is
 /// several extents, the ones after the first in `upload_part_extents`.
 const EXTENT: usize = 8 * 1024;
@@ -304,6 +311,109 @@ impl T {
         jobs
     }
 
+    /// The scan starts a pass at the next cron run, whatever rest it
+    /// was in.
+    fn wake(&self) {
+        self.sql("DELETE FROM scan_cursors WHERE k = 'orphans'");
+    }
+
+    /// What the catalogue last found about the marks of the buckets:
+    /// the rows it keeps for a day (`clean:<ms>` or `marked:<ms>`).
+    fn verdicts(&self) -> Vec<String> {
+        self.catalog().sql.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT v FROM scan_cursors WHERE k LIKE 'orphans:bucket:%' ORDER BY k")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        })
+    }
+
+    /// The tables of the catalogue, in the order they were made.
+    fn tables(&self) -> Vec<String> {
+        self.catalog().sql.with_conn(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name <> 'tx_guard' \
+                       AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'at_%' ORDER BY rowid",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        })
+    }
+
+    /// Keeps the catalogue as it is now under a name: a state that Time
+    /// Travel can return to.
+    fn bookmark(&self, name: &str) {
+        for table in self.tables() {
+            self.sql(&format!(
+                "DROP TABLE IF EXISTS at_{name}_{table}; \
+                 CREATE TABLE at_{name}_{table} AS SELECT * FROM {table};"
+            ));
+        }
+    }
+
+    /// Every table is as it was at the bookmark: what a Time Travel
+    /// restore does. The tables that triggers keep come after the ones
+    /// they follow, so they end as they were too.
+    fn time_travel(&self, name: &str) {
+        self.sql("PRAGMA foreign_keys = OFF;");
+        for table in self.tables() {
+            self.sql(&format!(
+                "DELETE FROM {table}; INSERT INTO {table} SELECT * FROM at_{name}_{table};"
+            ));
+        }
+        self.sql("PRAGMA foreign_keys = ON;");
+    }
+
+    /// The restore route, from the first record to the last, with the
+    /// service in maintenance for it: the replay that follows a
+    /// restore, on the catalogue as it is.
+    async fn replay_in_place(&mut self) {
+        self.replay_taking(0).await;
+    }
+
+    /// The same, with `took` milliseconds between its first request and
+    /// the ones that follow.
+    async fn replay_taking(&mut self, took: i64) {
+        self.maintenance(Maintenance::Restore);
+        let started = self.now();
+        let mut body = json!({ "since_ms": 0 });
+        loop {
+            let mut req = Req {
+                method: Method::Post,
+                target: "/_admin/restore".to_string(),
+                headers: Vec::new(),
+                body: body.to_string().into_bytes(),
+            };
+            req.set_header("host", HOST);
+            req.set_header("content-length", &req.body.len().to_string());
+            let token = self.rig.bridge.cfg.admin_token.expose().to_string();
+            req.set_header("authorization", &format!("Bearer {token}"));
+            let r = self.rig.send(req).await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            let report: Value = serde_json::from_slice(&r.body).unwrap();
+            if report["next"].is_null() {
+                break;
+            }
+            if self.now() == started {
+                self.advance(took);
+            }
+            body = json!({ "cursor": report["next"] });
+        }
+        assert_eq!(self.now().0 - started.0, took);
+        assert_eq!(
+            self.count("SELECT finished_at - started_at FROM restore_state WHERE id = 1"),
+            took
+        );
+        self.maintenance(Maintenance::Off);
+    }
+
+    fn maintenance(&mut self, mode: Maintenance) {
+        Rc::get_mut(&mut self.rig.bridge).unwrap().cfg.maintenance = mode;
+    }
+
     /// What the GC job does with one row, through the catalogue.
     async fn collect(&self, row: &GcRow, cutoff: UnixMs) -> bool {
         self.collect_all(std::slice::from_ref(row), cutoff).await[0]
@@ -312,7 +422,7 @@ impl T {
     /// What the GC job does with the rows of a window, through the
     /// catalogue: one claim for all of them, then the blobs it granted.
     async fn collect_all(&self, rows: &[GcRow], cutoff: UnixMs) -> Vec<bool> {
-        let granted = self.catalog().gc_orphan_claim(rows, cutoff).await.unwrap();
+        let granted = claim_rows(self.catalog(), rows, self.now(), cutoff).await;
         assert_eq!(granted.len(), rows.len());
         for (row, _) in rows.iter().zip(&granted).filter(|(_, granted)| **granted) {
             self.rig
@@ -401,6 +511,18 @@ impl T {
         self.rig.grant(AKID, &bucket, Perm::Rw).await;
         last
     }
+}
+
+/// A claim that no error cuts short.
+async fn claim_rows<C: Catalog>(
+    catalog: &C,
+    rows: &[GcRow],
+    now: UnixMs,
+    cutoff: UnixMs,
+) -> Vec<bool> {
+    let (granted, claimed) = catalog.gc_orphan_claim(rows, now, cutoff).await;
+    claimed.unwrap();
+    granted
 }
 
 fn gc_row(id: i64, extent: &str) -> GcRow {
@@ -509,18 +631,29 @@ async fn a_dropped_part_goes_at_the_grace_period_and_not_a_millisecond_before() 
         0
     );
 
-    // At it: the replaced part and nothing else.
-    t.advance(REST);
+    // At it: the replaced part and nothing else. (A pass rests for a
+    // day; the scan is woken here, to show the millisecond.)
+    t.advance(1);
+    t.wake();
     t.pass().await;
     assert_eq!(t.blobs(), gone(&[&replaced]));
     // A day later the unlisted part, another day later the aborted ones.
-    t.rig.bridge.clock.set(t0.plus_ms(DAY + ORPHAN_GRACE_MS));
+    t.rig
+        .bridge
+        .clock
+        .set(t0.plus_ms(DAY + ORPHAN_GRACE_MS - 1));
+    t.wake();
+    t.pass().await;
+    assert_eq!(t.blobs(), gone(&[&replaced]));
+    t.advance(1);
+    t.wake();
     t.pass().await;
     assert_eq!(t.blobs(), gone(&[&replaced, &unlisted]));
     t.rig
         .bridge
         .clock
         .set(t0.plus_ms(2 * DAY + ORPHAN_GRACE_MS));
+    t.wake();
     t.pass().await;
     assert_eq!(t.blobs(), gone(&[&replaced, &unlisted, &aborted]));
 
@@ -709,12 +842,10 @@ async fn a_completion_racing_the_collector_loses_nothing() {
         "m/",
         Rc::new(move || {
             for extent in &listed {
-                let claimed = bridge
-                    .catalog
-                    .gc_orphan_claim(&[gc_row(orphan_row.id, extent)], cutoff)
+                let row = [gc_row(orphan_row.id, extent)];
+                let claimed = claim_rows(&bridge.catalog, &row, bridge.clock.now(), cutoff)
                     .now_or_never()
-                    .expect("the catalogue answers at once")
-                    .unwrap();
+                    .expect("the catalogue answers at once");
                 assert_eq!(claimed, [false], "a listed part was claimed");
             }
             let job = Job::Gc { v: 1 };
@@ -931,8 +1062,8 @@ async fn a_claim_proves_its_row_again() {
     let cutoff = t.cutoff();
     let catalog = t.catalog();
     let claim = |id: i64, extent: &str, cutoff: UnixMs| {
-        let row = gc_row(id, extent);
-        async move { catalog.gc_orphan_claim(&[row], cutoff).await.unwrap()[0] }
+        let (row, now) = (gc_row(id, extent), t.now());
+        async move { claim_rows(catalog, &[row], now, cutoff).await[0] }
     };
 
     // Too young by a millisecond; the row of another action; a row that
@@ -1090,13 +1221,13 @@ async fn the_read_that_sorts_the_rows_of_a_claim_proves_nothing() {
         (false, true) => (&rows[1], &rows[0]),
         both => panic!("{both:?}"),
     };
-    let (sql, all) = (&t.catalog().sql, &rows);
+    let (sql, all, now) = (&t.catalog().sql, &rows, t.now());
     let claim = |change: String| async move {
         let catalog = SqlCatalog::new(ChangedAfterRead {
             inner: sql,
             change: Cell::new(Some(change)),
         });
-        let granted = catalog.gc_orphan_claim(all, cutoff).await.unwrap();
+        let granted = claim_rows(&catalog, all, now, cutoff).await;
         assert!(catalog.sql.change.take().is_none());
         granted
     };
@@ -1125,7 +1256,11 @@ async fn the_read_that_sorts_the_rows_of_a_claim_proves_nothing() {
 
     // The extent is in another bucket after the read, one with a marked
     // key that an upload was begun on: the claim that was sorted into
-    // the first bucket is refused, behind a guard that passed.
+    // the first bucket is refused, behind a guard that passed (the
+    // first bucket is asked about again, and found clean).
+    assert_eq!(t.verdicts().len(), 1);
+    assert!(t.verdicts()[0].starts_with("marked:"));
+    t.sql("DELETE FROM scan_cursors WHERE k LIKE 'orphans:bucket:%'");
     let granted = claim(format!(
         "UPDATE extents SET bucket_id = '{other}' WHERE id = '{in_bucket}'; \
          INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
@@ -1139,6 +1274,7 @@ async fn the_read_that_sorts_the_rows_of_a_claim_proves_nothing() {
     .await;
     let expect: Vec<bool> = rows.iter().map(|r| r.id == of_upload.id).collect();
     assert_eq!(granted, expect);
+    assert_eq!(t.verdicts(), [format!("clean:{}", now.0)]);
     assert_eq!(held(), 2);
     assert_eq!(t.blobs().len(), 3);
 }
@@ -1185,6 +1321,446 @@ async fn a_marked_key_holds_back_the_parts_of_its_own_bucket_only() {
         assert_eq!(granted, expect, "{marked}");
         assert_eq!(granted.iter().filter(|g| **g).count(), 1);
     }
+}
+// ---------------------------------------------------------------------------
+// The answer about the marks of a bucket, kept for a day
+// ---------------------------------------------------------------------------
+
+/// An upload on `key` with one part that was uploaded again: the older
+/// bytes are a part whose upload the catalogue no longer knows. Returns
+/// their blob.
+async fn replaced_part(t: &T, key: &str, seed: u8) -> String {
+    let before = t.blobs();
+    let id = t.create(key).await;
+    t.part(key, &id, 1, &pattern(seed, 100)).await;
+    let old: Vec<String> = t.blobs().difference(&before).cloned().collect();
+    t.part(key, &id, 1, &pattern(seed + 1, 100)).await;
+    assert_eq!(old.len(), 1);
+    old.into_iter().next().unwrap()
+}
+
+/// The open `delete_safety` row of a blob.
+fn row_of(t: &T, blob: &str) -> GcRow {
+    let queued = t.queued();
+    let q = queued
+        .iter()
+        .find(|q| blob_of(&q.extent) == blob && q.action == "delete_safety")
+        .unwrap();
+    gc_row(q.id, &q.extent)
+}
+
+/// A bucket with a marked key is asked once, and for the rest of the
+/// day its parts of unknown uploads are refused without a statement
+/// that writes or reads the uploads. Settling the key frees them with
+/// the next answer, a day after the last.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bucket_with_a_marked_key_is_asked_once_a_day() {
+    let t = setup().await;
+    let old = replaced_part(&t, "k", 1).await;
+    // A completion on another key of the bucket fails after it stored
+    // its record.
+    let other = t.create("other").await;
+    let etag = t.part("other", &other, 1, &pattern(9, 100)).await;
+    t.complete_lost("other", &other, &[(1, &etag)]).await;
+    assert_eq!(t.count(MARKS), 1);
+    t.advance(ORPHAN_GRACE_MS);
+    let (asked, cutoff) = (t.now(), t.cutoff());
+    let row = row_of(&t, &old);
+
+    assert!(t.verdicts().is_empty());
+    assert!(!t.collect(&row, cutoff).await);
+    assert_eq!(t.verdicts(), [format!("marked:{}", asked.0)]);
+    // Asked again the same day: no batch at all.
+    let sql = &t.catalog().sql;
+    sql.reset_write_steps();
+    t.advance(DAY - 1);
+    assert!(!t.collect(&row, t.cutoff()).await);
+    assert_eq!(sql.write_steps(), 0);
+    // The key is settled. The answer of the day stands.
+    t.delete("other").await;
+    assert_eq!(t.count(MARKS), 0);
+    assert!(!t.collect(&row, t.cutoff()).await);
+    assert_eq!(t.verdicts(), [format!("marked:{}", asked.0)]);
+    // A day after it the bucket is asked again, and the part goes.
+    t.advance(1);
+    assert!(t.collect(&row, t.cutoff()).await);
+    assert_eq!(t.verdicts(), [format!("clean:{}", t.now().0)]);
+    assert!(!t.blobs().contains(&old));
+}
+
+/// A mark that is raised after the bucket was found clean holds back
+/// nothing that day, and need not: its record was stored now, from a
+/// part list that the part dropped 31 days ago is not in. The replay
+/// makes an object of that record, and it reads.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mark_raised_after_the_answer_names_no_part_dropped_before_it() {
+    let t = setup().await;
+    let first = replaced_part(&t, "k", 1).await;
+    let second = replaced_part(&t, "k", 3).await;
+    t.advance(ORPHAN_GRACE_MS);
+    let cutoff = t.cutoff();
+    assert!(t.collect(&row_of(&t, &first), cutoff).await);
+    assert_eq!(t.verdicts(), [format!("clean:{}", t.now().0)]);
+
+    // An hour later a completion on the same key fails after it stored
+    // its record: the key is marked, and the record names the parts
+    // that upload lists now.
+    t.advance(HOUR);
+    let id = t.create("k").await;
+    let body = pattern(7, 300);
+    let etag = t.part("k", &id, 1, &body).await;
+    t.complete_lost("k", &id, &[(1, &etag)]).await;
+    assert_eq!(t.count(MARKS), 1);
+    // The other old part goes by the answer of an hour ago.
+    assert!(t.collect(&row_of(&t, &second), cutoff).await);
+    assert!(!t.blobs().contains(&second));
+    // A part of the marked upload itself does not: its upload is known,
+    // and that check is made by the claim.
+    t.abort("k", &id).await;
+    t.advance(ORPHAN_GRACE_MS - HOUR);
+    for q in t.queued().iter().filter(|q| !q.done) {
+        assert!(!t.collect(&gc_row(q.id, &q.extent), t.cutoff()).await);
+    }
+
+    let report = t.restore().await;
+    assert_eq!(report.damaged_total, 0, "{report:?}");
+    assert!(t.get("k").await == body);
+}
+
+/// The claim does not lean on what it read about the answer: the batch
+/// proves that the row says clean, and young enough.
+#[tokio::test(flavor = "current_thread")]
+async fn the_answer_about_a_bucket_is_proved_by_the_batch_of_the_claim() {
+    let t = setup().await;
+    let blobs = [
+        replaced_part(&t, "a", 1).await,
+        replaced_part(&t, "b", 3).await,
+        replaced_part(&t, "c", 5).await,
+        replaced_part(&t, "d", 7).await,
+    ];
+    t.advance(ORPHAN_GRACE_MS);
+    let (now, cutoff) = (t.now(), t.cutoff());
+    // The bucket is found clean.
+    assert!(t.collect(&row_of(&t, &blobs[0]), cutoff).await);
+    let clean = format!("clean:{}", now.0);
+    assert_eq!(t.verdicts(), std::slice::from_ref(&clean));
+
+    // An answer from a time that is still to come is not used: the
+    // bucket is asked about again.
+    t.sql(&format!(
+        "UPDATE scan_cursors SET v = 'marked:{}' WHERE k LIKE 'orphans:bucket:%'",
+        now.0 + 1
+    ));
+    assert!(t.collect(&row_of(&t, &blobs[3]), cutoff).await);
+    assert_eq!(t.verdicts(), std::slice::from_ref(&clean));
+
+    // Between the read of a claim and its batch the row comes to say
+    // something else: marked, clean a day ago, nothing a number can be
+    // read from, a word that is not "clean" before a time, or it is
+    // gone.
+    let stale = now.0 - DAY;
+    let changes = [
+        format!(
+            "UPDATE scan_cursors SET v = 'marked:{}' WHERE k LIKE 'orphans:bucket:%'",
+            now.0
+        ),
+        format!("UPDATE scan_cursors SET v = 'clean:{stale}' WHERE k LIKE 'orphans:bucket:%'"),
+        "UPDATE scan_cursors SET v = 'clean:' WHERE k LIKE 'orphans:bucket:%'".to_string(),
+        format!(
+            "UPDATE scan_cursors SET v = 'dirty:{}' WHERE k LIKE 'orphans:bucket:%'",
+            now.0
+        ),
+        "UPDATE scan_cursors SET v = 'cleaner:9007199254740991' WHERE k LIKE 'orphans:bucket:%'"
+            .to_string(),
+        "DELETE FROM scan_cursors WHERE k LIKE 'orphans:bucket:%'".to_string(),
+    ];
+    let row = row_of(&t, &blobs[1]);
+    for change in changes {
+        t.sql(&format!(
+            "UPDATE scan_cursors SET v = '{clean}' WHERE k LIKE 'orphans:bucket:%'"
+        ));
+        let catalog = SqlCatalog::new(ChangedAfterRead {
+            inner: &t.catalog().sql,
+            change: Cell::new(Some(change.clone())),
+        });
+        let granted = claim_rows(&catalog, std::slice::from_ref(&row), now, cutoff).await;
+        assert!(catalog.sql.change.take().is_none());
+        assert_eq!(granted, [false], "{change}");
+    }
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM extents WHERE safety_state = 'deleted'"),
+        2
+    );
+    // One millisecond younger than a day is young enough.
+    t.sql(&format!(
+        "INSERT INTO scan_cursors(k, v) SELECT 'orphans:bucket:' || id, 'clean:{}' FROM buckets \
+         WHERE true ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        stale + 1
+    ));
+    assert!(t.collect(&row, cutoff).await);
+    assert_eq!(t.verdicts(), [format!("clean:{}", stale + 1)]);
+}
+
+// ---------------------------------------------------------------------------
+// After a replay
+// ---------------------------------------------------------------------------
+
+/// What `undone_restore` leaves.
+struct Undone {
+    /// The older bytes of part 1, dropped on the history that was kept.
+    old: String,
+    dropped: UnixMs,
+    /// When the replay after the undoing ended.
+    ended: UnixMs,
+    /// The upload as the history that was left has it: its id, the
+    /// ETag of its part 1, and that part's bytes (the older ones).
+    id: String,
+    etag: String,
+    body: Vec<u8>,
+}
+
+/// The history that one history of the database cannot have:
+///
+/// - day 9: an upload is open, with two parts;
+/// - day 10: part 1 is uploaded again, and its older bytes are dropped;
+/// - day 10.5: the database is taken back to day 9, where the upload
+///   lists the older bytes, and replayed. The service runs on;
+/// - day 11.9: the state `left`;
+/// - day 12: the restore is undone (the database is taken back to day
+///   10.5 less a moment) and replayed, which takes the hour before day
+///   12. The drop of day 10 is back.
+///
+/// Time Travel reaches `left` until day 41.9.
+async fn undone_restore(t: &mut T) -> Undone {
+    let before = t.blobs();
+    let id = t.create("k").await;
+    let (body, b) = (pattern(1, 700), pattern(2, 900));
+    let etag = t.part("k", &id, 1, &body).await;
+    let old: Vec<String> = t.blobs().difference(&before).cloned().collect();
+    assert_eq!(old.len(), 1);
+    t.part("k", &id, 2, &b).await;
+    t.pass().await;
+    t.bookmark("day9");
+
+    t.advance(DAY);
+    let dropped = t.now();
+    t.part("k", &id, 1, &pattern(3, 700)).await;
+    t.pass().await;
+    t.advance(DAY / 2 - 1);
+    t.bookmark("day10");
+    t.advance(1);
+
+    // Taken back to day 9. The cron run finds the catalogue behind its
+    // stamp, and the replay opens it again.
+    let behind = |t: &T| {
+        t.rig.bridge.jobs.inner.take();
+        let report = t.rig.bridge.dispatch().now_or_never().unwrap().unwrap();
+        report.rolled_back
+    };
+    t.time_travel("day9");
+    assert!(behind(t));
+    t.replay_in_place().await;
+    assert!(!behind(t));
+    t.advance(DAY + 4 * DAY / 10);
+    t.pass().await;
+    t.bookmark("left");
+    t.advance(DAY / 10 - HOUR);
+
+    // The restore is undone. The replay takes an hour, and it is from
+    // its end that the collector waits.
+    t.time_travel("day10");
+    assert!(behind(t));
+    t.replay_taking(HOUR).await;
+    assert!(!behind(t));
+    let ended = UnixMs(t.count("SELECT finished_at FROM restore_state WHERE state = 'complete'"));
+    assert_eq!(ended, t.now());
+    assert_eq!(ended.0 - dropped.0, 2 * DAY);
+    Undone {
+        old: old.into_iter().next().unwrap(),
+        dropped,
+        ended,
+        id,
+        etag,
+        body,
+    }
+}
+
+/// After a replay the collector waits the grace period once more, to
+/// the millisecond: a part dropped 31 days ago stays until the replay
+/// ended 31 days ago as well.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replay_holds_the_collector_for_the_grace_period() {
+    let mut t = setup().await;
+    let u = undone_restore(&mut t).await;
+    let row = row_of(&t, &u.old);
+    let all = t.blobs();
+
+    // The part was dropped 31 days ago, and more.
+    for at in [
+        u.dropped.plus_ms(ORPHAN_GRACE_MS),
+        u.dropped.plus_ms(ORPHAN_GRACE_MS + DAY),
+        u.ended.plus_ms(ORPHAN_GRACE_MS - 1),
+    ] {
+        t.rig.bridge.clock.set(at);
+        t.wake();
+        t.pass().await;
+        assert_eq!(t.blobs(), all, "{at:?}");
+        assert!(!t.collect(&row, t.cutoff()).await);
+        // No answer about the bucket is asked for or kept meanwhile.
+        assert!(t.verdicts().is_empty());
+    }
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM extents WHERE safety_state = 'deleted'"),
+        0
+    );
+    t.advance(1);
+    t.wake();
+    t.pass().await;
+    let mut left = all.clone();
+    assert!(left.remove(&u.old));
+    assert_eq!(t.blobs(), left);
+}
+
+/// Why it waits. On the day the part has been dropped for 31 days, the
+/// history that the undone restore left is 29 days old: the database is
+/// taken back to it, the upload there lists the older bytes of part 1,
+/// and it completes with them and reads back.
+#[tokio::test(flavor = "current_thread")]
+async fn a_history_left_by_an_undone_restore_still_reads_its_parts() {
+    let mut t = setup().await;
+    let u = undone_restore(&mut t).await;
+    t.rig.bridge.clock.set(u.dropped.plus_ms(ORPHAN_GRACE_MS));
+    t.wake();
+    t.pass().await;
+    assert!(t.blobs().contains(&u.old));
+
+    t.time_travel("left");
+    t.rig.bridge.jobs.inner.take();
+    assert!(t.rig.bridge.dispatch().await.unwrap().rolled_back);
+    t.replay_in_place().await;
+    t.complete("k", &u.id, &[(1, &u.etag)]).await;
+    assert!(t.get("k").await == u.body);
+}
+
+// ---------------------------------------------------------------------------
+// A claim that an error cuts short
+// ---------------------------------------------------------------------------
+
+/// The catalogue of a test, with one batch that fails: the one after
+/// `pass` batches that went through.
+struct FailsABatch<'a> {
+    inner: &'a FailSql,
+    pass: Cell<Option<u32>>,
+}
+
+impl Sql for FailsABatch<'_> {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.inner.query(sql, params).await
+    }
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.inner.exec(sql, params).await
+    }
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        match self.pass.get() {
+            Some(0) => {
+                self.pass.set(None);
+                Err(BridgeError::Sql("database down".into()))
+            }
+            pass => {
+                self.pass.set(pass.map(|n| n - 1));
+                self.inner.batch(stmts).await
+            }
+        }
+    }
+}
+
+/// The rows of a window are claimed in more than one batch. When a
+/// later one fails, the claims that went through are answered as
+/// granted, with the error: the catalogue says those copies are gone,
+/// so they must go now and not wait for a pass that finds them again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_claim_that_an_error_cuts_short_keeps_what_it_granted() {
+    // The batch that fails: the one that asks about the bucket, then
+    // the one that claims behind the answer.
+    for pass in [1, 2] {
+        let t = setup().await;
+        // A part of a known upload, and one of an unknown.
+        let before = t.blobs();
+        let id = t.create("a").await;
+        t.part("a", &id, 1, &pattern(1, 100)).await;
+        t.abort("a", &id).await;
+        let known: Vec<String> = t.blobs().difference(&before).cloned().collect();
+        let unknown = replaced_part(&t, "b", 3).await;
+        t.advance(ORPHAN_GRACE_MS);
+        let (now, cutoff) = (t.now(), t.cutoff());
+        let rows = [row_of(&t, &unknown), row_of(&t, &known[0])];
+
+        let catalog = SqlCatalog::new(FailsABatch {
+            inner: &t.catalog().sql,
+            pass: Cell::new(Some(pass)),
+        });
+        let (granted, claimed) = catalog.gc_orphan_claim(&rows, now, cutoff).await;
+        assert!(matches!(claimed, Err(BridgeError::Sql(_))), "{claimed:?}");
+        assert!(catalog.sql.pass.get().is_none());
+        assert_eq!(granted, [false, true], "batch {pass}");
+        assert_eq!(
+            t.count("SELECT COUNT(*) FROM extents WHERE safety_state = 'deleted'"),
+            1
+        );
+        // The row that was not reached goes with a later claim.
+        assert_eq!(t.collect_all(&rows, cutoff).await, [true, true]);
+    }
+}
+/// The same through the job. It deletes the copies that its claim was
+/// granted, closes their rows, and asks to run again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_job_whose_claim_an_error_cuts_short_deletes_what_was_granted() {
+    let t = setup().await;
+    let before = t.blobs();
+    let id = t.create("a").await;
+    t.part("a", &id, 1, &pattern(1, 100)).await;
+    t.abort("a", &id).await;
+    let known: BTreeSet<String> = t.blobs().difference(&before).cloned().collect();
+    let unknown = replaced_part(&t, "b", 3).await;
+    // The upload on `b` is open, and keeps the bytes of now.
+    let kept: BTreeSet<String> = t
+        .blobs()
+        .into_iter()
+        .filter(|blob| !known.contains(blob))
+        .collect();
+    t.advance(ORPHAN_GRACE_MS);
+    // The database fails the batch that keeps the answer about a bucket.
+    t.sql(
+        "CREATE TRIGGER down BEFORE INSERT ON scan_cursors WHEN NEW.k LIKE 'orphans:bucket:%' \
+         BEGIN SELECT RAISE(ABORT, 'database down'); END;",
+    );
+
+    t.rig.bridge.jobs.inner.take();
+    assert!(t.rig.bridge.dispatch().await.unwrap().gc_enqueued);
+    let job = t.rig.bridge.jobs.inner.take().remove(0).job;
+    assert!(matches!(
+        t.rig.bridge.run_job(&job).await,
+        JobOutcome::Retry { .. }
+    ));
+    // The part of the aborted upload went, and its row is closed.
+    assert_eq!(t.blobs(), kept);
+    assert!(kept.contains(&unknown));
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM extents WHERE safety_state = 'deleted'"),
+        1
+    );
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM gc WHERE done_at IS NOT NULL AND action = 'delete_safety'"),
+        1
+    );
+
+    // The other goes with the next pass.
+    t.sql("DROP TRIGGER down;");
+    t.advance(REST);
+    t.pass().await;
+    let mut left = kept.clone();
+    assert!(left.remove(&unknown));
+    assert_eq!(t.blobs(), left);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1361,9 +1937,9 @@ async fn a_pass_steps_over_the_rows_of_deleted_objects_a_window_at_a_time() {
         t.count("SELECT COUNT(*) FROM gc WHERE done_at IS NOT NULL"),
         3
     );
-    // The scan rests: no job until the hour is over.
+    // The scan rests: no job until the day is over.
     assert!(!t.tick().await);
-    t.advance(HOUR - 1);
+    t.advance(DAY - 1);
     assert!(!t.tick().await);
     t.advance(1);
     assert!(t.tick().await);
@@ -1429,8 +2005,8 @@ async fn both_collectors_on_one_row() {
     assert_eq!(rows.len(), 4);
     let catalog = t.catalog();
     let claim = |row: &GcRow| {
-        let row = row.clone();
-        async move { catalog.gc_orphan_claim(&[row], cutoff).await.unwrap()[0] }
+        let (row, now) = (row.clone(), t.now());
+        async move { claim_rows(catalog, &[row], now, cutoff).await[0] }
     };
     let begins = |row: &GcRow| {
         let row = row.clone();
@@ -1502,16 +2078,20 @@ async fn both_collectors_on_one_row() {
 // ---------------------------------------------------------------------------
 
 /// The parts whose upload is not known (here: each uploaded twice) need
-/// the one statement that reads every upload of the catalogue. A window
-/// runs it once, however many such parts it holds: with a thousand more
-/// uploads in the catalogue, its claims cost a few steps per upload
-/// more, and not that for every part.
+/// the one statement that reads every upload of the catalogue. It runs
+/// once a day for a bucket, however many such parts and windows there
+/// are: with a thousand more uploads in the catalogue, the first claim
+/// of a day costs a few steps per upload more, and the claims of the
+/// rest of that day cost what they cost without them.
 #[tokio::test(flavor = "current_thread")]
-async fn the_uploads_are_read_once_for_a_window_and_not_once_for_a_part() {
+async fn the_uploads_of_a_bucket_are_read_once_a_day() {
     const PARTS: u16 = 40;
     const UPLOADS: u64 = 1000;
+    // When the windows are claimed, from the first: the same
+    // millisecond, the last one of that day, the first of the next.
+    const AT: [i64; 4] = [0, 0, DAY - 1, DAY];
     let mut cost = Vec::new();
-    for (uploads, one_by_one) in [(0, false), (UPLOADS, false), (UPLOADS, true)] {
+    for uploads in [0, UPLOADS] {
         let t = setup().await;
         let id = t.create("k").await;
         for n in 1..=PARTS {
@@ -1527,43 +2107,42 @@ async fn the_uploads_are_read_once_for_a_window_and_not_once_for_a_part() {
                     printf('old/%d', i), '{{}}', '{{}}', 'aborted', 1 FROM n WHERE {uploads} > 0"
         ));
         t.advance(ORPHAN_GRACE_MS);
-        let (now, cutoff) = (t.now(), t.cutoff());
+        let start = t.now();
         let rows = t
             .catalog()
-            .gc_orphans(now, cutoff, ORPHAN_SCAN, ORPHAN_BATCH)
+            .gc_orphans(start, t.cutoff(), ORPHAN_SCAN, ORPHAN_BATCH)
             .await
             .unwrap();
         assert_eq!(rows.len(), usize::from(PARTS));
         let sql = &t.catalog().sql;
-        sql.reset_read_stats();
-        sql.reset_write_steps();
-        let granted = if one_by_one {
-            let mut granted = Vec::new();
-            for row in &rows {
-                let row = std::slice::from_ref(row);
-                granted.extend(t.catalog().gc_orphan_claim(row, cutoff).await.unwrap());
-            }
-            granted
-        } else {
-            let granted = t.catalog().gc_orphan_claim(&rows, cutoff).await.unwrap();
-            // One read sorts the rows, and one batch claims them.
+        let mut steps = Vec::new();
+        for (window, at) in rows.chunks(rows.len() / AT.len()).zip(AT) {
+            t.rig.bridge.clock.set(start.plus_ms(at));
+            sql.reset_read_stats();
+            sql.reset_write_steps();
+            let granted = claim_rows(t.catalog(), window, t.now(), t.cutoff()).await;
+            assert_eq!(granted, vec![true; window.len()]);
+            // One read sorts the rows.
             assert_eq!(sql.read_stats().queries, 1);
-            granted
-        };
-        assert_eq!(granted, vec![true; rows.len()]);
-        cost.push(sql.write_steps());
+            steps.push(sql.write_steps());
+        }
+        assert_eq!(steps.len(), AT.len());
+        // The answer of the first day, then the one of the second.
+        assert_eq!(t.verdicts(), [format!("clean:{}", start.0 + DAY)]);
+        cost.push(steps);
     }
-    let [few, many, one_by_one] = cost[..] else {
-        unreachable!()
-    };
+    let (few, many) = (&cost[0], &cost[1]);
     println!(
-        "steps of the claims of {PARTS} parts: {few} with 1 upload, {many} with {UPLOADS} more, \
-         {one_by_one} for those when each part is claimed in a call of its own"
+        "steps of four claims of {} parts each, the last a day after the first: {few:?} with 1 \
+         upload, {many:?} with {UPLOADS} more",
+        usize::from(PARTS) / AT.len()
     );
-    let per_upload = (many - few) / UPLOADS;
-    assert!((1..=30).contains(&per_upload), "{few} {many}");
-    // What it must not cost: a read of the uploads for every part.
-    assert!(one_by_one - few > u64::from(PARTS) / 2 * (many - few));
+    let more: Vec<u64> = many.iter().zip(few).map(|(many, few)| many - few).collect();
+    for asked in [more[0], more[3]] {
+        assert!((1..=30).contains(&(asked / UPLOADS)), "{few:?} {many:?}");
+    }
+    // What it must not cost: a read of the uploads for every window.
+    assert_eq!(more[1..3], [0, 0], "{few:?} {many:?}");
 }
 
 /// What D1 bills for one collected part, on the schema of today and on
@@ -1669,6 +2248,7 @@ struct Upload {
 }
 
 /// The blob of a dropped part.
+#[derive(Clone, Copy)]
 struct Orphan {
     dropped: i64,
     /// The key of its upload.
@@ -1709,6 +2289,14 @@ struct Model {
     /// Of those, the ones for an orphan old enough that a lingering
     /// record held back.
     held: usize,
+    /// What the collector was last told about the marks of the bucket,
+    /// and when: (the time, no key of an upload was marked).
+    answer: Option<(i64, bool)>,
+    /// Old enough parts of unknown uploads that an answer of the day
+    /// let go under a mark raised since, and ones that it held back
+    /// after the last mark was gone.
+    let_go_by_answer: usize,
+    held_by_answer: usize,
 }
 
 /// Keys of uploads, and one that only ever sees whole objects.
@@ -1783,13 +2371,63 @@ impl Model {
         }
     }
 
-    /// Point 7 of the rule, in the model's words.
-    fn free(&self, orphan: &Orphan) -> bool {
+    /// No key that an upload was ever begun on is marked.
+    fn clean(&self) -> bool {
+        !self.marked.iter().any(|key| self.uploaded.contains(key))
+    }
+
+    /// Point 7 of the rule by the marks of now, in the model's words.
+    fn free_now(&self, orphan: &Orphan) -> bool {
         if orphan.known {
             !self.marked.contains(orphan.key)
         } else {
-            !self.marked.iter().any(|key| self.uploaded.contains(key))
+            self.clean()
         }
+    }
+
+    /// The answer about the bucket that the catalogue keeps, after a
+    /// claim at the time of now. It changes only when the last one is a
+    /// day old, and then it is what the marks of now say.
+    #[track_caller]
+    fn asked(&mut self, t: &T) {
+        let now = t.now().0;
+        let have = match &t.verdicts()[..] {
+            [] => None,
+            [one] => {
+                let (word, at) = one.split_once(':').unwrap();
+                assert!(matches!(word, "clean" | "marked"), "{one}");
+                Some((at.parse::<i64>().unwrap(), word == "clean"))
+            }
+            more => panic!("{more:?}"),
+        };
+        if have != self.answer {
+            let last = self.answer.map(|(at, _)| at);
+            assert!(last.is_none_or(|at| at <= now - DAY), "{last:?} {have:?}");
+            assert_eq!(have, Some((now, self.clean())));
+            self.answer = have;
+        }
+    }
+
+    /// Point 7 of the rule for an old enough part that a claim at the
+    /// time of now named, after that claim. A part of a known upload
+    /// goes by the mark of its key. One of an unknown upload goes by
+    /// the answer about the bucket, which by then is a day old at most.
+    #[track_caller]
+    fn free(&mut self, orphan: &Orphan, now: UnixMs) -> bool {
+        if orphan.known {
+            return !self.marked.contains(orphan.key);
+        }
+        let (at, clean) = self.answer.expect("nothing asked about the bucket");
+        assert!(
+            now.0 - DAY < at && at <= now.0,
+            "an answer of {at} at {now:?}"
+        );
+        match (clean, self.clean()) {
+            (true, false) => self.let_go_by_answer += 1,
+            (false, true) => self.held_by_answer += 1,
+            _ => {}
+        }
+        clean
     }
 
     /// The orphans old enough at `cutoff` that are still there.
@@ -1801,10 +2439,10 @@ impl Model {
             .collect()
     }
 
-    /// The ones of them the collector must take.
-    fn due(&self, cutoff: UnixMs) -> BTreeSet<String> {
+    /// The ones of them that no mark of now holds back.
+    fn due_now(&self, cutoff: UnixMs) -> BTreeSet<String> {
         let mut ripe = self.ripe(cutoff);
-        ripe.retain(|blob| self.free(&self.orphans[blob]));
+        ripe.retain(|blob| self.free_now(&self.orphans[blob]));
         ripe
     }
 
@@ -1999,17 +2637,13 @@ impl Model {
         match dice.roll(4) {
             // Whole passes of the job, as the cron runs them.
             0 => {
-                for _ in 0..2 {
-                    t.advance(REST);
-                    t.pass().await;
-                }
-                self.passed(t, "pass");
+                self.passes(t, "pass").await;
                 "pass"
             }
             // Whole passes through the catalogue, in small windows.
             1 => {
                 let (scan, limit) = (1 + dice.roll(9) as u32, 1 + dice.roll(4) as u32);
-                for _ in 0..2 {
+                for whole in [false, true] {
                     t.advance(REST);
                     let (now, cutoff) = (t.now(), t.cutoff());
                     let mut windows = 0;
@@ -2026,19 +2660,26 @@ impl Model {
                         windows += 1;
                         assert!(windows < 100_000);
                     }
+                    self.passed(t, whole, "windows");
                 }
-                self.passed(t, "windows");
                 "windows"
             }
             // A window is read, S3 calls run, and only then are its
-            // rows claimed: what a job does that was slow.
+            // rows claimed: what a job does that was slow. Half of the
+            // time its first row is claimed before the calls, so the
+            // bucket may be asked about before them and the answer
+            // used after.
             2 => {
                 let (now, cutoff) = (t.now(), t.cutoff());
-                let rows = t
+                let mut rows = t
                     .catalog()
                     .gc_orphans(now, cutoff, ORPHAN_SCAN, 5)
                     .await
                     .unwrap();
+                if dice.roll(2) == 0 && !rows.is_empty() {
+                    let first = rows.remove(0);
+                    self.take(t, &first, cutoff, "window").await;
+                }
                 for _ in 0..1 + dice.roll(4) {
                     self.write(t, dice).await;
                 }
@@ -2050,8 +2691,8 @@ impl Model {
             // A claim for every row there is, and for extents under
             // rows that are not theirs.
             _ => {
-                let cutoff = t.cutoff();
-                let (ripe, due) = (self.ripe(cutoff), self.due(cutoff));
+                let (now, cutoff) = (t.now(), t.cutoff());
+                let (ripe, due) = (self.ripe(cutoff), self.due_now(cutoff));
                 let queued = t.queued();
                 // First the extents under rows that are not theirs,
                 // while those rows are open.
@@ -2082,6 +2723,7 @@ impl Model {
                     }
                     answers
                 };
+                self.asked(t);
                 for ((_, q, crossed), did) in asked.iter().zip(answers) {
                     if *crossed {
                         assert!(!did, "an extent went under the row of another: {q:?}");
@@ -2090,7 +2732,12 @@ impl Model {
                     }
                     let blob = blob_of(&q.extent);
                     let open = !q.done && q.action == "delete_safety";
-                    assert_eq!(did, open && due.contains(&blob), "{q:?}");
+                    let old_enough = open && ripe.contains(&blob);
+                    let free = old_enough && {
+                        let orphan = self.orphans[&blob];
+                        self.free(&orphan, now)
+                    };
+                    assert_eq!(did, free, "{q:?}");
                     if did {
                         self.collected.insert(blob);
                     } else {
@@ -2105,18 +2752,21 @@ impl Model {
 
     /// A row the scan returned: it is a ripe orphan. Its claim goes
     /// through whatever ran since, unless a record lingers over it by
-    /// now. Returns whether it went through.
+    /// now, or did when the bucket was last asked about. Returns
+    /// whether it went through.
     async fn take(&mut self, t: &T, row: &GcRow, cutoff: UnixMs, what: &str) -> bool {
         let blob = row.extent_id.safety_key();
-        let orphan = self.orphans.get(&blob);
+        let orphan = self.orphans.get(&blob).copied();
         let dropped = orphan.map(|o| o.dropped);
         assert!(
             dropped.is_some_and(|at| at <= cutoff.0),
             "{what}: the scan returned {blob}, dropped at {dropped:?}, cutoff {cutoff:?}"
         );
         assert_eq!(row.due_at.0, dropped.unwrap());
-        let free = self.free(orphan.unwrap());
-        assert_eq!(t.collect(row, cutoff).await, free, "{what}: {blob}");
+        let did = t.collect(row, cutoff).await;
+        self.asked(t);
+        let free = self.free(&orphan.unwrap(), t.now());
+        assert_eq!(did, free, "{what}: {blob}");
         if free {
             self.collected.insert(blob);
         } else {
@@ -2126,11 +2776,32 @@ impl Model {
         free
     }
 
-    /// After whole passes at the time of now: every orphan that was due
-    /// went, and nothing else.
-    fn passed(&mut self, t: &T, what: &str) {
-        let due = self.due(t.cutoff());
-        self.collected.extend(due);
+    /// Two passes of the job, as the cron runs them, a rest apart. The
+    /// first is the rest of the pass that the windows read before it
+    /// left off; the second is a whole one.
+    async fn passes(&mut self, t: &T, what: &str) {
+        for whole in [false, true] {
+            t.advance(REST);
+            t.pass().await;
+            self.passed(t, whole, what);
+        }
+    }
+
+    /// After a pass at the time of now. Whatever went was an orphan
+    /// that was due; after a whole pass every orphan that was due went.
+    fn passed(&mut self, t: &T, whole: bool, what: &str) {
+        let (now, cutoff) = (t.now(), t.cutoff());
+        self.asked(t);
+        let have = t.blobs();
+        for blob in self.ripe(cutoff) {
+            if !whole && have.contains(&blob) {
+                continue;
+            }
+            let orphan = self.orphans[&blob];
+            if self.free(&orphan, now) {
+                self.collected.insert(blob);
+            }
+        }
         self.check_blobs(t, what);
     }
 
@@ -2183,6 +2854,8 @@ struct Tally {
     /// and the objects the replay made of lingering records.
     kept: usize,
     revived: usize,
+    let_go_by_answer: usize,
+    held_by_answer: usize,
 }
 
 /// One history.
@@ -2223,14 +2896,9 @@ async fn history(seed: u64, steps: u32) -> Tally {
     // record holds back, and nothing else ever does.
     let end = |m: &mut Model, what: &str| {
         t.advance(ORPHAN_GRACE_MS);
-        let passes = async {
-            for _ in 0..2 {
-                t.advance(REST);
-                t.pass().await;
-            }
-        };
+        let what = format!("seed {seed} {what}");
+        let passes = m.passes(&t, &what);
         passes.now_or_never().expect("nothing waits in a pass");
-        m.passed(&t, &format!("seed {seed} {what}"));
         m.check_catalogue(&t);
     };
     end(&mut m, "end");
@@ -2239,7 +2907,7 @@ async fn history(seed: u64, steps: u32) -> Tally {
         .orphans
         .iter()
         .filter(|(blob, _)| !m.collected.contains(*blob));
-    assert_eq!(left.filter(|(_, o)| !m.free(o)).count(), kept);
+    assert_eq!(left.filter(|(_, o)| !m.free_now(o)).count(), kept);
     // Half of the histories go on: the keys are written or deleted,
     // and then every dropped part goes.
     if seed.is_multiple_of(2) {
@@ -2291,6 +2959,8 @@ async fn history(seed: u64, steps: u32) -> Tally {
         held: m.held,
         kept,
         revived,
+        let_go_by_answer: m.let_go_by_answer,
+        held_by_answer: m.held_by_answer,
     }
 }
 
@@ -2307,6 +2977,8 @@ async fn random_histories_delete_exactly_the_dropped_parts() {
         sum.held += one.held;
         sum.kept += one.kept;
         sum.revived += one.revived;
+        sum.let_go_by_answer += one.let_go_by_answer;
+        sum.held_by_answer += one.held_by_answer;
     }
     let Tally {
         stored,
@@ -2317,12 +2989,16 @@ async fn random_histories_delete_exactly_the_dropped_parts() {
         held,
         kept,
         revived,
+        let_go_by_answer,
+        held_by_answer,
     } = sum;
     println!(
         "random histories: {stored} blobs stored, {orphans} of dropped parts, {early} of them \
          collected during the history ({raced} by a claim made after later calls), \
          {refused} claims refused ({held} for a lingering record), {kept} blobs kept to the \
-         end by one, {revived} lingering records made objects by the replay"
+         end by one, {revived} lingering records made objects by the replay; by the answer \
+         of the day about the bucket {let_go_by_answer} went under a mark raised since and \
+         {held_by_answer} stayed after the last mark was gone"
     );
     // The histories are worth their name.
     assert!(
@@ -2336,5 +3012,9 @@ async fn random_histories_delete_exactly_the_dropped_parts() {
     assert!(
         held > 1000 && kept > 100 && revived > 10,
         "{held} {kept} {revived}"
+    );
+    assert!(
+        let_go_by_answer > 5 && held_by_answer > 20,
+        "{let_go_by_answer} {held_by_answer}"
     );
 }

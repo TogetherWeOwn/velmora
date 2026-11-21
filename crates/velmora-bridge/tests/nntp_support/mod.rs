@@ -1729,8 +1729,8 @@ impl Catalog for MemCatalog {
     async fn gc_orphans(&self, _: UnixMs, _: UnixMs, _: u32, _: u32) -> Result<Vec<GcRow>> {
         unused()
     }
-    async fn gc_orphan_claim(&self, _: &[GcRow], _: UnixMs) -> Result<Vec<bool>> {
-        unused()
+    async fn gc_orphan_claim(&self, _: &[GcRow], _: UnixMs, _: UnixMs) -> (Vec<bool>, Result<()>) {
+        (Vec::new(), unused())
     }
     async fn gc_orphan_done(&self, _: i64, _: UnixMs) -> Result<()> {
         unused()

@@ -163,7 +163,8 @@ PERMITS = "d1"
 #   GC_ORPHANS (off): off | on. On: the cron deletes the pinned copy of an upload part that left its upload (uploaded again under
 #     its number, aborted, or left out of the part list of a completion) 31 days after it left, in every bucket and whatever
 #     GC_MODE says. It takes nothing an object, a server-side copy or an open upload refers to, nothing of a key that has a
-#     write whose outcome is not known, and nothing while a replay is under way or the catalogue is behind its rollback stamp.
+#     write whose outcome is not known, and nothing while a replay is under way, for 31 days after one ended, or while the
+#     catalogue is behind its rollback stamp.
 #     Not set here: read "Upload parts that left their upload" in ops/README.md before turning it on.
 #   CATALOGUE_ID (main): names this catalogue in its rollback stamp keys in SAFETY (rs/<id>/<counter>). Never change it for a catalogue in use.
 #   POST_SOCKETS (4): connections one post job opens, 1 to 8, each on its own provider permit.

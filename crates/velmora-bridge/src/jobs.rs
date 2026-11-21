@@ -448,9 +448,11 @@ where
             .await?;
         // The scan read the rows a moment ago; the claim proves each
         // again in the batch that records its delete, and only then
-        // does a blob go.
-        let granted = self.catalog.gc_orphan_claim(&rows, cutoff).await?;
-        let mut failed = None;
+        // does a blob go. Claims that an error cut short still granted
+        // what they granted: those blobs go now, and the job fails
+        // after.
+        let (granted, claimed) = self.catalog.gc_orphan_claim(&rows, now, cutoff).await;
+        let mut failed = claimed.err();
         for (row, _) in rows.iter().zip(granted).filter(|(_, granted)| *granted) {
             if let Err(e) = self.orphan_row(row).await {
                 failed.get_or_insert(e);

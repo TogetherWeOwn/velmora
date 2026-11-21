@@ -1099,10 +1099,17 @@ pub trait Catalog {
     /// Records that the safety copies of the rows' extents are gone,
     /// each in one batch with the proof that it may go: the row is open
     /// and was due at or before `cutoff`, the extent is still an
-    /// orphaned upload part, and no replay or rollback is being
-    /// handled. One answer per row, in order; `false`: nothing was
-    /// written for it and its blob must stay.
-    async fn gc_orphan_claim(&self, rows: &[GcRow], cutoff: UnixMs) -> Result<Vec<bool>>;
+    /// orphaned upload part, no replay or rollback is being handled,
+    /// and none ended after `cutoff`. One answer per row, in order;
+    /// `false`: nothing was written for it and its blob must stay.
+    /// The second value is the error that ended the claims early: the
+    /// answers before it stand, and the blobs they grant must go.
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>);
     /// Closes the row after the blob delete that a claim allowed.
     async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()>;
 
