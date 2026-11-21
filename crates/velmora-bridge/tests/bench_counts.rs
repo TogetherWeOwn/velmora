@@ -1419,17 +1419,32 @@ fn sanity(b: &Bench) {
     assert!(sum(|c| c.nntp_posts) > 0, "no post metered");
     assert!(sum(|c| c.nntp_bodies) > 0, "no cold read metered");
     assert!(sum(|c| c.queue_messages) > 0, "no queue message metered");
+    // RELEASE_AT_VERIFY=on without a minimum age: the verify job releases
+    // (its figures hold the release), and no release job runs. Read from
+    // the variables, so a commit from before the switch is measured too.
+    let var = |k: &str| b.vars.get(k).map(|v| v.trim());
+    let at_verify =
+        var("RELEASE_AT_VERIFY") == Some("on") && var("SAFETY_MIN_AGE_SECS") == Some("0");
+    let release = (!at_verify).then_some("stage:big:release");
     for label in [
         "op:get_cold_big",
         "op:put_big",
         "stage:big:post",
         "stage:big:verify",
-        "stage:big:release",
-    ] {
+    ]
+    .into_iter()
+    .chain(release)
+    {
         assert!(
             counts.contains_key(label),
             "no figures for {label}: {:?}",
             counts.keys()
+        );
+    }
+    if at_verify {
+        assert!(
+            !counts.contains_key("stage:big:release"),
+            "a release job ran under RELEASE_AT_VERIFY=on without a minimum age"
         );
     }
     // A cold read comes from Usenet and refills the cache; the read
