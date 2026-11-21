@@ -30,6 +30,7 @@ use std::task::{Poll, Waker};
 
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
+use velmora_bridge::jobmsg::Admission;
 use velmora_bridge::keepalive;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
@@ -258,11 +259,29 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
     };
     log_budget(&bridge);
     for msg in batch.messages()? {
-        let Ok(job) = serde_json::from_value::<Job>(msg.body().clone()) else {
-            // A job only names an outbox row; the dispatcher re-drives it.
-            console_error!("malformed job message dropped");
-            msg.ack();
-            continue;
+        let (scope, job) = match velmora_bridge::jobmsg::admit(msg.body()) {
+            Admission::Run { scope, job, .. } => (scope, job),
+            Admission::Malformed => {
+                // A job only names an outbox row; the dispatcher re-drives it.
+                console_error!("malformed job message dropped");
+                msg.ack();
+                continue;
+            }
+            Admission::Refused(why) => {
+                // Never run, never dropped in silence: handed back until
+                // its deliveries are used up, so that it reaches the
+                // dead-letter queue, which pages.
+                console_error!(
+                    "alert: job message refused ({}): to the dead-letter queue",
+                    why.code()
+                );
+                msg.retry_with_options(
+                    &QueueRetryOptionsBuilder::new()
+                        .with_delay_seconds(0)
+                        .build(),
+                );
+                continue;
+            }
         };
         let outcome = match &job {
             // Never through `run_job`, which reads the catalogue. A job
@@ -275,7 +294,7 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                     JobOutcome::Ack
                 }
             }
-            _ => run_in_table(&bridge, &job).await,
+            _ => run_in_table(&bridge, &scope, &job).await,
         };
         log_post_trace(&job, &outcome);
         plan_hint(&env, &bridge, &job, &outcome).await;
@@ -298,7 +317,11 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
 /// Runs a job in the isolate's job table, where a later invocation can
 /// drop it should this one be cancelled: a cancelled invocation is not
 /// dropped, and the job would keep its bytes of the budget (`jobs`).
-async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
+async fn run_in_table(
+    bridge: &Rc<env::WorkerBridge>,
+    scope: &velmora_bridge::TenantScope,
+    job: &Job,
+) -> JobOutcome {
     let now = velmora_bridge::ports::Clock::now(&bridge.clock);
     // A wake that is due runs its stage too.
     let post = matches!(
@@ -311,10 +334,7 @@ async fn run_in_table(bridge: &Rc<env::WorkerBridge>, job: &Job) -> JobOutcome {
             ..
         }
     );
-    let (b, j) = (Rc::clone(bridge), job.clone());
-    // The message names no tenant: every job is of tenant 0, and here is
-    // where it is said.
-    let scope = velmora_bridge::TenantScope::tenant_zero();
+    let (b, j, scope) = (Rc::clone(bridge), job.clone(), scope.clone());
     match jobs::run(now, post, async move { b.run_job(&scope, &j).await }).await {
         Some(outcome) => outcome,
         // `jobs::run` has logged it.
