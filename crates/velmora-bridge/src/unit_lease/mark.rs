@@ -124,7 +124,7 @@ pub fn exact(marks: &[Mark]) -> bool {
 }
 
 /// Words that make a statement one that can change the database.
-const WRITE_WORDS: [&str; 21] = [
+const WRITE_WORDS: [&str; 19] = [
     "INSERT",
     "UPDATE",
     "DELETE",
@@ -144,17 +144,26 @@ const WRITE_WORDS: [&str; 21] = [
     "COMMIT",
     "ROLLBACK",
     "SAVEPOINT",
-    "RELEASE",
-    "END",
 ];
+
+/// Words that write only as the first word of a statement: `END` is
+/// also the end of every `CASE`, and `RELEASE` a common literal.
+const FIRST_WRITE_WORDS: [&str; 2] = ["END", "RELEASE"];
 
 /// Whether `sql` may change the database: it holds one of the write
 /// words as a word of its own (case-insensitive; `updated_at` is not
-/// `UPDATE`). A word inside a string literal or a comment counts too:
+/// `UPDATE`), or a statement of it starts with `END` or `RELEASE`. A word inside a string literal or a comment counts too:
 /// see the module text for why that error is the safe one.
 pub fn statement_may_write(sql: &str) -> bool {
-    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|word| WRITE_WORDS.iter().any(|w| w.eq_ignore_ascii_case(word)))
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let anywhere = sql
+        .split(|c: char| !is_word(c))
+        .any(|word| WRITE_WORDS.iter().any(|w| w.eq_ignore_ascii_case(word)));
+    anywhere
+        || sql.split(';').any(|stmt| {
+            let first = stmt.trim_start().split(|c: char| !is_word(c)).next();
+            first.is_some_and(|f| FIRST_WRITE_WORDS.iter().any(|w| w.eq_ignore_ascii_case(f)))
+        })
 }
 
 /// The unit's database behind the write mark. See the [module](self).

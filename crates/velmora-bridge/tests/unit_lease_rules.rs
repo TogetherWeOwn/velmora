@@ -40,7 +40,7 @@ fn renew(lease: &mut FreshLease, proof_start: UnixMs, now: UnixMs) -> UnixMs {
     let proof_end = UnixMs(proof_start.0 + LEASE_RULES.term_ms);
     let upper_bound = previous.map_or(proof_end, |until| until.max(proof_end));
     let until = lease
-        .renew(proof_start, &HEAD, &HEAD, now, &LEASE_RULES)
+        .renew(proof_start, &HEAD, &HEAD, 0, now, &LEASE_RULES)
         .unwrap();
     assert_eq!(lease.fresh_until(), Some(until));
     assert!(until <= upper_bound);
@@ -102,7 +102,7 @@ fn stalled_proof_uses_proof_start() {
 fn proof_age_boundary() {
     let mut lease = FreshLease::expired();
     assert_eq!(
-        lease.renew(T0, &HEAD, &HEAD, at(30_001), &LEASE_RULES),
+        lease.renew(T0, &HEAD, &HEAD, 0, at(30_001), &LEASE_RULES),
         Err(RenewRefused::ProofTooOld { behind_ms: 30_001 }),
     );
     assert_eq!(lease, FreshLease::expired());
@@ -114,7 +114,7 @@ fn proof_age_boundary() {
 fn proof_ahead_boundary() {
     let mut lease = FreshLease::expired();
     assert_eq!(
-        lease.renew(at(5_001), &HEAD, &HEAD, T0, &LEASE_RULES),
+        lease.renew(at(5_001), &HEAD, &HEAD, 0, T0, &LEASE_RULES),
         Err(RenewRefused::ProofAhead { ahead_ms: 5_001 }),
     );
     assert_eq!(lease, FreshLease::expired());
@@ -434,7 +434,7 @@ fn a_renewal_is_refused_only_below_what_it_proved() {
         Proven { revoked: 2, ..HEAD },
     ] {
         assert_eq!(
-            lease.renew(T0, &HEAD, &own, T0, &LEASE_RULES),
+            lease.renew(T0, &HEAD, &own, 0, T0, &LEASE_RULES),
             Err(RenewRefused::NotProven { proven: HEAD, own })
         );
         assert_eq!(lease, FreshLease::expired());
@@ -457,7 +457,7 @@ fn a_renewal_is_refused_only_below_what_it_proved() {
     ] {
         let mut lease = FreshLease::expired();
         assert!(
-            lease.renew(T0, &HEAD, &own, T0, &LEASE_RULES).is_ok(),
+            lease.renew(T0, &HEAD, &own, 0, T0, &LEASE_RULES).is_ok(),
             "{own:?}"
         );
     }
@@ -468,6 +468,38 @@ fn a_renewal_is_refused_only_below_what_it_proved() {
     };
     assert!(never.covers(&never));
     assert!(!never.covers(&HEAD));
+}
+
+/// Pass 3 of the review: the revocations are bound by id. The proof
+/// listed {A, Y}; the apply of Y failed and a concurrent revoke of Z
+/// reached the unit, so the unit holds {A, Z}: the count is level, and
+/// the renewal is still refused because Y is not revoked there.
+#[test]
+fn a_renewal_with_a_listed_id_unapplied_is_refused() {
+    let listed = ["AKIAA", "AKIAY"];
+    let held = ["AKIAA", "AKIAZ"];
+    let missing = unapplied(listed, |id| held.contains(&id));
+    assert_eq!(missing, 1);
+    let proven = Proven { revoked: 2, ..HEAD };
+    let own = Proven {
+        revoked: 2,
+        keys_seq: HEAD.keys_seq + 1,
+        ..HEAD
+    };
+    let mut lease = FreshLease::expired();
+    assert_eq!(
+        lease.renew(T0, &proven, &own, missing, T0, &LEASE_RULES),
+        Err(RenewRefused::RevocationsUnapplied { count: 1 })
+    );
+    assert_eq!(lease, FreshLease::expired());
+
+    // With Y applied (or tombstoned) the renewal goes through.
+    let held = ["AKIAA", "AKIAY", "AKIAZ"];
+    let missing = unapplied(listed, |id| held.contains(&id));
+    assert_eq!(missing, 0);
+    assert!(lease
+        .renew(T0, &proven, &own, missing, T0, &LEASE_RULES)
+        .is_ok());
 }
 
 /// An alarm is set only when no alarm is armed or the wanted time is earlier.
@@ -579,6 +611,9 @@ fn statement_write_words_are_matched_whole() {
         "SELECT 1 RETURNING x",
         "CREATE TABLE z(a)",
         "PRAGMA foreign_keys = OFF",
+        "END",
+        "  release sp1",
+        "SELECT 1; END TRANSACTION",
         "WITH t AS (SELECT 1) INSERT INTO a SELECT * FROM t",
     ] {
         assert!(statement_may_write(sql), "{sql}");
@@ -588,6 +623,8 @@ fn statement_write_words_are_matched_whole() {
         "SELECT updated_at, deleted_flag FROM objects WHERE inserted_by = ?1",
         "SELECT count(*) FROM extents",
         "  select a from b",
+        "SELECT CASE WHEN a THEN 1 ELSE 0 END FROM b",
+        "SELECT x FROM t WHERE label = 'release' ORDER BY y",
     ] {
         assert!(!statement_may_write(sql), "{sql}");
     }

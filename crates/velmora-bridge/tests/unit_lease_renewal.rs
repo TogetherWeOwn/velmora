@@ -250,7 +250,7 @@ async fn the_lease_runs_from_the_start_of_the_proof() {
     let mut lease = FreshLease::expired();
     let rules = LeaseRules::DEFAULT;
     let until = lease
-        .renew(proof_start, &proven, &proven, clock.now(), &rules)
+        .renew(proof_start, &proven, &proven, 0, clock.now(), &rules)
         .unwrap();
     assert_eq!(until, UnixMs(T0.0 + rules.term_ms));
     assert!(until.0 < clock.now().0 + rules.term_ms);
@@ -259,7 +259,7 @@ async fn the_lease_runs_from_the_start_of_the_proof() {
     let mut lease = FreshLease::expired();
     clock.advance_ms(rules.max_behind_ms);
     assert!(lease
-        .renew(proof_start, &proven, &proven, clock.now(), &rules)
+        .renew(proof_start, &proven, &proven, 0, clock.now(), &rules)
         .is_err());
     assert_eq!(lease.fresh_until(), None);
 }
@@ -382,6 +382,7 @@ async fn a_revocation_only_in_the_bucket_is_applied_at_renewal_of_every_unit() {
             proof_start,
             &proven,
             &own,
+            0,
             clock.now(),
             &LeaseRules::DEFAULT
         ),
@@ -396,6 +397,7 @@ async fn a_revocation_only_in_the_bucket_is_applied_at_renewal_of_every_unit() {
             proof_start,
             &proven,
             &own,
+            0,
             clock.now(),
             &LeaseRules::DEFAULT
         )
@@ -657,6 +659,7 @@ async fn a_proof_from_a_newer_view_gives_a_rolled_back_unit_no_lease() {
             proof_start,
             &proven,
             &own,
+            0,
             clock.now(),
             &LeaseRules::DEFAULT
         ),

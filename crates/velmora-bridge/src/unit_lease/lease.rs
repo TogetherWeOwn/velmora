@@ -24,10 +24,17 @@
 //! - a unit rolled back to a lower counter or seq after the Worker took
 //!   its view gets no lease from a proof of the newer state;
 //! - a unit that holds fewer revocations than the proof listed was not
-//!   given every listed id (an apply that failed half-way), so a revoked
-//!   key cannot keep a lease of T on it (SEC-6). The unit counts a listed
-//!   id it holds no key for as revoked too (a tombstone), or the two
-//!   counts would never meet.
+//!   given every listed id (an apply that failed half-way). The unit
+//!   counts a listed id it holds no key for as revoked too (a
+//!   tombstone), or the two counts would never meet.
+//!
+//! **The listed ids are bound one by one, not only by count** (SEC-6).
+//! When the proof handed ids to apply, `renew` carries them, and the unit
+//! counts, in the same transaction, those it does not hold as revoked or
+//! tombstoned ([`unapplied`]); `renew` refuses unless that is 0. A count
+//! alone is not enough: an apply that failed for one id while a
+//! concurrent revoke of another key reached the unit leaves the count
+//! level and the first key alive.
 //!
 //! A value **above** the proven one is accepted. The proof saw no stamp
 //! object after its counter and no record after its seqs at the time it
@@ -129,6 +136,20 @@ pub enum RenewRefused {
     /// The unit holds less than the proof covered in some part: a lower
     /// seq or stamp counter, or fewer revocations.
     NotProven { proven: Proven, own: Proven },
+    /// This many ids that the proof listed for the unit to apply are not
+    /// revoked (or tombstoned) in the unit.
+    RevocationsUnapplied { count: usize },
+}
+
+/// How many of `listed` (the ids of [`super::renewal::Proof::Fresh`] that
+/// the Worker applied) the unit does not hold as revoked or tombstoned.
+/// `holds_revoked` answers from the unit's own key table, in the
+/// transaction of the `renew`.
+pub fn unapplied<'a>(
+    listed: impl IntoIterator<Item = &'a str>,
+    mut holds_revoked: impl FnMut(&str) -> bool,
+) -> usize {
+    listed.into_iter().filter(|id| !holds_revoked(id)).count()
 }
 
 /// The lease of one unit.
@@ -181,7 +202,8 @@ impl FreshLease {
     /// after the Worker proved the unit fresh (and after any `sync` and
     /// the revocations that the proof asked for). `own` is what the unit
     /// holds, read in the same transaction; it must cover `proven`
-    /// ([`Proven::covers`]).
+    /// ([`Proven::covers`]). `unapplied` is [`unapplied`] over the ids the
+    /// proof listed, counted in that transaction; it must be 0.
     ///
     /// Sets `fresh_until` to `proof_start + T` unless it is already
     /// later, and answers the lease in force afterwards. It is never set
@@ -195,6 +217,7 @@ impl FreshLease {
         proof_start: UnixMs,
         proven: &Proven,
         own: &Proven,
+        unapplied: usize,
         now: UnixMs,
         rules: &LeaseRules,
     ) -> Result<UnixMs, RenewRefused> {
@@ -203,6 +226,9 @@ impl FreshLease {
                 proven: *proven,
                 own: *own,
             });
+        }
+        if unapplied > 0 {
+            return Err(RenewRefused::RevocationsUnapplied { count: unapplied });
         }
         let behind_ms = now.0.saturating_sub(proof_start.0);
         if behind_ms > rules.max_behind_ms {

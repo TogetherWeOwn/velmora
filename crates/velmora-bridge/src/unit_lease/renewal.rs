@@ -19,8 +19,10 @@
 //! `proof_start` is the Worker's clock just before the first of these
 //! reads, and the unit sets `fresh_until = proof_start + T` from it
 //! ([`super::lease::FreshLease::renew`]). The proof also returns the
-//! state it was made for ([`Proven`]); `renew` carries it, and the unit
-//! refuses when it no longer holds exactly that state.
+//! state it was made for ([`Proven`]) and the ids to apply; `renew`
+//! carries both, and the unit refuses when it holds less than that state
+//! or does not hold one of those ids as revoked
+//! ([`super::lease::unapplied`]).
 //!
 //! What a finding means:
 //!
@@ -28,7 +30,7 @@
 //! |---|---|
 //! | a newer tenant or key record | `sync` first, then proves again |
 //! | a stamp object after the unit's counter | confirms it through the unit's stamp counter ([`crate::stamp::Stamp::checked`]): a raise that ran after the unit answered moves the counter and is not a rollback; with the counter unchanged the rollback is recorded, the unit is closed and the restore gate is needed (§8.6) |
-//! | more revocations listed than the unit holds | applies every listed id to that unit (setting `revoked` twice changes nothing), sends an `apply_control` message for the key chain so the finisher appends a missing record, then calls `renew` with the same `proof_start` |
+//! | more revocations listed than the unit holds | applies every listed id to that unit (setting `revoked` twice changes nothing), sends an `apply_control` message for the key chain so the finisher appends a missing record, then calls `renew` with the same `proof_start`, the proven state and the listed ids |
 //! | fewer revocations listed than the unit holds | does not renew, and pages: `m/rk/` is put-only, so the unit holds a revocation the bucket does not, which no correct history gives |
 //!
 //! Cost (P0a measured): 2 HEADs that answer `404`, 2 lists (the second
