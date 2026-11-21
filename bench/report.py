@@ -348,6 +348,9 @@ def compare(a_dir, b_dir, out):
         va, vb = ra["model"][k], rb["model"][k]
         ch = f"{(vb - va) / va * 100:+.1f}%" if va else ("" if va == vb else "new")
         L.append(f"| model {k} | {va:.3f} | {vb:.3f} | {ch} |")
+    for r in (ra, rb):
+        if r["model"].get("not_valid"):
+            L.append(f"| note | | | the model totals of {r['name']} are not valid: {r['model']['not_valid']} |")
     for name in stale:
         L.append(
             f"| note | | | the model totals of {name} price the native meter's rows written, "
@@ -375,6 +378,8 @@ def main(argv):
                                                   or not math.isfinite(cpu[k]) or cpu[k] < 0)]
         if bad:
             sys.exit(f"--cpu: not a finite number >= 0: {', '.join(sorted(bad))}")
+        if not any(k in cpu for k in timed):
+            sys.exit(f"--cpu: none of {', '.join(timed)}: nothing to price")
     name = opts.get("--name", run.name)
     counts, d1, labels = load(run)
     # The cost model is for 16 MiB extents (one 16 MiB part = one extent).

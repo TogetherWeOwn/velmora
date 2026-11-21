@@ -104,9 +104,13 @@ mkdir -p "$OUT"
 # One run at a time per output directory: two would mix their traces.
 # The lock is on the directory itself (opened read-only): no file is
 # created or followed.
+# Where the filesystem cannot lock (some NFS setups), the run goes on and
+# says so; only a lock held by another run stops it.
 if command -v flock >/dev/null; then
   exec 8<"$OUT"
-  flock -n 8 || { log "FAILED: another run writes $OUT"; exit 1; }
+  rc=0; flock -n -E 75 8 || rc=$?
+  if ((rc == 75)); then log "FAILED: another run writes $OUT"; exit 1; fi
+  ((rc == 0)) || log "warning: $OUT cannot be locked here (flock rc $rc); not guarded against a second run"
 fi
 # The native run works in the checkout and cargo runs it from the package
 # directory: every path handed on is absolute.
