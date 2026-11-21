@@ -356,7 +356,8 @@ fn body_version(job: &Job) -> u8 {
 }
 
 /// How many messages of each format a consumer read, said in one log
-/// line at most once every [`FormatCount::EVERY_MS`]. It is the check
+/// line at the isolate's first message and then at most once every
+/// [`FormatCount::EVERY_MS`]. It is the check
 /// line of the switch (both formats are read after step 1; no `v` 1
 /// message is left before step 3) and costs no storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -364,6 +365,7 @@ pub struct FormatCount {
     plain: u64,
     tenant: u64,
     refused: u64,
+    /// When the last line was said; `None` before the first.
     since: Option<crate::types::UnixMs>,
 }
 
@@ -371,9 +373,12 @@ impl FormatCount {
     /// The shortest time between two lines.
     pub const EVERY_MS: i64 = 60_000;
 
-    /// Counts one admission at `now`. Returns the line to log when the
-    /// time since the first count of this line has come, and starts a
-    /// new one. A malformed message is not counted: it has no format.
+    /// Counts one admission at `now`. Returns the line to log: for the
+    /// first message an isolate reads (so that every isolate says which
+    /// formats it sees), then once [`FormatCount::EVERY_MS`] has passed
+    /// since the last line. A line counts the messages since the last
+    /// one, this one included. A malformed message is not counted: it has
+    /// no format.
     pub fn count(&mut self, admission: &Admission, now: crate::types::UnixMs) -> Option<String> {
         match admission {
             Admission::Run { tenant: None, .. } => self.plain += 1,
@@ -383,18 +388,24 @@ impl FormatCount {
             Admission::Refused(_) => self.refused += 1,
             Admission::Malformed => return None,
         }
-        let since = *self.since.get_or_insert(now);
-        if now.0.saturating_sub(since.0) < Self::EVERY_MS {
-            return None;
-        }
+        let over = match self.since {
+            None => 0,
+            Some(last) if now.0.saturating_sub(last.0) >= Self::EVERY_MS => {
+                now.0.saturating_sub(last.0)
+            }
+            Some(_) => return None,
+        };
         let line = format!(
             "job message formats: v1={} v2={} refused={} over {} s",
             self.plain,
             self.tenant,
             self.refused,
-            now.0.saturating_sub(since.0) / 1000
+            over / 1000
         );
-        *self = FormatCount::default();
+        *self = FormatCount {
+            since: Some(now),
+            ..FormatCount::default()
+        };
         Some(line)
     }
 }
@@ -597,16 +608,23 @@ mod tests {
             }
         ));
         let refused = Admission::Refused(Refusal::NoTenant);
-        assert_eq!(count.count(&plain, t(0)), None);
+        assert_eq!(
+            count.count(&plain, t(0)).as_deref(),
+            Some("job message formats: v1=1 v2=0 refused=0 over 0 s")
+        );
         assert_eq!(count.count(&tenant, t(1)), None);
         assert_eq!(count.count(&Admission::Malformed, t(70_000)), None);
         assert_eq!(count.count(&refused, t(59_999)), None);
         assert_eq!(
             count.count(&tenant, t(60_000)).as_deref(),
-            Some("job message formats: v1=1 v2=2 refused=1 over 60 s")
+            Some("job message formats: v1=0 v2=2 refused=1 over 60 s")
         );
-        assert_eq!(count, FormatCount::default());
         assert_eq!(count.count(&plain, t(60_001)), None);
+        assert_eq!(count.count(&plain, t(119_999)), None);
+        assert_eq!(
+            count.count(&plain, t(120_000)).as_deref(),
+            Some("job message formats: v1=3 v2=0 refused=0 over 60 s")
+        );
     }
 
     #[test]
