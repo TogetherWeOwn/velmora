@@ -4,7 +4,7 @@
 worker-build 0.8.7 runs wasm-opt with `--debuginfo`, which keeps the
 `name` section (function names, about 600 KB). The Worker never reads
 it: V8 uses it only to print function names in stack traces. This
-script removes it after the build, so the wasm that the size budget
+script removes it after the build, so the wasm that the size check
 measures and the deploy uploads is the stripped one.
 
 Only the whole section is removed; every other byte (including the

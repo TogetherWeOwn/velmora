@@ -1415,8 +1415,9 @@ KEK.
 
 ## Naming a wasm frame
 
-The deployed wasm has no `name` section (bundle.sh drops it to stay
-under the size budget), so a panic's message is logged as before but
+The deployed wasm has no `name` section (bundle.sh drops it to keep the
+bundle small: about 800 KB, about 8 ms on a request served by a new
+isolate), so a panic's message is logged as before but
 its trace frames read `wasm-function[N]:0xOFF` instead of Rust function
 names. To name a frame:
 

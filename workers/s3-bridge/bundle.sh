@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds the Worker bundle into build/. This is the only build of it: the
 # wrangler.toml [build] command (wrangler dev, the local e2e), CI's size
-# budget and the deploy artifact all run this script, so the budget
-# measures the wasm that ships.
+# check (tools/size_check.sh) and the deploy artifact all run this script,
+# so the check measures the bundle that ships.
 #
 # After worker-build, the `name` custom section (function names, about
 # 600 KB) is dropped from build/index_bg.wasm (tools/strip_wasm.py). The
