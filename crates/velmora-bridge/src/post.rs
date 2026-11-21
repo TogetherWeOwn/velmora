@@ -1335,6 +1335,7 @@ where
     /// `Ok(false)` = it cannot be done now (no provider that posts, no
     /// intact safety copy, or the providers refused): the caller carries
     /// on as if there were no repost.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn repost(
         &self,
         scope: &TenantScope,
