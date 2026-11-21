@@ -1223,6 +1223,7 @@ async fn object_status_evict_and_drill_after_release() {
             // from the provider's own, whatever the request asks for.
             "sockets": 1,
             "sessions": 1,
+            "rebuilt": 0,
         })
     );
     assert!(
@@ -1296,6 +1297,74 @@ async fn drill_fx(
     .await;
     *weak.borrow_mut() = Rc::downgrade(&fx.bridge);
     fx
+}
+
+/// A drill rebuilds an article that no provider has from the extent's
+/// parity, as a cold read does, and says so. When the rebuild finds no
+/// room in the byte budget, the next try waits for the read and the
+/// rebuild together and has the rebuild's room in hand.
+#[tokio::test]
+async fn a_drill_rebuilds_a_lost_article_from_parity() {
+    for crowded in [false, true] {
+        // What another request of the isolate holds, until the drill's
+        // first wait.
+        let other: Rc<RefCell<Option<ingress::Charge>>> = Rc::default();
+        let polls = Rc::new(Cell::new(0u32));
+        let (held, counted) = (other.clone(), polls.clone());
+        let mut fx = Fx::with_sleeper(move |clock| {
+            Rc::new(move |ms| {
+                if !(COLD_POLL_MS..=COLD_POLL_MS + COLD_JITTER_MS).contains(&ms) {
+                    return Box::pin(std::future::pending());
+                }
+                let (held, counted, clock) = (held.clone(), counted.clone(), clock.clone());
+                Box::pin(async move {
+                    counted.set(counted.get() + 1);
+                    clock.advance_ms(i64::from(ms));
+                    held.borrow_mut().take();
+                })
+            })
+        })
+        .await;
+        let cfg = &mut Rc::get_mut(&mut fx.bridge).unwrap().cfg;
+        (cfg.packed_plans, cfg.parity) = (true, true);
+        let bucket = fx.bucket("scratch").await;
+        let o = fx.put(&bucket, "k", &plaintext()).await;
+        fx.drive(&o, OutboxStage::Done).await;
+        let r = fx.post("/evict/scratch/k?include_safety=1").await;
+        assert_eq!(r.status, 200);
+
+        // Whole on Usenet: nothing is rebuilt.
+        let v = fx.post("/drill/scratch/k").await.json();
+        assert_eq!((&v["match"], &v["rebuilt"]), (&json!(true), &json!(0)));
+        // What the drill holds to read the extent, over its one socket.
+        let cipher = fx.scalar("SELECT cipher_size FROM extents", &[]).await;
+        let cipher: u64 = cipher.parse().unwrap();
+        let read =
+            velmora_bridge::fetch::cold_step_bytes(cipher, 1).max(cipher + o.plain.len() as u64);
+
+        let stored = fx.bridge.catalog.stored_plan(&o.extent).await.unwrap();
+        fx.server.hide(&stored.rows[1].message_id).await;
+        if crowded {
+            // Room for the read, none for the rebuild beside it.
+            let rest = fx.bridge.budget.try_charge(BUDGET - read);
+            *other.borrow_mut() = Some(rest.expect("the budget is free"));
+        }
+        let r = fx.post("/drill/scratch/k").await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!((&v["match"], &v["rebuilt"]), (&json!(true), &json!(1)));
+        assert_eq!(v["plaintext_sha256"], hex(&sha256(&o.plain)));
+        assert_eq!(v["retries"], u32::from(crowded));
+        assert_eq!(polls.get(), u32::from(crowded));
+        assert_eq!(fx.bridge.budget.in_use(), 0);
+        assert_eq!(fx.bridge.nntp.live(), 0);
+
+        // Two of three lost with one parity article: not on Usenet.
+        fx.server.hide(&stored.rows[2].message_id).await;
+        let v = fx.post("/drill/scratch/k").await.json();
+        assert_eq!(v["match"], false);
+        assert_eq!(v["plaintext_sha256"], Value::Null);
+    }
 }
 
 /// A drill whose read a provider broke off is begun again after a short
