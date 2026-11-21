@@ -265,9 +265,12 @@ impl TenantKey {
         })
     }
 
-    /// Existing key bytes for key version `version` of `tenant` (tests).
-    /// The caller's copy is its own to wipe. A key from a key bucket or
-    /// an escrow copy comes from [`unwrap_tenant_key`] instead.
+    /// Existing key bytes for key version `version` of `tenant`. Tests
+    /// only: nothing checks that the bytes are that tenant's key. A key
+    /// from a key bucket or an escrow copy comes from
+    /// [`unwrap_tenant_key`], which checks the blob's name and check
+    /// value. The caller's copy is its own to wipe.
+    #[cfg(any(test, feature = "testkit"))]
     pub fn from_bytes(tenant: &TenantId, version: u32, bytes: [u8; KEY_LEN]) -> Result<Self> {
         Ok(TenantKey {
             tenant: tenant.clone(),
@@ -556,9 +559,12 @@ fn below<'a>(name: &'a str, dir: &str, tenant: &str) -> Option<&'a str> {
         .filter(|rest| !rest.is_empty())
 }
 
-/// Whether `name` lies in `tenant`'s record directory `m/x/<t>/`.
+/// Whether `name` is a data record of `tenant`: below `m/x/<t>/`, and
+/// not below its bucket configuration directory `m/x/<t>/b/`, which
+/// holds control records.
 fn under_tenant_dir(name: &str, tenant: &TenantId) -> bool {
-    below(name, TENANT_DIR, tenant.as_str()).is_some()
+    below(name, TENANT_DIR, tenant.as_str())
+        .is_some_and(|rest| !rest.starts_with(BUCKET_CONFIG_DIR))
 }
 
 /// Whether `sealed` starts like a VMR2 record. Says nothing about
@@ -574,8 +580,13 @@ pub fn record_v2_header(sealed: &[u8]) -> Result<(TenantId, u32)> {
     if sealed.len() < RECORD_V2_HEADER_LEN + WRAP_OVERHEAD || !is_record_v2(sealed) {
         return Err(ERR_RECORD_V2);
     }
-    let tenant = core::str::from_utf8(&sealed[4..4 + TENANT_ID_LEN]).map_err(|_| ERR_RECORD_V2)?;
-    let tenant = TenantId::parse(tenant).map_err(|_| ERR_RECORD_V2)?;
+    // An envelope that names no managed tenant (tenant 0, or bytes that
+    // are no id) is another tenant's record for every reader: the alarm
+    // error, not the generic one.
+    let tenant = core::str::from_utf8(&sealed[4..4 + TENANT_ID_LEN])
+        .ok()
+        .and_then(|t| TenantId::parse(t).ok())
+        .ok_or(ERR_RECORD_TENANT)?;
     Ok((tenant, header_version(sealed)))
 }
 
@@ -693,9 +704,12 @@ impl ControlOwner<'_> {
                 MANAGED_CONTROL_DIRS.iter().any(|dir| {
                     below(name, dir, self.label()).is_some_and(|rest| {
                         // Below `m/x/<t>/` only the bucket configuration
-                        // chains are control records; the rest are data
-                        // records.
-                        *dir != TENANT_DIR || rest.starts_with(BUCKET_CONFIG_DIR)
+                        // chains `b/<bucket>/...` are control records; the
+                        // rest are data records.
+                        *dir != TENANT_DIR
+                            || rest
+                                .strip_prefix(BUCKET_CONFIG_DIR)
+                                .is_some_and(|r| !r.is_empty())
                     })
                 })
             }
@@ -1040,6 +1054,9 @@ mod tests {
         assert!(!under_tenant_dir("m/x/t_00000000000000a1", &t));
         assert!(!under_tenant_dir("m/x/t_00000000000000a10/g_1", &t));
         assert!(!under_tenant_dir("m/g_1", &t));
+        // The bucket configuration directory holds control records.
+        assert!(!under_tenant_dir("m/x/t_00000000000000a1/b/b_01/1", &t));
+        assert!(under_tenant_dir("m/x/t_00000000000000a1/bb", &t));
     }
 
     #[test]
@@ -1061,6 +1078,7 @@ mod tests {
             "m/k/t_00000000000000a1/",
             "m/k/t_00000000000000a1",
             "m/x/t_00000000000000a1/g_1",
+            "m/x/t_00000000000000a1/b/",
             "m/kl/00000000000000000001",
             "m/g_1",
         ] {
