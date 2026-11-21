@@ -177,8 +177,8 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     token: u64,
     run: &'w mut ScrubRun,
     breaker: &'w mut Breaker,
-    /// The backbone of the last breaker trip, while it stands.
-    blocked: Option<String>,
+    /// The backbones of the breaker trips that stand.
+    blocked: Vec<String>,
     /// The `STAT` sessions, kept from one extent to the next.
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
 }
@@ -256,7 +256,7 @@ where
         let cfg = &self.cfg.scrub;
         // No repair on a backbone that tripped the breaker, until a run
         // that could have tripped it again did not.
-        let blocked = state.last_incident.clone();
+        let blocked = state.blocked();
         let mut run = ScrubRun::default();
         let mut breaker = Breaker::default();
         let mut reader = self.drill_reader(cfg.sockets)?;
@@ -269,9 +269,24 @@ where
             stats: &mut stats,
         };
         let ended = self.scrub_pages(started, &mut reader, &mut walk).await;
+        let blocked = core::mem::take(&mut walk.blocked);
         ProviderSession::close_all(stats).await;
         reader.close().await;
         run.ended = ended;
+        // The backbones under an incident after this run: its own trip
+        // adds one; a run that checked enough extents to trip the
+        // breaker and did not clears them all.
+        run.blocked = match &run.incident {
+            Some(label) => {
+                let mut kept = blocked;
+                if !kept.contains(label) {
+                    kept.push(label.clone());
+                }
+                kept
+            }
+            None if run.checked >= INCIDENT_MIN_EXTENTS => Vec::new(),
+            None => blocked,
+        };
         let now = self.clock.now();
         // A run that lost its lease adds nothing: the totals are another
         // run's to add.
@@ -316,15 +331,17 @@ where
             if now >= deadline {
                 return ScrubEnd::Time;
             }
-            let ask = left.min(SCRUB_PAGE).saturating_add(seen.len() as u32);
-            let page = match self.catalog.scrub_due(now, ask).await {
+            let page = match self.catalog.scrub_due(now, left.min(SCRUB_PAGE)).await {
                 Ok(page) => page,
                 Err(_) => return ScrubEnd::Stopped,
             };
+            // Every extent looked at is recorded with a due time ahead,
+            // so it leaves the list; one that is back at its head (its
+            // write did not land) ends the run rather than read a page
+            // that grows with the run.
             let fresh: Vec<&ScrubCandidate> = page
                 .iter()
                 .filter(|c| !seen.contains(&c.extent.id))
-                .take(left.min(SCRUB_PAGE) as usize)
                 .collect();
             if fresh.is_empty() {
                 return ScrubEnd::Idle;
@@ -381,25 +398,42 @@ where
         let cfg = &self.cfg.scrub;
         let token = walk.token;
         let extent = &candidate.extent;
-        let plan = self.catalog.articles(&extent.id).await?;
-        let posted = !plan.is_empty() && plan.iter().all(|a| a.state == ArticleState::Posted);
+        // Only the scrub gives a held extent a due time: it re-pinned it.
         let repinned = matches!(
             candidate.last,
-            Some(ScrubResult::Repairing | ScrubResult::Stalled)
+            Some(ScrubResult::Repairing | ScrubResult::Stalled | ScrubResult::Unrecoverable)
         );
-        match extent.safety_state {
-            SafetyState::Released if posted => {}
-            SafetyState::Held | SafetyState::Releasing if repinned && posted => {
+        let interval = u64::from(cfg.interval_days) * 86_400;
+        let plan = match extent.safety_state {
+            SafetyState::Released => {
+                // An extent no live object holds (deleted or overwritten,
+                // before garbage collection) is not read, and never
+                // brought back.
+                if !self.catalog.scrub_live(&extent.id).await? {
+                    return self
+                        .scrub_record_one(token, extent, ScrubResult::Skipped, interval)
+                        .await;
+                }
+                self.catalog.articles(&extent.id).await?
+            }
+            SafetyState::Held | SafetyState::Releasing if repinned => {
+                let plan = self.catalog.articles(&extent.id).await?;
                 return self
                     .watch_repair(token, reader, extent, plan, walk.run)
                     .await;
             }
-            // Not on Usenet in full, deleted, or pinned by something
-            // else than the scrub: off the due list.
+            // Deleted, or pinned by something else than the scrub: off
+            // the due list (it leaves the index with its due time).
             _ => {
                 self.catalog.scrub_drop(token, &extent.id).await?;
                 return Ok(());
             }
+        };
+        if plan.is_empty() || plan.iter().any(|a| a.state != ArticleState::Posted) {
+            // Not on Usenet in full: nothing to read back.
+            return self
+                .scrub_record_one(token, extent, ScrubResult::Skipped, interval)
+                .await;
         }
 
         let found = self.check(reader, walk.stats, extent, plan).await?;
@@ -414,7 +448,6 @@ where
             if found.refetched > 0 {
                 run.refetched += found.refetched;
             }
-            let interval = u64::from(cfg.interval_days) * 86_400;
             return self
                 .scrub_record_one(token, extent, ScrubResult::Ok, interval)
                 .await;
@@ -444,10 +477,7 @@ where
         }
         // Held back from a re-pin, not from the finding: an extent with
         // no intact copy anywhere is still said to be unrecoverable.
-        let may_repin = !walk
-            .blocked
-            .as_deref()
-            .is_some_and(|b| found.lacking.iter().any(|l| l == b))
+        let may_repin = !found.lacking.iter().any(|l| walk.blocked.contains(l))
             && run.repaired < cfg.repairs_per_run;
         self.repair(token, extent, found, run, may_repin).await
     }
@@ -509,7 +539,19 @@ where
         let now = self.clock.now();
         let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
         let rows: Vec<&ArticleRow> = plan.iter().collect();
-        for provider in pool.order(providers.to_vec(), PermitClass::Background) {
+        // As verify asks: the providers that still retain the oldest
+        // article first; the others only when none does. A provider past
+        // its retention answers 430 for what it no longer keeps, which
+        // is no loss of the backbone.
+        let oldest = plan.iter().filter_map(|a| a.posted_at).min();
+        let (mut fresh, expired): (Vec<_>, Vec<_>) = providers
+            .iter()
+            .copied()
+            .partition(|p| p.retains(oldest, now));
+        if fresh.is_empty() {
+            fresh = expired;
+        }
+        for provider in pool.order(fresh, PermitClass::Background) {
             let kept = stats.iter().position(|s| s.provider.id == provider.id);
             let mut tries = 0;
             loop {
@@ -557,18 +599,20 @@ where
         Ok(Presence::Unknown)
     }
 
-    /// A slot to ask `provider` with: one of its drill connections if it
-    /// has any free (the reader holds at most `SCRUB_SOCKETS` of them),
-    /// else a background slot of its `max_conns`, which keeps one for
-    /// reads. `None`: neither is free.
+    /// A slot to ask `provider` with: one of its drill connections when
+    /// it has more of them than the reader can hold (`SCRUB_SOCKETS`),
+    /// so the session never takes one the reader needs; else a
+    /// background slot of its `max_conns`, which keeps one for reads.
+    /// `None`: none is free.
     async fn stat_session<'s>(
         &'s self,
         provider: &'s ProviderConfig,
         holder: &str,
     ) -> Result<Option<ProviderSession<'s, C, N, T>>> {
-        let classes: &[PermitClass] = match provider.drill_conns {
-            0 => &[PermitClass::Background],
-            _ => &[PermitClass::Drill, PermitClass::Background],
+        let spare = provider.drill_conns > self.cfg.scrub.sockets;
+        let classes: &[PermitClass] = match spare {
+            false => &[PermitClass::Background],
+            true => &[PermitClass::Drill, PermitClass::Background],
         };
         for class in classes {
             let opened = ProviderSession::open(
@@ -703,18 +747,19 @@ where
     ) -> core::result::Result<(), Halt> {
         let cfg = &self.cfg.scrub;
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
+        // One charge for all this holds at once: the safety copy read
+        // back, or a read from Usenet and the copy written from it.
+        let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
+        let Ok(_charge) = self.budget.charge_job(bytes).await else {
+            return Err(Halt::Busy);
+        };
         let kept = match self.safety.get(&extent.id.safety_key(), None).await {
             Ok(Some(bytes)) => digest_ok(extent, &bytes),
             _ => false,
         };
         let mut rewrote = false;
         if !kept {
-            let bytes = cold_step_bytes(extent.cipher_size, reader.sockets());
-            let Ok(charge) = self.budget.charge_job(bytes).await else {
-                return Err(Halt::Busy);
-            };
             let read = reader.fetch_planned(extent, plan).await;
-            drop(charge);
             let cipher = match read? {
                 ColdFetch::Filled(cipher) => {
                     run.bytes_read += extent.cipher_size;

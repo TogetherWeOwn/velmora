@@ -1597,6 +1597,10 @@ pub trait Catalog {
     ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
+    /// Whether a live generation references the extent.
+    async fn scrub_live(&self, _extent: &ExtentId) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
     /// Takes an extent the scrub cannot check off its due list.
     async fn scrub_drop(&self, _token: u64, _extent: &ExtentId) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
