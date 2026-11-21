@@ -1594,6 +1594,10 @@ pub enum ScrubResult {
     /// overwritten, waiting for garbage collection), or not all of its
     /// articles are posted. Looked at again after the interval.
     Skipped,
+    /// The read broke off and every backbone said it holds every article:
+    /// nothing is known. Looked at again after `SCRUB_CONFIRM_SECS`; a
+    /// second time in a row is an alert.
+    Deferred,
 }
 
 impl ScrubResult {
@@ -1605,6 +1609,7 @@ impl ScrubResult {
             ScrubResult::Stalled => "stalled",
             ScrubResult::Unrecoverable => "unrecoverable",
             ScrubResult::Skipped => "skipped",
+            ScrubResult::Deferred => "deferred",
         }
     }
 
@@ -1616,6 +1621,7 @@ impl ScrubResult {
             "stalled" => ScrubResult::Stalled,
             "unrecoverable" => ScrubResult::Unrecoverable,
             "skipped" => ScrubResult::Skipped,
+            "deferred" => ScrubResult::Deferred,
             _ => return None,
         })
     }

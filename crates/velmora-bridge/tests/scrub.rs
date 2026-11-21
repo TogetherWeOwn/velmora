@@ -624,7 +624,7 @@ async fn a_provider_without_a_free_slot_ends_the_run_and_nothing_is_recorded() {
 /// repaired, and no loss there is repaired until a run that could have
 /// tripped it again does not.
 #[tokio::test(flavor = "current_thread")]
-async fn a_backbone_that_lacks_many_extents_trips_the_breaker_and_nothing_is_re_pinned() {
+async fn a_backbone_that_lacks_many_extents_trips_the_breaker_and_re_pins_trickle() {
     let w = world().await;
     let mut objs = Vec::new();
     for i in 0..9u8 {
@@ -644,22 +644,29 @@ async fn a_backbone_that_lacks_many_extents_trips_the_breaker_and_nothing_is_re_
     assert_eq!(state.incidents, 1);
     assert_eq!(state.blocked(), ["beta"]);
 
-    // Confirmed an hour later, but beta is still under the incident.
+    // Confirmed an hour later, but beta is still under the incident: one
+    // re-pin a run at most (BLOCKED_REPINS_PER_RUN), the rest stay.
     w.advance_secs(3600);
     let second = w.scrub().await;
-    assert_eq!(second.repaired, 0);
+    assert_eq!(
+        second.repaired,
+        velmora_bridge::scrub::BLOCKED_REPINS_PER_RUN
+    );
+    let mut held = 0;
     for o in &objs {
-        assert_eq!(w.safety_state(o).await, "released");
+        held += u32::from(w.safety_state(o).await == "held");
     }
+    assert_eq!(held, 1);
 
-    // Beta comes back: a run of 9 clean checks clears the incident.
+    // Beta comes back: 8 clean checks in a row clear the incident.
     for o in &objs {
         let plan = w.plan(o).await;
         w.servers[1].unhide(&plan[0].message_id).await;
     }
     w.advance_secs(3600);
     let third = w.scrub().await;
-    assert_eq!((third.checked, third.ok, third.repaired), (9, 9, 0));
+    // The one re-pinned in the second run is not due until its bound.
+    assert_eq!((third.checked, third.ok, third.repaired), (8, 8, 0));
     assert_eq!(w.state().await.last_incident, None);
     assert!(w.state().await.blocked().is_empty());
 }
@@ -734,7 +741,7 @@ async fn one_run_at_a_time_and_the_dispatcher_sends_one_only_while_the_lease_is_
 /// `SCRUB=off` (the default): no run is sent, and a run job that arrives
 /// does nothing.
 #[tokio::test(flavor = "current_thread")]
-async fn with_the_scrub_off_nothing_is_sent_and_nothing_is_read() {
+async fn with_the_scrub_off_nothing_is_sent_and_no_extent_is_checked() {
     let w = world_with(|cfg| cfg.scrub.on = false).await;
     let o = w.released("a", 31).await;
     w.advance_secs(31 * DAY_SECS);
@@ -892,20 +899,21 @@ async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
 }
 
 /// While an incident on a backbone stands, a confirmed loss there is not
-/// re-pinned, and a loss with no intact copy anywhere is still said to be
-/// unrecoverable.
+/// re-pinned beyond one a run, and a loss with no intact copy anywhere is
+/// still said to be unrecoverable.
 #[tokio::test(flavor = "current_thread")]
-async fn under_an_incident_nothing_is_re_pinned_and_unrecoverable_is_still_said() {
+async fn under_an_incident_one_re_pin_a_run_and_unrecoverable_is_still_said() {
     let w = world().await;
     let kept = w.released("a", 80).await;
+    let also = w.released("c", 82).await;
     let lost = w.released("b", 81).await;
     assert!(w.bridge().safety.lose(&lost.extent.safety_key()));
     w.advance_secs(31 * DAY_SECS);
-    for o in [&kept, &lost] {
+    for o in [&kept, &also, &lost] {
         w.hide(0, o, 0).await;
         w.hide(1, o, 0).await;
     }
-    assert_eq!(w.scrub().await.suspect, 2);
+    assert_eq!(w.scrub().await.suspect, 3);
     w.bridge()
         .catalog
         .sql
@@ -914,9 +922,9 @@ async fn under_an_incident_nothing_is_re_pinned_and_unrecoverable_is_still_said(
         .unwrap();
     w.advance_secs(3600);
     let run = w.scrub().await;
-    assert_eq!((run.repaired, run.unrecoverable, run.suspect), (0, 1, 1));
-    assert_eq!(w.result(&kept).await, "suspect");
-    assert_eq!(w.safety_state(&kept).await, "released");
+    assert_eq!((run.repaired, run.unrecoverable, run.suspect), (1, 1, 1));
+    let held = [w.safety_state(&kept).await, w.safety_state(&also).await];
+    assert_eq!(held.iter().filter(|s| *s == "held").count(), 1);
     assert_eq!(w.result(&lost).await, "unrecoverable");
     // The run checked fewer extents than a trip needs: the incident stands.
     assert_eq!(w.state().await.blocked(), ["beta"]);
@@ -1381,4 +1389,176 @@ async fn the_watch_leaves_an_extent_of_a_deleted_object_alone() {
         "no copy written"
     );
     assert_eq!(w.next_at(&o).await, None, "off the due list");
+}
+
+/// The re-pin's guard asks for `released` itself: a held extent whose
+/// posting is done and that a live object holds is not re-pinned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_extent_whose_posting_is_done_is_not_re_pinned() {
+    let w = world().await;
+    let o = w.released("a", 200).await;
+    let c = &w.bridge().catalog;
+    c.sql
+        .exec(
+            "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1 WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.stage(&o).await, "done");
+    let now = w.bridge().clock.now();
+    let token = c
+        .scrub_take(now, now.plus_secs(600))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!c
+        .scrub_repin(token, &o.extent, (now, now.plus_secs(60)), &[])
+        .await
+        .unwrap());
+}
+
+/// The re-pin counts the copy it puts back as pinned bytes of the
+/// extent: an extent whose released copy was evicted (count 0) has it
+/// counted again.
+#[tokio::test(flavor = "current_thread")]
+async fn the_re_pin_counts_the_copy_it_puts_back() {
+    let w = world().await;
+    let o = w.released("a", 201).await;
+    let c = &w.bridge().catalog;
+    c.sql
+        .exec(
+            "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_string())],
+        )
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.repaired, 1);
+    let counted = w
+        .scalar(
+            "SELECT hot_safety_bytes = cipher_size FROM extents WHERE id = ?1",
+            &o.extent,
+        )
+        .await;
+    assert_eq!(counted, "1");
+}
+
+/// A copy that cannot be written back after the re-pin is tried again,
+/// and said when it still is not there; the extent stays pinned for the
+/// watch.
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_that_cannot_be_written_back_is_tried_again_and_said() {
+    let w = world().await;
+    let o = w.released("a", 202).await;
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
+    let puts = w.bridge().safety.puts.borrow().len();
+    assert_eq!(w.scrub().await.repaired, 1);
+    assert_eq!(
+        w.bridge().safety.puts.borrow().len(),
+        puts + 2,
+        "tried twice"
+    );
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-repair-copy-missing ")));
+    assert_eq!(w.safety_state(&o).await, "held");
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
+    // The watch at the bound writes it.
+    let bound = repair_bound_secs(w.bridge().cfg.safety_min_age_secs, 3600);
+    w.advance_secs(u32::try_from(bound).unwrap());
+    assert_eq!(w.scrub().await.stalled, 1);
+    assert!(w.has_safety(&o));
+}
+
+/// The scrub's reader never takes the read slot a request's cold read is
+/// kept: with that slot held by a request, the run still reads.
+#[tokio::test(flavor = "current_thread")]
+async fn the_scrub_never_takes_the_read_reserve() {
+    let w = world_with(|cfg| {
+        for p in &mut cfg.providers {
+            p.drill_conns = 0;
+            p.max_conns = 2;
+        }
+        cfg.scrub.sockets = 1;
+    })
+    .await;
+    let o = w.released("a", 203).await;
+    w.advance_secs(31 * DAY_SECS);
+    let now = w.bridge().clock.now();
+    for p in w.bridge().cfg.providers.clone() {
+        let held = w
+            .bridge()
+            .catalog
+            .acquire_permit(&p, PermitClass::Read, "get:someone", now)
+            .await
+            .unwrap();
+        assert!(held.is_some(), "the read reserve of {}", p.id);
+    }
+    // Any take of a read slot fails from here on: the run must take none.
+    *w.bridge().catalog.sql.fail_matching.borrow_mut() = Some(("ORDER BY slot DESC", 0));
+    let run = w.scrub().await;
+    *w.bridge().catalog.sql.fail_matching.borrow_mut() = None;
+    assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert_eq!(w.result(&o).await, "ok");
+}
+
+/// The eviction job, begun before a re-pin, deletes the cache copy but not
+/// the safety copy the re-pin keeps.
+#[tokio::test(flavor = "current_thread")]
+async fn the_eviction_job_keeps_the_safety_copy_of_an_extent_re_pinned_under_it() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 204).await;
+    assert!(w.has_safety(&o));
+    // Right before the eviction asks whether the copy may still go, the
+    // scrub re-pins the extent.
+    *w.bridge().catalog.sql.before_matching.borrow_mut() = Some((
+        "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2",
+        0,
+        format!(
+            "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1 WHERE id = '{}'",
+            o.extent.as_str()
+        ),
+    ));
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        w.bridge().catalog.sql.before_matching.borrow().is_none(),
+        "the eviction asked"
+    );
+    assert!(w.has_safety(&o), "the safety copy stays");
+}
+
+/// A read that breaks off while every backbone says it holds every
+/// article is recorded `deferred`, looked at again after the confirm
+/// interval, and the run goes on with the next extent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_that_breaks_off_is_deferred_and_the_run_goes_on() {
+    let w = world().await;
+    let a = w.released("a", 205).await;
+    let b = w.released("b", 206).await;
+    w.advance_secs(31 * DAY_SECS);
+    for s in &w.servers {
+        s.drop_next_bodies(1000).await;
+    }
+    let run = w.scrub().await;
+    for s in &w.servers {
+        s.drop_next_bodies(0).await;
+    }
+    let results = [w.result(&a).await, w.result(&b).await];
+    assert_ne!(run.ended, ScrubEnd::Busy, "{results:?}");
+    assert!(
+        results.iter().all(|r| r == "deferred"),
+        "both looked at, neither recorded as a loss: {results:?}"
+    );
+    w.advance_secs(3600);
+    let again = w.scrub().await;
+    assert_eq!(again.ok, 2);
 }

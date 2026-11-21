@@ -87,6 +87,13 @@ pub const INCIDENT_MIN_EXTENTS: u32 = 8;
 /// cause is the backbone, not the articles.
 pub const INCIDENT_PERCENT: u32 = 12;
 
+/// Re-pins a run makes at most for losses on a backbone under an
+/// incident: one, the least that is not none. A loss that lasts on one
+/// backbone (a takedown of one large object) trips the breaker again on
+/// every run and would otherwise never be repaired; during a backbone
+/// outage this costs at most one extent pinned and verified per run.
+pub const BLOCKED_REPINS_PER_RUN: u32 = 1;
+
 /// How long a re-pinned extent is given before the scrub looks at it
 /// again: the minimum age of the safety copy, every wait verify makes
 /// for a missing article and its wait after a failed backbone, and one
@@ -187,6 +194,8 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     stats: &'w mut Vec<ProviderSession<'s, C, N, T>>,
     /// Providers that refused this run's login: not asked again in it.
     refused: Vec<String>,
+    /// Re-pins of this run for a loss on a backbone under an incident.
+    blocked_repins: u32,
     /// Checks in a row, since the last trip and across runs, that found
     /// nothing lacking on a backbone under an incident. A check that does
     /// sets it back to 0.
@@ -262,14 +271,29 @@ where
         let Some(token) = self.catalog.scrub_take(started, until).await? else {
             return Ok(None);
         };
-        let state = self.catalog.scrub_state().await?;
-        let cfg = &self.cfg.scrub;
+        // A failure before the run begins gives the lease back at once.
+        let begun = async {
+            let state = self.catalog.scrub_state().await?;
+            let reader = self.scrub_reader(self.cfg.scrub.sockets)?;
+            Ok::<_, crate::types::BridgeError>((state, reader))
+        };
+        let (state, mut reader) = match begun.await {
+            Ok(begun) => begun,
+            Err(e) => {
+                let now = self.clock.now();
+                let _ = self
+                    .catalog
+                    .scrub_end(token, &ScrubRun::default(), now)
+                    .await;
+                crate::trace::scrub_run(|| "ended=stopped before the first extent".to_owned());
+                return Err(e);
+            }
+        };
         // No repair on a backbone that tripped the breaker, until a run
         // that could have tripped it again did not.
         let blocked = state.blocked();
         let mut run = ScrubRun::default();
         let mut breaker = Breaker::default();
-        let mut reader = self.scrub_reader(cfg.sockets)?;
         let mut stats = Vec::new();
         let mut walk = Walk {
             token,
@@ -278,6 +302,7 @@ where
             blocked,
             stats: &mut stats,
             refused: Vec::new(),
+            blocked_repins: 0,
             clean: state.incident_clean,
         };
         let ended = self.scrub_pages(started, &mut reader, &mut walk).await;
@@ -286,6 +311,12 @@ where
         ProviderSession::close_all(stats).await;
         reader.close().await;
         run.ended = ended;
+        if ended == ScrubEnd::Busy && run.checked == 0 {
+            // A provider had no slot, or a backbone that counts could not
+            // be asked at all (all its providers cooling or refused): the
+            // run could check nothing.
+            crate::trace::alert(|| "scrub-no-progress ended=busy checked=0".to_owned());
+        }
         // The backbones under an incident after this run: its own trip
         // adds one; a run that checked enough extents to trip the
         // breaker and did not clears them all.
@@ -504,12 +535,17 @@ where
             // known. Looked at again after the confirm interval; the run
             // goes on, so one such extent does not hold up the rest.
             Err(Halt::Deferred) => {
-                let next = self
-                    .clock
-                    .now()
-                    .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
-                self.catalog.scrub_defer(token, &extent.id, next).await?;
-                return Ok(());
+                if candidate.last == Some(ScrubResult::Deferred) {
+                    crate::trace::alert(|| {
+                        format!(
+                            "scrub-deferred {} the read broke off twice in a row",
+                            extent.id.as_str()
+                        )
+                    });
+                }
+                return self
+                    .scrub_record_one(reader, walk, extent, (ScrubResult::Deferred, confirm))
+                    .await;
             }
             Err(halt) => return Err(halt),
         };
@@ -568,9 +604,15 @@ where
         }
         // Held back from a re-pin, not from the finding: an extent with
         // no intact copy anywhere is still said to be unrecoverable.
-        let may_repin = !found.lacking.iter().any(|l| walk.blocked.contains(l))
+        let under_incident = found.lacking.iter().any(|l| walk.blocked.contains(l));
+        let may_repin = (!under_incident || walk.blocked_repins < BLOCKED_REPINS_PER_RUN)
             && walk.run.repaired < cfg.repairs_per_run;
-        self.repair(reader, walk, extent, found, may_repin).await
+        let repaired = walk.run.repaired;
+        let done = self.repair(reader, walk, extent, found, may_repin).await;
+        if under_incident && walk.run.repaired > repaired {
+            walk.blocked_repins += 1;
+        }
+        done
     }
 
     /// `STAT` on every backbone that counts, then the whole extent read
@@ -640,6 +682,9 @@ where
             // No provider that may hold a missing article has a free
             // slot: the run waits for the next one.
             ColdFetch::Busy => return Err(Halt::Busy),
+            // A backbone already said it lacks articles: that is the
+            // finding, whatever became of the read.
+            ColdFetch::Interrupted if !lacking.is_empty() => None,
             ColdFetch::Interrupted => return Err(Halt::Deferred),
         };
         Ok(Found {
@@ -867,6 +912,15 @@ where
         // copy keeps it at two copies until a release, by its own rule
         // (a full read on record, `REQUIRED_BACKBONES` holding it), says
         // otherwise. The operator is told.
+        if found.refetched > 0 {
+            crate::trace::alert(|| {
+                format!(
+                    "scrub-refetched {} articles={} served whole only by another provider",
+                    extent.id.as_str(),
+                    found.refetched
+                )
+            });
+        }
         let counting = crate::verify::release_labels(&self.cfg.providers);
         let unpostable: Vec<&String> = found.lacking.iter().filter(|l| !self.posts_to(l)).collect();
         if !unpostable.is_empty() {
@@ -891,34 +945,38 @@ where
                 .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
                 .await;
         }
-        if source != RepairSource::Safety && !self.put_safety(extent, cipher.clone()).await {
-            // The store did not take it: try again at the next look.
-            walk.run.suspect += 1;
-            return self
-                .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, confirm))
-                .await;
-        }
         let now = self.clock.now();
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
         let next = now.plus_ms(i64::try_from(bound * 1000).unwrap_or(i64::MAX));
-        // No provider served the bytes: every backbone that counts gets a
-        // failed full read, so verify reads each in full and none counts
-        // toward the release before it has passed one, whatever `STAT`
-        // says (it says "present" for a body no provider serves).
-        let unread: Vec<String> = match read {
+        // No provider served the bytes, or one served some with other
+        // bytes: every backbone that counts gets a failed full read, so
+        // verify reads each in full and none counts toward the release
+        // before it has passed one, whatever `STAT` says (it says
+        // "present" for a body no provider serves).
+        let unread: Vec<String> = match read && found.refetched == 0 {
             true => Vec::new(),
             false => counting,
         };
+        // Re-pinned first, written after: a copy is never written for an
+        // extent the guard refuses (it would be counted nowhere), and an
+        // eviction listed before cannot begin on it any more.
         if self
             .catalog
             .scrub_repin(token, &extent.id, (now, next), &unread)
             .await?
         {
-            // An eviction that began before the re-pin may have deleted
-            // the copy since: it is put back while the bytes are here.
+            // The copy goes back unless it is the safety copy just read;
+            // then it is looked for once more (an eviction that began
+            // before the re-pin may have deleted it since).
             let key = extent.id.safety_key();
-            if !matches!(self.safety.head(&key).await, Ok(Some(_))) {
-                let _ = self.put_safety(extent, cipher).await;
+            let mut there = source == RepairSource::Safety
+                && matches!(self.safety.head(&key).await, Ok(Some(_)));
+            for _ in 0..2 {
+                if there {
+                    break;
+                }
+                there = self.put_safety(extent, cipher.clone()).await
+                    && matches!(self.safety.head(&key).await, Ok(Some(_)));
             }
             walk.run.repaired += 1;
             crate::trace::alert(|| {
@@ -928,6 +986,17 @@ where
                     source.as_str()
                 )
             });
+            if !there {
+                // Pinned without its copy: verify cannot post from it, and
+                // the watch at the bound writes it from Usenet or the
+                // cache if either has it.
+                crate::trace::alert(|| {
+                    format!(
+                        "scrub-repair-copy-missing {} the safety copy could not be written",
+                        extent.id.as_str()
+                    )
+                });
+            }
             return Ok(());
         }
         // Refused: the extent is no longer released and done, or no live

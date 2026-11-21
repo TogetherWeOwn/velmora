@@ -636,8 +636,10 @@ impl ScrubConfig {
                     30 * 86_400,
                 ),
             )?,
-            // Under the cron interval of 300 s: runs must not overlap.
-            run_secs: number_or(get, "SCRUB_RUN_SECS", d.run_secs, (1, 290))?,
+            // Under the cron interval of 300 s: runs must not overlap. At
+            // least 30 s: 8 extents at the measured 3.3 s each, so a run
+            // can check what the breaker needs to trip or to clear.
+            run_secs: number_or(get, "SCRUB_RUN_SECS", d.run_secs, (30, 290))?,
             repairs_per_run: number_or(
                 get,
                 "SCRUB_REPAIRS_PER_RUN",
