@@ -45,6 +45,10 @@ use velmora::rng::SystemRng;
 use velmora::transports::NativeTlsTransport;
 use velmora_bridge::config::BridgeConfig;
 use velmora_bridge::crypto::{wrap_bdk, wrap_secret, DataKey};
+use velmora_bridge::gate::{
+    shards_from_var, Gate, GateClient, GateRecord, GateReply, GateRequest, GateSession,
+    GateSharding, GateStore, GateTransport, PermitGate, PermitMode, SessionState,
+};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::recovery::Unpublished;
 use velmora_bridge::sql::SqlCatalog;
@@ -95,6 +99,17 @@ struct Counts {
     nntp_asks: u64,
     nntp_bodies: u64,
     nntp_body_bytes: u64,
+    /// Permit gate (Durable Object) requests billed whole: a session
+    /// opened, or a request outside a session. 0 with `PERMITS=d1`.
+    do_requests: u64,
+    /// Messages on open gate sessions and their closes: billed at 1/20
+    /// of a request each (WebSocket messages).
+    do_messages: u64,
+    /// Times a gate object came into memory (it is out of memory between
+    /// two invocations here, the most a hibernating object can start).
+    do_starts: u64,
+    /// Writes to a gate's own storage (its one record).
+    do_storage_writes: u64,
 }
 
 /// The label in force and everything charged so far.
@@ -157,9 +172,11 @@ fn param_json(v: &SqlValue) -> serde_json::Value {
     }
 }
 
-/// D1 behind the meter.
+/// D1 behind the meter. Cloned for the permit gates, which use the same
+/// database (the catalogue's slot rows they seize) and are metered alike.
+#[derive(Clone)]
 struct MeterSql {
-    inner: RusqliteSql,
+    inner: Rc<RusqliteSql>,
     hub: Rc<Hub>,
 }
 
@@ -212,6 +229,236 @@ impl Sql for MeterSql {
 
     fn limits(&self) -> SqlLimits {
         self.inner.limits()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The permit gates (`PERMITS=do`)
+// ---------------------------------------------------------------------------
+
+/// The variables of the permit gate, read by the Worker's environment
+/// (`workers/s3-bridge/src/env.rs`) and here by the rig.
+const PERMIT_VARS: [&str; 3] = ["PERMITS", "PERMIT_GATES", "PERMIT_SHARDS"];
+
+/// The permit variables, parsed (and refused) as `env.rs` does, whether
+/// or not the gate is bound.
+struct PermitSettings {
+    mode: PermitMode,
+    sharding: GateSharding,
+    shards: u32,
+}
+
+impl PermitSettings {
+    fn from_vars(vars: &BTreeMap<String, String>) -> Self {
+        let get = |k: &str| vars.get(k).map(String::as_str);
+        PermitSettings {
+            mode: PermitMode::from_var(get("PERMITS")).expect("PERMITS"),
+            sharding: GateSharding::from_var(get("PERMIT_GATES")).expect("PERMIT_GATES"),
+            shards: shards_from_var(get("PERMIT_SHARDS")).expect("PERMIT_SHARDS"),
+        }
+    }
+}
+
+/// The gate client a Worker builds (as `env.rs` does).
+fn gate_client(
+    host: &Rc<GateHost>,
+    permits: &PermitSettings,
+    cfg: &BridgeConfig,
+    clock: &FixedClock,
+) -> Rc<dyn PermitGate> {
+    let clock = clock.clone();
+    GateClient::new(
+        GateWire(Rc::clone(host)),
+        move || clock.now(),
+        permits.mode,
+        permits.sharding,
+        permits.shards,
+        &cfg.providers,
+    )
+    .into_gate()
+}
+
+/// The storage of one gate object: its one record. Each save is metered.
+#[derive(Clone)]
+struct GateStorage {
+    record: Rc<RefCell<Option<GateRecord>>>,
+    hub: Rc<Hub>,
+}
+
+impl GateStore for GateStorage {
+    async fn load(&self) -> Result<Option<GateRecord>> {
+        Ok(self.record.borrow().clone())
+    }
+    async fn save(&self, record: &GateRecord) -> Result<()> {
+        self.hub.add(|c| c.do_storage_writes += 1);
+        *self.record.borrow_mut() = Some(record.clone());
+        Ok(())
+    }
+}
+
+type BenchGate = Gate<MeterSql, GateStorage>;
+
+/// The gate objects of the deployment, as the runtime hosts them: their
+/// storage and their open sessions outlive their memory, which is lost
+/// between two invocations ([`GateHost::hibernate`]).
+struct GateHost {
+    sql: MeterSql,
+    hub: Rc<Hub>,
+    clock: FixedClock,
+    records: RefCell<BTreeMap<String, Rc<RefCell<Option<GateRecord>>>>>,
+    in_memory: RefCell<BTreeMap<String, Rc<BenchGate>>>,
+    /// Per gate, what is kept with each open session's connection.
+    sockets: RefCell<BTreeMap<String, BTreeMap<u64, SessionState>>>,
+}
+
+impl GateHost {
+    fn new(sql: MeterSql, hub: Rc<Hub>, clock: FixedClock) -> Self {
+        GateHost {
+            sql,
+            hub,
+            clock,
+            records: RefCell::default(),
+            in_memory: RefCell::default(),
+            sockets: RefCell::default(),
+        }
+    }
+
+    fn now(&self) -> UnixMs {
+        self.clock.now()
+    }
+
+    /// The objects leave memory; their sessions stay open.
+    fn hibernate(&self) {
+        self.in_memory.borrow_mut().clear();
+    }
+
+    /// The object `name` in memory, started with its open sessions.
+    async fn gate(&self, name: &str) -> Result<Rc<BenchGate>> {
+        let known = self.in_memory.borrow().get(name).cloned();
+        let gate = match known {
+            Some(gate) => gate,
+            None => {
+                let record = Rc::clone(self.records.borrow_mut().entry(name.into()).or_default());
+                let store = GateStorage {
+                    record,
+                    hub: Rc::clone(&self.hub),
+                };
+                // One deployed version for the whole run.
+                let gate = Rc::new(Gate::new(self.sql.clone(), store, "bench"));
+                self.in_memory
+                    .borrow_mut()
+                    .insert(name.into(), Rc::clone(&gate));
+                gate
+            }
+        };
+        if !gate.started() {
+            self.hub.add(|c| c.do_starts += 1);
+            let open = self.sockets.borrow().get(name).cloned().unwrap_or_default();
+            gate.resume(open.into_values().collect(), self.now())
+                .await?;
+        }
+        Ok(gate)
+    }
+
+    /// The session is kept with its connection before a reply leaves.
+    fn attach(&self, name: &str, gate: &BenchGate, id: u64) {
+        let state = gate.session(id, self.now());
+        self.sockets
+            .borrow_mut()
+            .entry(name.into())
+            .or_default()
+            .insert(id, state);
+    }
+}
+
+/// The way to the gates. A request and its reply cross as JSON, as on
+/// the wire.
+struct GateWire(Rc<GateHost>);
+
+fn over_the_wire<T: Serialize + serde::de::DeserializeOwned>(v: &T) -> T {
+    serde_json::from_str(&serde_json::to_string(v).expect("gate json")).expect("gate json")
+}
+
+/// The caller's end of a session with one gate.
+struct GateLine {
+    host: Rc<GateHost>,
+    gate: String,
+    id: u64,
+}
+
+impl GateSession for GateLine {
+    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        let open = self
+            .host
+            .sockets
+            .borrow()
+            .get(&self.gate)
+            .is_some_and(|s| s.contains_key(&self.id));
+        if !open {
+            return Err(BridgeError::Sql("gate: session ended".into()));
+        }
+        self.host.hub.add(|c| c.do_messages += 1);
+        let gate = self.host.gate(&self.gate).await?;
+        let id = request.id;
+        let reply = gate
+            .handle(Some(self.id), over_the_wire(&request), self.host.now())
+            .await
+            .unwrap_or(GateReply::failed(id));
+        self.host.attach(&self.gate, &gate, self.id);
+        Ok(over_the_wire(&reply))
+    }
+
+    fn close(&self) {
+        let was_open = self
+            .host
+            .sockets
+            .borrow_mut()
+            .get_mut(&self.gate)
+            .is_some_and(|s| s.remove(&self.id).is_some());
+        if was_open {
+            // The close reaches the object as an event (billed as a
+            // message); one in memory frees the session's slots at once,
+            // one that is not starts without it.
+            self.host.hub.add(|c| c.do_messages += 1);
+            let gate = self.host.in_memory.borrow().get(&self.gate).cloned();
+            if let Some(gate) = gate {
+                gate.close(self.id);
+            }
+        }
+    }
+}
+
+impl GateTransport for GateWire {
+    type Session = GateLine;
+
+    async fn open(&self, request: GateRequest) -> Result<(GateLine, GateReply)> {
+        let request = over_the_wire(&request);
+        self.0.hub.add(|c| c.do_requests += 1);
+        let gate = self.0.gate(&request.gate).await?;
+        let now = self.0.now();
+        let line = GateLine {
+            host: Rc::clone(&self.0),
+            gate: request.gate.clone(),
+            id: gate.open(now).await?,
+        };
+        match gate.handle(Some(line.id), request, now).await {
+            Ok(reply) => {
+                self.0.attach(&line.gate, &gate, line.id);
+                Ok((line, over_the_wire(&reply)))
+            }
+            Err(e) => {
+                gate.close(line.id);
+                Err(e)
+            }
+        }
+    }
+
+    async fn call(&self, request: GateRequest) -> Result<GateReply> {
+        let request = over_the_wire(&request);
+        self.0.hub.add(|c| c.do_requests += 1);
+        let gate = self.0.gate(&request.gate).await?;
+        let reply = gate.handle(None, request, self.0.now()).await?;
+        Ok(over_the_wire(&reply))
     }
 }
 
@@ -449,6 +696,59 @@ type BenchBridge =
 // Configuration: production's [vars], fake providers
 // ---------------------------------------------------------------------------
 
+/// Whether the production part of the Worker's `wrangler.toml` (before
+/// the first `[env.*]`) binds the permit gate (`PERMIT_GATE`).
+fn gate_bound() -> bool {
+    let file = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../workers/s3-bridge/wrangler.toml"
+    );
+    gate_bound_in(&std::fs::read_to_string(file).expect("wrangler.toml"))
+}
+
+fn gate_bound_in(text: &str) -> bool {
+    let mut in_binding = false;
+    // A comment never holds the binding: cut it (no `#` occurs inside
+    // the strings of these lines).
+    for line in text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+    {
+        if line.starts_with("[env.") {
+            break;
+        }
+        if line.starts_with('[') {
+            in_binding = line == "[[durable_objects.bindings]]";
+            continue;
+        }
+        if in_binding && line.replace(' ', "") == "name=\"PERMIT_GATE\"" {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn gate_bound_reads_the_production_part_only() {
+    let bound = "[vars]\nPERMITS = \"d1\"\n[[durable_objects.bindings]]\nname = \"PERMIT_GATE\"\nclass_name = \"PermitGate\"\n";
+    assert!(gate_bound_in(bound));
+    // A comment after the name is still the binding.
+    assert!(gate_bound_in(
+        "[[durable_objects.bindings]]\nname = \"PERMIT_GATE\" # the gate\n"
+    ));
+    // Commented out, under another table, or in a dev-only part: not bound.
+    assert!(!gate_bound_in(
+        "[[durable_objects.bindings]]\n# name = \"PERMIT_GATE\"\n"
+    ));
+    assert!(!gate_bound_in("[[services]]\nname = \"PERMIT_GATE\"\n"));
+    assert!(!gate_bound_in(
+        "[vars]\n[env.dev]\n[[env.dev.durable_objects.bindings]]\nname = \"PERMIT_GATE\"\n"
+    ));
+    assert!(!gate_bound_in(
+        "[env.dev]\n[[durable_objects.bindings]]\nname = \"PERMIT_GATE\"\n"
+    ));
+}
+
 /// The `KEY = "value"` lines of the top-level `[vars]` of the Worker's
 /// `wrangler.toml` (the production configuration).
 fn production_vars() -> BTreeMap<String, String> {
@@ -656,6 +956,7 @@ struct Bench {
     vars: BTreeMap<String, String>,
     /// What `VELMORA_BENCH_VARS` changed for this run.
     bench_vars: Vec<(String, String)>,
+    gates: Rc<GateHost>,
     /// Distinct extents, plaintext bytes and objects, by class.
     classes: BTreeMap<String, (u64, u64, u64)>,
 }
@@ -674,7 +975,9 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 impl Bench {
-    async fn new(trace: Option<File>) -> Bench {
+    /// `extra`: variables changed as `VELMORA_BENCH_VARS` changes them,
+    /// after it (the tests' way to measure a switch).
+    async fn new(trace: Option<File>, extra: &[(&str, &str)]) -> Bench {
         let mut cfg = ServerConfig::for_test();
         cfg.group = GROUP.to_string();
         cfg.users.clear();
@@ -693,7 +996,9 @@ impl Bench {
         for (k, v) in overrides(&server) {
             vars.insert(k.to_string(), v);
         }
-        let bench_vars = parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        let mut bench_vars =
+            parse_bench_vars(&std::env::var("VELMORA_BENCH_VARS").unwrap_or_default());
+        bench_vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         for (k, v) in &bench_vars {
             vars.insert(k.clone(), v.clone());
         }
@@ -705,7 +1010,10 @@ impl Bench {
         .expect("bench configuration");
         // A BENCH_VARS key the configuration never reads changed nothing:
         // a typo, or a variable the measured commit does not have.
-        let asked = asked.into_inner();
+        let mut asked = asked.into_inner();
+        // Read by the Worker's environment (workers/s3-bridge/src/env.rs),
+        // not by the bridge's configuration: the rig reads them below.
+        asked.extend(PERMIT_VARS.iter().map(|k| k.to_string()));
         for (k, _) in &bench_vars {
             assert!(
                 asked.contains(k),
@@ -717,11 +1025,29 @@ impl Bench {
         hub.set("setup");
         let sql = RusqliteSql::with_schema().expect("schema");
         sql.meter_writes().expect("write meter");
+        let sql = MeterSql {
+            inner: Rc::new(sql),
+            hub: Rc::clone(&hub),
+        };
+        // As production binds the gate: a Worker on `PERMITS=d1` holds a
+        // gate client too and only takes its slots from the catalogue.
+        let clock = FixedClock::new(T0);
+        let gates = Rc::new(GateHost::new(sql.clone(), Rc::clone(&hub), clock.clone()));
+        // Only where the measured commit binds the gate, as `env.rs`
+        // attaches the client only with the binding (and refuses
+        // `PERMITS=do` without it).
+        let permits = PermitSettings::from_vars(&vars);
+        let catalog = if gate_bound() {
+            SqlCatalog::with_gate(sql, gate_client(&gates, &permits, &cfg, &clock))
+        } else {
+            assert!(
+                permits.mode == PermitMode::Catalog,
+                "PERMITS=do: the measured commit binds no permit gate (PERMIT_GATE)"
+            );
+            SqlCatalog::new(sql)
+        };
         let bridge = Rc::new(Bridge {
-            catalog: SqlCatalog::new(MeterSql {
-                inner: sql,
-                hub: Rc::clone(&hub),
-            }),
+            catalog,
             safety: MeterBlobs {
                 inner: MemBlobStore::new(),
                 safety: true,
@@ -740,7 +1066,7 @@ impl Bench {
                 hub: Rc::clone(&hub),
             },
             kek: TestKek::new(),
-            clock: FixedClock::new(T0),
+            clock,
             budget: ByteBudget::new(cfg.inflight_budget_bytes),
             cfg,
         });
@@ -793,6 +1119,7 @@ impl Bench {
             signer: Signer::new(AKID, secret),
             vars,
             bench_vars,
+            gates,
             classes: BTreeMap::new(),
         }
     }
@@ -836,6 +1163,7 @@ impl Bench {
         let req = self
             .signer
             .sign(self.bridge.clock.now(), method, &raw, query, extra, body);
+        self.gates.hibernate();
         self.hub.set(&format!("op:{label}"));
         *self
             .hub
@@ -968,6 +1296,7 @@ impl Bench {
 
     async fn run_job(&self, job: &Job, redelivery: bool) -> JobOutcome {
         let label = self.job_label(job);
+        self.gates.hibernate();
         self.hub.set(&label);
         *self.hub.calls.borrow_mut().entry(label).or_default() += 1;
         let t = Instant::now();
@@ -987,6 +1316,7 @@ impl Bench {
     }
 
     async fn cron_as(&self, label: &str) {
+        self.gates.hibernate();
         self.hub.set(label);
         *self
             .hub
@@ -1109,7 +1439,11 @@ impl Bench {
 // ---------------------------------------------------------------------------
 
 async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
-    let mut b = Bench::new(trace).await;
+    scenario_with(s, trace, &[]).await
+}
+
+async fn scenario_with(s: &Scale, trace: Option<File>, extra: &[(&str, &str)]) -> Bench {
+    let mut b = Bench::new(trace, extra).await;
     let big_parts = s.part * s.parts;
 
     // Ingest. `big/`: whole extents (PutObject and a multipart upload);
@@ -1247,6 +1581,7 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
 
     // Evict everything evictable, then cold reads from Usenet, then the
     // same read again from the cache it filled.
+    b.gates.hibernate();
     b.hub.set("stage:evict");
     // The largest integer D1 takes (JavaScript's safe range).
     let all = (1u64 << 53) - 1;
@@ -1340,6 +1675,7 @@ async fn scenario(s: &Scale, trace: Option<File>) -> Bench {
         let sent = b.bridge.jobs.inner.take();
         b.hub.set("stage:cron_idle");
         for s in sent {
+            b.gates.hibernate();
             b.bridge.run_job(&s.job).await;
             b.hub.add(|c| c.invocations += 1);
         }
@@ -1369,6 +1705,9 @@ fn report(b: &Bench, scale: &str) -> serde_json::Value {
         "GET_FANOUT_BYTES",
         "INTENT_SWEEP",
         "PARITY",
+        "PERMITS",
+        "PERMIT_GATES",
+        "PERMIT_SHARDS",
     ];
     let vars: BTreeMap<&str, &String> = keep
         .iter()
@@ -1448,6 +1787,51 @@ async fn bench_counts_smoke() {
             .unwrap_or(0)
             > 0
     );
+}
+
+/// With `PERMITS=do` every permit comes from a gate: the catalogue's slot
+/// rows are never written, the gates are asked instead, and the
+/// scenario still passes end to end.
+#[tokio::test(flavor = "current_thread")]
+async fn bench_counts_smoke_gate() {
+    assert!(gate_bound(), "production binds the permit gate");
+    let d1 = scenario_with(&SMOKE, None, &[("PERMITS", "d1")]).await;
+    let gate = scenario_with(&SMOKE, None, &[("PERMITS", "do")]).await;
+    sanity(&gate);
+    let total =
+        |b: &Bench, f: fn(&Counts) -> u64| b.hub.counts.borrow().values().map(f).sum::<u64>();
+    assert_eq!(
+        total(&d1, |c| c.do_requests + c.do_messages),
+        0,
+        "d1 asked a gate"
+    );
+    assert!(
+        total(&gate, |c| c.do_requests) > 0,
+        "no gate request metered"
+    );
+    assert!(
+        total(&gate, |c| c.do_storage_writes) > 0,
+        "the gate stored no record"
+    );
+    // Slot-row tokens move once per catalogue acquire; with the gate in
+    // charge only the rows it seizes move, once each.
+    let moved = |b: &Bench| b.sql_count("SELECT COALESCE(SUM(token), 0) FROM provider_permits");
+    assert!(
+        moved(&d1) > moved(&gate),
+        "{} vs {}",
+        moved(&d1),
+        moved(&gate)
+    );
+    // The post stage of a whole extent writes fewer rows: no slot row.
+    let written = |b: &Bench| b.hub.counts.borrow()["stage:big:post"].d1_rows_written;
+    assert!(
+        written(&gate) < written(&d1),
+        "{} vs {}",
+        written(&gate),
+        written(&d1)
+    );
+    let json = report(&gate, "smoke");
+    assert_eq!(json["vars"]["PERMITS"], "do");
 }
 
 /// The full run: `VELMORA_BENCH_OUT=<dir> cargo test -p velmora-bridge
