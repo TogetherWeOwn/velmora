@@ -7,7 +7,8 @@
 (bench/d1-replay.mjs). Writes <run dir>/results.json and results.md.
 D1 rows read and written are D1's own counts from the replay; the native
 meter's rows written are kept as d1_rows_written_native and compared with
-them (rows_written_check, a warning when they differ).
+them (rows_written_check). The run fails (exit 1, after the report is
+written) when they differ by more than ROWS_WRITTEN_NOISE rows in all.
 
     python3 -I bench/report.py --compare <run dir A> <run dir B> [--out FILE]
 
@@ -87,6 +88,15 @@ def load(run):
     return counts, d1, labels
 
 
+# The most the native meter and D1 may differ by, in rows written summed
+# over every label, before the run fails. The native run and the replay run
+# the same statements from the same state, so they agree exactly when both
+# are right (measured: 0). The allowance is the one count that varies from
+# run to run (bench/README.md, Repeatability): the light check's full read
+# of one sampled extent, 1 row written.
+ROWS_WRITTEN_NOISE = 1
+
+
 def rows_written_check(labels):
     """The native meter against D1's own count, label by label."""
     differ = {
@@ -94,11 +104,15 @@ def rows_written_check(labels):
         for k, c in sorted(labels.items())
         if c["d1_rows_written_native"] != c["d1_rows_written"]
     }
+    off = sum(abs(v["native"] - v["d1"]) for v in differ.values())
     return {
         "native": sum(c["d1_rows_written_native"] for c in labels.values()),
         "d1": sum(c["d1_rows_written"] for c in labels.values()),
         "labels": len(labels),
         "labels_differing": differ,
+        "rows_off": off,
+        "noise": ROWS_WRITTEN_NOISE,
+        "ok": off <= ROWS_WRITTEN_NOISE,
     }
 
 
@@ -106,11 +120,21 @@ def check_line(chk):
     if not chk["labels_differing"]:
         return f"Rows-written check: the native meter equals D1's count on all {chk['labels']} labels ({chk['d1']:,} rows)."
     worst = sorted(chk["labels_differing"].items(), key=lambda kv: -abs(kv[1]["native"] - kv[1]["d1"]))[:5]
+    head = "Rows-written check, within the noise" if chk["ok"] else "FAILED, rows-written check"
+    tail = (
+        "The figures below are D1's."
+        if chk["ok"]
+        else "The native run and the replay did not run the same thing (the replay's starting state differs, "
+        "for example the usage counters off), or the native meter (src/meter.rs) miscounts a statement: "
+        "the figures of this run are not valid."
+    )
     return (
-        f"WARNING, rows-written check: the native meter gives {chk['native']:,} rows, D1 {chk['d1']:,} "
-        f"({len(chk['labels_differing'])} of {chk['labels']} labels differ; largest: "
+        f"{head}: the native meter gives {chk['native']:,} rows, D1 {chk['d1']:,}, "
+        f"{chk['rows_off']:,} rows apart (allowed {chk['noise']}); "
+        f"{len(chk['labels_differing'])} of {chk['labels']} labels differ; largest: "
         + ", ".join(f"{k} {v['native']:,} vs {v['d1']:,}" for k, v in worst)
-        + "). The figures below are D1's; the native meter (src/meter.rs) miscounts a statement of this run."
+        + ". "
+        + tail
     )
 
 
@@ -436,6 +460,8 @@ def main(argv):
     print(f"report: {run / 'results.md'}")
     if chk["labels_differing"]:
         print(check_line(chk), file=sys.stderr)
+    if not chk["ok"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
