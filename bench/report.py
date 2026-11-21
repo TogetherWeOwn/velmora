@@ -387,6 +387,13 @@ def compare(a_dir, b_dir, out):
     for r in (ra, rb):
         if r["model"].get("not_valid"):
             L.append(f"| note | | | the model totals of {r['name']} are not valid: {r['model']['not_valid']} |")
+    for r in (ra, rb):
+        chk = r.get("rows_written_check", {})
+        if chk.get("ok") is False:
+            L.append(
+                f"| note | | | the rows-written check of {r['name']} FAILED ({chk.get('rows_off', '?')} rows apart, "
+                f"allowed {chk.get('noise', '?')}): its D1 rows written and model totals are not valid |"
+            )
     for name in stale:
         L.append(
             f"| note | | | the model totals of {name} price the native meter's rows written, "

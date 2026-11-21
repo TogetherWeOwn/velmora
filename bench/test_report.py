@@ -58,14 +58,20 @@ class ReportRun(unittest.TestCase):
     """report.py on a run directory: the report is written, then the run
     fails when the check fails."""
 
-    def run_report(self, shift):
+    def fixture(self, name="run"):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
-        run = tmp / "run"
+        run = tmp / name
         shutil.copytree(HERE / "testdata" / "run", run)
+        return run
+
+    def run_report(self, shift, empty=False, run=None):
+        run = run or self.fixture()
         d1 = json.loads((run / "d1.json").read_text())
         for label, n in shift.items():
             d1["by_label"][label]["d1_rows_written_replay"] -= n
+        if empty:
+            d1["by_label"] = {}
         (run / "d1.json").write_text(json.dumps(d1))
         code = 0
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -92,6 +98,24 @@ class ReportRun(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(results["rows_written_check"]["ok"])
         self.assertIn("FAILED, rows-written check", md)
+
+    def test_empty_replay_fails_after_writing_the_report(self):
+        code, results, md = self.run_report({}, empty=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(results["rows_written_check"]["ok"])
+        self.assertEqual(results["rows_written_check"]["d1"], 0)
+        self.assertIn("FAILED, rows-written check", md)
+
+    def test_compare_flags_a_failed_check(self):
+        good = self.fixture("good")
+        bad = self.fixture("bad")
+        self.assertIn(self.run_report({}, run=good)[0], (0, None))
+        self.assertEqual(self.run_report({"stage:tiny:verify": 1, "op:put_tiny": 1}, run=bad)[0], 1)
+        out = good.parent / "compare.md"
+        report.main(["--compare", str(good), str(bad), "--out", str(out)])
+        text = out.read_text()
+        self.assertIn("the rows-written check of fixture FAILED (2 rows apart, allowed 1)", text)
+        self.assertEqual(text.count("rows-written check of"), 1)
 
 
 if __name__ == "__main__":
