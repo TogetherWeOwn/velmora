@@ -539,6 +539,19 @@ where
             // known. Looked at again after the confirm interval; the run
             // goes on, so one such extent does not hold up the rest.
             Err(Halt::Deferred) => {
+                // A loss seen before stays on record: the next look that
+                // finds it again confirms it, whatever broke off between.
+                if matches!(
+                    candidate.last,
+                    Some(ScrubResult::Suspect | ScrubResult::Unrecoverable)
+                ) {
+                    let next = self
+                        .clock
+                        .now()
+                        .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
+                    self.catalog.scrub_defer(token, &extent.id, next).await?;
+                    return Ok(());
+                }
                 if candidate.last == Some(ScrubResult::Deferred) {
                     crate::trace::alert(|| {
                         format!(
