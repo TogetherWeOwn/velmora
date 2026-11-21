@@ -648,3 +648,58 @@ fn a_first_window_given_up_serves_reads_until_the_thaw() {
         ZeroServe::Serve
     );
 }
+
+/// The marker a move writes into the catalogue, read back from SQL, is
+/// judged against the head: the window's own marker reads only, after a
+/// flip it is a database left behind.
+#[test]
+fn a_stored_marker_is_read_back_and_judged_against_the_head() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    let catalog = RusqliteSql::with_schema().unwrap();
+    first(&chain);
+    let moving = start(&chain, "main");
+    // The move tool writes flips + 1 of the head: the first move's 1.
+    let ordinal = moving.tenant_zero.as_ref().unwrap().flips + 1;
+    let facts = block_on(async {
+        catalog
+            .exec(
+                "INSERT INTO rollback_stamp (id, counter, catalogue_id) VALUES (1, 3, 'main')",
+                &[],
+            )
+            .await
+            .unwrap();
+        catalog
+            .exec(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2)",
+                &[
+                    SqlValue::Text(CUTOVER_MARKER_KEY.into()),
+                    SqlValue::Int(ordinal as i64),
+                ],
+            )
+            .await
+            .unwrap();
+        database_facts(&catalog).await.unwrap()
+    });
+    assert_eq!(facts.marker, Some(1));
+    let given_up = write(&chain, Change::GiveUpMove, Actor::MoveTool, NOW);
+    assert_eq!(
+        decide(&given_up, &facts, &mut fresh()),
+        ZeroServe::ServeReadOnly
+    );
+    // A second window, flipped and undone: the same marker 1 is now a
+    // move that flipped.
+    start(&chain, "main");
+    flip(&chain, 9);
+    let undone = undo(&chain, 10, "main2");
+    let mut bound_main2 = facts.clone();
+    bound_main2.catalogue_id = Some("main2".into());
+    assert_eq!(
+        decide(&undone, &bound_main2, &mut fresh()),
+        paged("database_left_behind")
+    );
+}
