@@ -158,6 +158,11 @@ struct Found {
     /// The read broke off: `cipher` is `None` for that, not because no
     /// provider has the bytes.
     interrupted: bool,
+    /// Backbones that count, said with `STAT` they hold every article,
+    /// and yet did not serve one of them whole (other bytes, or `430` on
+    /// `BODY`): in `lacking` too, and read in full by verify after a
+    /// re-pin.
+    bad_bodies: Vec<String>,
     /// The bytes the read holds, charged until the check is done with.
     _charge: Option<crate::ingress::Charge>,
 }
@@ -506,7 +511,7 @@ where
             }
             SafetyState::Held | SafetyState::Releasing if repinned => {
                 let plan = self.catalog.articles(&extent.id).await?;
-                return self.watch_repair(reader, walk, extent, plan).await;
+                return self.watch_repair(reader, walk, candidate, plan).await;
             }
             // Deleted, or pinned by something else than the scrub: off
             // the due list (it leaves the index with its due time).
@@ -696,6 +701,25 @@ where
         };
         let after = reader.stats();
         let interrupted = matches!(read, Ok(ColdFetch::Interrupted));
+        // A provider of a backbone that counts, which `STAT` said holds
+        // every article, did not serve one: that backbone does not hold
+        // the extent whole.
+        let mut lacking = lacking;
+        let mut bad_bodies = Vec::new();
+        for (name, providers) in release_backbones(&self.cfg.providers) {
+            if lacking.contains(&name) {
+                continue;
+            }
+            let failed_here = providers.iter().any(|p| {
+                let count =
+                    |s: &ColdStats| s.failed.iter().find(|f| f.0 == p.id).map_or(0, |f| f.1);
+                count(&after) > count(&before)
+            });
+            if failed_here {
+                lacking.push(name.clone());
+                bad_bodies.push(name);
+            }
+        }
         let cipher = match read? {
             ColdFetch::Filled(cipher) => Some(cipher),
             ColdFetch::Unavailable => None,
@@ -713,6 +737,7 @@ where
             rebuilt: rebuilt(&before, &after),
             refetched: after.refetched.saturating_sub(before.refetched),
             interrupted,
+            bad_bodies,
             _charge: Some(charge),
         })
     }
@@ -1008,7 +1033,7 @@ where
         // before it has passed one, whatever `STAT` says (it says
         // "present" for a body no provider serves).
         let unread: Vec<String> = match read {
-            true => Vec::new(),
+            true => found.bad_bodies.clone(),
             false => counting,
         };
         // The cache copy is the last copy when it is the source (Usenet
@@ -1035,10 +1060,13 @@ where
             let _ = crate::recovery::delete_blob(&self.safety, &key).await;
         }
         if repinned? {
-            // The copy is looked for (an eviction that began before the
-            // re-pin may have deleted it since), and written if it is not
-            // there.
-            let mut there = matches!(self.safety.head(&key).await, Ok(Some(_)));
+            // Read from Usenet: the copy is written (one in R2 may be
+            // there with other bytes). Already in R2 (the safety copy just
+            // read, or the cache copy written before the re-pin): it is
+            // looked for, since an eviction that began before the re-pin
+            // may have deleted it, and written if it is not there.
+            let in_r2 = matches!(source, RepairSource::Safety | RepairSource::Cache);
+            let mut there = in_r2 && matches!(self.safety.head(&key).await, Ok(Some(_)));
             for _ in 0..2 {
                 if there {
                     break;
@@ -1127,11 +1155,20 @@ where
         &'s self,
         reader: &mut ColdReader<'s, C, N, T>,
         walk: &mut Walk<'_, 's, C, N, T>,
-        extent: &ExtentRow,
+        candidate: &ScrubCandidate,
         plan: Vec<ArticleRow>,
     ) -> core::result::Result<(), Halt> {
+        let extent = &candidate.extent;
         let cfg = &self.cfg.scrub;
         let bound = repair_bound_secs(self.cfg.safety_min_age_secs, cfg.confirm_secs);
+        // An early look: the re-pin could not write the copy and asked to
+        // be looked at again after the confirm interval. Before the bound
+        // the repair has not stalled; it only needs its copy.
+        let deadline = candidate
+            .last_scrubbed_at
+            .map(|at| at.plus_ms(i64::try_from(bound * 1000).unwrap_or(i64::MAX)));
+        let early = candidate.last == Some(ScrubResult::Repairing)
+            && deadline.is_some_and(|d| self.clock.now() < d);
         // Blob reads come first: no session sits open through them.
         Self::hang_up_all(reader, walk.stats).await;
         // No live object holds it any more (deleted or overwritten while
@@ -1199,6 +1236,24 @@ where
                 }
             }
         }
+        if early {
+            let next = match (kept || rewrote, deadline) {
+                (true, Some(deadline)) => deadline,
+                _ => {
+                    crate::trace::alert(|| {
+                        format!(
+                            "scrub-repair-copy-missing {} the safety copy could not be written",
+                            extent.id.as_str()
+                        )
+                    });
+                    self.clock.now().plus_ms(i64::from(cfg.confirm_secs) * 1000)
+                }
+            };
+            self.catalog
+                .scrub_defer(walk.token, &extent.id, next)
+                .await?;
+            return Ok(());
+        }
         walk.run.stalled += 1;
         crate::trace::alert(|| {
             format!(
@@ -1259,6 +1314,7 @@ mod tests {
             rebuilt: 0,
             refetched: 0,
             interrupted: false,
+            bad_bodies: Vec::new(),
             _charge: None,
         };
         for _ in 0..7 {

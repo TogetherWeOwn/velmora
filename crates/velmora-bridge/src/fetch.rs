@@ -1086,9 +1086,19 @@ pub struct ColdStats {
     /// Extents that lost more than their parity could rebuild
     /// (`extent-unrecoverable`).
     pub unrecoverable: u32,
+    /// Those refetches per provider id.
+    pub failed: Vec<(String, u32)>,
 }
 
 impl ColdStats {
+    fn refetch(&mut self, provider: &str) {
+        self.refetched += 1;
+        match self.failed.iter_mut().find(|f| f.0 == provider) {
+            Some(f) => f.1 += 1,
+            None => self.failed.push((provider.to_owned(), 1)),
+        }
+    }
+
     fn count(&mut self, provider: &str, bytes: u64) {
         match self.share.iter_mut().find(|s| s.0 == provider) {
             Some(s) => {
@@ -2651,17 +2661,17 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
                         .count(&session.provider.id, row.cipher_len);
                 } else {
                     b.asks[slot] = MISSING_ASKS;
-                    stats.borrow_mut().refetched += 1;
+                    stats.borrow_mut().refetch(&session.provider.id);
                 }
             }
             Checked::Corrupt => {
                 b.asks[slot] = MISSING_ASKS;
-                stats.borrow_mut().refetched += 1;
+                stats.borrow_mut().refetch(&session.provider.id);
             }
             Checked::Missing => {
                 b.asks[slot] += 1;
                 if b.asks[slot] == MISSING_ASKS {
-                    stats.borrow_mut().refetched += 1;
+                    stats.borrow_mut().refetch(&session.provider.id);
                 }
             }
             // Not asked for.
