@@ -1250,6 +1250,47 @@ async fn a_job_delivered_twice_in_one_isolate_is_handed_a_slot_once() {
     assert_eq!(w.held("p").await, 1);
 }
 
+/// A slot that came from the line lies with the isolate until its job
+/// asks for it, and every job of the isolate that asks looks through
+/// what lies there, each on the clock of its own invocation. One whose
+/// clock is behind does not take the slot of another for old: the job
+/// it came to takes it, and gives it back on its session.
+#[tokio::test]
+async fn a_slot_from_the_line_is_kept_from_a_call_whose_clock_is_behind() {
+    for ms in [1, 40, 5_000] {
+        let w = World::new();
+        let p = provider("p", 3);
+        let providers = [p.clone()];
+        let behind = Rc::new(Cell::new(0_i64));
+        let clock = {
+            let (w, behind) = (w.clone(), behind.clone());
+            move || UnixMs(w.now().0 - behind.get())
+        };
+        let (mode, one) = (PermitMode::Gate, GateSharding::One);
+        let wire = Wire(w.clone(), "isolate".to_string());
+        let client = GateClient::new(wire, clock, mode, one, 1, &providers);
+        let c = SqlCatalog::with_gate(w.db.clone(), client.with_push(true).into_gate());
+        let first = take(&c, &w, &p, JOB, "job-1").await.unwrap();
+        let second = take(&c, &w, &p, JOB, "job-2").await.unwrap();
+        let (sleep, on) = (w.sleeper(), [&p]);
+        let mut waits = wait(&c, &on, "job-3", 60_000, &sleep);
+        assert_eq!(turn(&mut waits), None);
+        c.release_permit(&second).await.unwrap();
+        assert_eq!(turn(&mut waits), Some(SlotWait::Granted));
+        drop(waits);
+        behind.set(ms);
+        assert!(take(&c, &w, &p, JOB, "job-4").await.is_none(), "{ms} ms");
+        behind.set(0);
+        assert_eq!((w.sessions(), w.held("p").await), (2, 2), "{ms} ms");
+        let got = take(&c, &w, &p, JOB, "job-3").await;
+        let got = got.expect("the slot that came from the line");
+        assert_eq!((w.sessions(), w.held("p").await), (2, 2), "{ms} ms");
+        c.release_permit(&got).await.unwrap();
+        c.release_permit(&first).await.unwrap();
+        assert_eq!((w.sessions(), w.held("p").await), (0, 0), "{ms} ms");
+    }
+}
+
 /// A request to wait that reaches the gate twice on one session keeps
 /// the session's place, and the slot is sent once, under the id of the
 /// request that asked last. A request with no question (the waiter
