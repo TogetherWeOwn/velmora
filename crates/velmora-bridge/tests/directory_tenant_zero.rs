@@ -144,6 +144,11 @@ fn the_selector_the_marker_and_the_catalogue_id_decide() {
             paged("database_is_not_the_named_one")
         );
     }
+    // The named database with a marker after a move: left behind.
+    assert_eq!(
+        decide(&undone, &db(true, Some("main2")), &mut fresh()),
+        paged("database_left_behind")
+    );
     // Retired 30 days after the flip of a second move, from the named
     // catalogue.
     start(&chain, "main2");
@@ -490,4 +495,37 @@ fn a_failed_directory_read_is_not_an_unknown_key() {
     );
     assert_eq!(r, Route::Unavailable);
     assert_eq!(a.zero.get(), 0);
+}
+
+/// The fallback undo lands on the frozen catalogue once it is thawed: its
+/// marker gone, it serves; with the marker still there it does not.
+#[test]
+fn the_fallback_undo_serves_the_thawed_frozen_catalogue() {
+    let store = MemRecords::new();
+    let seal = PlainSeal::new();
+    let chain = TenantChain {
+        store: &store,
+        seal: &seal,
+    };
+    first(&chain);
+    start(&chain, "main");
+    flip(&chain, 9);
+    let back = write(
+        &chain,
+        Change::UndoMoveOntoFrozen {
+            undo_stamp: 10,
+            stamp_levelled: true,
+        },
+        Actor::MoveTool,
+        NOW,
+    );
+    let mut seen = Seen { moved: true };
+    assert_eq!(
+        decide(&back, &db(false, Some("main")), &mut seen),
+        ZeroServe::Serve
+    );
+    assert_eq!(
+        decide(&back, &db(true, Some("main")), &mut seen),
+        paged("database_left_behind")
+    );
 }

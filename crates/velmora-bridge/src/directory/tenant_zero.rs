@@ -17,7 +17,8 @@
 //! | `moving` | another id | `503`, paged |
 //! | `moved` | any | [`ZeroServe::Moved`]: drop cached tenant-0 routes and resolve the key again |
 //! | `d1`, a move with no undo above its stamp | any | `503`, paged: a database left behind |
-//! | `d1` after an undo (it names a catalogue id) | its id is the named one | serve (reads only with a marker) |
+//! | `d1` after an undo (it names a catalogue id) | its id is the named one, no marker | serve |
+//! | `d1` after an undo | the marker | `503`, paged: a database left behind |
 //! | `d1` after an undo | another id | `503`, paged |
 //! | `retired`, or `d1` with an undo stamp and no move | any | `503`, paged |
 //!
@@ -172,9 +173,12 @@ fn d1(z: &TenantZero, db: &DatabaseFacts, seen: &Seen) -> ZeroServe {
             _ => return unavailable("database_is_not_the_named_one"),
         }
     }
-    match db.marker {
-        false => ZeroServe::Serve,
-        true => ZeroServe::ServeReadOnly,
+    match (db.marker, &z.moved) {
+        (false, _) => ZeroServe::Serve,
+        // The window is opening, or was given up: nothing writes.
+        (true, None) => ZeroServe::ServeReadOnly,
+        // A marker after a move: this database was left behind.
+        (true, Some(_)) => unavailable("database_left_behind"),
     }
 }
 
