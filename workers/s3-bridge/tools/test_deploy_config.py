@@ -466,15 +466,37 @@ class SegmentWriterTest(GeneratorCase):
         doc = tomllib.loads(self.shipped)
         self.assertNotIn(WRITER, doc["vars"])
 
-    def test_the_number_is_the_one_of_the_bridge(self):
+    def bridge_const(self, name):
+        """The value of `pub const <name>: u32` in the bridge: a number,
+        or the value of the one other constant it is set to."""
         found = []
-        for name in sorted(os.listdir(BRIDGE_SRC)):
-            if name.endswith(".rs"):
+        for file in sorted(os.listdir(BRIDGE_SRC)):
+            if file.endswith(".rs"):
                 found += re.findall(
-                    r"^pub const SINGLE_RECORD_EXTENTS: u32 = ([0-9_]+);$",
-                    read(os.path.join(BRIDGE_SRC, name)), re.M)
-        self.assertEqual([int(n.replace("_", "")) for n in found], [SINGLE_RECORD_EXTENTS])
+                    rf"^pub const {name}: u32 = ([^;]+);$", read(os.path.join(BRIDGE_SRC, file)), re.M)
+        self.assertEqual(len(found), 1, name)
+        if re.fullmatch(r"[0-9_]+", found[0]):
+            return int(found[0].replace("_", ""))
+        other = re.fullmatch(r"(?:[a-z_]+::)*([A-Z_]+)", found[0])
+        self.assertIsNotNone(other, f"{name} = {found[0]}")
+        return self.bridge_const(other.group(1))
+
+    def test_the_number_is_the_one_of_the_bridge(self):
+        self.assertEqual(self.bridge_const("SINGLE_RECORD_EXTENTS"), SINGLE_RECORD_EXTENTS)
         self.assertIn(f"single = {SINGLE_RECORD_EXTENTS}\n", self.step.script)
+
+    def test_absent_is_off_in_the_worker_too(self):
+        # The generator takes an absent or empty MAX_OBJECT_EXTENTS as
+        # the writer off. That is true only while the value the Worker
+        # takes then is no more than one record holds. A build that
+        # raises it must make the generator take absent as on.
+        config = read(os.path.join(BRIDGE_SRC, "config.rs"))
+        arm = re.findall(
+            r'match optional_u64\(&get, "MAX_OBJECT_EXTENTS"\)\? \{\n\s*None => ([A-Z_]+),\n', config)
+        self.assertEqual(len(arm), 1, "the Worker's read of MAX_OBJECT_EXTENTS has another shape")
+        self.assertLessEqual(self.bridge_const(arm[0]), SINGLE_RECORD_EXTENTS, arm[0])
+        # Unset and empty are one case there, as they are here.
+        self.assertIn("/// An optional `u64`; unset or empty = `None`.\nfn optional_u64(", config)
 
     def test_the_writer_on_is_refused_with_the_flat_layout(self):
         for value in (
@@ -490,6 +512,15 @@ class SegmentWriterTest(GeneratorCase):
                 for layout in NOT_ASKED:
                     self.refused({**older, SWITCH: layout}, REFUSED_WRITER, doctored)
 
+    def one_line_more(self, flat, tenant, what):
+        """`tenant` is `flat` with the layout line after the VERIFY_MODE
+        line and no other byte changed."""
+        lines = flat.decode("utf-8").split("\n")
+        at = [i for i, line in enumerate(lines) if line == self.ANCHOR]
+        self.assertEqual(len(at), 1, what)
+        want = lines[: at[0] + 1] + [TENANT_LINE] + lines[at[0] + 1:]
+        self.assertEqual(tenant.decode("utf-8").split("\n"), want, what)
+
     def test_the_writer_on_is_generated_with_the_tenant_layout(self):
         for value in ('"10001"', '"131072"', '" 10001 "'):
             doctored = self.with_extents(value)
@@ -498,17 +529,23 @@ class SegmentWriterTest(GeneratorCase):
             self.assertEqual(doc["vars"]["RECORD_LAYOUT"], "tenant", value)
             self.assertEqual(doc["vars"][WRITER], tomllib.loads(f"v = {value}")["v"], value)
             self.assertEqual(out.splitlines()[-1], LOG + "tenant", value)
+            # The bytes: what the step wrote for this file before the
+            # rule, and the one line.
+            self.one_line_more(without_switches(doctored), written, value)
 
     def test_the_writer_off_is_generated_with_either_layout(self):
         for value in ('"10000"', '"1"', '"0"', '" 10000 "', '"09999"', '""', '"  "'):
             doctored = self.with_extents(value)
-            _, plain = self.ok({SWITCH: "tenant"}, self.shipped)
-            for layout in (*NOT_ASKED, "tenant"):
-                _, written = self.ok({SWITCH: layout}, doctored)
-                doc = tomllib.loads(written.decode("utf-8"))
-                self.assertEqual(doc["vars"][WRITER], tomllib.loads(f"v = {value}")["v"], value)
-                self.assertEqual(doc["vars"].get("RECORD_LAYOUT"),
-                                 "tenant" if layout == "tenant" else None, value)
+            for older in (OLDER[0], OLDER[-1]):
+                # The bytes the step wrote for this file before the
+                # rule, worked out here.
+                want = with_older(doctored, older)
+                self.assertIn(f"\n{WRITER} = {value}\n".encode("utf-8"), want, value)
+                for layout in NOT_ASKED:
+                    _, written = self.ok({**older, SWITCH: layout}, doctored)
+                    self.assertEqual(written, want, f"{value} {layout!r} {older!r}")
+            _, written = self.ok({SWITCH: "tenant"}, doctored)
+            self.one_line_more(without_switches(doctored), written, value)
 
     def test_a_writer_line_the_eye_does_not_see_is_still_read(self):
         # A quoted key, and a key set in a later line of the prod [vars]
