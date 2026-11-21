@@ -305,11 +305,18 @@ fn words(sql: &str) -> Vec<String> {
             i += 1;
         } else if c == b'\'' {
             i += 1;
+            let start = i;
             while i < b.len() && !(b[i] == b'\'' && b.get(i + 1) != Some(&b'\'')) {
                 i += if b[i] == b'\'' { 2 } else { 1 };
             }
+            // SQLite takes a quoted string where a name is expected as
+            // that name ('extents', 'plan_rev'), so its text is a word too.
+            out.push(
+                sql[start..i.min(sql.len())]
+                    .replace("''", "'")
+                    .to_ascii_lowercase(),
+            );
             i += 1;
-            out.push("'…'".to_string());
         } else if c == b'"' || c == b'`' || c == b'[' {
             let close = if c == b'[' { b']' } else { c };
             let start = i + 1;
@@ -620,6 +627,9 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         "const X: &str = concat! (\"UPDATE extents SET plan_\", \"rev = 2\");",
         "const X: &str = \"UPDATE extents SET plan\\u{5f}rev = 2\";",
         "const X: &str = \"UPDATE extents SET plan\\x5frev = 2\";",
+        // Single quotes where a name is expected.
+        "const X: &str = \"UPDATE 'extents' SET 'plan_rev' = 2\";",
+        "const X: &str = \"INSERT INTO 'extents'('id', 'plan_rev') VALUES (?1, 2)\";",
         // `format!`: a placeholder may hold the column or the table.
         "let s = format!(\"INSERT OR REPLACE INTO extents({EXTENT_COLS}) VALUES ({v})\");",
         "let s = format!(\"UPDATE extents SET {SET} WHERE id = ?1\");",

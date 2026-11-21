@@ -137,11 +137,14 @@ pub enum UnitOp {
     /// The key row of an access key: the first of the two calls of a cold
     /// isolate. Allowed without `authenticated`.
     KeyRow { access_key_id: String },
-    /// The read plan of a range of an object: the live generation and
-    /// its extents in `[start, end)`. Allowed without `authenticated`,
-    /// and then it writes nothing (no read stamp). `access_key_id`: the
-    /// key row comes back with it (one call for a cold isolate's read).
-    /// `reader`: set on a fan-out sub-request.
+    /// The read plan of a range of an object: the live generation (or
+    /// the one named) and its extents in `[start, end)`. Allowed without
+    /// `authenticated`, and then it writes nothing (no read stamp).
+    /// `access_key_id`: the key row comes back with it (one call for a
+    /// cold isolate's read). `reader`: set on a fan-out sub-request, which
+    /// also names the `generation` its grant was made for, so that a piece
+    /// of a large GET is read from the object the GET began on, not from
+    /// one that replaced it since.
     ReadPlan {
         bucket: String,
         key: String,
@@ -151,6 +154,8 @@ pub enum UnitOp {
         access_key_id: Option<String>,
         #[serde(default)]
         reader: Option<Reader>,
+        #[serde(default)]
+        generation: Option<String>,
     },
 }
 

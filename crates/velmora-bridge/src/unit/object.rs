@@ -42,7 +42,7 @@ use super::name::UnitName;
 use super::schema;
 use crate::ports::{Catalog, Sql, SqlValue};
 use crate::sql::SqlCatalog;
-use crate::types::{BridgeError, BucketId, ExtentId, KeyStatus, Result, UnixMs};
+use crate::types::{BridgeError, BucketId, ExtentId, GenerationId, KeyStatus, Result, UnixMs};
 
 /// The database of a unit: [`Sql`] with whole-call transactions.
 pub trait UnitSql: Sql {
@@ -394,7 +394,12 @@ impl<S: UnitSql> Unit<S> {
                 end,
                 access_key_id,
                 reader,
+                generation: named,
             } => {
+                // A fan-out piece reads the generation its grant names.
+                if reader.is_some() && named.is_none() {
+                    return Ok(Err(Refused::AccessDenied));
+                }
                 let Some(b) = self.cat.bucket_by_name(bucket).await? else {
                     // A missing bucket is decided by the Worker after the
                     // signature (a missing bucket and a missing
@@ -437,7 +442,15 @@ impl<S: UnitSql> Unit<S> {
                     },
                     None => None,
                 };
-                let Some(generation) = self.cat.live_generation(&b.id, key).await? else {
+                let generation = match named {
+                    Some(g) => self
+                        .cat
+                        .generation_by_id(&b.id, &GenerationId::new(g.as_str()))
+                        .await?
+                        .map(|(_, g)| g),
+                    None => self.cat.live_generation(&b.id, key).await?,
+                };
+                let Some(generation) = generation else {
                     return Ok(Ok(json!({
                         "bucket": b.id.as_str(),
                         "generation": Value::Null,

@@ -129,7 +129,11 @@ fn ready() -> Unit<RusqliteSql> {
     u
 }
 
+const GEN: &str = "g_0019a00000000c1c1c1c1c1c1c1c1";
+
 fn read_plan(reader: Option<Reader>) -> UnitOp {
+    // A fan-out piece names the generation its grant was made for.
+    let generation = reader.as_ref().map(|_| GEN.to_string());
     UnitOp::ReadPlan {
         bucket: "alpha".into(),
         key: "k".into(),
@@ -137,6 +141,7 @@ fn read_plan(reader: Option<Reader>) -> UnitOp {
         end: 20,
         access_key_id: Some(AKID.into()),
         reader,
+        generation,
     }
 }
 
@@ -568,6 +573,71 @@ fn a_fanout_read_with_lower_numbers_is_served_while_its_reader_is_allowed() {
         .unwrap();
     assert_eq!(
         u.handle(&fanout, NOW),
+        UnitAnswer::Refused {
+            reason: Refused::AccessDenied,
+            alarm: false
+        }
+    );
+}
+
+#[test]
+fn a_fanout_piece_reads_the_generation_its_grant_names() {
+    let u = ready();
+    // The object is overwritten after the GET began: a new generation is
+    // live for the key, with an extent of its own.
+    u.sql()
+        .apply(
+            "UPDATE generations SET state = 'superseded' WHERE id = 'g_0019a00000000c1c1c1c1c1c1c1c1'; \
+             INSERT INTO generations(id, bucket_id, key, state, size, etag, content_json, \
+               user_meta_json, extent_count, created_at) \
+               VALUES ('g_0019a00000001c2c2c2c2c2c2c2c2', 'b_00000000000000c1', 'k', 'live', 10, \
+                 '\"f\"', '{}', '{}', 1, 2); \
+             UPDATE objects SET generation_id = 'g_0019a00000001c2c2c2c2c2c2c2c2' WHERE key = 'k'; \
+             INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
+               plain_size, cipher_size, media_header, plain_md5, plain_sha256, cipher_sha256, \
+               safety_state, created_at) \
+               VALUES ('x_000000000000000000000000c3', 'b_00000000000000c1', \
+                 'g_0019a00000001c2c2c2c2c2c2c2c2', 'committed', 0, 0, 10, 10, zeroblob(48), \
+                 zeroblob(16), zeroblob(32), zeroblob(32), 'held', 2);",
+        )
+        .unwrap();
+    let reader = Some(Reader::Key {
+        access_key_id: AKID.into(),
+    });
+    let UnitAnswer::Ok { body, .. } = u.handle(
+        &call(
+            CallKind::Fanout,
+            seqs(3, 0),
+            true,
+            read_plan(reader.clone()),
+        ),
+        NOW,
+    ) else {
+        panic!("a fan-out piece is served");
+    };
+    assert_eq!(body["generation"], json!(GEN));
+    assert_eq!(
+        body["extents"],
+        json!([
+            "x_000000000000000000000000c1",
+            "x_000000000000000000000000c2"
+        ])
+    );
+    // A request reads the live generation.
+    let UnitAnswer::Ok { body, .. } = u.handle(
+        &call(CallKind::Request, seqs(3, 0), true, read_plan(None)),
+        NOW,
+    ) else {
+        panic!("a read is served");
+    };
+    assert_eq!(body["generation"], json!("g_0019a00000001c2c2c2c2c2c2c2c2"));
+    // A fan-out piece that names no generation is refused.
+    let mut op = read_plan(reader);
+    if let UnitOp::ReadPlan { generation, .. } = &mut op {
+        *generation = None;
+    }
+    assert_eq!(
+        u.handle(&call(CallKind::Fanout, seqs(3, 0), true, op), NOW),
         UnitAnswer::Refused {
             reason: Refused::AccessDenied,
             alarm: false
