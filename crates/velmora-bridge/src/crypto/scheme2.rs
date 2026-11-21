@@ -227,9 +227,11 @@ impl Scheme {
         }
     }
 
-    /// Refuses a wrapped column whose first byte is not this scheme's.
-    /// The caller alarms on the error: a wrap of the other scheme in a
-    /// tenant's row is a bug or a planted row, never a fallback.
+    /// Refuses a wrapped BDK or a wrapped secret whose first byte is not
+    /// this scheme's. The caller alarms on the error: a wrap of the other
+    /// scheme in a tenant's row is a bug or a planted row, never a
+    /// fallback. Not for file-key wraps: those are `0x01` in both
+    /// schemes, because they are made under a BDK and bind no tenant.
     pub fn check(&self, wrapped: &[u8]) -> Result<()> {
         match wrapped.first() {
             Some(&b) if b == self.wrap_byte() => Ok(()),
@@ -587,7 +589,9 @@ pub fn record_v2_header(sealed: &[u8]) -> Result<(TenantId, u32)> {
         .ok()
         .and_then(|t| TenantId::parse(t).ok())
         .ok_or(ERR_RECORD_TENANT)?;
-    Ok((tenant, header_version(sealed)))
+    // Version 0 is "no tenant key": no record is sealed under it.
+    let version = valid_tk_version(header_version(sealed)).map_err(|_| ERR_RECORD_V2)?;
+    Ok((tenant, version))
 }
 
 fn header_version(sealed: &[u8]) -> u32 {
