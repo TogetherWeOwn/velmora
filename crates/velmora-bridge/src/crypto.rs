@@ -10,6 +10,10 @@
 //!   └─ HKDF-SHA256(info "velmora/list-token/v1") → HMAC key for list tokens
 //! ```
 //!
+//! That is key scheme 1, tenant 0's for good. A managed tenant uses key
+//! scheme 2 ([`scheme2`]): a tenant key between the KEK and its BDKs,
+//! `ak/v2` secrets, VMR2 data records and two-part control records.
+//!
 //! Every wrap is `0x01 ‖ nonce[24] ‖ XChaCha20-Poly1305(plaintext) ‖ tag[16]`
 //! with a fresh random nonce, so a wrapped 32-byte key is 73 bytes
 //! ([`WrappedKey`]). The AAD names the purpose and the row the wrap belongs
@@ -103,6 +107,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ports::Kek;
 use crate::types::{BridgeError, BucketId, ByteSpan, ExtentId, ExtentRow, KekBytes, Result};
+
+pub mod scheme2;
 
 /// Context of the bridge's media profile. Distinct from every other
 /// product's context, so ciphertexts cannot be confused across products.
@@ -266,17 +272,32 @@ fn wrap_bytes<R: FillRandom>(
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u8>> {
+    wrap_bytes_as(WRAP_VERSION, key, aad.as_bytes(), plaintext, rng)
+}
+
+/// `version ‖ nonce ‖ ct ‖ tag` over `plaintext` with a fresh random
+/// nonce. The version byte says which key scheme made the wrap
+/// ([`WRAP_VERSION`] for scheme 1, [`scheme2::WRAP_VERSION_2`] for
+/// scheme 2); the AAD names the purpose, so the byte is a label for the
+/// reader and never what picks the key.
+fn wrap_bytes_as<R: FillRandom>(
+    version: u8,
+    key: &[u8; KEY_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>> {
     let mut nonce = [0u8; WRAP_NONCE_LEN];
     rng.fill_bytes(&mut nonce).map_err(|_| ERR_RNG)?;
 
     // Holds plaintext until encryption has run, so it is wiped on failure.
     let mut out = Zeroizing::new(Vec::with_capacity(plaintext.len() + WRAP_OVERHEAD));
-    out.push(WRAP_VERSION);
+    out.push(version);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(plaintext);
     let body = &mut out[1 + WRAP_NONCE_LEN..];
     let tag = wrap_cipher(key)
-        .encrypt_inout_detached(&XNonce::from(nonce), aad.as_bytes(), body.into())
+        .encrypt_inout_detached(&XNonce::from(nonce), aad, body.into())
         .map_err(|_| ERR_WRAP)?;
     out.extend_from_slice(tag.as_slice());
     // Ciphertext from here on: hand it out without the wipe.
@@ -286,7 +307,18 @@ fn wrap_bytes<R: FillRandom>(
 /// Opens a wrap. Every failure (length, version byte, key, binding, any
 /// changed byte) is the same error.
 fn unwrap_bytes(key: &[u8; KEY_LEN], aad: &str, wrapped: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    if wrapped.len() < WRAP_OVERHEAD || wrapped[0] != WRAP_VERSION {
+    unwrap_bytes_as(WRAP_VERSION, key, aad.as_bytes(), wrapped)
+}
+
+/// Opens a wrap whose first byte must be `version`. Every failure is the
+/// same error.
+fn unwrap_bytes_as(
+    version: u8,
+    key: &[u8; KEY_LEN],
+    aad: &[u8],
+    wrapped: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    if wrapped.len() < WRAP_OVERHEAD || wrapped[0] != version {
         return Err(ERR_UNWRAP);
     }
     let (nonce, rest) = wrapped[1..].split_at(WRAP_NONCE_LEN);
@@ -298,7 +330,7 @@ fn unwrap_bytes(key: &[u8; KEY_LEN], aad: &str, wrapped: &[u8]) -> Result<Zeroiz
     wrap_cipher(key)
         .decrypt_inout_detached(
             &XNonce::from(nonce),
-            aad.as_bytes(),
+            aad,
             out.as_mut_slice().into(),
             &Tag::from(tag),
         )
