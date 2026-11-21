@@ -60,10 +60,14 @@ database, so they run natively in tests); the Durable Object class, the
    `404` when none does.
 11. **Unauthenticated calls are read-only.** A call carries `authenticated`,
     set by the Worker only after SigV4, the service token or a fan-out grant
-    verified. Only two operations run without it: the key-row fetch and the
-    cold read plan (both read-only; a cold read returns the key row with the
-    plan, so a cold isolate verifies the signature from one call). Their
-    transaction is rolled back and refused if it changed a row.
+    verified. Of the callers' operations only two run without it: the
+    key-row fetch and the cold read plan (both read-only; a cold read
+    returns the key row with the plan, so a cold isolate verifies the
+    signature from one call). Their transaction is rolled back and refused
+    if it changed a row. The Worker's own calls (`provision`, `sync`) are
+    not judged by this flag: they carry records the Worker has verified,
+    never a caller's input, and a cold isolate needs `sync` before it can
+    verify a signature.
 13. **Key scheme.** Tenant 0 holds key scheme 1, every other tenant scheme 2;
     a token with the other scheme is refused.
 14. **Jurisdiction.** A token names the jurisdiction of the namespace its
@@ -136,5 +140,10 @@ Durable Object's SQLite storage. What it does about the runtime, as measured:
 `workers/unit-suite/run-suite.sh` runs the whole `velmora-bridge` test suite
 with a twin: every native test database gets a fresh Durable Object in
 workerd behind `DoSql`, every call runs on both and is compared, and the
-tests get the object's answers. Then `unit-smoke.py` drives the unit class
-itself in the same workerd.
+tests get the object's answers. Errors are compared by class and keep
+SQLite's message. Not compared, by design: calls that meet a state with a
+broken foreign key (a test that switched the keys off; they run on SQLite
+alone, are counted, and the twin is rebuilt at the next whole state), plain
+`EXPLAIN` bytecode (counted as skipped), and `total_changes()` and
+`last_insert_rowid()`, which are each connection's own counters. Then
+`unit-smoke.py` drives the unit class itself in the same workerd.

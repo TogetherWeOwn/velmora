@@ -177,7 +177,7 @@ fn ident_byte(b: u8) -> bool {
 /// string literals (`'…'`, with `x'…'` blobs), quoted identifiers (`"…"`,
 /// `` `…` ``, `[…]`) and comments (`--…`, `/*…*/`) hold no placeholder.
 /// A bare `?` takes the number one above the largest assigned before it.
-/// A named parameter (`:a`, `@a`, `$a`: a sigil that starts a token) is
+/// A named parameter (`:a`, `@a`, `$a`, `#a`, wherever it stands) is
 /// refused: no catalogue statement uses one, and its number would need
 /// the statement's parse.
 fn lex(sql: &str) -> Result<Lexed> {
@@ -259,10 +259,10 @@ fn lex(sql: &str) -> Result<Lexed> {
             b'"' => i = skip_quoted(i + 1, b'"', true),
             b'`' => i = skip_quoted(i + 1, b'`', true),
             b'[' => i = skip_quoted(i + 1, b']', false),
-            b':' | b'@' | b'$' | b'#'
-                if (i == 0 || !ident_byte(bytes[i - 1]))
-                    && bytes.get(i + 1).is_some_and(|c| ident_byte(*c)) =>
-            {
+            // A `$` inside an identifier was taken by the identifier
+            // branch; any sigil that reaches here starts a parameter, also
+            // right after a word (`LIMIT:n`, `WHERE@x`, `1#x`).
+            b':' | b'@' | b'$' | b'#' if bytes.get(i + 1).is_some_and(|c| ident_byte(*c)) => {
                 return Err(BridgeError::Sql("do: named parameter".into()));
             }
             b'?' => {
@@ -641,6 +641,14 @@ mod tests {
         assert!(bind_text("SELECT @x, ?", &[int(1)]).is_err());
         assert!(bind_text("SELECT $x, ?", &[int(1)]).is_err());
         assert!(bind_text("SELECT #x, ?", &[int(1)]).is_err());
+        // Right after a word or a number, SQLite still reads a parameter.
+        for sql in [
+            "SELECT 1 LIMIT:n",
+            "SELECT ?, 1 WHERE@x IS NULL OR ? = 2",
+            "SELECT 1#x",
+        ] {
+            assert!(bind_text(sql, &[int(1), int(2)]).is_err(), "{sql}");
+        }
     }
 
     #[test]

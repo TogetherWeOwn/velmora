@@ -4,8 +4,8 @@ Drives the real class (velmora_unit_do::UnitObject) through the suite
 Worker: rule 7 (unborn, listed and not), the name check of an object
 made without a name, rule 6 (birth, a replayed token), rule 5 (numbers),
 rule 11 (what runs without authentication), and the whole-call
-transaction of DoSql (/atomic). Prints one line per check and exits 1 on
-the first difference.
+transaction of DoSql (/atomic). Prints one line per check, runs every
+check, and exits 1 if any differed.
 """
 import glob
 import json

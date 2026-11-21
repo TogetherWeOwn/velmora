@@ -411,7 +411,8 @@ fn bracketed(w: &[String], j: usize) -> &[String] {
 /// column; or by a table renamed to `extents` (a rebuild).
 fn writes_plan_rev(sql: &str) -> bool {
     let w = words(sql);
-    let has = |list: &[String]| list.iter().any(|t| t == "plan_rev");
+    // `plan_rev`, or a `format!` placeholder that may hold it.
+    let has = |list: &[String]| list.iter().any(|t| t == "plan_rev" || t == "{");
     // A table rebuilt and renamed to `extents` writes every row of it.
     if w.windows(3)
         .any(|x| x[0] == "rename" && x[1] == "to" && x[2] == "extents")
@@ -424,10 +425,14 @@ fn writes_plan_rev(sql: &str) -> bool {
                 let Some((table, after)) = target(&w, i + 1, true) else {
                     continue;
                 };
-                if table == "extents"
+                // A table given by a placeholder may be `extents`.
+                if (table == "extents" || table == "{")
                     && w.get(after).map(String::as_str) == Some("set")
                     && has(set_list(&w, after + 1))
                 {
+                    return true;
+                }
+                if table == "{" {
                     return true;
                 }
             }
@@ -435,20 +440,58 @@ fn writes_plan_rev(sql: &str) -> bool {
                 let Some((table, after)) = target(&w, i + 1, false) else {
                     continue;
                 };
+                if table == "{" {
+                    return true;
+                }
                 if table != "extents" {
                     continue;
                 }
                 if w.get(after).map(String::as_str) != Some("(") || has(bracketed(&w, after)) {
                     return true;
                 }
-                // An upsert's `DO UPDATE SET` writes the same row.
-                let upsert = w[after..]
-                    .windows(3)
-                    .position(|x| x[0] == "do" && x[1] == "update" && x[2] == "set");
-                if let Some(k) = upsert {
-                    if has(set_list(&w, after + k + 3)) {
+                // Every `DO UPDATE SET` of an upsert writes the same row.
+                for (k, x) in w[after..].windows(3).enumerate() {
+                    if x[0] == "do"
+                        && x[1] == "update"
+                        && x[2] == "set"
+                        && has(set_list(&w, after + k + 3))
+                    {
                         return true;
                     }
+                }
+            }
+            // A migration that drops, adds or renames the column, or makes
+            // the table from a query.
+            "alter" if w.get(i + 1).map(String::as_str) == Some("table") => {
+                let Some((table, after)) = target(&w, i + 2, false) else {
+                    continue;
+                };
+                let statement = w[after..].iter().take_while(|t| *t != ";");
+                if table == "extents" && statement.into_iter().any(|t| t == "plan_rev") {
+                    return true;
+                }
+            }
+            "create" => {
+                let mut j = i + 1;
+                if matches!(w.get(j).map(String::as_str), Some("temp" | "temporary")) {
+                    j += 1;
+                }
+                if w.get(j).map(String::as_str) != Some("table") {
+                    continue;
+                }
+                j += 1;
+                if w.get(j).map(String::as_str) == Some("if") {
+                    j += 3;
+                }
+                // `[schema.]extents AS SELECT …` (not `target`: it would
+                // read the AS as an alias).
+                if w.get(j + 1).map(String::as_str) == Some(".") {
+                    j += 2;
+                }
+                if w.get(j).map(String::as_str) == Some("extents")
+                    && w.get(j + 1).map(String::as_str) == Some("as")
+                {
+                    return true;
                 }
             }
             _ => {}
@@ -577,6 +620,13 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
         "const X: &str = concat! (\"UPDATE extents SET plan_\", \"rev = 2\");",
         "const X: &str = \"UPDATE extents SET plan\\u{5f}rev = 2\";",
         "const X: &str = \"UPDATE extents SET plan\\x5frev = 2\";",
+        // `format!`: a placeholder may hold the column or the table.
+        "let s = format!(\"INSERT OR REPLACE INTO extents({EXTENT_COLS}) VALUES ({v})\");",
+        "let s = format!(\"UPDATE extents SET {SET} WHERE id = ?1\");",
+        "let s = format!(\"UPDATE {table} SET n = 1\");",
+        "let s = format!(\"INSERT INTO {table} VALUES (?1)\");",
+        // A second upsert clause.
+        "const X: &str = \"INSERT INTO extents(id) VALUES (?1) ON CONFLICT(id) DO UPDATE SET n = 1 ON CONFLICT DO UPDATE SET plan_rev = 2\";",
     ] {
         assert_eq!(one(src).len(), 1, "not found: {src}");
     }
@@ -600,6 +650,22 @@ fn the_scanner_finds_a_statement_however_it_is_written() {
     assert!(writes_plan_rev(&sql_pieces(sql)[0]));
     let sql = "UPDATE /* backfill */ extents SET plan_rev = 2;";
     assert!(writes_plan_rev(&sql_pieces(sql)[0]));
+    // Migrations that drop, add or rename the column, or make the table
+    // from a query.
+    for sql in [
+        "ALTER TABLE extents DROP COLUMN plan_rev;",
+        "ALTER TABLE extents ADD COLUMN plan_rev INTEGER NOT NULL DEFAULT 2;",
+        "ALTER TABLE extents RENAME COLUMN other TO plan_rev;",
+        "CREATE TABLE extents AS SELECT * FROM old;",
+    ] {
+        assert!(writes_plan_rev(&sql_pieces(sql)[0]), "{sql}");
+    }
+    assert!(!writes_plan_rev(
+        "ALTER TABLE extents ADD COLUMN last_read_at INTEGER;"
+    ));
+    assert!(!writes_plan_rev(
+        "CREATE TABLE extents (id TEXT, plan_rev INTEGER NOT NULL DEFAULT 0)"
+    ));
     // A rebuild of the table writes every row of it.
     let rebuild = "CREATE TABLE extents_new (id TEXT, plan_rev INTEGER);\n\
                    INSERT INTO extents_new(id, plan_rev) SELECT id, plan_rev + 1 FROM extents;\n\

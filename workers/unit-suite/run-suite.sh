@@ -91,6 +91,15 @@ const suite :Workerd.Worker = (
 CAPNP
 }
 
+# Every port must be free: a workerd left over from another run would
+# answer the readiness check, and the run would test an old build.
+for i in $(seq 0 $((INSTANCES - 1))); do
+  if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$((PORT + i))/"; then
+    log "port $((PORT + i)) already answers: stop the other run, or set SUITE_PORT"
+    exit 1
+  fi
+done
+
 cp -r "$HERE/build" "$RUN/build"
 URLS=
 for i in $(seq 0 $((INSTANCES - 1))); do
@@ -113,8 +122,8 @@ for i in $(seq 0 $((INSTANCES - 1))); do
     fi
     sleep 0.2
   done
-  if [ -z "$ready" ]; then
-    log "workerd $i did not answer"
+  if [ -z "$ready" ] || ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
+    log "workerd $i did not answer, or is not the one this run started"
     cat "$RUN/workerd$i.log" >&2
     exit 1
   fi
@@ -163,7 +172,7 @@ fi
 {
   echo "UNIT SUITE SUMMARY"
   echo "workerd: $("$WORKERD" --version) x $INSTANCES; primary: $PRIMARY; args: $*"
-  grep -E '^test result:' "$RUN/cargo.log" | awk '{p+=$4; f+=$6; i+=$8} END {printf "tests: %d passed, %d failed, %d ignored\n", p, f, i}'
+  { grep -E '^test result:' "$RUN/cargo.log" || true; } | awk '{p+=$4; f+=$6; i+=$8} END {printf "tests: %d passed, %d failed, %d ignored\n", p, f, i}'
   printf '%s\n' "$DB_LINES" | awk -F'\t' 'NF>=4 {n++; c+=$3; r+=$5; k+=$6; u+=$7} NF>=4 && $5>0 {rb++} END {printf "databases: %d; calls compared: %d; plain EXPLAINs skipped: %d; rebuilt after a change behind the port: %d databases, %d rebuilds; calls run on SQLite alone at a state with a broken foreign key: %d\n", n, c, k, rb+0, r+0, u+0}'
   echo "divergences: $divergences; twin unreachable: $unreachable"
   echo "tests with calls at a state with a broken foreign key (allowed):"
