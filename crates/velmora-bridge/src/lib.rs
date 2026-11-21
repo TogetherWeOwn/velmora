@@ -21,6 +21,7 @@ pub mod intents;
 pub mod jobs;
 pub mod jobtable;
 pub mod keepalive;
+pub mod keys;
 pub mod parity;
 pub mod plan;
 mod pool;
