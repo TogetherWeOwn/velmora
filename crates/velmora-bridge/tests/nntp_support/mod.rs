@@ -1920,6 +1920,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
     let cfg = BridgeConfig {
         environment: Environment::Dev,
         s3_host: "s3.test".to_string(),
+        s3_hosts: Vec::new(),
         region: "auto".to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,

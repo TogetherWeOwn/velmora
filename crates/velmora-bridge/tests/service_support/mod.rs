@@ -634,6 +634,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
     BridgeConfig {
         environment: Environment::Dev,
         s3_host: HOST.to_string(),
+        s3_hosts: Vec::new(),
         region: REGION.to_string(),
         max_extent_bytes: 16 * 1024 * 1024,
         max_put_bytes: 16 * 1024 * 1024,
