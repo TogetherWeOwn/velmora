@@ -82,7 +82,8 @@ pub trait Sql {
 }
 
 // The limits of the database behind [`Sql`] live here and nowhere else:
-// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`] and [`SqlLimits`]. They are
+// [`MAX_SQL_PARAMS`], [`MAX_SQL_VALUE_BYTES`], [`MAX_SQL_INT`] and
+// [`SqlLimits`]. They are
 // D1's. The statements themselves are plain SQLite and run unchanged on
 // any SQLite behind the port.
 
@@ -91,6 +92,12 @@ pub const MAX_SQL_PARAMS: usize = 100;
 
 /// D1's limit on one bound text or blob value, in bytes. More is an error.
 pub const MAX_SQL_VALUE_BYTES: usize = 2_000_000;
+
+/// The largest integer D1 takes or returns, and the negative of the
+/// smallest: a value crosses to D1 as a JS number, which is exact up to
+/// `Number.MAX_SAFE_INTEGER` only. A bound integer outside
+/// `-MAX_SQL_INT..=MAX_SQL_INT` is an error, before the statement runs.
+pub const MAX_SQL_INT: i64 = (1 << 53) - 1;
 
 /// How much a set-based statement may carry: one that takes its rows from
 /// a single JSON parameter (the publish of a generation).
@@ -1073,6 +1080,40 @@ pub trait Catalog {
     async fn gc_begin(&self, row: &GcRow, now: UnixMs) -> Result<GcStep>;
     /// After the blob delete that `GcStep::DeleteBlob` asked for.
     async fn gc_done(&self, id: i64, now: UnixMs) -> Result<()>;
+
+    // orphaned upload parts (`GC_ORPHANS`)
+    /// False while the scan for orphaned parts rests after a full pass:
+    /// the dispatcher sends no job for it.
+    async fn gc_orphans_due(&self, now: UnixMs) -> Result<bool>;
+    /// Reads the next `scan` open `gc` rows due at or before `cutoff`
+    /// and moves the scan past them. Returns the `delete_safety` rows
+    /// among them whose extent is an orphaned upload part, at most
+    /// `limit` (the scan then stops at the last one returned).
+    async fn gc_orphans(
+        &self,
+        now: UnixMs,
+        cutoff: UnixMs,
+        scan: u32,
+        limit: u32,
+    ) -> Result<Vec<GcRow>>;
+    /// Records that the safety copies of the rows' extents are gone,
+    /// each in one batch with the proof that it may go: the row is open
+    /// and was due at or before `cutoff`, the extent is still an
+    /// orphaned upload part, no replay or rollback is being handled,
+    /// and none ended after `cutoff`. One answer per row, in order;
+    /// `false`: nothing was written for it and its blob must stay.
+    /// The second value is the first error that left rows undecided
+    /// (answered `false`): every answer stands all the same, and the
+    /// blobs they grant must go.
+    async fn gc_orphan_claim(
+        &self,
+        rows: &[GcRow],
+        now: UnixMs,
+        cutoff: UnixMs,
+    ) -> (Vec<bool>, Result<()>);
+    /// Closes the row after the blob delete that a claim allowed. A row
+    /// whose extent the catalogue does not say is deleted stays open.
+    async fn gc_orphan_done(&self, id: i64, now: UnixMs) -> Result<()>;
 
     // recovery replay (DESIGN §A.8); every call is idempotent
     /// Where a manifest's generation stands in this catalogue.
