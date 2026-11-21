@@ -422,6 +422,10 @@ pub struct MemCatalog {
     /// Another job takes the row over just before the next release is
     /// asked for: the lease of the job that asks is stale by then.
     pub take_over_at_release: Cell<bool>,
+    /// The copy is found `releasing` when the next release is asked
+    /// for, the lease intact: a state the job did not see when it
+    /// loaded the extent.
+    pub releasing_at_release: Cell<bool>,
 }
 
 impl MemCatalog {
@@ -560,6 +564,11 @@ impl MemCatalog {
         if self.take_over_at_release.take() {
             self.take_over(&l.extent);
         }
+        if self.releasing_at_release.take() {
+            let mut entries = self.entries.borrow_mut();
+            let e = entries.get_mut(&l.extent).expect("seeded");
+            e.job.extent.safety_state = SafetyState::Releasing;
+        }
         let raised = self.escalations.borrow().clone();
         let applied = self.fenced(l, |e| {
             // As the SQL guard: under the light check, the escalations
@@ -601,6 +610,16 @@ impl MemCatalog {
             if !velmora_bridge::verify::release_rule(passes, counting, required, need_full) {
                 return false;
             }
+            // As the SQL guard: a release job takes a copy that is held
+            // or that a job before it left `releasing`, the one write
+            // of a verify job a held copy only.
+            let takes = matches!(
+                (whole, e.job.extent.safety_state),
+                (_, SafetyState::Held) | (None, SafetyState::Releasing)
+            );
+            if !takes {
+                return false;
+            }
             e.job.extent.release_evidence = Some(evidence_json.to_string());
             match whole {
                 None => e.job.extent.safety_state = SafetyState::Releasing,
@@ -610,6 +629,8 @@ impl MemCatalog {
                     e.job.extent.released_at = Some(now);
                     e.outbox.stage = OutboxStage::Done;
                     e.outbox.lease_until = None;
+                    e.outbox.cursor = 0;
+                    e.outbox.last_error = None;
                 }
             }
             true

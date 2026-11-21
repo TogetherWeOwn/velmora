@@ -1036,7 +1036,8 @@ pub trait Catalog {
     /// copy goes from `held` to `released` and the row from `verify` to
     /// `done` in the same batch, as [`Catalog::finish_release`] leaves
     /// them. Nothing is left `releasing` in between: a job that dies
-    /// has released or has not.
+    /// has released or has not. Only a copy that is `held` is taken: one
+    /// found `releasing` is refused, and is for a release job to finish.
     async fn release_at_verify(
         &self,
         l: &Lease,
