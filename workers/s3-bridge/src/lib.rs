@@ -30,7 +30,7 @@ use std::task::{Poll, Waker};
 
 use velmora_bridge::copy::Copier;
 use velmora_bridge::ingress;
-use velmora_bridge::jobmsg::{Admission, Disposition, FormatCount, REFUSED_RETRY_DELAY_SECS};
+use velmora_bridge::jobmsg::{Admission, FormatCount, REFUSED_RETRY_DELAY_SECS};
 use velmora_bridge::keepalive;
 use velmora_bridge::{
     BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
@@ -269,23 +269,24 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
         if let Some(line) = FORMATS.with(|count| count.borrow_mut().count(&admission, now)) {
             console_log!("{line}");
         }
-        match admission.disposition() {
-            Disposition::Run => {}
-            Disposition::Drop => {
+        // `Admission::disposition` (tested in the library) says the same
+        // for each arm: run, drop, or hand back.
+        let (scope, job) = match admission {
+            Admission::Run { scope, job, .. } => (scope, job),
+            Admission::Malformed => {
                 // A job only names an outbox row; the dispatcher re-drives it.
                 console_error!("malformed job message dropped");
                 msg.ack();
                 continue;
             }
-            Disposition::Refuse => {
+            Admission::Refused(why) => {
                 // Never run, never dropped in silence: handed back until
                 // its deliveries are used up, so that it reaches the
                 // dead-letter queue, which pages.
-                let why = match &admission {
-                    Admission::Refused(why) => why.code(),
-                    _ => "-",
-                };
-                console_error!("alert: job message refused ({why}): to the dead-letter queue");
+                console_error!(
+                    "alert: job message refused ({}): to the dead-letter queue",
+                    why.code()
+                );
                 msg.retry_with_options(
                     &QueueRetryOptionsBuilder::new()
                         .with_delay_seconds(REFUSED_RETRY_DELAY_SECS)
@@ -293,9 +294,6 @@ async fn queue(batch: MessageBatch<serde_json::Value>, env: Env, _ctx: Context) 
                 );
                 continue;
             }
-        }
-        let Admission::Run { scope, job, .. } = admission else {
-            continue;
         };
         let outcome = match &job {
             // Never through `run_job`, which reads the catalogue. A job
