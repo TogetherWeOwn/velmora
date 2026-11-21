@@ -394,14 +394,6 @@ fn claimed_key(headers: &Headers, target: &Target) -> Option<String> {
     (!akid.is_empty()).then(|| akid.to_owned())
 }
 
-/// Headers the edge adds, and the entry marker. They are never signed and
-/// the edge's values are not always printable ASCII, so they are dropped
-/// before header validation. Dropping a header can only fail a
-/// signature, never satisfy one.
-pub(super) fn edge_header(name: &str) -> bool {
-    crate::entry::dropped_header(name)
-}
-
 /// Authenticates and authorizes from the request line and headers only.
 /// The body is never touched. A key with no usable row is
 /// `InvalidAccessKeyId` for every bucket.
@@ -431,7 +423,7 @@ where
     let fields: Vec<(&str, &str)> = req
         .headers
         .iter()
-        .filter(|(n, _)| !edge_header(n))
+        .filter(|(n, _)| !crate::entry::dropped_header(n))
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let headers = Headers::new(&fields, &policy).map_err(s3_error);

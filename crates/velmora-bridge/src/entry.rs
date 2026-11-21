@@ -97,12 +97,12 @@ pub fn edge_header(name: &str) -> bool {
         || matches!(name, "cdn-loop" | "x-real-ip" | "true-client-ip")
 }
 
-/// Whether the request carries a header that only the edge adds.
-/// Names are compared without case.
+/// Whether the request carries a header that only the edge adds. Header
+/// names arrive in lower case (`S3Request::headers`); a name in any other
+/// case is no edge header here, and no entry marker either
+/// ([`Entry::of`] compares the same way).
 pub fn from_edge(headers: &[(String, String)]) -> bool {
-    headers
-        .iter()
-        .any(|(name, _)| edge_header(&name.to_ascii_lowercase()))
+    headers.iter().any(|(name, _)| edge_header(name))
 }
 
 /// A header that is dropped before signature verification: one the edge
@@ -117,9 +117,7 @@ impl Entry {
     /// exactly one [`ENTRY_HEADER`] says so and nothing says the request
     /// came from the edge.
     pub fn of(headers: &[(String, String)]) -> Entry {
-        let mut marks = headers
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(ENTRY_HEADER));
+        let mut marks = headers.iter().filter(|(name, _)| name == ENTRY_HEADER);
         let webdav = matches!(
             (marks.next(), marks.next()),
             (Some((_, value)), None) if value == WEBDAV
@@ -176,7 +174,7 @@ mod tests {
         // Any edge header: the marker is forged or the wrapper is missing.
         for edge in [
             "cf-connecting-ip",
-            "CF-Ray",
+            "cf-ray",
             "x-forwarded-proto",
             "cdn-loop",
             "x-real-ip",
@@ -196,7 +194,8 @@ mod tests {
             Entry::of(&h(&[(ENTRY_HEADER, WEBDAV), (ENTRY_HEADER, WEBDAV)])),
             Entry::S3
         );
-        assert_eq!(Entry::of(&h(&[("X-Velmora-Entry", WEBDAV)])), Entry::WebDav);
+        // Names arrive in lower case; another case is no marker.
+        assert_eq!(Entry::of(&h(&[("X-Velmora-Entry", WEBDAV)])), Entry::S3);
     }
 
     #[test]
@@ -208,10 +207,17 @@ mod tests {
         assert!(!Entry::WebDav.admits("AKIDTESTKEY000000001"));
     }
 
-    /// The Worker's entry module sets and deletes the same header with the
-    /// same value.
+    /// The Worker's main module is the wrapper (a revert to the generated
+    /// shim would drop the marker deletion and `DavEntry`), and its marker
+    /// module sets and deletes the same header with the same value.
     #[test]
     fn the_entry_module_agrees() {
+        let wrangler = include_str!("../../../workers/s3-bridge/wrangler.toml");
+        assert!(wrangler.lines().any(|l| l.trim() == "main = \"entry.mjs\""));
+        let main = include_str!("../../../workers/s3-bridge/entry.mjs");
+        assert!(main.contains("export class DavEntry extends WorkerEntrypoint"));
+        assert!(main.contains("marked(request, null)"));
+        assert!(main.contains("marked(request, WEBDAV)"));
         let module = include_str!("../../../workers/s3-bridge/entry-marker.mjs");
         assert!(module.contains(&format!("ENTRY_HEADER = \"{ENTRY_HEADER}\";")));
         assert!(module.contains(&format!("WEBDAV = \"{WEBDAV}\";")));
